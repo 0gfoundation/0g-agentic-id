@@ -337,7 +337,16 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 已知未做的事
 
-- 测试套件（`test/` 空）
+- 测试套件：已有 37 个 Foundry tests 覆盖 register / agentSeal set-once / iTransferFrom
+  完整 proof 流程 / iCloneFrom；仍缺 `TransferHook`（`_update` 清 `agentWallet` /
+  `authorizedUsers` 的副作用）、`Reputation`（ServeProof 验签）、以及 P1/P2 档的
+  状态管理 + admin 类测试
+- **链下 SDK 的 ECIES 端到端测试**：合约对 `sealedKey` 是黑箱（只验 Oracle 签名覆盖到
+  它，不验其加密正确性）。"Oracle TEE 封 dataKey → buyer 解出原始 dataKey" 这一段
+  只能在 TS/Rust SDK 的集成测试里用工业级 ECIES 库验；Solidity 层做不到
 - `TappRegistry` 合约本身（被引用但未定稿）
 - "Agent TEE 在线状态"的链上感知（当前完全 off-chain 协商）
 - Oracle 签 OwnershipProof 时不绑定 agentId（依赖 oracle 的 framework 自律）
+- 卖家对 `targetPubkey` 的约束机制：当前 buyer 可以把 `targetPubkey` 指定为任意
+  EOA pubkey（dataKey 会落到明文钱包）。如果卖家想强制"数据永远不出 TEE"，需要
+  在合约层加 `dataPolicy` 字段或通过 TappRegistry 做 TEE pubkey 白名单

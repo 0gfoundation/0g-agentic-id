@@ -1,52 +1,20 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-
-import {AgenticID} from "../contracts/AgenticID.sol";
-import {TEEDataVerifier} from "../contracts/verifiers/TEEDataVerifier.sol";
-import {AgenticIDNotTrustedAttestor, AgenticIDSealedKeyLengthMismatch, AgenticIDUseRegisterWithData} from "../contracts/AgenticID.sol";
+import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
+import {
+    AgenticIDNotTrustedAttestor,
+    AgenticIDSealedKeyLengthMismatch,
+    AgenticIDUseRegisterWithData
+} from "../contracts/AgenticID.sol";
 import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
 import {IERC7857Updatable} from "../contracts/interfaces/IERC7857Updatable.sol";
-import {IAgenticID} from "../contracts/interfaces/IAgenticID.sol";
 
-contract AgenticIDTest is Test {
-    AgenticID internal agenticId;
-    TEEDataVerifier internal verifier;
-
-    address internal owner = address(0xA11CE);
+contract AgenticIDTest is AgenticIDTestBase {
     address internal alice = address(0xA1);
-    address internal bob = address(0xB0B);
-    address internal attestor = address(0xA77E57);
-    address internal oracleAddr;
-    uint256 internal oraclePk;
 
-    bytes32 internal constant SEAL_ID = bytes32(uint256(0xBEEF));
-
-    uint256 internal constant MAX_PROOF_AGE = 1 days;
-
-    function setUp() public {
-        (oracleAddr, oraclePk) = makeAddrAndKey("oracle");
-
-        TEEDataVerifier verifierImpl = new TEEDataVerifier();
-        ERC1967Proxy verifierProxy = new ERC1967Proxy(
-            address(verifierImpl),
-            abi.encodeCall(TEEDataVerifier.initialize, (owner, oracleAddr, MAX_PROOF_AGE))
-        );
-        verifier = TEEDataVerifier(address(verifierProxy));
-
-        AgenticID agenticIdImpl = new AgenticID();
-        ERC1967Proxy agenticIdProxy = new ERC1967Proxy(
-            address(agenticIdImpl),
-            abi.encodeCall(
-                AgenticID.initialize,
-                ("AgenticID", "AID", address(verifier), owner, MAX_PROOF_AGE)
-            )
-        );
-        agenticId = AgenticID(address(agenticIdProxy));
-    }
+    // ── Self-mint ─────────────────────────────────────────────────────────────
 
     function test_register_selfMint_succeeds() public {
         IntelligentData[] memory datas = new IntelligentData[](1);
@@ -125,6 +93,7 @@ contract AgenticIDTest is Test {
     // ── registerWithSeal: trusted-attestor gating ─────────────────────────────
 
     function test_registerWithSeal_revertsWhenCallerNotTrusted() public {
+        // NB: base setUp does NOT whitelist attestor — that's exactly what's under test.
         IntelligentData[] memory datas = new IntelligentData[](1);
         datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("d")});
 
@@ -141,8 +110,7 @@ contract AgenticIDTest is Test {
     }
 
     function test_registerWithSeal_succeedsAfterAttestorWhitelisted() public {
-        vm.prank(owner);
-        agenticId.addTrustedAttestor(attestor);
+        _whitelistAttestor();
         assertTrue(agenticId.isTrustedAttestor(attestor), "attestor should be whitelisted");
 
         IntelligentData[] memory datas = new IntelligentData[](1);
