@@ -29,14 +29,26 @@ foundryup -i nightly --platform alpine    # musl 静态链接，不依赖系统 
 
 ### 安装依赖
 
-```bash
-# OZ 两套合约（已在 .gitmodules 中，正常克隆 + submodule update 即可）
-forge install openzeppelin/openzeppelin-contracts@v5.0.2 \
-              openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+所有依赖都已在 `.gitmodules` 里：
 
-# forge-std 当前未 submodule 化（.gitignore 排除），新克隆后需要手动装：
-forge install foundry-rs/forge-std
+```bash
+git clone --recurse-submodules <repo>
+# 或已 clone 过：
+git submodule update --init --recursive
 ```
+
+版本钉法（仅作参考，正常 clone 会自动拿到）：
+
+| 依赖 | 版本 |
+|---|---|
+| `openzeppelin-contracts` | v5.0.2 |
+| `openzeppelin-contracts-upgradeable` | v5.0.2 |
+| `forge-std` | **v1.12.0**（见下方警告） |
+
+> ⚠️ **forge-std 钉在 v1.12.0 是有意的。** v1.13.0+ 改了内部 memory 布局，会触发
+> Solidity 0.8.24 + via_ir 的一个 codegen bug——local `uint256` 变量在特定调用序列
+> 下会被意外改写（表现为 `deadline` 从 3601 变 7202）。要升级 forge-std 须先把
+> solc 升到 >= 0.8.27（多个 via_ir bug 已修）。
 
 ### 编译与测试
 
@@ -378,5 +390,5 @@ proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写�
 - **fuzz + invariant test 补强**：当前都是单点样例；nonce / deadline / pubkey 长度
   边界、`giveFeedback` 的 `valueDecimals` 归一化逻辑适合 `forge fuzz` 扫
 - **gas 基线**：`forge snapshot` 未建立；合约优化 / 升级时缺少回归参照
-- **forge-std submodule 化**：当前 `.gitignore` 排除 `lib/forge-std/`，clone 后需手动
-  `forge install foundry-rs/forge-std`。应改为正式 submodule 以便一次 clone 就可跑
+- **solc 升级 + forge-std 解钉**：forge-std v1.12.0 是暂时方案，未来 solc 升到
+  0.8.27+ 后可以解钉到最新 forge-std（见 §1 警告）
