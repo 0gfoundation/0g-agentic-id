@@ -42,6 +42,38 @@ contract DataStorageTest is AgenticIDTestBase {
         agenticId.update(agentId, empty);
     }
 
+    function test_update_emitsUpdatedEventWithOldAndNewDatas() public {
+        (uint256 agentId, bytes32 originalDataHash) = _mintWithSeal(alice);
+
+        IntelligentData[] memory newDatas = new IntelligentData[](1);
+        newDatas[0] = IntelligentData({dataDescription: "replaced", dataHash: keccak256("new-dh")});
+
+        IntelligentData[] memory oldDatas = new IntelligentData[](1);
+        oldDatas[0] = IntelligentData({dataDescription: "d", dataHash: originalDataHash});
+
+        vm.expectEmit(true, false, false, true);
+        emit IERC7857Updatable.Updated(agentId, oldDatas, newDatas);
+
+        vm.prank(alice);
+        agenticId.update(agentId, newDatas);
+    }
+
+    function test_updateAt_emitsEntryUpdatedEvent() public {
+        (uint256 agentId, bytes32 originalDataHash) = _mintWithSeal(alice);
+
+        IntelligentData memory replacement = IntelligentData({
+            dataDescription: "at-replaced",
+            dataHash: keccak256("at-new-dh")
+        });
+        IntelligentData memory original = IntelligentData({dataDescription: "d", dataHash: originalDataHash});
+
+        vm.expectEmit(true, true, false, true);
+        emit IERC7857Updatable.EntryUpdated(agentId, 0, original, replacement);
+
+        vm.prank(alice);
+        agenticId.updateAt(agentId, 0, replacement);
+    }
+
     function test_update_revertsWhenNotOwner() public {
         (uint256 agentId, ) = _mintWithSeal(alice);
         IntelligentData[] memory newDatas = new IntelligentData[](1);

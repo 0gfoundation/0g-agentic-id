@@ -10,6 +10,7 @@ import {
 import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
 import {IERC7857Updatable} from "../contracts/interfaces/IERC7857Updatable.sol";
+import {IERC7857, SealedKeyEntry} from "../contracts/interfaces/IERC7857.sol";
 
 contract AgenticIDTest is AgenticIDTestBase {
     address internal alice = address(0xA1);
@@ -131,5 +132,50 @@ contract AgenticIDTest is AgenticIDTestBase {
         assertEq(agenticId.getAgentSeal(agentId), agentSeal, "seal should be set");
         assertEq(agenticId.getSealId(agentId), SEAL_ID, "sealId should be bound");
         assertEq(agenticId.getAgentIdBySealId(SEAL_ID), agentId, "reverse mapping set");
+    }
+
+    // ── ITransferred emitted on mint (indexer contract) ───────────────────────
+    //
+    // README §2 says indexers detect mint via ITransferred(from=0, ...). Both
+    // register and registerWithSeal must emit this — verify both paths.
+
+    function test_register_emitsITransferredMintEvent() public {
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("dh-register")});
+
+        bytes[] memory sealedKeys = new bytes[](1);
+        sealedKeys[0] = hex"c0ffee";
+
+        MetadataEntry[] memory metadata = new MetadataEntry[](0);
+
+        SealedKeyEntry[] memory expectedEntries = new SealedKeyEntry[](1);
+        expectedEntries[0] = SealedKeyEntry({dataHash: datas[0].dataHash, sealedKey: sealedKeys[0]});
+
+        vm.expectEmit(true, true, true, true);
+        emit IERC7857.ITransferred(address(0), alice, 1, expectedEntries);
+
+        vm.prank(alice);
+        agenticId.register("", metadata, datas, sealedKeys);
+    }
+
+    function test_registerWithSeal_emitsITransferredMintEvent() public {
+        _whitelistAttestor();
+
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("dh-rws")});
+
+        bytes[] memory sealedKeys = new bytes[](1);
+        sealedKeys[0] = hex"feedface";
+
+        MetadataEntry[] memory metadata = new MetadataEntry[](0);
+
+        SealedKeyEntry[] memory expectedEntries = new SealedKeyEntry[](1);
+        expectedEntries[0] = SealedKeyEntry({dataHash: datas[0].dataHash, sealedKey: sealedKeys[0]});
+
+        vm.expectEmit(true, true, true, true);
+        emit IERC7857.ITransferred(address(0), alice, 1, expectedEntries);
+
+        vm.prank(attestor);
+        agenticId.registerWithSeal(alice, "", metadata, datas, sealedKeys, address(0xAA), SEAL_ID);
     }
 }

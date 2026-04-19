@@ -9,8 +9,8 @@ import {
     TEEDataVerifierWrongOracleType
 } from "../contracts/verifiers/TEEDataVerifier.sol";
 import {DataVerifierDataHashMismatch} from "../contracts/verifiers/BaseDataVerifier.sol";
-import {NonceExpired} from "../contracts/utils/NonceRegistryUpgradeable.sol";
-import {IERC7857} from "../contracts/interfaces/IERC7857.sol";
+import {NonceExpired, NonceAlreadyUsed} from "../contracts/utils/NonceRegistryUpgradeable.sol";
+import {IERC7857, SealedKeyEntry} from "../contracts/interfaces/IERC7857.sol";
 import {
     OracleType,
     AccessProof,
@@ -61,6 +61,36 @@ contract TransferFlowTest is AgenticIDTestBase {
         assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "ownership moved");
         assertEq(agenticId.getAgentSeal(agentId), SEAL_ADDR, "seal preserved across transfer");
         assertEq(agenticId.getSealId(agentId), SEAL_ID, "sealId preserved across transfer");
+    }
+
+    // ── ITransferred emitted on successful iTransferFrom ─────────────────────
+    //
+    // Canonical ERC-7857 transfer event — indexers rely on this over plain
+    // ERC-721 Transfer to pick up sealedKey payloads.
+
+    function test_iTransferFrom_emitsITransferredEvent() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+
+        bytes memory buyerPubkey = _pubkey(buyerWallet);
+        uint256 deadline = block.timestamp + 1 hours;
+
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, "", bytes("ap-emit"), deadline, buyerWallet.privateKey
+        );
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-emit"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
+
+        SealedKeyEntry[] memory expectedEntries = new SealedKeyEntry[](1);
+        expectedEntries[0] = SealedKeyEntry({dataHash: dataHash, sealedKey: SEALED_KEY_NEW});
+
+        vm.expectEmit(true, true, true, true);
+        emit IERC7857.ITransferred(sellerWallet.addr, buyerWallet.addr, agentId, expectedEntries);
+
+        vm.prank(sellerWallet.addr);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
     }
 
     // ── dataHash mismatch rejection ───────────────────────────────────────────
@@ -205,7 +235,9 @@ contract TransferFlowTest is AgenticIDTestBase {
         proofs2[0] = TransferValidityProof({accessProof: ap2, ownershipProof: op2});
 
         vm.prank(sellerWallet.addr);
-        vm.expectRevert();
+        // Partial match: NonceAlreadyUsed(bytes32 key) carries the specific key,
+        // but the selector alone is enough to prove we hit the replay guard.
+        vm.expectPartialRevert(NonceAlreadyUsed.selector);
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId2, proofs2);
     }
 

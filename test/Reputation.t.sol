@@ -5,7 +5,16 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticIDReputationRegistry} from "../contracts/AgenticIDReputationRegistry.sol";
+import {
+    AgenticIDReputationRegistry,
+    ReputationClientMismatch,
+    ReputationNoAgentSeal,
+    ReputationInvalidProofSignature,
+    ReputationInvalidIndex,
+    ReputationAlreadyRevoked,
+    ReputationNotAgentOwner,
+    ReputationAlreadyResponded
+} from "../contracts/AgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof, AgenticIDProofRequired} from "../contracts/interfaces/IAgenticIDReputationRegistry.sol";
@@ -167,9 +176,7 @@ contract ReputationTest is AgenticIDTestBase {
         );
 
         vm.prank(client);
-        vm.expectRevert(
-            bytes4(keccak256("ReputationNoAgentSeal()"))
-        );
+        vm.expectRevert(ReputationNoAgentSeal.selector);
         reputation.giveFeedback(
             agentId, 90, 0, "q", "l",
             "https://api.example.com", "ipfs://f", keccak256("f"),
@@ -192,7 +199,7 @@ contract ReputationTest is AgenticIDTestBase {
         );
 
         vm.prank(client2);
-        vm.expectRevert(bytes4(keccak256("ReputationClientMismatch()")));
+        vm.expectRevert(ReputationClientMismatch.selector);
         reputation.giveFeedback(
             agentId, 90, 0, "q", "l",
             "https://api.example.com", "ipfs://f", keccak256("f"),
@@ -216,7 +223,7 @@ contract ReputationTest is AgenticIDTestBase {
         );
 
         vm.prank(client);
-        vm.expectRevert(bytes4(keccak256("ReputationInvalidProofSignature()")));
+        vm.expectRevert(ReputationInvalidProofSignature.selector);
         reputation.giveFeedback(
             agentId, 90, 0, "q", "l",
             "https://api.example.com", "ipfs://f", keccak256("f"),
@@ -268,7 +275,7 @@ contract ReputationTest is AgenticIDTestBase {
 
         // Resubmit identical ServeProof — signature-derived nonce already consumed.
         vm.prank(client);
-        vm.expectRevert(); // NonceAlreadyUsed(key) — exact key depends on signature bytes
+        vm.expectPartialRevert(NonceAlreadyUsed.selector);
         reputation.giveFeedback(
             agentId, 80, 0, "q", "l",
             "https://api.example.com", "ipfs://f2", keccak256("f2"),
@@ -313,7 +320,7 @@ contract ReputationTest is AgenticIDTestBase {
         reputation.revokeFeedback(agentId, 0);
 
         vm.prank(client);
-        vm.expectRevert(bytes4(keccak256("ReputationAlreadyRevoked()")));
+        vm.expectRevert(ReputationAlreadyRevoked.selector);
         reputation.revokeFeedback(agentId, 0);
     }
 
@@ -322,10 +329,7 @@ contract ReputationTest is AgenticIDTestBase {
 
         vm.prank(client);
         vm.expectRevert(
-            abi.encodeWithSelector(
-                bytes4(keccak256("ReputationInvalidIndex(uint256,uint256)")),
-                uint256(5), uint256(0)
-            )
+            abi.encodeWithSelector(ReputationInvalidIndex.selector, uint256(5), uint256(0))
         );
         reputation.revokeFeedback(agentId, 5);
     }
@@ -366,7 +370,7 @@ contract ReputationTest is AgenticIDTestBase {
 
         vm.startPrank(agentOwner);
         reputation.appendResponse(agentId, client, 0, "ipfs://r1", keccak256("r1"));
-        vm.expectRevert(bytes4(keccak256("ReputationAlreadyResponded()")));
+        vm.expectRevert(ReputationAlreadyResponded.selector);
         reputation.appendResponse(agentId, client, 0, "ipfs://r2", keccak256("r2"));
         vm.stopPrank();
     }
@@ -384,7 +388,7 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         vm.prank(client);
-        vm.expectRevert(bytes4(keccak256("ReputationNotAgentOwner()")));
+        vm.expectRevert(ReputationNotAgentOwner.selector);
         reputation.appendResponse(agentId, client, 0, "ipfs://r", keccak256("r"));
     }
 }

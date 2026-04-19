@@ -7,6 +7,7 @@ import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {IERC7857} from "../contracts/interfaces/IERC7857.sol";
 import {IERC7857Cloneable} from "../contracts/interfaces/IERC7857Cloneable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
+import {DataVerifierDataHashMismatch} from "../contracts/verifiers/BaseDataVerifier.sol";
 import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
 import {
     AccessProof,
@@ -157,8 +158,30 @@ contract CloneTest is AgenticIDTestBase {
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
 
         vm.prank(sellerWallet.addr);
-        vm.expectRevert();
+        vm.expectRevert(DataVerifierDataHashMismatch.selector);
         agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
+    }
+
+    // ── Shared tokenId counter between register and iCloneFrom ────────────────
+    //
+    // AgenticID overrides `_incrementTokenId` via C3 MRO to point at ERC-8004's
+    // counter, so register and iCloneFrom share it. If the override ever gets
+    // reshuffled, clones could collide with subsequent registrations — this
+    // invariant is critical but otherwise invisible from the rest of the suite.
+
+    function test_tokenIdCounter_sharedBetweenRegisterAndClone() public {
+        (uint256 id1, bytes32 dh1) = _mintWithSeal(sellerWallet.addr);
+        assertEq(id1, 1, "first register mints tokenId 1");
+
+        TransferValidityProof[] memory proofs = _buildCloneProofs(dh1, "counter");
+        vm.prank(sellerWallet.addr);
+        uint256 id2 = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, id1, proofs);
+        assertEq(id2, 2, "clone must take next sequential tokenId");
+
+        // A fresh register after the clone should NOT collide with id2.
+        (uint256 id3, ) = _mintWithSealSalt(sellerWallet.addr, 42);
+        assertEq(id3, 3, "register after clone continues counter");
+        assertTrue(id3 != id2, "no tokenId collision");
     }
 
     // ── Source must be owned by `from` ────────────────────────────────────────
