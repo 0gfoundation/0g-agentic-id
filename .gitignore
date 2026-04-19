@@ -6,5 +6,3 @@ out/
 .DS_Store
 *.swp
 
-# Forge-std not yet wired as a submodule — install via `forge install foundry-rs/forge-std` after clone
-lib/forge-std/
