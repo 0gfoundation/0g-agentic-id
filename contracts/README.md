@@ -27,22 +27,25 @@ foundryup
 foundryup -i nightly --platform alpine    # musl 静态链接，不依赖系统 glibc
 ```
 
-### 安装 OZ 依赖
+### 安装依赖
 
 ```bash
+# OZ 两套合约（已在 .gitmodules 中，正常克隆 + submodule update 即可）
 forge install openzeppelin/openzeppelin-contracts@v5.0.2 \
               openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+
+# forge-std 当前未 submodule 化（.gitignore 排除），新克隆后需要手动装：
+forge install foundry-rs/forge-std
 ```
 
-装完会在 `lib/` 下产生两个 git submodule。
-
-### 编译
+### 编译与测试
 
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 运行测试（待补）
+forge test                      # 跑全量测试（当前 103 tests / 14 suites）
 forge test -vvvv                # 详细 trace
+forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
 forge clean                     # 清 out/
 ```
@@ -335,12 +338,34 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ---
 
-## 9. 已知未做的事
+## 9. 测试
 
-- 测试套件：已有 37 个 Foundry tests 覆盖 register / agentSeal set-once / iTransferFrom
-  完整 proof 流程 / iCloneFrom；仍缺 `TransferHook`（`_update` 清 `agentWallet` /
-  `authorizedUsers` 的副作用）、`Reputation`（ServeProof 验签）、以及 P1/P2 档的
-  状态管理 + admin 类测试
+103 个 Foundry tests / 14 suites，`forge test` 全绿。覆盖每个
+`external` / `public` 函数和每条文档化的 error 路径。
+
+| Suite | Cases | 覆盖 |
+|---|---|---|
+| `AgenticID.t.sol` | 8 | register / registerWithSeal / 禁用 overload / attestor 白名单 |
+| `AgentSeal.t.sol` | 6 | set-once / sealId 冲突 / 零值 / 补 seal / 非 attestor |
+| `TransferFlow.t.sol` | 16 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
+| `Clone.t.sol` | 7 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
+| `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
+| `Reputation.t.sol` | 13 | giveFeedback ServeProof 验签 + revoke / appendResponse 全路径 |
+| `DataStorage.t.sol` | 6 | update / updateAt + 空 / 越界 / 非 owner |
+| `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |
+| `AgentWallet.t.sol` | 7 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
+| `AgentURIAndMetadata.t.sol` | 7 | setAgentURI / setMetadata + 覆写 / nonexistent |
+| `VerifierAdmin.t.sol` | 7 | oracle 轮换 / pause / maxProofAge / onlyOwner |
+| `AgenticIDAdmin.t.sol` | 8 | attestor 增删 / frameworkHash / setVerifier / onlyOwner |
+| `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
+| `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
+
+共享 scaffolding 在 `test/AgenticIDTestBase.sol`：两种 EIP-191 变体
+（hex-encoded 用于 transfer proof，raw-32-byte 用于 ServeProof / wallet sig）、
+proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写业务断言。
+
+## 10. 已知未做的事
+
 - **链下 SDK 的 ECIES 端到端测试**：合约对 `sealedKey` 是黑箱（只验 Oracle 签名覆盖到
   它，不验其加密正确性）。"Oracle TEE 封 dataKey → buyer 解出原始 dataKey" 这一段
   只能在 TS/Rust SDK 的集成测试里用工业级 ECIES 库验；Solidity 层做不到
@@ -350,3 +375,8 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 - 卖家对 `targetPubkey` 的约束机制：当前 buyer 可以把 `targetPubkey` 指定为任意
   EOA pubkey（dataKey 会落到明文钱包）。如果卖家想强制"数据永远不出 TEE"，需要
   在合约层加 `dataPolicy` 字段或通过 TappRegistry 做 TEE pubkey 白名单
+- **fuzz + invariant test 补强**：当前都是单点样例；nonce / deadline / pubkey 长度
+  边界、`giveFeedback` 的 `valueDecimals` 归一化逻辑适合 `forge fuzz` 扫
+- **gas 基线**：`forge snapshot` 未建立；合约优化 / 升级时缺少回归参照
+- **forge-std submodule 化**：当前 `.gitignore` 排除 `lib/forge-std/`，clone 后需手动
+  `forge install foundry-rs/forge-std`。应改为正式 submodule 以便一次 clone 就可跑
