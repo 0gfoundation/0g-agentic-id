@@ -2,13 +2,13 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {IAgenticID} from "../contracts/interfaces/IAgenticID.sol";
-import {IERC8004IdentityRegistry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
-import {IERC7857} from "../contracts/interfaces/IERC7857.sol";
-import {IERC7857Authorize} from "../contracts/interfaces/IERC7857Authorize.sol";
-import {IERC7857Cloneable} from "../contracts/interfaces/IERC7857Cloneable.sol";
-import {IERC7857Delegate} from "../contracts/interfaces/IERC7857Delegate.sol";
-import {IERC7857Updatable} from "../contracts/interfaces/IERC7857Updatable.sol";
+import {IAgenticID} from "../src/interfaces/IAgenticID.sol";
+import {IERC8004IdentityRegistry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
+import {IERC7857} from "../src/interfaces/IERC7857.sol";
+import {IERC7857Authorize} from "../src/interfaces/IERC7857Authorize.sol";
+import {IERC7857Cloneable} from "../src/interfaces/IERC7857Cloneable.sol";
+import {IERC7857Delegate} from "../src/interfaces/IERC7857Delegate.sol";
+import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
 import {IERC721} from "@openzeppelin/contracts/interfaces/IERC721.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 

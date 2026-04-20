@@ -2,10 +2,10 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticIDNotTrustedAttestor} from "../contracts/AgenticID.sol";
+import {AgenticIDNotTrustedAttestor} from "../src/AgenticID.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
 contract AgenticIDAdminTest is AgenticIDTestBase {
     address internal alice = address(0xA1);

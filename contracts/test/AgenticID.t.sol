@@ -6,11 +6,11 @@ import {
     AgenticIDNotTrustedAttestor,
     AgenticIDSealedKeyLengthMismatch,
     AgenticIDUseRegisterWithData
-} from "../contracts/AgenticID.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
-import {IERC7857Updatable} from "../contracts/interfaces/IERC7857Updatable.sol";
-import {IERC7857, SealedKeyEntry} from "../contracts/interfaces/IERC7857.sol";
+} from "../src/AgenticID.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
+import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
+import {IERC7857, SealedKeyEntry} from "../src/interfaces/IERC7857.sol";
 
 contract AgenticIDTest is AgenticIDTestBase {
     address internal alice = address(0xA1);

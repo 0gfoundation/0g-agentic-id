@@ -8,9 +8,9 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
-import {AgenticID} from "../contracts/AgenticID.sol";
-import {AgenticIDReputationRegistry} from "../contracts/AgenticIDReputationRegistry.sol";
-import {TEEDataVerifier} from "../contracts/verifiers/TEEDataVerifier.sol";
+import {AgenticID} from "../src/AgenticID.sol";
+import {AgenticIDReputationRegistry} from "../src/AgenticIDReputationRegistry.sol";
+import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 
 /// @notice Deploy AgenticID stack behind BeaconProxy + TimelockController.
 ///

@@ -14,11 +14,11 @@ import {
     ReputationAlreadyRevoked,
     ReputationNotAgentOwner,
     ReputationAlreadyResponded
-} from "../contracts/AgenticIDReputationRegistry.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
-import {ServeProof, AgenticIDProofRequired} from "../contracts/interfaces/IAgenticIDReputationRegistry.sol";
-import {NonceExpired, NonceAlreadyUsed} from "../contracts/utils/NonceRegistryUpgradeable.sol";
+} from "../src/AgenticIDReputationRegistry.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
+import {ServeProof, AgenticIDProofRequired} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
+import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
 
 contract ReputationTest is AgenticIDTestBase {
     AgenticIDReputationRegistry internal reputation;

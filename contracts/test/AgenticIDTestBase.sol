@@ -6,16 +6,16 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
-import {AgenticID} from "../contracts/AgenticID.sol";
-import {TEEDataVerifier} from "../contracts/verifiers/TEEDataVerifier.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
+import {AgenticID} from "../src/AgenticID.sol";
+import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {
     OracleType,
     AccessProof,
     OwnershipProof,
     TransferValidityProof
-} from "../contracts/interfaces/IERC7857DataVerifier.sol";
+} from "../src/interfaces/IERC7857DataVerifier.sol";
 
 /// @notice Shared test scaffold for AgenticID test suites.
 /// @dev The base does NOT whitelist the attestor — each suite opts in via

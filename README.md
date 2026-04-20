@@ -1,66 +1,24 @@
-## Foundry
+# 0G AgenticID
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+Monorepo 分两个子项目：
 
-Foundry consists of:
+| 子项目 | 内容 | 工具链 |
+|---|---|---|
+| [`contracts/`](contracts/README.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
+| [`attestor/`](attestor/) | 后端服务（Attestor / Oracle TEE、API、worker、indexer） | Rust (cargo workspace) |
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+跨子项目的事（共享 ABI、联合 CI 等）以后按需加。
 
-## Documentation
+## 常用命令
 
-https://book.getfoundry.sh/
+```bash
+# 合约
+cd contracts && forge test                      # 跑测试套件
+cd contracts && forge build                     # 编译
 
-## Usage
-
-### Build
-
-```shell
-$ forge build
+# 后端
+cd attestor && cargo test                       # 跑 Rust 测试
+cd attestor && cargo build                      # 构建
 ```
 
-### Test
-
-```shell
-$ forge test
-```
-
-### Format
-
-```shell
-$ forge fmt
-```
-
-### Gas Snapshots
-
-```shell
-$ forge snapshot
-```
-
-### Anvil
-
-```shell
-$ anvil
-```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
-
-### Cast
-
-```shell
-$ cast <subcommand>
-```
-
-### Help
-
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+具体部署 / 升级 / verify 流程见 [`contracts/README.md` §10](contracts/README.md)。

@@ -7,9 +7,9 @@ import {
     AgenticIDZeroSeal,
     AgenticIDSealAlreadySet,
     AgenticIDSealIdTaken
-} from "../contracts/AgenticID.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
+} from "../src/AgenticID.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
 contract AgentSealTest is AgenticIDTestBase {
     address internal alice = address(0xA1);

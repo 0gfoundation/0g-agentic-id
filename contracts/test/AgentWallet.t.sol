@@ -4,8 +4,8 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {ERC8004InvalidWalletSignature} from "../contracts/ERC8004IdentityRegistryUpgradeable.sol";
-import {NonceExpired, NonceAlreadyUsed} from "../contracts/utils/NonceRegistryUpgradeable.sol";
+import {ERC8004InvalidWalletSignature} from "../src/ERC8004IdentityRegistryUpgradeable.sol";
+import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract AgentWalletTest is AgenticIDTestBase {

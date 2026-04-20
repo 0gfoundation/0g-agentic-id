@@ -4,15 +4,15 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {TEEDataVerifierInvalidSignature} from "../contracts/verifiers/TEEDataVerifier.sol";
-import {DataVerifierNotPauser} from "../contracts/verifiers/BaseDataVerifier.sol";
+import {TEEDataVerifierInvalidSignature} from "../src/verifiers/TEEDataVerifier.sol";
+import {DataVerifierNotPauser} from "../src/verifiers/BaseDataVerifier.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
     AccessProof,
     OwnershipProof,
     TransferValidityProof
-} from "../contracts/interfaces/IERC7857DataVerifier.sol";
+} from "../src/interfaces/IERC7857DataVerifier.sol";
 
 contract VerifierAdminTest is AgenticIDTestBase {
     Vm.Wallet internal sellerWallet;

@@ -2,8 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticID} from "../contracts/AgenticID.sol";
-import {TEEDataVerifier} from "../contracts/verifiers/TEEDataVerifier.sol";
+import {AgenticID} from "../src/AgenticID.sol";
+import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 
 /// @notice Guards against:

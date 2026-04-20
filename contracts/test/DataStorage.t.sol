@@ -2,8 +2,8 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {IERC7857Updatable} from "../contracts/interfaces/IERC7857Updatable.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract DataStorageTest is AgenticIDTestBase {

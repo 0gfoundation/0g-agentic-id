@@ -4,16 +4,16 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {IERC7857} from "../contracts/interfaces/IERC7857.sol";
-import {IERC7857Cloneable} from "../contracts/interfaces/IERC7857Cloneable.sol";
+import {IERC7857} from "../src/interfaces/IERC7857.sol";
+import {IERC7857Cloneable} from "../src/interfaces/IERC7857Cloneable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
-import {DataVerifierDataHashMismatch} from "../contracts/verifiers/BaseDataVerifier.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
+import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {
     AccessProof,
     OwnershipProof,
     TransferValidityProof
-} from "../contracts/interfaces/IERC7857DataVerifier.sol";
+} from "../src/interfaces/IERC7857DataVerifier.sol";
 
 contract CloneTest is AgenticIDTestBase {
     Vm.Wallet internal sellerWallet;

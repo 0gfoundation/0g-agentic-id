@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {IERC7857Authorize} from "../contracts/interfaces/IERC7857Authorize.sol";
+import {IERC7857Authorize} from "../src/interfaces/IERC7857Authorize.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 contract AuthorizeTest is AgenticIDTestBase {

@@ -4,13 +4,13 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {
     AccessProof,
     OwnershipProof,
     TransferValidityProof
-} from "../contracts/interfaces/IERC7857DataVerifier.sol";
+} from "../src/interfaces/IERC7857DataVerifier.sol";
 
 /// @notice Verifies the side-effects of iTransferFrom's _update hook chain:
 ///           • agentWallet is cleared

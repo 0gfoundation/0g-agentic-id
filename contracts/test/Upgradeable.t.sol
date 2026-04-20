@@ -7,10 +7,10 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
-import {AgenticID, AgenticIDNotPauser} from "../contracts/AgenticID.sol";
-import {TEEDataVerifier} from "../contracts/verifiers/TEEDataVerifier.sol";
-import {IntelligentData} from "../contracts/interfaces/IERC7857Metadata.sol";
-import {MetadataEntry} from "../contracts/interfaces/IERC8004IdentityRegistry.sol";
+import {AgenticID, AgenticIDNotPauser} from "../src/AgenticID.sol";
+import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
+import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
 /// @notice Minimal v2 that adds a new view to prove code swap took effect.
 contract AgenticIDV2 is AgenticID {

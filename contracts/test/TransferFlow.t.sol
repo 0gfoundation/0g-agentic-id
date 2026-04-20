@@ -7,16 +7,16 @@ import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {
     TEEDataVerifierInvalidSignature,
     TEEDataVerifierWrongOracleType
-} from "../contracts/verifiers/TEEDataVerifier.sol";
-import {DataVerifierDataHashMismatch} from "../contracts/verifiers/BaseDataVerifier.sol";
-import {NonceExpired, NonceAlreadyUsed} from "../contracts/utils/NonceRegistryUpgradeable.sol";
-import {IERC7857, SealedKeyEntry} from "../contracts/interfaces/IERC7857.sol";
+} from "../src/verifiers/TEEDataVerifier.sol";
+import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.sol";
+import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
+import {IERC7857, SealedKeyEntry} from "../src/interfaces/IERC7857.sol";
 import {
     OracleType,
     AccessProof,
     OwnershipProof,
     TransferValidityProof
-} from "../contracts/interfaces/IERC7857DataVerifier.sol";
+} from "../src/interfaces/IERC7857DataVerifier.sol";
 
 contract TransferFlowTest is AgenticIDTestBase {
     Vm.Wallet internal sellerWallet;
