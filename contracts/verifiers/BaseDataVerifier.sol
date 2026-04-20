@@ -22,6 +22,9 @@ error DataVerifierInvalidAccessProof();
 /// @notice The access proof dataHash does not match the ownership proof dataHash.
 error DataVerifierDataHashMismatch();
 
+/// @notice Caller is not the pauser.
+error DataVerifierNotPauser();
+
 /// @title BaseDataVerifier
 /// @notice Abstract base for ERC-7857 transfer validity verifiers.
 ///
@@ -44,13 +47,30 @@ abstract contract BaseDataVerifier is
     bytes32 private constant _TRANSFER_ACCESS_TAG    = keccak256("ERC7857_TRANSFER_ACCESS");
     bytes32 private constant _TRANSFER_OWNERSHIP_TAG = keccak256("ERC7857_TRANSFER_OWNERSHIP");
 
+    /// @custom:storage-location erc7857:0g.storage.BaseDataVerifier
+    struct BaseDataVerifierStorage {
+        address pauser;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("0g.storage.BaseDataVerifier")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant BaseDataVerifierStorageLocation =
+        0x2a6e9d47b6f4c10d00c1ba6c2a83e5a99f9ffd6b1a85ca0f0b97a3c3c3a27c00;
+
+    function _getBaseDataVerifierStorage() private pure returns (BaseDataVerifierStorage storage $) {
+        assembly { $.slot := BaseDataVerifierStorageLocation }
+    }
+
+    event PauserUpdated(address indexed previousPauser, address indexed newPauser);
+
     // ── Initializer ───────────────────────────────────────────────────────────
 
-    function __BaseDataVerifier_init(address owner_, uint256 maxProofAge_) internal onlyInitializing {
+    function __BaseDataVerifier_init(address owner_, address pauser_, uint256 maxProofAge_) internal onlyInitializing {
         __Ownable_init(owner_);
         __Pausable_init();
         __ReentrancyGuard_init();
         __NonceRegistry_init_unchained(maxProofAge_);
+        _getBaseDataVerifierStorage().pauser = pauser_;
+        emit PauserUpdated(address(0), pauser_);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -59,9 +79,27 @@ abstract contract BaseDataVerifier is
         _setNonceMaxAge(maxProofAge_);
     }
 
-    function pause() external onlyOwner { _pause(); }
+    // ── Pauser ────────────────────────────────────────────────────────────────
 
-    function unpause() external onlyOwner { _unpause(); }
+    function pauser() external view returns (address) {
+        return _getBaseDataVerifierStorage().pauser;
+    }
+
+    function setPauser(address newPauser) external onlyOwner {
+        BaseDataVerifierStorage storage $ = _getBaseDataVerifierStorage();
+        emit PauserUpdated($.pauser, newPauser);
+        $.pauser = newPauser;
+    }
+
+    function pause() external {
+        if (msg.sender != _getBaseDataVerifierStorage().pauser) revert DataVerifierNotPauser();
+        _pause();
+    }
+
+    function unpause() external {
+        if (msg.sender != _getBaseDataVerifierStorage().pauser) revert DataVerifierNotPauser();
+        _unpause();
+    }
 
     // ── Nonce cleanup (permissionless) ────────────────────────────────────────
 

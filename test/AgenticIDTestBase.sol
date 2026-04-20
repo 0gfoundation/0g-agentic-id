@@ -26,6 +26,7 @@ abstract contract AgenticIDTestBase is Test {
     TEEDataVerifier internal verifier;
 
     address internal owner = address(0xA11CE);
+    address internal pauser = address(0xBABE);
     address internal attestor = address(0xA77E57);
     address internal oracleAddr;
     uint256 internal oraclePk;
@@ -42,7 +43,7 @@ abstract contract AgenticIDTestBase is Test {
         TEEDataVerifier verifierImpl = new TEEDataVerifier();
         ERC1967Proxy verifierProxy = new ERC1967Proxy(
             address(verifierImpl),
-            abi.encodeCall(TEEDataVerifier.initialize, (owner, oracleAddr, MAX_PROOF_AGE))
+            abi.encodeCall(TEEDataVerifier.initialize, (owner, pauser, oracleAddr, MAX_PROOF_AGE))
         );
         verifier = TEEDataVerifier(address(verifierProxy));
 
@@ -51,7 +52,7 @@ abstract contract AgenticIDTestBase is Test {
             address(agenticIdImpl),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(verifier), owner, MAX_PROOF_AGE)
+                ("AgenticID", "AID", address(verifier), owner, pauser, MAX_PROOF_AGE)
             )
         );
         agenticId = AgenticID(address(agenticIdProxy));

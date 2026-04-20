@@ -42,7 +42,7 @@ contract ReputationTest is AgenticIDTestBase {
             address(repImpl),
             abi.encodeCall(
                 AgenticIDReputationRegistry.initialize,
-                (address(agenticId), owner, MAX_PROOF_AGE)
+                (address(agenticId), owner, pauser, MAX_PROOF_AGE)
             )
         );
         reputation = AgenticIDReputationRegistry(address(repProxy));

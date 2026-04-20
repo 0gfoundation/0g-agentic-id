@@ -1,6 +1,7 @@
-# Foundry build artifacts
+# Foundry build / run artifacts
 cache/
 out/
+broadcast/
 
 # Editor / OS
 .DS_Store

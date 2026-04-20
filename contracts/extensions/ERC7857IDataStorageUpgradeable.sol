@@ -31,13 +31,13 @@ contract ERC7857IDataStorageUpgradeable is IERC7857Updatable, ERC7857Upgradeable
 
     // ── IERC7857Updatable ─────────────────────────────────────────────────────
 
-    function update(uint256 tokenId, IntelligentData[] calldata newDatas) public virtual {
+    function update(uint256 tokenId, IntelligentData[] calldata newDatas) public virtual whenNotPaused {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         if (newDatas.length == 0) revert ERC7857EmptyData();
         _updateData(tokenId, newDatas);
     }
 
-    function updateAt(uint256 tokenId, uint256 index, IntelligentData calldata newData) public virtual {
+    function updateAt(uint256 tokenId, uint256 index, IntelligentData calldata newData) public virtual whenNotPaused {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         _updateDataAt(tokenId, index, newData);
     }

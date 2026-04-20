@@ -26,6 +26,9 @@ error TEEDataVerifierWrongOracleType();
 contract TEEDataVerifier is BaseDataVerifier {
     using ECDSA for bytes32;
 
+    /// @notice Current implementation version. Bump on every upgrade.
+    string public constant VERSION = "1.0.0";
+
     // ── Storage ───────────────────────────────────────────────────────────────
 
     /// @custom:storage-location erc7857:0g.storage.TEEDataVerifier
@@ -50,15 +53,17 @@ contract TEEDataVerifier is BaseDataVerifier {
 
     // ── Initializer ───────────────────────────────────────────────────────────
 
-    /// @param owner_            Contract owner (can update oracle address and pause).
+    /// @param owner_            Contract owner (config: oracle address, maxProofAge). Timelock in prod.
+    /// @param pauser_           Pauser (immediate pause/unpause). Not timelocked.
     /// @param teeOracleAddress_ Ethereum address corresponding to the TEE oracle's signing key.
     /// @param maxProofAge_      Maximum age (seconds) before a used nonce record can be deleted.
     function initialize(
         address owner_,
+        address pauser_,
         address teeOracleAddress_,
         uint256 maxProofAge_
     ) external initializer {
-        __BaseDataVerifier_init(owner_, maxProofAge_);
+        __BaseDataVerifier_init(owner_, pauser_, maxProofAge_);
         _getTEEDataVerifierStorage().teeOracleAddress = teeOracleAddress_;
     }
 

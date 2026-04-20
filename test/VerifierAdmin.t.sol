@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {TEEDataVerifierInvalidSignature} from "../contracts/verifiers/TEEDataVerifier.sol";
+import {DataVerifierNotPauser} from "../contracts/verifiers/BaseDataVerifier.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
@@ -80,7 +81,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
     function test_pause_blocksVerifyTransferValidity() public {
         (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
 
-        vm.prank(owner);
+        vm.prank(pauser);
         verifier.pause();
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
@@ -103,7 +104,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
     function test_unpause_restoresVerifyTransferValidity() public {
         (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
 
-        vm.startPrank(owner);
+        vm.startPrank(pauser);
         verifier.pause();
         verifier.unpause();
         vm.stopPrank();
@@ -125,13 +126,9 @@ contract VerifierAdminTest is AgenticIDTestBase {
         assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "transfer works after unpause");
     }
 
-    function test_pause_revertsWhenNotOwner() public {
+    function test_pause_revertsWhenNotPauser() public {
         vm.prank(address(0xB0B));
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(0xB0B)
-            )
-        );
+        vm.expectRevert(DataVerifierNotPauser.selector);
         verifier.pause();
     }
 

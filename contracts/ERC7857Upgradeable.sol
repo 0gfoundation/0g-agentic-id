@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {IERC721} from "@openzeppelin/contracts/interfaces/IERC721.sol";
 
@@ -14,7 +15,7 @@ import {
     TransferValidityProofOutput
 } from "./interfaces/IERC7857DataVerifier.sol";
 
-contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable {
+contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, PausableUpgradeable {
 
     /// @custom:storage-location erc7857:0g.storage.ERC7857
     struct ERC7857Storage {
@@ -42,10 +43,12 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable {
         address verifier_
     ) internal onlyInitializing {
         __ERC721_init(name_, symbol_);
+        __Pausable_init();
         __ERC7857_init_unchained(verifier_);
     }
 
     function __ERC7857_init_unchained(address verifier_) internal onlyInitializing {
+        __Pausable_init();
         _setVerifier(verifier_);
     }
 
@@ -66,7 +69,7 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable {
 
     // ── IERC7857Delegate ──────────────────────────────────────────────────────
 
-    function setAccessDelegate(address delegate) public virtual {
+    function setAccessDelegate(address delegate) public virtual whenNotPaused {
         _getERC7857Storage().accessDelegates[msg.sender] = delegate;
         emit DelegateUpdated(msg.sender, delegate);
     }
@@ -94,7 +97,7 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable {
         address to,
         uint256 tokenId,
         TransferValidityProof[] calldata proofs
-    ) public virtual returns (SealedKeyEntry[] memory entries) {
+    ) public virtual whenNotPaused returns (SealedKeyEntry[] memory entries) {
         // Authorization checked BEFORE proof verification so unauthorised
         // callers fail cheaply without spending gas on proof validation.
         _checkAuthorized(from, msg.sender, tokenId);

@@ -12,22 +12,22 @@ import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Ini
 contract InitializerGuardTest is AgenticIDTestBase {
     function test_proxy_cannotReinitialize() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        agenticId.initialize("x", "x", address(verifier), owner, MAX_PROOF_AGE);
+        agenticId.initialize("x", "x", address(verifier), owner, pauser, MAX_PROOF_AGE);
     }
 
     function test_verifier_cannotReinitialize() public {
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        verifier.initialize(owner, oracleAddr, MAX_PROOF_AGE);
+        verifier.initialize(owner, pauser, oracleAddr, MAX_PROOF_AGE);
     }
 
     function test_implementation_initializeDisabled() public {
         // Deploy a fresh impl — constructor calls _disableInitializers.
         AgenticID impl = new AgenticID();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        impl.initialize("x", "x", address(verifier), owner, MAX_PROOF_AGE);
+        impl.initialize("x", "x", address(verifier), owner, pauser, MAX_PROOF_AGE);
 
         TEEDataVerifier vImpl = new TEEDataVerifier();
         vm.expectRevert(Initializable.InvalidInitialization.selector);
-        vImpl.initialize(owner, oracleAddr, MAX_PROOF_AGE);
+        vImpl.initialize(owner, pauser, oracleAddr, MAX_PROOF_AGE);
     }
 }

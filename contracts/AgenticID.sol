@@ -34,6 +34,9 @@ error AgenticIDSealedKeyLengthMismatch(uint256 dataCount, uint256 sealedKeyCount
 /// @notice Use register(agentURI, metadata, intelligentDatas, sealedKeys) instead.
 error AgenticIDUseRegisterWithData();
 
+/// @notice Caller is not the pauser.
+error AgenticIDNotPauser();
+
 /// @title AgenticID
 /// @notice Main contract of the AgenticID protocol.
 ///
@@ -80,7 +83,13 @@ contract AgenticID is
         mapping(bytes32 => uint256) sealIdToAgentId;
         mapping(address => bool)    trustedAttestors;
         mapping(bytes32 => bool)    validFrameworkHashes;
+        address                     pauser;
     }
+
+    /// @notice Current implementation version. Bump on every upgrade.
+    string public constant VERSION = "1.0.0";
+
+    event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.AgenticID")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant AgenticIDStorageLocation =
@@ -104,11 +113,14 @@ contract AgenticID is
         string memory symbol_,
         address verifier_,
         address owner_,
+        address pauser_,
         uint256 maxProofAge_
     ) external initializer {
         __ERC8004IdentityRegistry_init(name_, symbol_, maxProofAge_);
         __ERC7857_init_unchained(verifier_);
         __Ownable_init(owner_);
+        _getAgenticIDStorage().pauser = pauser_;
+        emit PauserUpdated(address(0), pauser_);
     }
 
     // ── ERC-165 ───────────────────────────────────────────────────────────────
@@ -214,7 +226,7 @@ contract AgenticID is
         MetadataEntry[] calldata metadata,
         IntelligentData[] calldata intelligentDatas,
         bytes[] calldata sealedKeys
-    ) external returns (uint256 agentId) {
+    ) external whenNotPaused returns (uint256 agentId) {
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
         agentId = _mintAgent(msg.sender, agentURI);
         _setMetadataBatch(agentId, metadata);
@@ -239,7 +251,7 @@ contract AgenticID is
         bytes[] calldata sealedKeys,
         address agentSeal_,
         bytes32 sealId
-    ) external returns (uint256 agentId) {
+    ) external whenNotPaused returns (uint256 agentId) {
         if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
 
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
@@ -279,7 +291,7 @@ contract AgenticID is
         uint256 agentId,
         address agentSeal_,
         bytes32 sealId
-    ) external {
+    ) external whenNotPaused {
         if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
         _setAgentSeal(agentId, agentSeal_, sealId);
     }
@@ -345,6 +357,28 @@ contract AgenticID is
 
     function isValidFrameworkHash(bytes32 frameworkHash) external view returns (bool) {
         return _getAgenticIDStorage().validFrameworkHashes[frameworkHash];
+    }
+
+    // ── Pauser ────────────────────────────────────────────────────────────────
+
+    function pauser() external view returns (address) {
+        return _getAgenticIDStorage().pauser;
+    }
+
+    function setPauser(address newPauser) external onlyOwner {
+        AgenticIDStorage storage $ = _getAgenticIDStorage();
+        emit PauserUpdated($.pauser, newPauser);
+        $.pauser = newPauser;
+    }
+
+    function pause() external {
+        if (msg.sender != _getAgenticIDStorage().pauser) revert AgenticIDNotPauser();
+        _pause();
+    }
+
+    function unpause() external {
+        if (msg.sender != _getAgenticIDStorage().pauser) revert AgenticIDNotPauser();
+        _unpause();
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────

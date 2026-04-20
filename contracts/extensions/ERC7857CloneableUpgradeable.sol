@@ -45,7 +45,7 @@ contract ERC7857CloneableUpgradeable is IERC7857Cloneable, ERC7857Upgradeable {
         address to,
         uint256 tokenId,
         TransferValidityProof[] calldata proofs
-    ) public virtual returns (uint256 newTokenId) {
+    ) public virtual whenNotPaused returns (uint256 newTokenId) {
         // Authorization checked BEFORE proof verification
         if (_ownerOf(tokenId) != from) revert ERC721InvalidSender(from);
         _checkAuthorized(from, msg.sender, tokenId);

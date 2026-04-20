@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
@@ -16,14 +17,25 @@ error ReputationInvalidIndex(uint256 index, uint256 length);
 error ReputationAlreadyRevoked();
 error ReputationNotAgentOwner();
 error ReputationAlreadyResponded();
+error ReputationNotPauser();
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
 ///         on every submission to prevent sybil attacks.
-contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpgradeable, NonceRegistryUpgradeable {
+contract AgenticIDReputationRegistry is
+    IAgenticIDReputationRegistry,
+    OwnableUpgradeable,
+    PausableUpgradeable,
+    NonceRegistryUpgradeable
+{
     using ECDSA for bytes32;
 
+    /// @notice Current implementation version. Bump on every upgrade.
+    string public constant VERSION = "1.0.0";
+
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
+
+    event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
     // ── Storage structs ───────────────────────────────────────────────────────
 
@@ -53,6 +65,8 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
         mapping(uint256 => mapping(address => mapping(uint64 => address[]))) responseAuthors;
         // prevent duplicate responses per (agentId, client, feedbackIndex, responder)
         mapping(uint256 => mapping(address => mapping(uint64 => mapping(address => bool)))) hasResponse;
+
+        address pauser;
     }
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.AgenticIDReputationRegistry")) - 1)) & ~bytes32(uint256(0xff))
@@ -70,11 +84,16 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
     function initialize(
         address identityRegistry_,
         address owner_,
+        address pauser_,
         uint256 maxProofAge_
     ) external initializer {
         __Ownable_init(owner_);
+        __Pausable_init();
         __NonceRegistry_init_unchained(maxProofAge_);
-        _getReputationStorage().identityRegistry = identityRegistry_;
+        ReputationStorage storage $ = _getReputationStorage();
+        $.identityRegistry = identityRegistry_;
+        $.pauser = pauser_;
+        emit PauserUpdated(address(0), pauser_);
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -85,6 +104,28 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
 
     function cleanExpiredNonces(bytes32[] calldata keys) external {
         _cleanExpiredNonces(keys);
+    }
+
+    // ── Pauser ────────────────────────────────────────────────────────────────
+
+    function pauser() external view returns (address) {
+        return _getReputationStorage().pauser;
+    }
+
+    function setPauser(address newPauser) external onlyOwner {
+        ReputationStorage storage $ = _getReputationStorage();
+        emit PauserUpdated($.pauser, newPauser);
+        $.pauser = newPauser;
+    }
+
+    function pause() external {
+        if (msg.sender != _getReputationStorage().pauser) revert ReputationNotPauser();
+        _pause();
+    }
+
+    function unpause() external {
+        if (msg.sender != _getReputationStorage().pauser) revert ReputationNotPauser();
+        _unpause();
     }
 
     // ── IAgenticIDReputationRegistry — disabled base function ─────────────────
@@ -108,7 +149,7 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
         string calldata feedbackURI,
         bytes32 feedbackHash,
         ServeProof calldata proof
-    ) external {
+    ) external whenNotPaused {
         if (proof.client != msg.sender) revert ReputationClientMismatch();
 
         _verifyServeProof(proof);
@@ -147,7 +188,7 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
 
     // ── IERC8004ReputationRegistry — write ────────────────────────────────────
 
-    function revokeFeedback(uint256 agentId, uint64 feedbackIndex) external {
+    function revokeFeedback(uint256 agentId, uint64 feedbackIndex) external whenNotPaused {
         ReputationStorage storage $ = _getReputationStorage();
         FeedbackEntry[] storage entries = $.feedbacks[agentId][msg.sender];
         if (feedbackIndex >= entries.length)
@@ -164,7 +205,7 @@ contract AgenticIDReputationRegistry is IAgenticIDReputationRegistry, OwnableUpg
         uint64  feedbackIndex,
         string calldata responseURI,
         bytes32 responseHash
-    ) external {
+    ) external whenNotPaused {
         ReputationStorage storage $ = _getReputationStorage();
 
         if (IAgenticID($.identityRegistry).ownerOf(agentId) != msg.sender)

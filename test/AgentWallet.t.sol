@@ -58,7 +58,7 @@ contract AgentWalletTest is AgenticIDTestBase {
     function test_setAgentWallet_revertsOnExpiredDeadline() public {
         (uint256 agentId, ) = _mintWithSeal(alice);
 
-        uint256 deadline = block.timestamp + 1 hours;
+        uint256 deadline = 3601;                       // literal, opt-proof
         bytes32 nonce = keccak256("n");
         bytes memory sig = _signSetAgentWallet(paymentWallet, agentId, deadline, nonce);
 

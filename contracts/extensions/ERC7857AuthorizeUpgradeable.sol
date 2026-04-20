@@ -35,13 +35,13 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
 
     // ── IERC7857Authorize ─────────────────────────────────────────────────────
 
-    function authorizeUsage(uint256 tokenId, address user) public virtual {
+    function authorizeUsage(uint256 tokenId, address user) public virtual whenNotPaused {
         if (user == address(0)) revert ERC7857InvalidAuthorizedUser(user);
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         _authorizeUser(tokenId, user);
     }
 
-    function batchAuthorizeUsage(uint256 tokenId, address[] calldata users) public virtual {
+    function batchAuthorizeUsage(uint256 tokenId, address[] calldata users) public virtual whenNotPaused {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         for (uint256 i = 0; i < users.length; i++) {
             if (users[i] == address(0)) revert ERC7857InvalidAuthorizedUser(users[i]);
@@ -49,7 +49,7 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
         }
     }
 
-    function revokeAuthorization(uint256 tokenId, address user) public virtual {
+    function revokeAuthorization(uint256 tokenId, address user) public virtual whenNotPaused {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721InvalidSender(msg.sender);
         if (user == address(0)) revert ERC7857InvalidAuthorizedUser(user);
 
@@ -59,7 +59,7 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
         emit AuthorizationRevoked(msg.sender, user, tokenId);
     }
 
-    function clearAuthorizedUsers(uint256 tokenId) public virtual {
+    function clearAuthorizedUsers(uint256 tokenId) public virtual whenNotPaused {
         if (_ownerOf(tokenId) != msg.sender) revert ERC721IncorrectOwner(msg.sender, tokenId, _ownerOf(tokenId));
         _clearAuthorized(tokenId);
         emit AuthorizationCleared(msg.sender, tokenId);
