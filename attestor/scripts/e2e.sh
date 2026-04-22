@@ -1,13 +1,21 @@
 #!/usr/bin/env bash
 # End-to-end smoke test. Requires: attestor-api, attestor-worker, attestor-indexer
 # all running + Postgres up.
+#
+# Env:
+#   OWNER_PRIV   — required. 32-byte hex private key of the agent owner.
+#                  Also used to sign the sandbox envelope. For MOCK_SANDBOX=true
+#                  any valid key works; for real sandbox the derived address
+#                  must be funded (sandbox charges per create).
+#   API          — attestor-api base URL (default http://localhost:8080)
 
 set -euo pipefail
 
 API="${API:-http://localhost:8080}"
+: "${OWNER_PRIV:?set OWNER_PRIV (32-byte hex, e.g. from attestor/.env)}"
 IDEMP_KEY="test-$(date +%s)"
 
-OWNER="0x1111111111111111111111111111111111111111"
+OWNER=$(cast wallet address --private-key "$OWNER_PRIV")
 
 # secp256k1 compressed pubkey for priv=1 (the generator G). Used as container
 # pubkey in /provision so ECIES encryption succeeds. Not secret.
@@ -16,18 +24,59 @@ CONTAINER_PUB="0x0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81
 ZERO_HASH="0x0000000000000000000000000000000000000000000000000000000000000001"
 ZERO_SIG_65="0x$(printf '00%.0s' {1..65})"
 
-jq_bin="$(command -v jq || true)"
-if [[ -z "$jq_bin" ]]; then echo "install jq first"; exit 1; fi
-
 banner() { printf "\n── %s ──\n" "$1"; }
 
+# ── Build sandbox envelope ─────────────────────────────────────────────
+# User signs a canonical JSON; attestor relays the bytes + sig verbatim to
+# sandbox. Field order MUST be {action, expires_at, nonce, payload, resource_id}
+# — matches Go's json.Marshal of the sandbox `signedRequest` struct.
+
+NONCE=$(openssl rand -hex 16)
+EXPIRES_AT=$(($(date +%s) + 180))
+
+# The payload is whatever the user wants sandbox to receive as the HTTP body.
+# Attestor doesn't inspect it — only relays. For the smoke test a minimal
+# object is fine; in real flows this would carry snapshot ref / env vars.
+PAYLOAD=$(jq -cn \
+  --arg snapshot "0g-test-sealed" \
+  '{snapshot:$snapshot, sealed:true, env:{API_KEY:"sk-test-abc123xyz"}}')
+
+# Canonical JSON with strict field order. `-c` is mandatory: any whitespace
+# will shift the bytes vs what base64 encodes, and the signature will no
+# longer recover to OWNER.
+CANONICAL=$(jq -cn \
+  --arg action "create" \
+  --argjson expires_at "$EXPIRES_AT" \
+  --arg nonce "$NONCE" \
+  --argjson payload "$PAYLOAD" \
+  --arg resource_id "" \
+  '{action:$action, expires_at:$expires_at, nonce:$nonce, payload:$payload, resource_id:$resource_id}')
+
+# EIP-191 personal_sign with V ∈ {27,28}. `cast wallet sign` does this by
+# default — do NOT add --no-hash (that skips the prefix and breaks recover).
+SIG=$(cast wallet sign --private-key "$OWNER_PRIV" "$CANONICAL")
+
+# Base64 the *exact* bytes that were signed. Use printf (not echo) and strip
+# any wrapping newline so the bytes round-trip byte-for-byte on the server.
+B64=$(printf '%s' "$CANONICAL" | base64 | tr -d '\n')
+
+ENVELOPE=$(jq -cn \
+  --arg wallet_address "$OWNER" \
+  --arg signed_message_b64 "$B64" \
+  --arg wallet_signature "$SIG" \
+  '{wallet_address:$wallet_address, signed_message_b64:$signed_message_b64, wallet_signature:$wallet_signature}')
+
+echo "owner       = $OWNER"
+echo "expires_at  = $EXPIRES_AT ($(date -d @"$EXPIRES_AT" -u 2>/dev/null || true))"
+echo "nonce       = $NONCE"
+
+# ── 1. POST /deploy ────────────────────────────────────────────────────
 banner "1. POST /deploy"
-deploy_payload=$(cat <<JSON
-{
-  "idempotency_key": "$IDEMP_KEY",
-  "owner": "$OWNER",
-  "owner_signature": "$ZERO_SIG_65",
-  "i_data": [
+deploy_payload=$(jq -cn \
+  --arg idempotency_key "$IDEMP_KEY" \
+  --arg owner "$OWNER" \
+  --arg owner_signature "$ZERO_SIG_65" \
+  --argjson i_data '[
     {
       "role": "config",
       "plaintext": {
@@ -37,14 +86,17 @@ deploy_payload=$(cat <<JSON
       },
       "extra": {}
     }
-  ],
-  "agent_card": {
-    "name": "E2EAgent",
-    "description": "smoke test"
-  }
-}
-JSON
-)
+  ]' \
+  --argjson agent_card '{"name":"E2EAgent","description":"smoke test"}' \
+  --argjson sandbox_envelope "$ENVELOPE" \
+  '{
+     idempotency_key:  $idempotency_key,
+     owner:            $owner,
+     owner_signature:  $owner_signature,
+     i_data:           $i_data,
+     agent_card:       $agent_card,
+     sandbox_envelope: $sandbox_envelope
+   }')
 
 resp=$(curl -fsS -X POST "$API/deploy" \
   -H "Content-Type: application/json" \
