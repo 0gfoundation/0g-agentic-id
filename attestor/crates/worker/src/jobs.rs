@@ -3,8 +3,8 @@
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
     ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact, IDataInput,
-    IDataInputEncrypted, IntelligentData, JobPayload, MintParams, SandboxClient, SealId,
-    StageStatus, StorageClient, StorageRoot, WsEvent,
+    IDataInputEncrypted, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
+    SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             owner,
             i_data,
             agent_card,
+            sandbox_envelope,
         } => {
             // Decrypt iData plaintexts from the queue-at-rest form.
             let mut decrypted: Vec<IDataInput> = Vec::with_capacity(i_data.len());
@@ -35,9 +36,14 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 let plaintext = decrypt_i_data(ctx, &enc)?;
                 decrypted.push(plaintext);
             }
-            handle_deploy(ctx, seal_id, owner, decrypted, agent_card).await
+            handle_deploy(ctx, seal_id, owner, decrypted, agent_card, sandbox_envelope).await
         }
-        JobPayload::SandboxStart { seal_id } => ctx.sandbox.start(seal_id).await,
+        // SandboxStart/Restart here are for non-deploy flows and don't yet
+        // carry a user-signed envelope. Will be wired when /restart is
+        // refactored end-to-end.
+        JobPayload::SandboxStart { seal_id } => {
+            anyhow::bail!("SandboxStart job variant requires envelope plumbing: {seal_id:?}")
+        }
         JobPayload::SandboxRestart { seal_id } => ctx.sandbox.restart(seal_id).await,
     }
 }
@@ -60,6 +66,7 @@ async fn handle_deploy(
     owner: Address,
     i_data_inputs: Vec<IDataInput>,
     agent_card: serde_json::Value,
+    sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
@@ -142,7 +149,7 @@ async fn handle_deploy(
     // Fire three concurrent tracks.
     let storage_fut = run_storage_track(ctx, seal_id, &artifacts, ciphertexts);
     let mint_fut = run_mint_track(ctx, seal_id, mint_params);
-    let container_fut = run_container_track(ctx, seal_id);
+    let container_fut = run_container_track(ctx, seal_id, &sandbox_envelope);
 
     let (storage_res, mint_res, container_res) =
         tokio::join!(storage_fut, mint_fut, container_fut);
@@ -301,7 +308,11 @@ async fn run_mint_track(
     Ok(())
 }
 
-async fn run_container_track(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<()> {
+async fn run_container_track(
+    ctx: &Ctx,
+    seal_id: SealId,
+    envelope: &SandboxEnvelope,
+) -> anyhow::Result<()> {
     let now = Utc::now();
     ctx.deployments
         .set_container_stage(
@@ -313,7 +324,7 @@ async fn run_container_track(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<()> {
         .publish(WsEvent::ContainerStarting { seal_id })
         .await?;
 
-    if let Err(e) = ctx.sandbox.start(seal_id).await {
+    if let Err(e) = ctx.sandbox.start(seal_id, envelope).await {
         let now = Utc::now();
         let reason = format!("sandbox start: {e}");
         ctx.deployments

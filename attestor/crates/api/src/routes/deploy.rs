@@ -3,8 +3,8 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
-    derive_phase, DeployRequest, DeployResponse, Deployment, DeploymentPhase, IDataInputEncrypted,
-    JobPayload, StageStatus, WsEvent,
+    derive_phase, sandbox::verify_envelope, DeployRequest, DeployResponse, Deployment,
+    DeploymentPhase, IDataInputEncrypted, JobPayload, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -24,6 +24,34 @@ pub async fn handle(
     // TODO: verify owner_signature (EIP-191 / SIWE) matches req.owner.
     //       v0 accepts any signature.
     tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), "deploy request");
+
+    // ── Sandbox envelope: validate at edge so bogus requests don't burn a
+    //    worker slot. Sandbox itself re-verifies; this is defense-in-depth.
+    if req.sandbox_envelope.wallet_address != req.owner {
+        return Err(ApiError::bad_request(
+            "sandbox envelope signer must match deploy owner",
+        ));
+    }
+    let canonical = verify_envelope(&req.sandbox_envelope, state.crypto.as_ref())
+        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+    if canonical.action != "create" {
+        return Err(ApiError::bad_request(format!(
+            "sandbox envelope action must be 'create', got {}",
+            canonical.action
+        )));
+    }
+    if !canonical.resource_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "sandbox envelope resource_id must be empty for create",
+        ));
+    }
+    let now_secs = Utc::now().timestamp();
+    if canonical.expires_at <= now_secs {
+        return Err(ApiError::bad_request(format!(
+            "sandbox envelope already expired (expires_at={}, now={})",
+            canonical.expires_at, now_secs
+        )));
+    }
 
     // generate sealId + agentSeal
     let seal_id = state.crypto.generate_seal_id();
@@ -98,6 +126,7 @@ pub async fn handle(
             owner: req.owner,
             i_data: encrypted_i_data,
             agent_card: req.agent_card.clone(),
+            sandbox_envelope: req.sandbox_envelope.clone(),
         })
         .await?;
     tracing::info!(?seal_id, "DeployJob enqueued");

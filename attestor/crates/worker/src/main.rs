@@ -11,8 +11,9 @@ use attestor_shared::{
     kms::{derive_subkey, KmsClient, MockKmsClient, JOB_ENCRYPTION_KEY_INFO},
     mocks::{MockSandbox, MockStorage},
     repo::{self, PostgresDeploymentRepo},
+    sandbox::HttpSandbox,
     tee::{MockTeeKeyProvider, TeeKeyProvider},
-    ChainClient, Config, JobQueue,
+    ChainClient, Config, JobQueue, SandboxClient,
 };
 use jobs::Ctx;
 use std::sync::Arc;
@@ -47,7 +48,13 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_max_fee_gwei,
     )?;
     let storage = Arc::new(MockStorage::new(&cfg.storage_indexer));
-    let sandbox = Arc::new(MockSandbox);
+    let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
+        tracing::info!("sandbox: using MockSandbox (MOCK_SANDBOX=true)");
+        Arc::new(MockSandbox)
+    } else {
+        tracing::info!(endpoint = %cfg.sandbox_endpoint, "sandbox: using HttpSandbox");
+        Arc::new(HttpSandbox::new(cfg.sandbox_endpoint.clone()))
+    };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let queue = PostgresJobQueue::new(pool.clone());
