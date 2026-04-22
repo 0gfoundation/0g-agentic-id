@@ -162,8 +162,16 @@ pub struct MockSandbox;
 
 #[async_trait]
 impl SandboxClient for MockSandbox {
-    async fn start(&self, seal_id: SealId) -> anyhow::Result<()> {
-        tracing::info!(?seal_id, "mock sandbox: start");
+    async fn start(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            ?seal_id,
+            signer = %envelope.wallet_address,
+            "mock sandbox: start"
+        );
         Ok(())
     }
 

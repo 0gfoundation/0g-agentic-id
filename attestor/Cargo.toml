@@ -79,6 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
 
 # workspace crates
 attestor-shared = { path = "crates/shared" }

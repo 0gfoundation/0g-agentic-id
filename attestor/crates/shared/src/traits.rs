@@ -71,10 +71,19 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
-    /// Ask 0g-sandbox to spawn a new container for `seal_id`. Sandbox
-    /// internally generates an ephemeral kp, injects it, signs credentials.
-    async fn start(&self, seal_id: SealId) -> anyhow::Result<()>;
+    /// Ask 0g-sandbox to spawn a new container for `seal_id`. The user-signed
+    /// `envelope` is relayed verbatim as `X-Wallet-Address` /
+    /// `X-Signed-Message` / `X-Wallet-Signature` headers — sandbox does the
+    /// actual signature verification; we only relay.
+    async fn start(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()>;
 
+    // TODO: restart/stop also need a fresh user-signed envelope whose
+    // payload encodes `resource_id = <sandbox-id returned by create>`.
+    // Will be wired when the /restart flow is updated end-to-end.
     async fn restart(&self, seal_id: SealId) -> anyhow::Result<()>;
     async fn stop(&self, seal_id: SealId) -> anyhow::Result<()>;
 }

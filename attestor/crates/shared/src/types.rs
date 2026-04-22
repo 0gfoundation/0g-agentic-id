@@ -52,6 +52,26 @@ pub struct StorageRoot {
     pub size: u64,
 }
 
+// ── Sandbox envelope (user-signed, attestor relays verbatim) ───────────
+//
+// Three HTTP headers carrying a user-signed envelope that the attestor
+// relays unmodified to `POST {sandbox}/api/sandbox` (and peer endpoints).
+// Signature is EIP-191 personal_sign over the canonical JSON:
+//   {"action":"<action>","expires_at":<unix>,"nonce":"<32hex>",
+//    "payload":<action-body>,"resource_id":"<sandbox-id-or-empty>"}
+//
+// The attestor never re-signs — sandbox's own auth middleware verifies.
+// See `reference_sandbox_api.md` for the spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxEnvelope {
+    /// Signer's EOA — must equal the `/deploy` request's `owner` field.
+    pub wallet_address: Address,
+    /// base64(canonical JSON bytes that were signed). Opaque relay.
+    pub signed_message_b64: String,
+    /// 65-byte secp256k1 signature; V ∈ {27, 28}.
+    pub wallet_signature: Bytes,
+}
+
 // ── /deploy ─────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRequest {
@@ -63,6 +83,9 @@ pub struct DeployRequest {
     /// Agent Card JSON. Opaque to attestor (may read `name`/`description`
     /// for LLM auto-fill only).
     pub agent_card: serde_json::Value,
+    /// User-signed envelope authorizing sandbox `create`. Relayed as-is
+    /// by the worker when it calls `POST {sandbox}/api/sandbox`.
+    pub sandbox_envelope: SandboxEnvelope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +311,7 @@ pub enum JobPayload {
         owner: Address,
         i_data: Vec<IDataInputEncrypted>,
         agent_card: serde_json::Value,
+        sandbox_envelope: SandboxEnvelope,
     },
     SandboxStart {
         seal_id: SealId,

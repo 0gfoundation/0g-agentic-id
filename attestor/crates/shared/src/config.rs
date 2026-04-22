@@ -12,6 +12,9 @@ pub struct Config {
     pub storage_indexer: String,
 
     pub sandbox_endpoint: String,
+    /// When true, worker uses `MockSandbox` (logs only). When false, it
+    /// talks to `sandbox_endpoint` over HTTP and relays the user envelope.
+    pub mock_sandbox: bool,
 
     pub db_url: String,
     pub bind: String,
@@ -51,6 +54,9 @@ impl Config {
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,
 
             sandbox_endpoint: env("ATTESTOR_SANDBOX_ENDPOINT")?,
+            mock_sandbox: env_opt("MOCK_SANDBOX")
+                .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                .unwrap_or(true),
 
             db_url: env("ATTESTOR_DB_URL")?,
             bind: env_opt("ATTESTOR_BIND").unwrap_or_else(|| "0.0.0.0:8080".to_string()),

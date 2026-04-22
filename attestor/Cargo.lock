@@ -964,6 +964,7 @@ dependencies = [
  "alloy",
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "dotenvy",
