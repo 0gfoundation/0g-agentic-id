@@ -1,0 +1,30 @@
+[package]
+name = "attestor-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "attestor-indexer"
+path = "src/main.rs"
+
+[dependencies]
+attestor-shared.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+alloy.workspace = true
+hex.workspace = true
+
+sqlx.workspace = true
+
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
