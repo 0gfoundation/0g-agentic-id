@@ -1,0 +1,92 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shared",
+    "crates/api",
+    "crates/worker",
+    "crates/indexer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/0glabs/0g-agentic-id"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# http / ws
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# serde / encoding
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# chain
+alloy = { version = "0.3", features = [
+    "full",
+    "signer-local",
+    "sol-types",
+    "rpc-types-eth",
+    "provider-http",
+] }
+
+# Crypto
+k256 = { version = "0.13", features = ["ecdsa", "std"] }
+elliptic-curve = { version = "0.13", features = ["ff"] }
+generic-array = "0.14"
+typenum = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+sha3 = "0.10"
+# ECIES encryption compatible with eciesjs
+# Config 1: secp256k1 + AES-256-GCM (OpenSSL, best performance) ← CURRENT
+ecies = { version = "0.2", features = ["std"] }
+# Config 2: secp256k1 + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["xchacha20"] }
+# Config 3: curve25519 (x25519) + AES-256-GCM (OpenSSL)
+# ecies = { version = "0.2", features = ["std", "x25519"] }
+# Config 4: curve25519 (x25519) + XChaCha20-Poly1305 (Pure Rust)
+# ecies = { version = "0.2", default-features = false, features = ["x25519", "xchacha20"] }
+aes-gcm = "0.10"             # 对称加密 iData ciphertext（用 dataKey）
+hex = "0.4"
+rand = "0.8"
+
+# db
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+    "macros",
+] }
+
+# util
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["json"] }
+
+# workspace crates
+attestor-shared = { path = "crates/shared" }
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"

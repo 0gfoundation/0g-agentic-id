@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: attestor-postgres
+    environment:
+      POSTGRES_USER: attestor
+      POSTGRES_PASSWORD: attestor
+      POSTGRES_DB: attestor
+    ports:
+      - "5432:5432"
+    volumes:
+      - attestor-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U attestor"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  attestor-pgdata:
