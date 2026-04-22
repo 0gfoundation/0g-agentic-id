@@ -194,8 +194,37 @@ pub struct Deployment {
     pub mint_stage: StageStatus,
     pub container_stage: StageStatus,
 
+    /// 0g-sandbox's resource id (UUID) returned by `POST /api/sandbox`.
+    /// Required on the envelope for `/restart` and `/stop` (where it maps to
+    /// the canonical `resource_id` field). None until container track succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_id: Option<String>,
+
+    /// Timestamp of the first successful `POST /provision` call for this
+    /// deployment. Non-None means the container passed sandbox-attestation
+    /// checks and received its encrypted `agentSeal_priv`. Observers use
+    /// this to distinguish "container spawned but never auth'd" from
+    /// "container auth'd but hasn't reported running yet".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioned_at: Option<DateTime<Utc>>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+// ── Sandbox create response ─────────────────────────────────────────────
+//
+// Response body from `POST {sandbox}/api/sandbox`. Sandbox actually returns
+// many more fields (cpu/memory/labels/env/…) but we only persist what the
+// attestor needs for later lifecycle calls. `#[serde(default)]` +
+// non-strict field set keep us resilient to sandbox adding/removing fields.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SandboxCreateResponse {
+    pub id: String,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<String>,
 }
 
 // ── /provision ──────────────────────────────────────────────────────────

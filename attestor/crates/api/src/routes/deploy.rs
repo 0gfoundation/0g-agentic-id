@@ -96,6 +96,8 @@ pub async fn handle(
         storage_stage: StageStatus::NotStarted,
         mint_stage: StageStatus::NotStarted,
         container_stage: StageStatus::NotStarted,
+        sandbox_id: None,
+        provisioned_at: None,
         created_at: now,
         updated_at: now,
     };

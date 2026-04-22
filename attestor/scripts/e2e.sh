@@ -128,50 +128,36 @@ if [[ "$phase" == "failed" ]]; then
   echo "❌ deploy failed"; echo "$state" | jq .; exit 1
 fi
 
-banner "3. POST /provision (simulate container)"
-provision_payload=$(cat <<JSON
-{
-  "seal_id":          "$SEAL_ID",
-  "container_pubkey": "$CONTAINER_PUB",
-  "image_hash":       "$ZERO_HASH",
-  "issued_at":        $(date +%s),
-  "sandbox_signature":"$ZERO_SIG_65"
-}
-JSON
-)
-prov=$(curl -fsS -X POST "$API/provision" \
-  -H "Content-Type: application/json" \
-  -d "$provision_payload")
-echo "$prov" | jq '{encrypted_len: (.encrypted_agent_seal_priv|length)}'
+# banner "4. POST /status (container reports running)"
+# status_payload=$(cat <<JSON
+# {
+#   "seal_id": "$SEAL_ID",
+#   "status":  "running",
+#   "agent_seal_signature": "$ZERO_SIG_65"
+# }
+# JSON
+# )
+# curl -fsS -X POST "$API/status" \
+#   -H "Content-Type: application/json" \
+#   -d "$status_payload" | jq .
 
-banner "4. POST /status (container reports running)"
-status_payload=$(cat <<JSON
-{
-  "seal_id": "$SEAL_ID",
-  "status":  "running",
-  "agent_seal_signature": "$ZERO_SIG_65"
-}
-JSON
-)
-curl -fsS -X POST "$API/status" \
-  -H "Content-Type: application/json" \
-  -d "$status_payload" | jq .
-
-banner "5. Final /deployment/:id — expect phase=running"
+banner "3. Final /deployment/:id — expect provisioned_at set"
 final=$(curl -fsS "$API/deployment/$SEAL_ID")
 echo "$final" | jq '{
   phase,
   agent_id,
+  sandbox_id,
+  provisioned_at,
   storage_stage: .storage_stage.state,
   mint_stage:    .mint_stage.state,
   container_stage: .container_stage.state
 }'
 
-phase=$(echo "$final" | jq -r .phase)
-if [[ "$phase" == "running" ]]; then
-  echo "✅ PASS — phase=running"
+provisioned_at=$(echo "$final" | jq -r '.provisioned_at // "null"')
+if [[ "$provisioned_at" != "null" ]]; then
+  echo "✅ PASS — provisioned_at=$provisioned_at"
   exit 0
 else
-  echo "❌ FAIL — phase=$phase (expected running)"
+  echo "❌ FAIL — provisioned_at not set (container didn't reach /provision)"
   exit 1
 fi

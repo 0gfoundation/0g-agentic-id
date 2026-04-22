@@ -324,23 +324,34 @@ async fn run_container_track(
         .publish(WsEvent::ContainerStarting { seal_id })
         .await?;
 
-    if let Err(e) = ctx.sandbox.start(seal_id, envelope).await {
-        let now = Utc::now();
-        let reason = format!("sandbox start: {e}");
-        ctx.deployments
-            .set_container_stage(
-                seal_id,
-                StageStatus::Failed {
-                    at: now,
-                    reason: reason.clone(),
-                },
-            )
-            .await?;
-        ctx.events
-            .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
-            .await?;
-        anyhow::bail!(reason);
+    let resp = match ctx.sandbox.start(seal_id, envelope).await {
+        Ok(r) => r,
+        Err(e) => {
+            let now = Utc::now();
+            let reason = format!("sandbox start: {e}");
+            ctx.deployments
+                .set_container_stage(
+                    seal_id,
+                    StageStatus::Failed {
+                        at: now,
+                        reason: reason.clone(),
+                    },
+                )
+                .await?;
+            ctx.events
+                .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
+                .await?;
+            anyhow::bail!(reason);
+        }
+    };
+
+    // Persist sandbox id so later /restart /stop envelopes can reference it
+    // as `resource_id`. A failure here is non-fatal for this deploy: the
+    // container is already spawned; we just lose the handle for restart.
+    if let Err(e) = ctx.deployments.set_sandbox_id(seal_id, resp.id.clone()).await {
+        tracing::warn!(?seal_id, sandbox_id = %resp.id, error = %e, "failed to persist sandbox_id");
     }
+
     // Container will POST /status with "running" via api-server; that path
     // updates container_stage to Confirmed. Worker's job ends here.
     Ok(())

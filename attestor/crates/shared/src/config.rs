@@ -16,6 +16,18 @@ pub struct Config {
     /// talks to `sandbox_endpoint` over HTTP and relays the user envelope.
     pub mock_sandbox: bool,
 
+    /// Base URL the attestor advertises to sandbox containers. Written
+    /// into the sandbox create body as `env.ATTESTOR_URL` so the container
+    /// knows where to call `/provision` and `/status`. Required in non-mock
+    /// mode; in mock mode it's ignored.
+    pub attestor_public_url: String,
+
+    /// Eth address of the sandbox TEE key that signs container attestations.
+    /// /provision recovers the signer from the attestation signature and must
+    /// match this address to accept the request. When the TappRegistry
+    /// wiring lands this single-signer config becomes a fallback.
+    pub sandbox_tee_signer: Address,
+
     pub db_url: String,
     pub bind: String,
 
@@ -57,6 +69,10 @@ impl Config {
             mock_sandbox: env_opt("MOCK_SANDBOX")
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(true),
+
+            attestor_public_url: env_opt("ATTESTOR_PUBLIC_URL").unwrap_or_default(),
+
+            sandbox_tee_signer: env("ATTESTOR_SANDBOX_TEE_SIGNER")?.parse()?,
 
             db_url: env("ATTESTOR_DB_URL")?,
             bind: env_opt("ATTESTOR_BIND").unwrap_or_else(|| "0.0.0.0:8080".to_string()),

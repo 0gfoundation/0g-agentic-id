@@ -24,6 +24,11 @@ CREATE INDEX IF NOT EXISTS idx_deployments_owner    ON deployments (owner);
 CREATE INDEX IF NOT EXISTS idx_deployments_agent_id ON deployments (agent_id);
 CREATE INDEX IF NOT EXISTS idx_deployments_phase    ON deployments (phase);
 
+-- Columns added after initial schema. Use IF NOT EXISTS so the file
+-- remains idempotent across schema versions.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
+
 -- idempotency does NOT FK to deployments — /deploy reserves idempotency
 -- before inserting the deployment row, so a FK would fail. The idempotency
 -- record is a hint; loss-of-sync with deployments is recoverable.

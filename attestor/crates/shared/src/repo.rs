@@ -59,6 +59,8 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let storage_stage: serde_json::Value = row.try_get("storage_stage")?;
     let mint_stage: serde_json::Value = row.try_get("mint_stage")?;
     let container_stage: serde_json::Value = row.try_get("container_stage")?;
+    let sandbox_id: Option<String> = row.try_get("sandbox_id")?;
+    let provisioned_at: Option<DateTime<Utc>> = row.try_get("provisioned_at")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -89,6 +91,8 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         storage_stage,
         mint_stage,
         container_stage,
+        sandbox_id,
+        provisioned_at,
         created_at,
         updated_at,
     })
@@ -103,12 +107,14 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                 seal_id, agent_seal_addr, owner, agent_id,
                 agent_uri, agent_card, i_data,
                 phase, storage_stage, mint_stage, container_stage,
+                sandbox_id, provisioned_at,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7,
                 $8, $9, $10, $11,
-                $12, $13
+                $12, $13,
+                $14, $15
             )
             "#,
         )
@@ -123,6 +129,8 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(serde_json::to_value(&d.storage_stage)?)
         .bind(serde_json::to_value(&d.mint_stage)?)
         .bind(serde_json::to_value(&d.container_stage)?)
+        .bind(d.sandbox_id.as_deref())
+        .bind(d.provisioned_at)
         .bind(d.created_at)
         .bind(d.updated_at)
         .execute(&self.pool)
@@ -171,6 +179,37 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             "UPDATE deployments SET agent_id = $1, updated_at = now() WHERE seal_id = $2",
         )
         .bind(agent_id_to_text(&agent_id))
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments SET sandbox_id = $1, updated_at = now() WHERE seal_id = $2",
+        )
+        .bind(&sandbox_id)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_provisioned(
+        &self,
+        seal_id: SealId,
+        at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        // First-writer-wins: once provisioned_at is set, further successful
+        // /provision calls (e.g. container restarted and re-authenticated)
+        // leave the original timestamp intact.
+        sqlx::query(
+            "UPDATE deployments
+             SET provisioned_at = COALESCE(provisioned_at, $1), updated_at = now()
+             WHERE seal_id = $2",
+        )
+        .bind(at)
         .bind(seal_id.as_slice())
         .execute(&self.pool)
         .await?;

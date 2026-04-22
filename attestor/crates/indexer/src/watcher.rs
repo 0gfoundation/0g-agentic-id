@@ -417,6 +417,8 @@ impl Watcher {
             storage_stage,
             mint_stage,
             container_stage,
+            sandbox_id: None,
+            provisioned_at: None,
             created_at: now,
             updated_at: now,
         };

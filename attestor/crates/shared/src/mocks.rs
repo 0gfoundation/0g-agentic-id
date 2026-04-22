@@ -166,13 +166,18 @@ impl SandboxClient for MockSandbox {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SandboxCreateResponse> {
         tracing::info!(
             ?seal_id,
             signer = %envelope.wallet_address,
             "mock sandbox: start"
         );
-        Ok(())
+        // Deterministic stub id derived from seal_id so tests can recognise it.
+        Ok(SandboxCreateResponse {
+            id: format!("mock-{}", hex::encode(&seal_id.as_slice()[..8])),
+            state: Some("creating".to_string()),
+            created_at: None,
+        })
     }
 
     async fn restart(&self, seal_id: SealId) -> anyhow::Result<()> {

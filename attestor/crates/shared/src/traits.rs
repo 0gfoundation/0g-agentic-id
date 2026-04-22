@@ -74,12 +74,14 @@ pub trait SandboxClient: Send + Sync {
     /// Ask 0g-sandbox to spawn a new container for `seal_id`. The user-signed
     /// `envelope` is relayed verbatim as `X-Wallet-Address` /
     /// `X-Signed-Message` / `X-Wallet-Signature` headers — sandbox does the
-    /// actual signature verification; we only relay.
+    /// actual signature verification; we only relay. Returns sandbox's
+    /// resource id + lifecycle state so the caller can persist them for
+    /// later `/restart` and `/stop` envelopes.
     async fn start(
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<SandboxCreateResponse>;
 
     // TODO: restart/stop also need a fresh user-signed envelope whose
     // payload encodes `resource_id = <sandbox-id returned by create>`.
@@ -101,6 +103,18 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
+
+    /// Persist 0g-sandbox's resource id after container track submits.
+    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
+
+    /// Stamp the deployment row when `POST /provision` succeeds — proves
+    /// the container authenticated via sandbox attestation and received
+    /// its encrypted `agentSeal_priv`.
+    async fn mark_provisioned(
+        &self,
+        seal_id: SealId,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()>;
 
     async fn set_owner(&self, agent_id: AgentId, new_owner: Address) -> anyhow::Result<()>;
 

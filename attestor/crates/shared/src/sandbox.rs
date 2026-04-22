@@ -7,7 +7,7 @@
 //! bad requests are rejected before hitting the worker.
 
 use crate::traits::SandboxClient;
-use crate::types::{SandboxEnvelope, SealId};
+use crate::types::{SandboxCreateResponse, SandboxEnvelope, SealId};
 use alloy::primitives::keccak256;
 use async_trait::async_trait;
 use base64::Engine;
@@ -80,13 +80,20 @@ pub fn verify_envelope(
 
 pub struct HttpSandbox {
     base_url: String,
+    /// Public URL that containers use to reach this attestor. Injected into
+    /// the sandbox create body as `env.ATTESTOR_URL`.
+    attestor_public_url: String,
     http: reqwest::Client,
 }
 
 impl HttpSandbox {
-    pub fn new(base_url: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        attestor_public_url: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
+            attestor_public_url: attestor_public_url.into(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -107,15 +114,43 @@ impl SandboxClient for HttpSandbox {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
-        // Decode the base64 message solely to recover the `payload` field,
-        // which is the *actual* HTTP body that sandbox expects. The full
-        // canonical message is *only* used for signing.
+    ) -> anyhow::Result<SandboxCreateResponse> {
+        // Sandbox's auth middleware only validates the three X- headers
+        // against `signed_message_b64` — it does NOT cross-check that the
+        // HTTP body matches `canonical.payload`. That lets us inherit the
+        // user's payload (so their snapshot / sealed / env flow through)
+        // while injecting two attestor-controlled fields:
+        //   - top-level `seal_id`: sandbox's protocol slot; sandbox signs
+        //     this and delivers it to the container (sealed-state / identity
+        //     channel), so the container never trusts user-supplied env.
+        //   - `env.ATTESTOR_URL`: runtime config for the container —
+        //     where to call `/provision` and `/status`. Not sensitive,
+        //     fine to ride the plain env channel.
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("sandbox start: base64 decode: {e}"))?;
         let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
             .map_err(|e| anyhow::anyhow!("sandbox start: parse canonical JSON: {e}"))?;
+
+        let seal_hex = hex::encode(seal_id.as_slice());
+
+        let mut body = canonical.payload.clone();
+        let obj = body.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("sandbox start: canonical.payload must be a JSON object")
+        })?;
+
+        obj.insert("seal_id".into(), serde_json::Value::String(seal_hex));
+
+        let env_val = obj
+            .entry("env".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        let env_obj = env_val.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("sandbox start: canonical.payload.env must be a JSON object")
+        })?;
+        env_obj.insert(
+            "ATTESTOR_URL".into(),
+            serde_json::Value::String(self.attestor_public_url.clone()),
+        );
 
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
@@ -127,7 +162,7 @@ impl SandboxClient for HttpSandbox {
             .header("X-Wallet-Address", addr_hex)
             .header("X-Signed-Message", &envelope.signed_message_b64)
             .header("X-Wallet-Signature", sig_hex)
-            .json(&canonical.payload)
+            .json(&body)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("sandbox start: http send: {e}"))?;
@@ -138,11 +173,14 @@ impl SandboxClient for HttpSandbox {
             anyhow::bail!("sandbox start: {status} — {body}");
         }
 
-        // Sandbox returns `{id, ...}`. Log and move on; persisting the
-        // sandbox id for later /restart support is a follow-up.
+        // Sandbox returns a rich object; we only need `id` (+ light metadata)
+        // for later /restart /stop envelopes. Unknown fields are ignored so
+        // sandbox can evolve without breaking us.
         let body = res.text().await.unwrap_or_default();
-        tracing::info!(?seal_id, response = %body, "sandbox: created");
-        Ok(())
+        let parsed: SandboxCreateResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("sandbox start: parse response: {e} — body={body}"))?;
+        tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
+        Ok(parsed)
     }
 
     async fn restart(&self, seal_id: SealId) -> anyhow::Result<()> {

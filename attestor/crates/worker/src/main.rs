@@ -53,7 +53,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(MockSandbox)
     } else {
         tracing::info!(endpoint = %cfg.sandbox_endpoint, "sandbox: using HttpSandbox");
-        Arc::new(HttpSandbox::new(cfg.sandbox_endpoint.clone()))
+        Arc::new(HttpSandbox::new(
+            cfg.sandbox_endpoint.clone(),
+            cfg.attestor_public_url.clone(),
+        ))
     };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
