@@ -1,0 +1,41 @@
+[package]
+name = "attestor-shared"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+
+alloy.workspace = true
+
+k256.workspace = true
+elliptic-curve.workspace = true
+generic-array.workspace = true
+typenum.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+sha3.workspace = true
+ecies.workspace = true
+aes-gcm.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+sqlx.workspace = true
+
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dotenvy.workspace = true
+reqwest.workspace = true
