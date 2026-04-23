@@ -246,6 +246,40 @@ where
             })
             .collect())
     }
+
+    async fn set_agent_uri(
+        &self,
+        agent_id: AgentId,
+        uri: String,
+    ) -> anyhow::Result<TxHash> {
+        let call_data = AgenticID::setAgentURICall {
+            agentId: agent_id,
+            newURI: uri,
+        }
+        .abi_encode();
+
+        let mut tx = TransactionRequest::default()
+            .with_from(self.sender)
+            .with_to(self.contract_addr)
+            .with_input(call_data);
+
+        let gas = self.provider.estimate_gas(&tx).await? as u128;
+        let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
+        tx.set_gas_limit(gas_limit);
+        tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
+        tx.set_max_fee_per_gas(self.max_fee_wei);
+
+        tracing::info!(
+            %agent_id,
+            gas_limit,
+            "alloy: sending setAgentURI"
+        );
+
+        let pending = self.provider.send_transaction(tx).await?;
+        let tx_hash = *pending.tx_hash();
+        tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
+        Ok(tx_hash)
+    }
 }
 
 // Silence unused imports when generic bound uses them transitively.

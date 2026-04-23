@@ -4,12 +4,14 @@
 mod jobs;
 
 use attestor_shared::{
+    agent_profile::{OpenClawProfile, ProfileRegistry},
     chain::connect_http as chain_connect_http,
     crypto::{InMemoryMasterKey, RealCrypto},
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
     kms::{derive_subkey, KmsClient, MockKmsClient, JOB_ENCRYPTION_KEY_INFO},
     mocks::{MockSandbox, MockStorage},
+    oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
     sandbox::HttpSandbox,
     tee::{MockTeeKeyProvider, TeeKeyProvider},
@@ -60,8 +62,21 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
-    let queue = PostgresJobQueue::new(pool.clone());
+    let queue = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
+
+    // OSS client is required for the deploy path (setAgentURI second
+    // phase). Startup fails fast rather than silently running with a
+    // placeholder that breaks the contract handshake.
+    let oss = OssClient::from_env().ok_or_else(|| {
+        anyhow::anyhow!(
+            "OSS client not configured — set OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET"
+        )
+    })?;
+
+    // Framework profile registry — OpenClaw is the v0 fallback. Add
+    // future profiles via `.register()` before freezing into Arc.
+    let registry = Arc::new(ProfileRegistry::new(Arc::new(OpenClawProfile)));
 
     let ctx = Ctx {
         cfg: cfg.clone(),
@@ -71,7 +86,8 @@ async fn main() -> anyhow::Result<()> {
         sandbox,
         deployments,
         events,
-        job_key,
+        oss,
+        registry,
     };
 
     // background sweep task

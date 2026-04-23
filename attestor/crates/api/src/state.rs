@@ -20,8 +20,4 @@ pub struct AppState {
     pub idempotency: Arc<dyn IdempotencyStore>,
     pub jobs: Arc<dyn JobQueue>,
     pub events: Arc<dyn EventBus>,
-
-    /// Symmetric key used to encrypt `jobs.payload` iData plaintexts.
-    /// Derived from KMS master via HKDF (same on api + worker).
-    pub job_key: [u8; 32],
 }

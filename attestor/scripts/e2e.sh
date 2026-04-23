@@ -72,29 +72,24 @@ echo "nonce       = $NONCE"
 
 # ── 1. POST /deploy ────────────────────────────────────────────────────
 banner "1. POST /deploy"
+# Top-level display fields replace the old opaque `agent_card`. `i_data`
+# may be empty — attestor synthesizes a default OpenClaw config entry
+# when so. Here we pass `[]` to exercise that path.
 deploy_payload=$(jq -cn \
   --arg idempotency_key "$IDEMP_KEY" \
   --arg owner "$OWNER" \
   --arg owner_signature "$ZERO_SIG_65" \
-  --argjson i_data '[
-    {
-      "role": "config",
-      "plaintext": {
-        "framework": {"name": "openclaw", "version": "0.1.0"},
-        "persona":   {"system_prompt": "you are e2e"},
-        "inference": {"provider": "mock", "model": "mock"}
-      },
-      "extra": {}
-    }
-  ]' \
-  --argjson agent_card '{"name":"E2EAgent","description":"smoke test"}' \
+  --arg name "E2EAgent" \
+  --arg description "smoke test" \
+  --argjson i_data '[]' \
   --argjson sandbox_envelope "$ENVELOPE" \
   '{
      idempotency_key:  $idempotency_key,
      owner:            $owner,
      owner_signature:  $owner_signature,
+     name:             $name,
+     description:      $description,
      i_data:           $i_data,
-     agent_card:       $agent_card,
      sandbox_envelope: $sandbox_envelope
    }')
 

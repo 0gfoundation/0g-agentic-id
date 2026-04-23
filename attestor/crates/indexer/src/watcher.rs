@@ -140,6 +140,9 @@ impl Watcher {
         if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
             return self.on_registered(ev.data, block).await;
         }
+        if let Ok(ev) = AgenticID::URIUpdated::decode_log(&log.inner, true) {
+            return self.on_uri_updated(ev.data, block).await;
+        }
         if let Ok(ev) = AgenticID::Cloned::decode_log(&log.inner, true) {
             tracing::warn!(
                 token_id = %ev.data.tokenId,
@@ -329,6 +332,61 @@ impl Watcher {
                 })
                 .await;
         }
+        Ok(())
+    }
+
+    // ── URIUpdated ───────────────────────────────────────────────────
+    //
+    // Fires on every setAgentURI, including the attestor's own second-phase
+    // write after OSS PUT. The handler is idempotent: if the local row
+    // already matches the event's URI we just broadcast (so subscribers
+    // don't miss the attestor-written case); otherwise we fetch the new
+    // AgentCard JSON best-effort and update both columns.
+    async fn on_uri_updated(
+        &self,
+        ev: AgenticID::URIUpdated,
+        block: u64,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            agent_id = %ev.agentId,
+            updated_by = %ev.updatedBy,
+            uri = %ev.newURI,
+            block,
+            "URIUpdated"
+        );
+        let Some(d) = self.deployments.get_by_agent_id(ev.agentId).await? else {
+            tracing::debug!(agent_id = %ev.agentId, "URIUpdated for unknown agent; skipping");
+            return Ok(());
+        };
+
+        let uri = ev.newURI.clone();
+        if d.agent_uri != uri {
+            let agent_card = if !uri.is_empty() {
+                match self.http.get(&uri).send().await {
+                    Ok(resp) => resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap_or(serde_json::Value::Null),
+                    Err(e) => {
+                        tracing::debug!(error = %e, %uri, "agent_card fetch failed");
+                        serde_json::Value::Null
+                    }
+                }
+            } else {
+                serde_json::Value::Null
+            };
+            self.deployments
+                .set_agent_uri_and_card(d.seal_id, uri.clone(), agent_card)
+                .await?;
+        }
+        let _ = self
+            .events
+            .publish(WsEvent::AgentURIUpdated {
+                seal_id: d.seal_id,
+                agent_id: ev.agentId,
+                agent_uri: uri,
+            })
+            .await;
         Ok(())
     }
 

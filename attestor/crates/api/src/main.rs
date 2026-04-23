@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let idempotency = PostgresIdempotencyStore::new(pool.clone());
-    let jobs = PostgresJobQueue::new(pool.clone());
+    let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
     let state = AppState {
@@ -59,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
         idempotency,
         jobs,
         events,
-        job_key,
     };
 
     let app = routes::router(state);

@@ -246,6 +246,25 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(())
     }
 
+    async fn set_agent_uri_and_card(
+        &self,
+        seal_id: SealId,
+        agent_uri: String,
+        agent_card: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"UPDATE deployments
+               SET agent_uri = $1, agent_card = $2, updated_at = now()
+               WHERE seal_id = $3"#,
+        )
+        .bind(&agent_uri)
+        .bind(&agent_card)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn update_sealed_keys_by_data_hash(
         &self,
         agent_id: AgentId,

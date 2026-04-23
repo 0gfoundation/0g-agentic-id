@@ -52,6 +52,27 @@ pub struct Config {
     /// Set to the AgenticID deployment block for full reconstruction.
     /// Unset → first run starts at `latest - 128`.
     pub indexer_start_block: Option<u64>,
+
+    /// OSS object key prefix. The deploy flow writes AgentCard JSON and
+    /// images under `{oss_key_prefix}/<sealId>/card.json` etc. so multiple
+    /// AgenticID deployments sharing a bucket don't collide. Conventionally
+    /// set to `0x<agentic_id_addr>`.
+    pub oss_key_prefix: String,
+
+    // ── AgentCard.url construction (subdomain-routed proxy) ─────────
+    //
+    // Public URL the sandbox exposes containers under:
+    //   http://{agent_container_port}-{sandbox_id}.{sandbox_proxy_addr}{agent_entry_path}
+    // where `sandbox_proxy_addr` is a bare `host:port` string (e.g.
+    // `47.236.111.154.nip.io:4000`, `proxy.example.com:4000`). The
+    // caller is responsible for any wildcard-DNS suffix (.nip.io / real
+    // domain); the attestor just prepends `{port}-{sandbox_id}.` as the
+    // subdomain and splits the addr's colon to populate the URL port.
+    // Framework-agnostic: any agent runtime that binds to a known port
+    // and serves a known path fits.
+    pub sandbox_proxy_addr: String,
+    pub agent_container_port: u16,
+    pub agent_entry_path: String,
 }
 
 impl Config {
@@ -91,6 +112,26 @@ impl Config {
                 .unwrap_or(10),
             indexer_start_block: env_opt("ATTESTOR_INDEXER_START_BLOCK")
                 .and_then(|s| s.parse().ok()),
+            oss_key_prefix: env_opt("OSS_KEY_PREFIX").unwrap_or_else(|| {
+                // Default: namespace by contract address so a shared bucket
+                // across deployments doesn't collide.
+                format!(
+                    "0x{}",
+                    hex::encode(
+                        env("ATTESTOR_AGENTIC_ID_ADDR")
+                            .ok()
+                            .and_then(|s| s.parse::<Address>().ok())
+                            .map(|a| a.into_array())
+                            .unwrap_or_default()
+                    )
+                )
+            }),
+            sandbox_proxy_addr: env("ATTESTOR_SANDBOX_PROXY_ADDR")?,
+            agent_container_port: env_opt("ATTESTOR_AGENT_CONTAINER_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
+            agent_entry_path: env_opt("ATTESTOR_AGENT_ENTRY_PATH")
+                .unwrap_or_else(|| "/hello".to_string()),
         })
     }
 }

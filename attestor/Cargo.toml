@@ -47,6 +47,8 @@ typenum = "1"
 sha2 = "0.10"
 hkdf = "0.12"
 sha3 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
 # ECIES encryption compatible with eciesjs
 # Config 1: secp256k1 + AES-256-GCM (OpenSSL, best performance) ← CURRENT
 ecies = { version = "0.2", features = ["std"] }

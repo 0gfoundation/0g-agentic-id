@@ -73,16 +73,34 @@ pub struct SandboxEnvelope {
 }
 
 // ── /deploy ─────────────────────────────────────────────────────────────
+//
+// User-facing input shape. Public display fields (`name`/`description`/
+// `image`) live at the top level — they feed both the ERC-8004 metadata
+// entries and the off-chain AgentCard JSON (which the attestor uploads to
+// OSS and writes into ERC-721 `tokenURI`). The private runtime config
+// (framework/inference/persona/skills) lives inside `i_data` under
+// `role="config"`; when `i_data` is empty the attestor synthesizes a
+// default OpenClaw config so there's always ≥1 IntelligentData on chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRequest {
     pub idempotency_key: String,
     pub owner: Address,
     pub owner_signature: Bytes,
-    /// 1..N iData entries. Order determines on-chain positions.
+
+    /// Public display name. Required, non-empty.
+    pub name: String,
+    /// Public description. Required, non-empty.
+    pub description: String,
+    /// Public avatar URL. Optional; when absent the attestor falls back to
+    /// the OpenClaw default logo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// 0..N iData entries. Empty Vec is valid — attestor synthesizes a
+    /// default `role="config"` entry with OpenClaw defaults.
+    #[serde(default)]
     pub i_data: Vec<IDataInput>,
-    /// Agent Card JSON. Opaque to attestor (may read `name`/`description`
-    /// for LLM auto-fill only).
-    pub agent_card: serde_json::Value,
+
     /// User-signed envelope authorizing sandbox `create`. Relayed as-is
     /// by the worker when it calls `POST {sandbox}/api/sandbox`.
     pub sandbox_envelope: SandboxEnvelope,
@@ -185,8 +203,19 @@ pub struct Deployment {
     pub agent_seal_addr: Address,
     pub owner: Address,
     pub agent_id: Option<AgentId>,
+
+    /// Canonical OSS URL of the AgentCard JSON. Empty until the worker
+    /// finishes the upload + `setAgentURI` second-phase write.
     pub agent_uri: String,
+
+    /// The fully-derived AgentCard JSON — ERC-721 + ERC-8004 shape. The
+    /// worker assembles this after mint (so `registrations[].agentId` is
+    /// known) and uploads the bytes verbatim to OSS; `agent_uri` points at
+    /// those exact bytes. DB is the single source of truth — if OSS PUT
+    /// fails the worker can retry from this blob. Empty object until the
+    /// worker build stage runs.
     pub agent_card: serde_json::Value,
+
     pub i_data: Vec<IDataArtifact>,
 
     pub phase: DeploymentPhase,
@@ -320,17 +349,12 @@ pub struct ReceiptSummary {
 }
 
 // ── Jobs ────────────────────────────────────────────────────────────────
-
-/// `IDataInput` with `plaintext` encrypted under the queue's symmetric key
-/// (`job_key = HKDF(masterKey, "attestor.job_encryption_key.v1")`). Ensures
-/// plaintext agent config never lands in Postgres `jobs.payload`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IDataInputEncrypted {
-    pub role: String,
-    pub encrypted_plaintext: Bytes,
-    #[serde(default)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
+//
+// JobPayload travels plaintext in-memory; `PostgresJobQueue` wraps it in
+// AES-GCM(job_key) before writing the `jobs.payload` Postgres column, so
+// at-rest confidentiality covers the whole payload (i_data plaintexts,
+// sandbox envelope user-supplied env vars, etc.) without callers doing
+// per-field crypto.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -338,8 +362,15 @@ pub enum JobPayload {
     Deploy {
         seal_id: SealId,
         owner: Address,
-        i_data: Vec<IDataInputEncrypted>,
-        agent_card: serde_json::Value,
+        /// May be empty; worker synthesizes an OpenClaw-default config entry
+        /// when so.
+        i_data: Vec<IDataInput>,
+        /// Public display fields propagated from `DeployRequest`. The worker
+        /// assembles them into the AgentCard JSON after mint.
+        name: String,
+        description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
         sandbox_envelope: SandboxEnvelope,
     },
     SandboxStart {
@@ -348,4 +379,76 @@ pub enum JobPayload {
     SandboxRestart {
         seal_id: SealId,
     },
+}
+
+// ── Config iData (role="config" plaintext shape) ───────────────────────
+//
+// Shape of the decrypted plaintext that lives in 0G Storage for each
+// `role="config"` iData entry. All top-level fields are optional so the
+// attestor can merge lenient user input with the OpenClaw defaults at the
+// `role="config"` interpretation layer — the structural type itself never
+// enforces anything missing (Postel). Sub-structs apply the same rule
+// one level deeper: `FrameworkSpec { name, version }` are both Option so
+// `{"framework":{"name":"X"}}` still deserializes successfully and
+// `version` inherits from the default.
+//
+// Unknown top-level keys land in `extra` via `#[serde(flatten)]` and
+// round-trip verbatim into the encrypted ciphertext — i.e. forward-compat
+// fields from newer SDKs travel through the attestor unmodified.
+//
+// This type intentionally has NO public display fields — `name`,
+// `description`, `image` live only in `DeployRequest` + off-chain
+// AgentCard JSON; keeping them out of iData avoids duplication and
+// keeps encrypted payload minimal.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConfigInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<FrameworkSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<InferenceSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PersonaSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<SkillSpec>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FrameworkSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InferenceSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PersonaSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// A skill entry inside `ConfigInput.skills`. `id` + `name` are the only
+/// fields projected into the public AgentCard (`skills[] = {id,name}`);
+/// everything else (prompt/tools/…) stays inside the encrypted iData.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillSpec {
+    pub id: String,
+    pub name: String,
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }

@@ -4,7 +4,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
     derive_phase, sandbox::verify_envelope, DeployRequest, DeployResponse, Deployment,
-    DeploymentPhase, IDataInputEncrypted, JobPayload, StageStatus, WsEvent,
+    DeploymentPhase, JobPayload, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -17,9 +17,14 @@ pub async fn handle(
     if req.idempotency_key.is_empty() {
         return Err(ApiError::bad_request("idempotency_key is required"));
     }
-    if req.i_data.is_empty() {
-        return Err(ApiError::bad_request("i_data must be non-empty"));
+    if req.name.trim().is_empty() {
+        return Err(ApiError::bad_request("name is required"));
     }
+    if req.description.trim().is_empty() {
+        return Err(ApiError::bad_request("description is required"));
+    }
+    // `i_data` is allowed to be empty — the worker synthesizes a default
+    // OpenClaw config entry so the contract always sees ≥1 IntelligentData.
 
     // TODO: verify owner_signature (EIP-191 / SIWE) matches req.owner.
     //       v0 accepts any signature.
@@ -78,7 +83,9 @@ pub async fn handle(
         }));
     }
 
-    // insert deployment row (all stages NotStarted)
+    // insert deployment row (all stages NotStarted). `agent_card` starts
+    // as an empty JSON object; the worker fills it after mint with the
+    // fully-derived ERC-721+ERC-8004 shape before PUT'ing to OSS.
     let now = Utc::now();
     let deployment = Deployment {
         seal_id,
@@ -86,7 +93,7 @@ pub async fn handle(
         owner: req.owner,
         agent_id: None,
         agent_uri: String::new(),
-        agent_card: req.agent_card.clone(),
+        agent_card: serde_json::Value::Object(Default::default()),
         i_data: Vec::new(),
         phase: derive_phase(
             &StageStatus::NotStarted,
@@ -103,31 +110,18 @@ pub async fn handle(
     };
     state.deployments.insert(&deployment).await?;
 
-    // Encrypt each iData plaintext under the shared job_key before submitting.
-    // Postgres `jobs.payload` only ever sees ciphertext.
-    let mut encrypted_i_data = Vec::with_capacity(req.i_data.len());
-    for input in req.i_data {
-        let pt_bytes = serde_json::to_vec(&input.plaintext).map_err(|e| {
-            ApiError::internal(format!("serialize plaintext: {e}"))
-        })?;
-        let ct = state
-            .crypto
-            .aes_gcm_encrypt(&pt_bytes, &state.job_key)
-            .map_err(|e| ApiError::internal(format!("encrypt plaintext: {e}")))?;
-        encrypted_i_data.push(IDataInputEncrypted {
-            role: input.role,
-            encrypted_plaintext: ct.into(),
-            extra: input.extra,
-        });
-    }
-
+    // `PostgresJobQueue` seals the whole payload with AES-GCM(job_key)
+    // before hitting Postgres, so iData plaintexts (plus sandbox envelope
+    // contents) never land on disk in the clear. No per-field crypto here.
     state
         .jobs
         .submit(JobPayload::Deploy {
             seal_id,
             owner: req.owner,
-            i_data: encrypted_i_data,
-            agent_card: req.agent_card.clone(),
+            i_data: req.i_data,
+            name: req.name.clone(),
+            description: req.description.clone(),
+            image: req.image.clone(),
             sandbox_envelope: req.sandbox_envelope.clone(),
         })
         .await?;

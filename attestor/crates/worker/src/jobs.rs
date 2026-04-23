@@ -2,9 +2,13 @@
 
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
-    ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact, IDataInput,
-    IDataInputEncrypted, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
-    SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
+    agent_card::{build_agent_card, AgentCardInputs},
+    agent_profile::ProfileRegistry,
+    i_data_derive::{normalize_i_data, ROLE_CONFIG},
+    oss::OssClient,
+    AgentId, ChainClient, Config, ConfigInput, CryptoModule, DeploymentRepo, EventBus,
+    IDataArtifact, IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient,
+    SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::Utc;
 use std::sync::Arc;
@@ -18,7 +22,13 @@ pub struct Ctx {
     pub sandbox: Arc<dyn SandboxClient>,
     pub deployments: Arc<dyn DeploymentRepo>,
     pub events: Arc<dyn EventBus>,
-    pub job_key: [u8; 32],
+
+    /// OSS client for AgentCard uploads. Required — deploy fails if
+    /// not configured (no more placeholder URIs).
+    pub oss: Arc<OssClient>,
+    /// Framework profile registry — picks defaults per user's
+    /// `framework.name`, falls back to OpenClaw.
+    pub registry: Arc<ProfileRegistry>,
 }
 
 pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
@@ -27,16 +37,24 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             owner,
             i_data,
-            agent_card,
+            name,
+            description,
+            image,
             sandbox_envelope,
         } => {
-            // Decrypt iData plaintexts from the queue-at-rest form.
-            let mut decrypted: Vec<IDataInput> = Vec::with_capacity(i_data.len());
-            for enc in i_data {
-                let plaintext = decrypt_i_data(ctx, &enc)?;
-                decrypted.push(plaintext);
-            }
-            handle_deploy(ctx, seal_id, owner, decrypted, agent_card, sandbox_envelope).await
+            // `PostgresJobQueue` decrypted the whole payload at claim time —
+            // iData plaintexts are already live here.
+            handle_deploy(
+                ctx,
+                seal_id,
+                owner,
+                i_data,
+                name,
+                description,
+                image,
+                sandbox_envelope,
+            )
+            .await
         }
         // SandboxStart/Restart here are for non-deploy flows and don't yet
         // carry a user-signed envelope. Will be wired when /restart is
@@ -48,26 +66,33 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
     }
 }
 
-fn decrypt_i_data(ctx: &Ctx, enc: &IDataInputEncrypted) -> anyhow::Result<IDataInput> {
-    let pt_bytes = ctx
-        .crypto
-        .aes_gcm_decrypt(&enc.encrypted_plaintext, &ctx.job_key)?;
-    let plaintext: serde_json::Value = serde_json::from_slice(&pt_bytes)?;
-    Ok(IDataInput {
-        role: enc.role.clone(),
-        plaintext,
-        extra: enc.extra.clone(),
-    })
-}
-
 async fn handle_deploy(
     ctx: &Ctx,
     seal_id: SealId,
     owner: Address,
     i_data_inputs: Vec<IDataInput>,
-    agent_card: serde_json::Value,
+    name: String,
+    description: String,
+    image: Option<String>,
     sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
+    // Normalize user-supplied i_data: guarantees ≥1 role=config entry
+    // with a valid ConfigInput-parseable plaintext (merge or synthesize).
+    let i_data_inputs = normalize_i_data(
+        i_data_inputs,
+        &name,
+        &description,
+        ctx.registry.as_ref(),
+    );
+
+    // Pull the merged ConfigInput out pre-encryption; phase 2 needs it
+    // to pick the right AgentProfile for AgentCard assembly.
+    let config_input: ConfigInput = i_data_inputs
+        .iter()
+        .find(|e| e.role == ROLE_CONFIG)
+        .and_then(|e| serde_json::from_value::<ConfigInput>(e.plaintext.clone()).ok())
+        .unwrap_or_else(|| ctx.registry.fallback().default_config(&name, &description));
+
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
         .deployments
@@ -90,13 +115,14 @@ async fn handle_deploy(
         let root = ctx.storage.compute_root(&ciphertext)?;
         let sealed = ctx.crypto.ecies_encrypt(&data_key, &agent_seal_pub)?;
 
-        // Build the on-chain description JSON.
+        // Build the on-chain description JSON (shadows user-supplied
+        // `description` inside this block — intentional scoping).
         let storage_ptr = serde_json::json!({
             "root_hash": format!("0x{}", hex::encode(root.as_slice())),
             "indexer":   ctx.cfg.storage_indexer,
             "size":      ciphertext.len(),
         });
-        let description = serde_json::json!({
+        let on_chain_description = serde_json::json!({
             "role":        input.role,
             "extra":       input.extra,
             "storage_ptr": storage_ptr,
@@ -106,7 +132,7 @@ async fn handle_deploy(
 
         artifacts.push(IDataArtifact {
             role: input.role.clone(),
-            description,
+            description: on_chain_description,
             storage_root: StorageRoot {
                 root_hash: root,
                 indexer: ctx.cfg.storage_indexer.clone(),
@@ -118,12 +144,11 @@ async fn handle_deploy(
         ciphertexts.push(ciphertext);
     }
 
-    // Agent URI placeholder — in production, attestor hosts AgentCard at a
-    // stable URL keyed by sealId. v0 just encodes sealId.
-    let agent_uri = format!(
-        "https://agents.0g.ai/0x{}.json",
-        hex::encode(seal_id.as_slice())
-    );
+    // Two-phase agent_uri: mint with empty string; worker fills the
+    // canonical OSS URL via setAgentURI after AgentCard upload (phase 2).
+    // Trusted-attestor auth on the contract (see contracts #1) makes this
+    // second write possible without owner re-signing.
+    let agent_uri = String::new();
 
     ctx.deployments
         .set_i_data_artifacts(seal_id, artifacts.clone(), agent_uri.clone())
@@ -159,8 +184,78 @@ async fn handle_deploy(
     mint_res?;
     container_res?;
 
+    // ── Phase 2: AgentCard → OSS → setAgentURI ──────────────────────
+    //
+    // Re-read the deployment row so we pick up agent_id (set by the mint
+    // track) and sandbox_id (set by the container track) regardless of
+    // which order the tracks completed in. Both must be present for
+    // phase 2 to be meaningful; bail if either is missing, since the
+    // caller saw all three tracks succeed and wouldn't expect that.
+    let d = ctx
+        .deployments
+        .get(seal_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("deployment disappeared between phases"))?;
+    let agent_id: AgentId = d
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("mint confirmed but agent_id not recorded"))?;
+    let sandbox_id = d
+        .sandbox_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("container confirmed but sandbox_id not recorded"))?;
+
+    // Select the framework profile from the merged config's framework.name;
+    // `ProfileRegistry::select` falls back to OpenClaw on unknown/missing.
+    let profile = ctx.registry.select(
+        config_input
+            .framework
+            .as_ref()
+            .and_then(|f| f.name.as_deref()),
+    );
+    let agent_card = build_agent_card(AgentCardInputs {
+        name: &name,
+        description: &description,
+        image: image.as_deref(),
+        config: &config_input,
+        profile,
+        agent_id,
+        agent_seal_addr: seal_kp.address,
+        chain_id: ctx.cfg.chain_id,
+        sandbox_id: &sandbox_id,
+        sandbox_proxy_addr: &ctx.cfg.sandbox_proxy_addr,
+        agent_container_port: ctx.cfg.agent_container_port,
+        agent_entry_path: &ctx.cfg.agent_entry_path,
+    });
+
+    // Key under `{oss_key_prefix}/<sealId-hex>/card.json` so a shared
+    // bucket across deployments namespaces cleanly by contract.
+    let oss_key = format!(
+        "{}/{}/card.json",
+        ctx.cfg.oss_key_prefix.trim_end_matches('/'),
+        hex::encode(seal_id.as_slice())
+    );
+    let card_bytes = serde_json::to_vec(&agent_card)?;
+    let uri = ctx.oss.put_json(&oss_key, card_bytes).await?;
+    tracing::info!(?seal_id, %agent_id, %uri, "AgentCard uploaded to OSS");
+
+    // setAgentURI on chain — indexer's URIUpdated handler will observe
+    // this and broadcast to subscribers, but we also emit immediately
+    // so frontends don't wait for the indexer lag.
+    let tx_hash = ctx.chain.set_agent_uri(agent_id, uri.clone()).await?;
+    tracing::info!(?tx_hash, %agent_id, "setAgentURI tx submitted");
+
+    ctx.deployments
+        .set_agent_uri_and_card(seal_id, uri.clone(), agent_card)
+        .await?;
+    ctx.events
+        .publish(WsEvent::AgentURIUpdated {
+            seal_id,
+            agent_id,
+            agent_uri: uri,
+        })
+        .await?;
+
     let _ = deployment; // silence unused
-    let _ = agent_card; // v0: attestor doesn't process card yet
     Ok(())
 }
 

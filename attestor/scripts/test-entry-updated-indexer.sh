@@ -27,8 +27,9 @@ DEPLOY=$(curl -fsS -X POST "$API/deploy" \
   "idempotency_key": "$IDEMP_KEY",
   "owner": "$ATTESTOR_ADDR",
   "owner_signature": "$ZERO_SIG_65",
-  "i_data": [{"role":"config","plaintext":{"test":true},"extra":{}}],
-  "agent_card": {"name":"EntryTest","description":"test"}
+  "name": "EntryTest",
+  "description": "test",
+  "i_data": [{"role":"config","plaintext":{"test":true},"extra":{}}]
 }
 JSON
 )")

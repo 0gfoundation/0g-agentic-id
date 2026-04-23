@@ -33,6 +33,15 @@ pub enum WsEvent {
     // ── indexer-observed chain state ─────────────────
     SealedKeysUpdated { seal_id: SealId, agent_id: AgentId },
     EntryUpdated { seal_id: SealId, index: u64 },
+    /// `URIUpdated(agentId, newURI, updatedBy)` observed on chain.
+    /// Emitted by both the attestor's own `setAgentURI` second-phase write
+    /// and by any owner-initiated URI rewrite; subscribers can use the
+    /// `agent_uri` payload to re-fetch the AgentCard without a poll.
+    AgentURIUpdated {
+        seal_id: SealId,
+        agent_id: AgentId,
+        agent_uri: String,
+    },
 }
 
 impl WsEvent {
@@ -51,7 +60,8 @@ impl WsEvent {
             | Self::ContainerFailed { seal_id, .. }
             | Self::PhaseChanged { seal_id, .. }
             | Self::SealedKeysUpdated { seal_id, .. }
-            | Self::EntryUpdated { seal_id, .. } => *seal_id,
+            | Self::EntryUpdated { seal_id, .. }
+            | Self::AgentURIUpdated { seal_id, .. } => *seal_id,
         }
     }
 }

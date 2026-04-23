@@ -105,6 +105,25 @@ impl ChainClient for MockChain {
     ) -> anyhow::Result<Vec<IntelligentData>> {
         Ok(Vec::new())
     }
+
+    async fn set_agent_uri(
+        &self,
+        agent_id: AgentId,
+        uri: String,
+    ) -> anyhow::Result<TxHash> {
+        let tx_hash = self.next_tx_hash();
+        self.tx_to_receipt.lock().unwrap().insert(
+            tx_hash,
+            ReceiptSummary {
+                tx_hash,
+                block_number: 0,
+                success: true,
+                agent_id: Some(agent_id),
+            },
+        );
+        tracing::info!(?tx_hash, %agent_id, %uri, "mock chain: setAgentURI");
+        Ok(tx_hash)
+    }
 }
 
 // ── StorageClient mock ───────────────────────────────────────────────────

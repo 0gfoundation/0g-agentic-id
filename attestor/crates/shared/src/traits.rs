@@ -28,6 +28,17 @@ pub trait ChainClient: Send + Sync {
         &self,
         agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>>;
+
+    /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
+    /// trusted attestors to call this, so the attestor EOA can write the
+    /// AgentCard URL after OSS upload without going through the owner.
+    /// Two-phase deploy: mint with empty URI first, fill via this call
+    /// once the canonical AgentCard JSON is uploaded.
+    async fn set_agent_uri(
+        &self,
+        agent_id: AgentId,
+        uri: String,
+    ) -> anyhow::Result<TxHash>;
 }
 
 // ── Crypto (CPU-bound, sync) ────────────────────────────────────────────
@@ -123,6 +134,18 @@ pub trait DeploymentRepo: Send + Sync {
         seal_id: SealId,
         artifacts: Vec<IDataArtifact>,
         agent_uri: String,
+    ) -> anyhow::Result<()>;
+
+    /// Set `agent_uri` and `agent_card` together — used by (a) the worker
+    /// after building+uploading the AgentCard JSON and calling setAgentURI,
+    /// and (b) the indexer when it observes a URIUpdated event and
+    /// re-fetches the canonical card. `agent_card` may be `Value::Null` if
+    /// the fetch failed; callers should still update `agent_uri`.
+    async fn set_agent_uri_and_card(
+        &self,
+        seal_id: SealId,
+        agent_uri: String,
+        agent_card: serde_json::Value,
     ) -> anyhow::Result<()>;
 
     /// Update `sealed_key` on every artifact whose `data_hash` appears in
