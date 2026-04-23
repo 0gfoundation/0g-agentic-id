@@ -155,6 +155,18 @@ contract AgenticID is
         return super.tokenURI(tokenId);
     }
 
+    /// @dev Allow trusted attestors to set the URI in addition to the token
+    ///      owner. Deploy flow mints first (with empty URI), then the
+    ///      attestor uploads the canonical AgentCard JSON to off-chain
+    ///      storage and writes the resulting URL back via setAgentURI.
+    function _authorizeSetAgentURI(uint256 agentId)
+        internal view virtual
+        override(ERC8004IdentityRegistryUpgradeable)
+    {
+        if (_getAgenticIDStorage().trustedAttestors[msg.sender]) return;
+        super._authorizeSetAgentURI(agentId);
+    }
+
     function _intelligentDatasOf(uint256 tokenId)
         internal view virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)

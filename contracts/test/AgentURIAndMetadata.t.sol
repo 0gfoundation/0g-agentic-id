@@ -36,6 +36,32 @@ contract AgentURIAndMetadataTest is AgenticIDTestBase {
         agenticId.setAgentURI(agentId, "ipfs://hijack");
     }
 
+    function test_setAgentURI_byTrustedAttestor_succeeds() public {
+        (uint256 agentId, ) = _mintWithSeal(alice);
+
+        vm.prank(attestor);
+        agenticId.setAgentURI(agentId, "https://dev-agent-market.oss-cn-beijing.aliyuncs.com/card.json");
+
+        assertEq(
+            agenticId.tokenURI(agentId),
+            "https://dev-agent-market.oss-cn-beijing.aliyuncs.com/card.json",
+            "attestor-written URI persisted"
+        );
+    }
+
+    function test_setAgentURI_revertsForUntrustedAttestor() public {
+        (uint256 agentId, ) = _mintWithSeal(alice);
+
+        address rogue = address(0xDEAD);
+        vm.prank(rogue);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC721Errors.ERC721IncorrectOwner.selector, rogue, agentId, alice
+            )
+        );
+        agenticId.setAgentURI(agentId, "ipfs://hijack");
+    }
+
     function test_tokenURI_revertsOnNonexistentToken() public {
         vm.expectRevert(
             abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(999))

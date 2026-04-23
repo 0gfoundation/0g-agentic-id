@@ -138,10 +138,17 @@ abstract contract ERC8004IdentityRegistryUpgradeable is
     }
 
     function setAgentURI(uint256 agentId, string calldata newURI) external {
-        if (_ownerOf(agentId) != msg.sender)
-            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
+        _authorizeSetAgentURI(agentId);
         _getERC8004Storage().agentURIs[agentId] = newURI;
         emit URIUpdated(agentId, newURI, msg.sender);
+    }
+
+    /// @dev Authorize a setAgentURI call. Default: only the token owner.
+    ///      Subclasses may override to widen (e.g. AgenticID also allows
+    ///      trusted attestors so they can write the final URL after mint).
+    function _authorizeSetAgentURI(uint256 agentId) internal view virtual {
+        if (_ownerOf(agentId) != msg.sender)
+            revert ERC721IncorrectOwner(msg.sender, agentId, _ownerOf(agentId));
     }
 
     // ── Metadata ──────────────────────────────────────────────────────────────
