@@ -2,6 +2,7 @@
 
 pub mod agent_card;
 pub mod agent_profile;
+pub mod auth;
 pub mod chain;
 pub mod config;
 pub mod crypto;

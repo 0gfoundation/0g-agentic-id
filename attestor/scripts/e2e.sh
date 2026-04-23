@@ -75,22 +75,46 @@ banner "1. POST /deploy"
 # Top-level display fields replace the old opaque `agent_card`. `i_data`
 # may be empty — attestor synthesizes a default OpenClaw config entry
 # when so. Here we pass `[]` to exercise that path.
+AGENT_NAME="E2EAgent"
+AGENT_DESCRIPTION="smoke test"
+
+# Build the canonical owner-signed payload. Field order here doesn't need
+# to match server struct order (serde parses unordered); what MUST match
+# is that the EXACT bytes below are what's signed + base64'd.
+# Using `--arg owner` (lowercase hex from cast wallet address) keeps the
+# Address round-trip stable; serde accepts either checksummed or lower.
+OWNER_LOWER=$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')
+OWNER_CANONICAL=$(jq -cn \
+  --arg domain "AgenticID.Deploy.v1" \
+  --arg idempotency_key "$IDEMP_KEY" \
+  --arg owner "$OWNER_LOWER" \
+  --arg name "$AGENT_NAME" \
+  --arg description "$AGENT_DESCRIPTION" \
+  --argjson image null \
+  --argjson i_data '[]' \
+  '{domain:$domain, idempotency_key:$idempotency_key, owner:$owner, name:$name, description:$description, image:$image, i_data:$i_data}')
+
+OWNER_SIG=$(cast wallet sign --private-key "$OWNER_PRIV" "$OWNER_CANONICAL")
+OWNER_SIGNED_B64=$(printf '%s' "$OWNER_CANONICAL" | base64 | tr -d '\n')
+
 deploy_payload=$(jq -cn \
   --arg idempotency_key "$IDEMP_KEY" \
   --arg owner "$OWNER" \
-  --arg owner_signature "$ZERO_SIG_65" \
-  --arg name "E2EAgent" \
-  --arg description "smoke test" \
+  --arg owner_signature "$OWNER_SIG" \
+  --arg owner_signed_message_b64 "$OWNER_SIGNED_B64" \
+  --arg name "$AGENT_NAME" \
+  --arg description "$AGENT_DESCRIPTION" \
   --argjson i_data '[]' \
   --argjson sandbox_envelope "$ENVELOPE" \
   '{
-     idempotency_key:  $idempotency_key,
-     owner:            $owner,
-     owner_signature:  $owner_signature,
-     name:             $name,
-     description:      $description,
-     i_data:           $i_data,
-     sandbox_envelope: $sandbox_envelope
+     idempotency_key:           $idempotency_key,
+     owner:                     $owner,
+     owner_signature:           $owner_signature,
+     owner_signed_message_b64:  $owner_signed_message_b64,
+     name:                      $name,
+     description:               $description,
+     i_data:                    $i_data,
+     sandbox_envelope:          $sandbox_envelope
    }')
 
 resp=$(curl -fsS -X POST "$API/deploy" \

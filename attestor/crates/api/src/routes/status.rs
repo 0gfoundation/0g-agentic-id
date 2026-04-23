@@ -3,7 +3,10 @@
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::{ContainerReportStatus, StageStatus, StatusReport, WsEvent};
+use attestor_shared::{
+    auth::status::verify_status_signature, ContainerReportStatus, StageStatus, StatusReport,
+    WsEvent,
+};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -23,8 +26,12 @@ pub async fn handle(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
 
-    // TODO: verify report.agent_seal_signature recovers to d.agent_seal_addr
-    //       v0: accept any signature
+    // Agent authenticity: verify EIP-191 signature over the canonical
+    // status payload AND that every outer field matches what was signed.
+    // Signer must equal the on-record `agent_seal_addr` — blocks
+    // forgery by anyone without the container's TEE private key.
+    verify_status_signature(&report, d.agent_seal_addr, state.crypto.as_ref())
+        .map_err(|e| ApiError::bad_request(format!("agent_seal_signature: {e}")))?;
 
     let now = Utc::now();
     match report.status {
@@ -99,9 +106,6 @@ pub async fn handle(
                 .await?;
         }
     }
-
-    // suppress `d` unused warning — we loaded it for validation
-    let _ = d;
 
     Ok((StatusCode::OK, Json(json!({"ok": true}))))
 }

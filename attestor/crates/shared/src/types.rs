@@ -85,7 +85,16 @@ pub struct SandboxEnvelope {
 pub struct DeployRequest {
     pub idempotency_key: String,
     pub owner: Address,
+    /// EIP-191 `personal_sign` signature (65 bytes, V ∈ {27,28}) over
+    /// the exact bytes encoded in `owner_signed_message_b64`. See
+    /// `auth::deploy::CanonicalDeploy` for the payload shape.
     pub owner_signature: Bytes,
+    /// Base64 of the canonical JSON bytes the owner signed. The attestor
+    /// recovers the signer from this + `owner_signature`, asserts equality
+    /// with `owner`, and cross-checks every other field below against
+    /// the decoded payload — so a stolen signature can't be replayed on
+    /// a mutated request.
+    pub owner_signed_message_b64: String,
 
     /// Public display name. Required, non-empty.
     pub name: String,
@@ -287,6 +296,13 @@ pub struct StatusReport {
     pub status: ContainerReportStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the
+    /// container's `agentSeal_priv` over `keccak256(canonical_message)`,
+    /// where `canonical_message` is a colon-joined ASCII string
+    /// reconstructed server-side from the fields above. See
+    /// `auth::status::canonical_message`. This matches the attestation
+    /// signing style of `/provision` (TEE machine-to-machine, no
+    /// EIP-191 prefix, no JSON/base64 envelope).
     pub agent_seal_signature: Bytes,
 }
 

@@ -3,8 +3,8 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
-    derive_phase, sandbox::verify_envelope, DeployRequest, DeployResponse, Deployment,
-    DeploymentPhase, JobPayload, StageStatus, WsEvent,
+    auth::deploy::verify_deploy_signature, derive_phase, sandbox::verify_envelope, DeployRequest,
+    DeployResponse, Deployment, DeploymentPhase, JobPayload, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -26,8 +26,12 @@ pub async fn handle(
     // `i_data` is allowed to be empty — the worker synthesizes a default
     // OpenClaw config entry so the contract always sees ≥1 IntelligentData.
 
-    // TODO: verify owner_signature (EIP-191 / SIWE) matches req.owner.
-    //       v0 accepts any signature.
+    // Owner authorization: verify EIP-191 signature over the canonical
+    // deploy payload AND that every outer field matches what was signed.
+    // Rejects both "forged signer" and "tampered-after-sign" attacks.
+    verify_deploy_signature(&req, state.crypto.as_ref())
+        .map_err(|e| ApiError::bad_request(format!("owner_signature: {e}")))?;
+
     tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), "deploy request");
 
     // ── Sandbox envelope: validate at edge so bogus requests don't burn a
