@@ -34,6 +34,33 @@ sol!(
     "../../../contracts/out/AgenticID.sol/AgenticID.json"
 );
 
+/// Try to decode a revert reason embedded in an alloy RPC error string.
+/// Looks for `data: "0x<hex>"` and decodes against AgenticID's full set
+/// of custom errors (AgenticID + inherited ERC-7857/8004/NonceRegistry).
+/// Returns `Some(Debug-formatted variant)` or `None` if the error has no
+/// data field or the selector doesn't match a known error.
+pub fn decode_revert_data_in_error(err: &str) -> Option<String> {
+    use alloy::sol_types::SolInterface;
+    let key = "data: \"0x";
+    let start = err.find(key)? + key.len();
+    let rest = &err[start..];
+    let end = rest.find('"')?;
+    let bytes = alloy::hex::decode(&rest[..end]).ok()?;
+    let decoded = AgenticID::AgenticIDErrors::abi_decode(&bytes, true).ok()?;
+    Some(format!("{decoded:?}"))
+}
+
+/// Map any chain-RPC error to anyhow::Error, appending the decoded
+/// revert name if present. Used on `.map_err(decode_err)` at every
+/// `estimate_gas` / `send_transaction` call site.
+fn decode_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
+    let s = e.to_string();
+    match decode_revert_data_in_error(&s) {
+        Some(d) => anyhow::anyhow!("{s} [{d}]"),
+        None => anyhow::anyhow!(s),
+    }
+}
+
 // Multiplicative buffer for estimate_gas — add 20%.
 const GAS_LIMIT_BUFFER_NUMERATOR: u128 = 120;
 const GAS_LIMIT_BUFFER_DENOMINATOR: u128 = 100;
@@ -155,7 +182,11 @@ where
             .with_input(call_data);
 
         // Estimate gas limit, add 20% safety margin.
-        let gas = self.provider.estimate_gas(&tx).await? as u128;
+        let gas = self
+            .provider
+            .estimate_gas(&tx)
+            .await
+            .map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -168,7 +199,11 @@ where
             "alloy: sending registerWithSeal"
         );
 
-        let pending = self.provider.send_transaction(tx).await?;
+        let pending = self
+            .provider
+            .send_transaction(tx)
+            .await
+            .map_err(decode_err)?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -263,7 +298,11 @@ where
             .with_to(self.contract_addr)
             .with_input(call_data);
 
-        let gas = self.provider.estimate_gas(&tx).await? as u128;
+        let gas = self
+            .provider
+            .estimate_gas(&tx)
+            .await
+            .map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -275,7 +314,11 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = self.provider.send_transaction(tx).await?;
+        let pending = self
+            .provider
+            .send_transaction(tx)
+            .await
+            .map_err(decode_err)?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)
@@ -289,4 +332,54 @@ where
     T: Transport + Clone,
     P: Provider<T, Ethereum> + Clone,
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `0x042a85a4` == selector of `AgenticIDNotTrustedAttestor()`.
+    /// This is the exact error we saw in production (attestor EOA not
+    /// registered in trustedAttestors). Tests the no-args path.
+    #[test]
+    fn decode_revert_no_args() {
+        let err = r#"server returned an error response: error code 3: execution reverted, data: "0x042a85a4""#;
+        let decoded = decode_revert_data_in_error(err).expect("should decode");
+        assert!(
+            decoded.contains("AgenticIDNotTrustedAttestor"),
+            "got: {decoded}"
+        );
+    }
+
+    /// `AgenticIDSealIdTaken(bytes32,uint256)` — non-empty args.
+    /// Constructs the revert via the generated error struct so we don't
+    /// hand-pack ABI bytes.
+    #[test]
+    fn decode_revert_with_args() {
+        use alloy::sol_types::SolError;
+        let err_struct = AgenticID::AgenticIDSealIdTaken {
+            sealId: alloy::primitives::B256::repeat_byte(0xaa),
+            existingAgentId: alloy::primitives::U256::from(42u64),
+        };
+        let data_hex = alloy::hex::encode(err_struct.abi_encode());
+        let err = format!(r#"execution reverted, data: "0x{data_hex}""#);
+        let decoded = decode_revert_data_in_error(&err).expect("should decode");
+        assert!(decoded.contains("AgenticIDSealIdTaken"), "got: {decoded}");
+        assert!(decoded.contains("42"), "args must be shown: {decoded}");
+    }
+
+    /// Plain error string without a `data:` field → None.
+    #[test]
+    fn decode_returns_none_when_no_data_field() {
+        let err = "connection refused";
+        assert!(decode_revert_data_in_error(err).is_none());
+    }
+
+    /// `data:` present but selector doesn't match any known AgenticID
+    /// error → None (e.g., if a different contract's error leaked through).
+    #[test]
+    fn decode_returns_none_for_unknown_selector() {
+        let err = r#"execution reverted, data: "0xdeadbeef""#;
+        assert!(decode_revert_data_in_error(err).is_none());
+    }
 }
