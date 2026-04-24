@@ -1,0 +1,31 @@
+# Repo-root .dockerignore (build context is repo root, see attestor/Dockerfile).
+# Keep the build context small — the Docker daemon tars everything here.
+
+.git/
+**/target/
+**/node_modules/
+**/*.log
+**/.DS_Store
+
+# Secrets / local config (never ship env files into the image).
+**/.env
+**/.env.*
+!**/.env.example
+
+# Docs / dev scripts not used by the Rust build.
+**/README.md
+attestor/scripts/
+
+# Dev/operations files that would just bloat the context.
+attestor/Dockerfile
+attestor/.dockerignore
+attestor/docker-compose*.yml
+
+# contracts/: only contracts/out/AgenticID.sol/AgenticID.json is COPYied.
+# Forge artifacts and deps don't need to travel.
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+contracts/script/
+contracts/src/
+contracts/test/

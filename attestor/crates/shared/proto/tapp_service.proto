@@ -1,0 +1,589 @@
+syntax = "proto3";
+
+package tapp_service;
+
+// Service definition
+service TappService {
+  // Start an application using Docker Compose content (async - returns task ID)
+  rpc StartApp(StartAppRequest) returns (StartAppResponse);
+
+  // Stop a running application (synchronous)
+  rpc StopApp(StopAppRequest) returns (StopAppResponse);
+
+  // Get task status for async operations
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+
+  // List all deployed applications' measurement information
+  rpc ListAppMeasurements(ListAppMeasurementsRequest)
+      returns (ListAppMeasurementsResponse);
+
+  // Get attestation evidence for external verifiers
+  rpc GetEvidence(GetEvidenceRequest) returns (GetEvidenceResponse);
+
+  // Get application-bound key from KBS based on app ID
+  rpc GetAppKey(GetAppKeyRequest) returns (GetAppKeyResponse);
+
+  // Get application secret key (private key) - local access only
+  rpc GetAppSecretKey(GetAppSecretKeyRequest) returns (GetAppSecretKeyResponse);
+
+  // Get application information
+  rpc GetAppInfo(GetAppInfoRequest) returns (GetAppInfoResponse);
+
+  // Get TAPP service configuration
+  rpc GetTappInfo(GetTappInfoRequest) returns (GetTappInfoResponse);
+
+  // Get service status and health information
+  rpc GetServiceStatus(GetServiceStatusRequest)
+      returns (GetServiceStatusResponse);
+
+  // Get service logs with filtering options
+  rpc GetServiceLogs(GetServiceLogsRequest) returns (GetServiceLogsResponse);
+
+  // Get application logs (docker compose logs)
+  rpc GetAppLogs(GetAppLogsRequest) returns (GetAppLogsResponse);
+
+  // Permission Management (Owner only)
+  // Add address to whitelist
+  rpc AddToWhitelist(AddToWhitelistRequest) returns (AddToWhitelistResponse);
+
+  // Remove address from whitelist
+  rpc RemoveFromWhitelist(RemoveFromWhitelistRequest)
+      returns (RemoveFromWhitelistResponse);
+
+  // List all whitelisted addresses
+  rpc ListWhitelist(ListWhitelistRequest) returns (ListWhitelistResponse);
+
+  // App Ownership Tracking
+  // Get ownership info for a specific app
+  rpc GetAppOwnership(GetAppOwnershipRequest) returns (GetAppOwnershipResponse);
+
+  // List all app ownerships
+  rpc ListAllOwnerships(ListAllOwnershipsRequest)
+      returns (ListAllOwnershipsResponse);
+
+  // Ethereum Operations
+  // Withdraw all ETH from app address to owner address
+  rpc WithdrawBalance(WithdrawBalanceRequest) returns (WithdrawBalanceResponse);
+
+  // Docker Operations
+  // Login to Docker registry to pull private images
+  rpc DockerLogin(DockerLoginRequest) returns (DockerLoginResponse);
+
+  // Logout from Docker registry
+  rpc DockerLogout(DockerLogoutRequest) returns (DockerLogoutResponse);
+
+  // Prune unused Docker images
+  rpc PruneImages(PruneImagesRequest) returns (PruneImagesResponse);
+
+  // Service-level Operations
+  // Stop a specific service within an app
+  rpc StopService(StopServiceRequest) returns (StopServiceResponse);
+
+  // Start a specific service within an app
+  rpc StartService(StartServiceRequest) returns (StartServiceResponse);
+
+  // Get application container status
+  rpc GetAppContainerStatus(GetAppContainerStatusRequest)
+      returns (GetAppContainerStatusResponse);
+
+  // Get KMS-managed secret resource for this app. LOCAL ACCESS ONLY.
+  // tapp signs the KMS request with its in-memory key, decrypts the response, and returns plaintext.
+  rpc GetSecretResource(GetSecretResourceRequest)
+      returns (GetSecretResourceResponse);
+}
+
+enum LogLevel {
+  DEBUG = 0;
+  INFO = 1;
+  WARNING = 2;
+  ERROR = 3;
+}
+
+enum ServiceHealthStatus {
+  HEALTHY = 0;
+  UNHEALTHY = 1;
+  UNKNOWN = 2;
+}
+
+// Task status for async operations
+enum TaskStatus {
+  PENDING = 0;    // Task is queued but not started
+  RUNNING = 1;    // Task is currently running
+  COMPLETED = 2;  // Task completed successfully
+  FAILED = 3;     // Task failed with error
+}
+
+enum EvidenceFormat {
+  RAW_QUOTE = 0;           // Raw TDX quote
+  JSON_EVIDENCE = 1;       // JSON formatted evidence with metadata
+  COMPOSITE_EVIDENCE = 2;  // Evidence with additional device attestations
+}
+
+// Start App Messages
+message MountFile {
+  string source_path = 1;  // Source path in compose file, e.g., ./nginx.conf
+  bytes content = 2;       // File content (base64 encoded)
+  string mode = 3;         // File permissions, e.g., "0644"
+}
+
+message StartAppRequest {
+  string compose_content = 1;
+  string app_id = 2;  // Application identifier for key binding
+  repeated MountFile mount_files =
+      3;  // Files to mount (mapped by source_path from compose volumes)
+}
+
+message StartAppResponse {
+  bool success = 1;
+  string message = 2;
+  string task_id = 3;   // Async task identifier for tracking progress
+  int64 timestamp = 4;  // Timestamp of the start request
+}
+
+// Stop App Messages
+message StopAppRequest {
+  string app_id = 1;  // Application identifier to stop
+}
+
+message StopAppResponse {
+  bool success = 1;
+  string message = 2;
+  int64 timestamp = 3;  // Timestamp of the stop request
+}
+
+// Task Status Messages
+message GetTaskStatusRequest {
+  string task_id = 1;  // Task identifier to query
+}
+
+message TaskResult {
+  string app_id = 1;    // Application identifier (on success)
+  string deployer = 2;  // Deployer EVM address (on success)
+  string error = 3;     // Error message (on failure)
+}
+
+message GetTaskStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string task_id = 3;
+  TaskStatus status = 4;  // Current task status
+  TaskResult result = 5;  // Task result (only available when completed/failed)
+  int64 created_at = 6;   // Task creation timestamp
+  int64 updated_at = 7;   // Last update timestamp
+}
+
+// List App Measurements Messages
+message ListAppMeasurementsRequest {
+  // Optional filters (empty means list all)
+  string deployer_filter = 1;  // Filter by deployer (hex string)
+}
+
+message AppMeasurementInfo {
+  string app_id = 1;        // Application identifier
+  string operation = 2;     // "start_app", "stop_app", etc.
+  string result = 3;        // "success" or "failed"
+  string error = 4;         // Error message if failed
+  string compose_hash = 5;  // Hash of compose file content
+  string volumes_hash = 6;  // Hash of mounted volumes
+  string deployer = 7;      // Deployer public key (hex)
+  int64 timestamp = 8;      // Measurement timestamp
+}
+
+message ListAppMeasurementsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AppMeasurementInfo measurements = 3;
+  int32 total_count = 4;      // Total number of measurements
+  string hash_algorithm = 5;  // Hash algorithm used globally (e.g., "sha256")
+}
+
+// Get Evidence Messages
+message GetEvidenceRequest {
+  string app_id = 1;  // Application identifier
+                      // The EVM address (owner) of the app will be
+                      // automatically used as report_data
+}
+
+message GetEvidenceResponse {
+  bool success = 1;
+  string message = 2;
+  bytes evidence = 3;
+  // Metadata
+  string tee_type = 4;  // TEE type (e.g., "TDX", "SNP", "SGX")
+  int64 timestamp = 5;  // Evidence generation timestamp
+}
+
+// Get App Key Messages (replaces GetPubkey)
+message GetAppKeyRequest {
+  string app_id = 1;            // Application identifier
+  string key_type = 2;          // Key type: "ethereum", "rsa", "ec"
+  bytes additional_data = 3;    // Additional binding data
+  string kbs_resource_uri = 4;  // KBS resource URI for key material
+  bool x25519 = 5;              // Use X25519 key pair
+}
+
+message GetAppKeyResponse {
+  bool success = 1;
+  string message = 2;
+
+  // Key material (format depends on key_type)
+  bytes public_key = 3;  // Public key bytes
+  // Ethereum-specific fields (when key_type="ethereum")
+  bytes eth_address = 4;        // 20-byte Ethereum address
+  bytes x25519_public_key = 5;  // 32-byte X25519 public key
+  // Key provenance
+  string key_source = 6;  // Source: "kbs", "in-memory"
+}
+
+// Get App Secret Key Messages (local access only)
+message GetAppSecretKeyRequest {
+  string app_id = 1;    // Application identifier
+  string key_type = 2;  // Key type: "ethereum", "rsa", "ec"
+  bool x25519 = 3;      // Use X25519 key pair
+}
+
+message GetAppSecretKeyResponse {
+  bool success = 1;
+  string message = 2;
+
+  // Secret key material (SENSITIVE - only for local access)
+  bytes private_key = 3;        // Private key bytes (32 bytes for Ethereum)
+  bytes public_key = 4;         // Public key bytes (for verification)
+  bytes eth_address = 5;        // Ethereum address (if applicable)
+  bytes x25519_public_key = 6;  // 32-byte X25519 public key
+}
+
+message GetAppInfoRequest {
+  string app_id = 1;
+}
+
+message GetAppInfoResponse {
+  bool success = 1;
+  string message = 2;
+
+  string app_id = 3;
+  string owner = 4;
+  string compose_hash = 5;
+  map<string, string> volumes_hash = 6;  // Map: file_name -> hash
+  string compose_content = 7;
+  map<string, string> image_hash = 9;  // Map: service_name -> image_hash
+}
+
+// Get TAPP Info Messages
+message GetTappInfoRequest {
+  // No parameters needed
+}
+
+message LoggingConfigInfo {
+  string level = 1;
+  string format = 2;
+  string file_path = 3;  // Empty if logging to stdout
+}
+
+message ServerConfigInfo {
+  string bind_address = 1;
+  int32 max_connections = 2;
+  int32 request_timeout_seconds = 3;
+  bool tls_enabled = 4;
+  bool tls_cert_configured =
+      5;  // Whether TLS cert is configured (path not exposed)
+  bool permission_enabled = 6;
+  string owner_address = 7;  // TAPP owner address (if permission enabled)
+}
+
+message BootConfigInfo {
+  string aa_config_path = 1;  // Attestation agent config path
+}
+
+message RetryConfigInfo {
+  int32 max_retries = 1;
+  int32 initial_delay_ms = 2;
+  int32 max_delay_ms = 3;
+}
+
+message KbsConfigInfo {
+  repeated string node_urls = 1;
+  int32 timeout_seconds = 2;
+  bool cert_configured = 3;  // Whether custom CA cert is configured
+  RetryConfigInfo retry = 4;
+}
+
+message TappConfigInfo {
+  LoggingConfigInfo logging = 1;
+  ServerConfigInfo server = 2;
+  BootConfigInfo boot = 3;
+  KbsConfigInfo kbs = 4;  // Null if KBS is not configured
+  bool kbs_enabled = 5;
+}
+
+message GetTappInfoResponse {
+  bool success = 1;
+  string message = 2;
+  TappConfigInfo config = 3;
+  string version = 4;  // TAPP service version
+}
+
+// Service Status Messages
+message GetServiceStatusRequest {
+  int32 log_lines =
+      1;  // Number of recent log lines from journalctl (default: 50)
+}
+
+message GetServiceStatusResponse {
+  bool success = 1;
+  string message = 2;
+
+  // Service information from systemd/journalctl
+  string unit_name = 3;  // systemd unit name (e.g., "tapp-service.service")
+  string active_state =
+      4;                 // active, inactive, failed, activating, deactivating
+  string sub_state = 5;  // running, dead, exited, failed, etc.
+  int64 active_since_timestamp =
+      6;          // When the service became active (unix timestamp)
+  int32 pid = 7;  // Main process PID (0 if not running)
+
+  // Recent logs from journalctl -u <unit> -n <lines>
+  repeated string recent_logs = 8;
+  int32 log_lines_returned = 9;
+
+  int64 timestamp = 10;  // Response timestamp
+  string version = 11;   // TAPP service version
+}
+
+// Service Logs Messages
+message GetServiceLogsRequest {
+  string file_name = 1;  // Log file name (if empty, list all available files)
+  int32 lines =
+      2;  // Number of lines to retrieve (default: 100, tail -n behavior)
+          // If download_full is true, this parameter is ignored
+  bool download_full =
+      3;  // Download complete file content (ignores lines parameter)
+}
+
+message LogFileInfo {
+  string file_name = 1;     // File name
+  int64 size_bytes = 2;     // File size
+  int64 modified_time = 3;  // Last modified timestamp
+}
+
+message GetServiceLogsResponse {
+  bool success = 1;
+  string message = 2;
+
+  // If file_name is empty in request, return list of available files
+  repeated LogFileInfo available_files = 3;
+
+  // If file_name is specified, return file content
+  string content =
+      4;  // File content (last N lines, or full file if download_full=true)
+  int32 total_lines = 5;  // Total lines returned
+  int64 file_size = 6;    // File size in bytes (when download_full=true)
+}
+
+// Application Logs Messages
+message GetAppLogsRequest {
+  string app_id = 1;  // Application identifier
+  int32 lines = 2;    // Number of lines to retrieve (default: 100)
+  string service_name =
+      3;  // Optional: specific service in compose (e.g., "web", "broker")
+}
+
+message GetAppLogsResponse {
+  bool success = 1;
+  string message = 2;
+  string content = 3;     // Log content from docker compose logs
+  int32 total_lines = 4;  // Total lines returned
+}
+
+// Permission Management Messages
+message AddToWhitelistRequest {
+  string evm_address = 1;  // EVM address to add (e.g., "0xabcd...")
+}
+
+message AddToWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message RemoveFromWhitelistRequest {
+  string evm_address = 1;  // EVM address to remove
+}
+
+message RemoveFromWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message ListWhitelistRequest {
+  // No parameters needed
+}
+
+message ListWhitelistResponse {
+  bool success = 1;
+  string message = 2;
+  repeated string addresses = 3;  // List of whitelisted EVM addresses
+}
+
+// App Ownership Messages
+enum AppStatus {
+  ACTIVE = 0;
+  STOPPED = 1;
+}
+
+message AppOwnershipInfo {
+  string app_id = 1;
+  string owner_address = 2;  // EVM address of the app owner (who started it)
+  int64 started_at = 3;      // Unix timestamp when app was started
+  AppStatus status = 4;      // Current app status
+  int64 stopped_at = 5;  // Unix timestamp when app was stopped (0 if running)
+}
+
+message GetAppOwnershipRequest {
+  string app_id = 1;
+}
+
+message GetAppOwnershipResponse {
+  bool success = 1;
+  string message = 2;
+  AppOwnershipInfo ownership = 3;  // Ownership info (null if not found)
+}
+
+message ListAllOwnershipsRequest {
+  // No parameters needed
+}
+
+message ListAllOwnershipsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated AppOwnershipInfo ownerships = 3;  // List of all app ownerships
+}
+
+// Ethereum Withdrawal Messages
+
+message WithdrawBalanceRequest {
+  string app_id = 1;    // Application identifier
+  string rpc_url = 2;   // Ethereum RPC endpoint (e.g.,
+                        // "https://eth-sepolia.g.alchemy.com/v2/...")
+  uint64 chain_id = 3;  // Chain ID (e.g., 1 for mainnet, 11155111 for sepolia)
+  string recipient =
+      4;  // Optional: custom recipient address (defaults to tapp owner)
+}
+
+message WithdrawBalanceResponse {
+  bool success = 1;
+  string message = 2;
+  string transaction_hash = 3;  // Transaction hash on success
+  string from_address = 4;      // App's Ethereum address
+  string to_address = 5;        // Recipient address
+  string amount = 6;  // Amount transferred in Wei (as string to avoid overflow)
+  uint64 gas_used = 7;   // Estimated gas used
+  uint64 gas_price = 8;  // Gas price used (in Wei)
+  int64 timestamp = 9;   // Operation timestamp
+}
+
+// Docker Login Messages
+message DockerLoginRequest {
+  string registry = 1;  // Docker registry URL (e.g.,
+                        // "eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com")
+                        // If empty, defaults to Docker Hub (docker.io)
+  string username = 2;  // Registry username
+  string password = 3;  // Registry password or access token
+}
+
+message DockerLoginResponse {
+  bool success = 1;
+  string message = 2;
+  string registry = 3;  // Registry that was logged into
+  string username = 4;  // Username used for login
+  int64 timestamp = 5;  // Operation timestamp
+}
+
+// Docker Logout Messages
+message DockerLogoutRequest {
+  string registry = 1;  // Docker registry URL (e.g.,
+                        // "eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com")
+                        // If empty, defaults to Docker Hub (docker.io)
+}
+
+message DockerLogoutResponse {
+  bool success = 1;
+  string message = 2;
+  string registry = 3;  // Registry that was logged out from
+  int64 timestamp = 4;  // Operation timestamp
+}
+
+// Docker Prune Images Messages
+message PruneImagesRequest {
+  bool all =
+      1;  // Remove all unused images, not just dangling ones (default: false)
+}
+
+message PruneImagesResponse {
+  bool success = 1;
+  string message = 2;
+  int64 images_deleted = 3;            // Number of images deleted
+  int64 space_reclaimed = 4;           // Disk space reclaimed in bytes
+  repeated string deleted_images = 5;  // List of deleted image IDs/names
+  int64 timestamp = 6;                 // Operation timestamp
+}
+
+// Service-level Operation Messages
+message StopServiceRequest {
+  string app_id = 1;        // Application identifier
+  string service_name = 2;  // Service name from docker-compose.yml
+}
+
+message StopServiceResponse {
+  bool success = 1;
+  string message = 2;
+  string app_id = 3;        // Application identifier
+  string service_name = 4;  // Service that was stopped
+  int64 timestamp = 5;      // Operation timestamp
+}
+
+message StartServiceRequest {
+  string app_id = 1;        // Application identifier
+  string service_name = 2;  // Service name from docker-compose.yml
+  bool pull_image = 3;      // Whether to pull latest image (default: false)
+}
+
+message StartServiceResponse {
+  bool success = 1;
+  string message = 2;
+  string task_id = 3;   // Async task identifier for tracking progress
+  int64 timestamp = 4;  // Operation timestamp
+}
+
+// Get App Container Status Messages
+message GetAppContainerStatusRequest {
+  string app_id = 1;  // Application identifier
+}
+
+message GetAppContainerStatusResponse {
+  bool success = 1;
+  string message = 2;
+  string app_id = 3;
+  bool running = 4;                         // Whether the app is running
+  int32 container_count = 5;                // Number of containers
+  repeated ContainerStatus containers = 6;  // Container status details
+  int64 started_at = 7;  // App start timestamp (Unix timestamp)
+  int64 timestamp = 8;   // Response timestamp
+}
+
+message ContainerStatus {
+  string name = 1;            // Container name
+  string state = 2;           // Container state (running, stopped, etc.)
+  string health = 3;          // Health status (if available)
+  repeated string ports = 4;  // Port mappings (e.g., "0.0.0.0:8080->80/tcp")
+}
+
+// GetSecretResource Messages
+message GetSecretResourceRequest {
+  string app_id = 1;
+}
+
+message GetSecretResourceResponse {
+  bool success = 1;
+  string message = 2;
+  bytes secret = 3;  // plaintext KMS-derived app key
+}

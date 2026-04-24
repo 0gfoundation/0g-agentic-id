@@ -9,12 +9,12 @@ use attestor_shared::{
     crypto::{InMemoryMasterKey, RealCrypto},
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
     mocks::{MockSandbox, MockStorage},
     oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
     sandbox::HttpSandbox,
-    tee::{MockTeeKeyProvider, TeeKeyProvider},
+    tee::{MockTeeKeyProvider, TappTeeKeyProvider, TeeKeyProvider},
     ChainClient, Config, JobQueue, SandboxClient,
 };
 use jobs::Ctx;
@@ -32,14 +32,14 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = repo::connect(&cfg.db_url).await?;
 
+    // Attestor EOA key (mock env or tapp-server GetAppSecretKey).
+    let tee = build_tee_provider(&cfg).await?;
+    let app_priv = tee.app_private_key().await?;
+
     // Resolve master key from KMS (same source as api).
-    let kms = Arc::new(MockKmsClient) as Arc<dyn KmsClient>;
+    let kms = build_kms_client(&cfg).await?;
     let master_key = kms.master_key().await?;
     let job_key = derive_subkey(&master_key, JOB_ENCRYPTION_KEY_INFO);
-
-    // Attestor EOA key.
-    let tee = build_tee_provider(&cfg)?;
-    let app_priv = tee.app_private_key().await?;
 
     let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
     let chain: Arc<dyn ChainClient> = chain_connect_http(
@@ -142,14 +142,30 @@ fn init_tracing() {
         .init();
 }
 
-fn build_tee_provider(cfg: &Config) -> anyhow::Result<Arc<dyn TeeKeyProvider>> {
+async fn build_tee_provider(cfg: &Config) -> anyhow::Result<Arc<dyn TeeKeyProvider>> {
     if cfg.mock_tee {
-        let hex = cfg
+        let priv_hex = cfg
             .mock_app_private_key
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("MOCK_TEE=true but MOCK_APP_PRIVATE_KEY not set"))?;
-        Ok(Arc::new(MockTeeKeyProvider::from_hex(hex)?))
+        let addr_hex = cfg
+            .mock_app_eth_address
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MOCK_TEE=true but MOCK_APP_ETH_ADDRESS not set"))?;
+        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(priv_hex, addr_hex)?))
     } else {
-        anyhow::bail!("non-mock TEE key provider is not implemented yet — set MOCK_TEE=true")
+        Ok(Arc::new(TappTeeKeyProvider::connect(cfg).await?))
+    }
+}
+
+async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
+    if cfg.mock_kms {
+        let secret_hex = cfg
+            .mock_app_secret
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MOCK_KMS=true but MOCK_APP_SECRET not set"))?;
+        Ok(Arc::new(MockKmsClient::from_hex(secret_hex)?))
+    } else {
+        Ok(Arc::new(TappKmsClient::connect(cfg).await?))
     }
 }

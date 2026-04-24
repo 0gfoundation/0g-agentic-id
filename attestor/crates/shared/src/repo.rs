@@ -15,16 +15,41 @@ use sqlx::{PgPool, Row};
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Process-wide advisory lock id for schema bootstrap. Arbitrary i64; only
+/// needs to be unique within this app's Postgres instance.
+const SCHEMA_BOOTSTRAP_LOCK_ID: i64 = 0x4154_5445_5354_5452; // "ATTESTR"
+
 /// Connect + bootstrap schema.
 /// Uses `raw_sql` so multi-statement `schema.sql` isn't prepared as a single
 /// statement (Postgres rejects that with "cannot insert multiple commands
 /// into a prepared statement").
+///
+/// api/worker/indexer all call this at startup. Concurrent DDL on the same
+/// catalog objects (`CREATE TABLE IF NOT EXISTS`, `ALTER TABLE ... IF NOT
+/// EXISTS`) can deadlock when lock orders diverge, so we serialize the
+/// bootstrap across processes via a session-scoped advisory lock.
 pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
     let pool = PgPoolOptions::new()
         .max_connections(16)
         .connect(url)
         .await?;
-    sqlx::raw_sql(SCHEMA_SQL).execute(&pool).await?;
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(SCHEMA_BOOTSTRAP_LOCK_ID)
+        .execute(&mut *conn)
+        .await?;
+
+    let bootstrap = sqlx::raw_sql(SCHEMA_SQL).execute(&mut *conn).await;
+
+    // Always release, even on error. A dropped connection would release it
+    // too, but we may be keeping the conn around; explicit unlock is cheap.
+    let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(SCHEMA_BOOTSTRAP_LOCK_ID)
+        .execute(&mut *conn)
+        .await;
+
+    bootstrap?;
     Ok(pool)
 }
 

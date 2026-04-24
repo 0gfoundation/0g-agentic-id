@@ -42,3 +42,10 @@ tracing.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true
 base64.workspace = true
+
+# tapp-server gRPC (GetAppSecretKey, GetSecretResource)
+tonic.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

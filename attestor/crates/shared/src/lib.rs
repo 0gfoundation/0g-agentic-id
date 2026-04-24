@@ -16,6 +16,7 @@ pub mod mocks;
 pub mod oss;
 pub mod repo;
 pub mod sandbox;
+pub mod tapp_grpc;
 pub mod tee;
 pub mod traits;
 pub mod types;

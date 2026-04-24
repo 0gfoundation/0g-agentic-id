@@ -40,6 +40,28 @@ pub struct Config {
     /// Hex-encoded 32-byte secp256k1 private key, only used when
     /// `mock_tee` is true.
     pub mock_app_private_key: Option<String>,
+    /// Hex-encoded 20-byte Ethereum address corresponding to
+    /// `mock_app_private_key`. Env schema mirrors 0g-sandbox/tapp — the
+    /// mock provider validates the match at startup.
+    pub mock_app_eth_address: Option<String>,
+
+    /// When true, all three binaries use `MockKmsClient`. When false,
+    /// they use `TappKmsClient` (gRPC to tapp-server's `GetSecretResource`).
+    pub mock_kms: bool,
+    /// Hex-encoded 32-byte app secret, only used when `mock_kms=true`.
+    /// Env schema mirrors `MOCK_APP_PRIVATE_KEY` for TEE.
+    pub mock_app_secret: Option<String>,
+
+    // ── tapp-server gRPC (for TEE key fetch and KMS secret fetch) ────
+    /// Host for tapp-server gRPC. Default `host.docker.internal`, which
+    /// reaches the Docker host via `host-gateway`.
+    pub tapp_ip: String,
+    /// Port for tapp-server gRPC. Default 50051.
+    pub tapp_port: u16,
+    /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
+    /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
+    /// either `mock_tee=false` or `mock_kms=false`.
+    pub app_id: Option<String>,
 
     /// EIP-1559 priority fee (tip, gwei) set on every attestor-sent tx.
     /// Must be ≥ the chain's minimum (0G testnet enforces 2 gwei).
@@ -104,6 +126,17 @@ impl Config {
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(false),
             mock_app_private_key: env_opt("MOCK_APP_PRIVATE_KEY"),
+            mock_app_eth_address: env_opt("MOCK_APP_ETH_ADDRESS"),
+            mock_kms: env_opt("MOCK_KMS")
+                .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                .unwrap_or(true),
+            mock_app_secret: env_opt("MOCK_APP_SECRET"),
+            tapp_ip: env_opt("ATTESTOR_TAPP_IP")
+                .unwrap_or_else(|| "host.docker.internal".to_string()),
+            tapp_port: env_opt("ATTESTOR_TAPP_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50051),
+            app_id: env_opt("ATTESTOR_APP_ID"),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),

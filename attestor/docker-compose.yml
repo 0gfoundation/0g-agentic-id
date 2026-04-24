@@ -1,3 +1,20 @@
+x-attestor: &attestor
+  build:
+    # Context is repo root so the build can reach both `attestor/` and
+    # `contracts/out/AgenticID.sol/AgenticID.json` (alloy `sol!` macro).
+    context: ..
+    dockerfile: attestor/Dockerfile
+  image: attestor:local
+  env_file: .env
+  environment:
+    # Override: the .env file points at localhost for host-run dev.
+    # Inside compose, the db hostname is the service name.
+    ATTESTOR_DB_URL: postgres://attestor:attestor@postgres:5432/attestor
+  depends_on:
+    postgres:
+      condition: service_healthy
+  restart: unless-stopped
+
 services:
   postgres:
     image: postgres:16
@@ -15,6 +32,36 @@ services:
       interval: 2s
       timeout: 2s
       retries: 10
+
+  # All three services reach tapp-server on the host via
+  # `host.docker.internal` when MOCK_TEE=false or MOCK_KMS=false (api/worker
+  # fetch the TEE EOA key; all three fetch the KMS secret). On Linux,
+  # host.docker.internal doesn't resolve by default — extra_hosts maps it
+  # to the Docker host gateway.
+  attestor-api:
+    <<: *attestor
+    container_name: attestor-api
+    command: ["attestor-api"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./.env:/app/.env:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  attestor-worker:
+    <<: *attestor
+    container_name: attestor-worker
+    command: ["attestor-worker"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  attestor-indexer:
+    <<: *attestor
+    container_name: attestor-indexer
+    command: ["attestor-indexer"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   attestor-pgdata:

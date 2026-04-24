@@ -8,7 +8,7 @@ mod watcher;
 use attestor_shared::{
     crypto::{InMemoryMasterKey, RealCrypto},
     events_bus::PostgresEventBus,
-    kms::{KmsClient, MockKmsClient},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     repo::{self, PostgresDeploymentRepo},
     Config,
 };
@@ -28,9 +28,10 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = repo::connect(&cfg.db_url).await?;
 
-    // KMS + crypto so the indexer can re-derive agentSeal from sealId
-    // and detect "this AgentSealSet event belongs to us".
-    let kms = Arc::new(MockKmsClient) as Arc<dyn KmsClient>;
+    // KMS master so the indexer can re-derive agentSeal from sealId and
+    // detect "this AgentSealSet event belongs to us". Indexer never sends
+    // chain txs, so it doesn't need the TEE EOA key.
+    let kms = build_kms_client(&cfg).await?;
     let master_key = kms.master_key().await?;
     let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
 
@@ -46,4 +47,16 @@ fn init_tracing() {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
+    if cfg.mock_kms {
+        let secret_hex = cfg
+            .mock_app_secret
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("MOCK_KMS=true but MOCK_APP_SECRET not set"))?;
+        Ok(Arc::new(MockKmsClient::from_hex(secret_hex)?))
+    } else {
+        Ok(Arc::new(TappKmsClient::connect(cfg).await?))
+    }
 }

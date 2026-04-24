@@ -1,13 +1,15 @@
-//! KMS client abstraction + dev mock.
+//! KMS client abstraction + dev mock + tapp-server gRPC impl.
 //!
-//! Provides the 32-byte master secret from which the attestor derives:
+//! Provides the 32-byte app-scoped secret from which the attestor derives:
 //!   - agentSeal keypairs (per sealId, HKDF)
 //!   - job encryption key (HKDF, used by api/worker to avoid plaintext iData
 //!     sitting in `jobs.payload`)
 //!
-//! Both `attestor-api` and `attestor-worker` must resolve to the **same**
-//! master secret — that's why MockKmsClient hardcodes a single dev key.
-//! Prod swap: replace `MockKmsClient` with a real KMS-backed impl.
+//! All three binaries (api/worker/indexer) must resolve to the **same**
+//! 32-byte key — otherwise derived subkeys diverge and decrypt fails.
+//! `MockKmsClient` hardcodes a dev value; `TappKmsClient` goes over local
+//! gRPC to tapp-server's `GetSecretResource`, which internally signs the
+//! KMS request, decrypts the ECIES response, and hands us plaintext.
 
 use async_trait::async_trait;
 
@@ -16,23 +18,44 @@ pub trait KmsClient: Send + Sync {
     async fn master_key(&self) -> anyhow::Result<[u8; 32]>;
 }
 
-/// Dev-only mock. Returns a hardcoded 32-byte key.
-/// **DO NOT USE IN PRODUCTION.**
-pub struct MockKmsClient;
+/// Dev-only mock backed by a caller-supplied 32-byte key.
+/// **DO NOT USE IN PRODUCTION.** Env schema mirrors `MOCK_APP_PRIVATE_KEY`
+/// for TEE: set `MOCK_APP_SECRET=0x<64 hex>` in dev/CI.
+pub struct MockKmsClient {
+    key: [u8; 32],
+}
 
 impl MockKmsClient {
+    /// Historical dev default (kept for tests & backwards compatibility).
+    /// New code should use `from_hex` against an env-supplied value.
     pub const DEV_MASTER_KEY: [u8; 32] = [
         0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
         0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
         0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
         0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
     ];
+
+    pub fn dev() -> Self {
+        Self { key: Self::DEV_MASTER_KEY }
+    }
+
+    pub fn from_hex(hex_str: &str) -> anyhow::Result<Self> {
+        let trimmed = hex_str.trim_start_matches("0x");
+        let bytes = hex::decode(trimmed)
+            .map_err(|e| anyhow::anyhow!("MOCK_APP_SECRET hex decode: {e}"))?;
+        if bytes.len() != 32 {
+            anyhow::bail!("MOCK_APP_SECRET must be 32 bytes, got {}", bytes.len());
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&bytes);
+        Ok(Self { key })
+    }
 }
 
 #[async_trait]
 impl KmsClient for MockKmsClient {
     async fn master_key(&self) -> anyhow::Result<[u8; 32]> {
-        Ok(Self::DEV_MASTER_KEY)
+        Ok(self.key)
     }
 }
 
@@ -49,14 +72,88 @@ pub fn derive_subkey(master_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
 
 pub const JOB_ENCRYPTION_KEY_INFO: &[u8] = b"attestor.job_encryption_key.v1";
 
+// ── tapp-server gRPC (GetSecretResource, LOCAL ACCESS ONLY) ────────────
+
+use crate::tapp_grpc;
+use crate::Config;
+use tonic::transport::Channel;
+
+/// Fetches the KMS-managed app secret via tapp-server's `GetSecretResource`
+/// RPC. tapp-server signs the upstream KMS request with its in-memory key,
+/// decrypts the ECIES response, and returns the 32-byte plaintext to us
+/// over the local gRPC socket — no crypto work required on this side.
+///
+/// The gRPC channel is reused across calls; `master_key()` runs once at
+/// startup in practice.
+pub struct TappKmsClient {
+    channel: Channel,
+    app_id: String,
+}
+
+impl TappKmsClient {
+    pub async fn connect(cfg: &Config) -> anyhow::Result<Self> {
+        let channel = tapp_grpc::connect(cfg).await?;
+        let app_id = tapp_grpc::require_app_id(cfg)?;
+        Ok(Self { channel, app_id })
+    }
+}
+
+#[async_trait]
+impl KmsClient for TappKmsClient {
+    async fn master_key(&self) -> anyhow::Result<[u8; 32]> {
+        use tapp_grpc::proto::tapp_service_client::TappServiceClient;
+        use tapp_grpc::proto::GetSecretResourceRequest;
+
+        let mut client = TappServiceClient::new(self.channel.clone());
+        let mut last_err = anyhow::anyhow!("GetSecretResource never attempted");
+
+        for attempt in 1u32..=10 {
+            match client
+                .get_secret_resource(GetSecretResourceRequest {
+                    app_id: self.app_id.clone(),
+                })
+                .await
+            {
+                Ok(r) => {
+                    let resp = r.into_inner();
+                    if !resp.success {
+                        anyhow::bail!("GetSecretResource failed: {}", resp.message);
+                    }
+                    if resp.secret.len() != 32 {
+                        anyhow::bail!(
+                            "GetSecretResource bad secret length: {}",
+                            resp.secret.len()
+                        );
+                    }
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&resp.secret);
+                    return Ok(out);
+                }
+                Err(e) => {
+                    let delay = std::time::Duration::from_secs(attempt as u64);
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "GetSecretResource failed, retrying in {}s",
+                        delay.as_secs()
+                    );
+                    last_err = anyhow::anyhow!("GetSecretResource RPC failed: {}", e);
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+        Err(last_err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn mock_kms_is_deterministic() {
-        let a = MockKmsClient.master_key().await.unwrap();
-        let b = MockKmsClient.master_key().await.unwrap();
+        let a = MockKmsClient::dev().master_key().await.unwrap();
+        let b = MockKmsClient::dev().master_key().await.unwrap();
         assert_eq!(a, b, "mock KMS must return the same key on each call");
         assert_eq!(a, MockKmsClient::DEV_MASTER_KEY);
     }

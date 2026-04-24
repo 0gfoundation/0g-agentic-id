@@ -83,6 +83,12 @@ dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 
+# gRPC to tapp-server (local TEE runtime) for fetching the app EOA key
+# and KMS-derived app secret. tonic default features: transport + codegen + prost.
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+
 # workspace crates
 attestor-shared = { path = "crates/shared" }
 
