@@ -14,8 +14,9 @@ use attestor_shared::{
     oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
     sandbox::HttpSandbox,
+    storage_zg::ZgStorage,
     tee::{MockTeeKeyProvider, TappTeeKeyProvider, TeeKeyProvider},
-    ChainClient, Config, JobQueue, SandboxClient,
+    ChainClient, Config, JobQueue, SandboxClient, StorageClient,
 };
 use jobs::Ctx;
 use std::sync::Arc;
@@ -49,7 +50,21 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
     )?;
-    let storage = Arc::new(MockStorage::new(&cfg.storage_indexer));
+    let storage: Arc<dyn StorageClient> = if cfg.mock_storage {
+        tracing::info!("storage: using MockStorage (MOCK_STORAGE=true)");
+        Arc::new(MockStorage::new(&cfg.storage_indexer))
+    } else {
+        tracing::info!(indexer = %cfg.storage_indexer, "storage: using ZgStorage");
+        Arc::new(
+            ZgStorage::connect(
+                &cfg.chain_rpc,
+                cfg.chain_id,
+                app_priv,
+                cfg.storage_indexer.clone(),
+            )
+            .await?,
+        )
+    };
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         tracing::info!("sandbox: using MockSandbox (MOCK_SANDBOX=true)");
         Arc::new(MockSandbox)

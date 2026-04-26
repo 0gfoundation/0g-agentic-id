@@ -69,7 +69,7 @@ pub trait StorageClient: Send + Sync {
     /// Compute the merkle root (== on-chain dataHash) locally without
     /// contacting storage nodes. Enables mint to proceed in parallel with
     /// the actual upload.
-    fn compute_root(&self, data: &[u8]) -> anyhow::Result<B256>;
+    async fn compute_root(&self, data: &[u8]) -> anyhow::Result<B256>;
 
     /// Upload ciphertext to 0G Storage. Returns when the storage tx has
     /// been submitted (fast). Data availability confirmation happens

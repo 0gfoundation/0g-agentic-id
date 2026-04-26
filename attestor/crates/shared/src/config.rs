@@ -52,6 +52,11 @@ pub struct Config {
     /// Env schema mirrors `MOCK_APP_PRIVATE_KEY` for TEE.
     pub mock_app_secret: Option<String>,
 
+    /// When true, the worker uses `MockStorage` (keccak256 stand-in for
+    /// merkle root, no upload). When false, it uses `ZgStorage` against
+    /// the upstream 0g-storage Rust SDK.
+    pub mock_storage: bool,
+
     // ── tapp-server gRPC (for TEE key fetch and KMS secret fetch) ────
     /// Host for tapp-server gRPC. Default `host.docker.internal`, which
     /// reaches the Docker host via `host-gateway`.
@@ -131,6 +136,9 @@ impl Config {
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(true),
             mock_app_secret: env_opt("MOCK_APP_SECRET"),
+            mock_storage: env_opt("MOCK_STORAGE")
+                .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                .unwrap_or(true),
             tapp_ip: env_opt("ATTESTOR_TAPP_IP")
                 .unwrap_or_else(|| "host.docker.internal".to_string()),
             tapp_port: env_opt("ATTESTOR_TAPP_PORT")

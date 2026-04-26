@@ -24,6 +24,9 @@ RUN mkdir -p /usr/local/cargo \
 WORKDIR /build
 COPY attestor/Cargo.toml attestor/Cargo.lock attestor/rust-toolchain.toml ./attestor/
 COPY attestor/crates ./attestor/crates
+# Vendored crates patched in via `[patch.crates-io]` in the workspace
+# Cargo.toml. Required: `version-meld/core2/` (yanked-on-crates.io fix).
+COPY attestor/version-meld ./attestor/version-meld
 # Only the one ABI JSON is actually needed — no need to ship forge sources.
 COPY contracts/out/AgenticID.sol/AgenticID.json ./contracts/out/AgenticID.sol/AgenticID.json
 

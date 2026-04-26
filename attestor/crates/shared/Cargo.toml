@@ -47,5 +47,10 @@ base64.workspace = true
 tonic.workspace = true
 prost.workspace = true
 
+# 0g storage SDK (uploads + merkle root). Brings ethers 2.0 alongside our
+# alloy 0.3 — they coexist; we only convert H256 ↔ B256 at the boundary.
+zg-storage-client.workspace = true
+ethers = "2.0"
+
 [build-dependencies]
 tonic-build.workspace = true

@@ -152,13 +152,13 @@ impl MockStorage {
 
 #[async_trait]
 impl StorageClient for MockStorage {
-    fn compute_root(&self, data: &[u8]) -> anyhow::Result<B256> {
+    async fn compute_root(&self, data: &[u8]) -> anyhow::Result<B256> {
         // Stand-in for 0G merkle root: keccak256 for v0.
         Ok(B256::from(keccak256(data)))
     }
 
     async fn upload(&self, data: Vec<u8>) -> anyhow::Result<StorageUploadResult> {
-        let root_hash = self.compute_root(&data)?;
+        let root_hash = self.compute_root(&data).await?;
         let tx_hash = self.next_tx_hash();
         tracing::info!(size = data.len(), ?root_hash, ?tx_hash, "mock storage: uploaded");
         Ok(StorageUploadResult {

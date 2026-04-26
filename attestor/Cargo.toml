@@ -92,6 +92,18 @@ tonic-build = "0.12"
 # workspace crates
 attestor-shared = { path = "crates/shared" }
 
+# 0g-storage Rust SDK (git only — not on crates.io). Pinned to branch
+# main; bumps deliberately. Requires the core2 patch below.
+zg-storage-client = { git = "https://github.com/0gfoundation/0g-storage-sdk-rust", branch = "main" }
+
+# `core2` is yanked from crates.io and the upstream `bbqsrc/core2` repo was
+# wiped to a tombstone README. Vendor a pre-wipe copy under version-meld/
+# (mirrors `0g-storage-kv`'s pattern for stale crates), so the workspace
+# resolver sees a non-yanked source. zg-storage-client → libp2p 0.45 →
+# multihash 0.16 → core2 ^0.4.0 is what reaches it.
+[patch.crates-io]
+core2 = { path = "version-meld/core2" }
+
 [profile.dev]
 opt-level = 0
 debug = true

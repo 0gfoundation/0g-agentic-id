@@ -21,6 +21,9 @@ serde_json.workspace = true
 alloy.workspace = true
 hex.workspace = true
 
+# 0g-storage Rust SDK (vendored core2 patch in attestor/Cargo.toml).
+zg-storage-client.workspace = true
+
 sqlx.workspace = true
 
 anyhow.workspace = true

@@ -112,7 +112,7 @@ async fn handle_deploy(
         let plaintext = serde_json::to_vec(&input.plaintext)?;
         let data_key = ctx.crypto.random_key_32();
         let ciphertext = ctx.crypto.aes_gcm_encrypt(&plaintext, &data_key)?;
-        let root = ctx.storage.compute_root(&ciphertext)?;
+        let root = ctx.storage.compute_root(&ciphertext).await?;
         let sealed = ctx.crypto.ecies_encrypt(&data_key, &agent_seal_pub)?;
 
         // Build the on-chain description JSON (shadows user-supplied
