@@ -73,6 +73,17 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
+            // Attestor-injected env: container's view of chain / storage /
+            // contract config comes from us, not the deployer's payload.
+            // Same trust boundary as ATTESTOR_URL.
+            vec![
+                ("CHAIN_RPC_URL".into(), cfg.chain_rpc.clone()),
+                ("INDEXER_URL".into(), cfg.storage_indexer.clone()),
+                (
+                    "AGENTIC_ID_ADDR".into(),
+                    format!("{:#x}", cfg.agentic_id_addr),
+                ),
+            ],
         ))
     };
 

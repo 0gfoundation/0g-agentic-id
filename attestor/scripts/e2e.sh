@@ -127,20 +127,24 @@ AGENT_SEAL_ADDR=$(echo "$resp" | jq -r .agent_seal_addr)
 echo "seal_id         = $SEAL_ID"
 echo "agent_seal_addr = $AGENT_SEAL_ADDR"
 
-banner "2. Poll /deployment/:id until phase ∈ {ready, running, failed}"
-for i in $(seq 1 30); do
+banner "2. Poll /deployment/:id until phase ∈ {running, failed}"
+# `ready` means container provisioned but hasn't reported /status running.
+# We wait for the full handshake: container completed bootstrap and posted
+# back, attestor flipped phase to running. Up to ~2 minutes — storage
+# upload + container bootstrap together can take this long.
+for i in $(seq 1 120); do
   state=$(curl -fsS "$API/deployment/$SEAL_ID")
   phase=$(echo "$state" | jq -r .phase)
   storage=$(echo "$state" | jq -r .storage_stage.state)
   mint=$(echo "$state" | jq -r .mint_stage.state)
   container=$(echo "$state" | jq -r .container_stage.state)
   agent_id=$(echo "$state" | jq -r '.agent_id // "null"')
-  printf "  [%02d] phase=%-12s storage=%-10s mint=%-10s container=%-10s agent_id=%s\n" \
+  printf "  [%03d] phase=%-12s storage=%-10s mint=%-10s container=%-10s agent_id=%s\n" \
     "$i" "$phase" "$storage" "$mint" "$container" "$agent_id"
-  if [[ "$phase" == "ready" || "$phase" == "running" || "$phase" == "failed" ]]; then
+  if [[ "$phase" == "running" || "$phase" == "failed" ]]; then
     break
   fi
-  sleep 0.5
+  sleep 1
 done
 
 if [[ "$phase" == "failed" ]]; then
@@ -160,7 +164,7 @@ fi
 #   -H "Content-Type: application/json" \
 #   -d "$status_payload" | jq .
 
-banner "3. Final /deployment/:id — expect provisioned_at set"
+banner "3. Final /deployment/:id — expect phase=running"
 final=$(curl -fsS "$API/deployment/$SEAL_ID")
 echo "$final" | jq '{
   phase,
@@ -172,11 +176,10 @@ echo "$final" | jq '{
   container_stage: .container_stage.state
 }'
 
-provisioned_at=$(echo "$final" | jq -r '.provisioned_at // "null"')
-if [[ "$provisioned_at" != "null" ]]; then
-  echo "✅ PASS — provisioned_at=$provisioned_at"
+if [[ "$phase" == "running" ]]; then
+  echo "✅ PASS — phase=running (container completed bootstrap and reported running)"
   exit 0
 else
-  echo "❌ FAIL — provisioned_at not set (container didn't reach /provision)"
+  echo "❌ FAIL — phase=$phase (timed out waiting for container /status running)"
   exit 1
 fi

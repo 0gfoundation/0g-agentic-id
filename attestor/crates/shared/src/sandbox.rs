@@ -83,6 +83,12 @@ pub struct HttpSandbox {
     /// Public URL that containers use to reach this attestor. Injected into
     /// the sandbox create body as `env.ATTESTOR_URL`.
     attestor_public_url: String,
+    /// Additional `(KEY, VALUE)` pairs injected into the container's env on
+    /// top of `ATTESTOR_URL`. Same trust boundary — these are
+    /// attestor-controlled, NOT deployer-controlled, so the container can
+    /// trust them as the canonical chain / storage / contract config (a
+    /// malicious deployer can't make the container talk to a fake chain).
+    extra_env: Vec<(String, String)>,
     http: reqwest::Client,
 }
 
@@ -90,10 +96,12 @@ impl HttpSandbox {
     pub fn new(
         base_url: impl Into<String>,
         attestor_public_url: impl Into<String>,
+        extra_env: Vec<(String, String)>,
     ) -> Self {
         Self {
             base_url: base_url.into(),
             attestor_public_url: attestor_public_url.into(),
+            extra_env,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -151,6 +159,9 @@ impl SandboxClient for HttpSandbox {
             "ATTESTOR_URL".into(),
             serde_json::Value::String(self.attestor_public_url.clone()),
         );
+        for (k, v) in &self.extra_env {
+            env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+        }
 
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
