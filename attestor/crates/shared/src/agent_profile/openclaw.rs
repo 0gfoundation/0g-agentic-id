@@ -4,8 +4,8 @@ use super::AgentProfile;
 use crate::types::{ConfigInput, FrameworkSpec, InferenceSpec, PersonaSpec};
 
 /// OpenClaw default profile. All framework-specific strings (version,
-/// inference provider/model, logo URL) live in this file only — the rest
-/// of the crate never spells "openclaw" except as a value flowing through
+/// inference provider/model) live in this file only — the rest of the
+/// crate never spells "openclaw" except as a value flowing through
 /// `framework_name()`.
 pub struct OpenClawProfile;
 
@@ -14,9 +14,6 @@ impl OpenClawProfile {
     const FRAMEWORK_VERSION: &'static str = "0.1.0";
     const INFERENCE_PROVIDER: &'static str = "0g-compute";
     const INFERENCE_MODEL: &'static str = "glm";
-    // TODO: replace with a real hosted logo URL once we have one.
-    const DEFAULT_LOGO_URL: &'static str =
-        "https://dev-agent-market.oss-cn-beijing.aliyuncs.com/openclaw/logo.png";
 }
 
 impl AgentProfile for OpenClawProfile {
@@ -43,10 +40,6 @@ impl AgentProfile for OpenClawProfile {
             skills: Vec::new(),
             extra: Default::default(),
         }
-    }
-
-    fn default_image_url(&self) -> Option<&str> {
-        Some(Self::DEFAULT_LOGO_URL)
     }
 }
 

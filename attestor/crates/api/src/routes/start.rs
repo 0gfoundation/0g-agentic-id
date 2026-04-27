@@ -1,9 +1,10 @@
-//! POST /restart — owner-initiated restart of the container.
-//! Enqueues a SandboxRestart job; 0g-sandbox handles the container lifecycle.
+//! POST /start — owner-initiated start of a previously stopped sandbox.
+//! Enqueues a SandboxStart job; worker relays the owner-signed envelope to
+//! 0g-sandbox at `POST /api/sandbox/:id/start`.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::{JobPayload, RestartRequest};
+use attestor_shared::{JobPayload, LifecycleRequest};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -11,9 +12,9 @@ use serde_json::json;
 
 pub async fn handle(
     State(state): State<AppState>,
-    Json(req): Json<RestartRequest>,
+    Json(req): Json<LifecycleRequest>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    tracing::info!(seal_id = ?req.seal_id, owner = %req.owner, "restart request");
+    tracing::info!(seal_id = ?req.seal_id, owner = %req.owner, "start request");
 
     let d = state
         .deployments
@@ -21,17 +22,15 @@ pub async fn handle(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
 
-    // TODO: verify owner_signature matches req.owner
-    //       v0: accept any signature
-
     if d.owner != req.owner {
         return Err(ApiError::unauthorized("owner mismatch"));
     }
 
     state
         .jobs
-        .submit(JobPayload::SandboxRestart {
+        .submit(JobPayload::SandboxStart {
             seal_id: req.seal_id,
+            sandbox_envelope: req.sandbox_envelope,
         })
         .await?;
 

@@ -1,0 +1,1322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>0G AgenticID</title>
+<script src="/static/ethers.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  color-scheme: light;
+  --p:   oklch(50% 0.22 315);
+  --pd:  oklch(44% 0.20 315);
+  --pbg: oklch(96% 0.06 315);
+  --pbd: oklch(84% 0.12 315);
+  --text:   oklch(11% 0 0);
+  --text2:  oklch(36% 0.005 275);
+  --muted:  oklch(56% 0.005 275);
+  --border: oklch(88% 0.005 275);
+  --bg:     oklch(97.5% 0.003 275);
+  --surf:   oklch(100% 0 0);
+  --surf2:  oklch(96% 0.004 275);
+  --surf3:  oklch(91% 0.005 275);
+  --green:  oklch(42% 0.18 145); --gbg: oklch(95% 0.05 145); --gbd: oklch(82% 0.10 145);
+  --red:    oklch(48% 0.20 25);  --rbg: oklch(96% 0.05 25);  --rbd: oklch(84% 0.10 25);
+  --orange: oklch(50% 0.18 55);  --obg: oklch(96% 0.05 55);  --obd: oklch(84% 0.10 55);
+  --gray:   oklch(56% 0.005 275); --grbg: oklch(94% 0.004 275); --grbd: oklch(82% 0.005 275);
+  --sans: 'Inter', -apple-system, sans-serif;
+  --mono: 'JetBrains Mono', 'Courier New', monospace;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --t-fast: 150ms; --t-base: 300ms; --t-slow: 500ms;
+  --r-sm: 6px; --r: 10px; --r-lg: 14px;
+  --sh-sm: 0 1px 4px oklch(0% 0 0 / 0.06);
+  --sh:    0 4px 20px oklch(0% 0 0 / 0.08);
+  --sh-lg: 0 8px 32px oklch(0% 0 0 / 0.12);
+}
+body{font-family:var(--sans);font-size:14px;line-height:1.6;color:var(--text);background:var(--bg);min-height:100vh;-webkit-font-smoothing:antialiased}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+a{color:inherit;text-decoration:none}
+
+/* ── Topbar ─────────────────────────────────────────────────────── */
+.topbar{height:56px;display:flex;align-items:center;padding:0 clamp(16px,4vw,48px);position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border);background:oklch(97.5% 0.003 275 / 0.92);backdrop-filter:blur(16px)}
+.logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:14px;letter-spacing:-.02em;color:var(--text);cursor:pointer}
+.logo-sep{color:var(--border);margin:0 2px;font-weight:300;font-size:16px}
+.logo-sub{font-size:11px;color:var(--muted);font-weight:400}
+.nav{display:flex;gap:2px;margin-left:24px}
+.nav a{padding:5px 12px;font-size:13px;font-weight:500;color:var(--muted);border-radius:var(--r-sm);transition:color var(--t-fast),background var(--t-fast)}
+.nav a:hover{color:var(--text);background:var(--surf2)}
+.nav a.active{color:var(--p);background:var(--pbg)}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.chain-tag{display:flex;align-items:center;gap:5px;background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px var(--green)}
+.btn-connect{background:var(--p);color:oklch(99% 0 0);border:none;border-radius:var(--r-sm);padding:6px 16px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--sans);letter-spacing:-.01em;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring)}
+.btn-connect:hover{background:var(--pd);transform:translateY(-1px)}
+.addr-chip{background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:var(--r-sm);padding:4px 11px;font-size:11px;font-family:var(--mono);cursor:pointer;user-select:none;transition:background var(--t-fast);position:relative}
+.addr-chip:hover{background:var(--surf2)}
+.wallet-pop{position:absolute;top:calc(100% + 6px);right:0;background:var(--surf);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-lg);padding:6px;z-index:200;min-width:180px;display:none;animation:fadeIn var(--t-fast) var(--ease-out)}
+.wallet-pop.open{display:block}
+.wallet-pop button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:7px 10px;background:none;border:none;border-radius:var(--r-sm);color:var(--text);font:inherit;font-family:var(--sans);font-size:13px;cursor:pointer;transition:background var(--t-fast)}
+.wallet-pop button:hover{background:var(--surf2)}
+.wallet-pop button.danger{color:var(--red)}
+.wallet-pop button.danger:hover{background:var(--rbg)}
+.wallet-pop hr{border:none;border-top:1px solid var(--border);margin:4px 0}
+
+/* ── Toast ──────────────────────────────────────────────────────── */
+.toast-host{position:fixed;top:72px;right:20px;z-index:300;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{pointer-events:auto;background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:10px 14px;box-shadow:var(--sh);font-size:13px;color:var(--text);max-width:380px;animation:slideIn var(--t-base) var(--ease-out)}
+.toast.error{border-left-color:var(--red);background:var(--rbg)}
+.toast.success{border-left-color:var(--green);background:var(--gbg)}
+@keyframes slideIn{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
+
+/* ── Layout / Cards ─────────────────────────────────────────────── */
+.main{max-width:880px;margin:0 auto;padding:clamp(20px,4vw,48px) clamp(16px,4vw,48px) 60px}
+.view{display:none}
+.view.active{display:block;animation:fadeIn var(--t-base) var(--ease-out)}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+
+.hero{margin-bottom:28px}
+.hero h1{font-size:clamp(22px,3.5vw,30px);font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
+.hero p{color:var(--text2);font-size:14px}
+.hero.center{text-align:center}
+
+.card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px clamp(20px,3vw,28px);box-shadow:var(--sh-sm);margin-bottom:16px}
+.card h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:14px;font-family:var(--mono)}
+
+label{display:block;font-size:12px;color:var(--text2);margin-bottom:5px;font-weight:500}
+input{font:inherit;font-family:var(--sans);width:100%;padding:9px 12px;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);color:var(--text);transition:border-color var(--t-fast),box-shadow var(--t-fast)}
+input:focus{outline:none;border-color:var(--p);box-shadow:0 0 0 3px var(--pbg)}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+@media(max-width:600px){.row{grid-template-columns:1fr}}
+.field{margin-bottom:14px}
+.field:last-child{margin-bottom:0}
+.field-hint{display:block;color:var(--muted);font-size:11px;margin-top:5px;line-height:1.5}
+.field-hint code{font-family:var(--mono);font-size:10px;background:var(--surf2);padding:1px 5px;border-radius:4px}
+textarea{font:inherit;font-family:var(--mono);font-size:12px;width:100%;padding:9px 12px;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);color:var(--text);transition:border-color var(--t-fast),box-shadow var(--t-fast);resize:vertical;line-height:1.5}
+textarea:focus{outline:none;border-color:var(--p);box-shadow:0 0 0 3px var(--pbg)}
+textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
+
+/* ── Avatar picker ──────────────────────────────────────────────── */
+.avatar-picker{display:flex;align-items:center;gap:14px}
+.avatar-preview{width:64px;height:64px;border-radius:var(--r);border:1px solid var(--border);background:var(--surf2);display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;font-size:24px;color:var(--muted)}
+.avatar-preview img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated}
+.avatar-actions{display:flex;flex-direction:column;gap:6px;flex:1;min-width:0}
+.avatar-actions .row-btns{display:flex;gap:6px}
+.btn-mini{font:inherit;font-family:var(--sans);font-weight:500;font-size:12px;padding:5px 12px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surf);color:var(--text2);cursor:pointer;transition:background var(--t-fast),border-color var(--t-fast)}
+.btn-mini:hover:not(:disabled){background:var(--surf2);color:var(--text)}
+.btn-mini:disabled{opacity:.4;cursor:not-allowed}
+.avatar-meta{font-family:var(--mono);font-size:10px;color:var(--muted)}
+
+/* ── Password input with reveal ─────────────────────────────────── */
+.secret-row{position:relative}
+.secret-row input{padding-right:60px;font-family:var(--mono);font-size:12px}
+.secret-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);font-size:11px;font-weight:500;cursor:pointer;padding:6px 10px;border-radius:var(--r-sm);font-family:var(--sans)}
+.secret-toggle:hover{background:var(--surf2);color:var(--text)}
+
+/* ── Coming-soon badge ──────────────────────────────────────────── */
+.coming-soon{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--orange);background:var(--obg);border:1px solid var(--obd);border-radius:9999px;padding:2px 8px;margin-left:8px;vertical-align:middle}
+.card-disabled{opacity:.55;pointer-events:none}
+.card-disabled textarea{background:var(--surf2)}
+
+.btn{font:inherit;font-family:var(--sans);font-weight:600;font-size:13px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring),box-shadow var(--t-fast)}
+.btn-primary{background:var(--p);color:oklch(99% 0 0)}
+.btn-primary:hover:not(:disabled){background:var(--pd);transform:translateY(-1px);box-shadow:var(--sh-sm)}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.btn-ghost{background:var(--surf);color:var(--text);border-color:var(--border)}
+.btn-ghost:hover:not(:disabled){background:var(--surf2);border-color:var(--surf3)}
+.btn-danger{background:var(--rbg);color:var(--red);border-color:var(--rbd)}
+.btn-danger:hover:not(:disabled){background:oklch(93% 0.07 25)}
+small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
+
+/* ── Phase chips ────────────────────────────────────────────────── */
+.chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:9999px;font-size:11px;font-weight:600;font-family:var(--mono);letter-spacing:.04em;text-transform:uppercase}
+.chip-running{background:var(--gbg);color:var(--green);border:1px solid var(--gbd)}
+.chip-running .dot{background:var(--green);box-shadow:0 0 6px var(--green)}
+.chip-ready  {background:var(--pbg);color:var(--p);border:1px solid var(--pbd)}
+.chip-pending,.chip-provisioning{background:var(--obg);color:var(--orange);border:1px solid var(--obd)}
+.chip-failed,.chip-stopped{background:var(--grbg);color:var(--gray);border:1px solid var(--grbd)}
+.chip-failed{background:var(--rbg);color:var(--red);border-color:var(--rbd)}
+
+/* ── My Agents list ─────────────────────────────────────────────── */
+.list-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
+.list-toolbar .count{color:var(--muted);font-size:13px;font-family:var(--mono)}
+.list-toolbar [data-filter]{padding:5px 14px;font-size:12px}
+.list-toolbar [data-filter].on{background:var(--p);color:oklch(99% 0 0);border-color:var(--p)}
+.list-toolbar [data-filter]:disabled{opacity:.45;cursor:not-allowed}
+.agent-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
+.agent-card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px 18px;cursor:pointer;transition:border-color var(--t-fast),transform var(--t-fast),box-shadow var(--t-fast);display:flex;flex-direction:column;gap:10px}
+.agent-card:hover{border-color:var(--surf3);transform:translateY(-2px);box-shadow:var(--sh-sm)}
+.agent-card .row1{display:flex;align-items:center;gap:10px}
+.agent-card .avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;background:var(--surf2);border:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--muted)}
+.agent-card .body{flex:1;min-width:0}
+.agent-card .name{font-weight:600;font-size:14px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-card .desc{font-size:12px;color:var(--muted);margin-top:1px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
+.agent-card .row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.agent-card .row2 .meta-text{font-family:var(--mono);font-size:10px;color:var(--muted);margin-left:auto}
+.empty{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty p{margin-top:8px;font-size:13px}
+
+/* ── Deploy progress: vertical task list with spinner ─────────── */
+.seal-row{display:flex;align-items:center;gap:8px;font-size:12px;font-family:var(--mono);color:var(--text2);margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.seal-row .label{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.06em;font-weight:600}
+.seal-row .val{word-break:break-all}
+
+.phase-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:8px 0 6px}
+
+.tasks{list-style:none;padding:0;display:flex;flex-direction:column;position:relative}
+.task{display:flex;align-items:center;gap:14px;padding:10px 0;position:relative}
+.task:not(:last-child)::after{
+  content:"";position:absolute;left:13px;top:36px;bottom:-4px;width:2px;
+  background:var(--border);transition:background var(--t-slow) var(--ease-out)
+}
+.task.done:not(:last-child)::after{background:var(--green)}
+
+.task-icon{
+  width:28px;height:28px;border-radius:50%;display:grid;place-items:center;
+  font-family:var(--mono);font-weight:700;font-size:11px;color:var(--muted);
+  background:var(--surf);border:2px solid var(--border);flex-shrink:0;
+  position:relative;z-index:1;transition:all var(--t-base) var(--ease-out)
+}
+.task.idle .task-icon{color:var(--muted)}
+.task.active .task-icon{
+  color:var(--p);border-color:var(--p);background:var(--pbg);
+  /* Hide the number while active so the spinner has the stage. */
+  font-size:0;
+}
+.task.active .task-icon::after{
+  content:"";position:absolute;width:18px;height:18px;border-radius:50%;
+  border:2.5px solid var(--p);border-top-color:transparent;
+  animation:spin .9s linear infinite
+}
+.task.done .task-icon{
+  color:oklch(99% 0 0);background:var(--green);border-color:var(--green);
+  animation:stepPop var(--t-base) var(--ease-spring)
+}
+.task.fail .task-icon{
+  color:oklch(99% 0 0);background:var(--red);border-color:var(--red)
+}
+.task-icon svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.task.done .task-icon svg path{stroke-dasharray:24;stroke-dashoffset:24;animation:checkDraw .35s var(--ease-out) forwards}
+
+.task-info{flex:1;min-width:0}
+.task-title{font-weight:500;font-size:14px;color:var(--text)}
+.task.idle .task-title{color:var(--muted)}
+.task-state{font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:1px}
+.task.active .task-state{color:var(--p)}
+.task.done .task-state{color:var(--green)}
+.task.fail .task-state{color:var(--red)}
+
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes stepPop{0%{transform:scale(.85)}50%{transform:scale(1.15)}100%{transform:scale(1)}}
+@keyframes checkDraw{to{stroke-dashoffset:0}}
+
+details.log{margin-top:18px;padding-top:14px;border-top:1px solid var(--border)}
+details.log summary{cursor:pointer;color:var(--muted);font-size:12px;font-family:var(--mono);user-select:none}
+details.log[open] summary{color:var(--text2)}
+.event-log{max-height:200px;overflow-y:auto;margin-top:10px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px;font-family:var(--mono);font-size:11px}
+.ev-row{padding:2px 0;color:var(--text2);white-space:pre-wrap;word-break:break-all;animation:fadeIn var(--t-fast) var(--ease-out)}
+.ev-row .ts{color:var(--muted);margin-right:8px}
+.ev-row .type{color:var(--p);font-weight:600}
+.ev-row.ok .type{color:var(--green)}
+.ev-row.fail .type{color:var(--red)}
+
+/* ── Detail page (8004scan-style hero) ──────────────────────────── */
+.agent-hero{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:36px 28px 28px;margin-bottom:18px;box-shadow:var(--sh-sm);text-align:center}
+.agent-avatar{width:88px;height:88px;border-radius:50%;object-fit:cover;border:2px solid var(--border);background:var(--surf2);margin:0 auto 14px;display:block}
+.agent-name{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
+.agent-desc{color:var(--text2);font-size:14px;max-width:520px;margin:0 auto 14px}
+.agent-chips{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:18px}
+.stat-cell{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 14px;text-align:left}
+.stat-cell .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
+.stat-cell .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;margin-top:3px}
+.stat-cell .val.copy{cursor:pointer;transition:color var(--t-fast)}
+.stat-cell .val.copy:hover{color:var(--p)}
+.stat-cell .val a{color:var(--p)}
+.stat-cell .val a:hover{text-decoration:underline}
+
+/* A2A — interactive "say hi" card */
+.a2a-card{background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:16px 18px;margin-bottom:18px;box-shadow:var(--sh-sm)}
+.a2a-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:8px;flex-wrap:wrap}
+.a2a-head .a2a-title{font-weight:600;font-size:14px}
+.a2a-head .a2a-sub{font-size:11px;color:var(--muted);font-weight:400;margin-left:6px}
+.a2a-url{font-family:var(--mono);font-size:12px;color:var(--p);word-break:break-all;display:block;text-decoration:none;padding:8px 10px;background:var(--surf2);border-radius:var(--r-sm);margin-bottom:10px}
+.a2a-url:hover{background:var(--surf3);text-decoration:underline}
+.a2a-actions{display:flex;gap:6px;flex-wrap:wrap}
+.a2a-resp{margin-top:10px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--mono);font-size:12px;color:var(--text2);white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;display:none;animation:fadeIn var(--t-base) var(--ease-out)}
+.a2a-resp.show{display:block}
+.a2a-resp.error{border-color:var(--rbd);background:var(--rbg);color:var(--red)}
+
+.icon-btn{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 12px;font-size:12px;cursor:pointer;color:var(--text2);transition:all var(--t-fast);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;gap:6px;text-decoration:none}
+.icon-btn:hover{background:var(--surf3);color:var(--text)}
+.icon-btn.primary{background:var(--p);color:oklch(99% 0 0);border-color:var(--p)}
+.icon-btn.primary:hover{background:var(--pd);color:oklch(99% 0 0)}
+
+/* Owner action row inside hero */
+.hero-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px dashed var(--border)}
+.hero-actions-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);width:100%;text-align:center}
+
+.section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:18px 0 10px}
+
+.attrs{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px}
+.attr{padding:10px 14px;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm)}
+.attr .at-key{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-family:var(--mono);font-weight:600}
+.attr .at-val{font-size:14px;font-weight:600;margin-top:3px}
+
+.action-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+
+/* legacy kv + thumb classes (used in other places) */
+.kv{display:grid;grid-template-columns:140px 1fr;gap:6px 14px;font-size:13px;line-height:1.7}
+.kv .k{color:var(--muted)}
+.kv .v{font-family:var(--mono);color:var(--text2);word-break:break-all}
+.kv .v.copy{cursor:pointer;transition:color var(--t-fast)}
+.kv .v.copy:hover{color:var(--p)}
+.thumb{width:80px;height:80px;border-radius:var(--r);object-fit:cover;border:1px solid var(--border);background:var(--surf2)}
+
+.skel{background:var(--surf2);border-radius:var(--r-sm);height:14px;animation:pulse-skel 1.4s ease-in-out infinite}
+@keyframes pulse-skel{0%,100%{opacity:.7}50%{opacity:1}}
+
+/* ── Wallet picker modal ────────────────────────────────────────── */
+.modal-bg{position:fixed;inset:0;background:oklch(0% 0 0 / .35);z-index:400;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal-bg.open{display:flex}
+.modal{background:var(--surf);border-radius:var(--r-lg);padding:20px 22px;width:min(92vw,360px);box-shadow:var(--sh-lg)}
+.modal h3{font-size:15px;font-weight:600;margin-bottom:12px}
+</style>
+</head>
+<body>
+
+<!-- ── Topbar ────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <div class="logo" onclick="navigate('#/')">
+    0G <span class="logo-sep">/</span> AgenticID
+    <span class="logo-sub">discovery</span>
+  </div>
+  <nav class="nav">
+    <a href="#/" data-route="discovery">Discovery</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="chain-tag"><span class="dot"></span>0G testnet</span>
+    <button class="btn-connect" id="topDeployBtn" onclick="navigate('#/deploy')">+ Deploy agent</button>
+    <button class="btn-connect" id="connectBtn" onclick="connectWallet()" style="background:var(--surf);color:var(--text);border:1px solid var(--border)">Connect Wallet</button>
+    <span class="addr-chip" id="addrChip" style="display:none" onclick="event.stopPropagation();toggleWalletPop()">
+      <span id="addrChipText"></span>
+      <span class="wallet-pop" id="walletPop" onclick="event.stopPropagation()">
+        <button onclick="copyAddr()">📋 Copy address</button>
+        <hr/>
+        <button class="danger" onclick="disconnectWallet()">⏻ Disconnect</button>
+      </span>
+    </span>
+  </div>
+</div>
+
+<div class="modal-bg" id="walletModal" onclick="if(event.target===this)closeWalletModal()">
+  <div class="modal">
+    <h3>Choose a wallet</h3>
+    <div id="walletList" style="display:flex;flex-direction:column;gap:8px;margin-top:8px"></div>
+    <div style="display:flex;justify-content:flex-end;margin-top:14px">
+      <button class="btn btn-ghost" onclick="closeWalletModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-host" id="toastHost"></div>
+
+<!-- ── Main: 3 views ─────────────────────────────────────────────── -->
+<div class="main">
+
+  <!-- VIEW: Discovery ───────────────────────────────────────────── -->
+  <div class="view" id="viewDiscovery">
+    <div class="hero">
+      <h1>Discover Agents</h1>
+      <p>Every agent deployed through this attestor — public AgentCards, click any to inspect.</p>
+    </div>
+    <div class="list-toolbar">
+      <span class="count" id="agentCount"></span>
+      <div style="display:flex;gap:6px;margin-left:8px" id="discoveryFilter">
+        <button class="btn btn-ghost" data-filter="all" onclick="setDiscoveryFilter('all')">All</button>
+        <button class="btn btn-ghost" data-filter="mine" onclick="setDiscoveryFilter('mine')" disabled title="Connect wallet">Mine</button>
+      </div>
+      <button class="btn btn-ghost" onclick="loadDiscovery()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div class="agent-list" id="agentList"></div>
+  </div>
+
+  <!-- VIEW: Deploy ─────────────────────────────────────────────── -->
+  <div class="view" id="viewDeploy">
+    <div class="hero center">
+      <h1>Deploy a new agent</h1>
+      <p>Mint on-chain identity, encrypt config to 0G storage, spin up a sandboxed runtime.</p>
+    </div>
+
+    <section class="card">
+      <h2>Identity</h2>
+      <div class="row">
+        <div class="field">
+          <label for="name">Name <span style="color:var(--red)">*</span></label>
+          <input id="name" value="MyAgent" />
+        </div>
+        <div class="field">
+          <label for="description">Description <span style="color:var(--red)">*</span></label>
+          <input id="description" value="A demo agent" />
+        </div>
+      </div>
+      <div class="field">
+        <label>Avatar <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <div class="avatar-picker">
+          <div class="avatar-preview" id="avatarPreview">🤖</div>
+          <div class="avatar-actions">
+            <div class="row-btns">
+              <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="handleAvatarFile(event)" />
+              <button type="button" class="btn-mini" onclick="$('#avatarFile').click()">Upload image</button>
+              <button type="button" class="btn-mini" id="avatarClearBtn" disabled onclick="clearAvatar()">Use auto</button>
+            </div>
+            <div class="avatar-meta" id="avatarMeta">Auto-generated from seal_id</div>
+          </div>
+        </div>
+        <small class="field-hint">Embedded into AgentCard.image. Empty → deterministic pixel-art avatar derived from seal_id.</small>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Inference</h2>
+      <div class="field">
+        <label for="apiKey">LLM API key <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <div class="secret-row">
+          <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
+          <button type="button" class="secret-toggle" id="apiKeyToggle" onclick="toggleSecret('apiKey', 'apiKeyToggle')">show</button>
+        </div>
+        <small class="field-hint">encrypted; only the agent's TEE can decrypt. Never visible outside of TEE.</small>
+      </div>
+    </section>
+
+    <section class="card card-disabled">
+      <h2>iData JSON <span class="coming-soon">coming soon</span></h2>
+      <div class="field">
+        <label for="iDataJson">Raw config payload</label>
+        <textarea id="iDataJson" rows="6" disabled placeholder='[{"role": "config", "plaintext": { ... }}]'></textarea>
+        <small class="field-hint">Power-user mode: bypass profile defaults and provide the full encrypted iData payload yourself.</small>
+      </div>
+    </section>
+
+    <section class="card">
+      <button class="btn btn-primary" id="deployBtn" disabled onclick="submitDeploy()">Deploy</button>
+      <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope.</small>
+    </section>
+
+    <section class="card" id="cardProgress" style="display:none">
+      <h2>Deploy progress</h2>
+      <div class="seal-row">
+        <span class="label">seal_id</span>
+        <span class="val" id="outSeal"></span>
+      </div>
+
+      <div class="phase-label">Phase 1 — three concurrent tasks</div>
+      <ul class="tasks">
+        <li class="task idle" data-task="storage">
+          <span class="task-icon">1</span>
+          <div class="task-info">
+            <div class="task-title">Encrypt &amp; upload to 0G storage</div>
+            <div class="task-state">waiting</div>
+          </div>
+        </li>
+        <li class="task idle" data-task="mint">
+          <span class="task-icon">2</span>
+          <div class="task-info">
+            <div class="task-title">Mint AgenticID on chain</div>
+            <div class="task-state">waiting</div>
+          </div>
+        </li>
+        <li class="task idle" data-task="sandbox">
+          <span class="task-icon">3</span>
+          <div class="task-info">
+            <div class="task-title">Provision sandbox container</div>
+            <div class="task-state">waiting</div>
+          </div>
+        </li>
+      </ul>
+
+      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+      <ul class="tasks">
+        <li class="task idle" data-task="uri">
+          <span class="task-icon">4</span>
+          <div class="task-info">
+            <div class="task-title">Set agent URI on chain</div>
+            <div class="task-state">waiting</div>
+          </div>
+        </li>
+        <li class="task idle" data-task="running">
+          <span class="task-icon">5</span>
+          <div class="task-info">
+            <div class="task-title">Container reports running</div>
+            <div class="task-state">waiting</div>
+          </div>
+        </li>
+      </ul>
+      <div style="margin-top:18px" id="goDetailRow"></div>
+    </section>
+  </div>
+
+  <!-- VIEW: Detail ──────────────────────────────────────────────── -->
+  <div class="view" id="viewDetail">
+    <a href="#/" style="color:var(--muted);font-size:13px;display:inline-block;margin-bottom:14px">← Back to Discovery</a>
+    <div id="detailContent"></div>
+  </div>
+
+</div>
+
+<!-- Inline checkmark SVG template (cloned into step .icon when done) -->
+<template id="tplCheck">
+  <svg viewBox="0 0 24 24"><path d="M5 12 L10 17 L19 7"/></svg>
+</template>
+
+<script>
+// ───────────────────────────────────────────────────────────────────
+// State
+// ───────────────────────────────────────────────────────────────────
+const State = {
+  signer: null,
+  ownerAddr: null,
+  config: null,         // /config response
+  ws: null,             // current WS subscription
+  detailWs: null,       // separate WS for detail-page live updates
+  deployingSealId: null,
+  deployAvatarDataUrl: null,  // user-uploaded avatar, populated by handleAvatarFile
+  discoveryFilter: 'all',  // 'all' | 'mine'
+};
+
+const eip6963Providers = new Map();
+window.addEventListener('eip6963:announceProvider', (e) => {
+  eip6963Providers.set(e.detail.info.uuid, { info: e.detail.info, provider: e.detail.provider });
+});
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+const $  = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+
+// ───────────────────────────────────────────────────────────────────
+// Toast
+// ───────────────────────────────────────────────────────────────────
+function toast(msg, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.textContent = msg;
+  $('#toastHost').appendChild(el);
+  setTimeout(() => el.remove(), 5000);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function copyAddr() {
+  if (!State.ownerAddr) return;
+  navigator.clipboard.writeText(State.ownerAddr).then(() => toast('Address copied', 'success'));
+  $('#walletPop').classList.remove('open');
+}
+
+function toggleWalletPop() {
+  $('#walletPop').classList.toggle('open');
+}
+
+// Click outside closes the popover.
+document.addEventListener('click', () => {
+  $('#walletPop')?.classList.remove('open');
+});
+
+window.disconnectWallet = function () {
+  // EIP-1193 has no programmatic revoke; we just drop our local handle so
+  // the page returns to the disconnected state. The wallet itself stays
+  // permissioned for this origin until the user revokes from MetaMask.
+  State.signer = null;
+  State.ownerAddr = null;
+  $('#connectBtn').style.display = '';
+  $('#addrChip').style.display = 'none';
+  $('#walletPop').classList.remove('open');
+  $('#deployBtn').disabled = true;
+  // Tear down WS subscriptions so we don't leak old connections.
+  if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
+  if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+  // Drop "Mine" filter (no longer valid) + reload Discovery if showing.
+  if (State.discoveryFilter === 'mine') State.discoveryFilter = 'all';
+  if (location.hash === '#/' || !location.hash) loadDiscovery();
+  // If we were on a detail page, force a re-render (drops owner sections).
+  if (location.hash.startsWith('#/agent/')) handleHash();
+  toast('Disconnected', 'success');
+};
+
+// ───────────────────────────────────────────────────────────────────
+// Routing (hash-based)
+// ───────────────────────────────────────────────────────────────────
+function navigate(hash) {
+  if (location.hash !== hash) location.hash = hash;
+  else handleHash();
+}
+
+function handleHash() {
+  // Backward-compat: legacy #/agents redirects to root.
+  if (location.hash === '#/agents') { location.hash = '#/'; return; }
+
+  const h = location.hash || '#/';
+  $$('.view').forEach(v => v.classList.remove('active'));
+  $$('.nav a').forEach(a => a.classList.remove('active'));
+
+  let route;
+  if (h.startsWith('#/agent/')) {
+    route = 'detail';
+    const sealId = h.slice('#/agent/'.length);
+    $('#viewDetail').classList.add('active');
+    renderDetail(sealId);
+    $$('.nav a[data-route="discovery"]').forEach(a => a.classList.add('active'));
+  } else if (h === '#/deploy') {
+    route = 'deploy';
+    $('#viewDeploy').classList.add('active');
+    // Hide stale progress from a previous deploy and tear down its WS so
+    // unrelated events (e.g. user_stop on the previous agent) don't paint
+    // this view.
+    $('#cardProgress').style.display = 'none';
+    $('#goDetailRow').innerHTML = '';
+    State.deployingSealId = null;
+    if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
+    $('#deployBtn').disabled = !State.signer;
+  } else {
+    route = 'discovery';
+    $('#viewDiscovery').classList.add('active');
+    loadDiscovery();
+    $$('.nav a[data-route="discovery"]').forEach(a => a.classList.add('active'));
+  }
+
+  // Tear down stale WS subscriptions when navigating away.
+  if (route !== 'detail' && State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+}
+window.addEventListener('hashchange', handleHash);
+
+// ───────────────────────────────────────────────────────────────────
+// Bootstrap: load /config
+// ───────────────────────────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const r = await fetch('/config');
+    if (r.ok) State.config = await r.json();
+  } catch (e) {
+    toast('Failed to load /config: ' + e.message, 'error');
+  }
+  if (!location.hash) location.hash = '#/';
+  handleHash();
+});
+
+// ───────────────────────────────────────────────────────────────────
+// Wallet (EIP-6963 + window.ethereum)
+// ───────────────────────────────────────────────────────────────────
+window.connectWallet = function () {
+  const wallets = [...eip6963Providers.values()];
+  if (window.ethereum && !wallets.length) {
+    wallets.push({ info: { uuid: '__legacy__', name: 'Browser Wallet' }, provider: window.ethereum });
+  }
+  if (!wallets.length) {
+    toast('No EVM wallet detected. Install MetaMask, Rabby, or another EIP-1193 wallet.', 'error');
+    return;
+  }
+  if (wallets.length === 1) { selectWallet(wallets[0].provider); return; }
+
+  const list = $('#walletList');
+  list.innerHTML = '';
+  wallets.forEach(({ info, provider }) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-ghost';
+    btn.style.cssText = 'display:flex;align-items:center;gap:10px;text-align:left;justify-content:flex-start;width:100%';
+    if (info.icon) {
+      const img = document.createElement('img');
+      img.src = info.icon; img.width = img.height = 22; img.style.borderRadius = '4px';
+      btn.appendChild(img);
+    }
+    btn.appendChild(document.createTextNode(info.name));
+    btn.onclick = () => { closeWalletModal(); selectWallet(provider); };
+    list.appendChild(btn);
+  });
+  $('#walletModal').classList.add('open');
+};
+function closeWalletModal() { $('#walletModal').classList.remove('open'); }
+
+async function selectWallet(provider) {
+  try {
+    const browserProv = new ethers.BrowserProvider(provider);
+    // Force the account chooser even if already permitted — this is what
+    // makes "switch account" work. eth_requestAccounts is idempotent (no
+    // picker after first grant), but wallet_requestPermissions always
+    // re-prompts. Some wallets (Coinbase etc.) don't implement it; fall
+    // back gracefully.
+    try {
+      await browserProv.send('wallet_requestPermissions', [{ eth_accounts: {} }]);
+    } catch {
+      await browserProv.send('eth_requestAccounts', []);
+    }
+    State.signer = await browserProv.getSigner();
+    State.ownerAddr = await State.signer.getAddress();
+    $('#connectBtn').style.display = 'none';
+    $('#addrChipText').textContent = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
+    $('#addrChip').style.display = 'inline-block';
+    $('#deployBtn').disabled = false;
+    toast('Wallet connected', 'success');
+    // If on Discovery, refresh so the "Mine" filter button enables and any
+    // owner-only agent context becomes visible.
+    if (location.hash === '#/' || !location.hash) loadDiscovery();
+    // If on a detail page, re-render to surface owner sections.
+    if (location.hash.startsWith('#/agent/')) handleHash();
+  } catch (e) {
+    toast('Connect rejected: ' + (e.message || e), 'error');
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Helpers: signing + canonicals
+// ───────────────────────────────────────────────────────────────────
+const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
+const randomNonce = () => Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                                     b => b.toString(16).padStart(2, '0')).join('');
+
+async function signOwnerCanonical(idempKey, name, description, image) {
+  const canonical = JSON.stringify({
+    domain: 'AgenticID.Deploy.v1',
+    idempotency_key: idempKey,
+    owner: State.ownerAddr.toLowerCase(),
+    name, description,
+    image: image ?? null,
+    i_data: [],
+  });
+  const sig = await State.signer.signMessage(canonical);
+  return { canonical, sig };
+}
+
+// ── Avatar upload + secret-input helpers ──────────────────────────
+const AVATAR_MAX_BYTES = 256 * 1024;  // 256 KB cap so card.json stays sane
+
+window.handleAvatarFile = function (e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  if (file.size > AVATAR_MAX_BYTES) {
+    toast(`Image too large — max ${(AVATAR_MAX_BYTES / 1024).toFixed(0)} KB`, 'error');
+    e.target.value = '';
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    const dataUrl = ev.target.result;
+    State.deployAvatarDataUrl = dataUrl;
+    $('#avatarPreview').innerHTML = `<img src="${dataUrl}" alt=""/>`;
+    $('#avatarMeta').textContent = `${file.name} · ${(file.size / 1024).toFixed(1)} KB`;
+    $('#avatarClearBtn').disabled = false;
+  };
+  reader.readAsDataURL(file);
+};
+
+window.clearAvatar = function () {
+  State.deployAvatarDataUrl = null;
+  $('#avatarFile').value = '';
+  $('#avatarPreview').innerHTML = '🤖';
+  $('#avatarMeta').textContent = 'Auto-generated from seal_id';
+  $('#avatarClearBtn').disabled = true;
+};
+
+window.toggleSecret = function (inputId, btnId) {
+  const input = $('#' + inputId);
+  const btn = $('#' + btnId);
+  const showing = input.type === 'text';
+  input.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? 'show' : 'hide';
+};
+
+async function signSandboxEnvelope(action, resourceId, payload = {}) {
+  const canonical = JSON.stringify({
+    action,
+    expires_at: Math.floor(Date.now() / 1000) + 180,
+    nonce: randomNonce(),
+    payload,
+    resource_id: resourceId,
+  });
+  const sig = await State.signer.signMessage(canonical);
+  return {
+    canonical,
+    envelope: {
+      wallet_address: State.ownerAddr,
+      signed_message_b64: b64(canonical),
+      wallet_signature: sig,
+    },
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Deploy submit
+// ───────────────────────────────────────────────────────────────────
+window.submitDeploy = async function () {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  $('#deployBtn').disabled = true;
+
+  try {
+    const idempKey = `console-${Date.now()}`;
+    const name = $('#name').value.trim();
+    const description = $('#description').value.trim();
+    const image = State.deployAvatarDataUrl || null;
+    const apiKey = $('#apiKey').value.trim();
+
+    if (!name || !description) {
+      toast('Name and description are required', 'error');
+      $('#deployBtn').disabled = false;
+      return;
+    }
+
+    const { canonical: ownerCanonical, sig: ownerSig } =
+      await signOwnerCanonical(idempKey, name, description, image);
+
+    // api_key (when set) rides the sandbox envelope's payload.env channel —
+    // the same path scripts/e2e.sh has always used. attestor's
+    // HttpSandbox::create relays canonical.payload to 0g-sandbox unchanged
+    // (with ATTESTOR_URL + chain config injected on top), so the agent
+    // container receives API_KEY in process.env.
+    const env = apiKey ? { API_KEY: apiKey } : {};
+    const { canonical: sandboxCanonical, envelope: sandboxEnvelope } =
+      await signSandboxEnvelope('create', '', { snapshot: '0g-test-sealed', sealed: true, env });
+
+    const deployBody = {
+      idempotency_key: idempKey,
+      owner: State.ownerAddr,
+      owner_signature: ownerSig,
+      owner_signed_message_b64: b64(ownerCanonical),
+      name, description,
+      image,
+      i_data: [],
+      sandbox_envelope: sandboxEnvelope,
+    };
+
+    const resp = await fetch('/deploy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(deployBody),
+    });
+    if (!resp.ok) {
+      throw new Error(`/deploy ${resp.status}: ${await resp.text()}`);
+    }
+    const { seal_id } = await resp.json();
+    // Cache api_key in localStorage so Start can re-supply it when the
+    // sandbox runtime drops env on stop. Owner-local; never persisted by
+    // attestor.
+    if (apiKey) {
+      try { localStorage.setItem(`agentApiKey:${seal_id}`, apiKey); } catch {}
+    }
+    State.deployingSealId = seal_id;
+    $('#outSeal').textContent = seal_id;
+    $('#cardProgress').style.display = 'block';
+    $('#cardProgress').scrollIntoView({ behavior: 'smooth' });
+    resetProgress();
+    // All three Phase-1 tasks kick off concurrently.
+    setTask('storage', 'active', 'pending');
+    setTask('mint', 'active', 'pending');
+    setTask('sandbox', 'active', 'pending');
+    $('#goDetailRow').innerHTML = '';
+    subscribeDeployWS(seal_id);
+  } catch (e) {
+    toast(String(e.message || e), 'error');
+    $('#deployBtn').disabled = false;
+  }
+};
+
+function subscribeDeployWS(sealId) {
+  if (State.ws) { try { State.ws.close(); } catch {} }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/subscribe?seal_id=${sealId}`);
+  State.ws = ws;
+  ws.onmessage = (e) => {
+    let evt; try { evt = JSON.parse(e.data); } catch { return; }
+    appendEventLog('#eventLogDeploy', evt);
+    handleDeployEvent(evt, sealId);
+  };
+}
+
+function handleDeployEvent(evt, sealId) {
+  const t = evt.event;
+
+  if (t === 'storage_submitted') setTask('storage', 'active', 'tx submitted, awaiting confirm…');
+  if (t === 'storage_confirmed') setTask('storage', 'done', 'confirmed');
+  if (t === 'storage_failed')    setTask('storage', 'fail', evt.reason || 'failed');
+
+  if (t === 'mint_submitted') setTask('mint', 'active', 'tx submitted, awaiting confirm…');
+  if (t === 'mint_confirmed') setTask('mint', 'done', `confirmed — agent_id ${evt.agent_id}`);
+  if (t === 'mint_failed')    setTask('mint', 'fail', evt.reason || 'failed');
+
+  if (t === 'container_starting') setTask('sandbox', 'active', 'creating container…');
+  if (t === 'container_running')  setTask('sandbox', 'done', 'running');
+  if (t === 'container_failed' || t === 'container_stopped') {
+    setTask('sandbox', 'fail', evt.reason || t);
+  }
+
+  if (t === 'agent_u_r_i_updated') setTask('uri', 'done', 'tx submitted');
+
+  if (t === 'container_running') {
+    setTask('running', 'done', 'live');
+    $('#deployBtn').disabled = false;
+    $('#goDetailRow').innerHTML = `<small class="hint">Redirecting to agent detail…</small>`;
+    setTimeout(() => navigate(`#/agent/${sealId}`), 1500);
+  }
+  if (t === 'container_failed') {
+    setTask('running', 'fail', evt.reason || '');
+    $('#deployBtn').disabled = false;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Progress helpers — unified vertical task list
+// ───────────────────────────────────────────────────────────────────
+const TASK_ORDER = ['storage', 'mint', 'sandbox', 'uri', 'running'];
+
+function resetProgress() {
+  TASK_ORDER.forEach((n, i) => {
+    const li = $(`[data-task="${n}"]`);
+    if (!li) return;
+    li.classList.remove('active', 'done', 'fail');
+    li.classList.add('idle');
+    const icon = li.querySelector('.task-icon');
+    icon.innerHTML = '';
+    icon.textContent = String(i + 1);
+    li.querySelector('.task-state').textContent = 'waiting';
+  });
+}
+
+function setTask(name, status, stateText) {
+  const li = $(`[data-task="${name}"]`);
+  if (!li) return;
+  li.classList.remove('idle', 'active', 'done', 'fail');
+  li.classList.add(status);
+  const icon = li.querySelector('.task-icon');
+  icon.innerHTML = '';
+  if (status === 'done') {
+    icon.appendChild($('#tplCheck').content.cloneNode(true));
+  } else if (status === 'fail') {
+    icon.textContent = '✗';
+  } else if (status === 'active') {
+    // Spinner is drawn as ::after; keep textContent empty so it's not visible.
+    icon.textContent = '';
+  } else {
+    const idx = TASK_ORDER.indexOf(name);
+    icon.textContent = idx >= 0 ? String(idx + 1) : '';
+  }
+  if (stateText !== undefined) li.querySelector('.task-state').textContent = stateText;
+}
+
+function appendEventLog(rootSel, evt) {
+  const log = $(rootSel);
+  if (!log) return;
+  const div = document.createElement('div');
+  const t = new Date().toLocaleTimeString();
+  const type = evt.event || '?';
+  const cls = type.includes('failed') || type.includes('stopped') ? 'fail'
+            : type.includes('confirmed') || type.includes('running') ? 'ok' : '';
+  div.className = 'ev-row ' + cls;
+  div.innerHTML = `<span class="ts">[${t}]</span><span class="type">${escapeHtml(type)}</span> ${escapeHtml(JSON.stringify(evt))}`;
+  log.prepend(div);
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Discovery list (all agents, with optional Mine filter)
+// ───────────────────────────────────────────────────────────────────
+window.setDiscoveryFilter = function (mode) {
+  if (mode === 'mine' && !State.ownerAddr) { toast('Connect wallet first', 'error'); return; }
+  State.discoveryFilter = mode;
+  $$('#discoveryFilter [data-filter]').forEach(b => b.classList.toggle('on', b.dataset.filter === mode));
+  loadDiscovery();
+};
+
+async function loadDiscovery() {
+  const list = $('#agentList');
+  const count = $('#agentCount');
+  // Reflect current filter in pill state.
+  $$('#discoveryFilter [data-filter]').forEach(b => b.classList.toggle('on', b.dataset.filter === State.discoveryFilter));
+  $('#discoveryFilter [data-filter="mine"]').disabled = !State.ownerAddr;
+
+  count.textContent = 'loading…';
+  try {
+    const url = (State.discoveryFilter === 'mine' && State.ownerAddr)
+      ? `/deployments?owner=${State.ownerAddr}`
+      : '/deployments';
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`/deployments ${r.status}: ${await r.text()}`);
+    const items = await r.json();
+    items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+    count.textContent = `${items.length} agent${items.length === 1 ? '' : 's'}`;
+    if (!items.length) {
+      const empty = State.discoveryFilter === 'mine'
+        ? `<div class="empty">
+             <h2 style="margin-bottom:6px">No agents yet</h2>
+             <p>Deploy your first agent — it'll show up here.</p>
+             <button class="btn btn-primary" style="margin-top:14px" onclick="navigate('#/deploy')">+ New agent</button>
+           </div>`
+        : `<div class="empty">
+             <h2 style="margin-bottom:6px">No agents discovered</h2>
+             <p>This attestor hasn't deployed anything yet.</p>
+           </div>`;
+      list.innerHTML = empty;
+      return;
+    }
+    list.innerHTML = items.map(d => renderAgentCard(d)).join('');
+    $$('.agent-card').forEach(el => {
+      el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
+    });
+  } catch (e) {
+    count.textContent = 'failed';
+    list.innerHTML = `<div class="empty"><p style="color:var(--red)">${escapeHtml(e.message)}</p></div>`;
+  }
+}
+
+function ageString(iso) {
+  if (!iso) return '';
+  const ms = Date.now() - new Date(iso).getTime();
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+
+function renderAgentCard(d) {
+  const phase = d.phase || 'pending';
+  const card = d.agent_card || {};
+  const name = card.name || '(unnamed)';
+  const description = card.description || '';
+  const image = card.image || '';
+  const aid = d.agent_id || '—';
+  const sealHex = d.seal_id && d.seal_id.startsWith('0x') ? d.seal_id : '0x' + (d.seal_id || '').replace(/^0x/, '');
+
+  const avatar = image
+    ? `<img class="avatar" src="${escapeHtml(image)}" alt=""/>`
+    : `<div class="avatar">🤖</div>`;
+
+  return `
+    <div class="agent-card" data-seal="${sealHex}">
+      <div class="row1">
+        ${avatar}
+        <div class="body">
+          <div class="name">${escapeHtml(name)}</div>
+          ${description ? `<div class="desc">${escapeHtml(description)}</div>` : ''}
+        </div>
+      </div>
+      <div class="row2">
+        <span class="chip chip-${phase}">${phase === 'running' ? '<span class="dot"></span>' : ''}${phase}</span>
+        ${aid !== '—' ? `<span class="chip" style="background:var(--surf2);color:var(--text2);border:1px solid var(--border)">id ${escapeHtml(aid)}</span>` : ''}
+        <span class="meta-text">${ageString(d.created_at)}</span>
+      </div>
+    </div>`;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Detail page
+// ───────────────────────────────────────────────────────────────────
+async function renderDetail(sealId) {
+  const root = $('#detailContent');
+  root.innerHTML = `<div class="card"><div class="skel" style="width:60%;margin-bottom:10px"></div><div class="skel" style="width:40%"></div></div>`;
+
+  // Tear down any prior detail WS subscription.
+  if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+
+  let dep;
+  try {
+    const r = await fetch(`/deployment/${sealId}`);
+    if (!r.ok) throw new Error(`/deployment ${r.status}: ${await r.text()}`);
+    dep = await r.json();
+  } catch (e) {
+    root.innerHTML = `<div class="card"><p style="color:var(--red)">${escapeHtml(e.message)}</p></div>`;
+    return;
+  }
+
+  paintDetail(dep);
+  // Keep updating live via WS — phase / container_stage transitions
+  // (e.g. after stop / start) refresh the action buttons + chip.
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws/subscribe?seal_id=${sealId}`);
+  State.detailWs = ws;
+  ws.onmessage = async (e) => {
+    let evt; try { evt = JSON.parse(e.data); } catch { return; }
+    appendEventLog('#detailLog', evt);
+    // Refresh deployment doc (simplest correctness)
+    try {
+      const r = await fetch(`/deployment/${sealId}`);
+      if (r.ok) paintDetail(await r.json());
+    } catch {}
+  };
+}
+
+function paintDetail(dep) {
+  const root = $('#detailContent');
+  const sealId = '0x' + (typeof dep.seal_id === 'string' ? dep.seal_id.replace(/^0x/, '') : '');
+  const phase = dep.phase || 'pending';
+  const card = dep.agent_card || {};
+  const name = card.name || '(unnamed)';
+  const description = card.description || '';
+  const image = card.image || '';
+  const attributes = card.attributes || [];
+
+  const sandboxId = dep.sandbox_id || '';
+  const cfg = State.config || {};
+  // A2A URL: prefer on-chain agent_card.url (canonical truth) when present;
+  // fallback to client-side reconstruction from /config + sandbox_id.
+  const a2aUrl = card.url
+    || (sandboxId && cfg.sandbox_proxy_addr
+        ? `http://${cfg.agent_a2a_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_a2a_path}`
+        : '');
+  const dashboardUrl = (sandboxId && cfg.sandbox_proxy_addr)
+    ? `http://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_dashboard_path}`
+    : '';
+
+  const ownerMatches = State.ownerAddr && dep.owner &&
+    State.ownerAddr.toLowerCase() === dep.owner.toLowerCase();
+  const canStop  = ownerMatches && sandboxId && phase === 'running';
+  const canStart = ownerMatches && sandboxId && (phase === 'stopped' || phase === 'failed');
+
+  // Container is reachable only when phase=running. Stopped/failed agents
+  // hide A2A endpoint + dashboard since the proxy URL won't resolve.
+  const isLive = phase === 'running';
+
+  const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
+  // agentSeal addr: stored in registrations[0].agentAddress per AgentCard
+  // build (chain-recorded). Falls back to seal-based field on deployment.
+  const registrations = Array.isArray(card.registrations) ? card.registrations : [];
+  const agentSealAddr = (registrations[0] && registrations[0].agentAddress)
+    || dep.agent_seal_addr
+    || '';
+
+  const ownerActionsHtml = !ownerMatches ? '' : `
+    <div class="hero-actions-label">Owner controls</div>
+    <div class="hero-actions">
+      ${(isLive && dashboardUrl) ? `<a class="icon-btn primary" href="${escapeHtml(dashboardUrl)}" target="_blank" rel="noopener">⌘ Open dashboard</a>` : ''}
+      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">⏸ Stop</button>` : ''}
+      ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">▶ Start</button>` : ''}
+    </div>`;
+
+  const publicHtml = `
+    <div class="agent-hero">
+      ${image ? `<img class="agent-avatar" src="${escapeHtml(image)}" alt=""/>` : `<div class="agent-avatar" style="display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--muted)">🤖</div>`}
+      <div class="agent-name">${escapeHtml(name)}</div>
+      ${description ? `<div class="agent-desc">${escapeHtml(description)}</div>` : ''}
+      <div class="agent-chips">
+        <span class="chip chip-${phase}">${phase === 'running' ? '<span class="dot"></span>' : ''}${phase}</span>
+        ${dep.agent_id ? `<span class="chip" style="background:var(--surf2);color:var(--text2);border:1px solid var(--border)">agent_id ${escapeHtml(dep.agent_id)}</span>` : ''}
+      </div>
+
+      <div class="stat-grid">
+        <div class="stat-cell">
+          <div class="lbl">Owner</div>
+          <div class="val copy" title="${escapeHtml(dep.owner || '')}" onclick="navigator.clipboard.writeText('${escapeHtml(dep.owner || '')}').then(()=>toast('owner copied','success'))">${escapeHtml(ownerShort)}</div>
+        </div>
+        <div class="stat-cell">
+          <div class="lbl">Created</div>
+          <div class="val">${escapeHtml(ageString(dep.created_at) || '—')}</div>
+        </div>
+        <div class="stat-cell">
+          <div class="lbl">Phase</div>
+          <div class="val">${escapeHtml(phase)}</div>
+        </div>
+      </div>
+
+      ${ownerActionsHtml}
+    </div>
+
+    ${(isLive && a2aUrl) ? `
+    <div class="a2a-card">
+      <div class="a2a-head">
+        <div>
+          <span class="a2a-title">A2A endpoint</span>
+          <span class="a2a-sub">— say hi to this agent</span>
+        </div>
+        <div class="a2a-actions">
+          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(a2aUrl)}')">👋 Say hi</button>
+          <button class="icon-btn" onclick="navigator.clipboard.writeText('${escapeHtml(a2aUrl)}').then(()=>toast('URL copied','success'))">📋 Copy URL</button>
+        </div>
+      </div>
+      <a class="a2a-url" href="${escapeHtml(a2aUrl)}" target="_blank" rel="noopener">${escapeHtml(a2aUrl)}</a>
+      <div class="a2a-resp" id="a2aResp"></div>
+    </div>` : ''}
+
+    <div class="section-title" style="display:flex;align-items:center;gap:8px">
+      AgentCard
+      <span id="agentCardSrc" style="text-transform:none;font-weight:400;color:var(--muted);font-family:var(--sans);font-size:11px;letter-spacing:0">— fetching from agent_uri…</span>
+    </div>
+    <div class="card" style="padding:14px 18px;margin-bottom:18px">
+      <div id="agentCardBody">
+        <div class="skel" style="width:60%;margin-bottom:8px"></div>
+        <div class="skel" style="width:40%"></div>
+      </div>
+    </div>
+
+    <div class="section-title">On-chain identity</div>
+    <div class="card" style="padding:14px 18px">
+      <div class="kv" style="grid-template-columns:130px 1fr;font-size:12px">
+        <div class="k">agent_id</div><div class="v">${escapeHtml(dep.agent_id || '—')}</div>
+        <div class="k">seal_id</div><div class="v copy" onclick="navigator.clipboard.writeText('${escapeHtml(sealId)}').then(()=>toast('seal_id copied','success'))">${escapeHtml(sealId)}</div>
+        <div class="k">agent_seal</div><div class="v">${escapeHtml(agentSealAddr || '—')}</div>
+        <div class="k">owner</div><div class="v">${escapeHtml(dep.owner || '—')}</div>
+        <div class="k">agent_wallet</div><div class="v" id="kvAgentWallet">${escapeHtml(dep.owner || '—')} <span style="color:var(--muted)">(loading…)</span></div>
+        ${dep.agent_uri ? `<div class="k">agent_uri</div><div class="v"><a href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener" style="color:var(--p)">${escapeHtml(dep.agent_uri)}</a></div>` : ''}
+      </div>
+    </div>
+  `;
+
+  root.innerHTML = publicHtml;
+
+  // Read agent_wallet from the chain via ethers — defaults to owner unless
+  // the owner has explicitly delegated payments via setAgentWallet.
+  if (dep.agent_id && State.config?.chain_rpc && State.config?.agentic_id_addr) {
+    fetchAgentWallet(dep.agent_id, dep.owner).catch(() => {/* ignore — UI already shows fallback */});
+  }
+
+  // Fetch the canonical AgentCard from the OSS-hosted agent_uri and replace
+  // the placeholder. This is what 8004scan / external readers see.
+  if (dep.agent_uri) {
+    fetchAndRenderAgentCard(dep.agent_uri, dep.agent_card || {});
+  } else {
+    renderAgentCardBody(dep.agent_card || {}, '— no agent_uri yet (mint pending)');
+  }
+}
+
+async function fetchAndRenderAgentCard(uri, fallback) {
+  try {
+    const r = await fetch(uri, { mode: 'cors' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const card = await r.json();
+    renderAgentCardBody(card, `— fetched from ${uri.length > 60 ? uri.slice(0, 60) + '…' : uri}`);
+  } catch (e) {
+    // CORS-blocked or 404 — fall back to attestor's local cached copy.
+    renderAgentCardBody(fallback, `— OSS fetch failed (${e.message}); showing attestor cache`);
+  }
+}
+
+function renderAgentCardBody(card, srcLabel) {
+  const src = $('#agentCardSrc');
+  const body = $('#agentCardBody');
+  if (!body) return;
+  if (src) src.textContent = srcLabel;
+
+  const attributes = Array.isArray(card.attributes) ? card.attributes : [];
+  const fields = [];
+  if (card.name) fields.push(['name', escapeHtml(card.name)]);
+  if (card.description) fields.push(['description', escapeHtml(card.description)]);
+  if (card.image) {
+    const isData = card.image.startsWith('data:');
+    const label = isData ? `inline ${(card.image.length / 1024).toFixed(1)} KB · ${card.image.slice(0, card.image.indexOf(','))}` : escapeHtml(card.image);
+    fields.push(['image', `<a href="${escapeHtml(card.image)}" target="_blank" rel="noopener" style="color:var(--p)">${label}</a>`]);
+  }
+  if (card.url) fields.push(['url (A2A)', `<a href="${escapeHtml(card.url)}" target="_blank" rel="noopener" style="color:var(--p)">${escapeHtml(card.url)}</a>`]);
+
+  let html = '';
+  if (fields.length) {
+    html += `<div class="kv" style="grid-template-columns:130px 1fr;font-size:12px;margin-bottom:${attributes.length ? '12px' : '0'}">
+      ${fields.map(([k, v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join('')}
+    </div>`;
+  }
+  if (attributes.length) {
+    html += `<div class="attrs">
+      ${attributes.map(a => `<div class="attr"><div class="at-key">${escapeHtml(a.trait_type || '')}</div><div class="at-val">${escapeHtml(String(a.value ?? ''))}</div></div>`).join('')}
+    </div>`;
+  }
+  if (!fields.length && !attributes.length) {
+    html = `<div style="color:var(--muted);font-size:13px">AgentCard JSON is empty.</div>`;
+  }
+  // Raw JSON disclosure — useful for debugging / verifying what 8004scan parses.
+  html += `<details class="log" style="margin-top:12px">
+    <summary>View raw JSON</summary>
+    <pre class="event-log" style="max-height:300px">${escapeHtml(JSON.stringify(card, null, 2))}</pre>
+  </details>`;
+
+  body.innerHTML = html;
+}
+
+async function fetchAgentWallet(agentId, ownerAddr) {
+  const cfg = State.config;
+  const provider = new ethers.JsonRpcProvider(cfg.chain_rpc);
+  const c = new ethers.Contract(
+    cfg.agentic_id_addr,
+    ['function getAgentWallet(uint256) view returns (address)'],
+    provider,
+  );
+  const wallet = await c.getAgentWallet(BigInt(agentId));
+  const cell = $('#kvAgentWallet');
+  if (!cell) return;
+  const isZero = wallet === '0x0000000000000000000000000000000000000000';
+  if (isZero) {
+    cell.innerHTML = `${escapeHtml(ownerAddr || '—')} <span style="color:var(--muted)">(owner — no delegate set)</span>`;
+  } else {
+    cell.textContent = wallet;
+  }
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Stop / Start actions
+// ───────────────────────────────────────────────────────────────────
+async function lifecycleAction(verb, sealId, sandboxId) {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  try {
+    // 0g-sandbox drops container env on stop, so on start re-supply the
+    // api_key from localStorage (owner-cached at deploy time). Stop
+    // doesn't need any env, so pass an empty payload there.
+    let payload = {};
+    if (verb === 'start') {
+      const cachedKey = (() => {
+        try { return localStorage.getItem(`agentApiKey:${sealId}`); } catch { return null; }
+      })();
+      if (cachedKey) payload = { env: { API_KEY: cachedKey } };
+    }
+    const { envelope } = await signSandboxEnvelope(verb, sandboxId, payload);
+    const r = await fetch(`/${verb}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        seal_id: sealId,
+        owner: State.ownerAddr,
+        sandbox_envelope: envelope,
+      }),
+    });
+    if (!r.ok) throw new Error(`/${verb} ${r.status}: ${await r.text()}`);
+    toast(`${verb} accepted — waiting for sandbox…`, 'success');
+  } catch (e) {
+    toast(`${verb} failed: ${e.message || e}`, 'error');
+  }
+}
+
+window.actionStop  = (sealId, sandboxId) => lifecycleAction('stop',  sealId, sandboxId);
+window.actionStart = (sealId, sandboxId) => lifecycleAction('start', sealId, sandboxId);
+
+// ───────────────────────────────────────────────────────────────────
+// Say hi — fetch the A2A endpoint and render the agent's response
+// inline. The sandbox proxy at port 4000 sets `Access-Control-Allow-
+// Origin: *`, so a browser fetch from the attestor origin works as
+// long as the agent itself doesn't add stricter CORS headers.
+// ───────────────────────────────────────────────────────────────────
+window.sayHiToAgent = async function (url) {
+  const respEl = $('#a2aResp');
+  const btn = $('#btnSayHi');
+  if (!respEl || !btn) return;
+  respEl.classList.remove('error');
+  respEl.classList.add('show');
+  respEl.textContent = '⏳ contacting agent…';
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ sending…';
+  try {
+    const r = await fetch(url, { method: 'GET', mode: 'cors' });
+    const text = await r.text();
+    respEl.classList.toggle('error', !r.ok);
+    respEl.textContent = `HTTP ${r.status}\n\n${text}`;
+  } catch (e) {
+    respEl.classList.add('error');
+    respEl.textContent = 'request failed: ' + (e.message || e);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+};
+</script>
+</body>
+</html>

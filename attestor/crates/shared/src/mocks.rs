@@ -181,7 +181,7 @@ pub struct MockSandbox;
 
 #[async_trait]
 impl SandboxClient for MockSandbox {
-    async fn start(
+    async fn create(
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
@@ -189,7 +189,7 @@ impl SandboxClient for MockSandbox {
         tracing::info!(
             ?seal_id,
             signer = %envelope.wallet_address,
-            "mock sandbox: start"
+            "mock sandbox: create"
         );
         // Deterministic stub id derived from seal_id so tests can recognise it.
         Ok(SandboxCreateResponse {
@@ -199,13 +199,29 @@ impl SandboxClient for MockSandbox {
         })
     }
 
-    async fn restart(&self, seal_id: SealId) -> anyhow::Result<()> {
-        tracing::info!(?seal_id, "mock sandbox: restart");
+    async fn start(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            ?seal_id,
+            signer = %envelope.wallet_address,
+            "mock sandbox: start"
+        );
         Ok(())
     }
 
-    async fn stop(&self, seal_id: SealId) -> anyhow::Result<()> {
-        tracing::info!(?seal_id, "mock sandbox: stop");
+    async fn stop(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            ?seal_id,
+            signer = %envelope.wallet_address,
+            "mock sandbox: stop"
+        );
         Ok(())
     }
 }

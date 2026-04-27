@@ -56,13 +56,50 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             )
             .await
         }
-        // SandboxStart/Restart here are for non-deploy flows and don't yet
-        // carry a user-signed envelope. Will be wired when /restart is
-        // refactored end-to-end.
-        JobPayload::SandboxStart { seal_id } => {
-            anyhow::bail!("SandboxStart job variant requires envelope plumbing: {seal_id:?}")
+        JobPayload::SandboxStart {
+            seal_id,
+            sandbox_envelope,
+        } => {
+            ctx.sandbox.start(seal_id, &sandbox_envelope).await?;
+            // Sandbox has resumed; container will re-bootstrap and POST
+            // /status running back to attestor (existing flow), which flips
+            // container_stage to Confirmed. We just signal "starting" now.
+            let now = Utc::now();
+            ctx.deployments
+                .set_container_stage(
+                    seal_id,
+                    StageStatus::Submitted {
+                        tx_hash: None,
+                        at: now,
+                    },
+                )
+                .await?;
+            ctx.events
+                .publish(WsEvent::ContainerStarting { seal_id })
+                .await?;
+            Ok(())
         }
-        JobPayload::SandboxRestart { seal_id } => ctx.sandbox.restart(seal_id).await,
+        JobPayload::SandboxStop {
+            seal_id,
+            sandbox_envelope,
+        } => {
+            ctx.sandbox.stop(seal_id, &sandbox_envelope).await?;
+            let now = Utc::now();
+            let reason = "user_stop".to_string();
+            ctx.deployments
+                .set_container_stage(
+                    seal_id,
+                    StageStatus::Stopped {
+                        at: now,
+                        reason: reason.clone(),
+                    },
+                )
+                .await?;
+            ctx.events
+                .publish(WsEvent::ContainerStopped { seal_id, reason })
+                .await?;
+            Ok(())
+        }
     }
 }
 
@@ -221,10 +258,11 @@ async fn handle_deploy(
         agent_id,
         agent_seal_addr: seal_kp.address,
         chain_id: ctx.cfg.chain_id,
+        seal_id: &seal_id.0,
         sandbox_id: &sandbox_id,
         sandbox_proxy_addr: &ctx.cfg.sandbox_proxy_addr,
-        agent_container_port: ctx.cfg.agent_container_port,
-        agent_entry_path: &ctx.cfg.agent_entry_path,
+        agent_a2a_port: ctx.cfg.agent_a2a_port,
+        agent_a2a_path: &ctx.cfg.agent_a2a_path,
     });
 
     // Key under `{oss_key_prefix}/<sealId-hex>/card.json` so a shared
@@ -419,11 +457,11 @@ async fn run_container_track(
         .publish(WsEvent::ContainerStarting { seal_id })
         .await?;
 
-    let resp = match ctx.sandbox.start(seal_id, envelope).await {
+    let resp = match ctx.sandbox.create(seal_id, envelope).await {
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            let reason = format!("sandbox start: {e}");
+            let reason = format!("sandbox create: {e}");
             ctx.deployments
                 .set_container_stage(
                     seal_id,

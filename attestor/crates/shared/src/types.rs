@@ -100,8 +100,9 @@ pub struct DeployRequest {
     pub name: String,
     /// Public description. Required, non-empty.
     pub description: String,
-    /// Public avatar URL. Optional; when absent the attestor falls back to
-    /// the OpenClaw default logo.
+    /// Public avatar — either an external URL or a `data:` URL. Optional;
+    /// when absent the attestor falls back to a deterministic pixel-art
+    /// avatar derived from `seal_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
@@ -307,11 +308,15 @@ pub struct StatusReport {
 }
 
 // ── /restart ────────────────────────────────────────────────────────────
+/// Request body for `POST /start` and `POST /stop` — both lifecycle
+/// operations on an existing sandbox. `sandbox_envelope` is owner-signed
+/// canonical message with `action="start"` (or `"stop"`) and
+/// `resource_id=<sandbox_id>`; attestor relays it to sandbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RestartRequest {
+pub struct LifecycleRequest {
     pub seal_id: SealId,
     pub owner: Address,
-    pub owner_signature: Bytes,
+    pub sandbox_envelope: SandboxEnvelope,
 }
 
 // ── Crypto outputs ──────────────────────────────────────────────────────
@@ -389,11 +394,19 @@ pub enum JobPayload {
         image: Option<String>,
         sandbox_envelope: SandboxEnvelope,
     },
+    /// Resume a previously stopped sandbox. Worker calls
+    /// `SandboxClient::start(seal_id, envelope)` which relays to
+    /// `POST /api/sandbox/:id/start`.
     SandboxStart {
         seal_id: SealId,
+        sandbox_envelope: SandboxEnvelope,
     },
-    SandboxRestart {
+    /// Stop a running sandbox. Worker calls
+    /// `SandboxClient::stop(seal_id, envelope)` which relays to
+    /// `POST /api/sandbox/:id/stop`.
+    SandboxStop {
         seal_id: SealId,
+        sandbox_envelope: SandboxEnvelope,
     },
 }
 

@@ -86,20 +86,30 @@ pub struct Config {
     /// set to `0x<agentic_id_addr>`.
     pub oss_key_prefix: String,
 
-    // ── AgentCard.url construction (subdomain-routed proxy) ─────────
+    // ── Agent runtime endpoints ─────────────────────────────────────
     //
-    // Public URL the sandbox exposes containers under:
-    //   http://{agent_container_port}-{sandbox_id}.{sandbox_proxy_addr}{agent_entry_path}
+    // Two distinct endpoints exposed by every deployed agent container,
+    // reachable via the sandbox proxy:
+    //   http://{port}-{sandbox_id}.{sandbox_proxy_addr}{path}
     // where `sandbox_proxy_addr` is a bare `host:port` string (e.g.
-    // `47.236.111.154.nip.io:4000`, `proxy.example.com:4000`). The
-    // caller is responsible for any wildcard-DNS suffix (.nip.io / real
-    // domain); the attestor just prepends `{port}-{sandbox_id}.` as the
-    // subdomain and splits the addr's colon to populate the URL port.
-    // Framework-agnostic: any agent runtime that binds to a known port
-    // and serves a known path fits.
+    // `47.236.111.154.nip.io:4000`). Caller is responsible for any
+    // wildcard-DNS suffix (.nip.io / real domain); the attestor just
+    // prepends `{port}-{sandbox_id}.` as the subdomain.
+    //
+    // - **A2A**:       public agent-to-agent entry. Goes into
+    //                  AgentCard.url, which is published on chain via
+    //                  tokenURI. Anyone calling the agent uses this.
+    // - **Dashboard**: owner-only operator view. Used by the deploy
+    //                  console (My Agents detail page) — never written
+    //                  on chain.
+    //
+    // Two ports are configurable but in most setups they're the same
+    // (one process listening, two paths).
     pub sandbox_proxy_addr: String,
-    pub agent_container_port: u16,
-    pub agent_entry_path: String,
+    pub agent_a2a_port: u16,
+    pub agent_a2a_path: String,
+    pub agent_dashboard_port: u16,
+    pub agent_dashboard_path: String,
 }
 
 impl Config {
@@ -168,11 +178,16 @@ impl Config {
                 )
             }),
             sandbox_proxy_addr: env("ATTESTOR_SANDBOX_PROXY_ADDR")?,
-            agent_container_port: env_opt("ATTESTOR_AGENT_CONTAINER_PORT")
+            agent_a2a_port: env_opt("ATTESTOR_AGENT_A2A_PORT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),
-            agent_entry_path: env_opt("ATTESTOR_AGENT_ENTRY_PATH")
-                .unwrap_or_else(|| "/hello".to_string()),
+            agent_a2a_path: env_opt("ATTESTOR_AGENT_A2A_PATH")
+                .unwrap_or_else(|| "/result".to_string()),
+            agent_dashboard_port: env_opt("ATTESTOR_AGENT_DASHBOARD_PORT")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080),
+            agent_dashboard_path: env_opt("ATTESTOR_AGENT_DASHBOARD_PATH")
+                .unwrap_or_else(|| "/dashboard".to_string()),
         })
     }
 }

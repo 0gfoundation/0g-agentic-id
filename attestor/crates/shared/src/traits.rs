@@ -82,23 +82,33 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
-    /// Ask 0g-sandbox to spawn a new container for `seal_id`. The user-signed
-    /// `envelope` is relayed verbatim as `X-Wallet-Address` /
-    /// `X-Signed-Message` / `X-Wallet-Signature` headers — sandbox does the
-    /// actual signature verification; we only relay. Returns sandbox's
-    /// resource id + lifecycle state so the caller can persist them for
-    /// later `/restart` and `/stop` envelopes.
-    async fn start(
+    /// Create a new sandbox container for `seal_id`. The user-signed
+    /// `envelope` (action="create") is relayed as the three X-Wallet-*
+    /// headers. Returns sandbox's id + lifecycle state so callers can
+    /// persist them and later sign `start`/`stop` envelopes whose
+    /// `resource_id = <sandbox-id>`.
+    async fn create(
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
     ) -> anyhow::Result<SandboxCreateResponse>;
 
-    // TODO: restart/stop also need a fresh user-signed envelope whose
-    // payload encodes `resource_id = <sandbox-id returned by create>`.
-    // Will be wired when the /restart flow is updated end-to-end.
-    async fn restart(&self, seal_id: SealId) -> anyhow::Result<()>;
-    async fn stop(&self, seal_id: SealId) -> anyhow::Result<()>;
+    /// Resume a previously stopped sandbox. Envelope action="start",
+    /// resource_id=<sandbox_id>. Sandbox's HTTP path is
+    /// `POST /api/sandbox/:id/start` with empty body.
+    async fn start(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()>;
+
+    /// Stop a running sandbox. Envelope action="stop",
+    /// resource_id=<sandbox_id>. Sandbox path: `POST /api/sandbox/:id/stop`.
+    async fn stop(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()>;
 }
 
 // ── Deployment repository ───────────────────────────────────────────────
@@ -108,6 +118,10 @@ pub trait DeploymentRepo: Send + Sync {
     async fn get(&self, seal_id: SealId) -> anyhow::Result<Option<Deployment>>;
     async fn get_by_agent_id(&self, agent_id: AgentId) -> anyhow::Result<Option<Deployment>>;
     async fn list_by_owner(&self, owner: Address) -> anyhow::Result<Vec<Deployment>>;
+
+    /// List every deployment this attestor has handled, newest first.
+    /// Used by the Discovery page (public, no owner filter).
+    async fn list_all(&self) -> anyhow::Result<Vec<Deployment>>;
 
     async fn set_storage_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;

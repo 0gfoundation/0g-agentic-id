@@ -187,6 +187,13 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         rows.iter().map(row_to_deployment).collect()
     }
 
+    async fn list_all(&self) -> anyhow::Result<Vec<Deployment>> {
+        let rows = sqlx::query("SELECT * FROM deployments ORDER BY created_at DESC")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(row_to_deployment).collect()
+    }
+
     async fn set_storage_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.update_stage(seal_id, "storage_stage", stage).await
     }

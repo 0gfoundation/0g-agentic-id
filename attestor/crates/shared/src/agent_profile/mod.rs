@@ -31,12 +31,6 @@ pub trait AgentProfile: Send + Sync {
     /// `persona.system_prompt` can reference them.
     fn default_config(&self, name: &str, description: &str) -> ConfigInput;
 
-    /// Logo URL used for `AgentCard.image` when the user didn't provide
-    /// one. `None` → leave the field absent.
-    fn default_image_url(&self) -> Option<&str> {
-        None
-    }
-
     /// `AgentCard.capabilities` map. The A2A protocol defines three
     /// canonical booleans (`streaming`, `pushNotifications`,
     /// `stateTransitionHistory`); profiles may add more.

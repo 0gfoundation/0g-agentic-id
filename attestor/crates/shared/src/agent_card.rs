@@ -8,6 +8,7 @@
 //! to the *AgentCard schema* version, not the runtime framework.
 
 use crate::agent_profile::AgentProfile;
+use crate::avatar;
 use crate::types::{AgentId, ConfigInput};
 use alloy::primitives::Address;
 use serde_json::{json, Value};
@@ -28,21 +29,24 @@ pub struct AgentCardInputs<'a> {
     pub agent_id: AgentId,
     pub agent_seal_addr: Address,
     pub chain_id: u64,
+    /// Seeds the deterministic pixel-art avatar when `image` is None.
+    pub seal_id: &'a [u8; 32],
 
     // Sandbox endpoint — feeds AgentCard.url
     pub sandbox_id: &'a str,
     /// "host:port" SocketAddr-shaped string — split at `:` to fill nip.io
     /// subdomain + URL port independently.
     pub sandbox_proxy_addr: &'a str,
-    pub agent_container_port: u16,
-    pub agent_entry_path: &'a str,
+    /// Public A2A entry — what gets published on chain via `tokenURI`.
+    pub agent_a2a_port: u16,
+    pub agent_a2a_path: &'a str,
 }
 
 pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
     let image = i
         .image
         .map(str::to_string)
-        .or_else(|| i.profile.default_image_url().map(str::to_string));
+        .unwrap_or_else(|| avatar::seed_to_data_url(i.seal_id));
 
     // ── attributes: universal species tag + profile-specific additions ──
     let mut attributes: Vec<Value> = vec![json!({
@@ -55,8 +59,8 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
     let url = build_agent_url(
         i.sandbox_proxy_addr,
         i.sandbox_id,
-        i.agent_container_port,
-        i.agent_entry_path,
+        i.agent_a2a_port,
+        i.agent_a2a_path,
     );
 
     // ── registrations: [{ agentId, chainId, agentAddress }] ─────────────
@@ -94,15 +98,13 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
 fn build_agent_url(
     sandbox_proxy_addr: &str,
     sandbox_id: &str,
-    agent_container_port: u16,
-    agent_entry_path: &str,
+    container_port: u16,
+    path: &str,
 ) -> String {
     let (host, port) = sandbox_proxy_addr
         .rsplit_once(':')
         .unwrap_or((sandbox_proxy_addr, "80"));
-    format!(
-        "http://{agent_container_port}-{sandbox_id}.{host}:{port}{agent_entry_path}"
-    )
+    format!("http://{container_port}-{sandbox_id}.{host}:{port}{path}")
 }
 
 #[cfg(test)]
@@ -144,6 +146,7 @@ mod tests {
         let profile = OpenClawProfile;
         let cfg = profile.default_config("Sage", "DeFi helper");
         let seal_addr = Address::from_slice(&[0x42u8; 20]);
+        let seed = [7u8; 32];
         let inputs = AgentCardInputs {
             name: "Sage",
             description: "DeFi helper",
@@ -153,17 +156,22 @@ mod tests {
             agent_id: U256::from(7u64),
             agent_seal_addr: seal_addr,
             chain_id: 16602,
+            seal_id: &seed,
             sandbox_id: "sb-123",
             sandbox_proxy_addr: "47.236.111.154.nip.io:4000",
-            agent_container_port: 8080,
-            agent_entry_path: "/hello",
+            agent_a2a_port: 8080,
+            agent_a2a_path: "/hello",
         };
         let card = build_agent_card(inputs);
 
         // ERC-721 fields
         assert_eq!(card["name"], "Sage");
         assert_eq!(card["description"], "DeFi helper");
-        assert!(card["image"].is_string(), "image falls back to profile logo");
+        let img = card["image"].as_str().unwrap();
+        assert!(
+            img.starts_with("data:image/svg+xml;base64,"),
+            "image falls back to deterministic avatar: {img}"
+        );
         assert_eq!(card["attributes"][0]["trait_type"], "species");
         assert_eq!(card["attributes"][0]["value"], "agent");
 
@@ -190,6 +198,7 @@ mod tests {
     fn user_image_overrides_profile_default() {
         let profile = OpenClawProfile;
         let cfg = profile.default_config("A", "B");
+        let seed = [0u8; 32];
         let inputs = AgentCardInputs {
             name: "A",
             description: "B",
@@ -199,10 +208,11 @@ mod tests {
             agent_id: U256::from(1u64),
             agent_seal_addr: Address::ZERO,
             chain_id: 1,
+            seal_id: &seed,
             sandbox_id: "x",
             sandbox_proxy_addr: "h:1",
-            agent_container_port: 1,
-            agent_entry_path: "/",
+            agent_a2a_port: 1,
+            agent_a2a_path: "/",
         };
         let card = build_agent_card(inputs);
         assert_eq!(card["image"], "https://my.custom.logo/png");

@@ -118,7 +118,7 @@ impl HttpSandbox {
 
 #[async_trait]
 impl SandboxClient for HttpSandbox {
-    async fn start(
+    async fn create(
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
@@ -136,15 +136,15 @@ impl SandboxClient for HttpSandbox {
         //     fine to ride the plain env channel.
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
-            .map_err(|e| anyhow::anyhow!("sandbox start: base64 decode: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: base64 decode: {e}"))?;
         let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
-            .map_err(|e| anyhow::anyhow!("sandbox start: parse canonical JSON: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: parse canonical JSON: {e}"))?;
 
         let seal_hex = hex::encode(seal_id.as_slice());
 
         let mut body = canonical.payload.clone();
         let obj = body.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!("sandbox start: canonical.payload must be a JSON object")
+            anyhow::anyhow!("sandbox create: canonical.payload must be a JSON object")
         })?;
 
         obj.insert("seal_id".into(), serde_json::Value::String(seal_hex));
@@ -153,7 +153,7 @@ impl SandboxClient for HttpSandbox {
             .entry("env".to_string())
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
         let env_obj = env_val.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!("sandbox start: canonical.payload.env must be a JSON object")
+            anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
         })?;
         env_obj.insert(
             "ATTESTOR_URL".into(),
@@ -176,32 +176,101 @@ impl SandboxClient for HttpSandbox {
             .json(&body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("sandbox start: http send: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: http send: {e}"))?;
 
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("sandbox start: {status} — {body}");
+            anyhow::bail!("sandbox create: {status} — {body}");
         }
 
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
-        // for later /restart /stop envelopes. Unknown fields are ignored so
+        // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
         let body = res.text().await.unwrap_or_default();
         let parsed: SandboxCreateResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("sandbox start: parse response: {e} — body={body}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e} — body={body}"))?;
         tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
         Ok(parsed)
     }
 
-    async fn restart(&self, seal_id: SealId) -> anyhow::Result<()> {
-        // TODO: requires a fresh user-signed envelope with
-        //       `resource_id = <sandbox-id>`. See trait doc.
-        anyhow::bail!("HttpSandbox::restart not yet wired (need envelope path): seal={seal_id:?}");
+    async fn start(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()> {
+        self.lifecycle_call(seal_id, envelope, "start").await
     }
 
-    async fn stop(&self, seal_id: SealId) -> anyhow::Result<()> {
-        anyhow::bail!("HttpSandbox::stop not yet wired (need envelope path): seal={seal_id:?}");
+    async fn stop(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+    ) -> anyhow::Result<()> {
+        self.lifecycle_call(seal_id, envelope, "stop").await
+    }
+}
+
+impl HttpSandbox {
+    /// Shared body for `start` and `stop` — both use
+    /// `POST /api/sandbox/:id/<verb>` with empty body + 3 X- headers; the
+    /// only difference is the verb in the path. Sandbox-id is read from
+    /// the envelope's `canonical.resource_id` field (owner signs it
+    /// committing to a specific sandbox).
+    async fn lifecycle_call(
+        &self,
+        seal_id: SealId,
+        envelope: &SandboxEnvelope,
+        verb: &str,
+    ) -> anyhow::Result<()> {
+        let msg_bytes = base64::engine::general_purpose::STANDARD
+            .decode(envelope.signed_message_b64.as_bytes())
+            .map_err(|e| anyhow::anyhow!("sandbox {verb}: base64 decode: {e}"))?;
+        let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
+            .map_err(|e| anyhow::anyhow!("sandbox {verb}: parse canonical JSON: {e}"))?;
+        if canonical.resource_id.is_empty() {
+            anyhow::bail!("sandbox {verb}: envelope.resource_id (sandbox_id) must be non-empty");
+        }
+        if canonical.action != verb {
+            anyhow::bail!(
+                "sandbox {verb}: envelope.action mismatch — got {:?}, want {:?}",
+                canonical.action,
+                verb
+            );
+        }
+
+        let url = format!(
+            "{}/api/sandbox/{}/{}",
+            self.base_url.trim_end_matches('/'),
+            canonical.resource_id,
+            verb
+        );
+        let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
+        let addr_hex = format!("{:#x}", envelope.wallet_address);
+
+        // Forward `canonical.payload` as the request body so that fields
+        // like `payload.env` survive the round trip. The 0g-sandbox start
+        // path drops the original container's env on stop, so the owner
+        // re-supplies `API_KEY` (cached client-side) on each start.
+        let res = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("X-Wallet-Address", addr_hex)
+            .header("X-Signed-Message", &envelope.signed_message_b64)
+            .header("X-Wallet-Signature", sig_hex)
+            .json(&canonical.payload)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("sandbox {verb} POST {url}: {e}"))?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("sandbox {verb}: {status} — {body}");
+        }
+        tracing::info!(?seal_id, sandbox_id = %canonical.resource_id, %verb, "sandbox: lifecycle ok");
+        Ok(())
     }
 }
 
