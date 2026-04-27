@@ -109,6 +109,8 @@ pub async fn handle(
         container_stage: StageStatus::NotStarted,
         sandbox_id: None,
         provisioned_at: None,
+        container_pubkey: None,
+        container_pubkey_mac: None,
         created_at: now,
         updated_at: now,
     };

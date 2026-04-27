@@ -59,6 +59,14 @@ pub trait CryptoModule: Send + Sync {
     fn random_key_32(&self) -> [u8; 32];
     fn keccak256(&self, data: &[u8]) -> [u8; 32];
 
+    /// HMAC-SHA256 over `data` with a binding key derived per `info` from
+    /// the attestor master secret via HKDF (`HKDF(master, info) → key`,
+    /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
+    /// separator string so the same master secret can back independent
+    /// MACs (`"agentic-id.container-pubkey-binding.v1"` etc.) without
+    /// cross-protocol attacks.
+    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
+
     /// Recover signer from (eth personal_sign digest, 65-byte signature).
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address>;
 }
@@ -131,6 +139,17 @@ pub trait DeploymentRepo: Send + Sync {
 
     /// Persist 0g-sandbox's resource id after container track submits.
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
+
+    /// Persist the container's `(pubkey, mac)` pair on first /provision.
+    /// `mac` is `HMAC(binding_key, seal_id || pubkey)` — the binding_key
+    /// lives only in attestor memory (HKDF from master secret), so DB
+    /// tampering is detectable at verify time.
+    async fn set_container_binding(
+        &self,
+        seal_id: SealId,
+        pubkey: Vec<u8>,
+        mac: Vec<u8>,
+    ) -> anyhow::Result<()>;
 
     /// Stamp the deployment row when `POST /provision` succeeds — proves
     /// the container authenticated via sandbox attestation and received

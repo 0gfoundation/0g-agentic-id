@@ -247,6 +247,20 @@ pub struct Deployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioned_at: Option<DateTime<Utc>>,
 
+    /// Container's secp256k1 pubkey (33-byte compressed) recorded on the
+    /// first successful `/provision`. Subsequent /provision calls bypass the
+    /// freshness window when the request's pubkey matches and the MAC
+    /// verifies — see `container_pubkey_mac`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_pubkey: Option<alloy::primitives::Bytes>,
+
+    /// HMAC over `seal_id || container_pubkey` using a binding key derived
+    /// from the attestor master secret. DB is considered untrusted; this MAC
+    /// is what makes the binding tamper-evident — an attacker with DB write
+    /// access can't forge `(container_pubkey, mac)` without the binding key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

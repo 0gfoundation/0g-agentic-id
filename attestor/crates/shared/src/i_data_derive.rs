@@ -205,7 +205,7 @@ mod tests {
         assert_eq!(inf.model.as_deref(), Some("custom-llm"), "user model wins");
         assert_eq!(
             inf.provider.as_deref(),
-            Some("0g-compute"),
+            Some("anthropic"),
             "default provider inherited"
         );
         assert!(cfg.persona.unwrap().system_prompt.is_some());
@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(cfg.framework.unwrap().name.as_deref(), Some("langchain"));
         assert_eq!(
             cfg.inference.unwrap().provider.as_deref(),
-            Some("0g-compute"),
+            Some("anthropic"),
             "fallback OpenClaw default used"
         );
     }

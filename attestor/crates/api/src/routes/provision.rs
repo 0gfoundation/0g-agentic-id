@@ -27,6 +27,11 @@ const ATTESTATION_FRESHNESS_SECS: u64 = 300;
 /// Required length of the compressed secp256k1 pubkey in `container_pubkey`.
 const COMPRESSED_PUBKEY_LEN: usize = 33;
 
+/// Domain-separation tag for the container-pubkey HMAC binding. Bumping the
+/// `.v1` suffix invalidates all previous bindings — current containers
+/// would fall back through the freshness path on next /provision.
+const BINDING_INFO: &[u8] = b"agentic-id.container-pubkey-binding.v1";
+
 pub async fn handle(
     State(state): State<AppState>,
     Json(req): Json<ProvisionRequest>,
@@ -75,13 +80,53 @@ pub async fn handle(
         return Err(ApiError::unauthorized("image_hash not in validFrameworkHashes"));
     }
 
-    // 5. ts freshness. `abs_diff` handles both future- and past-skew.
-    let now_secs = Utc::now().timestamp().max(0) as u64;
-    let skew = now_secs.abs_diff(req.issued_at);
-    if skew > ATTESTATION_FRESHNESS_SECS {
-        return Err(ApiError::unauthorized(format!(
-            "sandbox attestation stale (|now - issued_at| = {skew}s > {ATTESTATION_FRESHNESS_SECS}s)"
-        )));
+    // 5. Freshness OR pubkey-binding (whichever passes — see module docs).
+    //
+    //    Sandbox-signed envelopes carry an `issued_at` timestamp; the 5-minute
+    //    window prevents an attacker from replaying an old envelope. But once
+    //    we've seen this seal_id's container before, we have a stronger
+    //    anchor: we recorded its pubkey + an HMAC over `seal_id || pubkey`.
+    //    On restart Daytona reuses the same SANDBOX_SEAL_KEY, so the new
+    //    /provision request's pubkey matches the stored one. The MAC defends
+    //    against DB tampering: an attacker who can write to the DB but
+    //    doesn't have the attestor master secret can't forge a valid
+    //    (pubkey, mac) pair, so any tampered binding fails verification and
+    //    we fall back to the freshness check.
+    let stored = state
+        .deployments
+        .get(req.seal_id)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let binding_valid = stored.as_ref().is_some_and(|d| {
+        match (&d.container_pubkey, &d.container_pubkey_mac) {
+            (Some(pk), Some(mac)) if pk.as_ref() == req.container_pubkey.as_ref() => {
+                let mut data = Vec::with_capacity(32 + pk.len());
+                data.extend_from_slice(req.seal_id.as_slice());
+                data.extend_from_slice(pk.as_ref());
+                let expected = state.crypto.hmac_binding(BINDING_INFO, &data);
+                // Constant-time equality to avoid timing leaks. Both sides
+                // are 32-byte HMAC tags so the length check is trivial.
+                use subtle::ConstantTimeEq;
+                mac.as_ref().len() == expected.len()
+                    && mac.as_ref().ct_eq(&expected).into()
+            }
+            _ => false,
+        }
+    });
+
+    if binding_valid {
+        tracing::info!(
+            seal_id = ?req.seal_id,
+            "provision: pubkey binding verified, skipping freshness window"
+        );
+    } else {
+        let now_secs = Utc::now().timestamp().max(0) as u64;
+        let skew = now_secs.abs_diff(req.issued_at);
+        if skew > ATTESTATION_FRESHNESS_SECS {
+            return Err(ApiError::unauthorized(format!(
+                "sandbox attestation stale (|now - issued_at| = {skew}s > {ATTESTATION_FRESHNESS_SECS}s)"
+            )));
+        }
     }
 
     // 6. Derive agentSeal_priv + ECIES-encrypt to the sandbox-signed pubkey.
@@ -105,6 +150,31 @@ pub async fn handle(
         // Not fatal — the container has its key either way. Log so ops can
         // notice persistent write failures.
         tracing::warn!(seal_id = ?req.seal_id, error = %e, "mark_provisioned failed");
+    }
+
+    // 8. First-time binding: compute the MAC and persist (pubkey, mac) so
+    //    future restarts of this container can short-circuit step 5.
+    //    `binding_valid` already guarantees we don't need to write again.
+    if !binding_valid {
+        let mut data = Vec::with_capacity(32 + req.container_pubkey.len());
+        data.extend_from_slice(req.seal_id.as_slice());
+        data.extend_from_slice(req.container_pubkey.as_ref());
+        let mac = state.crypto.hmac_binding(BINDING_INFO, &data);
+        if let Err(e) = state
+            .deployments
+            .set_container_binding(
+                req.seal_id,
+                req.container_pubkey.to_vec(),
+                mac.to_vec(),
+            )
+            .await
+        {
+            tracing::warn!(
+                seal_id = ?req.seal_id,
+                error = %e,
+                "set_container_binding failed; future restarts will fall back to freshness"
+            );
+        }
     }
 
     Ok(Json(ProvisionResponse {

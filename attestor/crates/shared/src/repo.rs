@@ -86,6 +86,8 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let container_stage: serde_json::Value = row.try_get("container_stage")?;
     let sandbox_id: Option<String> = row.try_get("sandbox_id")?;
     let provisioned_at: Option<DateTime<Utc>> = row.try_get("provisioned_at")?;
+    let container_pubkey_bytes: Option<Vec<u8>> = row.try_get("container_pubkey")?;
+    let container_pubkey_mac_bytes: Option<Vec<u8>> = row.try_get("container_pubkey_mac")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -118,6 +120,8 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         container_stage,
         sandbox_id,
         provisioned_at,
+        container_pubkey: container_pubkey_bytes.map(alloy::primitives::Bytes::from),
+        container_pubkey_mac: container_pubkey_mac_bytes.map(alloy::primitives::Bytes::from),
         created_at,
         updated_at,
     })
@@ -222,6 +226,25 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             "UPDATE deployments SET sandbox_id = $1, updated_at = now() WHERE seal_id = $2",
         )
         .bind(&sandbox_id)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_container_binding(
+        &self,
+        seal_id: SealId,
+        pubkey: Vec<u8>,
+        mac: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments
+             SET container_pubkey = $1, container_pubkey_mac = $2, updated_at = now()
+             WHERE seal_id = $3",
+        )
+        .bind(&pubkey)
+        .bind(&mac)
         .bind(seal_id.as_slice())
         .execute(&self.pool)
         .await?;

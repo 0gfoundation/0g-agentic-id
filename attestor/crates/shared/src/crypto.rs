@@ -16,6 +16,7 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use alloy::primitives::{keccak256, Address};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
 use rand::{thread_rng, RngCore};
 use sha2::Sha256;
@@ -137,6 +138,26 @@ impl CryptoModule for RealCrypto {
 
     fn keccak256(&self, data: &[u8]) -> [u8; 32] {
         keccak256(data).0
+    }
+
+    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32] {
+        // HKDF-derive a per-info binding key from the master secret, then
+        // HMAC-SHA256 the data with it. Domain separation lives in `info`
+        // (e.g. `"agentic-id.container-pubkey-binding.v1"`).
+        let master = self.master.master_key();
+        let hkdf = Hkdf::<Sha256>::new(None, &master);
+        let mut binding_key = [0u8; 32];
+        hkdf.expand(info, &mut binding_key)
+            .expect("HKDF-SHA256 expand to 32 bytes is infallible");
+
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&binding_key)
+            .expect("HMAC-SHA256 accepts any key length");
+        mac.update(data);
+        let tag = mac.finalize().into_bytes();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&tag);
+        out
     }
 
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {

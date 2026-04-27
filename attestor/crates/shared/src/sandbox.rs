@@ -248,18 +248,13 @@ impl HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
 
-        // Forward `canonical.payload` as the request body so that fields
-        // like `payload.env` survive the round trip. The 0g-sandbox start
-        // path drops the original container's env on stop, so the owner
-        // re-supplies `API_KEY` (cached client-side) on each start.
         let res = self
             .http
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header("Content-Length", "0")
             .header("X-Wallet-Address", addr_hex)
             .header("X-Signed-Message", &envelope.signed_message_b64)
             .header("X-Wallet-Signature", sig_hex)
-            .json(&canonical.payload)
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("sandbox {verb} POST {url}: {e}"))?;

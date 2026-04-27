@@ -43,21 +43,28 @@ body{font-family:var(--sans);font-size:14px;line-height:1.6;color:var(--text);ba
 a{color:inherit;text-decoration:none}
 
 /* ── Topbar ─────────────────────────────────────────────────────── */
-.topbar{height:56px;display:flex;align-items:center;padding:0 clamp(16px,4vw,48px);position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border);background:oklch(97.5% 0.003 275 / 0.92);backdrop-filter:blur(16px)}
-.logo{display:flex;align-items:center;gap:10px;font-weight:600;font-size:14px;letter-spacing:-.02em;color:var(--text);cursor:pointer}
-.logo-sep{color:var(--border);margin:0 2px;font-weight:300;font-size:16px}
-.logo-sub{font-size:11px;color:var(--muted);font-weight:400}
-.nav{display:flex;gap:2px;margin-left:24px}
-.nav a{padding:5px 12px;font-size:13px;font-weight:500;color:var(--muted);border-radius:var(--r-sm);transition:color var(--t-fast),background var(--t-fast)}
+.topbar{height:60px;display:flex;align-items:center;gap:14px;padding:0 clamp(16px,4vw,48px);position:sticky;top:0;z-index:100;border-bottom:1px solid var(--border);background:oklch(97.5% 0.003 275 / 0.85);backdrop-filter:blur(16px) saturate(180%);-webkit-backdrop-filter:blur(16px) saturate(180%)}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:14.5px;letter-spacing:-.015em;color:var(--text);cursor:pointer;transition:opacity var(--t-fast)}
+.logo:hover{opacity:.75}
+.logo-mark{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,var(--p) 0%,oklch(58% 0.22 280) 100%);display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:800;letter-spacing:-.04em;box-shadow:0 1px 6px oklch(50% 0.22 315 / 0.32);flex-shrink:0}
+.logo-text{display:flex;align-items:baseline;gap:6px}
+.logo-text .brand-1{color:var(--text)}
+.logo-text .brand-2{color:var(--muted);font-weight:500}
+.nav{display:flex;gap:2px;margin-left:14px}
+.nav a{padding:6px 14px;font-size:13px;font-weight:600;color:var(--muted);border-radius:var(--r-sm);transition:color var(--t-fast),background var(--t-fast)}
 .nav a:hover{color:var(--text);background:var(--surf2)}
 .nav a.active{color:var(--p);background:var(--pbg)}
-.topbar-right{margin-left:auto;display:flex;align-items:center;gap:10px}
-.chain-tag{display:flex;align-items:center;gap:5px;background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;font-family:var(--mono)}
-.dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px var(--green)}
-.btn-connect{background:var(--p);color:oklch(99% 0 0);border:none;border-radius:var(--r-sm);padding:6px 16px;font-size:12px;font-weight:700;cursor:pointer;font-family:var(--sans);letter-spacing:-.01em;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring)}
-.btn-connect:hover{background:var(--pd);transform:translateY(-1px)}
-.addr-chip{background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:var(--r-sm);padding:4px 11px;font-size:11px;font-family:var(--mono);cursor:pointer;user-select:none;transition:background var(--t-fast);position:relative}
-.addr-chip:hover{background:var(--surf2)}
+.topbar-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.chain-tag{display:inline-flex;align-items:center;gap:6px;background:var(--gbg);color:var(--green);border:1px solid var(--gbd);border-radius:9999px;padding:4px 12px;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-family:var(--mono)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px var(--green);animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+.btn-connect{background:var(--p);color:oklch(99% 0 0);border:1px solid var(--p);border-radius:var(--r-sm);padding:7px 16px;font-size:12.5px;font-weight:700;cursor:pointer;font-family:var(--sans);letter-spacing:-.005em;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring),box-shadow var(--t-fast);white-space:nowrap}
+.btn-connect:hover{background:var(--pd);border-color:var(--pd);transform:translateY(-1px);box-shadow:0 3px 12px oklch(50% 0.22 315 / 0.28)}
+.btn-connect.ghost{background:var(--surf);color:var(--text);border-color:var(--border);box-shadow:none}
+.btn-connect.ghost:hover{background:var(--surf2);border-color:var(--surf3);color:var(--text);box-shadow:var(--sh-sm)}
+.addr-chip{display:inline-flex;align-items:center;gap:6px;background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 11px;font-size:11.5px;font-family:var(--mono);font-weight:600;cursor:pointer;user-select:none;transition:background var(--t-fast),border-color var(--t-fast);position:relative}
+.addr-chip::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);flex-shrink:0}
+.addr-chip:hover{background:var(--surf2);border-color:var(--surf3)}
 .wallet-pop{position:absolute;top:calc(100% + 6px);right:0;background:var(--surf);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-lg);padding:6px;z-index:200;min-width:180px;display:none;animation:fadeIn var(--t-fast) var(--ease-out)}
 .wallet-pop.open{display:block}
 .wallet-pop button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:7px 10px;background:none;border:none;border-radius:var(--r-sm);color:var(--text);font:inherit;font-family:var(--sans);font-size:13px;cursor:pointer;transition:background var(--t-fast)}
@@ -74,15 +81,19 @@ a{color:inherit;text-decoration:none}
 @keyframes slideIn{from{transform:translateX(20px);opacity:0}to{transform:translateX(0);opacity:1}}
 
 /* ── Layout / Cards ─────────────────────────────────────────────── */
-.main{max-width:880px;margin:0 auto;padding:clamp(20px,4vw,48px) clamp(16px,4vw,48px) 60px}
+.main{max-width:1100px;margin:0 auto;padding:clamp(20px,4vw,48px) clamp(16px,4vw,48px) 60px}
 .view{display:none}
 .view.active{display:block;animation:fadeIn var(--t-base) var(--ease-out)}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 
-.hero{margin-bottom:28px}
+.hero{margin-bottom:24px}
 .hero h1{font-size:clamp(22px,3.5vw,30px);font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
-.hero p{color:var(--text2);font-size:14px}
+.hero p{color:var(--text2);font-size:14px;max-width:680px}
 .hero.center{text-align:center}
+.hero.center p{margin:0 auto}
+.hero.compact{margin-bottom:14px}
+.hero.compact h1{font-size:clamp(20px,2.8vw,26px);margin-bottom:4px}
+.hero.compact p{font-size:13px;color:var(--muted)}
 
 .card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px clamp(20px,3vw,28px);box-shadow:var(--sh-sm);margin-bottom:16px}
 .card h2{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;margin-bottom:14px;font-family:var(--mono)}
@@ -142,23 +153,59 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
 .chip-failed{background:var(--rbg);color:var(--red);border-color:var(--rbd)}
 
 /* ── My Agents list ─────────────────────────────────────────────── */
-.list-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}
-.list-toolbar .count{color:var(--muted);font-size:13px;font-family:var(--mono)}
-.list-toolbar [data-filter]{padding:5px 14px;font-size:12px}
-.list-toolbar [data-filter].on{background:var(--p);color:oklch(99% 0 0);border-color:var(--p)}
-.list-toolbar [data-filter]:disabled{opacity:.45;cursor:not-allowed}
-.agent-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px}
-.agent-card{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px 18px;cursor:pointer;transition:border-color var(--t-fast),transform var(--t-fast),box-shadow var(--t-fast);display:flex;flex-direction:column;gap:10px}
-.agent-card:hover{border-color:var(--surf3);transform:translateY(-2px);box-shadow:var(--sh-sm)}
-.agent-card .row1{display:flex;align-items:center;gap:10px}
-.agent-card .avatar{width:38px;height:38px;border-radius:50%;object-fit:cover;background:var(--surf2);border:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--muted)}
-.agent-card .body{flex:1;min-width:0}
-.agent-card .name{font-weight:600;font-size:14px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.agent-card .desc{font-size:12px;color:var(--muted);margin-top:1px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical;overflow:hidden}
-.agent-card .row2{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.agent-card .row2 .meta-text{font-family:var(--mono);font-size:10px;color:var(--muted);margin-left:auto}
-.empty{text-align:center;padding:60px 20px;color:var(--muted)}
+.list-toolbar{display:flex;align-items:center;gap:12px;margin-bottom:18px;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--border)}
+.list-toolbar .count{color:var(--muted);font-size:12px;font-family:var(--mono);letter-spacing:.04em;text-transform:uppercase;font-weight:600}
+.filter-group{display:inline-flex;background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:3px;gap:2px}
+.filter-group [data-filter]{padding:5px 16px;font-size:12px;font-weight:600;background:transparent;border:none;color:var(--muted);border-radius:9999px;cursor:pointer;transition:color var(--t-fast),background var(--t-fast);font-family:var(--sans)}
+.filter-group [data-filter]:hover:not(:disabled):not(.on){color:var(--text)}
+.filter-group [data-filter].on{background:var(--surf);color:var(--p);box-shadow:var(--sh-sm)}
+.filter-group [data-filter]:disabled{opacity:.4;cursor:not-allowed}
+/* ── Agent table (Discovery) ───────────────────────────────────── */
+.agent-table{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
+.agent-row{display:grid;grid-template-columns:minmax(0,1.5fr) 130px 130px minmax(0,1fr) 100px;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);transition:background var(--t-fast)}
+.agent-row:last-child{border-bottom:none}
+.agent-row.head{padding:10px 18px;font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);background:var(--surf2);border-bottom:1px solid var(--border)}
+.agent-row.body{cursor:pointer}
+.agent-row.body:hover{background:var(--surf2)}
+.agent-row .col-name{display:flex;align-items:center;gap:12px;min-width:0}
+.agent-row .col-name .avatar{width:34px;height:34px;border-radius:var(--r-sm);background:var(--surf2);border:1px solid var(--border);flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--muted);image-rendering:pixelated;overflow:hidden}
+.agent-row .col-name .avatar img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated}
+.agent-row .col-name .name-block{min-width:0;display:flex;flex-direction:column;gap:1px}
+.agent-row .col-name .name-line{display:flex;align-items:center;gap:8px;min-width:0}
+.agent-row .col-name .name{font-weight:600;font-size:14px;letter-spacing:-.005em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.agent-row .col-name .id-tag{font-family:var(--mono);font-size:11px;color:var(--muted);font-weight:500;flex-shrink:0}
+.agent-row .col-name .desc{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;line-height:1.4}
+.agent-row .col-chain{display:inline-flex;align-items:center;gap:5px;background:oklch(96% 0.06 75);color:oklch(45% 0.16 70);border:1px solid oklch(86% 0.10 75);border-radius:9999px;padding:3px 9px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;font-family:var(--mono);width:fit-content}
+.agent-row .col-status{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--text2)}
+.agent-row .col-status .status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.agent-row .col-status.s-running{color:var(--green)}
+.agent-row .col-status.s-running .status-dot{background:var(--green);box-shadow:0 0 5px var(--green)}
+.agent-row .col-status.s-stopped{color:var(--text2)}
+.agent-row .col-status.s-stopped .status-dot{background:var(--muted)}
+.agent-row .col-status.s-failed{color:var(--red)}
+.agent-row .col-status.s-failed .status-dot{background:var(--red)}
+.agent-row .col-status.s-pending,.agent-row .col-status.s-deploying,.agent-row .col-status.s-ready{color:var(--orange)}
+.agent-row .col-status.s-pending .status-dot,.agent-row .col-status.s-deploying .status-dot,.agent-row .col-status.s-ready .status-dot{background:var(--orange);animation:pulse 2s ease-in-out infinite}
+.agent-row .col-owner{font-family:var(--mono);font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.agent-row .col-created{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap}
+@media(max-width:720px){
+  .agent-row{grid-template-columns:minmax(0,1fr) auto;gap:8px}
+  .agent-row.head .col-chain,.agent-row.head .col-status,.agent-row.head .col-owner{display:none}
+  .agent-row.body .col-chain,.agent-row.body .col-status,.agent-row.body .col-owner{grid-column:1 / -1;font-size:11px;padding-left:46px}
+}
+
+/* ── Search + sort toolbar ────────────────────────────────────── */
+.search-wrap{position:relative;flex:1;min-width:0}
+.search-wrap input{padding-left:36px;font-size:13px}
+.search-wrap::before{content:'🔎';position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;opacity:.5;pointer-events:none}
+.sort-select{font:inherit;font-family:var(--sans);font-size:12px;font-weight:600;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 28px 8px 12px;color:var(--text2);cursor:pointer;appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><path fill="none" stroke="%2370708a" stroke-width="1.5" stroke-linecap="round" d="M2 4l3 3 3-3"/></svg>');background-repeat:no-repeat;background-position:right 10px center}
+.sort-select:hover{border-color:var(--surf3);background-color:var(--surf2)}
+.activity-line{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:14px}
+.activity-line .activity-dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);animation:pulse 2.4s ease-in-out infinite}
+.empty{text-align:center;padding:80px 20px;color:var(--muted);background:var(--surf);border:1px dashed var(--border);border-radius:var(--r-lg)}
+.empty h2{font-size:16px;font-weight:600;color:var(--text);letter-spacing:-.01em}
 .empty p{margin-top:8px;font-size:13px}
+.empty .btn{margin-top:18px}
 
 /* ── Deploy progress: vertical task list with spinner ─────────── */
 .seal-row{display:flex;align-items:center;gap:8px;font-size:12px;font-family:var(--mono);color:var(--text2);margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid var(--border);flex-wrap:wrap}
@@ -225,20 +272,51 @@ details.log[open] summary{color:var(--text2)}
 .ev-row.fail .type{color:var(--red)}
 
 /* ── Detail page (8004scan-style hero) ──────────────────────────── */
-.agent-hero{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:36px 28px 28px;margin-bottom:18px;box-shadow:var(--sh-sm);text-align:center}
-.agent-avatar{width:88px;height:88px;border-radius:50%;object-fit:cover;border:2px solid var(--border);background:var(--surf2);margin:0 auto 14px;display:block}
-.agent-name{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-bottom:6px}
-.agent-desc{color:var(--text2);font-size:14px;max-width:520px;margin:0 auto 14px}
-.agent-chips{display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+/* ── Detail hero (horizontal) ─────────────────────────────────── */
+.detail-hero{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px 26px;margin-bottom:14px;box-shadow:var(--sh-sm);display:grid;grid-template-columns:auto 1fr auto;gap:22px;align-items:flex-start}
+.detail-hero .avatar-big{width:80px;height:80px;border-radius:var(--r-lg);object-fit:cover;border:1px solid var(--border);background:var(--surf2);image-rendering:pixelated;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:34px;color:var(--muted);overflow:hidden}
+.detail-hero .avatar-big img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated}
+.detail-hero .info{min-width:0;display:flex;flex-direction:column;gap:6px}
+.detail-hero .info .chain-pill{display:inline-flex;align-items:center;gap:5px;background:oklch(96% 0.06 75);color:oklch(45% 0.16 70);border:1px solid oklch(86% 0.10 75);border-radius:9999px;padding:3px 10px;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;font-family:var(--mono);width:fit-content}
+.detail-hero .info .name-big{font-size:24px;font-weight:700;letter-spacing:-.02em;line-height:1.2;color:var(--text);word-break:break-word}
+.detail-hero .info .desc{color:var(--text2);font-size:13.5px;line-height:1.55;max-width:560px}
+.detail-hero .info .meta{display:flex;align-items:center;gap:14px;margin-top:4px;font-size:11.5px;color:var(--muted);font-family:var(--mono);flex-wrap:wrap}
+.detail-hero .info .meta .meta-item{display:inline-flex;align-items:center;gap:4px}
+.detail-hero .actions{display:flex;flex-direction:column;gap:6px;align-items:flex-end;flex-shrink:0}
+@media(max-width:720px){
+  .detail-hero{grid-template-columns:auto 1fr;gap:14px}
+  .detail-hero .actions{grid-column:1 / -1;flex-direction:row;justify-content:flex-start;flex-wrap:wrap}
+}
 
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-top:18px}
-.stat-cell{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px 14px;text-align:left}
-.stat-cell .lbl{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
-.stat-cell .val{font-family:var(--mono);font-size:13px;color:var(--text);word-break:break-all;margin-top:3px}
-.stat-cell .val.copy{cursor:pointer;transition:color var(--t-fast)}
-.stat-cell .val.copy:hover{color:var(--p)}
-.stat-cell .val a{color:var(--p)}
-.stat-cell .val a:hover{text-decoration:underline}
+/* Status pill row below the hero (e.g. ✓ Active, ○ Reputation) */
+.detail-status-row{display:flex;align-items:center;gap:8px;margin-bottom:18px;flex-wrap:wrap}
+.status-pill{display:inline-flex;align-items:center;gap:5px;border-radius:9999px;padding:4px 11px;font-size:11px;font-weight:600;font-family:var(--mono);letter-spacing:.03em;text-transform:capitalize}
+.status-pill.solid-green{background:var(--gbg);color:var(--green);border:1px solid var(--gbd)}
+.status-pill.solid-red{background:var(--rbg);color:var(--red);border:1px solid var(--rbd)}
+.status-pill.solid-orange{background:var(--obg);color:var(--orange);border:1px solid var(--obd)}
+.status-pill.solid-gray{background:var(--surf2);color:var(--text2);border:1px solid var(--border)}
+.status-pill.outline{background:var(--surf);color:var(--text2);border:1px dashed var(--border)}
+
+/* ── Detail two-column grid ──────────────────────────────────── */
+.detail-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:18px;align-items:start}
+@media(max-width:880px){.detail-grid{grid-template-columns:minmax(0,1fr)}}
+
+/* Right-column sidebar groups ─ "📄 CONTRACT STATE" pattern */
+.sidebar-stack{display:flex;flex-direction:column;gap:14px}
+.sidebar-group{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:16px 18px;box-shadow:var(--sh-sm)}
+.sidebar-group .group-title{display:flex;align-items:center;gap:7px;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:700;font-family:var(--mono);margin-bottom:12px;padding-bottom:10px;border-bottom:1px solid var(--border)}
+.sidebar-group .group-title .icon{font-size:13px;opacity:.7}
+.sidebar-group .kv-row{display:grid;grid-template-columns:90px 1fr auto;gap:10px;align-items:center;padding:6px 0;font-size:12px;line-height:1.4}
+.sidebar-group .kv-row + .kv-row{border-top:1px dashed var(--border)}
+.sidebar-group .kv-row .k{color:var(--muted);text-transform:uppercase;font-size:10px;letter-spacing:.06em;font-weight:600;font-family:var(--mono)}
+.sidebar-group .kv-row .v{font-family:var(--mono);font-size:12px;color:var(--text);text-align:right;word-break:break-all;min-width:0}
+.sidebar-group .kv-row .v.full{text-align:left;font-size:11px;line-height:1.6;grid-column:1 / -1;padding-top:4px;color:var(--text2)}
+.sidebar-group .kv-row .icons{display:inline-flex;gap:4px}
+.sidebar-group .kv-row .icon-action{cursor:pointer;color:var(--muted);background:none;border:none;padding:2px 4px;border-radius:4px;font-size:11px;line-height:1;transition:background var(--t-fast),color var(--t-fast)}
+.sidebar-group .kv-row .icon-action:hover{background:var(--surf2);color:var(--p)}
+
+/* Legacy classes still referenced elsewhere (chip styles etc) */
+.agent-chips{display:flex;gap:8px;flex-wrap:wrap}
 
 /* A2A — interactive "say hi" card */
 .a2a-card{background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:16px 18px;margin-bottom:18px;box-shadow:var(--sh-sm)}
@@ -256,10 +334,6 @@ details.log[open] summary{color:var(--text2)}
 .icon-btn:hover{background:var(--surf3);color:var(--text)}
 .icon-btn.primary{background:var(--p);color:oklch(99% 0 0);border-color:var(--p)}
 .icon-btn.primary:hover{background:var(--pd);color:oklch(99% 0 0)}
-
-/* Owner action row inside hero */
-.hero-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:14px;padding-top:14px;border-top:1px dashed var(--border)}
-.hero-actions-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);width:100%;text-align:center}
 
 .section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:18px 0 10px}
 
@@ -293,16 +367,15 @@ details.log[open] summary{color:var(--text2)}
 <!-- ── Topbar ────────────────────────────────────────────────────── -->
 <div class="topbar">
   <div class="logo" onclick="navigate('#/')">
-    0G <span class="logo-sep">/</span> AgenticID
-    <span class="logo-sub">discovery</span>
+    <span class="logo-mark">0G</span>
+    <span class="logo-text"><span class="brand-1">AgenticID</span></span>
   </div>
   <nav class="nav">
-    <a href="#/" data-route="discovery">Discovery</a>
+    <a href="#/" data-route="discovery">Agents</a>
   </nav>
   <div class="topbar-right">
     <span class="chain-tag"><span class="dot"></span>0G testnet</span>
-    <button class="btn-connect" id="topDeployBtn" onclick="navigate('#/deploy')">+ Deploy agent</button>
-    <button class="btn-connect" id="connectBtn" onclick="connectWallet()" style="background:var(--surf);color:var(--text);border:1px solid var(--border)">Connect Wallet</button>
+    <button class="btn-connect ghost" id="connectBtn" onclick="connectWallet()">Connect Wallet</button>
     <span class="addr-chip" id="addrChip" style="display:none" onclick="event.stopPropagation();toggleWalletPop()">
       <span id="addrChipText"></span>
       <span class="wallet-pop" id="walletPop" onclick="event.stopPropagation()">
@@ -311,6 +384,7 @@ details.log[open] summary{color:var(--text2)}
         <button class="danger" onclick="disconnectWallet()">⏻ Disconnect</button>
       </span>
     </span>
+    <button class="btn-connect" id="topDeployBtn" onclick="navigate('#/deploy')">+ Deploy agent</button>
   </div>
 </div>
 
@@ -332,18 +406,29 @@ details.log[open] summary{color:var(--text2)}
   <!-- VIEW: Discovery ───────────────────────────────────────────── -->
   <div class="view" id="viewDiscovery">
     <div class="hero">
-      <h1>Discover Agents</h1>
-      <p>Every agent deployed through this attestor — public AgentCards, click any to inspect.</p>
+      <h1>Agent Registry</h1>
+      <p>Discover and explore agents deployed through this attestor on the AgenticID registry.</p>
+    </div>
+    <div class="activity-line" id="activityLine" style="display:none">
+      <span class="activity-dot"></span>
+      <span id="activityText"></span>
     </div>
     <div class="list-toolbar">
-      <span class="count" id="agentCount"></span>
-      <div style="display:flex;gap:6px;margin-left:8px" id="discoveryFilter">
-        <button class="btn btn-ghost" data-filter="all" onclick="setDiscoveryFilter('all')">All</button>
-        <button class="btn btn-ghost" data-filter="mine" onclick="setDiscoveryFilter('mine')" disabled title="Connect wallet">Mine</button>
+      <div class="search-wrap">
+        <input id="agentSearch" type="text" placeholder="Search by name, description, or address" oninput="filterDiscovery()" />
       </div>
-      <button class="btn btn-ghost" onclick="loadDiscovery()" style="margin-left:auto">Refresh</button>
+      <select class="sort-select" id="agentSort" onchange="filterDiscovery()">
+        <option value="newest">Newest</option>
+        <option value="oldest">Oldest</option>
+      </select>
+      <div class="filter-group" id="discoveryFilter">
+        <button data-filter="all" onclick="setDiscoveryFilter('all')">All</button>
+        <button data-filter="mine" onclick="setDiscoveryFilter('mine')" disabled title="Connect wallet">Mine</button>
+      </div>
+      <button class="btn btn-ghost" onclick="loadDiscovery()" style="font-size:12px;padding:6px 14px">⟳ Refresh</button>
     </div>
-    <div class="agent-list" id="agentList"></div>
+    <div class="agent-table" id="agentList"></div>
+    <div class="count" id="agentCount" style="text-align:center;margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em"></div>
   </div>
 
   <!-- VIEW: Deploy ─────────────────────────────────────────────── -->
@@ -463,7 +548,7 @@ details.log[open] summary{color:var(--text2)}
 
   <!-- VIEW: Detail ──────────────────────────────────────────────── -->
   <div class="view" id="viewDetail">
-    <a href="#/" style="color:var(--muted);font-size:13px;display:inline-block;margin-bottom:14px">← Back to Discovery</a>
+    <a href="#/" style="color:var(--muted);font-size:13px;display:inline-block;margin-bottom:14px">← Back to Agents</a>
     <div id="detailContent"></div>
   </div>
 
@@ -481,12 +566,15 @@ details.log[open] summary{color:var(--text2)}
 const State = {
   signer: null,
   ownerAddr: null,
+  rawProvider: null,    // EIP-1193 provider, kept so we can re-subscribe / re-getSigner on accountsChanged
+  browserProvider: null,// ethers BrowserProvider wrapping rawProvider
   config: null,         // /config response
   ws: null,             // current WS subscription
   detailWs: null,       // separate WS for detail-page live updates
   deployingSealId: null,
   deployAvatarDataUrl: null,  // user-uploaded avatar, populated by handleAvatarFile
   discoveryFilter: 'all',  // 'all' | 'mine'
+  discoveryItems: [],  // last /deployments response, used by filterDiscovery
 };
 
 const eip6963Providers = new Map();
@@ -532,12 +620,19 @@ window.disconnectWallet = function () {
   // EIP-1193 has no programmatic revoke; we just drop our local handle so
   // the page returns to the disconnected state. The wallet itself stays
   // permissioned for this origin until the user revokes from MetaMask.
+  if (State.rawProvider && State.rawProvider.removeListener) {
+    try { State.rawProvider.removeListener('accountsChanged', onAccountsChanged); } catch {}
+    try { State.rawProvider.removeListener('chainChanged',    onChainChanged);    } catch {}
+  }
   State.signer = null;
   State.ownerAddr = null;
+  State.rawProvider = null;
+  State.browserProvider = null;
   $('#connectBtn').style.display = '';
   $('#addrChip').style.display = 'none';
   $('#walletPop').classList.remove('open');
-  $('#deployBtn').disabled = true;
+  const deployBtn = $('#deployBtn');
+  if (deployBtn) deployBtn.disabled = true;
   // Tear down WS subscriptions so we don't leak old connections.
   if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
   if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
@@ -655,21 +750,66 @@ async function selectWallet(provider) {
     } catch {
       await browserProv.send('eth_requestAccounts', []);
     }
-    State.signer = await browserProv.getSigner();
-    State.ownerAddr = await State.signer.getAddress();
-    $('#connectBtn').style.display = 'none';
-    $('#addrChipText').textContent = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
-    $('#addrChip').style.display = 'inline-block';
-    $('#deployBtn').disabled = false;
+    State.rawProvider = provider;
+    State.browserProvider = browserProv;
+    await applyAccount(await browserProv.getSigner());
+    bindWalletEvents(provider);
     toast('Wallet connected', 'success');
-    // If on Discovery, refresh so the "Mine" filter button enables and any
-    // owner-only agent context becomes visible.
     if (location.hash === '#/' || !location.hash) loadDiscovery();
-    // If on a detail page, re-render to surface owner sections.
     if (location.hash.startsWith('#/agent/')) handleHash();
   } catch (e) {
     toast('Connect rejected: ' + (e.message || e), 'error');
   }
+}
+
+// Adopt a freshly-fetched signer as the active session — single source of
+// truth for State.signer / State.ownerAddr / topbar UI / Mine filter.
+async function applyAccount(signer) {
+  State.signer = signer;
+  State.ownerAddr = await signer.getAddress();
+  $('#connectBtn').style.display = 'none';
+  $('#addrChipText').textContent = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
+  $('#addrChip').style.display = 'inline-block';
+  const deployBtn = $('#deployBtn');
+  if (deployBtn) deployBtn.disabled = false;
+}
+
+// Subscribe to the wallet's EIP-1193 events so account / chain switches in
+// MetaMask propagate to our UI without needing the user to click Connect
+// again. Idempotent — re-subscribing is safe (off+on).
+function bindWalletEvents(provider) {
+  if (!provider || typeof provider.on !== 'function') return;
+  if (provider.removeListener) {
+    try { provider.removeListener('accountsChanged', onAccountsChanged); } catch {}
+    try { provider.removeListener('chainChanged',    onChainChanged);    } catch {}
+  }
+  provider.on('accountsChanged', onAccountsChanged);
+  provider.on('chainChanged',    onChainChanged);
+}
+
+async function onAccountsChanged(accounts) {
+  if (!accounts || !accounts.length) {
+    // User disconnected from wallet side — mirror our disconnect flow.
+    disconnectWallet();
+    toast('Wallet disconnected', 'error');
+    return;
+  }
+  try {
+    const signer = await State.browserProvider.getSigner();
+    await applyAccount(signer);
+    toast(`Switched to ${State.ownerAddr.slice(0, 6)}…${State.ownerAddr.slice(-4)}`, 'success');
+    // Refresh viewport so "Mine" filter / owner-only sections re-evaluate.
+    if (location.hash === '#/' || !location.hash) loadDiscovery();
+    else if (location.hash.startsWith('#/agent/')) handleHash();
+  } catch (e) {
+    toast('Account switch failed: ' + (e.message || e), 'error');
+  }
+}
+
+function onChainChanged() {
+  // Wallets recommend a full reload on chain change (cached signer/provider
+  // can hold stale chainId). Cheaper than threading chainId everywhere.
+  location.reload();
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -801,12 +941,6 @@ window.submitDeploy = async function () {
       throw new Error(`/deploy ${resp.status}: ${await resp.text()}`);
     }
     const { seal_id } = await resp.json();
-    // Cache api_key in localStorage so Start can re-supply it when the
-    // sandbox runtime drops env on stop. Owner-local; never persisted by
-    // attestor.
-    if (apiKey) {
-      try { localStorage.setItem(`agentApiKey:${seal_id}`, apiKey); } catch {}
-    }
     State.deployingSealId = seal_id;
     $('#outSeal').textContent = seal_id;
     $('#cardProgress').style.display = 'block';
@@ -943,32 +1077,77 @@ async function loadDiscovery() {
       : '/deployments';
     const r = await fetch(url);
     if (!r.ok) throw new Error(`/deployments ${r.status}: ${await r.text()}`);
-    const items = await r.json();
-    items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-    count.textContent = `${items.length} agent${items.length === 1 ? '' : 's'}`;
-    if (!items.length) {
-      const empty = State.discoveryFilter === 'mine'
-        ? `<div class="empty">
-             <h2 style="margin-bottom:6px">No agents yet</h2>
-             <p>Deploy your first agent — it'll show up here.</p>
-             <button class="btn btn-primary" style="margin-top:14px" onclick="navigate('#/deploy')">+ New agent</button>
-           </div>`
-        : `<div class="empty">
-             <h2 style="margin-bottom:6px">No agents discovered</h2>
-             <p>This attestor hasn't deployed anything yet.</p>
-           </div>`;
-      list.innerHTML = empty;
-      return;
+    State.discoveryItems = await r.json();
+    // Most-recent activity hint at the top of the list (mirrors 8004scan).
+    const newest = [...State.discoveryItems]
+      .filter(d => d.created_at)
+      .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))[0];
+    if (newest) {
+      $('#activityText').textContent = `new agent registered ${ageString(newest.created_at)}`;
+      $('#activityLine').style.display = 'flex';
+    } else {
+      $('#activityLine').style.display = 'none';
     }
-    list.innerHTML = items.map(d => renderAgentCard(d)).join('');
-    $$('.agent-card').forEach(el => {
-      el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
-    });
+    filterDiscovery();
   } catch (e) {
     count.textContent = 'failed';
     list.innerHTML = `<div class="empty"><p style="color:var(--red)">${escapeHtml(e.message)}</p></div>`;
   }
 }
+
+window.filterDiscovery = function () {
+  const list = $('#agentList');
+  const count = $('#agentCount');
+  const items = State.discoveryItems || [];
+  const q = ($('#agentSearch').value || '').trim().toLowerCase();
+  const sortDir = $('#agentSort').value;
+
+  let view = items;
+  if (q) {
+    view = items.filter(d => {
+      const card = d.agent_card || {};
+      return (card.name || '').toLowerCase().includes(q)
+          || (card.description || '').toLowerCase().includes(q)
+          || (d.owner || '').toLowerCase().includes(q)
+          || (d.seal_id || '').toLowerCase().includes(q)
+          || String(d.agent_id || '').includes(q);
+    });
+  }
+  view = [...view].sort((a, b) => {
+    const cmp = (a.created_at || '').localeCompare(b.created_at || '');
+    return sortDir === 'oldest' ? cmp : -cmp;
+  });
+
+  if (!view.length) {
+    const empty = State.discoveryFilter === 'mine'
+      ? `<div class="empty">
+           <h2 style="margin-bottom:6px">No agents yet</h2>
+           <p>Deploy your first agent — it'll show up here.</p>
+           <button class="btn btn-primary" onclick="navigate('#/deploy')">+ New agent</button>
+         </div>`
+      : q
+        ? `<div class="empty"><h2>No matches</h2><p>Try a different search term.</p></div>`
+        : `<div class="empty"><h2>No agents discovered</h2><p>This attestor hasn't deployed anything yet.</p></div>`;
+    list.innerHTML = empty;
+    count.textContent = '';
+    return;
+  }
+
+  list.innerHTML = `
+    <div class="agent-row head">
+      <div>Name</div>
+      <div class="col-chain-head">Chain</div>
+      <div class="col-status-head">Status</div>
+      <div class="col-owner-head">Owner</div>
+      <div style="text-align:right">Created</div>
+    </div>
+    ${view.map(d => renderAgentRow(d)).join('')}
+  `;
+  $$('.agent-row.body').forEach(el => {
+    el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
+  });
+  count.textContent = `${view.length} of ${items.length} agent${items.length === 1 ? '' : 's'}`;
+};
 
 function ageString(iso) {
   if (!iso) return '';
@@ -982,33 +1161,44 @@ function ageString(iso) {
   return Math.floor(h / 24) + 'd ago';
 }
 
-function renderAgentCard(d) {
+function shortAddr(addr) {
+  if (!addr) return '—';
+  const a = addr.startsWith('0x') ? addr : '0x' + addr;
+  return a.length >= 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
+}
+
+function renderAgentRow(d) {
   const phase = d.phase || 'pending';
   const card = d.agent_card || {};
   const name = card.name || '(unnamed)';
   const description = card.description || '';
   const image = card.image || '';
-  const aid = d.agent_id || '—';
+  const aid = d.agent_id || '';
   const sealHex = d.seal_id && d.seal_id.startsWith('0x') ? d.seal_id : '0x' + (d.seal_id || '').replace(/^0x/, '');
 
   const avatar = image
-    ? `<img class="avatar" src="${escapeHtml(image)}" alt=""/>`
+    ? `<div class="avatar"><img src="${escapeHtml(image)}" alt=""/></div>`
     : `<div class="avatar">🤖</div>`;
 
   return `
-    <div class="agent-card" data-seal="${sealHex}">
-      <div class="row1">
+    <div class="agent-row body" data-seal="${sealHex}">
+      <div class="col-name">
         ${avatar}
-        <div class="body">
-          <div class="name">${escapeHtml(name)}</div>
+        <div class="name-block">
+          <div class="name-line">
+            <span class="name">${escapeHtml(name)}</span>
+            ${aid ? `<span class="id-tag">#${escapeHtml(aid)}</span>` : ''}
+          </div>
           ${description ? `<div class="desc">${escapeHtml(description)}</div>` : ''}
         </div>
       </div>
-      <div class="row2">
-        <span class="chip chip-${phase}">${phase === 'running' ? '<span class="dot"></span>' : ''}${phase}</span>
-        ${aid !== '—' ? `<span class="chip" style="background:var(--surf2);color:var(--text2);border:1px solid var(--border)">id ${escapeHtml(aid)}</span>` : ''}
-        <span class="meta-text">${ageString(d.created_at)}</span>
+      <div><span class="col-chain">⬢ 0G testnet</span></div>
+      <div class="col-status s-${phase}">
+        <span class="status-dot"></span>
+        <span>${escapeHtml(phase)}</span>
       </div>
+      <div class="col-owner" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
+      <div class="col-created" style="text-align:right">${ageString(d.created_at)}</div>
     </div>`;
 }
 
@@ -1088,43 +1278,123 @@ function paintDetail(dep) {
     || dep.agent_seal_addr
     || '';
 
-  const ownerActionsHtml = !ownerMatches ? '' : `
-    <div class="hero-actions-label">Owner controls</div>
-    <div class="hero-actions">
-      ${(isLive && dashboardUrl) ? `<a class="icon-btn primary" href="${escapeHtml(dashboardUrl)}" target="_blank" rel="noopener">⌘ Open dashboard</a>` : ''}
-      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">⏸ Stop</button>` : ''}
+  // Phase → status-pill color
+  const pillClass = phase === 'running' ? 'solid-green'
+                  : phase === 'failed'  ? 'solid-red'
+                  : phase === 'stopped' ? 'solid-gray'
+                  : 'solid-orange';
+
+  // Owner action buttons (top-right of hero) — only visible to the owner.
+  const heroActions = !ownerMatches ? '' : `
+    <div class="actions">
+      ${(isLive && dashboardUrl) ? `<a class="icon-btn primary" href="${escapeHtml(dashboardUrl)}" target="_blank" rel="noopener">⌘ Dashboard</a>` : ''}
+      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">⏸ Stop</button>` : ''}
       ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">▶ Start</button>` : ''}
     </div>`;
 
-  const publicHtml = `
-    <div class="agent-hero">
-      ${image ? `<img class="agent-avatar" src="${escapeHtml(image)}" alt=""/>` : `<div class="agent-avatar" style="display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--muted)">🤖</div>`}
-      <div class="agent-name">${escapeHtml(name)}</div>
-      ${description ? `<div class="agent-desc">${escapeHtml(description)}</div>` : ''}
-      <div class="agent-chips">
-        <span class="chip chip-${phase}">${phase === 'running' ? '<span class="dot"></span>' : ''}${phase}</span>
-        ${dep.agent_id ? `<span class="chip" style="background:var(--surf2);color:var(--text2);border:1px solid var(--border)">agent_id ${escapeHtml(dep.agent_id)}</span>` : ''}
+  const avatar = image
+    ? `<div class="avatar-big"><img src="${escapeHtml(image)}" alt=""/></div>`
+    : `<div class="avatar-big">🤖</div>`;
+
+  // Render an address-like row: shows the truncated form, with a tooltip
+  // (title attr) revealing the full value on hover. `📋` button copies the
+  // full value. Empty values are skipped.
+  const addrRow = (label, val) => {
+    if (!val) return '';
+    const fullVal = escapeHtml(val);
+    return `
+      <div class="kv-row">
+        <span class="k">${escapeHtml(label)}</span>
+        <span class="v" title="${fullVal}">${escapeHtml(shortAddr(val))}</span>
+        <span class="icons">
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="navigator.clipboard.writeText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'))">📋</button>
+        </span>
+      </div>`;
+  };
+  // Long arbitrary hex (seal_id etc): same shape as addrRow but a wider mid-truncation.
+  const hexRow = (label, val) => {
+    if (!val) return '';
+    const fullVal = escapeHtml(val);
+    const short = val.length >= 16 ? `${val.slice(0, 8)}…${val.slice(-6)}` : val;
+    return `
+      <div class="kv-row">
+        <span class="k">${escapeHtml(label)}</span>
+        <span class="v" title="${fullVal}">${escapeHtml(short)}</span>
+        <span class="icons">
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="navigator.clipboard.writeText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'))">📋</button>
+        </span>
+      </div>`;
+  };
+  const plainRow = (label, val) => {
+    if (val === undefined || val === null || val === '') return '';
+    return `
+      <div class="kv-row">
+        <span class="k">${escapeHtml(label)}</span>
+        <span class="v">${escapeHtml(String(val))}</span>
+        <span class="icons"></span>
+      </div>`;
+  };
+
+  const cfgState = State.config || {};
+  const registryAddr = cfgState.agentic_id_addr;
+  const chainId = cfgState.chain_id;
+
+  const sidebarHtml = `
+    <div class="sidebar-stack">
+      <div class="sidebar-group">
+        <div class="group-title"><span class="icon">🔗</span> Chain &amp; Contract</div>
+        ${plainRow('Chain', '0G testnet')}
+        ${chainId ? plainRow('Chain ID', chainId) : ''}
+        ${registryAddr ? addrRow('Registry', registryAddr) : ''}
       </div>
 
-      <div class="stat-grid">
-        <div class="stat-cell">
-          <div class="lbl">Owner</div>
-          <div class="val copy" title="${escapeHtml(dep.owner || '')}" onclick="navigator.clipboard.writeText('${escapeHtml(dep.owner || '')}').then(()=>toast('owner copied','success'))">${escapeHtml(ownerShort)}</div>
-        </div>
-        <div class="stat-cell">
-          <div class="lbl">Created</div>
-          <div class="val">${escapeHtml(ageString(dep.created_at) || '—')}</div>
-        </div>
-        <div class="stat-cell">
-          <div class="lbl">Phase</div>
-          <div class="val">${escapeHtml(phase)}</div>
+      <div class="sidebar-group">
+        <div class="group-title"><span class="icon">📌</span> Agent Identity</div>
+        ${plainRow('Agent ID', dep.agent_id || '—')}
+        ${hexRow('Seal ID', sealId)}
+        ${addrRow('Owner', dep.owner)}
+        ${addrRow('Agent Seal', agentSealAddr)}
+        <div class="kv-row">
+          <span class="k">Wallet</span>
+          <span class="v" id="kvAgentWallet" title="${escapeHtml(dep.owner || '')}">${escapeHtml(shortAddr(dep.owner))}<span style="color:var(--muted);margin-left:6px">(loading…)</span></span>
+          <span class="icons">
+            ${dep.owner ? `<button class="icon-action" id="kvAgentWalletCopy" title="Copy Wallet" onclick="navigator.clipboard.writeText(document.getElementById('kvAgentWallet').title || '').then(()=>toast('Wallet copied','success'))">📋</button>` : ''}
+          </span>
         </div>
       </div>
 
-      ${ownerActionsHtml}
+      ${(dep.agent_uri || sandboxId) ? `
+      <div class="sidebar-group">
+        <div class="group-title"><span class="icon">📋</span> Off-chain Metadata</div>
+        ${dep.agent_uri ? `
+        <div class="kv-row">
+          <span class="k">Agent URI</span>
+          <span class="v" title="${escapeHtml(dep.agent_uri)}">${escapeHtml(dep.agent_uri.length > 24 ? dep.agent_uri.slice(0, 18) + '…' : dep.agent_uri)}</span>
+          <span class="icons">
+            <button class="icon-action" title="Copy URI" onclick="navigator.clipboard.writeText('${escapeHtml(dep.agent_uri)}').then(()=>toast('URI copied','success'))">📋</button>
+            <a class="icon-action" title="Open" href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener">↗</a>
+          </span>
+        </div>` : ''}
+        ${sandboxId ? `
+        <div class="kv-row">
+          <span class="k">Sandbox ID</span>
+          <span class="v" title="${escapeHtml(sandboxId)}">${escapeHtml(sandboxId.length > 18 ? sandboxId.slice(0, 8) + '…' + sandboxId.slice(-6) : sandboxId)}</span>
+          <span class="icons">
+            <button class="icon-action" title="Copy Sandbox ID" onclick="navigator.clipboard.writeText('${escapeHtml(sandboxId)}').then(()=>toast('Sandbox ID copied','success'))">📋</button>
+          </span>
+        </div>` : ''}
+        ${plainRow('Name', name)}
+      </div>` : ''}
+
+      <div class="sidebar-group">
+        <div class="group-title"><span class="icon">🕐</span> Timestamps</div>
+        ${plainRow('Created', ageString(dep.created_at) || '—')}
+        ${dep.provisioned_at ? plainRow('Provisioned', ageString(dep.provisioned_at)) : ''}
+      </div>
     </div>
+  `;
 
-    ${(isLive && a2aUrl) ? `
+  const a2aBlock = (isLive && a2aUrl) ? `
     <div class="a2a-card">
       <div class="a2a-head">
         <div>
@@ -1138,29 +1408,41 @@ function paintDetail(dep) {
       </div>
       <a class="a2a-url" href="${escapeHtml(a2aUrl)}" target="_blank" rel="noopener">${escapeHtml(a2aUrl)}</a>
       <div class="a2a-resp" id="a2aResp"></div>
-    </div>` : ''}
+    </div>` : '';
 
-    <div class="section-title" style="display:flex;align-items:center;gap:8px">
-      AgentCard
-      <span id="agentCardSrc" style="text-transform:none;font-weight:400;color:var(--muted);font-family:var(--sans);font-size:11px;letter-spacing:0">— fetching from agent_uri…</span>
-    </div>
-    <div class="card" style="padding:14px 18px;margin-bottom:18px">
-      <div id="agentCardBody">
-        <div class="skel" style="width:60%;margin-bottom:8px"></div>
-        <div class="skel" style="width:40%"></div>
+  const publicHtml = `
+    <div class="detail-hero">
+      ${avatar}
+      <div class="info">
+        <span class="chain-pill">⬢ 0G testnet</span>
+        <div class="name-big">${escapeHtml(name)}</div>
+        ${description ? `<div class="desc">${escapeHtml(description)}</div>` : ''}
+        <div class="meta">
+          ${dep.agent_id ? `<span class="meta-item">#${escapeHtml(dep.agent_id)}</span>` : ''}
+          <span class="meta-item">🕐 ${escapeHtml(ageString(dep.created_at) || '—')}</span>
+          ${dep.owner ? `<span class="meta-item">👤 ${escapeHtml(shortAddr(dep.owner))}</span>` : ''}
+        </div>
       </div>
+      ${heroActions}
     </div>
 
-    <div class="section-title">On-chain identity</div>
-    <div class="card" style="padding:14px 18px">
-      <div class="kv" style="grid-template-columns:130px 1fr;font-size:12px">
-        <div class="k">agent_id</div><div class="v">${escapeHtml(dep.agent_id || '—')}</div>
-        <div class="k">seal_id</div><div class="v copy" onclick="navigator.clipboard.writeText('${escapeHtml(sealId)}').then(()=>toast('seal_id copied','success'))">${escapeHtml(sealId)}</div>
-        <div class="k">agent_seal</div><div class="v">${escapeHtml(agentSealAddr || '—')}</div>
-        <div class="k">owner</div><div class="v">${escapeHtml(dep.owner || '—')}</div>
-        <div class="k">agent_wallet</div><div class="v" id="kvAgentWallet">${escapeHtml(dep.owner || '—')} <span style="color:var(--muted)">(loading…)</span></div>
-        ${dep.agent_uri ? `<div class="k">agent_uri</div><div class="v"><a href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener" style="color:var(--p)">${escapeHtml(dep.agent_uri)}</a></div>` : ''}
+    <div class="detail-status-row">
+      <span class="status-pill ${pillClass}">${phase === 'running' ? '✓ ' : phase === 'failed' ? '✗ ' : phase === 'stopped' ? '⏸ ' : '○ '}${escapeHtml(phase)}</span>
+      ${dep.agent_id ? `<span class="status-pill outline">on-chain</span>` : `<span class="status-pill outline">off-chain (mint pending)</span>`}
+    </div>
+
+    <div class="detail-grid">
+      <div>
+        ${a2aBlock}
+        <div class="section-title" style="margin-top:0">AgentCard</div>
+        <div class="card" style="padding:14px 18px">
+          <div id="agentCardBody">
+            <div class="skel" style="width:60%;margin-bottom:8px"></div>
+            <div class="skel" style="width:40%"></div>
+          </div>
+        </div>
       </div>
+      ${sidebarHtml}
     </div>
   `;
 
@@ -1177,27 +1459,27 @@ function paintDetail(dep) {
   if (dep.agent_uri) {
     fetchAndRenderAgentCard(dep.agent_uri, dep.agent_card || {});
   } else {
-    renderAgentCardBody(dep.agent_card || {}, '— no agent_uri yet (mint pending)');
+    renderAgentCardBody(dep.agent_card || {});
   }
 }
 
 async function fetchAndRenderAgentCard(uri, fallback) {
+  // Try the canonical OSS copy first; fall back to attestor-cached version
+  // on any error (CORS / 404 / offline). Either way the user sees a card —
+  // we don't surface the source distinction in the UI.
   try {
     const r = await fetch(uri, { mode: 'cors' });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const card = await r.json();
-    renderAgentCardBody(card, `— fetched from ${uri.length > 60 ? uri.slice(0, 60) + '…' : uri}`);
-  } catch (e) {
-    // CORS-blocked or 404 — fall back to attestor's local cached copy.
-    renderAgentCardBody(fallback, `— OSS fetch failed (${e.message}); showing attestor cache`);
+    renderAgentCardBody(card);
+  } catch {
+    renderAgentCardBody(fallback);
   }
 }
 
-function renderAgentCardBody(card, srcLabel) {
-  const src = $('#agentCardSrc');
+function renderAgentCardBody(card) {
   const body = $('#agentCardBody');
   if (!body) return;
-  if (src) src.textContent = srcLabel;
 
   const attributes = Array.isArray(card.attributes) ? card.attributes : [];
   const fields = [];
@@ -1205,14 +1487,21 @@ function renderAgentCardBody(card, srcLabel) {
   if (card.description) fields.push(['description', escapeHtml(card.description)]);
   if (card.image) {
     const isData = card.image.startsWith('data:');
-    const label = isData ? `inline ${(card.image.length / 1024).toFixed(1)} KB · ${card.image.slice(0, card.image.indexOf(','))}` : escapeHtml(card.image);
-    fields.push(['image', `<a href="${escapeHtml(card.image)}" target="_blank" rel="noopener" style="color:var(--p)">${label}</a>`]);
+    const sizeLabel = isData ? `inline ${(card.image.length / 1024).toFixed(1)} KB` : 'remote';
+    fields.push(['image', `
+      <div style="display:flex;align-items:center;gap:10px">
+        <img src="${escapeHtml(card.image)}" alt="" style="width:48px;height:48px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surf2);object-fit:cover;image-rendering:pixelated;flex-shrink:0"/>
+        <a href="${escapeHtml(card.image)}" target="_blank" rel="noopener" style="color:var(--p);font-family:var(--mono);font-size:11px">${sizeLabel} ↗</a>
+      </div>
+    `]);
   }
-  if (card.url) fields.push(['url (A2A)', `<a href="${escapeHtml(card.url)}" target="_blank" rel="noopener" style="color:var(--p)">${escapeHtml(card.url)}</a>`]);
+  if (card.url) {
+    fields.push(['url (A2A)', `<span style="word-break:break-all">${escapeHtml(card.url)}</span>`]);
+  }
 
   let html = '';
   if (fields.length) {
-    html += `<div class="kv" style="grid-template-columns:130px 1fr;font-size:12px;margin-bottom:${attributes.length ? '12px' : '0'}">
+    html += `<div class="kv" style="grid-template-columns:110px 1fr;font-size:12px;margin-bottom:${attributes.length ? '12px' : '0'}">
       ${fields.map(([k, v]) => `<div class="k">${k}</div><div class="v">${v}</div>`).join('')}
     </div>`;
   }
@@ -1246,9 +1535,11 @@ async function fetchAgentWallet(agentId, ownerAddr) {
   if (!cell) return;
   const isZero = wallet === '0x0000000000000000000000000000000000000000';
   if (isZero) {
-    cell.innerHTML = `${escapeHtml(ownerAddr || '—')} <span style="color:var(--muted)">(owner — no delegate set)</span>`;
+    cell.innerHTML = `${escapeHtml(shortAddr(ownerAddr || ''))} <span style="color:var(--muted);margin-left:6px">(owner)</span>`;
+    cell.title = ownerAddr || '';
   } else {
-    cell.textContent = wallet;
+    cell.textContent = shortAddr(wallet);
+    cell.title = wallet;
   }
 }
 
@@ -1258,17 +1549,10 @@ async function fetchAgentWallet(agentId, ownerAddr) {
 async function lifecycleAction(verb, sealId, sandboxId) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
   try {
-    // 0g-sandbox drops container env on stop, so on start re-supply the
-    // api_key from localStorage (owner-cached at deploy time). Stop
-    // doesn't need any env, so pass an empty payload there.
-    let payload = {};
-    if (verb === 'start') {
-      const cachedKey = (() => {
-        try { return localStorage.getItem(`agentApiKey:${sealId}`); } catch { return null; }
-      })();
-      if (cachedKey) payload = { env: { API_KEY: cachedKey } };
-    }
-    const { envelope } = await signSandboxEnvelope(verb, sandboxId, payload);
+    // Daytona persists the container's env (including API_KEY) at create
+    // time and reuses it across stop/start, so we don't need to re-supply
+    // it here. Empty payload is correct.
+    const { envelope } = await signSandboxEnvelope(verb, sandboxId, {});
     const r = await fetch(`/${verb}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

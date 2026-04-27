@@ -29,6 +29,15 @@ CREATE INDEX IF NOT EXISTS idx_deployments_phase    ON deployments (phase);
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
+-- Container-pubkey binding for /provision freshness bypass on restart.
+-- The pubkey is what the container sent on first /provision; the MAC is
+-- HMAC(binding_key, seal_id || pubkey) where binding_key is HKDF-derived
+-- from the attestor master secret. DB tampering with `container_pubkey`
+-- alone is detectable via MAC mismatch — attacker without the master
+-- secret can't forge a valid (pk, mac) pair.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey     BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
+
 -- idempotency does NOT FK to deployments — /deploy reserves idempotency
 -- before inserting the deployment row, so a FK would fail. The idempotency
 -- record is a hint; loss-of-sync with deployments is recoverable.

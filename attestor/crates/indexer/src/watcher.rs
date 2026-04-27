@@ -477,6 +477,8 @@ impl Watcher {
             container_stage,
             sandbox_id: None,
             provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
             created_at: now,
             updated_at: now,
         };

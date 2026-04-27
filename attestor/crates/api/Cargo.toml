@@ -24,6 +24,7 @@ serde_json.workspace = true
 
 alloy.workspace = true
 hex.workspace = true
+subtle = { workspace = true }
 
 sqlx.workspace = true
 

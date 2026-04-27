@@ -12,8 +12,8 @@ pub struct OpenClawProfile;
 impl OpenClawProfile {
     const FRAMEWORK_NAME: &'static str = "openclaw";
     const FRAMEWORK_VERSION: &'static str = "0.1.0";
-    const INFERENCE_PROVIDER: &'static str = "0g-compute";
-    const INFERENCE_MODEL: &'static str = "glm";
+    const INFERENCE_PROVIDER: &'static str = "anthropic";
+    const INFERENCE_MODEL: &'static str = "claude-opus-4-7";
 }
 
 impl AgentProfile for OpenClawProfile {
@@ -54,8 +54,8 @@ mod tests {
         assert_eq!(fw.name.as_deref(), Some("openclaw"));
         assert_eq!(fw.version.as_deref(), Some("0.1.0"));
         let inf = c.inference.expect("inference");
-        assert_eq!(inf.provider.as_deref(), Some("0g-compute"));
-        assert_eq!(inf.model.as_deref(), Some("glm"));
+        assert_eq!(inf.provider.as_deref(), Some("anthropic"));
+        assert_eq!(inf.model.as_deref(), Some("claude-opus-4-7"));
         let p = c.persona.expect("persona");
         assert_eq!(
             p.system_prompt.as_deref(),
