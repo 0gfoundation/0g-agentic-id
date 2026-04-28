@@ -326,41 +326,46 @@ details.log[open] summary{color:var(--text2)}
 .a2a-url{font-family:var(--mono);font-size:12px;color:var(--p);word-break:break-all;display:block;text-decoration:none;padding:8px 10px;background:var(--surf2);border-radius:var(--r-sm);margin-bottom:10px}
 .a2a-url:hover{background:var(--surf3);text-decoration:underline}
 .a2a-actions{display:flex;gap:6px;flex-wrap:wrap}
-.a2a-resp{margin-top:10px;display:none;animation:fadeIn var(--t-base) var(--ease-out)}
-.a2a-resp.show{display:block}
+.a2a-resp{margin-top:14px;display:none;flex-direction:column;align-items:center;text-align:center;padding:22px 18px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surf);min-height:120px;animation:fadeIn var(--t-base) var(--ease-out)}
+.a2a-resp.show{display:flex}
+.a2a-resp.verified{border-color:var(--gbd);background:linear-gradient(180deg,var(--gbg) 0%,var(--surf) 70%)}
+.a2a-resp.failed{border-color:var(--rbd);background:linear-gradient(180deg,var(--rbg) 0%,var(--surf) 70%)}
+.a2a-resp.warn{border-color:var(--obd);background:linear-gradient(180deg,var(--obg) 0%,var(--surf) 70%)}
 
-/* Verify-status badge — sits above the body, animates in independently. */
-.a2a-verify{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--r-sm);font-size:12px;font-weight:600;font-family:var(--sans);margin-bottom:8px;border:1px solid transparent;opacity:0;transform:translateY(-6px) scale(.96);transition:opacity .25s var(--ease-out),transform .35s var(--ease-spring);min-height:32px}
-.a2a-verify.show{opacity:1;transform:translateY(0) scale(1)}
-.a2a-verify.verifying{background:var(--surf2);color:var(--text2);border-color:var(--border)}
-.a2a-verify.verified{background:var(--gbg);color:var(--green);border-color:var(--gbd);animation:verify-pulse 1.4s ease-out}
-.a2a-verify.failed{background:var(--rbg);color:var(--red);border-color:var(--rbd);animation:verify-shake .4s ease-in-out}
-.a2a-verify.warn{background:var(--obg);color:var(--orange);border-color:var(--obd)}
-.a2a-verify .check{display:inline-block;width:16px;height:16px;border-radius:50%;background:var(--green);color:#fff;text-align:center;line-height:16px;font-size:11px;font-weight:700;flex-shrink:0;animation:check-pop .35s var(--ease-spring)}
-.a2a-verify.failed .check{background:var(--red)}
-.a2a-verify.warn .check{background:var(--orange)}
-.a2a-verify .signer{font-family:var(--mono);font-size:11px;font-weight:500;opacity:.8;margin-left:auto;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;max-width:50%}
-.a2a-verify .spinner-mini{width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;opacity:.5;animation:spin .8s linear infinite}
+/* Big centered status icon: spinner / check / cross / warn */
+.a2a-icon{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff;margin-bottom:10px;animation:check-pop .4s var(--ease-spring)}
+.a2a-resp.verifying .a2a-icon{background:var(--surf2);color:var(--text2);animation:none}
+.a2a-resp.verifying .a2a-icon::after{content:'';width:22px;height:22px;border:3px solid var(--border);border-top-color:var(--p);border-radius:50%;animation:spin .8s linear infinite}
+.a2a-resp.verifying .a2a-icon{font-size:0}
+.a2a-resp.verified .a2a-icon{background:var(--green);box-shadow:0 0 0 6px var(--gbg);animation:check-pop .4s var(--ease-spring),verify-pulse 1.6s .3s ease-out}
+.a2a-resp.failed .a2a-icon{background:var(--red);box-shadow:0 0 0 6px var(--rbg);animation:check-pop .4s var(--ease-spring),verify-shake .5s .25s ease-in-out}
+.a2a-resp.warn .a2a-icon{background:var(--orange);box-shadow:0 0 0 6px var(--obg)}
 
-.a2a-body{padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--mono);font-size:12px;color:var(--text2);white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;margin:0}
-.a2a-resp.error .a2a-body{border-color:var(--rbd);background:var(--rbg);color:var(--red)}
+.a2a-title{font-size:14.5px;font-weight:700;letter-spacing:-.01em;color:var(--text);margin-bottom:4px}
+.a2a-resp.verified .a2a-title{color:var(--green)}
+.a2a-resp.failed  .a2a-title{color:var(--red)}
+.a2a-resp.warn    .a2a-title{color:var(--orange)}
+.a2a-sub-title{font-size:12px;color:var(--text2);max-width:420px;line-height:1.5;margin-bottom:10px}
+.a2a-signer{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;margin-bottom:10px;letter-spacing:.02em}
+.a2a-message{font-size:12.5px;color:var(--text2);line-height:1.55;font-style:italic;max-width:480px;margin-top:8px;padding:10px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);position:relative}
+.a2a-message::before{content:'"';position:absolute;left:6px;top:-4px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
+.a2a-message::after{content:'"';position:absolute;right:6px;bottom:-14px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
 
 @keyframes verify-pulse{
-  0%  { box-shadow:0 0 0 0 oklch(60% 0.18 145 / .55) }
-  60% { box-shadow:0 0 0 14px oklch(60% 0.18 145 / 0) }
-  100%{ box-shadow:0 0 0 0 oklch(60% 0.18 145 / 0) }
+  0%  { box-shadow:0 0 0 6px var(--gbg),0 0 0 6px oklch(60% 0.18 145 / .45) }
+  100%{ box-shadow:0 0 0 6px var(--gbg),0 0 0 22px oklch(60% 0.18 145 / 0) }
 }
 @keyframes verify-shake{
   0%,100% { transform:translateX(0) }
-  20%     { transform:translateX(-4px) }
-  40%     { transform:translateX(4px) }
-  60%     { transform:translateX(-3px) }
-  80%     { transform:translateX(2px) }
+  20%     { transform:translateX(-5px) }
+  40%     { transform:translateX(5px) }
+  60%     { transform:translateX(-4px) }
+  80%     { transform:translateX(3px) }
 }
 @keyframes check-pop{
-  0% { transform:scale(0) rotate(-40deg) }
-  60%{ transform:scale(1.18) rotate(0) }
-  100%{ transform:scale(1) rotate(0) }
+  0% { transform:scale(0) rotate(-30deg);opacity:0 }
+  60%{ transform:scale(1.15) rotate(0);opacity:1 }
+  100%{ transform:scale(1) rotate(0);opacity:1 }
 }
 @keyframes spin{ to{ transform:rotate(360deg) } }
 
@@ -1483,10 +1488,7 @@ function paintDetail(dep) {
         </div>
       </div>
       <a class="a2a-url" href="${escapeHtml(a2aUrl)}" target="_blank" rel="noopener">${escapeHtml(a2aUrl)}</a>
-      <div class="a2a-resp" id="a2aResp">
-        <div class="a2a-verify" id="a2aVerify"></div>
-        <pre class="a2a-body" id="a2aBody"></pre>
-      </div>
+      <div class="a2a-resp" id="a2aResp"></div>
     </div>` : '';
 
   const publicHtml = `
@@ -1706,102 +1708,87 @@ window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
   }
 };
 
+// Hits agent /hello, recovers the signer of `X-Agent-Signature` (EIP-191
+// over body) via ethers.verifyMessage, and confirms that signer ==
+// the on-chain agent_seal address. The whole result lives in a single
+// centered card that morphs through verifying spinner → ✓/✗/⚠ icon.
+// We don't dump the raw response — only the agent's human-readable
+// `message` field surfaces, as a quote under the verdict.
 window.sayHiToAgent = async function (url, expectedSealAddr) {
   const respEl = $('#a2aResp');
-  const verifyEl = $('#a2aVerify');
-  const bodyEl = $('#a2aBody');
   const btn = $('#btnSayHi');
-  if (!respEl || !verifyEl || !bodyEl || !btn) return;
+  if (!respEl || !btn) return;
 
-  // Reset
-  respEl.classList.remove('error');
-  respEl.classList.add('show');
-  verifyEl.className = 'a2a-verify';        // strip any previous state classes
-  verifyEl.innerHTML = '';
-  bodyEl.textContent = '⏳ contacting agent…';
+  const paint = (state, icon, title, sub, signer, message) => {
+    respEl.className = `a2a-resp show ${state}`;
+    respEl.innerHTML = `
+      <div class="a2a-icon">${icon}</div>
+      <div class="a2a-title">${title}</div>
+      ${sub ? `<div class="a2a-sub-title">${escapeHtml(sub)}</div>` : ''}
+      ${signer ? `<div class="a2a-signer" title="${escapeHtml(signer.full)}">${escapeHtml(signer.short)}</div>` : ''}
+      ${message ? `<div class="a2a-message">${escapeHtml(message)}</div>` : ''}
+    `;
+  };
 
   const oldText = btn.textContent;
   btn.disabled = true;
   btn.textContent = '⏳ sending…';
-
-  // Helper — paint a verification badge with state class + content. The
-  // .show class triggers the fade/slide-in transition; verified/failed get
-  // their own keyframe animations on top.
-  const setVerify = (state, html) => {
-    verifyEl.className = `a2a-verify ${state}`;
-    verifyEl.innerHTML = html;
-    // Force reflow so the .show transition runs even if state changes fast.
-    void verifyEl.offsetWidth;
-    verifyEl.classList.add('show');
-  };
+  paint('verifying', '', 'Contacting agent…', 'Fetching signed /hello response', null, null);
 
   try {
     const r = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
     const text = await r.text();
     const sig = r.headers.get('X-Agent-Signature') || '';
 
-    bodyEl.textContent = `HTTP ${r.status}\n\n${text}`;
-
+    if (!r.ok) {
+      paint('failed', '✗', `HTTP ${r.status}`, 'Agent rejected the request', null, null);
+      return;
+    }
     if (!sig) {
-      setVerify('warn', `<span class="check">⚠</span><span>No X-Agent-Signature header — response unverified</span>`);
-      if (!r.ok) respEl.classList.add('error');
+      let msg = '';
+      try { msg = JSON.parse(text)?.message || ''; } catch {}
+      paint('warn', '⚠', 'Response received',
+        'No X-Agent-Signature header — identity could not be verified', null, msg);
       return;
     }
 
-    // Brief deliberate pause so the verifying spinner is visible — pure UX
-    // (the actual verifyMessage call is microseconds).
-    setVerify('verifying', `<span class="spinner-mini"></span><span>Verifying signature…</span>`);
-    await new Promise(res => setTimeout(res, 550));
+    // Brief deliberate pause so the verifying state is perceptible —
+    // verifyMessage itself is microseconds.
+    paint('verifying', '', 'Verifying signature…',
+      'Recovering signer · matching on-chain agent_seal', null, null);
+    await new Promise(res => setTimeout(res, 600));
 
+    let recovered = '';
+    let parsedMessage = '';
     try {
-      const recovered = ethers.verifyMessage(text, sig);
-      // Pull whatever the body claims as its own agent address. Different
-      // /hello implementations have used different fields for this; accept
-      // any of them.
-      let claimedSelf = '';
-      try {
-        const parsed = JSON.parse(text);
-        claimedSelf = parsed?.agent
-          || parsed?.identity?.address
-          || parsed?.agentAddress
-          || '';
-      } catch {}
-      const matchesOnChain = expectedSealAddr
-        && expectedSealAddr.toLowerCase() === recovered.toLowerCase();
-      const matchesSelf = claimedSelf
-        && claimedSelf.toLowerCase() === recovered.toLowerCase();
-      const recoveredShort = `${recovered.slice(0, 6)}…${recovered.slice(-4)}`;
-
-      if (matchesOnChain) {
-        setVerify('verified',
-          `<span class="check">✓</span>
-           <span>Signature verified · matches on-chain agent_seal</span>
-           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
-      } else if (matchesSelf) {
-        setVerify('warn',
-          `<span class="check">⚠</span>
-           <span>Self-signed but on-chain agent_seal mismatch</span>
-           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
-        respEl.classList.add('error');
-      } else {
-        setVerify('failed',
-          `<span class="check">✗</span>
-           <span>Signature mismatch — wrong signer</span>
-           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
-        respEl.classList.add('error');
-      }
+      recovered = ethers.verifyMessage(text, sig);
+      try { parsedMessage = JSON.parse(text)?.message || ''; } catch {}
     } catch (e) {
-      setVerify('failed',
-        `<span class="check">✗</span><span>Verification error: ${escapeHtml(e.message || String(e))}</span>`);
-      respEl.classList.add('error');
+      paint('failed', '✗', 'Verification error', e.message || String(e), null, null);
+      return;
     }
 
-    if (!r.ok) respEl.classList.add('error');
+    const sigInfo = {
+      full: recovered,
+      short: `${recovered.slice(0, 6)}…${recovered.slice(-4)}`,
+    };
+    const matchesOnChain = expectedSealAddr
+      && expectedSealAddr.toLowerCase() === recovered.toLowerCase();
+
+    if (matchesOnChain) {
+      paint('verified', '✓', 'Identity verified',
+        'Response signed by the on-chain agent_seal — this is the real agent.',
+        sigInfo, parsedMessage);
+    } else {
+      const want = expectedSealAddr
+        ? `${expectedSealAddr.slice(0,6)}…${expectedSealAddr.slice(-4)}`
+        : '(unknown)';
+      paint('failed', '✗', 'Identity mismatch',
+        `Signer does not match the on-chain agent_seal (${want}).`,
+        sigInfo, parsedMessage);
+    }
   } catch (e) {
-    bodyEl.textContent = 'request failed: ' + (e.message || e);
-    setVerify('failed',
-      `<span class="check">✗</span><span>Request failed</span>`);
-    respEl.classList.add('error');
+    paint('failed', '✗', 'Request failed', e.message || String(e), null, null);
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;

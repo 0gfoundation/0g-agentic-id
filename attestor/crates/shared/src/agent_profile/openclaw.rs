@@ -15,8 +15,8 @@ impl OpenClawProfile {
     /// shape or any baked-in constant below changes.
     const FRAMEWORK_VERSION: &'static str = "2026.4.26";
     const INFERENCE_PROVIDER: &'static str = "anthropic";
-    const INFERENCE_MODEL: &'static str = "claude-opus-4-7";
-    const INFERENCE_FALLBACKS: &'static [&'static str] = &["claude-opus-4-6"];
+    const INFERENCE_MODEL: &'static str = "claude-opus-4-6";
+    const INFERENCE_FALLBACKS: &'static [&'static str] = &[];
 }
 
 impl AgentProfile for OpenClawProfile {
@@ -59,8 +59,8 @@ mod tests {
         assert_eq!(fw.version.as_deref(), Some("2026.4.26"));
         let inf = c.inference.expect("inference");
         assert_eq!(inf.provider.as_deref(), Some("anthropic"));
-        assert_eq!(inf.model.as_deref(), Some("claude-opus-4-7"));
-        assert_eq!(inf.fallbacks, vec!["claude-opus-4-6".to_string()]);
+        assert_eq!(inf.model.as_deref(), Some("claude-opus-4-6"));
+        assert!(inf.fallbacks.is_empty());
         let p = c.persona.expect("persona");
         assert_eq!(
             p.system_prompt.as_deref(),
