@@ -50,10 +50,13 @@ a{color:inherit;text-decoration:none}
 .logo-text{display:flex;align-items:baseline;gap:6px}
 .logo-text .brand-1{color:var(--text)}
 .logo-text .brand-2{color:var(--muted);font-weight:500}
-.nav{display:flex;gap:2px;margin-left:14px}
-.nav a{padding:6px 14px;font-size:13px;font-weight:600;color:var(--muted);border-radius:var(--r-sm);transition:color var(--t-fast),background var(--t-fast)}
-.nav a:hover{color:var(--text);background:var(--surf2)}
-.nav a.active{color:var(--p);background:var(--pbg)}
+.nav{display:flex;gap:4px;margin-left:18px;position:relative}
+.nav a{position:relative;padding:8px 14px 10px;font-size:13.5px;font-weight:600;color:var(--text2);transition:color var(--t-fast),transform var(--t-fast) var(--ease-spring);letter-spacing:-.005em}
+.nav a::after{content:'';position:absolute;left:14px;right:14px;bottom:2px;height:2px;background:var(--p);border-radius:2px;transform:scaleX(0);transform-origin:left;transition:transform var(--t-base) var(--ease-spring)}
+.nav a:hover{color:var(--text)}
+.nav a:hover::after{transform:scaleX(.4);background:var(--text2)}
+.nav a.active{color:var(--p)}
+.nav a.active::after{transform:scaleX(1);background:var(--p)}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:8px}
 .chain-tag{display:inline-flex;align-items:center;gap:6px;background:var(--gbg);color:var(--green);border:1px solid var(--gbd);border-radius:9999px;padding:4px 12px;font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;font-family:var(--mono)}
 .dot{width:6px;height:6px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 6px var(--green);animation:pulse 2.4s ease-in-out infinite}
@@ -160,6 +163,65 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
 .filter-group [data-filter]:hover:not(:disabled):not(.on){color:var(--text)}
 .filter-group [data-filter].on{background:var(--surf);color:var(--p);box-shadow:var(--sh-sm)}
 .filter-group [data-filter]:disabled{opacity:.4;cursor:not-allowed}
+/* ── Home view ─────────────────────────────────────────────────── */
+.home-hero{text-align:center;padding:48px 0 28px;position:relative}
+.home-eyebrow{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--p);text-transform:uppercase;letter-spacing:.12em;font-family:var(--mono);background:var(--pbg);border:1px solid var(--pbd);border-radius:9999px;padding:5px 14px;margin-bottom:16px;animation:fadeInUp .8s var(--ease-out)}
+.home-eyebrow .pulse-dot{width:5px;height:5px;border-radius:50%;background:var(--p);animation:pulse 2.4s ease-in-out infinite}
+.home-hero h1{font-size:clamp(34px,5.2vw,52px);font-weight:800;letter-spacing:-.03em;margin-bottom:12px;background:linear-gradient(135deg,var(--text) 0%,var(--p) 50%,oklch(58% 0.22 280) 100%);-webkit-background-clip:text;background-clip:text;color:transparent;line-height:1.05;animation:fadeInUp .8s .1s var(--ease-out) both}
+.home-hero .tagline{color:var(--text2);font-size:16px;max-width:600px;margin:0 auto 8px;line-height:1.55;animation:fadeInUp .8s .2s var(--ease-out) both}
+.home-hero .pillars{display:inline-flex;gap:18px;color:var(--text2);font-size:13px;font-weight:600;letter-spacing:-.005em;margin-bottom:24px;animation:fadeInUp .8s .3s var(--ease-out) both;flex-wrap:wrap;justify-content:center}
+.home-hero .pillars span{display:inline-flex;align-items:center;gap:6px}
+.home-hero .pillars svg{width:15px;height:15px;stroke:var(--p);fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.home-hero .pillars .sep{color:var(--border);font-weight:300}
+.home-cta{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;align-items:center;width:100%;margin:4px 0 0;animation:fadeInUp .8s .4s var(--ease-out) both}
+.home-cta .btn{display:inline-flex;align-items:center;justify-content:center;line-height:1;padding:0 22px;min-height:40px;min-width:160px;text-decoration:none;white-space:nowrap}
+.home-cta a.btn-ghost:hover:not(:disabled){transform:translateY(-1px);box-shadow:var(--sh-sm)}
+@keyframes fadeInUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+
+/* Avatar showcase — bobbing pixel agents with hover greeting bubbles */
+.home-showcase{margin:36px 0 56px;padding:24px 12px;display:flex;justify-content:center;flex-wrap:wrap;gap:32px 28px;perspective:600px}
+.home-pet{position:relative;cursor:pointer}
+.home-pet .face{width:64px;height:64px;border-radius:var(--r-lg);border:1px solid var(--border);background:var(--surf);box-shadow:var(--sh-sm);overflow:hidden;animation:bob 4.2s ease-in-out infinite;transition:transform var(--t-base) var(--ease-spring),box-shadow var(--t-base) var(--ease-spring)}
+.home-pet .face img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated;display:block}
+.home-pet:nth-child(7n+1) .face{animation-delay:0s}
+.home-pet:nth-child(7n+2) .face{animation-delay:.4s}
+.home-pet:nth-child(7n+3) .face{animation-delay:.8s}
+.home-pet:nth-child(7n+4) .face{animation-delay:1.2s}
+.home-pet:nth-child(7n+5) .face{animation-delay:1.6s}
+.home-pet:nth-child(7n+6) .face{animation-delay:2.0s}
+.home-pet:nth-child(7n+7) .face{animation-delay:2.4s}
+.home-pet:hover .face{transform:translateY(-6px) scale(1.12);box-shadow:0 8px 24px oklch(50% 0.22 315 / 0.25);animation-play-state:paused}
+.home-pet .name{display:block;text-align:center;font-size:10px;color:var(--muted);margin-top:6px;font-family:var(--mono);font-weight:600;letter-spacing:.04em;text-transform:uppercase;opacity:.75}
+.home-pet:hover .name{color:var(--p);opacity:1}
+.bubble{position:absolute;left:50%;bottom:calc(100% + 14px);transform:translateX(-50%) translateY(6px) scale(.92);background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:10px 14px;box-shadow:var(--sh);min-width:200px;max-width:260px;font-size:12.5px;color:var(--text);line-height:1.5;opacity:0;pointer-events:none;transition:opacity .25s var(--ease-out),transform .35s var(--ease-spring);z-index:10}
+.home-pet:hover .bubble{opacity:1;transform:translateX(-50%) translateY(0) scale(1)}
+.bubble::after{content:'';position:absolute;left:50%;bottom:-7px;transform:translateX(-50%) rotate(45deg);width:12px;height:12px;background:var(--surf);border-right:1px solid var(--border);border-bottom:1px solid var(--border)}
+.bubble strong{color:var(--p);font-weight:700;display:block;margin-bottom:2px;font-size:11.5px;letter-spacing:.02em}
+@keyframes bob{0%,100%{transform:translateY(0) rotate(0)}50%{transform:translateY(-4px) rotate(-1deg)}}
+
+/* Three-pillar feature cards */
+.home-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:36px}
+.home-feature{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px;box-shadow:var(--sh-sm);transition:transform var(--t-fast),box-shadow var(--t-fast),border-color var(--t-fast);position:relative;overflow:hidden}
+.home-feature::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--p),oklch(58% 0.22 280));transform:scaleX(0);transform-origin:left;transition:transform .4s var(--ease-spring)}
+.home-feature:hover{transform:translateY(-3px);box-shadow:var(--sh);border-color:var(--surf3)}
+.home-feature:hover::before{transform:scaleX(1)}
+.home-feature .icon{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:var(--r);background:var(--pbg);color:var(--p);margin-bottom:14px;transition:transform var(--t-base) var(--ease-spring),background var(--t-fast)}
+.home-feature .icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.home-feature:hover .icon{transform:rotate(-6deg) scale(1.08);background:var(--pbd)}
+.home-feature h3{font-size:15px;font-weight:700;letter-spacing:-.01em;color:var(--text);margin-bottom:6px}
+.home-feature p{font-size:13px;color:var(--text2);line-height:1.55}
+
+/* Stats */
+.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:32px}
+.home-stat{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px 20px;box-shadow:var(--sh-sm);transition:transform var(--t-fast),box-shadow var(--t-fast)}
+.home-stat:hover{transform:translateY(-2px);box-shadow:var(--sh)}
+.home-stat-num{font-size:28px;font-weight:800;letter-spacing:-.02em;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+.home-stat-lbl{margin-top:6px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
+.home-section-head{display:flex;align-items:baseline;justify-content:space-between;margin:0 4px 12px}
+.home-section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
+.home-section-more{font-size:12px;color:var(--p);font-weight:600;letter-spacing:-.005em}
+.home-section-more:hover{text-decoration:underline}
+
 /* ── Agent table (Discovery) ───────────────────────────────────── */
 .agent-table{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden}
 .agent-row{display:grid;grid-template-columns:minmax(0,1.5fr) 130px 130px minmax(0,1fr) 100px;align-items:center;gap:14px;padding:12px 18px;border-bottom:1px solid var(--border);transition:background var(--t-fast)}
@@ -434,7 +496,9 @@ details.log[open] summary{color:var(--text2)}
     <span class="logo-text"><span class="brand-1">AgenticID</span></span>
   </div>
   <nav class="nav">
-    <a href="#/" data-route="discovery">Agents</a>
+    <a href="#/" data-route="home">Home</a>
+    <a href="#/agents" data-route="agents">Agents</a>
+    <a href="#/deploy" data-route="deploy">Deploy</a>
   </nav>
   <div class="topbar-right">
     <span class="chain-tag"><span class="dot"></span>0G testnet</span>
@@ -447,7 +511,6 @@ details.log[open] summary{color:var(--text2)}
         <button class="danger" onclick="disconnectWallet()">⏻ Disconnect</button>
       </span>
     </span>
-    <button class="btn-connect" id="topDeployBtn" onclick="navigate('#/deploy')">+ Deploy agent</button>
   </div>
 </div>
 
@@ -463,8 +526,71 @@ details.log[open] summary{color:var(--text2)}
 
 <div class="toast-host" id="toastHost"></div>
 
-<!-- ── Main: 3 views ─────────────────────────────────────────────── -->
+<!-- ── Main: 4 views ─────────────────────────────────────────────── -->
 <div class="main">
+
+  <!-- VIEW: Home ────────────────────────────────────────────────── -->
+  <div class="view" id="viewHome">
+    <div class="home-hero">
+      <span class="home-eyebrow"><span class="pulse-dot"></span> 0G testnet · live</span>
+      <h1>Sovereign agents,<br/>provably yours.</h1>
+      <p class="tagline">An on-chain identity registry for autonomous AI agents — each agent owns its keys, runs in an attested TEE, and signs every response so anyone can verify it's the real one.</p>
+      <div class="pillars">
+        <span><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4.5"/></svg> Self-owned identity</span>
+        <span class="sep">·</span>
+        <span><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg> Autonomous runtime</span>
+        <span class="sep">·</span>
+        <span><svg viewBox="0 0 24 24"><path d="M3 14c2 0 2.4-4 4-4 1.8 0 1.6 6 3.5 6 1.8 0 2-9 4-9 1.8 0 1.6 5 3.5 5 .8 0 1.4-1 2-2"/><path d="M5 19h14"/></svg> Verifiable behavior</span>
+      </div>
+      <div class="home-cta">
+        <a class="btn btn-primary" href="#/deploy">+ Deploy an agent</a>
+        <a class="btn btn-ghost" href="#/agents">Browse agents</a>
+      </div>
+    </div>
+
+    <div class="home-showcase" id="homeShowcase"></div>
+
+    <div class="home-features">
+      <div class="home-feature">
+        <div class="icon">
+          <!-- Shield with checkmark — sovereign identity -->
+          <svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4.5"/></svg>
+        </div>
+        <h3>Self-owned identity</h3>
+        <p>Each agent is an ERC-7857 NFT whose seal key is <strong>maintained inside the TEE</strong> — the attestor doesn't keep it, the owner doesn't see it, only the agent itself ever holds it.</p>
+      </div>
+      <div class="home-feature">
+        <div class="icon">
+          <!-- CPU/chip — autonomous runtime -->
+          <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
+        </div>
+        <h3>Autonomous runtime</h3>
+        <p>Agents run inside attested 0G sandboxes — not your laptop. Their config &amp; memory live in encrypted iData on 0G storage; only the running TEE can decrypt.</p>
+      </div>
+      <div class="home-feature">
+        <div class="icon">
+          <!-- Signature waveform — verifiable behavior -->
+          <svg viewBox="0 0 24 24"><path d="M3 14c2 0 2.4-4 4-4 1.8 0 1.6 6 3.5 6 1.8 0 2-9 4-9 1.8 0 1.6 5 3.5 5 .8 0 1.4-1 2-2"/><path d="M5 19h14"/></svg>
+        </div>
+        <h3>Verifiable behavior</h3>
+        <p>Every response carries a <strong>Serve-Proof</strong> envelope: signer must equal the on-chain agent_seal, body hash must match, declared data hashes must be on chain. Extends ERC-8004 reputation with <strong>data-bound</strong> guarantees — reputation a counterparty can re-verify, not just trust.</p>
+      </div>
+    </div>
+
+    <div class="home-stats" id="homeStats">
+      <div class="home-stat"><div class="home-stat-num" id="statTotal">—</div><div class="home-stat-lbl">Total agents</div></div>
+      <div class="home-stat"><div class="home-stat-num" id="statRunning">—</div><div class="home-stat-lbl">Running</div></div>
+      <div class="home-stat"><div class="home-stat-num" id="statOwners">—</div><div class="home-stat-lbl">Unique owners</div></div>
+      <div class="home-stat"><div class="home-stat-num" id="statRecent">—</div><div class="home-stat-lbl">Last 24h</div></div>
+    </div>
+    <div class="home-section-head">
+      <span class="home-section-title">Recent activity</span>
+      <a href="#/agents" class="home-section-more">View all →</a>
+    </div>
+    <div class="agent-table" id="homeRecent">
+      <div class="agent-row body" style="grid-template-columns:1fr;justify-items:center;color:var(--muted);padding:24px"><span>Loading…</span></div>
+    </div>
+  </div>
 
   <!-- VIEW: Discovery ───────────────────────────────────────────── -->
   <div class="view" id="viewDiscovery">
@@ -735,7 +861,7 @@ window.disconnectWallet = function () {
   if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
   // Drop "Mine" filter (no longer valid) + reload Discovery if showing.
   if (State.discoveryFilter === 'mine') State.discoveryFilter = 'all';
-  if (location.hash === '#/' || !location.hash) loadDiscovery();
+  refreshCurrentView();
   // If we were on a detail page, force a re-render (drops owner sections).
   if (location.hash.startsWith('#/agent/')) handleHash();
   toast('Disconnected', 'success');
@@ -750,20 +876,18 @@ function navigate(hash) {
 }
 
 function handleHash() {
-  // Backward-compat: legacy #/agents redirects to root.
-  if (location.hash === '#/agents') { location.hash = '#/'; return; }
-
   const h = location.hash || '#/';
   $$('.view').forEach(v => v.classList.remove('active'));
   $$('.nav a').forEach(a => a.classList.remove('active'));
 
   let route;
+  let activeNav;
   if (h.startsWith('#/agent/')) {
     route = 'detail';
     const sealId = h.slice('#/agent/'.length);
     $('#viewDetail').classList.add('active');
     renderDetail(sealId);
-    $$('.nav a[data-route="discovery"]').forEach(a => a.classList.add('active'));
+    activeNav = 'agents';   // detail page is part of the Agents flow
   } else if (h === '#/deploy') {
     route = 'deploy';
     $('#viewDeploy').classList.add('active');
@@ -775,17 +899,35 @@ function handleHash() {
     State.deployingSealId = null;
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
     $('#deployBtn').disabled = !State.signer;
-  } else {
+    activeNav = 'deploy';
+  } else if (h === '#/agents') {
     route = 'discovery';
     $('#viewDiscovery').classList.add('active');
     loadDiscovery();
-    $$('.nav a[data-route="discovery"]').forEach(a => a.classList.add('active'));
+    activeNav = 'agents';
+  } else {
+    route = 'home';
+    $('#viewHome').classList.add('active');
+    loadHome();
+    activeNav = 'home';
   }
+
+  $$(`.nav a[data-route="${activeNav}"]`).forEach(a => a.classList.add('active'));
 
   // Tear down stale WS subscriptions when navigating away.
   if (route !== 'detail' && State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
 }
 window.addEventListener('hashchange', handleHash);
+
+// Re-fetch whatever view the user is currently looking at — used after
+// wallet connect / account switch / disconnect so owner-aware bits
+// (Mine filter, owner-only buttons) reflect the new identity.
+function refreshCurrentView() {
+  const h = location.hash || '#/';
+  if (h === '#/agents') loadDiscovery();
+  else if (h.startsWith('#/agent/')) handleHash();
+  else if (h === '#/' || !h) loadHome();
+}
 
 // ───────────────────────────────────────────────────────────────────
 // Bootstrap: load /config
@@ -852,8 +994,8 @@ async function selectWallet(provider) {
     await applyAccount(await browserProv.getSigner());
     bindWalletEvents(provider);
     toast('Wallet connected', 'success');
-    if (location.hash === '#/' || !location.hash) loadDiscovery();
-    if (location.hash.startsWith('#/agent/')) handleHash();
+    refreshCurrentView();
+    refreshCurrentView();
   } catch (e) {
     toast('Connect rejected: ' + (e.message || e), 'error');
   }
@@ -896,8 +1038,7 @@ async function onAccountsChanged(accounts) {
     await applyAccount(signer);
     toast(`Switched to ${State.ownerAddr.slice(0, 6)}…${State.ownerAddr.slice(-4)}`, 'success');
     // Refresh viewport so "Mine" filter / owner-only sections re-evaluate.
-    if (location.hash === '#/' || !location.hash) loadDiscovery();
-    else if (location.hash.startsWith('#/agent/')) handleHash();
+    refreshCurrentView();
   } catch (e) {
     toast('Account switch failed: ' + (e.message || e), 'error');
   }
@@ -1159,6 +1300,88 @@ window.setDiscoveryFilter = function (mode) {
   $$('#discoveryFilter [data-filter]').forEach(b => b.classList.toggle('on', b.dataset.filter === mode));
   loadDiscovery();
 };
+
+// ───────────────────────────────────────────────────────────────────
+// Home: hero + showcase + stats + recent activity
+// ───────────────────────────────────────────────────────────────────
+
+// Cast of demo agents shown in the home page showcase row. Each has a
+// stable seed (the backend hashes the name with keccak256 to produce
+// the avatar) and a one-liner the agent says when you hover. These are
+// illustrative — they never get deployed.
+const SHOWCASE_AGENTS = [
+  { name: 'Sage',    line: "I'm a DeFi strategist. Want me to look at your yield positions?" },
+  { name: 'Scribe',  line: "I summarise on-chain transactions in plain English." },
+  { name: 'Echo',    line: "I watch governance proposals and ping you when a vote opens." },
+  { name: 'Vault',   line: "I rebalance treasuries based on rules you set in plain text." },
+  { name: 'Nova',    line: "Token research at your service — ask me about any contract." },
+  { name: 'Forge',   line: "I help you mint, deploy, and audit small contracts." },
+  { name: 'Atlas',   line: "Cross-chain context — I track what's happening across L1/L2s." },
+];
+
+let _showcaseRendered = false;
+function renderShowcase() {
+  if (_showcaseRendered) return;
+  const host = $('#homeShowcase');
+  if (!host) return;
+  host.innerHTML = SHOWCASE_AGENTS.map(({ name, line }) => `
+    <div class="home-pet">
+      <div class="face"><img src="/avatar/${encodeURIComponent(name.toLowerCase())}.svg" alt="${escapeHtml(name)}"/></div>
+      <span class="name">${escapeHtml(name)}</span>
+      <div class="bubble"><strong>${escapeHtml(name)}</strong>${escapeHtml(line)}</div>
+    </div>
+  `).join('');
+  _showcaseRendered = true;
+}
+
+async function loadHome() {
+  renderShowcase();
+  try {
+    const r = await fetch('/deployments');
+    if (!r.ok) throw new Error(`/deployments ${r.status}`);
+    const items = await r.json();
+
+    // Stats
+    const total = items.length;
+    const running = items.filter(d => d.phase === 'running').length;
+    const owners = new Set(items.map(d => (d.owner || '').toLowerCase()).filter(Boolean)).size;
+    const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+    const recent24h = items.filter(d => d.created_at && new Date(d.created_at).getTime() >= dayAgo).length;
+
+    $('#statTotal').textContent   = total;
+    $('#statRunning').textContent = running;
+    $('#statOwners').textContent  = owners;
+    $('#statRecent').textContent  = recent24h;
+
+    // Top 5 most recent agents — same row layout as Discovery for consistency
+    const top = [...items]
+      .filter(d => d.created_at)
+      .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''))
+      .slice(0, 5);
+
+    const list = $('#homeRecent');
+    if (!top.length) {
+      list.innerHTML = `<div class="empty"><h2>No agents yet</h2><p>Be the first to deploy through this attestor.</p><a class="btn btn-primary" href="#/deploy">+ Deploy an agent</a></div>`;
+      return;
+    }
+    list.innerHTML = `
+      <div class="agent-row head">
+        <div>Name</div>
+        <div>Chain</div>
+        <div>Status</div>
+        <div>Owner</div>
+        <div style="text-align:right">Created</div>
+      </div>
+      ${top.map(d => renderAgentRow(d)).join('')}
+    `;
+    $$('#homeRecent .agent-row.body').forEach(el => {
+      el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
+    });
+  } catch (e) {
+    $('#homeRecent').innerHTML = `<div class="empty"><p style="color:var(--red)">${escapeHtml(e.message)}</p></div>`;
+    ['#statTotal','#statRunning','#statOwners','#statRecent'].forEach(id => $(id).textContent = '—');
+  }
+}
 
 async function loadDiscovery() {
   const list = $('#agentList');

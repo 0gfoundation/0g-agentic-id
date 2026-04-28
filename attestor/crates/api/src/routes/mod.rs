@@ -28,6 +28,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/static/ethers.js", get(serve_ethers))
         .route("/avatar/default.svg", get(avatar::default_avatar))
+        .route("/avatar/:seed", get(avatar::keyed_avatar))
         .route("/health", get(health))
         .route("/config", get(config::handle))
         .route("/deploy", post(deploy::handle))
