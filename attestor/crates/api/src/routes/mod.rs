@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
+mod avatar;
 mod config;
 mod deploy;
 mod deployment;
@@ -26,6 +27,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(serve_index))
         .route("/static/ethers.js", get(serve_ethers))
+        .route("/avatar/default.svg", get(avatar::default_avatar))
         .route("/health", get(health))
         .route("/config", get(config::handle))
         .route("/deploy", post(deploy::handle))

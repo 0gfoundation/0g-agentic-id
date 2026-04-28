@@ -318,38 +318,62 @@ details.log[open] summary{color:var(--text2)}
 /* Legacy classes still referenced elsewhere (chip styles etc) */
 .agent-chips{display:flex;gap:8px;flex-wrap:wrap}
 
-/* A2A — interactive "say hi" card */
-.a2a-card{background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:16px 18px;margin-bottom:18px;box-shadow:var(--sh-sm)}
-.a2a-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:8px;flex-wrap:wrap}
-.a2a-head .a2a-title{font-weight:600;font-size:14px}
-.a2a-head .a2a-sub{font-size:11px;color:var(--muted);font-weight:400;margin-left:6px}
-.a2a-url{font-family:var(--mono);font-size:12px;color:var(--p);word-break:break-all;display:block;text-decoration:none;padding:8px 10px;background:var(--surf2);border-radius:var(--r-sm);margin-bottom:10px}
-.a2a-url:hover{background:var(--surf3);text-decoration:underline}
-.a2a-actions{display:flex;gap:6px;flex-wrap:wrap}
-.a2a-resp{margin-top:14px;display:none;flex-direction:column;align-items:center;text-align:center;padding:22px 18px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surf);min-height:120px;animation:fadeIn var(--t-base) var(--ease-out)}
-.a2a-resp.show{display:flex}
-.a2a-resp.verified{border-color:var(--gbd);background:linear-gradient(180deg,var(--gbg) 0%,var(--surf) 70%)}
-.a2a-resp.failed{border-color:var(--rbd);background:linear-gradient(180deg,var(--rbg) 0%,var(--surf) 70%)}
-.a2a-resp.warn{border-color:var(--obd);background:linear-gradient(180deg,var(--obg) 0%,var(--surf) 70%)}
+/* Serve — interactive "say hi" card */
+.serve-card{background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:16px 18px;margin-bottom:18px;box-shadow:var(--sh-sm)}
+.serve-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:8px;flex-wrap:wrap}
+.serve-head .serve-title{font-weight:600;font-size:14px}
+.serve-head .serve-sub{font-size:11px;color:var(--muted);font-weight:400;margin-left:6px}
+.serve-url{font-family:var(--mono);font-size:12px;color:var(--p);word-break:break-all;display:block;text-decoration:none;padding:8px 10px;background:var(--surf2);border-radius:var(--r-sm);margin-bottom:10px}
+.serve-url:hover{background:var(--surf3);text-decoration:underline}
+.serve-actions{display:flex;gap:6px;flex-wrap:wrap}
+.serve-resp{margin-top:14px;display:none;flex-direction:column;align-items:center;text-align:center;padding:22px 18px;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surf);min-height:120px;animation:fadeIn var(--t-base) var(--ease-out)}
+.serve-resp.show{display:flex}
+.serve-resp.verified{border-color:var(--gbd);background:linear-gradient(180deg,var(--gbg) 0%,var(--surf) 70%)}
+.serve-resp.failed{border-color:var(--rbd);background:linear-gradient(180deg,var(--rbg) 0%,var(--surf) 70%)}
+.serve-resp.warn{border-color:var(--obd);background:linear-gradient(180deg,var(--obg) 0%,var(--surf) 70%)}
 
 /* Big centered status icon: spinner / check / cross / warn */
-.a2a-icon{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff;margin-bottom:10px;animation:check-pop .4s var(--ease-spring)}
-.a2a-resp.verifying .a2a-icon{background:var(--surf2);color:var(--text2);animation:none}
-.a2a-resp.verifying .a2a-icon::after{content:'';width:22px;height:22px;border:3px solid var(--border);border-top-color:var(--p);border-radius:50%;animation:spin .8s linear infinite}
-.a2a-resp.verifying .a2a-icon{font-size:0}
-.a2a-resp.verified .a2a-icon{background:var(--green);box-shadow:0 0 0 6px var(--gbg);animation:check-pop .4s var(--ease-spring),verify-pulse 1.6s .3s ease-out}
-.a2a-resp.failed .a2a-icon{background:var(--red);box-shadow:0 0 0 6px var(--rbg);animation:check-pop .4s var(--ease-spring),verify-shake .5s .25s ease-in-out}
-.a2a-resp.warn .a2a-icon{background:var(--orange);box-shadow:0 0 0 6px var(--obg)}
+.serve-icon{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff;margin-bottom:10px;animation:check-pop .4s var(--ease-spring)}
+.serve-resp.verifying .serve-icon{background:var(--surf2);color:var(--text2);animation:none}
+.serve-resp.verifying .serve-icon::after{content:'';width:22px;height:22px;border:3px solid var(--border);border-top-color:var(--p);border-radius:50%;animation:spin .8s linear infinite}
+.serve-resp.verifying .serve-icon{font-size:0}
+.serve-resp.verified .serve-icon{background:var(--green);box-shadow:0 0 0 6px var(--gbg);animation:check-pop .4s var(--ease-spring),verify-pulse 1.6s .3s ease-out}
+.serve-resp.failed .serve-icon{background:var(--red);box-shadow:0 0 0 6px var(--rbg);animation:check-pop .4s var(--ease-spring),verify-shake .5s .25s ease-in-out}
+.serve-resp.warn .serve-icon{background:var(--orange);box-shadow:0 0 0 6px var(--obg)}
 
-.a2a-title{font-size:14.5px;font-weight:700;letter-spacing:-.01em;color:var(--text);margin-bottom:4px}
-.a2a-resp.verified .a2a-title{color:var(--green)}
-.a2a-resp.failed  .a2a-title{color:var(--red)}
-.a2a-resp.warn    .a2a-title{color:var(--orange)}
-.a2a-sub-title{font-size:12px;color:var(--text2);max-width:420px;line-height:1.5;margin-bottom:10px}
-.a2a-signer{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;margin-bottom:10px;letter-spacing:.02em}
-.a2a-message{font-size:12.5px;color:var(--text2);line-height:1.55;font-style:italic;max-width:480px;margin-top:8px;padding:10px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);position:relative}
-.a2a-message::before{content:'"';position:absolute;left:6px;top:-4px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
-.a2a-message::after{content:'"';position:absolute;right:6px;bottom:-14px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
+.serve-title{font-size:14.5px;font-weight:700;letter-spacing:-.01em;color:var(--text);margin-bottom:4px}
+.serve-resp.verified .serve-title{color:var(--green)}
+.serve-resp.failed  .serve-title{color:var(--red)}
+.serve-resp.warn    .serve-title{color:var(--orange)}
+.serve-sub-title{font-size:12px;color:var(--text2);max-width:420px;line-height:1.5;margin-bottom:10px}
+.serve-signer{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;margin-bottom:10px;letter-spacing:.02em}
+.serve-message{font-size:12.5px;color:var(--text2);line-height:1.55;font-style:italic;max-width:480px;margin-top:8px;padding:10px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);position:relative}
+.serve-message::before{content:'"';position:absolute;left:6px;top:-4px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
+.serve-message::after{content:'"';position:absolute;right:6px;bottom:-14px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
+
+/* Verification check-list — 3 rows, each animates in with sequenced delay */
+.serve-checks{display:flex;flex-direction:column;gap:8px;width:100%;max-width:460px;margin:8px 0 4px;text-align:left}
+.serve-check-row{display:flex;align-items:flex-start;gap:11px;padding:9px 12px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);font-size:12.5px;color:var(--text2);transition:background var(--t-fast),border-color var(--t-fast),opacity var(--t-fast);opacity:.55}
+.serve-check-row.running{background:var(--surf);border-color:var(--surf3);opacity:1}
+.serve-check-row.passed{background:var(--gbg);border-color:var(--gbd);opacity:1;color:var(--text)}
+.serve-check-row.failed{background:var(--rbg);border-color:var(--rbd);opacity:1;color:var(--text);animation:row-shake .4s ease-in-out}
+.serve-check-row.skipped{opacity:.35}
+.serve-check-row .row-icon{flex-shrink:0;width:18px;height:18px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;background:var(--border);margin-top:1px}
+.serve-check-row.running .row-icon{background:transparent;border:2px solid var(--p);border-top-color:transparent;animation:spin .7s linear infinite;color:transparent;width:16px;height:16px}
+.serve-check-row.passed .row-icon{background:var(--green);animation:check-pop .35s var(--ease-spring)}
+.serve-check-row.failed .row-icon{background:var(--red);animation:check-pop .35s var(--ease-spring)}
+.serve-check-row.skipped .row-icon{background:var(--border);color:var(--muted)}
+.serve-check-row .row-text{flex:1;min-width:0}
+.serve-check-row .row-label{font-weight:600;letter-spacing:-.005em}
+.serve-check-row .row-detail{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono);word-break:break-all;line-height:1.45}
+.serve-check-row.passed .row-detail,.serve-check-row.failed .row-detail{color:var(--text2)}
+
+@keyframes row-shake{
+  0%,100% { transform:translateX(0) }
+  25%     { transform:translateX(-3px) }
+  50%     { transform:translateX(3px) }
+  75%     { transform:translateX(-2px) }
+}
 
 @keyframes verify-pulse{
   0%  { box-shadow:0 0 0 6px var(--gbg),0 0 0 6px oklch(60% 0.18 145 / .45) }
@@ -492,7 +516,7 @@ details.log[open] summary{color:var(--text2)}
       <div class="field">
         <label>Avatar <span style="color:var(--muted);font-weight:400">(optional)</span></label>
         <div class="avatar-picker">
-          <div class="avatar-preview" id="avatarPreview">🤖</div>
+          <div class="avatar-preview" id="avatarPreview"><img src="/avatar/default.svg" alt=""/></div>
           <div class="avatar-actions">
             <div class="row-btns">
               <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="handleAvatarFile(event)" />
@@ -930,7 +954,7 @@ window.handleAvatarFile = function (e) {
 window.clearAvatar = function () {
   State.deployAvatarDataUrl = null;
   $('#avatarFile').value = '';
-  $('#avatarPreview').innerHTML = '🤖';
+  $('#avatarPreview').innerHTML = '<img src="/avatar/default.svg" alt=""/>';
   $('#avatarMeta').textContent = 'Auto-generated from seal_id';
   $('#avatarClearBtn').disabled = true;
 };
@@ -1251,7 +1275,7 @@ function renderAgentRow(d) {
 
   const avatar = image
     ? `<div class="avatar"><img src="${escapeHtml(image)}" alt=""/></div>`
-    : `<div class="avatar">🤖</div>`;
+    : `<div class="avatar"><img src="/avatar/default.svg" alt=""/></div>`;
 
   return `
     <div class="agent-row body" data-seal="${sealHex}">
@@ -1324,11 +1348,11 @@ function paintDetail(dep) {
 
   const sandboxId = dep.sandbox_id || '';
   const cfg = State.config || {};
-  // A2A URL: prefer on-chain agent_card.url (canonical truth) when present;
+  // Serve URL: prefer on-chain agent_card.url (canonical truth) when present;
   // fallback to client-side reconstruction from /config + sandbox_id.
-  const a2aUrl = card.url
+  const serveUrl = card.url
     || (sandboxId && cfg.sandbox_proxy_addr
-        ? `http://${cfg.agent_a2a_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_a2a_path}`
+        ? `http://${cfg.agent_serve_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_serve_path}`
         : '');
   // Base origin of the dashboard host (no path). Used both for the SIWE
   // call (`<base>/_seal/auth`) and for assembling the tokenized URL we
@@ -1348,7 +1372,7 @@ function paintDetail(dep) {
   const canStart = ownerMatches && sandboxId && (phase === 'stopped' || phase === 'failed');
 
   // Container is reachable only when phase=running. Stopped/failed agents
-  // hide A2A endpoint + dashboard since the proxy URL won't resolve.
+  // hide Serve endpoint + dashboard since the proxy URL won't resolve.
   const isLive = phase === 'running';
 
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
@@ -1375,7 +1399,7 @@ function paintDetail(dep) {
 
   const avatar = image
     ? `<div class="avatar-big"><img src="${escapeHtml(image)}" alt=""/></div>`
-    : `<div class="avatar-big">🤖</div>`;
+    : `<div class="avatar-big"><img src="/avatar/default.svg" alt=""/></div>`;
 
   // Render an address-like row: shows the truncated form, with a tooltip
   // (title attr) revealing the full value on hover. `📋` button copies the
@@ -1475,20 +1499,20 @@ function paintDetail(dep) {
     </div>
   `;
 
-  const a2aBlock = (isLive && a2aUrl) ? `
-    <div class="a2a-card">
-      <div class="a2a-head">
+  const serveBlock = (isLive && serveUrl) ? `
+    <div class="serve-card">
+      <div class="serve-head">
         <div>
-          <span class="a2a-title">A2A endpoint</span>
-          <span class="a2a-sub">— say hi to this agent</span>
+          <span class="serve-title">Serve endpoint</span>
+          <span class="serve-sub">— say hi to this agent</span>
         </div>
-        <div class="a2a-actions">
-          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(a2aUrl)}', '${escapeHtml(agentSealAddr || '')}')">👋 Say hi</button>
-          <button class="icon-btn" onclick="copyText('${escapeHtml(a2aUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))">📋 Copy URL</button>
+        <div class="serve-actions">
+          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(serveUrl)}', '${escapeHtml(agentSealAddr || '')}', '${escapeHtml(dep.agent_id || '')}')">👋 Say hi</button>
+          <button class="icon-btn" onclick="copyText('${escapeHtml(serveUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))">📋 Copy URL</button>
         </div>
       </div>
-      <a class="a2a-url" href="${escapeHtml(a2aUrl)}" target="_blank" rel="noopener">${escapeHtml(a2aUrl)}</a>
-      <div class="a2a-resp" id="a2aResp"></div>
+      <a class="serve-url" href="${escapeHtml(serveUrl)}" target="_blank" rel="noopener">${escapeHtml(serveUrl)}</a>
+      <div class="serve-resp" id="serveResp"></div>
     </div>` : '';
 
   const publicHtml = `
@@ -1514,7 +1538,7 @@ function paintDetail(dep) {
 
     <div class="detail-grid">
       <div>
-        ${a2aBlock}
+        ${serveBlock}
         <div class="section-title" style="margin-top:0">AgentCard</div>
         <div class="card" style="padding:14px 18px">
           <div id="agentCardBody">
@@ -1576,7 +1600,7 @@ function renderAgentCardBody(card) {
     `]);
   }
   if (card.url) {
-    fields.push(['url (A2A)', `<span style="word-break:break-all">${escapeHtml(card.url)}</span>`]);
+    fields.push(['url (serve)', `<span style="word-break:break-all">${escapeHtml(card.url)}</span>`]);
   }
 
   let html = '';
@@ -1653,7 +1677,7 @@ window.actionStop  = (sealId, sandboxId) => lifecycleAction('stop',  sealId, san
 window.actionStart = (sealId, sandboxId) => lifecycleAction('start', sealId, sandboxId);
 
 // ───────────────────────────────────────────────────────────────────
-// Say hi — fetch the A2A endpoint and render the agent's response
+// Say hi — fetch the Serve endpoint and render the agent's response
 // inline. The sandbox proxy at port 4000 sets `Access-Control-Allow-
 // Origin: *`, so a browser fetch from the attestor origin works as
 // long as the agent itself doesn't add stricter CORS headers.
@@ -1708,27 +1732,66 @@ window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
   }
 };
 
-// Hits agent /hello, recovers the signer of `X-Agent-Signature` (EIP-191
-// over body) via ethers.verifyMessage, and confirms that signer ==
-// the on-chain agent_seal address. The whole result lives in a single
-// centered card that morphs through verifying spinner → ✓/✗/⚠ icon.
-// We don't dump the raw response — only the agent's human-readable
-// `message` field surfaces, as a quote under the verdict.
-window.sayHiToAgent = async function (url, expectedSealAddr) {
-  const respEl = $('#a2aResp');
+// Serve verification rendered as a 3-row checklist that animates one row at
+// a time so the user can see each cryptographic step resolve. Rows are
+// pre-declared so layout doesn't reflow as checks land:
+//   ⟳ Signer identity         — envelope sig recovers to on-chain agent_seal
+//   ⟳ Response body integrity — keccak(body) matches envelope.resp_body_hash
+//   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
+// Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
+// envelope = `{ resp_body_hash, data_hashes, ts, ... }`, sig is EIP-191
+// personal_sign over the envelope JSON bytes.
+function b64urlDecode(s) {
+  const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
+  return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+}
+
+window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
+  const respEl = $('#serveResp');
   const btn = $('#btnSayHi');
   if (!respEl || !btn) return;
 
-  const paint = (state, icon, title, sub, signer, message) => {
-    respEl.className = `a2a-resp show ${state}`;
+  // Three pre-declared rows; populated as each step lands.
+  // status: pending | running | passed | failed | skipped
+  const checks = [
+    { key: 'identity', label: 'Signer identity',         detail: '', status: 'pending' },
+    { key: 'body',     label: 'Response body integrity', detail: '', status: 'pending' },
+    { key: 'data',     label: 'On-chain data hashes',    detail: '', status: 'pending' },
+  ];
+  const ICONS = { pending: '·', running: '', passed: '✓', failed: '✗', skipped: '–' };
+
+  const paint = (phase, headIcon, title, sub, signer, message) => {
+    respEl.className = `serve-resp show ${phase}`;
+    const checksHtml = `
+      <div class="serve-checks">
+        ${checks.map(c => `
+          <div class="serve-check-row ${c.status}">
+            <div class="row-icon">${ICONS[c.status]}</div>
+            <div class="row-text">
+              <div class="row-label">${escapeHtml(c.label)}</div>
+              ${c.detail ? `<div class="row-detail">${escapeHtml(c.detail)}</div>` : ''}
+            </div>
+          </div>
+        `).join('')}
+      </div>`;
     respEl.innerHTML = `
-      <div class="a2a-icon">${icon}</div>
-      <div class="a2a-title">${title}</div>
-      ${sub ? `<div class="a2a-sub-title">${escapeHtml(sub)}</div>` : ''}
-      ${signer ? `<div class="a2a-signer" title="${escapeHtml(signer.full)}">${escapeHtml(signer.short)}</div>` : ''}
-      ${message ? `<div class="a2a-message">${escapeHtml(message)}</div>` : ''}
+      <div class="serve-icon">${headIcon}</div>
+      <div class="serve-title">${title}</div>
+      ${sub ? `<div class="serve-sub-title">${escapeHtml(sub)}</div>` : ''}
+      ${checksHtml}
+      ${signer ? `<div class="serve-signer" title="${escapeHtml(signer.full)}">${escapeHtml(signer.short)}</div>` : ''}
+      ${message ? `<div class="serve-message">${escapeHtml(message)}</div>` : ''}
     `;
   };
+
+  const sleep = ms => new Promise(res => setTimeout(res, ms));
+  const setRow = (key, status, detail) => {
+    const c = checks.find(c => c.key === key);
+    if (c) { c.status = status; if (detail !== undefined) c.detail = detail; }
+  };
+  const skipRest = () => checks.forEach(c => {
+    if (c.status === 'pending' || c.status === 'running') c.status = 'skipped';
+  });
 
   const oldText = btn.textContent;
   btn.disabled = true;
@@ -1738,56 +1801,118 @@ window.sayHiToAgent = async function (url, expectedSealAddr) {
   try {
     const r = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
     const text = await r.text();
-    const sig = r.headers.get('X-Agent-Signature') || '';
+    const proofHeader = r.headers.get('X-Agent-Proof') || '';
+    let humanMsg = '';
+    try { humanMsg = JSON.parse(text)?.message || ''; } catch {}
 
     if (!r.ok) {
+      skipRest();
       paint('failed', '✗', `HTTP ${r.status}`, 'Agent rejected the request', null, null);
       return;
     }
-    if (!sig) {
-      let msg = '';
-      try { msg = JSON.parse(text)?.message || ''; } catch {}
+    if (!proofHeader) {
+      skipRest();
       paint('warn', '⚠', 'Response received',
-        'No X-Agent-Signature header — identity could not be verified', null, msg);
+        'No X-Agent-Proof header — identity could not be verified', null, humanMsg);
       return;
     }
 
-    // Brief deliberate pause so the verifying state is perceptible —
-    // verifyMessage itself is microseconds.
-    paint('verifying', '', 'Verifying signature…',
-      'Recovering signer · matching on-chain agent_seal', null, null);
-    await new Promise(res => setTimeout(res, 600));
+    // ── Check 1: identity (envelope sig recovers to on-chain seal) ──
+    setRow('identity', 'running');
+    paint('verifying', '', 'Verifying agent identity…', null, null, null);
+    await sleep(550);
 
-    let recovered = '';
-    let parsedMessage = '';
+    let envelope, recovered, sigInfo;
     try {
-      recovered = ethers.verifyMessage(text, sig);
-      try { parsedMessage = JSON.parse(text)?.message || ''; } catch {}
+      const parts = proofHeader.split('.');
+      if (parts.length !== 2) throw new Error('malformed X-Agent-Proof (expected sig.envelope)');
+      const [sig, envB64] = parts;
+      const envelopeJson = b64urlDecode(envB64);
+      envelope = JSON.parse(envelopeJson);
+      recovered = ethers.verifyMessage(envelopeJson, sig);
+      sigInfo = { full: recovered, short: `${recovered.slice(0,6)}…${recovered.slice(-4)}` };
     } catch (e) {
-      paint('failed', '✗', 'Verification error', e.message || String(e), null, null);
+      setRow('identity', 'failed', `envelope: ${e.message || e}`);
+      skipRest();
+      paint('failed', '✗', 'Envelope error', null, null, null);
       return;
     }
 
-    const sigInfo = {
-      full: recovered,
-      short: `${recovered.slice(0, 6)}…${recovered.slice(-4)}`,
-    };
-    const matchesOnChain = expectedSealAddr
-      && expectedSealAddr.toLowerCase() === recovered.toLowerCase();
-
-    if (matchesOnChain) {
-      paint('verified', '✓', 'Identity verified',
-        'Response signed by the on-chain agent_seal — this is the real agent.',
-        sigInfo, parsedMessage);
-    } else {
+    if (!expectedSealAddr || expectedSealAddr.toLowerCase() !== recovered.toLowerCase()) {
       const want = expectedSealAddr
         ? `${expectedSealAddr.slice(0,6)}…${expectedSealAddr.slice(-4)}`
         : '(unknown)';
+      setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}`);
+      skipRest();
       paint('failed', '✗', 'Identity mismatch',
-        `Signer does not match the on-chain agent_seal (${want}).`,
-        sigInfo, parsedMessage);
+        'Recovered signer is not the on-chain agent_seal',
+        sigInfo, humanMsg);
+      return;
     }
+    setRow('identity', 'passed', `signer ${sigInfo.short} = on-chain agent_seal`);
+
+    // ── Check 2: response body integrity ──
+    setRow('body', 'running');
+    paint('verifying', '', 'Verifying response body…', null, null, null);
+    await sleep(500);
+
+    const actualBodyHash = ethers.keccak256(ethers.toUtf8Bytes(text)).toLowerCase();
+    const claimedHash = String(envelope.resp_body_hash || '').toLowerCase();
+    if (claimedHash !== actualBodyHash) {
+      setRow('body', 'failed', `keccak(body)=${actualBodyHash.slice(0,10)}… ≠ envelope.resp_body_hash`);
+      setRow('data', 'skipped');
+      paint('failed', '✗', 'Body tampered',
+        'Response body hash does not match the signed envelope',
+        sigInfo, humanMsg);
+      return;
+    }
+    setRow('body', 'passed', `keccak(body)=${actualBodyHash.slice(0,10)}… ✓ envelope`);
+
+    // ── Check 3: on-chain data hashes ──
+    setRow('data', 'running');
+    paint('verifying', '', 'Cross-checking on-chain data…', null, null, null);
+    await sleep(500);
+
+    const declared = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+    if (declared.length === 0) {
+      setRow('data', 'skipped', 'envelope declared no data hashes');
+    } else {
+      try {
+        const cfg = State.config;
+        if (!cfg?.chain_rpc || !cfg?.agentic_id_addr || !agentId) {
+          throw new Error('chain config or agent_id missing');
+        }
+        const provider = new ethers.JsonRpcProvider(cfg.chain_rpc);
+        const c = new ethers.Contract(
+          cfg.agentic_id_addr,
+          ['function intelligentDatasOf(uint256) view returns (tuple(string dataDescription, bytes32 dataHash)[])'],
+          provider,
+        );
+        const datas = await c.intelligentDatasOf(BigInt(agentId));
+        const onchain = datas.map(d => String(d.dataHash).toLowerCase());
+        const missing = declared.filter(h => !onchain.includes(String(h).toLowerCase()));
+        if (missing.length > 0) {
+          setRow('data', 'failed',
+            `${missing.length}/${declared.length} hash${missing.length===1?'':'es'} not on chain`);
+          paint('failed', '✗', 'Data hash mismatch',
+            'Agent declared data not registered to this identity',
+            sigInfo, humanMsg);
+          return;
+        }
+        setRow('data', 'passed',
+          `${declared.length}/${declared.length} hashes ✓ intelligentDatasOf(${agentId})`);
+      } catch (e) {
+        setRow('data', 'failed', e.message || String(e));
+        paint('failed', '✗', 'On-chain verification failed', null, null, null);
+        return;
+      }
+    }
+
+    paint('verified', '✓', 'Identity verified',
+      'All checks passed — this is the real agent.',
+      sigInfo, humanMsg);
   } catch (e) {
+    skipRest();
     paint('failed', '✗', 'Request failed', e.message || String(e), null, null);
   } finally {
     btn.disabled = false;

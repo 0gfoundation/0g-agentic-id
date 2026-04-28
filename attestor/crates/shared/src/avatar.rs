@@ -1977,6 +1977,12 @@ pub fn seed_to_data_url(seed: &[u8; 32]) -> String {
     format!("data:image/svg+xml;base64,{b64}")
 }
 
+/// Same algorithm as `seed_to_data_url` but returns the raw SVG bytes —
+/// suitable for serving directly as `image/svg+xml` from an HTTP route.
+pub fn seed_to_svg(seed: &[u8; 32]) -> String {
+    render_svg(seed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -5,8 +5,8 @@
 //!
 //! Two endpoints are exposed because the agent container has two distinct
 //! audiences:
-//!   - **A2A**:       public agent-to-agent entry. Same as the URL written
-//!                    on chain via `tokenURI` (AgentCard.url).
+//!   - **Serve**:     public service entry (`/hello` etc.). Same URL
+//!                    written on chain via `tokenURI` as AgentCard.url.
 //!   - **Dashboard**: owner-only operator view, used by the deploy console.
 
 use crate::state::AppState;
@@ -17,8 +17,8 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct ConfigResponse {
     pub sandbox_proxy_addr: String,
-    pub agent_a2a_port: u16,
-    pub agent_a2a_path: String,
+    pub agent_serve_port: u16,
+    pub agent_serve_path: String,
     pub agent_dashboard_port: u16,
     pub agent_dashboard_path: String,
     pub chain_rpc: String,
@@ -29,8 +29,8 @@ pub struct ConfigResponse {
 pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
     Json(ConfigResponse {
         sandbox_proxy_addr: state.cfg.sandbox_proxy_addr.clone(),
-        agent_a2a_port: state.cfg.agent_a2a_port,
-        agent_a2a_path: state.cfg.agent_a2a_path.clone(),
+        agent_serve_port: state.cfg.agent_serve_port,
+        agent_serve_path: state.cfg.agent_serve_path.clone(),
         agent_dashboard_port: state.cfg.agent_dashboard_port,
         agent_dashboard_path: state.cfg.agent_dashboard_path.clone(),
         chain_rpc: state.cfg.chain_rpc.clone(),

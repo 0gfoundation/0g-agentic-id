@@ -37,9 +37,10 @@ pub struct AgentCardInputs<'a> {
     /// "host:port" SocketAddr-shaped string — split at `:` to fill nip.io
     /// subdomain + URL port independently.
     pub sandbox_proxy_addr: &'a str,
-    /// Public A2A entry — what gets published on chain via `tokenURI`.
-    pub agent_a2a_port: u16,
-    pub agent_a2a_path: &'a str,
+    /// Public service entry the agent exposes — what gets published on
+    /// chain via `tokenURI`.
+    pub agent_serve_port: u16,
+    pub agent_serve_path: &'a str,
 }
 
 pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
@@ -59,8 +60,8 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
     let url = build_agent_url(
         i.sandbox_proxy_addr,
         i.sandbox_id,
-        i.agent_a2a_port,
-        i.agent_a2a_path,
+        i.agent_serve_port,
+        i.agent_serve_path,
     );
 
     // ── registrations: [{ agentId, chainId, agentAddress }] ─────────────
@@ -159,8 +160,8 @@ mod tests {
             seal_id: &seed,
             sandbox_id: "sb-123",
             sandbox_proxy_addr: "47.236.111.154.nip.io:4000",
-            agent_a2a_port: 8080,
-            agent_a2a_path: "/hello",
+            agent_serve_port: 8080,
+            agent_serve_path: "/hello",
         };
         let card = build_agent_card(inputs);
 
@@ -211,8 +212,8 @@ mod tests {
             seal_id: &seed,
             sandbox_id: "x",
             sandbox_proxy_addr: "h:1",
-            agent_a2a_port: 1,
-            agent_a2a_path: "/",
+            agent_serve_port: 1,
+            agent_serve_path: "/",
         };
         let card = build_agent_card(inputs);
         assert_eq!(card["image"], "https://my.custom.logo/png");

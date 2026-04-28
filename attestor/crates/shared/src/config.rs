@@ -96,9 +96,12 @@ pub struct Config {
     // wildcard-DNS suffix (.nip.io / real domain); the attestor just
     // prepends `{port}-{sandbox_id}.` as the subdomain.
     //
-    // - **A2A**:       public agent-to-agent entry. Goes into
-    //                  AgentCard.url, which is published on chain via
-    //                  tokenURI. Anyone calling the agent uses this.
+    // - **Serve**:     public service entry the agent exposes (e.g.
+    //                  `/hello`). Goes into AgentCard.url, which is
+    //                  published on chain via tokenURI. Anyone calling
+    //                  the agent uses this. (Renamed from "A2A" — the
+    //                  ERC-8004 spec uses "A2A" for the AgentCard itself,
+    //                  not the runtime endpoint.)
     // - **Dashboard**: owner-only operator view. Used by the deploy
     //                  console (My Agents detail page) — never written
     //                  on chain.
@@ -106,8 +109,8 @@ pub struct Config {
     // Two ports are configurable but in most setups they're the same
     // (one process listening, two paths).
     pub sandbox_proxy_addr: String,
-    pub agent_a2a_port: u16,
-    pub agent_a2a_path: String,
+    pub agent_serve_port: u16,
+    pub agent_serve_path: String,
     pub agent_dashboard_port: u16,
     pub agent_dashboard_path: String,
 }
@@ -178,10 +181,10 @@ impl Config {
                 )
             }),
             sandbox_proxy_addr: env("ATTESTOR_SANDBOX_PROXY_ADDR")?,
-            agent_a2a_port: env_opt("ATTESTOR_AGENT_A2A_PORT")
+            agent_serve_port: env_opt("ATTESTOR_AGENT_SERVE_PORT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),
-            agent_a2a_path: env_opt("ATTESTOR_AGENT_A2A_PATH")
+            agent_serve_path: env_opt("ATTESTOR_AGENT_SERVE_PATH")
                 .unwrap_or_else(|| "/result".to_string()),
             agent_dashboard_port: env_opt("ATTESTOR_AGENT_DASHBOARD_PORT")
                 .and_then(|s| s.parse().ok())

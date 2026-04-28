@@ -261,8 +261,8 @@ async fn handle_deploy(
         seal_id: &seal_id.0,
         sandbox_id: &sandbox_id,
         sandbox_proxy_addr: &ctx.cfg.sandbox_proxy_addr,
-        agent_a2a_port: ctx.cfg.agent_a2a_port,
-        agent_a2a_path: &ctx.cfg.agent_a2a_path,
+        agent_serve_port: ctx.cfg.agent_serve_port,
+        agent_serve_path: &ctx.cfg.agent_serve_path,
     });
 
     // Key under `{oss_key_prefix}/<sealId-hex>/card.json` so a shared
