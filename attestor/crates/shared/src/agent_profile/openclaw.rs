@@ -14,6 +14,7 @@ impl OpenClawProfile {
     const FRAMEWORK_VERSION: &'static str = "0.1.0";
     const INFERENCE_PROVIDER: &'static str = "anthropic";
     const INFERENCE_MODEL: &'static str = "claude-opus-4-7";
+    const INFERENCE_FALLBACKS: &'static [&'static str] = &["claude-opus-4-6"];
 }
 
 impl AgentProfile for OpenClawProfile {
@@ -31,6 +32,7 @@ impl AgentProfile for OpenClawProfile {
             inference: Some(InferenceSpec {
                 provider: Some(Self::INFERENCE_PROVIDER.to_string()),
                 model: Some(Self::INFERENCE_MODEL.to_string()),
+                fallbacks: Self::INFERENCE_FALLBACKS.iter().map(|s| s.to_string()).collect(),
                 extra: Default::default(),
             }),
             persona: Some(PersonaSpec {
@@ -56,6 +58,7 @@ mod tests {
         let inf = c.inference.expect("inference");
         assert_eq!(inf.provider.as_deref(), Some("anthropic"));
         assert_eq!(inf.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(inf.fallbacks, vec!["claude-opus-4-6".to_string()]);
         let p = c.persona.expect("persona");
         assert_eq!(
             p.system_prompt.as_deref(),

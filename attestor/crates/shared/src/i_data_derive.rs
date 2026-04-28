@@ -127,6 +127,11 @@ pub fn merge_config_input(
         if u_inf.model.is_some() {
             b_inf.model = u_inf.model;
         }
+        // fallbacks: user's vec wins wholesale when non-empty (same rule
+        // as `skills` at the top level). Empty user vec → inherit profile.
+        if !u_inf.fallbacks.is_empty() {
+            b_inf.fallbacks = u_inf.fallbacks;
+        }
         extend_map(&mut b_inf.extra, u_inf.extra);
         base.inference = Some(b_inf);
     }

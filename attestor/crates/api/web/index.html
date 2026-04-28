@@ -326,9 +326,43 @@ details.log[open] summary{color:var(--text2)}
 .a2a-url{font-family:var(--mono);font-size:12px;color:var(--p);word-break:break-all;display:block;text-decoration:none;padding:8px 10px;background:var(--surf2);border-radius:var(--r-sm);margin-bottom:10px}
 .a2a-url:hover{background:var(--surf3);text-decoration:underline}
 .a2a-actions{display:flex;gap:6px;flex-wrap:wrap}
-.a2a-resp{margin-top:10px;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--mono);font-size:12px;color:var(--text2);white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;display:none;animation:fadeIn var(--t-base) var(--ease-out)}
+.a2a-resp{margin-top:10px;display:none;animation:fadeIn var(--t-base) var(--ease-out)}
 .a2a-resp.show{display:block}
-.a2a-resp.error{border-color:var(--rbd);background:var(--rbg);color:var(--red)}
+
+/* Verify-status badge — sits above the body, animates in independently. */
+.a2a-verify{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--r-sm);font-size:12px;font-weight:600;font-family:var(--sans);margin-bottom:8px;border:1px solid transparent;opacity:0;transform:translateY(-6px) scale(.96);transition:opacity .25s var(--ease-out),transform .35s var(--ease-spring);min-height:32px}
+.a2a-verify.show{opacity:1;transform:translateY(0) scale(1)}
+.a2a-verify.verifying{background:var(--surf2);color:var(--text2);border-color:var(--border)}
+.a2a-verify.verified{background:var(--gbg);color:var(--green);border-color:var(--gbd);animation:verify-pulse 1.4s ease-out}
+.a2a-verify.failed{background:var(--rbg);color:var(--red);border-color:var(--rbd);animation:verify-shake .4s ease-in-out}
+.a2a-verify.warn{background:var(--obg);color:var(--orange);border-color:var(--obd)}
+.a2a-verify .check{display:inline-block;width:16px;height:16px;border-radius:50%;background:var(--green);color:#fff;text-align:center;line-height:16px;font-size:11px;font-weight:700;flex-shrink:0;animation:check-pop .35s var(--ease-spring)}
+.a2a-verify.failed .check{background:var(--red)}
+.a2a-verify.warn .check{background:var(--orange)}
+.a2a-verify .signer{font-family:var(--mono);font-size:11px;font-weight:500;opacity:.8;margin-left:auto;text-overflow:ellipsis;overflow:hidden;white-space:nowrap;max-width:50%}
+.a2a-verify .spinner-mini{width:13px;height:13px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;opacity:.5;animation:spin .8s linear infinite}
+
+.a2a-body{padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);font-family:var(--mono);font-size:12px;color:var(--text2);white-space:pre-wrap;word-break:break-all;max-height:160px;overflow-y:auto;margin:0}
+.a2a-resp.error .a2a-body{border-color:var(--rbd);background:var(--rbg);color:var(--red)}
+
+@keyframes verify-pulse{
+  0%  { box-shadow:0 0 0 0 oklch(60% 0.18 145 / .55) }
+  60% { box-shadow:0 0 0 14px oklch(60% 0.18 145 / 0) }
+  100%{ box-shadow:0 0 0 0 oklch(60% 0.18 145 / 0) }
+}
+@keyframes verify-shake{
+  0%,100% { transform:translateX(0) }
+  20%     { transform:translateX(-4px) }
+  40%     { transform:translateX(4px) }
+  60%     { transform:translateX(-3px) }
+  80%     { transform:translateX(2px) }
+}
+@keyframes check-pop{
+  0% { transform:scale(0) rotate(-40deg) }
+  60%{ transform:scale(1.18) rotate(0) }
+  100%{ transform:scale(1) rotate(0) }
+}
+@keyframes spin{ to{ transform:rotate(360deg) } }
 
 .icon-btn{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 12px;font-size:12px;cursor:pointer;color:var(--text2);transition:all var(--t-fast);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;gap:6px;text-decoration:none}
 .icon-btn:hover{background:var(--surf3);color:var(--text)}
@@ -601,9 +635,43 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+// Clipboard helper with secure-context fallback. `navigator.clipboard.writeText`
+// is gated behind a "secure context" check (HTTPS or localhost) — on plain
+// HTTP it throws/rejects silently. Fall back to the deprecated-but-universal
+// `document.execCommand('copy')` on a hidden, focused textarea.
+window.copyText = function (text) {
+  return new Promise((resolve, reject) => {
+    if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(resolve, reject);
+      return;
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '0';
+      ta.style.left = '0';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error('execCommand copy returned false'));
+    } catch (e) {
+      reject(e);
+    }
+  });
+};
+
 function copyAddr() {
   if (!State.ownerAddr) return;
-  navigator.clipboard.writeText(State.ownerAddr).then(() => toast('Address copied', 'success'));
+  copyText(State.ownerAddr).then(
+    () => toast('Address copied', 'success'),
+    () => toast('Copy failed', 'error'),
+  );
   $('#walletPop').classList.remove('open');
 }
 
@@ -1307,7 +1375,7 @@ function paintDetail(dep) {
         <span class="k">${escapeHtml(label)}</span>
         <span class="v" title="${fullVal}">${escapeHtml(shortAddr(val))}</span>
         <span class="icons">
-          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="navigator.clipboard.writeText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'))">📋</button>
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">📋</button>
         </span>
       </div>`;
   };
@@ -1321,7 +1389,7 @@ function paintDetail(dep) {
         <span class="k">${escapeHtml(label)}</span>
         <span class="v" title="${fullVal}">${escapeHtml(short)}</span>
         <span class="icons">
-          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="navigator.clipboard.writeText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'))">📋</button>
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">📋</button>
         </span>
       </div>`;
   };
@@ -1358,7 +1426,7 @@ function paintDetail(dep) {
           <span class="k">Wallet</span>
           <span class="v" id="kvAgentWallet" title="${escapeHtml(dep.owner || '')}">${escapeHtml(shortAddr(dep.owner))}<span style="color:var(--muted);margin-left:6px">(loading…)</span></span>
           <span class="icons">
-            ${dep.owner ? `<button class="icon-action" id="kvAgentWalletCopy" title="Copy Wallet" onclick="navigator.clipboard.writeText(document.getElementById('kvAgentWallet').title || '').then(()=>toast('Wallet copied','success'))">📋</button>` : ''}
+            ${dep.owner ? `<button class="icon-action" id="kvAgentWalletCopy" title="Copy Wallet" onclick="copyText(document.getElementById('kvAgentWallet').title || '').then(()=>toast('Wallet copied','success'),()=>toast('Copy failed','error'))">📋</button>` : ''}
           </span>
         </div>
       </div>
@@ -1371,7 +1439,7 @@ function paintDetail(dep) {
           <span class="k">Agent URI</span>
           <span class="v" title="${escapeHtml(dep.agent_uri)}">${escapeHtml(dep.agent_uri.length > 24 ? dep.agent_uri.slice(0, 18) + '…' : dep.agent_uri)}</span>
           <span class="icons">
-            <button class="icon-action" title="Copy URI" onclick="navigator.clipboard.writeText('${escapeHtml(dep.agent_uri)}').then(()=>toast('URI copied','success'))">📋</button>
+            <button class="icon-action" title="Copy URI" onclick="copyText('${escapeHtml(dep.agent_uri)}').then(()=>toast('URI copied','success'),()=>toast('Copy failed','error'))">📋</button>
             <a class="icon-action" title="Open" href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener">↗</a>
           </span>
         </div>` : ''}
@@ -1380,7 +1448,7 @@ function paintDetail(dep) {
           <span class="k">Sandbox ID</span>
           <span class="v" title="${escapeHtml(sandboxId)}">${escapeHtml(sandboxId.length > 18 ? sandboxId.slice(0, 8) + '…' + sandboxId.slice(-6) : sandboxId)}</span>
           <span class="icons">
-            <button class="icon-action" title="Copy Sandbox ID" onclick="navigator.clipboard.writeText('${escapeHtml(sandboxId)}').then(()=>toast('Sandbox ID copied','success'))">📋</button>
+            <button class="icon-action" title="Copy Sandbox ID" onclick="copyText('${escapeHtml(sandboxId)}').then(()=>toast('Sandbox ID copied','success'),()=>toast('Copy failed','error'))">📋</button>
           </span>
         </div>` : ''}
         ${plainRow('Name', name)}
@@ -1402,12 +1470,15 @@ function paintDetail(dep) {
           <span class="a2a-sub">— say hi to this agent</span>
         </div>
         <div class="a2a-actions">
-          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(a2aUrl)}')">👋 Say hi</button>
-          <button class="icon-btn" onclick="navigator.clipboard.writeText('${escapeHtml(a2aUrl)}').then(()=>toast('URL copied','success'))">📋 Copy URL</button>
+          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(a2aUrl)}', '${escapeHtml(agentSealAddr || '')}')">👋 Say hi</button>
+          <button class="icon-btn" onclick="copyText('${escapeHtml(a2aUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))">📋 Copy URL</button>
         </div>
       </div>
       <a class="a2a-url" href="${escapeHtml(a2aUrl)}" target="_blank" rel="noopener">${escapeHtml(a2aUrl)}</a>
-      <div class="a2a-resp" id="a2aResp"></div>
+      <div class="a2a-resp" id="a2aResp">
+        <div class="a2a-verify" id="a2aVerify"></div>
+        <pre class="a2a-body" id="a2aBody"></pre>
+      </div>
     </div>` : '';
 
   const publicHtml = `
@@ -1578,24 +1649,109 @@ window.actionStart = (sealId, sandboxId) => lifecycleAction('start', sealId, san
 // Origin: *`, so a browser fetch from the attestor origin works as
 // long as the agent itself doesn't add stricter CORS headers.
 // ───────────────────────────────────────────────────────────────────
-window.sayHiToAgent = async function (url) {
+// `/hello` is expected to return the body bytes signed (EIP-191 personal_sign)
+// by the agent's seal key, with the 65-byte signature served back as
+// `X-Agent-Signature: 0x...`. We verify by recovering the signer with
+// ethers and cross-checking against the on-chain agent_seal address pulled
+// from the AgentCard. The result is shown as an animated badge above the
+// raw body — verifying spinner → ✓ verified (green pulse) / ✗ failed
+// (red shake) / ⚠ unverified (no header).
+window.sayHiToAgent = async function (url, expectedSealAddr) {
   const respEl = $('#a2aResp');
+  const verifyEl = $('#a2aVerify');
+  const bodyEl = $('#a2aBody');
   const btn = $('#btnSayHi');
-  if (!respEl || !btn) return;
+  if (!respEl || !verifyEl || !bodyEl || !btn) return;
+
+  // Reset
   respEl.classList.remove('error');
   respEl.classList.add('show');
-  respEl.textContent = '⏳ contacting agent…';
+  verifyEl.className = 'a2a-verify';        // strip any previous state classes
+  verifyEl.innerHTML = '';
+  bodyEl.textContent = '⏳ contacting agent…';
+
   const oldText = btn.textContent;
   btn.disabled = true;
   btn.textContent = '⏳ sending…';
+
+  // Helper — paint a verification badge with state class + content. The
+  // .show class triggers the fade/slide-in transition; verified/failed get
+  // their own keyframe animations on top.
+  const setVerify = (state, html) => {
+    verifyEl.className = `a2a-verify ${state}`;
+    verifyEl.innerHTML = html;
+    // Force reflow so the .show transition runs even if state changes fast.
+    void verifyEl.offsetWidth;
+    verifyEl.classList.add('show');
+  };
+
   try {
-    const r = await fetch(url, { method: 'GET', mode: 'cors' });
+    const r = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
     const text = await r.text();
-    respEl.classList.toggle('error', !r.ok);
-    respEl.textContent = `HTTP ${r.status}\n\n${text}`;
+    const sig = r.headers.get('X-Agent-Signature') || '';
+
+    bodyEl.textContent = `HTTP ${r.status}\n\n${text}`;
+
+    if (!sig) {
+      setVerify('warn', `<span class="check">⚠</span><span>No X-Agent-Signature header — response unverified</span>`);
+      if (!r.ok) respEl.classList.add('error');
+      return;
+    }
+
+    // Brief deliberate pause so the verifying spinner is visible — pure UX
+    // (the actual verifyMessage call is microseconds).
+    setVerify('verifying', `<span class="spinner-mini"></span><span>Verifying signature…</span>`);
+    await new Promise(res => setTimeout(res, 550));
+
+    try {
+      const recovered = ethers.verifyMessage(text, sig);
+      // Pull whatever the body claims as its own agent address. Different
+      // /hello implementations have used different fields for this; accept
+      // any of them.
+      let claimedSelf = '';
+      try {
+        const parsed = JSON.parse(text);
+        claimedSelf = parsed?.agent
+          || parsed?.identity?.address
+          || parsed?.agentAddress
+          || '';
+      } catch {}
+      const matchesOnChain = expectedSealAddr
+        && expectedSealAddr.toLowerCase() === recovered.toLowerCase();
+      const matchesSelf = claimedSelf
+        && claimedSelf.toLowerCase() === recovered.toLowerCase();
+      const recoveredShort = `${recovered.slice(0, 6)}…${recovered.slice(-4)}`;
+
+      if (matchesOnChain) {
+        setVerify('verified',
+          `<span class="check">✓</span>
+           <span>Signature verified · matches on-chain agent_seal</span>
+           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
+      } else if (matchesSelf) {
+        setVerify('warn',
+          `<span class="check">⚠</span>
+           <span>Self-signed but on-chain agent_seal mismatch</span>
+           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
+        respEl.classList.add('error');
+      } else {
+        setVerify('failed',
+          `<span class="check">✗</span>
+           <span>Signature mismatch — wrong signer</span>
+           <span class="signer" title="${escapeHtml(recovered)}">${escapeHtml(recoveredShort)}</span>`);
+        respEl.classList.add('error');
+      }
+    } catch (e) {
+      setVerify('failed',
+        `<span class="check">✗</span><span>Verification error: ${escapeHtml(e.message || String(e))}</span>`);
+      respEl.classList.add('error');
+    }
+
+    if (!r.ok) respEl.classList.add('error');
   } catch (e) {
+    bodyEl.textContent = 'request failed: ' + (e.message || e);
+    setVerify('failed',
+      `<span class="check">✗</span><span>Request failed</span>`);
     respEl.classList.add('error');
-    respEl.textContent = 'request failed: ' + (e.message || e);
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;
