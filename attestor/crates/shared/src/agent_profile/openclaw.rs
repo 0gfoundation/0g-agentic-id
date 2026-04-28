@@ -11,7 +11,9 @@ pub struct OpenClawProfile;
 
 impl OpenClawProfile {
     const FRAMEWORK_NAME: &'static str = "openclaw";
-    const FRAMEWORK_VERSION: &'static str = "0.1.0";
+    /// CalVer (`YYYY.M.D`). Bump manually whenever the default config
+    /// shape or any baked-in constant below changes.
+    const FRAMEWORK_VERSION: &'static str = "2026.4.26";
     const INFERENCE_PROVIDER: &'static str = "anthropic";
     const INFERENCE_MODEL: &'static str = "claude-opus-4-7";
     const INFERENCE_FALLBACKS: &'static [&'static str] = &["claude-opus-4-6"];
@@ -54,7 +56,7 @@ mod tests {
         let c = OpenClawProfile.default_config("Sage", "DeFi helper");
         let fw = c.framework.expect("framework");
         assert_eq!(fw.name.as_deref(), Some("openclaw"));
-        assert_eq!(fw.version.as_deref(), Some("0.1.0"));
+        assert_eq!(fw.version.as_deref(), Some("2026.4.26"));
         let inf = c.inference.expect("inference");
         assert_eq!(inf.provider.as_deref(), Some("anthropic"));
         assert_eq!(inf.model.as_deref(), Some("claude-opus-4-7"));

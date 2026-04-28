@@ -1325,8 +1325,16 @@ function paintDetail(dep) {
     || (sandboxId && cfg.sandbox_proxy_addr
         ? `http://${cfg.agent_a2a_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_a2a_path}`
         : '');
-  const dashboardUrl = (sandboxId && cfg.sandbox_proxy_addr)
-    ? `http://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_dashboard_path}`
+  // Base origin of the dashboard host (no path). Used both for the SIWE
+  // call (`<base>/_seal/auth`) and for assembling the tokenized URL we
+  // navigate to (`<base>` + `dashboard_url` from the auth response).
+  const dashboardBaseUrl = (sandboxId && cfg.sandbox_proxy_addr)
+    ? `http://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}`
+    : '';
+  // Plain path-suffixed URL — kept around as a fallback link target if the
+  // auth flow ever fails (user can still see the dashboard's login page).
+  const dashboardUrl = dashboardBaseUrl
+    ? `${dashboardBaseUrl}${cfg.agent_dashboard_path}`
     : '';
 
   const ownerMatches = State.ownerAddr && dep.owner &&
@@ -1355,7 +1363,7 @@ function paintDetail(dep) {
   // Owner action buttons (top-right of hero) — only visible to the owner.
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
-      ${(isLive && dashboardUrl) ? `<a class="icon-btn primary" href="${escapeHtml(dashboardUrl)}" target="_blank" rel="noopener">⌘ Dashboard</a>` : ''}
+      ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')">⌘ Dashboard</button>` : ''}
       ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">⏸ Stop</button>` : ''}
       ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">▶ Start</button>` : ''}
     </div>`;
@@ -1558,12 +1566,11 @@ function renderAgentCardBody(card) {
   if (card.description) fields.push(['description', escapeHtml(card.description)]);
   if (card.image) {
     const isData = card.image.startsWith('data:');
-    const sizeLabel = isData ? `inline ${(card.image.length / 1024).toFixed(1)} KB` : 'remote';
+    const tip = isData
+      ? `inline · ${(card.image.length / 1024).toFixed(1)} KB`
+      : card.image;
     fields.push(['image', `
-      <div style="display:flex;align-items:center;gap:10px">
-        <img src="${escapeHtml(card.image)}" alt="" style="width:48px;height:48px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surf2);object-fit:cover;image-rendering:pixelated;flex-shrink:0"/>
-        <a href="${escapeHtml(card.image)}" target="_blank" rel="noopener" style="color:var(--p);font-family:var(--mono);font-size:11px">${sizeLabel} ↗</a>
-      </div>
+      <img src="${escapeHtml(card.image)}" alt="" title="${escapeHtml(tip)}" style="width:48px;height:48px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surf2);object-fit:cover;image-rendering:pixelated"/>
     `]);
   }
   if (card.url) {
@@ -1656,6 +1663,49 @@ window.actionStart = (sealId, sandboxId) => lifecycleAction('start', sealId, san
 // from the AgentCard. The result is shown as an animated badge above the
 // raw body — verifying spinner → ✓ verified (green pulse) / ✗ failed
 // (red shake) / ⚠ unverified (no header).
+// SIWE-style dashboard auth: owner signs `0GSealAuth:{sealId}:{ts}` with
+// MetaMask, attestor's frontend hands it to the agent's `/_seal/auth`
+// endpoint, agent verifies signer == on-chain owner and returns a
+// short-lived gateway token + the path to navigate to. We open the
+// dashboard with that token in the URL fragment so the SPA auto-logins
+// and the token never lands in server logs / Referer headers.
+window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  const btn = $('#btnDashboard');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Authenticating…'; }
+  try {
+    const sealId = sealIdHex.startsWith('0x') ? sealIdHex : '0x' + sealIdHex;
+    const ts = Math.floor(Date.now() / 1000);
+    const message = `0GSealAuth:${sealId}:${ts}`;
+    const signature = await State.signer.signMessage(message);
+
+    const r = await fetch(`${dashboardBaseUrl}/_seal/auth`, {
+      method: 'GET',
+      mode: 'cors',
+      cache: 'no-store',
+      headers: {
+        'X-Auth-Message':   message,
+        'X-Auth-Signature': signature,
+      },
+    });
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      throw new Error(`HTTP ${r.status}${body ? ': ' + body : ''}`);
+    }
+    const { dashboard_url } = await r.json();
+    if (!dashboard_url) throw new Error('auth response missing dashboard_url');
+
+    // Final URL: <base>/<dashboard_url>. Server returns it with a leading
+    // slash + fragment (e.g. `/#token=…`) so naive concatenation works.
+    window.open(dashboardBaseUrl + dashboard_url, '_blank', 'noopener');
+  } catch (e) {
+    toast('Dashboard auth failed: ' + (e.message || e), 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = oldText; }
+  }
+};
+
 window.sayHiToAgent = async function (url, expectedSealAddr) {
   const respEl = $('#a2aResp');
   const verifyEl = $('#a2aVerify');
