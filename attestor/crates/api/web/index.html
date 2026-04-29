@@ -200,23 +200,58 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
 @keyframes bob{0%,100%{transform:translateY(0) rotate(0)}50%{transform:translateY(-4px) rotate(-1deg)}}
 
 /* Three-pillar feature cards */
-.home-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:36px}
-.home-feature{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px;box-shadow:var(--sh-sm);transition:transform var(--t-fast),box-shadow var(--t-fast),border-color var(--t-fast);position:relative;overflow:hidden}
-.home-feature::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--p),oklch(58% 0.22 280));transform:scaleX(0);transform-origin:left;transition:transform .4s var(--ease-spring)}
-.home-feature:hover{transform:translateY(-3px);box-shadow:var(--sh);border-color:var(--surf3)}
+.home-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:36px}
+.home-feature{position:relative;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px;box-shadow:var(--sh-sm);transition:transform .3s var(--ease-spring),box-shadow .3s var(--ease-out),border-color var(--t-fast);overflow:hidden;isolation:isolate}
+/* big watermark numeral */
+.home-feature::after{content:attr(data-num);position:absolute;top:14px;right:18px;font-family:var(--mono);font-size:64px;font-weight:800;color:var(--surf2);letter-spacing:-.06em;line-height:1;pointer-events:none;transition:color .4s var(--ease-out),transform .4s var(--ease-spring);z-index:0}
+/* radial spotlight that follows the card on hover */
+.home-feature .glow{position:absolute;inset:-30%;background:radial-gradient(circle at 30% 20%,oklch(70% 0.16 315 / .14),transparent 55%);opacity:0;transition:opacity .4s var(--ease-out);pointer-events:none;z-index:0}
+/* top accent strip — slides in on hover */
+.home-feature::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:linear-gradient(90deg,var(--p),oklch(58% 0.22 280));transform:scaleX(0);transform-origin:left;transition:transform .5s var(--ease-spring);z-index:1}
+.home-feature > *{position:relative;z-index:2}
+.home-feature:hover{transform:translateY(-4px);box-shadow:0 12px 32px oklch(50% 0.22 315 / .14);border-color:var(--surf3)}
 .home-feature:hover::before{transform:scaleX(1)}
-.home-feature .icon{display:inline-flex;align-items:center;justify-content:center;width:42px;height:42px;border-radius:var(--r);background:var(--pbg);color:var(--p);margin-bottom:14px;transition:transform var(--t-base) var(--ease-spring),background var(--t-fast)}
-.home-feature .icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
-.home-feature:hover .icon{transform:rotate(-6deg) scale(1.08);background:var(--pbd)}
-.home-feature h3{font-size:15px;font-weight:700;letter-spacing:-.01em;color:var(--text);margin-bottom:6px}
-.home-feature p{font-size:13px;color:var(--text2);line-height:1.55}
+.home-feature:hover::after{color:var(--pbg);transform:scale(1.08) rotate(-3deg)}
+.home-feature:hover .glow{opacity:1}
 
-/* Stats */
-.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:32px}
-.home-stat{background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:18px 20px;box-shadow:var(--sh-sm);transition:transform var(--t-fast),box-shadow var(--t-fast)}
-.home-stat:hover{transform:translateY(-2px);box-shadow:var(--sh)}
-.home-stat-num{font-size:28px;font-weight:800;letter-spacing:-.02em;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
-.home-stat-lbl{margin-top:6px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
+.home-feature .icon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border-radius:var(--r);background:var(--pbg);color:var(--p);margin-bottom:14px;transition:transform .4s var(--ease-spring),background .25s var(--ease-out);position:relative}
+.home-feature .icon svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+/* concentric ripple inside icon, hidden by default — pulses on hover */
+.home-feature .icon::before{content:'';position:absolute;inset:0;border-radius:inherit;border:2px solid var(--p);opacity:0;transform:scale(.85)}
+.home-feature:hover .icon{transform:rotate(-6deg) scale(1.1);background:var(--pbd)}
+.home-feature:hover .icon::before{animation:icon-ripple 1.6s var(--ease-out) infinite}
+
+.home-feature h3{font-size:15.5px;font-weight:700;letter-spacing:-.012em;color:var(--text);margin-bottom:8px}
+.home-feature p{font-size:13px;color:var(--text2);line-height:1.6;margin-bottom:14px}
+.home-feature .meta{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-family:var(--mono);font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:4px 10px;transition:color var(--t-fast),background var(--t-fast),border-color var(--t-fast)}
+.home-feature .meta::before{content:'';width:5px;height:5px;border-radius:50%;background:currentColor;opacity:.6}
+.home-feature:hover .meta{color:var(--p);background:var(--pbg);border-color:var(--pbd)}
+
+@keyframes icon-ripple{
+  0%   { opacity:.4; transform:scale(.85) }
+  60%  { opacity:0;  transform:scale(1.4)  }
+  100% { opacity:0;  transform:scale(1.4)  }
+}
+
+/* Stats — number-as-protagonist; one subtle accent only.
+   Drop per-stat colors, drop floating icon badges, drop radial spotlights.
+   The four cards read as one coherent block instead of four small UIs. */
+.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;margin-bottom:32px;box-shadow:var(--sh-sm)}
+.home-stat{background:var(--surf);padding:22px 22px 20px;transition:background var(--t-base) var(--ease-out);position:relative}
+.home-stat:hover{background:var(--surf2)}
+.home-stat-num{font-size:34px;font-weight:800;letter-spacing:-.025em;color:var(--text);font-variant-numeric:tabular-nums;line-height:1;display:flex;align-items:baseline;gap:10px}
+.home-stat-lbl{margin-top:10px;font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);display:flex;align-items:center;gap:6px}
+.home-stat-lbl svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;opacity:.6}
+.home-stat:hover .home-stat-lbl svg{opacity:1;color:var(--p)}
+/* tiny dot before number for the Running card only — green when there's
+   at least one live agent, otherwise muted grey */
+.home-stat .running-dot{width:8px;height:8px;border-radius:50%;background:var(--green);align-self:center;box-shadow:0 0 0 0 var(--green);animation:running-ring 2.4s ease-out infinite;flex-shrink:0}
+.home-stat .running-dot.idle{background:var(--border);animation:none}
+@keyframes running-ring{
+  0%   { box-shadow: 0 0 0 0   oklch(60% 0.18 145 / .55) }
+  70%  { box-shadow: 0 0 0 8px  oklch(60% 0.18 145 / 0)   }
+  100% { box-shadow: 0 0 0 0   oklch(60% 0.18 145 / 0)   }
+}
 .home-section-head{display:flex;align-items:baseline;justify-content:space-between;margin:0 4px 12px}
 .home-section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono)}
 .home-section-more{font-size:12px;color:var(--p);font-weight:600;letter-spacing:-.005em}
@@ -256,10 +291,15 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
   .agent-row.body .col-chain,.agent-row.body .col-status,.agent-row.body .col-owner{grid-column:1 / -1;font-size:11px;padding-left:46px}
 }
 
+/* ── Inline SVG icon helper ────────────────────────────────────── */
+.ico{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;flex-shrink:0;vertical-align:-2px}
+.ico svg{width:100%;height:100%;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;display:block}
+.ico-lg{width:16px;height:16px}
+
 /* ── Search + sort toolbar ────────────────────────────────────── */
 .search-wrap{position:relative;flex:1;min-width:0}
 .search-wrap input{padding-left:36px;font-size:13px}
-.search-wrap::before{content:'🔎';position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:13px;opacity:.5;pointer-events:none}
+.search-wrap::before{content:'';position:absolute;left:12px;top:50%;transform:translateY(-50%);width:14px;height:14px;background:currentColor;opacity:.45;pointer-events:none;-webkit-mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><circle cx='7' cy='7' r='4.5'/><path d='m10.5 10.5 3.5 3.5'/></svg>") center/contain no-repeat;mask:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><circle cx='7' cy='7' r='4.5'/><path d='m10.5 10.5 3.5 3.5'/></svg>") center/contain no-repeat}
 .sort-select{font:inherit;font-family:var(--sans);font-size:12px;font-weight:600;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 28px 8px 12px;color:var(--text2);cursor:pointer;appearance:none;background-image:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 10 10"><path fill="none" stroke="%2370708a" stroke-width="1.5" stroke-linecap="round" d="M2 4l3 3 3-3"/></svg>');background-repeat:no-repeat;background-position:right 10px center}
 .sort-select:hover{border-color:var(--surf3);background-color:var(--surf2)}
 .activity-line{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);margin-bottom:14px}
@@ -275,6 +315,11 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
 .seal-row .val{word-break:break-all}
 
 .phase-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:8px 0 6px}
+.slow-hint{display:none;align-items:flex-start;gap:12px;margin-top:14px;padding:12px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);color:var(--text2);font-size:12.5px;line-height:1.5;animation:fadeIn .3s var(--ease-out)}
+.slow-hint.show{display:flex}
+.slow-hint strong{color:var(--text);font-size:13px;font-weight:600;display:block;margin-bottom:2px}
+.slow-hint .slow-hint-sub{display:block;color:var(--muted)}
+.slow-hint-spinner{flex-shrink:0;width:14px;height:14px;margin-top:2px;border:2px solid var(--border);border-top-color:var(--p);border-radius:50%;animation:spin 1s linear infinite}
 
 .tasks{list-style:none;padding:0;display:flex;flex-direction:column;position:relative}
 .task{display:flex;align-items:center;gap:14px;padding:10px 0;position:relative}
@@ -374,7 +419,8 @@ details.log[open] summary{color:var(--text2)}
 .sidebar-group .kv-row .v{font-family:var(--mono);font-size:12px;color:var(--text);text-align:right;word-break:break-all;min-width:0}
 .sidebar-group .kv-row .v.full{text-align:left;font-size:11px;line-height:1.6;grid-column:1 / -1;padding-top:4px;color:var(--text2)}
 .sidebar-group .kv-row .icons{display:inline-flex;gap:4px}
-.sidebar-group .kv-row .icon-action{cursor:pointer;color:var(--muted);background:none;border:none;padding:2px 4px;border-radius:4px;font-size:11px;line-height:1;transition:background var(--t-fast),color var(--t-fast)}
+.sidebar-group .kv-row .icon-action{cursor:pointer;color:var(--muted);background:none;border:none;padding:3px;border-radius:4px;line-height:0;transition:background var(--t-fast),color var(--t-fast);display:inline-flex;align-items:center;justify-content:center}
+.sidebar-group .kv-row .icon-action svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;display:block}
 .sidebar-group .kv-row .icon-action:hover{background:var(--surf2);color:var(--p)}
 
 /* Legacy classes still referenced elsewhere (chip styles etc) */
@@ -506,9 +552,9 @@ details.log[open] summary{color:var(--text2)}
     <span class="addr-chip" id="addrChip" style="display:none" onclick="event.stopPropagation();toggleWalletPop()">
       <span id="addrChipText"></span>
       <span class="wallet-pop" id="walletPop" onclick="event.stopPropagation()">
-        <button onclick="copyAddr()">📋 Copy address</button>
+        <button onclick="copyAddr()"><span class="ico"><svg viewBox="0 0 16 16"><rect x="5" y="5" width="8" height="9" rx="1"/><path d="M3 11V3.5C3 2.7 3.7 2 4.5 2H10"/></svg></span> Copy address</button>
         <hr/>
-        <button class="danger" onclick="disconnectWallet()">⏻ Disconnect</button>
+        <button class="danger" onclick="disconnectWallet()"><span class="ico"><svg viewBox="0 0 16 16"><path d="M8 2v6"/><path d="M5 5a4 4 0 1 0 6 0"/></svg></span> Disconnect</button>
       </span>
     </span>
   </div>
@@ -551,37 +597,64 @@ details.log[open] summary{color:var(--text2)}
     <div class="home-showcase" id="homeShowcase"></div>
 
     <div class="home-features">
-      <div class="home-feature">
+      <div class="home-feature" data-num="01">
+        <div class="glow"></div>
         <div class="icon">
-          <!-- Shield with checkmark — sovereign identity -->
           <svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4.5"/></svg>
         </div>
         <h3>Self-owned identity</h3>
         <p>Each agent is an ERC-7857 NFT whose seal key is <strong>maintained inside the TEE</strong> — the attestor doesn't keep it, the owner doesn't see it, only the agent itself ever holds it.</p>
+        <span class="meta">ERC-7857</span>
       </div>
-      <div class="home-feature">
+      <div class="home-feature" data-num="02">
+        <div class="glow"></div>
         <div class="icon">
-          <!-- CPU/chip — autonomous runtime -->
           <svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg>
         </div>
         <h3>Autonomous runtime</h3>
         <p>Agents run inside attested 0G sandboxes — not your laptop. Their config &amp; memory live in encrypted iData on 0G storage; only the running TEE can decrypt.</p>
+        <span class="meta">TEE attested</span>
       </div>
-      <div class="home-feature">
+      <div class="home-feature" data-num="03">
+        <div class="glow"></div>
         <div class="icon">
-          <!-- Signature waveform — verifiable behavior -->
           <svg viewBox="0 0 24 24"><path d="M3 14c2 0 2.4-4 4-4 1.8 0 1.6 6 3.5 6 1.8 0 2-9 4-9 1.8 0 1.6 5 3.5 5 .8 0 1.4-1 2-2"/><path d="M5 19h14"/></svg>
         </div>
         <h3>Verifiable behavior</h3>
         <p>Every response carries a <strong>Serve-Proof</strong> envelope: signer must equal the on-chain agent_seal, body hash must match, declared data hashes must be on chain. Extends ERC-8004 reputation with <strong>data-bound</strong> guarantees — reputation a counterparty can re-verify, not just trust.</p>
+        <span class="meta">ERC-8004 ext.</span>
       </div>
     </div>
 
     <div class="home-stats" id="homeStats">
-      <div class="home-stat"><div class="home-stat-num" id="statTotal">—</div><div class="home-stat-lbl">Total agents</div></div>
-      <div class="home-stat"><div class="home-stat-num" id="statRunning">—</div><div class="home-stat-lbl">Running</div></div>
-      <div class="home-stat"><div class="home-stat-num" id="statOwners">—</div><div class="home-stat-lbl">Unique owners</div></div>
-      <div class="home-stat"><div class="home-stat-num" id="statRecent">—</div><div class="home-stat-lbl">Last 24h</div></div>
+      <div class="home-stat">
+        <div class="home-stat-num"><span id="statTotal">0</span></div>
+        <div class="home-stat-lbl">
+          <svg viewBox="0 0 16 16"><path d="M2 12V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v7"/><path d="M6 12V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v9"/><path d="M10 12V7a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v5"/><path d="M1.5 13.5h13"/></svg>
+          Total agents
+        </div>
+      </div>
+      <div class="home-stat" id="statRunningCard">
+        <div class="home-stat-num"><span class="running-dot idle"></span><span id="statRunning">0</span></div>
+        <div class="home-stat-lbl">
+          <svg viewBox="0 0 16 16"><path d="M1.5 8h2.7l1.4-3 2.8 6 1.4-3h4.7"/></svg>
+          Running
+        </div>
+      </div>
+      <div class="home-stat">
+        <div class="home-stat-num"><span id="statOwners">0</span></div>
+        <div class="home-stat-lbl">
+          <svg viewBox="0 0 16 16"><circle cx="6" cy="6" r="2.5"/><path d="M2 13c0-2 1.8-3.2 4-3.2s4 1.2 4 3.2"/><circle cx="11.5" cy="5.5" r="2"/><path d="M14.5 12c0-1.6-1.3-2.7-3-2.7"/></svg>
+          Unique owners
+        </div>
+      </div>
+      <div class="home-stat">
+        <div class="home-stat-num"><span id="statRecent">0</span></div>
+        <div class="home-stat-lbl">
+          <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.3"/></svg>
+          Last 24h
+        </div>
+      </div>
     </div>
     <div class="home-section-head">
       <span class="home-section-title">Recent activity</span>
@@ -614,7 +687,7 @@ details.log[open] summary{color:var(--text2)}
         <button data-filter="all" onclick="setDiscoveryFilter('all')">All</button>
         <button data-filter="mine" onclick="setDiscoveryFilter('mine')" disabled title="Connect wallet">Mine</button>
       </div>
-      <button class="btn btn-ghost" onclick="loadDiscovery()" style="font-size:12px;padding:6px 14px">⟳ Refresh</button>
+      <button class="btn btn-ghost" onclick="loadDiscovery()" style="font-size:12px;padding:6px 14px;display:inline-flex;align-items:center;gap:6px"><span class="ico"><svg viewBox="0 0 16 16"><path d="M3 8a5 5 0 0 1 8.7-3.4L13 6"/><path d="M13 3v3h-3"/><path d="M13 8a5 5 0 0 1-8.7 3.4L3 10"/><path d="M3 13v-3h3"/></svg></span> Refresh</button>
     </div>
     <div class="agent-table" id="agentList"></div>
     <div class="count" id="agentCount" style="text-align:center;margin-top:14px;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em"></div>
@@ -708,7 +781,7 @@ details.log[open] summary{color:var(--text2)}
         <li class="task idle" data-task="sandbox">
           <span class="task-icon">3</span>
           <div class="task-info">
-            <div class="task-title">Provision sandbox container</div>
+            <div class="task-title">Provision agent sandbox</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
@@ -726,11 +799,18 @@ details.log[open] summary{color:var(--text2)}
         <li class="task idle" data-task="running">
           <span class="task-icon">5</span>
           <div class="task-info">
-            <div class="task-title">Container reports running</div>
+            <div class="task-title">Sandbox reports running</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
       </ul>
+      <div class="slow-hint" id="slowHint">
+        <span class="slow-hint-spinner"></span>
+        <div>
+          <strong>Still working…</strong>
+          <span class="slow-hint-sub">Installing &amp; starting the OpenClaw runtime inside the sandbox. First boot pulls a few hundred MB — usually finishes within a minute.</span>
+        </div>
+      </div>
       <div style="margin-top:18px" id="goDetailRow"></div>
     </section>
   </div>
@@ -750,6 +830,24 @@ details.log[open] summary{color:var(--text2)}
 
 <script>
 // ───────────────────────────────────────────────────────────────────
+// SVG icon library — one-line consts so callsites stay tidy. All draw
+// at 14×14 in viewBox 16×16 with currentColor stroke; wrap in <span
+// class="ico"> when inline-flowing with text.
+const ICO = {
+  chain:    '<span class="ico"><svg viewBox="0 0 16 16"><path d="M9.5 4.5l1-1a3 3 0 1 1 4 4l-1 1"/><path d="M6.5 11.5l-1 1a3 3 0 1 1-4-4l1-1"/><path d="M6 10l4-4"/></svg></span>',
+  badge:    '<span class="ico"><svg viewBox="0 0 16 16"><rect x="2.5" y="3.5" width="11" height="9" rx="1.5"/><circle cx="6" cy="7" r="1.5"/><path d="M9 6.5h2.5M9 8.5h2.5M3.8 11c0-1.2.9-1.6 2.2-1.6s2.2.4 2.2 1.6"/></svg></span>',
+  doc:      '<span class="ico"><svg viewBox="0 0 16 16"><path d="M4 2h5l3 3v9H4z"/><path d="M9 2v3h3"/><path d="M6 9h4M6 11h4"/></svg></span>',
+  clock:    '<span class="ico"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5"/><path d="M8 5v3l2 1.3"/></svg></span>',
+  copy:     '<svg viewBox="0 0 16 16"><rect x="5" y="5" width="8" height="9" rx="1"/><path d="M3 11V3.5C3 2.7 3.7 2 4.5 2H10"/></svg>',
+  external: '<svg viewBox="0 0 16 16"><path d="M7 3h6v6"/><path d="m13 3-7 7"/><path d="M11 9.5V12a1.5 1.5 0 0 1-1.5 1.5h-5A1.5 1.5 0 0 1 3 12V7a1.5 1.5 0 0 1 1.5-1.5H7"/></svg>',
+  wave:     '<svg viewBox="0 0 16 16"><path d="M5 8V4a1 1 0 0 1 2 0v4"/><path d="M7 7V3a1 1 0 0 1 2 0v5"/><path d="M9 7.5V4a1 1 0 0 1 2 0v5"/><path d="M11 8.5V6a1 1 0 0 1 2 0v5.5c0 1.7-1.3 3-3 3H7.5c-1.5 0-3-1-3-3V11"/></svg>',
+  grid:     '<svg viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg>',
+  pause:    '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><rect x="4.5" y="3.5" width="2.5" height="9" rx=".5"/><rect x="9" y="3.5" width="2.5" height="9" rx=".5"/></svg>',
+  play:     '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><path d="M5 3.5L13 8l-8 4.5z"/></svg>',
+  refresh:  '<svg viewBox="0 0 16 16"><path d="M3 8a5 5 0 0 1 8.7-3.4L13 6"/><path d="M13 3v3h-3"/><path d="M13 8a5 5 0 0 1-8.7 3.4L3 10"/><path d="M3 13v-3h3"/></svg>',
+  user:     '<span class="ico"><svg viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5c0-2.2 2.2-3.5 5-3.5s5 1.3 5 3.5"/></svg></span>',
+};
+
 // State
 // ───────────────────────────────────────────────────────────────────
 const State = {
@@ -788,6 +886,25 @@ function toast(msg, kind = '') {
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// Smoothly tick an integer counter from its current value up to `target`
+// over ~700ms using easeOutCubic. Cancels any in-flight animation on the
+// same element so rapid updates don't fight each other.
+function countUp(el, target, duration = 700) {
+  if (!el) return;
+  if (el._countTimer) cancelAnimationFrame(el._countTimer);
+  const start = parseInt(el.textContent, 10);
+  const startVal = Number.isFinite(start) ? start : 0;
+  const t0 = performance.now();
+  const tick = (now) => {
+    const p = Math.min(1, (now - t0) / duration);
+    const eased = 1 - Math.pow(1 - p, 3);
+    el.textContent = Math.round(startVal + (target - startVal) * eased);
+    if (p < 1) el._countTimer = requestAnimationFrame(tick);
+    else { el.textContent = target; el._countTimer = null; }
+  };
+  el._countTimer = requestAnimationFrame(tick);
 }
 
 // Clipboard helper with secure-context fallback. `navigator.clipboard.writeText`
@@ -896,6 +1013,8 @@ function handleHash() {
     // this view.
     $('#cardProgress').style.display = 'none';
     $('#goDetailRow').innerHTML = '';
+    $('#slowHint').classList.remove('show');
+    if (State.slowHintTimer) { clearTimeout(State.slowHintTimer); State.slowHintTimer = null; }
     State.deployingSealId = null;
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
     $('#deployBtn').disabled = !State.signer;
@@ -1189,6 +1308,17 @@ window.submitDeploy = async function () {
     setTask('mint', 'active', 'pending');
     setTask('sandbox', 'active', 'pending');
     $('#goDetailRow').innerHTML = '';
+    $('#slowHint').classList.remove('show');
+    // First-boot of an OpenClaw container can take a minute to pull layers.
+    // Surface a friendly hint after 30s if sandbox is still in flight so the
+    // user doesn't think things are stuck.
+    if (State.slowHintTimer) clearTimeout(State.slowHintTimer);
+    State.slowHintTimer = setTimeout(() => {
+      const sandboxTask = document.querySelector('.task[data-task="sandbox"]');
+      if (sandboxTask && sandboxTask.classList.contains('active')) {
+        $('#slowHint').classList.add('show');
+      }
+    }, 30000);
     subscribeDeployWS(seal_id);
   } catch (e) {
     toast(String(e.message || e), 'error');
@@ -1219,10 +1349,11 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'mint_confirmed') setTask('mint', 'done', `confirmed — agent_id ${evt.agent_id}`);
   if (t === 'mint_failed')    setTask('mint', 'fail', evt.reason || 'failed');
 
-  if (t === 'container_starting') setTask('sandbox', 'active', 'creating container…');
-  if (t === 'container_running')  setTask('sandbox', 'done', 'running');
+  if (t === 'container_starting') setTask('sandbox', 'active', 'creating sandbox…');
+  if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
+    $('#slowHint').classList.remove('show');
   }
 
   if (t === 'agent_u_r_i_updated') setTask('uri', 'done', 'tx submitted');
@@ -1348,10 +1479,15 @@ async function loadHome() {
     const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
     const recent24h = items.filter(d => d.created_at && new Date(d.created_at).getTime() >= dayAgo).length;
 
-    $('#statTotal').textContent   = total;
-    $('#statRunning').textContent = running;
-    $('#statOwners').textContent  = owners;
-    $('#statRecent').textContent  = recent24h;
+    countUp($('#statTotal'),   total);
+    countUp($('#statRunning'), running);
+    countUp($('#statOwners'),  owners);
+    countUp($('#statRecent'),  recent24h);
+
+    // Running dot beside the number — pulses when there's a live agent,
+    // sits as a static muted dot otherwise.
+    const dot = $('#statRunningCard')?.querySelector('.running-dot');
+    if (dot) dot.classList.toggle('idle', running === 0);
 
     // Top 5 most recent agents — same row layout as Discovery for consistency
     const top = [...items]
@@ -1615,9 +1751,9 @@ function paintDetail(dep) {
   // Owner action buttons (top-right of hero) — only visible to the owner.
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
-      ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')">⌘ Dashboard</button>` : ''}
-      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">⏸ Stop</button>` : ''}
-      ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">▶ Start</button>` : ''}
+      ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')"><span class="ico">${ICO.grid}</span> Dashboard</button>` : ''}
+      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
+      ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.play}</span> Start</button>` : ''}
     </div>`;
 
   const avatar = image
@@ -1635,7 +1771,7 @@ function paintDetail(dep) {
         <span class="k">${escapeHtml(label)}</span>
         <span class="v" title="${fullVal}">${escapeHtml(shortAddr(val))}</span>
         <span class="icons">
-          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">📋</button>
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">${ICO.copy}</button>
         </span>
       </div>`;
   };
@@ -1649,7 +1785,7 @@ function paintDetail(dep) {
         <span class="k">${escapeHtml(label)}</span>
         <span class="v" title="${fullVal}">${escapeHtml(short)}</span>
         <span class="icons">
-          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">📋</button>
+          <button class="icon-action" title="Copy ${escapeHtml(label)}" onclick="copyText('${fullVal}').then(()=>toast('${escapeHtml(label)} copied','success'),()=>toast('Copy failed','error'))">${ICO.copy}</button>
         </span>
       </div>`;
   };
@@ -1670,14 +1806,14 @@ function paintDetail(dep) {
   const sidebarHtml = `
     <div class="sidebar-stack">
       <div class="sidebar-group">
-        <div class="group-title"><span class="icon">🔗</span> Chain &amp; Contract</div>
+        <div class="group-title">${ICO.chain} Chain &amp; Contract</div>
         ${plainRow('Chain', '0G testnet')}
         ${chainId ? plainRow('Chain ID', chainId) : ''}
         ${registryAddr ? addrRow('Registry', registryAddr) : ''}
       </div>
 
       <div class="sidebar-group">
-        <div class="group-title"><span class="icon">📌</span> Agent Identity</div>
+        <div class="group-title">${ICO.badge} Agent Identity</div>
         ${plainRow('Agent ID', dep.agent_id || '—')}
         ${hexRow('Seal ID', sealId)}
         ${addrRow('Owner', dep.owner)}
@@ -1686,21 +1822,21 @@ function paintDetail(dep) {
           <span class="k">Wallet</span>
           <span class="v" id="kvAgentWallet" title="${escapeHtml(dep.owner || '')}">${escapeHtml(shortAddr(dep.owner))}<span style="color:var(--muted);margin-left:6px">(loading…)</span></span>
           <span class="icons">
-            ${dep.owner ? `<button class="icon-action" id="kvAgentWalletCopy" title="Copy Wallet" onclick="copyText(document.getElementById('kvAgentWallet').title || '').then(()=>toast('Wallet copied','success'),()=>toast('Copy failed','error'))">📋</button>` : ''}
+            ${dep.owner ? `<button class="icon-action" id="kvAgentWalletCopy" title="Copy Wallet" onclick="copyText(document.getElementById('kvAgentWallet').title || '').then(()=>toast('Wallet copied','success'),()=>toast('Copy failed','error'))">${ICO.copy}</button>` : ''}
           </span>
         </div>
       </div>
 
       ${(dep.agent_uri || sandboxId) ? `
       <div class="sidebar-group">
-        <div class="group-title"><span class="icon">📋</span> Off-chain Metadata</div>
+        <div class="group-title">${ICO.doc} Off-chain Metadata</div>
         ${dep.agent_uri ? `
         <div class="kv-row">
           <span class="k">Agent URI</span>
           <span class="v" title="${escapeHtml(dep.agent_uri)}">${escapeHtml(dep.agent_uri.length > 24 ? dep.agent_uri.slice(0, 18) + '…' : dep.agent_uri)}</span>
           <span class="icons">
-            <button class="icon-action" title="Copy URI" onclick="copyText('${escapeHtml(dep.agent_uri)}').then(()=>toast('URI copied','success'),()=>toast('Copy failed','error'))">📋</button>
-            <a class="icon-action" title="Open" href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener">↗</a>
+            <button class="icon-action" title="Copy URI" onclick="copyText('${escapeHtml(dep.agent_uri)}').then(()=>toast('URI copied','success'),()=>toast('Copy failed','error'))">${ICO.copy}</button>
+            <a class="icon-action" title="Open" href="${escapeHtml(dep.agent_uri)}" target="_blank" rel="noopener">${ICO.external}</a>
           </span>
         </div>` : ''}
         ${sandboxId ? `
@@ -1708,14 +1844,14 @@ function paintDetail(dep) {
           <span class="k">Sandbox ID</span>
           <span class="v" title="${escapeHtml(sandboxId)}">${escapeHtml(sandboxId.length > 18 ? sandboxId.slice(0, 8) + '…' + sandboxId.slice(-6) : sandboxId)}</span>
           <span class="icons">
-            <button class="icon-action" title="Copy Sandbox ID" onclick="copyText('${escapeHtml(sandboxId)}').then(()=>toast('Sandbox ID copied','success'),()=>toast('Copy failed','error'))">📋</button>
+            <button class="icon-action" title="Copy Sandbox ID" onclick="copyText('${escapeHtml(sandboxId)}').then(()=>toast('Sandbox ID copied','success'),()=>toast('Copy failed','error'))">${ICO.copy}</button>
           </span>
         </div>` : ''}
         ${plainRow('Name', name)}
       </div>` : ''}
 
       <div class="sidebar-group">
-        <div class="group-title"><span class="icon">🕐</span> Timestamps</div>
+        <div class="group-title">${ICO.clock} Timestamps</div>
         ${plainRow('Created', ageString(dep.created_at) || '—')}
         ${dep.provisioned_at ? plainRow('Provisioned', ageString(dep.provisioned_at)) : ''}
       </div>
@@ -1730,8 +1866,8 @@ function paintDetail(dep) {
           <span class="serve-sub">— say hi to this agent</span>
         </div>
         <div class="serve-actions">
-          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(serveUrl)}', '${escapeHtml(agentSealAddr || '')}', '${escapeHtml(dep.agent_id || '')}')">👋 Say hi</button>
-          <button class="icon-btn" onclick="copyText('${escapeHtml(serveUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))">📋 Copy URL</button>
+          <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(serveUrl)}', '${escapeHtml(agentSealAddr || '')}', '${escapeHtml(dep.agent_id || '')}')"><span class="ico">${ICO.wave}</span> Say hi</button>
+          <button class="icon-btn" onclick="copyText('${escapeHtml(serveUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))"><span class="ico">${ICO.copy}</span> Copy URL</button>
         </div>
       </div>
       <a class="serve-url" href="${escapeHtml(serveUrl)}" target="_blank" rel="noopener">${escapeHtml(serveUrl)}</a>
@@ -1747,15 +1883,15 @@ function paintDetail(dep) {
         ${description ? `<div class="desc">${escapeHtml(description)}</div>` : ''}
         <div class="meta">
           ${dep.agent_id ? `<span class="meta-item">#${escapeHtml(dep.agent_id)}</span>` : ''}
-          <span class="meta-item">🕐 ${escapeHtml(ageString(dep.created_at) || '—')}</span>
-          ${dep.owner ? `<span class="meta-item">👤 ${escapeHtml(shortAddr(dep.owner))}</span>` : ''}
+          <span class="meta-item">${ICO.clock} ${escapeHtml(ageString(dep.created_at) || '—')}</span>
+          ${dep.owner ? `<span class="meta-item">${ICO.user} ${escapeHtml(shortAddr(dep.owner))}</span>` : ''}
         </div>
       </div>
       ${heroActions}
     </div>
 
     <div class="detail-status-row">
-      <span class="status-pill ${pillClass}">${phase === 'running' ? '✓ ' : phase === 'failed' ? '✗ ' : phase === 'stopped' ? '⏸ ' : '○ '}${escapeHtml(phase)}</span>
+      <span class="status-pill ${pillClass}"><span class="dot" style="width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;margin-right:6px"></span>${escapeHtml(phase)}</span>
       ${dep.agent_id ? `<span class="status-pill outline">on-chain</span>` : `<span class="status-pill outline">off-chain (mint pending)</span>`}
     </div>
 
@@ -2132,7 +2268,7 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     }
 
     paint('verified', '✓', 'Identity verified',
-      'All checks passed — this is the real agent.',
+      'All checks passed — this is a truly autonomous agent.',
       sigInfo, humanMsg);
   } catch (e) {
     skipRest();
