@@ -25,6 +25,11 @@ pub struct OssClient {
     endpoint_host: String,
     public_url_base: String,
     http: reqwest::Client,
+    /// Test-only short-circuit. When `Some`, every `put`/`put_json`
+    /// call returns this synthetic URL without performing any HTTP
+    /// request — lets unit tests exercise code paths that traverse
+    /// OSS without needing real credentials or network. None in prod.
+    test_stub_url: Option<String>,
 }
 
 impl OssClient {
@@ -62,7 +67,23 @@ impl OssClient {
             endpoint_host,
             public_url_base,
             http: reqwest::Client::new(),
+            test_stub_url: None,
         }))
+    }
+
+    /// Test-only constructor: every `put`/`put_json` call returns
+    /// `https://oss.test/<key>` without issuing any HTTP. Lets unit
+    /// tests for code that crosses OSS run hermetically.
+    pub fn for_test() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            access_key_id: "test-key".into(),
+            access_key_secret: "test-secret".into(),
+            bucket: "test-bucket".into(),
+            endpoint_host: "oss.test".into(),
+            public_url_base: "https://oss.test".into(),
+            http: reqwest::Client::new(),
+            test_stub_url: Some("https://oss.test".into()),
+        })
     }
 
     /// PUT a JSON object. Returns the public URL on success.
@@ -81,6 +102,10 @@ impl OssClient {
     }
 
     async fn put(&self, key: &str, content_type: &str, body: Vec<u8>) -> anyhow::Result<String> {
+        if let Some(base) = &self.test_stub_url {
+            tracing::debug!(%key, bytes = body.len(), %content_type, "oss test stub: skipping HTTP");
+            return Ok(format!("{}/{}", base.trim_end_matches('/'), key));
+        }
         let url = format!("https://{}.{}/{}", self.bucket, self.endpoint_host, key);
         // RFC 1123 date is what OSS expects.
         let date = chrono::Utc::now()

@@ -452,6 +452,7 @@ impl Watcher {
                     storage_root,
                     sealed_key: Default::default(), // filled by ITransferred
                     data_hash: d.dataHash,
+                    ciphertext: Default::default(), // not reconstructed from chain
                 }
             })
             .collect();
@@ -479,6 +480,9 @@ impl Watcher {
             provisioned_at: None,
             container_pubkey: None,
             container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
             created_at: now,
             updated_at: now,
         };

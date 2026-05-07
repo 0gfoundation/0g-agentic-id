@@ -111,6 +111,9 @@ pub async fn handle(
         provisioned_at: None,
         container_pubkey: None,
         container_pubkey_mac: None,
+        provision_deadline: None,
+        last_provision_error: None,
+        last_provision_error_at: None,
         created_at: now,
         updated_at: now,
     };

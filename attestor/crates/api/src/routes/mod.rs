@@ -13,6 +13,7 @@ mod deploy;
 mod deployment;
 mod deployments;
 mod provision;
+mod retry;
 mod start;
 mod status;
 mod stop;
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/status", post(status::handle))
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
+        .route("/retry", post(retry::handle))
         .route("/deployment/:seal_id", get(deployment::handle))
         .route("/deployments", get(deployments::handle))
         .route("/ws/subscribe", get(ws::handle))

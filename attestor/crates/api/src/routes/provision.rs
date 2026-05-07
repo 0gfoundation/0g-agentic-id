@@ -17,7 +17,7 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use alloy::primitives::keccak256;
-use attestor_shared::{ProvisionRequest, ProvisionResponse};
+use attestor_shared::{ProvisionRequest, ProvisionResponse, SealId, WsEvent};
 use axum::extract::State;
 use axum::Json;
 use chrono::Utc;
@@ -46,10 +46,13 @@ pub async fn handle(
     // 1. Shape check: pubkey must be 33-byte compressed secp256k1, otherwise
     //    the canonical bytes sandbox signed won't recreate on this side.
     if req.container_pubkey.len() != COMPRESSED_PUBKEY_LEN {
-        return Err(ApiError::bad_request(format!(
+        let reason = format!(
             "container_pubkey must be {COMPRESSED_PUBKEY_LEN}-byte compressed secp256k1 (got {} bytes)",
             req.container_pubkey.len()
-        )));
+        );
+        // Permanent: container resending the same wrong shape won't fix it.
+        record_provision_error(&state, req.seal_id, reason.clone(), true).await;
+        return Err(ApiError::bad_request(reason));
     }
 
     // 2. Rebuild canonical bytes from the request fields exactly as sandbox
@@ -64,20 +67,54 @@ pub async fn handle(
     let digest = keccak256(canonical.as_bytes()).0;
 
     // 3. Recover signer, compare to configured sandbox TEE signer.
-    let signer = state
+    let signer = match state
         .crypto
         .recover_signer(&digest, req.sandbox_signature.as_ref())
-        .map_err(|e| ApiError::unauthorized(format!("sandbox attestation: recover: {e}")))?;
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // Soft: malformed sig might be a one-off (truncation, base64
+            // hiccup); container could retry with a fresh attestation.
+            // Don't flip Failed.
+            let reason = format!("sandbox attestation: recover: {e}");
+            record_provision_error(&state, req.seal_id, reason.clone(), false).await;
+            return Err(ApiError::unauthorized(reason));
+        }
+    };
     if signer != state.cfg.sandbox_tee_signer {
-        return Err(ApiError::unauthorized(format!(
+        // Permanent: signer is fixed in attestor config. Container
+        // resending won't change which key sandbox TEE is using.
+        let reason = format!(
             "sandbox attestation: signer mismatch (recovered {signer}, expected {})",
             state.cfg.sandbox_tee_signer
-        )));
+        );
+        record_provision_error(&state, req.seal_id, reason.clone(), true).await;
+        return Err(ApiError::unauthorized(reason));
     }
 
     // 4. image_hash must be in the on-chain framework whitelist.
-    if !state.chain.is_valid_framework_hash(req.image_hash).await? {
-        return Err(ApiError::unauthorized("image_hash not in validFrameworkHashes"));
+    let valid = match state.chain.is_valid_framework_hash(req.image_hash).await {
+        Ok(v) => v,
+        Err(e) => {
+            // Chain call errored — most commonly an "ABI decoding failed"
+            // when attestor is pointed at the wrong contract address
+            // (returns bytes that don't deserialize as `bool`), or RPC
+            // unreachable. Treat as permanent: a container retrying
+            // /provision against the same misconfig will hit the same
+            // wall every time, and we'd rather flip Failed immediately
+            // than wait for the 5min deadline sweep.
+            let reason = format!("framework whitelist check failed: {e}");
+            record_provision_error(&state, req.seal_id, reason.clone(), true).await;
+            return Err(ApiError::internal(reason));
+        }
+    };
+    if !valid {
+        // Permanent: image_hash is baked into the container image;
+        // resending the same hash won't pass. Operator must add it to
+        // the on-chain whitelist.
+        let reason = "image_hash not in validFrameworkHashes".to_string();
+        record_provision_error(&state, req.seal_id, reason.clone(), true).await;
+        return Err(ApiError::unauthorized(reason));
     }
 
     // 5. Freshness OR pubkey-binding (whichever passes — see module docs).
@@ -123,9 +160,13 @@ pub async fn handle(
         let now_secs = Utc::now().timestamp().max(0) as u64;
         let skew = now_secs.abs_diff(req.issued_at);
         if skew > ATTESTATION_FRESHNESS_SECS {
-            return Err(ApiError::unauthorized(format!(
+            // Soft: clock skew is transient; container can retry
+            // with a fresh `issued_at` and pass.
+            let reason = format!(
                 "sandbox attestation stale (|now - issued_at| = {skew}s > {ATTESTATION_FRESHNESS_SECS}s)"
-            )));
+            );
+            record_provision_error(&state, req.seal_id, reason.clone(), false).await;
+            return Err(ApiError::unauthorized(reason));
         }
     }
 
@@ -150,6 +191,18 @@ pub async fn handle(
         // Not fatal — the container has its key either way. Log so ops can
         // notice persistent write failures.
         tracing::warn!(seal_id = ?req.seal_id, error = %e, "mark_provisioned failed");
+    }
+
+    // /provision succeeded → no further timeout needed (sweep would
+    // otherwise still see container_stage=Submitted and flip Failed).
+    // (last_provision_error is left as-is; it's informational and the
+    // timestamp lets the UI decide whether to surface a stale message.)
+    if let Err(e) = state
+        .deployments
+        .set_provision_deadline(req.seal_id, None)
+        .await
+    {
+        tracing::warn!(seal_id = ?req.seal_id, error = %e, "clear provision_deadline failed");
     }
 
     // 8. First-time binding: compute the MAC and persist (pubkey, mac) so
@@ -180,4 +233,71 @@ pub async fn handle(
     Ok(Json(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
     }))
+}
+
+/// Record a `/provision` validation failure: stamp `last_provision_error`
+/// for visibility, and (when `mark_failed`) atomically flip
+/// `container_stage` to Failed + emit `ContainerFailed` + admin_delete
+/// the dead container so it stops eating sandbox resources.
+///
+/// `mark_failed` is true for permanent errors (image_hash not whitelisted,
+/// signer mismatch, malformed pubkey) — anything that won't fix on
+/// container retry. Transient errors (recover failure, stale attestation)
+/// pass false: container can retry with a fresh attestation.
+///
+/// Best-effort — DB / event-bus / sandbox failures are logged, never
+/// propagated: the calling handler is already on its way to returning a
+/// 4xx, and we don't want a downstream write failure to mask the
+/// original error.
+async fn record_provision_error(
+    state: &AppState,
+    seal_id: SealId,
+    reason: String,
+    mark_failed: bool,
+) {
+    if let Err(e) = state
+        .deployments
+        .record_provision_error(seal_id, reason.clone(), mark_failed)
+        .await
+    {
+        tracing::warn!(
+            ?seal_id,
+            error = %e,
+            "record_provision_error failed (non-fatal)"
+        );
+    }
+    if mark_failed {
+        if let Err(e) = state
+            .events
+            .publish(WsEvent::ContainerFailed {
+                seal_id,
+                reason: reason.clone(),
+            })
+            .await
+        {
+            tracing::warn!(
+                ?seal_id,
+                error = %e,
+                "publish ContainerFailed failed (non-fatal)"
+            );
+        }
+        // Permanent failure → kill the container that's been retrying
+        // /provision unsuccessfully. We need its sandbox_id from the DB
+        // (not the request — the request's pubkey may not even round-
+        // trip to the persisted sandbox if something's badly wrong).
+        let sandbox_id = match state.deployments.get(seal_id).await {
+            Ok(Some(d)) => d.sandbox_id,
+            _ => None,
+        };
+        if let Some(sb_id) = sandbox_id.filter(|s| !s.is_empty()) {
+            if let Err(e) = state.sandbox.admin_delete(&sb_id).await {
+                tracing::warn!(
+                    ?seal_id,
+                    sandbox_id = %sb_id,
+                    error = %e,
+                    "admin_delete on permanently-failed container failed (non-fatal)"
+                );
+            }
+        }
+    }
 }

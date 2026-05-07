@@ -38,6 +38,31 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey     BYTEA;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
 
+-- Provision timeout deadline. Written when `sandbox.create` succeeds
+-- (handle_deploy / handle_sandbox_recreate). The worker sweep loop
+-- flips `container_stage` to Failed once `now > provision_deadline`
+-- AND the stage is still Submitted — caters to the case where the
+-- container never got far enough to call /provision at all.
+-- NULL means "no deadline tracked" (legacy rows or no sandbox yet).
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provision_deadline TIMESTAMPTZ;
+
+-- Last /provision validation error visible to operators / dashboard.
+-- Written on every /provision rejection (bad pubkey shape, signer
+-- mismatch, image_hash not whitelisted, stale attestation, etc.) so
+-- "still booting" vs "broken" is distinguishable in the UI without
+-- having to grep logs. NULL until first failure.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_provision_error    TEXT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_provision_error_at TIMESTAMPTZ;
+
+-- Partial index for the deadline sweep: only Submitted rows with a
+-- deadline are candidates, vastly fewer than the table size in the
+-- common case. The cast to text on the JSONB stage probe is what
+-- the sweep query uses.
+CREATE INDEX IF NOT EXISTS idx_deployments_provision_deadline
+    ON deployments (provision_deadline)
+    WHERE provision_deadline IS NOT NULL
+      AND container_stage->>'state' = 'submitted';
+
 -- idempotency does NOT FK to deployments — /deploy reserves idempotency
 -- before inserting the deployment row, so a FK would fail. The idempotency
 -- record is a hint; loss-of-sync with deployments is recoverable.

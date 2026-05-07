@@ -88,6 +88,9 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let provisioned_at: Option<DateTime<Utc>> = row.try_get("provisioned_at")?;
     let container_pubkey_bytes: Option<Vec<u8>> = row.try_get("container_pubkey")?;
     let container_pubkey_mac_bytes: Option<Vec<u8>> = row.try_get("container_pubkey_mac")?;
+    let provision_deadline: Option<DateTime<Utc>> = row.try_get("provision_deadline")?;
+    let last_provision_error: Option<String> = row.try_get("last_provision_error")?;
+    let last_provision_error_at: Option<DateTime<Utc>> = row.try_get("last_provision_error_at")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -122,6 +125,9 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         provisioned_at,
         container_pubkey: container_pubkey_bytes.map(alloy::primitives::Bytes::from),
         container_pubkey_mac: container_pubkey_mac_bytes.map(alloy::primitives::Bytes::from),
+        provision_deadline,
+        last_provision_error,
+        last_provision_error_at,
         created_at,
         updated_at,
     })
@@ -301,6 +307,23 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(())
     }
 
+    async fn update_i_data_artifacts(
+        &self,
+        seal_id: SealId,
+        artifacts: Vec<IDataArtifact>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"UPDATE deployments
+               SET i_data = $1, updated_at = now()
+               WHERE seal_id = $2"#,
+        )
+        .bind(serde_json::to_value(&artifacts)?)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn set_agent_uri_and_card(
         &self,
         seal_id: SealId,
@@ -405,6 +428,108 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn set_provision_deadline(
+        &self,
+        seal_id: SealId,
+        deadline: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments
+             SET provision_deadline = $1, updated_at = now()
+             WHERE seal_id = $2",
+        )
+        .bind(deadline)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_provision_error(
+        &self,
+        seal_id: SealId,
+        reason: String,
+        mark_failed: bool,
+    ) -> anyhow::Result<()> {
+        let now = Utc::now();
+        if mark_failed {
+            // Atomic update: visibility fields + container_stage flip +
+            // recompute phase. Keeping it in one statement guarantees
+            // the UI never sees the error message without the Failed
+            // stage (or vice-versa).
+            let stage = serde_json::to_value(StageStatus::Failed {
+                at: now,
+                reason: reason.clone(),
+            })?;
+            sqlx::query(
+                "UPDATE deployments
+                 SET last_provision_error    = $1,
+                     last_provision_error_at = $2,
+                     container_stage         = $3,
+                     phase                   = 'failed',
+                     updated_at              = $2
+                 WHERE seal_id = $4",
+            )
+            .bind(&reason)
+            .bind(now)
+            .bind(stage)
+            .bind(seal_id.as_slice())
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE deployments
+                 SET last_provision_error    = $1,
+                     last_provision_error_at = $2,
+                     updated_at              = $2
+                 WHERE seal_id = $3",
+            )
+            .bind(&reason)
+            .bind(now)
+            .bind(seal_id.as_slice())
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn flip_provision_timeouts(
+        &self,
+        now: DateTime<Utc>,
+        reason: String,
+    ) -> anyhow::Result<Vec<SealId>> {
+        // Atomic: select-and-flip in a single SQL statement. The
+        // `RETURNING seal_id` lets the caller publish per-seal events
+        // without a second roundtrip. The `container_stage->>'state'`
+        // probe matches the partial index in schema.sql so this scan
+        // stays cheap.
+        let stage = serde_json::to_value(StageStatus::Failed {
+            at: now,
+            reason: reason.clone(),
+        })?;
+        let rows = sqlx::query(
+            "UPDATE deployments
+             SET container_stage = $1,
+                 phase           = 'failed',
+                 updated_at      = $2
+             WHERE provision_deadline IS NOT NULL
+               AND provision_deadline < $2
+               AND container_stage->>'state' = 'submitted'
+             RETURNING seal_id",
+        )
+        .bind(stage)
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bytes: &[u8] = row.try_get("seal_id")?;
+            out.push(B256::from_slice(bytes));
+        }
+        let _ = reason;
+        Ok(out)
     }
 }
 

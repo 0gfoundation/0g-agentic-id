@@ -10,9 +10,11 @@ use attestor_shared::{
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
     kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    mocks::MockSandbox,
     repo::{self, PostgresDeploymentRepo, PostgresIdempotencyStore},
+    sandbox::{AdminSigner, HttpSandbox},
     tee::{MockTeeKeyProvider, TappTeeKeyProvider, TeeKeyProvider},
-    ChainClient, Config,
+    ChainClient, Config, SandboxClient,
 };
 use state::AppState;
 use std::sync::Arc;
@@ -53,10 +55,29 @@ async fn main() -> anyhow::Result<()> {
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
+    // SandboxClient — api only uses `admin_delete` (kill a permanently
+    // failed container during /provision rejection). `create / start /
+    // stop` calls all live in the worker, so the mock here would also
+    // be fine for those — but using the same client matches worker's
+    // config so admin_delete signs with the same TEE EOA address.
+    let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
+        Arc::new(MockSandbox)
+    } else {
+        let admin_signer = AdminSigner::from_priv(app_priv).ok();
+        Arc::new(HttpSandbox::new(
+            cfg.sandbox_endpoint.clone(),
+            cfg.attestor_public_url.clone(),
+            // api never spawns containers, so extra_env is irrelevant.
+            Vec::new(),
+            admin_signer,
+        ))
+    };
+
     let state = AppState {
         cfg: cfg.clone(),
         crypto,
         chain,
+        sandbox,
         deployments,
         idempotency,
         jobs,

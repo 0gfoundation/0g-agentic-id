@@ -1,11 +1,13 @@
 //! Shared app state injected into axum handlers.
 //!
-//! api only needs crypto + chain (for provision validation) + the repos / bus.
-//! StorageClient / SandboxClient live in the worker crate; api never touches
-//! them directly.
+//! api needs crypto + chain (for provision validation) + the repos /
+//! bus, plus a SandboxClient so /provision can `admin_delete` a
+//! permanently-failed container immediately (no point waiting until
+//! the user clicks Bring back online).
 
 use attestor_shared::{
     ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IdempotencyStore, JobQueue,
+    SandboxClient,
 };
 use std::sync::Arc;
 
@@ -15,6 +17,7 @@ pub struct AppState {
 
     pub crypto: Arc<dyn CryptoModule>,
     pub chain: Arc<dyn ChainClient>,
+    pub sandbox: Arc<dyn SandboxClient>,
 
     pub deployments: Arc<dyn DeploymentRepo>,
     pub idempotency: Arc<dyn IdempotencyStore>,

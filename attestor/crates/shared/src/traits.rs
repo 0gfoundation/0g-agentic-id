@@ -117,6 +117,18 @@ pub trait SandboxClient: Send + Sync {
         seal_id: SealId,
         envelope: &SandboxEnvelope,
     ) -> anyhow::Result<()>;
+
+    /// Permanently destroy a sandbox using attestor admin auth (no
+    /// owner-signed envelope). Used in two scenarios:
+    ///   - after `SandboxRecreate` succeeds, to remove the previous
+    ///     sandbox that the deployment no longer points at;
+    ///   - after a permanent /provision rejection (image_hash not
+    ///     whitelisted, signer mismatch, etc.), to free the dead
+    ///     container immediately rather than leaving it idling.
+    /// Best-effort at the call site — failures must NOT fail the
+    /// outer flow. Implementations with no admin signer configured
+    /// should return Ok(()) and warn.
+    async fn admin_delete(&self, sandbox_id: &str) -> anyhow::Result<()>;
 }
 
 // ── Deployment repository ───────────────────────────────────────────────
@@ -169,6 +181,15 @@ pub trait DeploymentRepo: Send + Sync {
         agent_uri: String,
     ) -> anyhow::Result<()>;
 
+    /// Replace just the artifacts column, leaving `agent_uri` untouched.
+    /// Used after storage Confirmed to blank out persisted ciphertexts
+    /// without trampling the (possibly-already-set) Phase 2 agent_uri.
+    async fn update_i_data_artifacts(
+        &self,
+        seal_id: SealId,
+        artifacts: Vec<IDataArtifact>,
+    ) -> anyhow::Result<()>;
+
     /// Set `agent_uri` and `agent_card` together — used by (a) the worker
     /// after building+uploading the AgentCard JSON and calling setAgentURI,
     /// and (b) the indexer when it observes a URIUpdated event and
@@ -199,6 +220,42 @@ pub trait DeploymentRepo: Send + Sync {
         description: String,
         data_hash: DataHash,
     ) -> anyhow::Result<()>;
+
+    /// Stamp the wall-clock deadline by which the container must
+    /// complete `/provision`. Written by `handle_deploy` /
+    /// `handle_sandbox_recreate` once `sandbox.create` succeeds. NULL
+    /// out by passing `None` (e.g. on successful `/provision`).
+    async fn set_provision_deadline(
+        &self,
+        seal_id: SealId,
+        deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<()>;
+
+    /// Record a `/provision` validation failure for visibility. When
+    /// `mark_failed` is true, ALSO flip `container_stage` to Failed
+    /// (use for permanent errors like wrong image_hash, signer
+    /// mismatch, malformed pubkey — anything that won't fix on
+    /// container retry). Atomic with the stage update.
+    async fn record_provision_error(
+        &self,
+        seal_id: SealId,
+        reason: String,
+        mark_failed: bool,
+    ) -> anyhow::Result<()>;
+
+    /// Atomically flip every deployment whose `provision_deadline` has
+    /// passed AND whose `container_stage` is still `Submitted` to
+    /// `Failed { reason }`. Returns the affected `seal_id`s so the
+    /// caller can publish `WsEvent::ContainerFailed`.
+    ///
+    /// Used by the worker sweep loop to convert "container never
+    /// reached /provision" silent stuck-state into an observable
+    /// Failed for the UI's recovery flow.
+    async fn flip_provision_timeouts(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    ) -> anyhow::Result<Vec<SealId>>;
 }
 
 // ── Idempotency ─────────────────────────────────────────────────────────

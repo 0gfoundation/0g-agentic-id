@@ -13,7 +13,7 @@ use attestor_shared::{
     mocks::{MockSandbox, MockStorage},
     oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
-    sandbox::HttpSandbox,
+    sandbox::{AdminSigner, HttpSandbox},
     storage_zg::ZgStorage,
     tee::{MockTeeKeyProvider, TappTeeKeyProvider, TeeKeyProvider},
     ChainClient, Config, JobQueue, SandboxClient, StorageClient,
@@ -70,6 +70,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(MockSandbox)
     } else {
         tracing::info!(endpoint = %cfg.sandbox_endpoint, "sandbox: using HttpSandbox");
+        // Admin signer for orphan force-stop. Attestor's TEE EOA
+        // doubles as the admin identity — its address must be in the
+        // sandbox's ADMIN_ADDRESSES allowlist for force-stop to be
+        // accepted. If construction fails the worker still boots; admin
+        // calls just no-op and orphans fall back to sandbox runtime GC.
+        let admin_signer = AdminSigner::from_priv(app_priv).ok();
         Arc::new(HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
@@ -84,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
                     format!("{:#x}", cfg.agentic_id_addr),
                 ),
             ],
+            admin_signer,
         ))
     };
 
@@ -116,17 +123,49 @@ async fn main() -> anyhow::Result<()> {
         registry,
     };
 
-    // background sweep task
+    // background sweep task — two responsibilities, same 60s tick:
+    //  (a) job-queue retention (delete done/failed older than threshold)
+    //  (b) provision deadline (flip stuck container_stage=Submitted to
+    //      Failed once `now > provision_deadline`, publish events)
     {
         let queue = queue.clone();
         let retention = cfg.job_retention_seconds;
+        let deployments = ctx.deployments.clone();
+        let events = ctx.events.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // (a) Job retention.
                 match queue.sweep_expired(retention).await {
                     Ok(n) if n > 0 => tracing::info!(deleted = n, "swept expired jobs"),
                     Ok(_) => {}
-                    Err(e) => tracing::warn!(error = %e, "sweep failed"),
+                    Err(e) => tracing::warn!(error = %e, "job sweep failed"),
+                }
+
+                // (b) Provision deadline.
+                let now = chrono::Utc::now();
+                let timeouts = match deployments
+                    .flip_provision_timeouts(now, "provision timeout".to_string())
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "provision timeout sweep failed");
+                        continue;
+                    }
+                };
+                for seal_id in timeouts {
+                    tracing::info!(?seal_id, "provision timeout: container_stage flipped Failed");
+                    if let Err(e) = events
+                        .publish(attestor_shared::WsEvent::ContainerFailed {
+                            seal_id,
+                            reason: "provision timeout".to_string(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(?seal_id, error = %e, "publish ContainerFailed failed");
+                    }
                 }
             }
         });

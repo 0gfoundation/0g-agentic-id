@@ -1,0 +1,248 @@
+//! POST /retry — owner-triggered soft retry of a stalled deploy.
+//!
+//! "Soft" here means: re-run any track or phase that's currently in
+//! `Failed` state, where retry is naturally idempotent (storage upload
+//! using the persisted ciphertext; mint receipt re-fetch; OSS re-upload;
+//! `setAgentURI` re-write; DB cache update). Nothing here costs the
+//! user a wallet popup — that's [Bring back online]'s job (`/start`).
+//!
+//! Mint resubmit guards against double-mint by first calling
+//! `getAgentIdBySealId(seal_id)` view; if a non-zero id comes back, the
+//! prior tx actually landed and we just record it.
+//!
+//! Authorisation: `req.owner` must match the deployment's owner. No
+//! per-call signature because the worker only performs idempotent,
+//! attestor-authored on-chain writes (mint, setAgentURI) which require
+//! the attestor's own EOA — owner can't be tricked into anything.
+
+use crate::error::{ApiError, ApiResult};
+use crate::state::AppState;
+use attestor_shared::{JobPayload, RetryRequest};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use serde_json::json;
+
+pub async fn handle(
+    State(state): State<AppState>,
+    Json(req): Json<RetryRequest>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    tracing::info!(seal_id = ?req.seal_id, owner = %req.owner, "retry request");
+
+    let d = state
+        .deployments
+        .get(req.seal_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
+    if d.owner != req.owner {
+        return Err(ApiError::unauthorized("owner mismatch"));
+    }
+
+    state
+        .jobs
+        .submit(JobPayload::ResumeDeploy {
+            seal_id: req.seal_id,
+            sandbox_envelope: req.sandbox_envelope,
+        })
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"accepted": true}))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, B256};
+    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::mocks::{
+        InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
+        MockChain,
+    };
+    use attestor_shared::{
+        derive_phase, Config, Deployment, DeploymentRepo, JobPayload, SealId, StageStatus,
+    };
+    use chrono::Utc;
+    use std::sync::Arc;
+
+    fn test_config() -> Config {
+        Config {
+            chain_rpc: "http://localhost:0".into(),
+            chain_id: 1,
+            agentic_id_addr: Address::ZERO,
+            tapp_registry_addr: Address::ZERO,
+            storage_indexer: "indexer".into(),
+            sandbox_endpoint: "http://localhost:0".into(),
+            mock_sandbox: true,
+            attestor_public_url: String::new(),
+            sandbox_tee_signer: Address::ZERO,
+            db_url: String::new(),
+            bind: "0.0.0.0:0".into(),
+            job_retention_seconds: 3600,
+            mock_tee: true,
+            mock_app_private_key: None,
+            mock_app_eth_address: None,
+            mock_kms: true,
+            mock_app_secret: None,
+            mock_storage: true,
+            tapp_ip: "127.0.0.1".into(),
+            tapp_port: 0,
+            app_id: None,
+            chain_priority_fee_gwei: 2,
+            chain_max_fee_gwei: 10,
+            indexer_start_block: None,
+            oss_key_prefix: "test".into(),
+            sandbox_proxy_addr: "h.local:80".into(),
+            agent_serve_port: 8080,
+            agent_serve_path: "/result".into(),
+            agent_dashboard_port: 8080,
+            agent_dashboard_path: "/dashboard".into(),
+        }
+    }
+
+    struct Setup {
+        state: AppState,
+        deployments: Arc<InMemoryDeploymentRepo>,
+        jobs: Arc<InMemoryJobQueue>,
+        owner: Address,
+        seal_id: SealId,
+    }
+
+    fn make_setup() -> Setup {
+        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
+            [0u8; 32],
+        ))));
+        let chain = Arc::new(MockChain::new());
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let idempotency = Arc::new(InMemoryIdempotencyStore::new());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let events = Arc::new(InMemoryEventBus::new());
+
+        let owner = Address::from([0x33; 20]);
+        let seal_id = B256::repeat_byte(0xbb);
+        let now = Utc::now();
+        let d = Deployment {
+            seal_id,
+            agent_seal_addr: Address::from([0x44; 20]),
+            owner,
+            agent_id: None,
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            phase: derive_phase(
+                &StageStatus::Failed { at: now, reason: "x".into() },
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+            ),
+            storage_stage: StageStatus::Failed { at: now, reason: "x".into() },
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        deployments.seed(d);
+
+        let state = AppState {
+            cfg: test_config(),
+            crypto,
+            chain,
+            sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
+            deployments: deployments.clone(),
+            idempotency,
+            jobs: jobs.clone(),
+            events,
+        };
+        Setup { state, deployments, jobs, owner, seal_id }
+    }
+
+    #[tokio::test]
+    async fn happy_path_enqueues_resume_deploy() {
+        let s = make_setup();
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let submitted = s.jobs.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { seal_id, .. } => assert_eq!(*seal_id, s.seal_id),
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_seal_id_is_404() {
+        let s = make_setup();
+        let req = RetryRequest {
+            seal_id: B256::repeat_byte(0xfe),
+            owner: s.owner,
+            sandbox_envelope: None,
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("must reject");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owner_mismatch_is_401_and_no_job_enqueued() {
+        // Critical authorization test. A drive-by owner field on /retry
+        // would otherwise let any address poke "soft retry" against any
+        // other address's deployment. That's not catastrophic (idempotent
+        // mint resubmit, OSS overwrite), but it leaks "this seal_id
+        // exists" signal and burns attestor gas.
+        let s = make_setup();
+        let req = RetryRequest {
+            seal_id: s.seal_id,
+            owner: Address::from([0xee; 20]),
+            sandbox_envelope: None,
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("must reject");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty(),
+            "owner-mismatch must not enqueue a job");
+    }
+
+    #[tokio::test]
+    async fn deployment_state_unchanged_by_retry_request() {
+        // /retry only enqueues — never mutates the deployment row inline.
+        // Make sure we didn't accidentally introduce a stage reset that
+        // would race with whatever the worker is doing.
+        let s = make_setup();
+        let before = s.deployments.get(s.seal_id).await.unwrap().unwrap();
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        let _ = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let after = s.deployments.get(s.seal_id).await.unwrap().unwrap();
+        assert!(matches!(after.storage_stage, StageStatus::Failed { .. }));
+        assert!(
+            matches!(before.storage_stage, StageStatus::Failed { .. }),
+            "fixture sanity"
+        );
+        // Counter-based assertion: the handler doesn't touch the repo at all.
+        assert_eq!(
+            s.deployments
+                .set_storage_stage_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            s.deployments
+                .set_mint_stage_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+}

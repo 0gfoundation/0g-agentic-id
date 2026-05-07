@@ -8,9 +8,11 @@
 
 use crate::traits::SandboxClient;
 use crate::types::{SandboxCreateResponse, SandboxEnvelope, SealId};
-use alloy::primitives::keccak256;
+use alloy::primitives::{keccak256, Address};
 use async_trait::async_trait;
 use base64::Engine;
+use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 // ── Canonical signed message schema (matches go-sandbox signedRequest) ──
@@ -78,6 +80,31 @@ pub fn verify_envelope(
 
 // ── HTTP client against the real 0g-sandbox service ────────────────────
 
+/// Pre-derived signing material for admin-flavored sandbox calls
+/// (currently `force-stop` for orphan cleanup). Holds the attestor's
+/// TEE EOA secp256k1 key + the matching ETH address, so each admin
+/// call avoids re-deriving the address from priv.
+pub struct AdminSigner {
+    priv_key: [u8; 32],
+    address: Address,
+}
+
+impl AdminSigner {
+    pub fn from_priv(priv_key: [u8; 32]) -> anyhow::Result<Self> {
+        let sk = SigningKey::from_bytes((&priv_key).into())
+            .map_err(|e| anyhow::anyhow!("AdminSigner: invalid priv key: {e}"))?;
+        let vk = sk.verifying_key();
+        let uncompressed = vk.to_encoded_point(false);
+        let hash = keccak256(&uncompressed.as_bytes()[1..]);
+        let mut addr_bytes = [0u8; 20];
+        addr_bytes.copy_from_slice(&hash[12..]);
+        Ok(Self {
+            priv_key,
+            address: Address::from(addr_bytes),
+        })
+    }
+}
+
 pub struct HttpSandbox {
     base_url: String,
     /// Public URL that containers use to reach this attestor. Injected into
@@ -89,6 +116,11 @@ pub struct HttpSandbox {
     /// trust them as the canonical chain / storage / contract config (a
     /// malicious deployer can't make the container talk to a fake chain).
     extra_env: Vec<(String, String)>,
+    /// Attestor's TEE EOA, used to sign envelopes for admin-only sandbox
+    /// endpoints (orphan `force-stop`). The address must be in the
+    /// sandbox's `ADMIN_ADDRESSES` allowlist. None disables admin calls
+    /// (orphans get GC'd by sandbox runtime instead).
+    admin_signer: Option<AdminSigner>,
     http: reqwest::Client,
 }
 
@@ -97,11 +129,13 @@ impl HttpSandbox {
         base_url: impl Into<String>,
         attestor_public_url: impl Into<String>,
         extra_env: Vec<(String, String)>,
+        admin_signer: Option<AdminSigner>,
     ) -> Self {
         Self {
             base_url: base_url.into(),
             attestor_public_url: attestor_public_url.into(),
             extra_env,
+            admin_signer,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -208,6 +242,87 @@ impl SandboxClient for HttpSandbox {
         envelope: &SandboxEnvelope,
     ) -> anyhow::Result<()> {
         self.lifecycle_call(seal_id, envelope, "stop").await
+    }
+
+    async fn admin_delete(&self, sandbox_id: &str) -> anyhow::Result<()> {
+        let Some(signer) = &self.admin_signer else {
+            tracing::warn!(
+                %sandbox_id,
+                "sandbox admin_delete: no admin signer configured, skipping cleanup"
+            );
+            return Ok(());
+        };
+        if sandbox_id.is_empty() {
+            anyhow::bail!("sandbox admin_delete: empty sandbox_id");
+        }
+
+        // Build canonical envelope. Sandbox doesn't verify `action`
+        // on the admin force-delete path; we keep `"stop"` for
+        // compatibility with the protocol the sandbox team specified.
+        // `expires_at = now + 240s` leaves ~1min clock skew on top of
+        // sandbox's 5min nonce-replay TTL.
+        let nonce = {
+            let mut buf = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut buf);
+            hex::encode(buf)
+        };
+        let canonical = CanonicalSignedMessage {
+            action: "stop".into(),
+            expires_at: chrono::Utc::now().timestamp() + 240,
+            nonce,
+            payload: serde_json::Value::Object(Default::default()),
+            resource_id: sandbox_id.to_string(),
+        };
+        let msg_bytes = serde_json::to_vec(&canonical).map_err(|e| {
+            anyhow::anyhow!("sandbox admin_delete: serialize canonical: {e}")
+        })?;
+        let digest = eip191_digest(&msg_bytes);
+
+        // EIP-191 sign with the attestor's TEE EOA priv. v += 27 so
+        // the recovered v matches the eth_sign convention sandbox
+        // expects.
+        let sk = SigningKey::from_bytes((&signer.priv_key).into())
+            .map_err(|e| anyhow::anyhow!("admin_delete: invalid signer priv: {e}"))?;
+        let (sig, rec_id): (Signature, RecoveryId) = sk
+            .sign_prehash(&digest)
+            .map_err(|e| anyhow::anyhow!("admin_delete: sign_prehash: {e}"))?;
+        let mut sig_65 = [0u8; 65];
+        sig_65[..64].copy_from_slice(&sig.to_bytes());
+        sig_65[64] = Into::<u8>::into(rec_id) + 27;
+
+        // Endpoint: `DELETE /api/sandbox/:id/force` — admin-only,
+        // gated by sandbox's `isAdmin` middleware checking
+        // X-Wallet-Address ∈ ADMIN_ADDRESSES. The owner-only path is
+        // `DELETE /api/sandbox/:id` (NO `/force` suffix); hitting that
+        // by mistake returns `"forbidden"` from `withOwner`, which is
+        // the bug we just fixed.
+        let url = format!(
+            "{}/api/sandbox/{}/force",
+            self.base_url.trim_end_matches('/'),
+            sandbox_id,
+        );
+        let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&msg_bytes);
+        let sig_hex = format!("0x{}", hex::encode(sig_65));
+        let addr_hex = format!("{:#x}", signer.address);
+
+        let res = self
+            .http
+            .delete(&url)
+            .header("Content-Length", "0")
+            .header("X-Wallet-Address", &addr_hex)
+            .header("X-Signed-Message", &signed_b64)
+            .header("X-Wallet-Signature", &sig_hex)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("sandbox admin_delete DELETE {url}: {e}"))?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("sandbox admin_delete: {status} — {body}");
+        }
+        tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
+        Ok(())
     }
 }
 
@@ -404,4 +519,59 @@ mod tests {
     //   `attestor/scripts/test-sandbox-live.sh`
     // which drives the `sandbox_smoke` example with a funded signer key —
     // it's a manual/ops tool, not a cargo test (requires network + gas).
+
+    // ── AdminSigner ───────────────────────────────────────────────────
+    //
+    // Pin the address-derivation path (priv → uncompressed pub →
+    // keccak256 → last 20 bytes). Any drift here means our admin
+    // X-Wallet-Address header would NOT match what sandbox derives
+    // from `recover(eip191_digest, signature)`, so admin_stop would
+    // 401 on every call.
+
+    #[test]
+    fn admin_signer_address_matches_keypair_derivation() {
+        let (sk, expected_addr) = test_keypair();
+        let priv_bytes: [u8; 32] = sk.to_bytes().into();
+        let signer = AdminSigner::from_priv(priv_bytes).expect("valid priv");
+        assert_eq!(signer.address, expected_addr);
+    }
+
+    #[test]
+    fn admin_signer_envelope_recovers_to_address() {
+        // Round-trip: build the exact envelope shape `admin_stop` ships,
+        // then run it through the same `verify_envelope` path the
+        // sandbox would use. If recovery yields the AdminSigner's
+        // declared address, sandbox-side ADMIN_ADDRESSES check passes.
+        let (sk, addr) = test_keypair();
+        let priv_bytes: [u8; 32] = sk.to_bytes().into();
+        let signer = AdminSigner::from_priv(priv_bytes).unwrap();
+
+        let canonical = CanonicalSignedMessage {
+            action: "stop".into(),
+            expires_at: 9_999_999_999,
+            nonce: "deadbeefcafebabedeadbeefcafebabe".into(),
+            payload: serde_json::Value::Object(Default::default()),
+            resource_id: "sb-orphan-xyz".into(),
+        };
+        let msg_bytes = serde_json::to_vec(&canonical).unwrap();
+        let digest = eip191_digest(&msg_bytes);
+        let (sig, rec_id): (k256::ecdsa::Signature, k256::ecdsa::RecoveryId) =
+            sk.sign_prehash(&digest).unwrap();
+        let mut sig_65 = [0u8; 65];
+        sig_65[..64].copy_from_slice(&sig.to_bytes());
+        sig_65[64] = Into::<u8>::into(rec_id) + 27;
+
+        let envelope = SandboxEnvelope {
+            wallet_address: addr,
+            signed_message_b64: base64::engine::general_purpose::STANDARD.encode(&msg_bytes),
+            wallet_signature: Bytes::from(sig_65.to_vec()),
+        };
+        let crypto = crypto_for_tests();
+        let parsed = verify_envelope(&envelope, &crypto).expect("must verify");
+        assert_eq!(parsed.action, "stop");
+        assert_eq!(parsed.resource_id, "sb-orphan-xyz");
+        // Most important: AdminSigner.address == envelope's wallet_address
+        // == recovered address.
+        assert_eq!(envelope.wallet_address, signer.address);
+    }
 }

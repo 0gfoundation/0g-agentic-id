@@ -136,7 +136,7 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 .card-disabled{opacity:.55;pointer-events:none}
 .card-disabled textarea{background:var(--surf2)}
 
-.btn{font:inherit;font-family:var(--sans);font-weight:600;font-size:13px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring),box-shadow var(--t-fast)}
+.btn{display:inline-block;font:inherit;font-family:var(--sans);font-weight:600;font-size:13px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;text-decoration:none;line-height:1.2;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring),box-shadow var(--t-fast)}
 .btn-primary{background:var(--p);color:oklch(99% 0 0)}
 .btn-primary:hover:not(:disabled){background:var(--pd);transform:translateY(-1px);box-shadow:var(--sh-sm)}
 .btn-primary:disabled{opacity:.5;cursor:not-allowed;transform:none}
@@ -277,12 +277,11 @@ small.hint{display:block;color:var(--muted);font-size:12px;margin-top:6px}
 .agent-row .col-status .status-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
 .agent-row .col-status.s-running{color:var(--green)}
 .agent-row .col-status.s-running .status-dot{background:var(--green);box-shadow:0 0 5px var(--green)}
-.agent-row .col-status.s-stopped{color:var(--text2)}
-.agent-row .col-status.s-stopped .status-dot{background:var(--muted)}
-.agent-row .col-status.s-failed{color:var(--red)}
+.agent-row .col-status.s-failed{color:var(--red);cursor:help}
 .agent-row .col-status.s-failed .status-dot{background:var(--red)}
-.agent-row .col-status.s-pending,.agent-row .col-status.s-deploying,.agent-row .col-status.s-ready{color:var(--orange)}
-.agent-row .col-status.s-pending .status-dot,.agent-row .col-status.s-deploying .status-dot,.agent-row .col-status.s-ready .status-dot{background:var(--orange);animation:pulse 2s ease-in-out infinite}
+.agent-row .col-status.s-offline{color:var(--text2)}
+.agent-row .col-status.s-offline .status-dot{background:var(--muted)}
+.agent-row .col-status.s-offline[title]:not([title=""]){cursor:help}
 .agent-row .col-owner{font-family:var(--mono);font-size:12px;color:var(--text2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .agent-row .col-created{font-family:var(--mono);font-size:11px;color:var(--muted);white-space:nowrap}
 @media(max-width:720px){
@@ -397,9 +396,16 @@ details.log[open] summary{color:var(--text2)}
 
 /* Status pill row below the hero (e.g. ✓ Active, ○ Reputation) */
 .detail-status-row{display:flex;align-items:center;gap:8px;margin-bottom:18px;flex-wrap:wrap}
+.failure-banner{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;margin-bottom:18px;background:var(--rbg);border:1px solid var(--rbd);border-radius:var(--r-md);color:var(--text)}
+.failure-banner-title{font-size:12.5px;font-weight:600;color:var(--red);margin-bottom:2px;text-transform:uppercase;letter-spacing:.04em}
+.failure-banner-reason{font-size:13px;color:var(--text);font-family:var(--mono);word-break:break-word}
+.failure-banner-hint{font-size:12.5px;color:var(--text2);margin-top:8px;line-height:1.5;border-top:1px dashed var(--rbd);padding-top:8px}
+.provisioning-pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:9999px;background:var(--obg);color:var(--orange);border:1px solid var(--obd);font-size:12.5px;font-weight:600;font-family:var(--mono);letter-spacing:.01em;cursor:help}
+.provisioning-spinner{width:11px;height:11px;border:2px solid var(--obd);border-top-color:var(--orange);border-radius:50%;animation:provspin .9s linear infinite;flex-shrink:0}
+@keyframes provspin{to{transform:rotate(360deg)}}
 .status-pill{display:inline-flex;align-items:center;gap:5px;border-radius:9999px;padding:4px 11px;font-size:11px;font-weight:600;font-family:var(--mono);letter-spacing:.03em;text-transform:capitalize}
 .status-pill.solid-green{background:var(--gbg);color:var(--green);border:1px solid var(--gbd)}
-.status-pill.solid-red{background:var(--rbg);color:var(--red);border:1px solid var(--rbd)}
+.status-pill.solid-red{background:var(--rbg);color:var(--red);border:1px solid var(--rbd);cursor:help}
 .status-pill.solid-orange{background:var(--obg);color:var(--orange);border:1px solid var(--obd)}
 .status-pill.solid-gray{background:var(--surf2);color:var(--text2);border:1px solid var(--border)}
 .status-pill.outline{background:var(--surf);color:var(--text2);border:1px dashed var(--border)}
@@ -846,6 +852,7 @@ const ICO = {
   play:     '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><path d="M5 3.5L13 8l-8 4.5z"/></svg>',
   refresh:  '<svg viewBox="0 0 16 16"><path d="M3 8a5 5 0 0 1 8.7-3.4L13 6"/><path d="M13 3v3h-3"/><path d="M13 8a5 5 0 0 1-8.7 3.4L3 10"/><path d="M3 13v-3h3"/></svg>',
   user:     '<span class="ico"><svg viewBox="0 0 16 16"><circle cx="8" cy="5.5" r="2.5"/><path d="M3 13.5c0-2.2 2.2-3.5 5-3.5s5 1.3 5 3.5"/></svg></span>',
+  warn:     '<svg viewBox="0 0 16 16" fill="currentColor" stroke="none"><path d="M8 1.5L15 13.5H1L8 1.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><rect x="7.3" y="6" width="1.4" height="4" rx=".2"/><circle cx="8" cy="11.4" r=".8"/></svg>',
 };
 
 // State
@@ -1010,10 +1017,13 @@ function handleHash() {
     $('#viewDeploy').classList.add('active');
     // Hide stale progress from a previous deploy and tear down its WS so
     // unrelated events (e.g. user_stop on the previous agent) don't paint
-    // this view.
+    // this view. Also reset every task back to `idle` — the prior failure
+    // marks (red ✗, error reason text) would otherwise linger inside the
+    // hidden card and re-flash when a new deploy unhides it.
     $('#cardProgress').style.display = 'none';
     $('#goDetailRow').innerHTML = '';
     $('#slowHint').classList.remove('show');
+    resetProgress();
     if (State.slowHintTimer) { clearTimeout(State.slowHintTimer); State.slowHintTimer = null; }
     State.deployingSealId = null;
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
@@ -1341,19 +1351,47 @@ function subscribeDeployWS(sealId) {
 function handleDeployEvent(evt, sealId) {
   const t = evt.event;
 
+  // Cascade-cancel any task that's still pending/active. Used when one
+  // phase-1 track fails and the dependent downstream tracks would never
+  // legitimately complete (worker bails on the first `?` so phase 2 is
+  // skipped, and `handle_deploy` admin_deletes the orphan sandbox right
+  // after the join). Without this, the UI would leave a forever-spinning
+  // ⏳ next to "Provision agent sandbox" even though the sandbox is gone.
+  function cancelDownstream(taskNames) {
+    for (const n of taskNames) {
+      const li = $(`[data-task="${n}"]`);
+      if (!li) continue;
+      // Only override if it isn't already terminal — don't overwrite a
+      // genuine success/failure that arrived in a different order.
+      if (li.classList.contains('done') || li.classList.contains('fail')) continue;
+      setTask(n, 'fail', 'skipped — earlier step failed');
+    }
+    $('#slowHint').classList.remove('show');
+    $('#deployBtn').disabled = false;
+  }
+
   if (t === 'storage_submitted') setTask('storage', 'active', 'tx submitted, awaiting confirm…');
   if (t === 'storage_confirmed') setTask('storage', 'done', 'confirmed');
-  if (t === 'storage_failed')    setTask('storage', 'fail', evt.reason || 'failed');
+  if (t === 'storage_failed') {
+    setTask('storage', 'fail', evt.reason || 'failed');
+    // storage is phase 1 — sandbox/uri/running won't progress, and the
+    // worker will admin_delete any sandbox that did spawn.
+    cancelDownstream(['sandbox', 'uri', 'running']);
+  }
 
   if (t === 'mint_submitted') setTask('mint', 'active', 'tx submitted, awaiting confirm…');
   if (t === 'mint_confirmed') setTask('mint', 'done', `confirmed — agent_id ${evt.agent_id}`);
-  if (t === 'mint_failed')    setTask('mint', 'fail', evt.reason || 'failed');
+  if (t === 'mint_failed') {
+    setTask('mint', 'fail', evt.reason || 'failed');
+    cancelDownstream(['sandbox', 'uri', 'running']);
+  }
 
   if (t === 'container_starting') setTask('sandbox', 'active', 'creating sandbox…');
   if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
-    $('#slowHint').classList.remove('show');
+    // container failure → phase 2 won't run.
+    cancelDownstream(['uri', 'running']);
   }
 
   if (t === 'agent_u_r_i_updated') setTask('uri', 'done', 'tx submitted');
@@ -1363,10 +1401,6 @@ function handleDeployEvent(evt, sealId) {
     $('#deployBtn').disabled = false;
     $('#goDetailRow').innerHTML = `<small class="hint">Redirecting to agent detail…</small>`;
     setTimeout(() => navigate(`#/agent/${sealId}`), 1500);
-  }
-  if (t === 'container_failed') {
-    setTask('running', 'fail', evt.reason || '');
-    $('#deployBtn').disabled = false;
   }
 }
 
@@ -1623,6 +1657,134 @@ function shortAddr(addr) {
   return a.length >= 12 ? `${a.slice(0, 6)}…${a.slice(-4)}` : a;
 }
 
+// Render the 5-stage task progress for a deployment row, inferred
+// purely from its current stage states (no WS plumbing — paintDetail
+// re-runs on every event). Returns '' when phase is running/stopped
+// (the agent is settled, the task list adds no info). Used on the
+// detail page so /retry's progress is visible without leaving the
+// page — the deploy console's task list is for fresh deploys only.
+function renderTaskProgress(dep) {
+  const phase = dep.phase || 'pending';
+  if (phase === 'running' || phase === 'stopped') return '';
+
+  // Map a stage to (cls, icon, text). The fail-with-reason case takes
+  // precedence over generic state because users care about WHY most.
+  const renderStage = (idx, title, stage, override) => {
+    let cls = 'idle', icon = String(idx), text = 'waiting';
+    if (override) { ({ cls, icon, text } = override); }
+    else if (stage) {
+      switch (stage.state) {
+        case 'confirmed': cls = 'done';   icon = '✓'; text = 'confirmed'; break;
+        case 'failed':    cls = 'fail';   icon = '✗'; text = stage.reason || 'failed'; break;
+        case 'submitted': cls = 'active'; icon = '';  text = 'in flight…'; break;
+        case 'stopped':   cls = 'fail';   icon = '✗'; text = stage.reason || 'stopped'; break;
+        case 'not_started': default:      cls = 'idle'; icon = String(idx); text = 'waiting';
+      }
+    }
+    return `
+      <li class="task ${cls}" title="${escapeHtml(text)}">
+        <span class="task-icon">${escapeHtml(icon)}</span>
+        <div class="task-info">
+          <div class="task-title">${escapeHtml(title)}</div>
+          <div class="task-state">${escapeHtml(text)}</div>
+        </div>
+      </li>`;
+  };
+
+  // Phase-2 derived states (no dedicated stage column):
+  //   uri      → done when agent_uri non-empty; idle otherwise.
+  //              When mint or storage Failed, mark skipped (cascade
+  //              cancel — phase 2 will never run).
+  //   running  → done when phase === 'running'; idle otherwise.
+  //              Cascade-cancel on any phase-1 failure.
+  const sFailed = dep.storage_stage && dep.storage_stage.state === 'failed';
+  const mFailed = dep.mint_stage && dep.mint_stage.state === 'failed';
+  const cFailed = dep.container_stage && dep.container_stage.state === 'failed';
+  const phase1Failed = sFailed || mFailed || cFailed;
+
+  let uriOverride = null;
+  if (dep.agent_uri) uriOverride = { cls: 'done', icon: '✓', text: 'on-chain' };
+  else if (phase1Failed) uriOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+
+  let runningOverride = null;
+  if (phase === 'running') runningOverride = { cls: 'done', icon: '✓', text: 'live' };
+  else if (phase1Failed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+
+  // Always render all 5 tasks — completed ones show with ✓ instead of
+  // disappearing. This matches the deploy console's checklist style:
+  // users get the full picture of where the deploy got, not a shrinking
+  // list that "ate" success markers.
+  return `
+    <section class="card" style="margin-bottom:18px;padding:16px 20px">
+      <div class="phase-label" style="margin-top:0">Phase 1 — three concurrent tracks</div>
+      <ul class="tasks">
+        ${renderStage(1, 'Encrypt & upload to 0G storage', dep.storage_stage)}
+        ${renderStage(2, 'Mint AgenticID on chain',         dep.mint_stage)}
+        ${renderStage(3, 'Provision agent sandbox',         dep.container_stage)}
+      </ul>
+      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+      <ul class="tasks">
+        ${renderStage(4, 'Set agent URI on chain',     null, uriOverride)}
+        ${renderStage(5, 'Sandbox reports running',    null, runningOverride)}
+      </ul>
+    </section>`;
+}
+
+// Distill the actionable failure reason from a deployment row. Order:
+//   1. last_provision_error  (covers /provision rejections — image_hash
+//      whitelist, signer mismatch, stale attestation, etc.)
+//   2. failed stage's `reason`  (storage/mint/sandbox.create errors)
+// Returns '' if the deployment isn't currently failed. Surfaced on the
+// detail-page banner AND as a `title` tooltip on every status pill /
+// chip so the user knows what to do without clicking through.
+//
+// Critical: gate on `phase === 'failed'`. `last_provision_error` is a
+// sticky DB column (only set, never cleared) — without this gate it
+// would haunt every recovered deployment with a stale "Deployment
+// failed" banner long after the container has come back online.
+function failureReason(dep) {
+  if (!dep) return '';
+  if (dep.phase !== 'failed') return '';
+  // Priority matches the recovery-bucket priority:
+  //   storage / mint failures  ← root cause; deploy never made it to
+  //                              container, so c=Failed (if any) is a
+  //                              downstream symptom (provision timeout,
+  //                              etc.). Surface the upstream reason.
+  //   container failure        ← genuine container/runtime issue
+  //   last_provision_error     ← only when above don't have a reason
+  //                              (e.g. /provision rejected before any
+  //                              stage transitioned to Failed)
+  const stageReason = (s) =>
+    s && s.state === 'failed' && s.reason ? s.reason : '';
+  return stageReason(dep.storage_stage)
+    || stageReason(dep.mint_stage)
+    || stageReason(dep.container_stage)
+    || dep.last_provision_error
+    || '';
+}
+
+// Known-permanent /provision rejection markers. Recreating without a
+// human-side fix (registering the image_hash on chain, fixing config)
+// would just hit the same wall and burn another sandbox slot. We
+// still keep the recreate button (the user CAN unstick it once the
+// root cause is addressed) but surface a hint pointing at what to do.
+const PERMANENT_PROVISION_MARKERS = [
+  ['image_hash not in validFrameworkHashes',
+   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring back online.'],
+  ['signer mismatch',
+   'Sandbox TEE signer doesn\'t match attestor config. Coordinate with infra; recreate alone won\'t fix it.'],
+  ['container_pubkey must be',
+   'Container pubkey shape rejected. Likely a sandbox runtime mismatch — rebuild the image rather than recreate.'],
+];
+function permanentFailureHint(dep) {
+  const r = (dep && dep.last_provision_error) || '';
+  if (!r) return '';
+  for (const [marker, hint] of PERMANENT_PROVISION_MARKERS) {
+    if (r.includes(marker)) return hint;
+  }
+  return '';
+}
+
 function renderAgentRow(d) {
   const phase = d.phase || 'pending';
   const card = d.agent_card || {};
@@ -1649,10 +1811,14 @@ function renderAgentRow(d) {
         </div>
       </div>
       <div><span class="col-chain">⬢ 0G testnet</span></div>
-      <div class="col-status s-${phase}">
-        <span class="status-dot"></span>
-        <span>${escapeHtml(phase)}</span>
-      </div>
+      ${(() => {
+        const p = d.phase || 'pending';
+        const cls = p === 'running' ? 's-running' : p === 'failed' ? 's-failed' : 's-offline';
+        const txt = p === 'running' ? 'Running' : p === 'failed' ? 'Failed' : 'Offline';
+        const r = failureReason(d);
+        const title = r ? ` title="${escapeHtml(r)}"` : '';
+        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
+      })()}
       <div class="col-owner" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
       <div class="col-created" style="text-align:right">${ageString(d.created_at)}</div>
     </div>`;
@@ -1727,12 +1893,57 @@ function paintDetail(dep) {
 
   const ownerMatches = State.ownerAddr && dep.owner &&
     State.ownerAddr.toLowerCase() === dep.owner.toLowerCase();
-  const canStop  = ownerMatches && sandboxId && phase === 'running';
-  const canStart = ownerMatches && sandboxId && (phase === 'stopped' || phase === 'failed');
 
-  // Container is reachable only when phase=running. Stopped/failed agents
-  // hide Serve endpoint + dashboard since the proxy URL won't resolve.
-  const isLive = phase === 'running';
+  // ── 6-bucket state classification ─────────────────────────────────
+  //
+  // Inputs (only what the row carries — the backend is the source of
+  // truth, including the provision_deadline sweep that flips stuck
+  // Submitted to Failed once the timeout passes):
+  //
+  //   phase           : derive_phase(s, m, c) on the row
+  //   s/m/c           : individual stage states
+  //   sandbox_id      : present once `sandbox.create` succeeded
+  //   provisioned_at  : present once /provision succeeded
+  //
+  // Buckets — exactly one applies, in this priority order:
+  //
+  //   ① live        — phase=running                  (Stop + Dashboard)
+  //   ② paused      — phase=stopped                  (Bring back online → start)
+  //   ③ incomplete  — s or m Failed                  (Continue deploy, no sig)
+  //   ④ stuck       — c Failed                       (Bring back online → create)
+  //   ⑤ provisioning — phase=ready, has_sb, !prov    (no action — still booting)
+  //   ⑥ mid-deploy  — anything else (pending / provisioning) (no action)
+  //
+  // Why the order: `incomplete` checks individual s/m before `stuck`
+  // checks c so a deployment that fails on multiple tracks gets the
+  // softer recovery path first (idempotent retry), then escalates to
+  // sandbox recreate after.
+  const stageFailed = (s) => s && s.state === 'failed';
+  const sFailed = stageFailed(dep.storage_stage);
+  const mFailed = stageFailed(dep.mint_stage);
+  const cFailed = stageFailed(dep.container_stage);
+  const isProvisioned = !!(dep.provisioned_at && dep.container_pubkey);
+  const hasSandbox = !!sandboxId;
+
+  // Two recovery labels — distinguish only by what's broken, not by
+  // backend dispatch (which is identical: sign CREATE envelope, POST
+  // /retry, worker decides what to actually run).
+  //
+  //   isLive       → Stop + Dashboard
+  //   isIncomplete → "Retry"  (s or m failed — phase-1 didn't finish)
+  //   isOffline    → "Start"  (everything else broken: c failed,
+  //                            stopped, or ready stuck booting —
+  //                            static data is fine, runtime needs to
+  //                            come up)
+  const isLive       = phase === 'running';
+  const isIncomplete = ownerMatches && (sFailed || mFailed);
+  const isOffline    = ownerMatches && !isLive && !isIncomplete && (
+       cFailed
+    || phase === 'stopped'
+    || (phase === 'ready' && hasSandbox && !isProvisioned)
+  );
+
+  const canStop = ownerMatches && sandboxId && isLive;
 
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
   // agentSeal addr: stored in registrations[0].agentAddress per AgentCard
@@ -1742,18 +1953,26 @@ function paintDetail(dep) {
     || dep.agent_seal_addr
     || '';
 
-  // Phase → status-pill color
+  // Three pill states: Running / Failed / Offline. Same recovery
+  // action for the latter two (Start button), but failure deserves
+  // a red signal so the user notices "something broke" before they
+  // need to read the banner. Stopped + ready collapse into Offline.
   const pillClass = phase === 'running' ? 'solid-green'
                   : phase === 'failed'  ? 'solid-red'
-                  : phase === 'stopped' ? 'solid-gray'
-                  : 'solid-orange';
+                  : 'solid-gray';
+  const pillLabel = phase === 'running' ? 'Running'
+                  : phase === 'failed'  ? 'Failed'
+                  : 'Offline';
 
-  // Owner action buttons (top-right of hero) — only visible to the owner.
+  // Owner action buttons. Mutually exclusive recovery buttons + Stop +
+  // Dashboard. All recovery buttons share one click handler that signs
+  // a CREATE envelope and POSTs /retry — only the label differs.
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
       ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')"><span class="ico">${ICO.grid}</span> Dashboard</button>` : ''}
-      ${canStop  ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
-      ${canStart ? `<button class="icon-btn primary" onclick="actionStart('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.play}</span> Start</button>` : ''}
+      ${canStop ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
+      ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
+      ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.play}</span> Start</button>` : ''}
     </div>`;
 
   const avatar = image
@@ -1891,9 +2110,49 @@ function paintDetail(dep) {
     </div>
 
     <div class="detail-status-row">
-      <span class="status-pill ${pillClass}"><span class="dot" style="width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;margin-right:6px"></span>${escapeHtml(phase)}</span>
-      ${dep.agent_id ? `<span class="status-pill outline">on-chain</span>` : `<span class="status-pill outline">off-chain (mint pending)</span>`}
+      <span class="status-pill ${pillClass}"${(() => {
+        const r = failureReason(dep);
+        return r ? ` title="${escapeHtml(r)}"` : '';
+      })()}><span class="dot" style="width:6px;height:6px;border-radius:50%;background:currentColor;display:inline-block;margin-right:6px"></span>${escapeHtml(pillLabel)}</span>
+      ${(() => {
+        // Mint state pill — three branches, not two:
+        //   1. agent_id set        → "on-chain" (mint Confirmed)
+        //   2. mint Failed         → "mint failed" (red), avoids
+        //                            misleading "pending" while the
+        //                            mint stage is actually dead
+        //   3. anything else       → "mint pending" (in flight or
+        //                            NotStarted)
+        if (dep.agent_id) return `<span class="status-pill outline">on-chain</span>`;
+        const mFailed = dep.mint_stage && dep.mint_stage.state === 'failed';
+        if (mFailed) return `<span class="status-pill solid-red" title="${escapeHtml(dep.mint_stage.reason || 'mint failed')}">mint failed</span>`;
+        return `<span class="status-pill outline">off-chain (mint pending)</span>`;
+      })()}
     </div>
+
+    ${(() => {
+      // Failure banner with three layers, top-down:
+      //   1. Title — generic "Deployment failed"
+      //   2. Reason — verbatim error from backend (last_provision_error
+      //      or a failed stage's `reason`)
+      //   3. Hint — when the reason is a known-permanent /provision
+      //      rejection, an actionable next-step (e.g. "ask project to
+      //      register image_hash"). Lets the user fix the root cause
+      //      before clicking Bring back online.
+      const reason = failureReason(dep);
+      if (!reason) return '';
+      const hint = permanentFailureHint(dep);
+      return `
+        <div class="failure-banner">
+          <span class="ico" style="color:var(--red);flex-shrink:0">${ICO.warn || '!'}</span>
+          <div>
+            <div class="failure-banner-title">Deployment failed</div>
+            <div class="failure-banner-reason">${escapeHtml(reason)}</div>
+            ${hint ? `<div class="failure-banner-hint">${escapeHtml(hint)}</div>` : ''}
+          </div>
+        </div>`;
+    })()}
+
+    ${renderTaskProgress(dep)}
 
     <div class="detail-grid">
       <div>
@@ -2007,14 +2266,29 @@ async function fetchAgentWallet(agentId, ownerAddr) {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// Stop / Start actions
+// Lifecycle actions: stop / bring back online / continue deploy
 // ───────────────────────────────────────────────────────────────────
+
+// Per-seal in-flight guard for owner lifecycle actions. Prevents a
+// jittery / double-clicked Stop or Start from dispatching twice
+// against the same sandbox — the second call would otherwise race
+// in after the first succeeds and sandbox returns 400 "not started"
+// (or 400 "operation in progress"), which the worker would dutifully
+// flip to c=Failed even though the desired state was already met.
+//
+// The guard is cleared in `finally`, so a slow request that
+// eventually completes won't permanently block follow-up clicks.
+const _lifecycleInflight = new Set();
+
 async function lifecycleAction(verb, sealId, sandboxId) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  const guardKey = `${verb}:${sealId}`;
+  if (_lifecycleInflight.has(guardKey)) {
+    tracing(`lifecycle ${verb} already in flight for ${sealId}, ignoring duplicate click`);
+    return;
+  }
+  _lifecycleInflight.add(guardKey);
   try {
-    // Daytona persists the container's env (including API_KEY) at create
-    // time and reuses it across stop/start, so we don't need to re-supply
-    // it here. Empty payload is correct.
     const { envelope } = await signSandboxEnvelope(verb, sandboxId, {});
     const r = await fetch(`/${verb}`, {
       method: 'POST',
@@ -2029,11 +2303,81 @@ async function lifecycleAction(verb, sealId, sandboxId) {
     toast(`${verb} accepted — waiting for sandbox…`, 'success');
   } catch (e) {
     toast(`${verb} failed: ${e.message || e}`, 'error');
+  } finally {
+    _lifecycleInflight.delete(guardKey);
   }
 }
 
-window.actionStop  = (sealId, sandboxId) => lifecycleAction('stop',  sealId, sandboxId);
-window.actionStart = (sealId, sandboxId) => lifecycleAction('start', sealId, sandboxId);
+// Tiny wrapper — `tracing` is just `console.debug` aliased once so
+// we can grep for our own lifecycle logs without picking up library
+// noise. Drop-in replacement for `console.debug`.
+function tracing(msg) { console.debug('[attestor]', msg); }
+
+window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandboxId);
+
+// Bring back online — picks `start` vs `create` from the deployment's
+// CURRENT bucket, not from the historically-set provisioned_at flag.
+//
+//   isPaused (phase=stopped) → sign `start`: sandbox is just paused,
+//                              Daytona's `start` resumes the existing
+//                              container (pubkey binding keeps freshness
+//                              window short-circuited).
+//   isStuck (c=Failed)        → sign `create`: existing sandbox is dead
+//                              (errored, GC'd, or never provisioned).
+//                              Worker spawns a fresh sandbox via
+//                              SandboxRecreate; admin_delete cleans up
+//                              the orphan if it's still around.
+//
+// Why not `isProvisioned`? It's a sticky DB column (set on first
+// successful /provision, never cleared). A deployment that ran fine,
+// then got stopped, then failed start, then ended up in c=Failed
+// still has provisioned_at populated — picking action by that field
+// would sign `start` against a dead sandbox and loop forever in 400/403.
+// Unified recovery click handler — every "Retry" / "Activate" /
+// "Start" button funnels here. Always signs a CREATE envelope and
+// POSTs /retry; backend's ResumeDeploy job decides what to actually
+// do (mint/storage retry alone, sandbox recreate, or both) based on
+// the deployment row's stage states.
+//
+// `useStart` parameter retained for callsite compatibility but
+// currently ignored — the legacy `start` path was dropped to keep
+// recovery dispatch on a single backend endpoint.
+window.bringOnline = async function (sealId, sandboxId, _useStart) {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  // Same per-seal guard as lifecycleAction — defends against double
+  // clicks on Start / Retry that would otherwise dispatch a second
+  // recovery job (each one signing a fresh envelope, churning sandbox).
+  const guardKey = `recover:${sealId}`;
+  if (_lifecycleInflight.has(guardKey)) {
+    tracing(`recover already in flight for ${sealId}, ignoring duplicate click`);
+    return;
+  }
+  _lifecycleInflight.add(guardKey);
+  try {
+    const payload = { snapshot: '0g-test-sealed', sealed: true, env: {} };
+    const { envelope } = await signSandboxEnvelope('create', '', payload);
+    const r = await fetch('/retry', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        seal_id: sealId,
+        owner: State.ownerAddr,
+        sandbox_envelope: envelope,
+      }),
+    });
+    if (!r.ok) throw new Error(`/retry ${r.status}: ${await r.text()}`);
+    toast('Recovering — waiting for sandbox…', 'success');
+  } catch (e) {
+    toast('Recovery failed: ' + (e.message || e), 'error');
+  } finally {
+    _lifecycleInflight.delete(guardKey);
+  }
+};
+
+// (Continue deploy removed — Bring back online now drives /retry
+// with an envelope, covering both pure mint/storage retries and the
+// recreate-after-failure flow in a single action. The legacy unsigned
+// /retry path is preserved server-side for ops scripts.)
 
 // ───────────────────────────────────────────────────────────────────
 // Say hi — fetch the Serve endpoint and render the agent's response

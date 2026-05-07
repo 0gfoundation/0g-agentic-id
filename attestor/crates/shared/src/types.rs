@@ -42,6 +42,17 @@ pub struct IDataArtifact {
     pub storage_root: StorageRoot,
     pub sealed_key: Bytes,           // ECIES ciphertext
     pub data_hash: DataHash,
+    /// Encrypted iData bytes — populated at deploy time so a failed
+    /// storage upload can be retried with byte-identical content (same
+    /// dataHash matches what's already on chain). Cleared once storage
+    /// transitions to Confirmed; an empty Bytes means "already on 0g
+    /// storage, retrieve from `storage_root`".
+    #[serde(default, skip_serializing_if = "bytes_is_empty")]
+    pub ciphertext: Bytes,
+}
+
+fn bytes_is_empty(b: &Bytes) -> bool {
+    b.is_empty()
 }
 
 // ── Storage pointer embedded in description JSON ───────────────────────
@@ -261,8 +272,40 @@ pub struct Deployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
 
+    /// Wall-clock deadline for the container to complete `/provision`.
+    /// Written by `handle_deploy` / `handle_sandbox_recreate` once
+    /// `sandbox.create` succeeds. Worker sweep flips
+    /// `container_stage` to Failed if `now > deadline` AND stage is
+    /// still Submitted — so "/provision never came" becomes a
+    /// first-class observable state instead of an indistinguishable
+    /// stuck Submitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provision_deadline: Option<DateTime<Utc>>,
+
+    /// Last `/provision` validation error (image_hash rejected, signer
+    /// mismatch, stale attestation, etc.) — surfaces in the UI so
+    /// "still booting" is distinguishable from "broken". Cleared on
+    /// next successful `/provision`. None means no failures observed
+    /// yet (or pre-feature row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provision_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_provision_error_at: Option<DateTime<Utc>>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Deployment {
+    /// True once the container has completed `/provision` — both the
+    /// timestamp and the `(pubkey, mac)` binding are written. Subsequent
+    /// recovery flows can fast-path past the freshness check, so a
+    /// stop+start round trip doesn't need a fresh user-signed envelope.
+    pub fn is_provisioned(&self) -> bool {
+        self.provisioned_at.is_some()
+            && self.container_pubkey.is_some()
+            && self.container_pubkey_mac.is_some()
+    }
 }
 
 // ── Sandbox create response ─────────────────────────────────────────────
@@ -278,6 +321,266 @@ pub struct SandboxCreateResponse {
     pub state: Option<String>,
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::U256;
+
+    fn empty_deployment() -> Deployment {
+        let now = Utc::now();
+        Deployment {
+            seal_id: B256::ZERO,
+            agent_seal_addr: Address::ZERO,
+            owner: Address::ZERO,
+            agent_id: None,
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            phase: DeploymentPhase::Pending,
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn dummy_artifact() -> IDataArtifact {
+        IDataArtifact {
+            role: "config".into(),
+            description: "{}".into(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(0xab),
+                indexer: "indexer.example".into(),
+                size: 42,
+            },
+            sealed_key: Bytes::from_static(b"sealed"),
+            data_hash: B256::repeat_byte(0xcd),
+            ciphertext: Bytes::new(),
+        }
+    }
+
+    // ── Deployment::is_provisioned truth table ─────────────────────────
+    //
+    // Encodes what "provisioned" actually means: ALL THREE
+    // (provisioned_at, container_pubkey, container_pubkey_mac) must be
+    // set. The bug we want to catch is anyone "simplifying" the helper
+    // to look at only one or two fields — e.g. trusting `provisioned_at`
+    // alone would let DB-tampered rows skip the MAC check downstream.
+
+    #[test]
+    fn is_provisioned_all_three_set_returns_true() {
+        let mut d = empty_deployment();
+        d.provisioned_at = Some(Utc::now());
+        d.container_pubkey = Some(Bytes::from_static(b"pubkey"));
+        d.container_pubkey_mac = Some(Bytes::from_static(b"mac"));
+        assert!(d.is_provisioned());
+    }
+
+    #[test]
+    fn is_provisioned_any_field_missing_returns_false() {
+        let now = Utc::now();
+        let pk = Bytes::from_static(b"pubkey");
+        let mac = Bytes::from_static(b"mac");
+
+        // Iterate all 8 (2^3) combos via a tiny truth table.
+        let cases: &[(bool, bool, bool, bool)] = &[
+            (false, false, false, false),
+            (true,  false, false, false),
+            (false, true,  false, false),
+            (false, false, true,  false),
+            (true,  true,  false, false),
+            (true,  false, true,  false),
+            (false, true,  true,  false),
+            (true,  true,  true,  true),
+        ];
+        for (ts, pubk, m, expected) in cases.iter().copied() {
+            let mut d = empty_deployment();
+            d.provisioned_at = ts.then_some(now);
+            d.container_pubkey = pubk.then(|| pk.clone());
+            d.container_pubkey_mac = m.then(|| mac.clone());
+            assert_eq!(
+                d.is_provisioned(),
+                expected,
+                "(ts={ts}, pubk={pubk}, mac={m}) expected {expected}"
+            );
+        }
+    }
+
+    // ── IDataArtifact serde ────────────────────────────────────────────
+
+    #[test]
+    fn idata_artifact_empty_ciphertext_omitted_from_json() {
+        let a = dummy_artifact(); // ciphertext = Bytes::new()
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(
+            !s.contains("ciphertext"),
+            "empty ciphertext must be skipped: {s}"
+        );
+    }
+
+    #[test]
+    fn idata_artifact_non_empty_ciphertext_serialized() {
+        let mut a = dummy_artifact();
+        a.ciphertext = Bytes::from_static(b"\x01\x02\x03");
+        let s = serde_json::to_string(&a).unwrap();
+        assert!(s.contains("ciphertext"), "non-empty ciphertext must serialize: {s}");
+        // alloy::Bytes serializes as 0x-prefixed hex.
+        assert!(
+            s.contains("0x010203") || s.contains("\"0x010203\""),
+            "expected hex-encoded bytes, got: {s}"
+        );
+    }
+
+    #[test]
+    fn idata_artifact_missing_ciphertext_deserializes_to_empty() {
+        // Common production case: artifact came from a row where the
+        // ciphertext was already cleared (storage Confirmed). The JSON
+        // produced by us doesn't carry the field; deserializing it back
+        // must yield an empty Bytes — NOT panic, NOT some sentinel.
+        let json = r#"{
+          "role": "config",
+          "description": "{}",
+          "storage_root": {
+            "root_hash": "0xabababababababababababababababababababababababababababababababab",
+            "indexer": "indexer.example",
+            "size": 42
+          },
+          "sealed_key": "0x73656c656e",
+          "data_hash": "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        }"#;
+        let a: IDataArtifact = serde_json::from_str(json).unwrap();
+        assert!(a.ciphertext.is_empty());
+        assert_eq!(a.storage_root.size, 42);
+    }
+
+    #[test]
+    fn idata_artifact_full_roundtrip_preserves_fields() {
+        let mut a = dummy_artifact();
+        a.ciphertext = Bytes::from_static(b"\xde\xad\xbe\xef");
+        a.role = "memory".into();
+        a.storage_root.size = 9999;
+        let json = serde_json::to_string(&a).unwrap();
+        let b: IDataArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(a.role, b.role);
+        assert_eq!(a.description, b.description);
+        assert_eq!(a.storage_root.root_hash, b.storage_root.root_hash);
+        assert_eq!(a.storage_root.size, b.storage_root.size);
+        assert_eq!(a.storage_root.indexer, b.storage_root.indexer);
+        assert_eq!(a.sealed_key, b.sealed_key);
+        assert_eq!(a.data_hash, b.data_hash);
+        assert_eq!(a.ciphertext, b.ciphertext);
+    }
+
+    // ── Stage helpers ──────────────────────────────────────────────────
+    // is_terminal / is_failed are tiny, but they're load-bearing in
+    // resume logic — get them wrong and a Failed track silently retries
+    // on success or vice versa.
+
+    #[test]
+    fn stage_status_failed_is_terminal_and_failed() {
+        let s = StageStatus::Failed { at: Utc::now(), reason: "x".into() };
+        assert!(s.is_terminal());
+        assert!(s.is_failed());
+    }
+
+    #[test]
+    fn stage_status_confirmed_is_terminal_not_failed() {
+        let s = StageStatus::Confirmed { at: Utc::now() };
+        assert!(s.is_terminal());
+        assert!(!s.is_failed());
+    }
+
+    #[test]
+    fn stage_status_submitted_not_terminal() {
+        let s = StageStatus::Submitted { tx_hash: None, at: Utc::now() };
+        assert!(!s.is_terminal());
+        assert!(!s.is_failed());
+    }
+
+    // ── derive_phase ──────────────────────────────────────────────────
+
+    #[test]
+    fn derive_phase_failed_short_circuits() {
+        // Even if container is Confirmed, a Failed mint dominates.
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Failed { at: Utc::now(), reason: "x".into() },
+            &StageStatus::Confirmed { at: Utc::now() },
+        );
+        assert_eq!(phase, DeploymentPhase::Failed);
+    }
+
+    #[test]
+    fn derive_phase_running_when_container_confirmed() {
+        let phase = derive_phase(
+            &StageStatus::NotStarted,        // even if storage isn't done
+            &StageStatus::NotStarted,
+            &StageStatus::Confirmed { at: Utc::now() },
+        );
+        assert_eq!(phase, DeploymentPhase::Running);
+    }
+
+    #[test]
+    fn derive_phase_ready_when_phase1_done_but_container_pending() {
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Submitted { tx_hash: None, at: Utc::now() },
+        );
+        assert_eq!(phase, DeploymentPhase::Ready);
+    }
+
+    #[test]
+    fn derive_phase_pending_when_nothing_started() {
+        let phase = derive_phase(
+            &StageStatus::NotStarted,
+            &StageStatus::NotStarted,
+            &StageStatus::NotStarted,
+        );
+        assert_eq!(phase, DeploymentPhase::Pending);
+    }
+
+    // ── JobPayload variant serde — guards against silent variant rename ─
+    //
+    // Both ResumeDeploy and SandboxRecreate are dispatched by `kind`
+    // (rename_all=snake_case). If anyone renames the Rust variant
+    // without realising the on-disk JSON shape changes, queued jobs
+    // pre-rename will fail to deserialize at claim time. Pin the
+    // exact wire format.
+    #[test]
+    fn job_payload_resume_deploy_kind_is_resume_deploy() {
+        let p = JobPayload::ResumeDeploy { seal_id: B256::ZERO, sandbox_envelope: None };
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["kind"], "resume_deploy");
+    }
+
+    #[test]
+    fn job_payload_sandbox_recreate_kind_is_sandbox_recreate() {
+        let p = JobPayload::SandboxRecreate {
+            seal_id: B256::ZERO,
+            sandbox_envelope: SandboxEnvelope {
+                wallet_address: Address::ZERO,
+                signed_message_b64: String::new(),
+                wallet_signature: Bytes::new(),
+            },
+        };
+        let v: serde_json::Value = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["kind"], "sandbox_recreate");
+    }
+
+    // Silence unused-import warnings when feature flags shift.
+    #[allow(dead_code)]
+    fn _unused_compile_check(_: U256) {}
 }
 
 // ── /provision ──────────────────────────────────────────────────────────
@@ -331,6 +634,21 @@ pub struct LifecycleRequest {
     pub seal_id: SealId,
     pub owner: Address,
     pub sandbox_envelope: SandboxEnvelope,
+}
+
+/// Request body for `POST /retry` — owner-triggered recovery.
+///
+/// The optional `sandbox_envelope` (action="create") lets a single
+/// /retry call also recreate the sandbox when c is Failed/Stopped:
+/// after storage/mint retry runs, the worker reuses the envelope to
+/// spawn a fresh container, avoiding a second wallet popup. Pure
+/// storage/mint recovery (c healthy) ignores the envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryRequest {
+    pub seal_id: SealId,
+    pub owner: Address,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_envelope: Option<SandboxEnvelope>,
 }
 
 // ── Crypto outputs ──────────────────────────────────────────────────────
@@ -421,6 +739,34 @@ pub enum JobPayload {
     SandboxStop {
         seal_id: SealId,
         sandbox_envelope: SandboxEnvelope,
+    },
+    /// Recreate the sandbox from scratch — used to recover an
+    /// `inactive` agent whose previous sandbox never completed
+    /// attestation (or was deleted on the sandbox side). Worker calls
+    /// `SandboxClient::create` with the freshly-signed (action=create)
+    /// envelope, persists the new sandbox_id, and re-uploads the
+    /// AgentCard so its `url` field reflects the new sandbox.
+    SandboxRecreate {
+        seal_id: SealId,
+        sandbox_envelope: SandboxEnvelope,
+    },
+    /// Owner-triggered recovery dispatched by `POST /retry`. Three
+    /// behaviours, applied in order:
+    ///   1. storage Failed → re-upload from cached ciphertext
+    ///   2. mint Failed → query chain (idempotency) then resubmit
+    ///   3. After 1+2: if c is healthy, run phase 2; otherwise, if
+    ///      `sandbox_envelope` is provided, run the same SandboxRecreate
+    ///      flow (admin_delete old + spawn fresh + phase 2 with new
+    ///      sandbox_id). Without an envelope, recovery stops here and
+    ///      the user has to click again with a fresh signature.
+    ///
+    /// The unified envelope-bearing path lets the FE collapse "Continue
+    /// deploy" + "Bring back online" into a single button while still
+    /// honouring Daytona's per-action wallet auth requirement.
+    ResumeDeploy {
+        seal_id: SealId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_envelope: Option<SandboxEnvelope>,
     },
 }
 
