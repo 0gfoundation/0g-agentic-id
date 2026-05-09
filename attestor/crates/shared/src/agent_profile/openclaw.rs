@@ -11,9 +11,11 @@ pub struct OpenClawProfile;
 
 impl OpenClawProfile {
     const FRAMEWORK_NAME: &'static str = "openclaw";
-    /// CalVer (`YYYY.M.D`). Bump manually whenever the default config
-    /// shape or any baked-in constant below changes.
-    const FRAMEWORK_VERSION: &'static str = "2026.4.26";
+    /// npm-installable version openclaw is pinned to. Container
+    /// bootstrap does `npm install openclaw@<this>`; without it
+    /// bootstrap defaults to `latest`, which silently drifts when
+    /// upstream cuts a new release. Bump deliberately.
+    const PACKAGE_VERSION: &'static str = "2026.5.6";
     const INFERENCE_PROVIDER: &'static str = "anthropic";
     const INFERENCE_MODEL: &'static str = "claude-opus-4-6";
     const INFERENCE_FALLBACKS: &'static [&'static str] = &[];
@@ -28,7 +30,7 @@ impl AgentProfile for OpenClawProfile {
         ConfigInput {
             framework: Some(FrameworkSpec {
                 name: Some(Self::FRAMEWORK_NAME.to_string()),
-                version: Some(Self::FRAMEWORK_VERSION.to_string()),
+                package_version: Some(Self::PACKAGE_VERSION.to_string()),
                 extra: Default::default(),
             }),
             inference: Some(InferenceSpec {
@@ -56,7 +58,7 @@ mod tests {
         let c = OpenClawProfile.default_config("Sage", "DeFi helper");
         let fw = c.framework.expect("framework");
         assert_eq!(fw.name.as_deref(), Some("openclaw"));
-        assert_eq!(fw.version.as_deref(), Some("2026.4.26"));
+        assert_eq!(fw.package_version.as_deref(), Some("2026.5.6"));
         let inf = c.inference.expect("inference");
         assert_eq!(inf.provider.as_deref(), Some("anthropic"));
         assert_eq!(inf.model.as_deref(), Some("claude-opus-4-6"));

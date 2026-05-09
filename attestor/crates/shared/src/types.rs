@@ -807,8 +807,12 @@ pub struct ConfigInput {
 pub struct FrameworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// npm-installable version of the framework runtime (e.g.
+    /// `"2026.5.6"`, `"^2026.5"`). Container's bootstrap reads this
+    /// to do `npm install <name>@<package_version>`. When None,
+    /// bootstrap installs `latest` — silently drifts on every recreate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
+    pub package_version: Option<String>,
     #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }

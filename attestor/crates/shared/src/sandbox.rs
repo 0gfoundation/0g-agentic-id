@@ -200,9 +200,19 @@ impl SandboxClient for HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
 
+        // Per-request timeout override. The client default (30s) is fine
+        // for lifecycle calls (start/stop are snappy), but `create` does
+        // heavy lifting on Daytona's side (cold image pull, snapshot
+        // restore, container scheduling) and routinely takes 30-60s.
+        // 30s caused split-brain failures: reqwest gave up at the timeout,
+        // the request returned "error sending request", but sandbox kept
+        // going and the container actually came up — leaving an orphan
+        // attestor doesn't know about. 120s is generous enough for a
+        // cold pull while still bounding stuck calls.
         let res = self
             .http
             .post(self.sandbox_url())
+            .timeout(std::time::Duration::from_secs(120))
             .header("Content-Type", "application/json")
             .header("X-Wallet-Address", addr_hex)
             .header("X-Signed-Message", &envelope.signed_message_b64)

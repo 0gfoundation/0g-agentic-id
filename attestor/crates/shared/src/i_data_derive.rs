@@ -111,8 +111,8 @@ pub fn merge_config_input(
         if u_fw.name.is_some() {
             b_fw.name = u_fw.name;
         }
-        if u_fw.version.is_some() {
-            b_fw.version = u_fw.version;
+        if u_fw.package_version.is_some() {
+            b_fw.package_version = u_fw.package_version;
         }
         extend_map(&mut b_fw.extra, u_fw.extra);
         base.framework = Some(b_fw);
@@ -194,7 +194,7 @@ mod tests {
         let raw = vec![IDataInput {
             role: ROLE_CONFIG.to_string(),
             plaintext: serde_json::json!({
-                "framework": {"name": "openclaw", "version": "9.9.9"},
+                "framework": {"name": "openclaw", "package_version": "9.9.9"},
                 "inference": {"model": "custom-llm"}
                 // persona missing → default injected
             }),
@@ -205,7 +205,7 @@ mod tests {
         let cfg = config_plaintext(&out[0]);
         let fw = cfg.framework.unwrap();
         assert_eq!(fw.name.as_deref(), Some("openclaw"));
-        assert_eq!(fw.version.as_deref(), Some("9.9.9"), "user version wins");
+        assert_eq!(fw.package_version.as_deref(), Some("9.9.9"), "user package_version wins");
         let inf = cfg.inference.unwrap();
         assert_eq!(inf.model.as_deref(), Some("custom-llm"), "user model wins");
         assert_eq!(
@@ -279,7 +279,7 @@ mod tests {
         let raw = vec![IDataInput {
             role: ROLE_CONFIG.to_string(),
             plaintext: serde_json::json!({
-                "framework": {"name": "langchain", "version": "1.2.3"}
+                "framework": {"name": "langchain", "package_version": "1.2.3"}
             }),
             extra: Default::default(),
         }];

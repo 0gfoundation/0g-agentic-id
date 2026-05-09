@@ -2059,7 +2059,7 @@ mod tests {
         let mut cfg = attestor_shared::ConfigInput::default();
         cfg.framework = Some(attestor_shared::FrameworkSpec {
             name: Some("openclaw".into()),
-            version: Some("1.0".into()),
+            package_version: Some("2026.5.6".into()),
             extra: Default::default(),
         });
         let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
@@ -2098,8 +2098,8 @@ mod tests {
             Some("openclaw")
         );
         assert_eq!(
-            recovered.framework.as_ref().and_then(|f| f.version.as_deref()),
-            Some("1.0")
+            recovered.framework.as_ref().and_then(|f| f.package_version.as_deref()),
+            Some("2026.5.6")
         );
     }
 

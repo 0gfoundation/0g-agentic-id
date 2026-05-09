@@ -1284,6 +1284,11 @@ window.submitDeploy = async function () {
     // HttpSandbox::create relays canonical.payload to 0g-sandbox unchanged
     // (with ATTESTOR_URL + chain config injected on top), so the agent
     // container receives API_KEY in process.env.
+    //
+    // Stays generic `API_KEY` — provider-agnostic. The container's
+    // bootstrap reads the agent config's `inference.provider` and
+    // translates `API_KEY` to the provider-specific env name openclaw
+    // expects (e.g. ANTHROPIC_API_KEY when provider="anthropic").
     const env = apiKey ? { API_KEY: apiKey } : {};
     const { canonical: sandboxCanonical, envelope: sandboxEnvelope } =
       await signSandboxEnvelope('create', '', { snapshot: '0g-test-sealed', sealed: true, env });
@@ -1972,7 +1977,7 @@ function paintDetail(dep) {
       ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')"><span class="ico">${ICO.grid}</span> Dashboard</button>` : ''}
       ${canStop ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
-      ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.play}</span> Start</button>` : ''}
+      ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', ${phase === 'stopped'})"><span class="ico">${ICO.play}</span> Start</button>` : ''}
     </div>`;
 
   const avatar = image
@@ -2333,20 +2338,22 @@ window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandb
 // then got stopped, then failed start, then ended up in c=Failed
 // still has provisioned_at populated — picking action by that field
 // would sign `start` against a dead sandbox and loop forever in 400/403.
-// Unified recovery click handler — every "Retry" / "Activate" /
-// "Start" button funnels here. Always signs a CREATE envelope and
-// POSTs /retry; backend's ResumeDeploy job decides what to actually
-// do (mint/storage retry alone, sandbox recreate, or both) based on
-// the deployment row's stage states.
+// Recovery click handler. Two paths based on `useStart`:
 //
-// `useStart` parameter retained for callsite compatibility but
-// currently ignored — the legacy `start` path was dropped to keep
-// recovery dispatch on a single backend endpoint.
-window.bringOnline = async function (sealId, sandboxId, _useStart) {
+//   useStart=true  (only when phase=stopped) → sign START envelope,
+//      POST /start → SandboxStart → sandbox.start resumes the paused
+//      container in place. Same sandbox_id, no re-boot, just a
+//      Daytona resume. ~seconds.
+//
+//   useStart=false (failed / ready / cFailed / sFailed / mFailed) →
+//      sign CREATE envelope, POST /retry → ResumeDeploy → optionally
+//      re-runs storage/mint, then SandboxRecreate (kill+spawn) when
+//      c is unhealthy. New sandbox_id, full container re-boot.
+//
+// Per-seal in-flight guard (_lifecycleInflight) defends against
+// jittery double-clicks on either path.
+window.bringOnline = async function (sealId, sandboxId, useStart) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
-  // Same per-seal guard as lifecycleAction — defends against double
-  // clicks on Start / Retry that would otherwise dispatch a second
-  // recovery job (each one signing a fresh envelope, churning sandbox).
   const guardKey = `recover:${sealId}`;
   if (_lifecycleInflight.has(guardKey)) {
     tracing(`recover already in flight for ${sealId}, ignoring duplicate click`);
@@ -2354,9 +2361,29 @@ window.bringOnline = async function (sealId, sandboxId, _useStart) {
   }
   _lifecycleInflight.add(guardKey);
   try {
-    const payload = { snapshot: '0g-test-sealed', sealed: true, env: {} };
-    const { envelope } = await signSandboxEnvelope('create', '', payload);
-    const r = await fetch('/retry', {
+    const action = useStart ? 'start' : 'create';
+    // start: bind envelope to existing sandbox_id (Daytona auth checks
+    //        canonical.resource_id matches the URL :id). Empty payload.
+    // create: resource_id empty (spawning new). Carry default snapshot.
+    //         Re-prompt for the LLM API key — the recreated sandbox
+    //         starts with a fresh env, and attestor doesn't (and
+    //         shouldn't) cache the secret.
+    const resourceId = useStart ? sandboxId : '';
+    let payload;
+    if (useStart) {
+      payload = {};
+    } else {
+      const apiKey = (window.prompt(
+        'LLM API key for the new sandbox\n(leave blank to skip — agent will fall back to whatever the container snapshot baked in):',
+        ''
+      ) || '').trim();
+      const env = apiKey ? { API_KEY: apiKey } : {};
+      payload = { snapshot: '0g-test-sealed', sealed: true, env };
+    }
+    const { envelope } = await signSandboxEnvelope(action, resourceId, payload);
+
+    const url = useStart ? '/start' : '/retry';
+    const r = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -2365,8 +2392,8 @@ window.bringOnline = async function (sealId, sandboxId, _useStart) {
         sandbox_envelope: envelope,
       }),
     });
-    if (!r.ok) throw new Error(`/retry ${r.status}: ${await r.text()}`);
-    toast('Recovering — waiting for sandbox…', 'success');
+    if (!r.ok) throw new Error(`${url} ${r.status}: ${await r.text()}`);
+    toast(useStart ? 'Resuming sandbox…' : 'Recovering — waiting for sandbox…', 'success');
   } catch (e) {
     toast('Recovery failed: ' + (e.message || e), 'error');
   } finally {
