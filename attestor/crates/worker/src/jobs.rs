@@ -4,11 +4,11 @@ use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     agent_profile::ProfileRegistry,
-    i_data_derive::{normalize_i_data, ROLE_CONFIG},
+    i_data_derive::normalize_i_data,
     oss::OssClient,
-    AgentId, ChainClient, Config, ConfigInput, CryptoModule, Deployment, DeploymentRepo,
-    EventBus, IDataArtifact, IDataInput, IntelligentData, JobPayload, MintParams,
-    SandboxClient, SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
+    AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
+    IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
+    SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -296,9 +296,7 @@ async fn handle_resume_deploy(
     // Phase 2 is "complete" when agent_uri is non-empty (it's the OSS
     // URL written at the very end). If phase 1 all confirmed but
     // agent_uri still empty, run phase 2 — pulling name/description/
-    // image from the stub agent_card written by handle_deploy and
-    // decrypting config_input from the cached ciphertext on
-    // i_data[role=config].
+    // image from the stub agent_card written by handle_deploy.
     let phase1_done = matches!(d.storage_stage, StageStatus::Confirmed { .. })
         && matches!(d.mint_stage, StageStatus::Confirmed { .. })
         && d.sandbox_id.is_some();
@@ -306,16 +304,7 @@ async fn handle_resume_deploy(
     if phase1_done && phase2_pending {
         tracing::info!(?seal_id, "resume: re-running phase 2");
         let (name, description, image) = read_stub_card(&d.agent_card)?;
-        let config_input = recover_config_input(ctx, &d)?;
-        run_phase2(
-            ctx,
-            seal_id,
-            &name,
-            &description,
-            image.as_deref(),
-            &config_input,
-        )
-        .await?;
+        run_phase2(ctx, seal_id, &name, &description, image.as_deref()).await?;
     }
     Ok(())
 }
@@ -454,22 +443,15 @@ async fn handle_sandbox_recreate(
         .await?
         .ok_or_else(|| anyhow::anyhow!("deployment vanished mid-recreate"))?;
     if post_recreate.agent_uri.is_empty() {
-        // Reconstruct phase 2 inputs from cache (stub agent_card +
-        // i_data[role=config] ciphertext).
-        let phase2_attempt = (|| -> anyhow::Result<(String, String, Option<String>, ConfigInput)> {
-            let (name, description, image) = read_stub_card(&post_recreate.agent_card)?;
-            let cfg = recover_config_input(ctx, &post_recreate)?;
-            Ok((name, description, image, cfg))
-        })();
-        match phase2_attempt {
-            Ok((name, description, image, cfg)) => {
+        // Reconstruct phase 2 inputs from the stub agent_card.
+        match read_stub_card(&post_recreate.agent_card) {
+            Ok((name, description, image)) => {
                 if let Err(e) = run_phase2(
                     ctx,
                     seal_id,
                     &name,
                     &description,
                     image.as_deref(),
-                    &cfg,
                 )
                 .await
                 {
@@ -484,7 +466,7 @@ async fn handle_sandbox_recreate(
                 tracing::warn!(
                     ?seal_id,
                     error = %e,
-                    "phase 2 inputs unavailable during recreate (no stub or no cached ciphertext)"
+                    "phase 2 inputs unavailable during recreate (no stub agent_card)"
                 );
             }
         }
@@ -572,22 +554,14 @@ async fn handle_deploy(
     image: Option<String>,
     sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
-    // Normalize user-supplied i_data: guarantees ≥1 role=config entry
-    // with a valid ConfigInput-parseable plaintext (merge or synthesize).
+    // v0: normalize_i_data drops user input and replaces with the
+    // fallback profile's defaults (framework + persona).
     let i_data_inputs = normalize_i_data(
         i_data_inputs,
         &name,
         &description,
         ctx.registry.as_ref(),
     );
-
-    // Pull the merged ConfigInput out pre-encryption; phase 2 needs it
-    // to pick the right AgentProfile for AgentCard assembly.
-    let config_input: ConfigInput = i_data_inputs
-        .iter()
-        .find(|e| e.role == ROLE_CONFIG)
-        .and_then(|e| serde_json::from_value::<ConfigInput>(e.plaintext.clone()).ok())
-        .unwrap_or_else(|| ctx.registry.fallback().default_config(&name, &description));
 
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
@@ -754,7 +728,6 @@ async fn handle_deploy(
         &name,
         &description,
         image.as_deref(),
-        &config_input,
     )
     .await?;
 
@@ -768,15 +741,13 @@ async fn handle_deploy(
 ///
 /// Used both at initial deploy time (called from `handle_deploy` after
 /// the three phase-1 tracks succeed) and during recovery
-/// (`handle_resume_deploy`, which reconstructs `config_input` by
-/// decrypting the cached ciphertext).
+/// (`handle_resume_deploy` / `handle_sandbox_recreate`).
 async fn run_phase2(
     ctx: &Ctx,
     seal_id: SealId,
     name: &str,
     description: &str,
     image: Option<&str>,
-    config_input: &ConfigInput,
 ) -> anyhow::Result<()> {
     let d = ctx
         .deployments
@@ -792,19 +763,15 @@ async fn run_phase2(
         .ok_or_else(|| anyhow::anyhow!("phase 2: sandbox_id not recorded"))?;
     let agent_seal_addr = d.agent_seal_addr;
 
-    // Select the framework profile from the merged config's framework.name;
-    // `ProfileRegistry::select` falls back to OpenClaw on unknown/missing.
-    let profile = ctx.registry.select(
-        config_input
-            .framework
-            .as_ref()
-            .and_then(|f| f.name.as_deref()),
-    );
+    // v0 always uses the registry's fallback profile (OpenClaw) for
+    // capabilities + extra attributes — per-deployment framework picks
+    // are a future concern (will read framework.name from the framework
+    // dim plaintext at that point).
+    let profile = ctx.registry.fallback();
     let agent_card = build_agent_card(AgentCardInputs {
         name,
         description,
         image,
-        config: config_input,
         profile,
         agent_id,
         agent_seal_addr,
@@ -869,47 +836,6 @@ async fn run_phase2(
     }
 
     Ok(())
-}
-
-/// Recover the original `ConfigInput` plaintext from the cached
-/// ciphertext on `i_data[role=config]`.
-///
-/// Trust path:
-///   seal_id ──HKDF──→ agentSeal_priv (deterministically re-derivable)
-///   agentSeal_priv + sealed_key ──ECIES decrypt──→ data_key
-///   data_key + ciphertext ──AES-256-GCM decrypt──→ plaintext bytes
-///   plaintext bytes ──serde_json──→ ConfigInput
-///
-/// Errors if no role=config artifact exists or its ciphertext was
-/// already cleared (phase 2 done — caller should not have invoked
-/// recovery in that case).
-fn recover_config_input(ctx: &Ctx, deployment: &Deployment) -> anyhow::Result<ConfigInput> {
-    let art = deployment
-        .i_data
-        .iter()
-        .find(|a| a.role == ROLE_CONFIG)
-        .ok_or_else(|| anyhow::anyhow!("recover_config_input: no role=config artifact"))?;
-    if art.ciphertext.is_empty() {
-        anyhow::bail!(
-            "recover_config_input: ciphertext already cleared (phase 2 must be done already)"
-        );
-    }
-    let seal_kp = ctx.crypto.derive_agent_seal(deployment.seal_id)?;
-    let data_key_bytes = ctx
-        .crypto
-        .ecies_decrypt(art.sealed_key.as_ref(), &seal_kp.priv_key)
-        .map_err(|e| anyhow::anyhow!("recover_config_input: ECIES decrypt sealed_key: {e}"))?;
-    let data_key: [u8; 32] = data_key_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("recover_config_input: data_key wrong length"))?;
-    let plaintext = ctx
-        .crypto
-        .aes_gcm_decrypt(art.ciphertext.as_ref(), &data_key)
-        .map_err(|e| anyhow::anyhow!("recover_config_input: AES-GCM decrypt: {e}"))?;
-    let cfg: ConfigInput = serde_json::from_slice(&plaintext)
-        .map_err(|e| anyhow::anyhow!("recover_config_input: parse ConfigInput: {e}"))?;
-    Ok(cfg)
 }
 
 async fn run_storage_track(
@@ -978,11 +904,12 @@ async fn run_storage_track(
     ctx.events
         .publish(WsEvent::StorageConfirmed { seal_id })
         .await?;
-    // NB: ciphertext is intentionally NOT cleared here. Phase 2
-    // reconstruction (e.g. via /retry after mint failure) needs it to
-    // re-derive `config_input` by ECIES → AES decrypt. The cleanup
-    // happens at the tail of `run_phase2`, once the agent is fully
-    // ready and no further retry path will need the bytes.
+    // NB: ciphertext is intentionally NOT cleared here. A storage retry
+    // (e.g. via /retry after mint failure → re-run of run_storage_track)
+    // needs the original bytes for any entry whose individual upload had
+    // failed — re-encrypting from scratch would change the dataHash and
+    // diverge from what mint already wrote on chain. The cleanup happens
+    // at the tail of `run_phase2`, once the agent is fully ready.
 
     let _ = artifacts; // for future per-entry stage tracking
     Ok(())
@@ -1268,35 +1195,6 @@ mod tests {
         }
     }
 
-    /// Build a real role=config artifact whose `ciphertext` and
-    /// `sealed_key` were produced by the same `CryptoModule` and
-    /// `seal_id` the test uses, so `recover_config_input` can
-    /// round-trip it back to the original `ConfigInput`.
-    fn make_real_config_artifact(
-        crypto: &dyn CryptoModule,
-        seal_id: SealId,
-        cfg: &attestor_shared::ConfigInput,
-    ) -> IDataArtifact {
-        let plaintext = serde_json::to_vec(cfg).expect("serialize ConfigInput");
-        let data_key = crypto.random_key_32();
-        let ciphertext = crypto.aes_gcm_encrypt(&plaintext, &data_key).unwrap();
-        let kp = crypto.derive_agent_seal(seal_id).unwrap();
-        let sealed = crypto.ecies_encrypt(&data_key, &kp.pub_key).unwrap();
-        let root = B256::from(alloy::primitives::keccak256(&ciphertext));
-        IDataArtifact {
-            role: ROLE_CONFIG.to_string(),
-            description: "{}".into(),
-            storage_root: StorageRoot {
-                root_hash: root,
-                indexer: "indexer.example".into(),
-                size: ciphertext.len() as u64,
-            },
-            sealed_key: Bytes::from(sealed),
-            data_hash: root,
-            ciphertext: Bytes::from(ciphertext),
-        }
-    }
-
     /// Stamp the seeded deployment with a stub agent_card matching what
     /// `handle_deploy` writes pre-track. Resume tests need this so that
     /// `read_stub_card` can pull name/description/image during phase 2
@@ -1490,13 +1388,10 @@ mod tests {
     async fn resume_deploy_runs_phase2_when_pending_after_phase1() {
         // After phase 1 fully Confirmed but phase 2 never ran
         // (agent_uri still empty), resume now reconstructs phase 2
-        // from cached state: stub agent_card → name/description/image,
-        // i_data[role=config] ciphertext → ConfigInput plaintext via
-        // derive→ECIES→AES. Used to bail in v0; flipped here.
+        // from the stub agent_card. Used to bail in v0; flipped here.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let cfg = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
+        let art = artifact_with_ciphertext(0x70);
 
         seed_deployment(
             &t.deployments,
@@ -1584,13 +1479,11 @@ mod tests {
     async fn resume_deploy_recovers_mint_then_phase2_in_one_call() {
         // End-to-end recovery: storage Confirmed, mint Failed, sandbox
         // up, agent_uri empty, only the stub agent_card cached. /retry
-        // should: (a) short-circuit mint via on-chain check, (b)
-        // reconstruct ConfigInput from cached ciphertext, (c) run
+        // should: (a) short-circuit mint via on-chain check, (b) run
         // phase 2 to completion. Pre-flip this used to bail.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let cfg = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
+        let art = artifact_with_ciphertext(0x71);
 
         seed_deployment(
             &t.deployments,
@@ -1876,10 +1769,12 @@ mod tests {
     #[tokio::test]
     async fn storage_track_does_not_clear_ciphertext_after_confirm() {
         // Earlier design cleared ciphertext at end of run_storage_track
-        // for "DB space". That broke phase-2 reconstruction (resume
-        // needs ciphertext to ECIES→AES decrypt back to ConfigInput).
-        // Clearing was moved to end of run_phase2 — so storage track
-        // must leave ciphertext intact on the persisted artifacts.
+        // for "DB space". That breaks the per-entry storage retry path
+        // (a partial upload failure can't be replayed without the
+        // original bytes — re-encrypting changes the dataHash and
+        // diverges from what mint already wrote on chain). Clearing was
+        // moved to end of run_phase2; storage track must leave
+        // ciphertext intact on the persisted artifacts.
         let t = make_test_ctx();
         let seal = dummy_seal();
         let arts = vec![artifact_with_ciphertext(0x10), artifact_with_ciphertext(0x20)];
@@ -2043,157 +1938,6 @@ mod tests {
         assert_eq!(url, "http://1-s.h.io:80/x?y=z");
     }
 
-    // ── recover_config_input ──────────────────────────────────────────
-    //
-    // The trust chain is:
-    //   seal_id ──HKDF──→ agentSeal_priv (deterministic, re-derivable)
-    //   priv + sealed_key ──ECIES decrypt──→ data_key
-    //   data_key + ciphertext ──AES-GCM decrypt──→ ConfigInput JSON
-    //
-    // Below tests cover each link breaking, plus the happy round-trip.
-
-    #[test]
-    fn recover_config_input_round_trips_via_decrypt_chain() {
-        let t = make_test_ctx();
-        let seal = dummy_seal();
-        let mut cfg = attestor_shared::ConfigInput::default();
-        cfg.framework = Some(attestor_shared::FrameworkSpec {
-            name: Some("openclaw".into()),
-            package_version: Some("2026.5.6".into()),
-            extra: Default::default(),
-        });
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
-
-        let now = Utc::now();
-        let d = Deployment {
-            seal_id: seal,
-            agent_seal_addr: Address::ZERO,
-            owner: Address::ZERO,
-            agent_id: None,
-            agent_uri: String::new(),
-            agent_card: serde_json::Value::Null,
-            i_data: vec![art],
-            phase: derive_phase(
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-            ),
-            storage_stage: StageStatus::NotStarted,
-            mint_stage: StageStatus::NotStarted,
-            container_stage: StageStatus::NotStarted,
-            sandbox_id: None,
-            provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
-            provision_deadline: None,
-            last_provision_error: None,
-            last_provision_error_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-
-        let recovered = recover_config_input(&t.ctx, &d).expect("must round-trip");
-        assert_eq!(
-            recovered.framework.as_ref().and_then(|f| f.name.as_deref()),
-            Some("openclaw")
-        );
-        assert_eq!(
-            recovered.framework.as_ref().and_then(|f| f.package_version.as_deref()),
-            Some("2026.5.6")
-        );
-    }
-
-    #[test]
-    fn recover_config_input_errors_when_no_config_artifact() {
-        let t = make_test_ctx();
-        let now = Utc::now();
-        let d = Deployment {
-            seal_id: dummy_seal(),
-            agent_seal_addr: Address::ZERO,
-            owner: Address::ZERO,
-            agent_id: None,
-            agent_uri: String::new(),
-            agent_card: serde_json::Value::Null,
-            // Has artifacts, but none with role=config.
-            i_data: vec![IDataArtifact {
-                role: "memory".into(),
-                ..artifact_with_ciphertext(0x99)
-            }],
-            phase: derive_phase(
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-            ),
-            storage_stage: StageStatus::NotStarted,
-            mint_stage: StageStatus::NotStarted,
-            container_stage: StageStatus::NotStarted,
-            sandbox_id: None,
-            provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
-            provision_deadline: None,
-            last_provision_error: None,
-            last_provision_error_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-        let err = recover_config_input(&t.ctx, &d).unwrap_err().to_string();
-        assert!(
-            err.contains("role=config"),
-            "expected role=config error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn recover_config_input_errors_when_ciphertext_already_cleared() {
-        // Phase 2 already done → ciphertext was wiped. Recovery is
-        // meaningless at that point; surface a clear error rather than
-        // silently returning a wrong/empty config.
-        let t = make_test_ctx();
-        let seal = dummy_seal();
-        let cfg = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
-        // Same artifact but ciphertext blanked, simulating post-phase-2 state.
-        let cleared = IDataArtifact {
-            ciphertext: Bytes::new(),
-            ..art
-        };
-
-        let now = Utc::now();
-        let d = Deployment {
-            seal_id: seal,
-            agent_seal_addr: Address::ZERO,
-            owner: Address::ZERO,
-            agent_id: None,
-            agent_uri: String::new(),
-            agent_card: serde_json::Value::Null,
-            i_data: vec![cleared],
-            phase: derive_phase(
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-                &StageStatus::NotStarted,
-            ),
-            storage_stage: StageStatus::NotStarted,
-            mint_stage: StageStatus::NotStarted,
-            container_stage: StageStatus::NotStarted,
-            sandbox_id: None,
-            provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
-            provision_deadline: None,
-            last_provision_error: None,
-            last_provision_error_at: None,
-            created_at: now,
-            updated_at: now,
-        };
-
-        let err = recover_config_input(&t.ctx, &d).unwrap_err().to_string();
-        assert!(
-            err.contains("ciphertext"),
-            "expected ciphertext-cleared error, got: {err}"
-        );
-    }
-
     // ── read_stub_card ────────────────────────────────────────────────
     #[test]
     fn read_stub_card_extracts_required_fields() {
@@ -2238,8 +1982,7 @@ mod tests {
     async fn resume_deploy_skips_phase2_when_c_failed() {
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let cfg = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
+        let art = artifact_with_ciphertext(0x72);
         seed_deployment(
             &t.deployments,
             seal,
@@ -2283,8 +2026,7 @@ mod tests {
     async fn resume_deploy_skips_phase2_when_c_stopped() {
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let cfg = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg);
+        let art = artifact_with_ciphertext(0x73);
         seed_deployment(
             &t.deployments,
             seal,
@@ -2319,8 +2061,7 @@ mod tests {
         // on chain at all.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let cfg_input = attestor_shared::ConfigInput::default();
-        let art = make_real_config_artifact(t.ctx.crypto.as_ref(), seal, &cfg_input);
+        let art = artifact_with_ciphertext(0x74);
         seed_deployment(
             &t.deployments,
             seal,

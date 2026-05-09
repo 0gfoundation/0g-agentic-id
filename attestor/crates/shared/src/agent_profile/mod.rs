@@ -1,18 +1,17 @@
-//! Agent-framework profiles — pluggable defaults for config + AgentCard.
+//! Agent-framework profiles — pluggable defaults for iData + AgentCard.
 //!
 //! An `AgentProfile` encapsulates everything framework-specific the
-//! attestor needs: the shape of a minimal valid `ConfigInput`, the logo
-//! to use when the user doesn't provide an image, the capabilities flags
-//! advertised in the public AgentCard, and any extra OpenSea traits.
+//! attestor needs: the default `IDataInput` set used when the user
+//! doesn't supply iData, the capabilities flags advertised in the public
+//! AgentCard, and any extra OpenSea traits.
 //!
 //! The attestor stays framework-agnostic: `normalize_i_data` and
 //! `build_agent_card` never name a framework — they take a `&dyn
-//! AgentProfile` picked from the `ProfileRegistry` by the user's
-//! `ConfigInput.framework.name`. Adding a new framework (LangChain,
-//! LlamaIndex, custom) is a single file implementing the trait plus one
-//! `.register()` call at startup.
+//! AgentProfile` picked from the `ProfileRegistry`. Adding a new
+//! framework (LangChain, LlamaIndex, custom) is a single file
+//! implementing the trait plus one `.register()` call at startup.
 
-use crate::types::ConfigInput;
+use crate::types::IDataInput;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,15 +20,14 @@ pub mod openclaw;
 pub use openclaw::OpenClawProfile;
 
 pub trait AgentProfile: Send + Sync {
-    /// Stable lookup key. Matches `ConfigInput.framework.name` so a user
-    /// who sets `{"framework":{"name":"X"}}` routes to profile X.
+    /// Stable lookup key. Used by `ProfileRegistry::select` to route
+    /// future per-deployment framework picks (v0 always falls back).
     fn framework_name(&self) -> &str;
 
-    /// Fully-populated ConfigInput used when the user's is absent or
-    /// unparseable, and as the merge base when the user's is partial.
-    /// Receives the agent's display `name`/`description` so the default
-    /// `persona.system_prompt` can reference them.
-    fn default_config(&self, name: &str, description: &str) -> ConfigInput;
+    /// Default `IDataInput` set the attestor synthesizes when the user
+    /// omits `i_data`. Receives the agent's display `name`/`description`
+    /// so e.g. the default persona system prompt can reference them.
+    fn default_i_data(&self, name: &str, description: &str) -> Vec<IDataInput>;
 
     /// `AgentCard.capabilities` map. The A2A protocol defines three
     /// canonical booleans (`streaming`, `pushNotifications`,
@@ -97,8 +95,8 @@ mod tests {
         fn framework_name(&self) -> &str {
             self.name
         }
-        fn default_config(&self, _: &str, _: &str) -> ConfigInput {
-            ConfigInput::default()
+        fn default_i_data(&self, _: &str, _: &str) -> Vec<IDataInput> {
+            Vec::new()
         }
     }
 

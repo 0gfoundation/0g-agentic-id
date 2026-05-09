@@ -9,7 +9,7 @@
 
 use crate::agent_profile::AgentProfile;
 use crate::avatar;
-use crate::types::{AgentId, ConfigInput};
+use crate::types::AgentId;
 use alloy::primitives::Address;
 use serde_json::{json, Value};
 
@@ -22,7 +22,6 @@ pub struct AgentCardInputs<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub image: Option<&'a str>,
-    pub config: &'a ConfigInput,
     pub profile: &'a dyn AgentProfile,
 
     // Chain identity
@@ -71,8 +70,6 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
         "chainId":      i.chain_id,
         "agentAddress": i.agent_seal_addr.to_string(),
     }]);
-
-    let _ = i.config; // reserved for future trait-type extraction from config
 
     json!({
         // ── ERC-721 Metadata JSON Schema ──
@@ -145,14 +142,12 @@ mod tests {
     #[test]
     fn agent_card_carries_both_erc721_and_8004_fields() {
         let profile = OpenClawProfile;
-        let cfg = profile.default_config("Sage", "DeFi helper");
         let seal_addr = Address::from_slice(&[0x42u8; 20]);
         let seed = [7u8; 32];
         let inputs = AgentCardInputs {
             name: "Sage",
             description: "DeFi helper",
             image: None,
-            config: &cfg,
             profile: &profile,
             agent_id: U256::from(7u64),
             agent_seal_addr: seal_addr,
@@ -198,13 +193,11 @@ mod tests {
     #[test]
     fn user_image_overrides_profile_default() {
         let profile = OpenClawProfile;
-        let cfg = profile.default_config("A", "B");
         let seed = [0u8; 32];
         let inputs = AgentCardInputs {
             name: "A",
             description: "B",
             image: Some("https://my.custom.logo/png"),
-            config: &cfg,
             profile: &profile,
             agent_id: U256::from(1u64),
             agent_seal_addr: Address::ZERO,

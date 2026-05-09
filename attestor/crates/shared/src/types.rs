@@ -88,10 +88,10 @@ pub struct SandboxEnvelope {
 // User-facing input shape. Public display fields (`name`/`description`/
 // `image`) live at the top level — they feed both the ERC-8004 metadata
 // entries and the off-chain AgentCard JSON (which the attestor uploads to
-// OSS and writes into ERC-721 `tokenURI`). The private runtime config
-// (framework/inference/persona/skills) lives inside `i_data` under
-// `role="config"`; when `i_data` is empty the attestor synthesizes a
-// default OpenClaw config so there's always ≥1 IntelligentData on chain.
+// OSS and writes into ERC-721 `tokenURI`). Private runtime data lives in
+// `i_data`. v0 always overwrites the user's `i_data` with the OpenClaw
+// profile defaults (2 entries: `role="framework"` + `role="persona"`)
+// so there's always ≥1 IntelligentData on chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRequest {
     pub idempotency_key: String,
@@ -770,82 +770,3 @@ pub enum JobPayload {
     },
 }
 
-// ── Config iData (role="config" plaintext shape) ───────────────────────
-//
-// Shape of the decrypted plaintext that lives in 0G Storage for each
-// `role="config"` iData entry. All top-level fields are optional so the
-// attestor can merge lenient user input with the OpenClaw defaults at the
-// `role="config"` interpretation layer — the structural type itself never
-// enforces anything missing (Postel). Sub-structs apply the same rule
-// one level deeper: `FrameworkSpec { name, version }` are both Option so
-// `{"framework":{"name":"X"}}` still deserializes successfully and
-// `version` inherits from the default.
-//
-// Unknown top-level keys land in `extra` via `#[serde(flatten)]` and
-// round-trip verbatim into the encrypted ciphertext — i.e. forward-compat
-// fields from newer SDKs travel through the attestor unmodified.
-//
-// This type intentionally has NO public display fields — `name`,
-// `description`, `image` live only in `DeployRequest` + off-chain
-// AgentCard JSON; keeping them out of iData avoids duplication and
-// keeps encrypted payload minimal.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ConfigInput {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub framework: Option<FrameworkSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inference: Option<InferenceSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub persona: Option<PersonaSpec>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub skills: Vec<SkillSpec>,
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FrameworkSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// npm-installable version of the framework runtime (e.g.
-    /// `"2026.5.6"`, `"^2026.5"`). Container's bootstrap reads this
-    /// to do `npm install <name>@<package_version>`. When None,
-    /// bootstrap installs `latest` — silently drifts on every recreate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub package_version: Option<String>,
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct InferenceSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Ordered fallback model IDs the agent tries on failure of `model`.
-    /// Agent runtime is responsible for actually walking this list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallbacks: Vec<String>,
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PersonaSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
-
-/// A skill entry inside `ConfigInput.skills`. `id` + `name` are the only
-/// fields projected into the public AgentCard (`skills[] = {id,name}`);
-/// everything else (prompt/tools/…) stays inside the encrypted iData.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillSpec {
-    pub id: String,
-    pub name: String,
-    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
-    pub extra: serde_json::Map<String, serde_json::Value>,
-}
