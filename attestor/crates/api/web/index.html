@@ -1950,6 +1950,14 @@ function paintDetail(dep) {
 
   const canStop = ownerMatches && sandboxId && isLive;
 
+  // Reset — available once the deployment is past phase 1 (anything that
+  // implies a sandbox was at least attempted). Hidden during the initial
+  // deploy (phase=pending / provisioning-without-sandbox) where it'd race
+  // the in-flight worker job and leave the row in a worse state.
+  const canReset = ownerMatches && (
+    isLive || isIncomplete || isOffline || phase === 'failed'
+  );
+
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
   // agentSeal addr: stored in registrations[0].agentAddress per AgentCard
   // build (chain-recorded). Falls back to seal-based field on deployment.
@@ -1978,6 +1986,7 @@ function paintDetail(dep) {
       ${canStop ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
       ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', ${phase === 'stopped'})"><span class="ico">${ICO.play}</span> Start</button>` : ''}
+      ${canReset ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="resetAgent('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}')"><span class="ico">${ICO.refresh}</span> Reset</button>` : ''}
     </div>`;
 
   const avatar = image
@@ -2405,6 +2414,72 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
 // with an envelope, covering both pure mint/storage retries and the
 // recreate-after-failure flow in a single action. The legacy unsigned
 // /retry path is preserved server-side for ops scripts.)
+
+// Reset — unconditional kill+respawn of the sandbox. Two cases:
+//
+//   1. Same-tag, new-bytes image bump. `start` on a stopped sandbox
+//      resurrects whatever bytes were already there; the runtime only
+//      pulls fresh bytes on `create`. Reset is the only way to force a
+//      rebuilt image to actually run.
+//
+//   2. Stuck rows where /retry can't help (e.g. sandbox_id was lost
+//      mid-deploy so /start has no resource_id, but c=Confirmed so
+//      /retry skips SandboxRecreate). Reset bypasses both gates.
+//
+// Loses container in-memory state but NOT chain identity — agent_id,
+// seal_id, agentSeal stay; only the runtime container is replaced.
+// Two-step confirm because misclicks here cost a wallet popup + a
+// sandbox respawn.
+window.resetAgent = async function (sealId, sandboxId) {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  const ok = window.confirm(
+    'Reset this agent?\n\n' +
+    'A fresh container will be spawned (image re-pulled). The agent\'s ' +
+    'on-chain identity stays the same; any in-container runtime state ' +
+    'that hasn\'t been written to chain will be lost.\n\n' +
+    'Use this if a same-tag image was rebuilt, or the agent is stuck ' +
+    'in a state Retry / Start can\'t fix.'
+  );
+  if (!ok) return;
+
+  const guardKey = `reset:${sealId}`;
+  if (_lifecycleInflight.has(guardKey)) {
+    tracing(`reset already in flight for ${sealId}, ignoring duplicate click`);
+    return;
+  }
+  _lifecycleInflight.add(guardKey);
+  try {
+    // Same envelope shape as the bringOnline create branch — fresh
+    // sandbox needs a fresh env, and attestor doesn't (and shouldn't)
+    // cache the LLM key.
+    const apiKey = (window.prompt(
+      'LLM API key for the new sandbox\n(leave blank to skip — agent will fall back to whatever the container snapshot baked in):',
+      ''
+    ) || '').trim();
+    const env = apiKey ? { API_KEY: apiKey } : {};
+    const payload = { snapshot: '0g-test-sealed', sealed: true, env };
+    const { envelope } = await signSandboxEnvelope('create', '', payload);
+
+    const r = await fetch('/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        seal_id: sealId,
+        owner: State.ownerAddr,
+        sandbox_envelope: envelope,
+      }),
+    });
+    if (!r.ok) throw new Error(`/reset ${r.status}: ${await r.text()}`);
+    toast('Reset accepted — spawning fresh sandbox…', 'success');
+    // sandboxId arg unused — kept for symmetry with the other lifecycle
+    // entrypoints so the same onclick template can call any of them.
+    void sandboxId;
+  } catch (e) {
+    toast('Reset failed: ' + (e.message || e), 'error');
+  } finally {
+    _lifecycleInflight.delete(guardKey);
+  }
+};
 
 // ───────────────────────────────────────────────────────────────────
 // Say hi — fetch the Serve endpoint and render the agent's response
