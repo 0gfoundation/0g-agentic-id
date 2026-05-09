@@ -25,7 +25,7 @@
 # runtime bytecode against a small list of known candidates (AgenticID /
 # AgenticIDReputationRegistry / TEEDataVerifier). If the contract is a new
 # type, pass the identifier explicitly, e.g.
-#   script/verify.sh 0xaBE9...4971 contracts/AgenticIDV3.sol:AgenticIDV3
+#   script/verify.sh 0xaBE9...4971 src/AgenticIDV3.sol:AgenticIDV3
 
 set -euo pipefail
 
@@ -46,11 +46,14 @@ fi
 # ERC-1967: bytes32(uint256(keccak256("eip1967.proxy.beacon")) - 1)
 ERC1967_BEACON_SLOT=0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50
 
-# Known impl candidates for auto-detect mode. Add new versions as they ship.
+# Known impl candidates for auto-detect mode. Paths are relative to the
+# foundry project root (where this script is invoked from); `forge inspect`
+# resolves them via foundry.toml's `src = "src"`. Add new versions as they
+# ship.
 IMPL_CANDIDATES=(
-    "contracts/AgenticID.sol:AgenticID"
-    "contracts/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry"
-    "contracts/verifiers/TEEDataVerifier.sol:TEEDataVerifier"
+    "src/AgenticID.sol:AgenticID"
+    "src/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry"
+    "src/verifiers/TEEDataVerifier.sol:TEEDataVerifier"
 )
 
 BEACON_SRC="lib/openzeppelin-contracts/contracts/proxy/beacon/UpgradeableBeacon.sol:UpgradeableBeacon"

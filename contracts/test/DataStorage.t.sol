@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {AgenticIDNotAgentSeal} from "../src/AgenticID.sol";
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
@@ -15,7 +16,12 @@ contract DataStorageTest is AgenticIDTestBase {
         _whitelistAttestor();
     }
 
-    // ── update(): full replacement by owner ───────────────────────────────────
+    // ── update(): full replacement by agentSeal ───────────────────────────────
+    //
+    // AgenticID gates update/updateAt on the bound agentSeal (not the
+    // NFT owner). Tests prank as SEAL_ADDR — the address bound by
+    // _mintWithSeal — to reflect the agent-runtime path (TEE holds
+    // agentSeal_priv and signs txs with it).
 
     function test_update_replacesAllEntries() public {
         (uint256 agentId, ) = _mintWithSeal(alice);
@@ -24,7 +30,7 @@ contract DataStorageTest is AgenticIDTestBase {
         newDatas[0] = IntelligentData({dataDescription: "replaced-1", dataHash: keccak256("r1")});
         newDatas[1] = IntelligentData({dataDescription: "replaced-2", dataHash: keccak256("r2")});
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         agenticId.update(agentId, newDatas);
 
         IntelligentData[] memory stored = agenticId.intelligentDatasOf(agentId);
@@ -37,7 +43,7 @@ contract DataStorageTest is AgenticIDTestBase {
         (uint256 agentId, ) = _mintWithSeal(alice);
         IntelligentData[] memory empty = new IntelligentData[](0);
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         vm.expectRevert(IERC7857Updatable.ERC7857EmptyData.selector);
         agenticId.update(agentId, empty);
     }
@@ -54,7 +60,7 @@ contract DataStorageTest is AgenticIDTestBase {
         vm.expectEmit(true, false, false, true);
         emit IERC7857Updatable.Updated(agentId, oldDatas, newDatas);
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         agenticId.update(agentId, newDatas);
     }
 
@@ -70,19 +76,37 @@ contract DataStorageTest is AgenticIDTestBase {
         vm.expectEmit(true, true, false, true);
         emit IERC7857Updatable.EntryUpdated(agentId, 0, original, replacement);
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         agenticId.updateAt(agentId, 0, replacement);
     }
 
-    function test_update_revertsWhenNotOwner() public {
+    function test_update_revertsWhenNotAgentSeal() public {
         (uint256 agentId, ) = _mintWithSeal(alice);
         IntelligentData[] memory newDatas = new IntelligentData[](1);
         newDatas[0] = IntelligentData({dataDescription: "n", dataHash: keccak256("n")});
 
+        // bob is neither owner nor agentSeal.
         vm.prank(bob);
         vm.expectRevert(
             abi.encodeWithSelector(
-                IERC721Errors.ERC721IncorrectOwner.selector, bob, agentId, alice
+                AgenticIDNotAgentSeal.selector, agentId, bob, SEAL_ADDR
+            )
+        );
+        agenticId.update(agentId, newDatas);
+    }
+
+    function test_update_revertsWhenOwnerCallsButSealIsBound() public {
+        // Owner-only path is the legacy ERC-7857 default; AgenticID
+        // overrides to agentSeal-only ONCE A SEAL IS BOUND. The owner
+        // alice can no longer update — must use the agentSeal.
+        (uint256 agentId, ) = _mintWithSeal(alice);
+        IntelligentData[] memory newDatas = new IntelligentData[](1);
+        newDatas[0] = IntelligentData({dataDescription: "n", dataHash: keccak256("n")});
+
+        vm.prank(alice);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                AgenticIDNotAgentSeal.selector, agentId, alice, SEAL_ADDR
             )
         );
         agenticId.update(agentId, newDatas);
@@ -98,7 +122,7 @@ contract DataStorageTest is AgenticIDTestBase {
             dataHash: keccak256("new-hash")
         });
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         agenticId.updateAt(agentId, 1, replacement);
 
         IntelligentData[] memory stored = agenticId.intelligentDatasOf(agentId);
@@ -117,7 +141,7 @@ contract DataStorageTest is AgenticIDTestBase {
             dataHash: keccak256("x")
         });
 
-        vm.prank(alice);
+        vm.prank(SEAL_ADDR);
         vm.expectRevert(
             abi.encodeWithSelector(
                 IERC7857Updatable.ERC7857IndexOutOfBounds.selector, uint256(5), uint256(1)
@@ -126,7 +150,7 @@ contract DataStorageTest is AgenticIDTestBase {
         agenticId.updateAt(agentId, 5, replacement);
     }
 
-    function test_updateAt_revertsWhenNotOwner() public {
+    function test_updateAt_revertsWhenNotAgentSeal() public {
         (uint256 agentId, ) = _mintWithSeal(alice);
         IntelligentData memory replacement = IntelligentData({
             dataDescription: "x",
@@ -136,7 +160,7 @@ contract DataStorageTest is AgenticIDTestBase {
         vm.prank(bob);
         vm.expectRevert(
             abi.encodeWithSelector(
-                IERC721Errors.ERC721IncorrectOwner.selector, bob, agentId, alice
+                AgenticIDNotAgentSeal.selector, agentId, bob, SEAL_ADDR
             )
         );
         agenticId.updateAt(agentId, 0, replacement);

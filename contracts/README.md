@@ -425,7 +425,7 @@ executors=[0x0]=开放执行）、`NFT_NAME` / `NFT_SYMBOL`、`MAX_PROOF_AGE`。
 
 ```bash
 # Step 1: 部署新 impl（单独部署，不走 --verify，最后一步统一 verify）
-forge create contracts/AgenticIDV3.sol:AgenticIDV3 \
+forge create src/AgenticIDV3.sol:AgenticIDV3 \
   --rpc-url <RPC> --chain 16602 --private-key <PK> \
   --priority-gas-price 2000000000 --gas-price 5000000000 \
   --broadcast
@@ -493,7 +493,7 @@ script/verify.sh 0x4AAbc18962C2Bb5E451a0FDfa39c0C47a51bD971   # Reputation
 `script/verify.sh` 顶部的 `IMPL_CANDIDATES` 数组加一行，要么显式传参：
 
 ```bash
-script/verify.sh <proxy-address> contracts/AgenticIDV3.sol:AgenticIDV3
+script/verify.sh <proxy-address> src/AgenticIDV3.sol:AgenticIDV3
 ```
 
 **环境变量**（都有缺省）：`RPC_URL` / `VERIFIER_URL` / `CHAIN_ID` /

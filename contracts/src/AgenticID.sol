@@ -37,6 +37,16 @@ error AgenticIDUseRegisterWithData();
 /// @notice Caller is not the pauser.
 error AgenticIDNotPauser();
 
+/// @notice update / updateAt was called by an address that is not
+///         the agent's bound agentSeal. Once a seal is bound, iData
+///         updates are gated agentSeal-only because they represent
+///         the agent's own runtime state (memory, learned skills,
+///         refreshed config). When no seal is bound (post-mint
+///         pre-/provision, or legacy tokens), the contract falls
+///         back to owner-only and reverts with ERC721IncorrectOwner
+///         instead.
+error AgenticIDNotAgentSeal(uint256 agentId, address sender, address expected);
+
 /// @title AgenticID
 /// @notice Main contract of the AgenticID protocol.
 ///
@@ -195,6 +205,52 @@ contract AgenticID is
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
         super._updateDataAt(tokenId, index, newData);
+    }
+
+    // ── iData update authorization: agentSeal-first, owner fallback ───────────
+    //
+    // ERC-7857's default storage extension gates `update` / `updateAt`
+    // on `_ownerOf(tokenId) == msg.sender` (NFT-owner-only). AgenticID
+    // diverges: iData represents the agent's own runtime state
+    // (learned skills, memory, refreshed config), which the agent —
+    // running in TEE with `agentSeal_priv` — is best positioned to
+    // author. Once a seal is bound, *only* the agentSeal can update.
+    //
+    // Fallback: when agentSeal is zero (the brief window between mint
+    // and setAgentSeal, or legacy tokens that never got a seal bound),
+    // the original owner-only check applies — otherwise the token
+    // would be stuck with no one able to update it. Owner still
+    // controls transfer / authorize / setAgentURI in both branches.
+
+    function update(uint256 tokenId, IntelligentData[] calldata newDatas)
+        public override(ERC7857IDataStorageUpgradeable) whenNotPaused
+    {
+        _authorizeIDataUpdate(tokenId);
+        if (newDatas.length == 0) revert ERC7857EmptyData();
+        _updateData(tokenId, newDatas);
+    }
+
+    function updateAt(uint256 tokenId, uint256 index, IntelligentData calldata newData)
+        public override(ERC7857IDataStorageUpgradeable) whenNotPaused
+    {
+        _authorizeIDataUpdate(tokenId);
+        _updateDataAt(tokenId, index, newData);
+    }
+
+    function _authorizeIDataUpdate(uint256 tokenId) internal view {
+        address seal = _getAgenticIDStorage().agentSeals[tokenId];
+        if (seal != address(0)) {
+            // Bound seal: agentSeal-only.
+            if (msg.sender != seal) {
+                revert AgenticIDNotAgentSeal(tokenId, msg.sender, seal);
+            }
+        } else {
+            // No seal yet: fall back to ERC-7857 owner-only behaviour.
+            address owner_ = _ownerOf(tokenId);
+            if (msg.sender != owner_) {
+                revert ERC721IncorrectOwner(msg.sender, tokenId, owner_);
+            }
+        }
     }
 
     // ── Shared token-ID counter ───────────────────────────────────────────────
