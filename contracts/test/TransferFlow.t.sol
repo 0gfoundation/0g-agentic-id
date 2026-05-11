@@ -61,6 +61,16 @@ contract TransferFlowTest is AgenticIDTestBase {
         assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "ownership moved");
         assertEq(agenticId.getAgentSeal(agentId), SEAL_ADDR, "seal preserved across transfer");
         assertEq(agenticId.getSealId(agentId), SEAL_ID, "sealId preserved across transfer");
+        // sealedKeys are re-wrapped to the new owner and persisted to storage.
+        // V2 invariant: post-transfer `sealedKeysOf` returns the NEW wraps,
+        // not whatever the prior owner saw. Without this assertion, a regression
+        // that drops the _updateSealedKeys hook from iTransferFrom would still
+        // pass the event-emit test (events fire from the entries array) while
+        // leaving stale wraps in storage — exactly the bug class V2 was meant
+        // to eliminate.
+        bytes[] memory keysAfter = agenticId.sealedKeysOf(agentId);
+        assertEq(keysAfter.length, 1, "one wrap per dim");
+        assertEq(keysAfter[0], SEALED_KEY_NEW, "wrap rotated to new owner");
     }
 
     // ── ITransferred emitted on successful iTransferFrom ─────────────────────

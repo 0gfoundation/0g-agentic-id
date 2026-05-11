@@ -4,7 +4,6 @@ pragma solidity ^0.8.24;
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {
     AgenticIDNotTrustedAttestor,
-    AgenticIDSealedKeyLengthMismatch,
     AgenticIDUseRegisterWithData
 } from "../src/AgenticID.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -65,7 +64,11 @@ contract AgenticIDTest is AgenticIDTestBase {
 
         vm.prank(alice);
         vm.expectRevert(
-            abi.encodeWithSelector(AgenticIDSealedKeyLengthMismatch.selector, uint256(2), uint256(1))
+            abi.encodeWithSelector(
+                IERC7857Updatable.ERC7857SealedKeyArityMismatch.selector,
+                uint256(2),
+                uint256(1)
+            )
         );
         agenticId.register("", metadata, datas, sealedKeys);
     }

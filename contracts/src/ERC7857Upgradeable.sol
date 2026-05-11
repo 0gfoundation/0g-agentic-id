@@ -108,6 +108,15 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         // and to bypass our own transferFrom override.
         _safeTransfer(from, to, tokenId, "");
 
+        // Persist the new sealedKeys (wrapped to `to`) alongside the
+        // dataHashes that already live in storage. dataHashes don't
+        // change on transfer; only the wrap target does.
+        bytes[] memory sealedKeys = new bytes[](entries.length);
+        for (uint256 i; i < entries.length; ++i) {
+            sealedKeys[i] = entries[i].sealedKey;
+        }
+        _updateSealedKeys(tokenId, sealedKeys);
+
         emit ITransferred(from, to, tokenId, entries);
     }
 
@@ -171,6 +180,11 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         return _intelligentDatasOf(tokenId);
     }
 
+    function sealedKeysOf(uint256 tokenId) public view virtual returns (bytes[] memory) {
+        if (_ownerOf(tokenId) == address(0)) revert ERC721NonexistentToken(tokenId);
+        return _sealedKeysOf(tokenId);
+    }
+
     // ── Internal hooks (override in subcontracts) ─────────────────────────────
 
     function _intelligentDatasOf(uint256) internal view virtual returns (IntelligentData[] memory) {
@@ -181,7 +195,26 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         return 0;
     }
 
-    function _updateData(uint256 tokenId, IntelligentData[] memory newDatas) internal virtual {}
+    function _sealedKeysOf(uint256) internal view virtual returns (bytes[] memory) {
+        return new bytes[](0);
+    }
 
-    function _updateDataAt(uint256 tokenId, uint256 index, IntelligentData memory newData) internal virtual {}
+    /// @dev Rewrite the sealedKeys array for `tokenId` without touching
+    ///      the IntelligentData entries. Called by `iTransferFrom` to
+    ///      re-wrap to the new owner; `_updateData` handles the combined
+    ///      datas+keys rewrite when the dataHashes themselves change.
+    function _updateSealedKeys(uint256 tokenId, bytes[] memory sealedKeys) internal virtual {}
+
+    function _updateData(
+        uint256 tokenId,
+        IntelligentData[] memory newDatas,
+        bytes[] memory sealedKeys
+    ) internal virtual {}
+
+    function _updateDataAt(
+        uint256 tokenId,
+        uint256 index,
+        IntelligentData memory newData,
+        bytes memory sealedKey
+    ) internal virtual {}
 }

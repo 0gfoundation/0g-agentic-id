@@ -29,7 +29,6 @@ error AgenticIDSealAlreadySet(uint256 agentId);
 error AgenticIDZeroSeal();
 
 /// @notice intelligentDatas.length does not match sealedKeys.length.
-error AgenticIDSealedKeyLengthMismatch(uint256 dataCount, uint256 sealedKeyCount);
 
 /// @notice Use register(agentURI, metadata, intelligentDatas, sealedKeys) instead.
 error AgenticIDUseRegisterWithData();
@@ -193,18 +192,42 @@ contract AgenticID is
         return super._intelligentDatasLengthOf(tokenId);
     }
 
-    function _updateData(uint256 tokenId, IntelligentData[] memory newDatas)
+    function _updateData(
+        uint256 tokenId,
+        IntelligentData[] memory newDatas,
+        bytes[] memory sealedKeys
+    )
         internal virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
-        super._updateData(tokenId, newDatas);
+        super._updateData(tokenId, newDatas, sealedKeys);
     }
 
-    function _updateDataAt(uint256 tokenId, uint256 index, IntelligentData memory newData)
+    function _updateDataAt(
+        uint256 tokenId,
+        uint256 index,
+        IntelligentData memory newData,
+        bytes memory sealedKey
+    )
         internal virtual
         override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
     {
-        super._updateDataAt(tokenId, index, newData);
+        super._updateDataAt(tokenId, index, newData, sealedKey);
+    }
+
+    function _updateSealedKeys(uint256 tokenId, bytes[] memory sealedKeys)
+        internal virtual
+        override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
+    {
+        super._updateSealedKeys(tokenId, sealedKeys);
+    }
+
+    function _sealedKeysOf(uint256 tokenId)
+        internal view virtual
+        override(ERC7857Upgradeable, ERC7857IDataStorageUpgradeable)
+        returns (bytes[] memory)
+    {
+        return super._sealedKeysOf(tokenId);
     }
 
     // ── iData update authorization: agentSeal-first, owner fallback ───────────
@@ -222,19 +245,31 @@ contract AgenticID is
     // would be stuck with no one able to update it. Owner still
     // controls transfer / authorize / setAgentURI in both branches.
 
-    function update(uint256 tokenId, IntelligentData[] calldata newDatas)
+    function update(
+        uint256 tokenId,
+        IntelligentData[] calldata newDatas,
+        bytes[] calldata sealedKeys
+    )
         public override(ERC7857IDataStorageUpgradeable) whenNotPaused
     {
         _authorizeIDataUpdate(tokenId);
         if (newDatas.length == 0) revert ERC7857EmptyData();
-        _updateData(tokenId, newDatas);
+        if (newDatas.length != sealedKeys.length) {
+            revert ERC7857SealedKeyArityMismatch(newDatas.length, sealedKeys.length);
+        }
+        _updateData(tokenId, newDatas, sealedKeys);
     }
 
-    function updateAt(uint256 tokenId, uint256 index, IntelligentData calldata newData)
+    function updateAt(
+        uint256 tokenId,
+        uint256 index,
+        IntelligentData calldata newData,
+        bytes calldata sealedKey
+    )
         public override(ERC7857IDataStorageUpgradeable) whenNotPaused
     {
         _authorizeIDataUpdate(tokenId);
-        _updateDataAt(tokenId, index, newData);
+        _updateDataAt(tokenId, index, newData, sealedKey);
     }
 
     function _authorizeIDataUpdate(uint256 tokenId) internal view {
@@ -296,9 +331,12 @@ contract AgenticID is
         bytes[] calldata sealedKeys
     ) external whenNotPaused returns (uint256 agentId) {
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
+        if (intelligentDatas.length != sealedKeys.length) {
+            revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
+        }
         agentId = _mintAgent(msg.sender, agentURI);
         _setMetadataBatch(agentId, metadata);
-        _updateData(agentId, intelligentDatas);
+        _updateData(agentId, intelligentDatas, sealedKeys);
         _emitMintedKeys(agentId, msg.sender, intelligentDatas, sealedKeys);
     }
 
@@ -323,9 +361,12 @@ contract AgenticID is
         if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
 
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
+        if (intelligentDatas.length != sealedKeys.length) {
+            revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
+        }
         agentId = _mintAgent(to, agentURI);
         _setMetadataBatch(agentId, metadata);
-        _updateData(agentId, intelligentDatas);
+        _updateData(agentId, intelligentDatas, sealedKeys);
         _setAgentSeal(agentId, agentSeal_, sealId);
         _emitMintedKeys(agentId, to, intelligentDatas, sealedKeys);
     }
@@ -340,9 +381,8 @@ contract AgenticID is
         IntelligentData[] calldata iDatas,
         bytes[] calldata sealedKeys
     ) internal {
-        if (iDatas.length != sealedKeys.length)
-            revert AgenticIDSealedKeyLengthMismatch(iDatas.length, sealedKeys.length);
-
+        // Arity is checked by the public callers (register / registerWithSeal)
+        // before reaching here, using ERC7857SealedKeyArityMismatch.
         SealedKeyEntry[] memory entries = new SealedKeyEntry[](iDatas.length);
         for (uint256 i = 0; i < iDatas.length; i++) {
             entries[i] = SealedKeyEntry({
