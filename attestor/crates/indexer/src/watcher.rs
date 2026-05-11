@@ -18,7 +18,7 @@ use attestor_shared::{
     chain::AgenticID,
     repo::{load_checkpoint, save_checkpoint},
     types::{
-        derive_phase, AgentId, DataHash, Deployment, DeploymentPhase, IDataArtifact, SealId,
+        derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId,
         StageStatus, StorageRoot,
     },
     Config, CryptoModule, DeploymentRepo, EventBus, WsEvent,
@@ -137,6 +137,9 @@ impl Watcher {
         if let Ok(ev) = AgenticID::EntryUpdated::decode_log(&log.inner, true) {
             return self.on_entry_updated(ev.data, block).await;
         }
+        if let Ok(ev) = AgenticID::Updated::decode_log(&log.inner, true) {
+            return self.on_updated(ev.data, block).await;
+        }
         if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
             return self.on_registered(ev.data, block).await;
         }
@@ -254,6 +257,11 @@ impl Watcher {
     }
 
     // ── ITransferred ─────────────────────────────────────────────────
+    //
+    // Event is the trigger; the contract's `sealedKeysOf` view is the
+    // data source. We don't parse `ev.entries` for sealedKey bytes any
+    // more — that decoupling means an event-payload change (e.g. extra
+    // fields, reordered tuple) won't silently mis-sync the indexer.
     async fn on_i_transferred(
         &self,
         ev: AgenticID::ITransferred,
@@ -267,15 +275,7 @@ impl Watcher {
             block,
             "ITransferred"
         );
-        let updates: Vec<(DataHash, alloy::primitives::Bytes)> = ev
-            .entries
-            .iter()
-            .map(|e| (e.dataHash, e.sealedKey.clone()))
-            .collect();
-        let changed = self
-            .deployments
-            .update_sealed_keys_by_data_hash(ev.tokenId, updates)
-            .await?;
+        let changed = self.refresh_sealed_keys(ev.tokenId).await?;
 
         // Only broadcast on actual post-mint transfers (from != 0) since mints
         // are already fully observed by the worker.
@@ -318,11 +318,9 @@ impl Watcher {
                 ev.newData.dataHash,
             )
             .await?;
-        tracing::warn!(
-            token_id = %ev.tokenId,
-            index,
-            "sealed_key for this entry is now stale (owner bypassed attestor)"
-        );
+        // V2: the new sealedKey is on chain. Refresh from view (full
+        // array) — simpler and DRY-er than a single-cell write path.
+        self.refresh_sealed_keys(ev.tokenId).await?;
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -333,6 +331,49 @@ impl Watcher {
                 .await;
         }
         Ok(())
+    }
+
+    // ── Updated ──────────────────────────────────────────────────────
+    //
+    // Full-array iData replace (delete + push-all on chain). We don't
+    // try to reconstruct the new datas+keys from `ev.newDatas` /
+    // `ev.sealedKeys` — same rationale as ITransferred, pull from view.
+    async fn on_updated(
+        &self,
+        ev: AgenticID::Updated,
+        block: u64,
+    ) -> anyhow::Result<()> {
+        tracing::info!(
+            token_id = %ev.tokenId,
+            n_old = ev.oldDatas.len(),
+            n_new = ev.newDatas.len(),
+            block,
+            "Updated"
+        );
+        // TODO: refresh i_data descriptions/dataHashes from view too
+        //       once a `sealed.intelligentDatasOf(token_id)` call path
+        //       exists in repo. v0 only carries sealedKeys back.
+        self.refresh_sealed_keys(ev.tokenId).await?;
+        if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
+            let _ = self
+                .events
+                .publish(WsEvent::SealedKeysUpdated {
+                    seal_id: d.seal_id,
+                    agent_id: ev.tokenId,
+                })
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Pull authoritative sealedKeys from the contract view and overwrite
+    /// the deployment row's `i_data[*].sealed_key` column. The event log
+    /// is the trigger; the chain state is the source. Returns the count
+    /// of cells written (`min(view.len(), db.i_data.len())`).
+    async fn refresh_sealed_keys(&self, token_id: AgentId) -> anyhow::Result<usize> {
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        let keys: Vec<alloy::primitives::Bytes> = c.sealedKeysOf(token_id).call().await?._0;
+        self.deployments.set_sealed_keys(token_id, keys).await
     }
 
     // ── URIUpdated ───────────────────────────────────────────────────

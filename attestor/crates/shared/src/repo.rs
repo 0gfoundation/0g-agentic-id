@@ -343,10 +343,10 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(())
     }
 
-    async fn update_sealed_keys_by_data_hash(
+    async fn set_sealed_keys(
         &self,
         agent_id: AgentId,
-        updates: Vec<(DataHash, alloy::primitives::Bytes)>,
+        keys: Vec<alloy::primitives::Bytes>,
     ) -> anyhow::Result<usize> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
@@ -364,17 +364,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let i_data_json: serde_json::Value = row.try_get("i_data")?;
         let mut artifacts: Vec<IDataArtifact> = serde_json::from_value(i_data_json)?;
 
-        let mut changed = 0usize;
-        for (target_hash, new_sealed) in updates {
-            for a in &mut artifacts {
-                if a.data_hash == target_hash {
-                    a.sealed_key = new_sealed.clone();
-                    changed += 1;
-                }
-            }
+        let n = std::cmp::min(keys.len(), artifacts.len());
+        for i in 0..n {
+            artifacts[i].sealed_key = keys[i].clone();
         }
 
-        if changed > 0 {
+        if n > 0 {
             sqlx::query(
                 "UPDATE deployments SET i_data = $1, updated_at = now() WHERE seal_id = $2",
             )
@@ -384,7 +379,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             .await?;
         }
         tx.commit().await?;
-        Ok(changed)
+        Ok(n)
     }
 
     async fn update_i_data_entry_at(

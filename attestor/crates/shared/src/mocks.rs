@@ -724,23 +724,21 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         })
     }
 
-    async fn update_sealed_keys_by_data_hash(
+    async fn set_sealed_keys(
         &self,
         agent_id: AgentId,
-        updates: Vec<(DataHash, alloy::primitives::Bytes)>,
+        keys: Vec<alloy::primitives::Bytes>,
     ) -> anyhow::Result<usize> {
         let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
             Some(s) => s,
             None => return Ok(0),
         };
-        let map: HashMap<DataHash, alloy::primitives::Bytes> = updates.into_iter().collect();
         let mut count = 0usize;
         self.mut_with(seal, |d| {
-            for art in d.i_data.iter_mut() {
-                if let Some(new_key) = map.get(&art.data_hash) {
-                    art.sealed_key = new_key.clone();
-                    count += 1;
-                }
+            let n = std::cmp::min(keys.len(), d.i_data.len());
+            for i in 0..n {
+                d.i_data[i].sealed_key = keys[i].clone();
+                count += 1;
             }
         })?;
         Ok(count)

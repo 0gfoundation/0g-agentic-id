@@ -202,13 +202,22 @@ pub trait DeploymentRepo: Send + Sync {
         agent_card: serde_json::Value,
     ) -> anyhow::Result<()>;
 
-    /// Update `sealed_key` on every artifact whose `data_hash` appears in
-    /// the `updates` map. Used by indexer to reflect `ITransferred` events.
-    /// Returns the number of entries actually updated.
-    async fn update_sealed_keys_by_data_hash(
+    /// Overwrite the full `sealed_key` array for the deployment, ordered
+    /// by index. Used by the indexer after observing any event that
+    /// rewrites sealedKeys on chain (`ITransferred` / `Updated` /
+    /// `EntryUpdated` / `Cloned`); the indexer pulls authoritative
+    /// bytes via `sealedKeysOf(token_id)` and hands the whole vector
+    /// here. Returns the number of cells written.
+    ///
+    /// `keys.len() != deployment.i_data.len()` results in a partial
+    /// write up to `min(keys.len(), i_data.len())` — caller is
+    /// expected to feed in lockstep with the on-chain array. (Pre-V2
+    /// rows may have `i_data` populated but no on-chain sealedKeys
+    /// yet; that's reflected as a shorter `keys`.)
+    async fn set_sealed_keys(
         &self,
         agent_id: AgentId,
-        updates: Vec<(DataHash, alloy::primitives::Bytes)>,
+        keys: Vec<alloy::primitives::Bytes>,
     ) -> anyhow::Result<usize>;
 
     /// Update `description` + `data_hash` of the artifact at `index`.
