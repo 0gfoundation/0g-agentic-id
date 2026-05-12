@@ -136,6 +136,15 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 .card-disabled{opacity:.55;pointer-events:none}
 .card-disabled textarea{background:var(--surf2)}
 
+/* File-drop placeholder — purely visual; lives inside card-disabled so
+   no actual upload handling. Dashed border + centered icon/text reads
+   as "drop file here" to anyone who's seen a Web upload widget. */
+.file-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:32px 16px;background:var(--surf2);border:2px dashed var(--border);border-radius:var(--r-sm);color:var(--muted);font-family:var(--sans);font-size:13px;text-align:center}
+.file-drop .file-drop-icon{width:32px;height:32px;color:var(--text2)}
+.file-drop .file-drop-icon svg{width:100%;height:100%;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
+.file-drop .file-drop-main{font-weight:500;color:var(--text2)}
+.file-drop .file-drop-sub{font-size:11px;color:var(--muted)}
+
 .btn{display:inline-block;font:inherit;font-family:var(--sans);font-weight:600;font-size:13px;padding:10px 18px;border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;text-decoration:none;line-height:1.2;transition:background var(--t-fast),transform var(--t-fast) var(--ease-spring),box-shadow var(--t-fast)}
 .btn-primary{background:var(--p);color:oklch(99% 0 0)}
 .btn-primary:hover:not(:disabled){background:var(--pd);transform:translateY(-1px);box-shadow:var(--sh-sm)}
@@ -482,6 +491,18 @@ details.log[open] summary{color:var(--text2)}
 .serve-check-row .row-detail{font-size:11px;color:var(--muted);margin-top:2px;font-family:var(--mono);word-break:break-all;line-height:1.45}
 .serve-check-row.passed .row-detail,.serve-check-row.failed .row-detail{color:var(--text2)}
 
+/* Per-dim checklist nested inside the data-hash row. One line per dim
+   showing role / truncated hash / pass-fail mark, so a user can see
+   exactly which dataHash the agent declared and how it matched chain. */
+.serve-check-row .row-dims{margin-top:6px;display:flex;flex-direction:column;gap:3px}
+.serve-check-row .row-dim{display:flex;align-items:center;gap:8px;font-size:11px;font-family:var(--mono);line-height:1.4}
+.serve-check-row .row-dim .dim-icon{flex-shrink:0;width:13px;text-align:center;font-weight:700;font-family:var(--sans)}
+.serve-check-row .row-dim.passed .dim-icon{color:var(--green)}
+.serve-check-row .row-dim.failed .dim-icon{color:var(--red)}
+.serve-check-row .row-dim .dim-role{color:var(--text2);font-family:var(--sans);font-weight:600;min-width:72px}
+.serve-check-row .row-dim .dim-hash{color:var(--muted);font-size:10.5px}
+.serve-check-row .row-dim .dim-note{color:var(--muted);font-family:var(--sans);font-style:italic;font-size:10.5px}
+
 @keyframes row-shake{
   0%,100% { transform:translateX(0) }
   25%     { transform:translateX(-3px) }
@@ -512,20 +533,24 @@ details.log[open] summary{color:var(--text2)}
 .icon-btn.primary{background:var(--p);color:oklch(99% 0 0);border-color:var(--p)}
 .icon-btn.primary:hover{background:var(--pd);color:oklch(99% 0 0)}
 
-/* Logs dropdown — native <details> styled to match icon-btn. summary
-   is the clickable trigger; .menu is the absolutely-positioned panel
-   that appears below when open. No JS — the browser handles open/close,
-   click-outside-to-close needs a tiny inline handler in the markup. */
+/* Dropdown trigger — native <details>/<summary>, styled to be visually
+   indistinguishable from .icon-btn so the action row reads as a single
+   set. Explicit line-height + box-sizing + min-width keep pair-aligned
+   dropdowns (View ▾ / Manage ▾) at the exact same height + width even
+   though the labels differ in character count. SVG caret instead of
+   Unicode ▾ so font fallback can't subtly shift baselines. */
 .dd{position:relative;display:inline-block}
-.dd > summary{list-style:none;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 12px;font-size:12px;cursor:pointer;color:var(--text2);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;gap:6px}
+.dd > summary{list-style:none;box-sizing:border-box;min-width:92px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 12px;font-size:12px;line-height:1.4;cursor:pointer;color:var(--text);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;justify-content:space-between;gap:6px;transition:all var(--t-fast)}
 .dd > summary::-webkit-details-marker{display:none}
-.dd > summary:hover{background:var(--surf3);color:var(--text)}
-.dd[open] > summary{background:var(--surf3);color:var(--text);border-color:var(--text2)}
-.dd .caret{margin-left:2px;opacity:.7;transition:transform var(--t-fast)}
-.dd[open] .caret{transform:rotate(180deg)}
-.dd .menu{position:absolute;top:calc(100% + 4px);right:0;min-width:160px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);box-shadow:0 4px 12px oklch(0% 0 0 / 0.12);padding:4px;z-index:20;display:flex;flex-direction:column;gap:1px}
-.dd .menu a{padding:7px 10px;font-size:12px;color:var(--text2);text-decoration:none;border-radius:var(--r-xs,4px);display:flex;align-items:center;gap:8px}
-.dd .menu a:hover{background:var(--surf3);color:var(--text)}
+.dd > summary:hover{background:var(--surf3);border-color:var(--muted)}
+.dd[open] > summary{background:var(--surf3);border-color:var(--text2)}
+.dd .dd-label{display:inline-flex;align-items:center;gap:6px}
+.dd .caret{flex-shrink:0;width:10px;height:10px;opacity:.5;transition:transform var(--t-fast)}
+.dd .caret svg{width:100%;height:100%;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
+.dd[open] .caret{transform:rotate(180deg);opacity:.85}
+.dd .menu{position:absolute;top:calc(100% + 4px);right:0;min-width:160px;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);box-shadow:0 4px 16px oklch(0% 0 0 / 0.10);padding:4px;z-index:20;display:flex;flex-direction:column;gap:1px}
+.dd .menu a{padding:7px 10px;font-size:12px;color:var(--text2);text-decoration:none;border-radius:var(--r-xs,4px);display:flex;align-items:center;gap:8px;transition:background var(--t-fast),color var(--t-fast)}
+.dd .menu a:hover{background:var(--surf2);color:var(--text)}
 
 .section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:18px 0 10px}
 
@@ -763,11 +788,16 @@ details.log[open] summary{color:var(--text2)}
     </section>
 
     <section class="card card-disabled">
-      <h2>iData JSON <span class="coming-soon">coming soon</span></h2>
+      <h2>Import openclaw <span class="coming-soon">coming soon</span></h2>
       <div class="field">
-        <label for="iDataJson">Raw config payload</label>
-        <textarea id="iDataJson" rows="6" disabled placeholder='[{"role": "config", "plaintext": { ... }}]'></textarea>
-        <small class="field-hint">Power-user mode: bypass profile defaults and provide the full encrypted iData payload yourself.</small>
+        <div class="file-drop">
+          <div class="file-drop-icon">
+            <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 16v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/></svg>
+          </div>
+          <div class="file-drop-main">Drop openclaw package here, or click to browse</div>
+          <div class="file-drop-sub">.tar.gz · contains framework / persona / skills / ops</div>
+        </div>
+        <small class="field-hint">Power-user mode: bypass profile defaults and import a packaged openclaw config.</small>
       </div>
     </section>
 
@@ -1993,29 +2023,40 @@ function paintDetail(dep) {
                   : phase === 'failed'  ? 'Failed'
                   : 'Offline';
 
-  // Owner action buttons. Mutually exclusive recovery buttons + Stop +
-  // Dashboard + Logs dropdown. All recovery buttons share one click
-  // handler that signs a CREATE envelope and POSTs /retry — only the
-  // label differs. Logs is a native <details> dropdown whose items are
-  // plain anchors pointing at sandbox-side `/log` and `/log/openclaw`;
-  // surfaced whenever there's a sandbox (including failed states —
-  // that's when they're most useful for diagnosis).
-  const logsDropdown = !dashboardBaseUrl ? '' : `
+  // Owner action buttons. Per-state CTA (Stop / Start / Retry) + Reset
+  // (destructive) + a unified `View ▾` dropdown that collects every
+  // read-only "go look at this agent" entry point: live-dashboard +
+  // bootstrap log + openclaw log. Dropdown items close themselves on
+  // click so the menu doesn't linger after a new-tab navigation.
+  const ddCaret = `<span class="caret"><svg viewBox="0 0 10 10"><path d="M2 4l3 3 3-3"/></svg></span>`;
+  const viewDropdown = !dashboardBaseUrl ? '' : `
     <details class="dd">
-      <summary>${ICO.terminal} Logs <span class="caret">▾</span></summary>
+      <summary><span class="dd-label">View</span>${ddCaret}</summary>
       <div class="menu">
-        <a target="_blank" rel="noopener" href="${escapeHtml(dashboardBaseUrl)}/log">Startup</a>
-        <a target="_blank" rel="noopener" href="${escapeHtml(dashboardBaseUrl)}/log/openclaw">OpenClaw</a>
+        ${(isLive && dashboardBaseUrl) ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')">Open dashboard</a>` : ''}
+        <a target="_blank" rel="noopener" onclick="this.closest('details').open=false" href="${escapeHtml(dashboardBaseUrl)}/log.html">Startup log</a>
+        <a target="_blank" rel="noopener" onclick="this.closest('details').open=false" href="${escapeHtml(dashboardBaseUrl)}/log/openclaw.html">OpenClaw log</a>
       </div>
     </details>`;
+  // Destructive ops collected under a single `Manage ▾` dropdown.
+  // Visually identical to View ▾ — neutral outline, same height, same
+  // typography. Danger semantics live in the labels (Stop / Reset),
+  // not the trigger styling, so the two dropdowns read as a matched
+  // pair rather than competing visual weights.
+  const manageDropdown = (canStop || canReset) ? `
+    <details class="dd">
+      <summary><span class="dd-label">Manage</span>${ddCaret}</summary>
+      <div class="menu">
+        ${canStop ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">Stop</a>` : ''}
+        ${canReset ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; resetAgent('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}')">Reset</a>` : ''}
+      </div>
+    </details>` : '';
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
-      ${(isLive && dashboardBaseUrl) ? `<button class="icon-btn primary" id="btnDashboard" onclick="openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')"><span class="ico">${ICO.grid}</span> Dashboard</button>` : ''}
-      ${logsDropdown}
-      ${canStop ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')"><span class="ico">${ICO.pause}</span> Stop</button>` : ''}
+      ${viewDropdown}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
       ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', ${phase === 'stopped'})"><span class="ico">${ICO.play}</span> Start</button>` : ''}
-      ${canReset ? `<button class="icon-btn" style="border-color:var(--rbd);color:var(--red);background:var(--rbg)" onclick="resetAgent('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}')"><span class="ico">${ICO.refresh}</span> Reset</button>` : ''}
+      ${manageDropdown}
     </div>`;
 
   const avatar = image
@@ -2587,15 +2628,28 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
 
   // Three pre-declared rows; populated as each step lands.
   // status: pending | running | passed | failed | skipped
+  // dims: optional sub-list of per-dim checks (used by the data row
+  //       to break out role-by-role results).
   const checks = [
-    { key: 'identity', label: 'Signer identity',         detail: '', status: 'pending' },
-    { key: 'body',     label: 'Response body integrity', detail: '', status: 'pending' },
-    { key: 'data',     label: 'On-chain data hashes',    detail: '', status: 'pending' },
+    { key: 'identity', label: 'Signer identity',         detail: '', status: 'pending', dims: null },
+    { key: 'body',     label: 'Response body integrity', detail: '', status: 'pending', dims: null },
+    { key: 'data',     label: 'On-chain data hashes',    detail: '', status: 'pending', dims: null },
   ];
   const ICONS = { pending: '·', running: '', passed: '✓', failed: '✗', skipped: '–' };
 
   const paint = (phase, headIcon, title, sub, signer, message) => {
     respEl.className = `serve-resp show ${phase}`;
+    const dimsHtml = (dims) => !dims || !dims.length ? '' : `
+      <div class="row-dims">
+        ${dims.map(d => `
+          <div class="row-dim ${d.status}">
+            <span class="dim-icon">${ICONS[d.status]}</span>
+            <span class="dim-role">${escapeHtml(d.role)}</span>
+            <span class="dim-hash" title="${escapeHtml(d.hash)}">${escapeHtml(d.hash.slice(0,10) + '…' + d.hash.slice(-6))}</span>
+            ${d.note ? `<span class="dim-note">${escapeHtml(d.note)}</span>` : ''}
+          </div>
+        `).join('')}
+      </div>`;
     const checksHtml = `
       <div class="serve-checks">
         ${checks.map(c => `
@@ -2604,6 +2658,7 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
             <div class="row-text">
               <div class="row-label">${escapeHtml(c.label)}</div>
               ${c.detail ? `<div class="row-detail">${escapeHtml(c.detail)}</div>` : ''}
+              ${dimsHtml(c.dims)}
             </div>
           </div>
         `).join('')}
@@ -2619,9 +2674,13 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
   };
 
   const sleep = ms => new Promise(res => setTimeout(res, ms));
-  const setRow = (key, status, detail) => {
+  const setRow = (key, status, detail, dims) => {
     const c = checks.find(c => c.key === key);
-    if (c) { c.status = status; if (detail !== undefined) c.detail = detail; }
+    if (c) {
+      c.status = status;
+      if (detail !== undefined) c.detail = detail;
+      if (dims !== undefined) c.dims = dims;
+    }
   };
   const skipRest = () => checks.forEach(c => {
     if (c.status === 'pending' || c.status === 'running') c.status = 'skipped';
@@ -2707,8 +2766,21 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     paint('verifying', '', 'Cross-checking on-chain data…', null, null, null);
     await sleep(500);
 
-    const declared = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
-    if (declared.length === 0) {
+    // envelope.data_hashes is `{role: {content_hash, data_hash?}}` —
+    // every dim the agent is tracking, including ones absent from chain
+    // (in which case data_hash is omitted). Two-level verification per dim:
+    //   * declared role missing on chain → chain-default, PASS
+    //     (chain intentionally omitted this dim; agent runs adapter
+    //     defaults; content_hash is signed but not cross-checkable here)
+    //   * declared role present on chain, data_hash matches → PASS
+    //   * declared role present on chain, data_hash differs/missing → FAIL
+    const declared = (envelope && typeof envelope.data_hashes === 'object'
+                      && envelope.data_hashes !== null
+                      && !Array.isArray(envelope.data_hashes))
+      ? envelope.data_hashes
+      : null;
+    const declaredEntries = declared ? Object.entries(declared) : [];
+    if (declaredEntries.length === 0) {
       setRow('data', 'skipped', 'envelope declared no data hashes');
     } else {
       try {
@@ -2723,18 +2795,52 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           provider,
         );
         const datas = await c.intelligentDatasOf(BigInt(agentId));
-        const onchain = datas.map(d => String(d.dataHash).toLowerCase());
-        const missing = declared.filter(h => !onchain.includes(String(h).toLowerCase()));
-        if (missing.length > 0) {
+        // Build role → on-chain dataHash. dataDescription is a JSON
+        // string the attestor writes at mint time; unparseable entries
+        // (e.g. legacy or attestor bug) are silently skipped — they
+        // simply can't be matched by role and fall into the
+        // "chain-absent" branch below.
+        const onchainByRole = new Map();
+        for (const d of datas) {
+          try {
+            const parsed = JSON.parse(d.dataDescription);
+            const role = parsed && typeof parsed === 'object' ? parsed.role : null;
+            if (typeof role === 'string' && role) {
+              onchainByRole.set(role, String(d.dataHash).toLowerCase());
+            }
+          } catch (_) { /* not JSON; skip */ }
+        }
+
+        // Display the dim's content_hash in the dim row (always present);
+        // dimsHtml truncates it itself with slice(0,10)+'…'+slice(-6).
+        // For legacy proofs (info is a string), fall back to that string.
+        const dims = declaredEntries.map(([role, info]) => {
+          const content = (info && typeof info === 'object') ? String(info.content_hash || '').toLowerCase() : '';
+          const declaredData = (info && typeof info === 'object')
+            ? String(info.data_hash || '').toLowerCase()
+            : String(info || '').toLowerCase();
+          const displayHash = content || declaredData || '';
+          const oc = onchainByRole.get(role);
+          if (oc === undefined) {
+            return { role, hash: displayHash, status: 'passed', note: 'chain-default · absent' };
+          }
+          if (declaredData && oc === declaredData) {
+            return { role, hash: displayHash, status: 'passed', note: 'matches chain' };
+          }
+          return { role, hash: displayHash, status: 'failed',
+                   note: `chain has ${oc.slice(0,10)}…${oc.slice(-6)}` };
+        });
+        const failedDims = dims.filter(d => d.status === 'failed').length;
+        if (failedDims > 0) {
           setRow('data', 'failed',
-            `${missing.length}/${declared.length} hash${missing.length===1?'':'es'} not on chain`);
+            `${failedDims}/${dims.length} dim${failedDims===1?'':'s'} mismatch`, dims);
           paint('failed', '✗', 'Data hash mismatch',
-            'Agent declared data not registered to this identity',
+            'Agent declared a data hash that contradicts chain',
             sigInfo, humanMsg);
           return;
         }
         setRow('data', 'passed',
-          `${declared.length}/${declared.length} hashes ✓ intelligentDatasOf(${agentId})`);
+          `${dims.length}/${dims.length} dim${dims.length===1?'':'s'} verified`, dims);
       } catch (e) {
         setRow('data', 'failed', e.message || String(e));
         paint('failed', '✗', 'On-chain verification failed', null, null, null);
