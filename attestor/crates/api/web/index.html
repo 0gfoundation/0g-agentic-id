@@ -776,9 +776,32 @@ details.log[open] summary{color:var(--text2)}
     </section>
 
     <section class="card">
+      <h2>Framework</h2>
+      <div class="field">
+        <label for="framework">Framework</label>
+        <select id="framework">
+          <option value="openclaw">OpenClaw</option>
+        </select>
+        <small class="field-hint">More frameworks coming soon — for now every agent runs on OpenClaw.</small>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Inference</h2>
       <div class="field">
-        <label for="apiKey">LLM API key <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <label for="provider">Provider</label>
+        <select id="provider" onchange="onProviderChange()">
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+          <option value="0g-compute">0G Compute</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="model">Model</label>
+        <select id="model"></select>
+      </div>
+      <div class="field">
+        <label for="apiKey"><span id="apiKeyLabel">Anthropic API key</span> <span style="color:var(--muted);font-weight:400">(optional)</span></label>
         <div class="secret-row">
           <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
           <button type="button" class="secret-toggle" id="apiKeyToggle" onclick="toggleSecret('apiKey', 'apiKeyToggle')">show</button>
@@ -1114,6 +1137,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   } catch (e) {
     toast('Failed to load /config: ' + e.message, 'error');
   }
+  // Seed the deploy form's Model select with the default provider's
+  // model list. onProviderChange handles subsequent switches; this
+  // covers the initial pageload before any user interaction.
+  const initialProvider = $('#provider');
+  if (initialProvider) populateModelsFor(initialProvider.value);
   if (!location.hash) location.hash = '#/';
   handleHash();
 });
@@ -1232,18 +1260,109 @@ const b64 = (s) => btoa(String.fromCharCode(...new TextEncoder().encode(s)));
 const randomNonce = () => Array.from(crypto.getRandomValues(new Uint8Array(16)),
                                      b => b.toString(16).padStart(2, '0')).join('');
 
-async function signOwnerCanonical(idempKey, name, description, image) {
+async function signOwnerCanonical(idempKey, name, description, image, iData) {
+  // i_data MUST byte-match what /deploy receives — attestor re-serializes
+  // both sides via serde and compares. Pass the exact same array.
   const canonical = JSON.stringify({
     domain: 'AgenticID.Deploy.v1',
     idempotency_key: idempKey,
     owner: State.ownerAddr.toLowerCase(),
     name, description,
     image: image ?? null,
-    i_data: [],
+    i_data: iData,
   });
   const sig = await State.signer.signMessage(canonical);
   return { canonical, sig };
 }
+
+// Per-provider model registry. First entry is the default (preselected
+// when the provider changes). Pure frontend list -- the agent runtime
+// only validates the model string downstream, so typos surface at
+// runtime not deploy time.
+//
+// Each list is hand-curated against what we've actually seen work end
+// to end. Don't add fancy-sounding IDs from training data -- Anthropic
+// claude-opus-4-7 was tested previously and didn't work, so it's
+// intentionally excluded; openclaw 2026.5.6's bundled catalog knows
+// some IDs that the upstream provider API doesn't actually serve.
+//
+// 0g-compute starts empty: we fetch the live catalog from the router's
+// GET /v1/models on first use. ZG_COMPUTE_FALLBACK exists for when the
+// router is unreachable -- keep at least one option so the dropdown
+// never renders empty.
+const MODELS_FOR = {
+  'anthropic':  ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'],
+  'openai':     ['gpt-4o'],
+  '0g-compute': [],  // populated by fetchZgComputeModels()
+};
+const ZG_COMPUTE_INDEXER = 'https://router-api.0g.ai/v1/models';
+const ZG_COMPUTE_FALLBACK = [
+  '0GM-1.0-35B-A3B',
+  'deepseek-v4-pro',
+  'deepseek/deepseek-chat-v3-0324',
+  'qwen3.6-plus',
+  'zai-org/GLM-5-FP8',
+  'zai-org/GLM-5.1-FP8',
+];
+const PROVIDER_LABEL = {
+  'anthropic':  'Anthropic',
+  'openai':     'OpenAI',
+  '0g-compute': '0G Compute',
+};
+
+// Cached chatbot-only model id list, fetched once per page load. Filters
+// the router's response by type==="chatbot" to skip speech-to-text /
+// image-gen entries that wouldn't make sense for an agent's primary
+// inference. Falls back to ZG_COMPUTE_FALLBACK on any error (CORS,
+// network, schema change).
+let zgComputeFetched = null;
+async function fetchZgComputeModels() {
+  if (zgComputeFetched) return zgComputeFetched;
+  try {
+    const r = await fetch(ZG_COMPUTE_INDEXER, { mode: 'cors' });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const body = await r.json();
+    const ids = (body.data || [])
+      .filter(m => m && m.type === 'chatbot' && typeof m.id === 'string')
+      .map(m => m.id);
+    zgComputeFetched = ids.length ? ids : ZG_COMPUTE_FALLBACK.slice();
+  } catch (e) {
+    console.warn('0g-compute /v1/models fetch failed, using fallback list:', e);
+    zgComputeFetched = ZG_COMPUTE_FALLBACK.slice();
+  }
+  MODELS_FOR['0g-compute'] = zgComputeFetched;
+  return zgComputeFetched;
+}
+
+function renderModelOptions(sel, models) {
+  sel.innerHTML = models
+    .map(m => `<option value="${m}">${m}</option>`)
+    .join('');
+}
+
+async function populateModelsFor(provider) {
+  const sel = $('#model');
+  if (!sel) return;
+  if (provider === '0g-compute') {
+    // "Loading…" placeholder so the dropdown isn't empty during the
+    // round-trip. Cached fetches resolve synchronously.
+    if (!zgComputeFetched) {
+      sel.innerHTML = '<option value="" disabled selected>loading 0G catalog…</option>';
+    }
+    const ids = await fetchZgComputeModels();
+    // Guard against the user switching providers mid-flight.
+    if ($('#provider').value === '0g-compute') renderModelOptions(sel, ids);
+    return;
+  }
+  renderModelOptions(sel, MODELS_FOR[provider] || []);
+}
+
+window.onProviderChange = function () {
+  const provider = $('#provider').value;
+  populateModelsFor(provider);
+  const apiKeyLabel = $('#apiKeyLabel');
+  if (apiKeyLabel) apiKeyLabel.textContent = `${PROVIDER_LABEL[provider] || provider} API key`;
+};
 
 // ── Avatar upload + secret-input helpers ──────────────────────────
 const AVATAR_MAX_BYTES = 256 * 1024;  // 256 KB cap so card.json stays sane
@@ -1315,6 +1434,8 @@ window.submitDeploy = async function () {
     const description = $('#description').value.trim();
     const image = State.deployAvatarDataUrl || null;
     const apiKey = $('#apiKey').value.trim();
+    const provider = $('#provider').value;
+    const model = $('#model').value;
 
     if (!name || !description) {
       toast('Name and description are required', 'error');
@@ -1322,8 +1443,25 @@ window.submitDeploy = async function () {
       return;
     }
 
+    // Persona dim — overrides the attestor's default_i_data persona by
+    // role. The `system_prompt` is rebuilt frontend-side using the same
+    // template the backend's default would use (You are <name>. <desc>),
+    // so even though we replace the entire dim, the prompt content
+    // matches what the user would have gotten by leaving everything
+    // default. Per-role merge in normalize_i_data keeps the framework
+    // dim untouched.
+    const personaPlaintext = {
+      system_prompt: `You are ${name}. ${description}\n`,
+      inference: { provider, model },
+    };
+    const iData = [{
+      role: 'persona',
+      plaintext: personaPlaintext,
+      extra: {},
+    }];
+
     const { canonical: ownerCanonical, sig: ownerSig } =
-      await signOwnerCanonical(idempKey, name, description, image);
+      await signOwnerCanonical(idempKey, name, description, image, iData);
 
     // api_key (when set) rides the sandbox envelope's payload.env channel —
     // the same path scripts/e2e.sh has always used. attestor's
@@ -1346,7 +1484,7 @@ window.submitDeploy = async function () {
       owner_signed_message_b64: b64(ownerCanonical),
       name, description,
       image,
-      i_data: [],
+      i_data: iData,
       sandbox_envelope: sandboxEnvelope,
     };
 
