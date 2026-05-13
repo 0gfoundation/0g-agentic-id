@@ -1,0 +1,8 @@
+{
+  "name": "seal-verify",
+  "version": "1.0.0",
+  "description": "Sealed container self-verification",
+  "dependencies": {
+    "ethers": "^6"
+  }
+}
