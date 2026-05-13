@@ -68,6 +68,28 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
+            // Double-click guard: if a previous start already landed
+            // (Confirmed) or is currently in flight (Submitted), do not
+            // call sandbox.start again — the runtime treats concurrent
+            // start as "operation in progress" and our error handler
+            // below would flip the deployment to Failed + admin_delete,
+            // wiping a perfectly healthy container. Worker jobs are
+            // serialized, so seeing these states here means the earlier
+            // start job already took effect. The user's desired end
+            // state (running) IS achieved; return success silently.
+            if let Some(d) = ctx.deployments.get(seal_id).await? {
+                if matches!(
+                    d.container_stage,
+                    StageStatus::Confirmed { .. } | StageStatus::Submitted { .. }
+                ) {
+                    tracing::info!(
+                        ?seal_id,
+                        stage = ?d.container_stage,
+                        "sandbox start: container already in target state, noop"
+                    );
+                    return Ok(());
+                }
+            }
             // sandbox.start can fail when the runtime got into a bad
             // state (concurrent op in progress, "errored" stuck after
             // a botched stop, owner forbidden after sandbox-side GC).
@@ -130,6 +152,22 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
+            // Double-click guard: if a previous stop already landed,
+            // skip the sandbox call entirely. The string-match fallback
+            // below still catches state-drift cases (attestor thinks
+            // running but sandbox already stopped), but checking local
+            // state first avoids a round-trip and is robust against the
+            // sandbox changing its error wording.
+            if let Some(d) = ctx.deployments.get(seal_id).await? {
+                if matches!(d.container_stage, StageStatus::Stopped { .. }) {
+                    tracing::info!(
+                        ?seal_id,
+                        stage = ?d.container_stage,
+                        "sandbox stop: container already stopped, noop"
+                    );
+                    return Ok(());
+                }
+            }
             // Same protection as SandboxStart: a failed stop puts the
             // sandbox into an inconsistent runtime state. Flip Failed so
             // the user can recreate, instead of leaving Stopped+success
@@ -1762,6 +1800,207 @@ mod tests {
 
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert_eq!(d.sandbox_id.as_deref(), Some("mock-id"));
+    }
+
+    // ── SandboxStart / SandboxStop double-click guards ──────────────────
+
+    #[tokio::test]
+    async fn sandbox_start_noop_when_already_confirmed() {
+        // Worker jobs run serially, so seeing Confirmed at the top of
+        // handle SandboxStart means an earlier start already finished.
+        // Re-calling sandbox.start would race; the failure handler in
+        // handle_job would then flip c=Failed + admin_delete the
+        // healthy container. Pre-check must short-circuit silently.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(101u64)),
+            Some("sb-running".into()),
+        );
+        t.deployments
+            .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
+            .await
+            .unwrap();
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("noop must return Ok");
+
+        assert_eq!(
+            t.sandbox.start_calls.load(Ordering::SeqCst),
+            0,
+            "pre-check must skip sandbox.start when already Confirmed"
+        );
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_noop_when_already_submitted() {
+        // Submitted = previous start/recreate already hit sandbox.start
+        // but container hasn't yet POSTed /provision. Re-issuing start
+        // would trip sandbox's "concurrent op in progress" error path.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(102u64)),
+            Some("sb-starting".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Submitted { tx_hash: None, at: Utc::now() },
+            )
+            .await
+            .unwrap();
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("noop must return Ok");
+
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_proceeds_when_stopped() {
+        // Stopped → legitimate /start to resume. Pre-check must NOT
+        // short-circuit; sandbox.start must be called.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(103u64)),
+            Some("sb-stopped".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("start must succeed");
+
+        assert_eq!(
+            t.sandbox.start_calls.load(Ordering::SeqCst),
+            1,
+            "Stopped → fall through to sandbox.start"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_noop_when_already_stopped() {
+        // Double-click on Stop. The string-match fallback in the handler
+        // would also catch this on sandbox's error response, but the
+        // local-state pre-check skips the round-trip entirely and stays
+        // robust if sandbox changes its error wording.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(104u64)),
+            Some("sb-x".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "prior_stop".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("stop"),
+            },
+        )
+        .await
+        .expect("noop must return Ok");
+
+        assert_eq!(
+            t.sandbox.stop_calls.load(Ordering::SeqCst),
+            0,
+            "pre-check must skip sandbox.stop when already Stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_proceeds_when_confirmed() {
+        // Confirmed (running) → legitimate stop request.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(105u64)),
+            Some("sb-running".into()),
+        );
+        t.deployments
+            .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
+            .await
+            .unwrap();
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("stop"),
+            },
+        )
+        .await
+        .expect("stop must succeed");
+
+        assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 1);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Stopped { .. }));
     }
 
     // ── run_storage_track ─────────────────────────────────────────────

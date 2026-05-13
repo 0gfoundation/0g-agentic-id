@@ -6,6 +6,7 @@
 //! We still perform a defense-in-depth check at `/deploy` time so obviously
 //! bad requests are rejected before hitting the worker.
 
+use crate::retry::{retry_send, RetryPolicy};
 use crate::traits::SandboxClient;
 use crate::types::{SandboxCreateResponse, SandboxEnvelope, SealId};
 use alloy::primitives::{keccak256, Address};
@@ -209,18 +210,25 @@ impl SandboxClient for HttpSandbox {
         // going and the container actually came up — leaving an orphan
         // attestor doesn't know about. 120s is generous enough for a
         // cold pull while still bounding stuck calls.
-        let res = self
-            .http
-            .post(self.sandbox_url())
-            .timeout(std::time::Duration::from_secs(120))
-            .header("Content-Type", "application/json")
-            .header("X-Wallet-Address", addr_hex)
-            .header("X-Signed-Message", &envelope.signed_message_b64)
-            .header("X-Wallet-Signature", sig_hex)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("sandbox create: http send: {e}"))?;
+        //
+        // Strict retry: sandbox.create has server-side nonce dedup —
+        // a retry after the server processed the original would produce
+        // an orphan container. Only retry on connect-class errors (we're
+        // sure the request never landed).
+        let url = self.sandbox_url();
+        let res = retry_send("sandbox create", RetryPolicy::Strict, || {
+            let req = self
+                .http
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(120))
+                .header("Content-Type", "application/json")
+                .header("X-Wallet-Address", &addr_hex)
+                .header("X-Signed-Message", &envelope.signed_message_b64)
+                .header("X-Wallet-Signature", &sig_hex)
+                .json(&body);
+            async move { req.send().await }
+        })
+        .await?;
 
         let status = res.status();
         if !status.is_success() {
@@ -315,16 +323,19 @@ impl SandboxClient for HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(sig_65));
         let addr_hex = format!("{:#x}", signer.address);
 
-        let res = self
-            .http
-            .delete(&url)
-            .header("Content-Length", "0")
-            .header("X-Wallet-Address", &addr_hex)
-            .header("X-Signed-Message", &signed_b64)
-            .header("X-Wallet-Signature", &sig_hex)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("sandbox admin_delete DELETE {url}: {e}"))?;
+        // Idempotent retry: force-delete on a sandbox_id is idempotent
+        // (already-deleted returns OK or a 4xx the caller handles).
+        let res = retry_send("sandbox admin_delete", RetryPolicy::Idempotent, || {
+            let req = self
+                .http
+                .delete(&url)
+                .header("Content-Length", "0")
+                .header("X-Wallet-Address", &addr_hex)
+                .header("X-Signed-Message", &signed_b64)
+                .header("X-Wallet-Signature", &sig_hex);
+            async move { req.send().await }
+        })
+        .await?;
 
         let status = res.status();
         if !status.is_success() {
@@ -373,16 +384,25 @@ impl HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
 
-        let res = self
-            .http
-            .post(&url)
-            .header("Content-Length", "0")
-            .header("X-Wallet-Address", addr_hex)
-            .header("X-Signed-Message", &envelope.signed_message_b64)
-            .header("X-Wallet-Signature", sig_hex)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("sandbox {verb} POST {url}: {e}"))?;
+        // Idempotent retry: lifecycle start/stop on a known sandbox_id is
+        // safe to replay — sandbox treats repeated transitions to the
+        // same state as no-ops.
+        let op: &'static str = match verb {
+            "start" => "sandbox start",
+            "stop" => "sandbox stop",
+            _ => "sandbox lifecycle",
+        };
+        let res = retry_send(op, RetryPolicy::Idempotent, || {
+            let req = self
+                .http
+                .post(&url)
+                .header("Content-Length", "0")
+                .header("X-Wallet-Address", &addr_hex)
+                .header("X-Signed-Message", &envelope.signed_message_b64)
+                .header("X-Wallet-Signature", &sig_hex);
+            async move { req.send().await }
+        })
+        .await?;
 
         let status = res.status();
         if !status.is_success() {

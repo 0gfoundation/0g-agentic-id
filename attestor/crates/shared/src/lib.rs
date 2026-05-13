@@ -16,6 +16,7 @@ pub mod kms;
 pub mod mocks;
 pub mod oss;
 pub mod repo;
+pub mod retry;
 pub mod sandbox;
 pub mod storage_zg;
 pub mod tapp_grpc;

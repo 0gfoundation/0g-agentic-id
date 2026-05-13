@@ -7,6 +7,7 @@
 //! tiny bespoke client rather than pulling `aws-sdk-s3` — we only need
 //! PUT with a canonical URL and this keeps the dep footprint minimal.
 
+use crate::retry::{retry_send, RetryPolicy};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -123,16 +124,22 @@ impl OssClient {
             oss_acl,
         )?;
 
-        let resp = self
-            .http
-            .put(&url)
-            .header("Date", &date)
-            .header("Content-Type", content_type)
-            .header("x-oss-object-acl", oss_acl)
-            .header("Authorization", authorization)
-            .body(body)
-            .send()
-            .await?;
+        // Idempotent retry: OSS PUT to the same key is an overwrite, so
+        // replays are safe by design. Body must be cloned per attempt
+        // since reqwest's `.body()` consumes the Vec.
+        let resp = retry_send("oss put", RetryPolicy::Idempotent, || {
+            let body = body.clone();
+            let req = self
+                .http
+                .put(&url)
+                .header("Date", &date)
+                .header("Content-Type", content_type)
+                .header("x-oss-object-acl", oss_acl)
+                .header("Authorization", &authorization)
+                .body(body);
+            async move { req.send().await }
+        })
+        .await?;
 
         let status = resp.status();
         if !status.is_success() {

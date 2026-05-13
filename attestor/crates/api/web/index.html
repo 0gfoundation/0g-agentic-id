@@ -551,6 +551,8 @@ details.log[open] summary{color:var(--text2)}
 .dd .menu{position:absolute;top:calc(100% + 4px);right:0;min-width:160px;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);box-shadow:0 4px 16px oklch(0% 0 0 / 0.10);padding:4px;z-index:20;display:flex;flex-direction:column;gap:1px}
 .dd .menu a{padding:7px 10px;font-size:12px;color:var(--text2);text-decoration:none;border-radius:var(--r-xs,4px);display:flex;align-items:center;gap:8px;transition:background var(--t-fast),color var(--t-fast)}
 .dd .menu a:hover{background:var(--surf2);color:var(--text)}
+.dd .menu a.danger{color:var(--red)}
+.dd .menu a.danger:hover{background:var(--rbg);color:var(--red)}
 
 .section-title{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;font-weight:600;font-family:var(--mono);margin:18px 0 10px}
 
@@ -2118,12 +2120,11 @@ function paintDetail(dep) {
   // backend dispatch (which is identical: sign CREATE envelope, POST
   // /retry, worker decides what to actually run).
   //
-  //   isLive       → Stop + Dashboard
-  //   isIncomplete → "Retry"  (s or m failed — phase-1 didn't finish)
-  //   isOffline    → "Start"  (everything else broken: c failed,
-  //                            stopped, or ready stuck booting —
-  //                            static data is fine, runtime needs to
-  //                            come up)
+  //   isLive       → Manage(Stop, Reset) + View
+  //   isIncomplete → Retry button (primary; phase-1 didn't finish)
+  //   isOffline + paused → Manage(Resume, Reset) — symmetric with Live
+  //   isOffline + broken → Recreate button (primary; sandbox.create
+  //                        + prompts for LLM API key) + Manage(Reset)
   const isLive       = phase === 'running';
   const isIncomplete = ownerMatches && (sFailed || mFailed);
   const isOffline    = ownerMatches && !isLive && !isIncomplete && (
@@ -2133,6 +2134,11 @@ function paintDetail(dep) {
   );
 
   const canStop = ownerMatches && sandboxId && isLive;
+  // Resume lives in the Manage dropdown as Stop's mirror — same place,
+  // same weight. Only the `paused` flavor of offline qualifies; the
+  // broken flavors (cFailed, stuck booting) need the louder Recreate
+  // CTA in the action row instead.
+  const canResume = ownerMatches && isOffline && phase === 'stopped';
 
   // Reset — available once the deployment is past phase 1 (anything that
   // implies a sandbox was at least attempted). Hidden during the initial
@@ -2181,19 +2187,24 @@ function paintDetail(dep) {
   // typography. Danger semantics live in the labels (Stop / Reset),
   // not the trigger styling, so the two dropdowns read as a matched
   // pair rather than competing visual weights.
-  const manageDropdown = (canStop || canReset) ? `
+  const manageDropdown = (canStop || canResume || canReset) ? `
     <details class="dd">
       <summary><span class="dd-label">Manage</span>${ddCaret}</summary>
       <div class="menu">
         ${canStop ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; actionStop('${escapeHtml(sealId)}', '${escapeHtml(sandboxId)}')">Stop</a>` : ''}
-        ${canReset ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; resetAgent('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}')">Reset</a>` : ''}
+        ${canResume ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', true)">Resume</a>` : ''}
+        ${canReset ? `<a href="#" class="danger" onclick="event.preventDefault(); this.closest('details').open=false; resetAgent('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}')">Reset</a>` : ''}
       </div>
     </details>` : '';
+  // Action row CTAs are reserved for "something needs your attention"
+  // recoveries (Retry, Recreate). The benign toggle between running
+  // and paused (Stop / Resume) lives in Manage above — same place,
+  // same weight, regardless of which way you're flipping it.
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
       ${viewDropdown}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
-      ${isOffline ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', ${phase === 'stopped'})"><span class="ico">${ICO.play}</span> Start</button>` : ''}
+      ${(isOffline && phase !== 'stopped') ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Recreate</button>` : ''}
       ${manageDropdown}
     </div>`;
 
@@ -2590,6 +2601,19 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
     if (useStart) {
       payload = {};
     } else {
+      // Recreate is destructive: in-container runtime state is lost
+      // and the image is re-pulled. Mirror /reset's confirm step so
+      // the user knows they're entering the rebuild path, not the
+      // cheap resume path. (Reset and this share the same backend
+      // dispatch — sandbox.create — so the UX gate should match.)
+      const ok = window.confirm(
+        'Recreate this agent?\n\n' +
+        'A fresh sandbox will be spawned (image re-pulled). On-chain ' +
+        'identity is preserved; any in-container runtime state that ' +
+        'isn\'t already on chain is lost. You\'ll be asked for the LLM ' +
+        'API key next.'
+      );
+      if (!ok) return;
       const apiKey = (window.prompt(
         'LLM API key for the new sandbox\n(leave blank to skip — agent will fall back to whatever the container snapshot baked in):',
         ''
