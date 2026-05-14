@@ -1,23 +1,33 @@
-// Package uploader pushes a drifted iData dim to chain. End-to-end flow:
+// Package uploader syncs the agent's on-chain iData state to its on-disk
+// state via a single wholesale-replacement primitive: Apply.
 //
-//  1. adapter.EvolutionFor(dim) -> plaintext bytes
-//  2. dataplane.NewDataKey + Encrypt -> ciphertext
-//  3. dataplane.Upload -> 0g-storage root_hash (= new dataHash on chain)
-//  4. dataplane.SealDataKey -> sealedKey wrapping the data_key for the
-//     agent's own seal pubkey (so future restarts can decrypt)
-//  5. chain.IntelligentDatasOf + chain.SealedKeysOf -> current arrays
-//  6. label-keyed merge: replace the changed dim's entry, keep all others
-//  7. chain.Update -> single tx with the full new arrays
-//  8. agent.RecordChainUpload -> sync chainSnapshot to reflect the new
-//     on-chain state (HasChanges() for this dim becomes false)
+// Per-tick flow (watcher → Apply):
 //
-// Caller (watcher OnDimDrift handler) decides WHEN to call Push; this
-// package only handles the HOW.
+//  1. Caller (watcher) has already invoked adapter.EvolutionFor for every
+//     declared role and passes the (role → plaintext) map to Apply.
+//  2. Apply reads current chain entries + sealedKeys.
+//  3. For each declared role:
+//       - plaintext == sha256(Defaults): omit from newDatas. §16.10
+//         "plaintext = defaults ↔ no chain entry".
+//       - plaintext == chainSnapshot.ContentHash: reuse chain entry
+//         verbatim (no re-encrypt, no upload).
+//       - otherwise: encrypt + upload to 0g-storage, build fresh entry;
+//         reuse data_key when chain has prior entry (so manifest child
+//         blobs stay decipherable), mint fresh otherwise.
+//  4. Anything on chain whose role is outside adapter.Roles() (e.g. mint-
+//     only `persona` after bootstrap translation) is dropped — never
+//     visited in the per-role loop, never written into newDatas.
+//  5. If newDatas equals current chainEntries → skip the tx.
+//  6. Otherwise chain.Update once with the full new arrays.
+//  7. agent.RecordChainUpload for every role whose state changed.
+//
+// Failures: any error (encrypt, 0g-storage upload, chain.Update) returns
+// without mutating state. The next watcher tick re-detects divergence
+// (chainSnapshot stays stale, current still differs) and Apply re-runs
+// naturally — no special retry path needed.
 package uploader
 
 import (
-	"context"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -27,9 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/chain"
-	"seal-verify/internal/dataplane"
-	"seal-verify/internal/framework/openclaw"
-	"seal-verify/internal/logger"
+	"seal-verify/internal/framework"
 	"seal-verify/internal/state"
 )
 
@@ -64,40 +72,54 @@ func roleOf(desc string) string {
 	return desc
 }
 
-// Uploader bundles the deps + identity material a Push needs. Constructed
+// rootOf returns the 0g-storage root referenced by an iData entry's
+// dataDescription. Used by manifest mode to download the prior manifest
+// blob for incremental diffing.
+func rootOf(desc string) ([32]byte, error) {
+	var d onChainDescription
+	if err := json.Unmarshal([]byte(desc), &d); err != nil {
+		return [32]byte{}, fmt.Errorf("parse dataDescription: %w", err)
+	}
+	hexStr := d.StoragePtr.RootHash
+	if len(hexStr) >= 2 && hexStr[:2] == "0x" {
+		hexStr = hexStr[2:]
+	}
+	b, err := hex.DecodeString(hexStr)
+	if err != nil || len(b) != 32 {
+		return [32]byte{}, fmt.Errorf("invalid storage_ptr.root_hash %q", d.StoragePtr.RootHash)
+	}
+	var out [32]byte
+	copy(out[:], b)
+	return out, nil
+}
+
+// Uploader bundles the deps + identity material Apply needs. Constructed
 // once at startAgent time after bootstrap has resolved agentID + the chain
-// client is dialed; per-dim Pushes reuse it.
+// client is dialed; subsequent watcher ticks reuse it.
 type Uploader struct {
-	adapter       *openclaw.Adapter
+	adapter       Adapter
 	agent         *state.Agent
-	chain         *chain.Client
+	chain         ChainClient
+	storage       StorageClient
 	tokenID       *big.Int
 	agentSealPriv []byte
 	agentSealPub  []byte // 33-byte compressed secp256k1 pubkey
 
-	rpcURL        string // for storage submit tx (separate from chain RPC client because the SDK wants its own web3 instance)
-	indexerURL    string
-	agentSealHex  string // hex (no 0x prefix) of agent_seal_priv — what 0g-storage SDK expects
+	indexerURL string // recorded into dataDescription.storage_ptr.indexer
 
-	// dimLocks serializes Push calls per-dim so a slow upload + a fresh
-	// drift tick can't fire two parallel Pushes for the same dim (they
-	// would both read the same chain state, both succeed, double-paying
-	// for an effectively duplicate update tx). Different dims still
-	// upload concurrently.
-	locksMu  sync.Mutex
-	dimLocks map[string]*sync.Mutex
-
-	// FailureCount tracks consecutive Push failures per dim. Reset to 0
-	// on success. Exposed (read-only) via FailureCount so callers can
-	// decide to escalate (e.g. report.Status("error", ...) after N).
-	failMu      sync.Mutex
-	failureCnt  map[string]int
+	// roleLocks serializes Apply's per-role work in case any future code
+	// path invokes Apply outside the single watcher goroutine (today only
+	// the watcher tick fires it, so contention is theoretical — the locks
+	// are belt-and-braces).
+	locksMu   sync.Mutex
+	roleLocks map[string]*sync.Mutex
 }
 
-// New constructs an Uploader. Returns an error if agent_seal_priv can't be
-// parsed (would block every Push otherwise).
+// New constructs a production Uploader wired to a concrete chain.Client
+// and the dataplane CLI-shelling storage backend. Returns an error if
+// agent_seal_priv can't be parsed (would block every Push otherwise).
 func New(
-	adapter *openclaw.Adapter,
+	adapter Adapter,
 	agent *state.Agent,
 	chainClient *chain.Client,
 	tokenID *big.Int,
@@ -109,158 +131,60 @@ func New(
 		return nil, fmt.Errorf("parse agent_seal_priv: %w", err)
 	}
 	pub := crypto.CompressPubkey(&priv.PublicKey)
+	storage := &dataplaneStorage{
+		indexerURL:    indexerURL,
+		rpcURL:        rpcURL,
+		signerPrivHex: hex.EncodeToString(agentSealPriv),
+	}
+	return newWith(adapter, agent, chainClient, storage, tokenID, agentSealPriv, pub, indexerURL), nil
+}
+
+// newWith builds an Uploader from already-validated dependencies. Used by
+// New (production path) and by tests that inject mock chain / storage.
+// Not exported to keep the unit-test seam narrow.
+func newWith(
+	adapter Adapter,
+	agent *state.Agent,
+	chainClient ChainClient,
+	storage StorageClient,
+	tokenID *big.Int,
+	agentSealPriv []byte,
+	agentSealPub []byte,
+	indexerURL string,
+) *Uploader {
 	return &Uploader{
 		adapter:       adapter,
 		agent:         agent,
 		chain:         chainClient,
+		storage:       storage,
 		tokenID:       tokenID,
 		agentSealPriv: agentSealPriv,
-		agentSealPub:  pub,
-		rpcURL:        rpcURL,
+		agentSealPub:  agentSealPub,
 		indexerURL:    indexerURL,
-		agentSealHex:  hex.EncodeToString(agentSealPriv),
-		dimLocks:      make(map[string]*sync.Mutex),
-		failureCnt:    make(map[string]int),
-	}, nil
+		roleLocks:     make(map[string]*sync.Mutex),
+	}
 }
 
-// lockFor returns the per-dim mutex, lazily creating it on first use.
-func (u *Uploader) lockFor(dim string) *sync.Mutex {
+// lockFor returns the per-role mutex, lazily creating it on first use.
+func (u *Uploader) lockFor(role string) *sync.Mutex {
 	u.locksMu.Lock()
 	defer u.locksMu.Unlock()
-	m, ok := u.dimLocks[dim]
+	m, ok := u.roleLocks[role]
 	if !ok {
 		m = &sync.Mutex{}
-		u.dimLocks[dim] = m
+		u.roleLocks[role] = m
 	}
 	return m
 }
 
-// FailureCount returns the number of consecutive failed Push attempts
-// for dim. Resets to 0 on the next successful Push. Callers use this
-// to decide when to escalate (report.Status("error", ...) at a threshold).
-func (u *Uploader) FailureCount(dim string) int {
-	u.failMu.Lock()
-	defer u.failMu.Unlock()
-	return u.failureCnt[dim]
-}
-
-// Push uploads the current state of `dim` to chain. Steps annotated inline.
-//
-// Concurrent Push calls for different dims run in parallel; concurrent
-// Push calls for the SAME dim serialize on a per-dim mutex (otherwise both
-// would read the same chain state and pay gas for effectively duplicate
-// updates).
-//
-// Maintains a per-dim consecutive-failure counter: incremented on error,
-// reset to 0 on success. Callers query via FailureCount(dim) to decide
-// when to escalate (e.g. report.Status("error", ...)).
-func (u *Uploader) Push(ctx context.Context, dim string) (retErr error) {
-	lock := u.lockFor(dim)
-	lock.Lock()
-	defer lock.Unlock()
-
-	defer func() {
-		u.failMu.Lock()
-		defer u.failMu.Unlock()
-		if retErr != nil {
-			u.failureCnt[dim]++
-			return
+// shapeOf returns the declared shape for a role, or Leaf as the fallback
+// for unknown roles (so legacy labels coexisting with declared ones during
+// migration behave like leaves).
+func (u *Uploader) shapeOf(role string) framework.Shape {
+	for _, r := range u.adapter.Roles() {
+		if r.Name == role {
+			return r.Shape
 		}
-		u.failureCnt[dim] = 0
-	}()
-
-	// 1. Read current plaintext.
-	plaintext, err := u.adapter.EvolutionFor(ctx, dim)
-	if err != nil {
-		return fmt.Errorf("EvolutionFor[%s]: %w", dim, err)
 	}
-	contentSum := sha256.Sum256(plaintext)
-	contentHashHex := hex.EncodeToString(contentSum[:])
-
-	// 2-3. Encrypt + upload.
-	dataKey, err := dataplane.NewDataKey()
-	if err != nil {
-		return fmt.Errorf("new data_key: %w", err)
-	}
-	ciphertext, err := dataplane.Encrypt(plaintext, dataKey)
-	if err != nil {
-		return fmt.Errorf("encrypt: %w", err)
-	}
-	root, err := dataplane.Upload(ctx, ciphertext, u.indexerURL, u.rpcURL, u.agentSealHex)
-	if err != nil {
-		return fmt.Errorf("storage upload: %w", err)
-	}
-
-	// 4. Wrap data_key to agent_seal_pub. Future restarts read sealedKeysOf,
-	//    unwrap with the same priv, decrypt the ciphertext.
-	sealedKey, err := dataplane.SealDataKey(dataKey, u.agentSealPub)
-	if err != nil {
-		return fmt.Errorf("seal data_key: %w", err)
-	}
-
-	// 5. Read current chain state for label-keyed merge.
-	chainEntries, err := u.chain.IntelligentDatasOf(ctx, u.tokenID)
-	if err != nil {
-		return fmt.Errorf("read chain entries: %w", err)
-	}
-	chainSealedKeys, err := u.chain.SealedKeysOf(ctx, u.tokenID)
-	if err != nil {
-		return fmt.Errorf("read sealedKeysOf: %w", err)
-	}
-
-	// 6. Build newEntries / newSealedKeys: copy all chain entries except
-	//    the one we're replacing, then append the changed dim. If the dim
-	//    wasn't on chain (default mint case), append becomes an "add" —
-	//    the contract's update accepts variable-length so this works
-	//    uniformly without explicit ADD/UPDATE branching.
-	newEntries := make([]chain.IntelligentData, 0, len(chainEntries)+1)
-	newSealedKeys := make([][]byte, 0, len(chainEntries)+1)
-	for _, e := range chainEntries {
-		if roleOf(e.DataDescription) == dim {
-			continue // skip, will append new version below
-		}
-		sk, ok := chainSealedKeys[e.DataHash]
-		if !ok {
-			return fmt.Errorf("chain inconsistency: dataHash=%x has no sealedKey", e.DataHash)
-		}
-		newEntries = append(newEntries, e)
-		newSealedKeys = append(newSealedKeys, sk)
-	}
-
-	// Mirror attestor's JSON shape so sealed's bootstrap (which json.Unmarshals
-	// dataDescription) and any indexer scraping the chain see a consistent
-	// format across mint + every update.
-	descJSON, err := json.Marshal(onChainDescription{
-		Role: dim,
-		StoragePtr: storagePtr{
-			RootHash: "0x" + hex.EncodeToString(root[:]),
-			Indexer:  u.indexerURL,
-			Size:     len(ciphertext),
-		},
-		Encryption: "AES-GCM-256",
-	})
-	if err != nil {
-		return fmt.Errorf("marshal dataDescription: %w", err)
-	}
-	newEntries = append(newEntries, chain.IntelligentData{
-		DataDescription: string(descJSON),
-		DataHash:        root,
-	})
-	newSealedKeys = append(newSealedKeys, sealedKey)
-
-	// 7. Submit the update tx (signed by agent_seal_priv — contract authz
-	//    requires this since the seal is bound).
-	logger.Logf("uploader.Push[%s]: storage root=%x content=%s sealedKey=%dB; submitting update tx (%d entries)",
-		dim, root, contentHashHex[:12]+"...", len(sealedKey), len(newEntries))
-	txHash, err := u.chain.Update(ctx, u.tokenID, newEntries, newSealedKeys, u.agentSealPriv)
-	if err != nil {
-		return fmt.Errorf("chain.Update: %w", err)
-	}
-
-	// 8. Sync state — chainSnapshot now matches what's on chain.
-	dataHashHex := "0x" + hex.EncodeToString(root[:])
-	u.agent.RecordChainUpload(dim, contentHashHex, dataHashHex)
-	logger.Logf("uploader.Push[%s]: complete, tx=%s dataHash=%s", dim, txHash.Hex(), dataHashHex)
-	return nil
+	return framework.Leaf
 }

@@ -33,6 +33,7 @@ import (
 	"seal-verify/internal/framework/openclaw"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
+	"seal-verify/internal/manifest"
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
@@ -49,14 +50,23 @@ const bootstrapTimeout = 10 * time.Minute
 // configure this; the agent discovers it via SEAL_SIGN_SOCK env var.
 const sealSignSockPath = "/run/seal-sign.sock"
 
-// decryptedEntry mirrors the legacy bootstrap.go decryptedEntry, used to
-// pass around an iData entry's plaintext + role tag while we still operate
-// on a single role="config" entry. Phase 4 will move all dispatch into the
-// framework adapter.
+// decryptedEntry is the post-bootstrap representation of one iData
+// chain entry: role tag + dataHash + decrypted plaintext + the role-level
+// data_key + indexer URL used to download it.
+//
+// DataKey + Indexer are retained because manifest-shape roles need them
+// to fetch child entry blobs from 0g-storage with the same crypto key
+// the parent manifest was sealed under.
 type decryptedEntry struct {
 	Role      string
 	DataHash  [32]byte
 	Plaintext []byte
+	DataKey   []byte
+	Indexer   string
+	// ContentHash is sha256(Plaintext) in lowercase hex. Computed once here
+	// at bootstrap so SeedChainSnapshot can record the authoritative "chain
+	// content hash" without re-decrypting later.
+	ContentHash string
 }
 
 // storageDescription is the JSON wrapper inside dataDescription that points
@@ -302,7 +312,14 @@ func decryptEntry(ctx context.Context, idx int, d chain.IntelligentData, sealedK
 	}
 
 	logger.Logf("OK   bootstrap%s decrypted (%d bytes, role=%q)", tag, len(plaintext), desc.Role)
-	return decryptedEntry{Role: desc.Role, DataHash: d.DataHash, Plaintext: plaintext}, true
+	return decryptedEntry{
+		Role:        desc.Role,
+		DataHash:    d.DataHash,
+		Plaintext:   plaintext,
+		DataKey:     dataKey,
+		Indexer:     indexer,
+		ContentHash: sha256Hex(plaintext),
+	}, true
 }
 
 // startAgent dispatches each decrypted entry to the framework adapter, seeds
@@ -331,66 +348,111 @@ func startAgent(
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Required dims: framework + persona. Other adapter dims (knowledge /
-	// skills / ops) are optional -- a default mint may produce only the
-	// minimum and rely on adapter defaults for the rest. When the agent
-	// later self-modifies an absent dim (e.g. writes its first MEMORY.md),
-	// the uploader detects drift on a dim with empty chain dataHash and
-	// adds a new entry via the contract's sealUpdate ADD path.
+	// Path-driven role set (§16). sealed enforces no "required" roles —
+	// missing roles fall back to adapter defaults. Mint-time owner-side
+	// requirements are an attestor concern, not sealed's.
 	//
 	// Duplicates are a hard fail per EVOLUTION_DESIGN §8.1.
-	required := []string{"framework", "persona"}
-	allDims := append([]string{"framework"}, adapter.Dimensions()...)
+	roles := adapter.Roles()
+	declared := make(map[string]bool, len(roles))
+	for _, r := range roles {
+		declared[r.Name] = true
+	}
 
-	dataHashByDim := map[string]string{}
+	// Phase A: declared roles — Restore plaintext, seed chainSnapshot with
+	// the authoritative sha256(plaintext) so subsequent reconcile ticks
+	// can compare disk against the true chain content (not a "best-guess"
+	// disk-derived hash).
+	//
+	// Phase B: declared roles missing from chain — Restore(nil) writes
+	// adapter defaults to disk, chainSnapshot is seeded with sha256(Defaults)
+	// so §16.10's "plaintext = defaults ↔ no chain entry" invariant holds
+	// naturally in the reconcile loop.
+	//
+	// Phase C: legacy chain entries (roles outside adapter.Roles(), e.g.
+	// mint-only `persona`) — fire HandleLegacy to translate their content
+	// into path-driven on-disk artifacts. Runs AFTER all declared-role
+	// Restores so legacy translation reliably overwrites any defaults
+	// Phase B may have written.
+	seen := map[string]bool{}
 	for i := range res.entries {
 		role := res.entries[i].Role
-		if _, dup := dataHashByDim[role]; dup {
+		if seen[role] {
 			return fmt.Errorf("duplicate iData entry for role=%q", role)
 		}
-		dataHashByDim[role] = "0x" + hex.EncodeToString(res.entries[i].DataHash[:])
+		seen[role] = true
 	}
-	for _, r := range required {
-		if _, ok := dataHashByDim[r]; !ok {
-			return fmt.Errorf("missing required iData entry: role=%q", r)
+
+	// Phase A
+	for _, r := range roles {
+		entry := findEntry(res.entries, r.Name)
+		if entry == nil {
+			continue
 		}
+		if err := adapter.Restore(ctx, r.Name, entry.Plaintext); err != nil {
+			return fmt.Errorf("restore %s: %w", r.Name, err)
+		}
+		if r.Shape == framework.DirectoryManifest && len(entry.Plaintext) > 0 {
+			if err := restoreManifestEntries(ctx, adapter, r.Name, entry.Plaintext, entry.DataKey, entry.Indexer); err != nil {
+				return fmt.Errorf("restore manifest entries for %s: %w", r.Name, err)
+			}
+		}
+		dataHashHex := "0x" + hex.EncodeToString(entry.DataHash[:])
+		// Manifest-shape plaintext from 0g-storage carries filled StoragePtr
+		// fields, but evoXxx() at watcher tick time produces the empty-ptr
+		// form — those two are the canonical pair (push_manifest.go:22-26).
+		// Seed chainSnapshot with sha256(empty-ptr) so drift detection
+		// compares apples to apples; otherwise every restart shows phantom
+		// drift on manifest roles and re-uploads them.
+		contentHashForSeed := entry.ContentHash
+		if r.Shape == framework.DirectoryManifest && len(entry.Plaintext) > 0 {
+			stripped, err := manifest.StripStoragePtrs(entry.Plaintext)
+			if err != nil {
+				return fmt.Errorf("normalize manifest contentHash for %s: %w", r.Name, err)
+			}
+			contentHashForSeed = sha256Hex(stripped)
+		}
+		agent.SeedChainSnapshot(r.Name, contentHashForSeed, dataHashHex)
 	}
-	for _, dim := range allDims {
-		if _, ok := dataHashByDim[dim]; !ok {
-			logger.Logf("iData entry %q absent on chain -- using adapter defaults; "+
-				"uploader will add this dim on first drift", dim)
+
+	// Phase B
+	for _, r := range roles {
+		if findEntry(res.entries, r.Name) != nil {
+			continue
+		}
+		if err := adapter.Restore(ctx, r.Name, nil); err != nil {
+			return fmt.Errorf("restore %s (defaults): %w", r.Name, err)
+		}
+		defaultHash := sha256Hex(adapter.Defaults(r.Name))
+		agent.SeedChainSnapshot(r.Name, defaultHash, "")
+		logger.Logf("iData entry %q absent on chain — Restored to defaults; will appear on chain when disk diverges", r.Name)
+	}
+
+	// Phase C
+	for i := range res.entries {
+		role := res.entries[i].Role
+		if declared[role] {
+			continue
+		}
+		if err := adapter.HandleLegacy(ctx, role, res.entries[i].Plaintext); err != nil {
+			return fmt.Errorf("HandleLegacy %s: %w", role, err)
 		}
 	}
 
-	// Restore framework first so its schema_version check fails fast.
-	frameworkEntry := findEntry(res.entries, "framework")
-	if err := adapter.Restore(ctx, "framework", frameworkEntry.Plaintext); err != nil {
-		return fmt.Errorf("restore framework: %w", err)
+	// Build the uploader. The watcher tick handler reuses this single
+	// instance to call upload.Apply each cycle.
+	upload, err := uploader.New(adapter, agent, res.client, res.agentID,
+		agentSealPriv, cfg.ChainRPC, cfg.FallbackIndexer)
+	if err != nil {
+		return fmt.Errorf("init uploader: %w", err)
 	}
 
-	// Restore EVERY adapter dim, even when absent on chain (plaintext=nil).
-	// Adapters use zero-value config for nil and still write their disk
-	// artifacts — empty workspace markdown / empty openclaw.json sections.
-	// This pre-empts openclaw's `writeFileIfMissing` template auto-install
-	// (~8KB AGENTS.md / 650B USER.md per absent dim) which would otherwise
-	// fire on first agent activity and drift the dim falsely.
-	//
-	// Dim order is irrelevant per EVOLUTION_DESIGN §7.2 (Restore must commute).
-	for _, dim := range adapter.Dimensions() {
-		var pt []byte
-		if e := findEntry(res.entries, dim); e != nil {
-			pt = e.Plaintext
-		}
-		if err := adapter.Restore(ctx, dim, pt); err != nil {
-			return fmt.Errorf("restore %s: %w", dim, err)
-		}
-	}
-
-	// Pre-seed every dim from post-Restore disk state. This gives /hello
-	// non-empty dataHashes immediately after mgr.Start arms phase=Running,
-	// even though openclaw hasn't finished its own initialisation yet.
+	// Phase 1 seed: capture post-Restore + post-HandleLegacy disk state
+	// into currentSnapshot so /hello can report non-empty dataHashes
+	// immediately after mgr.Start arms phase=Running. chainSnapshot is
+	// untouched here — Phase A/B already seeded it with chain truth.
 	logger.Logf("--- iData seed phase 1: post-Restore (pre-Start) ---")
-	if err := seedAllDims(ctx, adapter, agent, allDims, dataHashByDim); err != nil {
+	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
 		return err
 	}
 
@@ -429,30 +491,21 @@ func startAgent(
 	logger.Logf("--- iData seed phase 2: waiting %s for openclaw to settle ---", openclawSettleDelay)
 	time.Sleep(openclawSettleDelay)
 	logger.Logf("--- iData seed phase 2: post-settle baseline capture ---")
-	if err := seedAllDims(ctx, adapter, agent, allDims, dataHashByDim); err != nil {
+	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
 		return fmt.Errorf("re-seed after settle: %w", err)
 	}
-	logger.Logf("OK   baseline captured: %d dims total, %d on chain, %d absent (will add on drift)",
-		len(allDims), len(dataHashByDim), len(allDims)-len(dataHashByDim))
+	logger.Logf("OK   baseline captured: %d roles total", len(roles))
 
-	// Build the uploader once after baseline is captured. It owns the
-	// chain.Client returned by chainBootstrap (no Close — process lives
-	// forever). Each drift-handler invocation reuses it; per-Push the
-	// uploader dials a separate 0g-storage web3 instance because the SDK
-	// insists on its own.
-	upload, err := uploader.New(adapter, agent, res.client, res.agentID,
-		agentSealPriv, cfg.ChainRPC, cfg.FallbackIndexer)
-	if err != nil {
-		return fmt.Errorf("init uploader: %w", err)
-	}
-
-	// Start the iData watcher inside startAgent so the OnDimDrift callback
-	// closes over the real manager (for Reload), adapter (for
-	// ReconcileFramework), and uploader.
+	// Start the iData watcher. OnDrift fires whenever a tick discovers any
+	// role whose disk hash diverges from chainSnapshot (current != chain).
+	// The handler routes framework drift to ReconcileFramework + Reload,
+	// then asks the uploader to push the entire post-reconcile state in
+	// one wholesale chain.Update via upload.Apply.
 	watchCtx := context.Background()
 	go watcher.New(adapter, agent, watcher.Config{
-		OnDimDrift: func(dim string) {
-			handleDimDrift(watchCtx, dim, adapter, mgr, upload, cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID)
+		OnDrift: func(plaintexts map[string][]byte, drifted []string) {
+			handleDrift(watchCtx, plaintexts, drifted, adapter, agent, mgr, upload,
+				cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID)
 		},
 	}).Run(watchCtx)
 
@@ -484,49 +537,57 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 	}
 }
 
-// handleDimDrift is the bootstrap-side reaction to a watcher-detected
-// drift event. Currently it covers two paths:
+// handleDrift is the watcher's per-tick callback. Fires only on ticks
+// where at least one role's disk hash differs from chainSnapshot.
 //
-//   - framework drift: reconcile to the validated whitelist max version
-//     (npm-install if needed, update in-memory pin), then reload the
-//     manager so the running process actually uses the new binary.
+// Two-step:
 //
-//   - any other drift: log a "[mock uploader]" note. The real uploader
-//     (encrypt + 0g-storage upload + chain.update + state.RecordChainUpload)
-//     replaces this stub once built; until then iData on chain stays at
-//     whatever it was at mint time.
+//  1. If framework drifted, reconcile to whitelistMax (npm install +
+//     in-memory binding bump) and reload the manager so the running
+//     process actually uses the new binary. Then re-read framework's
+//     plaintext so upload.Apply sees the post-reconcile version, not
+//     the pre-reconcile one we captured at tick start.
 //
-// Errors are logged but never crash the watcher — drift handling is
-// best-effort (next tick will retry if the condition persists). After
-// pushFailureEscalateAt consecutive failures for the same dim, the
-// handler reports an "error" status to the attestor so the platform can
-// step in (the watcher itself keeps retrying — the report is informative).
-const pushFailureEscalateAt = 5
+//  2. Call upload.Apply with the (possibly framework-refreshed)
+//     plaintexts map. Apply constructs newDatas wholesale from declared-
+//     role disk content + reused chain entries, drops anything outside
+//     adapter.Roles(), submits one chain.Update tx. On failure: the
+//     next watcher tick re-detects divergence (chainSnapshot stays
+//     stale, currentSnapshot still differs) and Apply re-runs naturally.
+//
+// All errors are logged. After failureEscalateAt consecutive Apply
+// failures we surface a single "error" status to the attestor so the
+// platform UI can flag the sandbox — the watcher itself keeps retrying.
+const failureEscalateAt = 5
 
-func handleDimDrift(
+var consecutiveApplyFailures int
+
+func handleDrift(
 	ctx context.Context,
-	dim string,
+	plaintexts map[string][]byte,
+	drifted []string,
 	adapter *openclaw.Adapter,
+	agent *state.Agent,
 	mgr *manager.Manager,
 	upload *uploader.Uploader,
 	attestorURL string,
 	agentSealPriv []byte,
 	sealID string,
 ) {
-	// 0g-storage Go SDK has panic-prone call sites (e.g. blockchain.MustNewWeb3,
-	// logrus.Fatal in some error paths). Without recover, a panic here kills
-	// the whole sealed process and the operator loses /log + /healthz too.
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Logf("drift: handleDimDrift[%s] PANIC: %v", dim, r)
+			logger.Logf("drift: handleDrift PANIC: %v", r)
 		}
 	}()
-	if dim == "framework" {
-		// framework drift is a different openclaw binary version -- openclaw
-		// can't swap itself out, so sealed has to npm-install and restart it.
-		// Every other dim (persona/knowledge/skills/ops) is openclaw's own
-		// config and is left for openclaw to hot-apply; sealed only pins
-		// the new state to chain via upload.Push below.
+
+	for _, dim := range drifted {
+		if dim != "framework" {
+			continue
+		}
+		// framework drift = a different openclaw binary version landed on
+		// disk. openclaw can't swap itself out, so sealed npm-installs
+		// whitelistMax + reloads. Then refresh plaintexts["framework"] so
+		// Apply pushes the post-reconcile version.
 		if err := adapter.ReconcileFramework(ctx); err != nil {
 			logger.Logf("drift: ReconcileFramework: %v", err)
 			return
@@ -535,24 +596,27 @@ func handleDimDrift(
 			logger.Logf("drift: manager.Reload: %v", err)
 			return
 		}
-		logger.Logf("drift: framework reconciled + reloaded; will upload new pin")
-	}
-	// Bound the upload so a stuck SDK call cannot wedge the drift handler
-	// forever (next tick fires every 30s).
-	pushCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	err := upload.Push(pushCtx, dim)
-	if err != nil {
-		logger.Logf("drift: uploader.Push[%s]: %v", dim, err)
-		// Escalate exactly at the threshold (not on every subsequent
-		// failure) to avoid flooding the attestor with identical reports.
-		if upload.FailureCount(dim) == pushFailureEscalateAt {
-			logger.Logf("drift: uploader.Push[%s] failed %d consecutive times; reporting error",
-				dim, pushFailureEscalateAt)
-			report.Status(attestorURL, agentSealPriv, sealID, "error",
-				fmt.Sprintf("uploader.Push[%s] failed %d times: %v", dim, pushFailureEscalateAt, err))
+		logger.Logf("drift: framework reconciled + reloaded")
+		newFW, err := adapter.EvolutionFor(ctx, "framework")
+		if err == nil {
+			plaintexts["framework"] = newFW
+			agent.UpdateCurrentSnapshot("framework", sha256Hex(newFW))
 		}
 	}
+
+	applyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	if err := upload.Apply(applyCtx, plaintexts); err != nil {
+		consecutiveApplyFailures++
+		logger.Logf("drift: upload.Apply: %v (consecutive failures: %d)",
+			err, consecutiveApplyFailures)
+		if consecutiveApplyFailures == failureEscalateAt {
+			report.Status(attestorURL, agentSealPriv, sealID, "error",
+				fmt.Sprintf("upload.Apply failed %d times: %v", failureEscalateAt, err))
+		}
+		return
+	}
+	consecutiveApplyFailures = 0
 }
 
 // openclawSettleDelay is how long bootstrap waits after mgr.Start succeeds
@@ -562,26 +626,24 @@ func handleDimDrift(
 // auto-applied defaults as false drift on the first watcher tick.
 const openclawSettleDelay = 5 * time.Second
 
-// seedAllDims runs adapter.EvolutionFor for each dim, hashes the output,
-// and seeds both chainSnapshot and currentSnapshot. dataHashByDim carries
-// the on-chain storage root per dim; absent dims get "" (uploader will
-// detect them by empty DataHash and add new chain entries on first drift).
-func seedAllDims(
-	ctx context.Context,
-	adapter *openclaw.Adapter,
-	agent *state.Agent,
-	dims []string,
-	dataHashByDim map[string]string,
-) error {
-	for _, dim := range dims {
-		bytes, err := adapter.EvolutionFor(ctx, dim)
+// seedCurrentSnapshots reads disk via adapter.EvolutionFor for each
+// declared role, hashes the output, and pushes it into currentSnapshot.
+// chainSnapshot is untouched (it's seeded once at bootstrap by Phase A/B
+// of startAgent and thereafter only advances via uploader RecordChainUpload
+// after a confirmed chain.Update tx).
+//
+// Used by both phase 1 (pre-Start) and phase 2 (post-settle) seeding —
+// they share the same "snapshot disk truth into currentSnapshot" logic.
+func seedCurrentSnapshots(ctx context.Context, adapter *openclaw.Adapter, agent *state.Agent) error {
+	for _, r := range adapter.Roles() {
+		bytes, err := adapter.EvolutionFor(ctx, r.Name)
 		if err != nil {
 			if errors.Is(err, framework.ErrUnsupportedDim) {
 				continue
 			}
-			return fmt.Errorf("EvolutionFor[%s] (seed): %w", dim, err)
+			return fmt.Errorf("EvolutionFor[%s] (seed): %w", r.Name, err)
 		}
-		agent.SeedSnapshots(dim, sha256Hex(bytes), dataHashByDim[dim])
+		agent.UpdateCurrentSnapshot(r.Name, sha256Hex(bytes))
 	}
 	return nil
 }
@@ -602,6 +664,56 @@ func findEntry(entries []decryptedEntry, role string) *decryptedEntry {
 	for i := range entries {
 		if entries[i].Role == role {
 			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// restoreManifestEntries fetches each child blob referenced by a manifest
+// plaintext and feeds it to adapter.RestoreEntry. Used at bootstrap time
+// for DirectoryManifest-shape roles whose parent iData has already been
+// downloaded and decrypted by chainBootstrap; this step writes the child
+// content blobs to disk.
+//
+// All child blobs share the parent role's data_key (manifest mode reuses
+// one key across the role's blob set). Indexer URL is the one resolved
+// for the parent entry — manifest child entries don't carry per-entry
+// indexer overrides.
+//
+// Best-effort per entry: a single child failure aborts so the caller
+// (bootstrap) can report a clean error rather than half-restore the role.
+func restoreManifestEntries(
+	ctx context.Context,
+	adapter *openclaw.Adapter,
+	role string,
+	manifestPT []byte,
+	dataKey []byte,
+	indexer string,
+) error {
+	m, err := manifest.Unmarshal(manifestPT)
+	if err != nil {
+		return fmt.Errorf("parse manifest: %w", err)
+	}
+	for _, entry := range m.Entries {
+		rootHex := entry.StoragePtr.RootHash
+		if rootHex == "" {
+			return fmt.Errorf("entry %q has empty storage_ptr.root_hash", entry.Path)
+		}
+		outPath := fmt.Sprintf("/tmp/idata-entry-%s.bin", sha256Hex([]byte(role+"/"+entry.Path)))
+		if err := dataplane.Download(ctx, rootHex, indexer, outPath); err != nil {
+			return fmt.Errorf("download entry %q: %w", entry.Path, err)
+		}
+		ct, err := readFile(outPath)
+		removeFile(outPath)
+		if err != nil {
+			return fmt.Errorf("read entry %q ciphertext: %w", entry.Path, err)
+		}
+		pt, err := dataplane.Decrypt(ct, dataKey)
+		if err != nil {
+			return fmt.Errorf("decrypt entry %q: %w", entry.Path, err)
+		}
+		if err := adapter.RestoreEntry(ctx, role, entry.Path, pt); err != nil {
+			return fmt.Errorf("RestoreEntry %q: %w", entry.Path, err)
 		}
 	}
 	return nil

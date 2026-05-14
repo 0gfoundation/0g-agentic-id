@@ -16,6 +16,35 @@ import (
 	"time"
 )
 
+// Shape declares how a role's plaintext maps to 0g-storage blobs.
+//
+// Leaf: iData points to one encrypted blob whose plaintext is the role's
+// canonical bytes (e.g. a JSON config file).
+//
+// DirectoryManifest: iData points to a manifest plaintext whose entries
+// each reference their own content blob. Supports per-entry incremental
+// upload. See sealed/internal/manifest.
+type Shape string
+
+const (
+	Leaf              Shape = "leaf"
+	DirectoryManifest Shape = "directory_manifest"
+)
+
+// RoleSpec declares one role this adapter handles. Returned from
+// Framework.Roles(); used by main bootstrap to enumerate roles and by
+// the uploader to pick a per-role encoding path.
+//
+// There is intentionally no "Required" field: sealed treats every role
+// as optional and falls back to adapter defaults when chain has no entry.
+// Mint-time "what owner must provide" is enforced by attestor (a separate
+// codebase and concern), not by the sealed protocol layer. See
+// EVOLUTION_DESIGN §16.10.
+type RoleSpec struct {
+	Name  string
+	Shape Shape
+}
+
 // Framework is the adapter interface every agent framework must implement.
 type Framework interface {
 	// Name returns the static framework identifier, e.g. "openclaw".
@@ -26,14 +55,55 @@ type Framework interface {
 	// status payloads.
 	Version(ctx context.Context) (string, error)
 
-	// Dimensions returns the labels this adapter understands, NOT including
-	// the protocol-level "framework" entry. Order is informational only.
-	Dimensions() []string
+	// Roles returns every role this adapter declares — INCLUDING the
+	// protocol-reserved "framework" role. See EVOLUTION_DESIGN §16.
+	Roles() []RoleSpec
+
+	// Defaults returns the canonical "empty/zero" plaintext for a role.
+	// For DirectoryManifest roles this is an empty manifest (schema_version=1
+	// kind=directory_manifest entries=[]). For Leaf roles that have no
+	// meaningful default (e.g. required roles), implementations return nil.
+	//
+	// Used by:
+	//   - bootstrap: Restore(role, Defaults(role)) when chain lacks the role
+	//   - uploader: compare against EvolutionFor output to decide "plaintext
+	//     equals default → skip upload / delete chain entry"
+	Defaults(role string) []byte
+
 
 	// Restore applies the plaintext bytes for a single dimension to the
 	// adapter's in-memory composed state. Multiple Restore calls must
 	// commute and be idempotent (see EVOLUTION_DESIGN.md 7.2).
+	//
+	// For path-driven roles (§16): Leaf roles write the plaintext directly.
+	// DirectoryManifest roles parse the manifest plaintext but do NOT
+	// fetch entry blobs themselves — caller (bootstrap / uploader) iterates
+	// the parsed manifest and calls RestoreEntry per entry.
 	Restore(ctx context.Context, dim string, plaintext []byte) error
+
+	// LoadEntry returns the plaintext bytes for one entry inside a
+	// DirectoryManifest role. Inverse of RestoreEntry.
+	//
+	// For EntryFile entries, this is the file's raw bytes (with any
+	// adapter-specific stripping, e.g. TOOLS.md platform-injection).
+	// For EntryDir entries, this is the deterministic tar.gz of the
+	// subtree.
+	//
+	// Returns ErrUnsupportedDim if role isn't a DirectoryManifest role.
+	// Returns an OS error if the entry's disk source is missing.
+	LoadEntry(ctx context.Context, role string, path string) ([]byte, error)
+
+	// RestoreEntry writes one entry's plaintext under the role's disk
+	// location. Inverse of LoadEntry. Order-independent and idempotent
+	// across multiple calls (see EVOLUTION_DESIGN.md 7.2).
+	//
+	// For EntryFile-style paths (no trailing "/"): plaintext is the file
+	// bytes; written verbatim.
+	// For EntryDir-style paths (trailing "/"): plaintext is a tar.gz
+	// produced by manifest.PackDir; extracted to <role disk>/<path>.
+	//
+	// Returns ErrUnsupportedDim if role isn't a DirectoryManifest role.
+	RestoreEntry(ctx context.Context, role string, path string, plaintext []byte) error
 
 	// EvolutionFor returns the canonical plaintext bytes representing the
 	// agent's current state for the given dimension. Used by the watcher
@@ -46,6 +116,23 @@ type Framework interface {
 	//
 	// Returns ErrUnsupportedDim for dim names the adapter doesn't handle.
 	EvolutionFor(ctx context.Context, dim string) ([]byte, error)
+
+	// HandleLegacy is called by bootstrap once for every chain iData entry
+	// whose role is NOT in Roles(). Mint-only "ingestion" roles (e.g.
+	// openclaw's `persona`) live here: the adapter translates the legacy
+	// plaintext into the path-driven on-disk artifacts that subsequent
+	// reconciliation cycles will manage.
+	//
+	// Invoked AFTER Restore() for all declared roles (so legacy translation
+	// reliably overwrites adapter Defaults written by Restore(role, nil)).
+	// Idempotent: re-invoking with the same plaintext must produce the same
+	// disk state.
+	//
+	// Unknown legacy role names should be logged and ignored (return nil),
+	// not error — chains may carry experimental roles a given adapter
+	// version doesn't understand, and refusing to start over it is worse
+	// than running with a partial migration.
+	HandleLegacy(ctx context.Context, role string, plaintext []byte) error
 
 	// Start spawns the agent process based on the previously-Restored state.
 	// Returns the upstream URL the proxy should forward to.

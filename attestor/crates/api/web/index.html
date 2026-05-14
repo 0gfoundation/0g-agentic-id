@@ -2651,8 +2651,18 @@ function paintDetail(dep) {
   // implies a sandbox was at least attempted). Hidden during the initial
   // deploy (phase=pending / provisioning-without-sandbox) where it'd race
   // the in-flight worker job and leave the row in a worse state.
+  //
+  // Also hidden in the broken-offline subcases (c=Failed, stuck booting)
+  // where the visible Recreate CTA already drives /retry → SandboxRecreate
+  // — same backend dispatch, so a second danger-styled entry point would
+  // just be a duplicate. Reset only earns its own slot in states where
+  // Recreate WOULDN'T already rebuild: Live (force re-pull on same-tag
+  // image bump), paused (Resume just resurrects existing bytes), or s/m
+  // incomplete (where /retry may skip SandboxRecreate).
   const canReset = ownerMatches && (
-    isLive || isIncomplete || isOffline || phase === 'failed'
+    isLive
+    || isIncomplete
+    || (isOffline && phase === 'stopped')
   );
 
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';

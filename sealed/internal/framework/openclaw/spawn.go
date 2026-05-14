@@ -39,13 +39,18 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("openclaw: no config restored before Start")
 	}
 
-	provider := cfg.persona.Inference.Provider
-	model := cfg.persona.Inference.Model
-	if provider == "" {
-		return framework.StartResult{}, fmt.Errorf("persona.inference.provider missing")
+	// Resolve inference provider+model from the on-disk openclaw.json
+	// that path-driven Restore just wrote. Empty values are not a hard
+	// fail here — openclaw will report the missing config more clearly
+	// at first inference, and the manager will surface that to attestor.
+	pick, err := resolveInferenceFromOpenclawJSON()
+	if err != nil {
+		return framework.StartResult{}, fmt.Errorf("read openclaw.json: %w", err)
 	}
-	if model == "" {
-		return framework.StartResult{}, fmt.Errorf("persona.inference.model missing")
+	provider := pick.Provider
+	model := pick.Model
+	if provider == "" || model == "" {
+		logger.Logf("warn: openclaw.json has no agents.defaults.model.primary; openclaw will fail at first chat")
 	}
 
 	authToken := cachedToken
@@ -59,6 +64,14 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 		if err := writeRuntimeSections(authToken); err != nil {
 			return framework.StartResult{}, err
+		}
+
+		// 0g-compute runtime augmentation: owner specifies "0g-compute"
+		// as a provider name; sealed rewrites that to "openai" with the
+		// 0G router endpoint + compat flags so openclaw can dial it.
+		// No-op for any other provider name.
+		if err := applyZGComputeAugmentation(provider, model); err != nil {
+			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
 		if err := installOpenclaw(cfg.framework.PackageVersion); err != nil {

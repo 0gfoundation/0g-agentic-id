@@ -30,6 +30,7 @@ package openclaw
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -40,6 +41,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/manifest"
 )
 
 const (
@@ -87,12 +89,62 @@ func (a *Adapter) Version(ctx context.Context) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// Dimensions returns the adapter-owned dim labels — NOT including the
-// protocol-reserved "framework" entry (EVOLUTION_DESIGN §7.1). Bootstrap
-// handles framework separately (validates schema_version, picks adapter)
-// and then iterates these for restore + snapshot seeding.
-func (a *Adapter) Dimensions() []string {
-	return []string{"persona", "knowledge", "skills", "ops"}
+// Roles returns the path-driven role set this adapter declares
+// (EVOLUTION_DESIGN §16.2). Five entries:
+//
+//   - "framework"          (leaf)      framework binding metadata
+//   - "openclaw.json"      (leaf)      filtered openclaw config
+//   - "workspace/"         (manifest)  root markdown files
+//   - "workspace/skills/"  (manifest)  each skill subdir is an entry
+//   - "workspace/canvas/"  (manifest)  each top-level item is an entry
+//
+// Path-suffix convention: trailing "/" means manifest, no trailing slash
+// means leaf. This is informational; Shape is authoritative.
+//
+// None of these are sealed-required: missing roles fall back to
+// adapter Defaults() / nil-plaintext Restore. Owner-side mint rules
+// ("which roles must be filled at mint") live in attestor.
+func (a *Adapter) Roles() []framework.RoleSpec {
+	return []framework.RoleSpec{
+		{Name: "framework", Shape: framework.Leaf},
+		{Name: "openclaw.json", Shape: framework.Leaf},
+		{Name: "workspace/", Shape: framework.DirectoryManifest},
+		{Name: "workspace/skills/", Shape: framework.DirectoryManifest},
+		{Name: "workspace/canvas/", Shape: framework.DirectoryManifest},
+	}
+}
+
+// Defaults returns the canonical "empty/zero" plaintext for a role.
+// Used by uploader to decide "plaintext equals default → skip upload /
+// remove chain entry" and by bootstrap to fall back when chain has no
+// entry for a role.
+//
+//   - "framework": current adapter name + whitelistMax version + schema 1
+//   - "openclaw.json": empty JSON object
+//   - manifest roles: empty Manifest (schema_version=1, kind, entries=[])
+func (a *Adapter) Defaults(role string) []byte {
+	switch role {
+	case "framework":
+		fb := frameworkBinding{
+			Name:           "openclaw",
+			PackageVersion: whitelistMax(),
+			SchemaVersion:  1,
+		}
+		b, err := json.Marshal(&fb)
+		if err != nil {
+			return nil
+		}
+		return b
+	case "openclaw.json":
+		return []byte("{}")
+	case "workspace/", "workspace/skills/", "workspace/canvas/":
+		b, err := manifest.New().Marshal()
+		if err != nil {
+			return nil
+		}
+		return b
+	}
+	return nil
 }
 
 // AuthResponse implements framework.Framework. Returns the openclaw

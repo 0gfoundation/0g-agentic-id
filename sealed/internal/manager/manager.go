@@ -200,8 +200,8 @@ func (m *Manager) Reload(ctx context.Context) error {
 
 func (m *Manager) armState(res framework.StartResult) {
 	// Identity / runtime fields. Snapshot data is seeded separately by
-	// bootstrap (via SeedSnapshots) and updated at runtime by the watcher
-	// (UpdateCurrent) — manager doesn't touch snapshots on (re-)start.
+	// bootstrap (via SeedChainSnapshot) and updated at runtime by the watcher
+	// (UpdateCurrentSnapshot) — manager doesn't touch snapshots on (re-)start.
 	m.agent.Set(
 		m.params.AgentSealPriv,
 		res.Upstream,

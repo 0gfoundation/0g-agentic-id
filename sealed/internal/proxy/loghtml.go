@@ -132,12 +132,16 @@ func classifyLine(body string) string {
 		return "fail"
 	case strings.HasPrefix(trim, "OK"):
 		return "ok"
-	case strings.HasPrefix(trim, "iData chain uploaded") ||
+	case strings.HasPrefix(trim, "iData chain") ||
 		strings.HasPrefix(trim, "chain.Update") ||
 		strings.HasPrefix(trim, "0g-storage upload OK"):
 		return "chain"
-	case strings.HasPrefix(trim, "iData drift") ||
-		strings.HasPrefix(trim, "drift:") ||
+	case strings.HasPrefix(trim, "iData local["):
+		if strings.Contains(trim, "DRIFT") {
+			return "drift"
+		}
+		return "default"
+	case strings.HasPrefix(trim, "drift:") ||
 		strings.HasPrefix(trim, "uploader.Push"):
 		return "drift"
 	case strings.HasPrefix(trim, "watcher:"):

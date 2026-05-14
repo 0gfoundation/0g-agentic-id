@@ -46,6 +46,10 @@ test/sealed/
 
 ## 3. 数据模型
 
+> ⚠️ **本章描述初版 5-dim 模型,已被 [§16 路径驱动 iData 结构](#16-路径驱动-idata-结构当前设计) 取代。**
+> §3.2 的"不上链清单"仍然有效,被 §16.7 继承并扩展。其它内容保留作设计史参考,
+> 不再代表当前实现。
+
 ### 3.1 维度
 
 每个 agent 的链上数据被拆成一组固定维度。第一条是协议级别;其余由 adapter
@@ -77,6 +81,11 @@ test/sealed/
 
 
 ## 4. iData Schema
+
+> ⚠️ **本章描述初版 5-dim 模型下 iData entry 的形态。已被 [§16 路径驱动 iData 结构](#16-路径驱动-idata-结构当前设计) 取代。**
+> 链上 `IntelligentData` struct 本身(`dataHash` + `dataDescription`)和加密布局
+> (§5)在新设计下完全保留;变化的是 `dataDescription` 的取值规约(从 5 个固定
+> label 改为路径字符串)和 plaintext 的内部结构(从单 blob 改为可选 manifest)。
 
 每条 iData entry 形态完全相同。**没有 inline 模式,默认值也不是特例**。
 默认值是真实(很小)的加密 blob,有真实 sealedKey,这样 iTransferFrom 的
@@ -296,6 +305,10 @@ for each i in 0..N:
 
 
 ## 7. Framework Adapter 契约
+
+> ⚠️ **本章描述初版 5-dim 模型下的 adapter 接口。已被 [§16 路径驱动 iData 结构](#16-路径驱动-idata-结构当前设计) 中 §16.8 的接口定义取代。**
+> §7.2 的 compose/decompose 顺序无关性约束仍然适用 —— 在新设计中等价于
+> "多个 role 的 Restore 必须满足交换律和幂等性"。
 
 ### 7.1 接口
 
@@ -709,7 +722,479 @@ type RouteRule struct {
 绝大多数场景。
 
 
-## 16. 术语表
+## 16. 路径驱动 iData 结构(当前设计)
+
+§3–§7 描述的 5-dim 模型(framework/persona/knowledge/skills/ops 固定五条)是
+本项目的初版设计。运行后发现它存在两个结构性问题:
+
+1. **dim 边界由"语义分类"和"存储分桶"两个目标同时拉扯,导致归类纠结**
+   (IDENTITY.md 属于 persona 还是 knowledge?canvas/ 属于 skills 还是
+   knowledge?)
+2. **某些 dim 的内容形态是"目录树"而不是"单 JSON"**(workspace/skills/
+   下每个 slug 是独立目录,canvas/ 下是任意文件树),用单 plaintext blob
+   装下整个 dim 既导致增量上传不可能,也容易漏内容(`evoSkills` 漏掉整个
+   workspace/skills/ 目录就是这个问题)。
+
+路径驱动结构用 openclaw 的**物理目录拓扑**直接作为链上 schema 解决这两个
+问题。
+
+### 16.1 设计原则
+
+- **role 字符串 = 磁盘路径**。`role="workspace/skills/"` 对应
+  `~/.openclaw/workspace/skills/`,一一对应,不再做语义分类。
+- **协议层对 role 完全 opaque**。合约的 `IntelligentData.dataDescription`
+  本就是任意字符串、数组变长;attestor、sealed core、链上 indexer 都不
+  解读 role 内容,只按字符串路由。
+- **叶子 blob 和 manifest blob 两种形态**。配置文件、版本号这类小整体
+  用叶子;目录树用 manifest(链上指向一份小目录,目录里再指向若干内容
+  blob)。
+- **framework-agnostic vs framework-specific 分层**。sealed core / 合约 /
+  attestor 协议层完全不依赖 openclaw,以后加 eliza 或自研框架只需要新写
+  一个 adapter 包。
+
+### 16.2 角色命名空间
+
+只有一个协议保留 role,其余由 adapter 声明:
+
+| Role 名 | 形态 | 拥有者 | 备注 |
+| --- | --- | --- | --- |
+| `framework` | 叶子 | 协议级 | framework name + runtime 版本 + 协议 schema 版本。必出现且仅一次 |
+| adapter 声明 | 叶子或 manifest | adapter | 推荐用磁盘路径作为 role 名 |
+
+openclaw adapter 当前声明的 role 集:
+
+| Role 名 | 形态 | 必填? | 磁盘对应 | 内容 |
+| --- | --- | --- | --- | --- |
+| `framework` | 叶子 | ✅ | (无) | `{name, package_version, schema_version}` |
+| `openclaw.json` | 叶子 | ✅ | `~/.openclaw/openclaw.json` | 过滤敏感字段后的整文件 |
+| `workspace/` | manifest | ❌ | `~/.openclaw/workspace/*.md` | 根下 md(SOUL/IDENTITY/AGENTS/USER/TOOLS/MEMORY/DREAMS),每个 md 一个 entry |
+| `workspace/skills/` | manifest | ❌ | `~/.openclaw/workspace/skills/<slug>/` | 每个 skill 子目录一个 entry |
+| `workspace/canvas/` | manifest | ❌ | `~/.openclaw/workspace/canvas/` | canvas 文件/子目录一个 entry |
+
+未来 openclaw 加新顶层目录(假设 `workspace/notebooks/`),adapter 自己声明
+新 role,合约 / attestor / sealed core 完全不动。
+
+"必填"指的是**mint 时**必须存在(owner 没填就拒绝 mint);"可选"role 在 mint
+时如果 owner 没提供内容则**不写 iData 条目**,链上少一条,省 storage 上传费。
+具体语义见 §16.10。
+
+### 16.3 角色命名规约
+
+- 全部小写 ASCII,可含 `/` 和 `.`
+- 保留 role:`framework`(必须出现且仅一次)
+- 路径末尾带 `/` 暗示 directory_manifest 形态,不带 `/` 暗示叶子 blob
+- adapter 不能用 `framework` 作为非协议 role
+- 同一 agent 不能有两个相同 role 的 entry(reader 拒绝启动,见 §8.1)
+
+### 16.4 两种 blob 形态
+
+**叶子 blob** — 链上 iData 直接指向加密的 plaintext。
+
+```
+chain iData {role: "openclaw.json", storage_ptr.root_hash → ROOT_A}
+                                                                ↓
+0g-storage ROOT_A ← AES-GCM(openclaw.json plaintext, data_key)
+```
+
+适用:小、整体替换、内部强耦合的内容(配置文件、版本号)。
+
+**Manifest blob** — 链上 iData 指向一份"目录",目录里再指向若干内容 blob。
+
+```
+chain iData {role: "workspace/skills/", storage_ptr.root_hash → ROOT_M}
+                                                                    ↓
+0g-storage ROOT_M ← AES-GCM(manifest plaintext, data_key)
+                              ↓
+                              entries: [
+                                {path: "airdrop-hunter/", storage_ptr → ROOT_A},
+                                {path: "weather/",        storage_ptr → ROOT_B},
+                              ]
+                                                          ↓
+0g-storage ROOT_A ← AES-GCM(airdrop-hunter.tar.gz, data_key)
+0g-storage ROOT_B ← AES-GCM(weather.tar.gz,        data_key)
+```
+
+适用:任意大、可独立演化、子项数量动态变化的内容(skill 目录、canvas
+文件、未来的 notebooks)。
+
+### 16.5 Manifest plaintext schema
+
+```json
+{
+  "schema_version": 1,
+  "kind": "directory_manifest",
+  "entries": [
+    {
+      "path":         "<相对路径,以 / 结尾表示子目录,否则单文件>",
+      "kind":         "file" | "dir",
+      "content_hash": "0x<sha256 of plaintext bytes or determinism-tarred dir>",
+      "size":         <plaintext 字节数>,
+      "storage_ptr": {
+        "root_hash":  "0x<对应内容 blob 在 0g-storage 上的位置>",
+        "size":       <ciphertext 字节数>
+      }
+    }
+  ]
+}
+```
+
+entries 按 `path` 字典序排。tar 时 header 清零(`mtime/uid/gid/uname/gname`),
+mode 归一化(dir 0755 / file 0644)。这两条保证"同样磁盘状态 → 同样
+plaintext bytes → 同样 sha256",watcher 才能正确判断 drift。
+
+`data_key` 整 role 共用一把:manifest 自己和所有 entries 的内容 blob 用
+同一个 data_key 加密,链上对该 role 只有一把 sealedKey。
+
+### 16.6 增量上传算法
+
+watcher tick(沿用现有机制):
+
+```
+for role in adapter.Roles() + ["framework"]:
+    bytes ← adapter.EvolutionFor(ctx, role)
+    hash  ← sha256(bytes)
+    if hash != currentSnapshot[role]:
+        currentSnapshot[role] = hash
+        OnRoleDrift(role)
+```
+
+watcher 看到的 plaintext = role 的"逻辑内容字节"。叶子是 blob 本身;
+manifest 是 manifest 字节但**entries[].storage_ptr 字段视为空**(因为
+上传前还不知道 ptr)。这样 watcher 算的 hash 跟 uploader 落盘后算的
+hash 一致,不会假阳性。
+
+uploader.Push(role):
+
+```
+adapter_bytes ← adapter.EvolutionFor(ctx, role)
+shape         ← adapter.RoleShape(role)    // "leaf" or "directory_manifest"
+
+if shape == "leaf":
+    ciphertext   ← AES-GCM(adapter_bytes, data_key)
+    storage_root ← 0g-storage.Upload(ciphertext)
+    chain_entry  ← {role, dataHash: sha256(adapter_bytes),
+                    storage_ptr.root_hash: storage_root}
+
+else if shape == "directory_manifest":
+    old_manifest ← download + decrypt 链上当前 role 的 manifest
+    old_index    ← map[path → (content_hash, storage_ptr)] from old_manifest
+
+    cur_manifest ← parse(adapter_bytes)    // entries[].storage_ptr 为空
+
+    for e in cur_manifest.entries:
+        if old_index[e.path].content_hash == e.content_hash:
+            e.storage_ptr = old_index[e.path].storage_ptr     # 复用
+        else:
+            content_pt   ← adapter.LoadEntry(role, e.path)   # 读盘
+            content_ct   ← AES-GCM(content_pt, data_key)
+            content_root ← 0g-storage.Upload(content_ct)
+            e.storage_ptr = {root_hash: content_root, size: len(content_ct)}
+
+    manifest_pt   ← json.Marshal(cur_manifest)               // 含 storage_ptr
+    manifest_ct   ← AES-GCM(manifest_pt, data_key)
+    manifest_root ← 0g-storage.Upload(manifest_ct)
+    chain_entry   ← {role, dataHash: sha256(adapter_bytes),
+                     storage_ptr.root_hash: manifest_root}
+
+# label-keyed merge + chain.Update + RecordChainUpload(沿用 §6.2)
+```
+
+**data_key 复用**:同一 role 的 data_key 一次生成、永远复用。Push 时从
+`sealedKeysOf` 解出旧 data_key,加密新内容,sealedKey 不变。AES-GCM 安全
+要求每次加密用新 nonce,这点 `dataplane.Encrypt` 已经保证(随机 12 字节
+nonce)。
+
+### 16.7 排除清单(继承 §3.2 + 新增)
+
+| 路径 | 排除理由 |
+| --- | --- |
+| `~/.openclaw/agents/<id>/auth-profiles.json` | Channel 凭据(同 §3.2) |
+| `~/.openclaw/workspace/memory/YYYY-MM-DD.md` | 每日流水(同 §3.2) |
+| `~/.openclaw/agents/<id>/codex-home/` | 推理引擎运行时状态 |
+| `~/.openclaw/agents/<id>/sessions/` | 对话流水(同 §3.2) |
+| `~/.openclaw/credentials/` | 通道凭据 |
+| `~/.openclaw/skills/`(顶层) | 用户级 managed skill,跨工作区共享,不属 agent |
+| `openclaw.json: auth.profiles.*.credentials` | 凭据(由 dashboard 现填) |
+| `openclaw.json: models.providers.*.apiKey` 的 value | 同上(允许保留 `{source:env, id:...}` 引用) |
+| `openclaw.json: gateway.*` | 每次容器启动重新生成 |
+| `openclaw.json: logging / diagnostics` | 运行时配置 |
+
+`openclaw.json` 上链前 adapter 必须按这张表过滤掉敏感字段。
+
+### 16.8 framework-agnostic 协议层 vs framework-specific 适配层
+
+为后续支持非 openclaw framework(eliza、自研 X)预留扩展边界,明确分层:
+
+**Framework-agnostic(任何 framework 共用,不动)**
+
+| 模块 | 内容 |
+| --- | --- |
+| 合约 `AgenticID` | `IntelligentData{dataHash, dataDescription}` 数组,变长,role 字符串完全 opaque |
+| attestor mint API | 接收 `framework: string + roles: map[string]bytes`,逐对加密上传 + 链上 register,不解读 role 名也不解读 plaintext |
+| sealed `state` | 按 role 字符串维护 snapshot 对(`chainSnapshot[role]`、`currentSnapshot[role]`) |
+| sealed `watcher` | 按 `adapter.Roles()` 列表轮询 hash,role 字符串透明 |
+| sealed `uploader` | label-keyed merge + chain.Update,role 字符串透明 |
+| Manifest schema | `directory_manifest` / `single_blob` 两种 kind,跨 framework 通用 |
+
+**Framework-specific(每个 framework 自己实现一个 adapter package)**
+
+| 接口 | 职责 |
+| --- | --- |
+| `Roles() []RoleSpec` | 替代旧 `Dimensions()`,返回 `{name, shape, required}` 列表 |
+| `RoleShape(role) Shape` | 返回 leaf / directory_manifest |
+| `EvolutionFor(role) []byte` | 读盘 → 确定性序列化 → 返回 watcher 看的字节 |
+| `LoadEntry(role, path) []byte` | 仅 manifest role 用:读单个 entry 的内容 plaintext |
+| `Restore(role, plaintext) error` | 反向操作:plaintext → 写盘 |
+| `RestoreEntry(role, path, plaintext)` | 仅 manifest role 用:把单个 entry 内容写到磁盘对应位置 |
+| `RequiredRoles() []string` | mint 时必须存在的 role(openclaw 给 `["framework", "openclaw.json"]`) |
+| `Defaults(role) []byte` | 链上某 role 缺失时的回退 plaintext |
+| `Filter(role, raw_plaintext) []byte` | 上链前过滤敏感字段(`openclaw.json` 走这条) |
+
+**加新 framework 的步骤**
+
+1. `sealed/internal/framework/<name>/` 新建包,实现 `Framework` 接口
+2. 在 `main.go` 用 `framework.Register("<name>", adapter)` 注册
+3. 容器以新 framework 启动(`framework` role 的 plaintext 里 `name: "<name>"`)
+4. attestor 侧:为新 framework 提供 mint 表单 schema(可以是 adapter
+   暴露的 JSON Schema 文件,attestor 据此校验 owner 输入,但不解读
+   plaintext 内容本身)
+
+合约、indexer、链上结构 0 改动。
+
+### 16.9 一个完整示例
+
+agent "Sage" 装了 openclaw 5.3.2 + 一个 `airdrop-hunter` skill。链上看到:
+
+```
+intelligentDatasOf(42) = [
+  { role: "framework",
+    dataHash: 0x7f8e..., storage_ptr.root_hash: 0xa1b2... },
+  { role: "openclaw.json",
+    dataHash: 0x4c3d..., storage_ptr.root_hash: 0xb2c3... },
+  { role: "workspace/",
+    dataHash: 0x9e8f..., storage_ptr.root_hash: 0xc3d4... },   # manifest
+  { role: "workspace/skills/",
+    dataHash: 0x6b5a..., storage_ptr.root_hash: 0xd4e5... },   # manifest
+]
+
+sealedKeysOf(42) = [
+  {dataHash: 0x7f8e..., sealedKey: ECIES(framework_data_key)},
+  {dataHash: 0x4c3d..., sealedKey: ECIES(openclaw_json_data_key)},
+  {dataHash: 0x9e8f..., sealedKey: ECIES(workspace_data_key)},
+  {dataHash: 0x6b5a..., sealedKey: ECIES(skills_data_key)},
+]
+```
+
+下载并解密 `workspace/skills/` 的 manifest(0xd4e5...):
+
+```json
+{
+  "schema_version": 1,
+  "kind": "directory_manifest",
+  "entries": [
+    { "path": "airdrop-hunter/",
+      "kind": "dir",
+      "content_hash": "0xabc...",
+      "size":         42100,
+      "storage_ptr":  { "root_hash": "0x9f8e7d6c...", "size": 42376 } }
+  ]
+}
+```
+
+继续下载并解密 `0x9f8e7d6c...` 得到 airdrop-hunter 整个目录的 tar.gz。
+
+agent 改了 `airdrop-hunter/scripts/sweep.ts` 一行,下次 Push 后链上变化:
+
+- iData[3] 的 `dataHash` 和 `storage_ptr.root_hash` 更新(新 manifest)
+- 0g-storage 多 2 个 blob(新 airdrop-hunter.tar.gz + 新 manifest)
+- 其余 iData 和 sealedKey 一字节不动
+
+
+### 16.10 默认值与省钱语义
+
+mint 时和 evolution 时都遵循一条原则:**plaintext 等于"零值/默认"的 role 不
+上链**。
+
+#### Mint 行为
+
+attestor 在 mint 时**不感知 openclaw 的配置 schema**(它服务多框架,持有
+openclaw 的字段名/嵌套结构是耦合污染)。所以 mint 上链的 iData 只有两条:
+
+- **`framework`**:attestor 自动填(`{name, package_version, schema_version}`)
+- **`persona`**(语义 mint-only role):owner 选的 `system_prompt + inference`
+  打成一个不依赖具体框架的 JSON。是 attestor 唯一会主动 mint 的"用户输入"
+  载体。
+
+二者都必填。owner 没填 persona → 拒绝 mint。
+
+`persona` 不进 `adapter.Roles()`,不进 evolution 循环 — 它在 sealed 容器
+**首次启动**时被 adapter 一次性翻译成路径驱动的磁盘 artifacts,然后通过一次
+"整数组替换"型 `chain.Update` 把 persona 移出链上、把翻译产物以路径驱动
+role 形式写入。详见 §16.11。
+
+**典型默认 mint(owner 只填 provider + model + system prompt):**
+
+```
+mint 上链 iData 共 2 条:
+  [0] role="framework"  (~150 B plaintext,attestor 自动填)
+  [1] role="persona"    (~250 B plaintext,owner 输入打包)
+
+0g-storage 上传 2 次(framework + persona 的密文 blob)
+```
+
+容器首次启动、adapter 翻译完 persona、整数组替换 push 之后:
+
+```
+chain iData 共 3 条:
+  [0] role="framework"      (与 mint 时一致,沿用旧 dataKey/sealedKey)
+  [1] role="openclaw.json"  (~400 B,persona.inference 翻译而来)
+  [2] role="workspace/"     (manifest 含 SOUL.md 一条 entry,来自
+                             persona.system_prompt)
+  ↑ persona 不再出现,被新数组替换掉
+
+0g-storage 总上传 = mint 时 2 次 + ingestion 时 3 次(openclaw.json +
+                    workspace/ manifest + SOUL.md blob)
+```
+
+注意 `chain.Update` 是 **wholesale 整数组替换**,不存在"按 role 删一条"的
+原语;ingestion 是把 newDatas 构造为 `[framework, openclaw.json, workspace/]`
+不含 persona,提交后 persona 就从链上消失了。
+
+**`workspace/skills/` 和 `workspace/canvas/` 默认 mint 时不存在**,首启
+ingestion 也不会主动创建。owner 第一次通过 dashboard 装个 skill → watcher
+检测到磁盘多了文件 → uploader 第一次 push `workspace/skills/` role →
+chain.Update **新增**一条 iData(label-keyed merge,见 §6.2)。
+
+#### Bootstrap 行为(可选 role 缺失)
+
+```go
+for _, role := range adapter.Roles() {
+    var pt []byte
+    if e := findEntry(chain_entries, role.Name); e != nil {
+        pt = e.Plaintext            // 链上有,取出 plaintext
+    }
+    // pt == nil 表示链上无对应 iData
+    if err := adapter.Restore(ctx, role.Name, pt); err != nil {
+        return err
+    }
+}
+```
+
+`adapter.Restore(role, nil)` 表示"链上没这条":
+
+- 叶子 role(如 `openclaw.json`):理论上必填,nil 时 adapter **拒绝启动**
+  (必填 role 缺失等于 chain 损坏)
+- manifest role(如 `workspace/`):nil 时按"空 manifest"处理。adapter 内部
+  可以做防御性 disk 初始化(例如 touch 空的 SOUL.md/AGENTS.md 等空文件,
+  防止 openclaw 的 `writeFileIfMissing` 自动塞 8KB 模板污染后续 watcher
+  快照)。这部分是 framework-specific 细节,协议层不感知。
+
+#### Push 行为(plaintext 等于默认 → 删 iData)
+
+```
+plaintext  ← adapter.EvolutionFor(role)
+defaults_pt ← adapter.Defaults(role)        # 例如空 manifest
+
+if sha256(plaintext) == sha256(defaults_pt):
+    if chain has iData[role]:
+        chain.Update(newEntries 不含该 role)    # 主动删条目
+    else:
+        no-op
+    return
+
+# 否则正常 push:加密 + 0g-storage upload + chain.Update
+```
+
+这保证不变量:**plaintext = defaults ↔ 链上无 iData 条目**。owner 把所有
+skill 删光后,链上 `workspace/skills/` 那条 iData 也会被删掉,不留空壳。
+
+#### 例外:`openclaw.json` 的 settle drift
+
+openclaw 启动后会把内置 defaults 写回 `~/.openclaw/openclaw.json`(例如
+默认 `memory` 引擎选择)。`openclawSettleDelay`(main.go:430)就是为了
+等 openclaw 把这些 default 字段落盘后**再**捕获 watcher baseline,这样
+owner 没主动改任何东西时 watcher 不会误以为漂移、不会触发无意义 push。
+这条机制在新设计下继续生效,不变。
+
+
+### 16.11 Mint-only ingestion roles
+
+attestor 服务多框架(openclaw / LangChain / 自定义...)的前提是它不能持有
+任何一个框架的具体配置 schema:一旦 attestor 知道 `agents.defaults.model
+.primary` 这种 openclaw 专属字段名,新增一个框架就得改 attestor 代码。
+
+所以 attestor mint 时只能产出 **framework-agnostic** 的 iData。但 §16.2 的
+路径驱动 role 集是 **framework-specific** 的(`openclaw.json`、`workspace/`
+都是 openclaw 的磁盘路径)。两个要求冲突。
+
+解法是引入一类"协议级语义 role"——它们只出现在 mint TX 中,容器首启时
+由 adapter 翻译成本框架特有的路径驱动 role,然后被一次"整数组替换"
+type 的 `chain.Update` 从链上抹掉。
+
+#### openclaw 的 `persona` role
+
+openclaw adapter 声明 `persona` 是它的 mint-only ingestion role,plaintext
+shape:
+
+```json
+{
+  "system_prompt": "You are Sage. DeFi helper\n",
+  "inference": {"provider": "anthropic", "model": "claude-opus-4-6"}
+}
+```
+
+attestor 不知道这段 JSON 会变成什么——只知道把 owner 表单字段往这个
+shape 里塞、加密、上传、写 iData。这层抽象是双方契约。
+
+容器首启时 sealed bootstrap 检测链上有 `persona` 条目 →
+`adapter.IngestPersona(plaintext)` 翻译到磁盘:
+
+- `persona.system_prompt`  → `~/.openclaw/workspace/SOUL.md`
+- `persona.inference`      → `~/.openclaw/openclaw.json` 的
+                              `agents.defaults.model.primary` +
+                              `auth.{order, profiles}`
+
+随后 sealed 调一次 `uploader.IngestUpdate(keep, rebuild)`:
+
+- `keep = ["framework"]` — 沿用现有 chain 条目(同样的 dataHash / dataKey
+  / sealedKey,省一次加密上传)
+- `rebuild = ["openclaw.json", "workspace/"]` — `EvolutionFor` 读盘 + 加密
+  + 0g-storage 上传 + 拼 IntelligentData
+- newDatas = keep + rebuild 拼出来的 3 条,**不含 persona**
+- 提交一次 `chain.Update(tokenID, newDatas, newSealedKeys, agentSealPriv)`
+
+提交成功后链上就是 `[framework, openclaw.json, workspace/]`,persona 被
+新数组替换掉。
+
+#### 后续 boot 的判据
+
+ingestion 分支以 **"链上是否存在 persona 条目"** 为开关:首次 push 之后链上
+没有 persona → 分支跳过 → 走标准路径驱动 Restore 循环。判据不需要额外的
+marker / migration version / 状态机,因为"persona 存在与否"自身就是状态。
+
+#### 崩溃恢复语义
+
+ingestion 的两个 side effect(磁盘写、链上 push)按顺序发生:
+
+1. `IngestPersona` 写磁盘 — 纯本地 op,可重做
+2. `IngestUpdate` 提交 chain.Update — 单 tx,原子
+
+如果在 1 与 2 之间崩了 → 下次 boot 链上仍有 persona → 再走一次 ingestion →
+磁盘再写一遍(幂等,字节级相同)→ 再提交。第二次提交成功后链上变正常。
+如果 2 提交成功但容器在 RecordChainUpload 前死了 → 下次 boot 链上已经没
+persona → 走标准路径,内存 snapshot 也由 phase-1 seed 重新捕获。任何中间
+状态都能从 mint 状态 + 链上当前状态恢复。
+
+#### 适用面
+
+`persona` 是 openclaw 当前唯一的 mint-only ingestion role。别的 framework
+adapter 各自决定要不要声明类似的 role(LangChain 可能用 `chain_spec`,
+自定义 framework 可能不需要)。**协议层不关心** mint-only role 的名字、
+schema 或翻译规则 — 只要 adapter 实现 `IngestXxx(plaintext) error` +
+caller 在 bootstrap 里检测并调用,所有路径驱动 invariants 都成立。
+
+
+## 17. 术语表
 
 - **agent_seal_priv / agent_seal_pubkey**:每个 agent 由 trusted attestor
   派生的 secp256k1 密钥对,在所有 bootstrap 同一 agent 的 sandbox 间稳定。

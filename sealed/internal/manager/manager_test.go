@@ -29,11 +29,23 @@ type fakeAdapter struct {
 	exitCB func(err error)
 }
 
-func (f *fakeAdapter) Name() string                                                 { return "fake" }
-func (f *fakeAdapter) Version(ctx context.Context) (string, error)                  { return "1.0", nil }
-func (f *fakeAdapter) Dimensions() []string                                          { return []string{"config"} }
-func (f *fakeAdapter) Restore(ctx context.Context, dim string, p []byte) error       { return nil }
-func (f *fakeAdapter) EvolutionFor(ctx context.Context, dim string) ([]byte, error)  { return nil, nil }
+func (f *fakeAdapter) Name() string                                            { return "fake" }
+func (f *fakeAdapter) Version(ctx context.Context) (string, error)             { return "1.0", nil }
+func (f *fakeAdapter) Roles() []framework.RoleSpec {
+	return []framework.RoleSpec{{Name: "config", Shape: framework.Leaf}}
+}
+func (f *fakeAdapter) Defaults(string) []byte                                  { return nil }
+func (f *fakeAdapter) Restore(ctx context.Context, dim string, p []byte) error { return nil }
+func (f *fakeAdapter) HandleLegacy(context.Context, string, []byte) error      { return nil }
+func (f *fakeAdapter) EvolutionFor(ctx context.Context, dim string) ([]byte, error) {
+	return nil, nil
+}
+func (f *fakeAdapter) LoadEntry(context.Context, string, string) ([]byte, error) {
+	return nil, framework.ErrUnsupportedDim
+}
+func (f *fakeAdapter) RestoreEntry(context.Context, string, string, []byte) error {
+	return framework.ErrUnsupportedDim
+}
 func (f *fakeAdapter) Readiness(ctx context.Context) error                           { return nil }
 func (f *fakeAdapter) AuthResponse(ctx context.Context) (any, error)                 { return map[string]any{}, nil }
 

@@ -4,15 +4,15 @@
 //
 // This is the "agent -> state" half of the evolution pipeline:
 //
-//	watcher (this) -> state.UpdateCurrent -> (proxy /hello picks up new hash)
+//	watcher (this) -> state.UpdateCurrentSnapshot -> (proxy /hello picks up new hash)
 //	                                        ↓
 //	                                    evaluator decides upload
 //	                                        ↓
 //	                                    uploader -> state.RecordChainUpload
 //
 // Watcher does NOT decide whether to upload -- that's the evaluator's job.
-// Watcher's only mutation is state.UpdateCurrent. Logging in state's
-// UpdateCurrent makes drift visible without watcher needing to log.
+// Watcher's only mutation is state.UpdateCurrentSnapshot. Logging in state's
+// UpdateCurrentSnapshot makes drift visible without watcher needing to log.
 package watcher
 
 import (
@@ -40,13 +40,18 @@ type Config struct {
 	// Interval between poll cycles. Default: 30s.
 	Interval time.Duration
 
-	// OnDimDrift, if non-nil, is invoked once per drifted dim per tick
-	// (not when a dim stays stable). Hands off to the bootstrap layer
-	// for dim-specific reactions: framework drift triggers
-	// reconcile + manager.Reload; other dims may schedule an iData
-	// chain push via the uploader. Errors thrown by the callback are
-	// the caller's responsibility — watcher just dispatches.
-	OnDimDrift func(dim string)
+	// OnDrift, if non-nil, is invoked exactly once per tick whenever
+	// at least one role's disk hash differs from chainSnapshot
+	// (current != chain). Receives the full plaintext map captured
+	// this tick so the handler can route framework drift specially
+	// AND call uploader.Apply with the same plaintexts without re-
+	// reading disk. drifted is the subset of roles that triggered
+	// the fire; handler decides what to do with each.
+	//
+	// No fire on stable ticks (all roles in sync). Errors thrown by
+	// the callback are the caller's responsibility — watcher just
+	// dispatches.
+	OnDrift func(plaintexts map[string][]byte, drifted []string)
 }
 
 func (c *Config) applyDefaults() {
@@ -102,30 +107,35 @@ func (w *Watcher) Stop() {
 	w.once.Do(func() { close(w.stopCh) })
 }
 
-// dimsToPoll returns the protocol-reserved "framework" plus every adapter-
-// owned dim. framework drift detection is critical (catches dashboard
-// upgrades / npm version drift) and the adapter's Dimensions() doesn't
-// include it (per EVOLUTION_DESIGN §7.1), so we prepend it here.
+// dimsToPoll returns the role names this watcher should poll on every
+// tick — exactly the role set the adapter declares (path-driven; see
+// EVOLUTION_DESIGN §16.2). "framework" is included by adapter.Roles(),
+// not prepended separately, since it's just one role among others now.
 func (w *Watcher) dimsToPoll() []string {
-	return append([]string{"framework"}, w.adapter.Dimensions()...)
+	roles := w.adapter.Roles()
+	out := make([]string, 0, len(roles))
+	for _, r := range roles {
+		out = append(out, r.Name)
+	}
+	return out
 }
 
-// tick runs a single poll cycle: for each dim, ask adapter for current
-// canonical bytes, sha256, push to state if drifted. Errors are logged
-// per-dim and don't abort the cycle.
+// tick runs a single poll cycle: for each declared role, read disk via
+// EvolutionFor, hash it, advance currentSnapshot, and remember the
+// plaintext. After visiting every role, fire OnDrift exactly once with
+// the (plaintexts, drifted) pair if anything actually diverged from
+// chainSnapshot.
 //
-// At the end of each tick we emit a single-line summary so /log readers
-// can see "watcher is alive and these are the current per-dim hashes"
-// even when there's no drift. Drift events get their own detailed log
-// from state.UpdateCurrent.
+// One summary log line per tick — drift roles marked with `!`.
 func (w *Watcher) tick(ctx context.Context) {
-	type dimHash struct {
+	type dimResult struct {
 		dim     string
 		hash    string
 		size    int
 		drifted bool
 	}
-	results := make([]dimHash, 0, 5)
+	results := make([]dimResult, 0, 5)
+	plaintexts := make(map[string][]byte, 5)
 
 	for _, dim := range w.dimsToPoll() {
 		bytes, err := w.adapter.EvolutionFor(ctx, dim)
@@ -137,37 +147,31 @@ func (w *Watcher) tick(ctx context.Context) {
 			continue
 		}
 		hash := sha256Hex(bytes)
-		drifted := w.agent.UpdateCurrent(dim, hash)
-		results = append(results, dimHash{dim, hash, len(bytes), drifted})
+		drifted := w.agent.UpdateCurrentSnapshot(dim, hash)
+		results = append(results, dimResult{dim, hash, len(bytes), drifted})
+		plaintexts[dim] = bytes
 	}
 
-	// Single summary line per tick. Drift dims marked with !; stable dims
-	// just show their truncated hash + plaintext size.
 	var parts []string
-	driftCount := 0
+	var driftedRoles []string
 	for _, r := range results {
 		marker := ""
 		if r.drifted {
 			marker = "!"
-			driftCount++
+			driftedRoles = append(driftedRoles, r.dim)
 		}
 		parts = append(parts, fmt.Sprintf("%s%s=%s/%dB", marker, r.dim, r.hash[:8], r.size))
 	}
-	if driftCount > 0 {
-		logger.Logf("watcher: tick -- %d drifted: %s", driftCount, strings.Join(parts, " "))
+	if len(driftedRoles) > 0 {
+		logger.Logf("watcher: tick -- %d drifted: %s", len(driftedRoles), strings.Join(parts, " "))
 	} else {
 		logger.Logf("watcher: tick -- stable: %s", strings.Join(parts, " "))
 	}
 
-	// Dispatch drift callbacks AFTER logging so the summary line prints
-	// even if a callback panics (recover would still let other handlers
-	// run, but visibility into "what drifted" is preserved either way).
-	if w.cfg.OnDimDrift != nil {
-		for _, r := range results {
-			if r.drifted {
-				w.cfg.OnDimDrift(r.dim)
-			}
-		}
+	// Single dispatch after logging so the summary always lands even if
+	// the callback panics.
+	if w.cfg.OnDrift != nil && len(driftedRoles) > 0 {
+		w.cfg.OnDrift(plaintexts, driftedRoles)
 	}
 }
 

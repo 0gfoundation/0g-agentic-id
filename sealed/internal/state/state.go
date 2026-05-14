@@ -121,8 +121,9 @@ func (a *Agent) SetPhase(p Phase) {
 }
 
 // Set arms identity + runtime fields (called by manager on start / restart).
-// Snapshot data is NOT touched here -- bootstrap seeds via SeedSnapshots and
-// runtime watchers update via UpdateCurrent.
+// Snapshot data is NOT touched here -- bootstrap seeds chainSnapshot via
+// SeedChainSnapshot and the watcher advances currentSnapshot via
+// UpdateCurrentSnapshot.
 //
 // Transitions phase to PhaseRunning.
 func (a *Agent) Set(priv []byte, upstream, sealID, owner string) {
@@ -151,66 +152,104 @@ func (a *Agent) Clear() {
 
 // ── Snapshot management ─────────────────────────────────────────────────────
 
-// SeedSnapshots initialises both chainSnapshot and currentSnapshot for a
-// dimension. Called by bootstrap once per dim. Both snapshots start equal
-// so subsequent watcher tick comparisons see no drift on first poll.
+// SeedChainSnapshot installs the chain side of a dim's snapshot. Bootstrap
+// calls this exactly once per known role:
 //
-// contentHash is sha256(plaintext). dataHash is the 0g-storage root hex
-// from the iData entry on chain -- or "" when the dim is not on chain
-// (default mint may produce only framework + persona; absent dims have
-// empty dataHash and uploader will add them on first meaningful drift).
+//   - role present on chain: contentHash = sha256(decrypted plaintext from
+//     chain), dataHash = chain entry's 0g-storage root hex.
+//   - role absent from chain: contentHash = sha256(adapter.Defaults(role)),
+//     dataHash = "" (sentinel for "no entry yet"). This makes §16.10's
+//     invariant "plaintext = defaults ↔ no chain entry" naturally express
+//     itself in the reconcile loop: when disk hashes to Defaults the
+//     comparison against chainSnapshot is automatically equal.
 //
-// Logs also show whether this is a no-op (re-seed with identical content,
-// e.g. baseline didn't shift between pre- and post-settle pass) for
-// debug clarity.
-func (a *Agent) SeedSnapshots(dim, contentHash, dataHash string) {
+// currentSnapshot is left alone — phase 1 seed reads disk via EvolutionFor
+// and calls UpdateCurrentSnapshot per role to populate it.
+//
+// chainSnapshot is otherwise advanced only by RecordChainUpload after a
+// confirmed chain.Update tx.
+func (a *Agent) SeedChainSnapshot(dim, contentHash, dataHash string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	prev, exists := a.currentSnapshot.PerDim[dim]
-	entry := DimEntry{ContentHash: contentHash, DataHash: dataHash}
-	a.chainSnapshot.PerDim[dim] = entry
-	a.currentSnapshot.PerDim[dim] = entry
+	prev, exists := a.chainSnapshot.PerDim[dim]
+	a.chainSnapshot.PerDim[dim] = DimEntry{ContentHash: contentHash, DataHash: dataHash}
 
-	chainStatus := "off-chain"
+	status := "placeholder (no on-chain entry)"
 	if dataHash != "" {
-		chainStatus = "on-chain " + shortHash(dataHash)
+		status = "pinned (data=" + shortHash(dataHash) + ")"
 	}
 	switch {
 	case !exists:
-		logger.Logf("iData seed[init]: dim=%s content=%s %s", dim, shortHash(contentHash), chainStatus)
-	case prev.ContentHash == contentHash:
-		logger.Logf("iData seed[stable]: dim=%s content=%s %s (no shift)", dim, shortHash(contentHash), chainStatus)
+		logger.Logf("iData chain: dim=%s hash=%s %s", dim, shortHash(contentHash), status)
+	case prev.ContentHash == contentHash && prev.DataHash == dataHash:
+		logger.Logf("iData chain: dim=%s hash=%s %s (no change)", dim, shortHash(contentHash), status)
 	default:
-		logger.Logf("iData seed[shift]: dim=%s content %s -> %s %s",
-			dim, shortHash(prev.ContentHash), shortHash(contentHash), chainStatus)
+		logger.Logf("iData chain: dim=%s hash=%s (was %s) %s",
+			dim, shortHash(contentHash), shortHash(prev.ContentHash), status)
 	}
 }
 
-// UpdateCurrent advances the current snapshot for a dimension. Returns
-// true if the content hash actually changed (caller can use this for
-// summary logging). Called by the watcher when adapter.EvolutionFor
-// reveals a content hash that differs from currentSnapshot's last value.
+// UpdateCurrentSnapshot advances currentSnapshot for a dim. Always writes
+// the new contentHash; returns true iff it diverges from chainSnapshot
+// (current ≠ chain — the canonical "drift" signal driving Apply retries).
 //
-// chain snapshot is intentionally NOT touched -- only RecordChainUpload
-// can move it forward, and only after a confirmed tx.
-func (a *Agent) UpdateCurrent(dim, contentHash string) bool {
+// This is reconciliation semantics, not change-tracking: returning false
+// means "in sync with chain" even when the value did change between two
+// polls (e.g. settle drift bounced back to chain's value). Returning true
+// means "chain.Update should be attempted to push the new contentHash";
+// failed Apply leaves chainSnapshot stale, so the next tick will still
+// see drift and retry automatically.
+//
+// chainSnapshot is intentionally NOT touched — only RecordChainUpload
+// advances it, and only after a confirmed tx.
+func (a *Agent) UpdateCurrentSnapshot(dim, contentHash string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	prev := a.currentSnapshot.PerDim[dim]
-	if prev.ContentHash == contentHash {
-		return false
-	}
 	chain := a.chainSnapshot.PerDim[dim]
+
 	a.currentSnapshot.PerDim[dim] = DimEntry{
 		ContentHash: contentHash,
-		// DataHash carries forward; it'll be replaced once this contentHash
-		// gets uploaded and chain confirms a new storage root.
+		// DataHash carries forward; RecordChainUpload bumps it after upload.
 		DataHash: prev.DataHash,
 	}
-	logger.Logf("iData drift: dim=%s content %s -> %s (chain still %s, dataHash=%s)",
-		dim, shortHash(prev.ContentHash), shortHash(contentHash),
-		shortHash(chain.ContentHash), shortHash(chain.DataHash))
-	return true
+
+	drifted := chain.ContentHash != contentHash
+	if prev.ContentHash != contentHash {
+		chainLabel := "placeholder"
+		if chain.DataHash != "" {
+			chainLabel = "pinned"
+		}
+		verdict := "MATCH"
+		if drifted {
+			verdict = "DRIFT"
+		}
+		if prev.ContentHash == "" {
+			logger.Logf("iData local[init]: dim=%s hash=%s chain=%s (%s) -> %s",
+				dim, shortHash(contentHash),
+				shortHash(chain.ContentHash), chainLabel, verdict)
+		} else {
+			logger.Logf("iData local[change]: dim=%s hash=%s (prev=%s) chain=%s (%s) -> %s",
+				dim, shortHash(contentHash), shortHash(prev.ContentHash),
+				shortHash(chain.ContentHash), chainLabel, verdict)
+		}
+	}
+	return drifted
+}
+
+// ChainEntry returns a copy of the chainSnapshot entry for a dim, or
+// zero-value DimEntry when no entry exists.
+func (a *Agent) ChainEntry(dim string) DimEntry {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.chainSnapshot.PerDim[dim]
+}
+
+// CurrentEntry returns a copy of the currentSnapshot entry for a dim.
+func (a *Agent) CurrentEntry(dim string) DimEntry {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.currentSnapshot.PerDim[dim]
 }
 
 // RecordChainUpload syncs the chain snapshot for a dimension. Called by the
