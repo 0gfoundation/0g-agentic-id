@@ -169,9 +169,10 @@ func (a *Adapter) loadEntryWorkspace(path string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("openclaw.LoadEntry[workspace/]: read %s: %w", full, err)
 	}
-	// TOOLS.md must return the STRIPPED content so its hash matches what
-	// EvolutionFor produces. See evolution_paths.go evoWorkspace.
-	if path == "TOOLS.md" {
+	// Strip any sealed-injected section so the returned plaintext matches
+	// what EvolutionFor would hash. Files without markers are unaffected.
+	// See evoWorkspace for the mirrored strip on the hash path.
+	if strings.HasSuffix(path, ".md") {
 		content = stripPlatformInjection(content)
 	}
 	return content, nil

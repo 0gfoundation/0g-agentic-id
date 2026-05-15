@@ -82,13 +82,14 @@ func (a *Adapter) evoWorkspace() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("openclaw evoWorkspace: read %s: %w", full, err)
 		}
-		// TOOLS.md special case: strip the per-boot platform-injected
-		// section (CORS / public URL guidance) before hashing. The
-		// spawn-time helper upsertPlatformSection adds it back to disk
-		// after Restore, so the chain payload stays platform-neutral.
-		if e.Name() == "TOOLS.md" {
-			content = stripPlatformInjection(content)
-		}
+		// Strip any sealed-injected platform section (marker-delimited)
+		// before hashing. spawn-time upserts re-add it after Restore, so
+		// the chain payload stays platform-neutral. Files without the
+		// markers pass through unchanged (stripPlatformInjection is a
+		// no-op on those). Running unconditionally on every workspace md
+		// is the future-proof shape: any new sealed-injected file picks
+		// up the strip without further wiring.
+		content = stripPlatformInjection(content)
 		// Empty md is not tracked — Restore's template-defense touch
 		// creates zero-byte files for required md names, and openclaw
 		// 5.x writes empty placeholders for some on first boot. Treating

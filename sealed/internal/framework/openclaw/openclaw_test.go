@@ -57,7 +57,7 @@ func TestStripPlatformInjection_MissingEndMarker(t *testing.T) {
 
 func TestUpsertPlatformSection_FreshFile(t *testing.T) {
 	tmp := t.TempDir() + "/TOOLS.md"
-	if err := upsertPlatformSection(tmp, platformCaps{publicURL: "http://8080-x.example.com:4000"}); err != nil {
+	if err := upsertToolsMD(tmp, platformCaps{publicURL: "http://8080-x.example.com:4000"}); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -78,7 +78,7 @@ func TestUpsertPlatformSection_PreservesOwnerContent(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte(owner), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertPlatformSection(tmp, platformCaps{publicURL: "http://x.example.com"}); err != nil {
+	if err := upsertToolsMD(tmp, platformCaps{publicURL: "http://x.example.com"}); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -98,7 +98,7 @@ func TestUpsertPlatformSection_Idempotent(t *testing.T) {
 	}
 	url := "http://8080-test.example.com"
 	for i := 0; i < 3; i++ {
-		if err := upsertPlatformSection(tmp, platformCaps{publicURL: url}); err != nil {
+		if err := upsertToolsMD(tmp, platformCaps{publicURL: url}); err != nil {
 			t.Fatalf("upsert iter %d: %v", i, err)
 		}
 	}
@@ -113,10 +113,10 @@ func TestUpsertPlatformSection_Idempotent(t *testing.T) {
 
 func TestUpsertPlatformSection_EmptyURLStripsSection(t *testing.T) {
 	tmp := t.TempDir() + "/TOOLS.md"
-	if err := upsertPlatformSection(tmp, platformCaps{publicURL: "http://x.example.com"}); err != nil {
+	if err := upsertToolsMD(tmp, platformCaps{publicURL: "http://x.example.com"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertPlatformSection(tmp, platformCaps{}); err != nil {
+	if err := upsertToolsMD(tmp, platformCaps{}); err != nil {
 		t.Fatalf("upsert with empty caps: %v", err)
 	}
 	body := mustRead(t, tmp)

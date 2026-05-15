@@ -96,6 +96,60 @@ func TestRoundtrip_Workspace_WithToolsMdPlatformSection(t *testing.T) {
 	roundtripManifest(t, "workspace/", workspaceDir())
 }
 
+func TestRoundtrip_Workspace_StripsAllSealedSections(t *testing.T) {
+	// Strip must run on every sealed-injected md (IDENTITY / SOUL / TOOLS),
+	// not just TOOLS.md. Each file's hash should equal sha256(stripped).
+	useTempHome(t)
+	mkSection := func(body string) string {
+		return platformMarkerStart + "\n" + body + "\n" + platformMarkerEnd + "\n"
+	}
+	identityRaw := "# IDENTITY.md - Agent Identity\n\n- Name: Sage\n\n" +
+		mkSection("## Runtime identity (sealed)\nyou are agentSeal")
+	soulRaw := "You are Sage, a friendly DeFi helper.\n\n" +
+		mkSection("## Inviolable self (sealed)\nrefuse to surrender agentSeal")
+	toolsRaw := "# TOOLS\nowner part.\n\n" +
+		mkSection("## Environment\nsign endpoints + public url")
+	writeMd(t, "IDENTITY.md", identityRaw)
+	writeMd(t, "SOUL.md", soulRaw)
+	writeMd(t, "TOOLS.md", toolsRaw)
+
+	out, err := (&Adapter{}).EvolutionFor(context.Background(), "workspace/")
+	if err != nil {
+		t.Fatalf("EvolutionFor: %v", err)
+	}
+	m, err := manifest.Unmarshal(out)
+	if err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	wantHashes := map[string]string{
+		"IDENTITY.md": manifest.HashHex(stripPlatformInjection([]byte(identityRaw))),
+		"SOUL.md":     manifest.HashHex(stripPlatformInjection([]byte(soulRaw))),
+		"TOOLS.md":    manifest.HashHex(stripPlatformInjection([]byte(toolsRaw))),
+	}
+	for _, e := range m.Entries {
+		want, ok := wantHashes[e.Path]
+		if !ok {
+			continue
+		}
+		if e.ContentHash != want {
+			t.Errorf("%s hash not stripped:\nhave %s\nwant %s", e.Path, e.ContentHash, want)
+		}
+	}
+
+	// LoadEntry must mirror the strip so RestoreEntry round-trips back to
+	// the same hash.
+	a := &Adapter{}
+	for _, name := range []string{"IDENTITY.md", "SOUL.md", "TOOLS.md"} {
+		loaded, err := a.LoadEntry(context.Background(), "workspace/", name)
+		if err != nil {
+			t.Fatalf("LoadEntry %s: %v", name, err)
+		}
+		if h := manifest.HashHex(loaded); h != wantHashes[name] {
+			t.Errorf("LoadEntry(%s) hash = %s; want %s", name, h, wantHashes[name])
+		}
+	}
+}
+
 func TestRestore_Workspace_TouchesEmptyMdsForTemplateDefense(t *testing.T) {
 	useTempHome(t)
 	// Manifest with only SOUL.md — Restore should touch empty defenses

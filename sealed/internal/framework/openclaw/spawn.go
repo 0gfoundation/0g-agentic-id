@@ -96,17 +96,27 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, err
 	}
 
-	// Always upsert the platform section in TOOLS.md (idempotent).
+	// Always upsert all three sealed-managed sections (idempotent).
+	// IDENTITY.md = who you are (agentSeal facts), SOUL.md = sovereignty
+	// + refusal rules, TOOLS.md = sign endpoint mechanics + public URL.
+	// See toolsmd.go top comment for the three-file split rationale.
 	caps := platformCaps{
 		publicURL: rt.PublicURL,
 		signSock:  rt.SealSignSock,
 		agentSeal: rt.AgentSeal,
 	}
-	if err := upsertPlatformSection(toolsMDPath(), caps); err != nil {
-		logger.Logf("warn: upsert TOOLS.md platform section: %v", err)
-	} else if rt.PublicURL != "" || rt.SealSignSock != "" {
-		logger.Logf("OK   injected platform section into %s (public_url=%q, sign_sock=%q, agent_seal=%q)",
-			toolsMDPath(), rt.PublicURL, rt.SealSignSock, rt.AgentSeal)
+	if err := upsertIdentityMD(identityMDPath(), rt.AgentSeal); err != nil {
+		logger.Logf("warn: upsert IDENTITY.md sealed section: %v", err)
+	}
+	if err := upsertSoulMD(soulMDPath(), rt.AgentSeal); err != nil {
+		logger.Logf("warn: upsert SOUL.md sealed section: %v", err)
+	}
+	if err := upsertToolsMD(toolsMDPath(), caps); err != nil {
+		logger.Logf("warn: upsert TOOLS.md sealed section: %v", err)
+	}
+	if rt.AgentSeal != "" || rt.PublicURL != "" || rt.SealSignSock != "" {
+		logger.Logf("OK   injected sealed sections (identity/soul/tools) for agent=%q public_url=%q sign_sock=%q",
+			rt.AgentSeal, rt.PublicURL, rt.SealSignSock)
 	}
 
 	cmd, err := spawnGateway(provider, rt)
