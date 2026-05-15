@@ -85,6 +85,20 @@ pub async fn handle(
                 })
                 .await?;
         }
+        ContainerReportStatus::Warning => {
+            // Warning is a transient UI signal — agent stays operational
+            // (StageStatus stays whatever it was, typically Confirmed).
+            // sealed re-emits this on every heartbeat while the condition
+            // holds, so a missed event self-heals within heartbeatInterval.
+            let reason = report.error_detail.unwrap_or_else(|| "unknown".into());
+            state
+                .events
+                .publish(WsEvent::ContainerWarning {
+                    seal_id: report.seal_id,
+                    reason,
+                })
+                .await?;
+        }
         ContainerReportStatus::Stopping => {
             let reason = report.error_detail.unwrap_or_else(|| "user_stop".into());
             state

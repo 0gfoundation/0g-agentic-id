@@ -657,6 +657,15 @@ details.log[open] summary{color:var(--text2)}
 .detail-hero .seal-plea--low{background:var(--obg);border-color:var(--obd);color:var(--orange);animation-delay:-12s}
 .detail-hero .seal-plea--low::before{border-color:var(--obd)}
 .detail-hero .seal-plea--low:hover{background:oklch(94% 0.07 80);box-shadow:0 4px 8px oklch(0% 0 0 / 0.08),0 14px 32px oklch(50% 0.18 55 / 0.28),0 28px 60px oklch(50% 0.18 55 / 0.18)}
+/* Alert variant: container reported a warning right now (e.g. it just
+   failed to publish a drift tx because the agent_seal wallet is dry).
+   Unlike --low (frontend's polled balance hint), this is the container's
+   own report — we pin the bubble open instead of letting it peek-and-
+   fade, so the owner can't miss it. Copy stays short (same single-line
+   pool style as --low); the verbose RPC reason is preserved as a
+   `title` attribute for hover, and full payload lives in the event
+   log card below. */
+.detail-hero .seal-plea--alert{animation:none;opacity:1;pointer-events:auto;transform:translateX(-50%) translateY(0) scale(1)}
 /* The peek cycle: 87% invisible → fade in over 3% → hold for 10% → fade
    out over 3% → invisible. With 30s total that's ~3.9s of visibility. */
 @keyframes plea-peek{
@@ -1306,6 +1315,12 @@ const State = {
   deployAvatarDataUrl: null,  // user-uploaded avatar, populated by handleAvatarFile
   discoveryFilter: 'all',  // 'all' | 'mine'
   discoveryItems: [],  // last /deployments response, used by filterDiscovery
+  // Latest container-reported warning for the currently-open detail page.
+  // Set by the WS handler on `container_warning`, cleared on any other
+  // container_* event. The detail UI overlays this on the seal-plea
+  // bubble (taking precedence over the balance-polled plea) so the
+  // owner sees the container's authoritative reason text.
+  containerWarning: null, // { sealId, reason } | null
 };
 
 const eip6963Providers = new Map();
@@ -2531,6 +2546,10 @@ async function renderDetail(sealId) {
 
   // Tear down any prior detail WS subscription.
   if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+  // Drop any stale warning carried over from a previous detail page —
+  // warnings are per-agent and don't survive navigation. Sealed re-emits
+  // on the next heartbeat (≤5min) if the condition still holds.
+  State.containerWarning = null;
 
   let dep;
   try {
@@ -2551,7 +2570,24 @@ async function renderDetail(sealId) {
   ws.onmessage = async (e) => {
     let evt; try { evt = JSON.parse(e.data); } catch { return; }
     appendEventLog('#detailLog', evt);
-    // Refresh deployment doc (simplest correctness)
+    // Container-reported warning (e.g. agent wallet out of gas while
+    // trying to publish a drift tx). The event isn't persisted in
+    // `container_stage` — it's a transient UI signal that sealed
+    // re-emits on every heartbeat while the condition holds. So we
+    // stash it in State and clear on any subsequent container_*
+    // event that implies the agent is back to a normal state.
+    if (evt.event === 'container_warning') {
+      State.containerWarning = { sealId, reason: evt.reason || 'unknown' };
+    } else if (evt.event === 'container_running'
+            || evt.event === 'container_starting'
+            || evt.event === 'container_stopped'
+            || evt.event === 'container_failed') {
+      State.containerWarning = null;
+    }
+    // Refresh deployment doc (simplest correctness). paintDetail
+    // calls applyContainerWarning() itself after rebuilding the avatar
+    // block, so the bubble repaint is automatic — no extra hook needed
+    // here.
     try {
       const r = await fetch(`/deployment/${sealId}`);
       if (r.ok) paintDetail(await r.json());
@@ -2939,6 +2975,14 @@ function paintDetail(dep) {
 
   root.innerHTML = publicHtml;
 
+  // Re-apply any active container warning on the freshly-rebuilt avatar
+  // block — the WS handler stashes the reason in State, paintDetail
+  // replaces the bubble DOM, so we have to re-attach it here. Cheap
+  // no-op when nothing is pending. Passing the seal addr makes the
+  // bubble immediately clickable (top-up flow) without waiting for the
+  // balance RPC to resolve.
+  applyContainerWarning(agentSealAddr, name);
+
   // Read agent_wallet from the chain via ethers — defaults to owner unless
   // the owner has explicitly delegated payments via setAgentWallet.
   if (dep.agent_id && State.config?.chain_rpc && State.config?.agentic_id_addr) {
@@ -3102,15 +3146,18 @@ function renderSealStatus(balance, sealAddr, agentName) {
   status.setAttribute('aria-label', status.title);
   status.onclick = () => depositToAgentSeal(sealAddr, agentName);
 
-  // Plea bubble: only surfaces when balance is low or empty, picks copy
-  // from a small pool so repeat peeks feel less mechanical.
-  if (plea) {
+  // Plea bubble: container-reported warnings win over the balance-polled
+  // plea (they carry the container's actual error text, e.g. "insufficient
+  // funds for gas * price + value"), so when one is active we defer to
+  // applyContainerWarning() and leave the bubble alone here.
+  if (plea && !State.containerWarning) {
     if (isEmpty || isLow) {
       const lines = isEmpty
         ? ["I'm out of gas 💸", 'Wallet empty 🥺', 'Need a top-up, please']
         : ['Running low ⚠', 'Getting thirsty…', 'Wallet getting thin'];
       plea.textContent = lines[Math.floor(Math.random() * lines.length)];
       plea.classList.toggle('seal-plea--low', isLow);
+      plea.classList.remove('seal-plea--alert');
       plea.onclick = () => depositToAgentSeal(sealAddr, agentName);
       plea.onkeydown = (e) => {
         if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); depositToAgentSeal(sealAddr, agentName); }
@@ -3121,6 +3168,53 @@ function renderSealStatus(balance, sealAddr, agentName) {
       plea.onclick = null;
       plea.onkeydown = null;
     }
+  } else if (plea && State.containerWarning) {
+    // Container-warning path — make sure the bubble is bound to the
+    // top-up flow (insufficient-funds is the only owner-recoverable
+    // condition wired today).
+    applyContainerWarning(sealAddr, agentName);
+  }
+}
+
+// Curated short copy for the pinned warning bubble. Self-update-themed
+// because the only owner-recoverable condition wired today is "agent_seal
+// out of gas while trying to publish a drift tx" — i.e. the agent
+// literally cannot evolve until topped up. Random pick on each apply
+// keeps repeat visits from feeling mechanical.
+const CONTAINER_WARNING_LINES = [
+  'Out of gas — can’t evolve 🧬',
+  'Need gas to self-update 💸',
+  'Wallet empty — drift on hold',
+];
+
+// Pin the seal-plea bubble open to signal a container-reported warning.
+// Called from paintDetail (after the avatar block is rebuilt) and from
+// renderSealStatus (so the balance plea doesn't clobber it). Idempotent.
+// No-op when there's no plea element or no active warning. Copy is
+// curated; the raw container reason goes on the `title` attribute for
+// hover, and the verbose payload is still in the event log card below.
+function applyContainerWarning(sealAddr, agentName) {
+  const plea = document.getElementById('sealPlea');
+  if (!plea) return;
+  const w = State.containerWarning;
+  if (!w) {
+    plea.classList.remove('seal-plea--alert');
+    // Don't toggle hidden here — renderSealStatus owns visibility when
+    // there's no active warning (so the balance plea can take over).
+    return;
+  }
+  plea.textContent = CONTAINER_WARNING_LINES[
+    Math.floor(Math.random() * CONTAINER_WARNING_LINES.length)
+  ];
+  plea.title = w.reason || '';
+  plea.classList.add('seal-plea--alert');
+  plea.classList.remove('seal-plea--low');
+  plea.hidden = false;
+  if (sealAddr) {
+    plea.onclick = () => depositToAgentSeal(sealAddr, agentName);
+    plea.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); depositToAgentSeal(sealAddr, agentName); }
+    };
   }
 }
 
@@ -3143,6 +3237,20 @@ window.depositToAgentSeal = async function (sealAddr, agentName) {
     toast(`Sent ${amount} OG — waiting for confirmation…`, 'success');
     await tx.wait();
     toast('Top-up confirmed 🎉 your agent thanks you', 'success');
+    // Top-up resolved the owner-recoverable condition the container
+    // reported, so drop the pinned warning immediately — don't make
+    // the user wait for sealed's next heartbeat to clear it. The
+    // balance refresh below then re-evaluates whether the low-balance
+    // peek bubble should appear (it shouldn't, post-top-up).
+    State.containerWarning = null;
+    const plea = document.getElementById('sealPlea');
+    if (plea) {
+      plea.classList.remove('seal-plea--alert');
+      plea.hidden = true;
+      plea.onclick = null;
+      plea.onkeydown = null;
+      plea.removeAttribute('title');
+    }
     // Refresh the bubble — balance may now be above threshold, in
     // which case the bubble silently disappears.
     checkAgentSealBalance(sealAddr, agentName).catch(() => {/* ignore */});

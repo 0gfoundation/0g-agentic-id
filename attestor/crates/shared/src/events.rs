@@ -26,6 +26,14 @@ pub enum WsEvent {
     ContainerRunning { seal_id: SealId },
     ContainerStopped { seal_id: SealId, reason: String },
     ContainerFailed { seal_id: SealId, reason: String },
+    /// Owner-recoverable condition (e.g. insufficient funds for the
+    /// drift-publish tx). Agent stays operational; frontend renders the
+    /// `reason` string as a UI hint (e.g. avatar bubble prompting the
+    /// owner to fund the agent wallet). Not persisted in `StageStatus`
+    /// — sealed re-emits this event on every heartbeat while the
+    /// condition holds, so a stale page-load is bounded by the
+    /// heartbeat interval (5min).
+    ContainerWarning { seal_id: SealId, reason: String },
 
     // ── derived phase ────────────────────────────────
     PhaseChanged { seal_id: SealId, phase: DeploymentPhase },
@@ -58,6 +66,7 @@ impl WsEvent {
             | Self::ContainerRunning { seal_id }
             | Self::ContainerStopped { seal_id, .. }
             | Self::ContainerFailed { seal_id, .. }
+            | Self::ContainerWarning { seal_id, .. }
             | Self::PhaseChanged { seal_id, .. }
             | Self::SealedKeysUpdated { seal_id, .. }
             | Self::EntryUpdated { seal_id, .. }

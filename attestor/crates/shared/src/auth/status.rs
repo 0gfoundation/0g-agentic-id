@@ -36,6 +36,7 @@ fn status_slug(s: ContainerReportStatus) -> &'static str {
     match s {
         ContainerReportStatus::Starting => "starting",
         ContainerReportStatus::Running => "running",
+        ContainerReportStatus::Warning => "warning",
         ContainerReportStatus::Error => "error",
         ContainerReportStatus::Stopping => "stopping",
     }

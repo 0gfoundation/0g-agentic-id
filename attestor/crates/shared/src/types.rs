@@ -604,6 +604,14 @@ pub struct ProvisionResponse {
 pub enum ContainerReportStatus {
     Starting,
     Running,
+    /// Owner-recoverable condition (e.g. agent wallet has insufficient
+    /// funds for the drift-publish transaction). Agent itself is
+    /// operational; this is a UI prompt for the owner to act, not a
+    /// system failure. Surfaces as a `WsEvent::ContainerWarning` for
+    /// the frontend to render (e.g. avatar bubble); not persisted in
+    /// `StageStatus` for now, sealed re-emits it on every heartbeat
+    /// while the condition holds.
+    Warning,
     Error,
     Stopping,
 }
