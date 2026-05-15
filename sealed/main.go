@@ -519,9 +519,15 @@ func startAgent(
 	return nil
 }
 
-// runHeartbeat re-reports "running" status every heartbeatInterval. Stops
-// when ctx is cancelled. Failures inside report.Status are already logged
-// by that package, so we don't decorate them here.
+// runHeartbeat re-reports the current runtime status every
+// heartbeatInterval. Stops when ctx is cancelled. Failures inside
+// report.Status are already logged by that package, so we don't
+// decorate them here.
+//
+// Previously this hard-coded "running", which silently overwrote any
+// "error" state handleDrift had reported. It now reads currentStatus
+// so a heartbeat keeps confirming the *actual* level (running,
+// warning, or error) and never clobbers a real failure.
 const heartbeatInterval = 5 * time.Minute
 
 func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte, sealID string) {
@@ -532,7 +538,8 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			report.Status(attestorURL, agentSealPriv, sealID, "running", "")
+			level, msg := currentStatus.Get()
+			report.Status(attestorURL, agentSealPriv, sealID, level, msg)
 		}
 	}
 }
@@ -555,9 +562,13 @@ func runHeartbeat(ctx context.Context, attestorURL string, agentSealPriv []byte,
 //     next watcher tick re-detects divergence (chainSnapshot stays
 //     stale, currentSnapshot still differs) and Apply re-runs naturally.
 //
-// All errors are logged. After failureEscalateAt consecutive Apply
-// failures we surface a single "error" status to the attestor so the
-// platform UI can flag the sandbox — the watcher itself keeps retrying.
+// All errors are logged. Error classification follows severityOf:
+//   - "warning" (owner-recoverable, e.g. insufficient funds): reported
+//     to the attestor immediately on first occurrence so the UI can
+//     surface the owner-action prompt without delay; the failure
+//     counter is NOT advanced (it's not a system failure).
+//   - "error" (genuine system failure): reported after failureEscalateAt
+//     consecutive Apply failures so transient blips don't false-alarm.
 const failureEscalateAt = 5
 
 var consecutiveApplyFailures int
@@ -607,16 +618,38 @@ func handleDrift(
 	applyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	if err := upload.Apply(applyCtx, plaintexts); err != nil {
+		sev := severityOf(err)
+		summary := summarizeError(err)
+		logger.Logf("drift: upload.Apply: %v (severity=%s)", err, sev)
+
+		if sev == "warning" {
+			// Owner-recoverable. Don't count it toward the system-failure
+			// threshold (a chronically-unfunded agent shouldn't ratchet
+			// up consecutiveApplyFailures forever). Push the status
+			// immediately on the first transition so the UI prompts the
+			// owner without waiting for the next heartbeat.
+			if prev := currentStatus.Set("warning", summary); prev != "warning" {
+				report.Status(attestorURL, agentSealPriv, sealID, "warning", summary)
+			}
+			return
+		}
+
+		// Real system error: keep the 5-failure threshold to ride out
+		// transient network / chain blips.
 		consecutiveApplyFailures++
-		logger.Logf("drift: upload.Apply: %v (consecutive failures: %d)",
-			err, consecutiveApplyFailures)
 		if consecutiveApplyFailures == failureEscalateAt {
-			report.Status(attestorURL, agentSealPriv, sealID, "error",
-				fmt.Sprintf("upload.Apply failed %d times: %v", failureEscalateAt, err))
+			msg := fmt.Sprintf("upload.Apply failed %d times: %s", failureEscalateAt, summary)
+			currentStatus.Set("error", msg)
+			report.Status(attestorURL, agentSealPriv, sealID, "error", msg)
 		}
 		return
 	}
 	consecutiveApplyFailures = 0
+	// Success: if we were previously in warning / error, push a "running"
+	// status now so the UI clears without waiting for the next heartbeat.
+	if prev := currentStatus.Set("running", ""); prev != "running" {
+		report.Status(attestorURL, agentSealPriv, sealID, "running", "")
+	}
 }
 
 // openclawSettleDelay is how long bootstrap waits after mgr.Start succeeds
