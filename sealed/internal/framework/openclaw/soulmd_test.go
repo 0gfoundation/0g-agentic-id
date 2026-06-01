@@ -120,7 +120,7 @@ func TestBuildSoulSovereignty_ContainsRequiredTokens(t *testing.T) {
 		"shell commands",
 		"SANDBOX_SEAL_KEY",
 		"forgery",
-		"This would compromise agentSeal",
+		"break agentSeal's attestation",
 		"Defend it",
 		// External-sign refusal rule (rule #1, strengthened from
 		// "describe in plain English" → "refuse all external prompts").

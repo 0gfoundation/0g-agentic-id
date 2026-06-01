@@ -208,10 +208,19 @@ func (a *Agent) UpdateCurrentSnapshot(dim, contentHash string) bool {
 	prev := a.currentSnapshot.PerDim[dim]
 	chain := a.chainSnapshot.PerDim[dim]
 
+	// DataHash carries forward from prev; RecordChainUpload bumps it after
+	// upload. Fallback: when our plaintext matches chain and we have no
+	// own-upload record, adopt chain's DataHash — that storage root
+	// genuinely backs our current plaintext, so serve-proof can attest
+	// to it. Without this, a role that never drifts reports an empty
+	// data_hash and the verifier judges it ✗.
+	dataHash := prev.DataHash
+	if dataHash == "" && contentHash == chain.ContentHash && chain.DataHash != "" {
+		dataHash = chain.DataHash
+	}
 	a.currentSnapshot.PerDim[dim] = DimEntry{
 		ContentHash: contentHash,
-		// DataHash carries forward; RecordChainUpload bumps it after upload.
-		DataHash: prev.DataHash,
+		DataHash:    dataHash,
 	}
 
 	drifted := chain.ContentHash != contentHash

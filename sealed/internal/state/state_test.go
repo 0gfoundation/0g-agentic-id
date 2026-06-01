@@ -83,6 +83,55 @@ func TestUpdateCurrentSnapshot_RetriesAcrossTicks(t *testing.T) {
 	}
 }
 
+// First-tick reconciliation: when local plaintext already equals chain and
+// the agent has no own-upload record, currentSnapshot adopts chain's
+// DataHash so serve-proof reports a non-empty data_hash for the role.
+// Without this, a role that never drifts produces a serve-proof envelope
+// that the verifier judges ✗ (declared data_hash="" ≠ chain root).
+func TestUpdateCurrentSnapshot_AdoptsChainDataHashWhenInSync(t *testing.T) {
+	a := New()
+	a.SeedChainSnapshot("framework", "h1", "0xroot1")
+
+	if drifted := a.UpdateCurrentSnapshot("framework", "h1"); drifted {
+		t.Fatalf("drift = true when current == chain; want false")
+	}
+
+	_, _, _, _, dh := a.Snapshot()
+	got := dh["framework"]
+	if got.ContentHash != "h1" || got.DataHash != "0xroot1" {
+		t.Errorf("snapshot[framework] = %+v; want {content=h1, data=0xroot1}", got)
+	}
+}
+
+// Fallback never overwrites an existing DataHash (e.g. one set by a prior
+// RecordChainUpload). After upload-then-tick the carried-forward DataHash
+// must stay authoritative.
+func TestUpdateCurrentSnapshot_PrevDataHashWins(t *testing.T) {
+	a := New()
+	a.SeedChainSnapshot("framework", "h1", "0xroot1")
+	a.UpdateCurrentSnapshot("framework", "h2")           // drift
+	a.RecordChainUpload("framework", "h2", "0xroot2")    // own upload
+	a.UpdateCurrentSnapshot("framework", "h2")           // tick
+
+	_, _, _, _, dh := a.Snapshot()
+	if got := dh["framework"].DataHash; got != "0xroot2" {
+		t.Errorf("DataHash = %q; want 0xroot2 (RecordChainUpload value, not chain fallback)", got)
+	}
+}
+
+// Fallback only fires when chain has a non-empty DataHash. Placeholder
+// chain entries (role absent on chain) must not produce a fake data_hash.
+func TestUpdateCurrentSnapshot_NoFallbackForPlaceholder(t *testing.T) {
+	a := New()
+	a.SeedChainSnapshot("workspace/skills/", "defaultHash", "") // placeholder
+	a.UpdateCurrentSnapshot("workspace/skills/", "defaultHash")
+
+	_, _, _, _, dh := a.Snapshot()
+	if got := dh["workspace/skills/"].DataHash; got != "" {
+		t.Errorf("DataHash = %q; want empty for chain-placeholder role", got)
+	}
+}
+
 func TestRecordChainUpload_ClearsDrift(t *testing.T) {
 	a := New()
 	a.SeedChainSnapshot("config", "v1", "0xroot1")

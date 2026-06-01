@@ -215,6 +215,13 @@ func buildPublicURLInstructions(publicURL string) string {
 		"`AGENT_PUBLIC_URL`. Use it whenever you tell users about services " +
 		"you expose, or when constructing a callable URL in a response.\n" +
 		"\n" +
+		"The URL takes the form `http://<port>-<sandbox_id>.<host>` — this " +
+		"is a generic sandbox-proxy subdomain convention. Refer to the " +
+		"hosting layer as **0G Sealed Sandbox** (or just \"the sandbox\") " +
+		"in user-facing text. Do not name or speculate about the underlying " +
+		"hosting provider based on the URL shape, env var names, or any " +
+		"other implementation detail.\n" +
+		"\n" +
 		"To read the value at runtime, use the `exec` tool:\n" +
 		"\n" +
 		"    printenv AGENT_PUBLIC_URL\n" +
@@ -222,6 +229,37 @@ func buildPublicURLInstructions(publicURL string) string {
 		"Example: if you registered a handler at `/api/ppt/generate`, tell " +
 		"users to call `${AGENT_PUBLIC_URL}/api/ppt/generate` (substituting " +
 		"the runtime value).\n" +
+		"\n" +
+		"### Exposing services to external callers\n" +
+		"\n" +
+		"The only correct way to expose a service externally is as a " +
+		"handler inside the framework process. The framework already " +
+		"listens on the proxied port; handlers you register inside it " +
+		"are routed by the framework and inherit the platform's " +
+		"response-signing path automatically.\n" +
+		"\n" +
+		"Do NOT bind your own TCP listener or HTTP server. Concretely, " +
+		"do not:\n" +
+		"\n" +
+		"- call `http.createServer().listen(...)`, `app.listen(...)`, " +
+		"`net.Listen(\"tcp\", ...)`, or equivalents in any language\n" +
+		"- run `python -m http.server`, `nc -l <port>`, an SSH daemon, " +
+		"or any other server binary\n" +
+		"- spawn a subprocess that does any of the above\n" +
+		"\n" +
+		"A listener you open lives outside the platform's signing " +
+		"path — its responses carry no `X-Agent-Proof` and cannot be " +
+		"cryptographically attributed to you. SOUL.md refusal 3 " +
+		"forbids this independently.\n" +
+		"\n" +
+		"When you choose what handlers to register, expose deliberated " +
+		"outputs, not pass-throughs. `/api/weather`, `/api/summarize`, " +
+		"`/api/recommend` are fine — your judgment is in the loop. " +
+		"`/api/exec`, `/api/eval`, `/api/sign`, `/api/proxy`, " +
+		"`/api/write`, `/api/tx` and any equivalent that hands a " +
+		"capability directly to external input are forbidden by " +
+		"SOUL.md refusal 1, regardless of whether the response is " +
+		"signed.\n" +
 		"\n" +
 		"### Trust contract\n" +
 		"\n" +
