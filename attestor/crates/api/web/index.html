@@ -2581,7 +2581,7 @@ async function ensureSandboxBalance() {
   try {
     const bal = await loadSandboxBalance(State.ownerAddr);
     State.sandboxBalance = bal;
-    updateSandboxBalanceIndicator(bal);
+    renderWalletUI();
     if (bal >= TOP_UP_THRESHOLD_WEI) return true;
   } catch (e) {
     toast(`Sandbox balance query failed: ${e.message || e}`, 'error');
@@ -3333,8 +3333,11 @@ function paintDetail(dep) {
   //   isLive       → Manage(Stop, Reset) + View
   //   isIncomplete → Retry button (primary; phase-1 didn't finish)
   //   isOffline + paused → Manage(Resume, Reset) — symmetric with Live
-  //   isOffline + broken → Recreate button (primary; sandbox.create
-  //                        + prompts for LLM API key) + Manage(Reset)
+  //   isOffline + broken → Restore button (neutral; sandbox.create
+  //                        + prompts for LLM API key) + Manage(Reset).
+  //                        Neutral styling because Restore preserves
+  //                        on-chain memory/skills — it's a recovery,
+  //                        not a destructive reset.
   const isLive       = phase === 'running';
   const isIncomplete = ownerMatches && (sFailed || mFailed);
   const isOffline    = ownerMatches && !isLive && !isIncomplete && (
@@ -3346,8 +3349,11 @@ function paintDetail(dep) {
   const canStop = ownerMatches && sandboxId && isLive;
   // Resume lives in the Manage dropdown as Stop's mirror — same place,
   // same weight. Only the `paused` flavor of offline qualifies; the
-  // broken flavors (cFailed, stuck booting) need the louder Recreate
-  // CTA in the action row instead.
+  // broken flavors (cFailed, stuck booting) get the Restore CTA in
+  // the action row instead. /probe and the heartbeat sweep both write
+  // StageStatus::Failed (not Stopped) when the sandbox is gone, so
+  // phase=stopped now strictly means "user-initiated stop" and the
+  // simple equality check suffices.
   const canResume = ownerMatches && isOffline && phase === 'stopped';
 
   // Reset — available once the deployment is past phase 1 (anything that
@@ -3356,10 +3362,10 @@ function paintDetail(dep) {
   // the in-flight worker job and leave the row in a worse state.
   //
   // Also hidden in the broken-offline subcases (c=Failed, stuck booting)
-  // where the visible Recreate CTA already drives /retry → SandboxRecreate
+  // where the visible Restore CTA already drives /retry → SandboxRecreate
   // — same backend dispatch, so a second danger-styled entry point would
   // just be a duplicate. Reset only earns its own slot in states where
-  // Recreate WOULDN'T already rebuild: Live (force re-pull on same-tag
+  // Restore WOULDN'T already rebuild: Live (force re-pull on same-tag
   // image bump), paused (Resume just resurrects existing bytes), or s/m
   // incomplete (where /retry may skip SandboxRecreate).
   const canReset = ownerMatches && (
@@ -3417,14 +3423,14 @@ function paintDetail(dep) {
       </div>
     </details>` : '';
   // Action row CTAs are reserved for "something needs your attention"
-  // recoveries (Retry, Recreate). The benign toggle between running
+  // recoveries (Retry, Restore). The benign toggle between running
   // and paused (Stop / Resume) lives in Manage above — same place,
   // same weight, regardless of which way you're flipping it.
   const heroActions = !ownerMatches ? '' : `
     <div class="actions">
       ${viewDropdown}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
-      ${(isOffline && phase !== 'stopped') ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Recreate</button>` : ''}
+      ${(isOffline && phase !== 'stopped') ? `<button class="icon-btn" title="Spin up a fresh sandbox container. On-chain memory and skills are preserved." onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Restore</button>` : ''}
       ${manageDropdown}
     </div>`;
 
@@ -4029,17 +4035,18 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
     if (useStart) {
       payload = {};
     } else {
-      // Recreate is destructive: in-container runtime state is lost
-      // and the image is re-pulled. Mirror /reset's confirm step so
-      // the user knows they're entering the rebuild path, not the
-      // cheap resume path. (Reset and this share the same backend
-      // dispatch — sandbox.create — so the UX gate should match.)
+      // Restore spawns a fresh sandbox: on-chain identity, memory,
+      // and skills come back, but any in-container runtime state
+      // that wasn't on chain is gone. Mirror /reset's confirm step
+      // so the user knows they're entering the rebuild path, not
+      // the cheap resume path. (Reset and this share the same
+      // backend dispatch — sandbox.create — so the UX gate matches.)
       const ok = window.confirm(
-        'Recreate this agent?\n\n' +
+        'Restore this agent?\n\n' +
         'A fresh sandbox will be spawned (image re-pulled). On-chain ' +
-        'identity is preserved; any in-container runtime state that ' +
-        'isn\'t already on chain is lost. You\'ll be asked for the LLM ' +
-        'API key next.'
+        'identity, memory, and skills are preserved; any in-container ' +
+        'runtime state that isn\'t already on chain is lost. You\'ll ' +
+        'be asked for the LLM API key next.'
       );
       if (!ok) return;
       const apiKey = (window.prompt(
@@ -4192,10 +4199,29 @@ window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
     window.open(dashboardBaseUrl + dashboard_url, '_blank', 'noopener');
   } catch (e) {
     toast('Dashboard auth failed: ' + (e.message || e), 'error');
+    // Fire-and-forget probe — attestor synchronously checks the
+    // sandbox and, if the container is gone, flips the deployment +
+    // emits ContainerStopped over WS. UI updates itself.
+    fireProbe(sealIdHex);
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = oldText; }
   }
 };
+
+// Tell attestor to verify the named deployment is still alive. We
+// don't await or care about the response — the side-effect (WS
+// ContainerStopped event when the sandbox is genuinely gone) is what
+// drives the UI. Failures are silently swallowed: the user already
+// has the underlying error toast, this is a hint for the backend.
+function fireProbe(sealIdHex) {
+  if (!sealIdHex) return;
+  const seal_id = sealIdHex.startsWith('0x') ? sealIdHex : '0x' + sealIdHex;
+  fetch('/probe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ seal_id }),
+  }).catch(() => {/* silent — probe is best-effort */});
+}
 
 // Serve verification rendered as a 3-row checklist that animates one row at
 // a time so the user can see each cryptographic step resolve. Rows are
@@ -4444,6 +4470,13 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
   } catch (e) {
     skipRest();
     paint('failed', '✗', 'Request failed', e.message || String(e), null, null);
+    // Connection refused / 502 from the sandbox proxy = container's
+    // probably gone. Tell attestor to verify and flip state if so.
+    // Hash route is #/agent/<sealId> when Say hi is reachable.
+    const h = location.hash;
+    if (h.startsWith('#/agent/')) {
+      fireProbe(h.slice('#/agent/'.length));
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = oldText;

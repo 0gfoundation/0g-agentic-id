@@ -323,6 +323,20 @@ pub struct SandboxCreateResponse {
     pub created_at: Option<String>,
 }
 
+// Shape returned by `SandboxClient::get_sandbox`. Mirrors the relevant
+// subset of 0g-sandbox's `daytona.Sandbox` JSON — only fields attestor
+// reads today are surfaced; non-strict field set keeps us resilient.
+//
+// `state` values observed on the wire: "started", "stopped",
+// "stopping", "archived", "error", "starting". `/probe` and the
+// staleness sweep both classify any state != "started" as
+// container-not-running.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SandboxInfo {
+    pub id: String,
+    pub state: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

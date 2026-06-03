@@ -526,6 +526,69 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let _ = reason;
         Ok(out)
     }
+
+    async fn mark_heartbeat(
+        &self,
+        seal_id: SealId,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        // Touch updated_at too — heartbeats are themselves a form of
+        // mutation, and keeping the two timestamps coherent simplifies
+        // consumer queries (they can sort by updated_at).
+        sqlx::query(
+            "UPDATE deployments
+             SET last_heartbeat = $1, updated_at = $1
+             WHERE seal_id = $2",
+        )
+        .bind(now)
+        .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn flip_stale_heartbeats(
+        &self,
+        now: DateTime<Utc>,
+        threshold_secs: i64,
+        reason: String,
+    ) -> anyhow::Result<Vec<SealId>> {
+        // Atomic select-and-flip mirroring flip_provision_timeouts. The
+        // container went silent on its own (sandbox killed it, sealed
+        // crashed, network partition past tolerance) — that's a
+        // runtime failure, not a user-initiated stop, so we write
+        // StageStatus::Failed + phase='failed'. The UI's existing
+        // cFailed/isOffline path drives the user to Recreate; Stopped
+        // would incorrectly offer Resume against a sandbox that is no
+        // longer reachable.
+        let stage = serde_json::to_value(StageStatus::Failed {
+            at: now,
+            reason: reason.clone(),
+        })?;
+        let cutoff = now - chrono::Duration::seconds(threshold_secs);
+        let rows = sqlx::query(
+            "UPDATE deployments
+             SET container_stage = $1,
+                 phase           = 'failed',
+                 updated_at      = $2
+             WHERE last_heartbeat IS NOT NULL
+               AND last_heartbeat < $3
+               AND phase = 'running'
+             RETURNING seal_id",
+        )
+        .bind(stage)
+        .bind(now)
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bytes: &[u8] = row.try_get("seal_id")?;
+            out.push(B256::from_slice(bytes));
+        }
+        let _ = reason;
+        Ok(out)
+    }
 }
 
 impl PostgresDeploymentRepo {

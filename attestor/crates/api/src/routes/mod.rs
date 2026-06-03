@@ -12,6 +12,7 @@ mod config;
 mod deploy;
 mod deployment;
 mod deployments;
+mod probe;
 mod provision;
 mod reset;
 mod retry;
@@ -35,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/config", get(config::handle))
         .route("/deploy", post(deploy::handle))
         .route("/provision", post(provision::handle))
+        .route("/probe", post(probe::handle))
         .route("/status", post(status::handle))
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))

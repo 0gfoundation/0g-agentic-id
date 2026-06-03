@@ -34,6 +34,15 @@ pub async fn handle(
         .map_err(|e| ApiError::bad_request(format!("agent_seal_signature: {e}")))?;
 
     let now = Utc::now();
+
+    // Bump last_heartbeat regardless of severity — the sweep treats
+    // *any* report as proof the container's still alive. Best-effort:
+    // a DB write failure is logged but doesn't fail the request (the
+    // next 5-min heartbeat will retry naturally).
+    if let Err(e) = state.deployments.mark_heartbeat(report.seal_id, now).await {
+        tracing::warn!(seal_id = ?report.seal_id, error = %e, "mark_heartbeat failed (non-fatal)");
+    }
+
     match report.status {
         ContainerReportStatus::Starting => {
             state

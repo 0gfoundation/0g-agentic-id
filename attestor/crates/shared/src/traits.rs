@@ -139,6 +139,17 @@ pub trait SandboxClient: Send + Sync {
     /// outer flow. Implementations with no admin signer configured
     /// should return Ok(()) and warn.
     async fn admin_delete(&self, sandbox_id: &str) -> anyhow::Result<()>;
+
+    /// Read-only sandbox lookup using attestor admin auth. Used by the
+    /// `/probe` route to verify a deployment marked Running actually
+    /// has a live container on the sandbox side.
+    /// - `Ok(Some(info))` → sandbox exists; `info.state` is sandbox's
+    ///   current lifecycle state ("started", "stopped", "archived", …).
+    /// - `Ok(None)`       → sandbox 404 (gone). Caller should flip the
+    ///   deployment to Stopped.
+    /// - `Err(_)`         → transport / auth / parse failure; caller
+    ///   should NOT mutate state on this (could be a flapping RPC).
+    async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>>;
 }
 
 // ── Deployment repository ───────────────────────────────────────────────
@@ -273,6 +284,27 @@ pub trait DeploymentRepo: Send + Sync {
     async fn flip_provision_timeouts(
         &self,
         now: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    ) -> anyhow::Result<Vec<SealId>>;
+
+    /// Bump `last_heartbeat = now()` for the given deployment. Called
+    /// from `POST /status` to track container liveness; the worker
+    /// sweep uses the resulting freshness to detect sandbox-side
+    /// terminations attestor would otherwise miss.
+    async fn mark_heartbeat(
+        &self,
+        seal_id: SealId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()>;
+
+    /// Atomically flip every running deployment whose last heartbeat
+    /// is older than `now - threshold_secs` to `container_stage =
+    /// Stopped { reason }`. Returns the affected `seal_id`s so the
+    /// caller can publish `WsEvent::ContainerStopped`.
+    async fn flip_stale_heartbeats(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        threshold_secs: i64,
         reason: String,
     ) -> anyhow::Result<Vec<SealId>>;
 }

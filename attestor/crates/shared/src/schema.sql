@@ -63,6 +63,23 @@ CREATE INDEX IF NOT EXISTS idx_deployments_provision_deadline
     WHERE provision_deadline IS NOT NULL
       AND container_stage->>'state' = 'submitted';
 
+-- Container heartbeat freshness. sealed POSTs /status every 5 min; the
+-- /status handler bumps `last_heartbeat`. A worker sweep flips
+-- container_stage to Failed when the gap exceeds the staleness
+-- threshold (15 min), surfacing sandbox-side terminations (e.g.
+-- balance exhaustion) that attestor would otherwise miss.
+-- Failed (not Stopped) because the container disappeared on its own
+-- and can only be Recreated, never Resumed.
+-- NULL on rows that haven't yet received a heartbeat (pre-running).
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS last_heartbeat TIMESTAMPTZ;
+
+-- Partial index for the sweep: only running rows with a heartbeat
+-- recorded are candidates. Mirrors the provision-deadline pattern.
+CREATE INDEX IF NOT EXISTS idx_deployments_last_heartbeat
+    ON deployments (last_heartbeat)
+    WHERE last_heartbeat IS NOT NULL
+      AND phase = 'running';
+
 -- idempotency does NOT FK to deployments — /deploy reserves idempotency
 -- before inserting the deployment row, so a FK would fail. The idempotency
 -- record is a hint; loss-of-sync with deployments is recoverable.

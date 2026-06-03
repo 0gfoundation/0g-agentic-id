@@ -238,6 +238,15 @@ impl SandboxClient for MockSandbox {
         tracing::info!(%sandbox_id, "mock sandbox: admin_delete");
         Ok(())
     }
+
+    async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>> {
+        // Mock defaults to "still alive" so /probe paths return no-op
+        // without test setup. Failure paths use ConfigurableSandbox.
+        Ok(Some(SandboxInfo {
+            id: sandbox_id.to_string(),
+            state: "started".into(),
+        }))
+    }
 }
 
 // ── ConfigurableSandbox (test double with explicit behaviour) ───────────
@@ -342,6 +351,17 @@ impl SandboxClient for ConfigurableSandbox {
             anyhow::bail!("configured to fail");
         }
         Ok(())
+    }
+
+    async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>> {
+        // ConfigurableSandbox: probe defaults to "started" so tests not
+        // exercising the /probe path stay terse. Tests that want a
+        // 404 / non-started response should switch to a fresh test
+        // double or extend this with a mutex when needed.
+        Ok(Some(SandboxInfo {
+            id: sandbox_id.to_string(),
+            state: "started".into(),
+        }))
     }
 }
 
@@ -549,6 +569,10 @@ impl StorageClient for ConfigurableStorage {
 pub struct InMemoryDeploymentRepo {
     pub by_seal: Mutex<HashMap<SealId, Deployment>>,
     pub by_agent: Mutex<HashMap<AgentId, SealId>>,
+    /// Mirror of `last_heartbeat` (DB column not surfaced on the
+    /// `Deployment` struct). Tests checking heartbeat freshness read
+    /// from this map directly.
+    pub heartbeats: Mutex<HashMap<SealId, chrono::DateTime<chrono::Utc>>>,
     pub set_storage_stage_calls: AtomicU64,
     pub set_mint_stage_calls: AtomicU64,
     pub set_container_stage_calls: AtomicU64,
@@ -560,6 +584,8 @@ pub struct InMemoryDeploymentRepo {
     pub set_provision_deadline_calls: AtomicU64,
     pub record_provision_error_calls: AtomicU64,
     pub flip_provision_timeouts_calls: AtomicU64,
+    pub mark_heartbeat_calls: AtomicU64,
+    pub flip_stale_heartbeats_calls: AtomicU64,
 }
 
 impl InMemoryDeploymentRepo {
@@ -567,6 +593,7 @@ impl InMemoryDeploymentRepo {
         Self {
             by_seal: Mutex::new(HashMap::new()),
             by_agent: Mutex::new(HashMap::new()),
+            heartbeats: Mutex::new(HashMap::new()),
             set_storage_stage_calls: AtomicU64::new(0),
             set_mint_stage_calls: AtomicU64::new(0),
             set_container_stage_calls: AtomicU64::new(0),
@@ -578,6 +605,8 @@ impl InMemoryDeploymentRepo {
             set_provision_deadline_calls: AtomicU64::new(0),
             record_provision_error_calls: AtomicU64::new(0),
             flip_provision_timeouts_calls: AtomicU64::new(0),
+            mark_heartbeat_calls: AtomicU64::new(0),
+            flip_stale_heartbeats_calls: AtomicU64::new(0),
         }
     }
 
@@ -832,6 +861,51 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 &d.mint_stage,
                 &d.container_stage,
             );
+            d.updated_at = now;
+            affected.push(d.seal_id);
+        }
+        Ok(affected)
+    }
+
+    async fn mark_heartbeat(
+        &self,
+        seal_id: SealId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.mark_heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+        self.heartbeats.lock().unwrap().insert(seal_id, now);
+        Ok(())
+    }
+
+    async fn flip_stale_heartbeats(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        threshold_secs: i64,
+        reason: String,
+    ) -> anyhow::Result<Vec<SealId>> {
+        self.flip_stale_heartbeats_calls.fetch_add(1, Ordering::SeqCst);
+        let cutoff = now - chrono::Duration::seconds(threshold_secs);
+        let stale: Vec<SealId> = {
+            let hb = self.heartbeats.lock().unwrap();
+            hb.iter()
+                .filter(|(_, t)| **t < cutoff)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let mut affected = Vec::new();
+        let mut g = self.by_seal.lock().unwrap();
+        for seal_id in stale {
+            let Some(d) = g.get_mut(&seal_id) else { continue };
+            if d.phase != crate::types::DeploymentPhase::Running {
+                continue;
+            }
+            // Failed, not Stopped: container disappeared on its own,
+            // user must Recreate, not Resume. (Mirrors repo.rs reasoning.)
+            d.container_stage = StageStatus::Failed {
+                at: now,
+                reason: reason.clone(),
+            };
+            d.phase = crate::types::DeploymentPhase::Failed;
             d.updated_at = now;
             affected.push(d.seal_id);
         }

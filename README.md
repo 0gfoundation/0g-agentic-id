@@ -78,8 +78,12 @@ attestation 值,并留下可追溯的日志。没有"悄悄改掉一个运行中
 0g-Tapp 还提供一个链上注册表 **TappRegistry**,应用在这里登记自己的代码指纹。
 支持两种注册模式:**预验证**(注册前先在链上验 RA quote)与**后验证**(应用
 先注册,用户使用前自行 attest)。AgenticID 的三个核心组件——Attestor、
-0g-Sandbox、0g-compute——都作为 Tapp 应用部署、在 TappRegistry 登记。这个登记
+0g-Sandbox、0g-kms——都作为 Tapp 应用部署、在 TappRegistry 登记。这个登记
 是整条信任链的根。
+
+0g-Tapp 的设计哲学是为了支持非代码绑定的可升级, 舍弃了代码绑定的强检查, 但保留
+强审计。也就是说, App owner 可以有能力部署、注册恶意的代码, 但这些恶意行为无法
+绕过审计, 部署的代码版本均会记录上链。
 
 ### 3 · AgentSeal:伪造不出来的身份
 
@@ -92,6 +96,10 @@ attestation 值,并留下可追溯的日志。没有"悄悄改掉一个运行中
 AgentSeal 给它产出的**每一条响应**签名——这个签名证明:响应来自一个跑在 TEE
 里、且严格按链上记录运行的 agent。
 
+具体的说, AgenticID 的后端 Attestor 会注册到 TappRegistry, 注册信息包括 Attestor 当前的 App 名、代码和配置哈希，以及
+App 硬件绑定的身份（由 Tapp 为每个 App 分配，和硬件相关的，每次 Tapp 重启和更换硬件该身份都会变化，此时需要重新注册）。在
+分发 app master key 时, KMS 检查链上注册身份与请求中的签名身份是否匹配, 匹配则为其派生 app master key。
+
 > 链上侧:`agentSeal` / `sealId` 是 **set-once 永久绑定**——一个 agentId 只能
 > 设一次,转让也不清除。换硬件时 attestor 给新的 Agent TEE 重新 provision 同一
 > 把 `agentSeal_priv` 即可,地址不变。见 [`contracts/README.md`](contracts/README.md) §4。
@@ -101,6 +109,12 @@ AgentSeal 给它产出的**每一条响应**签名——这个签名证明:响�
 **0g-Sandbox** 是一个作为 Tapp 部署的隐私沙箱。它的定义性属性:连作为服务方
 的 0G 自己也看不进一个运行中的沙箱。AgenticID 用的是 **Sealed Sandbox 模式**,
 更进一步——连 agent **自己的 owner 也看不进去**。
+
+值得注意的是, agent 运行时 (Sealed Sandbox) 的信任链继承自使用 Tapp 部署的 0g-Sandbox: 0g-Sandbox
+使用 Tapp 部署, 其可验证性和封装性由 Tapp 保证, 进一步 0g-Sandbox 创建的 sealed sandbox 由 0g-Sandbox
+的逻辑保证其对外的封装性, 并使用 0g-Sandbox 的硬件身份签名 sealed sandbox 的镜像哈希, Attestor 在 provision
+时检查 0g-Sandbox 身份签名和链上注册的 sealed sandbox 镜像哈希, 检查通过才 provision agentSeal_priv, 可见
+仅 0g-Sandbox 创建的注册在链上的合法 sealed sandbox 才能获取 agentSeal_priv, 信任规约到 Tapp 的 "强审计" 哲学。
 
 0g-Sandbox 承担两项验证职责:
 

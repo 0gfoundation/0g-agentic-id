@@ -127,16 +127,23 @@ async fn main() -> anyhow::Result<()> {
         registry,
     };
 
-    // background sweep task — two responsibilities, same 60s tick:
+    // background sweep task — three responsibilities, same 60s tick:
     //  (a) job-queue retention (delete done/failed older than threshold)
     //  (b) provision deadline (flip stuck container_stage=Submitted to
     //      Failed once `now > provision_deadline`, publish events)
+    //  (c) heartbeat staleness (flip running rows whose sealed runtime
+    //      has stopped reporting to Stopped, publish events)
     {
         let queue = queue.clone();
         let retention = cfg.job_retention_seconds;
         let deployments = ctx.deployments.clone();
         let events = ctx.events.clone();
         tokio::spawn(async move {
+            // 15 minutes = 3 missed 5-min heartbeats. Sandbox-side
+            // terminations (balance exhaustion, manual kill, hardware
+            // failure) all surface within one threshold window.
+            const HEARTBEAT_STALENESS_SECS: i64 = 15 * 60;
+
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -165,6 +172,34 @@ async fn main() -> anyhow::Result<()> {
                         .publish(attestor_shared::WsEvent::ContainerFailed {
                             seal_id,
                             reason: "provision timeout".to_string(),
+                        })
+                        .await
+                    {
+                        tracing::warn!(?seal_id, error = %e, "publish ContainerFailed failed");
+                    }
+                }
+
+                // (c) Heartbeat staleness.
+                let stales = match deployments
+                    .flip_stale_heartbeats(
+                        now,
+                        HEARTBEAT_STALENESS_SECS,
+                        "heartbeat timeout (15min)".to_string(),
+                    )
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "heartbeat staleness sweep failed");
+                        continue;
+                    }
+                };
+                for seal_id in stales {
+                    tracing::info!(?seal_id, "heartbeat staleness: container_stage flipped Failed");
+                    if let Err(e) = events
+                        .publish(attestor_shared::WsEvent::ContainerFailed {
+                            seal_id,
+                            reason: "heartbeat timeout (15min)".to_string(),
                         })
                         .await
                     {

@@ -8,7 +8,7 @@
 
 use crate::retry::{retry_send, RetryPolicy};
 use crate::traits::SandboxClient;
-use crate::types::{SandboxCreateResponse, SandboxEnvelope, SealId};
+use crate::types::{SandboxCreateResponse, SandboxEnvelope, SandboxInfo, SealId};
 use alloy::primitives::{keccak256, Address};
 use async_trait::async_trait;
 use base64::Engine;
@@ -344,6 +344,79 @@ impl SandboxClient for HttpSandbox {
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
         Ok(())
+    }
+
+    async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>> {
+        let Some(signer) = &self.admin_signer else {
+            anyhow::bail!("get_sandbox requires admin signer to be configured");
+        };
+        if sandbox_id.is_empty() {
+            anyhow::bail!("get_sandbox: empty sandbox_id");
+        }
+
+        // GET /api/sandbox/:id is `withOwnerOrAdmin`-gated. We sign the
+        // standard CanonicalSignedMessage with the admin signer; the
+        // sandbox auth middleware verifies the three X-Wallet-* headers
+        // independently of the HTTP method. `action`/`payload` are not
+        // checked on admin paths but we fill plausible values for audit.
+        let nonce = {
+            let mut buf = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut buf);
+            hex::encode(buf)
+        };
+        let canonical = CanonicalSignedMessage {
+            action: "get_sandbox".into(),
+            expires_at: chrono::Utc::now().timestamp() + 240,
+            nonce,
+            payload: serde_json::Value::Object(Default::default()),
+            resource_id: sandbox_id.to_string(),
+        };
+        let msg_bytes = serde_json::to_vec(&canonical)
+            .map_err(|e| anyhow::anyhow!("get_sandbox: serialize canonical: {e}"))?;
+        let digest = eip191_digest(&msg_bytes);
+
+        let sk = SigningKey::from_bytes((&signer.priv_key).into())
+            .map_err(|e| anyhow::anyhow!("get_sandbox: invalid signer priv: {e}"))?;
+        let (sig, rec_id): (Signature, RecoveryId) = sk
+            .sign_prehash(&digest)
+            .map_err(|e| anyhow::anyhow!("get_sandbox: sign_prehash: {e}"))?;
+        let mut sig_65 = [0u8; 65];
+        sig_65[..64].copy_from_slice(&sig.to_bytes());
+        sig_65[64] = Into::<u8>::into(rec_id) + 27;
+
+        let url = format!(
+            "{}/api/sandbox/{}",
+            self.base_url.trim_end_matches('/'),
+            sandbox_id,
+        );
+        let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&msg_bytes);
+        let sig_hex = format!("0x{}", hex::encode(sig_65));
+        let addr_hex = format!("{:#x}", signer.address);
+
+        let res = retry_send("sandbox get_sandbox", RetryPolicy::Idempotent, || {
+            let req = self
+                .http
+                .get(&url)
+                .header("X-Wallet-Address", &addr_hex)
+                .header("X-Signed-Message", &signed_b64)
+                .header("X-Wallet-Signature", &sig_hex);
+            async move { req.send().await }
+        })
+        .await?;
+
+        let status = res.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = res.text().await.unwrap_or_default();
+            anyhow::bail!("sandbox get_sandbox: {status} — {body}");
+        }
+        let info: SandboxInfo = res
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("get_sandbox: parse response: {e}"))?;
+        Ok(Some(info))
     }
 }
 
