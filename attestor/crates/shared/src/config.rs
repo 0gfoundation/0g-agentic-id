@@ -22,12 +22,6 @@ pub struct Config {
     /// mode; in mock mode it's ignored.
     pub attestor_public_url: String,
 
-    /// Eth address of the sandbox TEE key that signs container attestations.
-    /// /provision recovers the signer from the attestation signature and must
-    /// match this address to accept the request. When the TappRegistry
-    /// wiring lands this single-signer config becomes a fallback.
-    pub sandbox_tee_signer: Address,
-
     pub db_url: String,
     pub bind: String,
 
@@ -65,8 +59,38 @@ pub struct Config {
     pub tapp_port: u16,
     /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
     /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
-    /// either `mock_tee=false` or `mock_kms=false`.
+    /// either `mock_tee=false` or `mock_kms=false`. Also surfaced to the
+    /// frontend as the "attestor" slot in the trust-roots ack modal.
     pub app_id: Option<String>,
+
+    // ── Trust-roots ack (TappRegistry + SandboxServing) ───────────────
+    //
+    // Three Tapp apps the user is asked to acknowledge before their first
+    // deploy: attestor itself (`app_id` above), the KMS it derives keys
+    // from, and the sandbox it launches containers on. The frontend reads
+    // each app's composeHash / nodes / user-ack version from TappRegistry
+    // and (for the sandbox slot only) additionally pulls
+    // `SandboxServing.services[provider]` for url / pricing / createFee.
+    // A single batch tx (`TappRegistry.acknowledgeApps`) acks all missing
+    // ones at once.
+    //
+    // All four fields are Option so mock / dev setups keep working; when
+    // any is unset the frontend treats the ack flow as disabled.
+    /// Tapp appId of the KMS attestor derives its master secret from.
+    pub kms_app_id: Option<String>,
+    /// Tapp appId of the sandbox provider attestor launches containers on.
+    pub sandbox_app_id: Option<String>,
+    /// Provider address registered in SandboxServing — the frontend reads
+    /// `services[this]` to render the sandbox slot's pricing / service URL.
+    pub sandbox_provider_addr: Option<Address>,
+    /// SandboxServing contract address. Separate from TappRegistry; holds
+    /// the per-provider business state (price schedule, service URL).
+    pub sandbox_serving_addr: Option<Address>,
+    /// Sandbox snapshot identifier the attestor instantiates new agent
+    /// containers from (passed into the sandbox `create` envelope's
+    /// `snapshot` field). Bumping this points new deploys at a newer
+    /// sealed-runtime image without code changes.
+    pub sandbox_snapshot: String,
 
     /// EIP-1559 priority fee (tip, gwei) set on every attestor-sent tx.
     /// Must be ≥ the chain's minimum (0G testnet enforces 2 gwei).
@@ -116,6 +140,23 @@ pub struct Config {
 }
 
 impl Config {
+    /// Returns `(tapp_registry_addr, sandbox_app_id)` when both are
+    /// configured — used by the chain client constructor to enable
+    /// `is_sandbox_node` lookups. Returns `None` when TappRegistry isn't
+    /// wired (mock / partial dev setups), so chain clients silently fall
+    /// back to env-configured single signers.
+    pub fn tapp_registry_for_chain(&self) -> Option<(Address, String)> {
+        if self.tapp_registry_addr == Address::ZERO {
+            return None;
+        }
+        match self.sandbox_app_id.as_deref() {
+            Some(s) if !s.is_empty() => {
+                Some((self.tapp_registry_addr, self.sandbox_app_id.clone().unwrap()))
+            }
+            _ => None,
+        }
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let _ = dotenvy::dotenv();
         Ok(Self {
@@ -132,8 +173,6 @@ impl Config {
                 .unwrap_or(true),
 
             attestor_public_url: env_opt("ATTESTOR_PUBLIC_URL").unwrap_or_default(),
-
-            sandbox_tee_signer: env("ATTESTOR_SANDBOX_TEE_SIGNER")?.parse()?,
 
             db_url: env("ATTESTOR_DB_URL")?,
             bind: env_opt("ATTESTOR_BIND").unwrap_or_else(|| "0.0.0.0:8080".to_string()),
@@ -158,6 +197,14 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50051),
             app_id: env_opt("ATTESTOR_APP_ID"),
+            kms_app_id: env_opt("ATTESTOR_KMS_APP_ID"),
+            sandbox_app_id: env_opt("ATTESTOR_SANDBOX_APP_ID"),
+            sandbox_provider_addr: env_opt("ATTESTOR_SANDBOX_PROVIDER_ADDR")
+                .and_then(|s| s.parse().ok()),
+            sandbox_serving_addr: env_opt("ATTESTOR_SANDBOX_SERVING_ADDR")
+                .and_then(|s| s.parse().ok()),
+            sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
+                .unwrap_or_else(|| "0g-test-sealed".to_string()),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),

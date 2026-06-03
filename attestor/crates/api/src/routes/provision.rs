@@ -3,7 +3,9 @@
 //!
 //! Authorization chain:
 //!   sandbox TEE signs {seal_id, container_pubkey, image_hash, issued_at}
-//!   → attestor recovers signer, checks `cfg.sandbox_tee_signer`
+//!   → attestor recovers signer, checks it's an active node of the sandbox
+//!     app on TappRegistry (sandbox-side key rotations propagate without
+//!     an attestor restart)
 //!   → checks image_hash ∈ on-chain validFrameworkHashes
 //!   → checks |now - issued_at| ≤ 300s
 //!   → derives agentSeal_priv(seal_id), ECIES-encrypts to container_pubkey
@@ -81,15 +83,31 @@ pub async fn handle(
             return Err(ApiError::unauthorized(reason));
         }
     };
-    if signer != state.cfg.sandbox_tee_signer {
-        // Permanent: signer is fixed in attestor config. Container
-        // resending won't change which key sandbox TEE is using.
-        let reason = format!(
-            "sandbox attestation: signer mismatch (recovered {signer}, expected {})",
-            state.cfg.sandbox_tee_signer
-        );
-        record_provision_error(&state, req.seal_id, reason.clone(), true).await;
-        return Err(ApiError::unauthorized(reason));
+    // Validate the recovered signer against TappRegistry's live node
+    // list. Sandbox-side key rotations propagate via `addNode` /
+    // `updateNode` on TappRegistry; no attestor config change required.
+    match state.chain.is_sandbox_node(signer).await {
+        Ok(true) => {
+            tracing::debug!(?signer, "provision: sandbox signer matches TappRegistry node list");
+        }
+        Ok(false) => {
+            // Permanent: container retry can't change which key the
+            // sandbox is signing with. The sandbox provider must call
+            // `addNode` / `updateNode` for this signer to be accepted.
+            let reason = format!(
+                "sandbox attestation: signer {signer} is not an active node of the sandbox app"
+            );
+            record_provision_error(&state, req.seal_id, reason.clone(), true).await;
+            return Err(ApiError::unauthorized(reason));
+        }
+        Err(e) => {
+            // Chain RPC failure or TappRegistry not configured at all.
+            // Soft (transient) — don't flip Failed so the container can
+            // retry once the operator fixes the upstream issue.
+            let reason = format!("sandbox attestation: TappRegistry lookup failed: {e}");
+            record_provision_error(&state, req.seal_id, reason.clone(), false).await;
+            return Err(ApiError::internal(reason));
+        }
     }
 
     // 4. image_hash must be in the on-chain framework whitelist.

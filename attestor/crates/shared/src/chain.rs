@@ -34,6 +34,17 @@ sol!(
     "../../../contracts/out/AgenticID.sol/AgenticID.json"
 );
 
+// TappRegistry — minimal inline interface (not a JSON-ABI import, to keep
+// this crate self-contained without a cross-repo dep on 0g-tapp). Add
+// methods here as the attestor needs them; today we only read the sandbox
+// app's active node list to validate /provision attestations.
+sol!(
+    #[sol(rpc)]
+    interface TappRegistry {
+        function getNodeList(string calldata appId) external view returns (address[] memory);
+    }
+);
+
 /// Try to decode a revert reason embedded in an alloy RPC error string.
 /// Looks for `data: "0x<hex>"` and decodes against AgenticID's full set
 /// of custom errors (AgenticID + inherited ERC-7857/8004/NonceRegistry).
@@ -78,6 +89,10 @@ where
     sender: Address,
     priority_fee_wei: u128,
     max_fee_wei: u128,
+    // TappRegistry + sandbox appId — present together iff TappRegistry is
+    // wired. Both unset → is_sandbox_node returns Ok(None) and the caller
+    // falls back to its env-configured single sandbox signer.
+    tapp_registry: Option<(Address, String)>,
     _t: PhantomData<T>,
 }
 
@@ -92,6 +107,7 @@ where
         sender: Address,
         priority_fee_gwei: u64,
         max_fee_gwei: u64,
+        tapp_registry: Option<(Address, String)>,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
@@ -99,6 +115,7 @@ where
             sender,
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
+            tapp_registry,
             _t: PhantomData,
         })
     }
@@ -117,6 +134,7 @@ pub fn connect_http(
     signer_priv: [u8; 32],
     priority_fee_gwei: u64,
     max_fee_gwei: u64,
+    tapp_registry: Option<(Address, String)>,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
@@ -133,6 +151,7 @@ pub fn connect_http(
         sender,
         priority_fee_gwei,
         max_fee_gwei,
+        tapp_registry,
     );
     Ok(chain)
 }
@@ -260,6 +279,16 @@ where
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.isTrustedAttestor(addr).call().await?._0)
+    }
+
+    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
+        let (registry_addr, app_id) = self
+            .tapp_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("TappRegistry not configured (ATTESTOR_TAPP_REGISTRY_ADDR + ATTESTOR_SANDBOX_APP_ID required)"))?;
+        let r = TappRegistry::new(*registry_addr, self.provider.clone());
+        let nodes = r.getNodeList(app_id.clone()).call().await?._0;
+        Ok(nodes.iter().any(|n| *n == addr))
     }
 
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String> {

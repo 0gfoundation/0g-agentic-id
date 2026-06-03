@@ -43,12 +43,16 @@ async fn main() -> anyhow::Result<()> {
     let job_key = derive_subkey(&master_key, JOB_ENCRYPTION_KEY_INFO);
 
     let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
+    // Worker doesn't call is_sandbox_node today, but threading the same
+    // wiring keeps both binaries' ChainClient identically configured —
+    // avoids surprises if a future worker job needs the TappRegistry view.
     let chain: Arc<dyn ChainClient> = chain_connect_http(
         &cfg.chain_rpc,
         cfg.agentic_id_addr,
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
+        cfg.tapp_registry_for_chain(),
     )?;
     let storage: Arc<dyn StorageClient> = if cfg.mock_storage {
         tracing::info!("storage: using MockStorage (MOCK_STORAGE=true)");

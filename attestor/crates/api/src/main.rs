@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
+        cfg.tapp_registry_for_chain(),
     )?;
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());

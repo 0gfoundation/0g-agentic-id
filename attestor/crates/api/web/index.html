@@ -170,7 +170,14 @@ summary:focus-visible{outline:2px solid var(--p);outline-offset:3px}
 .addr-chip{display:inline-flex;align-items:center;gap:6px;background:var(--surf);color:var(--text2);border:1px solid var(--border);border-radius:var(--r-sm);padding:5px 11px;font-size:var(--fs-xs);font-family:var(--mono);font-weight:600;cursor:pointer;user-select:none;transition:background var(--t-fast),border-color var(--t-fast);position:relative}
 .addr-chip::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 5px var(--green);flex-shrink:0}
 .addr-chip:hover{background:var(--surf2);border-color:var(--surf3)}
-.wallet-pop{position:absolute;top:calc(100% + 6px);right:0;background:var(--surf);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-lg);padding:6px;z-index:200;min-width:180px;display:none;animation:fadeIn var(--t-fast) var(--ease-out)}
+.wallet-pop{position:absolute;top:calc(100% + 6px);right:0;background:var(--surf);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--sh-lg);padding:6px;z-index:200;min-width:260px;display:none;animation:fadeIn var(--t-fast) var(--ease-out)}
+.wallet-pop .pop-row{display:flex;align-items:center;gap:8px;padding:8px 10px;font-family:var(--mono);font-size:var(--fs-xs);color:var(--text2)}
+.wallet-pop .pop-label{color:var(--muted);font-weight:500;flex-shrink:0;min-width:88px}
+.wallet-pop .pop-value{flex:1;color:var(--text);font-weight:600;text-align:right;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis}
+.wallet-pop .pop-value[data-tone="low"]{color:var(--orange)}
+.wallet-pop .pop-value[data-tone="ok"]{color:var(--green)}
+.wallet-pop .pop-action{flex-shrink:0;padding:4px 10px !important;background:var(--pbg) !important;color:var(--p) !important;border:1px solid var(--pbd) !important;border-radius:var(--r-sm) !important;font-family:var(--sans) !important;font-size:var(--fs-xs) !important;font-weight:600 !important;cursor:pointer;width:auto !important;transition:background var(--t-fast)}
+.wallet-pop .pop-action:hover{background:oklch(92% 0.08 315) !important}
 .wallet-pop.open{display:block}
 .wallet-pop button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:7px 10px;background:none;border:none;border-radius:var(--r-sm);color:var(--text);font:inherit;font-family:var(--sans);font-size:var(--fs-sm);cursor:pointer;transition:background var(--t-fast)}
 .wallet-pop button:hover{background:var(--surf2)}
@@ -953,7 +960,38 @@ details.log[open] summary{color:var(--text2)}
 .modal-bg{position:fixed;inset:0;background:oklch(0% 0 0 / .35);z-index:400;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
 .modal-bg.open{display:flex}
 .modal{background:var(--surf);border-radius:var(--r-lg);padding:20px 22px;width:min(92vw,360px);box-shadow:var(--sh-lg)}
+.modal.modal-wide{width:min(94vw,720px);max-height:88vh;overflow-y:auto}
 .modal h3{font-size:var(--fs-base);font-weight:600;margin-bottom:12px}
+
+/* ── Trust-roots ack modal ──────────────────────────────────────── */
+.ack-intro{color:var(--text2);font-size:var(--fs-sm);line-height:1.5;margin-bottom:16px}
+.ack-rows{display:flex;flex-direction:column;gap:10px}
+.ack-row{border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;background:var(--surf2);transition:border-color var(--t-fast),background var(--t-fast)}
+.ack-row[data-status="acked"]{border-color:var(--gbd);background:var(--gbg)}
+.ack-row[data-status="missing"]{border-color:var(--obd);background:var(--obg)}
+.ack-row[data-status="error"]{border-color:var(--rbd);background:var(--rbg)}
+.ack-row-head{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
+.ack-row-icon{width:18px;height:18px;border-radius:50%;border:2px solid var(--muted);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:11px;font-weight:700;color:var(--surf);background:transparent}
+.ack-row[data-status="acked"] .ack-row-icon{background:var(--green);border-color:var(--green);color:var(--surf)}
+.ack-row[data-status="missing"] .ack-row-icon{border-color:var(--orange);background:transparent;color:transparent}
+.ack-row[data-status="error"] .ack-row-icon{background:var(--red);border-color:var(--red);color:var(--surf)}
+.ack-row-title{font-family:var(--sans);font-weight:600;font-size:var(--fs-base);color:var(--text);flex:1}
+.ack-row-version{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted)}
+.ack-row-chev{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);transition:transform var(--t-fast)}
+.ack-row[data-open] .ack-row-chev{transform:rotate(90deg)}
+.ack-row-body{display:none;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-family:var(--mono);font-size:var(--fs-xs);color:var(--text2);line-height:1.55}
+.ack-row[data-open] .ack-row-body{display:block}
+.ack-kv{display:grid;grid-template-columns:120px 1fr;gap:4px 10px}
+.ack-kv .ack-k{color:var(--muted)}
+.ack-kv .ack-v{color:var(--text);word-break:break-all}
+.ack-sub-h{margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);font-family:var(--sans);font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600}
+.ack-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.ack-error{padding:10px 12px;background:var(--rbg);border:1px solid var(--rbd);border-radius:var(--r-sm);color:var(--red);font-size:var(--fs-sm);margin-bottom:12px;display:none}
+.ack-error[data-show]{display:block}
+
+/* Top-up quick-add buttons row */
+.top-up-quicks{display:flex;gap:8px;margin-top:8px}
+.top-up-quicks .btn{padding:6px 12px;font-family:var(--mono);font-size:var(--fs-xs);font-weight:500}
 </style>
 </head>
 <body>
@@ -975,6 +1013,17 @@ details.log[open] summary{color:var(--text2)}
     <span class="addr-chip" id="addrChip" style="display:none" onclick="event.stopPropagation();toggleWalletPop()">
       <span id="addrChipText"></span>
       <span class="wallet-pop" id="walletPop" onclick="event.stopPropagation()">
+        <div class="pop-row" id="popBalanceRow">
+          <span class="pop-label">Balance</span>
+          <span class="pop-value" id="popBalanceValue">—</span>
+          <button class="pop-action" id="popTopUpBtn" onclick="closeWalletPop();openTopUpModal(null)">Top up</button>
+        </div>
+        <div class="pop-row" id="popTrustRow">
+          <span class="pop-label">Trust roots</span>
+          <span class="pop-value" id="popTrustValue">—</span>
+          <button class="pop-action" id="popAckBtn" style="display:none" onclick="closeWalletPop();openAckModalForReview()">Acknowledge</button>
+        </div>
+        <hr/>
         <button onclick="copyAddr()"><span class="ico"><svg viewBox="0 0 16 16"><rect x="5" y="5" width="8" height="9" rx="1"/><path d="M3 11V3.5C3 2.7 3.7 2 4.5 2H10"/></svg></span> Copy address</button>
         <hr/>
         <button class="danger" onclick="disconnectWallet()"><span class="ico"><svg viewBox="0 0 16 16"><path d="M8 2v6"/><path d="M5 5a4 4 0 1 0 6 0"/></svg></span> Disconnect</button>
@@ -989,6 +1038,54 @@ details.log[open] summary{color:var(--text2)}
     <div id="walletList" style="display:flex;flex-direction:column;gap:8px;margin-top:8px"></div>
     <div style="display:flex;justify-content:flex-end;margin-top:14px">
       <button class="btn btn-ghost" onclick="closeWalletModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Sandbox top-up modal ──────────────────────────────────────── -->
+<div class="modal-bg" id="topUpModal" onclick="if(event.target===this)closeTopUpModal()">
+  <div class="modal">
+    <h3>Top up sandbox balance</h3>
+    <p class="ack-intro">
+      Deposit OG into your prepaid sandbox account. The sandbox provider
+      settles voucher fees against this balance as your agents run.
+      Deploy requires at least 0.1 OG on hand.
+    </p>
+    <div class="ack-kv" style="margin-bottom:14px;font-family:var(--mono);font-size:var(--fs-xs)">
+      <div class="ack-k">recipient</div><div class="ack-v" id="topUpRecipient">—</div>
+      <div class="ack-k">provider</div><div class="ack-v" id="topUpProvider">—</div>
+      <div class="ack-k">current balance</div><div class="ack-v" id="topUpCurrent">—</div>
+    </div>
+    <label class="field-label" for="topUpAmount" style="display:block;margin-bottom:6px;font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600">Amount (OG)</label>
+    <input id="topUpAmount" type="number" min="0" step="0.01" placeholder="0.5" />
+    <div class="top-up-quicks">
+      <button type="button" class="btn btn-ghost" onclick="setTopUpAmount('0.1')">+0.1</button>
+      <button type="button" class="btn btn-ghost" onclick="setTopUpAmount('1')">+1</button>
+      <button type="button" class="btn btn-ghost" onclick="setTopUpAmount('10')">+10</button>
+    </div>
+    <div class="ack-actions">
+      <button class="btn btn-ghost" onclick="closeTopUpModal()">Cancel</button>
+      <button class="btn btn-primary" id="topUpSubmitBtn" onclick="submitTopUp()">Deposit</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Trust-roots ack modal ─────────────────────────────────────── -->
+<div class="modal-bg" id="ackModal" onclick="if(event.target===this)closeAckModal()">
+  <div class="modal modal-wide">
+    <h3>Acknowledge trust roots</h3>
+    <p class="ack-intro">
+      Before deploying you confirm the three TEE apps your agent depends on:
+      the attestor that derives identity, the KMS that supplies its master
+      secret, and the sandbox that runs the container. A single batch
+      transaction acks whichever are missing.
+    </p>
+    <div id="ackRows" class="ack-rows"></div>
+    <div class="ack-actions">
+      <button class="btn btn-ghost" onclick="closeAckModal()">Cancel</button>
+      <button class="btn btn-primary" id="ackSubmitBtn" onclick="submitAckBatch()" disabled>
+        Acknowledge missing (0)
+      </button>
     </div>
   </div>
 </header>
@@ -1203,7 +1300,7 @@ details.log[open] summary{color:var(--text2)}
 
     <section class="card">
       <button class="btn btn-primary" id="deployBtn" disabled onclick="submitDeploy()">Deploy</button>
-      <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope.</small>
+      <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope. If trust roots aren't acknowledged or sandbox balance is below 0.1 OG, you'll be asked to handle that first.</small>
     </section>
 
     <section class="card" id="cardProgress" style="display:none">
@@ -1321,7 +1418,39 @@ const State = {
   // bubble (taking precedence over the balance-polled plea) so the
   // owner sees the container's authoritative reason text.
   containerWarning: null, // { sealId, reason } | null
+  // Last loaded trust-roots snapshot, cached per (owner, ackVersion)
+  // tuple so re-opening the deploy form doesn't re-query unchanged
+  // state. Cleared on wallet account change.
+  trustRoots: null,       // { rows: [...], allAcked: bool, missingIds: [...] } | null
+  // Sandbox prepaid balance for the connected wallet against the
+  // configured provider (SandboxServing.getBalance). Refreshed on
+  // wallet connect, deploy-view enter, and after a successful top-up
+  // tx. Used by the deploy gate to require ≥ TOP_UP_THRESHOLD_WEI.
+  sandboxBalance: null,   // bigint wei | null
 };
+
+// ───────────────────────────────────────────────────────────────────
+// Trust-roots ack: TappRegistry + SandboxServing ABI fragments
+// ───────────────────────────────────────────────────────────────────
+// Used by the pre-deploy ack modal. Three apps in TappRegistry —
+// attestor, KMS, sandbox — must each be acknowledged at their current
+// ackVersion before deploy can proceed. SandboxServing additionally
+// supplies per-provider business state (url + pricing + createFee) for
+// the sandbox slot.
+const TAPP_REGISTRY_ABI = [
+  'function acknowledgeApps(string[] appIds) external',
+  'function getAppInfo(string appId) view returns (tuple(bytes composeHash, bytes volumesHash, bytes[] imageHashes, address owner, uint256 registeredAt))',
+  'function getAckVersion(string appId) view returns (uint256)',
+  'function isAcknowledged(address user, string appId) view returns (bool)',
+  'function getNodeList(string appId) view returns (address[])',
+  'function getNode(string appId, address signer) view returns (tuple(string teeUrl, uint256 addedAt, uint256 stakeAmount))',
+];
+const SANDBOX_SERVING_ABI = [
+  'function services(address provider) view returns (string url, string appId, uint256 pricePerCPUPerMin, uint256 pricePerMemGBPerMin, uint256 createFee)',
+  'function serviceExists(address provider) view returns (bool)',
+  'function getBalance(address user, address provider) view returns (uint256)',
+  'function deposit(address recipient, address provider) payable',
+];
 
 const eip6963Providers = new Map();
 window.addEventListener('eip6963:announceProvider', (e) => {
@@ -1552,6 +1681,8 @@ window.disconnectWallet = function () {
   $('#connectBtn').style.display = '';
   $('#addrChip').style.display = 'none';
   $('#walletPop').classList.remove('open');
+  State.sandboxBalance = null;
+  State.trustRoots = null;
   const deployBtn = $('#deployBtn');
   if (deployBtn) deployBtn.disabled = true;
   // Tear down WS subscriptions so we don't leak old connections.
@@ -1607,6 +1738,8 @@ function handleHash() {
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
     $('#deployBtn').disabled = !State.signer;
     activeNav = 'deploy';
+    // Indicators live in the topbar wallet popover now; no per-route
+    // refresh needed — applyAccount already kicks both off on connect.
   } else if (h === '#/agents') {
     route = 'discovery';
     $('#viewDiscovery').classList.add('active');
@@ -1734,10 +1867,17 @@ async function applyAccount(signer) {
   State.signer = signer;
   State.ownerAddr = await signer.getAddress();
   $('#connectBtn').style.display = 'none';
-  $('#addrChipText').textContent = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
   $('#addrChip').style.display = 'inline-block';
   const deployBtn = $('#deployBtn');
   if (deployBtn) deployBtn.disabled = false;
+  // Invalidate per-owner caches; refresh both so addr-chip and popover
+  // are warm across every route (the wallet pop is global, not tied to
+  // deploy view).
+  State.trustRoots = null;
+  State.sandboxBalance = null;
+  renderWalletUI();
+  refreshSandboxBalanceIndicator();
+  refreshTrustRootsIndicator();
 }
 
 // Subscribe to the wallet's EIP-1193 events so account / chain switches in
@@ -1946,11 +2086,533 @@ async function signSandboxEnvelope(action, resourceId, payload = {}) {
 }
 
 // ───────────────────────────────────────────────────────────────────
+// Trust-roots ack: query / render / batch-tx
+// ───────────────────────────────────────────────────────────────────
+// Three apps in TappRegistry — attestor / KMS / sandbox — must be acked
+// by the connected wallet before deploy. Each app's ackVersion can be
+// bumped by updateApp / updateNode / authorized invalidator
+// (SandboxServing's prices), so a prior ack stays valid only as long
+// as the relevant version hasn't moved.
+//
+// Returns { slots, allAcked, missingAppIds, disabled, errors } where:
+//   slots          = [{key, label, appId, status, app, nodes, sandbox, error}]
+//   status         = 'acked' | 'missing' | 'error'
+//   disabled       = true if any required config is missing (mock setup)
+//   missingAppIds  = appIds the user still needs to ack (skip 'acked'/'error')
+async function loadTrustRoots(ownerAddr) {
+  const cfg = State.config;
+  if (!cfg) throw new Error('config not loaded yet');
+
+  // Build slot definitions in dependency order: KMS → attestor → sandbox.
+  // Skip a slot if its appId is unset (mock setup or partial deploy).
+  const slotDefs = [
+    { key: 'attestor', label: 'Attestor', appId: cfg.attestor_app_id },
+    { key: 'kms',      label: 'KMS',      appId: cfg.kms_app_id },
+    { key: 'sandbox',  label: 'Sandbox',  appId: cfg.sandbox_app_id },
+  ];
+  const disabled = !cfg.tapp_registry_addr
+    || cfg.tapp_registry_addr === '0x0000000000000000000000000000000000000000'
+    || slotDefs.some(s => !s.appId);
+  if (disabled) {
+    return { slots: [], allAcked: true, missingAppIds: [], disabled: true, errors: [] };
+  }
+
+  const provider = new ethers.JsonRpcProvider(cfg.chain_rpc);
+  const reg = new ethers.Contract(cfg.tapp_registry_addr, TAPP_REGISTRY_ABI, provider);
+  const serving = (cfg.sandbox_serving_addr && cfg.sandbox_serving_addr !== '0x0000000000000000000000000000000000000000')
+    ? new ethers.Contract(cfg.sandbox_serving_addr, SANDBOX_SERVING_ABI, provider)
+    : null;
+
+  const slots = await Promise.all(slotDefs.map(async (def) => {
+    try {
+      const [info, ackVersion, acked, nodeList] = await Promise.all([
+        reg.getAppInfo(def.appId),
+        reg.getAckVersion(def.appId),
+        reg.isAcknowledged(ownerAddr, def.appId),
+        reg.getNodeList(def.appId),
+      ]);
+      // info is a tuple: [composeHash, volumesHash, imageHashes[], owner, registeredAt]
+      const app = {
+        composeHash: info[0],
+        volumesHash: info[1],
+        imageHashes: info[2],
+        owner:       info[3],
+        registeredAt: Number(info[4]),
+        ackVersion:  Number(ackVersion),
+      };
+      // Fetch node details in parallel; a small node list (typically 1) is the norm.
+      const nodes = await Promise.all(nodeList.map(async (addr) => {
+        const n = await reg.getNode(def.appId, addr);
+        return {
+          signer: addr,
+          teeUrl: n[0],
+          addedAt: Number(n[1]),
+          stakeAmount: n[2], // bigint
+        };
+      }));
+      let sandbox = null;
+      if (def.key === 'sandbox' && serving && cfg.sandbox_provider_addr
+          && cfg.sandbox_provider_addr !== '0x0000000000000000000000000000000000000000') {
+        try {
+          const svc = await serving.services(cfg.sandbox_provider_addr);
+          sandbox = {
+            providerAddr:        cfg.sandbox_provider_addr,
+            url:                 svc[0],
+            appId:               svc[1],
+            pricePerCPUPerMin:   svc[2],
+            pricePerMemGBPerMin: svc[3],
+            createFee:           svc[4],
+          };
+        } catch (e) {
+          sandbox = { providerAddr: cfg.sandbox_provider_addr, error: String(e.message || e) };
+        }
+      }
+      return {
+        ...def,
+        status: acked ? 'acked' : 'missing',
+        app,
+        nodes,
+        sandbox,
+      };
+    } catch (e) {
+      return { ...def, status: 'error', error: String(e.message || e) };
+    }
+  }));
+
+  const errors = slots.filter(s => s.status === 'error').map(s => `${s.label}: ${s.error}`);
+  const allAcked = slots.every(s => s.status === 'acked');
+  const missingAppIds = slots.filter(s => s.status === 'missing').map(s => s.appId);
+  return { slots, allAcked, missingAppIds, disabled: false, errors };
+}
+
+function fmtPriceWei(bn) {
+  // Stake / pricing values are bigint wei; render with 18-decimal OG suffix
+  // when readable, else raw. Keeps the modal honest about the unit.
+  try {
+    const v = ethers.formatEther(bn);
+    return `${v} OG`;
+  } catch (_) { return String(bn); }
+}
+
+function fmtHashShort(hexLike) {
+  if (!hexLike) return '—';
+  const s = typeof hexLike === 'string' ? hexLike : ethers.hexlify(hexLike);
+  if (s.length <= 18) return s;
+  return s.slice(0, 10) + '…' + s.slice(-6);
+}
+
+function renderAckModal(snap) {
+  const rowsHost = $('#ackRows');
+  if (!rowsHost) return;
+  rowsHost.innerHTML = snap.slots.map(s => {
+    const icon = s.status === 'acked' ? '✓'
+               : s.status === 'error' ? '!'
+               : '';
+    const versionLine = s.app ? `v${s.app.ackVersion}` : (s.error ? 'unavailable' : '');
+    const imageHashesShort = s.app
+      ? (s.app.imageHashes.length === 0
+          ? '<span class="ack-v" style="color:var(--muted)">none</span>'
+          : s.app.imageHashes.map(h => `<div class="ack-v">${escapeHtml(fmtHashShort(h))}</div>`).join(''))
+      : '';
+    const nodesBlock = s.nodes && s.nodes.length
+      ? s.nodes.map(n => `
+          <div class="ack-kv" style="margin-top:4px">
+            <div class="ack-k">signer</div><div class="ack-v">${escapeHtml(n.signer)}</div>
+            <div class="ack-k">tee url</div><div class="ack-v">${escapeHtml(n.teeUrl || '—')}</div>
+            <div class="ack-k">stake</div><div class="ack-v">${escapeHtml(fmtPriceWei(n.stakeAmount))}</div>
+          </div>`).join('')
+      : '<div class="ack-v" style="color:var(--muted)">no active nodes</div>';
+    const sandboxBlock = s.sandbox && !s.sandbox.error
+      ? `
+        <div class="ack-sub-h">Service (SandboxServing)</div>
+        <div class="ack-kv" style="margin-top:6px">
+          <div class="ack-k">provider</div><div class="ack-v">${escapeHtml(s.sandbox.providerAddr)}</div>
+          <div class="ack-k">url</div><div class="ack-v">${escapeHtml(s.sandbox.url || '—')}</div>
+          <div class="ack-k">CPU/min</div><div class="ack-v">${escapeHtml(fmtPriceWei(s.sandbox.pricePerCPUPerMin))}</div>
+          <div class="ack-k">mem GB/min</div><div class="ack-v">${escapeHtml(fmtPriceWei(s.sandbox.pricePerMemGBPerMin))}</div>
+          <div class="ack-k">create fee</div><div class="ack-v">${escapeHtml(fmtPriceWei(s.sandbox.createFee))}</div>
+        </div>`
+      : s.sandbox && s.sandbox.error
+        ? `<div class="ack-sub-h">Service (SandboxServing)</div>
+           <div class="ack-v" style="color:var(--red);margin-top:6px">${escapeHtml(s.sandbox.error)}</div>`
+        : '';
+    const bodyContent = s.error
+      ? `<div class="ack-v" style="color:var(--red)">${escapeHtml(s.error)}</div>`
+      : `
+          <div class="ack-kv">
+            <div class="ack-k">app id</div><div class="ack-v">${escapeHtml(s.appId)}</div>
+            <div class="ack-k">composeHash</div><div class="ack-v">${escapeHtml(fmtHashShort(s.app.composeHash))}</div>
+            <div class="ack-k">volumesHash</div><div class="ack-v">${escapeHtml(fmtHashShort(s.app.volumesHash))}</div>
+            <div class="ack-k">imageHashes</div><div>${imageHashesShort}</div>
+            <div class="ack-k">owner</div><div class="ack-v">${escapeHtml(s.app.owner)}</div>
+          </div>
+          <div class="ack-sub-h">Nodes (${s.nodes ? s.nodes.length : 0})</div>
+          ${nodesBlock}
+          ${sandboxBlock}`;
+    return `
+      <div class="ack-row" data-status="${s.status}" data-key="${s.key}">
+        <div class="ack-row-head" onclick="this.parentElement.toggleAttribute('data-open')">
+          <span class="ack-row-icon">${icon}</span>
+          <span class="ack-row-title">${escapeHtml(s.label)}</span>
+          <span class="ack-row-version">${escapeHtml(versionLine)}</span>
+          <span class="ack-row-chev">▸</span>
+        </div>
+        <div class="ack-row-body">
+          ${bodyContent}
+        </div>
+      </div>`;
+  }).join('');
+
+  const btn = $('#ackSubmitBtn');
+  if (btn) {
+    const n = snap.missingAppIds.length;
+    if (snap.errors.length) {
+      btn.textContent = 'Retry query';
+      btn.disabled = false;
+    } else if (n === 0) {
+      btn.textContent = 'All acknowledged';
+      btn.disabled = true;
+    } else {
+      btn.textContent = `Acknowledge missing (${n})`;
+      btn.disabled = false;
+    }
+  }
+}
+
+let _ackResolve = null;  // closure resolver for the awaiting deploy gate
+window.openAckModal = function (snap, resolveFn) {
+  State.trustRoots = snap;
+  _ackResolve = resolveFn || null;
+  renderAckModal(snap);
+  $('#ackModal').classList.add('open');
+};
+window.closeAckModal = function () {
+  $('#ackModal').classList.remove('open');
+  if (_ackResolve) { _ackResolve(false); _ackResolve = null; }
+};
+
+window.submitAckBatch = async function () {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  const snap = State.trustRoots;
+  if (!snap) return;
+  // If the previous query errored, "Retry query" just refetches.
+  if (snap.errors.length) {
+    const refreshed = await loadTrustRoots(State.ownerAddr);
+    renderAckModal(refreshed);
+    State.trustRoots = refreshed;
+    return;
+  }
+  if (snap.missingAppIds.length === 0) return;
+
+  const cfg = State.config;
+  const btn = $('#ackSubmitBtn');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Signing…';
+  try {
+    const reg = new ethers.Contract(cfg.tapp_registry_addr, TAPP_REGISTRY_ABI, State.signer);
+    const tx = await reg.acknowledgeApps(snap.missingAppIds);
+    btn.textContent = 'Confirming…';
+    await tx.wait();
+    btn.textContent = 'Re-verifying…';
+    const refreshed = await loadTrustRoots(State.ownerAddr);
+    State.trustRoots = refreshed;
+    renderAckModal(refreshed);
+    if (refreshed.allAcked) {
+      toast('Trust roots acknowledged', 'success');
+      $('#ackModal').classList.remove('open');
+      if (_ackResolve) { _ackResolve(true); _ackResolve = null; }
+      updateTrustRootsIndicator(refreshed);
+    }
+  } catch (e) {
+    toast(`Acknowledge failed: ${e.message || e}`, 'error');
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+};
+
+// `updateTrustRootsIndicator` is retained as a thin alias so existing
+// call sites keep working — the actual rendering lives in
+// renderWalletUI() now that the standalone chip is gone.
+function updateTrustRootsIndicator(_snap) {
+  renderWalletUI();
+}
+
+// Passive load — keeps the popover's trust-roots row fresh. Called on
+// wallet connect (warm cache so the popover doesn't show "…" when
+// opened) and on /loadTrustRoots failure paths.
+async function refreshTrustRootsIndicator() {
+  if (!State.ownerAddr || !State.config) { renderWalletUI(); return; }
+  try {
+    State.trustRoots = await loadTrustRoots(State.ownerAddr);
+  } catch (e) {
+    State.trustRoots = {
+      disabled: false, allAcked: false, missingAppIds: [],
+      errors: [String(e.message || e)], slots: [],
+    };
+  }
+  renderWalletUI();
+}
+
+// Called by submitDeploy; returns true if the user is ready (or no ack
+// needed), false if they cancelled the modal.
+async function ensureTrustRootsAcked() {
+  if (!State.ownerAddr) return false;
+  let snap;
+  try {
+    snap = await loadTrustRoots(State.ownerAddr);
+  } catch (e) {
+    toast(`Trust roots query failed: ${e.message || e}`, 'error');
+    return false;
+  }
+  State.trustRoots = snap;
+  updateTrustRootsIndicator(snap);
+  if (snap.disabled) return true;       // dev mode: ack flow disabled
+  if (snap.allAcked) return true;       // green light
+  return await new Promise(resolve => openAckModal(snap, resolve));
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Sandbox prepaid balance: query / indicator / top-up
+// ───────────────────────────────────────────────────────────────────
+// SandboxServing tracks per-(user, provider) balance in wei. Owner
+// deposits OG to fund their agents' sandbox usage; the provider
+// settles voucher fees against this balance. Deploy gate requires
+// balance ≥ TOP_UP_THRESHOLD_WEI (a future revision could pull
+// Service.createFee dynamically; v1 hardcodes a sane floor).
+const TOP_UP_THRESHOLD_WEI = ethers.parseEther('0.1');
+
+function sandboxServingEnabled() {
+  const cfg = State.config;
+  return !!cfg
+      && cfg.sandbox_serving_addr
+      && cfg.sandbox_serving_addr !== '0x0000000000000000000000000000000000000000'
+      && cfg.sandbox_provider_addr
+      && cfg.sandbox_provider_addr !== '0x0000000000000000000000000000000000000000';
+}
+
+async function loadSandboxBalance(ownerAddr) {
+  const cfg = State.config;
+  const provider = new ethers.JsonRpcProvider(cfg.chain_rpc);
+  const c = new ethers.Contract(cfg.sandbox_serving_addr, SANDBOX_SERVING_ABI, provider);
+  return await c.getBalance(ownerAddr, cfg.sandbox_provider_addr);
+}
+
+// ── Wallet UI rendering ───────────────────────────────────────────
+// addr-chip + popover are the single surface for owner state: short
+// address + balance on the chip, full balance + Top up + trust-roots
+// status + Acknowledge inside the popover. Anywhere that mutates
+// `State.sandboxBalance` or `State.trustRoots` should call
+// `renderWalletUI()` to keep both in sync.
+function renderWalletUI() {
+  if (!State.ownerAddr) return;
+  // Chip text — short address optionally suffixed with rounded balance.
+  const short = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
+  let chipText = short;
+  if (State.sandboxBalance !== null && sandboxServingEnabled()) {
+    const og = (+ethers.formatEther(State.sandboxBalance)).toFixed(4);
+    chipText = `${short} · ${og} OG`;
+  }
+  const chipEl = $('#addrChipText');
+  if (chipEl) chipEl.textContent = chipText;
+
+  // Balance row in popover.
+  const bRow = $('#popBalanceRow');
+  const bVal = $('#popBalanceValue');
+  const bBtn = $('#popTopUpBtn');
+  if (bRow) {
+    if (!sandboxServingEnabled()) {
+      bRow.style.display = 'none';
+    } else {
+      bRow.style.display = 'flex';
+      if (State.sandboxBalance === null) {
+        bVal.textContent = '…';
+        bVal.removeAttribute('data-tone');
+      } else {
+        const og = ethers.formatEther(State.sandboxBalance);
+        bVal.textContent = `${(+og).toFixed(4)} OG`;
+        bVal.dataset.tone = State.sandboxBalance < TOP_UP_THRESHOLD_WEI ? 'low' : 'ok';
+      }
+      if (bBtn) bBtn.style.display = 'inline-block';
+    }
+  }
+
+  // Trust-roots row.
+  const tRow = $('#popTrustRow');
+  const tVal = $('#popTrustValue');
+  const tBtn = $('#popAckBtn');
+  if (tRow) {
+    if (!State.trustRoots) {
+      tRow.style.display = 'flex';
+      tVal.textContent = '…';
+      tVal.removeAttribute('data-tone');
+      if (tBtn) tBtn.style.display = 'none';
+    } else if (State.trustRoots.disabled) {
+      tRow.style.display = 'flex';
+      tVal.textContent = 'dev mode';
+      tVal.removeAttribute('data-tone');
+      if (tBtn) tBtn.style.display = 'none';
+    } else if (State.trustRoots.errors.length) {
+      tRow.style.display = 'flex';
+      tVal.textContent = 'query failed';
+      tVal.dataset.tone = 'low';
+      if (tBtn) tBtn.style.display = 'none';
+    } else if (State.trustRoots.allAcked) {
+      tRow.style.display = 'flex';
+      tVal.textContent = '✓ all acknowledged';
+      tVal.dataset.tone = 'ok';
+      if (tBtn) tBtn.style.display = 'none';
+    } else {
+      tRow.style.display = 'flex';
+      const missing = State.trustRoots.missingAppIds.length;
+      const total = State.trustRoots.slots.length;
+      tVal.textContent = `${total - missing}/${total} acknowledged`;
+      tVal.dataset.tone = 'low';
+      if (tBtn) tBtn.style.display = 'inline-block';
+    }
+  }
+}
+
+function closeWalletPop() {
+  $('#walletPop')?.classList.remove('open');
+}
+
+// Open ack modal from the popover (review / explicit ack). No deploy
+// gate resolver — modal close just closes; user navigates back manually.
+window.openAckModalForReview = async function () {
+  let snap = State.trustRoots;
+  if (!snap) {
+    try { snap = await loadTrustRoots(State.ownerAddr); State.trustRoots = snap; }
+    catch (e) { toast(`Trust roots query failed: ${e.message || e}`, 'error'); return; }
+    renderWalletUI();
+  }
+  openAckModal(snap, null);
+};
+
+async function refreshSandboxBalanceIndicator() {
+  if (!State.ownerAddr || !State.config) { renderWalletUI(); return; }
+  if (!sandboxServingEnabled()) {
+    State.sandboxBalance = null;
+    renderWalletUI();
+    return;
+  }
+  // Set null first so the chip shows "…" while the call is in flight.
+  State.sandboxBalance = null;
+  renderWalletUI();
+  try {
+    State.sandboxBalance = await loadSandboxBalance(State.ownerAddr);
+  } catch (e) {
+    State.sandboxBalance = null;
+    toast(`Balance query failed: ${e.message || e}`, 'error');
+  }
+  renderWalletUI();
+}
+
+let _topUpResolve = null;
+window.openTopUpModal = function (resolveFn) {
+  if (!State.ownerAddr) { toast('Connect wallet first', 'error'); return; }
+  if (!sandboxServingEnabled()) { toast('Sandbox top-up not configured on this attestor', 'error'); return; }
+  _topUpResolve = resolveFn || null;
+  $('#topUpRecipient').textContent = State.ownerAddr;
+  $('#topUpProvider').textContent = State.config.sandbox_provider_addr;
+  const balLabel = State.sandboxBalance !== null
+    ? `${ethers.formatEther(State.sandboxBalance)} OG`
+    : 'unknown';
+  $('#topUpCurrent').textContent = balLabel;
+  $('#topUpAmount').value = '';
+  $('#topUpSubmitBtn').disabled = false;
+  $('#topUpSubmitBtn').textContent = 'Deposit';
+  $('#topUpModal').classList.add('open');
+};
+window.closeTopUpModal = function () {
+  $('#topUpModal').classList.remove('open');
+  if (_topUpResolve) { _topUpResolve(false); _topUpResolve = null; }
+};
+window.setTopUpAmount = function (og) {
+  const input = $('#topUpAmount');
+  if (input) input.value = og;
+};
+
+window.submitTopUp = async function () {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  const cfg = State.config;
+  const raw = $('#topUpAmount').value.trim();
+  if (!raw) { toast('Enter an amount', 'error'); return; }
+  let amountWei;
+  try {
+    amountWei = ethers.parseEther(raw);
+  } catch (_) {
+    toast('Invalid amount', 'error');
+    return;
+  }
+  if (amountWei <= 0n) { toast('Amount must be > 0', 'error'); return; }
+
+  const btn = $('#topUpSubmitBtn');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Signing…';
+  try {
+    const c = new ethers.Contract(cfg.sandbox_serving_addr, SANDBOX_SERVING_ABI, State.signer);
+    const tx = await c.deposit(State.ownerAddr, cfg.sandbox_provider_addr, { value: amountWei });
+    btn.textContent = 'Confirming…';
+    await tx.wait();
+    btn.textContent = 'Re-checking…';
+    const bal = await loadSandboxBalance(State.ownerAddr);
+    State.sandboxBalance = bal;
+    renderWalletUI();
+    toast(`Deposited ${raw} OG`, 'success');
+    $('#topUpModal').classList.remove('open');
+    if (_topUpResolve) {
+      // Resolve true only if the gate-required threshold is now met;
+      // otherwise the deploy gate will re-open the modal next loop.
+      _topUpResolve(bal >= TOP_UP_THRESHOLD_WEI);
+      _topUpResolve = null;
+    }
+  } catch (e) {
+    toast(`Top-up failed: ${e.message || e}`, 'error');
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+};
+
+// Deploy gate: balance must be ≥ TOP_UP_THRESHOLD_WEI to proceed.
+async function ensureSandboxBalance() {
+  if (!State.ownerAddr || !sandboxServingEnabled()) return true; // dev mode: skip
+  try {
+    const bal = await loadSandboxBalance(State.ownerAddr);
+    State.sandboxBalance = bal;
+    updateSandboxBalanceIndicator(bal);
+    if (bal >= TOP_UP_THRESHOLD_WEI) return true;
+  } catch (e) {
+    toast(`Sandbox balance query failed: ${e.message || e}`, 'error');
+    return false;
+  }
+  return await new Promise(resolve => openTopUpModal(resolve));
+}
+
+// ───────────────────────────────────────────────────────────────────
 // Deploy submit
 // ───────────────────────────────────────────────────────────────────
 window.submitDeploy = async function () {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
   $('#deployBtn').disabled = true;
+
+  // Gate 1: every trust root must be acked at its current ackVersion.
+  // The modal handles the batch tx; we just wait for the resolution.
+  // A dev/mock attestor with appIds unset returns true immediately.
+  const acked = await ensureTrustRootsAcked();
+  if (!acked) {
+    $('#deployBtn').disabled = false;
+    return;
+  }
+
+  // Gate 2: prepaid sandbox balance must be ≥ 0.1 OG. Opens the
+  // top-up modal otherwise.
+  const funded = await ensureSandboxBalance();
+  if (!funded) {
+    $('#deployBtn').disabled = false;
+    return;
+  }
 
   try {
     const idempKey = `console-${Date.now()}`;
@@ -1998,8 +2660,13 @@ window.submitDeploy = async function () {
     // translates `API_KEY` to the provider-specific env name openclaw
     // expects (e.g. ANTHROPIC_API_KEY when provider="anthropic").
     const env = apiKey ? { API_KEY: apiKey } : {};
+    // Snapshot identifier comes from attestor /config — operators bump
+    // ATTESTOR_SANDBOX_SNAPSHOT to point new deploys at a newer image
+    // without a frontend redeploy. Fall back to the legacy default if
+    // the field is missing (older attestor binary).
+    const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
     const { canonical: sandboxCanonical, envelope: sandboxEnvelope } =
-      await signSandboxEnvelope('create', '', { snapshot: '0g-test-sealed', sealed: true, env });
+      await signSandboxEnvelope('create', '', { snapshot, sealed: true, env });
 
     const deployBody = {
       idempotency_key: idempKey,

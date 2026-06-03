@@ -99,6 +99,11 @@ impl ChainClient for MockChain {
         Ok(true)
     }
 
+    async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
+        // Mock defaults to passing; tests needing rejection use ConfigurableChain.
+        Ok(true)
+    }
+
     async fn token_uri(&self, _agent_id: AgentId) -> anyhow::Result<String> {
         Ok(String::new())
     }
@@ -441,6 +446,11 @@ impl ChainClient for ConfigurableChain {
     }
 
     async fn is_trusted_attestor(&self, _addr: Address) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
+        // Mock defaults to passing; tests needing rejection use ConfigurableChain.
         Ok(true)
     }
 

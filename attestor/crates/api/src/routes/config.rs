@@ -24,6 +24,17 @@ pub struct ConfigResponse {
     pub chain_rpc: String,
     pub chain_id: u64,
     pub agentic_id_addr: String,
+
+    // Trust-roots ack. Frontend uses these to build the pre-deploy ack
+    // modal (TappRegistry.acknowledgeApps batch). Any field empty/null →
+    // the corresponding ack slot is disabled (dev / mock setup).
+    pub tapp_registry_addr: String,
+    pub attestor_app_id: Option<String>,
+    pub kms_app_id: Option<String>,
+    pub sandbox_app_id: Option<String>,
+    pub sandbox_provider_addr: Option<String>,
+    pub sandbox_serving_addr: Option<String>,
+    pub sandbox_snapshot: String,
 }
 
 pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -36,5 +47,19 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         chain_rpc: state.cfg.chain_rpc.clone(),
         chain_id: state.cfg.chain_id,
         agentic_id_addr: format!("{:#x}", state.cfg.agentic_id_addr),
+
+        tapp_registry_addr: format!("{:#x}", state.cfg.tapp_registry_addr),
+        attestor_app_id: state.cfg.app_id.clone(),
+        kms_app_id: state.cfg.kms_app_id.clone(),
+        sandbox_app_id: state.cfg.sandbox_app_id.clone(),
+        sandbox_provider_addr: state
+            .cfg
+            .sandbox_provider_addr
+            .map(|a| format!("{:#x}", a)),
+        sandbox_serving_addr: state
+            .cfg
+            .sandbox_serving_addr
+            .map(|a| format!("{:#x}", a)),
+        sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
     })
 }

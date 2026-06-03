@@ -19,6 +19,16 @@ pub trait ChainClient: Send + Sync {
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
+    /// Returns whether `addr` is a currently-active node signer of the
+    /// configured sandbox app in TappRegistry. Used by `/provision` to
+    /// validate that the recovered sandbox attestation signer is one
+    /// the sandbox provider has registered (and rotations propagate
+    /// without an attestor restart).
+    ///
+    /// Returns `Err` when TappRegistry isn't wired in the chain client
+    /// — the attestor requires it to be configured.
+    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool>;
+
     /// ERC-721 `tokenURI(agentId)`. Used by indexer reconstruction.
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String>;
 
