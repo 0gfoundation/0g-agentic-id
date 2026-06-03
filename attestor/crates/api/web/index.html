@@ -322,6 +322,12 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 /* ── Password input with reveal ─────────────────────────────────── */
 .secret-row{position:relative}
 .secret-row input{padding-right:80px;font-family:var(--mono);font-size:var(--fs-sm);font-weight:500;letter-spacing:var(--ls-normal)}
+/* Placeholder inherits the mono font from the input, but the global
+   input::placeholder rule drops weight to 400 — that mismatch caused a
+   visible "jump" the moment a user typed the first character. Pin it
+   to the input's own weight so the placeholder and the typed value
+   sit on the same baseline + visual weight. */
+.secret-row input::placeholder{font-family:var(--mono);font-weight:500;letter-spacing:var(--ls-normal)}
 .secret-toggle{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);font-size:var(--fs-xs);font-weight:700;letter-spacing:var(--ls-eyebrow);text-transform:uppercase;cursor:pointer;min-width:44px;min-height:36px;padding:0 12px;border-radius:var(--r-sm);font-family:var(--mono);transition:background var(--t-fast),color var(--t-fast)}
 .secret-toggle:hover{background:var(--surf2);color:var(--p)}
 .secret-toggle:focus-visible{outline:2px solid var(--p);outline-offset:2px}
@@ -1275,12 +1281,12 @@ details.log[open] summary{color:var(--text2)}
         <select id="model"></select>
       </div>
       <div class="field">
-        <label for="apiKey"><span id="apiKeyLabel">Anthropic API key</span> <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <label for="apiKey"><span id="apiKeyLabel">Anthropic API key</span></label>
         <div class="secret-row">
-          <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
+          <input id="apiKey" type="password" placeholder="sk-…" autocomplete="off" />
           <button type="button" class="secret-toggle" id="apiKeyToggle" onclick="toggleSecret('apiKey', 'apiKeyToggle')">show</button>
         </div>
-        <small class="field-hint">encrypted; only the agent's TEE can decrypt. Never visible outside of TEE.</small>
+        <small class="field-hint">Encrypted; only the agent's TEE can decrypt. Leave blank only if your sandbox snapshot already bakes in a provider key.</small>
       </div>
     </section>
 

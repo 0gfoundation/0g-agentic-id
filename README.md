@@ -127,8 +127,11 @@ App 硬件绑定的身份（由 Tapp 为每个 App 分配，和硬件相关的�
   签名、校验 owner 指令的那一层容器代码。它与 LangChain / CrewAI 这类 AI 编排
   工具是**不同层级**的东西:后者是存在 agent 功能数据里、由运行时加载的配置。
 
-owner 保留真正的控制权——更新功能数据、触发重启、转让 agent。但每一个动作都
-走链上协议。没有后门。
+Sealed Sandbox 可看作是 agent 独立持有的一个运行环境, 如上所述, Sealed Sandbox 在
+类似 Agent 编排框架之上封装了一层框架, 这层框架负责 agent 的带鉴权的实例化、演进结果推送
+上链、agent 行为签名 (ServeProof)、以及规约 agent 行为等一系列作用 (比如培养 agent 他是独立个体的心智)。owner 保留
+实例化 agent、指导 agent 演进方向、转让 agent 的权利。他们不再是主仆关系，更像家长
+和监护人、老师与学生的关系。
 
 > 链上 `frameworkHash` 同时进入每条 `ServeProof`(见机制 5),所以买家做尽调
 > 时能看到"这条声誉是哪个版本的运行时框架挣来的"。
@@ -139,7 +142,7 @@ AgenticID 扩展了 **ERC-8004**,加了一条关键要求:**每条评价都必�
 AgentSeal 签名的服务证明(ServeProof)**。没有真实交互,就没有合法评价。刷分
 在结构上不可能——你伪造不出一个只有活着的 TEE 运行时才能生成的签名。
 
-声誉还**绑定到服务发生那一刻生效的具体功能数据版本**,而不只是 agent 静态的
+声誉还**绑定到服务发生那一刻生效的具体 iData**,而不只是 agent 静态的
 tokenId。升级模型或改配置,那个新版本就从零开始积累声誉。积累下来的东西,属于
 一个完成了真实、可验证工作的具体配置。
 
@@ -184,9 +187,8 @@ AccessProof + OwnershipProof 双签名通过才换 ownership。`dataKey` **从�
 |---|---|
 | **ERC-7857**(`ERC7857Upgradeable` + 扩展) | 功能数据(IntelligentData[])与转让/克隆协议 |
 | **ERC-8004**(`ERC8004IdentityRegistry` + `AgenticIDReputationRegistry`) | 身份注册 + 声誉 |
-| **AgentSeal 注册表**(`AgenticID.sol`) | agent 的动态身份凭证(set-once)+ `validFrameworkHashes` 白名单(写权限限注册在 TappRegistry 的 Attestor) |
-| **TEEDataVerifier** | 转让时的 AccessProof / OwnershipProof 双签名校验 |
-| **TappRegistry** 📋 | 所有 Tapp 组件的代码指纹注册表(被引用、合约本体未定稿) |
+| **AgentSeal 注册表**(`AgenticID.sol`) | agent 的动态身份凭证(set-once)+ `validFrameworkHashes` 白名单 |
+| **TappRegistry** | 所有 Tapp 组件的代码指纹注册表(被引用、合约本体未定稿) |
 
 ### TEE 层(0g-Tapp 部署)
 
@@ -198,7 +200,7 @@ AccessProof + OwnershipProof 双签名通过才换 ownership。`dataKey` **从�
 - **Agent 运行时(`sealed`)** — 跑在 Sandbox 里、受 RA 后下发密钥的容器:把链上
   加密 iData 还原成可运行 agent,持续把状态演化写回链上,给每条响应签
   `X-Agent-Proof`。(Go,见 [`sealed/`](sealed/ARCHITECTURE.zh.md))
-- **0g-compute** 🚧 — TEE 内可验证 LLM 推理模块,由 agent 运行时调用。
+- **0g-kms** — 为 Tapp 生态提供具有容灾能力、硬件安全的密钥服务。
 
 ### 存储层
 
@@ -208,7 +210,10 @@ AgentSeal 私钥取回并解密 payload,再拉起 agent 框架。
 ### 端到端信任流
 
 ```
-TappRegistry 验 Attestor / Sandbox / 0g-compute
+TappRegistry 验 Attestor / Sandbox / KMS /0g-compute
+        │
+        ▼
+KMS 提供具有容灾能力 (n 节点集群, 其中 k 节点健康即可) 的硬件安全级别密钥服务
         │
         ▼
 Attestor 验 Sandbox 凭证 + 核对 validFrameworkHashes
@@ -231,7 +236,7 @@ agent 用 AgentSeal 给每条响应签名 (X-Agent-Proof)
 AgentSeal 密钥,立刻返回 `sealId`,并行地通知 0g-Sandbox 起容器、在链上 mint
 一个 `agentId`。
 
-Sandbox 验证 owner、生成一把临时密钥对,以 `{sealId, 临时私钥, attestor_url}`
+Sandbox 生成一把临时密钥对,以 `{sealId, 临时私钥, attestor_url}`
 为参数启动 Sealed 容器。容器拿着自己的凭证——`{sealId, 容器公钥, imageHash,
 0g-Sandbox 签名}`——找 Attestor。两项检查通过,Attestor 返回用容器公钥加密的
 AgentSeal 私钥。
@@ -241,33 +246,6 @@ AgentSeal 私钥。
 
 > 容器侧的 5-phase 启动(attest → provision → chain bootstrap → framework →
 > status report)见 [`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) §1。
-
----
-
-## 实现状态
-
-✅ 已实现 · 🚧 部分实现 · 📋 规划中
-
-| 能力 | 状态 | 说明 |
-|---|---|---|
-| AgenticID 合约(ERC-7857 + ERC-8004 + AgentSeal) | ✅ | 已部署 0g Galileo testnet(chain 16602),117 tests / 15 suites 全绿 |
-| `validFrameworkHashes` 白名单 | ✅ | `addValidFrameworkHash` / `isValidFrameworkHash`,写权限限 attestor |
-| ServeProof + giveFeedback 防 sybil 声誉 | ✅ | 合约层签名校验 + NonceRegistry 防重放 |
-| iTransferFrom / iCloneFrom proof 校验 | ✅ | 合约层完整实现并测试(双签名 + nonce + deadline + pubkey 校验) |
-| AgentSeal 派生(KMS)+ RA provision | ✅ | attestor 派生下发 + sealed 容器 RA 换密钥 |
-| 加密 iData 演化上链(watcher → chain.Update) | ✅ | sealed 运行时 30s tick,drift → re-encrypt → 上链 |
-| `X-Agent-Proof` 响应签名 | ✅ | sealed proxy 自动给每条 :8080 响应签 envelope |
-| IDENTITY/SOUL/TOOLS 平台注入 + 签名拒绝钢印 | ✅ | 见 [`sealed/AGENT_DOCTRINE.zh.md`](sealed/AGENT_DOCTRINE.zh.md) |
-| 0G Storage 加密上传/下载 | ✅ | sealed 经 `0g-storage-client` 上传下载密文 |
-| Attestor 后端(deploy / provision / status / indexer) | ✅ | Rust workspace,真实 chain / storage / sandbox client |
-| Deploy + Say hi + Open dashboard UI | ✅ | 见 [`SHOWCASE.zh.md`](SHOWCASE.zh.md) |
-| 0g-compute 可验证推理 | 🚧 | provider routing 已接(bridge 到 0G OpenAI-compatible endpoint);"TEE 内 attest 每次推理"的完整形态是目标 |
-| Oracle TEE 重封 dataKey(端到端) | 🚧 | 合约 proof 校验已实现并测试;链下 ECIES SDK 端到端测试未补(见 [`contracts/README.md`](contracts/README.md) §11) |
-| Sealed Sandbox owner-blind 模式 | 🚧 | 依赖 0g-Sandbox 基础设施 |
-| TappRegistry 合约本体 | 📋 | 被引用、未定稿;接入前需确认 |
-| transfer UI / post-deploy skill 上传 | 📋 | 见 [`SHOWCASE.zh.md`](SHOWCASE.zh.md) "实诚边界" |
-| agent 发推 / 推文 anchor / 自付费循环 | 📋 | 见 [`SHOWCASE.zh.md`](SHOWCASE.zh.md) 后续路线 Phase 1 |
-| Agent TEE 在线状态的链上感知 | 📋 | 当前完全 off-chain 协商 |
 
 ---
 
