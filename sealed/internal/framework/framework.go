@@ -2,7 +2,7 @@
 // frameworks (openclaw, eliza, ...) behind a uniform interface used by the
 // rest of the sealed bootstrap pipeline.
 //
-// See sealed/EVOLUTION_DESIGN.md section 7 for the full contract specification.
+// See sealed/ARCHITECTURE.zh.md §3 for the full contract specification.
 //
 // In the current single-config implementation the only meaningful dimension
 // is "config" (mapped from the existing iData role); knowledge / skills / ops
@@ -39,7 +39,7 @@ const (
 // as optional and falls back to adapter defaults when chain has no entry.
 // Mint-time "what owner must provide" is enforced by attestor (a separate
 // codebase and concern), not by the sealed protocol layer. See
-// EVOLUTION_DESIGN §16.10.
+// ARCHITECTURE.zh.md §5 (wholesale-replace + isDefault semantics).
 type RoleSpec struct {
 	Name  string
 	Shape Shape
@@ -56,7 +56,8 @@ type Framework interface {
 	Version(ctx context.Context) (string, error)
 
 	// Roles returns every role this adapter declares — INCLUDING the
-	// protocol-reserved "framework" role. See EVOLUTION_DESIGN §16.
+	// protocol-reserved "framework" role. See ARCHITECTURE.zh.md §6
+	// (role table) for the current openclaw adapter's 5 roles.
 	Roles() []RoleSpec
 
 	// Defaults returns the canonical "empty/zero" plaintext for a role.
@@ -73,7 +74,8 @@ type Framework interface {
 
 	// Restore applies the plaintext bytes for a single dimension to the
 	// adapter's in-memory composed state. Multiple Restore calls must
-	// commute and be idempotent (see EVOLUTION_DESIGN.md 7.2).
+	// commute and be idempotent (see ARCHITECTURE.zh.md §3 closing
+	// paragraph on Restore commutativity).
 	//
 	// For path-driven roles (§16): Leaf roles write the plaintext directly.
 	// DirectoryManifest roles parse the manifest plaintext but do NOT
@@ -95,7 +97,8 @@ type Framework interface {
 
 	// RestoreEntry writes one entry's plaintext under the role's disk
 	// location. Inverse of LoadEntry. Order-independent and idempotent
-	// across multiple calls (see EVOLUTION_DESIGN.md 7.2).
+	// across multiple calls (see ARCHITECTURE.zh.md §3 closing paragraph
+	// on Restore commutativity).
 	//
 	// For EntryFile-style paths (no trailing "/"): plaintext is the file
 	// bytes; written verbatim.

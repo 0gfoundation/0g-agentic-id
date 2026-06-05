@@ -50,7 +50,8 @@ type Bootstrap struct {
 	// PublicURL is the externally-reachable URL prefix for this sandbox,
 	// composed from DAYTONA_SANDBOX_ID + SANDBOX_PROXY_DOMAIN. Empty when
 	// SANDBOX_PROXY_DOMAIN is unset (e.g. local dev outside the sandbox
-	// proxy infrastructure). See EVOLUTION_DESIGN section 15.5.
+	// proxy infrastructure). See ARCHITECTURE.zh.md §8
+	// (AGENT_PUBLIC_URL 怎么暴露给 agent).
 	PublicURL string
 }
 

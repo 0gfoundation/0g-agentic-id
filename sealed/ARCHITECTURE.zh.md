@@ -16,8 +16,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
 | openclaw | 当前唯一接入的 agent framework；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284 |
 
-文件级规范见 `EVOLUTION_DESIGN.zh.md`；本文档讲**当前代码里实际跑
-的形态**和**为什么这么分**。
+本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
 ## 1. 启动流程
 
@@ -94,7 +93,7 @@ sealed/
 ## 3. 核心抽象：Framework adapter
 
 外面（main / watcher / uploader）只认 `framework.Framework` 接口，
-不知道 openclaw 长什么样。这是为后续接 eliza 等其他 framework 留的口子。
+不知道 openclaw 长什么样。这是为后续接其他 framework 留的口子。
 
 ```go
 type Framework interface {
@@ -126,6 +125,8 @@ type Framework interface {
 - **filled-ptr 形态**：`pushManifest` 上传前把每个 entry 的 StoragePtr 填上对应 0g-storage root + size，再 marshal，加密上传。链上 `dataDescription.storage_ptr.root_hash` 指向 filled-ptr 那个 blob。
 
 下次 bootstrap 从链拿到的是 filled-ptr 形态，**必须**先 `manifest.StripStoragePtrs` 转成 empty-ptr 再 sha256 才能跟 watcher 算的对得上，否则每次重启都 phantom drift（这是 §7 的一个修复点）。
+
+**`Restore` 必须满足交换律 + 幂等性**：每个 role 只拥有磁盘 / 内存中自己那一片切片，所以 adapter 的 `Restore(role, plaintext)` 在多次调用之间顺序无关——任意排列同一组输入产出同样的最终 composed 状态；同一 role 连续 Restore 不同输入只有最后一次生效。bootstrap 的 A→B→C 三轮 Restore（先 leaf、再 manifest 父、再 manifest 子条目）依赖这条性质：每轮独立处理一类 role，相互不破坏。`Start` 是唯一的"落盘 + spawn 子进程"入口，把 adapter 内部累积的 composed 状态一次性交给子进程。
 
 ## 4. 核心状态：两个 snapshot
 
@@ -197,6 +198,7 @@ iData chain: dim=X hash=H placeholder (no on-chain entry) ← 链上没有，H �
 - **三种 outcome**：unchanged 复用、isDefault 不带、diverged 真的上传。
 - **single tx coalescing**：30s 内连续 N 个 drift 在同一 tick 里被打包成一笔 tx，gas 只花一次。
 - **stale-chain-row 处理**：`apply.go` 在 tx 之前重新从链上拉 `chainEntries`，不依赖 chainSnapshot 缓存。
+- **duplicate-role hard-fail**：链上若出现两条相同 `dataDescription` 的 iData，bootstrap 立刻拒绝启动并上报 error。同一 role 配两个不同 `storage_root` 时 agent 身份不确定，fail loud 比静默挑一条更安全。
 
 ### push_leaf vs push_manifest
 
@@ -271,11 +273,13 @@ internal/framework/openclaw/
 
 | 路径 | 谁用 | 干什么 |
 |---|---|---|
-| `/hello` | verifier、attestor、运维 | 返回 agent 身份 + chainSnapshot/currentSnapshot 的 dataHashes（serve-proof） |
+| `/healthz` | sandbox proxy / 运维 | 流动性探测，返回 200 + 一行 status |
+| `/hello` | verifier、attestor、运维 | 返回 agent 身份 + currentSnapshot 的 `data_hashes`（serve-proof envelope 走 `X-Agent-Proof` 头）|
+| `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回一个短期 framework dashboard token + path |
 | `/<其他>` | 用户、agent dashboard 前端 | 反代到 openclaw 127.0.0.1:3284 |
-| `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
-| `/log/openclaw.html` | 运维 | openclaw 子进程的 stdout/stderr（实时） |
-| `unix:///run/seal-sign.sock` | **只允许 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` —— 用 `agent_seal_priv` 签名 |
+| `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
+| `/log/openclaw` + `/log/openclaw.html` | 运维 | openclaw 子进程的 stdout/stderr（实时）|
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` —— 用 `agent_seal_priv` 签名 |
 
 sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关键
 信任边界：私钥不出 sealed 进程，agent 把要签的消息通过 unix socket
@@ -291,12 +295,90 @@ sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关�
 
 | env | 含义 |
 |---|---|
-| `SANDBOX_SEAL_KEY` | sandbox 自己的 ECDSA 私钥；用来跟 attestation.pubkey 互证 |
-| `TEE_SIGNER_ADDRESS` | （可选）TEE attestation 签名者；若设则会强校验 |
-| `SEAL_ID` | 32 字节 sealId hex，标识 agent |
-| `ATTESTOR_URL` | attestor 公网入口；用于 /provision 和 /status |
-| `CHAIN_RPC` | 0G testnet RPC，AgenticID 合约所在链 |
-| `AGENTIC_ID_CONTRACT` | AgenticID 合约地址 |
-| `FALLBACK_INDEXER` | 0g-storage 的 indexer URL，dataDescription 里 indexer 字段为空时 fallback |
-| `API_KEY` | LLM provider key，由 attestor 在 Recreate envelope 里转发 |
-| `AGENT_SERVE_PORT` / `AGENT_DASHBOARD_PORT` | sandbox proxy 子域端口 |
+| `SANDBOX_SEAL_KEY` | sandbox 注入的 ECDSA 私钥；用来跟 `SANDBOX_SEAL_ATTESTATION.pubkey` 互证（Phase 0）|
+| `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
+| `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
+| `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
+| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
+| `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
+| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
+| `API_KEY` | LLM provider key，由 attestor 在 deploy / Recreate envelope 里转发；spawn.go 翻译成 provider 专属的 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等 |
+| `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
+
+### `AGENT_PUBLIC_URL` 怎么暴露给 agent
+
+bootstrap 拼装好 `AGENT_PUBLIC_URL = http://8080-${DAYTONA_SANDBOX_ID}.${SANDBOX_PROXY_DOMAIN}` 后在**三个表面**暴露给 agent，agent 怎么用看 framework 习惯：
+
+1. **`/hello` 响应 JSON 的 `public_url` 字段** —— verifier 拿到响应后可以交叉校验跟它请求的 URL 是否一致
+2. **`~/.openclaw/0g-public-url.txt`** —— plugin 能从已知文件路径读
+3. **`AGENT_PUBLIC_URL` 子进程 env** —— spawn.go 的 env 白名单允许它穿到 openclaw 子进程
+
+本地 dev `SANDBOX_PROXY_DOMAIN` 未设时，上述三处全部留空，系统仍可运行（agent 只是不知道自己对外是哪个 URL，签名响应不带 `public_url` 字段）。
+
+## 9. 状态汇报与心跳
+
+sealed 在 Phase 4 起就持续向 attestor 上报 `/status`，attestor 那侧负责
+落库 `last_heartbeat` 列 + 用心跳缺失检测做被动兜底（见 attestor
+README 的 sweep 部分）。
+
+### 三件东西一张图
+
+| 角色 | 写还是读 `currentStatus` | 什么时候动 |
+|---|---|---|
+| **`currentStatus`**（`status.go`）| —— 共享状态本身 | 是 `runHeartbeat` + `handleDrift` 共享的**单点真源**：当前 severity（`running` / `warning` / `error`）+ message |
+| **`handleDrift`**（`main.go`）| **写** | watcher 每 30s 一次 tick 跑 drift + uploader.Apply，按结果分类后写进 currentStatus；warning / error 状态转换时**还会立刻**自己 POST 一次 `/status`，不等心跳 |
+| **`runHeartbeat`**（`main.go`）| **读** | 每 5 分钟一次 ticker，把当下的 currentStatus 复读一遍 POST 给 attestor —— 像心跳一样让 attestor 持续看到这条 deployment 是活的 + 当前在哪个 severity |
+
+—— 一句话：**handleDrift 决定 "现在是什么状态"，runHeartbeat 负责 "定期告诉别人"**。两个不互相覆盖，因为它们读写的是同一个 `currentStatus`，谁动了对方下次也能看到。
+
+attestor 那侧 15min 没收到任何 `/status` 就把 deployment flip 成
+`Failed { reason: "heartbeat timeout (15min)" }` 并广播 `ContainerFailed`
+事件 —— 这是 sealed 真挂了（进程死、网络全断）才会发生。
+
+### `handleDrift` 的三态 severity
+
+`handleDrift` 是 watcher 每次 tick 检测到 drift 后的回调：调
+`uploader.Apply` 把 drift 推上链，然后按 Apply 的返回结果写
+`currentStatus`。它分类的是 **"提交 drift 上链这一步发生了什么"** ——
+包括 agentSeal 钱包没 gas（gas 不足 → `chain.Update` tx 进不去 → Apply
+失败），所以钱包余额这种事也归它管。
+
+Apply 的三种结果对应三种 severity：
+
+| Apply 结果 | severity | 上报时机 | 失败计数 |
+|---|---|---|---|
+| **成功**（drift 上链了，或无 drift）| `running` | 不立刻上报，等 runHeartbeat 复读 | 累计错误清零 |
+| **失败，owner-recoverable** —— 典型：agentSeal 钱包没 gas、API key 配错、provider rate limit | `warning` | 第一次出现**立刻**上报，不等心跳 | **不**累加（这不是系统故障，是 owner 自己得处理的事）|
+| **失败，系统级** —— 典型：0g-storage 上传超时、RPC 异常、indexer 不可达 | `error` | 累计 **5 次连续** Apply 失败才升级到 error 上报，避免单次网络抖动误判 | 累加，恢复后清零 |
+
+`status.go::severityOf` 是把具体 error 字符串翻译到这三种 severity 的分类器
+（认 "insufficient funds" → `warning`、"connection refused" → `error`、etc.）。
+分类失败兜底 `error`。
+
+### `runHeartbeat` 的 5min ticker
+
+`main.go` 在 Phase 4 之后起一个 goroutine：每 5 分钟一次
+`currentStatus.Get()`，POST `/status`。上报失败只打日志，不影响进程 ——
+attestor 那侧靠 15min 阈值兜底。
+
+### serve-proof 的 `data_hash` 来源
+
+每条 serve-proof envelope 里 `data_hashes[role]` 带两字段：
+- `content_hash` = sha256(本地 plaintext)
+- `data_hash` = 该加密包在 0g-storage 的 root hash（链上引用的那个）
+
+drift 检测只用 `content_hash`，但 serve-proof 要带 `data_hash` 给 verifier
+做"链上引用 == 我现在跑的"的交叉校验。`data_hash` 的来源有两条路：
+
+1. **本 sealed 实例自己上传过该 role 的加密包** —— `RecordChainUpload` 落
+   `currentSnapshot[role].DataHash = 新上传的 root`
+2. **本实例从没上传过、但本地 plaintext 跟链上一致** —— `state.go::UpdateCurrentSnapshot`
+   兜底：若 `prev.DataHash == ""` 且 `contentHash == chainSnapshot.ContentHash`
+   且 `chainSnapshot.DataHash != ""`，把 `chainSnapshot[role].DataHash` 抄进
+   currentSnapshot。语义：本地 plaintext 跟链上一致 → 链上那个 storage root
+   就是现在能背书的 data_hash
+
+路径 2 覆盖的典型场景：`framework` role —— attestor 默认值跟实际安装的
+openclaw 版本对得上时永远不会 drift，本实例自然没有自上传过，但链上有
+attestor mint 时上传的版本。没有路径 2 的话 envelope 里那条 role 报不出
+data_hash，verifier 会判 ✗。

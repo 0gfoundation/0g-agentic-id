@@ -326,9 +326,8 @@ func decryptEntry(ctx context.Context, idx int, d chain.IntelligentData, sealedK
 // per-dim iData snapshots into shared state, then hands off to the manager
 // which spawns the process and supervises it.
 //
-// Currently each iData entry is routed by its role string. Long-term this
-// becomes label-based dispatch (EVOLUTION_DESIGN section 4) but the
-// snapshot-seeding pattern is already correct: every entry contributes one
+// Each iData entry is routed by its role string (see ARCHITECTURE.zh.md §6
+// for the openclaw adapter's 5-role set). Every entry contributes one
 // (dim, contentHash, dataHash) tuple to both chainSnapshot and currentSnapshot.
 //
 // The supervisor (manager) handles process death, liveness probes, restart
@@ -348,11 +347,14 @@ func startAgent(
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Path-driven role set (§16). sealed enforces no "required" roles —
+	// Path-driven role set. sealed enforces no "required" roles —
 	// missing roles fall back to adapter defaults. Mint-time owner-side
 	// requirements are an attestor concern, not sealed's.
 	//
-	// Duplicates are a hard fail per EVOLUTION_DESIGN §8.1.
+	// Duplicate role entries on chain are a hard fail (see
+	// ARCHITECTURE.zh.md §5 "duplicate-role hard-fail" bullet) — same
+	// role with two different storage_roots leaves agent identity
+	// undefined, so we fail loud at bootstrap.
 	roles := adapter.Roles()
 	declared := make(map[string]bool, len(roles))
 	for _, r := range roles {

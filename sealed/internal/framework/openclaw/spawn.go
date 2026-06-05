@@ -25,7 +25,8 @@ import (
 //
 //   - Subsequent calls (supervisor restart): just spawn. We don't re-install
 //     openclaw or re-write any config -- agent self-modifications survive
-//     restart untouched (EVOLUTION_DESIGN: platform doesn't interfere).
+//     restart untouched (see ARCHITECTURE.zh.md §6: platform doesn't
+//     interfere with agent's own evolution).
 //
 // The auth token is generated on first init and cached in a.authToken; the
 // dashboard stays signed in across restarts because the token is stable.

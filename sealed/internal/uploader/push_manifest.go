@@ -23,7 +23,7 @@ import (
 // root, not the empty-ptr version. The watcher-facing contentHash (sha256
 // of the empty-ptr plaintext) is computed by the caller in Push and is
 // what RecordChainUpload records; the two values are intentionally
-// different — see EVOLUTION_DESIGN §16.6.
+// different — see ARCHITECTURE.zh.md §5 (push_leaf vs push_manifest).
 //
 // data_key is the role-level key (reused across all blobs under this role
 // so a manifest entry's storage_ptr from a prior push still decrypts).

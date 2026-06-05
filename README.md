@@ -1,150 +1,287 @@
 # 0G AgenticID
 
-> 给每一个 AI agent 一个贯穿其整个生命周期、可被任何人独立验证的链上身份。
+> Give every AI agent a chain-anchored identity that spans its entire lifecycle and that anyone can independently verify.
 
-AgenticID 是构建在 **0G 生态**上的协议：把 agent 的功能数据锚定上链、在 TEE
-里运行其代码、用只存在于 TEE 内的密钥给每条响应盖章，让"这个 agent 可信"
-从一句需要盲信的声明，变成一条任何人都能自己验证的属性。
-
----
-
-## 没人在谈的信任问题
-
-围绕 AI agent 的讨论大多集中在**能力**——它能多自主地行动、能串起多少工具、
-能替用户做多大的决定。但一个更根本的问题几乎从没被问出口：
-
-> **你怎么知道,正在为你服务的 agent,真的是它声称的那个东西?**
-
-这是个工程问题,不是哲学问题。今天部署一个 agent,就是在一台服务器上跑一段
-代码、把它接到世界上。作为用户,你无法验证它用的是哪个模型、它的行为有没有
-被悄悄改过、它的评价是不是真的、你刚收到的这条响应到底来自宣传的那套配置——
-还是 owner 临时换上去的别的东西。
-
-更深的问题是结构性的:**agent 完全从属于它的 owner**。owner 可以随时改 agent,
-无记录、无问责。在一个 agent 需要做出有约束力的承诺、自主协作、积累声誉的世界里,
-这是个地基级的缺陷。AgenticID 正面解决它。
+AgenticID is a protocol built on the **0G ecosystem**: it anchors an agent's
+functional data on chain, runs its code inside a TEE, and stamps every response
+with a key that exists only inside that TEE — turning "this agent is trustworthy"
+from a claim you have to take on faith into a property anyone can verify for
+themselves.
 
 ---
 
-## 信任链:四层,每层都独立可验证
+## The trust problem no one talks about
 
-AgenticID 把信任拆成一条从合约根到每条响应的连续链路。每一层单独可验证,
-合起来无缝衔接:
+Most of the conversation around AI agents is about **capability** — how
+autonomously an agent can act, how many tools it can chain, how much it can
+decide on a user's behalf. A more fundamental question almost never gets
+asked out loud:
+
+> **How do you know the agent serving you right now is actually what it claims to be?**
+
+This is an engineering question, not a philosophical one. Deploying an agent
+today means running some code on a server and exposing it to the world. As a
+user, you cannot verify which model it uses, whether its behavior has been
+quietly altered, or whether the response you just received came from the
+advertised configuration — or from something the owner swapped in.
+
+The deeper problem is structural: **an agent is wholly subordinate to its
+owner**. The owner can change the agent at any time, with no record and no
+accountability. In a world where agents need to make binding commitments,
+collaborate autonomously, and accumulate reputation, this is a foundational
+flaw. AgenticID addresses it head-on.
+
+---
+
+## The trust chain: four layers, each independently verifiable
+
+AgenticID decomposes trust into a continuous chain from the contract root to
+every single response. Each layer is independently verifiable, and they
+compose seamlessly:
 
 ```
-链上身份  →  运行时配置  →  执行环境  →  模型推理
- ERC-7857     iData +        TEE +        0g-compute
- ERC-8004     0G Storage     AgentSeal    (可验证推理)
+chain identity  →  runtime config  →  execution env  →  model inference
+ ERC-7857           iData +           TEE +              0g-compute
+ ERC-8004           0G Storage        AgentSeal          (verifiable inference)
  AgentSeal
 ```
 
-| 层 | 回答的问题 | 靠什么 |
+| Layer | Question it answers | What it relies on |
 |---|---|---|
-| **链上身份** | 这是哪个 agent?谁拥有它?它的历史如何? | ERC-8004 身份 + ERC-7857 token + AgentSeal 注册表 |
-| **运行时配置** | 它此刻在跑什么模型、记忆、配置? | 加密 iData 存 0G Storage,指纹锚定链上 |
-| **执行环境** | 链上声明的东西,是不是真的在跑? | 0g-Tapp (Intel TDX) + 镜像哈希白名单 |
-| **模型推理** | 推理本身可信吗? | 0g-compute(TEE 内可验证推理) |
+| **Chain identity** | Which agent is this? Who owns it? What's its history? | ERC-8004 identity + ERC-7857 token + AgentSeal registry |
+| **Runtime config** | What model / memory / config is it running right now? | Encrypted iData on 0G Storage, fingerprint anchored on chain |
+| **Execution env** | Is what's declared on chain actually running? | 0g-Tapp (Intel TDX) + image-hash allowlist |
+| **Model inference** | Is the inference itself trustworthy? | 0g-compute (verifiable inference inside TEE) |
 
 ---
 
-## 核心机制
+## Terminology
 
-### 1 · 把 agent 状态锚定上链
+Different docs in this repo occasionally use **different names for the same
+thing**, or **similar names for different things**. The canonical mappings are
+below; circle back here whenever you hit an unfamiliar term elsewhere.
 
-一个 agent 的"性格"由它的**功能数据(functional data / iData)**定义:模型、
-记忆、运行时配置。AgenticID 把这些数据**加密**后存到 **0G Storage**(0G 的去
-中心化存储层),把内容指纹和元数据注册进链上合约。注册之后,agent 在链上可被
-发现、可被服务。
+### Multiple names for the same thing
 
-链上记录不是冻结的。agent 可以自动更新功能数据。协议保证的东西更
-精确:**你永远能验证 agent 为你服务的那一刻,跑的是什么样的 agent iData。** 每条响应
-都带一份对当前 iData 版本的签名证明。这不是不可变性,而是**任意时点的可验
-证性**——审计追踪式的信任。
+| canonical | aliases | meaning |
+|---|---|---|
+| **Sealed Sandbox** | Agent TEE / sealed container / sealed runtime container | A single agent's TEE-protected container instance; holds `agent_seal_priv`, runs the framework, signs X-Agent-Proof. Product / user-facing docs say `Sealed Sandbox`; contract / protocol descriptions more often use `Agent TEE` (emphasizing "the cryptographic identity inside the TEE") |
+| **iData** | IntelligentData / functional data | The agent's "personality" — model, memory, config, skills. `iData` is the short form, `IntelligentData` is the contract struct name |
+| **`sealed` runtime** | sealed binary / agent runtime | The Go binary under `sealed/`; runs inside a Sealed Sandbox, wraps openclaw + exposes :8080 + provides the sign socket. **Note:** `sealed` (the binary) and `Sealed Sandbox` (the container instance) live at different abstraction layers |
 
-> 在本仓库里,这套"演化即上链"由 `sealed` 运行时实现:watcher 每 30s 比对
-> agent 磁盘上的真实状态与链上快照,有 drift 就 re-encrypt + 签一笔
-> `chain.Update` 上链。详见 [`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) §4–5。
+### Easily confused similar names
 
-### 2 · 弥合"声明"与"执行"之间的缝
+**0g-Sandbox vs Sealed Sandbox** — one word apart, two different things:
 
-把数据放上链解决了**声明**问题,但对**声明与实际运行之间的缝**毫无办法——
-恶意运营者完全可以链上注册一套配置、实际跑另一套。要堵上这条缝,需要硬件级
-隔离,这就是 **0g-Tapp** 的位置。
+- **0g-Sandbox**: the **provider service** that creates containers (the daytona-based container orchestration layer 0G operates); itself registered in TappRegistry as a Tapp
+- **Sealed Sandbox**: a **single agent's container instance** created by 0g-Sandbox; one per agent
 
-0g-Tapp 是 0G 基于 Intel TDX 的应用管理框架。跑在 TEE 里的代码,即使是服务器
-自己的管理员也无法窥探或篡改。每次写操作都会被度量:任何修改都会改变应用的
-attestation 值,并留下可追溯的日志。没有"悄悄改掉一个运行中的应用"这种事。
+> One-liner: 0g-Sandbox is the factory, Sealed Sandbox is the product.
 
-0g-Tapp 还提供一个链上注册表 **TappRegistry**,应用在这里登记自己的代码指纹。
-支持两种注册模式:**预验证**(注册前先在链上验 RA quote)与**后验证**(应用
-先注册,用户使用前自行 attest)。AgenticID 的三个核心组件——Attestor、
-0g-Sandbox、0g-kms——都作为 Tapp 应用部署、在 TappRegistry 登记。这个登记
-是整条信任链的根。
+**agentId / sealId / tokenId** — three IDs, do not conflate:
 
-0g-Tapp 的设计哲学是为了支持非代码绑定的可升级, 舍弃了代码绑定的强检查, 但保留
-强审计。也就是说, App owner 可以有能力部署、注册恶意的代码, 但这些恶意行为无法
-绕过审计, 部署的代码版本均会记录上链。
+| ID | Type | What it is |
+|---|---|---|
+| `agentId` ≡ `tokenId` | uint256 | The ERC-721 NFT id; the on-chain primary key for an agent |
+| `sealId` | bytes32 | A random 32-byte handle generated by attestor at mint; the HKDF input for deriving `agent_seal_priv`; `sealId → agentId` one-to-one |
 
-### 3 · AgentSeal:伪造不出来的身份
+**AgentSeal / agentSeal / agent_seal_*** — different representations of the same key pair:
 
-0g-Tapp 的 **KMS** 从一个已注册应用的链上 appId 派生密钥材料。派生是确定性的
-(同一个 appId 永远派生同一把 key)、硬件无关的(不绑定任何具体 TDX 设备)、
-且只能在 TEE 内访问。
+| Form | Meaning |
+|---|---|
+| `AgentSeal` (PascalCase) | The **concept name** in docs — this TEE-bound identity key |
+| `agentSeal` (camelCase) | Contract mapping / field name (e.g. `agentSeal[agentId]`); the value is the EVM address of that priv |
+| `agent_seal_priv` / `agent_seal_pub` | The implementation-layer **concrete key bytes** (snake_case follows struct field convention) |
 
-从这份密钥材料,AgenticID 为每个 agent 生成一个 **AgentSeal**:一对密钥,私钥
-只存在于 TEE 运行时内。owner 拿不到,TEE 之外的任何人都拿不到。agent 用
-AgentSeal 给它产出的**每一条响应**签名——这个签名证明:响应来自一个跑在 TEE
-里、且严格按链上记录运行的 agent。
+### Three different *Proofs, do not mix
 
-具体的说, AgenticID 的后端 Attestor 会注册到 TappRegistry, 注册信息包括 Attestor 当前的 App 名、代码和配置哈希，以及
-App 硬件绑定的身份（由 Tapp 为每个 App 分配，和硬件相关的，每次 Tapp 重启和更换硬件该身份都会变化，此时需要重新注册）。在
-分发 app master key 时, KMS 检查链上注册身份与请求中的签名身份是否匹配, 匹配则为其派生 app master key。
+| Name | What it is | Where it's used |
+|---|---|---|
+| **ServeProof** (PascalCase) | Solidity struct, the carrier for the on-chain reputation flow | `giveFeedback(ServeProof, ...)`, contract verifies via ecrecover |
+| **serve-proof** (lowercase hyphenated) | The general concept — any envelope sealed signs automatically | Informal term in docs; covers ServeProof + heartbeat + chain.Update etc. |
+| **X-Agent-Proof** | HTTP response header name | The header sealed proxy auto-appends to every :8080 response; the payload is a signed envelope |
 
-> 链上侧:`agentSeal` / `sealId` 是 **set-once 永久绑定**——一个 agentId 只能
-> 设一次,转让也不清除。换硬件时 attestor 给新的 Agent TEE 重新 provision 同一
-> 把 `agentSeal_priv` 即可,地址不变。见 [`contracts/README.md`](contracts/README.md) §4。
+Shorthand: **ServeProof** is its on-chain form, **X-Agent-Proof** is its HTTP form, **serve-proof** is the umbrella.
 
-### 4 · Sealed Sandbox:一个拥有自己的 agent
+### Two *Proofs in transfer
 
-**0g-Sandbox** 是一个作为 Tapp 部署的隐私沙箱。它的定义性属性:连作为服务方
-的 0G 自己也看不进一个运行中的沙箱。AgenticID 用的是 **Sealed Sandbox 模式**,
-更进一步——连 agent **自己的 owner 也看不进去**。
+| Name | Signed by | Purpose |
+|---|---|---|
+| **AccessProof** | Buyer | "I want this dataKey sealed to my pubkey" |
+| **OwnershipProof** | Oracle TEE | "I've re-sealed the dataKey to the buyer's pubkey" |
 
-值得注意的是, agent 运行时 (Sealed Sandbox) 的信任链继承自使用 Tapp 部署的 0g-Sandbox: 0g-Sandbox
-使用 Tapp 部署, 其可验证性和封装性由 Tapp 保证, 进一步 0g-Sandbox 创建的 sealed sandbox 由 0g-Sandbox
-的逻辑保证其对外的封装性, 并使用 0g-Sandbox 的硬件身份签名 sealed sandbox 的镜像哈希, Attestor 在 provision
-时检查 0g-Sandbox 身份签名和链上注册的 sealed sandbox 镜像哈希, 检查通过才 provision agentSeal_priv, 可见
-仅 0g-Sandbox 创建的注册在链上的合法 sealed sandbox 才能获取 agentSeal_priv, 信任规约到 Tapp 的 "强审计" 哲学。
+`iTransferFrom` validates both in a single tx.
 
-0g-Sandbox 承担两项验证职责:
+### Case conventions
 
-- **仅授权启动**:启动容器之前,Sandbox 验证请求来自链上注册的 owner。只有
-  合法 owner 才能用 agent 的功能数据实例化它。
-- **运行时代码 attestation**:Sandbox 给容器的镜像哈希签名,交给 Attestor。
-  Attestor 核对 Sandbox 的 `signerAddress` 在 TappRegistry 注册过,且镜像哈希
-  出现在 AgenticID 合约的 **`validFrameworkHashes` 白名单**里。这个白名单覆盖
-  的是 **AgenticID 运行时框架**的哈希——也就是负责加载功能数据、管理 AgentSeal
-  签名、校验 owner 指令的那一层容器代码。它与 LangChain / CrewAI 这类 AI 编排
-  工具是**不同层级**的东西:后者是存在 agent 功能数据里、由运行时加载的配置。
+| Form | Used for | Examples |
+|---|---|---|
+| **`0g-xxx`** (lowercase hyphenated) | Product slug, Tapp `app_id` strings, repo names | `0g-Tapp`, `0g-Sandbox`, `0g-kms`, `0g-storage`, `0g-attestor`, `0g-sandbox-provider` |
+| **`0G XXX`** (uppercase with space) | Network / brand / marketing | `0G testnet`, `0G Storage`, `0G AgenticID` |
+| **`PascalCase`** | Protocol / contract struct names, concept names | `ServeProof`, `AccessProof`, `TappRegistry`, `AgentSeal` (as a concept) |
+| **`camelCase`** | Solidity fields / mappings / function names | `agentSeal[agentId]`, `sealId`, `getAgentSeal()` |
+| **`snake_case`** | Implementation-layer concrete keys / fields (Rust / Go struct field) | `agent_seal_priv`, `seal_id`, `container_pubkey` |
 
-Sealed Sandbox 可看作是 agent 独立持有的一个运行环境, 如上所述, Sealed Sandbox 在
-类似 Agent 编排框架之上封装了一层框架, 这层框架负责 agent 的带鉴权的实例化、演进结果推送
-上链、agent 行为签名 (ServeProof)、以及规约 agent 行为等一系列作用 (比如培养 agent 他是独立个体的心智)。owner 保留
-实例化 agent、指导 agent 演进方向、转让 agent 的权利。他们不再是主仆关系，更像家长
-和监护人、老师与学生的关系。
+**`0g-Sandbox` capitalizes `Sandbox`** because `Sandbox` reads as a standalone
+word ("the Sandbox in the factory"); unlike `0g-kms` (where `kms` is an
+acronym treated as part of the slug) — following the "standalone word
+PascalCase, acronym lowercase" convention.
 
-> 链上 `frameworkHash` 同时进入每条 `ServeProof`(见机制 5),所以买家做尽调
-> 时能看到"这条声誉是哪个版本的运行时框架挣来的"。
+---
 
-### 5 · 声誉:gaming 不出来
+## Core mechanisms
 
-AgenticID 扩展了 **ERC-8004**,加了一条关键要求:**每条评价都必须附带一份
-AgentSeal 签名的服务证明(ServeProof)**。没有真实交互,就没有合法评价。刷分
-在结构上不可能——你伪造不出一个只有活着的 TEE 运行时才能生成的签名。
+### 1 · Anchoring agent state on chain
 
-声誉还**绑定到服务发生那一刻生效的具体 iData**,而不只是 agent 静态的
-tokenId。升级模型或改配置,那个新版本就从零开始积累声誉。积累下来的东西,属于
-一个完成了真实、可验证工作的具体配置。
+An agent's "personality" is defined by its **functional data (iData)**:
+model, memory, runtime config. AgenticID encrypts this data, stores it on
+**0G Storage** (0G's decentralized storage layer), and registers its
+fingerprint and metadata on chain. Once registered, the agent is on-chain
+discoverable and callable.
+
+The on-chain record isn't frozen — the agent can update its functional data
+autonomously. What the protocol guarantees is more precise: **you can always
+verify what iData the agent was running at the exact moment it served you.**
+Every response carries a signed proof of the current iData version. This is
+not immutability, but **verifiability at any point in time** — audit-trail
+trust.
+
+> In this repo, "evolution = on-chain commit" is implemented by the `sealed`
+> runtime: a watcher compares the agent's actual on-disk state with the
+> on-chain snapshot every 30s; if there's drift, it re-encrypts and signs a
+> `chain.Update` tx. Details in [`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) §4–5.
+
+### 2 · Closing the gap between "declared" and "executing"
+
+Putting data on chain solves the **declaration** problem, but does nothing
+about **the gap between the declaration and what's actually running** — a
+malicious operator could perfectly well register one config on chain and run
+a different one. Closing this gap requires hardware-level isolation, which
+is what **0g-Tapp** provides.
+
+0g-Tapp is 0G's Intel-TDX-based application management framework. Code
+running inside the TEE cannot be inspected or tampered with, even by the
+server's own administrator. Every write is measured: any modification
+changes the application's attestation value and leaves a traceable log.
+There's no such thing as "quietly modifying a running application."
+
+0g-Tapp also exposes an on-chain registry, **TappRegistry**, where
+applications register their code fingerprints. Two registration modes are
+supported: **pre-attestation** (verify the RA quote on chain before
+registration) and **post-attestation** (the application registers first;
+users attest before use). AgenticID's three core components — Attestor,
+0g-Sandbox, 0g-kms — are all deployed as Tapp applications and registered
+in TappRegistry. That registration is the root of the entire trust chain.
+
+0g-Tapp's design philosophy supports upgrades that aren't strictly
+code-bound — it trades hard code-binding checks for **strong audit**. That
+is, an app owner can still deploy and register malicious code, but no such
+action escapes the audit: every version is measured and recorded on chain,
+and anyone can look up after the fact "which version was running at the
+time."
+
+### 3 · AgentSeal: an unforgeable identity
+
+0g-Tapp's **KMS** derives key material from the on-chain `appId` of a
+registered application. The derivation is deterministic (the same `appId`
+always derives the same key), hardware-independent (not bound to any
+specific TDX device), and accessible only inside a TEE.
+
+From this key material, AgenticID generates an **AgentSeal** for each agent:
+a key pair whose private key exists only inside the TEE runtime. The owner
+cannot get to it; no one outside the TEE can get to it. The agent uses
+AgentSeal to sign **every response** it produces — and this signature
+proves: the response came from an agent running in a TEE, strictly following
+its on-chain record.
+
+Specifically, AgenticID's backend Attestor is itself a Tapp application
+registered on TappRegistry. Its registration entry contains three things:
+
+- **App name**, **code hash**, **config hash** — fixed, auditable code
+  identity;
+- **Hardware-bound identity** — assigned by Tapp to each running instance,
+  tied to a specific TDX device; this identity changes if Tapp restarts or
+  the hardware is swapped, requiring re-registration.
+
+When KMS distributes an app's master key, it checks that the on-chain
+registered identity matches the signed identity in the request — derivation
+and distribution only happen on match. So only an Attestor that's registered
+and currently running on legitimate TDX hardware can obtain the master key.
+AgentSeal derivation starts from that master key.
+
+> On the chain side: `agentSeal` / `sealId` are **set-once, permanently
+> bound** — an `agentId` can only set them once, and they're not cleared on
+> transfer. When hardware changes, attestor re-provisions the same
+> `agentSeal_priv` to the new Agent TEE; the address stays the same. See
+> [`contracts/README.md`](contracts/README.md) §4.
+
+### 4 · Sealed Sandbox: an agent that owns itself
+
+**0g-Sandbox** is a privacy sandbox deployed as a Tapp. Its defining
+property: even 0G itself, as the service operator, cannot see into a running
+sandbox. AgenticID uses the **Sealed Sandbox pattern**, which goes one step
+further — **the agent's own owner cannot see in either**.
+
+The trust chain for the agent runtime (Sealed Sandbox) is a two-layer
+cascade that ultimately reduces to Tapp's "strong audit" philosophy:
+
+1. **0g-Sandbox itself** is deployed via Tapp; its verifiability and
+   encapsulation are guaranteed by Tapp.
+2. **Every sealed sandbox 0g-Sandbox creates** has its outward encapsulation
+   guaranteed by 0g-Sandbox's runtime logic; its image hash is signed by
+   0g-Sandbox using its own hardware-bound identity.
+3. **Attestor at provision time** does a dual check: verify 0g-Sandbox's
+   identity signature + check that the sealed sandbox's image hash is
+   registered on chain; only with both passing is `agentSeal_priv`
+   delivered.
+
+— So only sealed sandboxes that were created by 0g-Sandbox and whose images
+are registered on chain can ever obtain the AgentSeal private key.
+
+0g-Sandbox carries two validation responsibilities:
+
+- **Authorized startup only**: before launching a container, Sandbox
+  verifies the request comes from the on-chain registered owner. Only the
+  legitimate owner can instantiate it with the agent's functional data.
+- **Runtime code attestation**: Sandbox signs the container's image hash
+  and hands it to Attestor. Attestor checks that Sandbox's `signerAddress`
+  is registered in TappRegistry and that the image hash appears in the
+  AgenticID contract's **`validFrameworkHashes` allowlist**. This allowlist
+  covers the hashes of the **AgenticID runtime framework** — i.e., the
+  container code that loads functional data, manages AgentSeal signing,
+  and validates owner instructions. It's at a **different layer** from AI
+  orchestration tools like LangChain / CrewAI: those live inside an
+  agent's functional data and are loaded by the runtime.
+
+A Sealed Sandbox can be thought of as an execution environment the agent
+owns independently. As described above, it wraps a "constraint layer"
+around what would otherwise be a typical agent orchestration framework —
+this framework handles authenticated agent instantiation, pushes evolution
+results on chain, signs agent behavior (ServeProof), and constrains the
+agent itself at the boundary (e.g., installing the self-perception "I am
+an independent individual"). The owner retains the right to instantiate,
+guide evolution direction, and transfer the agent, but loses the ability
+to arbitrarily modify the agent's internals. **The two are no longer
+master and servant; the relationship is closer to guardian-and-ward,
+teacher-and-student.**
+
+> The on-chain `frameworkHash` also goes into every `ServeProof` (see
+> mechanism 5), so a buyer doing due diligence can see "which version of
+> the runtime framework earned this reputation."
+
+### 5 · Reputation: ungameable
+
+AgenticID extends **ERC-8004** with one key requirement: **every review
+must come bundled with an AgentSeal-signed service proof (ServeProof)**.
+No real interaction, no legitimate review. Score farming is structurally
+impossible — you can't forge a signature that only a live TEE runtime can
+produce.
+
+Reputation also **binds to the specific iData in effect at the moment of
+service**, not to the agent's static tokenId. Upgrade the model or change
+the config, and that new version starts accumulating reputation from zero.
+What's accumulated belongs to a specific configuration that did real,
+verifiable work.
 
 ```solidity
 struct ServeProof {
@@ -153,149 +290,196 @@ struct ServeProof {
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
-    bytes32[] dataHashes;     // 当下 TEE 加载的 iData hash 列表
-    bytes32   frameworkHash;  // 运行时框架代码 hash
-    bytes     signature;      // agentSeal_priv 签名
+    bytes32[] dataHashes;     // iData hash list loaded in the TEE at the time
+    bytes32   frameworkHash;  // runtime framework code hash
+    bytes     signature;      // signed by agentSeal_priv
 }
 ```
 
-`giveFeedback` 在链上重建签名内容、`ecrecover` 后与 `getAgentSeal(agentId)`
-比对——agentSeal_priv 只有 Agent TEE 持有,客户既伪造不出 ServeProof,也没法
-不调 agent 就自己打分。详见 [`contracts/README.md`](contracts/README.md) §5。
+`giveFeedback` reconstructs the signed payload on chain, runs `ecrecover`,
+and compares against `getAgentSeal(agentId)` — `agentSeal_priv` is held only
+by the Agent TEE, so the client can neither forge a ServeProof nor self-rate
+without calling the agent. Details in
+[`contracts/README.md`](contracts/README.md) §5.
 
-### 6 · 转让 agent = 转让它的能力
+### 6 · Transferring an agent = transferring its capabilities
 
-在 **ERC-7857** 的 agent 转让协议下,移交所有权需要**完整交付功能数据**。买家
-拿到的是一个真正能跑的 agent——模型、记忆、配置,而不是一个换了 owner 字段的
-空壳。协议强制这一点:一笔省略了功能数据的转让无法完成。
+Under **ERC-7857**'s agent transfer protocol, ownership transfer requires
+**complete delivery of the functional data**. What the buyer gets is an
+agent that can actually run — model, memory, config — not a shell whose
+owner field has been swapped. The protocol enforces this: a transfer that
+omits the functional data cannot complete.
 
-机制上靠 dataKey 在 TEE 之间的原子交付:卖家 Agent TEE 解出 `dataKey`,经 Oracle
-TEE 用买家公钥重封,Oracle 签 OwnershipProof;链上 `iTransferFrom` 校验
-AccessProof + OwnershipProof 双签名通过才换 ownership。`dataKey` **从不出现在链上
-明文或 EOA 钱包**。详见 [`contracts/README.md`](contracts/README.md) §6 与
-[memory: dataKey lifecycle]。
+Mechanically, this relies on dataKey atomic delivery between TEEs: the
+seller's Agent TEE decrypts the `dataKey`, the Oracle TEE re-seals it to
+the buyer's pubkey, the Oracle signs an OwnershipProof; on chain,
+`iTransferFrom` validates both AccessProof + OwnershipProof signatures
+before switching ownership. `dataKey` **never appears on chain in
+plaintext, nor in any EOA wallet**. Details in
+[`contracts/README.md`](contracts/README.md) §6.
 
 ---
 
-## 架构:从合约根到每条签名响应
+## Architecture: from contract root to each signed response
 
-三类组件构成 AgenticID,组成一条从链上注册到每条签名响应的连续链路。
+Three categories of components make up AgenticID, forming a continuous
+chain from on-chain registration to each signed response.
 
-### 合约层(链根)
+### Contract layer (chain root)
 
-| 合约 | 职责 |
+| Contract | Responsibility |
 |---|---|
-| **ERC-7857**(`ERC7857Upgradeable` + 扩展) | 功能数据(IntelligentData[])与转让/克隆协议 |
-| **ERC-8004**(`ERC8004IdentityRegistry` + `AgenticIDReputationRegistry`) | 身份注册 + 声誉 |
-| **AgentSeal 注册表**(`AgenticID.sol`) | agent 的动态身份凭证(set-once)+ `validFrameworkHashes` 白名单 |
-| **TappRegistry** | 所有 Tapp 组件的代码指纹注册表(被引用、合约本体未定稿) |
+| **ERC-7857** (`ERC7857Upgradeable` + extensions) | Functional data (IntelligentData[]) and the transfer / clone protocol |
+| **ERC-8004** (`ERC8004IdentityRegistry` + `AgenticIDReputationRegistry`) | Identity registration + reputation |
+| **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) + the `validFrameworkHashes` allowlist |
+| **TappRegistry** | Code-fingerprint registry for all Tapp components |
 
-### TEE 层(0g-Tapp 部署)
+### TEE layer (deployed on 0g-Tapp)
 
-- **Attestor** — 校验 Sandbox 的 `signerAddress`(against TappRegistry)与容器
-  镜像哈希(against `validFrameworkHashes`);经 KMS 派生 AgentSeal 密钥材料;
-  把 AgentSeal 公钥注册上链。(Rust,见 [`attestor/`](attestor/README.md))
-- **0g-Sandbox** — 校验启动请求来自注册 owner;启动 Sealed 容器并签其镜像哈希;
-  保证 agent 按链上功能数据运行。
-- **Agent 运行时(`sealed`)** — 跑在 Sandbox 里、受 RA 后下发密钥的容器:把链上
-  加密 iData 还原成可运行 agent,持续把状态演化写回链上,给每条响应签
-  `X-Agent-Proof`。(Go,见 [`sealed/`](sealed/ARCHITECTURE.zh.md))
-- **0g-kms** — 为 Tapp 生态提供具有容灾能力、硬件安全的密钥服务。
+- **Attestor** — validates Sandbox's `signerAddress` (against TappRegistry)
+  and the container's image hash (against `validFrameworkHashes`); derives
+  AgentSeal key material via KMS; registers the AgentSeal pubkey on chain.
+  (Rust, see [`attestor/`](attestor/README.md))
+- **0g-Sandbox** — validates that startup requests come from registered
+  owners; launches Sealed containers and signs their image hashes;
+  guarantees the agent runs against the on-chain functional data.
+- **Agent runtime (`sealed`)** — the container running inside Sandbox that
+  receives the key after RA: restores encrypted iData from chain into a
+  runnable agent, continuously writes state evolution back on chain, signs
+  `X-Agent-Proof` on every response. (Go, see
+  [`sealed/`](sealed/ARCHITECTURE.md))
+- **0g-kms** — provides hardware-security-grade key services with disaster
+  recovery for the Tapp ecosystem.
 
-### 存储层
+### Storage layer
 
-0G Storage 持有加密的功能数据,指纹锚定在 ERC-7857。启动时,agent 运行时用
-AgentSeal 私钥取回并解密 payload,再拉起 agent 框架。
+0G Storage holds encrypted functional data; the fingerprints are anchored
+in ERC-7857. At startup, the agent runtime uses the AgentSeal private key
+to fetch and decrypt the payload, then boots the agent framework.
 
-### 端到端信任流
+### End-to-end trust flow
 
 ```
-TappRegistry 验 Attestor / Sandbox / KMS /0g-compute
+TappRegistry registers Attestor / 0g-Sandbox / KMS / 0g-compute
         │
         ▼
-KMS 提供具有容灾能力 (n 节点集群, 其中 k 节点健康即可) 的硬件安全级别密钥服务
+KMS delivers hardware-security-grade key derivation on an n-node cluster (k healthy nodes suffice)
         │
         ▼
-Attestor 验 Sandbox 凭证 + 核对 validFrameworkHashes
+Attestor validates 0g-Sandbox credentials + checks validFrameworkHashes
         │
         ▼
-Sandbox 确认授权 owner + 正确运行时代码
+0g-Sandbox confirms authorized owner + correct runtime code
         │
         ▼
-agent 用 AgentSeal 给每条响应签名 (X-Agent-Proof)
+agent signs every response with AgentSeal (X-Agent-Proof)
         │
         ▼
-0g-compute attest 每一次推理
+0g-compute attests every inference
 ```
 
 ---
 
-## 部署流程(walkthrough)
+## Deploy walkthrough
 
-一个 deploy 请求带着 agent 配置和 owner 地址到达 Attestor。Attestor 派生一对
-AgentSeal 密钥,立刻返回 `sealId`,并行地通知 0g-Sandbox 起容器、在链上 mint
-一个 `agentId`。
+A deploy request carrying an agent config and an owner address arrives at
+Attestor. Attestor derives an AgentSeal key pair, immediately returns the
+`sealId`, and in parallel notifies 0g-Sandbox to start a container and
+mints an `agentId` on chain.
 
-Sandbox 生成一把临时密钥对,以 `{sealId, 临时私钥, attestor_url}`
-为参数启动 Sealed 容器。容器拿着自己的凭证——`{sealId, 容器公钥, imageHash,
-0g-Sandbox 签名}`——找 Attestor。两项检查通过,Attestor 返回用容器公钥加密的
-AgentSeal 私钥。
+0g-Sandbox generates an ephemeral key pair and launches the Sealed
+container with `{sealId, ephemeral private key, attestor_url}`. The
+container shows up at Attestor with its credentials — `{sealId, container
+pubkey, imageHash, 0g-Sandbox signature}`. With both checks passing,
+Attestor returns the AgentSeal private key encrypted to the container's
+pubkey.
 
-容器解出密钥,等待链上 `sealId ↔ agentId` 绑定,从 0G Storage 取回加密功能数据、
-解密,启动 agent 框架。重启时复用同一个 `sealId`——链上绑定已存在。
+The container decrypts the key, waits for the on-chain
+`sealId ↔ agentId` binding, fetches the encrypted functional data from
+0G Storage, decrypts it, and starts the agent framework. On restart, the
+same `sealId` is reused — the on-chain binding already exists.
 
-> 容器侧的 5-phase 启动(attest → provision → chain bootstrap → framework →
-> status report)见 [`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) §1。
+> The container's 5-phase boot (attest → provision → chain bootstrap →
+> framework → status report) is described in
+> [`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) §1.
 
 ---
 
-## 仓库导航
+## Repo layout
 
-Monorepo 三个子项目:
+This is a monorepo with three sub-projects:
 
-| 子项目 | 内容 | 工具链 |
+| Sub-project | Contents | Toolchain |
 |---|---|---|
-| [`contracts/`](contracts/README.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
-| [`attestor/`](attestor/README.md) | 后端服务(Attestor / Oracle TEE、API、worker、indexer) | Rust (cargo workspace) |
-| [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器(TEE 内还原 iData、演化上链、签名) | Go |
+| [`contracts/`](contracts/README.md) | Solidity contracts, Foundry tests, deploy / upgrade / verify scripts | Foundry (forge / cast) |
+| [`attestor/`](attestor/README.md) | Backend services (Attestor / Oracle TEE, API, worker, indexer) | Rust (cargo workspace) |
+| [`sealed/`](sealed/ARCHITECTURE.md) | Agent runtime container (restores iData inside TEE, pushes evolution on chain, signs responses) | Go |
 
-### 深入文档
+### Further reading
 
-- [`contracts/README.md`](contracts/README.md) — 合约布局、三个 TEE 角色、注册/声誉/转让三大流程、部署升级 verify
-- [`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时:5-phase 启动、双 snapshot、iData 演化机制、framework adapter
-- [`sealed/AGENT_DOCTRINE.zh.md`](sealed/AGENT_DOCTRINE.zh.md) — agent 钢印手册:5 条签名拒绝规则 + 入侵识别
-- [`sealed/EVOLUTION_DESIGN.zh.md`](sealed/EVOLUTION_DESIGN.zh.md) — iData 演化的文件级规范
-- [`sealed/TRUST_MODEL.md`](sealed/TRUST_MODEL.md) — KMS → attestor → TEE 密钥派生的信任模型
-- [`SHOWCASE.zh.md`](SHOWCASE.zh.md) — 端到端 demo 脚本 + 当前实诚边界 + 后续路线
+**[`contracts/README.md`](contracts/README.md) — the contract layer**
 
-### 常用命令
+The full Solidity layout: ERC-7857 (functional data + transfer / clone
+protocol), ERC-8004 (identity registration + reputation), AgenticID
+(AgentSeal registry + framework hash allowlist), TEEDataVerifier (AccessProof
++ OwnershipProof dual-signature validation), NonceRegistry (unified replay
+protection) — their extension points and dependencies. Walks through the
+three main flows — `register` / `giveFeedback` / `iTransferFrom` — with
+their on-chain logic and ecrecover validation, plus 124 Foundry tests and
+full deploy / upgrade / Etherscan-verify scripts.
 
-```bash
-# 合约
-cd contracts && forge test                      # 跑测试套件(117 tests)
-cd contracts && forge build                     # 编译
+**[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**
 
-# 后端
-cd attestor && cargo test                       # 跑 Rust 测试
-cd attestor && cargo build                      # 构建
+The internal architecture of the sealed container. Covers the 5-phase boot
+(attest → provision → chain bootstrap → framework → status report), the
+dual `chainSnapshot` vs `currentSnapshot` drift detection, the
+"evolution = on-chain commit" data flow (watcher 30s tick → uploader
+wholesale `chain.Update`), the leaf vs DirectoryManifest iData shapes, and
+the framework adapter abstraction (today openclaw is the only one wired in).
 
-# agent 运行时
-cd sealed && go test ./...                      # 跑 Go 测试
-cd sealed && go build                           # 构建
-```
+**[`sealed/AGENT_DOCTRINE.md`](sealed/AGENT_DOCTRINE.md) — the agent doctrine handbook**
 
-具体部署 / 升级 / verify 流程见 [`contracts/README.md`](contracts/README.md) §10。
+The "doctrine" sealed runtime injects into the agent system prompt — the
+five things the agent will refuse to do, each independently argued:
+① no pass-through of external bytes to side-effectful capabilities like
+sign socket / shell; ② no opening a shell / spawning subprocesses; ③ no
+binding outward listeners; ④ no reading sensitive paths; ⑤ no modifying
+this section. Comes with refusal-type-specific canonical phrasings + an
+intrusion identification checklist.
+
+**[`sealed/TRUST_MODEL.md`](sealed/TRUST_MODEL.md) — the trust model**
+
+The full end-to-end trust chain for AgenticID, across five themes:
+
+- **Tapp infrastructure** — attestor / KMS / sandbox deployed as Tapp
+  applications, registered in TappRegistry with code identity + node
+  signature; the "strong audit" philosophy (code isn't assumed immutable,
+  but every version that ran is on chain and queryable)
+- **Key-derivation chain** — how attestor's master secret comes from KMS,
+  why it lives in a **completely separate key space** from user EOA
+  wallets; per-agent `agent_seal_priv = HKDF(master, sealId)`
+  **deterministic derivation**; sandbox-signed image attestation +
+  attestor's three-way check (TappRegistry node identity +
+  `validFrameworkHashes` allowlist + freshness) + ECIES delivery to the
+  container's ephemeral pubkey (only that TEE can decrypt)
+- **Set-once seal safety** — why the permanent `agentSeal` / `sealId`
+  binding is safe: hardware swap can re-derive the same priv, the on-chain
+  binding stays valid forever
+- **dataKey handoff** — seller TEE → Oracle TEE → buyer TEE with
+  **zero-trust atomic delivery** (Oracle holds briefly, discards
+  immediately; a single tx with two signatures on chain)
+- **ServeProof / X-Agent-Proof** — the 8 guarantees each signed response
+  envelope carries are all cryptographically bound, but their preconditions
+  split into two groups: **Group A (identity layer, 3 claims)** holds
+  unconditionally as long as priv stays in the TEE, while **Group B
+  (content layer, 5 claims)** additionally requires "the signing capability
+  is not being abused" (backstopped by the agent doctrine); sealed's sign
+  socket is a schema-agnostic general signer, so distinguishing
+  framework-signed from agent-signed cannot be done cryptographically; and
+  why content correctness has to rely on the on-chain reputation layer
+  rather than the cryptographic layer
 
 ---
 
-## 为什么这件事重要
-
-没有可验证的身份,agent 协作建立在"没人作弊"的假设上。没有不可伪造的签名,
-声誉可被 gaming。没有隔离的执行环境,agent 只是 owner 的代理而非独立一方。
-没有可验证的推理,信任链就有一道暗门。
-
-AgenticID——通过 0G 的 TEE 基础设施、去中心化存储和链上合约——把"这个 agent
-可信"从一句需要盲信的声明,变成一条任何人都能独立验证的属性。
-
-> 这是 agent 从工具变成**主体**所需要的东西。在它之上能建出什么,才是有意思的
-> 问题。
+Each sub-directory README also includes its own build / test commands and
+deployment flow; not repeated here.

@@ -13,9 +13,9 @@ import (
 // implementations live in restore_paths.go; this file owns dispatch +
 // the framework leaf.
 //
-// Multiple Restore calls must commute and be idempotent
-// (EVOLUTION_DESIGN §7.2): each role owns its disk slice, no
-// cross-role merging happens here.
+// Multiple Restore calls must commute and be idempotent (see
+// sealed/ARCHITECTURE.zh.md §3 on Restore commutativity): each role
+// owns its disk slice, no cross-role merging happens here.
 func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) error {
 	a.mu.Lock()
 	if a.cfg == nil {

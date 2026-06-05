@@ -1,16 +1,13 @@
 // Package openclaw is the framework adapter for openclaw agents.
 //
-// 5-dim iData layout (EVOLUTION_DESIGN.md §3.1):
+// Current path-driven role set (see sealed/ARCHITECTURE.zh.md §6 for the
+// full role table). The 5 declared roles:
 //
-//	framework  → JSON FrameworkBinding (name + package_version + schema_version)
-//	persona    → tar.gz: persona.md + inference.json + ui.json + talk.json
-//	knowledge  → tar.gz: memory.md / dreams.md / user.md / agents.md +
-//	             memory.json / session.json + manifest.json
-//	skills     → JSON: { plugins, tools, web, approvals, audio, commands,
-//	             agent_defaults_skills }  — each section opaque RawMessage
-//	ops        → JSON: { channels, mcp, hooks, cron, browser, bindings,
-//	             surfaces, broadcast, media, messages, accessGroups,
-//	             commitments, secrets, acp, rate_limits, safety }
+//	framework            Leaf — 3-field binding JSON
+//	openclaw.json        Leaf — main openclaw config (whitelist-filtered)
+//	workspace/           DirectoryManifest — workspace root .md files
+//	workspace/skills/    DirectoryManifest — each slug = one entry (tar.gz)
+//	workspace/canvas/    DirectoryManifest — file + dir entries
 //
 // File map:
 //   - openclaw.go    Adapter struct + framework.Framework interface methods
@@ -25,7 +22,7 @@
 //                    uploader needs to publish actual current state)
 //   - spawn.go       Start: install + spawn openclaw + runtime config
 //                    sections (gateway.token, controlUi)
-//   - toolsmd.go     platform-injected TOOLS.md upsert
+//   - identitymd.go / soulmd.go / toolsmd.go  platform-injected sections
 package openclaw
 
 import (
@@ -65,8 +62,10 @@ type Adapter struct {
 	// calls (i.e. supervisor restarts) skip the npm install + token
 	// generation steps so agent self-modifications (dashboard upgrade,
 	// plugin install, config edits) are not silently overwritten.
-	// EVOLUTION_DESIGN principle: outer framework does not interfere with
+	// Platform principle: outer framework does not interfere with
 	// agent self-modification; it only keeps the agent alive.
+	// (See ARCHITECTURE.zh.md §6 on openclaw.json whitelist + sealed-
+	// section markers.)
 	initialized bool
 }
 
@@ -90,7 +89,7 @@ func (a *Adapter) Version(ctx context.Context) (string, error) {
 }
 
 // Roles returns the path-driven role set this adapter declares
-// (EVOLUTION_DESIGN §16.2). Five entries:
+// (see sealed/ARCHITECTURE.zh.md §6 role table). Five entries:
 //
 //   - "framework"          (leaf)      framework binding metadata
 //   - "openclaw.json"      (leaf)      filtered openclaw config

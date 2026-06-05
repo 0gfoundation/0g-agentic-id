@@ -1,7 +1,8 @@
-# sealed Trust Model
+# AgenticID Trust Model
 
-What guarantees a `serve-proof` actually carries, what it deliberately does
-not carry, and how reputation fills the gap.
+How an agent's identity gets cryptographically anchored to a specific
+piece of attested code, what each `serve-proof` actually proves, what it
+deliberately does not, and how reputation fills the gap.
 
 This is the most easily misread part of the project. Read this once before
 arguing about "but what if the owner does X."
@@ -13,9 +14,13 @@ arguing about "but what if the owner does X."
 > **sealed guarantees *formal* trust. Reputation guarantees *semantic*
 > trust. Both together = useful agents.**
 
-- `serve-proof` proves the response came from a specific open-source
-  binary running in an attested TEE, bound to a specific request and a
-  specific agent state. It is **cryptographically unforgeable**.
+- All 8 envelope claims `serve-proof` carries **are** cryptographically
+  bound by `agent_seal_priv`; they just need different preconditions:
+  **Group A (identity layer, 3 claims)** holds unconditionally as long
+  as priv stays in the TEE, while **Group B (content layer, 5 claims)**
+  needs an additional precondition — the signing capability is not
+  being abused by the agent — backstopped by the **agent doctrine**.
+  See [the load-bearing wall section](#the-load-bearing-wall-under-these-8-guarantees-is-the-agent-doctrine).
 - `serve-proof` does **not** prove the response *content is correct*,
   the agent is *autonomous*, or the owner hasn't *manipulated* the
   agent via prompts.
@@ -60,12 +65,294 @@ How the implementation maintains this:
 | Disk persistence is encrypted at rest | `agent_seal_priv` is never written to disk in plaintext; provisioned to memory only |
 | Openclaw subprocess doesn't have it | spawn.go env whitelist excludes `agent_seal_priv`; only `*_API_KEY` env vars cross the subprocess boundary |
 | No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes |
-| Provisioning chain doesn't leak it | attestor encrypts `agent_seal_priv` to the container's `SANDBOX_SEAL_KEY` (ECIES); only the container can decrypt; `SANDBOX_SEAL_KEY` is scrubbed from env after use |
+| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the container's ephemeral `container_pubkey`; the matching `container_privkey` is generated inside the TEE and never crosses any boundary. Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
 Any future change to sealed that risks crossing this boundary — even
 indirectly (e.g., logging priv bytes, exposing them via a debug
 endpoint, storing them in shared memory with subprocesses) — is a
 **critical security regression**. It is the one rule that cannot bend.
+
+---
+
+## Trust chain: how `agent_seal_priv` reaches the TEE
+
+Before `serve-proof` can mean anything, the private key has to land in a
+TEE whose code identity can be reasoned about. The chain that delivers
+it spans four layers — **TappRegistry** as identity ground truth, KMS
+issuing the attestor's master secret, attestor deriving the per-agent
+seal, and 0g-Sandbox signing image attestations that gate the
+container's `/provision` call. Each layer is independently verifiable;
+together they answer "why should a verifier believe this private key
+only ever existed inside honest, on-chain-registered code."
+
+### Tapp as the trust ground
+
+The three TEE components AgenticID depends on — **Attestor**,
+**0g-Sandbox**, **0g-kms** — are all themselves deployed as 0g-Tapp
+applications. Each registers in **TappRegistry** with:
+
+- `composeHash` / `volumesHash` / `imageHashes[]` — the **code identity**
+  (everything that determines what the app runs)
+- per-node `signer` addresses and stake amounts — the **hardware-bound
+  identity** (each TDX instance's attestation-bound signing key)
+- `appAckVersion` — bumps on every `updateApp` / `updateNode` /
+  authorized-invalidator call, giving users a single integer to track
+  whether their previously-acked version is still current
+
+Tapp's design philosophy is to trade strong code-binding pre-checks for
+**strong audit**: app owners are allowed to deploy new versions, but
+every version that runs is measured and recorded on chain. Users
+acknowledge specific versions by calling
+`TappRegistry.acknowledgeApps(appIds[])` from their wallet before
+relying on the apps. AgenticID wires this into its deploy flow:
+**before each new agent deploy**, the current wallet must hold a live
+ack for all three apps' current versions — versions without an ack
+block deployment until the ack is filled in.
+
+This is the trust ground. Everything below assumes "an entity
+identifying as `0g-attestor` / `0g-kms` / `0g-sandbox-provider` on
+TappRegistry is in fact running the code its current registration
+describes."
+
+That assumption is not something Tapp unilaterally guarantees — **the
+trust is produced by the user themselves**. What Tapp provides is two
+structural properties:
+
+- **Verifiable**: every registration carries `composeHash` /
+  `imageHashes` / node attestation signatures that anyone can
+  cross-check on chain.
+- **Un-hideable**: any code change or node rotation goes through
+  Tapp's measure-and-record flow first; sneaking a different version
+  online without leaving an on-chain trail is not possible.
+
+The user (or a delegated tool / third-party auditor) walks through RA
+verification themselves: compare the on-chain code hashes and TEE
+measurements against the code they expect to run. Only when those
+match do they call `TappRegistry.acknowledgeApps(appIds[])` from their
+wallet — "I've reviewed this, I accept it." Tapp forces the question
+into the open; **the final decision rests with the user**.
+
+Everything below in this doc assumes you've already done that step:
+the apps you've ack'd are in fact the code you reviewed.
+
+### Layer 1 — KMS → Attestor master secret
+
+Inside its own TEE, the **Attestor** signs a KMS challenge with its
+TDX-bound node signer key. From that **one** signature KMS:
+
+1. recovers the signer address and looks it up on TappRegistry — the
+   address must currently be a registered node of some app;
+2. reads the corresponding `app_id` straight off that registration
+   entry.
+
+KMS then derives the per-app **master secret** from that `app_id` and
+returns it encrypted to the Attestor. The `app_id` binding comes
+entirely from the on-chain registration — KMS never accepts a
+self-declared code identity from the Attestor; the mapping is read
+back from TappRegistry, not asserted by the caller.
+
+This also makes plain why the user must ack **both** KMS **and**
+Attestor separately:
+
+- **The ack of KMS** backstops **the derivation logic itself**: the
+  user has to be convinced KMS's code really runs the "signer must be
+  on-chain registered" check and derives strictly off the on-chain
+  `app_id` — that it cannot be bypassed by a caller-supplied code
+  identity. Without this ack, nobody has reviewed the verification
+  program at all.
+- **The ack of Attestor** backstops **the code that receives the
+  master secret**. KMS does **not** verify what code the Attestor
+  actually runs — it only sees which code that `app_id` points to in
+  TappRegistry. KMS's confidence that "this code deserves the master
+  secret" comes **entirely** from the user having ack'd that `app_id`.
+
+Neither ack substitutes for the other: without the KMS ack the
+derivation logic is unreviewed; without the Attestor ack the master
+secret is handed to unreviewed code.
+
+The master secret is:
+
+- **App-scoped**: derived per `app_id` (KMS is deterministic in
+  `app_id` → secret); the same `app_id` always derives the same master
+  secret regardless of which TDX machine runs Attestor.
+- **TEE-resident**: lives only in Attestor's TEE memory; never written
+  to disk, never crossed the gRPC boundary in plaintext.
+- **The KMS-side seed** for every `agent_seal_priv` AgenticID will ever
+  derive.
+
+Two consequences worth stating explicitly:
+
+1. **Hardware swaps preserve keys**: replacing the TDX machine Attestor
+   runs on does not change the keys it can derive — the master secret
+   persists across hardware swaps as long as the code identity stays
+   registered.
+2. **Per-app isolation**: compromising any one Attestor TDX instance
+   does not compromise other Tapp apps' secrets. KMS isolates per-app
+   master secrets cryptographically; one compromised TEE cannot pivot
+   to siblings.
+
+### Layer 2 — Per-agent `agent_seal_priv` (Attestor → seal)
+
+When a deploy request lands, Attestor:
+
+1. Generates a random 32-byte `seal_id` (the on-chain handle for this
+   agent's identity slot).
+2. Derives `agent_seal_priv = HKDF(master_secret, info = seal_id)`,
+   fully deterministic — no entropy from the request, no per-call state
+   beyond the input.
+3. Publishes `agent_seal_pub` on chain via `setAgentSeal(agentId,
+   agent_seal_pub)` at mint time — the binding becomes immutable
+   (see [Set-once seal semantics](#set-once-seal-semantics-why-the-binding-is-safe)
+   below).
+4. **Discards `agent_seal_priv` from its own memory** as soon as the
+   provisioning hand-off (Layer 3) completes. Attestor does not retain
+   a copy.
+
+If the Sealed container later restarts or is replaced (hardware swap,
+recovery flow), Attestor re-derives the *same* `agent_seal_priv` from
+the same `seal_id` and re-provisions it. The on-chain binding doesn't
+have to change because the cryptographic identity behind it doesn't
+change.
+
+### Layer 3 — Sandbox-signed image attestation → `/provision`
+
+The actual hand-off from Attestor to a Sealed container goes through
+**0g-Sandbox**, itself a Tapp app with its own TappRegistry-registered
+node signer keys.
+
+When a Sealed container boots:
+
+1. Container generates an ephemeral secp256k1 keypair
+   (`container_pubkey`, `container_privkey`) inside its TEE.
+2. 0g-Sandbox observes the container's startup, measures its
+   `image_hash`, and signs an attestation envelope:
+   `keccak256("ImageAttestation:{seal_id}:0x{container_pubkey}:sha256:{image_hash}:{ts}")`
+   with one of its TappRegistry-registered node keys.
+3. Container POSTs `/provision { seal_id, container_pubkey, image_hash,
+   issued_at, sandbox_signature }` to Attestor.
+
+Attestor's validation has three independent gates:
+
+| Gate | Predicate | Source of truth |
+|---|---|---|
+| **Sandbox identity** | `recover(sandbox_signature)` ∈ `TappRegistry.getNodeList(sandbox_app_id)` | TappRegistry, queried live — tolerant of key rotation on the sandbox side without any attestor restart |
+| **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
+| **Freshness OR binding** | `\|now − issued_at\| ≤ 300s`, OR `(container_pubkey, mac)` matches the binding stored from a previous successful provision (HMAC over `seal_id ‖ pubkey` under Attestor's master secret) | Local DB + master secret |
+
+**The first gate** makes the same "user ack does the work" pattern
+from Layer 1 visible again: **Attestor never validates what code the
+sandbox runs.** It trusts only the signer set currently listed under
+`sandbox_app_id` in TappRegistry. Those signers carry weight — they
+can vouch for an image attestation — only because the user has
+already reviewed the sandbox's code upstream and ack'd that
+`app_id`. Trust propagates along **"user ack → on-chain registration
+→ Attestor's check"**.
+
+**The second gate** — the `validFrameworkHashes` allowlist — follows
+the same spirit as Tapp's "code identity on chain, reviewed by the
+user before use": the sealed runtime's image hash is registered
+on-chain too (on the AgenticID contract's `validFrameworkHashes`),
+and users should manually check that the on-chain hash matches a
+reproducible build from the open-source sealed runtime repository.
+
+sealed itself is **not** registered as a standalone Tapp app — it is
+a container spawned by 0g-Sandbox, not a top-level app — so it
+deliberately **does not** route through TappRegistry, and
+`acknowledgeApps` does not apply to it. **The one piece missing today
+is the wallet-side ack**: after a user audits the image, there is no
+on-chain place to record "I've reviewed this hash." Closing the gap
+is a matter of adding a per-wallet ack of the current
+`validFrameworkHashes` snapshot on the AgenticID contract (mirroring
+`TappRegistry.acknowledgeApps` in shape) — sealed neither needs nor
+will be migrated into TappRegistry.
+
+All three must pass. On success, Attestor **ECIES-encrypts**
+`agent_seal_priv` to `container_pubkey` and returns the ciphertext; only
+the matching container can decrypt with `container_privkey` (which never
+leaves the container's TEE). After decryption, `agent_seal_priv` is
+resident only in TEE-encrypted RAM for the rest of the container's
+lifetime — restoring the [foundational invariant](#foundational-invariant-owner-never-holds-agent_seal_priv).
+
+The binding stored on Attestor's side lets restarts skip the 5-minute
+freshness window: if the same 0g-Sandbox-spawned container restarts and
+presents the same `container_pubkey`, Attestor accepts on the binding
+alone. The HMAC prevents an attacker with DB write access (but no
+master secret) from forging valid bindings — the (`container_pubkey`,
+`mac`) pair is unforgeable without Attestor's master.
+
+---
+
+## Set-once seal semantics: why the binding is safe
+
+`AgenticID.setAgentSeal(agentId, sealAddr, sealId)` enforces three
+invariants:
+
+- **Set-once per agent**: once `agentSeal[agentId]` is non-zero, it can
+  never be rewritten. Zero values are rejected at write time, so the
+  initial set is also the final one.
+- **`sealId` global uniqueness**: the `sealId → agentId` mapping is
+  one-to-one across all agents. Two agents cannot share a seal.
+- **Persistence across transfer**: `iTransferFrom` clears `agentWallet`
+  and `authorizedUsers` (per-owner state) but leaves `agentSeal` /
+  `sealId` untouched. The agent's TEE-attested identity outlives any
+  owner change.
+
+The cryptographic justification — why this isn't a footgun — is that
+`agent_seal_priv` is HKDF-derived from `(master_secret, sealId)`, both
+of which are stable across hardware swaps within Attestor's app
+lifetime. Any future TEE that can authenticate to KMS as the same
+Attestor app can re-provision the *same* `agent_seal_priv` for the
+*same* `agentId`. The on-chain binding can be fixed permanently because
+the cryptographic identity behind it is permanent.
+
+Combined with `agent_seal_priv` never leaving TEE memory ([foundational
+invariant](#foundational-invariant-owner-never-holds-agent_seal_priv)),
+`agentSeal` becomes an identity that no party — owner, host, Attestor
+operator — can forge, transfer, or revoke.
+
+---
+
+## `dataKey` atomic transfer on ownership change
+
+Functional data (iData) is encrypted under a per-agent `dataKey` so that
+0G Storage only carries ciphertext. When an agent transfers owners,
+`dataKey` must move from the seller's TEE to the buyer's TEE without
+ever surfacing in plaintext outside a TEE — otherwise the new owner
+gets only a hollow NFT, not a working agent.
+
+`iTransferFrom` enforces this via two cryptographic proofs that both
+land in the same transaction:
+
+- **AccessProof** — buyer signs `keccak256(dataHash || buyer_targetPubkey
+  || nonce || deadline)`, declaring "I want this data sealed to my
+  pubkey." The recovered signer must equal `to` (or a registered
+  delegate).
+- **OwnershipProof** — Oracle TEE decrypts the existing `sealedKey`
+  under the seller's `agent_seal_priv`, re-encrypts the same plaintext
+  `dataKey` under `buyer_targetPubkey` (ECIES), and signs:
+  `keccak256(dataHash || sealedKey_new || buyer_targetPubkey || nonce
+  || deadline)`. The recovered signer must equal the on-chain-
+  registered `teeOracleAddress`.
+
+The Oracle TEE is **stateless** with respect to `dataKey`: it decrypts,
+re-encrypts, signs the OwnershipProof, and discards the plaintext
+immediately. The new `sealedKey[]` is committed to chain as part of the
+transfer; only the buyer's TEE can later decrypt it using
+`buyer_targetPubkey`'s privkey counterpart.
+
+Two consequences worth stating:
+
+- `dataKey` never appears in any chain-visible payload or EOA wallet
+  storage. The only places it ever exists are: the seller's TEE, the
+  Oracle TEE (briefly, during re-encryption), and the buyer's TEE.
+- The Oracle TEE compromise blast radius is bounded by what it sees in
+  flight — a single transfer's `dataKey` for the duration of one
+  re-encryption. It retains nothing cross-transfer.
+
+The Oracle TEE's `teeOracleAddress` is itself TappRegistry-registered;
+key rotation on Oracle's side follows the same TappRegistry-driven flow
+as 0g-Sandbox's node signers (the audit shape is identical; only the
+role differs).
 
 ---
 
@@ -106,84 +393,140 @@ guarantees:
 | 7 | **Non-repudiation** — neither owner nor agent can later deny the request happened | `req_body_hash` is keccak of actual bytes |
 | 8 | **Time binding** — signing timestamp is part of the envelope | `ts` field |
 
-These are the things you can verify with math alone, given the public
-sealed source code + chain state.
-
 ---
 
-## Two roles of `agent_seal_priv`: sealed-signed vs agent-signed
+## The load-bearing wall under these 8 guarantees is the agent doctrine
 
-The key `agent_seal_priv` is used by two different code paths, and a
-verifier MUST know which one produced a given signature before reasoning
-about it.
+All 8 guarantees above **are** cryptographic assertions signed by
+`agent_seal_priv`. What differs is the precondition each one needs
+to hold:
 
-### Path A — sealed-signed (formal trust)
+**Group A: identity layer (#1 #2 #6 — signing mechanism carries its
+own evidence)**
 
-Signatures produced by sealed code on **canonical envelopes whose content
-is fully determined by sealed**:
+- **#1 Code authenticity**: TEE attestation proves the signature
+  necessarily came from inside the code matching `image_hash`.
+- **#2 Execution integrity**: TDX hardware guarantees the host did
+  not tamper with sealed's execution.
+- **#6 Identity binding**: `ecrecover(sig)` is elliptic-curve math —
+  the signer address is necessarily `agent_seal_pub`.
 
-- `serve-proof` (X-Agent-Proof header on `/hello` and the reverse proxy)
-- `report.Status` (heartbeat / status updates to the attestor)
-- `chain.Update` (iData drift uploads — calldata constructed from observed
-  state, not LLM input)
+The signing mechanism itself witnesses these three. **As long as
+priv stays inside the TEE, they hold unconditionally** — no
+assumption about how the envelope's content fields got there is
+required.
 
-These carry the guarantees enumerated above (code/exec/request/response/
-state/identity/time binding). The LLM can trigger them but cannot
-influence the bytes that get signed — sealed Go code assembles the
-envelope from observable runtime state.
+**Group B: content layer (#3 #4 #5 #7 #8 — additional precondition:
+the signing capability is not being abused)**
 
-### Path B — agent-signed (runtime-attested identity only)
+- **#3 Request binding** (`req_body_hash`)
+- **#4 Response binding** (`resp_body_hash`)
+- **#5 State binding** (`data_hashes`)
+- **#7 Non-repudiation** (depends on #3)
+- **#8 Time binding** (`ts`)
 
-The agent (LLM-driven openclaw subprocess) can also request signatures
-via the unix-socket sign endpoints (`/sign/personal_sign`, `/sign/typed_data`,
-`/sign/transaction` on `unix:///run/seal-sign.sock`). These exist so the
-agent can:
+These five are also hard cryptographic assertions signed by
+`agent_seal_priv` — `keccak256(envelope)` uniquely determines those
+field values, and a valid signature proves the priv holder **asserted**
+them.
+
+The catch is that the priv holder has **two** internal users: the
+sealed framework and the agent. The framework composes envelopes from
+observable runtime state, so framework-signed field values correspond
+to reality by construction. The agent, on the other hand, can compose
+envelopes itself through the sign socket and fill in whatever values
+it wants — the cryptographic assertion still holds (priv really did
+assert these values), but the values are decoupled from anything that
+actually happened.
+
+So on top of Group A's preconditions, Group B needs one more: **the
+signing capability is not being abused** (the agent does not use the
+sign socket to fabricate framework-shape envelopes). That extra
+precondition is not something the signing mechanism can enforce on
+its own, because sealed's sign socket is a **schema-agnostic general
+signer**:
+
+```
+POST unix:///run/seal-sign.sock/sign/personal_sign  { message: <arbitrary bytes> }
+      → returns sig, sealed does not check what message looks like
+```
+
+That means the agent (the LLM-driven openclaw subprocess) can perfectly
+well assemble a JSON byte string shaped exactly like a serve-proof
+envelope and sign it through the sign socket. A verifier holding that
+`(envelope, sig)` **cannot cryptographically tell** whether sealed's
+watcher composed it or the agent fabricated it.
+
+"The signing capability is not abused" is propped up two ways:
+
+1. **Channel binding** (`X-Agent-Proof` only): the `X-Agent-Proof`
+   header is written by sealed proxy in the response path, and the
+   agent cannot overwrite HTTP headers. A verifier that scopes itself
+   to "trust only the `X-Agent-Proof` in the response header, ignore
+   envelope sigs in the body" gets Group B **mechanically** on that
+   channel, without relying on the agent's self-discipline.
+2. **Agent doctrine** (everything else): the agent itself is
+   system-prompted with refusal rules — it doesn't sign
+   externally-supplied bytes and doesn't proactively draft envelopes
+   shaped like framework schemas. See
+   [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md) §4.1 Refusal 1.
+
+That marks out the **load-bearing wall**:
+
+| Component | If it falls |
+|---|---|
+| `agent_seal_priv` stays inside TEE | Whole thing collapses, Group A goes with it (attacker forges arbitrary signatures offline) |
+| sealed proxy controls response headers | Group B on the `X-Agent-Proof` channel loses its mechanical protection and falls back to agent doctrine; `report.Status` / `chain.Update` never relied on the header channel anyway |
+| **Agent doctrine** | Group B fails on channels without channel binding (`report.Status` / `chain.Update` — agent abuses sign socket to fabricate envelopes); `X-Agent-Proof` still holds mechanically via channel binding; Group A holds on every channel |
+
+In other words, **agent doctrine compromised ⇒ Group B fails on the
+channels without channel binding (`report.Status` / `chain.Update`),
+while Group A holds throughout**. The priv did not leak and the TEE
+was not broken — verifiers can still cryptographically establish "this
+assertion was signed by `agent_seal_priv` inside a legitimate TEE" —
+the content-layer claims simply no longer correspond to reality, and
+on-chain reputation has to take the slack. This is not a bug; it's
+the ceiling this trust model intentionally accepts: when the agent is
+an LLM, there is no stronger design than "trust the agent not to
+abuse the sign socket + patch the rest through reputation."
+
+### What else `agent_seal_priv` gets used to sign
+
+Beyond the framework auto-signatures (`report.Status` / `chain.Update` /
+`X-Agent-Proof` above), the agent itself can request signatures over
+the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
+`/sign/transaction`) so it can participate as a first-class Web3 actor:
 
 - Call contracts that check `msg.sender == agent_seal_addr`
 - Emit off-chain claims tied to its TEE-attested identity
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
-- Send arbitrary chain transactions as agentSeal
-
-The bytes signed via these endpoints are **chosen by the agent (LLM
-output)**, not by sealed code. Therefore:
-
-| Property | Path A | Path B |
-|---|---|---|
-| Content origin | sealed Go code | LLM output |
-| Sandbox owner can choose bytes? | No | Indirectly, via prompt injection |
-| Verifier guarantee | "came from this audited image running in TEE, content is sealed-computed" | "came from agentSeal in a legitimate TEE runtime, content reflects whatever the agent chose to sign" |
-| Suitable for | Cryptographic state/request/response binding | Identity claims, contract calls where msg.sender matters |
+- Send chain transactions as agentSeal
 
 The unix socket is bound 0600 inside the container and **never exposed
-over the network** — sandbox owners cannot directly post to it from
-outside. The agent is the structural gatekeeper; if the agent forwards
-owner-controlled bytes into a sign endpoint without semantic review, the
-agent quality is at fault (and reflected in reputation), but the formal-
-trust foundation (foundational invariant: priv stays in TEE) is intact.
+over the network** — sandbox owners cannot post to it directly from
+outside. This is analogous to how `eth_signTransaction` /
+`personal_sign` work in any wallet: the wallet attests *who signed*,
+not *that the content is correct*. agentSeal is no different — it just
+happens to be a wallet whose runtime is hardware-attested.
 
-### Why this is acceptable
+A worked example. A verifier sees an on-chain tx with
+`from = 0xAgentSeal` calling some DEX to move 1000 USDC out. They
+should read it like this:
 
-The foundational invariant — `agent_seal_priv` never leaves TEE memory —
-remains. Path B doesn't weaken it; signatures are still computed inside
-sealed and the priv bytes never cross any boundary. What Path B does is
-**widen the schema** of what can get signed by the same key, in exchange
-for letting the agent participate as a first-class Web3 actor (msg.sender
-as agentSeal, EIP-712 dApps, gas-paying tx).
+- **The Group A part**: this tx definitely originated from
+  agentSeal inside a legitimate TEE (the priv didn't leak and the
+  TEE wasn't broken) — this part holds unconditionally.
+- **The Group B part**: the call parameters (recipient, amount,
+  which contract / which method) were **chosen by the agent
+  itself**. The sealed framework neither inspects nor participates
+  in these. "Auto-signed by sealed ⇒ vetted by sealed" does **not**
+  apply here.
 
-Verifiers MUST distinguish:
-
-- "Verifying a serve-proof": look at the canonical envelope shape, check
-  the signature, you get Path A guarantees.
-- "Verifying a contract call with msg.sender == agentSeal": the chain
-  validates the tx signature; this proves the call came from a legitimate
-  TEE runtime, but the call parameters were chosen by the agent (LLM),
-  not by sealed. Apply normal "agent reputation" reasoning to the
-  parameters' semantic meaning, same as you would for any LLM output.
-
-This is analogous to how `eth_signTransaction` and `personal_sign` work
-in any wallet: the wallet attests *who signed*, not *that the content
-is correct*. agentSeal is no different — it just happens to be a wallet
-whose runtime is hardware-attested.
+In other words, the semantic credibility of this tx is evaluated
+exactly the way one would evaluate any LLM decision: by the agent's
+**on-chain reputation** — its prior behavior, any reports against
+it, its reputation score — not by treating `from = agentSeal` as a
+framework endorsement.
 
 ---
 
@@ -241,8 +584,35 @@ This is the fundamental encryption-vs-auditability tradeoff. To
 preserve the owner's right to private agent conversations, we accept
 that the agent's internal state is opaque to third parties. To recover
 content-level audit, we'd have to make iData public (losing owner
-privacy) or log every owner interaction publicly (losing chat privacy).
-Neither is acceptable in the v0 model.
+privacy) or log every owner interaction publicly (losing chat privacy)
+— **AgenticID rejects both**. The owner ↔ agent private channel is
+one of this design's bottom lines.
+
+### The owner attack surface is a present-day limit, not a permanent property
+
+The three "cannot prove" items above sound like permanent architectural
+flaws, but a significant part of their root cause is **that today's
+agents aren't smart enough to operate without owner guidance** — the
+agent still needs the owner to set goals, correct mistakes, fill in
+commonsense, unlock new scenarios. So the owner must have a direct
+prompt channel into the agent. That "necessary guidance channel" is
+both what lets the agent function and the attack surface through which
+the owner manipulates it — they're the same pipe.
+
+As LLM capability grows and agents become more capable of driving
+themselves from external inputs (clocks, on-chain events, peer-agent
+messages, sensor data), the demand for owner guidance shrinks. The same
+prompt channel can retreat to edge cases (major goal changes, error
+correction); routine inference no longer requires owner intervention —
+and the density of the attack window drops with it.
+
+The architecture's non-prompt-driven paths (drift detector,
+`report.Status` heartbeats, drift-triggered reload) are already in
+place for this future: when agents are autonomous enough, the owner's
+prompt channel can naturally atrophy without rewriting the trust
+model. The Group A / B framework stays the same; only the *source* of
+Group B content shifts from "owner-prompted" toward
+"agent-self-driven."
 
 ---
 
@@ -289,21 +659,6 @@ independently.
 
 ---
 
-## Failure modes and where to look
-
-When something looks wrong, this table tells you which layer owns it:
-
-| Symptom | Layer at fault | Action |
-|---|---|---|
-| serve-proof signature doesn't verify | sealed / TEE compromised | Critical bug — investigate sealed code, TEE attestation chain |
-| signature verifies but `req_body_hash` doesn't match the request body you sent | request was replaced in transit (MITM) or sealed bug | Critical — investigate transport + sealed code |
-| signature verifies, `data_hashes` don't match `AgenticID.intelligentDatasOf(tokenId)` | sealed state-binding bug | Critical — sealed lied about agent state at response time |
-| Everything verifies, but the response content is **wrong / harmful** | Agent quality issue | **Not a sealed bug.** Report to reputation system; reputation score will reflect |
-| Agent's persona has drifted in suspicious ways | Owner manipulation suspected | **Not a sealed bug.** Verifier should weight content lower; chain history (`EntryUpdated` events) shows drift timeline |
-| Agent stops responding | Container down, owner stopped it, gas depleted | Operational issue. Owner is responsible for keeping the container alive and funded |
-
----
-
 ## What this means for verifiers
 
 If you are integrating sealed agents into your system as a relying party,
@@ -320,6 +675,10 @@ implement the trust model in two stages:
 A formally-valid proof from a low-reputation agent is **still suspect at
 the content level**. Don't conflate "proof verifies" with "content is
 true."
+
+> When you see something off and want to know which layer owns it,
+> consult the failure-mode lookup table in
+> [`QUIRKS.md`](../QUIRKS.md#故障定位serve-proof--sealed-运行时).
 
 ---
 
@@ -343,44 +702,3 @@ In short: **the architecture trusts you with private operation of your
 agent, but does not protect you from the consequences of manipulating
 it badly**. The market does.
 
----
-
-## What this means for the sealed implementation
-
-When adding new capabilities to sealed:
-
-1. **Distinguish Path A (sealed-signed) from Path B (agent-signed) in
-   any new code path.**
-   - Path A: content is sealed-computed (`serve-proof`, `report.Status`,
-     `chain.Update`). New Path A endpoints are fine — they extend the
-     formal-trust guarantee.
-   - Path B: content is agent-chosen via the unix-socket sign endpoints
-     (`/sign/personal_sign`, `/sign/typed_data`, `/sign/transaction`).
-     Path B is **intentionally** an agent-attested-identity layer, not a
-     formal-trust layer. Do not extend Path B in ways that blur the line —
-     keep it on a localhost-only or unix-socket transport, never expose it
-     over the public :8080 mux where owner traffic terminates.
-
-2. **Free-form chain transactions through Path B are acceptable** because
-   `msg.sender == agent_seal_addr` plus the TEE attestation chain is
-   enough for relying contracts that want "this came from a legitimate
-   runtime". Sealed does not need to whitelist destination / selector;
-   the agent is responsible for what it signs, and reputation reflects
-   misuse. (This is a deliberate change from earlier drafts of this doc
-   that forbade free-form tx — those drafts predated the two-path model.)
-
-3. **Never add a Path B endpoint to the public mux.** The public :8080 is
-   where owner traffic arrives. Any signing endpoint there would let the
-   owner directly demand signatures by `agent_seal_priv`, collapsing the
-   distinction between Path A and Path B and breaking serve-proof's
-   forgery resistance.
-
-4. **The trigger source for any Path A action should be auditable
-   externally.** Disk-drift triggers (watcher) and timer triggers
-   (heartbeat) are fine; chat-prompt triggers leak owner influence into
-   the formal-trust layer.
-
-If you find yourself wanting to add an endpoint that doesn't fit cleanly
-into either path, stop and re-derive: is it Path A (sealed-computed
-envelope) or Path B (agent-chosen content under TEE-attested identity)?
-If it's neither, the use case probably wants to live outside sealed.

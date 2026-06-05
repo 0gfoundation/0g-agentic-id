@@ -109,7 +109,7 @@ func (w *Watcher) Stop() {
 
 // dimsToPoll returns the role names this watcher should poll on every
 // tick — exactly the role set the adapter declares (path-driven; see
-// EVOLUTION_DESIGN §16.2). "framework" is included by adapter.Roles(),
+// sealed/ARCHITECTURE.zh.md §6). "framework" is included by adapter.Roles(),
 // not prepended separately, since it's just one role among others now.
 func (w *Watcher) dimsToPoll() []string {
 	roles := w.adapter.Roles()
