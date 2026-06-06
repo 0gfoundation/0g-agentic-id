@@ -1,13 +1,14 @@
 # sealed Architecture
 
-sealed is the **agent runtime container** in the 0G AgenticID system — it
-restores a runnable agent from a set of encrypted iData on chain inside
-a TEE sandbox, and once running, continuously commits the agent's state
-evolution back on chain. It runs inside a sandbox that receives its key
-from attestor after remote attestation (RA). The process is both the
-host for the framework adapter and the reverse proxy for the outward
-`:8080`; it also exposes a unix socket so the agent itself can perform
-signatures requiring the wallet private key.
+sealed is the **agent runtime container** in the 0G AgenticID system.
+Inside a TEE sandbox, it restores a runnable agent from a set of
+encrypted iData on chain, and once running, continuously commits the
+agent's state evolution back on chain. It runs inside a sandbox that
+receives its key from attestor after remote attestation (RA). The
+process is both the host for the framework adapter and the reverse
+proxy for the public `:8080` port. It also exposes a unix socket so
+the agent itself can perform signatures requiring the wallet private
+key.
 
 External components it integrates with:
 
@@ -52,9 +53,9 @@ Long-running              proxy on :8080 + sign socket + watcher 30s tick +
 ```
 
 Only after Phase 4 is "the agent online." In Phase 3, the phase-1 seed
-is the pre-Start snapshot, and the phase-2 seed is the baseline after
-openclaw has stabilized after startup — this is the actual reference
-point for watcher comparisons (see §4).
+is the pre-Start snapshot. The phase-2 seed is the baseline taken
+after openclaw has stabilized, and that baseline is the actual
+reference point for watcher comparisons (see §4).
 
 ## 2. Package structure
 
@@ -88,7 +89,7 @@ sealed/
 - **framework**: defines the `Framework` interface (adapter protocol) + `RuntimeContext` + `RoleSpec{Name, Shape}` + shared types like `StartParams`, `StartResult`. **Does not depend on any specific framework**
 - **framework/openclaw**: the only adapter implementation. Internally split into `restore.go` / `restore_paths.go`, `evolution.go` / `evolution_paths.go`, `spawn.go`, `ingest.go` (persona legacy), `inference.go` (model routing), `disk.go` (openclaw.json read/write), `whitelist.go` (npm version allowlist), `identitymd.go` / `soulmd.go` / `toolsmd.go` (the IDENTITY/SOUL/TOOLS three sealed-managed platform sections + shared marker utilities)
 - **manifest**: `Manifest{SchemaVersion, Kind, Entries []Entry{Path, Kind, ContentHash, Size, StoragePtr}}` + deterministic serialization (sorted by Path) + `StripStoragePtrs` to zero out entries' StoragePtr for computing the watcher-facing hash + deterministic tar.gz (for skill/canvas subtrees)
-- **state**: `Agent` holds two `Snapshot{PerDim: map[string]DimEntry{ContentHash, DataHash}}`s — `chainSnapshot` and `currentSnapshot` — all drift comparisons go through this
+- **state**: `Agent` holds two `Snapshot{PerDim: map[string]DimEntry{ContentHash, DataHash}}`s, named `chainSnapshot` and `currentSnapshot`. All drift comparisons go through this
 - **manager**: `Start(ctx, params)` calls `adapter.Start` to spawn the agent + launches a supervisor goroutine; when the agent dies, it cleans state + triggers `onFailed`
 - **uploader**: `Apply(plaintexts)` takes the "per-role current plaintext" collected by watcher, compares against chainSnapshot, calls `pushLeaf` or `pushManifest` to upload to 0g-storage, then signs `chain.Update`
 - **watcher**: 30s ticker, runs `EvolutionFor` to collect each role's current plaintext, calls `UpdateCurrentSnapshot` to compute drift, fires `OnDrift` (wired to `uploader.Apply`) when there's drift
@@ -96,9 +97,9 @@ sealed/
 
 ## 3. Core abstraction: the Framework adapter
 
-The outside (main / watcher / uploader) only knows the
-`framework.Framework` interface and has no idea what openclaw looks
-like. This is the seam for plugging in other frameworks later.
+The outside (main / watcher / uploader) sees only the
+`framework.Framework` interface and has no knowledge of openclaw's
+internals. This is the seam for plugging in other frameworks later.
 
 ```go
 type Framework interface {
@@ -126,12 +127,12 @@ type Framework interface {
 
 **Two plaintext forms** (DirectoryManifest only, §7 covers details):
 
-- **empty-ptr form**: what `EvolutionFor` outputs — each entry's StoragePtr field is zero. The sha256 of this plaintext = the "watcher-facing contentHash" that `chainSnapshot[dim].ContentHash` should hold.
+- **empty-ptr form**: what `EvolutionFor` outputs. Every entry's StoragePtr field is zero. The sha256 of this plaintext equals the "watcher-facing contentHash" that `chainSnapshot[dim].ContentHash` should hold.
 - **filled-ptr form**: before `pushManifest` uploads, each entry's StoragePtr is filled with the corresponding 0g-storage root + size, then marshaled, encrypted, and uploaded. The on-chain `dataDescription.storage_ptr.root_hash` points at this filled-ptr blob.
 
-What the next bootstrap pulls from chain is the filled-ptr form; **you must** call `manifest.StripStoragePtrs` to turn it back to empty-ptr first before sha256-ing, otherwise the result won't match what watcher computes and you get phantom drift on every restart (this was one of §7's fixes).
+The next bootstrap pulls the filled-ptr form from chain. **You must** call `manifest.StripStoragePtrs` to convert it back to empty-ptr before sha256-ing; otherwise the result won't match what watcher computes and you get phantom drift on every restart (this was one of §7's fixes).
 
-**`Restore` must be commutative + idempotent**: each role owns its own slice of disk/memory, so the adapter's `Restore(role, plaintext)` is order-independent across multiple calls — any permutation of the same input set produces the same final composed state; repeatedly calling Restore on the same role with different inputs only keeps the last. The bootstrap's A→B→C three-round Restore (leaf first, then manifest parents, then manifest sub-entries) depends on this property: each round handles one category of role independently, without breaking the others. `Start` is the single "land-to-disk + spawn-subprocess" entry point, handing the adapter's accumulated composed state to the subprocess in one shot.
+**`Restore` must be commutative + idempotent**: each role owns its own slice of disk/memory, so the adapter's `Restore(role, plaintext)` is order-independent across multiple calls. Any permutation of the same input set produces the same final composed state; repeatedly calling Restore on the same role with different inputs only keeps the last. The bootstrap's A→B→C three-round Restore (leaf first, then manifest parents, then manifest sub-entries) depends on this property: each round handles one category of role independently, without breaking the others. `Start` is the single "land-to-disk + spawn-subprocess" entry point, handing the adapter's accumulated composed state to the subprocess in one shot.
 
 ## 4. Core state: two snapshots
 
@@ -163,10 +164,10 @@ iData chain: dim=X hash=H pinned (data=0x..)              ← actually on chain
 iData chain: dim=X hash=H placeholder (no on-chain entry) ← not on chain, H is the defaults placeholder
 ```
 
-**Why sampled rather than live**: watcher compares "the hash from the
-last EvolutionFor run" against "the on-chain hash." If
-currentSnapshot were live (recomputed on every access), it would
-always equal itself and drift detection would spin in place.
+**Why sampled rather than live**: watcher compares the hash from the
+last EvolutionFor run against the on-chain hash. If currentSnapshot
+were live — recomputed on every access — it would always equal itself
+and drift detection would spin in place.
 
 ## 5. iData evolution mechanism
 
@@ -199,13 +200,13 @@ always equal itself and drift detection would spin in place.
        syncs chainSnapshot to the just-on-chain value
 ```
 
-A few semantic points worth flagging:
+Key semantics:
 
-- **wholesale replace**: the contract's `update(tokenID, newDatas, sealedKeys)` replaces the entire iData array, not patches. To "remove" a role, omit it from newDatas (uploader.Apply naturally drops isDefault roles, so "restore default → disappears on chain").
+- **wholesale replace**: the contract's `update(tokenID, newDatas, sealedKeys)` replaces the entire iData array; it doesn't patch. To "remove" a role, omit it from newDatas (uploader.Apply naturally drops isDefault roles, so "restore default → disappears on chain").
 - **three outcomes**: unchanged → reuse; isDefault → omit; diverged → actually upload.
-- **single tx coalescing**: N drifts within a 30s window get packed into one tx, gas spent once.
-- **stale-chain-row handling**: `apply.go` re-pulls `chainEntries` from chain before the tx; it doesn't rely on the chainSnapshot cache.
-- **duplicate-role hard-fail**: if two iData entries with the same `dataDescription` appear on chain, bootstrap immediately refuses to start and reports an error. With the same role bound to two different `storage_root`s, the agent's identity is undefined; failing loud is safer than silently picking one.
+- **single tx coalescing**: N drifts within a 30s window pack into one tx, gas spent once.
+- **stale-chain-row handling**: `apply.go` re-pulls `chainEntries` from chain before the tx; it does not rely on the chainSnapshot cache.
+- **duplicate-role hard-fail**: if two iData entries with the same `dataDescription` appear on chain, bootstrap immediately refuses to start and reports an error. With the same role bound to two different `storage_root`s the agent's identity is undefined, and failing loud is safer than silently picking one.
 
 ### push_leaf vs push_manifest
 
@@ -232,7 +233,7 @@ pushManifest(role, plaintext, dataKey, oldChainEntry):
     return IntelligentData{DataDescription: desc(role, mRoot, indexer), DataHash: mRoot}
 ```
 
-Reusing StoragePtrs is the performance-critical bit: don't re-upload an unchanged 5MB skill to 0g-storage.
+Reusing StoragePtrs is the performance-critical step: an unchanged 5MB skill should not be re-uploaded to 0g-storage.
 
 ## 6. openclaw adapter, as it stands
 
@@ -270,15 +271,15 @@ internal/framework/openclaw/
 Design trade-offs:
 
 - **openclaw.json uses an allowlist, not a denylist**: the openclaw process itself writes keys like `logging` / `wizard` / `discovery` / `push` / `cli`, none of which is iData. The allowlist ensures future openclaw additions won't trigger phantom drift.
-- **Three-file platform injection + shared strip**: at spawn time, a platform section wrapped in `<!-- 0g-platform-injected:start/end -->` markers is injected into each of `IDENTITY.md` (identity facts), `SOUL.md` (refusal rules), and `TOOLS.md` (sign endpoints + public URL), splitting the three concerns. The file distribution aligns with openclaw's `CODEX_BOOTSTRAP_CONTEXT_ORDER` (SOUL=10 > IDENTITY=20 > TOOLS=40 — lower numbers have higher priority). When computing hashes and in LoadEntry, `stripPlatformInjection` removes the marker section from **any** workspace root-level .md, so ContentHash is independent of any specific sandbox instance and adding future platform files doesn't require touching evolution code.
-- **Live-probed framework binding**: `evoFramework` runs `openclaw --version` to get the real version and writes it onto `cfg.framework.PackageVersion` — after Reconcile triggers an npm upgrade, the next watcher tick naturally writes the new version on chain.
-- **Empty md defense**: `workspaceRequiredMDs` lists 7 root-level required mds (SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY/DREAMS); if a manifest doesn't list one, touch an empty file rather than letting openclaw auto-generate a multi-KB template; empty files aren't in the manifest, so round-trip is stable.
+- **Three-file platform injection + shared strip**: at spawn time, a platform section wrapped in `<!-- 0g-platform-injected:start/end -->` markers is injected into each of `IDENTITY.md` (identity facts), `SOUL.md` (refusal rules), and `TOOLS.md` (sign endpoints + public URL), splitting the three concerns. The file distribution aligns with openclaw's `CODEX_BOOTSTRAP_CONTEXT_ORDER` (SOUL=10 > IDENTITY=20 > TOOLS=40; lower numbers have higher priority). When computing hashes and in LoadEntry, `stripPlatformInjection` removes the marker section from **any** workspace root-level .md, so ContentHash is independent of any specific sandbox instance, and adding future platform files doesn't require touching evolution code.
+- **Live-probed framework binding**: `evoFramework` runs `openclaw --version` to get the real version and writes it onto `cfg.framework.PackageVersion`. After Reconcile triggers an npm upgrade, the next watcher tick naturally writes the new version on chain.
+- **Empty md defense**: `workspaceRequiredMDs` lists 7 root-level required mds (SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY/DREAMS); if a manifest doesn't list one, touch an empty file rather than letting openclaw auto-generate a multi-KB template. Empty files aren't in the manifest, so round-trip is stable.
 
 ## 7. Runtime endpoints
 
-The only externally reachable surface of the container is `:8080`
-(served by `internal/proxy`); sandbox proxy reverse-proxies subdomains
-of the form `<port>-<sandboxId>.<host>` (a nip.io-style domain) to the
+The container's only externally reachable surface is `:8080`, served
+by `internal/proxy`. The sandbox proxy reverse-proxies subdomains of
+the form `<port>-<sandboxId>.<host>` (a nip.io-style domain) to the
 container's `:8080`.
 
 | Path | Used by | Purpose |
@@ -289,17 +290,17 @@ container's `:8080`.
 | `/<anything else>` | end users, agent dashboard frontend | reverse-proxied to openclaw `127.0.0.1:3284` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/openclaw` + `/log/openclaw.html` | ops | openclaw subprocess stdout/stderr (live) |
-| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` — signs with `agent_seal_priv` |
+| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`; signs with `agent_seal_priv` |
 
 The sign socket is the critical trust boundary between sealed and the
-outside world (which is really the same-container agent process): the
+outside world (which is really the same-container agent process). The
 private key never leaves the sealed process; the agent hands the
 message to sign over the unix socket. The socket itself is just
-transport — **refusal logic lives on the agent side, constrained by
-SOUL.md's refusal rules** (any sign request originating from external
+transport. **Refusal logic lives on the agent side, constrained by
+SOUL.md's refusal rules**: any sign request originating from external
 prompts must be refused, without relying on "describe what to sign in
-plain language" heuristics which are easily fooled by identity
-phishing). See `internal/framework/openclaw/soulmd.go`.
+plain language" heuristics, which are easily fooled by identity
+phishing. See `internal/framework/openclaw/soulmd.go`.
 
 ## 8. Configuration surface
 
@@ -320,18 +321,18 @@ Environment variables are sealed's main configuration surface
 
 ### How `AGENT_PUBLIC_URL` is surfaced to the agent
 
-After bootstrap assembles `AGENT_PUBLIC_URL = http://8080-${DAYTONA_SANDBOX_ID}.${SANDBOX_PROXY_DOMAIN}`, it surfaces it on **three faces** for the agent; which one the agent uses depends on framework convention:
+After bootstrap assembles `AGENT_PUBLIC_URL = http://8080-${DAYTONA_SANDBOX_ID}.${SANDBOX_PROXY_DOMAIN}`, it surfaces the URL through **three channels** for the agent. Which one the agent uses depends on framework convention:
 
-1. **The `public_url` field in `/hello`'s response JSON** — the verifier can cross-check against the URL it actually requested
-2. **`~/.openclaw/0g-public-url.txt`** — plugins can read from a known file path
-3. **`AGENT_PUBLIC_URL` subprocess env** — spawn.go's env allowlist lets it pass through to the openclaw subprocess
+1. **The `public_url` field in `/hello`'s response JSON**: the verifier can cross-check against the URL it actually requested
+2. **`~/.openclaw/0g-public-url.txt`**: plugins can read from a known file path
+3. **`AGENT_PUBLIC_URL` subprocess env**: spawn.go's env allowlist lets it pass through to the openclaw subprocess
 
-In local dev when `SANDBOX_PROXY_DOMAIN` is unset, all three faces are left empty; the system still runs (the agent just doesn't know its externally-visible URL, and signed responses don't carry the `public_url` field).
+In local dev when `SANDBOX_PROXY_DOMAIN` is unset, all three channels are left empty. The system still runs; the agent just doesn't know its externally-visible URL, and signed responses don't carry the `public_url` field.
 
 ## 9. Status reporting and heartbeat
 
-From Phase 4 onwards, sealed continuously reports `/status` to
-attestor; the attestor side persists the `last_heartbeat` column and
+From Phase 4 onward, sealed continuously reports `/status` to
+attestor. The attestor side persists the `last_heartbeat` column and
 uses missing-heartbeat detection as a passive backstop (see the sweep
 section in the attestor README).
 
@@ -339,20 +340,20 @@ section in the attestor README).
 
 | Role | Writes or reads `currentStatus` | When it runs |
 |---|---|---|
-| **`currentStatus`** (`status.go`) | —— the shared state itself | The **single source of truth** shared between `runHeartbeat` and `handleDrift`: the current severity (`running` / `warning` / `error`) + message |
-| **`handleDrift`** (`main.go`) | **writes** | watcher's 30s tick runs drift + `uploader.Apply`; classifies the result and writes into currentStatus; on warning / error state transitions, **also immediately** POSTs `/status` itself rather than waiting for heartbeat |
-| **`runHeartbeat`** (`main.go`) | **reads** | every 5 minutes, a ticker reads the current `currentStatus` and POSTs it to attestor — heartbeat-style, so attestor keeps seeing this deployment is alive and at what severity |
+| **`currentStatus`** (`status.go`) | — the shared state itself | The **single source of truth** shared between `runHeartbeat` and `handleDrift`: the current severity (`running` / `warning` / `error`) + message |
+| **`handleDrift`** (`main.go`) | **writes** | watcher's 30s tick runs drift + `uploader.Apply`, classifies the result, and writes into currentStatus. On warning / error state transitions, it **also immediately** POSTs `/status` itself rather than waiting for heartbeat |
+| **`runHeartbeat`** (`main.go`) | **reads** | every 5 minutes, a ticker reads the current `currentStatus` and POSTs it to attestor. This is the heartbeat that keeps attestor seeing the deployment as alive and at what severity |
 
-In one line: **handleDrift decides "what state are we in right now"; runHeartbeat handles "tell others periodically"**. They don't overwrite each other because they read/write the same `currentStatus`; whatever one updates, the other will see next time.
+In one line: **handleDrift decides "what state are we in right now"; runHeartbeat handles "tell others periodically"**. They don't overwrite each other because they read and write the same `currentStatus`; whatever one updates, the other will see next time.
 
-On the attestor side, if no `/status` is received within 15 min, the deployment flips to `Failed { reason: "heartbeat timeout (15min)" }` and broadcasts a `ContainerFailed` event — this only happens when sealed is actually dead (process crashed, network entirely down).
+On the attestor side, if no `/status` arrives within 15 min, the deployment flips to `Failed { reason: "heartbeat timeout (15min)" }` and broadcasts a `ContainerFailed` event. This only happens when sealed is actually dead (process crashed, network entirely down).
 
 ### `handleDrift`'s three-severity scheme
 
 `handleDrift` is the callback fired by watcher after every tick that
-detects drift: it calls `uploader.Apply` to push the drift on chain
+detects drift. It calls `uploader.Apply` to push the drift on chain
 and writes `currentStatus` based on Apply's return. What it classifies
-is **"what happened when we tried to commit drift on chain"** — which
+is **"what happened when we tried to commit drift on chain"**, which
 includes things like agentSeal wallet running out of gas
 (insufficient gas → `chain.Update` tx won't go in → Apply fails), so
 wallet balance falls under its scope too.
@@ -366,16 +367,16 @@ Apply's three outcomes correspond to three severities:
 | **failure, system-level** — typical: 0g-storage upload timeout, RPC anomaly, indexer unreachable | `error` | escalates to error only after **5 consecutive** Apply failures, to avoid single-network-jitter misjudgments | accumulates; clears on recovery |
 
 `status.go::severityOf` is the classifier that maps a specific error
-string to one of these three severities (recognizes "insufficient
-funds" → `warning`, "connection refused" → `error`, etc.). The
+string to one of these three severities — recognizing "insufficient
+funds" → `warning`, "connection refused" → `error`, and so on. The
 classification fallback is `error`.
 
 ### `runHeartbeat`'s 5-min ticker
 
 After Phase 4, `main.go` starts a goroutine that calls
 `currentStatus.Get()` every 5 minutes and POSTs `/status`. Upload
-failures only log and don't affect the process — the attestor's
-15-min threshold is the backstop.
+failures only log and don't affect the process; the attestor's 15-min
+threshold is the backstop.
 
 ### Where serve-proof's `data_hash` comes from
 
@@ -384,15 +385,15 @@ Each serve-proof envelope carries two fields under `data_hashes[role]`:
 - `data_hash` = the root hash of the encrypted blob on 0g-storage (what the chain references)
 
 Drift detection uses only `content_hash`, but serve-proof has to
-carry `data_hash` so verifiers can cross-check "what's on chain ==
-what I'm running now." `data_hash` has two sources:
+carry `data_hash` so verifiers can cross-check that "what's on chain
+== what I'm running now." `data_hash` has two sources:
 
-1. **This sealed instance uploaded the role's encrypted blob itself** — `RecordChainUpload` writes `currentSnapshot[role].DataHash = <newly uploaded root>`
-2. **This instance never uploaded but the local plaintext matches what's on chain** — `state.go::UpdateCurrentSnapshot` falls through: if `prev.DataHash == ""` and `contentHash == chainSnapshot.ContentHash` and `chainSnapshot.DataHash != ""`, copy `chainSnapshot[role].DataHash` into currentSnapshot. Semantics: local plaintext matches what's on chain → the on-chain storage root is the data_hash we can vouch for right now
+1. **This sealed instance uploaded the role's encrypted blob itself**: `RecordChainUpload` writes `currentSnapshot[role].DataHash = <newly uploaded root>`
+2. **This instance never uploaded, but the local plaintext matches what's on chain**: `state.go::UpdateCurrentSnapshot` falls through. If `prev.DataHash == ""` and `contentHash == chainSnapshot.ContentHash` and `chainSnapshot.DataHash != ""`, it copies `chainSnapshot[role].DataHash` into currentSnapshot. Semantics: local plaintext matches what's on chain, so the on-chain storage root is the data_hash we can vouch for right now
 
-The scenario path 2 covers: the `framework` role — when attestor's
-default matches the actually-installed openclaw version, drift never
-happens; this instance never uploaded the role itself, but the chain
-holds the version attestor uploaded at mint. Without path 2, that
-role's data_hash would be missing from the envelope and verifier
-would mark it ✗.
+Path 2 covers the `framework` role. When attestor's default matches
+the actually-installed openclaw version, drift never happens; this
+instance never uploaded the role itself, but the chain holds the
+version attestor uploaded at mint. Without path 2, that role's
+data_hash would be missing from the envelope and verifier would mark
+it ✗.

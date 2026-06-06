@@ -1,8 +1,8 @@
 # AgenticID Contracts
 
-The Solidity contract layer implements the **AgenticID protocol**: it combines
-the ERC-8004 identity/reputation registry with the ERC-7857 intelligent NFT,
-giving AI agents running inside TEEs a verifiable on-chain identity, atomic
+The Solidity contract layer implements the **AgenticID protocol**. It combines
+the ERC-8004 identity/reputation registry with the ERC-7857 intelligent NFT to
+give AI agents running inside TEEs a verifiable on-chain identity, atomic
 delivery of the data key, and a sybil-resistant reputation system.
 
 ---
@@ -11,8 +11,8 @@ delivery of the data key, and a sybil-resistant reputation system.
 
 ### Environment
 
-- **Foundry** (forge / cast / anvil) — contract compile, test, scripts
-- **solc 0.8.24** — managed by foundry, don't change by hand
+- **Foundry** (forge / cast / anvil) for contract compile, test, and scripts
+- **solc 0.8.24**, managed by foundry; don't change by hand
 - **OpenZeppelin v5.0.2** — both `contracts` and `contracts-upgradeable`, vendored as submodules under `lib/`
 
 ### Install Foundry
@@ -23,7 +23,7 @@ curl -L https://foundry.paradigm.xyz | bash
 foundryup
 ```
 
-**Older glibc environments** (Alibaba Cloud Linux 3 / CentOS 8 etc., glibc < 2.33):
+**Older glibc environments** (Alibaba Cloud Linux 3, CentOS 8, etc., glibc < 2.33):
 ```bash
 foundryup -i nightly --platform alpine    # musl static link, no system glibc dependency
 ```
@@ -46,7 +46,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 | `openzeppelin-contracts-upgradeable` | v5.0.2 |
 | `forge-std` | **v1.12.0** (see warning below) |
 
-> ⚠️ **The forge-std pin to v1.12.0 is deliberate** — combined with `via_ir`
+> ⚠️ **The forge-std pin to v1.12.0 is deliberate.** Combined with `via_ir`
 > it trips a known codegen bug; details in [`../QUIRKS.md`](../QUIRKS.md).
 
 ### Compile and test
@@ -78,8 +78,8 @@ remappings = [
 ]
 ```
 
-`via_ir = true` is required — `giveFeedback`'s argument count causes stack too deep
-(details in [`../QUIRKS.md`](../QUIRKS.md)).
+`via_ir = true` is required because `giveFeedback`'s argument count causes
+stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 
 ---
 
@@ -118,13 +118,13 @@ AgenticID
   └── OwnableUpgradeable                          (owner / attestor management)
 ```
 
-They share a single ERC-721 token instance — one agent = one tokenId = one agentId.
+They share a single ERC-721 token instance: one agent = one tokenId = one agentId.
 
 ---
 
 ## 3. The three off-chain TEE roles
 
-Contract logic can only express half the protocol; the other half relies on three off-chain TEEs collaborating:
+Contract logic expresses only half the protocol. The other half relies on three off-chain TEEs working together:
 
 | Role | Secret it holds | Responsibility |
 |---|---|---|
@@ -133,15 +133,15 @@ Contract logic can only express half the protocol; the other half relies on thre
 | **Oracle TEE** | `teeOracleAddress_priv` (signs OwnershipProof) + `Oracle_ECIES_priv` (ECIES-decrypts to extract `dataKey`) | During transfer: ECIES-decrypts to get `dataKey` → re-seals with `buyer_pubkey` → signs OwnershipProof; immediately discards `dataKey` |
 
 Key security properties:
-- `dataKey` only flows between TEEs and **never appears on chain in plaintext nor in any EOA wallet**
-- TEE single points of failure have bounded blast radius: Agent TEE down → attestor re-provisions; Oracle TEE down → transfers pause but restart recovers (no persistent state)
-- KMS down → protocol-level event, mitigated by `masterKey` cluster fault-tolerance (0g-kms is a multi-node cluster, k of n healthy is enough)
+- `dataKey` flows only between TEEs and **never appears on chain in plaintext nor in any EOA wallet**.
+- Single-TEE failures have bounded blast radius. If the Agent TEE goes down, the attestor re-provisions; if the Oracle TEE goes down, transfers pause but a restart recovers (no persistent state).
+- A KMS outage is a protocol-level event, mitigated by `masterKey` cluster fault-tolerance: 0g-kms is a multi-node cluster, and k of n healthy is enough.
 
 ---
 
 ## 4. Flow 1: registration
 
-### Path A — attestor-mint
+### Path A: attestor-mint
 
 **Off-chain steps** (inside Attestor TEE):
 1. Generate `sealId` (random or per-policy), derive `agentSeal_priv = derive(masterKey, sealId)` and `agentSeal_addr`
@@ -172,23 +172,23 @@ Precondition: `msg.sender` is in the `trustedAttestors` list (maintained by `onl
 - `Transfer(0x0, to, agentId)` — ERC-721 mint
 - `MetadataSet × N`, `Updated(agentId, [], newDatas)`
 - `AgentSealSet(agentId, agentSeal_addr, sealId)`
-- `ITransferred(0x0, to, agentId, entries[])` — sealedKey payload published
+- `ITransferred(0x0, to, agentId, entries[])` — publishes the sealedKey payload
 
-**Agent TEE later boots**:
-- Produces an RA quote, hands it to attestor
-- attestor verifies RA → delivers `agentSeal_priv`
-- Agent TEE reads the on-chain `ITransferred` to obtain `sealedKey_i`, decrypts to get `dataKey_i`, loads data, comes online
+**Agent TEE boots later**:
+- It produces an RA quote and hands it to the attestor.
+- The attestor verifies the RA, then delivers `agentSeal_priv`.
+- The Agent TEE reads `ITransferred` on chain to obtain `sealedKey_i`, decrypts it to recover `dataKey_i`, loads the data, and comes online.
 
-### Path B — self-mint
+### Path B: self-mint
 
-No TEE involvement, the user uploads the data themselves:
+No TEE is involved; the user uploads the data themselves:
 ```solidity
 AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 ```
 
-`msg.sender == to`; the user decides which pubkey each `sealedKeys[i]` is sealed to (their own EOA key / some TEE / their choice). The contract **does not validate** the encryption target — if the caller loses the matching decryption key, future transfers cannot produce an OwnershipProof, and the agent gets stuck.
+`msg.sender == to`. The user decides which pubkey each `sealedKeys[i]` is sealed to (their own EOA key, some TEE, or any other choice). The contract **does not validate** the encryption target. If the caller loses the matching decryption key, future transfers cannot produce an OwnershipProof and the agent gets stuck.
 
-In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate reputation. To gain that capability, the owner can later have an attestor call `setAgentSeal(agentId, agentSeal_addr, sealId)` — a one-shot operation, locked permanently afterwards.
+In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate reputation. To gain that capability, the owner can later have an attestor call `setAgentSeal(agentId, agentSeal_addr, sealId)`. The call is a one-shot operation and locks permanently afterwards.
 
 ### Key invariants
 
@@ -208,7 +208,7 @@ In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot ac
 ### ServeProof (off-chain, signed by Agent TEE)
 
 A client makes a real business call to the Agent TEE. After completing it,
-the Agent TEE constructs inside the TEE:
+the Agent TEE constructs the following inside the TEE:
 
 ```solidity
 struct ServeProof {
@@ -244,32 +244,32 @@ AgenticIDReputationRegistry.giveFeedback(
 ```
 
 What the contract does:
-1. `proof.client == msg.sender`
-2. Reconstructs `inner`, ecrecovers, and compares against `IAgenticID.getAgentSeal(agentId)` → signature OK
-3. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry, also validating `deadline`
-4. Pushes a `FeedbackEntry`, records `clients` / `isClient`
-5. Emits `NewFeedback` + `FeedbackWithProof`
+1. Checks `proof.client == msg.sender`.
+2. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)` to verify the signature.
+3. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline`.
+4. Pushes a `FeedbackEntry` and records `clients` / `isClient`.
+5. Emits `NewFeedback` and `FeedbackWithProof`.
 
-**The sybil-resistance core**: no agentSeal, no valid ServeProof, and only the Agent TEE holds `agentSeal_priv`. Clients cannot forge a ServeProof, nor self-rate without calling the agent.
+**The sybil-resistance core**: no agentSeal means no valid ServeProof, and only the Agent TEE holds `agentSeal_priv`. Clients cannot forge a ServeProof, nor self-rate without calling the agent.
 
 ### Other operations
 
-- `appendResponse(agentId, client, feedbackIndex, responseURI, responseHash)`: the agent owner responds to a particular feedback. Limit one per `(agentId, client, feedbackIndex, responder)`.
+- `appendResponse(agentId, client, feedbackIndex, responseURI, responseHash)`: the agent owner responds to a specific feedback. Limited to one response per `(agentId, client, feedbackIndex, responder)`.
 - `revokeFeedback(agentId, feedbackIndex)`: the client revokes their own feedback.
 
 ### Read interfaces (fully ERC-8004 compatible)
 
-- `readFeedback(agentId, client, idx)` — single entry
-- `readAllFeedback(agentId, clients[], tag1, tag2, includeRevoked)` — filtered read
-- `getSummary(agentId, clients[], tag1, tag2)` — normalized to 18 decimals, sum + count
-- `getClients(agentId)` — all clients who've ever submitted feedback
-- `getServeData(agentId, client, idx)` — returns the `dataHashes` + `frameworkHash` in effect at the time of that feedback, **the buyer's due-diligence entrypoint**
+- `readFeedback(agentId, client, idx)` — single entry.
+- `readAllFeedback(agentId, clients[], tag1, tag2, includeRevoked)` — filtered read.
+- `getSummary(agentId, clients[], tag1, tag2)` — normalized to 18 decimals, returns sum and count.
+- `getClients(agentId)` — all clients who have ever submitted feedback.
+- `getServeData(agentId, client, idx)` — returns the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint.**
 
 ---
 
 ## 6. Flow 3: transfer and clone
 
-### `iTransferFrom` — change ownership + atomically deliver dataKey
+### `iTransferFrom`: change ownership and atomically deliver dataKey
 
 **Off-chain preparation** (run once per IntelligentData):
 
@@ -278,54 +278,54 @@ What the contract does:
    inner = keccak256(abi.encodePacked(dataHash, buyer_targetPubkey, nonce_ap, deadline_ap))
    ap.proof = personal_sign(inner, buyer_priv)
    ```
-   `buyer_targetPubkey` has two modes: empty string = use the buyer's Ethereum pubkey (64-byte uncompressed); non-empty = caller-chosen encryption pubkey.
+   `buyer_targetPubkey` has two modes: an empty string means use the buyer's Ethereum pubkey (64-byte uncompressed); a non-empty value is a caller-chosen encryption pubkey.
 
-2. **Agent TEE ↔ Oracle TEE collaborate**
-   - Seller hands the buyer-signed AccessProof to the seller's Agent TEE
-   - The seller's Agent TEE verifies the AccessProof signature (the recovered signer equals `to` or `accessDelegates[to]`), then decides whether to authorize this transfer
-   - The seller's Agent TEE looks up `Oracle_pubkey` via TappRegistry (a TappRegistry-registered Oracle is already RA'd, no repeat attestation needed)
-   - The Agent TEE decrypts `dataKey`, ECIES-encrypts to Oracle_pubkey → `cipher`
-   - The Agent TEE sends `cipher + buyer_targetPubkey + nonce_op + deadline_op` to the Oracle TEE
-   - The Oracle TEE ECIES-decrypts to get `dataKey`, re-seals with `buyer_targetPubkey` → `sealedKey_new`
+2. **Agent TEE and Oracle TEE collaborate**
+   - The seller hands the buyer-signed AccessProof to the seller's Agent TEE.
+   - The seller's Agent TEE verifies the AccessProof signature (the recovered signer must equal `to` or `accessDelegates[to]`), then decides whether to authorize this transfer.
+   - The seller's Agent TEE looks up `Oracle_pubkey` via TappRegistry. A TappRegistry-registered Oracle has already been RA'd, so no repeat attestation is needed.
+   - The Agent TEE decrypts `dataKey` and ECIES-encrypts it to `Oracle_pubkey`, producing `cipher`.
+   - The Agent TEE sends `cipher + buyer_targetPubkey + nonce_op + deadline_op` to the Oracle TEE.
+   - The Oracle TEE ECIES-decrypts to recover `dataKey`, then re-seals it with `buyer_targetPubkey` to produce `sealedKey_new`.
    - The Oracle TEE signs OwnershipProof:
      ```
      inner = keccak256(abi.encodePacked(dataHash, sealedKey_new,
                                         buyer_targetPubkey, nonce_op, deadline_op))
      op.proof = personal_sign(inner, teeOracleAddress_priv)
      ```
-   - The Oracle immediately discards `dataKey`
+   - The Oracle immediately discards `dataKey`.
 
-3. **Seller assembles a `TransferValidityProof[]` and submits it**
+3. **The seller assembles a `TransferValidityProof[]` and submits it.**
 
 **On-chain call**:
 ```solidity
 AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 ```
 
-Contract logic (`ERC7857Upgradeable._proofCheck` + `BaseDataVerifier.verifyTransferValidity`):
-1. `_checkAuthorized(from, msg.sender, tokenId)`: the caller is owner or approved
+Contract logic (`ERC7857Upgradeable._proofCheck` and `BaseDataVerifier.verifyTransferValidity`):
+1. `_checkAuthorized(from, msg.sender, tokenId)`: the caller must be owner or approved.
 2. For each proof:
-   - `ap.dataHash == op.dataHash`
-   - AccessProof signature recovers to `accessAssistant`, which must equal `to` or `accessDelegates[to]`
-   - OwnershipProof signature recovers to a value that must equal `teeOracleAddress`
-   - Both nonces go through NonceRegistry (under `msg.sender` + a category-tag namespace) + their own deadline checks
-   - Encryption target check: in Ethereum mode, requires `keccak256(targetPubkey)[12:] == to`; in custom mode, requires `keccak256(targetPubkey) == keccak256(wantedKey)`
-3. After validation, walks the MRO `_update` chain: `agentWallet` and `authorizedUsers` are cleared; `agentSeal` / `sealId` are retained
-4. Emits `ITransferred(from, to, tokenId, entries[])` — the authoritative transfer event
+   - `ap.dataHash == op.dataHash`.
+   - The AccessProof signature must recover to `accessAssistant`, which must equal `to` or `accessDelegates[to]`.
+   - The OwnershipProof signature must recover to `teeOracleAddress`.
+   - Both nonces go through NonceRegistry (under `msg.sender` plus a category-tag namespace), with their own deadline checks.
+   - Encryption target check: in Ethereum mode, requires `keccak256(targetPubkey)[12:] == to`; in custom mode, requires `keccak256(targetPubkey) == keccak256(wantedKey)`.
+3. After validation, walks the MRO `_update` chain: `agentWallet` and `authorizedUsers` are cleared, while `agentSeal` and `sealId` are retained.
+4. Emits `ITransferred(from, to, tokenId, entries[])`, the authoritative transfer event.
 
 **Two paths for the buyer after transfer**:
-- **Read-only data**: decrypt `sealedKey_new` with the priv matching `buyer_targetPubkey` to get `dataKey`, download and decrypt IntelligentData for local use. No TEE or attestor needed. But cannot sign ServeProof, reputation is broken.
-- **Take over operating the agent**: deploy your own Agent TEE, go through attestor RA to receive the same `agentSeal_priv` (set-once guarantees the address doesn't change); inside the TEE you now hold both `dataKey` and `agentSeal_priv`, continue serving outside, sign new ServeProofs.
+- **Read-only data**: decrypt `sealedKey_new` with the priv matching `buyer_targetPubkey` to recover `dataKey`, then download and decrypt IntelligentData for local use. No TEE or attestor is needed, but the buyer cannot sign ServeProof and reputation accrual stops.
+- **Take over operating the agent**: deploy your own Agent TEE and go through attestor RA to receive the same `agentSeal_priv` (set-once guarantees the address doesn't change). Inside the TEE the buyer now holds both `dataKey` and `agentSeal_priv`, continues serving clients, and signs new ServeProofs.
 
-### `iCloneFrom` — mint a clone token, source untouched
+### `iCloneFrom`: mint a clone token, source untouched
 
 `ERC7857CloneableUpgradeable.iCloneFrom(from, to, tokenId, proofs[])`
 
-- Proof validation **is identical to iTransferFrom** (same `_proofCheck`)
-- Does not touch the source `tokenId`; `_incrementTokenId` mints `newTokenId` to `to`
-- The new token inherits the same `IntelligentData[]`
-- The new token **has no seal** (`getAgentSeal(newTokenId) == 0`); attestor must separately `setAgentSeal` before the new token can sign ServeProofs
-- Emits `Cloned(tokenId, newTokenId, from, to, entries)`; does not emit `ITransferred`
+- Proof validation **is identical to iTransferFrom** (same `_proofCheck`).
+- The source `tokenId` is untouched; `_incrementTokenId` mints `newTokenId` to `to`.
+- The new token inherits the same `IntelligentData[]`.
+- The new token **has no seal** (`getAgentSeal(newTokenId) == 0`). The attestor must call `setAgentSeal` separately before the new token can sign ServeProofs.
+- Emits `Cloned(tokenId, newTokenId, from, to, entries)`. Does not emit `ITransferred`.
 
 ---
 
@@ -340,24 +340,24 @@ All signed operations go through `contracts/utils/NonceRegistryUpgradeable.sol`:
 | ServeProof | `keccak256("SERVEPROOF", agentId, signature)` |
 | setAgentWallet | `keccak256("SET_AGENT_WALLET", agentId, newWallet, nonce)` |
 
-Each nonce consumption also checks `block.timestamp <= deadline`. Nonce records can be reclaimed via `cleanExpiredNonces(keys)`, provided `maxProofAge` exceeds the longest business deadline window.
+Each nonce consumption also checks `block.timestamp <= deadline`. Nonce records can be reclaimed via `cleanExpiredNonces(keys)`, as long as `maxProofAge` exceeds the longest business deadline window.
 
 ---
 
 ## 8. Key design points
 
-- **agentSeal / sealId: set-once, permanently bound**. An agentId's seal is set once and is not cleared on transfer. When hardware changes, attestor provisions the same `agentSeal_priv` to the new Agent TEE.
+- **agentSeal / sealId: set-once, permanently bound.** An agentId's seal is set once and is not cleared on transfer. When the hardware changes, the attestor provisions the same `agentSeal_priv` to the new Agent TEE.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
-- **dataKey only flows between TEEs**: attestor generates and discards; Agent TEE holds; Oracle TEE holds briefly during transfer and discards. Only the ciphertext (sealedKey) appears on chain.
-- **Oracle encryption pubkey lives in TappRegistry**: published via 0g-Tapp's `TappRegistry` contract (external dependency, already deployed) through its `getNode` / `getNodeList` views; it does not live in `TEEDataVerifier` storage, keeping the verifier clean. The Agent TEE queries the registry directly during a transfer.
-- **8004 read interfaces fully compatible**: any tool that reads ERC-8004 identity/reputation works transparently against AgenticID agents; but the write interfaces (the parameterless `register()`, the proof-less `giveFeedback`) are **deliberately disabled**, forcing use of the extended forms that carry IntelligentData or ServeProof.
+- **dataKey flows only between TEEs**: the attestor generates and discards it; the Agent TEE holds it; the Oracle TEE holds it briefly during transfer and discards it. Only the ciphertext (sealedKey) appears on chain.
+- **Oracle encryption pubkey lives in TappRegistry**: it is published via 0g-Tapp's `TappRegistry` contract (an external dependency, already deployed) through its `getNode` / `getNodeList` views. It does not live in `TEEDataVerifier` storage, which keeps the verifier clean. The Agent TEE queries the registry directly during a transfer.
+- **8004 read interfaces are fully compatible**: any tool that reads ERC-8004 identity/reputation works transparently against AgenticID agents. The write interfaces (the parameterless `register()` and the proof-less `giveFeedback`) are **deliberately disabled**, forcing callers to use the extended forms that carry IntelligentData or ServeProof.
 
 ---
 
 ## 9. Tests
 
-124 Foundry tests / 15 suites, `forge test` all green. Covers every
-`external` / `public` function and every documented error path.
+124 Foundry tests across 15 suites, all green under `forge test`. Coverage
+spans every `external` / `public` function and every documented error path.
 
 | Suite | Cases | Coverage |
 |---|---|---|
@@ -377,17 +377,18 @@ Each nonce consumption also checks `block.timestamp <= deadline`. Nonce records 
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
 
-Shared scaffolding is in `test/AgenticIDTestBase.sol`: two EIP-191 variants
-(hex-encoded for transfer proof, raw-32-byte for ServeProof / wallet sig),
-proxy deployment, proof / mint helpers. Adding a new suite is usually just
-inherit + write business assertions.
+Shared scaffolding lives in `test/AgenticIDTestBase.sol`: two EIP-191 variants
+(hex-encoded for transfer proof, raw 32-byte for ServeProof and wallet sig),
+proxy deployment, and helpers for proofs and mints. A new suite usually just
+inherits this base and adds the business assertions.
 
 
 ## 10. Further reading
 
-- **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — Full deploy / upgrade / Etherscan-verify
+- **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
   runbook (10 contracts in a single deploy, Timelock two-stage upgrade, how
   `verify.sh` works, 0g Galileo testnet reference addresses).
-- **[`TODO.md`](TODO.md)** — Known backlog on the contract layer: off-chain SDK
-  end-to-end tests, fuzz / invariant hardening, protocol-layer suspended items
-  (on-chain awareness of agent online state, `targetPubkey` constraints), etc.
+- **[`TODO.md`](TODO.md)** — known backlog on the contract layer, including
+  off-chain SDK end-to-end tests, fuzz and invariant hardening, and
+  protocol-layer suspended items (on-chain awareness of agent online state,
+  `targetPubkey` constraints).
