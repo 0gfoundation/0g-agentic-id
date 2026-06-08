@@ -105,6 +105,34 @@ fn build_agent_url(
     format!("http://{container_port}-{sandbox_id}.{host}:{port}{path}")
 }
 
+/// The sealed proxy's `/healthz` URL for a sandbox — same subdomain routing
+/// as the agent's serve URL. Used by the worker's reconcile sweep to confirm
+/// a stale-heartbeat agent is genuinely down before reaping its sandbox.
+pub fn build_healthz_url(
+    sandbox_proxy_addr: &str,
+    sandbox_id: &str,
+    agent_serve_port: u16,
+) -> String {
+    build_agent_url(sandbox_proxy_addr, sandbox_id, agent_serve_port, "/healthz")
+}
+
+/// GET `healthz_url` with a short timeout. Returns true ONLY on a 2xx
+/// response; any failure (connection refused, timeout, non-2xx) → false.
+/// Callers pair this with a stale heartbeat: only when BOTH the agent has
+/// gone silent past the sweep window AND `/healthz` is unreachable is it
+/// treated as dead — two independent signals guard against false positives
+/// (e.g. a healthy agent whose outbound heartbeat path is briefly broken).
+pub async fn agent_is_healthy(healthz_url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    matches!(client.get(healthz_url).send().await, Ok(r) if r.status().is_success())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

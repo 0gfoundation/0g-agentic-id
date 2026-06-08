@@ -307,6 +307,16 @@ pub trait DeploymentRepo: Send + Sync {
         threshold_secs: i64,
         reason: String,
     ) -> anyhow::Result<Vec<SealId>>;
+
+    /// Read-only: running deployments whose last heartbeat is older than
+    /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
+    /// (the worker's reconcile sweep) can check each sandbox's real state and
+    /// decide Stopped vs Failed vs reap — instead of blindly flipping Failed.
+    async fn stale_running_candidates(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        threshold_secs: i64,
+    ) -> anyhow::Result<Vec<(SealId, Option<String>)>>;
 }
 
 // ── Idempotency ─────────────────────────────────────────────────────────

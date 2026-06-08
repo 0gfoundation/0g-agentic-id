@@ -589,6 +589,35 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let _ = reason;
         Ok(out)
     }
+
+    async fn stale_running_candidates(
+        &self,
+        now: DateTime<Utc>,
+        threshold_secs: i64,
+    ) -> anyhow::Result<Vec<(SealId, Option<String>)>> {
+        // Read-only counterpart to flip_stale_heartbeats: same predicate
+        // (running + heartbeat older than the window), but we hand the
+        // candidates back so the worker can reconcile each against its
+        // sandbox before deciding Stopped vs Failed vs reap.
+        let cutoff = now - chrono::Duration::seconds(threshold_secs);
+        let rows = sqlx::query(
+            "SELECT seal_id, sandbox_id
+             FROM deployments
+             WHERE last_heartbeat IS NOT NULL
+               AND last_heartbeat < $1
+               AND phase = 'running'",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let bytes: &[u8] = row.try_get("seal_id")?;
+            let sandbox_id: Option<String> = row.try_get("sandbox_id")?;
+            out.push((B256::from_slice(bytes), sandbox_id));
+        }
+        Ok(out)
+    }
 }
 
 impl PostgresDeploymentRepo {

@@ -101,6 +101,24 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // online" → SandboxRecreate (action=create) for a fresh
             // sandbox.
             if let Err(e) = ctx.sandbox.start(seal_id, &sandbox_envelope).await {
+                // Insufficient sandbox balance (HTTP 402) is owner-recoverable:
+                // top up and Resume again. Unlike a genuine runtime fault it must
+                // NOT flip Failed or admin_delete the sandbox — that would force a
+                // full Recreate over a transient funding gap. Leave the deployment
+                // Stopped (the /start route never changed it, so it's still
+                // resumable) and surface a top-up hint instead.
+                if e.to_string().contains("insufficient balance") {
+                    tracing::warn!(?seal_id, error = %e, "sandbox.start: insufficient balance; staying Stopped for retry after top-up");
+                    ctx.events
+                        .publish(WsEvent::ContainerWarning {
+                            seal_id,
+                            reason: "insufficient sandbox balance — top up to resume".to_string(),
+                        })
+                        .await?;
+                    // Not retry-worthy: the next user-driven Resume (post top-up)
+                    // enqueues a fresh start job.
+                    return Ok(());
+                }
                 let now = Utc::now();
                 let reason = format!("sandbox start: {e}");
                 tracing::warn!(?seal_id, error = %e, "sandbox.start failed; flipping c=Failed");
@@ -411,6 +429,26 @@ async fn handle_sandbox_recreate(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
+            // Insufficient balance (HTTP 402): no sandbox was created, so
+            // there's nothing to resume — but it's owner-recoverable, not a
+            // dead end. Land in the Failed bucket (which offers "bring back
+            // online" = recreate) and surface a top-up hint rather than a raw
+            // error. No bail → no retry loop hammering create at zero balance.
+            if e.to_string().contains("insufficient balance") {
+                let reason =
+                    "insufficient sandbox balance — top up, then bring back online".to_string();
+                tracing::warn!(?seal_id, error = %e, "sandbox recreate: insufficient balance; awaiting top-up");
+                ctx.deployments
+                    .set_container_stage(
+                        seal_id,
+                        StageStatus::Failed { at: now, reason: reason.clone() },
+                    )
+                    .await?;
+                ctx.events
+                    .publish(WsEvent::ContainerWarning { seal_id, reason })
+                    .await?;
+                return Ok(());
+            }
             let reason = format!("sandbox recreate: {e}");
             ctx.deployments
                 .set_container_stage(
@@ -1077,7 +1115,16 @@ async fn run_container_track(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            let reason = format!("sandbox create: {e}");
+            // Insufficient balance (HTTP 402): the frontend gates on balance
+            // before deploy, so this is rare (a drain between check and
+            // create), but surface a clear top-up message instead of a raw
+            // 402 dump so the owner knows to fund and retry rather than
+            // reading it as a hard system failure.
+            let reason = if e.to_string().contains("insufficient balance") {
+                "insufficient sandbox balance — top up and deploy again".to_string()
+            } else {
+                format!("sandbox create: {e}")
+            };
             ctx.deployments
                 .set_container_stage(
                     seal_id,
@@ -1735,6 +1782,110 @@ mod tests {
             t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
             0,
             "admin_delete must NOT target the just-spawned sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_insufficient_balance_stays_stopped() {
+        // 402 on Resume is owner-recoverable: the deployment must stay
+        // Stopped (still resumable), the sandbox must NOT be reaped, and a
+        // ContainerWarning (top-up hint) is emitted — NOT ContainerFailed.
+        // Regression guard for the bug where any start error flipped Failed
+        // + admin_deleted, forcing a needless Recreate over a funding gap.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(402u64)),
+            Some("sb-broke".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_msg.lock().unwrap() =
+            Some("sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("402 must not be a hard error");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Stopped { .. }),
+            "must stay Stopped (resumable), got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "must NOT reap the sandbox on a 402"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            "expected a ContainerWarning top-up hint"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            "must NOT emit ContainerFailed on a 402"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_recreate_insufficient_balance_warns_not_hard_fail() {
+        // 402 on recreate: no sandbox was created, so it lands in the Failed
+        // (bring-back-online) bucket — but with a ContainerWarning top-up
+        // hint and WITHOUT bailing, distinct from a generic create failure
+        // which bails as a hard error. No reap either.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(402u64)),
+            Some("sb-old".into()),
+        );
+        t.sandbox.create_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_msg.lock().unwrap() =
+            Some("sandbox create: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
+
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .expect("402 recreate must return Ok, not bail");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "recreate 402 → Failed bucket, got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "recreate 402 must not reap"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            "expected a ContainerWarning top-up hint"
         );
     }
 

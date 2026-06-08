@@ -1414,6 +1414,7 @@ const State = {
   config: null,         // /config response
   ws: null,             // current WS subscription
   detailWs: null,       // separate WS for detail-page live updates
+  detailProbeTimer: null, // periodic /probe while the detail page is open
   deployingSealId: null,
   deployAvatarDataUrl: null,  // user-uploaded avatar, populated by handleAvatarFile
   discoveryFilter: 'all',  // 'all' | 'mine'
@@ -1664,7 +1665,13 @@ function copyAddr() {
 }
 
 function toggleWalletPop() {
+  const opening = !$('#walletPop').classList.contains('open');
   $('#walletPop').classList.toggle('open');
+  // Re-pull the balance every time the popover opens. It's only fetched
+  // at connect-time and after a top-up otherwise, so as agents settle
+  // voucher fees against the prepaid balance the displayed figure goes
+  // stale. Cheap RPC read, fire-and-forget so the popover opens instantly.
+  if (opening) refreshSandboxBalanceIndicator();
 }
 
 // Click outside closes the popover.
@@ -1762,6 +1769,7 @@ function handleHash() {
 
   // Tear down stale WS subscriptions when navigating away.
   if (route !== 'detail' && State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+  if (route !== 'detail' && State.detailProbeTimer) { clearInterval(State.detailProbeTimer); State.detailProbeTimer = null; }
 }
 window.addEventListener('hashchange', handleHash);
 
@@ -3217,8 +3225,9 @@ async function renderDetail(sealId) {
   const root = $('#detailContent');
   root.innerHTML = `<div class="card"><div class="skel" style="width:60%;margin-bottom:10px"></div><div class="skel" style="width:40%"></div></div>`;
 
-  // Tear down any prior detail WS subscription.
+  // Tear down any prior detail WS subscription + probe timer.
   if (State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
+  if (State.detailProbeTimer) { clearInterval(State.detailProbeTimer); State.detailProbeTimer = null; }
   // Drop any stale warning carried over from a previous detail page —
   // warnings are per-agent and don't survive navigation. Sealed re-emits
   // on the next heartbeat (≤5min) if the condition still holds.
@@ -3240,6 +3249,16 @@ async function renderDetail(sealId) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws/subscribe?seal_id=${sealId}`);
   State.detailWs = ws;
+
+  // Active liveness patrol while this page is open: periodically ask the
+  // attestor to verify the sandbox so a death surfaces within seconds (via
+  // the WS event /probe emits when it flips state) instead of waiting on the
+  // 15-min background sweep. Fire once immediately so opening the page on an
+  // already-dead agent flips right away rather than after the first interval.
+  // Cleared on navigation away (handleHash) and on re-entry (above).
+  fireProbe(sealId);
+  State.detailProbeTimer = setInterval(() => fireProbe(sealId), 30000);
+
   ws.onmessage = async (e) => {
     let evt; try { evt = JSON.parse(e.data); } catch { return; }
     appendEventLog('#detailLog', evt);

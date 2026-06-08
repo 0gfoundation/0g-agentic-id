@@ -83,19 +83,21 @@ func linkifyHex(escaped string) string {
 }
 
 // renderLogHTML builds the full <html> page. Each line gets a CSS class
-// chosen by classifyLine; auto-refreshes every 3s so the page stays live
-// without WebSocket plumbing.
+// chosen by classifyLine. Manual-refresh: the page is static once loaded
+// and the user pulls updates with the header "Refresh" button. A 3s
+// meta-refresh used to make the page unreadable — the constant reload, plus
+// a forced jump to the bottom, defeated any attempt to scroll back up.
 func renderLogHTML(title string, lines []string) string {
 	var b strings.Builder
 	b.Grow(len(lines)*120 + 1024)
 	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
-	b.WriteString(`<meta http-equiv="refresh" content="3">`)
 	b.WriteString(`<title>`)
 	b.WriteString(html.EscapeString(title))
 	b.WriteString(`</title><style>` + logCSS + `</style></head><body>`)
 	b.WriteString(`<header><span class="title">`)
 	b.WriteString(html.EscapeString(title))
-	b.WriteString(`</span><span class="meta">auto-refresh 3s &middot; `)
+	b.WriteString(`</span><span class="meta">`)
+	b.WriteString(`<button onclick="location.reload()" style="font:inherit;cursor:pointer;background:none;border:1px solid currentColor;border-radius:6px;padding:1px 8px;color:inherit">&#x21bb; Refresh</button> &middot; `)
 	b.WriteString(fmt.Sprintf("%d lines", len(lines)))
 	b.WriteString(`</span></header><div id="log">`)
 	for _, raw := range lines {
