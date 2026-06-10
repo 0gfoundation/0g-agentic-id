@@ -909,8 +909,8 @@ details.log[open] summary{color:var(--text2)}
 }
 @keyframes spin{ to{ transform:rotate(360deg) } }
 
-.icon-btn{background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 14px;font-size:var(--fs-xs);cursor:pointer;color:var(--text2);transition:background var(--t-fast),color var(--t-fast),border-color var(--t-fast),transform 160ms var(--ease-spring),box-shadow var(--t-fast);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;gap:6px;text-decoration:none}
-.icon-btn:hover{background:var(--surf3);color:var(--text);transform:translateY(-1px);box-shadow:var(--sh-sm)}
+.icon-btn{box-sizing:border-box;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 14px;font-size:var(--fs-sm);line-height:1.4;cursor:pointer;color:var(--text);transition:background var(--t-fast),color var(--t-fast),border-color var(--t-fast),transform 160ms var(--ease-spring),box-shadow var(--t-fast);font-family:var(--sans);font-weight:500;display:inline-flex;align-items:center;gap:6px;text-decoration:none}
+.icon-btn:hover{background:var(--surf-hover);border-color:var(--surf3);transform:translateY(-1px);box-shadow:var(--sh-sm)}
 .icon-btn:active{transform:translateY(1px);box-shadow:none}
 .icon-btn.primary{background:var(--p);color:oklch(99% 0 0);border-color:transparent;box-shadow:0 1px 2px oklch(50% 0.22 315 / 0.22),0 4px 14px oklch(50% 0.22 315 / 0.22)}
 .icon-btn.primary:hover{background:var(--pd);color:oklch(99% 0 0);transform:translateY(-2px);box-shadow:0 2px 4px oklch(50% 0.22 315 / 0.28),0 10px 24px oklch(50% 0.22 315 / 0.3)}
@@ -969,35 +969,56 @@ details.log[open] summary{color:var(--text2)}
 .modal.modal-wide{width:min(94vw,720px);max-height:88vh;overflow-y:auto}
 .modal h3{font-size:var(--fs-base);font-weight:600;margin-bottom:12px}
 
-/* ── Trust-roots ack modal ──────────────────────────────────────── */
-.ack-intro{color:var(--text2);font-size:var(--fs-sm);line-height:1.5;margin-bottom:16px}
-.ack-rows{display:flex;flex-direction:column;gap:10px}
-.ack-row{border:1px solid var(--border);border-radius:var(--r-md);padding:12px 14px;background:var(--surf2);transition:border-color var(--t-fast),background var(--t-fast)}
-.ack-row[data-status="acked"]{border-color:var(--gbd);background:var(--gbg)}
-.ack-row[data-status="missing"]{border-color:var(--obd);background:var(--obg)}
-.ack-row[data-status="error"]{border-color:var(--rbd);background:var(--rbg)}
-.ack-row-head{display:flex;align-items:center;gap:10px;cursor:pointer;user-select:none}
-.ack-row-icon{width:18px;height:18px;border-radius:50%;border:2px solid var(--muted);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:11px;font-weight:700;color:var(--surf);background:transparent}
-.ack-row[data-status="acked"] .ack-row-icon{background:var(--green);border-color:var(--green);color:var(--surf)}
-.ack-row[data-status="missing"] .ack-row-icon{border-color:var(--orange);background:transparent;color:transparent}
-.ack-row[data-status="error"] .ack-row-icon{background:var(--red);border-color:var(--red);color:var(--surf)}
-.ack-row-title{font-family:var(--sans);font-weight:600;font-size:var(--fs-base);color:var(--text);flex:1}
-.ack-row-version{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted)}
-.ack-row-chev{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);transition:transform var(--t-fast)}
-.ack-row[data-open] .ack-row-chev{transform:rotate(90deg)}
-.ack-row-body{display:none;margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);font-family:var(--mono);font-size:var(--fs-xs);color:var(--text2);line-height:1.55}
+/* ── Trust-roots ack modal ──────────────────────────────────────────
+   Pattern: web2 terms-of-service consent card. Each row reads like
+   a "I agree to..." checkbox. Status is conveyed by the checkbox and
+   a 3px left accent, not by tinting the whole row — keeps the modal
+   feeling like a checklist rather than a stack of alerts. */
+.ack-intro{color:var(--text2);font-size:var(--fs-sm);line-height:1.55;margin-bottom:18px}
+.ack-intro b{color:var(--text);font-weight:600}
+.ack-rows{display:flex;flex-direction:column;gap:8px}
+.ack-row{position:relative;border:1px solid var(--border);border-radius:var(--r);background:var(--surf);padding:14px 16px 14px 18px;transition:border-color var(--t-fast),background var(--t-fast),box-shadow var(--t-fast);overflow:hidden}
+.ack-row::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--surf3);transition:background var(--t-fast)}
+.ack-row[data-status="acked"]::before{background:var(--green)}
+.ack-row[data-status="missing"]::before{background:var(--orange)}
+.ack-row[data-status="error"]::before{background:var(--red)}
+.ack-row:hover{border-color:var(--surf3);background:var(--surf-hover)}
+.ack-row-head{display:flex;align-items:flex-start;gap:12px}
+.ack-check{width:20px;height:20px;border-radius:5px;border:1.5px solid var(--surf3);display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:13px;font-weight:800;color:transparent;background:var(--surf);margin-top:1px;transition:background var(--t-fast),border-color var(--t-fast),color var(--t-fast)}
+.ack-row[data-status="acked"] .ack-check{background:var(--green);border-color:var(--green);color:oklch(99% 0 0)}
+.ack-row[data-status="missing"] .ack-check{border-color:var(--orange);background:var(--surf)}
+.ack-row[data-status="error"] .ack-check{background:var(--red);border-color:var(--red);color:oklch(99% 0 0)}
+.ack-row-main{flex:1;min-width:0}
+.ack-row-line{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.ack-row-terms{font-family:var(--sans);font-size:var(--fs-sm);color:var(--text);font-weight:500;line-height:1.5}
+.ack-row-terms b{font-weight:700}
+.ack-row-version{font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:1px 8px;letter-spacing:var(--ls-eyebrow);font-weight:600;white-space:nowrap}
+.ack-row-desc{margin-top:4px;font-size:var(--fs-xs);color:var(--text2);line-height:1.55}
+.ack-row-toggle{margin-top:10px;font-family:var(--sans);font-size:var(--fs-xs);font-weight:600;color:var(--p);cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:4px;letter-spacing:var(--ls-label);background:none;border:none;padding:0}
+.ack-row-toggle:hover{color:var(--pd)}
+.ack-row-toggle .chev{display:inline-block;transition:transform var(--t-fast);font-family:var(--mono);font-size:10px}
+.ack-row[data-open] .ack-row-toggle .chev{transform:rotate(90deg)}
+.ack-row-body{display:none;margin-top:14px;padding-top:14px;border-top:1px dashed var(--border)}
 .ack-row[data-open] .ack-row-body{display:block}
-.ack-kv{display:grid;grid-template-columns:120px 1fr;gap:4px 10px}
-.ack-kv .ack-k{color:var(--muted)}
+.ack-kv{display:grid;grid-template-columns:130px 1fr;gap:6px 14px;font-family:var(--mono);font-size:var(--fs-xs);line-height:1.6}
+.ack-kv .ack-k{color:var(--muted);font-weight:500}
 .ack-kv .ack-v{color:var(--text);word-break:break-all}
-.ack-sub-h{margin-top:8px;padding-top:8px;border-top:1px dashed var(--border);font-family:var(--sans);font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600}
-.ack-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:18px}
+.ack-sub-h{margin-top:14px;margin-bottom:6px;font-family:var(--sans);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:700}
+.ack-sub-h:first-child{margin-top:0}
+.ack-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
 .ack-error{padding:10px 12px;background:var(--rbg);border:1px solid var(--rbd);border-radius:var(--r-sm);color:var(--red);font-size:var(--fs-sm);margin-bottom:12px;display:none}
 .ack-error[data-show]{display:block}
 
 /* Top-up quick-add buttons row */
 .top-up-quicks{display:flex;gap:8px;margin-top:8px}
 .top-up-quicks .btn{padding:6px 12px;font-family:var(--mono);font-size:var(--fs-xs);font-weight:500}
+
+/* ── Restore / Reset confirmation modal ──────────────────────────── */
+.restore-body{color:var(--text2);font-size:var(--fs-sm);line-height:1.55;margin-bottom:16px}
+.restore-field{margin-bottom:4px}
+.restore-label{display:block;margin-bottom:7px;font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600}
+.restore-opt{display:inline-block;font-size:10px;color:var(--text2);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:1px 8px;margin-left:6px;text-transform:none;letter-spacing:0;font-weight:500;vertical-align:1px}
+.modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
 </style>
 </head>
 <body>
@@ -1079,12 +1100,11 @@ details.log[open] summary{color:var(--text2)}
 <!-- ── Trust-roots ack modal ─────────────────────────────────────── -->
 <div class="modal-bg" id="ackModal" onclick="if(event.target===this)closeAckModal()">
   <div class="modal modal-wide">
-    <h3>Acknowledge trust roots</h3>
+    <h3>Trust the three apps under the hood</h3>
     <p class="ack-intro">
-      Before deploying you confirm the three TEE apps your agent depends on:
-      the attestor that derives identity, the KMS that supplies its master
-      secret, and the sandbox that runs the container. A single batch
-      transaction acks whichever are missing.
+      Your agent is about to lean on three TEE apps. Tick off the ones you've
+      reviewed — anything still pending gets bundled into <b>one</b> on-chain
+      ack tx. New code version means a fresh tick.
     </p>
     <div id="ackRows" class="ack-rows"></div>
     <div class="ack-actions">
@@ -1094,6 +1114,34 @@ details.log[open] summary{color:var(--text2)}
       </button>
     </div>
   </div>
+</div>
+
+<!-- ── Restore / Reset confirmation modal ──────────────────────────
+     Replaces the native window.confirm + window.prompt pair used by
+     Restore and Reset. Same shape for both flows: a one-paragraph
+     "what's about to happen" + an optional LLM API key input. The
+     caller passes title / body / confirm-label and awaits the
+     resolved {apiKey} payload (or null on cancel). -->
+<div class="modal-bg" id="restoreModal" onclick="if(event.target===this)cancelRestoreModal()">
+  <div class="modal">
+    <h3 id="restoreTitle">Restore this agent?</h3>
+    <p class="restore-body" id="restoreBody"></p>
+    <div class="restore-field">
+      <label for="restoreApiKey" class="restore-label">
+        LLM API key <span class="restore-opt">optional</span>
+      </label>
+      <div class="secret-row">
+        <input id="restoreApiKey" type="password" placeholder="sk-…" autocomplete="off" />
+        <button type="button" class="secret-toggle" id="restoreApiKeyToggle" onclick="toggleSecret('restoreApiKey','restoreApiKeyToggle')">show</button>
+      </div>
+      <small class="field-hint">Leave blank to fall back on whatever the container snapshot baked in. attestor never caches this.</small>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="cancelRestoreModal()">Cancel</button>
+      <button class="btn btn-primary" id="restoreConfirmBtn" onclick="submitRestoreModal()">Restore</button>
+    </div>
+  </div>
+</div>
 </header>
 
 <div class="toast-host" id="toastHost" role="status" aria-live="polite" aria-atomic="false"></div>
@@ -2119,10 +2167,24 @@ async function loadTrustRoots(ownerAddr) {
 
   // Build slot definitions in dependency order: KMS → attestor → sandbox.
   // Skip a slot if its appId is unset (mock setup or partial deploy).
+  // `terms` reads first-person to match the web2 terms-of-service tone;
+  // `desc` is the one-liner under it explaining what trust is being placed.
   const slotDefs = [
-    { key: 'attestor', label: 'Attestor', appId: cfg.attestor_app_id },
-    { key: 'kms',      label: 'KMS',      appId: cfg.kms_app_id },
-    { key: 'sandbox',  label: 'Sandbox',  appId: cfg.sandbox_app_id },
+    {
+      key: 'attestor', label: 'Attestor', appId: cfg.attestor_app_id,
+      terms: 'I trust the <b>Attestor</b> to mint my agent and provision its identity key.',
+      desc: 'Bridges chain and TEE: sends the mint tx on my behalf and hands the agent its sealed identity key after remote attestation.',
+    },
+    {
+      key: 'kms',      label: 'KMS',      appId: cfg.kms_app_id,
+      terms: 'I trust the <b>KMS</b> to derive the master secret behind my agent’s keys.',
+      desc: 'Recovers the master secret from chain-registered code identity. Every key the agent ever derives traces back to this root.',
+    },
+    {
+      key: 'sandbox',  label: 'Sandbox',  appId: cfg.sandbox_app_id,
+      terms: 'I trust the <b>Sandbox</b> to run my agent’s container and sign its sandbox identity.',
+      desc: 'Spins up the agent’s TEE container and produces the sandbox-side signature that gates the provision handshake.',
+    },
   ];
   const disabled = !cfg.tapp_registry_addr
     || cfg.tapp_registry_addr === '0x0000000000000000000000000000000000000000'
@@ -2219,10 +2281,16 @@ function renderAckModal(snap) {
   const rowsHost = $('#ackRows');
   if (!rowsHost) return;
   rowsHost.innerHTML = snap.slots.map(s => {
-    const icon = s.status === 'acked' ? '✓'
-               : s.status === 'error' ? '!'
-               : '';
-    const versionLine = s.app ? `v${s.app.ackVersion}` : (s.error ? 'unavailable' : '');
+    const checkmark = s.status === 'acked' ? '✓'
+                    : s.status === 'error' ? '!'
+                    : '';
+    const versionPill = s.app
+      ? `<span class="ack-row-version" title="ack version">v${s.app.ackVersion}</span>`
+      : (s.error ? '<span class="ack-row-version" title="lookup failed">unavailable</span>' : '');
+    // `terms` may contain inline <b> markup; the upstream string is a
+    // const we author, never user input — safe to pass through.
+    const termsHtml = s.terms || escapeHtml(s.label);
+    const descHtml = escapeHtml(s.desc || '');
     const imageHashesShort = s.app
       ? (s.app.imageHashes.length === 0
           ? '<span class="ack-v" style="color:var(--muted)">none</span>'
@@ -2230,16 +2298,16 @@ function renderAckModal(snap) {
       : '';
     const nodesBlock = s.nodes && s.nodes.length
       ? s.nodes.map(n => `
-          <div class="ack-kv" style="margin-top:4px">
+          <div class="ack-kv" style="margin-top:6px">
             <div class="ack-k">signer</div><div class="ack-v">${escapeHtml(n.signer)}</div>
             <div class="ack-k">tee url</div><div class="ack-v">${escapeHtml(n.teeUrl || '—')}</div>
             <div class="ack-k">stake</div><div class="ack-v">${escapeHtml(fmtPriceWei(n.stakeAmount))}</div>
           </div>`).join('')
-      : '<div class="ack-v" style="color:var(--muted)">no active nodes</div>';
+      : '<div class="ack-v" style="color:var(--muted);margin-top:6px">no active nodes</div>';
     const sandboxBlock = s.sandbox && !s.sandbox.error
       ? `
         <div class="ack-sub-h">Service (SandboxServing)</div>
-        <div class="ack-kv" style="margin-top:6px">
+        <div class="ack-kv">
           <div class="ack-k">provider</div><div class="ack-v">${escapeHtml(s.sandbox.providerAddr)}</div>
           <div class="ack-k">url</div><div class="ack-v">${escapeHtml(s.sandbox.url || '—')}</div>
           <div class="ack-k">CPU/min</div><div class="ack-v">${escapeHtml(fmtPriceWei(s.sandbox.pricePerCPUPerMin))}</div>
@@ -2248,11 +2316,12 @@ function renderAckModal(snap) {
         </div>`
       : s.sandbox && s.sandbox.error
         ? `<div class="ack-sub-h">Service (SandboxServing)</div>
-           <div class="ack-v" style="color:var(--red);margin-top:6px">${escapeHtml(s.sandbox.error)}</div>`
+           <div class="ack-v" style="color:var(--red)">${escapeHtml(s.sandbox.error)}</div>`
         : '';
     const bodyContent = s.error
-      ? `<div class="ack-v" style="color:var(--red)">${escapeHtml(s.error)}</div>`
+      ? `<div class="ack-v" style="color:var(--red);font-family:var(--mono);font-size:var(--fs-xs)">${escapeHtml(s.error)}</div>`
       : `
+          <div class="ack-sub-h">Code identity (TappRegistry)</div>
           <div class="ack-kv">
             <div class="ack-k">app id</div><div class="ack-v">${escapeHtml(s.appId)}</div>
             <div class="ack-k">composeHash</div><div class="ack-v">${escapeHtml(fmtHashShort(s.app.composeHash))}</div>
@@ -2265,11 +2334,18 @@ function renderAckModal(snap) {
           ${sandboxBlock}`;
     return `
       <div class="ack-row" data-status="${s.status}" data-key="${s.key}">
-        <div class="ack-row-head" onclick="this.parentElement.toggleAttribute('data-open')">
-          <span class="ack-row-icon">${icon}</span>
-          <span class="ack-row-title">${escapeHtml(s.label)}</span>
-          <span class="ack-row-version">${escapeHtml(versionLine)}</span>
-          <span class="ack-row-chev">▸</span>
+        <div class="ack-row-head">
+          <span class="ack-check" aria-hidden="true">${checkmark}</span>
+          <div class="ack-row-main">
+            <div class="ack-row-line">
+              <span class="ack-row-terms">${termsHtml}</span>
+              ${versionPill}
+            </div>
+            <div class="ack-row-desc">${descHtml}</div>
+            <button type="button" class="ack-row-toggle" onclick="this.closest('.ack-row').toggleAttribute('data-open')">
+              <span class="chev">▸</span><span class="toggle-label">view details</span>
+            </button>
+          </div>
         </div>
         <div class="ack-row-body">
           ${bodyContent}
@@ -2303,6 +2379,37 @@ window.openAckModal = function (snap, resolveFn) {
 window.closeAckModal = function () {
   $('#ackModal').classList.remove('open');
   if (_ackResolve) { _ackResolve(false); _ackResolve = null; }
+};
+
+// ── Restore / Reset confirmation modal ──────────────────────────────
+// Replaces native window.confirm + window.prompt for the bringOnline
+// (create branch) and resetAgent flows. Caller awaits openRestorePrompt
+// and gets either null (user cancelled) or { apiKey: string } where the
+// string may be empty when the user submits with the field blank.
+let _restoreResolve = null;
+function openRestorePrompt({ title, body, confirmLabel }) {
+  return new Promise(resolve => {
+    _restoreResolve = resolve;
+    $('#restoreTitle').textContent = title;
+    $('#restoreBody').textContent = body;
+    $('#restoreConfirmBtn').textContent = confirmLabel || 'Confirm';
+    const inp = $('#restoreApiKey');
+    inp.value = '';
+    inp.type = 'password';                       // reset toggle state
+    $('#restoreApiKeyToggle').textContent = 'show';
+    $('#restoreModal').classList.add('open');
+    // Defer focus so the modal's fade-in doesn't fight the focus call.
+    setTimeout(() => inp.focus(), 60);
+  });
+}
+window.cancelRestoreModal = function () {
+  $('#restoreModal').classList.remove('open');
+  if (_restoreResolve) { _restoreResolve(null); _restoreResolve = null; }
+};
+window.submitRestoreModal = function () {
+  const apiKey = $('#restoreApiKey').value.trim();
+  $('#restoreModal').classList.remove('open');
+  if (_restoreResolve) { _restoreResolve({ apiKey }); _restoreResolve = null; }
 };
 
 window.submitAckBatch = async function () {
@@ -4066,19 +4173,16 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
       // so the user knows they're entering the rebuild path, not
       // the cheap resume path. (Reset and this share the same
       // backend dispatch — sandbox.create — so the UX gate matches.)
-      const ok = window.confirm(
-        'Restore this agent?\n\n' +
-        'A fresh sandbox will be spawned (image re-pulled). On-chain ' +
-        'identity, memory, and skills are preserved; any in-container ' +
-        'runtime state that isn\'t already on chain is lost. You\'ll ' +
-        'be asked for the LLM API key next.'
-      );
-      if (!ok) return;
-      const apiKey = (window.prompt(
-        'LLM API key for the new sandbox\n(leave blank to skip — agent will fall back to whatever the container snapshot baked in):',
-        ''
-      ) || '').trim();
-      const env = apiKey ? { API_KEY: apiKey } : {};
+      const result = await openRestorePrompt({
+        title: 'Restore this agent?',
+        body: 'A fresh sandbox will be spawned (image re-pulled). ' +
+              'On-chain identity, memory, and skills are preserved; ' +
+              'any in-container runtime state that isn\'t already on ' +
+              'chain is lost.',
+        confirmLabel: 'Restore',
+      });
+      if (!result) return;
+      const env = result.apiKey ? { API_KEY: result.apiKey } : {};
       payload = { snapshot: '0g-test-sealed', sealed: true, env };
     }
     const { envelope } = await signSandboxEnvelope(action, resourceId, payload);
@@ -4124,15 +4228,16 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
 // sandbox respawn.
 window.resetAgent = async function (sealId, sandboxId) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
-  const ok = window.confirm(
-    'Reset this agent?\n\n' +
-    'A fresh container will be spawned (image re-pulled). The agent\'s ' +
-    'on-chain identity stays the same; any in-container runtime state ' +
-    'that hasn\'t been written to chain will be lost.\n\n' +
-    'Use this if a same-tag image was rebuilt, or the agent is stuck ' +
-    'in a state Retry / Start can\'t fix.'
-  );
-  if (!ok) return;
+  const result = await openRestorePrompt({
+    title: 'Reset this agent?',
+    body: 'A fresh container will be spawned (image re-pulled). The ' +
+          'agent\'s on-chain identity stays the same; any in-container ' +
+          'runtime state that hasn\'t been written to chain will be lost. ' +
+          'Use this if a same-tag image was rebuilt, or the agent is ' +
+          'stuck in a state Retry / Start can\'t fix.',
+    confirmLabel: 'Reset',
+  });
+  if (!result) return;
 
   const guardKey = `reset:${sealId}`;
   if (_lifecycleInflight.has(guardKey)) {
@@ -4143,12 +4248,8 @@ window.resetAgent = async function (sealId, sandboxId) {
   try {
     // Same envelope shape as the bringOnline create branch — fresh
     // sandbox needs a fresh env, and attestor doesn't (and shouldn't)
-    // cache the LLM key.
-    const apiKey = (window.prompt(
-      'LLM API key for the new sandbox\n(leave blank to skip — agent will fall back to whatever the container snapshot baked in):',
-      ''
-    ) || '').trim();
-    const env = apiKey ? { API_KEY: apiKey } : {};
+    // cache the LLM key. apiKey came from the modal above.
+    const env = result.apiKey ? { API_KEY: result.apiKey } : {};
     const payload = { snapshot: '0g-test-sealed', sealed: true, env };
     const { envelope } = await signSandboxEnvelope('create', '', payload);
 
