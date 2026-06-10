@@ -127,10 +127,12 @@ script/verify.sh <proxy-address> src/AgenticIDV3.sol:AgenticIDV3
 浏览器的 "Read as Proxy" 需要 proxy + beacon + impl 三者都 verify 才能自动展开
 业务 ABI。
 
-## 5. 0g Galileo Testnet 参考部署（chain 16602）
+## 5. 0g Galileo Testnet 部署（chain 16602）
 
-本地 `broadcast/Deploy.s.sol/16602/run-latest.json` 始终是最新一次部署的真相；
-参考快照（当前测试网中的活地址，已经走过完整 upgrade + verify 流程）：
+本地 `broadcast/Deploy.s.sol/16602/run-latest.json` 始终是**最新一次**部署的真相。
+testnet 上目前有两套独立部署，按用途区分：
+
+### 开发环境（dev）—— attestor 默认 `.env` 指向它
 
 ```
 TimelockController        0xb551faaa1488ec26bc7751ee2fa4382416951af0
@@ -145,7 +147,32 @@ ReputationRegistry beacon 0xbF80fb46E9Ec0379547B0D2C502f067a0AA7944a
 ReputationRegistry proxy  0x4AAbc18962C2Bb5E451a0FDfa39c0C47a51bD971
 ```
 
-Timelock delay = 60s，三个角色都是同一部署者地址，**仅供测试**。Prod 必须：
+### 测试网环境（testnet）—— attestor `.env.testnet` 指向它
+
+部署于 2026-06-10。deployer / owner / pauser / teeOracle 均为
+`0xea695C312CE119dE347425B29AFf85371c9d1837`，`TIMELOCK_DELAY=60`，
+部署后已 `addTrustedAttestor(0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266)`。
+
+```
+TimelockController        0x0c2d2ae2a8A9022143F3E18FD5b1E0bfE7ab3E47
+TEEDataVerifier impl      0x33341C062c20e0Ece7F900fC8F0C756B1dd27788
+TEEDataVerifier beacon    0xF8ECFefcd495a818D578833bD76610702E18F35c
+TEEDataVerifier proxy     0x1b6bba3db8a04B20702Feb62E30Caa831ca1e1f1
+AgenticID impl            0xd3fB1442bB4d3B82F51135497E81548a4B41B7Ac
+AgenticID beacon          0xD886b4be72BA30938A4FA03fD283aCe562AE76C2
+AgenticID proxy           0xbea77c9aBd0aA46e812444583947718593bBD139
+ReputationRegistry impl   0xE71850F59f35D7333D3D51F7Df513E249e3fedC3
+ReputationRegistry beacon 0x57775B1f4129d5Fa824b04C08Cd64E70267488a4
+ReputationRegistry proxy  0x8bC1E129aEb0Baa306715BC1CBB720Eb2A4324AA
+```
+
+> ⚠️ **gas 参数（forge 1.6 + 0g testnet）**：§2 文档里的
+> `--priority-gas-price 2000000000 --gas-price 5000000000` 在 forge 1.6 下会被
+> 节点拒绝（`max priority fee per gas higher than max fee per gas`，0g base fee
+> 极低导致）。本次 testnet 部署实际用 **`--legacy --gas-price 5000000000 --slow`**
+> 才成功——新版 forge 下部署/升级建议改用 legacy 模式。
+
+两套都：Timelock delay = 60s、三个角色同一部署者地址，**仅供测试**。Prod 必须：
 
 - `TEE_ORACLE` 换成真实 TEE 内签名地址
 - `TIMELOCK_DELAY` 改成 ≥ 2 天

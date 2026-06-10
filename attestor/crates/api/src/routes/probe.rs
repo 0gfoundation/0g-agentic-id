@@ -70,10 +70,14 @@ pub async fn handle(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
 
-    // Only running deployments are candidates for the live-check. Any
-    // other phase is either already stopped, never reached running, or
-    // failed — probing wouldn't change those.
-    if d.phase != DeploymentPhase::Running {
+    // Running and Stopped are both probe candidates: a Running agent
+    // can silently die (sweep / explicit probe flips Failed), and a
+    // Stopped one can be externally deleted on the sandbox provider
+    // (TTL, manual cleanup) — in which case the UI keeps offering
+    // Resume that will never succeed. Probing both states catches it.
+    // Other phases (pending / provisioning / failed / ready-without-
+    // sandbox) either have no sandbox to probe or are already terminal.
+    if d.phase != DeploymentPhase::Running && d.phase != DeploymentPhase::Stopped {
         return Ok(Json(ProbeResponse {
             seal_id: req.seal_id,
             phase: d.phase,

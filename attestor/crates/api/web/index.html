@@ -1097,6 +1097,36 @@ details.log[open] summary{color:var(--text2)}
   </div>
 </div>
 
+<!-- ── Agent-seal top-up modal ────────────────────────────────────
+     Replaces the native window.prompt the seal-low pleas used to
+     fire. Same shape as the sandbox top-up modal — header KV +
+     amount input + quick buttons + Cancel/Send. -->
+<div class="modal-bg" id="sealTopUpModal" onclick="if(event.target===this)closeSealTopUpModal()">
+  <div class="modal">
+    <h3 id="sealTopUpTitle">Top up agent</h3>
+    <p class="ack-intro">
+      Send OG straight to this agent's seal address. The agent uses
+      it to publish on-chain updates (drift convergence, iData
+      writes) and to settle its own gas costs.
+    </p>
+    <div class="ack-kv" style="margin-bottom:14px;font-family:var(--mono);font-size:var(--fs-xs)">
+      <div class="ack-k">agent</div><div class="ack-v" id="sealTopUpAgent">—</div>
+      <div class="ack-k">agent_seal</div><div class="ack-v" id="sealTopUpSeal">—</div>
+    </div>
+    <label class="field-label" for="sealTopUpAmount" style="display:block;margin-bottom:6px;font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600">Amount (OG)</label>
+    <input id="sealTopUpAmount" type="number" min="0" step="0.001" placeholder="0.01" />
+    <div class="top-up-quicks">
+      <button type="button" class="btn btn-ghost" onclick="setSealTopUpAmount('0.01')">+0.01</button>
+      <button type="button" class="btn btn-ghost" onclick="setSealTopUpAmount('0.1')">+0.1</button>
+      <button type="button" class="btn btn-ghost" onclick="setSealTopUpAmount('1')">+1</button>
+    </div>
+    <div class="ack-actions">
+      <button class="btn btn-ghost" onclick="closeSealTopUpModal()">Cancel</button>
+      <button class="btn btn-primary" id="sealTopUpSubmitBtn" onclick="submitSealTopUp()">Send</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Trust-roots ack modal ─────────────────────────────────────── -->
 <div class="modal-bg" id="ackModal" onclick="if(event.target===this)closeAckModal()">
   <div class="modal modal-wide">
@@ -2696,6 +2726,77 @@ window.submitTopUp = async function () {
   }
 };
 
+// ── Agent-seal top-up modal ────────────────────────────────────────
+// Per-agent OG deposit straight to the seal address. Same shape as
+// the sandbox top-up modal — header KV + amount input + quicks +
+// Cancel/Send. Replaces the native window.prompt the seal-low pleas
+// used to fire.
+let _sealTopUpTarget = null;  // { sealAddr, agentName } while modal is open
+window.openSealTopUpModal = function (sealAddr, agentName) {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  if (!sealAddr) { toast('No agent seal address', 'error'); return; }
+  _sealTopUpTarget = { sealAddr, agentName: agentName || '' };
+  const who = agentName ? `"${agentName}"` : 'agent';
+  $('#sealTopUpTitle').textContent = `Top up ${who}`;
+  $('#sealTopUpAgent').textContent = agentName || '(unnamed)';
+  $('#sealTopUpSeal').textContent = sealAddr;
+  $('#sealTopUpAmount').value = '0.01';
+  $('#sealTopUpSubmitBtn').disabled = false;
+  $('#sealTopUpSubmitBtn').textContent = 'Send';
+  $('#sealTopUpModal').classList.add('open');
+  setTimeout(() => $('#sealTopUpAmount').focus(), 60);
+};
+window.closeSealTopUpModal = function () {
+  $('#sealTopUpModal').classList.remove('open');
+  _sealTopUpTarget = null;
+};
+window.setSealTopUpAmount = function (og) {
+  const input = $('#sealTopUpAmount');
+  if (input) input.value = og;
+};
+window.submitSealTopUp = async function () {
+  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
+  if (!_sealTopUpTarget) return;
+  const { sealAddr, agentName } = _sealTopUpTarget;
+  const raw = $('#sealTopUpAmount').value.trim();
+  if (!raw) { toast('Enter an amount', 'error'); return; }
+  let value;
+  try { value = ethers.parseEther(raw); }
+  catch (_) { toast('Invalid amount', 'error'); return; }
+  if (value <= 0n) { toast('Amount must be > 0', 'error'); return; }
+
+  const btn = $('#sealTopUpSubmitBtn');
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Signing…';
+  try {
+    const tx = await State.signer.sendTransaction({ to: sealAddr, value });
+    btn.textContent = 'Confirming…';
+    toast(`Sent ${raw} OG — waiting for confirmation…`, 'success');
+    await tx.wait();
+    toast('Top-up confirmed 🎉 your agent thanks you', 'success');
+    // Top-up resolved the owner-recoverable condition the container
+    // reported, so drop the pinned warning immediately — don't make
+    // the user wait for sealed's next heartbeat to clear it.
+    State.containerWarning = null;
+    const plea = document.getElementById('sealPlea');
+    if (plea) {
+      plea.classList.remove('seal-plea--alert');
+      plea.hidden = true;
+      plea.onclick = null;
+      plea.onkeydown = null;
+      plea.removeAttribute('title');
+    }
+    checkAgentSealBalance(sealAddr, agentName).catch(() => {/* ignore */});
+    $('#sealTopUpModal').classList.remove('open');
+    _sealTopUpTarget = null;
+  } catch (e) {
+    toast('Top-up failed: ' + (e.shortMessage || e.message || e), 'error');
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+};
+
 // Deploy gate: balance must be ≥ TOP_UP_THRESHOLD_WEI to proceed.
 async function ensureSandboxBalance() {
   if (!State.ownerAddr || !sandboxServingEnabled()) return true; // dev mode: skip
@@ -3415,8 +3516,13 @@ function paintDetail(dep) {
   // Base origin of the dashboard host (no path). Used both for the SIWE
   // call (`<base>/_seal/auth`) and for assembling the tokenized URL we
   // navigate to (`<base>` + `dashboard_url` from the auth response).
+  // Scheme mirrors the backend's build_agent_url: a bare host (no port) is a
+  // real domain fronted by TLS → https; a host:port is a dev/IP plain-HTTP
+  // proxy → http. Getting this right matters for the dashboard's POST
+  // /_seal/auth — an http→https redirect would mangle the signed request.
+  const dashboardScheme = cfg.sandbox_proxy_addr && cfg.sandbox_proxy_addr.includes(':') ? 'http' : 'https';
   const dashboardBaseUrl = (sandboxId && cfg.sandbox_proxy_addr)
-    ? `http://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}`
+    ? `${dashboardScheme}://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}`
     : '';
   // Plain path-suffixed URL — kept around as a fallback link target if the
   // auth flow ever fails (user can still see the dashboard's login page).
@@ -3488,19 +3594,23 @@ function paintDetail(dep) {
   // simple equality check suffices.
   const canResume = ownerMatches && isOffline && phase === 'stopped';
 
-  // Reset — available once the deployment is past phase 1 (anything that
-  // implies a sandbox was at least attempted). Hidden during the initial
-  // deploy (phase=pending / provisioning-without-sandbox) where it'd race
-  // the in-flight worker job and leave the row in a worse state.
+  // Reset — kills the existing sandbox and respawns one. Strictly
+  // requires `hasSandbox`: if mint or storage failed before a sandbox
+  // was ever created (phase 1 errored before provision ran), there's
+  // nothing to kill and `sandbox.create` would just race the next
+  // /retry attempt. The pre-mint failure case takes /retry only.
   //
-  // Also hidden in the broken-offline subcases (c=Failed, stuck booting)
+  // Past that gate, Reset earns its slot in states where Restore
+  // WOULDN'T already rebuild: Live (force re-pull on same-tag image
+  // bump), paused (Resume just resurrects existing bytes), or s/m
+  // incomplete with a sandbox already up (mint/storage failed after
+  // sandbox.create succeeded — /retry may skip SandboxRecreate).
+  //
+  // Hidden in the broken-offline subcases (c=Failed, stuck booting)
   // where the visible Restore CTA already drives /retry → SandboxRecreate
-  // — same backend dispatch, so a second danger-styled entry point would
-  // just be a duplicate. Reset only earns its own slot in states where
-  // Restore WOULDN'T already rebuild: Live (force re-pull on same-tag
-  // image bump), paused (Resume just resurrects existing bytes), or s/m
-  // incomplete (where /retry may skip SandboxRecreate).
-  const canReset = ownerMatches && (
+  // — same backend dispatch, so a second danger-styled entry point
+  // would just be a duplicate.
+  const canReset = ownerMatches && hasSandbox && (
     isLive
     || isIncomplete
     || (isOffline && phase === 'stopped')
@@ -4023,45 +4133,10 @@ function applyContainerWarning(sealAddr, agentName) {
   }
 }
 
-window.depositToAgentSeal = async function (sealAddr, agentName) {
-  if (!State.signer) { toast('Connect wallet first', 'error'); return; }
-  if (!sealAddr) { toast('No agent seal address', 'error'); return; }
-  const who = agentName ? `"${agentName}"` : 'this agent';
-  const amount = (window.prompt(
-    `Top up ${who}\nagent_seal: ${sealAddr.slice(0,6)}…${sealAddr.slice(-4)}\n\nAmount in OG:`,
-    '0.01'
-  ) || '').trim();
-  if (!amount) return;
-  let value;
-  try { value = ethers.parseEther(amount); }
-  catch (_) { toast('Invalid amount', 'error'); return; }
-  if (value <= 0n) { toast('Amount must be greater than 0', 'error'); return; }
-
-  try {
-    const tx = await State.signer.sendTransaction({ to: sealAddr, value });
-    toast(`Sent ${amount} OG — waiting for confirmation…`, 'success');
-    await tx.wait();
-    toast('Top-up confirmed 🎉 your agent thanks you', 'success');
-    // Top-up resolved the owner-recoverable condition the container
-    // reported, so drop the pinned warning immediately — don't make
-    // the user wait for sealed's next heartbeat to clear it. The
-    // balance refresh below then re-evaluates whether the low-balance
-    // peek bubble should appear (it shouldn't, post-top-up).
-    State.containerWarning = null;
-    const plea = document.getElementById('sealPlea');
-    if (plea) {
-      plea.classList.remove('seal-plea--alert');
-      plea.hidden = true;
-      plea.onclick = null;
-      plea.onkeydown = null;
-      plea.removeAttribute('title');
-    }
-    // Refresh the bubble — balance may now be above threshold, in
-    // which case the bubble silently disappears.
-    checkAgentSealBalance(sealAddr, agentName).catch(() => {/* ignore */});
-  } catch (e) {
-    toast('Top-up failed: ' + (e.shortMessage || e.message || e), 'error');
-  }
+// Thin entry point — all of the prompt/tx/toast logic lives in the
+// agent-seal top-up modal (openSealTopUpModal → submitSealTopUp).
+window.depositToAgentSeal = function (sealAddr, agentName) {
+  openSealTopUpModal(sealAddr, agentName);
 };
 
 // ───────────────────────────────────────────────────────────────────
@@ -4183,7 +4258,10 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
       });
       if (!result) return;
       const env = result.apiKey ? { API_KEY: result.apiKey } : {};
-      payload = { snapshot: '0g-test-sealed', sealed: true, env };
+      // Snapshot name comes from /config so a bump of ATTESTOR_SANDBOX_SNAPSHOT
+      // takes effect on Restore/Reset, not just fresh deploys.
+      const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
+      payload = { snapshot, sealed: true, env };
     }
     const { envelope } = await signSandboxEnvelope(action, resourceId, payload);
 
@@ -4248,9 +4326,12 @@ window.resetAgent = async function (sealId, sandboxId) {
   try {
     // Same envelope shape as the bringOnline create branch — fresh
     // sandbox needs a fresh env, and attestor doesn't (and shouldn't)
-    // cache the LLM key. apiKey came from the modal above.
+    // cache the LLM key. apiKey came from the modal above. Snapshot
+    // pulled from /config so an operator bump of ATTESTOR_SANDBOX_SNAPSHOT
+    // also drives Reset (not just fresh deploys).
     const env = result.apiKey ? { API_KEY: result.apiKey } : {};
-    const payload = { snapshot: '0g-test-sealed', sealed: true, env };
+    const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
+    const payload = { snapshot, sealed: true, env };
     const { envelope } = await signSandboxEnvelope('create', '', payload);
 
     const r = await fetch('/reset', {

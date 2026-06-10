@@ -88,21 +88,30 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
 }
 
 /// Construct the subdomain-routed proxy URL: `{port}-{sandbox_id}` is
-/// prepended as a subdomain to whatever host the proxy is advertised
-/// under. We do NOT hard-code a wildcard-DNS suffix (nip.io / xip.io /
-/// real domain) — the caller provides the full base host via
-/// `sandbox_proxy_addr` (e.g. `47.236.111.154.nip.io:4000`,
-/// `proxy.example.com:4000`). A colonless addr defaults to port 80.
-fn build_agent_url(
+/// prepended as a subdomain to whatever host the proxy is advertised under.
+/// We do NOT hard-code a wildcard-DNS suffix — the caller supplies the full
+/// base host via `sandbox_proxy_addr`. The scheme is inferred from whether a
+/// port is present:
+///   - `host:port` → `http://{port}-{sid}.{host}:{port}{path}`
+///     (dev / IP behind a plain-HTTP proxy, e.g. `47.236.111.154.nip.io:4000`)
+///   - bare `host` → `https://{port}-{sid}.{host}{path}`
+///     (a real domain fronted by TLS on 443, e.g. `art.0g.ai`)
+///
+/// The bare-host → https rule keeps the on-chain AgentCard.url canonical:
+/// without it a TLS domain would be written as `http://…:80` and only "work"
+/// via an HTTP→HTTPS redirect, leaving the wrong scheme on chain.
+pub fn build_agent_url(
     sandbox_proxy_addr: &str,
     sandbox_id: &str,
     container_port: u16,
     path: &str,
 ) -> String {
-    let (host, port) = sandbox_proxy_addr
-        .rsplit_once(':')
-        .unwrap_or((sandbox_proxy_addr, "80"));
-    format!("http://{container_port}-{sandbox_id}.{host}:{port}{path}")
+    match sandbox_proxy_addr.rsplit_once(':') {
+        Some((host, port)) => {
+            format!("http://{container_port}-{sandbox_id}.{host}:{port}{path}")
+        }
+        None => format!("https://{container_port}-{sandbox_id}.{sandbox_proxy_addr}{path}"),
+    }
 }
 
 /// The sealed proxy's `/healthz` URL for a sandbox — same subdomain routing
@@ -162,9 +171,12 @@ mod tests {
     }
 
     #[test]
-    fn url_template_tolerates_missing_port() {
-        let url = build_agent_url("10.0.0.1.nip.io", "sb", 8080, "/");
-        assert_eq!(url, "http://8080-sb.10.0.0.1.nip.io:80/");
+    fn url_template_bare_host_is_https() {
+        // A bare host (no port) is a real domain fronted by TLS → https on
+        // 443, no explicit port. Keeps the on-chain URL canonical instead of
+        // an http://…:80 that only works via a redirect.
+        let url = build_agent_url("art.0g.ai", "sb", 8080, "/hello");
+        assert_eq!(url, "https://8080-sb.art.0g.ai/hello");
     }
 
     #[test]

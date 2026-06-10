@@ -608,16 +608,22 @@ async fn refresh_agent_card_url(
     Ok(())
 }
 
+// Delegates to the single source of truth in `agent_card` — keeping a
+// second copy here is exactly what let the on-chain URL drift to http://…:80
+// on recreate after the scheme fix. Same scheme rule: bare host → https,
+// host:port → http.
 fn build_serve_url(
     sandbox_proxy_addr: &str,
     sandbox_id: &str,
     serve_port: u16,
     serve_path: &str,
 ) -> String {
-    let (host, port) = sandbox_proxy_addr
-        .rsplit_once(':')
-        .unwrap_or((sandbox_proxy_addr, "80"));
-    format!("http://{serve_port}-{sandbox_id}.{host}:{port}{serve_path}")
+    attestor_shared::agent_card::build_agent_url(
+        sandbox_proxy_addr,
+        sandbox_id,
+        serve_port,
+        serve_path,
+    )
 }
 
 async fn handle_deploy(
@@ -2310,10 +2316,13 @@ mod tests {
     }
 
     #[test]
-    fn build_serve_url_without_port_defaults_to_80() {
-        // Bare host (no `:` to rsplit on) → port defaults to 80.
+    fn build_serve_url_bare_host_is_https() {
+        // Bare host (no `:`) = a real domain fronted by TLS → https on 443,
+        // no explicit port. (Same rule as agent_card::build_agent_url, which
+        // this now delegates to — recreate must produce the same scheme as a
+        // fresh mint, else old agents stay http://…:80 after a reset.)
         let url = build_serve_url("example.com", "sbx-xyz", 8080, "/result");
-        assert_eq!(url, "http://8080-sbx-xyz.example.com:80/result");
+        assert_eq!(url, "https://8080-sbx-xyz.example.com/result");
     }
 
     #[test]
