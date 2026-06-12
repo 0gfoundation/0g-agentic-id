@@ -1017,7 +1017,6 @@ details.log[open] summary{color:var(--text2)}
 .restore-body{color:var(--text2);font-size:var(--fs-sm);line-height:1.55;margin-bottom:16px}
 .restore-field{margin-bottom:4px}
 .restore-label{display:block;margin-bottom:7px;font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600}
-.restore-opt{display:inline-block;font-size:10px;color:var(--text2);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:1px 8px;margin-left:6px;text-transform:none;letter-spacing:0;font-weight:500;vertical-align:1px}
 .modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:20px}
 </style>
 </head>
@@ -1157,14 +1156,12 @@ details.log[open] summary{color:var(--text2)}
     <h3 id="restoreTitle">Restore this agent?</h3>
     <p class="restore-body" id="restoreBody"></p>
     <div class="restore-field">
-      <label for="restoreApiKey" class="restore-label">
-        LLM API key <span class="restore-opt">optional</span>
-      </label>
+      <label for="restoreApiKey" class="restore-label">LLM API key</label>
       <div class="secret-row">
-        <input id="restoreApiKey" type="password" placeholder="sk-…" autocomplete="off" />
+        <input id="restoreApiKey" type="password" placeholder="sk-…" autocomplete="off" oninput="onRestoreApiKeyInput()" />
         <button type="button" class="secret-toggle" id="restoreApiKeyToggle" onclick="toggleSecret('restoreApiKey','restoreApiKeyToggle')">show</button>
       </div>
-      <small class="field-hint">Leave blank to fall back on whatever the container snapshot baked in. attestor never caches this.</small>
+      <small class="field-hint">Required — the fresh sandbox starts with an empty env, so the agent needs a key to talk to its provider. attestor never caches this.</small>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="cancelRestoreModal()">Cancel</button>
@@ -1317,19 +1314,14 @@ details.log[open] summary{color:var(--text2)}
         </div>
       </div>
       <div class="field">
-        <label>Avatar <span style="color:var(--muted);font-weight:400">(optional)</span></label>
+        <label>Avatar</label>
         <div class="avatar-picker">
           <div class="avatar-preview" id="avatarPreview"><img src="/avatar/default.svg" alt=""/></div>
           <div class="avatar-actions">
-            <div class="row-btns">
-              <input type="file" id="avatarFile" accept="image/*" style="display:none" onchange="handleAvatarFile(event)" />
-              <button type="button" class="btn-mini" onclick="$('#avatarFile').click()">Upload image</button>
-              <button type="button" class="btn-mini" id="avatarClearBtn" disabled onclick="clearAvatar()">Use auto</button>
-            </div>
             <div class="avatar-meta" id="avatarMeta">Auto-generated from seal_id</div>
           </div>
         </div>
-        <small class="field-hint">Embedded into AgentCard.image. Empty → deterministic pixel-art avatar derived from seal_id.</small>
+        <small class="field-hint">Deterministic pixel-art avatar derived from seal_id.</small>
       </div>
     </section>
 
@@ -2422,7 +2414,9 @@ function openRestorePrompt({ title, body, confirmLabel }) {
     _restoreResolve = resolve;
     $('#restoreTitle').textContent = title;
     $('#restoreBody').textContent = body;
-    $('#restoreConfirmBtn').textContent = confirmLabel || 'Confirm';
+    const btn = $('#restoreConfirmBtn');
+    btn.textContent = confirmLabel || 'Confirm';
+    btn.disabled = true;                         // gated on non-empty apiKey
     const inp = $('#restoreApiKey');
     inp.value = '';
     inp.type = 'password';                       // reset toggle state
@@ -2432,12 +2426,20 @@ function openRestorePrompt({ title, body, confirmLabel }) {
     setTimeout(() => inp.focus(), 60);
   });
 }
+// Live-bound to the input; enable Confirm only once the user has typed
+// something. The fresh sandbox boots with an empty env, so an empty
+// apiKey would land us with an LLM-less agent.
+window.onRestoreApiKeyInput = function () {
+  const btn = $('#restoreConfirmBtn');
+  if (btn) btn.disabled = $('#restoreApiKey').value.trim().length === 0;
+};
 window.cancelRestoreModal = function () {
   $('#restoreModal').classList.remove('open');
   if (_restoreResolve) { _restoreResolve(null); _restoreResolve = null; }
 };
 window.submitRestoreModal = function () {
   const apiKey = $('#restoreApiKey').value.trim();
+  if (!apiKey) { toast('LLM API key is required', 'error'); return; }
   $('#restoreModal').classList.remove('open');
   if (_restoreResolve) { _restoreResolve({ apiKey }); _restoreResolve = null; }
 };
