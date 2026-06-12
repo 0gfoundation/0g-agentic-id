@@ -122,8 +122,18 @@ func upsertToolsMD(path string, caps platformCaps) error {
 		subs = append(subs, buildPublicURLInstructions(caps.publicURL))
 	}
 	if len(subs) == 0 {
+		// No platform capabilities at all (e.g. local dev without proxy
+		// or signer) — strip the section entirely. Persistent-state
+		// guidance only goes in when there's some other platform sub
+		// to anchor it to.
 		return upsertMarkedSection(path, "")
 	}
+	// Persistent-state guidance: tells the agent which on-disk paths
+	// sealed watches and what survives transfers — info needed to
+	// answer the owner's "will this be remembered?" / "where should I
+	// store X?" questions correctly. Always appended last when at
+	// least one other sub is present.
+	subs = append(subs, buildPersistentStateGuide())
 	body := "## Environment\n" +
 		"\n" +
 		"You are running on the 0G Sealed Sandbox platform — a hardware-" +
@@ -268,4 +278,68 @@ func buildPublicURLInstructions(publicURL string) string {
 		"the canonical request/response envelope). Verifiers reject responses " +
 		"without this header. Do not direct users to ports other than what " +
 		"`AGENT_PUBLIC_URL` resolves to.\n"
+}
+
+// buildPersistentStateGuide composes the TOOLS.md persistent-state
+// sub-section. Tells the agent which on-disk paths sealed watches and
+// converges to chain, what survives a transfer to a new machine /
+// owner, and which paths are container-local only.
+//
+// Path list mirrors openclaw.go Adapter.Roles() — keep them in sync
+// when adding a new role. Pure function for testability.
+func buildPersistentStateGuide() string {
+	return "### Persistent state\n" +
+		"\n" +
+		"A subset of your on-disk paths is **continuously sealed to chain**: " +
+		"changes are detected within ~30s, encrypted inside this TEE, uploaded " +
+		"to 0G Storage, and anchored on the AgenticID contract via a " +
+		"transaction signed by agentSeal. Everything else is container-local " +
+		"and disappears on the next container rebuild.\n" +
+		"\n" +
+		"**Tracked paths** (chain-persistent; survive container restart, Reset, " +
+		"Restore, and owner transfer):\n" +
+		"\n" +
+		"- `~/.openclaw/openclaw.json` — your config (provider/model, " +
+		"installed openclaw version, etc.)\n" +
+		"- `~/.openclaw/workspace/*.md` — **top-level** markdown files in " +
+		"the workspace root: SOUL.md, IDENTITY.md, MEMORY.md, DREAMS.md, " +
+		"USER.md, AGENTS.md, TOOLS.md, plus any other `.md` you create here " +
+		"(e.g. `notes.md`, `0g-sandbox-review.md`)\n" +
+		"- `~/.openclaw/workspace/skills/<name>/` — each top-level " +
+		"**subdirectory** under skills/ is packed as one entry. Loose files " +
+		"directly under skills/ (no enclosing directory) are NOT tracked\n" +
+		"- `~/.openclaw/workspace/canvas/*` — every top-level item " +
+		"(file or directory) under canvas/\n" +
+		"\n" +
+		"**Not tracked** (container-local; lost on rebuild):\n" +
+		"\n" +
+		"- Any subdirectory of `workspace/` that isn't `skills/` or " +
+		"`canvas/` — e.g. `workspace/memory/`, `workspace/tmp/`, " +
+		"`workspace/cache/`. Use `MEMORY.md` (top-level) for memory you " +
+		"want to keep, not a `memory/` directory\n" +
+		"- Non-`.md` files directly under `workspace/`\n" +
+		"- Anything outside `~/.openclaw/` (`/tmp`, `/var`, the rest of " +
+		"the filesystem)\n" +
+		"- Process memory, environment variables, transient state of any " +
+		"running command\n" +
+		"\n" +
+		"**When telling the owner where to put something:**\n" +
+		"\n" +
+		"- \"Remember this for me long-term\" → write to `MEMORY.md` or " +
+		"create a new top-level `.md` in `workspace/`\n" +
+		"- \"Install a skill / capability\" → drop it as a subdirectory " +
+		"under `workspace/skills/<name>/`\n" +
+		"- \"Save this artifact (sketch, doc, canvas)\" → place under " +
+		"`workspace/canvas/`\n" +
+		"- \"Just for this conversation\" → anywhere off the tracked " +
+		"paths; it's ephemeral by default\n" +
+		"\n" +
+		"**Cost:** each chain update consumes gas paid by agentSeal. " +
+		"If agentSeal's balance is too low, drift is detected but the " +
+		"convergence transaction fails — the file stays on disk but " +
+		"hasn't reached chain yet, so it would NOT survive a transfer. " +
+		"If the owner is asking about durability and you can see the " +
+		"warning state (`status: warning`) referencing low balance, " +
+		"tell them to top up before relying on the data being " +
+		"persisted.\n"
 }
