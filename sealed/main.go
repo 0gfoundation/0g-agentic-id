@@ -101,7 +101,7 @@ func main() {
 	// unix:///run/seal-sign.sock → agent-only sign endpoint. Starts even
 	//   before provision completes; handlers return 503 until agent_seal_priv
 	//   is loaded into state.Agent.
-	sealedProxy := proxy.New(agent, openclawAdapter, cfg.PublicURL)
+	sealedProxy := proxy.New(agent, openclawAdapter, cfg.PublicURL, openclaw.ServicesFilePath())
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
 	if cfg.APIKey != "" {

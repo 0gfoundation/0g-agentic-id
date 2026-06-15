@@ -822,6 +822,29 @@ details.log[open] summary{color:var(--text2)}
 /* Legacy classes still referenced elsewhere (chip styles etc) */
 .agent-chips{display:flex;gap:8px;flex-wrap:wrap}
 
+/* Endpoint list lives inside .agent-intro under the message — no
+   borders, no margins around the list container, the wrapper handles
+   the framing. Items use native <details> for free expand/collapse. */
+.serve-skills{width:100%;text-align:left;margin-top:12px}
+.endpoint-list{display:flex;flex-direction:column;gap:4px;text-align:left}
+.endpoint-item{border:1px solid var(--border);border-radius:var(--r-sm);background:var(--surf);overflow:hidden;transition:border-color var(--t-fast)}
+.endpoint-item[open]{border-color:var(--surf3);box-shadow:var(--sh-sm)}
+.endpoint-summary{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;user-select:none;list-style:none;transition:background var(--t-fast)}
+.endpoint-summary::-webkit-details-marker{display:none}
+.endpoint-summary:hover{background:var(--surf-hover)}
+.endpoint-item[open] .endpoint-summary{background:var(--surf-hover);border-bottom:1px solid var(--border)}
+.endpoint-chev{font-family:var(--mono);font-size:10px;color:var(--muted);transition:transform var(--t-fast);flex-shrink:0;width:10px;text-align:center}
+.endpoint-item[open] .endpoint-chev{transform:rotate(90deg)}
+.endpoint-method{font-family:var(--mono);font-size:10px;font-weight:700;color:var(--p);background:var(--pbg);border:1px solid var(--pbd);border-radius:var(--r-sm);padding:1px 7px;letter-spacing:var(--ls-label);min-width:48px;text-align:center;flex-shrink:0;text-transform:uppercase}
+.endpoint-path{font-family:var(--mono);font-size:var(--fs-sm);font-weight:600;color:var(--text);overflow-wrap:break-word;flex:1;min-width:0;text-align:left}
+.endpoint-summary-desc{font-size:var(--fs-xs);color:var(--text2);font-weight:400;text-align:left;flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}
+.endpoint-body{padding:10px 14px 12px;font-size:var(--fs-sm)}
+.endpoint-desc{color:var(--text2);line-height:1.5;margin-bottom:10px}
+.endpoint-curl-block{position:relative;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r-sm)}
+.endpoint-curl-code{font-family:var(--mono);font-size:var(--fs-xs);color:var(--text);padding:10px 50px 10px 12px;margin:0;line-height:1.55;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;text-align:left}
+.endpoint-copy{position:absolute;top:6px;right:6px;font-family:var(--sans);font-size:11px;font-weight:600;color:var(--p);background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);padding:3px 9px;cursor:pointer;letter-spacing:var(--ls-label);transition:background var(--t-fast),border-color var(--t-fast)}
+.endpoint-copy:hover{background:var(--pbg);border-color:var(--pbd)}
+
 /* Serve — interactive "say hi" card */
 .serve-card{background:var(--surf);border:1px solid var(--border);border-left:3px solid var(--p);border-radius:var(--r);padding:16px 18px;margin-bottom:18px;box-shadow:var(--sh-sm)}
 .serve-head{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:8px;flex-wrap:wrap}
@@ -850,10 +873,16 @@ details.log[open] summary{color:var(--text2)}
 .serve-resp.failed  .serve-title{color:var(--red)}
 .serve-resp.warn    .serve-title{color:var(--orange)}
 .serve-sub-title{font-size:var(--fs-xs);color:var(--text2);max-width:420px;line-height:1.5;margin-bottom:10px}
-.serve-signer{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:3px 10px;margin-bottom:10px;letter-spacing:var(--ls-normal)}
-.serve-message{font-size:var(--fs-xs);color:var(--text2);line-height:1.55;font-style:italic;max-width:480px;margin-top:8px;padding:10px 14px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);position:relative}
-.serve-message::before{content:'"';position:absolute;left:6px;top:-4px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
-.serve-message::after{content:'"';position:absolute;right:6px;bottom:-14px;font-size:24px;color:var(--muted);font-style:normal;line-height:1}
+/* Unified agent-voice card — wraps the quote (message bubble) plus the
+   skill list so they read as a single piece of speech rather than two
+   stacked containers. The quote-marks decorations live on this outer
+   wrapper, so the closing " always lands after the endpoint list, not
+   between message and list. */
+.agent-intro{position:relative;width:100%;max-width:560px;margin-top:10px;padding:14px 22px 16px;background:var(--surf2);border:1px solid var(--border);border-radius:var(--r);align-self:center}
+.agent-intro::before{content:'"';position:absolute;left:8px;top:-2px;font-size:28px;color:var(--muted);font-style:normal;line-height:1}
+.agent-intro::after{content:'"';position:absolute;right:10px;bottom:-14px;font-size:28px;color:var(--muted);font-style:normal;line-height:1}
+.serve-message{font-size:var(--fs-xs);color:var(--text2);line-height:1.6;font-style:italic;text-align:left;background:transparent;border:none;border-radius:0;padding:0;margin:0;max-width:none;position:static}
+.serve-message::before,.serve-message::after{content:none}
 
 /* Verification check-list — 3 rows, each animates in with sequenced delay */
 .serve-checks{display:flex;flex-direction:column;gap:8px;width:100%;max-width:460px;margin:8px 0 4px;text-align:left}
@@ -3807,7 +3836,7 @@ function paintDetail(dep) {
         </div>
         <div class="serve-actions">
           <button class="icon-btn primary" id="btnSayHi" onclick="sayHiToAgent('${escapeHtml(serveUrl)}', '${escapeHtml(agentSealAddr || '')}', '${escapeHtml(dep.agent_id || '')}')"><span class="ico">${ICO.wave}</span> Say hi</button>
-          <button class="icon-btn" onclick="copyText('${escapeHtml(serveUrl)}').then(()=>toast('URL copied','success'),()=>toast('Copy failed','error'))"><span class="ico">${ICO.copy}</span> Copy URL</button>
+          <button class="icon-btn" onclick="copyText(${escapeHtml(JSON.stringify(`curl -i -H 'Accept: application/json' ${serveUrl}`))}).then(()=>toast('curl copied','success'),()=>toast('Copy failed','error'))"><span class="ico">${ICO.copy}</span> Copy curl</button>
         </div>
       </div>
       <a class="serve-url" href="${escapeHtml(serveUrl)}" target="_blank" rel="noopener">${escapeHtml(serveUrl)}</a>
@@ -4446,6 +4475,100 @@ function b64urlDecode(s) {
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
 }
 
+// Flatten an agent-declared JSON input_example into a URL query string
+// for GET/HEAD curls. Only handles flat objects with primitive (or
+// primitive-array) values — nested objects and unparseable strings
+// return '' so the curl falls back to the bare URL. Used by
+// buildEndpointSkillsHtml when generating GET curl templates.
+function exampleToQueryString(example) {
+  let obj;
+  try { obj = JSON.parse(example); } catch (_) { return ''; }
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return '';
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    if (Array.isArray(v)) {
+      for (const item of v) {
+        if (item !== null && item !== undefined && typeof item !== 'object') {
+          params.append(k, String(item));
+        }
+      }
+    } else if (typeof v !== 'object') {
+      params.set(k, String(v));
+    }
+  }
+  const s = params.toString();
+  return s ? '?' + s : '';
+}
+
+// Build the "Here's what I can do for you" skills HTML appended to a
+// verified Say hi response. Pure function — caller decides where to
+// inject. Returns '' when services is empty so callers can interpolate
+// unconditionally; an empty array reads as "agent has nothing to
+// offer right now", which doesn't deserve a hanging "I can do" intro.
+//
+// `helloUrl` is the /hello URL just hit; its origin becomes the base
+// for each endpoint's full URL in the curl template.
+function buildEndpointSkillsHtml(services, helloUrl) {
+  const arr = Array.isArray(services) ? services : [];
+  if (arr.length === 0) return '';
+  let baseOrigin = '';
+  try { baseOrigin = new URL(helloUrl).origin; } catch (_) {}
+  const rows = arr.map(s => {
+    const method = (s.method || 'GET').toUpperCase();
+    const path = s.path || '/';
+    let full = baseOrigin ? baseOrigin + path : path;
+    const example = s.input_example || '';
+    const isBodyMethod = method !== 'GET' && method !== 'HEAD';
+    // For body-bearing methods, the example becomes the -d body. For
+    // GET/HEAD, we try to flatten the JSON example into a query string
+    // and append to the URL — agent declared `{"name":"python"}` for
+    // GET should produce `?name=python`. Only flat objects with
+    // primitive values translate; anything else (nested, array) falls
+    // back to no query (the curl runs against the bare path).
+    let bodyArg = '';
+    if (isBodyMethod && example) {
+      bodyArg = ` -d '${example}'`;
+    } else if (!isBodyMethod && example) {
+      const qs = exampleToQueryString(example);
+      if (qs) full += qs;
+    }
+    const contentType = isBodyMethod ? ` -H 'Content-Type: application/json'` : '';
+    const curl = `curl -i -H 'Accept: application/json'${contentType}${
+      method === 'GET' ? '' : ` -X ${method}`
+    }${bodyArg} '${full}'`;
+    // escapeHtml the JSON-encoded curl so the embedded double quotes
+    // become &quot; — otherwise they prematurely close the double-quoted
+    // onclick attribute and leak the rest of the JS into the DOM as
+    // visible text.
+    const curlAttr = escapeHtml(JSON.stringify(curl));
+    return `
+      <details class="endpoint-item">
+        <summary class="endpoint-summary">
+          <span class="endpoint-chev">▸</span>
+          <span class="endpoint-method">${escapeHtml(method)}</span>
+          <span class="endpoint-path">${escapeHtml(path)}</span>
+          ${s.description ? `<span class="endpoint-summary-desc">${escapeHtml(s.description)}</span>` : ''}
+        </summary>
+        <div class="endpoint-body">
+          ${s.description ? `<div class="endpoint-desc">${escapeHtml(s.description)}</div>` : ''}
+          <div class="endpoint-curl-block">
+            <pre class="endpoint-curl-code">${escapeHtml(curl)}</pre>
+            <button class="endpoint-copy" onclick="copyText(${curlAttr}).then(()=>toast('curl copied','success'),()=>toast('Copy failed','error'))">Copy</button>
+          </div>
+        </div>
+      </details>`;
+  }).join('');
+  // No intro line here — sealed embeds "Here's what I can do for you:"
+  // as the third sentence of the message bubble when services exist, so
+  // the bubble's quote naturally leads into this list and the whole
+  // self-introduction reads as one voice.
+  return `
+    <div class="serve-skills">
+      <div class="endpoint-list">${rows}</div>
+    </div>`;
+}
+
 window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
   const respEl = $('#serveResp');
   const btn = $('#btnSayHi');
@@ -4462,7 +4585,7 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
   ];
   const ICONS = { pending: '·', running: '', passed: '✓', failed: '✗', skipped: '–' };
 
-  const paint = (phase, headIcon, title, sub, signer, message) => {
+  const paint = (phase, headIcon, title, sub, signer, message, services, helloUrl) => {
     respEl.className = `serve-resp show ${phase}`;
     const dimsHtml = (dims) => !dims || !dims.length ? '' : `
       <div class="row-dims">
@@ -4488,13 +4611,32 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           </div>
         `).join('')}
       </div>`;
+    // Skills block only on verified phase — failed/warn responses
+    // don't get to list capabilities, since identity wasn't proven.
+    const skillsHtml = phase === 'verified' ? buildEndpointSkillsHtml(services, helloUrl) : '';
+    // Wrap the agent's voice (quote + skill list) in a single card so
+    // they read as one piece of speech. The wrapper carries the
+    // open/close quote marks, so the closing " always lands after the
+    // skill list, signalling that all three sentences plus the list
+    // are part of the same monologue.
+    const agentIntroHtml = (message || skillsHtml)
+      ? `<div class="agent-intro">${
+            message ? `<div class="serve-message">${escapeHtml(message)}</div>` : ''
+          }${skillsHtml}</div>`
+      : '';
+    // Signer pill removed — the recovered address is already shown in
+    // the "Signer identity" check row's detail ("signer 0xAB…CD = on-
+    // chain agent_seal") AND repeated as the first sentence of the
+    // message bubble ("I am 0x..."). Three copies of the same hex was
+    // noise. The `signer` arg is still accepted so call sites don't
+    // need updating; it's just no longer rendered.
+    void signer;
     respEl.innerHTML = `
       <div class="serve-icon">${headIcon}</div>
       <div class="serve-title">${title}</div>
       ${sub ? `<div class="serve-sub-title">${escapeHtml(sub)}</div>` : ''}
       ${checksHtml}
-      ${signer ? `<div class="serve-signer" title="${escapeHtml(signer.full)}">${escapeHtml(signer.short)}</div>` : ''}
-      ${message ? `<div class="serve-message">${escapeHtml(message)}</div>` : ''}
+      ${agentIntroHtml}
     `;
   };
 
@@ -4521,7 +4663,12 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     const text = await r.text();
     const proofHeader = r.headers.get('X-Agent-Proof') || '';
     let humanMsg = '';
-    try { humanMsg = JSON.parse(text)?.message || ''; } catch {}
+    let helloServices = [];
+    try {
+      const parsed = JSON.parse(text);
+      humanMsg = parsed?.message || '';
+      helloServices = Array.isArray(parsed?.services) ? parsed.services : [];
+    } catch {}
 
     if (!r.ok) {
       skipRest();
@@ -4673,9 +4820,14 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
       }
     }
 
+    // Final verified state — paint() appends the agent-voice skills
+    // block ("Here's what I can do for you:") inline below the message
+    // when services are present, so the whole panel reads as a single
+    // self-introduction (identity → checks → message → capabilities)
+    // rather than a verification box followed by a separate catalog.
     paint('verified', '✓', 'Identity verified',
       'All checks passed — this is a truly autonomous agent.',
-      sigInfo, humanMsg);
+      sigInfo, humanMsg, helloServices, url);
   } catch (e) {
     skipRest();
     paint('failed', '✗', 'Request failed', e.message || String(e), null, null);

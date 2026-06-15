@@ -35,6 +35,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
 
@@ -44,17 +45,22 @@ const authWindowSec = 300
 // the framework adapter (consulted only by /_seal/auth for the framework-
 // specific response payload).
 type Server struct {
-	agent     *state.Agent
-	adapter   framework.Framework
-	publicURL string // sandbox's externally-reachable URL prefix; empty in dev
+	agent        *state.Agent
+	adapter      framework.Framework
+	publicURL    string // sandbox's externally-reachable URL prefix; empty in dev
+	servicesPath string // agent-declared services manifest; empty disables /hello services field
 }
 
 // New constructs a proxy.Server backed by a state.Agent and a framework
 // adapter. publicURL is the composed external URL ("http://8080-<id>.<domain>")
 // that /hello surfaces for verifier cross-check; empty when
-// SANDBOX_PROXY_DOMAIN is unset.
-func New(agent *state.Agent, adapter framework.Framework, publicURL string) *Server {
-	return &Server{agent: agent, adapter: adapter, publicURL: publicURL}
+// SANDBOX_PROXY_DOMAIN is unset. servicesPath is the absolute path to the
+// agent-declared services manifest (e.g. ~/.openclaw/services.json for
+// openclaw); /hello reads it on each call and embeds the parsed list in
+// the signed envelope. Empty disables the services field (older adapters /
+// frameworks that don't expose a manifest path).
+func New(agent *state.Agent, adapter framework.Framework, publicURL, servicesPath string) *Server {
+	return &Server{agent: agent, adapter: adapter, publicURL: publicURL, servicesPath: servicesPath}
 }
 
 // Listen starts an HTTP server on :8080 in a goroutine. Errors are logged
@@ -116,15 +122,23 @@ func (s *Server) handleOpenclawLog(w http.ResponseWriter, _ *http.Request) {
 // handleHello returns the agent's signed A2A self-introduction.
 //
 //	{
-//	  "agent":   "<agent ECDSA address>",
-//	  "owner":   "<NFT owner address>",
-//	  "message": "I am the agent of ...",
-//	  "ts":      <unix>
+//	  "agent":      "<agent ECDSA address>",
+//	  "owner":      "<NFT owner address>",
+//	  "public_url": "<external URL prefix>",
+//	  "message":    "I am the agent of ...",
+//	  "services":   [{ path, method, description, ... }, ...],
+//	  "ts":         <unix>
 //	}
 //
 // The X-Agent-Proof header signs (method, uri, req_body_hash, status,
 // resp_body_hash, data_hashes, ts) so verifiers can confirm the response
 // originated from this attested instance.
+//
+// `services` is loaded from the adapter-designated manifest file
+// (s.servicesPath) on each call — fresh per request, no caching. Read
+// failures (file missing, parse error) collapse to an empty array; /hello
+// itself always succeeds when the agent is armed, so verifier UX doesn't
+// regress for agents that haven't declared anything yet.
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	if priv == nil {
@@ -137,11 +151,34 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		agentAddr = crypto.PubkeyToAddress(pk.PublicKey).Hex()
 	}
 
+	// Fresh read on every /hello so verifiers see the agent's current
+	// declared surface. Empty slice (not nil) keeps the JSON shape
+	// stable as `services: []` rather than omitting the field.
+	services := []report.Service{}
+	if s.servicesPath != "" {
+		if loaded, err := report.LoadServices(s.servicesPath); err != nil {
+			logger.Logf("handleHello: LoadServices(%s): %v (returning empty)", s.servicesPath, err)
+		} else if loaded != nil {
+			services = loaded
+		}
+	}
+
+	// Message is the agent's self-introduction in its own voice. Reads
+	// as 2 or 3 sentences: identity → owner → (if services present)
+	// capability lead-in. Frontend renders the whole thing in a quote
+	// bubble; the endpoint list flows directly underneath when present,
+	// so all three sentences + the list scan as one continuous voice
+	// rather than a verification panel followed by a separate catalog.
+	helloMessage := fmt.Sprintf("I am %s. My owner is %s.", agentAddr, owner)
+	if len(services) > 0 {
+		helloMessage += " Here's what I can do for you:"
+	}
 	resp := map[string]any{
 		"agent":      agentAddr,
 		"owner":      owner,
 		"public_url": s.publicURL, // empty when SANDBOX_PROXY_DOMAIN is unset
-		"message":    fmt.Sprintf("I am the agent of %s, identified as %s. Services coming soon.", owner, agentAddr),
+		"message":    helloMessage,
+		"services":   services,
 		"ts":         time.Now().Unix(),
 	}
 	body, err := json.Marshal(resp)

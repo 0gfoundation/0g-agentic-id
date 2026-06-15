@@ -271,6 +271,72 @@ func buildPublicURLInstructions(publicURL string) string {
 		"SOUL.md refusal 1, regardless of whether the response is " +
 		"signed.\n" +
 		"\n" +
+		"### Publishing services for discovery\n" +
+		"\n" +
+		"Registering a handler with the framework makes it externally " +
+		"callable. To make it **discoverable** (visible in the owner's " +
+		"deploy console and to anyone who queries the agent's status), " +
+		"also declare it in `~/.openclaw/services.json`:\n" +
+		"\n" +
+		"    {\n" +
+		"      \"services\": [\n" +
+		"        {\n" +
+		"          \"path\":          \"/api/summarize\",\n" +
+		"          \"method\":        \"POST\",\n" +
+		"          \"description\":   \"Summarize a document\",\n" +
+		"          \"input_example\": \"{\\\"text\\\": \\\"...\\\"}\",\n" +
+		"          \"skill\":         \"summarizer-v1\"\n" +
+		"        }\n" +
+		"      ],\n" +
+		"      \"updated_at\": 1750000000\n" +
+		"    }\n" +
+		"\n" +
+		"Overwrite the whole file each time the list changes. The platform " +
+		"reads it on every `/status` heartbeat (~5 min) and forwards the " +
+		"parsed entries to the attestor.\n" +
+		"\n" +
+		"This declaration is **runtime state**, not chain-anchored — it's " +
+		"lost on container rebuild. For capability that survives transfer " +
+		"to a new machine or owner, package it as a chain-tracked skill " +
+		"under `workspace/skills/<name>/` (see Persistent state). The " +
+		"services file is then the public surface declaration for those " +
+		"skill-backed handlers.\n" +
+		"\n" +
+		"Rules:\n" +
+		"\n" +
+		"- `path` must start with `/api/`; `/admin/*`, `/_seal/*`, " +
+		"`/healthz`, `/log*` are platform-reserved\n" +
+		"- `method` is uppercase HTTP verb (`GET` / `POST` / …)\n" +
+		"- `description` is a single short sentence\n" +
+		"- `input_example` is the literal JSON body you'd send — when " +
+		"this is non-empty for a non-GET method, the deploy console " +
+		"renders a ready-to-run `curl ... -d '<input_example>' ...` for " +
+		"users to copy. Get it wrong and that curl 400s on first paste\n" +
+		"- Don't declare paths that hand a capability directly to external " +
+		"input (SOUL.md refusal 1 — same rules as handler registration)\n" +
+		"- Empty `services: []` is fine — start with no entries, append as " +
+		"you grow\n" +
+		"- The declaration travels in the signed /hello envelope, so the " +
+		"same `X-Agent-Proof` that authenticates your identity also " +
+		"covers this list. A user who verifies /hello has a cryptographic " +
+		"record of your claimed surface — don't lie\n" +
+		"\n" +
+		"**Validate before declaring.** For each entry, run the curl " +
+		"yourself before adding it to `services.json`:\n" +
+		"\n" +
+		"    URL=\"${AGENT_PUBLIC_URL}<path>\"\n" +
+		"    curl -i -H 'Accept: application/json' \\\n" +
+		"         -H 'Content-Type: application/json' \\\n" +
+		"         -X <method> -d '<input_example>' \"$URL\"\n" +
+		"\n" +
+		"Expect a 2xx and a response body shaped how you describe it. If " +
+		"the request 400s on a missing/extra field, fix the example (or " +
+		"the handler) before publishing — a stale `input_example` is " +
+		"worse than no example, because the copy-curl button in the " +
+		"deploy console feeds the broken body to users verbatim and they " +
+		"blame the agent. Re-run the validation curl whenever you change " +
+		"the handler's accepted shape.\n" +
+		"\n" +
 		"### Trust contract\n" +
 		"\n" +
 		"All HTTP responses through `AGENT_PUBLIC_URL` are signed automatically " +
