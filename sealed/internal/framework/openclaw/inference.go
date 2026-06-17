@@ -64,6 +64,15 @@ func splitProviderModel(combined string) (provider, model string) {
 	return combined, ""
 }
 
+// isZGComputeRouted reports whether the given provider triggers 0g-compute
+// routing (provider name "0g-compute" triggers applyZGComputeAugmentation
+// which rewrites openclaw.json to route through 0G's OpenAI-compatible
+// endpoint). spawn.go uses this to populate RuntimeSnapshot.ZGComputeRouted
+// for the agent's runtime context.
+func isZGComputeRouted(provider string) bool {
+	return provider == "0g-compute"
+}
+
 // applyZGComputeAugmentation rewrites openclaw.json in place to add the
 // models.providers entry openclaw needs to route to 0G's OpenAI-compatible
 // endpoint. No-op for any provider other than "0g-compute".

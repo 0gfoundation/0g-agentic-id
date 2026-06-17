@@ -44,6 +44,11 @@ import (
 
 const bootstrapTimeout = 10 * time.Minute
 
+// sealedVersion is the git short hash injected at build time via
+// -ldflags "-X main.sealedVersion=$(git rev-parse --short HEAD)".
+// Empty if the binary was built without ldflags (e.g. go run / IDE).
+var sealedVersion = ""
+
 // sealSignSockPath is the unix domain socket path where the agent-only
 // signing endpoint listens. Mounted at /run (tmpfs in containers, no risk
 // of stale state across restarts). Hardcoded — operators don't need to
@@ -470,10 +475,20 @@ func startAgent(
 	})
 	if err := mgr.Start(context.Background(), manager.StartParams{
 		Runtime: framework.RuntimeContext{
-			APIKey:       apiKey,
-			PublicURL:    publicURL,
-			SealSignSock: sealSignSockPath,
-			AgentSeal:    agentSealAddr,
+			APIKey:        apiKey,
+			PublicURL:     publicURL,
+			SealSignSock:  sealSignSockPath,
+			AgentSeal:     agentSealAddr,
+
+			// Chain bootstrap context (public on-chain data, not secrets).
+			AgentID:      res.agentID.String(),
+			Owner:        res.owner,
+			ChainRPC:     cfg.ChainRPC,
+			ContractAddr: cfg.ContractAddr,
+			AttestorURL:  cfg.AttestorURL,
+
+			// Sealed runtime metadata.
+			SealedVersion: sealedVersion,
 		},
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
