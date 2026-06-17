@@ -16,6 +16,17 @@ var openclawHome = "/root/.openclaw"
 func openclawJSONPath() string { return openclawHome + "/openclaw.json" }
 func workspaceDir() string     { return openclawHome + "/workspace" }
 
+// ServicesFilePath is where the agent declares its currently-published HTTP
+// services for the deploy console to surface. Deliberately outside
+// workspace/ so it isn't chain-tracked — see TOOLS.md "Publishing services
+// for discovery": this is runtime state, not durable capability, and
+// chain-anchoring it would force gas + drift round-trips on every
+// register/unregister.
+//
+// Exposed so the heartbeat path in cmd/sealed can read it without
+// depending on the adapter's private layout.
+func ServicesFilePath() string { return openclawHome + "/services.json" }
+
 // Workspace markdown files sealed reads / writes:
 //
 //	SOUL.md      persona dim (owner) + sealed-managed sovereignty section

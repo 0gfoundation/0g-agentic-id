@@ -1,7 +1,9 @@
 target/
 Cargo.lock.bak
+# All env files (dev / testnet / local secrets) except the committed template.
 .env
-.env.local
+.env.*
+!.env.example
 *.log
 
 # IDE

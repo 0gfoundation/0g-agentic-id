@@ -112,13 +112,24 @@ func Load() (*Bootstrap, error) {
 // The :8080 port suffix is hardcoded — that's the bootstrap proxy.Server's
 // port, the only externally-bound listen socket and the only one carrying
 // X-Agent-Proof.
+//
+// Scheme inference mirrors attestor/shared/agent_card::build_agent_url:
+// a bare host (e.g. "art.0g.ai") yields https://…, while a host:port
+// form (e.g. "47.236.111.154.nip.io:4000", dev/IP) stays http://…. The
+// rule keeps AGENT_PUBLIC_URL canonical for TLS-fronted production
+// domains so the agent doesn't hand users URLs that only "work" via an
+// HTTP→HTTPS redirect.
 func composePublicURL() string {
 	domain := os.Getenv("SANDBOX_PROXY_DOMAIN")
 	id := os.Getenv("DAYTONA_SANDBOX_ID")
 	if domain == "" || id == "" {
 		return ""
 	}
-	return "http://8080-" + id + "." + domain
+	scheme := "https"
+	if strings.Contains(domain, ":") {
+		scheme = "http"
+	}
+	return scheme + "://8080-" + id + "." + domain
 }
 
 // verifyAttestation runs the two-part Phase 0 check:

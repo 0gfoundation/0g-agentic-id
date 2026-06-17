@@ -101,7 +101,7 @@ func main() {
 	// unix:///run/seal-sign.sock → agent-only sign endpoint. Starts even
 	//   before provision completes; handlers return 503 until agent_seal_priv
 	//   is loaded into state.Agent.
-	sealedProxy := proxy.New(agent, openclawAdapter, cfg.PublicURL)
+	sealedProxy := proxy.New(agent, openclawAdapter, cfg.PublicURL, openclaw.ServicesFilePath())
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
 	if cfg.APIKey != "" {
@@ -617,9 +617,16 @@ func handleDrift(
 		}
 	}
 
-	applyCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	if err := upload.Apply(applyCtx, plaintexts); err != nil {
+	// No top-level Apply timeout — dataplane.Upload enforces a per-blob
+	// 90s deadline so a hung CLI invocation is still bounded, but Apply
+	// itself runs as long as needed. Capping Apply at 2 min used to kill
+	// the last entry whenever a manifest had many blobs (10s/entry × 11
+	// entries hit the budget mid-way), and a failed Apply means no
+	// chain.Update, which means the next tick re-uploads everything from
+	// zero — a death loop of "10 OKs + 1 kill" with no progress to chain.
+	// Inheriting ctx (watchCtx) here is effectively unbounded, gated only
+	// by the per-blob timeout downstream.
+	if err := upload.Apply(ctx, plaintexts); err != nil {
 		sev := severityOf(err)
 		summary := summarizeError(err)
 		logger.Logf("drift: upload.Apply: %v (severity=%s)", err, sev)

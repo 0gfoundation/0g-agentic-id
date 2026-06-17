@@ -2,6 +2,11 @@
 //
 // Canonical message: "StatusReport:<seal_id_0x>:<status>:<error_detail>"
 // hashed with raw keccak256 (NOT EIP-191), V=27/28. Signed by agent_seal_priv.
+//
+// Services declarations are NOT shipped here — /hello carries them
+// instead (proxy.handleHello reads ~/.openclaw/services.json on each call
+// and embeds the array in the signed envelope). Service struct +
+// LoadServices live in services.go so the /hello path can reuse them.
 package report
 
 import (
@@ -18,8 +23,8 @@ import (
 	"seal-verify/internal/logger"
 )
 
-// Status posts a status report (running / error) for a sealId. Failures are
-// logged; this is a best-effort notification.
+// Status posts a status report (running / error / warning / starting / stopping)
+// for a sealId. Failures are logged; this is a best-effort notification.
 func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetail string) {
 	msg := fmt.Sprintf("StatusReport:0x%s:%s:%s", sealID, status, errorDetail)
 	hash := crypto.Keccak256([]byte(msg))

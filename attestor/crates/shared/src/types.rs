@@ -327,10 +327,13 @@ pub struct SandboxCreateResponse {
 // subset of 0g-sandbox's `daytona.Sandbox` JSON — only fields attestor
 // reads today are surfaced; non-strict field set keeps us resilient.
 //
-// `state` values observed on the wire: "started", "stopped",
-// "stopping", "archived", "error", "starting". `/probe` and the
-// staleness sweep both classify any state != "started" as
-// container-not-running.
+// `state` values observed on the wire: "started", "starting", "stopped",
+// "stopping", "archived", "archiving", "error" (provider-defined; the set
+// may grow). `/probe` and the staleness sweep classify by CATEGORY, not by
+// enumerating exact values: started/starting = up; "error" = broken (Failed);
+// 404 = gone (Failed); everything else = preserved-but-not-running (Stopped,
+// resumable). Defaulting unknowns to Stopped avoids wrongly Failing/reaping a
+// live sandbox when a new transitional state (e.g. "archiving") appears.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SandboxInfo {
     pub id: String,

@@ -80,6 +80,12 @@ CREATE INDEX IF NOT EXISTS idx_deployments_last_heartbeat
     WHERE last_heartbeat IS NOT NULL
       AND phase = 'running';
 
+-- Agent-declared services moved off the heartbeat onto /hello (signed
+-- envelope, fresh per call). Drop the column on the next startup —
+-- attestor no longer reads or writes it, and a stale UPDATE from a
+-- mid-version rollback would just write into nothing anyway.
+ALTER TABLE deployments DROP COLUMN IF EXISTS services;
+
 -- idempotency does NOT FK to deployments — /deploy reserves idempotency
 -- before inserting the deployment row, so a FK would fail. The idempotency
 -- record is a hint; loss-of-sync with deployments is recoverable.

@@ -262,6 +262,10 @@ pub struct ConfigurableSandbox {
     pub start_fails: AtomicBool,
     pub stop_fails: AtomicBool,
     pub admin_delete_fails: AtomicBool,
+    /// When set, create/start fail with this message instead of the generic
+    /// "configured to fail" — lets tests inject a specific error such as the
+    /// sandbox's 402 "insufficient balance" body.
+    pub fail_msg: Mutex<Option<String>>,
     pub create_calls: AtomicU64,
     pub start_calls: AtomicU64,
     pub stop_calls: AtomicU64,
@@ -277,6 +281,7 @@ impl ConfigurableSandbox {
             start_fails: AtomicBool::new(false),
             stop_fails: AtomicBool::new(false),
             admin_delete_fails: AtomicBool::new(false),
+            fail_msg: Mutex::new(None),
             create_calls: AtomicU64::new(0),
             start_calls: AtomicU64::new(0),
             stop_calls: AtomicU64::new(0),
@@ -293,6 +298,15 @@ impl ConfigurableSandbox {
     pub fn with_create_id(self, id: impl Into<String>) -> Self {
         *self.create_id.lock().unwrap() = id.into();
         self
+    }
+
+    /// The error create/start return when their fail flag is set — the
+    /// injected `fail_msg` if any, else the generic placeholder.
+    fn fail_error(&self) -> anyhow::Error {
+        match self.fail_msg.lock().unwrap().clone() {
+            Some(m) => anyhow::anyhow!(m),
+            None => anyhow::anyhow!("configured to fail"),
+        }
     }
 }
 
@@ -311,7 +325,7 @@ impl SandboxClient for ConfigurableSandbox {
     ) -> anyhow::Result<SandboxCreateResponse> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
         if self.create_fails.load(Ordering::SeqCst) {
-            anyhow::bail!("configured to fail");
+            return Err(self.fail_error());
         }
         Ok(SandboxCreateResponse {
             id: self.create_id.lock().unwrap().clone(),
@@ -327,7 +341,7 @@ impl SandboxClient for ConfigurableSandbox {
     ) -> anyhow::Result<()> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
         if self.start_fails.load(Ordering::SeqCst) {
-            anyhow::bail!("configured to fail");
+            return Err(self.fail_error());
         }
         Ok(())
     }
@@ -865,6 +879,31 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             affected.push(d.seal_id);
         }
         Ok(affected)
+    }
+
+    async fn stale_running_candidates(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        threshold_secs: i64,
+    ) -> anyhow::Result<Vec<(SealId, Option<String>)>> {
+        let cutoff = now - chrono::Duration::seconds(threshold_secs);
+        let stale: Vec<SealId> = {
+            let hb = self.heartbeats.lock().unwrap();
+            hb.iter()
+                .filter(|(_, t)| **t < cutoff)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let g = self.by_seal.lock().unwrap();
+        let mut out = Vec::new();
+        for seal_id in stale {
+            if let Some(d) = g.get(&seal_id) {
+                if d.phase == crate::types::DeploymentPhase::Running {
+                    out.push((seal_id, d.sandbox_id.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn mark_heartbeat(

@@ -138,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
         let retention = cfg.job_retention_seconds;
         let deployments = ctx.deployments.clone();
         let events = ctx.events.clone();
+        let sandbox = ctx.sandbox.clone();
+        let sandbox_proxy_addr = cfg.sandbox_proxy_addr.clone();
+        let agent_serve_port = cfg.agent_serve_port;
         tokio::spawn(async move {
             // 15 minutes = 3 missed 5-min heartbeats. Sandbox-side
             // terminations (balance exhaustion, manual kill, hardware
@@ -179,31 +182,117 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // (c) Heartbeat staleness.
-                let stales = match deployments
-                    .flip_stale_heartbeats(
-                        now,
-                        HEARTBEAT_STALENESS_SECS,
-                        "heartbeat timeout (15min)".to_string(),
-                    )
+                // (c) Heartbeat staleness — reconcile against the sandbox
+                // instead of blindly flipping Failed. For each stale runner
+                // we check the sandbox's real state and act accordingly,
+                // reaping (admin_delete) confirmed-dead sandboxes so they
+                // don't linger as orphans, while preserving stopped ones for
+                // the owner to Resume.
+                let candidates = match deployments
+                    .stale_running_candidates(now, HEARTBEAT_STALENESS_SECS)
                     .await
                 {
                     Ok(v) => v,
                     Err(e) => {
-                        tracing::warn!(error = %e, "heartbeat staleness sweep failed");
+                        tracing::warn!(error = %e, "stale-candidate query failed");
                         continue;
                     }
                 };
-                for seal_id in stales {
-                    tracing::info!(?seal_id, "heartbeat staleness: container_stage flipped Failed");
-                    if let Err(e) = events
-                        .publish(attestor_shared::WsEvent::ContainerFailed {
-                            seal_id,
-                            reason: "heartbeat timeout (15min)".to_string(),
-                        })
-                        .await
-                    {
-                        tracing::warn!(?seal_id, error = %e, "publish ContainerFailed failed");
+
+                // What to do with a stale runner after inspecting its sandbox.
+                enum Act {
+                    Skip,               // actually alive (healthz ok) — leave it
+                    Stop(String),       // sandbox preserved → Stopped (resumable)
+                    Fail(String, bool), // → Failed; bool = reap (admin_delete)
+                }
+
+                for (seal_id, sandbox_id) in candidates {
+                    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+                        // No sandbox to reconcile against; leave for an operator.
+                        continue;
+                    };
+                    let info = match sandbox.get_sandbox(&sb).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Flapping sandbox RPC — don't mutate; retry next tick.
+                            tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed (skip)");
+                            continue;
+                        }
+                    };
+                    let act = match info {
+                        // Gone already — flip Failed, nothing to reap.
+                        None => Act::Fail("container missing (sandbox deleted)".to_string(), false),
+                        Some(ref i) => match i.state.as_str() {
+                            // Sandbox up but heartbeat stale: confirm with a
+                            // /healthz probe before declaring the agent dead,
+                            // so we don't reap a healthy-but-isolated agent.
+                            "started" | "starting" => {
+                                let url = attestor_shared::agent_card::build_healthz_url(
+                                    &sandbox_proxy_addr,
+                                    &sb,
+                                    agent_serve_port,
+                                );
+                                if attestor_shared::agent_card::agent_is_healthy(&url).await {
+                                    Act::Skip
+                                } else {
+                                    Act::Fail(
+                                        "agent unreachable (heartbeat stale + /healthz down)"
+                                            .to_string(),
+                                        true,
+                                    )
+                                }
+                            }
+                            // Sandbox runtime explicitly reports broken → reap.
+                            "error" => Act::Fail("sandbox error".to_string(), true),
+                            // Anything else — stopped / stopping / archived /
+                            // archiving / any future transitional state — is
+                            // "not running but preserved" → resumable. Flip
+                            // Stopped, NEVER reap. Safe default: an unrecognized
+                            // state must not delete a still-live sandbox (we
+                            // already mis-Failed "archiving" once by enumerating).
+                            other => Act::Stop(format!("sandbox {other}")),
+                        },
+                    };
+
+                    match act {
+                        Act::Skip => {
+                            tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but /healthz ok — leaving alone");
+                        }
+                        Act::Stop(reason) => {
+                            if let Err(e) = deployments
+                                .set_container_stage(
+                                    seal_id,
+                                    attestor_shared::StageStatus::Stopped { at: now, reason: reason.clone() },
+                                )
+                                .await
+                            {
+                                tracing::warn!(?seal_id, error = %e, "sweep: set Stopped failed");
+                            }
+                            let _ = events
+                                .publish(attestor_shared::WsEvent::ContainerStopped { seal_id, reason })
+                                .await;
+                            tracing::info!(?seal_id, sandbox_id = %sb, "sweep: sandbox stopped → c=Stopped");
+                        }
+                        Act::Fail(reason, reap) => {
+                            if reap {
+                                if let Err(e) = sandbox.admin_delete(&sb).await {
+                                    tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: admin_delete failed (non-fatal)");
+                                }
+                            }
+                            if let Err(e) = deployments
+                                .set_container_stage(
+                                    seal_id,
+                                    attestor_shared::StageStatus::Failed { at: now, reason: reason.clone() },
+                                )
+                                .await
+                            {
+                                tracing::warn!(?seal_id, error = %e, "sweep: set Failed failed");
+                            }
+                            let _ = events
+                                .publish(attestor_shared::WsEvent::ContainerFailed { seal_id, reason })
+                                .await;
+                            tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, "sweep: → c=Failed");
+                        }
                     }
                 }
             }
