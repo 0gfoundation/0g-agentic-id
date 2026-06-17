@@ -376,12 +376,23 @@ contract AgenticIDReputationRegistry is
     ///      State-mutating despite the "verify" name — this is the single entrypoint
     ///      that guarantees each ServeProof can be redeemed at most once.
     function _verifyServeProof(ServeProof calldata proof) internal {
-        address agentSeal = IAgenticID(
-            _getReputationStorage().identityRegistry
-        ).getAgentSeal(proof.agentId);
+        address identityRegistry = _getReputationStorage().identityRegistry;
+        address agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
         if (agentSeal == address(0)) revert ReputationNoAgentSeal();
 
+        // Domain separation: bind the signed payload to (tag, chainId, identity
+        // registry) so a ServeProof minted for one (chain, contract) cannot be
+        // replayed against another deployment that happens to share the same
+        // agentSeal. Without this, a seal reused across chains/contracts — or an
+        // agentId collision across deployments — would let a single real service
+        // call be redeemed as reputation everywhere the seal is bound; the seal's
+        // signing capability alone does not encode where it may speak, this hash
+        // does. NOTE: the off-chain sealed signer MUST mirror this exact preimage
+        // (prepend tag ‖ chainId ‖ identityRegistry) or every proof fails to verify.
         bytes32 proofHash = keccak256(abi.encode(
+            _SERVEPROOF_TAG,
+            block.chainid,
+            identityRegistry,
             proof.agentId,
             proof.client,
             proof.timestamp,

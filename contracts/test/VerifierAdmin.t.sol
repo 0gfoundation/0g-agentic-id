@@ -28,7 +28,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
     // ── setTeeOracleAddress: rotation ─────────────────────────────────────────
 
     function test_setTeeOracleAddress_rotatesActiveOracle() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         // Rotate to a new oracle key.
         (address newOracleAddr, uint256 newOraclePk) = makeAddrAndKey("new-oracle");
@@ -79,7 +79,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
     // ── pause / unpause ───────────────────────────────────────────────────────
 
     function test_pause_blocksVerifyTransferValidity() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         vm.prank(pauser);
         verifier.pause();
@@ -102,7 +102,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
     }
 
     function test_unpause_restoresVerifyTransferValidity() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         vm.startPrank(pauser);
         verifier.pause();

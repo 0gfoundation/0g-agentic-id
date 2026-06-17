@@ -35,6 +35,9 @@ contract Deploy is Script {
         string    nftName;
         string    nftSymbol;
         uint256   maxProofAge;
+        // Fixed canonical ERC-8004 registry to custody-bind to.
+        // 0G Galileo testnet: 0x8004a818bfb912233c491871b3d84c89a494bd9e
+        address   canonical;
     }
 
     struct Deployed {
@@ -80,7 +83,7 @@ contract Deploy is Script {
             address(agenticIdBeacon),
             abi.encodeCall(
                 AgenticID.initialize,
-                (c.nftName, c.nftSymbol, address(verifierProxy), c.owner, c.pauser, c.maxProofAge)
+                (c.nftName, c.nftSymbol, address(verifierProxy), c.owner, c.pauser, c.maxProofAge, c.canonical)
             )
         );
         d.agenticIdImpl = address(agenticIdImpl);
@@ -114,6 +117,8 @@ contract Deploy is Script {
         c.nftName       = vm.envOr("NFT_NAME", string("AgenticID"));
         c.nftSymbol     = vm.envOr("NFT_SYMBOL", string("AID"));
         c.maxProofAge   = vm.envOr("MAX_PROOF_AGE", uint256(86400));
+        // Defaults to the live canonical ERC-8004 registry on 0G Galileo testnet.
+        c.canonical     = vm.envOr("CANONICAL_8004", address(0x8004A818BFB912233c491871b3d84c89A494BD9e));
 
         address[] memory defaultProposers = new address[](1);
         defaultProposers[0] = c.owner;
@@ -131,6 +136,7 @@ contract Deploy is Script {
         console2.log("teeOracle:     ", c.teeOracle);
         console2.log("timelockDelay: ", c.timelockDelay);
         console2.log("maxProofAge:   ", c.maxProofAge);
+        console2.log("canonical8004: ", c.canonical);
     }
 
     function _printDeployed(Deployed memory d) internal pure {

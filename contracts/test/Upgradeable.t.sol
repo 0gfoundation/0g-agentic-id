@@ -8,6 +8,7 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 
 import {AgenticID, AgenticIDNotPauser} from "../src/AgenticID.sol";
+import {CanonicalIdentityRegistryMock} from "./mocks/CanonicalIdentityRegistryMock.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -52,6 +53,9 @@ contract UpgradeableTest is Test {
         );
         verifier = TEEDataVerifier(address(verifierProxy));
 
+        CanonicalIdentityRegistryMock canonical = new CanonicalIdentityRegistryMock();
+        canonical.initialize();
+
         // AgenticID behind beacon (owned by timelock).
         AgenticID agenticIdImpl = new AgenticID();
         beacon = new UpgradeableBeacon(address(agenticIdImpl), address(timelock));
@@ -59,7 +63,7 @@ contract UpgradeableTest is Test {
             address(beacon),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(verifier), owner, pauser, MAX_PROOF_AGE)
+                ("AgenticID", "AID", address(verifier), owner, pauser, MAX_PROOF_AGE, address(canonical))
             )
         );
         agenticId = AgenticID(address(agenticIdProxy));

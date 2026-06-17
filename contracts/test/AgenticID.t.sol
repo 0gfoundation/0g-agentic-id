@@ -28,7 +28,7 @@ contract AgenticIDTest is AgenticIDTestBase {
         vm.prank(alice);
         uint256 agentId = agenticId.register("ipfs://foo", metadata, datas, sealedKeys);
 
-        assertEq(agentId, 1, "first agentId should be 1");
+        assertEq(agentId, 0, "first agentId is canonical id 0");
         assertEq(agenticId.ownerOf(agentId), alice, "owner should be minter");
         assertEq(agenticId.tokenURI(agentId), "ipfs://foo", "URI should match");
         assertEq(agenticId.getAgentSeal(agentId), address(0), "self-mint has no seal");
@@ -154,8 +154,9 @@ contract AgenticIDTest is AgenticIDTestBase {
         SealedKeyEntry[] memory expectedEntries = new SealedKeyEntry[](1);
         expectedEntries[0] = SealedKeyEntry({dataHash: datas[0].dataHash, sealedKey: sealedKeys[0]});
 
+        // Canonical registry numbers agentIds from 0, so the first mint is id 0.
         vm.expectEmit(true, true, true, true);
-        emit IERC7857.ITransferred(address(0), alice, 1, expectedEntries);
+        emit IERC7857.ITransferred(address(0), alice, 0, expectedEntries);
 
         vm.prank(alice);
         agenticId.register("", metadata, datas, sealedKeys);
@@ -176,7 +177,7 @@ contract AgenticIDTest is AgenticIDTestBase {
         expectedEntries[0] = SealedKeyEntry({dataHash: datas[0].dataHash, sealedKey: sealedKeys[0]});
 
         vm.expectEmit(true, true, true, true);
-        emit IERC7857.ITransferred(address(0), alice, 1, expectedEntries);
+        emit IERC7857.ITransferred(address(0), alice, 0, expectedEntries);
 
         vm.prank(attestor);
         agenticId.registerWithSeal(alice, "", metadata, datas, sealedKeys, address(0xAA), SEAL_ID);

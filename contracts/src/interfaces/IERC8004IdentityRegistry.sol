@@ -56,16 +56,17 @@ interface IERC8004IdentityRegistry is IERC721 {
     // ── Agent wallet ──────────────────────────────────────────────────────────
 
     /// @notice Set the wallet that receives service payments for this agent.
-    /// @dev Requires an EIP-712 signature from `newWallet` proving consent.
-    ///      Signed type: SetAgentWallet(uint256 agentId,address wallet,uint256 deadline,bytes32 nonce).
-    ///      Replay protection: both `deadline` and `nonce` are recorded via
-    ///      NonceRegistry — the same (agentId, wallet, nonce) signature can be
-    ///      used at most once.
+    /// @dev Forwarded to the canonical ERC-8004 registry, which enforces the
+    ///      official consent scheme: an EIP-712 signature from `newWallet` over
+    ///      AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)
+    ///      under domain "ERC8004IdentityRegistry"/"1", where `owner` is the
+    ///      canonical token holder (the AgenticID contract). The canonical
+    ///      contract caps `deadline` at `block.timestamp + 5 minutes`; replay is
+    ///      moot because the call idempotently overwrites the stored wallet.
     function setAgentWallet(
         uint256 agentId,
         address newWallet,
         uint256 deadline,
-        bytes32 nonce,
         bytes calldata signature
     ) external;
 

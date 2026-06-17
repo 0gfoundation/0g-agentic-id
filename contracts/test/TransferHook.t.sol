@@ -48,22 +48,13 @@ contract TransferHookTest is AgenticIDTestBase {
         );
     }
 
-    function _performTransfer(uint256 agentId, bytes32 dataHash) internal {
-        bytes memory buyerPubkey = _pubkey(buyerWallet);
-        uint256 deadline = block.timestamp + 1 hours;
-
-        AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
-        );
-        OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
-        );
-
-        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
-        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
-
+    /// @dev Seal-bound agents transfer ownership-only via standard transferFrom;
+    ///      the _update hook chain (clear agentWallet / authorizedUsers, retain
+    ///      seal) runs regardless of the entrypoint. dataHash arg kept for
+    ///      call-site compatibility.
+    function _performTransfer(uint256 agentId, bytes32 /*dataHash*/) internal {
         vm.prank(sellerWallet.addr);
-        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+        agenticId.transferFrom(sellerWallet.addr, buyerWallet.addr, agentId);
     }
 
     // ── agentWallet cleared on transfer ───────────────────────────────────────
@@ -72,12 +63,11 @@ contract TransferHookTest is AgenticIDTestBase {
         (uint256 agentId, bytes32 dataHash) = _mintWithSealAndMetadata(sellerWallet.addr);
 
         Vm.Wallet memory paymentWallet = vm.createWallet("payment");
-        uint256 deadline = block.timestamp + 1 hours;
-        bytes32 nonce = keccak256("wallet-nonce");
+        uint256 deadline = block.timestamp + 4 minutes;
 
-        bytes memory sig = _signSetAgentWallet(paymentWallet, agentId, deadline, nonce);
+        bytes memory sig = _signSetAgentWallet(paymentWallet, agentId, deadline);
         vm.prank(sellerWallet.addr);
-        agenticId.setAgentWallet(agentId, paymentWallet.addr, deadline, nonce, sig);
+        agenticId.setAgentWallet(agentId, paymentWallet.addr, deadline, sig);
         assertEq(agenticId.getAgentWallet(agentId), paymentWallet.addr, "wallet set pre-transfer");
 
         _performTransfer(agentId, dataHash);
