@@ -13,6 +13,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/platform"
 )
 
 // Start does the heavy lifting of bringing openclaw up, in two flavours:
@@ -97,22 +98,45 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, err
 	}
 
-	// Always upsert all three sealed-managed sections (idempotent).
-	// IDENTITY.md = who you are (agentSeal facts), SOUL.md = sovereignty
-	// + refusal rules, TOOLS.md = sign endpoint mechanics + public URL.
-	// See toolsmd.go top comment for the three-file split rationale.
-	caps := platformCaps{
-		publicURL: rt.PublicURL,
-		signSock:  rt.SealSignSock,
-		agentSeal: rt.AgentSeal,
+	// Build the single PlatformContext from RuntimeContext + config.
+	// This is the one place where all platform-injection content is
+	// assembled. The adapter's upsert functions only handle file I/O.
+	// See internal/platform/context.go for content generation.
+	fwVersion := probeOpenclawVersion(ctx)
+	rs := platform.RuntimeSnapshot{
+		SealedVersion:    rt.SealedVersion,
+		FrameworkVersion: fwVersion,
+		AgentSeal:        rt.AgentSeal,
+		AgentID:          rt.AgentID,
+		Owner:            rt.Owner,
+		ChainRPC:         rt.ChainRPC,
+		ContractAddr:     rt.ContractAddr,
+		AttestorURL:      rt.AttestorURL,
+		PublicURL:        rt.PublicURL,
+		SealSignSock:     rt.SealSignSock,
+		Provider:         provider,
+		Model:            model,
+		ZGComputeRouted:  isZGComputeRouted(provider),
+		BootTime:         time.Now(),
 	}
-	if err := upsertIdentityMD(identityMDPath(), rt.AgentSeal); err != nil {
+	rs.Whitelist = make([]platform.WhitelistEntry, len(supportedOpenclawVersions))
+	for i, v := range supportedOpenclawVersions {
+		rs.Whitelist[i] = platform.WhitelistEntry{Version: v}
+	}
+	rs.WhitelistMax = whitelistMax()
+
+	pc := platform.Build(rs)
+
+	// Deliver: adapter maps PlatformContext sections to framework files.
+	// IDENTITY.md ← pc.Identity, SOUL.md ← pc.Sovereignty,
+	// TOOLS.md ← pc.Capabilities + pc.Constraints + pc.Runtime.
+	if err := upsertIdentityMD(identityMDPath(), pc.Identity); err != nil {
 		logger.Logf("warn: upsert IDENTITY.md sealed section: %v", err)
 	}
-	if err := upsertSoulMD(soulMDPath(), rt.AgentSeal); err != nil {
+	if err := upsertSoulMD(soulMDPath(), pc.Sovereignty); err != nil {
 		logger.Logf("warn: upsert SOUL.md sealed section: %v", err)
 	}
-	if err := upsertToolsMD(toolsMDPath(), caps); err != nil {
+	if err := upsertToolsMD(toolsMDPath(), pc); err != nil {
 		logger.Logf("warn: upsert TOOLS.md sealed section: %v", err)
 	}
 	if rt.AgentSeal != "" || rt.PublicURL != "" || rt.SealSignSock != "" {

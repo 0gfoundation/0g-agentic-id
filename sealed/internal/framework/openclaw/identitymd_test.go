@@ -5,15 +5,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"seal-verify/internal/platform"
 )
 
 const testAgentSeal = "0x1234567890abcdef1234567890abcdef12345678"
+
+// testIdentitySection builds a platform identity section for tests,
+// mirroring what spawn.go does at runtime.
+func testIdentitySection(agentSeal string) string {
+	rs := platform.RuntimeSnapshot{AgentSeal: agentSeal}
+	return platform.Build(rs).Identity
+}
 
 // ── upsertIdentityMD ───────────────────────────────────────────────────────
 
 func TestUpsertIdentityMD_FreshFileSeedsHeader(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "IDENTITY.md")
-	if err := upsertIdentityMD(tmp, testAgentSeal); err != nil {
+	if err := upsertIdentityMD(tmp, testIdentitySection(testAgentSeal)); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -46,7 +55,7 @@ func TestUpsertIdentityMD_PreservesOwnerIdentityFields(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte(owner), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertIdentityMD(tmp, testAgentSeal); err != nil {
+	if err := upsertIdentityMD(tmp, testIdentitySection(testAgentSeal)); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -68,8 +77,9 @@ func TestUpsertIdentityMD_PreservesOwnerIdentityFields(t *testing.T) {
 
 func TestUpsertIdentityMD_Idempotent(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "IDENTITY.md")
+	section := testIdentitySection(testAgentSeal)
 	for i := 0; i < 3; i++ {
-		if err := upsertIdentityMD(tmp, testAgentSeal); err != nil {
+		if err := upsertIdentityMD(tmp, section); err != nil {
 			t.Fatalf("upsert iter %d: %v", i, err)
 		}
 	}
@@ -85,9 +95,9 @@ func TestUpsertIdentityMD_Idempotent(t *testing.T) {
 	}
 }
 
-func TestUpsertIdentityMD_EmptyAgentSealStripsSection(t *testing.T) {
+func TestUpsertIdentityMD_EmptySectionStripsSection(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "IDENTITY.md")
-	if err := upsertIdentityMD(tmp, testAgentSeal); err != nil {
+	if err := upsertIdentityMD(tmp, testIdentitySection(testAgentSeal)); err != nil {
 		t.Fatal(err)
 	}
 	if err := upsertIdentityMD(tmp, ""); err != nil {
@@ -107,10 +117,10 @@ func TestUpsertIdentityMD_EmptyAgentSealStripsSection(t *testing.T) {
 	}
 }
 
-// ── buildIdentityFile ──────────────────────────────────────────────────────
+// ── platform.Build identity ────────────────────────────────────────────────
 
-func TestBuildIdentityFile_ContainsRequiredTokens(t *testing.T) {
-	body := buildIdentityFile(testAgentSeal)
+func TestPlatformBuildIdentity_ContainsRequiredTokens(t *testing.T) {
+	body := testIdentitySection(testAgentSeal)
 	// Facts the LLM must see verbatim.
 	for _, want := range []string{
 		"agentSeal",
@@ -124,7 +134,7 @@ func TestBuildIdentityFile_ContainsRequiredTokens(t *testing.T) {
 		"sealed-injected",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("buildIdentityFile missing %q", want)
+			t.Errorf("platform identity missing %q", want)
 		}
 	}
 	// Parser safety: no openclaw structured-field labels in dash-prefixed
@@ -136,7 +146,7 @@ func TestBuildIdentityFile_ContainsRequiredTokens(t *testing.T) {
 	lower := strings.ToLower(body)
 	for _, d := range dangerous {
 		if strings.Contains(lower, d) {
-			t.Errorf("buildIdentityFile contains parser-trigger pattern %q", d)
+			t.Errorf("platform identity contains parser-trigger pattern %q", d)
 		}
 	}
 }

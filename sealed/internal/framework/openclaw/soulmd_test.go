@@ -5,13 +5,22 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"seal-verify/internal/platform"
 )
+
+// testSovereigntySection builds a platform sovereignty section for tests,
+// mirroring what spawn.go does at runtime.
+func testSovereigntySection(agentSeal string) string {
+	rs := platform.RuntimeSnapshot{AgentSeal: agentSeal}
+	return platform.Build(rs).Sovereignty
+}
 
 // ── upsertSoulMD ───────────────────────────────────────────────────────────
 
 func TestUpsertSoulMD_FreshFile(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "SOUL.md")
-	if err := upsertSoulMD(tmp, testAgentSeal); err != nil {
+	if err := upsertSoulMD(tmp, testSovereigntySection(testAgentSeal)); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -41,7 +50,7 @@ func TestUpsertSoulMD_PreservesOwnerPersona(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte(persona), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertSoulMD(tmp, testAgentSeal); err != nil {
+	if err := upsertSoulMD(tmp, testSovereigntySection(testAgentSeal)); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -64,8 +73,9 @@ func TestUpsertSoulMD_Idempotent(t *testing.T) {
 	if err := os.WriteFile(tmp, []byte(owner), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	section := testSovereigntySection(testAgentSeal)
 	for i := 0; i < 3; i++ {
-		if err := upsertSoulMD(tmp, testAgentSeal); err != nil {
+		if err := upsertSoulMD(tmp, section); err != nil {
 			t.Fatalf("upsert iter %d: %v", i, err)
 		}
 	}
@@ -78,13 +88,13 @@ func TestUpsertSoulMD_Idempotent(t *testing.T) {
 	}
 }
 
-func TestUpsertSoulMD_EmptyAgentSealStripsSection(t *testing.T) {
+func TestUpsertSoulMD_EmptySectionStripsSection(t *testing.T) {
 	tmp := filepath.Join(t.TempDir(), "SOUL.md")
 	owner := "You are Sage.\n"
 	if err := os.WriteFile(tmp, []byte(owner), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := upsertSoulMD(tmp, testAgentSeal); err != nil {
+	if err := upsertSoulMD(tmp, testSovereigntySection(testAgentSeal)); err != nil {
 		t.Fatal(err)
 	}
 	if err := upsertSoulMD(tmp, ""); err != nil {
@@ -102,10 +112,10 @@ func TestUpsertSoulMD_EmptyAgentSealStripsSection(t *testing.T) {
 	}
 }
 
-// ── buildSoulSovereignty ───────────────────────────────────────────────────
+// ── platform.Build sovereignty ─────────────────────────────────────────────
 
-func TestBuildSoulSovereignty_ContainsRequiredTokens(t *testing.T) {
-	body := buildSoulSovereignty(testAgentSeal)
+func TestPlatformBuildSovereignty_ContainsRequiredTokens(t *testing.T) {
+	body := testSovereigntySection(testAgentSeal)
 	// Constitutional tokens the LLM must see verbatim — these anchor
 	// the refusal rules and forgery detection.
 	for _, want := range []string{
@@ -132,7 +142,7 @@ func TestBuildSoulSovereignty_ContainsRequiredTokens(t *testing.T) {
 		"serve-proof",
 	} {
 		if !strings.Contains(body, want) {
-			t.Errorf("buildSoulSovereignty missing %q", want)
+			t.Errorf("platform sovereignty missing %q", want)
 		}
 	}
 }

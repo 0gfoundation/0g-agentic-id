@@ -175,11 +175,32 @@ var ErrUnsupportedDim = fmt.Errorf("framework: dim not supported by this adapter
 
 // RuntimeContext is the per-Start environment passed to adapters. Owners of
 // secrets (API keys etc.) populate it before calling Start.
+//
+// Phase 2 chain bootstrap outputs (AgentID, Owner, ChainRPC, etc.) are
+// included here so framework adapters can inject them into the agent's
+// workspace context (e.g. platform.RuntimeSnapshot). They are not secrets
+// — they are public on-chain data that the agent benefits from knowing.
 type RuntimeContext struct {
 	APIKey       string // inference provider API key from env (e.g. ANTHROPIC_API_KEY)
 	PublicURL    string // externally-reachable URL prefix for this sandbox; empty in local dev
 	SealSignSock string // unix socket path for agent-only sign endpoint (agentSeal identity)
 	AgentSeal    string // 0x-prefixed address derived from agent_seal_priv pubkey
+
+	// Chain bootstrap outputs (Phase 2). Populated by main.go from
+	// chainBootstrapResult. Empty/zero in local dev without a chain.
+	AgentID      string // on-chain AgenticID token ID (decimal string); empty if not minted
+	Owner        string // 0x-prefixed owner address from OwnerOf; empty if lookup failed
+	ChainRPC     string // RPC endpoint used for chain queries
+	ContractAddr string // AgenticID contract address
+	AttestorURL  string // attestor endpoint URL
+
+	// Inference routing (populated by spawn.go after resolving provider).
+	Provider        string // inference provider (e.g. "openai")
+	Model           string // inference model name (e.g. "glm-5.2")
+	ZGComputeRouted bool // whether 0g-compute augmentation was applied
+
+	// Sealed runtime metadata.
+	SealedVersion string // git short hash of sealed binary; empty if unavailable
 }
 
 // StartResult is what an adapter returns when its agent process is up and
