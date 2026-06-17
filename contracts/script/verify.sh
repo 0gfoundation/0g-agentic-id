@@ -148,7 +148,7 @@ verify_one() {
         --compiler-version "$COMPILER_VERSION" \
         --num-of-optimizations "$OPTIMIZER_RUNS" \
         --via-ir \
-        "${arg_flag[@]}" \
+        ${arg_flag[@]+"${arg_flag[@]}"} \
         2>&1 | grep -E "GUID|Response|Submitting|Error|error" | sed 's/^/       /' || true
     printf '\n'
 }

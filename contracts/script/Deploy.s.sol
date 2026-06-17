@@ -57,6 +57,13 @@ contract Deploy is Script {
         Config memory c = _readConfig();
         _printConfig(c);
 
+        // Fail fast if canonical points at the wrong contract (e.g. the testnet
+        // address used on mainnet, which resolves to a different v0.0.1 contract).
+        require(
+            keccak256(bytes(ICanonical8004(c.canonical).getVersion())) == keccak256(bytes("2.0.0")),
+            "canonical is not ERC-8004 IdentityRegistry v2.0.0 on this chain"
+        );
+
         vm.startBroadcast();
 
         // 1. Timelock — owner of every beacon.
@@ -117,8 +124,8 @@ contract Deploy is Script {
         c.nftName       = vm.envOr("NFT_NAME", string("AgenticID"));
         c.nftSymbol     = vm.envOr("NFT_SYMBOL", string("AID"));
         c.maxProofAge   = vm.envOr("MAX_PROOF_AGE", uint256(86400));
-        // Defaults to the live canonical ERC-8004 registry on 0G Galileo testnet.
-        c.canonical     = vm.envOr("CANONICAL_8004", address(0x8004A818BFB912233c491871b3d84c89A494BD9e));
+        // Canonical ERC-8004 registry, chosen by chainId (override via CANONICAL_8004).
+        c.canonical     = vm.envOr("CANONICAL_8004", _defaultCanonical(block.chainid));
 
         address[] memory defaultProposers = new address[](1);
         defaultProposers[0] = c.owner;
@@ -152,4 +159,20 @@ contract Deploy is Script {
         console2.log("ReputationRegistry beacon:  ", d.reputationBeacon);
         console2.log("ReputationRegistry proxy:   ", d.reputation);
     }
+
+    /// @dev Canonical ERC-8004 IdentityRegistry by chainId. ERC-8004 is deployed
+    ///      via CREATE2: all mainnets share one address, all testnets another.
+    function _defaultCanonical(uint256 chainId) internal pure returns (address) {
+        if (chainId == 16661 || chainId == 1) {
+            return 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432; // 0G / Ethereum mainnet
+        }
+        if (chainId == 16602 || chainId == 11155111) {
+            return 0x8004A818BFB912233c491871b3d84c89A494BD9e; // 0G Galileo / Ethereum Sepolia
+        }
+        revert("no known canonical ERC-8004 for this chainId; set CANONICAL_8004");
+    }
+}
+
+interface ICanonical8004 {
+    function getVersion() external view returns (string memory);
 }
