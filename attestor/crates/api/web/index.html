@@ -3538,20 +3538,24 @@ function paintDetail(dep) {
 
   const sandboxId = dep.sandbox_id || '';
   const cfg = State.config || {};
+  // Scheme inference shared by serveUrl + dashboard URL fallback paths:
+  // mirrors attestor/shared/agent_card::build_agent_url. A bare host
+  // (no port in sandbox_proxy_addr) is a real domain fronted by TLS →
+  // https; host:port is a dev/IP plain-HTTP proxy → http. Without this,
+  // a TLS-fronted agent whose on-chain agent_card.url isn't populated
+  // yet falls through to a hardcoded http://, and any signed request
+  // hits an HTTP→HTTPS redirect that mangles the envelope.
+  const proxyScheme = cfg.sandbox_proxy_addr && cfg.sandbox_proxy_addr.includes(':') ? 'http' : 'https';
   // Serve URL: prefer on-chain agent_card.url (canonical truth) when present;
   // fallback to client-side reconstruction from /config + sandbox_id.
   const serveUrl = card.url
     || (sandboxId && cfg.sandbox_proxy_addr
-        ? `http://${cfg.agent_serve_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_serve_path}`
+        ? `${proxyScheme}://${cfg.agent_serve_port}-${sandboxId}.${cfg.sandbox_proxy_addr}${cfg.agent_serve_path}`
         : '');
   // Base origin of the dashboard host (no path). Used both for the SIWE
   // call (`<base>/_seal/auth`) and for assembling the tokenized URL we
   // navigate to (`<base>` + `dashboard_url` from the auth response).
-  // Scheme mirrors the backend's build_agent_url: a bare host (no port) is a
-  // real domain fronted by TLS → https; a host:port is a dev/IP plain-HTTP
-  // proxy → http. Getting this right matters for the dashboard's POST
-  // /_seal/auth — an http→https redirect would mangle the signed request.
-  const dashboardScheme = cfg.sandbox_proxy_addr && cfg.sandbox_proxy_addr.includes(':') ? 'http' : 'https';
+  const dashboardScheme = proxyScheme;
   const dashboardBaseUrl = (sandboxId && cfg.sandbox_proxy_addr)
     ? `${dashboardScheme}://${cfg.agent_dashboard_port}-${sandboxId}.${cfg.sandbox_proxy_addr}`
     : '';
