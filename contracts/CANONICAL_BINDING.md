@@ -40,25 +40,32 @@ verifying).
 
 ## 2. Proof domain separation (security)
 
-The TEE-signed proofs were missing chain/contract binding, so a proof minted for
-one (chain, contract) could be replayed against another deployment sharing the
-same seal. All three signed preimages now bind `chainId` + the relevant contract.
-**The off-chain signers MUST mirror these exactly.**
+The TEE-signed transfer proofs were missing chain/contract binding, so a proof
+minted for one (chain, contract) could be replayed against another deployment.
+The **transfer** proofs now bind `chainId` + the calling token contract. The
+off-chain transfer signers MUST mirror these exactly.
 
-| Proof | Signer (off-chain) | New preimage (pre-EIP-191) |
+| Proof | Signer (off-chain) | Preimage (pre-EIP-191) |
 |---|---|---|
-| **ServeProof** | `sealed` runtime (agentSeal) | `keccak256(abi.encode(keccak256("SERVEPROOF"), chainId, identityRegistry, agentId, client, timestamp, deadline, taskHash, keccak256(dataHashes), frameworkHash))` then `toEthSignedMessageHash` (raw-32 EIP-191) |
 | **AccessProof** | buyer wallet | `keccak256(abi.encodePacked(chainId, erc7857, dataHash, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
 | **OwnershipProof** | oracle TEE | `keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
 
-`identityRegistry` = the AgenticID contract address; `erc7857` = the AgenticID
-contract address (the token contract calling the verifier).
+`erc7857` = the AgenticID contract address (the token contract calling the verifier).
 
-### Off-chain changes required
-- **`sealed` runtime** (Go): prepend `keccak256("SERVEPROOF") ‖ chainId ‖
-  identityRegistry` to the ServeProof / X-Agent-Proof envelope hash.
-- **Oracle TEE** (Go): prepend `chainId ‖ erc7857` to the OwnershipProof hash.
+**ServeProof is deliberately NOT envelope-domain-separated.** Cross-chain /
+cross-contract replay of a ServeProof is prevented at the **key layer** instead:
+agentSeal is (to be) derived per `(chainId, agenticID, sealId)`, so the same
+agentId on another chain/contract resolves to a *different* agentSeal and the
+recovered signer won't match. This keeps the off-chain agentSeal signer (in
+`sealed`) unchanged — its envelope needs no chainId/contract fields. The key-layer
+scoping is tracked in the KMS threshold-derivation issue (#7); until it lands,
+ServeProof has no cross-deployment protection, which is acceptable because the
+on-chain ServeProof flow (giveFeedback) and #7 are expected to ship together.
+
+### Off-chain changes required (transfer proofs only)
+- **Oracle TEE**: prepend `chainId ‖ erc7857` to the OwnershipProof hash.
 - **Buyer SDK**: prepend `chainId ‖ erc7857` to the AccessProof hash.
+- **`sealed` runtime**: no change — ServeProof envelope unchanged (see above).
 
 ## 3. agentSeal derivation (attestor — recommended, off-chain only)
 

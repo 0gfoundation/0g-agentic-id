@@ -8,7 +8,6 @@ import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Recei
 
 import {IERC8004IdentityRegistry, MetadataEntry} from "./interfaces/IERC8004IdentityRegistry.sol";
 import {ICanonicalIdentityRegistry} from "./interfaces/ICanonicalIdentityRegistry.sol";
-import {NonceRegistryUpgradeable} from "./utils/NonceRegistryUpgradeable.sol";
 
 /// @title ERC8004CanonicalBoundUpgradeable
 /// @notice ERC-8004 identity layer for AgenticID, implemented as a **custody
@@ -36,8 +35,7 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     IERC8004IdentityRegistry,
     IERC721Receiver,
     ERC721Upgradeable,
-    EIP712Upgradeable,
-    NonceRegistryUpgradeable
+    EIP712Upgradeable
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -70,12 +68,10 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     function __ERC8004CanonicalBound_init(
         string memory name_,
         string memory symbol_,
-        uint256 maxProofAge_,
         address canonical_
     ) internal onlyInitializing {
         __ERC721_init(name_, symbol_);
         __EIP712_init(name_, "1");
-        __NonceRegistry_init_unchained(maxProofAge_);
         __ERC8004CanonicalBound_init_unchained(canonical_);
     }
 

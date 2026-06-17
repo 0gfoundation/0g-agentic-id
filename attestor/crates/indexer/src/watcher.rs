@@ -40,6 +40,9 @@ type HttpProvider = RootProvider<Http<Client>>;
 pub struct Watcher {
     provider: HttpProvider,
     contract_addr: Address,
+    /// Canonical ERC-8004 registry the AgenticID contract is bound to. After
+    /// binding, Registered / URIUpdated are emitted here, not on contract_addr.
+    canonical_addr: Address,
     crypto: Arc<dyn CryptoModule>,
     deployments: Arc<dyn DeploymentRepo>,
     events: Arc<dyn EventBus>,
@@ -61,6 +64,7 @@ impl Watcher {
         Ok(Self {
             provider,
             contract_addr: cfg.agentic_id_addr,
+            canonical_addr: cfg.canonical_addr,
             crypto,
             deployments,
             events,
@@ -99,8 +103,12 @@ impl Watcher {
         }
         let to_block = std::cmp::min(from_block + BATCH_BLOCKS, horizon);
 
+        // Watch both the AgenticID contract (seal / transfer / iData events) and
+        // the canonical registry (Registered / URIUpdated, which moved there after
+        // binding). handle_log routes by emitting address so the shared canonical
+        // registry's events for OTHER projects' agents are ignored where relevant.
         let filter = Filter::new()
-            .address(self.contract_addr)
+            .address(vec![self.contract_addr, self.canonical_addr])
             .from_block(from_block)
             .to_block(to_block);
         let logs = self.provider.get_logs(&filter).await?;
@@ -123,8 +131,26 @@ impl Watcher {
 
     async fn handle_log(&self, log: &alloy::rpc::types::Log) -> anyhow::Result<()> {
         let block = log.block_number.unwrap_or(0);
+        let source = log.inner.address;
 
-        // Try each known event. First successful decode wins.
+        // Route by emitting contract. The canonical registry is a SHARED global
+        // registry — only consume its identity events (Registered / URIUpdated),
+        // and never its Transfer / MetadataSet, which would otherwise pull in
+        // other projects' agents (e.g. canonical's custody-mint Transfer to this
+        // wrapper, or unrelated agents' transfers). The per-agent "is this ours"
+        // gate still runs inside the handlers via deployments lookups.
+        if source == self.canonical_addr {
+            if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
+                return self.on_registered(ev.data, block).await;
+            }
+            if let Ok(ev) = AgenticID::URIUpdated::decode_log(&log.inner, true) {
+                return self.on_uri_updated(ev.data, block).await;
+            }
+            tracing::trace!(?log, "skipped canonical log (not an identity event we track)");
+            return Ok(());
+        }
+
+        // AgenticID-native events. First successful decode wins.
         if let Ok(ev) = AgenticID::AgentSealSet::decode_log(&log.inner, true) {
             return self.on_agent_seal_set(ev.data, block).await;
         }
@@ -139,12 +165,6 @@ impl Watcher {
         }
         if let Ok(ev) = AgenticID::Updated::decode_log(&log.inner, true) {
             return self.on_updated(ev.data, block).await;
-        }
-        if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
-            return self.on_registered(ev.data, block).await;
-        }
-        if let Ok(ev) = AgenticID::URIUpdated::decode_log(&log.inner, true) {
-            return self.on_uri_updated(ev.data, block).await;
         }
         if let Ok(ev) = AgenticID::Cloned::decode_log(&log.inner, true) {
             tracing::warn!(

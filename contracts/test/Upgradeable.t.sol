@@ -63,7 +63,7 @@ contract UpgradeableTest is Test {
             address(beacon),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(verifier), owner, pauser, MAX_PROOF_AGE, address(canonical))
+                ("AgenticID", "AID", address(verifier), owner, pauser, address(canonical))
             )
         );
         agenticId = AgenticID(address(agenticIdProxy));

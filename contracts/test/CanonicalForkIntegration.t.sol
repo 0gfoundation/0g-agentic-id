@@ -51,7 +51,7 @@ contract CanonicalForkIntegrationTest is Test {
             address(impl),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(vProxy), deployer, deployer, 1 days, CANONICAL_8004)
+                ("AgenticID", "AID", address(vProxy), deployer, deployer, CANONICAL_8004)
             )
         );
         agenticId = AgenticID(address(proxy));

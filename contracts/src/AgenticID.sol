@@ -146,10 +146,9 @@ contract AgenticID is
         address verifier_,
         address owner_,
         address pauser_,
-        uint256 maxProofAge_,
         address canonical_
     ) external initializer {
-        __ERC8004CanonicalBound_init(name_, symbol_, maxProofAge_, canonical_);
+        __ERC8004CanonicalBound_init(name_, symbol_, canonical_);
         __ERC7857_init_unchained(verifier_);
         __Ownable_init(owner_);
         _getAgenticIDStorage().pauser = pauser_;
@@ -573,18 +572,10 @@ contract AgenticID is
         _setVerifier(newVerifier);
     }
 
-    /// @notice Update the max age after which consumed nonce records can be GC'd.
-    /// @dev Vestigial: setAgentWallet now forwards to the canonical registry and
-    ///      consumes no local nonce. Retained for storage-layout / admin-surface
-    ///      stability; safe to remove in a future clean-up.
-    function setMaxProofAge(uint256 maxProofAge_) external onlyOwner {
-        _setNonceMaxAge(maxProofAge_);
-    }
-
-    /// @notice Permissionless cleanup of consumed nonce records (see setMaxProofAge note).
-    function cleanExpiredNonces(bytes32[] calldata keys) external {
-        _cleanExpiredNonces(keys);
-    }
+    // NonceRegistry was dropped from this contract: setAgentWallet forwards to the
+    // canonical registry (which uses a 5-minute deadline, no nonce), so AgenticID
+    // no longer consumes any local nonce. The transfer verifier and reputation
+    // registry keep their own NonceRegistry independently.
 
     // ── _update — diamond disambiguation ──────────────────────────────────────
     // agentSeal / sealId are NOT cleared on transfer: seals are one-time bindings

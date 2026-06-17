@@ -76,13 +76,8 @@ contract ReputationTest is AgenticIDTestBase {
         uint256 deadline,
         uint256 signerPk
     ) internal view returns (ServeProof memory) {
-        // Mirror the contract's domain-separated preimage:
-        // tag ‖ chainId ‖ identityRegistry ‖ <fields>.
         bytes32 inner = keccak256(
             abi.encode(
-                keccak256("SERVEPROOF"),
-                block.chainid,
-                address(agenticId),
                 agentId,
                 client_,
                 block.timestamp,

@@ -7,6 +7,11 @@ pub struct Config {
     pub chain_rpc: String,
     pub chain_id: u64,
     pub agentic_id_addr: Address,
+    /// Fixed canonical ERC-8004 registry the AgenticID contract is bound to.
+    /// The identity events Registered / URIUpdated are emitted here (not on
+    /// agentic_id_addr) after the canonical binding, so the indexer must also
+    /// watch this address. On 0G Galileo: 0x8004a818bfb912233c491871b3d84c89a494bd9e.
+    pub canonical_addr: Address,
     pub tapp_registry_addr: Address,
 
     pub storage_indexer: String,
@@ -163,6 +168,7 @@ impl Config {
             chain_rpc: env("ATTESTOR_CHAIN_RPC")?,
             chain_id: env("ATTESTOR_CHAIN_ID")?.parse()?,
             agentic_id_addr: env("ATTESTOR_AGENTIC_ID_ADDR")?.parse()?,
+            canonical_addr: env("ATTESTOR_CANONICAL_8004_ADDR")?.parse()?,
             tapp_registry_addr: env("ATTESTOR_TAPP_REGISTRY_ADDR")?.parse()?,
 
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,

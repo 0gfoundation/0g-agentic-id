@@ -83,7 +83,7 @@ contract Deploy is Script {
             address(agenticIdBeacon),
             abi.encodeCall(
                 AgenticID.initialize,
-                (c.nftName, c.nftSymbol, address(verifierProxy), c.owner, c.pauser, c.maxProofAge, c.canonical)
+                (c.nftName, c.nftSymbol, address(verifierProxy), c.owner, c.pauser, c.canonical)
             )
         );
         d.agenticIdImpl = address(agenticIdImpl);

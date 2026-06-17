@@ -100,16 +100,4 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
         );
         agenticId.setVerifier(address(0xDEAD));
     }
-
-    // ── setMaxProofAge ────────────────────────────────────────────────────────
-
-    function test_setMaxProofAge_revertsWhenNotOwner() public {
-        vm.prank(stranger);
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                OwnableUpgradeable.OwnableUnauthorizedAccount.selector, stranger
-            )
-        );
-        agenticId.setMaxProofAge(2 days);
-    }
 }

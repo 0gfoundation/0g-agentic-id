@@ -34,7 +34,7 @@ contract DeployAndMint is Script {
             address(impl),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(vProxy), me, me, 1 days, CANONICAL_8004)
+                ("AgenticID", "AID", address(vProxy), me, me, CANONICAL_8004)
             )
         );
         AgenticID agenticId = AgenticID(address(proxy));
