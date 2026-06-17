@@ -114,6 +114,14 @@ func NewDataKey() ([]byte, error) {
 // Logged by /root/go/pkg/mod/github.com/0gfoundation/0g-storage-client/cmd/upload.go.
 var rootLineRegexp = regexp.MustCompile(`root\s*=\s*(0x[0-9a-fA-F]{64})`)
 
+// perUploadTimeout bounds a single `0g-storage-client upload` invocation.
+// 90s is generous for testnet conditions (typical successful uploads
+// land in ~10s) while still tight enough to surface a genuinely hung
+// CLI. The cap lives here — not on the surrounding Apply — so the cost
+// of one slow blob doesn't eat the budget of the other entries in the
+// same manifest.
+const perUploadTimeout = 90 * time.Second
+
 // Upload pushes ciphertext to 0g-storage and returns the storage root
 // hash. The root is what gets recorded as IntelligentData.dataHash on
 // chain. signerPrivHex is the hex-encoded (with or without 0x prefix)
@@ -132,6 +140,14 @@ func Upload(
 	signerPrivHex string,
 ) ([32]byte, error) {
 	signerPrivHex = strings.TrimPrefix(signerPrivHex, "0x")
+
+	// Per-blob deadline. Inherits the caller's ctx so an Apply-level
+	// cancel still propagates, but caps this single subprocess at
+	// perUploadTimeout so a stuck CLI is bounded even when the parent
+	// context is effectively unbounded (uploader.Apply runs without a
+	// top-level timeout since sealed/main.go's drift loop).
+	uploadCtx, cancel := context.WithTimeout(ctx, perUploadTimeout)
+	defer cancel()
 
 	tmp, err := os.CreateTemp("", "0g-upload-*.bin")
 	if err != nil {
@@ -153,7 +169,7 @@ func Upload(
 	//   --fast-mode            small-file fast path (CLI default true)
 	//   --full-trusted         use trusted nodes (CLI default true)
 	//   --method random        avoid shard.Select empty-method bug
-	cmd := exec.CommandContext(ctx, "0g-storage-client", "upload",
+	cmd := exec.CommandContext(uploadCtx, "0g-storage-client", "upload",
 		"--file", tmpPath,
 		"--indexer", indexerURL,
 		"--url", rpcURL,
