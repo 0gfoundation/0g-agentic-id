@@ -116,23 +116,59 @@ assertion.
 > mediated fork with a fresh dataKey; KMS threshold derivation) remain tracked in
 > issues #3/#4/#5/#6/#7.
 
-## 5. Testnet deployment (0G Galileo, chain 16602)
+## 5. Deployments (0G Galileo testnet, chain 16602)
 
-Simplified UUPS topology (owner/pauser/oracle = deployer), bound to the live
-canonical `0x8004…`. The production `Deploy.s.sol` (Timelock + beacons) is the
-real governance setup; remember `--priority-gas-price 2000000000`.
+> Deployment log — append new entries, do not overwrite. The authoritative
+> reference table in `DEPLOYMENT.md` §5 still lists the **old self-implemented**
+> AgenticID (`0xf952…`), which predates the canonical binding and is unrelated to
+> the contracts in this doc.
+
+### 5.1 Standard deployment — 2026-06-17 (current)
+
+**Why:** the canonical-binding contracts in this PR (custody binding to the
+official ERC-8004 + seal-bound transfer/clone split + NonceRegistry-removal size
+fix) are new bytecode. Neither the old self-implemented `0xf952…` nor the earlier
+simplified trial in §5.2 runs this logic, so a fresh deploy was required. This one
+uses the **production `Deploy.s.sol`** topology (TimelockController + UpgradeableBeacon
+per contract), deployed with `--priority-gas-price 2000000000`.
 
 | Contract | Address |
 |---|---|
-| Canonical ERC-8004 (live) | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
-| AgenticID (proxy) | `0x375316a8f05206fBFC1E76Ad8D7C6647F7bAc409` |
-| TEEDataVerifier (proxy) | `0xcD2D0Cfa6f6DC559B5BAdc0E47DcC66A3DD3ae1D` |
-| Deployer / owner | `0xB831371eb2703305f1d9F8542163633D0675CEd7` |
+| **AgenticID proxy** | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` |
+| AgenticID impl | `0x1E2AD04C5c9BbE2e5Dd3c257ac6fd82985461C54` |
+| AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` |
+| **ReputationRegistry proxy** | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` |
+| ReputationRegistry impl | `0xf053cF2996a2cfb24b26D0F57977512fF8378E01` |
+| ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` |
+| **TEEDataVerifier proxy** | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` |
+| TEEDataVerifier impl | `0xD5F7602a4a690846cF7D6315d14BCd7535388EE0` |
+| TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` |
+| TimelockController (beacon owner) | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` |
+| Canonical ERC-8004 (bound target) | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
+| owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` |
 
-First self-mint took global `agentId = 10`: local `ownerOf` = deployer,
-canonical `ownerOf` = the AgenticID contract (custody), `tokenURI` =
-`ipfs://first-real-agent` readable on the canonical registry, `agentWallet`
-cleared. Repro: `script/DeployAndMint.s.sol`.
+Wiring verified on-chain: `AgenticID.canonical()` = canonical `0x8004…`,
+`Reputation.getIdentityRegistry()` = AgenticID proxy, `beacon.owner()` = Timelock.
+All impls / beacons / proxies source-verified on chainscan-galileo.
+
+**Governance config is TESTNET-ONLY:** owner = pauser = oracle = deployer EOA,
+`timelockDelay = 0`, open executor. For mainnet: real multisig owner/proposers,
+non-zero delay, real TEE oracle address.
+
+**Post-deploy config required (fresh contract = empty allowlists):** mint and
+provision fail until the owner seeds the allowlists —
+`addTrustedAttestor(<attestor>)` (else `AgenticIDNotTrustedAttestor`) and
+`addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in validFrameworkHashes`).
+
+### 5.2 Earlier simplified trial — superseded
+
+A quick UUPS-only deploy (no Timelock/beacon) used to validate the binding
+end-to-end before the standard deploy. **Superseded by 5.1; do not use.**
+
+- AgenticID (UUPS proxy): `0x375316a8f05206fBFC1E76Ad8D7C6647F7bAc409`
+- TEEDataVerifier (proxy): `0xcD2D0Cfa6f6DC559B5BAdc0E47DcC66A3DD3ae1D`
+- Note: predates the seal-bound split + NonceRegistry-removal; first self-mint
+  took global `agentId = 10` (`script/DeployAndMint.s.sol`).
 
 ## 6. Notes / follow-ups
 
