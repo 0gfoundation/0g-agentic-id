@@ -381,6 +381,13 @@ contract AgenticIDReputationRegistry is
         ).getAgentSeal(proof.agentId);
         if (agentSeal == address(0)) revert ReputationNoAgentSeal();
 
+        // No (chainId, contract) domain separation in the envelope on purpose:
+        // cross-chain / cross-contract replay of a ServeProof is prevented at the
+        // KEY layer — agentSeal is derived per (chainId, agenticID, sealId), so the
+        // same agentId on another chain/contract has a different agentSeal and the
+        // recovered signer won't match. Keeping the envelope minimal means the
+        // off-chain agentSeal signer needs no extra fields. (Seal derivation
+        // scoping is tracked separately; see the KMS threshold-derivation issue.)
         bytes32 proofHash = keccak256(abi.encode(
             proof.agentId,
             proof.client,

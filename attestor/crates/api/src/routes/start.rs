@@ -91,6 +91,7 @@ mod tests {
             chain_rpc: "http://localhost:0".into(),
             chain_id: 1,
             agentic_id_addr: Address::ZERO,
+            canonical_addr: Address::ZERO,
             tapp_registry_addr: Address::ZERO,
             storage_indexer: "indexer".into(),
             sandbox_endpoint: "http://localhost:0".into(),

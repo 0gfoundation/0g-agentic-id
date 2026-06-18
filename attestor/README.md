@@ -127,6 +127,7 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID contract address |
+| `ATTESTOR_CANONICAL_8004_ADDR` | Canonical ERC-8004 IdentityRegistry (optional; auto-derived from chainId — mainnet `0x8004A169…`, testnet `0x8004A818…`) |
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry contract address |
 | `ATTESTOR_PRIORITY_FEE_GWEI` / `ATTESTOR_MAX_FEE_GWEI` | EIP-1559 gas bounds (0G testnet requires `priority` ≥ 2) |
 

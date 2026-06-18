@@ -7,6 +7,7 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
+import {CanonicalIdentityRegistryMock} from "./mocks/CanonicalIdentityRegistryMock.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -23,6 +24,7 @@ import {
 ///      pre-whitelist revert path cleanly.
 abstract contract AgenticIDTestBase is Test {
     AgenticID internal agenticId;
+    CanonicalIdentityRegistryMock internal canonical;
     TEEDataVerifier internal verifier;
 
     address internal owner = address(0xA11CE);
@@ -47,12 +49,17 @@ abstract contract AgenticIDTestBase is Test {
         );
         verifier = TEEDataVerifier(address(verifierProxy));
 
+        // Stand-in for the fixed canonical ERC-8004 registry (0x8004… on 0G).
+        // Deployed standalone; agentIds start at 0, matching the live contract.
+        canonical = new CanonicalIdentityRegistryMock();
+        canonical.initialize();
+
         AgenticID agenticIdImpl = new AgenticID();
         ERC1967Proxy agenticIdProxy = new ERC1967Proxy(
             address(agenticIdImpl),
             abi.encodeCall(
                 AgenticID.initialize,
-                ("AgenticID", "AID", address(verifier), owner, pauser, MAX_PROOF_AGE)
+                ("AgenticID", "AID", address(verifier), owner, pauser, address(canonical))
             )
         );
         agenticId = AgenticID(address(agenticIdProxy));
@@ -101,8 +108,11 @@ abstract contract AgenticIDTestBase is Test {
         bytes memory nonce,
         uint256 deadline,
         uint256 signerPk
-    ) internal pure returns (AccessProof memory) {
-        bytes32 inner = keccak256(abi.encodePacked(dataHash, targetPubkey, nonce, deadline));
+    ) internal view returns (AccessProof memory) {
+        // Mirror the verifier's domain-separated preimage: chainId ‖ erc7857 ‖ <fields>.
+        bytes32 inner = keccak256(abi.encodePacked(
+            block.chainid, address(agenticId), dataHash, targetPubkey, nonce, deadline
+        ));
         return AccessProof({
             dataHash: dataHash,
             targetPubkey: targetPubkey,
@@ -131,9 +141,11 @@ abstract contract AgenticIDTestBase is Test {
         bytes memory nonce,
         uint256 deadline,
         uint256 signerPk
-    ) internal pure returns (OwnershipProof memory) {
-        bytes32 inner =
-            keccak256(abi.encodePacked(dataHash, sealedKey, targetPubkey, nonce, deadline));
+    ) internal view returns (OwnershipProof memory) {
+        // Mirror the verifier's domain-separated preimage: chainId ‖ erc7857 ‖ <fields>.
+        bytes32 inner = keccak256(abi.encodePacked(
+            block.chainid, address(agenticId), dataHash, sealedKey, targetPubkey, nonce, deadline
+        ));
         return OwnershipProof({
             oracleType: OracleType.TEE,
             dataHash: dataHash,
@@ -209,18 +221,56 @@ abstract contract AgenticIDTestBase is Test {
         agentId = agenticId.register("", metadata, datas, sealedKeys);
     }
 
+    /// @dev Self-mint (no seal) with a salt so the same owner can hold several,
+    ///      each with a distinct dataHash. Used by the proof-gated transfer/clone
+    ///      tests, which only apply to non-seal agents after the seal-bound split.
+    function _selfMintData(address who, uint256 salt)
+        internal
+        returns (uint256 agentId, bytes32 dataHash)
+    {
+        dataHash = keccak256(abi.encode("self-data", who, salt));
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: dataHash});
+        bytes[] memory sealedKeys = new bytes[](1);
+        sealedKeys[0] = SEALED_KEY_ORIGINAL;
+        MetadataEntry[] memory metadata = new MetadataEntry[](0);
+
+        vm.prank(who);
+        agentId = agenticId.register("", metadata, datas, sealedKeys);
+    }
+
+    /// @dev Self-mint (no seal) with N IntelligentData entries.
+    function _selfMintNDatas(address who, uint256 n)
+        internal
+        returns (uint256 agentId, bytes32[] memory dataHashes)
+    {
+        dataHashes = new bytes32[](n);
+        IntelligentData[] memory datas = new IntelligentData[](n);
+        bytes[] memory sealedKeys = new bytes[](n);
+        for (uint256 i = 0; i < n; i++) {
+            dataHashes[i] = keccak256(abi.encode("self-multi", who, i));
+            datas[i] = IntelligentData({dataDescription: "d", dataHash: dataHashes[i]});
+            sealedKeys[i] = abi.encodePacked(hex"cafe", bytes32(i));
+        }
+        MetadataEntry[] memory metadata = new MetadataEntry[](0);
+
+        vm.prank(who);
+        agentId = agenticId.register("", metadata, datas, sealedKeys);
+    }
+
     // ── setAgentWallet EIP-712 helper ─────────────────────────────────────────
 
-    /// @dev Builds an EIP-712 signature for setAgentWallet, pulling the domain
-    ///      from the contract so the helper stays in sync if name/version ever change.
+    /// @dev Builds the official ERC-8004 EIP-712 signature for setAgentWallet.
+    ///      The domain comes from the CANONICAL registry (where the signature is
+    ///      verified), and the struct uses the official 4-field form whose `owner`
+    ///      is the canonical token holder — i.e. the AgenticID contract.
     function _signSetAgentWallet(
         Vm.Wallet memory walletToSign,
         uint256 agentId,
-        uint256 deadline,
-        bytes32 nonce
+        uint256 deadline
     ) internal view returns (bytes memory) {
         (, string memory name_, string memory version_, uint256 chainId_, address verifyingContract_, , )
-            = agenticId.eip712Domain();
+            = canonical.eip712Domain();
 
         bytes32 domainSeparator = keccak256(
             abi.encode(
@@ -237,12 +287,12 @@ abstract contract AgenticIDTestBase is Test {
         bytes32 structHash = keccak256(
             abi.encode(
                 keccak256(
-                    "SetAgentWallet(uint256 agentId,address wallet,uint256 deadline,bytes32 nonce)"
+                    "AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)"
                 ),
                 agentId,
                 walletToSign.addr,
-                deadline,
-                nonce
+                address(agenticId),
+                deadline
             )
         );
 

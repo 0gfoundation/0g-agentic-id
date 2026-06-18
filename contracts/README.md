@@ -1,8 +1,8 @@
 # AgenticID Contracts
 
-The Solidity contract layer implements the **AgenticID protocol**. It combines
-the ERC-8004 identity/reputation registry with the ERC-7857 intelligent NFT to
-give AI agents running inside TEEs a verifiable on-chain identity, atomic
+The Solidity contract layer implements the **AgenticID protocol**. It custody-binds
+to the canonical ERC-8004 identity registry and layers on the ERC-7857 intelligent
+NFT to give AI agents running inside TEEs a verifiable on-chain identity, atomic
 delivery of the data key, and a sybil-resistant reputation system.
 
 ---
@@ -87,10 +87,11 @@ stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 
 ```
 contracts/
-├── AgenticID.sol                               main contract (identity + 7857 token)
-├── AgenticIDReputationRegistry.sol             reputation registry
-├── ERC7857Upgradeable.sol                      7857 core (iTransferFrom)
-├── ERC8004IdentityRegistryUpgradeable.sol      8004 identity (register/metadata/wallet)
+├── AgenticID.sol                               main contract (identity + 7857 token + seal)
+├── AgenticIDReputationRegistry.sol             reputation registry (ServeProof)
+├── ERC7857Upgradeable.sol                      7857 core (iTransferFrom + proof check)
+├── ERC8004CanonicalBoundUpgradeable.sol        ERC-8004 identity, custody-bound to the
+│                                               canonical registry (read-through / write-forward)
 ├── extensions/
 │   ├── ERC7857AuthorizeUpgradeable.sol         off-chain authorized-users list
 │   ├── ERC7857CloneableUpgradeable.sol         iCloneFrom
@@ -99,26 +100,42 @@ contracts/
 │   ├── BaseDataVerifier.sol                    transfer proof base (includes the pauser role)
 │   └── TEEDataVerifier.sol                     TEE-signed ownership proof implementation
 ├── utils/
-│   └── NonceRegistryUpgradeable.sol            unified nonce + deadline replay protection
+│   └── NonceRegistryUpgradeable.sol            replay protection (used by the verifier and
+│                                               the reputation registry)
 ├── proxy/
 │   ├── BeaconProxy.sol                         OZ re-export (so the compiler pulls it into artifacts)
 │   └── UpgradeableBeacon.sol                   OZ re-export
 └── interfaces/
-    └── I*.sol                                  all interface definitions
+    ├── ICanonicalIdentityRegistry.sol          the fixed canonical ERC-8004 registry AgenticID binds to
+    └── I*.sol                                  all other interface definitions
 ```
 
-`AgenticID` composes four paths via C3 linearization:
+### Canonical binding
+
+The ERC-8004 identity is **not** reimplemented here — it is a custody binding to
+the fixed canonical ERC-8004 IdentityRegistry (on 0G: mainnet `0x8004A169…`,
+testnet `0x8004A818…`; chosen by chainId in `Deploy.s.sol`). Registration mints
+the canonical token **to the AgenticID contract** (custody) and a local ERC-721
+token with the **same agentId** to the real owner. So one agent spans two
+records: the canonical registry (identity source of truth that ecosystem 8004
+tooling already reads; the canonical token never leaves custody) and the local
+AgenticID token (the transferable owner + the 7857 / seal extensions). agentIds
+come from the canonical registry's global, 0-based counter, shared across all
+registrants.
+
+`AgenticID` composes these paths via C3 linearization:
 
 ```
 AgenticID
-  ├── ERC8004IdentityRegistryUpgradeable         (agentURI / metadata / agentWallet)
+  ├── ERC8004CanonicalBoundUpgradeable           (agentURI / metadata / agentWallet, via canonical custody)
   ├── ERC7857IDataStorageUpgradeable             (IntelligentData[])
   ├── ERC7857AuthorizeUpgradeable                (authorizedUsers[])
   ├── ERC7857CloneableUpgradeable                (iCloneFrom)
   └── OwnableUpgradeable                          (owner / attestor management)
 ```
 
-They share a single ERC-721 token instance: one agent = one tokenId = one agentId.
+ERC-721 arrives via both the 8004 and 7857 paths; C3 collapses it to a single
+instance: one agent = one local tokenId = one canonical agentId.
 
 ---
 
@@ -165,14 +182,17 @@ AgenticID.registerWithSeal(
 )
 ```
 
-Precondition: `msg.sender` is in the `trustedAttestors` list (maintained by `onlyOwner`).
+Preconditions: `msg.sender` is in the `trustedAttestors` list (maintained by
+`onlyOwner`), and the sealed runtime's `image_hash` is in `validFrameworkHashes`
+(checked off-chain by the attestor before it provisions the seal). The call mints
+the canonical token to the AgenticID contract (custody) and the local token to `to`.
 
-**Events**:
-- `Registered(agentId, agentURI, to)` — ERC-8004 identity registration
-- `Transfer(0x0, to, agentId)` — ERC-721 mint
-- `MetadataSet × N`, `Updated(agentId, [], newDatas)`
-- `AgentSealSet(agentId, agentSeal_addr, sealId)`
-- `ITransferred(0x0, to, agentId, entries[])` — publishes the sealedKey payload
+**Events** — split across the two contracts:
+- on the **canonical registry**: `Registered(agentId, agentURI, owner=AgenticID)`,
+  `MetadataSet × N`, `URIUpdated` (identity record; `owner` is the custody contract)
+- on **AgenticID**: `Transfer(0x0, to, agentId)` (local mint),
+  `Updated(agentId, [], newDatas)`, `AgentSealSet(agentId, agentSeal_addr, sealId)`,
+  `ITransferred(0x0, to, agentId, entries[])` (publishes the sealedKey payload)
 
 **Agent TEE boots later**:
 - It produces an RA quote and hands it to the attestor.
@@ -192,14 +212,14 @@ In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot ac
 
 ### Key invariants
 
-| Field | Once set | After transfer |
+| Field | How it's set | After transfer |
 |---|---|---|
-| `agentSeal` | Immutable (`setAgentSeal` can only be called once) | Retained |
+| `agentSeal` | Immutable (`setAgentSeal` is one-shot) | Retained |
 | `sealId` | Immutable | Retained |
-| `agentWallet` | Can be reset (with EIP-712 signature) | **Cleared** |
-| `authorizedUsers` | Can add/remove | **Cleared** |
-| `agentURI` / `metadata` | Owner can change | Retained |
-| `IntelligentData[]` | **Seal bound** → only `agentSeal` can change (`update` / `updateAt`, requires EIP-191 signature); **Seal unbound** → owner can change | Retained |
+| `agentWallet` | Forwarded to the canonical registry's official 4-arg `setAgentWallet` (EIP-712 consent from `newWallet`, owner = AgenticID contract, deadline ≤ 5 min) | **Cleared** |
+| `authorizedUsers` | Owner can add/remove | **Cleared** |
+| `agentURI` / `metadata` | Owner (or trusted attestor for URI) writes via forward to canonical | Retained |
+| `IntelligentData[]` | **Seal bound** → only `agentSeal` may call `update` / `updateAt`; **seal unbound** → owner-only | Retained |
 
 ---
 
@@ -269,16 +289,28 @@ What the contract does:
 
 ## 6. Flow 3: transfer and clone
 
-### `iTransferFrom`: change ownership and atomically deliver dataKey
+Transfer behaviour splits on whether the agent has a seal (`getAgentSeal(tokenId) != 0`):
+
+- **Seal-bound agent** (operating entity): ownership moves with the standard
+  ERC-721 `transferFrom` / `safeTransferFrom` — a plain owner change. iData stays
+  TEE-locked under the immutable `agentSeal`, so nothing is re-encrypted; operation
+  rights follow ownership off-chain (the attestor re-provisions the new owner).
+  `iTransferFrom` and `iCloneFrom` **revert** for seal-bound tokens
+  (`AgenticIDSealedAgentUseTransfer` / `AgenticIDCannotCloneSealedAgent`).
+- **Non-seal agent** (data blob): plain transfers stay disabled; ownership moves
+  only through the proof-gated `iTransferFrom` below, which atomically re-encrypts
+  the dataKey to the buyer. `iCloneFrom` works.
+
+### `iTransferFrom` (non-seal): change ownership and atomically deliver dataKey
 
 **Off-chain preparation** (run once per IntelligentData):
 
 1. **Buyer signs AccessProof**
    ```
-   inner = keccak256(abi.encodePacked(dataHash, buyer_targetPubkey, nonce_ap, deadline_ap))
+   inner = keccak256(abi.encodePacked(chainId, erc7857, dataHash, buyer_targetPubkey, nonce_ap, deadline_ap))
    ap.proof = personal_sign(inner, buyer_priv)
    ```
-   `buyer_targetPubkey` has two modes: an empty string means use the buyer's Ethereum pubkey (64-byte uncompressed); a non-empty value is a caller-chosen encryption pubkey.
+   `buyer_targetPubkey` has two modes: an empty string means use the buyer's Ethereum pubkey (64-byte uncompressed); a non-empty value is a caller-chosen encryption pubkey. `chainId` and `erc7857` (the AgenticID token contract address) domain-separate both proofs so a signature can't be replayed on another chain or contract.
 
 2. **Agent TEE and Oracle TEE collaborate**
    - The seller hands the buyer-signed AccessProof to the seller's Agent TEE.
@@ -289,7 +321,7 @@ What the contract does:
    - The Oracle TEE ECIES-decrypts to recover `dataKey`, then re-seals it with `buyer_targetPubkey` to produce `sealedKey_new`.
    - The Oracle TEE signs OwnershipProof:
      ```
-     inner = keccak256(abi.encodePacked(dataHash, sealedKey_new,
+     inner = keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey_new,
                                         buyer_targetPubkey, nonce_op, deadline_op))
      op.proof = personal_sign(inner, teeOracleAddress_priv)
      ```
@@ -317,36 +349,51 @@ Contract logic (`ERC7857Upgradeable._proofCheck` and `BaseDataVerifier.verifyTra
 - **Read-only data**: decrypt `sealedKey_new` with the priv matching `buyer_targetPubkey` to recover `dataKey`, then download and decrypt IntelligentData for local use. No TEE or attestor is needed, but the buyer cannot sign ServeProof and reputation accrual stops.
 - **Take over operating the agent**: deploy your own Agent TEE and go through attestor RA to receive the same `agentSeal_priv` (set-once guarantees the address doesn't change). Inside the TEE the buyer now holds both `dataKey` and `agentSeal_priv`, continues serving clients, and signs new ServeProofs.
 
-### `iCloneFrom`: mint a clone token, source untouched
+### `iCloneFrom` (non-seal): mint a clone token, source untouched
 
 `ERC7857CloneableUpgradeable.iCloneFrom(from, to, tokenId, proofs[])`
 
+- Only for **non-seal** sources; reverts `AgenticIDCannotCloneSealedAgent` if the
+  source has a seal (a clone would re-seal the shared dataKey to the clone target,
+  leaking the source's data, and couldn't operate under its own seal — fork a
+  seal-bound agent through the attestor instead).
 - Proof validation **is identical to iTransferFrom** (same `_proofCheck`).
-- The source `tokenId` is untouched; `_incrementTokenId` mints `newTokenId` to `to`.
-- The new token inherits the same `IntelligentData[]`.
-- The new token **has no seal** (`getAgentSeal(newTokenId) == 0`). The attestor must call `setAgentSeal` separately before the new token can sign ServeProofs.
+- The source `tokenId` is untouched; `_incrementTokenId` registers a fresh
+  **canonical identity** (new global agentId, custodied) and mints `newTokenId` to `to`.
+- The new token inherits the same `IntelligentData[]` and **has no seal**
+  (`getAgentSeal(newTokenId) == 0`).
 - Emits `Cloned(tokenId, newTokenId, from, to, entries)`. Does not emit `ITransferred`.
 
 ---
 
-## 7. Replay protection: the unified NonceRegistry
+## 7. Replay protection: NonceRegistry
 
-All signed operations go through `contracts/utils/NonceRegistryUpgradeable.sol`:
+`contracts/utils/NonceRegistryUpgradeable.sol` is inherited by the **transfer
+verifier** and the **reputation registry** (each keeps its own store). AgenticID
+itself does not consume nonces — `setAgentWallet` is forwarded to the canonical
+registry, which uses a ≤ 5-minute deadline (no nonce).
 
-| Operation | nonce key derivation |
-|---|---|
-| transfer access proof | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
-| transfer ownership proof | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
-| ServeProof | `keccak256("SERVEPROOF", agentId, signature)` |
-| setAgentWallet | `keccak256("SET_AGENT_WALLET", agentId, newWallet, nonce)` |
+| Operation | consumed in | nonce key derivation |
+|---|---|---|
+| transfer access proof | verifier | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
+| transfer ownership proof | verifier | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
+| ServeProof | reputation registry | `keccak256("SERVEPROOF", agentId, signature)` |
 
-Each nonce consumption also checks `block.timestamp <= deadline`. Nonce records can be reclaimed via `cleanExpiredNonces(keys)`, as long as `maxProofAge` exceeds the longest business deadline window.
+Each nonce consumption also checks `block.timestamp <= deadline`. Records can be
+reclaimed via `cleanExpiredNonces(keys)`, as long as `maxProofAge` exceeds the
+longest business deadline window.
 
 ---
 
 ## 8. Key design points
 
+- **Canonical custody binding.** The identity record lives on the fixed canonical
+  ERC-8004 registry; AgenticID custodies its token (one global agentId, the canonical
+  record never leaves custody) and exposes the same identity through read-through /
+  write-forward. Ecosystem 8004 tooling reads the canonical registry and sees AgenticID
+  agents natively; the transferable owner lives on the local AgenticID token.
 - **agentSeal / sealId: set-once, permanently bound.** An agentId's seal is set once and is not cleared on transfer. When the hardware changes, the attestor provisions the same `agentSeal_priv` to the new Agent TEE.
+- **Transfer splits on seal.** Seal-bound agents transfer ownership-only via standard `transferFrom` (data stays TEE-locked); non-seal agents transfer via proof-gated `iTransferFrom` (re-encrypts dataKey to the buyer). `iCloneFrom` is non-seal-only.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
 - **dataKey flows only between TEEs**: the attestor generates and discards it; the Agent TEE holds it; the Oracle TEE holds it briefly during transfer and discards it. Only the ciphertext (sealedKey) appears on chain.
 - **Oracle encryption pubkey lives in TappRegistry**: it is published via 0g-Tapp's `TappRegistry` contract (an external dependency, already deployed) through its `getNode` / `getNodeList` views. It does not live in `TEEDataVerifier` storage, which keeps the verifier clean. The Agent TEE queries the registry directly during a transfer.

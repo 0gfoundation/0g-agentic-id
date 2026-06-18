@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
+import {AgenticIDCannotCloneSealedAgent} from "../src/AgenticID.sol";
 import {IERC7857} from "../src/interfaces/IERC7857.sol";
 import {IERC7857Cloneable} from "../src/interfaces/IERC7857Cloneable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
@@ -55,7 +56,7 @@ contract CloneTest is AgenticIDTestBase {
     // ── Happy path ────────────────────────────────────────────────────────────
 
     function test_iCloneFrom_succeeds() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-1");
 
         vm.prank(sellerWallet.addr);
@@ -68,24 +69,38 @@ contract CloneTest is AgenticIDTestBase {
 
     // ── Source fully preserved ────────────────────────────────────────────────
 
-    function test_iCloneFrom_sourceSealAndDataUnchanged() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+    function test_iCloneFrom_sourceDataUnchanged() public {
+        // Clone is only allowed for non-seal sources (seal-bound clone reverts —
+        // see test_iCloneFrom_sealBoundSource_reverts). Source data is preserved.
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-src");
 
         vm.prank(sellerWallet.addr);
         agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
 
-        assertEq(agenticId.getAgentSeal(srcId), SEAL_ADDR, "source seal preserved");
-        assertEq(agenticId.getSealId(srcId), SEAL_ID, "source sealId preserved");
+        assertEq(agenticId.getAgentSeal(srcId), address(0), "non-seal source still seal-less");
         IntelligentData[] memory srcDatas = agenticId.intelligentDatasOf(srcId);
         assertEq(srcDatas.length, 1, "source data length unchanged");
         assertEq(srcDatas[0].dataHash, dataHash, "source dataHash unchanged");
     }
 
+    // ── Seal-bound source cannot be cloned ────────────────────────────────────
+
+    function test_iCloneFrom_sealBoundSource_reverts() public {
+        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-sb");
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgenticIDCannotCloneSealedAgent.selector, srcId)
+        );
+        agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
+    }
+
     // ── Clone inherits IntelligentData ────────────────────────────────────────
 
     function test_iCloneFrom_newTokenInheritsData() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-data");
 
         vm.prank(sellerWallet.addr);
@@ -99,7 +114,7 @@ contract CloneTest is AgenticIDTestBase {
     // ── Clone has no seal — must be set separately to sign ServeProofs ────────
 
     function test_iCloneFrom_newTokenHasNoSeal() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-seal");
 
         vm.prank(sellerWallet.addr);
@@ -112,7 +127,7 @@ contract CloneTest is AgenticIDTestBase {
     // ── Event: emits Cloned, not ITransferred ─────────────────────────────────
 
     function test_iCloneFrom_emitsCloned() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-evt");
 
         vm.recordLogs();
@@ -142,7 +157,7 @@ contract CloneTest is AgenticIDTestBase {
     // ── Bad proof rejected same as iTransferFrom ──────────────────────────────
 
     function test_iCloneFrom_revertsOnDataHashMismatch() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
@@ -170,24 +185,27 @@ contract CloneTest is AgenticIDTestBase {
     // invariant is critical but otherwise invisible from the rest of the suite.
 
     function test_tokenIdCounter_sharedBetweenRegisterAndClone() public {
-        (uint256 id1, bytes32 dh1) = _mintWithSeal(sellerWallet.addr);
-        assertEq(id1, 1, "first register mints tokenId 1");
+        // agentIds come from the canonical registry's global counter, which
+        // starts at 0 in this test deployment. What matters is that register
+        // and iCloneFrom share one counter so ids stay sequential and distinct.
+        (uint256 id1, bytes32 dh1) = _selfMintData(sellerWallet.addr, 0);
+        assertEq(id1, 0, "first register mints canonical id 0");
 
         TransferValidityProof[] memory proofs = _buildCloneProofs(dh1, "counter");
         vm.prank(sellerWallet.addr);
         uint256 id2 = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, id1, proofs);
-        assertEq(id2, 2, "clone must take next sequential tokenId");
+        assertEq(id2, 1, "clone must take next sequential tokenId");
 
         // A fresh register after the clone should NOT collide with id2.
-        (uint256 id3, ) = _mintWithSealSalt(sellerWallet.addr, 42);
-        assertEq(id3, 3, "register after clone continues counter");
+        (uint256 id3, ) = _selfMintData(sellerWallet.addr, 42);
+        assertEq(id3, 2, "register after clone continues counter");
         assertTrue(id3 != id2, "no tokenId collision");
     }
 
     // ── Source must be owned by `from` ────────────────────────────────────────
 
     function test_iCloneFrom_revertsWhenFromDoesNotOwnSource() public {
-        (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
         TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-bad-from");
 
         address stranger = address(0xDEADBEEF);

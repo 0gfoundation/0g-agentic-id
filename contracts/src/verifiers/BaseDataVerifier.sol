@@ -136,18 +136,27 @@ abstract contract BaseDataVerifier is
 
     // ── Access proof ──────────────────────────────────────────────────────────
 
-    /// @dev Signed message: keccak256(abi.encodePacked(dataHash, targetPubkey, nonce, deadline)).
-    function _verifyAccessProof(AccessProof calldata ap) internal pure returns (address accessAssistant) {
-        bytes32 inner = keccak256(abi.encodePacked(ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline));
+    /// @dev Signed message:
+    ///      keccak256(abi.encodePacked(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
+    ///      `chainId` and `erc7857` (the ERC-7857 token contract this transfer is
+    ///      for) domain-separate the proof so a buyer's AccessProof cannot be
+    ///      replayed against the same dataHash on another chain or another token
+    ///      contract. NOTE: the off-chain buyer signer MUST prepend these two.
+    function _verifyAccessProof(AccessProof calldata ap, address erc7857)
+        internal view returns (address accessAssistant)
+    {
+        bytes32 inner = keccak256(abi.encodePacked(
+            block.chainid, erc7857, ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline
+        ));
         accessAssistant = _eip191Hash(inner).recover(ap.proof);
         if (accessAssistant == address(0)) revert DataVerifierInvalidAccessProof();
     }
 
     // ── Ownership proof (oracle-specific) ─────────────────────────────────────
 
-    /// @dev Subclasses verify the oracle-specific ownership proof.
-    ///      Must revert with an appropriate error on failure.
-    function _verifyOwnershipProof(OwnershipProof calldata op) internal virtual;
+    /// @dev Subclasses verify the oracle-specific ownership proof for the given
+    ///      ERC-7857 token contract. Must revert on failure.
+    function _verifyOwnershipProof(OwnershipProof calldata op, address erc7857) internal virtual;
 
     // ── IERC7857DataVerifier ──────────────────────────────────────────────────
 
@@ -156,14 +165,18 @@ abstract contract BaseDataVerifier is
     ) external virtual override whenNotPaused nonReentrant returns (TransferValidityProofOutput[] memory outputs) {
         outputs = new TransferValidityProofOutput[](proofs.length);
 
+        // The ERC-7857 token contract calling this verifier; proofs are bound to
+        // it (plus chainId) so they cannot be replayed against another contract.
+        address erc7857 = msg.sender;
+
         for (uint256 i = 0; i < proofs.length; i++) {
             AccessProof    calldata ap = proofs[i].accessProof;
             OwnershipProof calldata op = proofs[i].ownershipProof;
 
             if (ap.dataHash != op.dataHash) revert DataVerifierDataHashMismatch();
 
-            address accessAssistant = _verifyAccessProof(ap);
-            _verifyOwnershipProof(op); // reverts on failure
+            address accessAssistant = _verifyAccessProof(ap, erc7857);
+            _verifyOwnershipProof(op, erc7857); // reverts on failure
 
             _checkAndMarkNonce(_accessNonceKey(ap.nonce),    ap.deadline);
             _checkAndMarkNonce(_ownershipNonceKey(op.nonce), op.deadline);

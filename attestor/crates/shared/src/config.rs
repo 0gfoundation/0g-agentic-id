@@ -7,6 +7,11 @@ pub struct Config {
     pub chain_rpc: String,
     pub chain_id: u64,
     pub agentic_id_addr: Address,
+    /// Fixed canonical ERC-8004 registry the AgenticID contract is bound to.
+    /// The identity events Registered / URIUpdated are emitted here (not on
+    /// agentic_id_addr) after the canonical binding, so the indexer must also
+    /// watch this address. On 0G Galileo: 0x8004a818bfb912233c491871b3d84c89a494bd9e.
+    pub canonical_addr: Address,
     pub tapp_registry_addr: Address,
 
     pub storage_indexer: String,
@@ -159,10 +164,20 @@ impl Config {
 
     pub fn from_env() -> anyhow::Result<Self> {
         let _ = dotenvy::dotenv();
+        let chain_id: u64 = env("ATTESTOR_CHAIN_ID")?.parse()?;
         Ok(Self {
             chain_rpc: env("ATTESTOR_CHAIN_RPC")?,
-            chain_id: env("ATTESTOR_CHAIN_ID")?.parse()?,
+            chain_id,
             agentic_id_addr: env("ATTESTOR_AGENTIC_ID_ADDR")?.parse()?,
+            // Canonical ERC-8004 registry. Derived from chainId (all mainnets
+            // share one CREATE2 address, all testnets another), with an optional
+            // explicit override for local/anvil or new chains. The wrong address
+            // can deploy a *different* contract on the other network type, so we
+            // never silently default to a single hardcoded value.
+            canonical_addr: match env_opt("ATTESTOR_CANONICAL_8004_ADDR") {
+                Some(s) => s.parse()?,
+                None => default_canonical_8004(chain_id)?,
+            },
             tapp_registry_addr: env("ATTESTOR_TAPP_REGISTRY_ADDR")?.parse()?,
 
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,
@@ -240,6 +255,22 @@ impl Config {
                 .unwrap_or_else(|| "/dashboard".to_string()),
         })
     }
+}
+
+/// Canonical ERC-8004 IdentityRegistry address, keyed by chainId. ERC-8004 is
+/// deployed via CREATE2, so all mainnets share one vanity address and all
+/// testnets another. The testnet address also exists on 0G mainnet but resolves
+/// to a DIFFERENT contract (v0.0.1), so binding to the wrong one fails silently
+/// — selection MUST be by chainId, never a single hardcoded default.
+fn default_canonical_8004(chain_id: u64) -> anyhow::Result<Address> {
+    let addr = match chain_id {
+        16661 | 1 => "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432", // 0G / Ethereum mainnet
+        16602 | 11155111 => "0x8004A818BFB912233c491871b3d84c89A494BD9e", // 0G Galileo / Ethereum Sepolia
+        other => anyhow::bail!(
+            "no known canonical ERC-8004 address for chainId {other}; set ATTESTOR_CANONICAL_8004_ADDR explicitly"
+        ),
+    };
+    Ok(addr.parse()?)
 }
 
 fn env(key: &str) -> anyhow::Result<String> {

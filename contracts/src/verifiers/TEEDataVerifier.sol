@@ -75,12 +75,18 @@ contract TEEDataVerifier is BaseDataVerifier {
 
     // ── Ownership proof ───────────────────────────────────────────────────────
 
-    /// @dev Signed message: keccak256(abi.encodePacked(dataHash, sealedKey, targetPubkey, nonce, deadline)).
-    ///      Uses the same EIP-191 hex-encoded format as the access proof.
-    function _verifyOwnershipProof(OwnershipProof calldata op) internal override {
+    /// @dev Signed message:
+    ///      keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline)).
+    ///      Uses the same EIP-191 hex-encoded format as the access proof. `chainId`
+    ///      and `erc7857` domain-separate the oracle's OwnershipProof against
+    ///      cross-chain / cross-contract replay. NOTE: the off-chain oracle signer
+    ///      MUST prepend these two.
+    function _verifyOwnershipProof(OwnershipProof calldata op, address erc7857) internal override {
         if (op.oracleType != OracleType.TEE) revert TEEDataVerifierWrongOracleType();
 
-        bytes32 inner = keccak256(abi.encodePacked(op.dataHash, op.sealedKey, op.targetPubkey, op.nonce, op.deadline));
+        bytes32 inner = keccak256(abi.encodePacked(
+            block.chainid, erc7857, op.dataHash, op.sealedKey, op.targetPubkey, op.nonce, op.deadline
+        ));
         address signer = _eip191Hash(inner).recover(op.proof);
 
         if (signer != _getTEEDataVerifierStorage().teeOracleAddress)

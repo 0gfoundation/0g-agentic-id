@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
+import {AgenticIDSealedAgentUseTransfer} from "../src/AgenticID.sol";
 import {
     TEEDataVerifierInvalidSignature,
     TEEDataVerifierWrongOracleType
@@ -32,7 +33,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Ethereum-mode happy path ──────────────────────────────────────────────
 
     function test_iTransferFrom_ethMode_succeeds() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         assertEq(
@@ -59,8 +60,8 @@ contract TransferFlowTest is AgenticIDTestBase {
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
 
         assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "ownership moved");
-        assertEq(agenticId.getAgentSeal(agentId), SEAL_ADDR, "seal preserved across transfer");
-        assertEq(agenticId.getSealId(agentId), SEAL_ID, "sealId preserved across transfer");
+        // Non-seal agent: the proof-gated path is for seal-less data agents.
+        assertEq(agenticId.getAgentSeal(agentId), address(0), "non-seal agent has no seal");
         // sealedKeys are re-wrapped to the new owner and persisted to storage.
         // V2 invariant: post-transfer `sealedKeysOf` returns the NEW wraps,
         // not whatever the prior owner saw. Without this assertion, a regression
@@ -79,7 +80,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ERC-721 Transfer to pick up sealedKey payloads.
 
     function test_iTransferFrom_emitsITransferredEvent() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
@@ -106,7 +107,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── dataHash mismatch rejection ───────────────────────────────────────────
 
     function test_iTransferFrom_revertsOnDataHashMismatch() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
@@ -133,7 +134,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Delegate-signed AccessProof ───────────────────────────────────────────
 
     function test_iTransferFrom_ethMode_signedByDelegate_succeeds() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         Vm.Wallet memory delegateWallet = vm.createWallet("delegate");
         vm.prank(buyerWallet.addr);
@@ -164,7 +165,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     }
 
     function test_iTransferFrom_revertsWhenSignedByUnregisteredDelegate() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         Vm.Wallet memory strangerWallet = vm.createWallet("stranger");
 
@@ -189,7 +190,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Expired deadline ──────────────────────────────────────────────────────
 
     function test_iTransferFrom_revertsOnExpiredAccessDeadline() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         uint256 deadline = block.timestamp + 1 hours;
         bytes memory buyerPubkey = _pubkey(buyerWallet);
@@ -216,8 +217,8 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Nonce replay ──────────────────────────────────────────────────────────
 
     function test_iTransferFrom_revertsOnAccessNonceReplay() public {
-        (uint256 agentId1, bytes32 dataHash1) = _mintWithSealSalt(sellerWallet.addr, 0);
-        (uint256 agentId2, bytes32 dataHash2) = _mintWithSealSalt(sellerWallet.addr, 1);
+        (uint256 agentId1, bytes32 dataHash1) = _selfMintData(sellerWallet.addr, 0);
+        (uint256 agentId2, bytes32 dataHash2) = _selfMintData(sellerWallet.addr, 1);
 
         uint256 deadline = block.timestamp + 1 hours;
         bytes memory buyerPubkey = _pubkey(buyerWallet);
@@ -254,7 +255,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Oracle signature attacks ──────────────────────────────────────────────
 
     function test_iTransferFrom_revertsOnNonOracleSigner() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         (, uint256 imposterPk) = makeAddrAndKey("imposter-oracle");
         bytes memory buyerPubkey = _pubkey(buyerWallet);
@@ -276,7 +277,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     }
 
     function test_iTransferFrom_revertsOnWrongOracleType() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
@@ -300,7 +301,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Custom-pubkey mode ────────────────────────────────────────────────────
 
     function test_iTransferFrom_customMode_succeeds() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory customPubkey = hex"01020304050607080910111213141516";
         uint256 deadline = block.timestamp + 1 hours;
@@ -322,7 +323,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     }
 
     function test_iTransferFrom_revertsOnCustomModeKeyMismatch() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory apCustomKey = hex"01020304";
         bytes memory opCustomKey = hex"deadbeef";
@@ -346,7 +347,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Ethereum-mode pubkey validation ───────────────────────────────────────
 
     function test_iTransferFrom_revertsOnShortTargetPubkey() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         bytes memory shortPubkey = new bytes(63);
         uint256 deadline = block.timestamp + 1 hours;
@@ -367,7 +368,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     }
 
     function test_iTransferFrom_revertsOnPubkeyNotMatchingTo() public {
-        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
 
         Vm.Wallet memory otherReceiver = vm.createWallet("other-receiver");
 
@@ -392,7 +393,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     // ── Proof array shape validation ──────────────────────────────────────────
 
     function test_iTransferFrom_revertsOnEmptyProofs() public {
-        (uint256 agentId, ) = _mintWithSeal(sellerWallet.addr);
+        (uint256 agentId, ) = _selfMintData(sellerWallet.addr, 0);
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](0);
 
@@ -402,7 +403,7 @@ contract TransferFlowTest is AgenticIDTestBase {
     }
 
     function test_iTransferFrom_revertsOnProofsLengthMismatch() public {
-        (uint256 agentId, bytes32[] memory dataHashes) = _mintWithNDatas(sellerWallet.addr, 2);
+        (uint256 agentId, bytes32[] memory dataHashes) = _selfMintNDatas(sellerWallet.addr, 2);
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
@@ -422,21 +423,54 @@ contract TransferFlowTest is AgenticIDTestBase {
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
     }
 
-    // ── Disabled ERC-721 transfers ────────────────────────────────────────────
+    // ── Plain ERC-721 transfers disabled for NON-SEAL agents ──────────────────
 
-    function test_transferFrom_disabled_reverts() public {
-        (uint256 agentId, ) = _mintWithSeal(sellerWallet.addr);
+    function test_transferFrom_nonSeal_reverts() public {
+        (uint256 agentId, ) = _selfMintData(sellerWallet.addr, 0);
 
         vm.prank(sellerWallet.addr);
         vm.expectRevert(IERC7857.ERC7857UseITransferFrom.selector);
         agenticId.transferFrom(sellerWallet.addr, buyerWallet.addr, agentId);
     }
 
-    function test_safeTransferFrom_disabled_reverts() public {
-        (uint256 agentId, ) = _mintWithSeal(sellerWallet.addr);
+    function test_safeTransferFrom_nonSeal_reverts() public {
+        (uint256 agentId, ) = _selfMintData(sellerWallet.addr, 0);
 
         vm.prank(sellerWallet.addr);
         vm.expectRevert(IERC7857.ERC7857UseITransferFrom.selector);
         agenticId.safeTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId);
+    }
+
+    // ── Seal-bound agents: ownership-only transfer; proof path disabled ───────
+
+    function test_sealBound_transferFrom_succeeds() public {
+        (uint256 agentId, ) = _mintWithSeal(sellerWallet.addr);
+
+        vm.prank(sellerWallet.addr);
+        agenticId.transferFrom(sellerWallet.addr, buyerWallet.addr, agentId);
+
+        assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "seal-bound ownership moved");
+        assertEq(agenticId.getAgentSeal(agentId), SEAL_ADDR, "seal retained across transfer");
+    }
+
+    function test_sealBound_iTransferFrom_reverts() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
+
+        bytes memory buyerPubkey = _pubkey(buyerWallet);
+        uint256 deadline = block.timestamp + 1 hours;
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, "", bytes("ap-sb"), deadline, buyerWallet.privateKey
+        );
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-sb"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(
+            abi.encodeWithSelector(AgenticIDSealedAgentUseTransfer.selector, agentId)
+        );
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
     }
 }
