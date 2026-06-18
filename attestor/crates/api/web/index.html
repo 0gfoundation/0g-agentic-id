@@ -3629,25 +3629,19 @@ function paintDetail(dep) {
   // simple equality check suffices.
   const canResume = ownerMatches && isOffline && phase === 'stopped';
 
-  // Reset — kills the existing sandbox and respawns one. Strictly
-  // requires `hasSandbox`: if mint or storage failed before a sandbox
-  // was ever created (phase 1 errored before provision ran), there's
-  // nothing to kill and `sandbox.create` would just race the next
-  // /retry attempt. The pre-mint failure case takes /retry only.
+  // Reset — kills the existing sandbox and respawns one. Reserved for
+  // agents that actually came up: Live (force re-pull on a same-tag image
+  // bump) and paused (Resume just resurrects existing bytes; Reset rebuilds).
+  // Both require `hasSandbox`.
   //
-  // Past that gate, Reset earns its slot in states where Restore
-  // WOULDN'T already rebuild: Live (force re-pull on same-tag image
-  // bump), paused (Resume just resurrects existing bytes), or s/m
-  // incomplete with a sandbox already up (mint/storage failed after
-  // sandbox.create succeeded — /retry may skip SandboxRecreate).
-  //
-  // Hidden in the broken-offline subcases (c=Failed, stuck booting)
-  // where the visible Restore CTA already drives /retry → SandboxRecreate
-  // — same backend dispatch, so a second danger-styled entry point
-  // would just be a duplicate.
+  // NOT offered on a failed deploy. If mint/storage failed the agent never
+  // came online, so "reset a running agent" is meaningless — that path takes
+  // Retry, and a half-created sandbox (if any) is rebuilt by /retry →
+  // SandboxRecreate. This keeps every failure state consistent: storage/mint
+  // failed → Retry, container failed / stuck booting → Restore, and Reset
+  // stays exclusively a live/paused action.
   const canReset = ownerMatches && hasSandbox && (
     isLive
-    || isIncomplete
     || (isOffline && phase === 'stopped')
   );
 
