@@ -123,29 +123,28 @@ assertion.
 > AgenticID (`0xf952…`), which predates the canonical binding and is unrelated to
 > the contracts in this doc.
 
-### 5.1 Standard deployment — 2026-06-17 (current)
+### 5.1 Standard deployment — 2026-06-18 (current)
 
-**Why:** the canonical-binding contracts in this PR (custody binding to the
-official ERC-8004 + seal-bound transfer/clone split + NonceRegistry-removal size
-fix) are new bytecode. Neither the old self-implemented `0xf952…` nor the earlier
-simplified trial in §5.2 runs this logic, so a fresh deploy was required. This one
-uses the **production `Deploy.s.sol`** topology (TimelockController + UpgradeableBeacon
-per contract), deployed with `--priority-gas-price 2000000000`.
+**Why:** redeployed from the merged `main` (post PR #10) under a dedicated
+deployer key. Production `Deploy.s.sol` topology (TimelockController +
+UpgradeableBeacon per contract); canonical address auto-selected by chainId and
+the deploy-time `getVersion() == "2.0.0"` check passed. Deployed with
+`--priority-gas-price 2000000000`.
 
 | Contract | Address |
 |---|---|
-| **AgenticID proxy** | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` |
-| AgenticID impl | `0x1E2AD04C5c9BbE2e5Dd3c257ac6fd82985461C54` |
-| AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` |
-| **ReputationRegistry proxy** | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` |
-| ReputationRegistry impl | `0xf053cF2996a2cfb24b26D0F57977512fF8378E01` |
-| ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` |
-| **TEEDataVerifier proxy** | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` |
-| TEEDataVerifier impl | `0xD5F7602a4a690846cF7D6315d14BCd7535388EE0` |
-| TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` |
-| TimelockController (beacon owner) | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` |
+| **AgenticID proxy** | `0x34493302287308f565CF3409DAAdEDF4C8895648` |
+| AgenticID impl | `0x852D34434AE4C3aD28e58272ab9fa871ebeE24c9` |
+| AgenticID beacon | `0x201E35B8566EDC26057348D8419Bc8cBCa609c0E` |
+| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` |
+| ReputationRegistry impl | `0x731273A04D123B22aCd650FA7529831F4F1331A4` |
+| ReputationRegistry beacon | `0x309AfEca706659e415FCb0CcF53B25F18859BB99` |
+| **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` |
+| TEEDataVerifier impl | `0x306d12BA4b2A3862AdEe45a12C97376a889d937f` |
+| TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` |
+| TimelockController (beacon owner) | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` |
 | Canonical ERC-8004 (bound target) | `0x8004A818BFB912233c491871b3d84c89A494BD9e` |
-| owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` |
+| owner / pauser / oracle / deployer | `0xea695C312CE119dE347425B29AFf85371c9d1837` |
 
 Wiring verified on-chain: `AgenticID.canonical()` = canonical `0x8004…`,
 `Reputation.getIdentityRegistry()` = AgenticID proxy, `beacon.owner()` = Timelock.
@@ -156,19 +155,24 @@ All impls / beacons / proxies source-verified on chainscan-galileo.
 non-zero delay, real TEE oracle address.
 
 **Post-deploy config required (fresh contract = empty allowlists):** mint and
-provision fail until the owner seeds the allowlists —
+provision fail until the owner (`0xea695C31…`) seeds the allowlists —
 `addTrustedAttestor(<attestor>)` (else `AgenticIDNotTrustedAttestor`) and
 `addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in validFrameworkHashes`).
 
-### 5.2 Earlier simplified trial — superseded
+### 5.2 Superseded deployments — do not use
 
-A quick UUPS-only deploy (no Timelock/beacon) used to validate the binding
-end-to-end before the standard deploy. **Superseded by 5.1; do not use.**
+Earlier stacks on the same testnet, kept for reference only:
 
-- AgenticID (UUPS proxy): `0x375316a8f05206fBFC1E76Ad8D7C6647F7bAc409`
-- TEEDataVerifier (proxy): `0xcD2D0Cfa6f6DC559B5BAdc0E47DcC66A3DD3ae1D`
-- Note: predates the seal-bound split + NonceRegistry-removal; first self-mint
-  took global `agentId = 10` (`script/DeployAndMint.s.sol`).
+- **2026-06-17 standard** (owner `0xB831…`): AgenticID `0x5BB50987…D975B24A`,
+  Reputation `0x884c2809…C31363d2`, verifier `0x5e5BD9bB…5b5Da75c7`,
+  Timelock `0x9715F9ff…Eb3e4B9`. First standard deploy, on the PR branch.
+- **2026-06-18 interim standard** (owner `0xB831…`): AgenticID `0x5046060D…6a14a51D`,
+  verifier `0xdB76512f…E69b7328`, Reputation `0xb2043F7C…09dEaAE4`, Timelock
+  `0x8048C341…AEb3e4B9`. An accidental re-run with the old key before the key
+  switch — abandoned.
+- **UUPS-only trial** (owner `0xB831…`): AgenticID `0x375316a8…F7bAc409`,
+  verifier `0xcD2D0Cfa…3DD3ae1D`. First end-to-end validation via
+  `script/DeployAndMint.s.sol` (agent id 10).
 
 ## 6. Notes / follow-ups
 
