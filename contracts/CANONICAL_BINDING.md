@@ -159,20 +159,38 @@ provision fail until the owner (`0xea695C31…`) seeds the allowlists —
 `addTrustedAttestor(<attestor>)` (else `AgenticIDNotTrustedAttestor`) and
 `addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in validFrameworkHashes`).
 
-### 5.2 Superseded deployments — do not use
+### 5.2 Standard deployment — 2026-06-17 — superseded
 
-Earlier stacks on the same testnet, kept for reference only:
+First standard (`Deploy.s.sol`, Timelock + beacon) deploy, on the PR branch under
+the original deployer key. Superseded by 5.1; do not use. Full record retained:
 
-- **2026-06-17 standard** (owner `0xB831…`): AgenticID `0x5BB50987…D975B24A`,
-  Reputation `0x884c2809…C31363d2`, verifier `0x5e5BD9bB…5b5Da75c7`,
-  Timelock `0x9715F9ff…Eb3e4B9`. First standard deploy, on the PR branch.
-- **2026-06-18 interim standard** (owner `0xB831…`): AgenticID `0x5046060D…6a14a51D`,
-  verifier `0xdB76512f…E69b7328`, Reputation `0xb2043F7C…09dEaAE4`, Timelock
-  `0x8048C341…AEb3e4B9`. An accidental re-run with the old key before the key
-  switch — abandoned.
-- **UUPS-only trial** (owner `0xB831…`): AgenticID `0x375316a8…F7bAc409`,
-  verifier `0xcD2D0Cfa…3DD3ae1D`. First end-to-end validation via
-  `script/DeployAndMint.s.sol` (agent id 10).
+| Contract | Address |
+|---|---|
+| AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` |
+| AgenticID impl | `0x1E2AD04C5c9BbE2e5Dd3c257ac6fd82985461C54` |
+| AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` |
+| ReputationRegistry proxy | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` |
+| ReputationRegistry impl | `0xf053cF2996a2cfb24b26D0F57977512fF8378E01` |
+| ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` |
+| TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` |
+| TEEDataVerifier impl | `0xD5F7602a4a690846cF7D6315d14BCd7535388EE0` |
+| TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` |
+| owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` |
+
+### 5.3 Other superseded deployments — do not use
+
+- **2026-06-18 interim standard** (owner `0xB831…`, accidental old-key re-run before
+  the key switch, abandoned): AgenticID proxy `0x5046060D8eBD281EDdF837f8Bf2578086a14a51D`,
+  impl `0x3F015656bC8787a60CC529ecB9E7B98fa0b79F80`, beacon `0xe9aaFaa1aebC19c518B937ac10A304f7b27DfD3f`;
+  Reputation proxy `0xb2043F7C06dF8086cd27F0C34E0B8fB009dEaAE4`, impl `0x07613CBeEeFB04260030Cc20480128c8092325C0`,
+  beacon `0xCC4faa5cb66B9a40dc834328cAcF1Dfa7850C6F9`; verifier proxy `0xdB76512f25dE745A95900a7eC8E136EBE69b7328`,
+  impl `0x4BeCD05eFdD4204faD808a17DD9919a1d8927A30`, beacon `0xD56d7168509b81B30b398107bFE4a379EA9993aB`;
+  Timelock `0x8048C341CD31c422c51525f5179C573EAEb3e4B9`.
+- **UUPS-only trial** (owner `0xB831…`, first end-to-end validation via
+  `script/DeployAndMint.s.sol`, agent id 10): AgenticID proxy
+  `0x375316a8f05206fBFC1E76Ad8D7C6647F7bAc409`, TEEDataVerifier proxy
+  `0xcD2D0Cfa6f6DC559B5BAdc0E47DcC66A3DD3ae1D`.
 
 ## 6. Notes / follow-ups
 
