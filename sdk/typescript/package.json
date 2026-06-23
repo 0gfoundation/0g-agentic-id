@@ -1,0 +1,37 @@
+{
+  "name": "@0g/agenticid-sdk",
+  "version": "1.0.0",
+  "description": "TypeScript SDK for the 0G AgenticID protocol — register, manage, and interact with on-chain AI agent identities",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "src"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "0g",
+    "agenticid",
+    "agent",
+    "identity",
+    "tee",
+    "blockchain",
+    "ethereum",
+    "viem"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
