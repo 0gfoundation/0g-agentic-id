@@ -20,7 +20,7 @@ Three phases, built sequentially:
 |------|------|--------|
 | **Key security** | Root key reassembles in full at each use; also existed in full at genesis | One compromise → all agent identities exposed |
 | **Service availability** | Attestor is single-node | One outage → all provisioning halts |
-| **Protocol completeness** | Transfer, clone, reputation flows are half-wired (on-chain yes, off-chain no) | Agent changes owner on-chain but still serves the old owner |
+| **Protocol completeness** | Transfer, clone, reputation flows are half-wired (on-chain yes, off-chain no) | Agent lifecycle management is incomplete — cannot trade, fork, or score agents |
 | **Observability** | No metrics, no alerts, no dashboards | Can't operate a federation; problems found by humans, not systems |
 | **Disk security** | No full-disk encryption; sensitive data must be manually encrypted per use | Adds dev overhead, easy to miss, not composable with automated tooling |
 | **Developer access** | No SDK; only openclaw integrated; no framework docs | High barrier to entry; every interface change breaks integrators |
