@@ -26,6 +26,7 @@
 //! the orphan. That's a Reset-twice-in-a-row footgun, mitigated by the
 //! frontend disabling the button while a Reset job is queued.
 
+use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::sandbox::CanonicalSignedMessage;
@@ -47,13 +48,9 @@ pub async fn handle(
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
-    if d.owner != req.owner {
-        return Err(ApiError::unauthorized("owner mismatch"));
-    }
-
-    // Sanity-check the envelope is the right kind. Worker re-verifies the
-    // signature on the way out — we just gate on the action so a misclick
-    // (signing "stop" and POSTing it here) fails fast at the API.
+    // Sanity-check the envelope is the right kind first (cheap, → 400). We
+    // gate on the action so a misclick (signing "stop" and POSTing it here)
+    // fails fast at the API.
     let msg_bytes = base64::engine::general_purpose::STANDARD
         .decode(req.sandbox_envelope.signed_message_b64.as_bytes())
         .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
@@ -65,6 +62,12 @@ pub async fn handle(
             canonical.action
         )));
     }
+
+    // Real owner authorization: the create envelope must be signed by the
+    // current on-chain owner. The previous `req.owner == d.owner` check
+    // trusted an unsigned, attacker-supplied field and was forgeable — see
+    // {lifecycle_auth}.
+    authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
 
     state
         .jobs
@@ -79,7 +82,7 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{Address, Bytes, B256};
+    use alloy::primitives::{Address, Bytes, B256, U256};
     use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
@@ -133,10 +136,24 @@ mod tests {
         }
     }
 
+    // Owner / attacker / buyer signing keys. The owner key derives the
+    // address seeded as the deployment owner; envelopes signed by the others
+    // exercise the lifecycle owner gate.
+    const OWNER_PRIV: [u8; 32] = [0x11; 32];
+    const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
+    const BUYER_PRIV: [u8; 32] = [0x55; 32];
+
+    /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
+    fn signed_req(seal_id: SealId, priv_bytes: &[u8; 32], action: &str) -> LifecycleRequest {
+        let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
+        LifecycleRequest { seal_id, owner: env.wallet_address, sandbox_envelope: env }
+    }
+
     struct Setup {
         state: AppState,
         deployments: Arc<InMemoryDeploymentRepo>,
         jobs: Arc<InMemoryJobQueue>,
+        chain: Arc<MockChain>,
         owner: Address,
         seal_id: SealId,
     }
@@ -151,7 +168,10 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let events = Arc::new(InMemoryEventBus::new());
 
-        let owner = Address::from([0x11; 20]);
+        // owner address = address of OWNER_PRIV (so an OWNER_PRIV-signed
+        // envelope authorizes, others don't). agent_id is None here, so the
+        // gate falls back to this deployment owner.
+        let owner = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create").wallet_address;
         let seal_id = B256::repeat_byte(0xaa);
         let now = Utc::now();
         // Seed a "running" deployment — the whole point of /reset is that
@@ -187,14 +207,14 @@ mod tests {
         let state = AppState {
             cfg: test_config(),
             crypto,
-            chain,
+            chain: chain.clone(),
             sandbox: Arc::new(attestor_shared::mocks::MockSandbox),
             deployments: deployments.clone(),
             idempotency,
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, deployments, jobs, owner, seal_id }
+        Setup { state, deployments, jobs, chain, owner, seal_id }
     }
 
     fn envelope_with_action(action: &str) -> SandboxEnvelope {
@@ -226,7 +246,7 @@ mod tests {
         // Core invariant: /reset on a healthy (c=Confirmed) deployment
         // still enqueues SandboxRecreate. /retry would skip; we don't.
         let s = make_setup();
-        let req = lifecycle_req(s.seal_id, s.owner, "create");
+        let req = signed_req(s.seal_id, &OWNER_PRIV, "create");
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("must accept");
@@ -279,14 +299,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_mismatch_is_401() {
-        // Reset spins a fresh sandbox under the deployment's owner (the
-        // envelope's signer is checked downstream, but the deployment-
-        // owner gate has to live here). A drive-by reset on someone
-        // else's agent must not get past this.
+    async fn non_owner_signed_envelope_is_401() {
+        // A drive-by reset on someone else's agent must not get past the
+        // gate. The attacker validly signs a create envelope and can forge
+        // `req.owner` to anything, but the envelope signer (attacker) is not
+        // the deployment owner, so the gate rejects it.
         let s = make_setup();
-        let other = Address::from([0x99; 20]);
-        let req = lifecycle_req(s.seal_id, other, "create");
+        let req = signed_req(s.seal_id, &ATTACKER_PRIV, "create");
         let err = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .err()
@@ -301,5 +320,37 @@ mod tests {
             .unwrap()
             .expect("seeded");
         assert_eq!(d.sandbox_id.as_deref(), Some("sb-old"));
+    }
+
+    #[tokio::test]
+    async fn old_owner_rejected_after_transfer_new_owner_accepted() {
+        // Once the agent is minted, the gate reads the live on-chain owner
+        // (not the seeded deployment owner). After a transfer the seller —
+        // who deployed and still signs a perfectly valid envelope — is no
+        // longer the on-chain owner, so reset is refused; the buyer is.
+        let s = make_setup();
+        s.deployments
+            .set_agent_id(s.seal_id, U256::from(1u64))
+            .await
+            .unwrap();
+        let buyer = attestor_shared::mocks::signed_envelope(&BUYER_PRIV, "create").wallet_address;
+        s.chain.set_owner_of(buyer);
+
+        // Seller (OWNER_PRIV, the deploy-time owner) is now rejected.
+        let seller_req = signed_req(s.seal_id, &OWNER_PRIV, "create");
+        let err = handle(axum::extract::State(s.state.clone()), Json(seller_req))
+            .await
+            .err()
+            .expect("seller must be rejected post-transfer");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+
+        // Buyer (current on-chain owner) is accepted.
+        let buyer_req = signed_req(s.seal_id, &BUYER_PRIV, "create");
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(buyer_req))
+            .await
+            .expect("buyer must be accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
     }
 }

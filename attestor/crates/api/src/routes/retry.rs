@@ -15,6 +15,7 @@
 //! attestor-authored on-chain writes (mint, setAgentURI) which require
 //! the attestor's own EOA — owner can't be tricked into anything.
 
+use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{JobPayload, RetryRequest};
@@ -34,8 +35,20 @@ pub async fn handle(
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
-    if d.owner != req.owner {
-        return Err(ApiError::unauthorized("owner mismatch"));
+    // When a create envelope is attached, the worker may escalate
+    // ResumeDeploy → SandboxRecreate (a fresh container), so that envelope
+    // must be signed by the current on-chain owner — see {lifecycle_auth}.
+    // Without an envelope the worker only performs idempotent,
+    // attestor-authored on-chain writes (mint resubmit, setAgentURI) — no
+    // container is created and no seal is handed out — so the cheaper owner
+    // field check is retained for that path.
+    match &req.sandbox_envelope {
+        Some(env) => authorize_lifecycle(&state, &d, env).await?,
+        None => {
+            if d.owner != req.owner {
+                return Err(ApiError::unauthorized("owner mismatch"));
+            }
+        }
     }
 
     state
@@ -103,6 +116,9 @@ mod tests {
         }
     }
 
+    const OWNER_PRIV: [u8; 32] = [0x33; 32];
+    const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
+
     struct Setup {
         state: AppState,
         deployments: Arc<InMemoryDeploymentRepo>,
@@ -121,7 +137,10 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let events = Arc::new(InMemoryEventBus::new());
 
-        let owner = Address::from([0x33; 20]);
+        // owner address = address of OWNER_PRIV (so an OWNER_PRIV-signed
+        // create envelope authorizes the escalation path). agent_id is None
+        // here, so the gate falls back to this deployment owner.
+        let owner = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create").wallet_address;
         let seal_id = B256::repeat_byte(0xbb);
         let now = Utc::now();
         let d = Deployment {
@@ -179,6 +198,40 @@ mod tests {
             JobPayload::ResumeDeploy { seal_id, .. } => assert_eq!(*seal_id, s.seal_id),
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_envelope_requires_current_owner() {
+        // When a create envelope is attached, the worker may escalate to a
+        // fresh sandbox, so the envelope must be signed by the current owner.
+        // An attacker's valid envelope (with a forged `owner` field) is
+        // refused; the owner's is accepted.
+        let s = make_setup();
+
+        let attacker_env = attestor_shared::mocks::signed_envelope(&ATTACKER_PRIV, "create");
+        let bad = RetryRequest {
+            seal_id: s.seal_id,
+            owner: attacker_env.wallet_address,
+            sandbox_envelope: Some(attacker_env),
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(bad))
+            .await
+            .err()
+            .expect("attacker envelope must be rejected");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+
+        let owner_env = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create");
+        let good = RetryRequest {
+            seal_id: s.seal_id,
+            owner: owner_env.wallet_address,
+            sandbox_envelope: Some(owner_env),
+        };
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(good))
+            .await
+            .expect("owner envelope must be accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
