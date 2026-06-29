@@ -4120,15 +4120,32 @@ function renderSealStatus(balance, sealAddr, agentName) {
   }
 }
 
-// Curated short copy for the pinned warning bubble. Self-update-themed
-// because the only owner-recoverable condition wired today is "agent_seal
-// out of gas while trying to publish a drift tx" — i.e. the agent
-// literally cannot evolve until topped up. Random pick on each apply
-// keeps repeat visits from feeling mechanical.
-const CONTAINER_WARNING_LINES = [
+// Curated short copy for the pinned warning bubble.
+//
+// Two distinct warning sources funnel into ContainerWarning events:
+//
+//   1. sealed runtime: agentSeal wallet is dry — drift-publish tx
+//      fails. The agent literally cannot evolve until the owner
+//      funds the agent_seal address.
+//
+//   2. attestor worker: owner's sandbox prepaid balance is
+//      insufficient — sandbox.start / sandbox.create returned 402.
+//      The agent can't run at all until the owner tops up the
+//      sandbox balance.
+//
+// The reason string distinguishes them: sandbox-balance warnings
+// contain "sandbox balance"; sealed drift warnings carry the raw
+// RPC error (e.g. "insufficient funds for gas * price + value").
+// We pick copy and top-up target based on that distinction.
+const CONTAINER_WARNING_LINES_SEAL = [
   'Out of gas — can’t evolve 🧬',
   'Need gas to self-update 💸',
   'Wallet empty — drift on hold',
+];
+const CONTAINER_WARNING_LINES_SANDBOX = [
+  'Sandbox balance low ⚠',
+  'Need prepaid funds to run 💸',
+  'Top up sandbox to resume',
 ];
 
 // Pin the seal-plea bubble open to signal a container-reported warning.
@@ -4147,14 +4164,34 @@ function applyContainerWarning(sealAddr, agentName) {
     // there's no active warning (so the balance plea can take over).
     return;
   }
-  plea.textContent = CONTAINER_WARNING_LINES[
-    Math.floor(Math.random() * CONTAINER_WARNING_LINES.length)
+
+  // Distinguish sandbox-balance warnings (owner prepaid balance) from
+  // agentSeal-gas warnings (drift-publish failure). The reason string
+  // from the attestor worker contains "sandbox balance"; sealed drift
+  // warnings carry the raw RPC error text instead.
+  const isSandboxBalance = /sandbox balance/i.test(w.reason || '');
+  const lines = isSandboxBalance
+    ? CONTAINER_WARNING_LINES_SANDBOX
+    : CONTAINER_WARNING_LINES_SEAL;
+  plea.textContent = lines[
+    Math.floor(Math.random() * lines.length)
   ];
   plea.title = w.reason || '';
   plea.classList.add('seal-plea--alert');
   plea.classList.remove('seal-plea--low');
   plea.hidden = false;
-  if (sealAddr) {
+
+  // Route the click handler to the correct top-up flow:
+  //   sandbox balance → sandbox prepaid top-up modal (owner deposits
+  //     to the SandboxServing contract via the provider).
+  //   agentSeal gas → agent-seal top-up modal (owner sends OG
+  //     directly to the agent's seal address for drift-tx gas).
+  if (isSandboxBalance) {
+    plea.onclick = () => openTopUpModal(null);
+    plea.onkeydown = (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTopUpModal(null); }
+    };
+  } else if (sealAddr) {
     plea.onclick = () => depositToAgentSeal(sealAddr, agentName);
     plea.onkeydown = (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); depositToAgentSeal(sealAddr, agentName); }
