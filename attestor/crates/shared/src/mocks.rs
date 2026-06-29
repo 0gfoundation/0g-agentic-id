@@ -726,6 +726,17 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         })
     }
 
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        self.mut_with(seal, |d| {
+            d.container_pubkey = None;
+            d.container_pubkey_mac = None;
+        })
+    }
+
     async fn mark_provisioned(
         &self,
         seal_id: SealId,

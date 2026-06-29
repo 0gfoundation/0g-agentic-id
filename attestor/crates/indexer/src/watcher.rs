@@ -198,6 +198,13 @@ impl Watcher {
             return Ok(());
         }
         self.deployments.set_owner(ev.tokenId, ev.to).await?;
+        // Drop the container pubkey binding so the prior owner's resumed
+        // container (reused SANDBOX_SEAL_KEY, stale attestation) can no longer
+        // skip the freshness window — it now fails /provision instead of
+        // silently inheriting the old binding. The new owner's fresh
+        // container re-establishes a binding via a fresh attestation. See
+        // {provision} step 5.
+        self.deployments.clear_container_binding(ev.tokenId).await?;
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -596,4 +603,118 @@ fn parse_description(desc: &str) -> (String, StorageRoot) {
 #[allow(dead_code)]
 fn _unused() -> U256 {
     U256::ZERO
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Bytes, B256};
+    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::mocks::{InMemoryDeploymentRepo, InMemoryEventBus};
+
+    fn test_watcher(deployments: Arc<dyn DeploymentRepo>, events: Arc<dyn EventBus>) -> Watcher {
+        // Neither the provider nor the pool is touched by on_transfer; build
+        // them in non-connecting form so the handler is unit-testable offline.
+        let provider = ProviderBuilder::new().on_http("http://localhost:0".parse().unwrap());
+        let pool = PgPool::connect_lazy("postgres://localhost/unused").expect("lazy pool");
+        Watcher {
+            provider,
+            contract_addr: Address::ZERO,
+            canonical_addr: Address::ZERO,
+            crypto: Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32])))),
+            deployments,
+            events,
+            pool,
+            http: reqwest::Client::new(),
+            start_block: None,
+        }
+    }
+
+    fn seed_bound(
+        deployments: &InMemoryDeploymentRepo,
+        seal_id: SealId,
+        agent_id: AgentId,
+        owner: Address,
+    ) {
+        let now = Utc::now();
+        deployments.seed(Deployment {
+            seal_id,
+            agent_seal_addr: Address::from([0x22; 20]),
+            owner,
+            agent_id: Some(agent_id),
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            phase: derive_phase(
+                &StageStatus::Confirmed { at: now },
+                &StageStatus::Confirmed { at: now },
+                &StageStatus::Confirmed { at: now },
+            ),
+            storage_stage: StageStatus::Confirmed { at: now },
+            mint_stage: StageStatus::Confirmed { at: now },
+            container_stage: StageStatus::Confirmed { at: now },
+            sandbox_id: Some("sb-1".into()),
+            provisioned_at: Some(now),
+            // A live binding — what a resumed container would otherwise inherit.
+            container_pubkey: Some(Bytes::from(vec![1, 2, 3])),
+            container_pubkey_mac: Some(Bytes::from(vec![4, 5, 6])),
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    #[tokio::test]
+    async fn transfer_updates_owner_and_clears_container_binding() {
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let seal_id = B256::repeat_byte(0xaa);
+        let agent_id = U256::from(7u64);
+        let seller = Address::from([0x11; 20]);
+        let buyer = Address::from([0x99; 20]);
+        seed_bound(&deployments, seal_id, agent_id, seller);
+
+        let w = test_watcher(deployments.clone(), events.clone());
+        w.on_transfer(
+            AgenticID::Transfer { from: seller, to: buyer, tokenId: agent_id },
+            100,
+        )
+        .await
+        .expect("transfer handled");
+
+        let after = deployments.get(seal_id).await.unwrap().expect("seeded");
+        assert_eq!(after.owner, buyer, "owner synced to new on-chain owner");
+        assert!(
+            after.container_pubkey.is_none() && after.container_pubkey_mac.is_none(),
+            "binding cleared so the seller's resumed container can't skip freshness"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_transfer_preserves_binding() {
+        // Transfer from the zero address is a mint, not an ownership change —
+        // it must not touch an existing binding.
+        let deployments = Arc::new(InMemoryDeploymentRepo::new());
+        let events = Arc::new(InMemoryEventBus::new());
+        let seal_id = B256::repeat_byte(0xbb);
+        let agent_id = U256::from(8u64);
+        let owner = Address::from([0x11; 20]);
+        seed_bound(&deployments, seal_id, agent_id, owner);
+
+        let w = test_watcher(deployments.clone(), events.clone());
+        w.on_transfer(
+            AgenticID::Transfer { from: Address::ZERO, to: owner, tokenId: agent_id },
+            100,
+        )
+        .await
+        .expect("mint handled");
+
+        let after = deployments.get(seal_id).await.unwrap().expect("seeded");
+        assert!(
+            after.container_pubkey.is_some(),
+            "mint must not clear the binding"
+        );
+    }
 }

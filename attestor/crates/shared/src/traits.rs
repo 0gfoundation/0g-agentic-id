@@ -184,6 +184,14 @@ pub trait DeploymentRepo: Send + Sync {
         mac: Vec<u8>,
     ) -> anyhow::Result<()>;
 
+    /// Clear the container `(pubkey, mac)` binding, keyed by agent_id.
+    /// Called on ownership transfer: the inherited binding is what lets a
+    /// resumed container skip the attestation freshness window, so dropping
+    /// it forces the next /provision to re-establish a binding via a fresh
+    /// attestation. A stale prior owner's container (reused SANDBOX_SEAL_KEY,
+    /// old `issued_at`) then fails freshness and cannot re-provision.
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()>;
+
     /// Stamp the deployment row when `POST /provision` succeeds — proves
     /// the container authenticated via sandbox attestation and received
     /// its encrypted `agentSeal_priv`.

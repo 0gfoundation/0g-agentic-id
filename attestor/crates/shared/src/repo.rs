@@ -257,6 +257,18 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(())
     }
 
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments
+             SET container_pubkey = NULL, container_pubkey_mac = NULL, updated_at = now()
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id_to_text(&agent_id))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn mark_provisioned(
         &self,
         seal_id: SealId,
