@@ -4111,30 +4111,26 @@ function renderSealStatus(balance, sealAddr, agentName) {
 
 // Curated short copy for the pinned warning bubble.
 //
-// Two distinct warning sources funnel into ContainerWarning events:
+// Two warning sources funnel into ContainerWarning events, but only one
+// belongs on the avatar:
 //
-//   1. sealed runtime: agentSeal wallet is dry — drift-publish tx
-//      fails. The agent literally cannot evolve until the owner
-//      funds the agent_seal address.
+//   1. sealed runtime: agentSeal wallet is dry — drift-publish tx fails.
+//      The agent literally cannot evolve until the owner funds the
+//      agent_seal address. This IS about the avatar's wallet → pin it.
 //
-//   2. attestor worker: owner's sandbox prepaid balance is
-//      insufficient — sandbox.start / sandbox.create returned 402.
-//      The agent can't run at all until the owner tops up the
-//      sandbox balance.
+//   2. attestor worker: owner's sandbox prepaid balance is insufficient
+//      — sandbox.start / sandbox.create returned 402. That's the owner's
+//      account, not the agent's seal, and it lands the agent in Offline
+//      where the failure banner already says so + offers top-up. Not the
+//      avatar's concern → applyContainerWarning bails on it.
 //
-// The reason string distinguishes them: sandbox-balance warnings
-// contain "sandbox balance"; sealed drift warnings carry the raw
-// RPC error (e.g. "insufficient funds for gas * price + value").
-// We pick copy and top-up target based on that distinction.
+// The reason string distinguishes them: sandbox-balance warnings contain
+// "sandbox balance"; sealed drift warnings carry the raw RPC error
+// (e.g. "insufficient funds for gas * price + value").
 const CONTAINER_WARNING_LINES_SEAL = [
   'Out of gas — can’t evolve 🧬',
   'Need gas to self-update 💸',
   'Wallet empty — drift on hold',
-];
-const CONTAINER_WARNING_LINES_SANDBOX = [
-  'Sandbox balance low ⚠',
-  'Need prepaid funds to run 💸',
-  'Top up sandbox to resume',
 ];
 
 // Pin the seal-plea bubble open to signal a container-reported warning.
@@ -4154,14 +4150,21 @@ function applyContainerWarning(sealAddr, agentName) {
     return;
   }
 
-  // Distinguish sandbox-balance warnings (owner prepaid balance) from
-  // agentSeal-gas warnings (drift-publish failure). The reason string
-  // from the attestor worker contains "sandbox balance"; sealed drift
-  // warnings carry the raw RPC error text instead.
+  // Sandbox prepaid balance is the OWNER's account — not the agent_seal
+  // wallet the avatar represents — so a sandbox-balance 402 must NOT pin
+  // the avatar plea. That case lands the agent in Offline, where the
+  // failure banner already surfaces "insufficient sandbox balance" with a
+  // top-up action; doubling it onto the avatar reads as the *agent* being
+  // broke, which it isn't. Leave the bubble to renderSealStatus (balance
+  // plea) and bail. Only agentSeal-gas warnings — the agent literally
+  // can't pay to publish a drift tx — belong on the avatar.
   const isSandboxBalance = /sandbox balance/i.test(w.reason || '');
-  const lines = isSandboxBalance
-    ? CONTAINER_WARNING_LINES_SANDBOX
-    : CONTAINER_WARNING_LINES_SEAL;
+  if (isSandboxBalance) {
+    plea.classList.remove('seal-plea--alert');
+    return;
+  }
+
+  const lines = CONTAINER_WARNING_LINES_SEAL;
   plea.textContent = lines[
     Math.floor(Math.random() * lines.length)
   ];
@@ -4170,17 +4173,9 @@ function applyContainerWarning(sealAddr, agentName) {
   plea.classList.remove('seal-plea--low');
   plea.hidden = false;
 
-  // Route the click handler to the correct top-up flow:
-  //   sandbox balance → sandbox prepaid top-up modal (owner deposits
-  //     to the SandboxServing contract via the provider).
-  //   agentSeal gas → agent-seal top-up modal (owner sends OG
-  //     directly to the agent's seal address for drift-tx gas).
-  if (isSandboxBalance) {
-    plea.onclick = () => openTopUpModal(null);
-    plea.onkeydown = (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTopUpModal(null); }
-    };
-  } else if (sealAddr) {
+  // agentSeal gas → agent-seal top-up modal (owner sends OG directly to
+  // the agent's seal address for drift-tx gas).
+  if (sealAddr) {
     plea.onclick = () => depositToAgentSeal(sealAddr, agentName);
     plea.onkeydown = (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); depositToAgentSeal(sealAddr, agentName); }
@@ -4285,6 +4280,16 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
   }
   _lifecycleInflight.add(guardKey);
   try {
+    // Same pre-flight gates as deploy: bringing a sandbox up (create) or
+    // resuming one (start) needs the owner's trust roots acked AND prepaid
+    // sandbox balance ≥ threshold. Surface the ack + top-up modals up
+    // front rather than letting the worker 402 and bounce the agent back
+    // into Offline. Both calls are no-ops when already satisfied; a falsey
+    // return means the user dismissed the modal, so abort (finally still
+    // releases the in-flight guard).
+    if (!await ensureTrustRootsAcked()) return;
+    if (!await ensureSandboxBalance()) return;
+
     const action = useStart ? 'start' : 'create';
     // start: bind envelope to existing sandbox_id (Daytona auth checks
     //        canonical.resource_id matches the URL :id). Empty payload.

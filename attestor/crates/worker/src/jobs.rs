@@ -372,18 +372,35 @@ async fn handle_resume_deploy(
     // Re-load deployment after potential storage/mint retries above.
     let d = ctx.deployments.get(seal_id).await?.expect("just had it");
 
-    // ── c-health escalation (covers BOTH phase-2-already-done and
-    //    phase-2-pending cases). If c is Failed/Stopped, the sandbox
-    //    isn't actually serving even when agent_uri is on chain, so we
-    //    need to recreate. SandboxRecreate handles either subcase
-    //    internally:
+    // ── Container escalation → SandboxRecreate. Fires when there's no
+    //    serving container AND no existing sandbox to drive phase 2 with:
+    //      - Failed / Stopped       → the sandbox died or was paused and
+    //                                 then lost; respawn a fresh one.
+    //      - NotStarted, no sandbox → minted agent whose container never
+    //                                 came up (deploy interrupted after
+    //                                 mint), or a post-transfer reset
+    //                                 (Layer-2 teardown clears
+    //                                 container_stage to NotStarted and
+    //                                 drops sandbox_id). Without this arm
+    //                                 such a deployment is a dead end: the
+    //                                 phase-2 block below requires
+    //                                 sandbox_id.is_some(), so /retry would
+    //                                 silently no-op.
+    //    NotStarted *with* a sandbox_id is NOT escalated — that's the
+    //    "phase 2 pending on an existing sandbox" case, handled by the
+    //    phase-2 block below (recreating would needlessly kill a live box).
+    //    SandboxRecreate handles every subcase internally:
     //      - agent_uri empty  → run_phase2 with the new sandbox_id
     //      - agent_uri set    → refresh_agent_card_url with new id
+    //    create (vs start) is correct even when no sandbox exists:
+    //    handle_sandbox_recreate treats a None old_sandbox_id as a fresh
+    //    spawn and skips orphan cleanup.
     //    Without the envelope we can't (Daytona auth), so log + return.
-    if matches!(
+    let needs_fresh_sandbox = matches!(
         d.container_stage,
         StageStatus::Failed { .. } | StageStatus::Stopped { .. }
-    ) {
+    ) || (matches!(d.container_stage, StageStatus::NotStarted) && d.sandbox_id.is_none());
+    if needs_fresh_sandbox {
         if let Some(env) = sandbox_envelope {
             tracing::info!(
                 ?seal_id,
@@ -2502,6 +2519,59 @@ mod tests {
 
         handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must Ok");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_deploy_creates_sandbox_when_minted_but_never_started() {
+        // The "Bring online" case: storage + mint Confirmed, but the
+        // container never came up — container_stage NotStarted and NO
+        // sandbox_id (a deploy interrupted after mint, or a post-transfer
+        // Layer-2 teardown that reset the container track). /retry carries
+        // a create envelope; resume must escalate to SandboxRecreate and
+        // spawn a fresh sandbox. Before the fix this silently no-op'd
+        // (the phase-2 block requires sandbox_id.is_some()), which is what
+        // made "Bring online" do nothing.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        let art = artifact_with_ciphertext(0x75);
+        seed_deployment(
+            &t.deployments,
+            seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(42u64)),
+            None, // no sandbox — container never started
+        );
+        write_stub_card(&t.deployments, seal, "Sage");
+        let new_id = "sb-fresh-online";
+        let _ = std::mem::replace(
+            &mut *t.sandbox.create_id.lock().unwrap(),
+            new_id.to_string(),
+        );
+
+        handle_resume_deploy(&t.ctx, seal, Some(dummy_envelope("create")))
+            .await
+            .expect("resume must Ok");
+
+        // A fresh sandbox was created (not start), and no orphan delete
+        // fired (there was no prior sandbox to reap).
+        assert_eq!(
+            t.sandbox.create_calls.load(Ordering::SeqCst),
+            1,
+            "expected exactly one sandbox.create"
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "no orphan to delete when sandbox_id was None"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some(new_id));
+        assert!(
+            matches!(d.container_stage, StageStatus::Submitted { .. }),
+            "container stage must be Submitted after recreate"
+        );
     }
 
     // ── handle_sandbox_recreate phase-2 fallback ──────────────────────
