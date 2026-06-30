@@ -3354,19 +3354,25 @@ function renderTaskProgress(dep) {
   if (phase === 'running') runningOverride = { cls: 'done', icon: '✓', text: 'live' };
   else if (identityFailed || cFailed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
 
-  // Always render all 5 tasks — completed ones show with ✓ instead of
-  // disappearing. This matches the deploy console's checklist style:
-  // users get the full picture of where the deploy got, not a shrinking
-  // list that "ate" success markers.
-  return `
-    <section class="phase-tracker">
+  // Once identity is finalized (agent_uri on chain) it's permanent and
+  // uninteresting — the hero's "on-chain" mint-chip already signals it, so
+  // the completed Identity checklist is just clutter. Hide that group once
+  // done and show only the Runtime group (the part that still needs the
+  // user — e.g. an Offline agent waiting on Bring online). Until identity
+  // completes (or if it failed), show it so the user sees where it got.
+  const identityComplete = !!dep.agent_uri;
+  const identityGroup = identityComplete ? '' : `
       <div class="phase-label" style="margin-top:0">Identity — on-chain agent</div>
       <ul class="tasks">
         ${renderStage(1, 'Encrypt & upload to 0G storage', dep.storage_stage)}
         ${renderStage(2, 'Mint AgenticID on chain',         dep.mint_stage)}
         ${renderStage(3, 'Set agent URI on chain',          null, uriOverride)}
-      </ul>
-      <div class="phase-label" style="margin-top:14px">Runtime — agent sandbox</div>
+      </ul>`;
+
+  return `
+    <section class="phase-tracker">
+      ${identityGroup}
+      <div class="phase-label" style="margin-top:${identityComplete ? '0' : '14px'}">Runtime — agent sandbox</div>
       <ul class="tasks">
         ${renderStage(4, 'Provision agent sandbox',         dep.container_stage)}
         ${renderStage(5, 'Sandbox reports running',         null, runningOverride)}
