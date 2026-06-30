@@ -308,6 +308,10 @@ pub struct ConfigurableSandbox {
     /// "configured to fail" — lets tests inject a specific error such as the
     /// sandbox's 402 "insufficient balance" body.
     pub fail_msg: Mutex<Option<String>>,
+    /// HTTP status the injected failure carries, so tests can exercise the
+    /// SandboxError transient/fatal classification (e.g. 402 balance, 400
+    /// "in progress", 409 conflict, 5xx). `None` → a statusless error.
+    pub fail_status: Mutex<Option<u16>>,
     pub create_calls: AtomicU64,
     pub start_calls: AtomicU64,
     pub stop_calls: AtomicU64,
@@ -324,6 +328,7 @@ impl ConfigurableSandbox {
             stop_fails: AtomicBool::new(false),
             admin_delete_fails: AtomicBool::new(false),
             fail_msg: Mutex::new(None),
+            fail_status: Mutex::new(None),
             create_calls: AtomicU64::new(0),
             start_calls: AtomicU64::new(0),
             stop_calls: AtomicU64::new(0),
@@ -342,13 +347,24 @@ impl ConfigurableSandbox {
         self
     }
 
-    /// The error create/start return when their fail flag is set — the
-    /// injected `fail_msg` if any, else the generic placeholder.
+    /// The error create/start return when their fail flag is set — a
+    /// `SandboxError` carrying the injected `fail_msg`/`fail_status` (so
+    /// tests exercise the real status-based classification), else a generic
+    /// statusless placeholder.
     fn fail_error(&self) -> anyhow::Error {
-        match self.fail_msg.lock().unwrap().clone() {
-            Some(m) => anyhow::anyhow!(m),
-            None => anyhow::anyhow!("configured to fail"),
+        let msg = self
+            .fail_msg
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "configured to fail".to_string());
+        let status = *self.fail_status.lock().unwrap();
+        crate::sandbox::SandboxError {
+            op: "mock".to_string(),
+            status,
+            message: msg,
         }
+        .into()
     }
 }
 

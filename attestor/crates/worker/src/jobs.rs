@@ -6,6 +6,7 @@ use attestor_shared::{
     agent_profile::ProfileRegistry,
     i_data_derive::normalize_i_data,
     oss::OssClient,
+    sandbox::SandboxError,
     AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
     IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
     SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
@@ -101,40 +102,30 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // online" → SandboxRecreate (action=create) for a fresh
             // sandbox.
             if let Err(e) = ctx.sandbox.start(seal_id, &sandbox_envelope).await {
-                // Insufficient sandbox balance (HTTP 402) is owner-recoverable:
-                // top up and Resume again. Unlike a genuine runtime fault it must
-                // NOT flip Failed or admin_delete the sandbox — that would force a
-                // full Recreate over a transient funding gap. Leave the deployment
-                // Stopped (the /start route never changed it, so it's still
-                // resumable) and surface a top-up hint instead.
-                if e.to_string().contains("insufficient balance") {
-                    tracing::warn!(?seal_id, error = %e, "sandbox.start: insufficient balance; staying Stopped for retry after top-up");
+                // Classify by the provider's HTTP status (SandboxError), not
+                // by string-matching the body. A transient/recoverable
+                // condition — a state-transition conflict, the ~90s post-stop
+                // backup lock (returned as 400/409 "operation in progress"), a
+                // rate limit, an upstream RPC hiccup, or a top-up-able balance
+                // gap — must NOT flip Failed or admin_delete: the sandbox is
+                // healthy (or will be once the condition clears) and still
+                // resumable. Leave the deployment Stopped (the /start route
+                // never changed it) and surface a hint; the next user-driven
+                // Resume retries. Only a genuinely fatal error falls through to
+                // the recreate path below.
+                let transient = e
+                    .downcast_ref::<SandboxError>()
+                    .map(|se| se.is_transient())
+                    .unwrap_or(false);
+                if transient {
+                    let reason = if e.to_string().to_lowercase().contains("balance") {
+                        "insufficient sandbox balance — top up to resume".to_string()
+                    } else {
+                        "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
+                    };
+                    tracing::warn!(?seal_id, error = %e, "sandbox.start: transient condition; staying Stopped for retry");
                     ctx.events
-                        .publish(WsEvent::ContainerWarning {
-                            seal_id,
-                            reason: "insufficient sandbox balance — top up to resume".to_string(),
-                        })
-                        .await?;
-                    // Not retry-worthy: the next user-driven Resume (post top-up)
-                    // enqueues a fresh start job.
-                    return Ok(());
-                }
-                // "Operation already in progress" is a TRANSIENT lock, not a
-                // runtime fault: daytona runs a ~90s backup after a stop and
-                // holds the sandbox lock for its duration, so a Resume that
-                // lands in that window is rejected. The sandbox is healthy and
-                // still resumable — flipping Failed + admin_delete here would
-                // destroy a perfectly good container over a lock that clears on
-                // its own (and force a full Recreate). Leave it Stopped and
-                // tell the user to Resume again once the backup finishes.
-                if e.to_string().to_lowercase().contains("in progress") {
-                    tracing::warn!(?seal_id, error = %e, "sandbox.start: operation in progress (transient backup lock); staying Stopped for retry");
-                    ctx.events
-                        .publish(WsEvent::ContainerWarning {
-                            seal_id,
-                            reason: "sandbox is backing up — try Resume again in a moment"
-                                .to_string(),
-                        })
+                        .publish(WsEvent::ContainerWarning { seal_id, reason })
                         .await?;
                     return Ok(());
                 }
@@ -2017,6 +2008,7 @@ mod tests {
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(402);
         *t.sandbox.fail_msg.lock().unwrap() =
             Some("sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
 
@@ -2080,8 +2072,9 @@ mod tests {
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(400);
         *t.sandbox.fail_msg.lock().unwrap() = Some(
-            "sandbox start: 400 Bad Request — {\"message\":\"Sandbox failed to start: An operation is already in progress for this resource\"}".into(),
+            "Sandbox failed to start: An operation is already in progress for this resource".into(),
         );
 
         run(
@@ -2113,6 +2106,62 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
             "must NOT emit ContainerFailed on a transient lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_fatal_error_flips_failed_and_reaps() {
+        // The classifier's other half: a genuinely fatal start error (404 the
+        // sandbox is gone, a real 400 validation error, 403, …) IS terminal —
+        // flip Failed + admin_delete so the UI moves Stopped → Offline and
+        // offers Recreate. Only transient statuses are spared.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(9u64)),
+            Some("sb-gone".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(404);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox not found".into());
+
+        let res = run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await;
+
+        assert!(res.is_err(), "a fatal start error must bail");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "fatal error must flip Failed, got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            1,
+            "fatal error must reap the dead sandbox"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            "fatal error must emit ContainerFailed"
         );
     }
 
