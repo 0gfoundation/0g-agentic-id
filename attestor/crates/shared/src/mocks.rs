@@ -13,9 +13,42 @@ use crate::traits::{
 use crate::types::*;
 use alloy::primitives::{keccak256, Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
+use crate::sandbox::CanonicalSignedMessage;
+use base64::Engine as _;
+use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// Build a validly EIP-191-signed sandbox lifecycle envelope for tests,
+/// signed by `priv_bytes`. The returned envelope's `wallet_address` is the
+/// signer's derived address — pass it as the deployment owner and/or the
+/// `MockChain::set_owner_of` value to exercise the lifecycle owner gate.
+pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
+    let sk = SigningKey::from_bytes(priv_bytes.into()).expect("valid signing key");
+    let encoded = sk.verifying_key().to_encoded_point(false);
+    let addr = Address::from_slice(&keccak256(&encoded.as_bytes()[1..])[12..]);
+
+    let canonical = CanonicalSignedMessage {
+        action: action.into(),
+        expires_at: 9_999_999_999,
+        nonce: "00000000000000000000000000000000".into(),
+        payload: serde_json::Value::Object(Default::default()),
+        resource_id: String::new(),
+    };
+    let msg_bytes = serde_json::to_vec(&canonical).expect("serialize canonical");
+    let digest = crate::sandbox::eip191_digest(&msg_bytes);
+    let (sig, rec_id): (Signature, RecoveryId) = sk.sign_prehash(&digest).expect("sign prehash");
+    let mut sig_65 = [0u8; 65];
+    sig_65[..64].copy_from_slice(&sig.to_bytes());
+    sig_65[64] = Into::<u8>::into(rec_id) + 27;
+
+    SandboxEnvelope {
+        wallet_address: addr,
+        signed_message_b64: base64::engine::general_purpose::STANDARD.encode(&msg_bytes),
+        wallet_signature: Bytes::from(sig_65.to_vec()),
+    }
+}
 
 // ── ChainClient mock ─────────────────────────────────────────────────────
 
@@ -24,6 +57,9 @@ pub struct MockChain {
     seal_to_agent: Mutex<HashMap<SealId, AgentId>>,
     tx_to_receipt: Mutex<HashMap<TxHash, ReceiptSummary>>,
     tx_counter: AtomicU64,
+    /// Address returned by `owner_of` (for any agent_id). Defaults to ZERO;
+    /// set via `set_owner_of` to exercise the lifecycle owner gate in tests.
+    owner: Mutex<Address>,
 }
 
 impl MockChain {
@@ -33,7 +69,13 @@ impl MockChain {
             seal_to_agent: Mutex::new(HashMap::new()),
             tx_to_receipt: Mutex::new(HashMap::new()),
             tx_counter: AtomicU64::new(1),
+            owner: Mutex::new(Address::ZERO),
         }
+    }
+
+    /// Set the address `owner_of` returns (test-only).
+    pub fn set_owner_of(&self, addr: Address) {
+        *self.owner.lock().unwrap() = addr;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -88,7 +130,7 @@ impl ChainClient for MockChain {
     }
 
     async fn owner_of(&self, _agent_id: AgentId) -> anyhow::Result<Address> {
-        Ok(Address::ZERO)
+        Ok(*self.owner.lock().unwrap())
     }
 
     async fn is_valid_framework_hash(&self, _hash: ImageHash) -> anyhow::Result<bool> {
@@ -703,6 +745,19 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| d.container_stage = stage)
     }
 
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
+        self.mut_with(seal_id, |d| {
+            d.container_stage = StageStatus::NotStarted;
+            d.sandbox_id = None;
+            d.provisioned_at = None;
+            d.phase = crate::types::derive_phase(
+                &d.storage_stage,
+                &d.mint_stage,
+                &d.container_stage,
+            );
+        })
+    }
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
         self.set_agent_id_calls.fetch_add(1, Ordering::SeqCst);
         self.by_agent.lock().unwrap().insert(agent_id, seal_id);
@@ -723,6 +778,17 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| {
             d.container_pubkey = Some(Bytes::from(pubkey));
             d.container_pubkey_mac = Some(Bytes::from(mac));
+        })
+    }
+
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        self.mut_with(seal, |d| {
+            d.container_pubkey = None;
+            d.container_pubkey_mac = None;
         })
     }
 

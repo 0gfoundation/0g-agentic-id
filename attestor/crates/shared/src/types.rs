@@ -793,5 +793,14 @@ pub enum JobPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_envelope: Option<SandboxEnvelope>,
     },
+    /// Force-tear-down a seal-bound agent's sandbox after its token was
+    /// transferred (Layer 2 of the seal-bound-transfer ownership work).
+    /// Enqueued by the indexer's `on_transfer`; the worker `admin_delete`s
+    /// the container so the prior owner's still-running instance stops.
+    /// No envelope — uses the attestor's admin signer, not an owner envelope.
+    /// No-op when the deployment has no sandbox_id (non-seal / never-provisioned).
+    SandboxTeardown {
+        seal_id: SealId,
+    },
 }
 

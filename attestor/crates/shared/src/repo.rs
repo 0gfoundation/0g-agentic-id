@@ -216,6 +216,41 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         self.update_stage(seal_id, "container_stage", stage).await
     }
 
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE deployments
+             SET container_stage = $1, sandbox_id = NULL, provisioned_at = NULL, updated_at = now()
+             WHERE seal_id = $2",
+        )
+        .bind(serde_json::to_value(StageStatus::NotStarted)?)
+        .bind(seal_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+
+        // Recompute phase from all stages (container now NotStarted → Ready
+        // when storage + mint are Confirmed).
+        let row = sqlx::query(
+            "SELECT storage_stage, mint_stage, container_stage FROM deployments WHERE seal_id = $1",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+        let s: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let m: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let c: StageStatus = serde_json::from_value(row.try_get("container_stage")?)?;
+        let phase = derive_phase(&s, &m, &c);
+
+        sqlx::query("UPDATE deployments SET phase = $1 WHERE seal_id = $2")
+            .bind(phase.serde_tag())
+            .bind(seal_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE deployments SET agent_id = $1, updated_at = now() WHERE seal_id = $2",
@@ -252,6 +287,18 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(&pubkey)
         .bind(&mac)
         .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments
+             SET container_pubkey = NULL, container_pubkey_mac = NULL, updated_at = now()
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id_to_text(&agent_id))
         .execute(&self.pool)
         .await?;
         Ok(())

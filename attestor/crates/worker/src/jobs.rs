@@ -253,7 +253,57 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
         JobPayload::ResumeDeploy { seal_id, sandbox_envelope } => {
             handle_resume_deploy(ctx, seal_id, sandbox_envelope).await
         }
+        JobPayload::SandboxTeardown { seal_id } => handle_sandbox_teardown(ctx, seal_id).await,
     }
+}
+
+/// Layer 2 of seal-bound-transfer ownership: tear down the prior owner's
+/// running container after the token was transferred. Enqueued by the
+/// indexer's `on_transfer`. Uses the attestor's admin signer (no owner
+/// envelope) to `admin_delete` the sandbox. Best-effort: a failure here just
+/// means the container lingers until the sandbox runtime GCs it — the sealed
+/// fail-safe self-kill (deferred #5) is the guarantee, this is cleanup.
+async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<()> {
+    let sandbox_id = match ctx.deployments.get(seal_id).await? {
+        Some(d) => d.sandbox_id,
+        None => {
+            tracing::warn!(?seal_id, "teardown: deployment vanished, nothing to do");
+            return Ok(());
+        }
+    };
+    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+        tracing::info!(?seal_id, "teardown: no sandbox_id, nothing to delete");
+        return Ok(());
+    };
+    tracing::info!(
+        ?seal_id,
+        sandbox_id = %sb,
+        "ownership transfer: tearing down prior owner's sandbox"
+    );
+    if let Err(e) = ctx.sandbox.admin_delete(&sb).await {
+        tracing::warn!(
+            ?seal_id,
+            sandbox_id = %sb,
+            error = %e,
+            "teardown: admin_delete failed (non-fatal; runtime GC will reap)"
+        );
+    }
+    // Reset the container track so the deployment shows Ready (provisioned on
+    // chain + storage, no running container), NOT Stopped (implies resumable —
+    // the sandbox is deleted) or Failed (implies a crash). A transfer leaves
+    // the agent awaiting the NEW owner to bring it online via a fresh deploy.
+    // This clears the now-stale sandbox_id / provisioned_at and drops it out
+    // of the phase='running' health sweep so it can't be flipped to Failed.
+    if let Err(e) = ctx.deployments.reset_container_track(seal_id).await {
+        tracing::warn!(?seal_id, error = %e, "teardown: reset_container_track failed (non-fatal)");
+    }
+    if let Ok(Some(d)) = ctx.deployments.get(seal_id).await {
+        let _ = ctx
+            .events
+            .publish(WsEvent::PhaseChanged { seal_id, phase: d.phase })
+            .await;
+    }
+    Ok(())
 }
 
 /// Soft-retry: walks the deployment row and re-runs any track whose

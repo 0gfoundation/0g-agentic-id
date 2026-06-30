@@ -168,6 +168,15 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
 
+    /// Reset the container track after the sandbox is torn down on ownership
+    /// transfer: container_stage → NotStarted, sandbox_id → NULL,
+    /// provisioned_at → NULL. With storage + mint still Confirmed this yields
+    /// phase `Ready` ("provisioned on chain + storage, no running container —
+    /// the new owner brings it online via a fresh deploy"), rather than
+    /// `Stopped` (implies resumable; the sandbox is deleted) or `Failed`
+    /// (implies a crash). Recomputes + persists phase.
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()>;
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
 
     /// Persist 0g-sandbox's resource id after container track submits.
@@ -183,6 +192,14 @@ pub trait DeploymentRepo: Send + Sync {
         pubkey: Vec<u8>,
         mac: Vec<u8>,
     ) -> anyhow::Result<()>;
+
+    /// Clear the container `(pubkey, mac)` binding, keyed by agent_id.
+    /// Called on ownership transfer: the inherited binding is what lets a
+    /// resumed container skip the attestation freshness window, so dropping
+    /// it forces the next /provision to re-establish a binding via a fresh
+    /// attestation. A stale prior owner's container (reused SANDBOX_SEAL_KEY,
+    /// old `issued_at`) then fails freshness and cannot re-provision.
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()>;
 
     /// Stamp the deployment row when `POST /provision` succeeds — proves
     /// the container authenticated via sandbox attestation and received
