@@ -745,6 +745,19 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| d.container_stage = stage)
     }
 
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
+        self.mut_with(seal_id, |d| {
+            d.container_stage = StageStatus::NotStarted;
+            d.sandbox_id = None;
+            d.provisioned_at = None;
+            d.phase = crate::types::derive_phase(
+                &d.storage_stage,
+                &d.mint_stage,
+                &d.container_stage,
+            );
+        })
+    }
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
         self.set_agent_id_calls.fetch_add(1, Ordering::SeqCst);
         self.by_agent.lock().unwrap().insert(agent_id, seal_id);
