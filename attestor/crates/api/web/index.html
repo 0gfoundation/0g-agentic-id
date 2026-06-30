@@ -4280,6 +4280,16 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
   }
   _lifecycleInflight.add(guardKey);
   try {
+    // Same pre-flight gates as deploy: bringing a sandbox up (create) or
+    // resuming one (start) needs the owner's trust roots acked AND prepaid
+    // sandbox balance ≥ threshold. Surface the ack + top-up modals up
+    // front rather than letting the worker 402 and bounce the agent back
+    // into Offline. Both calls are no-ops when already satisfied; a falsey
+    // return means the user dismissed the modal, so abort (finally still
+    // releases the in-flight guard).
+    if (!await ensureTrustRootsAcked()) return;
+    if (!await ensureSandboxBalance()) return;
+
     const action = useStart ? 'start' : 'create';
     // start: bind envelope to existing sandbox_id (Daytona auth checks
     //        canonical.resource_id matches the URL :id). Empty payload.
