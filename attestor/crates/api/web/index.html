@@ -3297,7 +3297,7 @@ function shortAddr(addr) {
 // detail page so /retry's progress is visible without leaving the
 // page — the deploy console's task list is for fresh deploys only.
 function renderTaskProgress(dep) {
-  const phase = dep.phase || 'pending';
+  const phase = dep.phase || 'deploying';
   if (phase === 'running' || phase === 'stopped') return '';
 
   // Map a stage to (cls, icon, text). The fail-with-reason case takes
@@ -3377,23 +3377,36 @@ function renderTaskProgress(dep) {
 // failed" banner long after the container has come back online.
 function failureReason(dep) {
   if (!dep) return '';
-  if (dep.phase !== 'failed') return '';
-  // Priority matches the recovery-bucket priority:
-  //   storage / mint failures  ← root cause; deploy never made it to
-  //                              container, so c=Failed (if any) is a
-  //                              downstream symptom (provision timeout,
-  //                              etc.). Surface the upstream reason.
-  //   container failure        ← genuine container/runtime issue
-  //   last_provision_error     ← only when above don't have a reason
-  //                              (e.g. /provision rejected before any
-  //                              stage transitioned to Failed)
   const stageReason = (s) =>
     s && s.state === 'failed' && s.reason ? s.reason : '';
-  return stageReason(dep.storage_stage)
-    || stageReason(dep.mint_stage)
-    || stageReason(dep.container_stage)
-    || dep.last_provision_error
-    || '';
+  if (dep.phase === 'failed') {
+    // Deploy never completed. Priority matches the root-cause ordering:
+    //   storage / mint failures  ← root cause; deploy never made it to
+    //                              container, so c=Failed (if any) is a
+    //                              downstream symptom (provision timeout,
+    //                              etc.). Surface the upstream reason.
+    //   container failure        ← genuine container/runtime issue
+    //   last_provision_error     ← only when above don't have a reason
+    //                              (e.g. /provision rejected before any
+    //                              stage transitioned to Failed)
+    return stageReason(dep.storage_stage)
+      || stageReason(dep.mint_stage)
+      || stageReason(dep.container_stage)
+      || dep.last_provision_error
+      || '';
+  }
+  if (dep.phase === 'offline') {
+    // Minted agent with no running container. A genuine container failure
+    // (crash, provision timeout, image_hash rejection) carries a reason; a
+    // clean offline — owner stop→reset, or transfer (which resets
+    // container_stage to NotStarted) — carries none, so the banner stays
+    // silent. Offline-after-transfer is a "needs re-provision" prompt, not
+    // an error. Deliberately does NOT fall back to the sticky
+    // last_provision_error here, to avoid a stale reason haunting an agent
+    // that's offline for a benign reason.
+    return stageReason(dep.container_stage);
+  }
+  return '';
 }
 
 // Known-permanent /provision rejection markers. Recreating without a
@@ -3403,7 +3416,7 @@ function failureReason(dep) {
 // root cause is addressed) but surface a hint pointing at what to do.
 const PERMANENT_PROVISION_MARKERS = [
   ['image_hash not in validFrameworkHashes',
-   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring back online.'],
+   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring online.'],
   ['signer mismatch',
    'Sandbox TEE signer doesn\'t match attestor config. Coordinate with infra; recreate alone won\'t fix it.'],
   ['container_pubkey must be',
@@ -3419,7 +3432,7 @@ function permanentFailureHint(dep) {
 }
 
 function renderAgentRow(d) {
-  const phase = d.phase || 'pending';
+  const phase = d.phase || 'deploying';
   const card = d.agent_card || {};
   const name = card.name || '(unnamed)';
   const description = card.description || '';
@@ -3445,9 +3458,13 @@ function renderAgentRow(d) {
       </div>
       <div><span class="col-chain">⬢ 0G testnet</span></div>
       ${(() => {
-        const p = d.phase || 'pending';
+        const p = d.phase || 'deploying';
         const cls = p === 'running' ? 's-running' : p === 'failed' ? 's-failed' : 's-offline';
-        const txt = p === 'running' ? 'Running' : p === 'failed' ? 'Failed' : 'Offline';
+        const txt = p === 'running'   ? 'Running'
+                  : p === 'failed'    ? 'Failed'
+                  : p === 'stopped'   ? 'Stopped'
+                  : p === 'deploying' ? 'Deploying'
+                  : 'Offline';
         const r = failureReason(d);
         const title = r ? ` title="${escapeHtml(r)}"` : '';
         return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
@@ -3529,7 +3546,7 @@ async function renderDetail(sealId) {
 function paintDetail(dep) {
   const root = $('#detailContent');
   const sealId = '0x' + (typeof dep.seal_id === 'string' ? dep.seal_id.replace(/^0x/, '') : '');
-  const phase = dep.phase || 'pending';
+  const phase = dep.phase || 'deploying';
   const card = dep.agent_card || {};
   const name = card.name || '(unnamed)';
   const description = card.description || '';
@@ -3568,82 +3585,47 @@ function paintDetail(dep) {
   const ownerMatches = State.ownerAddr && dep.owner &&
     State.ownerAddr.toLowerCase() === dep.owner.toLowerCase();
 
-  // ── 6-bucket state classification ─────────────────────────────────
+  // ── State → owner-action mapping ──────────────────────────────────
   //
-  // Inputs (only what the row carries — the backend is the source of
-  // truth, including the provision_deadline sweep that flips stuck
-  // Submitted to Failed once the timeout passes):
-  //
-  //   phase           : derive_phase(s, m, c) on the row
-  //   s/m/c           : individual stage states
-  //   sandbox_id      : present once `sandbox.create` succeeded
-  //   provisioned_at  : present once /provision succeeded
-  //
-  // Buckets — exactly one applies, in this priority order:
-  //
-  //   ① live        — phase=running                  (Stop + Dashboard)
-  //   ② paused      — phase=stopped                  (Bring back online → start)
-  //   ③ incomplete  — s or m Failed                  (Continue deploy, no sig)
-  //   ④ stuck       — c Failed                       (Bring back online → create)
-  //   ⑤ provisioning — phase=ready, has_sb, !prov    (no action — still booting)
-  //   ⑥ mid-deploy  — anything else (pending / provisioning) (no action)
-  //
-  // Why the order: `incomplete` checks individual s/m before `stuck`
-  // checks c so a deployment that fails on multiple tracks gets the
-  // softer recovery path first (idempotent retry), then escalates to
-  // sandbox recreate after.
-  const stageFailed = (s) => s && s.state === 'failed';
-  const sFailed = stageFailed(dep.storage_stage);
-  const mFailed = stageFailed(dep.mint_stage);
-  const cFailed = stageFailed(dep.container_stage);
-  const isProvisioned = !!(dep.provisioned_at && dep.container_pubkey);
+  // The backend derive_phase(s, m, c) collapses the storage/mint/container
+  // stages into one of five phases; the frontend reads that phase and maps
+  // it straight to CTAs — no second-layer re-classification. The detailed
+  // "why" (crash vs timeout vs image_hash vs transfer) rides in the failure
+  // banner's reason, not in extra states.
   const hasSandbox = !!sandboxId;
 
-  // Two recovery labels — distinguish only by what's broken, not by
-  // backend dispatch (which is identical: sign CREATE envelope, POST
-  // /retry, worker decides what to actually run).
+  // Phase is the single source of truth (5 states). No second-layer
+  // re-derivation from sandbox_id / provisioned_at / per-stage flags —
+  // derive_phase already collapsed all of that into one string, and the
+  // owner CTAs map onto it 1:1:
   //
-  //   isLive       → Manage(Stop, Reset) + View
-  //   isIncomplete → Retry button (primary; phase-1 didn't finish)
-  //   isOffline + paused → Manage(Resume, Reset) — symmetric with Live
-  //   isOffline + broken → Restore button (neutral; sandbox.create
-  //                        + prompts for LLM API key) + Manage(Reset).
-  //                        Neutral styling because Restore preserves
-  //                        on-chain memory/skills — it's a recovery,
-  //                        not a destructive reset.
+  //   running   → Manage(Stop, Reset) + View(dashboard)
+  //   stopped   → Manage(Resume, Reset) — owner-paused, sandbox resumable
+  //   offline   → Restore CTA (spin up a fresh sandbox; on-chain memory
+  //               and skills are preserved) + Manage(Reset) if a sandbox
+  //               record still exists. Covers crash / provision timeout /
+  //               image_hash rejection / post-transfer "needs re-provision".
+  //   failed    → Retry CTA — storage/mint never finished; deploy from top.
+  //   deploying → in flight; no owner action (just watch task progress).
   const isLive       = phase === 'running';
-  const isIncomplete = ownerMatches && (sFailed || mFailed);
-  const isOffline    = ownerMatches && !isLive && !isIncomplete && (
-       cFailed
-    || phase === 'stopped'
-    || (phase === 'ready' && hasSandbox && !isProvisioned)
-  );
+  const isPaused     = phase === 'stopped';
+  const isOffline    = phase === 'offline';
+  const isIncomplete = phase === 'failed';
 
-  const canStop = ownerMatches && sandboxId && isLive;
+  const canStop   = ownerMatches && isLive && hasSandbox;
   // Resume lives in the Manage dropdown as Stop's mirror — same place,
-  // same weight. Only the `paused` flavor of offline qualifies; the
-  // broken flavors (cFailed, stuck booting) get the Restore CTA in
-  // the action row instead. /probe and the heartbeat sweep both write
-  // StageStatus::Failed (not Stopped) when the sandbox is gone, so
-  // phase=stopped now strictly means "user-initiated stop" and the
-  // simple equality check suffices.
-  const canResume = ownerMatches && isOffline && phase === 'stopped';
+  // same weight. Only an owner-paused agent (phase=stopped) qualifies;
+  // /probe and the heartbeat sweep write the container stage to Failed
+  // (→ phase=offline), not Stopped, when the sandbox is gone, so
+  // phase=stopped strictly means "user-initiated stop".
+  const canResume = ownerMatches && isPaused;
 
   // Reset — kills the existing sandbox and respawns one. Reserved for
-  // agents that actually came up: Live (force re-pull on a same-tag image
-  // bump) and paused (Resume just resurrects existing bytes; Reset rebuilds).
-  // Both require `hasSandbox`.
-  //
-  // NOT offered on a failed deploy. If mint/storage failed the agent never
-  // came online, so "reset a running agent" is meaningless — that path takes
-  // Retry, and a half-created sandbox (if any) is rebuilt by /retry →
-  // SandboxRecreate. This keeps every failure state consistent: storage/mint
-  // failed → Retry, container failed / stuck booting → Restore, and Reset
-  // stays exclusively a live/paused action.
-  const canReset = ownerMatches && hasSandbox && (
-    isLive
-    || (isOffline && phase === 'stopped')
-  );
+  // agents that actually came up: live (force re-pull on a same-tag image
+  // bump) and paused (Resume resurrects existing bytes; Reset rebuilds).
+  // Both require an existing sandbox record. Offline takes Restore and
+  // failed takes Retry, so Reset stays a live/paused-only action.
+  const canReset  = ownerMatches && hasSandbox && (isLive || isPaused);
 
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
   // agentSeal addr: stored in registrations[0].agentAddress per AgentCard
@@ -3653,15 +3635,18 @@ function paintDetail(dep) {
     || dep.agent_seal_addr
     || '';
 
-  // Three pill states: Running / Failed / Offline. Same recovery
-  // action for the latter two (Start button), but failure deserves
-  // a red signal so the user notices "something broke" before they
-  // need to read the banner. Stopped + ready collapse into Offline.
+  // Pill mirrors the 5-state phase 1:1. Green = healthy/running, red =
+  // failed deploy (something broke before the agent ever came online),
+  // gray covers the benign/in-flight rest (deploying, stopped, offline).
+  // The exact label still distinguishes them so the user reads state at
+  // a glance; the failure banner below carries the detailed reason.
   const pillClass = phase === 'running' ? 'solid-green'
                   : phase === 'failed'  ? 'solid-red'
                   : 'solid-gray';
-  const pillLabel = phase === 'running' ? 'Running'
-                  : phase === 'failed'  ? 'Failed'
+  const pillLabel = phase === 'running'   ? 'Running'
+                  : phase === 'failed'    ? 'Failed'
+                  : phase === 'stopped'   ? 'Stopped'
+                  : phase === 'deploying' ? 'Deploying'
                   : 'Offline';
 
   // Owner action buttons. Per-state CTA (Stop / Start / Retry) + Reset
@@ -3701,7 +3686,7 @@ function paintDetail(dep) {
     <div class="actions">
       ${viewDropdown}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
-      ${(isOffline && phase !== 'stopped') ? `<button class="icon-btn" title="Spin up a fresh sandbox container. On-chain memory and skills are preserved." onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Restore</button>` : ''}
+      ${isOffline ? `<button class="icon-btn primary" title="Spin up a fresh sandbox container. On-chain memory and skills are preserved." onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Bring online</button>` : ''}
       ${manageDropdown}
     </div>`;
 
@@ -3889,11 +3874,15 @@ function paintDetail(dep) {
       const reason = failureReason(dep);
       if (!reason) return '';
       const hint = permanentFailureHint(dep);
+      // Offline = a minted agent whose container later went down; calling
+      // that "Deployment failed" would be misleading. Only phase=failed
+      // (deploy never completed) earns that title.
+      const bannerTitle = dep.phase === 'offline' ? 'Agent offline' : 'Deployment failed';
       return `
         <div class="failure-banner">
           <span class="ico" style="color:var(--red);flex-shrink:0">${ICO.warn || '!'}</span>
           <div>
-            <div class="failure-banner-title">Deployment failed</div>
+            <div class="failure-banner-title">${bannerTitle}</div>
             <div class="failure-banner-reason">${escapeHtml(reason)}</div>
             ${hint ? `<div class="failure-banner-hint">${escapeHtml(hint)}</div>` : ''}
           </div>
@@ -4280,10 +4269,10 @@ window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandb
 //      container in place. Same sandbox_id, no re-boot, just a
 //      Daytona resume. ~seconds.
 //
-//   useStart=false (failed / ready / cFailed / sFailed / mFailed) →
-//      sign CREATE envelope, POST /retry → ResumeDeploy → optionally
-//      re-runs storage/mint, then SandboxRecreate (kill+spawn) when
-//      c is unhealthy. New sandbox_id, full container re-boot.
+//   useStart=false (phase=offline → Bring online, or phase=failed →
+//      Retry) → sign CREATE envelope, POST /retry → ResumeDeploy →
+//      optionally re-runs storage/mint, then SandboxRecreate (kill+spawn)
+//      when the container is unhealthy. New sandbox_id, full re-boot.
 //
 // Per-seal in-flight guard (_lifecycleInflight) defends against
 // jittery double-clicks on either path.

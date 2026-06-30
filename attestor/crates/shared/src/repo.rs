@@ -510,7 +510,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                  SET last_provision_error    = $1,
                      last_provision_error_at = $2,
                      container_stage         = $3,
-                     phase                   = 'failed',
+                     phase                   = 'offline',
                      updated_at              = $2
                  WHERE seal_id = $4",
             )
@@ -554,7 +554,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let rows = sqlx::query(
             "UPDATE deployments
              SET container_stage = $1,
-                 phase           = 'failed',
+                 phase           = 'offline',
                  updated_at      = $2
              WHERE provision_deadline IS NOT NULL
                AND provision_deadline < $2
@@ -602,12 +602,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
     ) -> anyhow::Result<Vec<SealId>> {
         // Atomic select-and-flip mirroring flip_provision_timeouts. The
         // container went silent on its own (sandbox killed it, sealed
-        // crashed, network partition past tolerance) — that's a
-        // runtime failure, not a user-initiated stop, so we write
-        // StageStatus::Failed + phase='failed'. The UI's existing
-        // cFailed/isOffline path drives the user to Recreate; Stopped
-        // would incorrectly offer Resume against a sandbox that is no
-        // longer reachable.
+        // crashed, network partition past tolerance) — that's a runtime
+        // failure of a *minted* agent, not a user-initiated stop, so we write
+        // StageStatus::Failed (carries the reason) + phase='offline'. Offline
+        // drives the user to bring it back online (create); Stopped would
+        // incorrectly offer Resume against a sandbox that is no longer
+        // reachable, and Failed would mislabel a minted agent as a dead deploy.
         let stage = serde_json::to_value(StageStatus::Failed {
             at: now,
             reason: reason.clone(),
@@ -616,7 +616,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let rows = sqlx::query(
             "UPDATE deployments
              SET container_stage = $1,
-                 phase           = 'failed',
+                 phase           = 'offline',
                  updated_at      = $2
              WHERE last_heartbeat IS NOT NULL
                AND last_heartbeat < $3
@@ -782,11 +782,10 @@ pub async fn save_checkpoint(pool: &PgPool, name: &str, block: i64) -> anyhow::R
 impl DeploymentPhase {
     pub fn serde_tag(&self) -> &'static str {
         match self {
-            Self::Pending => "pending",
-            Self::Provisioning => "provisioning",
-            Self::Ready => "ready",
+            Self::Deploying => "deploying",
             Self::Running => "running",
             Self::Stopped => "stopped",
+            Self::Offline => "offline",
             Self::Failed => "failed",
         }
     }
