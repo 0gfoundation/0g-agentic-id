@@ -21,7 +21,7 @@ use attestor_shared::{
         derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId,
         StageStatus, StorageRoot,
     },
-    Config, CryptoModule, DeploymentRepo, EventBus, WsEvent,
+    Config, CryptoModule, DeploymentRepo, EventBus, JobPayload, JobQueue, WsEvent,
 };
 use chrono::Utc;
 use sqlx::PgPool;
@@ -46,6 +46,9 @@ pub struct Watcher {
     crypto: Arc<dyn CryptoModule>,
     deployments: Arc<dyn DeploymentRepo>,
     events: Arc<dyn EventBus>,
+    /// Used to enqueue SandboxTeardown on ownership transfer (Layer 2). The
+    /// worker holds the admin signer; the indexer only detects + enqueues.
+    jobs: Arc<dyn JobQueue>,
     pool: PgPool,
     http: reqwest::Client,
     start_block: Option<u64>,
@@ -58,6 +61,7 @@ impl Watcher {
         crypto: Arc<dyn CryptoModule>,
         deployments: Arc<dyn DeploymentRepo>,
         events: Arc<dyn EventBus>,
+        jobs: Arc<dyn JobQueue>,
     ) -> anyhow::Result<Self> {
         let url: reqwest::Url = cfg.chain_rpc.parse()?;
         let provider = ProviderBuilder::new().on_http(url);
@@ -68,6 +72,7 @@ impl Watcher {
             crypto,
             deployments,
             events,
+            jobs,
             pool,
             http: reqwest::Client::new(),
             start_block: cfg.indexer_start_block,
@@ -213,6 +218,24 @@ impl Watcher {
                     phase: d.phase,
                 })
                 .await;
+            // Layer 2: tear down the prior owner's running container so it
+            // stops operating the sold agent. Enqueue for the worker (which
+            // holds the admin signer). Skip when there's no sandbox to kill
+            // (non-seal/data tokens, or never-provisioned). Best-effort — the
+            // sealed fail-safe self-kill (deferred #5) is the real guarantee.
+            if d.sandbox_id.as_deref().is_some_and(|s| !s.is_empty()) {
+                if let Err(e) = self
+                    .jobs
+                    .submit(JobPayload::SandboxTeardown { seal_id: d.seal_id })
+                    .await
+                {
+                    tracing::warn!(
+                        seal_id = ?d.seal_id,
+                        error = %e,
+                        "transfer: enqueue SandboxTeardown failed (non-fatal)"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -610,9 +633,13 @@ mod tests {
     use super::*;
     use alloy::primitives::{Bytes, B256};
     use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
-    use attestor_shared::mocks::{InMemoryDeploymentRepo, InMemoryEventBus};
+    use attestor_shared::mocks::{InMemoryDeploymentRepo, InMemoryEventBus, InMemoryJobQueue};
 
-    fn test_watcher(deployments: Arc<dyn DeploymentRepo>, events: Arc<dyn EventBus>) -> Watcher {
+    fn test_watcher(
+        deployments: Arc<dyn DeploymentRepo>,
+        events: Arc<dyn EventBus>,
+        jobs: Arc<dyn JobQueue>,
+    ) -> Watcher {
         // Neither the provider nor the pool is touched by on_transfer; build
         // them in non-connecting form so the handler is unit-testable offline.
         let provider = ProviderBuilder::new().on_http("http://localhost:0".parse().unwrap());
@@ -624,6 +651,7 @@ mod tests {
             crypto: Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32])))),
             deployments,
             events,
+            jobs,
             pool,
             http: reqwest::Client::new(),
             start_block: None,
@@ -676,7 +704,8 @@ mod tests {
         let buyer = Address::from([0x99; 20]);
         seed_bound(&deployments, seal_id, agent_id, seller);
 
-        let w = test_watcher(deployments.clone(), events.clone());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
         w.on_transfer(
             AgenticID::Transfer { from: seller, to: buyer, tokenId: agent_id },
             100,
@@ -690,6 +719,14 @@ mod tests {
             after.container_pubkey.is_none() && after.container_pubkey_mac.is_none(),
             "binding cleared so the seller's resumed container can't skip freshness"
         );
+        // Layer 2: a SandboxTeardown is enqueued so the worker kills the
+        // seller's still-running container (it had sandbox_id = "sb-1").
+        let submitted = jobs.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1, "exactly one teardown enqueued");
+        match &submitted[0] {
+            JobPayload::SandboxTeardown { seal_id: s } => assert_eq!(*s, seal_id),
+            other => panic!("expected SandboxTeardown, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -703,7 +740,8 @@ mod tests {
         let owner = Address::from([0x11; 20]);
         seed_bound(&deployments, seal_id, agent_id, owner);
 
-        let w = test_watcher(deployments.clone(), events.clone());
+        let jobs = Arc::new(InMemoryJobQueue::new());
+        let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
         w.on_transfer(
             AgenticID::Transfer { from: Address::ZERO, to: owner, tokenId: agent_id },
             100,
@@ -715,6 +753,11 @@ mod tests {
         assert!(
             after.container_pubkey.is_some(),
             "mint must not clear the binding"
+        );
+        // Mint (from == 0) must not enqueue a teardown.
+        assert!(
+            jobs.submitted.lock().unwrap().is_empty(),
+            "mint enqueues no teardown"
         );
     }
 }
