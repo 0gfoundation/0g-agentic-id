@@ -577,7 +577,7 @@ impl Watcher {
             created_at: now,
             updated_at: now,
         };
-        let _ = DeploymentPhase::Provisioning; // silence unused import tone
+        let _ = DeploymentPhase::Deploying; // silence unused import tone
         self.deployments.insert(&deployment).await?;
         Ok(())
     }

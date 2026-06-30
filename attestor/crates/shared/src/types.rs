@@ -180,12 +180,26 @@ impl StageStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentPhase {
-    Pending,       // deploy accepted, no track started
-    Provisioning,  // some track in-flight, none failed, not yet Ready/Running
-    Ready,         // storage + mint both Confirmed, container not yet Running
-    Running,       // container Confirmed (agent serving)
-    Stopped,       // container Stopped after running
-    Failed,        // any track Failed
+    // Deploy in flight: storage / mint / container provisioning, nothing
+    // failed, container not yet running. (Collapses the old Pending +
+    // Provisioning + booting-Ready — granular per-track progress is shown
+    // separately via the storage/mint/container stages, not the phase.)
+    Deploying,
+    // Container Confirmed — the agent is serving.
+    Running,
+    // Container Stopped — owner-initiated pause; the sandbox is preserved and
+    // resumable via `start`. (The sweeps write Offline, not Stopped, when the
+    // sandbox is actually gone, so Stopped strictly means "user stopped it".)
+    Stopped,
+    // Minted + data uploaded, but no running container — the container failed,
+    // timed out, crashed, or was torn down on ownership transfer. The agent
+    // exists on chain; the (new) owner brings it online via a fresh create.
+    // The cause is carried in `container_stage`'s Failed/Stopped `reason`, which
+    // the UI maps to the right message + bring-online sub-routing.
+    Offline,
+    // Deploy never completed: storage or mint Failed. Recover via retry.
+    // (Container-level failure is Offline, not Failed — the agent is minted.)
+    Failed,
 }
 
 pub fn derive_phase(
@@ -193,28 +207,32 @@ pub fn derive_phase(
     mint: &StageStatus,
     container: &StageStatus,
 ) -> DeploymentPhase {
-    if storage.is_failed() || mint.is_failed() || container.is_failed() {
+    // Deploy never completed: a storage/mint failure dominates → Failed
+    // (retry). A *container* failure is NOT Failed — the agent is already
+    // minted, so it falls through to Offline below.
+    if storage.is_failed() || mint.is_failed() {
         return DeploymentPhase::Failed;
-    }
-    if matches!(container, StageStatus::Stopped { .. }) {
-        return DeploymentPhase::Stopped;
     }
     if matches!(container, StageStatus::Confirmed { .. }) {
         return DeploymentPhase::Running;
     }
+    if matches!(container, StageStatus::Stopped { .. }) {
+        return DeploymentPhase::Stopped;
+    }
+    // Minted + data uploaded (storage + mint both Confirmed): the agent exists
+    // on chain. If the container failed or was reset/torn-down (NotStarted) it
+    // needs to be brought online → Offline; if it's still coming up
+    // (Submitted) it's Deploying.
     if matches!(storage, StageStatus::Confirmed { .. })
         && matches!(mint, StageStatus::Confirmed { .. })
     {
-        return DeploymentPhase::Ready;
+        return match container {
+            StageStatus::Failed { .. } | StageStatus::NotStarted => DeploymentPhase::Offline,
+            _ => DeploymentPhase::Deploying,
+        };
     }
-    let any_started = !matches!(storage, StageStatus::NotStarted)
-        || !matches!(mint, StageStatus::NotStarted)
-        || !matches!(container, StageStatus::NotStarted);
-    if any_started {
-        DeploymentPhase::Provisioning
-    } else {
-        DeploymentPhase::Pending
-    }
+    // storage / mint still in flight (nothing failed yet) → Deploying.
+    DeploymentPhase::Deploying
 }
 
 // ── Deployment aggregate (persisted) ────────────────────────────────────
@@ -355,7 +373,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
-            phase: DeploymentPhase::Pending,
+            phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,
             mint_stage: StageStatus::NotStarted,
             container_stage: StageStatus::NotStarted,
@@ -548,23 +566,48 @@ mod tests {
     }
 
     #[test]
-    fn derive_phase_ready_when_phase1_done_but_container_pending() {
+    fn derive_phase_deploying_when_container_coming_up() {
+        // storage + mint done, container Submitted (booting) → Deploying.
         let phase = derive_phase(
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Submitted { tx_hash: None, at: Utc::now() },
         );
-        assert_eq!(phase, DeploymentPhase::Ready);
+        assert_eq!(phase, DeploymentPhase::Deploying);
     }
 
     #[test]
-    fn derive_phase_pending_when_nothing_started() {
+    fn derive_phase_deploying_when_nothing_started() {
         let phase = derive_phase(
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,
         );
-        assert_eq!(phase, DeploymentPhase::Pending);
+        assert_eq!(phase, DeploymentPhase::Deploying);
+    }
+
+    #[test]
+    fn derive_phase_offline_when_minted_container_failed() {
+        // Minted agent whose container failed/crashed → Offline (NOT Failed —
+        // the agent exists on chain; bring it back online via create).
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Failed { at: Utc::now(), reason: "agent unreachable".into() },
+        );
+        assert_eq!(phase, DeploymentPhase::Offline);
+    }
+
+    #[test]
+    fn derive_phase_offline_when_minted_container_reset() {
+        // Container track reset to NotStarted on ownership transfer
+        // (reset_container_track) while storage + mint stay Confirmed → Offline.
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::NotStarted,
+        );
+        assert_eq!(phase, DeploymentPhase::Offline);
     }
 
     // ── JobPayload variant serde — guards against silent variant rename ─
