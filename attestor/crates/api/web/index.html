@@ -1415,7 +1415,7 @@ details.log[open] summary{color:var(--text2)}
         <span class="val" id="outSeal"></span>
       </div>
 
-      <div class="phase-label">Phase 1 — three concurrent tasks</div>
+      <div class="phase-label">Identity — on-chain agent</div>
       <ul class="tasks">
         <li class="task idle" data-task="storage">
           <span class="task-icon">1</span>
@@ -1431,21 +1431,21 @@ details.log[open] summary{color:var(--text2)}
             <div class="task-state">waiting</div>
           </div>
         </li>
-        <li class="task idle" data-task="sandbox">
+        <li class="task idle" data-task="uri">
           <span class="task-icon">3</span>
           <div class="task-info">
-            <div class="task-title">Provision agent sandbox</div>
+            <div class="task-title">Set agent URI on chain</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
       </ul>
 
-      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+      <div class="phase-label" style="margin-top:14px">Runtime — agent sandbox</div>
       <ul class="tasks">
-        <li class="task idle" data-task="uri">
+        <li class="task idle" data-task="sandbox">
           <span class="task-icon">4</span>
           <div class="task-info">
-            <div class="task-title">Set agent URI on chain</div>
+            <div class="task-title">Provision agent sandbox</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
@@ -3023,8 +3023,11 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
-    // container failure → phase 2 won't run.
-    cancelDownstream(['uri', 'running']);
+    // Container failure is a RUNTIME failure only — it cancels just
+    // `running`. Identity (uri) is independent and still finalizes (the
+    // agent ends up minted + carded + Offline, recoverable via Bring
+    // online), so we must NOT cancel `uri` here.
+    cancelDownstream(['running']);
   }
 
   if (t === 'agent_u_r_i_updated') setTask('uri', 'done', 'tx submitted');
@@ -3040,7 +3043,11 @@ function handleDeployEvent(evt, sealId) {
 // ───────────────────────────────────────────────────────────────────
 // Progress helpers — unified vertical task list
 // ───────────────────────────────────────────────────────────────────
-const TASK_ORDER = ['storage', 'mint', 'sandbox', 'uri', 'running'];
+// Two independent tracks: Identity (storage → mint → uri, on-chain) and
+// Runtime (sandbox → running). The URI write no longer waits on the
+// sandbox — identity finalizes regardless of whether the container came
+// up — so `uri` sits in the identity group, ahead of `sandbox`.
+const TASK_ORDER = ['storage', 'mint', 'uri', 'sandbox', 'running'];
 
 function resetProgress() {
   TASK_ORDER.forEach((n, i) => {

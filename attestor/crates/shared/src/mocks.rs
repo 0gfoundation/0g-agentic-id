@@ -732,17 +732,31 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
 
     async fn set_storage_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_storage_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.storage_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.storage_stage = stage;
+            // Recompute phase from all stages, matching the Postgres
+            // `update_stage` helper (which does this atomically in a tx).
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
     }
 
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_mint_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.mint_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.mint_stage = stage;
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
     }
 
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_container_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.container_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.container_stage = stage;
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
     }
 
     async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {

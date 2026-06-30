@@ -814,14 +814,17 @@ async fn handle_deploy(
     let (storage_res, mint_res, container_res) =
         tokio::join!(storage_fut, mint_fut, container_fut);
 
-    // If any phase-1 track failed, kill the sandbox before bailing.
-    // sandbox.create may have succeeded inside container_track even when
-    // mint/storage failed elsewhere — that container is now an orphan
-    // (deploy can't reach phase 2, the user's only recovery is /retry
-    // which doesn't touch container, or recreate from scratch). Either
-    // way the existing sandbox is useless and just burns sandbox quota.
-    let any_failed = storage_res.is_err() || mint_res.is_err() || container_res.is_err();
-    if any_failed {
+    // Identity vs runtime: only storage/mint constitute the on-chain
+    // IDENTITY. A container-track failure must NOT fail the deploy — the
+    // agent is still minted, and `run_phase2` finalizes its card/URI with
+    // an empty `url` (the runtime fills it in later via Bring online). The
+    // agent lands Offline (minted, no running container), recoverable.
+    let identity_failed = storage_res.is_err() || mint_res.is_err();
+    if identity_failed {
+        // Identity failed → there's no agent to finalize. Any sandbox that
+        // container_track managed to create is now an orphan (no on-chain
+        // identity points at it); kill it before bailing so it doesn't
+        // burn sandbox quota.
         if let Ok(Some(d)) = ctx.deployments.get(seal_id).await {
             if let Some(sb) = d.sandbox_id.filter(|s| !s.is_empty()) {
                 if let Err(e) = ctx.sandbox.admin_delete(&sb).await {
@@ -829,21 +832,20 @@ async fn handle_deploy(
                         ?seal_id,
                         sandbox_id = %sb,
                         error = %e,
-                        "admin_delete after phase-1 failure failed (non-fatal)"
+                        "admin_delete after identity failure failed (non-fatal)"
                     );
                 } else {
                     tracing::info!(
                         ?seal_id,
                         sandbox_id = %sb,
-                        "admin_delete: cleaned orphan sandbox after phase-1 failure"
+                        "admin_delete: cleaned orphan sandbox after identity failure"
                     );
                 }
             }
-            // Also flip c=Failed + clear provision_deadline so the
-            // worker sweep doesn't fire 5min later and overwrite the
-            // real failure reason (mint/storage) with a misleading
-            // "provision timeout". Only do this when c was still in
-            // an active state — a genuine container_failed should keep
+            // Flip c=Failed + clear provision_deadline so the sweep doesn't
+            // fire 5min later and overwrite the real failure reason
+            // (mint/storage) with a misleading "provision timeout". Only
+            // when c was still active — a genuine container_failed keeps
             // its own reason.
             if matches!(d.container_stage, StageStatus::Submitted { .. } | StageStatus::NotStarted) {
                 let now = Utc::now();
@@ -853,7 +855,7 @@ async fn handle_deploy(
                         seal_id,
                         StageStatus::Failed {
                             at: now,
-                            reason: "skipped — phase 1 failed".to_string(),
+                            reason: "skipped — identity (storage/mint) failed".to_string(),
                         },
                     )
                     .await;
@@ -863,14 +865,22 @@ async fn handle_deploy(
                     .await;
             }
         }
+        // Propagate the identity error; both tracks already recorded their
+        // own stage updates. Never `container_res?` — a container failure
+        // is not an identity failure.
+        storage_res?;
+        mint_res?;
+        return Ok(()); // unreachable: one of the two above is Err
     }
 
-    // Propagate first error; all 3 already recorded their own stage updates.
-    storage_res?;
-    mint_res?;
-    container_res?;
+    // Identity succeeded. A container-only failure is intentionally NOT
+    // propagated — run_container_track already recorded its Failed stage
+    // (with reason), and the agent stays Offline. Finalize identity either
+    // way: with the sandbox_id when the container came up (real url), or
+    // with an empty url when it didn't (filled later by Bring online).
+    let _ = container_res;
 
-    // Phase 2: AgentCard → OSS → setAgentURI → ciphertext cleanup.
+    // Identity finalize: AgentCard → OSS → setAgentURI → ciphertext cleanup.
     run_phase2(
         ctx,
         seal_id,
@@ -906,10 +916,12 @@ async fn run_phase2(
     let agent_id: AgentId = d
         .agent_id
         .ok_or_else(|| anyhow::anyhow!("phase 2: agent_id not recorded"))?;
-    let sandbox_id = d
-        .sandbox_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("phase 2: sandbox_id not recorded"))?;
+    // Identity finalize is independent of the runtime: the card's only
+    // sandbox-dependent field is `url`, and that's empty (filled later by
+    // refresh_agent_card_url, OSS-only) when no container exists yet. So we
+    // do NOT require a sandbox_id here — a container failure must not block
+    // minting the on-chain identity.
+    let sandbox_id = d.sandbox_id.clone().unwrap_or_default();
     let agent_seal_addr = d.agent_seal_addr;
 
     // v0 always uses the registry's fallback profile (OpenClaw) for
@@ -1248,8 +1260,8 @@ mod tests {
     };
     use attestor_shared::oss::OssClient;
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, IDataArtifact, SandboxEnvelope,
-        StorageRoot,
+        derive_phase, Config, Deployment, DeploymentPhase, DeploymentRepo, IDataArtifact,
+        SandboxEnvelope, StorageRoot,
     };
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use chrono::Utc;
@@ -1421,6 +1433,107 @@ mod tests {
             signed_message_b64: B64.encode(&bytes),
             wallet_signature: Bytes::new(),
         }
+    }
+
+    // ── handle_deploy: identity vs runtime split ──────────────────────
+
+    #[tokio::test]
+    async fn deploy_finalizes_identity_when_container_create_fails() {
+        // Container create fails, but storage + mint succeed. Identity is
+        // independent of the runtime, so the agent must still be minted +
+        // carded (setAgentURI once), land Offline, and carry a card with an
+        // empty url. Recoverable via Bring online — NOT a failed deploy.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        t.sandbox.create_fails.store(true, Ordering::SeqCst);
+
+        handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            Vec::new(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            dummy_envelope("create"),
+        )
+        .await
+        .expect("deploy must succeed despite a container failure");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        // Identity finalized.
+        assert!(d.agent_id.is_some(), "agent must be minted");
+        assert!(!d.agent_uri.is_empty(), "agent_uri (stable OSS key) must be written");
+        assert_eq!(
+            t.chain.set_uri_calls.load(Ordering::SeqCst),
+            1,
+            "setAgentURI must run exactly once"
+        );
+        // Runtime failed → Offline, card url empty.
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "container stage must be Failed"
+        );
+        assert_eq!(d.phase, DeploymentPhase::Offline, "minted + container failed = Offline");
+        assert_eq!(
+            d.agent_card.get("url").and_then(|v| v.as_str()),
+            Some(""),
+            "card url must be empty with no sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_bails_and_reaps_orphan_when_mint_fails() {
+        // Mint (identity) fails while the container track created a sandbox.
+        // The deploy must bail (identity is the point), the orphan sandbox
+        // must be admin_deleted, and setAgentURI must NOT run.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        t.chain.register_fails.store(true, Ordering::SeqCst); // mint fails
+
+        let res = handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            Vec::new(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            dummy_envelope("create"),
+        )
+        .await;
+
+        assert!(res.is_err(), "identity failure must fail the deploy");
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            1,
+            "orphan sandbox must be reaped"
+        );
+        assert_eq!(
+            t.chain.set_uri_calls.load(Ordering::SeqCst),
+            0,
+            "setAgentURI must NOT run when identity failed"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.phase, DeploymentPhase::Failed, "mint failure = Failed");
     }
 
     // ── handle_resume_deploy ──────────────────────────────────────────
