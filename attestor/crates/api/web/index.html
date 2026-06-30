@@ -3340,15 +3340,19 @@ function renderTaskProgress(dep) {
   const sFailed = dep.storage_stage && dep.storage_stage.state === 'failed';
   const mFailed = dep.mint_stage && dep.mint_stage.state === 'failed';
   const cFailed = dep.container_stage && dep.container_stage.state === 'failed';
-  const phase1Failed = sFailed || mFailed || cFailed;
+  // Identity (storage→mint→uri) and Runtime (sandbox→running) are
+  // independent. `uri` is skipped only when IDENTITY failed — a container
+  // failure no longer blocks the on-chain finalize. `running` needs a live
+  // container, so it's skipped when identity OR the container failed.
+  const identityFailed = sFailed || mFailed;
 
   let uriOverride = null;
   if (dep.agent_uri) uriOverride = { cls: 'done', icon: '✓', text: 'on-chain' };
-  else if (phase1Failed) uriOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+  else if (identityFailed) uriOverride = { cls: 'fail', icon: '✗', text: 'skipped — identity step failed' };
 
   let runningOverride = null;
   if (phase === 'running') runningOverride = { cls: 'done', icon: '✓', text: 'live' };
-  else if (phase1Failed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+  else if (identityFailed || cFailed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
 
   // Always render all 5 tasks — completed ones show with ✓ instead of
   // disappearing. This matches the deploy console's checklist style:
@@ -3356,16 +3360,16 @@ function renderTaskProgress(dep) {
   // list that "ate" success markers.
   return `
     <section class="phase-tracker">
-      <div class="phase-label" style="margin-top:0">Phase 1 — three concurrent tracks</div>
+      <div class="phase-label" style="margin-top:0">Identity — on-chain agent</div>
       <ul class="tasks">
         ${renderStage(1, 'Encrypt & upload to 0G storage', dep.storage_stage)}
         ${renderStage(2, 'Mint AgenticID on chain',         dep.mint_stage)}
-        ${renderStage(3, 'Provision agent sandbox',         dep.container_stage)}
+        ${renderStage(3, 'Set agent URI on chain',          null, uriOverride)}
       </ul>
-      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+      <div class="phase-label" style="margin-top:14px">Runtime — agent sandbox</div>
       <ul class="tasks">
-        ${renderStage(4, 'Set agent URI on chain',     null, uriOverride)}
-        ${renderStage(5, 'Sandbox reports running',    null, runningOverride)}
+        ${renderStage(4, 'Provision agent sandbox',         dep.container_stage)}
+        ${renderStage(5, 'Sandbox reports running',         null, runningOverride)}
       </ul>
     </section>`;
 }
