@@ -119,6 +119,25 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     // enqueues a fresh start job.
                     return Ok(());
                 }
+                // "Operation already in progress" is a TRANSIENT lock, not a
+                // runtime fault: daytona runs a ~90s backup after a stop and
+                // holds the sandbox lock for its duration, so a Resume that
+                // lands in that window is rejected. The sandbox is healthy and
+                // still resumable — flipping Failed + admin_delete here would
+                // destroy a perfectly good container over a lock that clears on
+                // its own (and force a full Recreate). Leave it Stopped and
+                // tell the user to Resume again once the backup finishes.
+                if e.to_string().to_lowercase().contains("in progress") {
+                    tracing::warn!(?seal_id, error = %e, "sandbox.start: operation in progress (transient backup lock); staying Stopped for retry");
+                    ctx.events
+                        .publish(WsEvent::ContainerWarning {
+                            seal_id,
+                            reason: "sandbox is backing up — try Resume again in a moment"
+                                .to_string(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 let now = Utc::now();
                 let reason = format!("sandbox start: {e}");
                 tracing::warn!(?seal_id, error = %e, "sandbox.start failed; flipping c=Failed");
@@ -2030,6 +2049,70 @@ mod tests {
         assert!(
             !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
             "must NOT emit ContainerFailed on a 402"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_operation_in_progress_stays_stopped() {
+        // daytona runs a ~90s backup after a stop and holds the sandbox lock
+        // during it, so a Resume in that window gets "An operation is already
+        // in progress for this resource". That's a TRANSIENT lock — the
+        // sandbox is healthy and resumable once the backup finishes. The
+        // deployment must stay Stopped, the sandbox must NOT be reaped, and a
+        // ContainerWarning (not ContainerFailed) is emitted. Regression guard
+        // for the bug where this transient lock destroyed a good container.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(7u64)),
+            Some("sb-backing-up".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_msg.lock().unwrap() = Some(
+            "sandbox start: 400 Bad Request — {\"message\":\"Sandbox failed to start: An operation is already in progress for this resource\"}".into(),
+        );
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("a transient in-progress lock must not be a hard error");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Stopped { .. }),
+            "must stay Stopped (resumable), got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "must NOT reap the sandbox over a transient backup lock"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            "expected a ContainerWarning retry hint"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            "must NOT emit ContainerFailed on a transient lock"
         );
     }
 
