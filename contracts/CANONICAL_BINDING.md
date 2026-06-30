@@ -123,13 +123,22 @@ assertion.
 > AgenticID (`0xf952…`), which predates the canonical binding and is unrelated to
 > the contracts in this doc.
 
-### 5.1 Standard deployment — 2026-06-18 (current)
+> **Two active environments run in parallel** — pick the right contract set by
+> environment:
+> - **test** (§5.1) — AgenticID `0x3449…`, owner `0xea69…`.
+> - **dev** (§5.2) — AgenticID `0x5BB5…`, owner `0xB831…`. **This is what the
+>   dev-host attestor points at** (`ATTESTOR_AGENTIC_ID_ADDR`).
+>
+> §5.3 lists abandoned deploys (do not use). "active" below means a live
+> environment, not "the single current deploy".
 
-**Why:** redeployed from the merged `main` (post PR #10) under a dedicated
-deployer key. Production `Deploy.s.sol` topology (TimelockController +
-UpgradeableBeacon per contract); canonical address auto-selected by chainId and
-the deploy-time `getVersion() == "2.0.0"` check passed. Deployed with
-`--priority-gas-price 2000000000`.
+### 5.1 Test environment — 2026-06-18 (active)
+
+**Role:** the **test** environment. Deployed from the merged `main` (post PR #10)
+under a dedicated deployer key (`0xea69…`). Production `Deploy.s.sol` topology
+(TimelockController + UpgradeableBeacon per contract); canonical address
+auto-selected by chainId and the deploy-time `getVersion() == "2.0.0"` check
+passed. Deployed with `--priority-gas-price 2000000000`.
 
 | Contract | Address |
 |---|---|
@@ -159,10 +168,12 @@ provision fail until the owner (`0xea695C31…`) seeds the allowlists —
 `addTrustedAttestor(<attestor>)` (else `AgenticIDNotTrustedAttestor`) and
 `addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in validFrameworkHashes`).
 
-### 5.2 Standard deployment — 2026-06-17 — superseded
+### 5.2 Dev environment — 2026-06-17 (active)
 
-First standard (`Deploy.s.sol`, Timelock + beacon) deploy, on the PR branch under
-the original deployer key. Superseded by 5.1; do not use. Full record retained:
+**Role:** the **dev** environment — **this is the contract set the dev-host
+attestor uses** (`ATTESTOR_AGENTIC_ID_ADDR = 0x5BB5…`); it runs in parallel with
+the test env in §5.1, NOT superseded by it. First standard (`Deploy.s.sol`,
+Timelock + beacon) deploy, owner `0xB831…`.
 
 | Contract | Address |
 |---|---|
