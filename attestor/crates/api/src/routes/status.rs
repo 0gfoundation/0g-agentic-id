@@ -33,6 +33,29 @@ pub async fn handle(
     verify_status_signature(&report, d.agent_seal_addr, state.crypto.as_ref())
         .map_err(|e| ApiError::bad_request(format!("agent_seal_signature: {e}")))?;
 
+    // Ghost-container guard. The signature above only proves the report
+    // was signed by the agentSeal key — but that key is derived
+    // deterministically from seal_id, so EVERY container ever spawned for
+    // this seal holds it, including stale ones the attestor no longer
+    // tracks (sandbox_id cleared by a transfer teardown, a DB reset, or an
+    // orphan that outlived its bookkeeping). If we have no sandbox_id on
+    // record there is no container we consider live, so the report can
+    // only be such a ghost. Honoring it would flip the agent to Running
+    // with no sandbox and no prepaid billing behind it. Ack the heartbeat
+    // shape (200, so a fire-and-forget reporter doesn't hot-loop) but make
+    // no state change.
+    if d.sandbox_id.as_deref().map(str::is_empty).unwrap_or(true) {
+        tracing::warn!(
+            seal_id = ?report.seal_id,
+            status = ?report.status,
+            "status report for a deployment with no sandbox on record — ignoring (ghost container?)"
+        );
+        return Ok((
+            StatusCode::OK,
+            Json(json!({"ok": true, "ignored": "no sandbox on record"})),
+        ));
+    }
+
     let now = Utc::now();
 
     // Bump last_heartbeat regardless of severity — the sweep treats
