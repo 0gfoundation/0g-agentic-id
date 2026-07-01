@@ -15,7 +15,7 @@
 use crate::traits::ChainClient;
 use crate::types::*;
 use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::fillers::{ChainIdFiller, NonceFiller, SimpleNonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
@@ -309,6 +309,11 @@ where
                 data_hash: d.dataHash,
             })
             .collect())
+    }
+
+    async fn sealed_keys_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        Ok(c.sealedKeysOf(agent_id).call().await?._0)
     }
 
     async fn set_agent_uri(

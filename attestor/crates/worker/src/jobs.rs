@@ -972,34 +972,44 @@ async fn handle_clone(
         .get(source_seal_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("clone: source deployment vanished"))?;
-    if source.i_data.is_empty() {
-        anyhow::bail!("clone: source has no iData");
+    let source_agent_id = source
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("clone: source is not minted"))?;
+
+    // Read the AUTHORITATIVE current iData + sealed keys from CHAIN — not the
+    // attestor DB snapshot, which is frozen at deploy time and goes stale once
+    // the agent evolves its iData on chain (0g-agentic-id#27). The clone must
+    // copy what the source agent actually runs now.
+    let idatas = ctx.chain.intelligent_datas_of(source_agent_id).await?;
+    let sealed = ctx.chain.sealed_keys_of(source_agent_id).await?;
+    if idatas.is_empty() {
+        anyhow::bail!("clone: source has no on-chain iData");
+    }
+    if idatas.len() != sealed.len() {
+        anyhow::bail!(
+            "clone: on-chain iData/sealedKeys length mismatch ({} vs {})",
+            idatas.len(),
+            sealed.len()
+        );
     }
 
     let new_kp = ctx.crypto.derive_agent_seal(new_seal_id)?;
 
-    // Re-seal every dataKey to the clone's agentSeal. This is pre-mint: on
-    // any failure, mark mint Failed (→ phase Failed) so the clone surfaces as
-    // broken rather than stuck, then bail.
-    let resealed: anyhow::Result<Vec<IDataArtifact>> = (|| {
+    // Re-seal every dataKey from the source agentSeal to the clone's new
+    // agentSeal (KMS re-derives the source priv to unseal). Storage roots and
+    // dataHashes in `idatas` are reused verbatim — same ciphertext on chain,
+    // nothing re-uploaded. Pre-mint: on failure mark mint Failed + bail.
+    let resealed: anyhow::Result<Vec<Bytes>> = (|| {
         let source_kp = ctx.crypto.derive_agent_seal(source_seal_id)?;
-        let mut artifacts = Vec::with_capacity(source.i_data.len());
-        for src in &source.i_data {
-            let data_key = ctx.crypto.ecies_decrypt(&src.sealed_key, &source_kp.priv_key)?;
-            let new_sealed = ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?;
-            artifacts.push(IDataArtifact {
-                role: src.role.clone(),
-                description: src.description.clone(),
-                storage_root: src.storage_root.clone(),
-                sealed_key: Bytes::from(new_sealed),
-                data_hash: src.data_hash,
-                ciphertext: Bytes::new(), // storage reuse — nothing to upload
-            });
+        let mut out = Vec::with_capacity(sealed.len());
+        for sk in &sealed {
+            let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
+            out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
         }
-        Ok(artifacts)
+        Ok(out)
     })();
-    let artifacts = match resealed {
-        Ok(a) => a,
+    let sealed_keys = match resealed {
+        Ok(v) => v,
         Err(e) => {
             let now = Utc::now();
             let reason = format!("clone re-seal: {e}");
@@ -1015,10 +1025,9 @@ async fn handle_clone(
         }
     };
 
-    // Persist the re-sealed artifacts + a stub card (recovery/UI fallback).
-    ctx.deployments
-        .set_i_data_artifacts(new_seal_id, artifacts.clone(), String::new())
-        .await?;
+    // Stub card (UI/recovery fallback); run_phase2 overwrites it with the full
+    // AgentCard. The clone's iData is authoritative on chain — we deliberately
+    // do NOT persist an i_data snapshot in the clone's deployment row.
     let stub_card = serde_json::json!({
         "name": name,
         "description": description,
@@ -1028,8 +1037,8 @@ async fn handle_clone(
         .set_agent_uri_and_card(new_seal_id, String::new(), stub_card)
         .await?;
 
-    // Storage reuses the source roots — nothing to upload, so mark Confirmed
-    // directly (no run_storage_track).
+    // Storage reuses the source's on-chain roots — nothing to upload, so mark
+    // Confirmed directly (no run_storage_track).
     let now = Utc::now();
     ctx.deployments
         .set_storage_stage(new_seal_id, StageStatus::Confirmed { at: now })
@@ -1040,20 +1049,14 @@ async fn handle_clone(
         })
         .await?;
 
-    // Mint the clone to the target owner with the re-sealed keys + same
-    // dataHashes (same on-chain data commitment as the source).
+    // Mint the clone to the target owner: the source's CURRENT on-chain iData
+    // (descriptions + dataHashes) with keys re-sealed to the clone's agentSeal.
     let mint_params = MintParams {
         to: target_owner,
         agent_uri: String::new(),
         metadata: Vec::new(),
-        intelligent_datas: artifacts
-            .iter()
-            .map(|a| IntelligentData {
-                description: a.description.clone(),
-                data_hash: a.data_hash,
-            })
-            .collect(),
-        sealed_keys: artifacts.iter().map(|a| a.sealed_key.clone()).collect(),
+        intelligent_datas: idatas,
+        sealed_keys,
         agent_seal: new_kp.address,
         seal_id: new_seal_id,
     };
@@ -1763,25 +1766,23 @@ mod tests {
 
         let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).unwrap();
         let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
-        // Source artifact: a known dataKey sealed to the SOURCE agentSeal.
+        // Source's AUTHORITATIVE on-chain iData: a known dataKey sealed to the
+        // SOURCE agentSeal. Clone reads this from the chain (not the DB).
         let known_key = vec![0x9u8; 32];
         let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
-        let art = IDataArtifact {
-            role: "persona".into(),
-            description: "{}".into(),
-            storage_root: StorageRoot {
-                root_hash: B256::repeat_byte(0x33),
-                indexer: "indexer.example".into(),
-                size: 32,
-            },
-            sealed_key: Bytes::from(sealed),
-            data_hash: B256::repeat_byte(0x33),
-            ciphertext: Bytes::new(),
-        };
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(sealed)],
+        );
+        // Source deployment only needs to exist + be minted (agent_id set);
+        // its DB i_data is intentionally NOT used by clone anymore.
         seed_deployment(
             &t.deployments,
             source_seal,
-            vec![art],
+            Vec::new(),
             StageStatus::Confirmed { at: Utc::now() },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(5u64)),
@@ -1793,28 +1794,23 @@ mod tests {
             .await
             .expect("clone must succeed");
 
-        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
-        // Re-seal correctness: the clone's sealed_key decrypts (with the NEW
-        // agentSeal priv) to the SAME dataKey — data reused, key re-sealed.
-        let got = t
-            .ctx
-            .crypto
-            .ecies_decrypt(&clone.i_data[0].sealed_key, &new_kp.priv_key)
-            .unwrap();
-        assert_eq!(got, known_key, "clone dataKey must equal source (re-sealed to new agentSeal)");
-        // Storage reuse: same data_hash/root, and NO upload happened.
-        assert_eq!(clone.i_data[0].data_hash, B256::repeat_byte(0x33));
+        // Minted to the target owner with the clone's new agentSeal, and the
+        // minted sealed_key re-seals correctly: decrypting it with the NEW
+        // agentSeal priv yields the SAME source dataKey (data reused).
+        let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(to, target, "must mint to target_owner");
+        assert_eq!(agent_seal, new_kp.address, "must mint with the clone's agentSeal");
+        assert_eq!(keys.len(), 1);
+        let got = t.ctx.crypto.ecies_decrypt(&keys[0], &new_kp.priv_key).unwrap();
+        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey under the clone agentSeal");
+        // Storage reuse: NO upload happened (source roots reused via chain iData).
         assert_eq!(
             t.storage.upload_calls.load(Ordering::SeqCst),
             0,
             "clone must reuse source storage, not re-upload"
         );
-        // Minted to the target owner with the clone's new agentSeal.
-        let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
-        assert_eq!(to, target, "must mint to target_owner");
-        assert_eq!(agent_seal, new_kp.address, "must mint with the clone's agentSeal");
-        assert_eq!(keys.len(), 1);
         // Identity finalized → Offline; setAgentURI ran once.
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
         assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
         assert!(clone.agent_id.is_some(), "clone must be minted");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
@@ -1827,23 +1823,18 @@ mod tests {
         let new_seal = B256::repeat_byte(0x22);
         let target = Address::from([0xbb; 20]);
         let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
-        // Corrupt sealed_key → ecies_decrypt fails → pre-mint failure.
-        let art = IDataArtifact {
-            role: "persona".into(),
-            description: "{}".into(),
-            storage_root: StorageRoot {
-                root_hash: B256::repeat_byte(0x33),
-                indexer: "indexer.example".into(),
-                size: 32,
-            },
-            sealed_key: Bytes::from(vec![0u8; 10]),
-            data_hash: B256::repeat_byte(0x33),
-            ciphertext: Bytes::new(),
-        };
+        // Corrupt on-chain sealed_key → ecies_decrypt fails → pre-mint failure.
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(vec![0u8; 10])],
+        );
         seed_deployment(
             &t.deployments,
             source_seal,
-            vec![art],
+            Vec::new(),
             StageStatus::Confirmed { at: Utc::now() },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(5u64)),

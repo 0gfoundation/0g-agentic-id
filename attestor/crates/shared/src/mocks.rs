@@ -60,6 +60,11 @@ pub struct MockChain {
     /// Address returned by `owner_of` (for any agent_id). Defaults to ZERO;
     /// set via `set_owner_of` to exercise the lifecycle owner gate in tests.
     owner: Mutex<Address>,
+    /// On-chain iData + sealed keys returned by `intelligent_datas_of` /
+    /// `sealed_keys_of` (for any agent_id). Seed via `seed_idata` to exercise
+    /// clone reading the authoritative chain state.
+    idata: Mutex<Vec<IntelligentData>>,
+    sealed_keys: Mutex<Vec<Bytes>>,
 }
 
 impl MockChain {
@@ -70,12 +75,21 @@ impl MockChain {
             tx_to_receipt: Mutex::new(HashMap::new()),
             tx_counter: AtomicU64::new(1),
             owner: Mutex::new(Address::ZERO),
+            idata: Mutex::new(Vec::new()),
+            sealed_keys: Mutex::new(Vec::new()),
         }
     }
 
     /// Set the address `owner_of` returns (test-only).
     pub fn set_owner_of(&self, addr: Address) {
         *self.owner.lock().unwrap() = addr;
+    }
+
+    /// Seed the on-chain iData + sealed keys returned for any agent_id
+    /// (test-only) — exercises clone reading the authoritative chain state.
+    pub fn seed_idata(&self, idata: Vec<IntelligentData>, sealed_keys: Vec<Bytes>) {
+        *self.idata.lock().unwrap() = idata;
+        *self.sealed_keys.lock().unwrap() = sealed_keys;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -154,7 +168,11 @@ impl ChainClient for MockChain {
         &self,
         _agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>> {
-        Ok(Vec::new())
+        Ok(self.idata.lock().unwrap().clone())
+    }
+
+    async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+        Ok(self.sealed_keys.lock().unwrap().clone())
     }
 
     async fn set_agent_uri(
@@ -456,6 +474,10 @@ pub struct ConfigurableChain {
     /// Last `registerWithSeal` params (to, agent_seal, sealed_keys) so tests
     /// can assert who a mint/clone was minted to.
     pub last_register: Mutex<Option<(Address, Address, Vec<Bytes>)>>,
+    /// On-chain iData + sealed keys for `intelligent_datas_of`/`sealed_keys_of`
+    /// (for any agent_id). Seed via `seed_idata` to exercise clone.
+    idata: Mutex<Vec<IntelligentData>>,
+    sealed_keys: Mutex<Vec<Bytes>>,
     next_agent_id: AtomicU64,
     tx_counter: AtomicU64,
     receipts: Mutex<HashMap<TxHash, ReceiptSummary>>,
@@ -471,6 +493,8 @@ impl ConfigurableChain {
             set_uri_fails: AtomicBool::new(false),
             last_set_uri: Mutex::new(None),
             last_register: Mutex::new(None),
+            idata: Mutex::new(Vec::new()),
+            sealed_keys: Mutex::new(Vec::new()),
             next_agent_id: AtomicU64::new(1),
             tx_counter: AtomicU64::new(1),
             receipts: Mutex::new(HashMap::new()),
@@ -479,6 +503,13 @@ impl ConfigurableChain {
 
     pub fn seed_minted(&self, seal_id: SealId, agent_id: AgentId) {
         self.seal_to_agent.lock().unwrap().insert(seal_id, agent_id);
+    }
+
+    /// Seed the on-chain iData + sealed keys returned for any agent_id
+    /// (test-only) — exercises clone reading the authoritative chain state.
+    pub fn seed_idata(&self, idata: Vec<IntelligentData>, sealed_keys: Vec<Bytes>) {
+        *self.idata.lock().unwrap() = idata;
+        *self.sealed_keys.lock().unwrap() = sealed_keys;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -560,7 +591,11 @@ impl ChainClient for ConfigurableChain {
         &self,
         _agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>> {
-        Ok(Vec::new())
+        Ok(self.idata.lock().unwrap().clone())
+    }
+
+    async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+        Ok(self.sealed_keys.lock().unwrap().clone())
     }
 
     async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {

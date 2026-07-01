@@ -3,7 +3,7 @@
 
 use crate::events::WsEvent;
 use crate::types::*;
-use alloy::primitives::{Address, B256, TxHash};
+use alloy::primitives::{Address, Bytes, B256, TxHash};
 use async_trait::async_trait;
 
 // ── Chain ───────────────────────────────────────────────────────────────
@@ -38,6 +38,13 @@ pub trait ChainClient: Send + Sync {
         &self,
         agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>>;
+
+    /// ERC-7857 `sealedKeysOf(agentId)` view — the per-iData sealed data
+    /// keys (ECIES to the agent's agentSeal), in the same order as
+    /// `intelligentDatasOf`. This is the AUTHORITATIVE current state (the
+    /// agent may have evolved its iData on chain since deploy), so clone
+    /// reads sealed keys from here rather than the deploy-time DB snapshot.
+    async fn sealed_keys_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<Bytes>>;
 
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
