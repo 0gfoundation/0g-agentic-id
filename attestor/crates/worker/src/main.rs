@@ -211,28 +211,29 @@ async fn main() -> anyhow::Result<()> {
                         // No sandbox to reconcile against; leave for an operator.
                         continue;
                     };
-                    let info = match sandbox.get_sandbox(&sb).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Flapping sandbox RPC — don't mutate; retry next tick.
-                            tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed (skip)");
-                            continue;
-                        }
+                    // Probe the agent's /healthz directly — used both to confirm
+                    // a "started" sandbox is really serving, and as the fallback
+                    // liveness signal when get_sandbox itself is unavailable.
+                    let healthz_ok = || async {
+                        let url = attestor_shared::agent_card::build_healthz_url(
+                            &sandbox_proxy_addr,
+                            &sb,
+                            agent_serve_port,
+                        );
+                        attestor_shared::agent_card::agent_is_healthy(&url).await
                     };
-                    let act = match info {
+
+                    let act = match sandbox.get_sandbox(&sb).await {
                         // Gone already — flip Failed, nothing to reap.
-                        None => Act::Fail("container missing (sandbox deleted)".to_string(), false),
-                        Some(ref i) => match i.state.as_str() {
+                        Ok(None) => {
+                            Act::Fail("container missing (sandbox deleted)".to_string(), false)
+                        }
+                        Ok(Some(ref i)) => match i.state.as_str() {
                             // Sandbox up but heartbeat stale: confirm with a
                             // /healthz probe before declaring the agent dead,
                             // so we don't reap a healthy-but-isolated agent.
                             "started" | "starting" => {
-                                let url = attestor_shared::agent_card::build_healthz_url(
-                                    &sandbox_proxy_addr,
-                                    &sb,
-                                    agent_serve_port,
-                                );
-                                if attestor_shared::agent_card::agent_is_healthy(&url).await {
+                                if healthz_ok().await {
                                     Act::Skip
                                 } else {
                                     Act::Fail(
@@ -252,6 +253,28 @@ async fn main() -> anyhow::Result<()> {
                             // already mis-Failed "archiving" once by enumerating).
                             other => Act::Stop(format!("sandbox {other}")),
                         },
+                        // get_sandbox unavailable — e.g. the provider 500s on a
+                        // destroyed/error sandbox (its state machine can't report
+                        // it; see 0g-sandbox#50), or a genuine transient. Don't
+                        // skip forever, or a dead agent stays "running". The
+                        // heartbeat is already stale (candidate filter), so fall
+                        // back to a direct /healthz probe as an independent
+                        // liveness signal: unreachable there too → confidently
+                        // dead → Failed + reap; still reachable → alive, just a
+                        // flaky get_sandbox → leave it. Never reaps on one signal.
+                        Err(e) => {
+                            if healthz_ok().await {
+                                tracing::debug!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed but /healthz ok — leaving alone");
+                                Act::Skip
+                            } else {
+                                tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed + /healthz down — reaping unreachable agent");
+                                Act::Fail(
+                                    "agent unreachable (get_sandbox unavailable + heartbeat stale + /healthz down)"
+                                        .to_string(),
+                                    true,
+                                )
+                            }
+                        }
                     };
 
                     match act {
