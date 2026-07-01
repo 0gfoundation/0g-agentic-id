@@ -149,14 +149,6 @@ pub struct CloneRequest {
     /// EIP-191 signature by the source owner over the canonical clone payload.
     pub owner_signature: Bytes,
     pub owner_signed_message_b64: String,
-    /// Optional overrides for the clone's card; when omitted the source
-    /// card's values are copied.
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

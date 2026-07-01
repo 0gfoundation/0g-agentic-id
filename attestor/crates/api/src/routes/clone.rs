@@ -29,7 +29,7 @@ pub async fn handle(
         return Err(ApiError::bad_request("target_owner is required"));
     }
 
-    // Source must be a known, minted agent with iData.
+    // Source must be a known, minted agent.
     let source = state
         .deployments
         .get_by_agent_id(req.source_agent_id)
@@ -38,8 +38,18 @@ pub async fn handle(
     if source.agent_id.is_none() {
         return Err(ApiError::bad_request("source agent is not minted yet"));
     }
-    if source.i_data.is_empty() {
-        return Err(ApiError::bad_request("source agent has no iData to clone"));
+    // iData lives on chain — the DB `i_data` snapshot is empty for clone-minted
+    // agents and stale for evolved ones. Gate on the LIVE on-chain iData, the
+    // same source the worker re-seals from.
+    let source_idata = state
+        .chain
+        .intelligent_datas_of(req.source_agent_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("intelligent_datas_of: {e}")))?;
+    if source_idata.is_empty() {
+        return Err(ApiError::bad_request(
+            "source agent has no on-chain iData to clone",
+        ));
     }
 
     // Authorize: the signer must be the CURRENT on-chain owner of the source
@@ -52,22 +62,15 @@ pub async fn handle(
     verify_clone_signature(&req, owner, state.crypto.as_ref())
         .map_err(|e| ApiError::unauthorized(format!("owner_signature: {e}")))?;
 
-    // Resolve the clone's card fields: caller override, else copy the source
-    // card. A name is required — reject if neither yields one.
+    // The clone copies the source card verbatim — no caller overrides. A name
+    // is required, so reject if the source card has none.
     let card = &source.agent_card;
     let from_card = |key: &str| card.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    let name = req
-        .name
-        .clone()
-        .or_else(|| from_card("name"))
+    let name = from_card("name")
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| ApiError::bad_request("name is required (source card has none)"))?;
-    let description = req
-        .description
-        .clone()
-        .or_else(|| from_card("description"))
-        .unwrap_or_default();
-    let image = req.image.clone().or_else(|| from_card("image"));
+        .ok_or_else(|| ApiError::bad_request("source card has no name to clone"))?;
+    let description = from_card("description").unwrap_or_default();
+    let image = from_card("image");
 
     tracing::info!(
         source_agent_id = %req.source_agent_id,
@@ -185,7 +188,9 @@ mod tests {
         MockChain, MockSandbox,
     };
     use attestor_shared::sandbox::eip191_digest;
-    use attestor_shared::{AgentId, Config, DeploymentRepo, IDataArtifact, StageStatus, StorageRoot};
+    use attestor_shared::{
+        AgentId, Config, IDataArtifact, IntelligentData, StageStatus, StorageRoot,
+    };
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use chrono::Utc;
     use std::sync::Arc;
@@ -242,6 +247,14 @@ mod tests {
     fn make_setup() -> Setup {
         let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32]))));
         let chain = Arc::new(MockChain::new());
+        // The route now gates on LIVE on-chain iData, so seed one entry.
+        chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from_static(b"sealed")],
+        );
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
         let jobs = Arc::new(InMemoryJobQueue::new());
 
@@ -307,15 +320,11 @@ mod tests {
         source_agent_id: AgentId,
         target: Address,
     ) -> CloneRequest {
-        let name = Some("Clone".to_string());
         let canonical = serde_json::json!({
             "domain": CanonicalClone::DOMAIN,
             "idempotency_key": idem,
             "source_agent_id": source_agent_id,
             "target_owner": target,
-            "name": name,
-            "description": null,
-            "image": null,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let sig = signer.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap();
@@ -325,9 +334,6 @@ mod tests {
             target_owner: target,
             owner_signature: Bytes::from(<Vec<u8>>::from(sig)),
             owner_signed_message_b64: B64.encode(&bytes),
-            name,
-            description: None,
-            image: None,
         }
     }
 

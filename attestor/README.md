@@ -85,6 +85,7 @@ Grouped by category.
 | Path | Purpose | Auth |
 |---|---|---|
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
+| `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
 | `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent | owner envelope |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` | none |
 

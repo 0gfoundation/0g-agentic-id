@@ -18,12 +18,6 @@ pub struct CanonicalClone {
     pub idempotency_key: String,
     pub source_agent_id: AgentId,
     pub target_owner: Address,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub image: Option<String>,
 }
 
 impl Canonical for CanonicalClone {
@@ -58,15 +52,6 @@ pub fn verify_clone_signature(
     if canon.target_owner != req.target_owner {
         anyhow::bail!("clone envelope: target_owner mismatch");
     }
-    if canon.name != req.name {
-        anyhow::bail!("clone envelope: name mismatch");
-    }
-    if canon.description != req.description {
-        anyhow::bail!("clone envelope: description mismatch");
-    }
-    if canon.image != req.image {
-        anyhow::bail!("clone envelope: image mismatch");
-    }
     Ok(())
 }
 
@@ -92,16 +77,12 @@ mod tests {
         idem: &str,
         source_agent_id: AgentId,
         target_owner: Address,
-        name: Option<String>,
     ) -> CloneRequest {
         let canonical = serde_json::json!({
             "domain": CanonicalClone::DOMAIN,
             "idempotency_key": idem,
             "source_agent_id": source_agent_id,
             "target_owner": target_owner,
-            "name": name,
-            "description": null,
-            "image": null,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let digest = eip191_digest(&bytes);
@@ -113,9 +94,6 @@ mod tests {
             target_owner,
             owner_signature: Bytes::from(sig_bytes),
             owner_signed_message_b64: B64.encode(&bytes),
-            name,
-            description: None,
-            image: None,
         }
     }
 
@@ -123,7 +101,7 @@ mod tests {
     fn valid_signature_verifies() {
         let signer = PrivateKeySigner::random();
         let target = Address::from([0xbb; 20]);
-        let req = build(&signer, "idem-1", U256::from(7u64), target, Some("Sage".into()));
+        let req = build(&signer, "idem-1", U256::from(7u64), target);
         verify_clone_signature(&req, signer.address(), crypto().as_ref())
             .expect("valid sig should verify");
     }
@@ -132,7 +110,7 @@ mod tests {
     fn tampered_field_rejected() {
         let signer = PrivateKeySigner::random();
         let target = Address::from([0xbb; 20]);
-        let mut req = build(&signer, "idem-1", U256::from(7u64), target, Some("Sage".into()));
+        let mut req = build(&signer, "idem-1", U256::from(7u64), target);
         req.target_owner = Address::from([0xcc; 20]);
         let err = verify_clone_signature(&req, signer.address(), crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("target_owner mismatch"), "got: {err}");
@@ -144,7 +122,7 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let not_owner = PrivateKeySigner::random();
         let target = Address::from([0xbb; 20]);
-        let req = build(&signer, "idem-1", U256::from(7u64), target, Some("Sage".into()));
+        let req = build(&signer, "idem-1", U256::from(7u64), target);
         let err =
             verify_clone_signature(&req, not_owner.address(), crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("signer mismatch"), "got: {err}");
@@ -159,9 +137,6 @@ mod tests {
             "idempotency_key": "idem-1",
             "source_agent_id": U256::from(7u64),
             "target_owner": target,
-            "name": null,
-            "description": null,
-            "image": null,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let digest = eip191_digest(&bytes);
@@ -173,9 +148,6 @@ mod tests {
             target_owner: target,
             owner_signature: Bytes::from(sig_bytes),
             owner_signed_message_b64: B64.encode(&bytes),
-            name: None,
-            description: None,
-            image: None,
         };
         let err = verify_clone_signature(&req, signer.address(), crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("domain"), "got: {err}");
