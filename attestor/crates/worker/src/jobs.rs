@@ -283,6 +283,25 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             handle_resume_deploy(ctx, seal_id, sandbox_envelope).await
         }
         JobPayload::SandboxTeardown { seal_id } => handle_sandbox_teardown(ctx, seal_id).await,
+        JobPayload::Clone {
+            new_seal_id,
+            source_seal_id,
+            target_owner,
+            name,
+            description,
+            image,
+        } => {
+            handle_clone(
+                ctx,
+                new_seal_id,
+                source_seal_id,
+                target_owner,
+                name,
+                description,
+                image,
+            )
+            .await
+        }
     }
 }
 
@@ -924,6 +943,126 @@ async fn handle_deploy(
     .await?;
 
     let _ = deployment; // silence unused
+    Ok(())
+}
+
+/// Clone: mint a brand-new agent (`new_seal_id`) for `target_owner`, reusing
+/// the source agent's iData. Each source `data_key` is re-sealed from the
+/// source agentSeal to the clone's new agentSeal (deterministic KMS
+/// derivation lets us re-derive the source priv to unseal, then seal to the
+/// new pub); `storage_root`/`data_hash`/`description` are reused verbatim — the
+/// source ciphertext on 0g-storage is shared, nothing is re-uploaded. Then
+/// mint via `run_mint_track` and finalize identity via `run_phase2`; the clone
+/// lands Offline for `target_owner` to bring online later.
+///
+/// A pre-mint re-seal failure flips `mint_stage = Failed` (phase → Failed, so
+/// the dead clone is visible, not stuck Deploying) and bails. Clone failures
+/// aren't retryable via `/retry` in v0 — re-POST `/clone` with a new key.
+async fn handle_clone(
+    ctx: &Ctx,
+    new_seal_id: SealId,
+    source_seal_id: SealId,
+    target_owner: Address,
+    name: String,
+    description: String,
+    image: Option<String>,
+) -> anyhow::Result<()> {
+    let source = ctx
+        .deployments
+        .get(source_seal_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("clone: source deployment vanished"))?;
+    if source.i_data.is_empty() {
+        anyhow::bail!("clone: source has no iData");
+    }
+
+    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id)?;
+
+    // Re-seal every dataKey to the clone's agentSeal. This is pre-mint: on
+    // any failure, mark mint Failed (→ phase Failed) so the clone surfaces as
+    // broken rather than stuck, then bail.
+    let resealed: anyhow::Result<Vec<IDataArtifact>> = (|| {
+        let source_kp = ctx.crypto.derive_agent_seal(source_seal_id)?;
+        let mut artifacts = Vec::with_capacity(source.i_data.len());
+        for src in &source.i_data {
+            let data_key = ctx.crypto.ecies_decrypt(&src.sealed_key, &source_kp.priv_key)?;
+            let new_sealed = ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?;
+            artifacts.push(IDataArtifact {
+                role: src.role.clone(),
+                description: src.description.clone(),
+                storage_root: src.storage_root.clone(),
+                sealed_key: Bytes::from(new_sealed),
+                data_hash: src.data_hash,
+                ciphertext: Bytes::new(), // storage reuse — nothing to upload
+            });
+        }
+        Ok(artifacts)
+    })();
+    let artifacts = match resealed {
+        Ok(a) => a,
+        Err(e) => {
+            let now = Utc::now();
+            let reason = format!("clone re-seal: {e}");
+            tracing::warn!(?new_seal_id, ?source_seal_id, error = %e, "clone: re-seal failed");
+            let _ = ctx
+                .deployments
+                .set_mint_stage(
+                    new_seal_id,
+                    StageStatus::Failed { at: now, reason: reason.clone() },
+                )
+                .await;
+            anyhow::bail!(reason);
+        }
+    };
+
+    // Persist the re-sealed artifacts + a stub card (recovery/UI fallback).
+    ctx.deployments
+        .set_i_data_artifacts(new_seal_id, artifacts.clone(), String::new())
+        .await?;
+    let stub_card = serde_json::json!({
+        "name": name,
+        "description": description,
+        "image": image,
+    });
+    ctx.deployments
+        .set_agent_uri_and_card(new_seal_id, String::new(), stub_card)
+        .await?;
+
+    // Storage reuses the source roots — nothing to upload, so mark Confirmed
+    // directly (no run_storage_track).
+    let now = Utc::now();
+    ctx.deployments
+        .set_storage_stage(new_seal_id, StageStatus::Confirmed { at: now })
+        .await?;
+    ctx.events
+        .publish(WsEvent::StorageConfirmed {
+            seal_id: new_seal_id,
+        })
+        .await?;
+
+    // Mint the clone to the target owner with the re-sealed keys + same
+    // dataHashes (same on-chain data commitment as the source).
+    let mint_params = MintParams {
+        to: target_owner,
+        agent_uri: String::new(),
+        metadata: Vec::new(),
+        intelligent_datas: artifacts
+            .iter()
+            .map(|a| IntelligentData {
+                description: a.description.clone(),
+                data_hash: a.data_hash,
+            })
+            .collect(),
+        sealed_keys: artifacts.iter().map(|a| a.sealed_key.clone()).collect(),
+        agent_seal: new_kp.address,
+        seal_id: new_seal_id,
+    };
+    run_mint_track(ctx, new_seal_id, mint_params).await?;
+
+    // Identity finalize (card + setAgentURI, empty url). Container never
+    // runs → clone lands Offline; target owner brings it online later.
+    run_phase2(ctx, new_seal_id, &name, &description, image.as_deref()).await?;
+
     Ok(())
 }
 
@@ -1574,6 +1713,157 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert_eq!(d.phase, DeploymentPhase::Failed, "mint failure = Failed");
+    }
+
+    // ── handle_clone ──────────────────────────────────────────────────
+
+    /// Seed a fresh (all-NotStarted, no-iData) deployment row with a custom
+    /// seal/agentSeal/owner — as the /clone route would insert for a clone.
+    fn seed_fresh_row(
+        repo: &InMemoryDeploymentRepo,
+        seal: SealId,
+        agent_seal_addr: Address,
+        owner: Address,
+    ) {
+        let now = Utc::now();
+        repo.seed(Deployment {
+            seal_id: seal,
+            agent_seal_addr,
+            owner,
+            agent_id: None,
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            phase: derive_phase(
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+            ),
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    #[tokio::test]
+    async fn handle_clone_reseals_and_mints_to_target() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        // Source artifact: a known dataKey sealed to the SOURCE agentSeal.
+        let known_key = vec![0x9u8; 32];
+        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        let art = IDataArtifact {
+            role: "persona".into(),
+            description: "{}".into(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(0x33),
+                indexer: "indexer.example".into(),
+                size: 32,
+            },
+            sealed_key: Bytes::from(sealed),
+            data_hash: B256::repeat_byte(0x33),
+            ciphertext: Bytes::new(),
+        };
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
+
+        handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None)
+            .await
+            .expect("clone must succeed");
+
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        // Re-seal correctness: the clone's sealed_key decrypts (with the NEW
+        // agentSeal priv) to the SAME dataKey — data reused, key re-sealed.
+        let got = t
+            .ctx
+            .crypto
+            .ecies_decrypt(&clone.i_data[0].sealed_key, &new_kp.priv_key)
+            .unwrap();
+        assert_eq!(got, known_key, "clone dataKey must equal source (re-sealed to new agentSeal)");
+        // Storage reuse: same data_hash/root, and NO upload happened.
+        assert_eq!(clone.i_data[0].data_hash, B256::repeat_byte(0x33));
+        assert_eq!(
+            t.storage.upload_calls.load(Ordering::SeqCst),
+            0,
+            "clone must reuse source storage, not re-upload"
+        );
+        // Minted to the target owner with the clone's new agentSeal.
+        let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(to, target, "must mint to target_owner");
+        assert_eq!(agent_seal, new_kp.address, "must mint with the clone's agentSeal");
+        assert_eq!(keys.len(), 1);
+        // Identity finalized → Offline; setAgentURI ran once.
+        assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
+        assert!(clone.agent_id.is_some(), "clone must be minted");
+        assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_clone_reseal_failure_marks_mint_failed() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        // Corrupt sealed_key → ecies_decrypt fails → pre-mint failure.
+        let art = IDataArtifact {
+            role: "persona".into(),
+            description: "{}".into(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(0x33),
+                indexer: "indexer.example".into(),
+                size: 32,
+            },
+            sealed_key: Bytes::from(vec![0u8; 10]),
+            data_hash: B256::repeat_byte(0x33),
+            ciphertext: Bytes::new(),
+        };
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
+
+        let res = handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None).await;
+        assert!(res.is_err(), "re-seal failure must bail");
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert!(
+            matches!(clone.mint_stage, StageStatus::Failed { .. }),
+            "pre-mint failure must flip mint_stage=Failed, got {:?}",
+            clone.mint_stage
+        );
+        assert_eq!(
+            t.chain.register_calls.load(Ordering::SeqCst),
+            0,
+            "mint must not run when re-seal failed"
+        );
     }
 
     // ── handle_resume_deploy ──────────────────────────────────────────
