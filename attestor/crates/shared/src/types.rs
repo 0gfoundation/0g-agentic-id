@@ -675,7 +675,11 @@ mod tests {
     // exact wire format.
     #[test]
     fn job_payload_resume_deploy_kind_is_resume_deploy() {
-        let p = JobPayload::ResumeDeploy { seal_id: B256::ZERO, sandbox_envelope: None };
+        let p = JobPayload::ResumeDeploy {
+            seal_id: B256::ZERO,
+            artifacts: Vec::new(),
+            sandbox_envelope: None,
+        };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
         assert_eq!(v["kind"], "resume_deploy");
     }
@@ -889,6 +893,13 @@ pub enum JobPayload {
     /// honouring Daytona's per-action wallet auth requirement.
     ResumeDeploy {
         seal_id: SealId,
+        /// Pre-mint resume context, carried by the job itself. Populated by
+        /// `/retry` from the deployment's `i_data` only when the agent isn't
+        /// minted yet; empty once minted (post-mint the authoritative iData is
+        /// read from chain). Sealed at rest in the job envelope, same as
+        /// `Deploy`'s inputs.
+        #[serde(default)]
+        artifacts: Vec<IDataArtifact>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_envelope: Option<SandboxEnvelope>,
     },

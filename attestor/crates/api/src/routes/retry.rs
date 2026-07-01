@@ -51,10 +51,22 @@ pub async fn handle(
         }
     }
 
+    // Carry the pre-mint resume context in the job itself. Only meaningful
+    // before mint: the artifacts (ciphertext/root/sealed_key) are derived from
+    // a random dataKey and can't be recomputed, so a pre-mint resume needs
+    // them. Once minted, the authoritative iData lives on chain, so we send
+    // nothing and the worker reads it from there.
+    let artifacts = if d.agent_id.is_none() {
+        d.i_data.clone()
+    } else {
+        Vec::new()
+    };
+
     state
         .jobs
         .submit(JobPayload::ResumeDeploy {
             seal_id: req.seal_id,
+            artifacts,
             sandbox_envelope: req.sandbox_envelope,
         })
         .await?;
@@ -71,10 +83,27 @@ mod tests {
         MockChain,
     };
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, JobPayload, SealId, StageStatus,
+        derive_phase, Config, Deployment, DeploymentRepo, IDataArtifact, JobPayload, SealId,
+        StageStatus, StorageRoot,
     };
+    use alloy::primitives::{Bytes, U256};
     use chrono::Utc;
     use std::sync::Arc;
+
+    fn test_artifact() -> IDataArtifact {
+        IDataArtifact {
+            role: "framework".into(),
+            description: "{}".into(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(0x33),
+                indexer: "indexer".into(),
+                size: 32,
+            },
+            sealed_key: Bytes::from_static(b"sealed"),
+            data_hash: B256::repeat_byte(0x33),
+            ciphertext: Bytes::from_static(b"ct"),
+        }
+    }
 
     fn test_config() -> Config {
         Config {
@@ -196,6 +225,51 @@ mod tests {
         assert_eq!(submitted.len(), 1);
         match &submitted[0] {
             JobPayload::ResumeDeploy { seal_id, .. } => assert_eq!(*seal_id, s.seal_id),
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_carries_i_data_as_artifacts_when_unminted() {
+        // Pre-mint: the resume context can't be recomputed (random dataKey),
+        // so /retry must carry the deployment's current i_data in the job.
+        let s = make_setup(); // agent_id: None
+        {
+            let mut g = s.deployments.by_seal.lock().unwrap();
+            g.get_mut(&s.seal_id).unwrap().i_data = vec![test_artifact()];
+        }
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let submitted = s.jobs.submitted.lock().unwrap();
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { artifacts, .. } => {
+                assert_eq!(artifacts.len(), 1, "pre-mint retry must carry the snapshot");
+            }
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_sends_empty_artifacts_when_minted() {
+        // Post-mint: authoritative iData is on chain, so /retry carries none.
+        let s = make_setup();
+        {
+            let mut g = s.deployments.by_seal.lock().unwrap();
+            let d = g.get_mut(&s.seal_id).unwrap();
+            d.i_data = vec![test_artifact()];
+            d.agent_id = Some(U256::from(9u64)); // minted
+        }
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let submitted = s.jobs.submitted.lock().unwrap();
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { artifacts, .. } => {
+                assert!(artifacts.is_empty(), "post-mint retry reads chain, carries nothing");
+            }
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }
     }

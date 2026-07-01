@@ -279,8 +279,8 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => handle_sandbox_recreate(ctx, seal_id, sandbox_envelope).await,
-        JobPayload::ResumeDeploy { seal_id, sandbox_envelope } => {
-            handle_resume_deploy(ctx, seal_id, sandbox_envelope).await
+        JobPayload::ResumeDeploy { seal_id, artifacts, sandbox_envelope } => {
+            handle_resume_deploy(ctx, seal_id, artifacts, sandbox_envelope).await
         }
         JobPayload::SandboxTeardown { seal_id } => handle_sandbox_teardown(ctx, seal_id).await,
         JobPayload::Clone {
@@ -362,6 +362,11 @@ async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<(
 async fn handle_resume_deploy(
     ctx: &Ctx,
     seal_id: SealId,
+    // Pre-mint resume context carried by the job (from `/retry`). Empty once
+    // minted — post-mint the authoritative iData is read from chain, so these
+    // aren't needed. Not read from the deployment row: that snapshot is only a
+    // transient pre-mint holder and is blanked after phase 2.
+    artifacts: Vec<IDataArtifact>,
     sandbox_envelope: Option<SandboxEnvelope>,
 ) -> anyhow::Result<()> {
     let d = ctx
@@ -375,7 +380,7 @@ async fn handle_resume_deploy(
         tracing::info!(?seal_id, "resume: re-running storage track");
         // run_storage_track skips entries whose ciphertext was cleared
         // (confirmed earlier) and re-uploads only what's still pending.
-        run_storage_track(ctx, seal_id, &d.i_data).await?;
+        run_storage_track(ctx, seal_id, &artifacts).await?;
     }
 
     // ── Mint track retry ──
@@ -396,20 +401,19 @@ async fn handle_resume_deploy(
                 .await?;
         } else {
             // Mint never made it on chain. Resubmit using the artifacts
-            // already persisted — same dataHashes / sealedKeys / agentSeal.
+            // carried by the job — same dataHashes / sealedKeys / agentSeal.
             let mint_params = MintParams {
                 to: d.owner,
                 agent_uri: String::new(),
                 metadata: Vec::new(),
-                intelligent_datas: d
-                    .i_data
+                intelligent_datas: artifacts
                     .iter()
                     .map(|a| IntelligentData {
                         description: a.description.clone(),
                         data_hash: a.data_hash,
                     })
                     .collect(),
-                sealed_keys: d.i_data.iter().map(|a| a.sealed_key.clone()).collect(),
+                sealed_keys: artifacts.iter().map(|a| a.sealed_key.clone()).collect(),
                 agent_seal: d.agent_seal_addr,
                 seal_id,
             };
@@ -1147,27 +1151,22 @@ async fn run_phase2(
         })
         .await?;
 
-    // Phase 2 succeeded — agent is fully ready. Clear ciphertext from
-    // each artifact (storage_root + sealed_key + data_hash stay; only
-    // the bulk encrypted bytes go). Best-effort: a leftover ciphertext
-    // is wasted DB bytes, not a correctness bug.
-    let cleared: Vec<IDataArtifact> = d
-        .i_data
-        .iter()
-        .map(|a| IDataArtifact {
-            ciphertext: Bytes::new(),
-            ..a.clone()
-        })
-        .collect();
+    // Phase 2 succeeded — agent is fully ready. Blank the whole iData
+    // snapshot: it was only a pre-mint resume scratch, and now the
+    // authoritative iData lives on chain (intelligentDatasOf/sealedKeysOf).
+    // Keeping a copy here would go stale once the agent evolves its iData on
+    // chain — exactly what caused the clone-from-stale-snapshot bug.
+    // Best-effort: a leftover snapshot is wasted DB bytes, not a correctness
+    // bug (all reads now go to chain or the resume job payload).
     if let Err(e) = ctx
         .deployments
-        .update_i_data_artifacts(seal_id, cleared)
+        .update_i_data_artifacts(seal_id, Vec::new())
         .await
     {
         tracing::warn!(
             ?seal_id,
             error = %e,
-            "failed to clear ciphertext after phase 2 (non-fatal)"
+            "failed to blank iData snapshot after phase 2 (non-fatal)"
         );
     }
 
@@ -1893,7 +1892,7 @@ mod tests {
         mark_phase2_done(&t.deployments, seal);
         t.chain.seed_minted(seal, seeded_agent_id);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -1920,12 +1919,16 @@ mod tests {
         let t = make_test_ctx();
         let seal = dummy_seal();
         let agent_seal_addr = Address::from([0x55; 20]);
-        // Need at least one i_data so MintParams is non-trivial.
-        let art = artifact_with_ciphertext(0x01);
+        // Need at least one artifact so MintParams is non-trivial. The job
+        // carries these (post-`/retry`); the deployment snapshot is irrelevant.
+        let arts = vec![IDataArtifact {
+            ciphertext: Bytes::new(),
+            ..artifact_with_ciphertext(0x01)
+        }];
         seed_deployment(
             &t.deployments,
             seal,
-            vec![IDataArtifact { ciphertext: Bytes::new(), ..art }], // already cleared
+            arts.clone(),
             StageStatus::Confirmed { at: Utc::now() },
             StageStatus::Failed { at: Utc::now(), reason: "first attempt".into() },
             None,
@@ -1934,7 +1937,7 @@ mod tests {
         mark_phase2_done(&t.deployments, seal);
         // chain.seal_to_agent intentionally NOT seeded.
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -1953,11 +1956,11 @@ mod tests {
         // storage track only — must NOT touch chain.register_with_seal.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let art = artifact_with_ciphertext(0x02);
+        let arts = vec![artifact_with_ciphertext(0x02)];
         seed_deployment(
             &t.deployments,
             seal,
-            vec![art],
+            arts.clone(),
             StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(99u64)),
@@ -1965,7 +1968,7 @@ mod tests {
         );
         mark_phase2_done(&t.deployments, seal);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
 
         assert_eq!(
             t.storage.upload_calls.load(Ordering::SeqCst),
@@ -1979,6 +1982,38 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(matches!(d.storage_stage, StageStatus::Confirmed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_uses_payload_artifacts_not_deployment_snapshot() {
+        // Regression guard for the context-relocation change: the deployment
+        // row's i_data is empty (it's only a transient pre-mint holder, blanked
+        // after phase 2), yet resume must still re-run the storage track from
+        // the artifacts carried by the job payload. If the handler regressed to
+        // reading d.i_data, upload_calls would be 0.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(), // snapshot empty on purpose
+            StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            Some("sb-1".into()),
+        );
+        mark_phase2_done(&t.deployments, seal);
+
+        let arts = vec![artifact_with_ciphertext(0x0a)];
+        handle_resume_deploy(&t.ctx, seal, arts, None)
+            .await
+            .expect("resume must succeed");
+
+        assert_eq!(
+            t.storage.upload_calls.load(Ordering::SeqCst),
+            1,
+            "storage must run from the payload artifacts even with d.i_data empty"
+        );
     }
 
     #[tokio::test]
@@ -2001,7 +2036,7 @@ mod tests {
         );
         write_stub_card(&t.deployments, seal, "Sage");
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("phase 2 reconstruction must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("phase 2 reconstruction must succeed");
 
         // setAgentURI must have run exactly once.
         assert_eq!(
@@ -2065,7 +2100,7 @@ mod tests {
         d.agent_card = serde_json::json!({"name": "Sage"});
         t.deployments.seed(d);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("noop resume");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("noop resume");
 
         assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
         assert_eq!(t.storage.upload_calls.load(Ordering::SeqCst), 0);
@@ -2094,7 +2129,7 @@ mod tests {
         write_stub_card(&t.deployments, seal, "Sage");
         t.chain.seed_minted(seal, U256::from(7u64));
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
 
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         // Mint recovered.
@@ -2105,17 +2140,18 @@ mod tests {
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
         // No mint resubmission (chain short-circuit).
         assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
-        // Ciphertext was cleared at end of phase 2.
+        // iData snapshot blanked at end of phase 2 (authoritative copy is
+        // now on chain; a lingering snapshot would go stale).
         assert!(
-            d.i_data.iter().all(|a| a.ciphertext.is_empty()),
-            "phase 2 must clear ciphertext after agent ready"
+            d.i_data.is_empty(),
+            "phase 2 must blank the iData snapshot after agent ready"
         );
     }
 
     #[tokio::test]
     async fn resume_deploy_unknown_seal_id_errors() {
         let t = make_test_ctx();
-        let err = handle_resume_deploy(&t.ctx, B256::repeat_byte(0xaa), None)
+        let err = handle_resume_deploy(&t.ctx, B256::repeat_byte(0xaa), Vec::new(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -3032,7 +3068,7 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
 
         // Critical: setAgentURI must NOT have been called — that would
         // upload the stale URL to chain.
@@ -3074,7 +3110,7 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -3107,7 +3143,7 @@ mod tests {
             new_id.to_string(),
         );
 
-        handle_resume_deploy(&t.ctx, seal, Some(dummy_envelope("create")))
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), Some(dummy_envelope("create")))
             .await
             .expect("resume must Ok");
 
