@@ -23,6 +23,7 @@ use crate::traits::CryptoModule;
 use alloy::primitives::Address;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
+pub mod clone;
 pub mod deploy;
 pub mod status;
 

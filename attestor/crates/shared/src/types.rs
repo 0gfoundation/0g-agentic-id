@@ -134,6 +134,39 @@ pub struct DeployResponse {
     pub subscribe_url: String,
 }
 
+/// `POST /clone` — the SOURCE agent's owner asks the attestor to mint a
+/// brand-new agent (new seal/agentSeal/tokenId) for `target_owner`, reusing
+/// the source's iData. Authorized by an owner signature over
+/// `auth::clone::CanonicalClone`; the attestor additionally checks the signer
+/// equals the live on-chain `ownerOf(source_agent_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneRequest {
+    pub idempotency_key: String,
+    /// The already-minted source agent to clone from.
+    pub source_agent_id: AgentId,
+    /// Who the clone is minted to.
+    pub target_owner: Address,
+    /// EIP-191 signature by the source owner over the canonical clone payload.
+    pub owner_signature: Bytes,
+    pub owner_signed_message_b64: String,
+    /// Optional overrides for the clone's card; when omitted the source
+    /// card's values are copied.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneResponse {
+    /// The NEW clone's seal_id (not the source's).
+    pub seal_id: SealId,
+    pub agent_seal_addr: Address,
+    pub subscribe_url: String,
+}
+
 // ── Stage state machine (per track) ─────────────────────────────────────
 //
 // Three parallel tracks: storage / mint / container. Each is its own
@@ -361,7 +394,38 @@ pub struct SandboxInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::U256;
+    use alloy::primitives::{Address, B256, U256};
+
+    #[test]
+    fn job_payload_clone_serde_roundtrip() {
+        // PostgresJobQueue seals+serializes JobPayload; a missing/renamed
+        // field would only surface at runtime. Lock the Clone shape here.
+        let p = JobPayload::Clone {
+            new_seal_id: B256::repeat_byte(1),
+            source_seal_id: B256::repeat_byte(2),
+            target_owner: Address::from([3u8; 20]),
+            name: "Sage".into(),
+            description: "d".into(),
+            image: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: JobPayload = serde_json::from_str(&json).unwrap();
+        match back {
+            JobPayload::Clone {
+                new_seal_id,
+                source_seal_id,
+                target_owner,
+                name,
+                ..
+            } => {
+                assert_eq!(new_seal_id, B256::repeat_byte(1));
+                assert_eq!(source_seal_id, B256::repeat_byte(2));
+                assert_eq!(target_owner, Address::from([3u8; 20]));
+                assert_eq!(name, "Sage");
+            }
+            other => panic!("expected Clone, got {other:?}"),
+        }
+    }
 
     fn empty_deployment() -> Deployment {
         let now = Utc::now();
@@ -844,6 +908,22 @@ pub enum JobPayload {
     /// No-op when the deployment has no sandbox_id (non-seal / never-provisioned).
     SandboxTeardown {
         seal_id: SealId,
+    },
+    /// Clone an existing agent's iData into a brand-new agent owned by
+    /// `target_owner`. The worker re-seals each iData `data_key` from the
+    /// source agentSeal to the clone's new agentSeal (source storage roots
+    /// are reused, not re-uploaded), mints via `registerWithSeal`, and
+    /// finalizes identity — the clone lands Offline (its owner brings it
+    /// online later). `name`/`description`/`image` are resolved at the
+    /// route (override or copied from the source card).
+    Clone {
+        new_seal_id: SealId,
+        source_seal_id: SealId,
+        target_owner: Address,
+        name: String,
+        description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
 }
 

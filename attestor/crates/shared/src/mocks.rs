@@ -453,6 +453,9 @@ pub struct ConfigurableChain {
     pub set_uri_calls: AtomicU64,
     pub set_uri_fails: AtomicBool,
     pub last_set_uri: Mutex<Option<(AgentId, String)>>,
+    /// Last `registerWithSeal` params (to, agent_seal, sealed_keys) so tests
+    /// can assert who a mint/clone was minted to.
+    pub last_register: Mutex<Option<(Address, Address, Vec<Bytes>)>>,
     next_agent_id: AtomicU64,
     tx_counter: AtomicU64,
     receipts: Mutex<HashMap<TxHash, ReceiptSummary>>,
@@ -467,6 +470,7 @@ impl ConfigurableChain {
             set_uri_calls: AtomicU64::new(0),
             set_uri_fails: AtomicBool::new(false),
             last_set_uri: Mutex::new(None),
+            last_register: Mutex::new(None),
             next_agent_id: AtomicU64::new(1),
             tx_counter: AtomicU64::new(1),
             receipts: Mutex::new(HashMap::new()),
@@ -495,6 +499,8 @@ impl Default for ConfigurableChain {
 impl ChainClient for ConfigurableChain {
     async fn register_with_seal(&self, params: MintParams) -> anyhow::Result<TxHash> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_register.lock().unwrap() =
+            Some((params.to, params.agent_seal, params.sealed_keys.clone()));
         if self.register_fails.load(Ordering::SeqCst) {
             anyhow::bail!("configured to fail");
         }
