@@ -221,6 +221,25 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     );
                     // intentionally fall through to the success-path
                     // bookkeeping below
+                } else if e
+                    .downcast_ref::<SandboxError>()
+                    .map(|se| se.is_transient())
+                    .unwrap_or(false)
+                {
+                    // Transient (lock held, rate limit, upstream hiccup): the
+                    // stop didn't take, but the container is still healthy and
+                    // running — flipping Failed would mark a live agent dead.
+                    // Leave the stage as-is (still Running) and let the user
+                    // retry Stop.
+                    tracing::warn!(?seal_id, error = %e, "sandbox.stop: transient condition; leaving agent running for retry");
+                    ctx.events
+                        .publish(WsEvent::ContainerWarning {
+                            seal_id,
+                            reason: "sandbox temporarily busy — try Stop again in a moment"
+                                .to_string(),
+                        })
+                        .await?;
+                    return Ok(());
                 } else {
                     let now = Utc::now();
                     let reason = format!("sandbox stop: {e}");
@@ -506,33 +525,37 @@ async fn handle_sandbox_recreate(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            // Insufficient balance (HTTP 402): no sandbox was created, so
-            // there's nothing to resume — but it's owner-recoverable, not a
-            // dead end. Land in the Failed bucket (which offers "bring back
-            // online" = recreate) and surface a top-up hint rather than a raw
-            // error. No bail → no retry loop hammering create at zero balance.
-            if e.to_string().contains("insufficient balance") {
-                let reason =
-                    "insufficient sandbox balance — top up, then bring back online".to_string();
-                tracing::warn!(?seal_id, error = %e, "sandbox recreate: insufficient balance; awaiting top-up");
-                ctx.deployments
-                    .set_container_stage(
-                        seal_id,
-                        StageStatus::Failed { at: now, reason: reason.clone() },
-                    )
-                    .await?;
-                ctx.events
-                    .publish(WsEvent::ContainerWarning { seal_id, reason })
-                    .await?;
-                return Ok(());
-            }
-            let reason = format!("sandbox recreate: {e}");
+            // No sandbox was created either way; the agent stays recoverable
+            // (Failed → Offline for a minted agent, offering "bring online").
+            // Classify by status: a TRANSIENT condition (balance gap, lock,
+            // rate limit, upstream hiccup) is owner-recoverable — warn + no
+            // bail (so we don't hammer create in a retry loop). A FATAL error
+            // surfaces as ContainerFailed + bails.
+            let transient = e
+                .downcast_ref::<SandboxError>()
+                .map(|se| se.is_transient())
+                .unwrap_or(false);
+            let balance = e.to_string().to_lowercase().contains("balance");
+            let reason = if transient && balance {
+                "insufficient sandbox balance — top up, then bring back online".to_string()
+            } else if transient {
+                "sandbox temporarily unavailable — try bring online again in a moment".to_string()
+            } else {
+                format!("sandbox recreate: {e}")
+            };
             ctx.deployments
                 .set_container_stage(
                     seal_id,
                     StageStatus::Failed { at: now, reason: reason.clone() },
                 )
                 .await?;
+            if transient {
+                tracing::warn!(?seal_id, error = %e, "sandbox recreate: transient condition; awaiting retry");
+                ctx.events
+                    .publish(WsEvent::ContainerWarning { seal_id, reason })
+                    .await?;
+                return Ok(());
+            }
             ctx.events
                 .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
                 .await?;
@@ -1210,13 +1233,20 @@ async fn run_container_track(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            // Insufficient balance (HTTP 402): the frontend gates on balance
-            // before deploy, so this is rare (a drain between check and
-            // create), but surface a clear top-up message instead of a raw
-            // 402 dump so the owner knows to fund and retry rather than
-            // reading it as a hard system failure.
-            let reason = if e.to_string().contains("insufficient balance") {
+            // Container failed to come up. The identity track still finalizes
+            // (agent minted → Offline, recoverable via Bring online), so this
+            // isn't a hard deploy failure. Classify the reason by status so
+            // the Offline banner tells the owner what to do: a transient
+            // condition (balance gap, lock, rate limit, upstream hiccup) →
+            // retry hint; anything else → the raw create error.
+            let transient = e
+                .downcast_ref::<SandboxError>()
+                .map(|se| se.is_transient())
+                .unwrap_or(false);
+            let reason = if transient && e.to_string().to_lowercase().contains("balance") {
                 "insufficient sandbox balance — top up and deploy again".to_string()
+            } else if transient {
+                "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
                 format!("sandbox create: {e}")
             };
@@ -2183,6 +2213,7 @@ mod tests {
             Some("sb-old".into()),
         );
         t.sandbox.create_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(402);
         *t.sandbox.fail_msg.lock().unwrap() =
             Some("sandbox create: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
 
