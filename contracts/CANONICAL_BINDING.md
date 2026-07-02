@@ -181,13 +181,15 @@ Timelock + beacon) deploy, owner `0xB831…`.
 | AgenticID impl | `0x1E2AD04C5c9BbE2e5Dd3c257ac6fd82985461C54` |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` |
 | ReputationRegistry proxy | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` |
-| ReputationRegistry impl | `0xf053cF2996a2cfb24b26D0F57977512fF8378E01` |
+| ReputationRegistry impl | `0x9dbC8045c1D32aDbc604C2d85942F0733B48732A` |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` |
 | TEEDataVerifier impl | `0xD5F7602a4a690846cF7D6315d14BCd7535388EE0` |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` |
 | TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` |
 | owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` |
+
+> **Reputation beacon upgrade (2026-07-02):** impl `0xf053cF29…` → `0x9dbC8045c1D32aDbc604C2d85942F0733B48732A` — drops `client` from `ServeProof` (attribution is now `msg.sender`; see PR #28). proxy `0x884c28…` + storage unchanged.
 
 ### 5.3 Other superseded deployments — do not use
 
