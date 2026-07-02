@@ -25,6 +25,7 @@ import {
   ZERO_G_GALILEO_TESTNET,
   getAddresses,
   RPC_URL,
+  RECEIPT_WAIT,
   type Environment,
 } from './constants';
 import type {
@@ -357,7 +358,7 @@ export class ReputationClient {
    * @returns Transaction receipt
    */
   async waitForTransaction(txHash: Hash): Promise<TransactionReceipt> {
-    return this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    return this.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
   }
 
   // ── Private helpers ──

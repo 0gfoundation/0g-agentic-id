@@ -233,7 +233,7 @@ Chain: 0G Galileo Testnet (`chainId 16602`, `RPC_URL = https://evmrpc-testnet.0g
 ## Notes
 
 - **No client binding in serve-proofs.** Feedback is attributed to `msg.sender` at `giveFeedback`; a proof is a bearer attestation (single-use via the signature nonce). Serve currently runs over plain HTTP, so treat proofs as sensitive.
-- **0G receipt timing.** `waitForTransaction` can occasionally time out even though the tx landed — poll `getBalance`/`getLastIndex`/etc. to confirm state rather than relying solely on the receipt.
+- **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries, since receipt availability lags a few blocks). If it still times out, the tx has likely landed anyway — confirm by reading state (`getBalance`/`getLastIndex`/etc.).
 - `value` / `summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint) — match the on-chain types exactly.
 
 ## Advanced

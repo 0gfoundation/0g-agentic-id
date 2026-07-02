@@ -90,3 +90,16 @@ export const RPC_URL = 'https://evmrpc-testnet.0g.ai';
  * Chain ID for the 0G Galileo Testnet.
  */
 export const CHAIN_ID = 16602;
+
+/**
+ * `waitForTransactionReceipt` options tuned for 0G: receipt availability can lag
+ * a few blocks after a tx lands, and the RPC occasionally 404s the tx before it
+ * propagates. A generous timeout + retries avoids spurious
+ * "transaction receipt could not be found" failures on txs that actually landed.
+ */
+export const RECEIPT_WAIT = {
+  timeout: 120_000,
+  pollingInterval: 2_000,
+  retryCount: 12,
+  retryDelay: 2_000,
+} as const;

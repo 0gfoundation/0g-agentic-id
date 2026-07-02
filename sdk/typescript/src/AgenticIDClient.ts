@@ -26,6 +26,7 @@ import {
   ZERO_G_GALILEO_TESTNET,
   getAddresses,
   RPC_URL,
+  RECEIPT_WAIT,
   type Environment,
 } from './constants';
 
@@ -192,6 +193,6 @@ export class AgenticIDClient {
   }
 
   async waitForTransaction(txHash: Hash): Promise<TransactionReceipt> {
-    return this.publicClient.waitForTransactionReceipt({ hash: txHash });
+    return this.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
   }
 }
