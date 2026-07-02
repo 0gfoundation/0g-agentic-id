@@ -51,6 +51,15 @@ attestor 的 alloy chain client（`attestor/crates/shared/src/chain.rs`）已经
 参见 [`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) 的 deploy / upgrade
 命令块。
 
+### receipt 可用性滞后 → `waitForTransaction` 误报
+
+tx 上链后，`eth_getTransactionReceipt` 常常要滞后几个块才返回，且 tx 刚广播时
+RPC 会短暂 404。结果:viem `waitForTransactionReceipt` 在**实际已上链**的 tx 上
+误报 "transaction receipt could not be found"。TS SDK 用一份 `RECEIPT_WAIT`
+配置绕过(`timeout 120s`、`pollingInterval 2s`、`retryCount 12`、`retryDelay 2s`,
+见 `sdk/typescript/src/constants.ts`)。仍超时的话,tx 大概率已落——读链上状态
+(余额 / index 等)确认,别只信 receipt。
+
 ---
 
 ## Etherscan 兼容 verifier（0G 端点）
