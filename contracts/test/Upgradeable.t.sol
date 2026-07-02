@@ -13,8 +13,15 @@ import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
-/// @notice Minimal v2 that adds a new view to prove code swap took effect.
+/// @notice Minimal v2 impls that add a new view to prove the code swap took
+///         effect. Same beacon+timelock upgrade path applies to every contract.
 contract AgenticIDV2 is AgenticID {
+    function version2Tag() external pure returns (string memory) {
+        return "v2";
+    }
+}
+
+contract TEEDataVerifierV2 is TEEDataVerifier {
     function version2Tag() external pure returns (string memory) {
         return "v2";
     }
@@ -22,7 +29,8 @@ contract AgenticIDV2 is AgenticID {
 
 contract UpgradeableTest is Test {
     TimelockController internal timelock;
-    UpgradeableBeacon  internal beacon;
+    UpgradeableBeacon  internal beacon;          // AgenticID beacon
+    UpgradeableBeacon  internal verifierBeacon;  // TEEDataVerifier beacon
     AgenticID          internal agenticId;
     TEEDataVerifier    internal verifier;
 
@@ -46,7 +54,7 @@ contract UpgradeableTest is Test {
 
         // Verifier behind its own beacon (owned by timelock).
         TEEDataVerifier verifierImpl = new TEEDataVerifier();
-        UpgradeableBeacon verifierBeacon = new UpgradeableBeacon(address(verifierImpl), address(timelock));
+        verifierBeacon = new UpgradeableBeacon(address(verifierImpl), address(timelock));
         BeaconProxy verifierProxy = new BeaconProxy(
             address(verifierBeacon),
             abi.encodeCall(TEEDataVerifier.initialize, (owner, pauser, oracleAddr, MAX_PROOF_AGE))
@@ -109,6 +117,24 @@ contract UpgradeableTest is Test {
         assertEq(AgenticIDV2(address(agenticId)).version2Tag(), "v2");
         // Pre-existing state preserved (VERSION from the base impl).
         assertEq(agenticId.VERSION(), "1.0.0");
+    }
+
+    function test_upgrade_verifierBeacon_throughTimelock_succeeds() public {
+        // Same generic beacon+timelock path, applied to the TEEDataVerifier.
+        assertEq(verifierBeacon.owner(), address(timelock));
+        TEEDataVerifierV2 v2 = new TEEDataVerifierV2();
+        bytes memory callData = abi.encodeCall(UpgradeableBeacon.upgradeTo, (address(v2)));
+
+        vm.prank(proposer);
+        timelock.schedule(address(verifierBeacon), 0, callData, bytes32(0), bytes32(0), DELAY);
+        vm.warp(block.timestamp + DELAY + 1);
+        vm.prank(executor);
+        timelock.execute(address(verifierBeacon), 0, callData, bytes32(0), bytes32(0));
+
+        assertEq(verifierBeacon.implementation(), address(v2));
+        assertEq(TEEDataVerifierV2(address(verifier)).version2Tag(), "v2");
+        // Storage preserved through the swap.
+        assertEq(verifier.owner(), owner);
     }
 
     // ── Pause ────────────────────────────────────────────────────────────────
