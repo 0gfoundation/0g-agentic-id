@@ -48,14 +48,13 @@ export interface SealedKeyEntry {
 }
 
 /**
- * Serve proof — attests that an agent served a client at a specific time.
+ * Serve proof — attests that an agent served a task at a specific time.
+ * No client binding: attribution is via msg.sender at submission.
  * @struct
  */
 export interface ServeProof {
   /** The agent ID */
   agentId: bigint;
-  /** The client address */
-  client: `0x${string}`;
   /** Timestamp of service (unix seconds) */
   timestamp: bigint;
   /** Deadline for the proof's validity (unix seconds) */

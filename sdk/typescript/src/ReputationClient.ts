@@ -136,7 +136,6 @@ export class ReputationClient {
         params.feedbackHash,
         {
           agentId: sp.agentId,
-          client: sp.client,
           timestamp: sp.timestamp,
           deadline: sp.deadline,
           taskHash: sp.taskHash,

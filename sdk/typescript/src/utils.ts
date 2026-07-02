@@ -19,11 +19,10 @@ import type { TransferValidityProof, IntelligentData, SealedKeyEntry, MetadataEn
  *
  * The Solidity payload is:
  * ```
- * keccak256(abi.encode(agentId, client, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))
+ * keccak256(abi.encode(agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))
  * ```
  *
  * @param agentId - The agent ID
- * @param client - The client address
  * @param timestamp - Timestamp (unix seconds)
  * @param deadline - Deadline (unix seconds)
  * @param taskHash - Task hash
@@ -33,7 +32,6 @@ import type { TransferValidityProof, IntelligentData, SealedKeyEntry, MetadataEn
  */
 export function computeServeProofHash(
   agentId: bigint,
-  client: Address,
   timestamp: bigint,
   deadline: bigint,
   taskHash: Hash,
@@ -46,11 +44,10 @@ export function computeServeProofHash(
     : '0x';
   const dataHashesHash = keccak256(packedDataHashes);
 
-  // Step 2: abi.encode(agentId, client, timestamp, deadline, taskHash, dataHashesHash, frameworkHash)
-  // Each field is 32 bytes: uint256 = 32, address = padded to 32, bytes32 = 32
+  // Step 2: abi.encode(agentId, timestamp, deadline, taskHash, dataHashesHash, frameworkHash)
+  // Each field is a static 32-byte word: uint256 = 32, bytes32 = 32.
   const encoded = concat([
     pad(toHex(agentId), { size: 32 }),
-    pad(client as Hex, { size: 32 }),
     pad(toHex(timestamp), { size: 32 }),
     pad(toHex(deadline), { size: 32 }),
     pad(taskHash as Hex, { size: 32 }),
@@ -158,7 +155,6 @@ export function transferValidityProofToTuple(proof: TransferValidityProof): {
  */
 export function serveProofToTuple(serveProof: {
   agentId: bigint;
-  client: Address;
   timestamp: bigint;
   deadline: bigint;
   taskHash: Hash;
@@ -167,7 +163,6 @@ export function serveProofToTuple(serveProof: {
   signature: Hex;
 }): {
   agentId: bigint;
-  client: Address;
   timestamp: bigint;
   deadline: bigint;
   taskHash: Hash;
@@ -177,7 +172,6 @@ export function serveProofToTuple(serveProof: {
 } {
   return {
     agentId: serveProof.agentId,
-    client: serveProof.client,
     timestamp: serveProof.timestamp,
     deadline: serveProof.deadline,
     taskHash: serveProof.taskHash,

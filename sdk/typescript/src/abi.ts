@@ -531,7 +531,6 @@ export const reputationRegistryAbi = [
       { name: 'feedbackHash', type: 'bytes32' },
       { name: 'ServeProof', type: 'tuple', components: [
         { name: 'agentId', type: 'uint256' },
-        { name: 'client', type: 'address' },
         { name: 'timestamp', type: 'uint256' },
         { name: 'deadline', type: 'uint256' },
         { name: 'taskHash', type: 'bytes32' },
@@ -759,6 +758,74 @@ export const teeDataVerifierAbi = [
         { name: 'deadline', type: 'uint256' },
         { name: 'proof', type: 'bytes' },
       ] },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+] as const;
+
+/**
+ * TappRegistry — trust-root acknowledgement. `ack` acknowledges the set of
+ * TEE components (attestor, kms, sandbox) the deploy/sandbox flow depends on.
+ */
+export const tappRegistryAbi = [
+  {
+    type: 'function',
+    name: 'acknowledgeApps',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'appIds', type: 'string[]' }],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'isAcknowledged',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'user', type: 'address' },
+      { name: 'appId', type: 'string' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
+    name: 'getAckVersion',
+    stateMutability: 'view',
+    inputs: [{ name: 'appId', type: 'string' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const;
+
+/**
+ * SandboxServing — prepaid sandbox balance. `deposit` funds the caller's (or a
+ * recipient's) balance held against a provider; `getBalance` reads it.
+ */
+export const sandboxServingAbi = [
+  {
+    type: 'function',
+    name: 'deposit',
+    stateMutability: 'payable',
+    inputs: [
+      { name: 'recipient', type: 'address' },
+      { name: 'provider', type: 'address' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'getBalance',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'user', type: 'address' },
+      { name: 'provider', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'isTEEAcknowledged',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'user', type: 'address' },
+      { name: 'provider', type: 'address' },
     ],
     outputs: [{ name: '', type: 'bool' }],
   },

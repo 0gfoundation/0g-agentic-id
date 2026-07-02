@@ -1,30 +1,42 @@
 /**
  * @file index.ts
- * @description Main entry point for the @0g/agenticid-sdk package.
+ * @description Entry point for @0g/agenticid-sdk.
  *
- * Exports all types, client classes, utilities, and constants for interacting
- * with the 0G AgenticID protocol.
+ * Scope (current): ack + deposit (sandbox), seal-bound transfer, seal-bound
+ * clone (via attestor), and reputation (capture serve-proof + submit feedback).
+ * The full identity-management surface is deferred to a later pass.
  *
  * @example
  * ```typescript
  * import {
- *   AgenticIDClient,
- *   ReputationClient,
- *   buildServeProofMessageHash,
- *   signServeProof,
- *   ZERO_G_GALILEO_TESTNET,
- *   getAddresses,
+ *   AgenticIDClient, ReputationClient, SandboxClient, AttestorClient,
+ *   ServeSession, captureProof, getAddresses,
  * } from '@0g/agenticid-sdk';
  * ```
  */
 
 // ── Clients ──
 export { AgenticIDClient } from './AgenticIDClient';
-export type { AgenticIDClientOptions } from './AgenticIDClient';
-export type { IntelligentDataResult } from './AgenticIDClient';
+export type { AgenticIDClientOptions, IntelligentDataResult } from './AgenticIDClient';
 
 export { ReputationClient } from './ReputationClient';
 export type { ReputationClientOptions } from './ReputationClient';
+
+export { SandboxClient } from './SandboxClient';
+export type { SandboxClientOptions } from './SandboxClient';
+
+export { AttestorClient, CLONE_DOMAIN } from './AttestorClient';
+export type { AttestorClientOptions, CloneParams, CloneResponse } from './AttestorClient';
+
+// ── Reputation: serve-proof transport + verification ──
+export {
+  ServeSession,
+  SERVE_PROOF_HEADER,
+  parseServeProofHeader,
+  proofFromResponse,
+  captureProof,
+} from './ServeSession';
+export type { ServeSessionOptions, ProofVerification } from './ServeSession';
 
 // ── ServeProof utilities ──
 export {
@@ -36,33 +48,13 @@ export {
 } from './ServeProof';
 export type { BuildServeProofHashParams } from './ServeProof';
 
-// ── General utilities ──
-export {
-  computeServeProofHash,
-  serveProofToTuple,
-  transferValidityProofToTuple,
-  intelligentDatasToTuple,
-  sealedKeysToTuple,
-  metadataToTuple,
-} from './utils';
-
 // ── Types ──
 export type {
   IntelligentData,
-  MetadataEntry,
-  SealedKeyEntry,
   ServeProof,
-  AccessProof,
-  OwnershipProof,
-  TransferValidityProof,
   Feedback,
   FeedbackSummary,
   ServeData,
-  RegisterParams,
-  RegisterWithSealParams,
-  UpdateParams,
-  UpdateAtParams,
-  SetAgentWalletParams,
   GiveFeedbackParams,
   AppendResponseParams,
   ReadAllFeedbackParams,
@@ -70,8 +62,6 @@ export type {
   SDKConfig,
   Environment,
 } from './types';
-
-export { OracleType } from './types';
 
 // ── Constants ──
 export {
@@ -85,9 +75,10 @@ export {
 } from './constants';
 export type { ContractAddresses } from './constants';
 
-// ── ABIs (for advanced usage) ──
+// ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
   reputationRegistryAbi,
-  teeDataVerifierAbi,
+  tappRegistryAbi,
+  sandboxServingAbi,
 } from './abi';

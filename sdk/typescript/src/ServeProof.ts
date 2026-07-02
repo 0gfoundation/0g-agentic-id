@@ -2,9 +2,13 @@
  * @file ServeProof.ts
  * @description ServeProof construction and signing utilities for the 0G AgenticID protocol.
  *
- * A ServeProof attests that an agent (identified by agentSeal) served a client at a
+ * A ServeProof attests that an agent (identified by agentSeal) served a task at a
  * specific time. The agentSeal private key signs the proof. The signature is
  * EIP-191 (personal_sign) over the keccak256 of the abi.encode of the proof fields.
+ *
+ * There is NO `client` binding: attribution is via msg.sender at giveFeedback
+ * submission time (feedback is stored under the submitting address). The proof
+ * is a bearer attestation whoever holds it submits (single-use via the sig nonce).
  */
 
 import {
@@ -13,6 +17,7 @@ import {
   toHex,
   pad,
   concat,
+  recoverAddress,
   type Address,
   type Hex,
   type Hash,
@@ -25,8 +30,6 @@ import type { ServeProof as ServeProofType } from './types';
 export interface BuildServeProofHashParams {
   /** The agent ID */
   agentId: bigint;
-  /** The client address */
-  client: Address;
   /** Timestamp of service (unix seconds) */
   timestamp: bigint;
   /** Deadline for the proof's validity (unix seconds) */
@@ -46,7 +49,6 @@ export interface BuildServeProofHashParams {
  * ```solidity
  * bytes32 messageHash = keccak256(abi.encode(
  *     agentId,
- *     client,
  *     timestamp,
  *     deadline,
  *     taskHash,
@@ -59,7 +61,7 @@ export interface BuildServeProofHashParams {
  * @returns The keccak256 hash of the abi.encode payload
  */
 export function buildServeProofMessageHash(params: BuildServeProofHashParams): Hash {
-  const { agentId, client, timestamp, deadline, taskHash, dataHashes, frameworkHash } = params;
+  const { agentId, timestamp, deadline, taskHash, dataHashes, frameworkHash } = params;
 
   // Step 1: keccak256(abi.encodePacked(dataHashes)) — concatenate bytes32 values
   const packedDataHashes: Hex = dataHashes.length > 0
@@ -67,11 +69,10 @@ export function buildServeProofMessageHash(params: BuildServeProofHashParams): H
     : '0x';
   const dataHashesHash = keccak256(packedDataHashes);
 
-  // Step 2: abi.encode(agentId, client, timestamp, deadline, taskHash, dataHashesHash, frameworkHash)
-  // Each field is 32 bytes: uint256 = 32, address = padded to 32, bytes32 = 32
+  // Step 2: abi.encode(agentId, timestamp, deadline, taskHash, dataHashesHash, frameworkHash)
+  // Each field is a static 32-byte word: uint256 = 32, bytes32 = 32.
   const encoded = concat([
     pad(toHex(agentId), { size: 32 }),
-    pad(client as Hex, { size: 32 }),
     pad(toHex(timestamp), { size: 32 }),
     pad(toHex(deadline), { size: 32 }),
     pad(taskHash as Hex, { size: 32 }),
@@ -130,7 +131,7 @@ export function buildServeProof(
  * import { buildServeProof, signServeProof } from '@0g/agenticid-sdk';
  *
  * const proof = await signServeProof(
- *   { agentId: 1n, client: '0x...', timestamp: 1700000000n, deadline: 1700003600n,
+ *   { agentId: 1n, timestamp: 1700000000n, deadline: 1700003600n,
  *     taskHash: '0x...', dataHashes: ['0x...'], frameworkHash: '0x...' },
  *   async (hash) => account.signMessage({ message: { raw: hash } }),
  * );
@@ -155,20 +156,11 @@ export async function signServeProof(
  * @param expectedSigner - The agentSeal address that should have signed
  * @returns True if the signature is valid for the expected signer
  */
-export function verifyServeProofSignature(
+export async function verifyServeProofSignature(
   proof: ServeProofType,
   expectedSigner: Address,
-): boolean {
-  // This requires ecrecover — we import it lazily to keep the module tree-shakeable
-  // The verification is done by recovering the address from the signature
-  // and comparing it to expectedSigner.
-  //
-  // In a full implementation, this would use viem's recoverAddress:
-  //   const signingHash = buildServeProofSigningHash(proof);
-  //   const recovered = await recoverAddress({ hash: signingHash, signature: proof.signature });
-  //   return recovered.toLowerCase() === expectedSigner.toLowerCase();
-  //
-  // For now we return true and let the on-chain verification be the source of truth.
-  // Users should use the TEEDataVerifier contract for authoritative verification.
-  return true;
+): Promise<boolean> {
+  const signingHash = buildServeProofSigningHash(proof);
+  const recovered = await recoverAddress({ hash: signingHash, signature: proof.signature });
+  return recovered.toLowerCase() === expectedSigner.toLowerCase();
 }

@@ -33,6 +33,10 @@ export interface ContractAddresses {
   teeDataVerifier: `0x${string}`;
   /** ReputationRegistry proxy contract address */
   reputationRegistry: `0x${string}`;
+  /** TappRegistry — trust-root acknowledgement (ack) */
+  tappRegistry: `0x${string}`;
+  /** SandboxServing — prepaid sandbox balance (deposit) */
+  sandboxServing: `0x${string}`;
 }
 
 /**
@@ -42,6 +46,9 @@ export const DEV_ADDRESSES: ContractAddresses = {
   agenticID: '0xf952e7dD046779f34C0Ca0c058e1D940B7B9d525',
   teeDataVerifier: '0x2EAa6fcB9847A5A4B25acCdeca3C957a1732C23F',
   reputationRegistry: '0x4AAbc18962C2Bb5E451a0FDfa39c0C47a51bD971',
+  // Shared infra (0g-kms / 0g-sandbox), same across environments on testnet.
+  tappRegistry: '0x95a0BF4148b30F6F8D86870534c51df46Da5511c',
+  sandboxServing: '0x3d4d8a05e9471E19E2068C49D5AB6f528494cf6f',
 };
 
 /**
@@ -51,6 +58,8 @@ export const TESTNET_ADDRESSES: ContractAddresses = {
   agenticID: '0xbea77c9aBd0aA46e812444583947718593bBD139',
   teeDataVerifier: '0x1b6bba3db8a04B20702Feb62E30Caa831ca1e1f1',
   reputationRegistry: '0x8bC1E129aEb0Baa306715BC1CBB720Eb2A4324AA',
+  tappRegistry: '0x95a0BF4148b30F6F8D86870534c51df46Da5511c',
+  sandboxServing: '0x3d4d8a05e9471E19E2068C49D5AB6f528494cf6f',
 };
 
 /**
