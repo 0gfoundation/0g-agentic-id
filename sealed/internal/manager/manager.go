@@ -207,6 +207,8 @@ func (m *Manager) armState(res framework.StartResult) {
 		res.Upstream,
 		m.params.SealID,
 		m.params.Owner,
+		m.params.Runtime.AgentID,
+		m.params.Runtime.FrameworkHash,
 	)
 }
 

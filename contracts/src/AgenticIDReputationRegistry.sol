@@ -10,7 +10,6 @@ import {IAgenticIDReputationRegistry, ServeProof, AgenticIDProofRequired} from "
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
 import {NonceRegistryUpgradeable} from "./utils/NonceRegistryUpgradeable.sol";
 
-error ReputationClientMismatch();
 error ReputationNoAgentSeal();
 error ReputationInvalidProofSignature();
 error ReputationInvalidIndex(uint256 index, uint256 length);
@@ -150,8 +149,6 @@ contract AgenticIDReputationRegistry is
         bytes32 feedbackHash,
         ServeProof calldata proof
     ) external whenNotPaused {
-        if (proof.client != msg.sender) revert ReputationClientMismatch();
-
         _verifyServeProof(proof);
 
         ReputationStorage storage $ = _getReputationStorage();
@@ -390,7 +387,6 @@ contract AgenticIDReputationRegistry is
         // scoping is tracked separately; see the KMS threshold-derivation issue.)
         bytes32 proofHash = keccak256(abi.encode(
             proof.agentId,
-            proof.client,
             proof.timestamp,
             proof.deadline,
             proof.taskHash,

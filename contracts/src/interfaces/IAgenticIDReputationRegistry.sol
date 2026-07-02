@@ -8,13 +8,17 @@ import {IERC8004ReputationRegistry} from "./IERC8004ReputationRegistry.sol";
 ///      this proof. dataHashes and frameworkHash are recorded as audit data —
 ///      they are part of the signed message and therefore trusted, but are NOT
 ///      re-verified against on-chain state at submission time.
-///      Signed payload: keccak256(abi.encode(agentId, client, timestamp, deadline,
+///      Signed payload: keccak256(abi.encode(agentId, timestamp, deadline,
 ///          taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)).
 ///      Replay protection: nonce key is keccak256("SERVEPROOF" ‖ agentId ‖ signature)
 ///      — the signature is unique per sealed payload so it doubles as the nonce.
+///
+///      No `client` binding: attribution is via msg.sender at submission time
+///      (feedback is stored under the submitting address). The proof is a
+///      bearer attestation that the agent served *a* task; whoever holds it
+///      submits one feedback (single-use via the signature nonce).
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     /// @dev Unix timestamp after which the proof is rejected at submission.
     uint256   deadline;
