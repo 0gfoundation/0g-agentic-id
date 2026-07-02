@@ -522,7 +522,7 @@ export const reputationRegistryAbi = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'agentId', type: 'uint256' },
-      { name: 'value', type: 'uint256' },
+      { name: 'value', type: 'int128' },
       { name: 'valueDecimals', type: 'uint8' },
       { name: 'tag1', type: 'string' },
       { name: 'tag2', type: 'string' },
@@ -549,7 +549,7 @@ export const reputationRegistryAbi = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'agentId', type: 'uint256' },
-      { name: 'feedbackIndex', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
     ],
     outputs: [],
   },
@@ -562,7 +562,7 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256' },
       { name: 'clientAddress', type: 'address' },
-      { name: 'feedbackIndex', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
       { name: 'responseURI', type: 'string' },
       { name: 'responseHash', type: 'bytes32' },
     ],
@@ -577,10 +577,10 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256' },
       { name: 'clientAddress', type: 'address' },
-      { name: 'feedbackIndex', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
     ],
     outputs: [
-      { name: 'value', type: 'uint256' },
+      { name: 'value', type: 'int128' },
       { name: 'valueDecimals', type: 'uint8' },
       { name: 'tag1', type: 'string' },
       { name: 'tag2', type: 'string' },
@@ -601,11 +601,13 @@ export const reputationRegistryAbi = [
       { name: 'includeRevoked', type: 'bool' },
     ],
     outputs: [
-      { name: 'values', type: 'uint256[]' },
-      { name: 'valueDecimalsArray', type: 'uint8[]' },
+      { name: 'clients', type: 'address[]' },
+      { name: 'feedbackIndexes', type: 'uint64[]' },
+      { name: 'values', type: 'int128[]' },
+      { name: 'valueDecimals', type: 'uint8[]' },
       { name: 'tag1s', type: 'string[]' },
       { name: 'tag2s', type: 'string[]' },
-      { name: 'isRevokedArray', type: 'bool[]' },
+      { name: 'revokedStatuses', type: 'bool[]' },
     ],
   },
 
@@ -621,8 +623,8 @@ export const reputationRegistryAbi = [
       { name: 'tag2', type: 'string' },
     ],
     outputs: [
-      { name: 'count', type: 'uint256' },
-      { name: 'summaryValue', type: 'uint256' },
+      { name: 'count', type: 'uint64' },
+      { name: 'summaryValue', type: 'int128' },
       { name: 'summaryValueDecimals', type: 'uint8' },
     ],
   },
@@ -635,10 +637,10 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256' },
       { name: 'clientAddress', type: 'address' },
-      { name: 'feedbackIndex', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
       { name: 'responders', type: 'address[]' },
     ],
-    outputs: [{ name: 'count', type: 'uint256' }],
+    outputs: [{ name: 'count', type: 'uint64' }],
   },
 
   // ── Get Clients ──
@@ -670,7 +672,7 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256' },
       { name: 'clientAddress', type: 'address' },
-      { name: 'feedbackIndex', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
     ],
     outputs: [
       { name: 'dataHashes', type: 'bytes32[]' },
@@ -685,7 +687,7 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256', indexed: true },
       { name: 'client', type: 'address', indexed: true },
-      { name: 'feedbackIndex', type: 'uint256', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: true },
     ],
   },
   {
@@ -693,7 +695,7 @@ export const reputationRegistryAbi = [
     name: 'FeedbackRevoked',
     inputs: [
       { name: 'agentId', type: 'uint256', indexed: true },
-      { name: 'feedbackIndex', type: 'uint256', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: true },
     ],
   },
   {
@@ -702,7 +704,7 @@ export const reputationRegistryAbi = [
     inputs: [
       { name: 'agentId', type: 'uint256', indexed: true },
       { name: 'clientAddress', type: 'address', indexed: true },
-      { name: 'feedbackIndex', type: 'uint256', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: true },
     ],
   },
 ] as const;

@@ -43,9 +43,11 @@ export interface ContractAddresses {
  * Dev environment contract addresses (0G Galileo Testnet).
  */
 export const DEV_ADDRESSES: ContractAddresses = {
-  agenticID: '0xf952e7dD046779f34C0Ca0c058e1D940B7B9d525',
-  teeDataVerifier: '0x2EAa6fcB9847A5A4B25acCdeca3C957a1732C23F',
-  reputationRegistry: '0x4AAbc18962C2Bb5E451a0FDfa39c0C47a51bD971',
+  // dev environment (CANONICAL_BINDING.md §5.2) — the set the dev-host attestor
+  // + live agents use. Reputation impl upgraded to the client-less ServeProof.
+  agenticID: '0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A',
+  teeDataVerifier: '0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7',
+  reputationRegistry: '0x884c2809888Bfd789919331eA1fB2DA9C31363d2',
   // Shared infra (0g-kms / 0g-sandbox), same across environments on testnet.
   tappRegistry: '0x95a0BF4148b30F6F8D86870534c51df46Da5511c',
   sandboxServing: '0x3d4d8a05e9471E19E2068C49D5AB6f528494cf6f',

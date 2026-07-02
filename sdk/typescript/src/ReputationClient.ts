@@ -238,15 +238,15 @@ export class ReputationClient {
         params.includeRevoked,
       ],
     });
-    const [values, valueDecimalsArray, tag1s, tag2s, isRevokedArray] = result as [
-      bigint[], number[], string[], string[], boolean[],
+    const [, , values, valueDecimals, tag1s, tag2s, revokedStatuses] = result as [
+      `0x${string}`[], bigint[], bigint[], number[], string[], string[], boolean[],
     ];
     return values.map((value, i) => ({
       value,
-      valueDecimals: valueDecimalsArray[i],
+      valueDecimals: valueDecimals[i],
       tag1: tag1s[i],
       tag2: tag2s[i],
-      isRevoked: isRevokedArray[i],
+      isRevoked: revokedStatuses[i],
     }));
   }
 

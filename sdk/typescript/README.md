@@ -1,414 +1,241 @@
 # @0g/agenticid-sdk
 
-TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents built on ERC-8004 (identity registry) and ERC-7857 (intelligent data with sealed keys).
+TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
 
-## Features
+## Scope
 
-- **Agent registration** — Register agents with or without TEE seal binding
-- **Seal management** — Bind agents to agentSeal addresses and seal IDs
-- **Intelligent transfers** — Transfer agents with cryptographic proofs (TEE/ZKP)
-- **Agent cloning** — Clone agents with proof-based key re-encryption
-- **Metadata & URI** — Manage agent metadata and URIs
-- **Agent wallet** — Set/update agent wallet addresses with signature verification
-- **Authorization** — Manage usage authorizations and access delegates
-- **Reputation system** — Submit feedback with ServeProofs, append responses, query summaries
-- **ServeProof utilities** — Build, sign, and verify ServeProof payloads
+This build covers the operations the protocol supports today:
 
-## Installation
+| Area | Client | What it does |
+|---|---|---|
+| **Reputation** | `ServeSession` + `ReputationClient` | Capture a TEE-signed serve-proof from an agent's response, verify it, and submit/read on-chain feedback |
+| **Seal-bound transfer** | `AgenticIDClient` | Plain ERC-721 `transferFrom` + the reads used by verify/transfer/clone |
+| **Seal-bound clone** | `AttestorClient` | Owner signs a clone request; the attestor mints a copy for a new owner |
+| **Ack + deposit** | `SandboxClient` | Acknowledge the TEE trust-root set; fund a prepaid sandbox balance / agent gas |
+
+> Full identity management (register / update / metadata / authorization / pause / intelligent transfer & clone) is **not** in this build yet — it will land in a later pass.
+
+## Install
 
 ```bash
 npm install @0g/agenticid-sdk viem
 ```
 
-## Quick Start
+## Setup
 
-```typescript
-import {
-  AgenticIDClient,
-  ReputationClient,
-  ZERO_G_GALILEO_TESTNET,
-  getAddresses,
-} from '@0g/agenticid-sdk';
+Reads need only an RPC; writes need a viem wallet + account.
+
+```ts
 import { createWalletClient, http } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { ZERO_G_GALILEO_TESTNET, RPC_URL } from '@0g/agenticid-sdk';
 
-// Setup wallet
-const account = privateKeyToAccount('0xYOUR_PRIVATE_KEY');
-const walletClient = createWalletClient({
-  account,
-  chain: ZERO_G_GALILEO_TESTNET,
-  transport: http(),
-});
-
-// Create AgenticID client
-const agenticId = new AgenticIDClient({
-  environment: 'testnet',
-  walletClient,
-  account,
-});
-
-// Create Reputation client
-const reputation = new ReputationClient({
-  environment: 'testnet',
-  walletClient,
-  account,
-});
+const account = privateKeyToAccount('0x<private-key>');
+const walletClient = createWalletClient({ account, chain: ZERO_G_GALILEO_TESTNET, transport: http(RPC_URL) });
 ```
 
-## Usage Examples
+Every client takes `{ environment, rpcUrl?, walletClient?, account? }`. `environment` is `'dev'` (the set live dev agents use) or `'testnet'`; it selects the contract addresses (see [Addresses](#addresses)).
 
-### Register an Agent
+---
 
-```typescript
-const txHash = await agenticId.register({
-  agentURI: 'ipfs://QmYourAgentMetadata',
-  metadata: [
-    { metadataKey: 'name', metadataValue: '0x...' },
-  ],
-  intelligentDatas: [
-    { dataDescription: 'model weights', dataHash: '0x...' },
-  ],
-  sealedKeys: [
-    { dataHash: '0x...', sealedKey: '0x...' },
-  ],
-});
+## Reputation
 
-const receipt = await agenticId.waitForTransaction(txHash);
-console.log('Agent registered:', receipt);
+The reputation flow has three steps, and **the SDK does not model the agent's serve API** (it's framework-specific): you call the agent however it expects, and the SDK captures the `X-Agent-Proof` header the sealed proxy stamps on every response.
+
+```
+call agent → capture serve-proof → (verify) → giveFeedback on-chain
 ```
 
-### Register with TEE Seal Binding
+Attribution is by `msg.sender` at submission — the proof carries **no** client binding.
 
-```typescript
-const txHash = await agenticId.registerWithSeal({
-  to: account.address,
-  agentURI: 'ipfs://QmYourAgentMetadata',
-  metadata: [],
-  intelligentDatas: [
-    { dataDescription: 'model weights', dataHash: '0x...' },
-  ],
-  sealedKeys: [
-    { dataHash: '0x...', sealedKey: '0x...' },
-  ],
-  agentSeal: '0xAgentSealAddress',
-  sealId: '0xSealIdBytes32',
-});
-```
+### 1. Capture the serve-proof
 
-### Query Agent Information
+```ts
+import { captureProof } from '@0g/agenticid-sdk';
 
-```typescript
-// Get agent seal address
-const seal = await agenticId.getAgentSeal(1n);
-
-// Get seal ID
-const sealId = await agenticId.getSealId(1n);
-
-// Check if seal ID is bound
-const isBound = await agenticId.isSealIdBound(sealId);
-
-// Get intelligent data
-const datas = await agenticId.intelligentDatasOf(1n);
-console.log('Intelligent data:', datas);
-
-// Get sealed keys
-const keys = await agenticId.sealedKeysOf(1n);
-
-// Get owner
-const owner = await agenticId.ownerOf(1n);
-
-// Get metadata
-const value = await agenticId.getMetadata(1n, 'name');
-```
-
-### Update Agent Data
-
-```typescript
-// Update all intelligent data and sealed keys
-const txHash = await agenticId.update(1n, [
-  { dataDescription: 'updated model', dataHash: '0x...' },
-], [
-  { dataHash: '0x...', sealedKey: '0x...' },
-]);
-
-// Update at specific index
-await agenticId.updateAt(1n, 0n, {
-  dataDescription: 'patched model',
-  dataHash: '0x...',
-}, {
-  dataHash: '0x...',
-  sealedKey: '0x...',
-});
-```
-
-### Manage Authorizations
-
-```typescript
-// Authorize a user
-await agenticId.authorizeUsage(1n, '0xUserAddress');
-
-// Batch authorize
-await agenticId.batchAuthorizeUsage(1n, [
-  '0xUser1',
-  '0xUser2',
-  '0xUser3',
-]);
-
-// List authorized users
-const users = await agenticId.authorizedUsersOf(1n);
-
-// Revoke authorization
-await agenticId.revokeAuthorization(1n, '0xUser1');
-
-// Clear all
-await agenticId.clearAuthorizedUsers(1n);
-```
-
-### Transfer an Agent
-
-```typescript
-// Standard transfer (seal-bound agents only)
-await agenticId.transferFrom(account.address, '0xRecipient', 1n);
-
-// Safe transfer
-await agenticId.safeTransferFrom(account.address, '0xRecipient', 1n, '0x');
-
-// Intelligent transfer with proofs
-await agenticId.iTransferFrom(
-  account.address,
-  '0xRecipient',
-  1n,
-  [{
-    accessProof: {
-      dataHash: '0x...',
-      targetPubkey: '0x...',
-      nonce: '0x...',
-      deadline: 1700003600n,
-      proof: '0x...',
-    },
-    ownershipProof: {
-      oracleType: 0, // OracleType.TEE
-      dataHash: '0x...',
-      sealedKey: '0x...',
-      targetPubkey: '0x...',
-      nonce: '0x...',
-      deadline: 1700003600n,
-      proof: '0x...',
-    },
-  }],
+const { response, proof } = await captureProof(() =>
+  fetch(`${agentUrl}/chat`, { method: 'POST', body: JSON.stringify({ q: 'hi' }) }),
 );
+const data = await response.json();   // consume the body yourself
 ```
 
-### Reputation: Give Feedback
+`proof` (or `null` if the agent stamped none):
 
-```typescript
-import { buildServeProofSigningHash, signServeProof } from '@0g/agenticid-sdk';
+```jsonc
+{
+  "agentId": 33n,
+  "timestamp": 1782985733n,
+  "deadline": 1782989333n,
+  "taskHash": "0x87f479ace9e57270763af90d8c9ee0b95b0f2e9e1bdfcfb8e47453fbe27545dd",
+  "dataHashes": ["0xde8b8e7baaa2b9aded65f223e32fd4d6eb2188f14c9c6921a813cf6fba9a6a16"],
+  "frameworkHash": "0x8bb24e0411876e6d2e64f2c7f451a29577a2864d2a230e1ed866abc5ef17553a",
+  "signature": "0x6dcd3556…1b"
+}
+```
 
-// Build and sign a ServeProof
-const serveProof = await signServeProof(
-  {
-    agentId: 1n,
-    client: account.address,
-    timestamp: BigInt(Math.floor(Date.now() / 1000)),
-    deadline: BigInt(Math.floor(Date.now() / 1000) + 3600),
-    taskHash: '0xTaskHash',
-    dataHashes: ['0xDataHash1', '0xDataHash2'],
-    frameworkHash: '0xFrameworkHash',
-  },
-  async (hash) => account.signMessage({ message: { raw: hash } }),
-);
+Other transport helpers: `proofFromResponse(response)` (extract from a Response you already have), `parseServeProofHeader(headerValue)` (parse the raw header string).
 
-// Submit feedback
-await reputation.giveFeedback({
-  agentId: 1n,
-  value: 5n,
+### 2. Verify before spending gas (optional but recommended)
+
+```ts
+import { ServeSession } from '@0g/agenticid-sdk';
+
+const session = new ServeSession({ environment: 'dev' });
+const v = await session.verifyProof(proof);
+```
+
+Output — checks signer == on-chain `agentSeal`, deadline not passed, and every `dataHash` present in the agent's on-chain iData:
+
+```jsonc
+{ "ok": true, "signerMatches": true, "notExpired": true, "dataOnChain": true, "reasons": [] }
+```
+
+### 3. Submit feedback
+
+```ts
+import { ReputationClient } from '@0g/agenticid-sdk';
+import { keccak256, toBytes } from 'viem';
+
+const rep = new ReputationClient({ environment: 'dev', walletClient, account });
+
+const txHash = await rep.giveFeedback({
+  agentId: 33n,
+  value: 5n,               // int128; interpret with valueDecimals
   valueDecimals: 0,
   tag1: 'quality',
-  tag2: 'general',
-  endpoint: 'https://agent.example.com',
-  feedbackURI: 'ipfs://QmFeedback',
-  feedbackHash: '0xFeedbackHash',
-  serveProof,
+  tag2: 'latency',
+  endpoint: 'https://…/chat',
+  feedbackURI: 'ipfs://…',                  // optional off-chain detail
+  feedbackHash: keccak256(toBytes('great')),
+  serveProof: proof,                        // from step 1
 });
+// → "0x3fa9ecb7edbc…"  (feedback recorded under `account.address`)
 ```
 
-### Reputation: Query Feedback
+### Read reputation
 
-```typescript
-// Read a single feedback
-const feedback = await reputation.readFeedback(1n, '0xClient', 0n);
-console.log('Value:', feedback.value);
-console.log('Tag:', feedback.tag1);
-console.log('Revoked:', feedback.isRevoked);
+```ts
+const idx = await rep.getLastIndex(33n, buyer);        // → 2n  (last feedback index for buyer)
 
-// Read all feedback
-const allFeedback = await reputation.readAllFeedback({
-  agentId: 1n,
-  clientAddresses: [],
-  tag1: 'quality',
-  tag2: '',
-  includeRevoked: false,
-});
+await rep.readFeedback(33n, buyer, idx);
+// → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "e2e", isRevoked: false }
 
-// Get summary
-const summary = await reputation.getSummary({
-  agentId: 1n,
-  clientAddresses: [],
-  tag1: 'quality',
-  tag2: '',
-});
-console.log(`Count: ${summary.count}, Avg: ${summary.summaryValue}`);
+await rep.readAllFeedback({ agentId: 33n, clientAddresses: [buyer], tag1: '', tag2: '', includeRevoked: true });
+// → [ { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "e2e", isRevoked: false }, … ]   (empty tag = wildcard)
 
-// Get all clients who gave feedback
-const clients = await reputation.getClients(1n);
+await rep.getSummary({ agentId: 33n, clientAddresses: [buyer], tag1: '', tag2: '' });
+// → { count: 3n, summaryValue: 15000000000000000000n, summaryValueDecimals: 18 }   (avg normalized to 18 dp)
+
+await rep.getServeData(33n, buyer, idx);
+// → { dataHashes: ["0xde8b8e…"], frameworkHash: "0x8bb24e…" }   (what the TEE was running)
+
+await rep.getClients(33n);                             // → ["0xea69…", …]
 ```
 
-### Reputation: Append Response
+### Owner response & revocation
 
-```typescript
-await reputation.appendResponse({
-  agentId: 1n,
-  clientAddress: '0xClientAddress',
-  feedbackIndex: 0n,
-  responseURI: 'ipfs://QmResponse',
-  responseHash: '0xResponseHash',
+```ts
+// Agent owner responds to a client's feedback (msg.sender must be ownerOf(agentId)):
+await repOwner.appendResponse({
+  agentId: 33n, clientAddress: buyer, feedbackIndex: idx,
+  responseURI: 'ipfs://reply', responseHash: keccak256(toBytes('reply')),
 });
+await repOwner.getResponseCount(33n, buyer, idx, [ownerAddress]);   // → 1n
+
+// The client who left feedback can revoke it:
+await rep.revokeFeedback(33n, idx);
 ```
 
-### ServeProof Utilities
+---
 
-```typescript
-import {
-  buildServeProofMessageHash,
-  buildServeProofSigningHash,
-  buildServeProof,
-  signServeProof,
-} from '@0g/agenticid-sdk';
+## Seal-bound transfer & reads
 
-// Compute the message hash (as the contract does)
-const msgHash = buildServeProofMessageHash({
-  agentId: 1n,
-  client: '0xClient',
-  timestamp: 1700000000n,
-  deadline: 1700003600n,
-  taskHash: '0xTaskHash',
-  dataHashes: ['0xDataHash1', '0xDataHash2'],
-  frameworkHash: '0xFrameworkHash',
-});
+```ts
+import { AgenticIDClient } from '@0g/agenticid-sdk';
+const id = new AgenticIDClient({ environment: 'dev', walletClient, account });
 
-// Compute the EIP-191 signing hash
-const signingHash = buildServeProofSigningHash({
-  agentId: 1n,
-  client: '0xClient',
-  timestamp: 1700000000n,
-  deadline: 1700003600n,
-  taskHash: '0xTaskHash',
-  dataHashes: ['0xDataHash1', '0xDataHash2'],
-  frameworkHash: '0xFrameworkHash',
-});
+// Transfer (plain ERC-721). The attestor observes it and clears the prior owner's runtime binding.
+await id.transferFrom(from, to, 33n);
+await id.safeTransferFrom(from, to, 33n);
 
-// Build proof without signature
-const proof = buildServeProof({
-  agentId: 1n,
-  client: '0xClient',
-  timestamp: 1700000000n,
-  deadline: 1700003600n,
-  taskHash: '0xTaskHash',
-  dataHashes: ['0xDataHash1'],
-  frameworkHash: '0xFrameworkHash',
-});
+// Reads
+await id.getAgentSeal(33n);          // → "0x88c3AD0f45DC25f1e26f4b226e68A0707326E3b0"
+await id.getSealId(33n);             // → "0xa68ea263…"
+await id.getAgentIdBySealId(sealId); // → 33n
+await id.isSealIdBound(sealId);      // → true
+await id.intelligentDatasOf(33n);    // → [ { dataDescription: "{…}", dataHash: "0x…" }, … ]
+await id.sealedKeysOf(33n);          // → ["0x04…", …]
+await id.ownerOf(33n);               // → "0xB831…"
+await id.balanceOf(owner);           // → 5n
 ```
 
-## API Reference
+---
 
-### AgenticIDClient
+## Seal-bound clone
 
-| Method | Type | Description |
-|--------|------|-------------|
-| `register(params)` | write | Register a new agent |
-| `registerWithSeal(params)` | write | Register with TEE seal binding |
-| `setAgentSeal(agentId, seal, sealId)` | write | Set agent seal |
-| `getAgentSeal(agentId)` | read | Get agent seal address |
-| `getSealId(agentId)` | read | Get seal ID |
-| `getAgentIdBySealId(sealId)` | read | Get agent ID by seal ID |
-| `isSealIdBound(sealId)` | read | Check if seal ID is bound |
-| `addTrustedAttestor(addr)` | write | Add trusted attestor |
-| `removeTrustedAttestor(addr)` | write | Remove trusted attestor |
-| `isTrustedAttestor(addr)` | read | Check if attestor is trusted |
-| `addValidFrameworkHash(hash)` | write | Add valid framework hash |
-| `removeValidFrameworkHash(hash)` | write | Remove valid framework hash |
-| `isValidFrameworkHash(hash)` | read | Check if framework hash is valid |
-| `transferFrom(from, to, id)` | write | Transfer agent (seal-bound) |
-| `safeTransferFrom(...)` | write | Safe transfer (seal-bound) |
-| `iTransferFrom(from, to, id, proofs)` | write | Intelligent transfer with proofs |
-| `iCloneFrom(from, to, id, proofs)` | write | Clone agent with proofs |
-| `update(tokenId, datas, keys)` | write | Update all intelligent data |
-| `updateAt(tokenId, idx, data, key)` | write | Update single data entry |
-| `intelligentDatasOf(tokenId)` | read | Get all intelligent data |
-| `sealedKeysOf(tokenId)` | read | Get all sealed keys |
-| `setAgentURI(agentId, uri)` | write | Set agent URI |
-| `getMetadata(agentId, key)` | read | Get metadata value |
-| `setMetadata(agentId, key, value)` | write | Set metadata value |
-| `setAgentWallet(...)` | write | Set agent wallet |
-| `getAgentWallet(agentId)` | read | Get agent wallet |
-| `unsetAgentWallet(agentId)` | write | Unset agent wallet |
-| `authorizeUsage(tokenId, user)` | write | Authorize user |
-| `batchAuthorizeUsage(tokenId, users)` | write | Batch authorize |
-| `revokeAuthorization(tokenId, user)` | write | Revoke authorization |
-| `clearAuthorizedUsers(tokenId)` | write | Clear all authorizations |
-| `authorizedUsersOf(tokenId)` | read | Get authorized users |
-| `setAccessDelegate(delegate)` | write | Set access delegate |
-| `getAccessDelegate(user)` | read | Get access delegate |
-| `ownerOf(tokenId)` | read | Get token owner |
-| `balanceOf(owner)` | read | Get balance |
-| `pause()` / `unpause()` | write | Pause/unpause contract |
-| `pauser()` | read | Get pauser address |
-| `setPauser(addr)` | write | Set new pauser |
-| `setVerifier(addr)` | write | Set new verifier |
+Clone is **not** an on-chain call — the source owner signs a request and the attestor mints a fresh agent for the target owner (reusing the source's on-chain iData). The connected wallet must be the current on-chain owner of the source.
 
-### ReputationClient
+```ts
+import { AttestorClient } from '@0g/agenticid-sdk';
+const attestor = new AttestorClient({ baseUrl: 'http://47.236.111.154:8080', walletClient, account });
 
-| Method | Type | Description |
-|--------|------|-------------|
-| `giveFeedback(params)` | write | Submit feedback with ServeProof |
-| `revokeFeedback(agentId, idx)` | write | Revoke feedback |
-| `appendResponse(params)` | write | Append response to feedback |
-| `readFeedback(agentId, client, idx)` | read | Read single feedback |
-| `readAllFeedback(params)` | read | Read all feedback |
-| `getSummary(params)` | read | Get feedback summary |
-| `getResponseCount(...)` | read | Get response count |
-| `getClients(agentId)` | read | Get all clients |
-| `getLastIndex(agentId, client)` | read | Get last feedback index |
-| `getServeData(agentId, client, idx)` | read | Get serve data |
+const clone = await attestor.clone({
+  sourceAgentId: 33n,
+  targetOwner: '0xea69…',
+  idempotencyKey: 'clone-33-001',    // a replay returns the same clone
+});
+// → { seal_id: "0x7e9ad62c…", agent_seal_addr: "0x…", subscribe_url: "ws://…/ws/subscribe?seal_id=0x…" }
+```
 
-### ServeProof Utilities
+The clone lands **Offline** for the target owner to bring online.
 
-| Function | Description |
-|----------|-------------|
-| `buildServeProofMessageHash(params)` | Compute keccak256 of abi.encode payload |
-| `buildServeProofSigningHash(params)` | Compute EIP-191 wrapped hash |
-| `buildServeProof(params)` | Build proof object without signature |
-| `signServeProof(params, signFn)` | Build and sign proof |
-| `verifyServeProofSignature(proof, addr)` | Verify signature (stub) |
+---
 
-## Contract Addresses
+## Ack + deposit (sandbox)
 
-### Testnet (0G Galileo Testnet, Chain ID: 16602)
+```ts
+import { SandboxClient } from '@0g/agenticid-sdk';
+import { parseEther } from 'viem';
 
-| Contract | Address |
-|----------|---------|
-| AgenticID | `0xbea77c9aBd0aA46e812444583947718593bBD139` |
-| TEEDataVerifier | `0x1b6bba3db8a04B20702Feb62E30Caa831ca1e1f1` |
-| ReputationRegistry | `0x8bC1E129aEb0Baa306715BC1CBB720Eb2A4324AA` |
+const sandbox = new SandboxClient({
+  environment: 'dev', walletClient, account,
+  componentAppIds: ['0g-attestor', '0g-kms', '0g-sandbox-provider'],   // trust-root set to acknowledge
+});
 
-### Dev
+// ── ack: acknowledge the whole component set in one tx (skips what's already acked) ──
+await sandbox.ackStatus(owner);   // → { allAcked: true, missing: [] }
+await sandbox.ack();              // → tx hash, or null if nothing to ack
 
-| Contract | Address |
-|----------|---------|
-| AgenticID | `0xf952e7dD046779f34C0Ca0c058e1D940B7B9d525` |
-| TEEDataVerifier | `0x2EAa6fcB9847A5A4B25acCdeca3C957a1732C23F` |
-| ReputationRegistry | `0x4AAbc18962C2Bb5E451a0FDfa39c0C47a51bD971` |
+// ── deposit: prepaid sandbox balance (charged for create / CPU / mem) ──
+const provider = '0xea69…';                                   // sandbox provider address
+await sandbox.getSandboxBalance(owner, provider);             // → 1800000000000003200n  (wei)
+await sandbox.depositSandboxBalance({ provider, amountWei: parseEther('0.5'), /* recipient?: defaults to self */ });
 
-## License
+// ── top up an agent's own key with native gas (for its on-chain writes) ──
+await sandbox.topUpAgentSeal(agentSealAddress, parseEther('0.01'));
+```
 
-MIT
+---
+
+## Addresses
+
+`getAddresses(env)` returns the contract set. `dev` is the deployment live agents run on; `testnet` is a parallel set.
+
+```ts
+import { getAddresses } from '@0g/agenticid-sdk';
+getAddresses('dev');
+// → { agenticID: "0x5BB5…", reputationRegistry: "0x884c28…", teeDataVerifier: "0x5e5B…",
+//     tappRegistry: "0x95a0…", sandboxServing: "0x3d4d…" }
+```
+
+Chain: 0G Galileo Testnet (`chainId 16602`, `RPC_URL = https://evmrpc-testnet.0g.ai`).
+
+## Notes
+
+- **No client binding in serve-proofs.** Feedback is attributed to `msg.sender` at `giveFeedback`; a proof is a bearer attestation (single-use via the signature nonce). Serve currently runs over plain HTTP, so treat proofs as sensitive.
+- **0G receipt timing.** `waitForTransaction` can occasionally time out even though the tx landed — poll `getBalance`/`getLastIndex`/etc. to confirm state rather than relying solely on the receipt.
+- `value` / `summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint) — match the on-chain types exactly.
+
+## Advanced
+
+Raw ABIs (`agenticIDAbi`, `reputationRegistryAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`) are exported for advanced use.
