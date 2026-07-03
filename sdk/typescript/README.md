@@ -21,35 +21,34 @@ npm install @0g/agenticid-sdk viem
 
 ## Setup
 
-Construct **once** with contract addresses (no `environment` enum — pass addresses explicitly so the SDK never drifts from what's deployed). Reads need no wallet; writes need a viem wallet + account; deploy/clone need `attestorUrl`.
+Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
 ```ts
-import { createWalletClient, http } from 'viem';
-import { privateKeyToAccount } from 'viem/accounts';
-import { AgenticID, DEV_ADDRESSES, ZERO_G_GALILEO_TESTNET, RPC_URL } from '@0g/agenticid-sdk';
+import { AgenticID, DEV_ADDRESSES } from '@0g/agenticid-sdk';
 
-// ZERO_G_GALILEO_TESTNET is the viem `Chain` definition this SDK exports for the
-// 0G Galileo testnet (chainId 16602); RPC_URL is its default public RPC. Use
-// them wherever viem wants a `chain` / transport.
-const account = privateKeyToAccount(process.env.PRIVATE_KEY as `0x${string}`);
-const walletClient = createWalletClient({ account, chain: ZERO_G_GALILEO_TESTNET, transport: http(RPC_URL) });
+// read-only:
+const ro = new AgenticID({ addresses: DEV_ADDRESSES });
 
+// with a signer (for writes):
 const ag = new AgenticID({
   addresses: DEV_ADDRESSES,               // required — a known set or your own (see Addresses below)
+  account: process.env.PRIVATE_KEY,       // a private key (0x…) or a viem Account; enables writes
   attestorUrl: process.env.ATTESTOR_URL,  // only for agent.deploy / agent.clone
-  walletClient, account,                  // only for writes — omit both for a read-only client
-  // rpcUrl / chain are optional; both default to the 0G Galileo testnet
+  // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
 ```
 
-`AgenticIDConfig`: `{ rpcUrl?, chain?, addresses, attestorUrl?, walletClient?, account?, componentAppIds? }`.
+`AgenticIDConfig`: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
+
+- **`account`** — a private key or a viem `Account`. Supplying it is enough to sign writes; the SDK constructs the wallet client for you.
+- **`walletClient`** (advanced) — bring your own instead of `account`, e.g. an injected browser wallet. `ZERO_G_GALILEO_TESTNET` and `RPC_URL` are exported for that case.
 
 The snippets below assume these bindings:
 
 ```ts
-const agentId = 33n;                    // an existing agent (ERC-721 tokenId)
-const owner   = account.address;        // this wallet, when it owns the agent
-const buyer   = account.address;        // this wallet, when it leaves feedback (attribution is msg.sender)
+const agentId = 33n;   // an existing agent (ERC-721 tokenId)
+const owner = '0xAaAa...';   // the address that owns the agent (often your own signer's address)
+const buyer = '0xBbBb...';   // the address leaving feedback — whatever wallet `ag` signs with (attribution is msg.sender)
 ```
 
 ---

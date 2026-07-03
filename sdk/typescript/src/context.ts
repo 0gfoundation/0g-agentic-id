@@ -6,12 +6,14 @@
 
 import {
   createPublicClient,
+  createWalletClient,
   http,
   type Account,
   type Chain,
   type PublicClient,
   type WalletClient,
 } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
 import { ZERO_G_GALILEO_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
 /** Public config for `new AgenticID(config)`. */
@@ -24,10 +26,17 @@ export interface AgenticIDConfig {
   addresses: ContractAddresses;
   /** Attestor base URL — required for agent.deploy / agent.clone. */
   attestorUrl?: string;
-  /** Wallet client for write transactions (optional for read-only usage). */
+  /**
+   * Signer for writes. A private key (`0x…`) or a viem `Account`. When set, the
+   * SDK builds the wallet client for you from the rpcUrl + chain — you don't
+   * need to construct one. Omit for a read-only client.
+   */
+  account?: Account | `0x${string}`;
+  /**
+   * Bring-your-own wallet client (e.g. an injected browser wallet). Optional —
+   * usually you just pass `account`. When set, its account is used for writes.
+   */
   walletClient?: WalletClient;
-  /** Account for transactions + signing. */
-  account?: Account;
   /**
    * Trust-root component appIds acknowledged by `sandbox.ack()`. Defaults to
    * the standard set (attestor / kms / sandbox provider).
@@ -50,14 +59,31 @@ const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider
 
 export function buildCtx(config: AgenticIDConfig): Ctx {
   const chain = (config.chain ?? ZERO_G_GALILEO_TESTNET) as Chain;
+  const rpcUrl = config.rpcUrl ?? RPC_URL;
+
+  // Resolve the signer + wallet client. A bring-your-own walletClient wins; else
+  // build one from `account` (a private key string or a viem Account) — so the
+  // caller only needs to supply an RPC + a key, not a hand-built viem client.
+  let account: Account | undefined;
+  let walletClient: WalletClient | undefined;
+  if (config.walletClient) {
+    walletClient = config.walletClient;
+    account =
+      config.walletClient.account ??
+      (typeof config.account === 'string' ? privateKeyToAccount(config.account) : config.account);
+  } else if (config.account) {
+    account = typeof config.account === 'string' ? privateKeyToAccount(config.account) : config.account;
+    walletClient = createWalletClient({ account, chain, transport: http(rpcUrl) });
+  }
+
   return {
     chain,
     addresses: config.addresses,
     attestorUrl: config.attestorUrl,
-    walletClient: config.walletClient,
-    account: config.account,
+    walletClient,
+    account,
     componentAppIds: config.componentAppIds ?? DEFAULT_COMPONENT_APP_IDS,
-    publicClient: createPublicClient({ chain, transport: http(config.rpcUrl ?? RPC_URL) }),
+    publicClient: createPublicClient({ chain, transport: http(rpcUrl) }),
   };
 }
 
