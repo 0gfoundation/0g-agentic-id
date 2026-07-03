@@ -294,18 +294,3 @@ export interface GetSummaryParams {
   /** Second tag filter */
   tag2: string;
 }
-
-/**
- * Configuration for SDK clients.
- */
-export interface SDKConfig {
-  /** Environment ('dev' or 'testnet') */
-  environment: Environment;
-  /** Custom RPC URL (defaults to 0G Galileo Testnet RPC) */
-  rpcUrl?: string;
-}
-
-/**
- * Environment type.
- */
-export type Environment = 'dev' | 'testnet';
