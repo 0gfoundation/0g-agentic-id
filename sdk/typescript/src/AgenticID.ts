@@ -1,13 +1,16 @@
 /**
  * @file AgenticID.ts
  * @description The single entry point. Construct once with rpc + addresses (+
- * attestorUrl + signer), then use three intent namespaces:
- *   - `agent`      — lifecycle (deploy / clone / transfer) + reads
+ * attestorUrl + signer), then use two intent namespaces:
+ *   - `agent`      — lifecycle (deploy / clone / transfer), reads, agent-seal gas top-up
  *   - `reputation` — serve-proof capture/verify + on-chain feedback
- *   - `sandbox`    — trust-root ack + prepaid balance / agent-seal gas
+ *
+ * plus top-level ops that don't belong to a single agent: `ack` / `ackStatus`
+ * (acknowledge the TEE trust-root component set) and `deposit` / `getBalance`
+ * (prepaid sandbox balance).
  *
  * Backends (AgenticID / Reputation / TappRegistry / SandboxServing contracts +
- * attestor HTTP) are hidden behind these namespaces.
+ * attestor HTTP) are hidden behind the facade.
  *
  * @example
  * ```typescript
@@ -15,7 +18,7 @@
  * const ag = new AgenticID({ rpcUrl, addresses: DEV_ADDRESSES, attestorUrl, walletClient, account });
  * await ag.agent.transferFrom(from, to, 33n);
  * const { proof } = await ag.reputation.capture(() => fetch(`${url}/chat`, ...));
- * await ag.sandbox.ack();
+ * await ag.ack();
  * ```
  */
 
@@ -25,7 +28,7 @@ import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
-import { buildCtx, type AgenticIDConfig, type Ctx } from './context';
+import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import type {
   ServeProof, GiveFeedbackParams, AppendResponseParams, ReadAllFeedbackParams,
   GetSummaryParams, Feedback, FeedbackSummary, ServeData,
@@ -44,7 +47,9 @@ function assertSealBound(seal: Address, op: string): void {
 export class AgentApi {
   private readonly id: AgenticIDClient;
   private readonly attestor: AttestorClient;
+  private readonly ctx: Ctx;
   constructor(ctx: Ctx) {
+    this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
     this.attestor = new AttestorClient(ctx);
   }
@@ -64,6 +69,11 @@ export class AgentApi {
   async safeTransferFrom(from: Address, to: Address, tokenId: bigint, data: `0x${string}` = '0x'): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'safeTransferFrom');
     return this.id.safeTransferFrom(from, to, tokenId, data);
+  }
+  /** Send native gas to an agent's agentSeal so it can self-fund on-chain writes. */
+  topUpAgentSeal(agentSeal: Address, amountWei: bigint): Promise<`0x${string}`> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.sendTransaction({ to: agentSeal, value: amountWei, account, chain: this.ctx.chain });
   }
 
   // — reads —
@@ -111,12 +121,24 @@ export class ReputationApi {
 export class AgenticID {
   readonly agent: AgentApi;
   readonly reputation: ReputationApi;
-  readonly sandbox: SandboxClient;
+  private readonly infra: SandboxClient;
 
   constructor(config: AgenticIDConfig) {
     const ctx = buildCtx(config);
     this.agent = new AgentApi(ctx);
     this.reputation = new ReputationApi(ctx);
-    this.sandbox = new SandboxClient(ctx);
+    this.infra = new SandboxClient(ctx);
   }
+
+  // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —
+  /** Acknowledge the TEE trust-root component set in one batched tx; null if already done. */
+  ack(): Promise<WriteContractReturnType | null> { return this.infra.ack(); }
+  /** Which configured components `user` (or the connected account) still needs to acknowledge. */
+  ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> { return this.infra.ackStatus(user); }
+
+  // — prepaid sandbox balance —
+  /** Fund a prepaid sandbox balance against a provider (payable). Recipient defaults to the caller. */
+  deposit(params: { provider: Address; amountWei: bigint; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
+  /** Read a user's prepaid sandbox balance against a provider (wei). */
+  getBalance(user: Address, provider: Address): Promise<bigint> { return this.infra.getBalance(user, provider); }
 }

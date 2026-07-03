@@ -2,9 +2,10 @@
  * @file index.ts
  * @description Entry point for @0g/agenticid-sdk.
  *
- * One facade (`AgenticID`) with three intent namespaces — `agent` (lifecycle:
- * deploy/clone/transfer + reads), `reputation` (serve-proof + feedback), and
- * `sandbox` (ack + deposit). Construct once with rpc + addresses.
+ * One facade (`AgenticID`): two intent namespaces — `agent` (lifecycle:
+ * deploy/clone/transfer + reads + agent-seal gas) and `reputation` (serve-proof
+ * + feedback) — plus top-level `ack`/`ackStatus` (trust roots) and
+ * `deposit`/`getBalance` (sandbox balance). Construct once with rpc + addresses.
  *
  * @example
  * ```typescript

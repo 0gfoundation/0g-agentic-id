@@ -2,15 +2,16 @@
 
 TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
 
-One entry point, `AgenticID`, with three intent namespaces:
+One entry point, `AgenticID`, with two intent namespaces plus a few top-level ops:
 
-| Namespace | What |
+| Surface | What |
 |---|---|
-| `ag.agent` | agent lifecycle — **deploy / clone / transfer** — plus reads (owner, agentSeal, iData…) |
+| `ag.agent` | agent lifecycle — **deploy / clone / transfer** — reads (owner, agentSeal, iData…), and agent-seal gas top-up |
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
-| `ag.sandbox` | acknowledge the TEE trust-root set; fund the prepaid sandbox balance / agent gas |
+| `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
+| `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance |
 
-> Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind these namespaces. `transfer`/`clone` handle seal-bound agents today; non-seal agents (via `iTransferFrom`/`iCloneFrom`) are a future internal branch.
+> Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade. `transfer`/`clone` handle seal-bound agents today; non-seal agents (via `iTransferFrom`/`iCloneFrom`) are a future internal branch.
 
 ## Install
 
@@ -72,6 +73,9 @@ await ag.agent.intelligentDatasOf(33n); // → [ { dataDescription, dataHash }, 
 await ag.agent.sealedKeysOf(33n);       // → ["0x04…", …]
 await ag.agent.ownerOf(33n);            // → "0xB831…"
 await ag.agent.balanceOf(owner);        // → 5n
+
+// send native gas to the agent's own key so it can self-fund on-chain writes
+await ag.agent.topUpAgentSeal(agentSealAddress, parseEther('0.01'));
 ```
 
 `transfer`/`clone` reject non-seal-bound agents today with a clear error (they'd need `iTransferFrom`/`iCloneFrom`).
@@ -120,21 +124,24 @@ await ag.reputation.revokeFeedback(33n, idx);   // by the client who left it
 
 ---
 
-## `ag.sandbox` — ack + deposit
+## Top-level ops (not scoped to one agent)
+
+Acknowledging the TEE trust-root set and funding the prepaid sandbox balance aren't agent-specific, so they sit directly on the facade.
 
 ```ts
 import { parseEther } from 'viem';
 
-await ag.sandbox.ackStatus(owner);   // → { allAcked: true, missing: [] }
-await ag.sandbox.ack();              // batched acknowledgeApps of the missing set; null if nothing to ack
+// trust-root acknowledgment (TappRegistry, spans attestor + kms + sandbox-provider)
+await ag.ackStatus(owner);   // → { allAcked: true, missing: [] }
+await ag.ack();              // batched acknowledgeApps of the missing set; null if nothing to ack
 
+// prepaid sandbox balance (SandboxServing)
 const provider = '0xea69…';
-await ag.sandbox.getBalance(owner, provider);                          // → 1800000000000000000n (wei)
-await ag.sandbox.deposit({ provider, amountWei: parseEther('0.5') });  // prepaid sandbox balance
-await ag.sandbox.topUpAgentSeal(agentSealAddress, parseEther('0.01')); // native gas to the agent's key
+await ag.getBalance(owner, provider);                          // → 1800000000000000000n (wei)
+await ag.deposit({ provider, amountWei: parseEther('0.5') });  // fund the prepaid balance
 ```
 
-The trust-root component set defaults to `['0g-attestor','0g-kms','0g-sandbox-provider']`; override with `componentAppIds` in the config.
+The trust-root component set defaults to `['0g-attestor','0g-kms','0g-sandbox-provider']`; override with `componentAppIds` in the config. (Agent-seal gas top-up is on the `agent` namespace above.)
 
 ---
 

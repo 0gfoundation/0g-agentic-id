@@ -1,12 +1,13 @@
 /**
  * @file SandboxClient.ts
- * @description Internal client for trust-root ack (TappRegistry) + sandbox funding
- * (SandboxServing). Consumers use the `AgenticID` facade's `sandbox` namespace.
+ * @description Internal client for trust-root ack (TappRegistry) + prepaid
+ * sandbox balance (SandboxServing). Surfaced on the `AgenticID` facade as
+ * top-level ops (`ack`/`ackStatus`/`deposit`/`getBalance`) — none is scoped to a
+ * single agent. (Agent-seal gas top-up lives on the `agent` namespace.)
  *
  *  - ack:     acknowledge the TEE component set (attestor/kms/sandbox) in one
  *             batched call over whatever isn't already acknowledged.
  *  - deposit: prepaid sandbox balance (charged for create/CPU/mem before deploy).
- *  - topUpAgentSeal: native gas to the agent's own key for its on-chain writes.
  *
  * NOTE: acknowledgeApps is a TappRegistry (tapp-layer) primitive wrapped here
  * until a dedicated tapp SDK exists.
@@ -89,17 +90,6 @@ export class SandboxClient {
       functionName: 'deposit',
       args: [params.recipient ?? account.address, params.provider],
       value: params.amountWei,
-      account,
-      chain: this.ctx.chain,
-    });
-  }
-
-  /** Send native gas to an agent's agentSeal address so it can self-fund on-chain writes. */
-  async topUpAgentSeal(agentSeal: Address, amountWei: bigint): Promise<`0x${string}`> {
-    const { walletClient, account } = requireWallet(this.ctx);
-    return walletClient.sendTransaction({
-      to: agentSeal,
-      value: amountWei,
       account,
       chain: this.ctx.chain,
     });
