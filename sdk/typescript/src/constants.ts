@@ -19,12 +19,10 @@ export const ZERO_G_GALILEO_TESTNET = {
 } as const;
 
 /**
- * Deployment environments.
- */
-export type Environment = 'dev' | 'testnet';
-
-/**
- * Contract addresses for each environment.
+ * Contract address set. Pass one explicitly to `new AgenticID({ addresses })`
+ * (no baked-in `environment` enum — addresses are given directly so the SDK
+ * can't drift from what's actually deployed). The known sets below are exported
+ * for convenience.
  */
 export interface ContractAddresses {
   /** AgenticID proxy contract address */
@@ -40,7 +38,8 @@ export interface ContractAddresses {
 }
 
 /**
- * Dev environment contract addresses (0G Galileo Testnet).
+ * Dev deployment addresses (0G Galileo Testnet) — the set the dev-host attestor
+ * + live agents use. See contracts/DEPLOYMENT.md §6.2.
  */
 export const DEV_ADDRESSES: ContractAddresses = {
   // dev environment (CANONICAL_BINDING.md §5.2) — the set the dev-host attestor
@@ -65,24 +64,7 @@ export const TESTNET_ADDRESSES: ContractAddresses = {
 };
 
 /**
- * Map of environment → contract addresses.
- */
-export const ADDRESSES: Record<Environment, ContractAddresses> = {
-  dev: DEV_ADDRESSES,
-  testnet: TESTNET_ADDRESSES,
-};
-
-/**
- * Get contract addresses for a given environment.
- * @param env - The deployment environment ('dev' or 'testnet')
- * @returns Contract addresses for the specified environment
- */
-export function getAddresses(env: Environment = 'testnet'): ContractAddresses {
-  return ADDRESSES[env];
-}
-
-/**
- * The RPC URL for the 0G Galileo Testnet.
+ * Default RPC URL for the 0G Galileo Testnet (override via `AgenticID({ rpcUrl })`).
  */
 export const RPC_URL = 'https://evmrpc-testnet.0g.ai';
 

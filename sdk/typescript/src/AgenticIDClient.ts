@@ -1,101 +1,43 @@
 /**
  * @file AgenticIDClient.ts
- * @description Scoped client for the 0G AgenticID contract.
- *
- * Covers what the current SDK surface needs: seal-bound transfer + the reads
- * used by transfer/clone/reputation flows (getAgentSeal, iData, ownerOf, seal
- * lookups). The full identity-management surface (register / update / metadata
- * / authorization / pause / intelligent transfer & clone) is intentionally NOT
- * exposed yet — it will be added back in a later SDK pass.
+ * @description Internal client for the AgenticID contract (seal-bound transfer +
+ * the reads that transfer/clone/reputation use). Consumers use the `AgenticID`
+ * facade's `agent` namespace, not this directly.
  */
 
 import {
-  createPublicClient,
-  http,
-  type WalletClient,
-  type PublicClient,
   type Address,
   type Hash,
-  type Chain,
-  type Account,
-  type WriteContractReturnType,
   type TransactionReceipt,
+  type WriteContractReturnType,
 } from 'viem';
 import { agenticIDAbi } from './abi';
-import {
-  ZERO_G_GALILEO_TESTNET,
-  getAddresses,
-  RPC_URL,
-  RECEIPT_WAIT,
-  type Environment,
-} from './constants';
+import { RECEIPT_WAIT } from './constants';
+import { requireWallet, type Ctx } from './context';
 
-/**
- * Configuration options for the AgenticIDClient.
- */
-export interface AgenticIDClientOptions {
-  /** Environment ('dev' or 'testnet') */
-  environment?: Environment;
-  /** Custom RPC URL */
-  rpcUrl?: string;
-  /** Wallet client for write transactions (optional for read-only usage) */
-  walletClient?: WalletClient;
-  /** Account to use for transactions */
-  account?: Account;
-}
-
-/**
- * Read result for agent intelligent data.
- */
 export interface IntelligentDataResult {
   dataDescription: string;
   dataHash: Hash;
 }
 
-/**
- * Scoped client for the AgenticID contract. Read methods work without a wallet;
- * write methods (transfers) require a walletClient + account.
- */
 export class AgenticIDClient {
-  public readonly publicClient: PublicClient;
-  public readonly walletClient?: WalletClient;
-  public readonly account?: Account;
-  public readonly address: Address;
-  private readonly chain: Chain;
+  constructor(private readonly ctx: Ctx) {}
 
-  constructor(options: AgenticIDClientOptions = {}) {
-    const env = options.environment ?? 'testnet';
-    this.address = getAddresses(env).agenticID;
-    this.chain = ZERO_G_GALILEO_TESTNET;
-    this.publicClient = createPublicClient({
-      chain: this.chain,
-      transport: http(options.rpcUrl ?? RPC_URL),
-    });
-    if (options.walletClient) this.walletClient = options.walletClient;
-    if (options.account) this.account = options.account;
-  }
-
-  private requireWallet(): void {
-    if (!this.walletClient || !this.account) {
-      throw new Error('a walletClient + account are required for write operations');
-    }
+  private get address(): Address {
+    return this.ctx.addresses.agenticID;
   }
 
   // ── Seal-bound transfer ────────────────────────────────────────────────────
 
-  /**
-   * Transfer an agent (plain ERC-721 transferFrom). The attestor observes the
-   * on-chain transfer and clears the prior owner's runtime binding.
-   */
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
-    this.requireWallet();
-    return this.walletClient!.writeContract({
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
       address: this.address,
       abi: agenticIDAbi,
       functionName: 'transferFrom',
       args: [from, to, tokenId],
-      account: this.account!,
-      chain: this.chain,
+      account,
+      chain: this.ctx.chain,
     });
   }
 
@@ -105,94 +47,70 @@ export class AgenticIDClient {
     tokenId: bigint,
     data: `0x${string}` = '0x',
   ): Promise<WriteContractReturnType> {
-    this.requireWallet();
-    return this.walletClient!.writeContract({
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
       address: this.address,
       abi: agenticIDAbi,
       functionName: 'safeTransferFrom',
       args: [from, to, tokenId, data],
-      account: this.account!,
-      chain: this.chain,
+      account,
+      chain: this.ctx.chain,
     });
   }
 
-  // ── Reads (used by transfer / clone / reputation) ──────────────────────────
+  // ── Reads ──────────────────────────────────────────────────────────────────
 
   async getAgentSeal(agentId: bigint): Promise<Address> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'getAgentSeal',
-      args: [agentId],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'getAgentSeal', args: [agentId],
     }) as Promise<Address>;
   }
 
   async getSealId(agentId: bigint): Promise<Hash> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'getSealId',
-      args: [agentId],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'getSealId', args: [agentId],
     }) as Promise<Hash>;
   }
 
   async getAgentIdBySealId(sealId: Hash): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'getAgentIdBySealId',
-      args: [sealId],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'getAgentIdBySealId', args: [sealId],
     }) as Promise<bigint>;
   }
 
   async isSealIdBound(sealId: Hash): Promise<boolean> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'isSealIdBound',
-      args: [sealId],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'isSealIdBound', args: [sealId],
     }) as Promise<boolean>;
   }
 
   async intelligentDatasOf(tokenId: bigint): Promise<IntelligentDataResult[]> {
-    const result = (await this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'intelligentDatasOf',
-      args: [tokenId],
+    const result = (await this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'intelligentDatasOf', args: [tokenId],
     })) as readonly { dataDescription: string; dataHash: Hash }[];
     return result.map((d) => ({ dataDescription: d.dataDescription, dataHash: d.dataHash }));
   }
 
   async sealedKeysOf(tokenId: bigint): Promise<`0x${string}`[]> {
-    const result = (await this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'sealedKeysOf',
-      args: [tokenId],
+    const result = (await this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'sealedKeysOf', args: [tokenId],
     })) as readonly `0x${string}`[];
     return [...result];
   }
 
   async ownerOf(tokenId: bigint): Promise<Address> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'ownerOf',
-      args: [tokenId],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'ownerOf', args: [tokenId],
     }) as Promise<Address>;
   }
 
   async balanceOf(owner: Address): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.address,
-      abi: agenticIDAbi,
-      functionName: 'balanceOf',
-      args: [owner],
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'balanceOf', args: [owner],
     }) as Promise<bigint>;
   }
 
   async waitForTransaction(txHash: Hash): Promise<TransactionReceipt> {
-    return this.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
+    return this.ctx.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
   }
 }

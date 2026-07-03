@@ -7,9 +7,6 @@
  */
 
 import {
-  createWalletClient,
-  createPublicClient,
-  http,
   type WalletClient,
   type PublicClient,
   type Address,
@@ -21,13 +18,8 @@ import {
   type TransactionReceipt,
 } from 'viem';
 import { reputationRegistryAbi } from './abi';
-import {
-  ZERO_G_GALILEO_TESTNET,
-  getAddresses,
-  RPC_URL,
-  RECEIPT_WAIT,
-  type Environment,
-} from './constants';
+import { RECEIPT_WAIT } from './constants';
+import { type Ctx } from './context';
 import type {
   ServeProof,
   GiveFeedbackParams,
@@ -40,77 +32,17 @@ import type {
 } from './types';
 
 /**
- * Configuration options for the ReputationClient.
- */
-export interface ReputationClientOptions {
-  /** Environment ('dev' or 'testnet') */
-  environment?: Environment;
-  /** Custom RPC URL */
-  rpcUrl?: string;
-  /** Wallet client for write transactions (optional for read-only usage) */
-  walletClient?: WalletClient;
-  /** Account to use for transactions */
-  account?: Account;
-}
-
-/**
- * Client for the ReputationRegistry contract.
- *
- * Provides both read and write methods. Write methods require a walletClient.
- *
- * @example
- * ```typescript
- * import { ReputationClient } from '@0g/agenticid-sdk';
- *
- * const client = new ReputationClient({
- *   environment: 'testnet',
- *   walletClient,
- *   account,
- * });
- *
- * // Give feedback for an agent
- * const txHash = await client.giveFeedback({
- *   agentId: 1n,
- *   value: 5n,
- *   valueDecimals: 0,
- *   tag1: 'quality',
- *   tag2: 'general',
- *   endpoint: 'https://...',
- *   feedbackURI: 'ipfs://...',
- *   feedbackHash: '0x...',
- *   serveProof: { ... },
- * });
- * ```
+ * Internal client for the ReputationRegistry contract. Consumers use the
+ * `AgenticID` facade's `reputation` namespace, not this directly.
  */
 export class ReputationClient {
-  /** The public client for read operations */
-  public readonly publicClient: PublicClient;
-  /** The wallet client for write operations (may be undefined for read-only) */
-  public readonly walletClient?: WalletClient;
-  /** The account used for transactions */
-  public readonly account?: Account;
-  /** The ReputationRegistry contract address */
-  public readonly address: Address;
-  private readonly chain: Chain;
+  constructor(private readonly ctx: Ctx) {}
 
-  constructor(options: ReputationClientOptions = {}) {
-    const env = options.environment ?? 'testnet';
-    const addresses = getAddresses(env);
-    this.address = addresses.reputationRegistry;
-    this.chain = ZERO_G_GALILEO_TESTNET;
-
-    this.publicClient = createPublicClient({
-      chain: this.chain,
-      transport: http(options.rpcUrl ?? RPC_URL),
-    });
-
-    if (options.walletClient) {
-      this.walletClient = options.walletClient;
-    }
-    if (options.account) {
-      this.account = options.account;
-    }
-  }
+  private get publicClient(): PublicClient { return this.ctx.publicClient; }
+  private get walletClient(): WalletClient | undefined { return this.ctx.walletClient; }
+  private get account(): Account | undefined { return this.ctx.account; }
+  private get chain(): Chain { return this.ctx.chain; }
+  private get address(): Address { return this.ctx.addresses.reputationRegistry; }
 
   // ── Give Feedback ──
 

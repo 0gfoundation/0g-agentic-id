@@ -1,85 +1,40 @@
 /**
  * @file SandboxClient.ts
- * @description Trust-root acknowledgement (ack) + sandbox funding (deposit) for
- * the deploy / bring-online flow.
+ * @description Internal client for trust-root ack (TappRegistry) + sandbox funding
+ * (SandboxServing). Consumers use the `AgenticID` facade's `sandbox` namespace.
  *
- *  - ack:     acknowledge the set of TEE components (attestor, kms, sandbox) on
- *             TappRegistry — a single batched call over whatever isn't already
- *             acknowledged. No per-app argument at the call site.
- *  - deposit: two funding paths —
- *               1. depositSandboxBalance — prepaid sandbox account on
- *                  SandboxServing (charged for create/CPU/mem before deploy).
- *               2. topUpAgentSeal — native gas to the agent's own key so it can
- *                  pay for its on-chain writes.
+ *  - ack:     acknowledge the TEE component set (attestor/kms/sandbox) in one
+ *             batched call over whatever isn't already acknowledged.
+ *  - deposit: prepaid sandbox balance (charged for create/CPU/mem before deploy).
+ *  - topUpAgentSeal: native gas to the agent's own key for its on-chain writes.
  *
- * NOTE: acknowledgeApps is a TappRegistry (tapp-layer) primitive; we wrap the
- * minimal ABI here until a dedicated tapp SDK exists.
+ * NOTE: acknowledgeApps is a TappRegistry (tapp-layer) primitive wrapped here
+ * until a dedicated tapp SDK exists.
  */
 
 import {
-  createPublicClient,
-  http,
-  type Account,
   type Address,
-  type Chain,
-  type PublicClient,
-  type WalletClient,
   type WriteContractReturnType,
 } from 'viem';
 import { tappRegistryAbi, sandboxServingAbi } from './abi';
-import { ZERO_G_GALILEO_TESTNET, getAddresses, RPC_URL, type Environment } from './constants';
-
-export interface SandboxClientOptions {
-  environment?: Environment;
-  rpcUrl?: string;
-  walletClient?: WalletClient;
-  account?: Account;
-  /**
-   * AppIds of the TEE components the flow depends on — the "trust-root set"
-   * (attestor, kms, sandbox provider). `ack()` acknowledges the missing ones.
-   */
-  componentAppIds?: string[];
-}
+import { requireWallet, type Ctx } from './context';
 
 export class SandboxClient {
-  public readonly publicClient: PublicClient;
-  public readonly walletClient?: WalletClient;
-  public readonly account?: Account;
-  public readonly tappRegistry: Address;
-  public readonly sandboxServing: Address;
-  public readonly componentAppIds: string[];
-  private readonly chain: Chain;
+  constructor(private readonly ctx: Ctx) {}
 
-  constructor(options: SandboxClientOptions = {}) {
-    const addresses = getAddresses(options.environment ?? 'testnet');
-    this.tappRegistry = addresses.tappRegistry;
-    this.sandboxServing = addresses.sandboxServing;
-    this.componentAppIds = options.componentAppIds ?? [];
-    this.chain = ZERO_G_GALILEO_TESTNET;
-    this.publicClient = createPublicClient({
-      chain: this.chain,
-      transport: http(options.rpcUrl ?? RPC_URL),
-    });
-    if (options.walletClient) this.walletClient = options.walletClient;
-    if (options.account) this.account = options.account;
-  }
-
-  private requireWallet(): void {
-    if (!this.walletClient || !this.account) {
-      throw new Error('a walletClient + account are required for write operations');
-    }
-  }
+  private get tappRegistry(): Address { return this.ctx.addresses.tappRegistry; }
+  private get sandboxServing(): Address { return this.ctx.addresses.sandboxServing; }
 
   // ── ack ──────────────────────────────────────────────────────────────────
 
   /** Which of the configured component appIds `user` still needs to acknowledge. */
   async ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> {
-    const addr = user ?? this.account?.address;
+    const addr = user ?? this.ctx.account?.address;
     if (!addr) throw new Error('no user address (pass one or set account)');
-    const appIds = this.requireComponents();
+    const appIds = this.ctx.componentAppIds;
     const flags = await Promise.all(
       appIds.map((appId) =>
-        this.publicClient.readContract({
+        this.ctx.publicClient.readContract({
           address: this.tappRegistry,
           abi: tappRegistryAbi,
           functionName: 'isAcknowledged',
@@ -92,35 +47,28 @@ export class SandboxClient {
   }
 
   /**
-   * Acknowledge the whole component set in one tx. Skips (no tx, returns null)
-   * when everything is already acknowledged.
+   * Acknowledge the whole component set in one tx. Returns null (no tx) when
+   * everything is already acknowledged.
    */
   async ack(): Promise<WriteContractReturnType | null> {
-    this.requireWallet();
-    const { missing } = await this.ackStatus(this.account!.address);
+    const { walletClient, account } = requireWallet(this.ctx);
+    const { missing } = await this.ackStatus(account.address);
     if (missing.length === 0) return null;
-    return this.walletClient!.writeContract({
+    return walletClient.writeContract({
       address: this.tappRegistry,
       abi: tappRegistryAbi,
       functionName: 'acknowledgeApps',
       args: [missing],
-      account: this.account!,
-      chain: this.chain,
+      account,
+      chain: this.ctx.chain,
     });
   }
 
-  private requireComponents(): string[] {
-    if (this.componentAppIds.length === 0) {
-      throw new Error('componentAppIds not configured (set the trust-root appIds)');
-    }
-    return this.componentAppIds;
-  }
+  // ── deposit ──────────────────────────────────────────────────────────────
 
-  // ── deposit ────────────────────────────────────────────────────────────────
-
-  /** Read a user's prepaid sandbox balance held against a provider (wei). */
-  async getSandboxBalance(user: Address, provider: Address): Promise<bigint> {
-    return this.publicClient.readContract({
+  /** Read a user's prepaid sandbox balance against a provider (wei). */
+  async getBalance(user: Address, provider: Address): Promise<bigint> {
+    return this.ctx.publicClient.readContract({
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'getBalance',
@@ -128,36 +76,32 @@ export class SandboxClient {
     }) as Promise<bigint>;
   }
 
-  /**
-   * Fund a prepaid sandbox balance (SandboxServing.deposit, payable).
-   * Recipient defaults to the caller's account.
-   */
-  async depositSandboxBalance(params: {
+  /** Fund a prepaid sandbox balance (SandboxServing.deposit, payable). Recipient defaults to the caller. */
+  async deposit(params: {
     provider: Address;
     amountWei: bigint;
     recipient?: Address;
   }): Promise<WriteContractReturnType> {
-    this.requireWallet();
-    const recipient = params.recipient ?? this.account!.address;
-    return this.walletClient!.writeContract({
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'deposit',
-      args: [recipient, params.provider],
+      args: [params.recipient ?? account.address, params.provider],
       value: params.amountWei,
-      account: this.account!,
-      chain: this.chain,
+      account,
+      chain: this.ctx.chain,
     });
   }
 
-  /** Send native OG gas to an agent's agentSeal address so it can self-fund on-chain writes. */
+  /** Send native gas to an agent's agentSeal address so it can self-fund on-chain writes. */
   async topUpAgentSeal(agentSeal: Address, amountWei: bigint): Promise<`0x${string}`> {
-    this.requireWallet();
-    return this.walletClient!.sendTransaction({
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.sendTransaction({
       to: agentSeal,
       value: amountWei,
-      account: this.account!,
-      chain: this.chain,
+      account,
+      chain: this.ctx.chain,
     });
   }
 }

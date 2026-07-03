@@ -15,15 +15,13 @@
  */
 
 import {
-  createPublicClient,
-  http,
   type Address,
   type Hash,
   type PublicClient,
 } from 'viem';
 import { agenticIDAbi } from './abi';
-import { ZERO_G_GALILEO_TESTNET, getAddresses, RPC_URL, type Environment } from './constants';
 import { verifyServeProofSignature } from './ServeProof';
+import { type Ctx } from './context';
 import type { ServeProof } from './types';
 
 export const SERVE_PROOF_HEADER = 'X-Agent-Proof';
@@ -101,8 +99,6 @@ export interface ProofVerification {
 }
 
 export interface ServeSessionOptions {
-  environment?: Environment;
-  rpcUrl?: string;
   /** Seconds of clock skew tolerated when checking the deadline. Default 0. */
   clockSkew?: number;
   /** Current unix time (seconds); injectable for testing. */
@@ -119,13 +115,9 @@ export class ServeSession {
   private readonly clockSkew: number;
   private readonly now: () => number;
 
-  constructor(options: ServeSessionOptions = {}) {
-    const addresses = getAddresses(options.environment ?? 'testnet');
-    this.agenticID = addresses.agenticID;
-    this.publicClient = createPublicClient({
-      chain: ZERO_G_GALILEO_TESTNET,
-      transport: http(options.rpcUrl ?? RPC_URL),
-    });
+  constructor(ctx: Ctx, options: ServeSessionOptions = {}) {
+    this.agenticID = ctx.addresses.agenticID;
+    this.publicClient = ctx.publicClient;
     this.clockSkew = options.clockSkew ?? 0;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
   }

@@ -2,31 +2,28 @@
  * @file index.ts
  * @description Entry point for @0g/agenticid-sdk.
  *
- * Scope (current): ack + deposit (sandbox), seal-bound transfer, seal-bound
- * clone (via attestor), and reputation (capture serve-proof + submit feedback).
- * The full identity-management surface is deferred to a later pass.
+ * One facade (`AgenticID`) with three intent namespaces — `agent` (lifecycle:
+ * deploy/clone/transfer + reads), `reputation` (serve-proof + feedback), and
+ * `sandbox` (ack + deposit). Construct once with rpc + addresses.
  *
  * @example
  * ```typescript
- * import {
- *   AgenticIDClient, ReputationClient, SandboxClient, AttestorClient,
- *   ServeSession, captureProof, getAddresses,
- * } from '@0g/agenticid-sdk';
+ * import { AgenticID, DEV_ADDRESSES } from '@0g/agenticid-sdk';
+ * const ag = new AgenticID({ rpcUrl, addresses: DEV_ADDRESSES, attestorUrl, walletClient, account });
  * ```
  */
 
-// ── Clients ──
-export { AgenticIDClient } from './AgenticIDClient';
-export type { AgenticIDClientOptions, IntelligentDataResult } from './AgenticIDClient';
+// ── Facade + namespaces ──
+export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
+export type { AgenticIDConfig } from './context';
 
-export { ReputationClient } from './ReputationClient';
-export type { ReputationClientOptions } from './ReputationClient';
-
+// ── Namespace implementation classes (advanced / typing) ──
 export { SandboxClient } from './SandboxClient';
-export type { SandboxClientOptions } from './SandboxClient';
-
-export { AttestorClient, CLONE_DOMAIN } from './AttestorClient';
-export type { AttestorClientOptions, CloneParams, CloneResponse } from './AttestorClient';
+export { AgenticIDClient } from './AgenticIDClient';
+export type { IntelligentDataResult } from './AgenticIDClient';
+export { ReputationClient } from './ReputationClient';
+export { AttestorClient, CLONE_DOMAIN, DEPLOY_DOMAIN } from './AttestorClient';
+export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 
 // ── Reputation: serve-proof transport + verification ──
 export {
@@ -59,8 +56,6 @@ export type {
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,
-  SDKConfig,
-  Environment,
 } from './types';
 
 // ── Constants ──
@@ -68,10 +63,9 @@ export {
   ZERO_G_GALILEO_TESTNET,
   DEV_ADDRESSES,
   TESTNET_ADDRESSES,
-  ADDRESSES,
   RPC_URL,
   CHAIN_ID,
-  getAddresses,
+  RECEIPT_WAIT,
 } from './constants';
 export type { ContractAddresses } from './constants';
 
