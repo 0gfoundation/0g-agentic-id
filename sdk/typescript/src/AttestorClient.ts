@@ -42,8 +42,10 @@ export interface DeployParams {
 export interface DeployCloneResponse {
   seal_id: `0x${string}`;
   agent_seal_addr: Address;
-  subscribe_url: string;
 }
+// NOTE: the attestor's JSON also carries `subscribe_url` (a ws:// progress feed
+// its own frontend renders). It's omitted here — programmatic callers track
+// completion by polling instead (getAgentIdBySealId(seal_id) / GET /deployment).
 
 function b64encode(s: string): string {
   const g = globalThis as { btoa?: (d: string) => string };

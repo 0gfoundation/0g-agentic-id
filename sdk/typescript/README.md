@@ -83,13 +83,15 @@ const dep = await ag.agent.deploy({
     apiKey:   process.env.AGENT_API_KEY,           // injected into the container as an env secret
   },
 });
-// dep → { seal_id: "0x…", agent_seal_addr: "0x…", subscribe_url: "ws://…/ws/subscribe?seal_id=0x…" }
-//       drives storage → mint → setAgentURI and brings a container online; watch subscribe_url for progress
+// dep → { seal_id: "0x…", agent_seal_addr: "0x…" }
+//   deploy is ASYNC: this kicks off storage → mint → setAgentURI → container in
+//   the background. Track completion by polling — getAgentIdBySealId(dep.seal_id)
+//   returns a non-zero id once minted (or GET /deployment/:seal_id on the attestor).
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
 const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner, idempotencyKey: 'my-clone-001' });
-// cl → { seal_id, agent_seal_addr, subscribe_url }  (lands Offline for the new owner)
+// cl → { seal_id, agent_seal_addr }  — also async; lands Offline for the new owner (poll as above)
 
 // transfer — plain ERC-721; the attestor tears down the old owner's runtime on transfer
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → tx hash "0x…"
