@@ -161,6 +161,13 @@ export async function verifyServeProofSignature(
   expectedSigner: Address,
 ): Promise<boolean> {
   const signingHash = buildServeProofSigningHash(proof);
-  const recovered = await recoverAddress({ hash: signingHash, signature: proof.signature });
+  // A malformed signature (bad length / invalid v) is just a failed verification,
+  // not an exception — a buyer verifying a hostile proof should get `false`.
+  let recovered: Address;
+  try {
+    recovered = await recoverAddress({ hash: signingHash, signature: proof.signature });
+  } catch {
+    return false;
+  }
   return recovered.toLowerCase() === expectedSigner.toLowerCase();
 }
