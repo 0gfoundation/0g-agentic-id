@@ -271,8 +271,20 @@ proxy+beacon+impl 三者都 verify 才能展开业务 ABI。
 - **AgenticID** `1.0.0` —— canonical-bound 初版。
 - **TEEDataVerifier** `1.0.0` —— 初版。
 
-> 约定:改了 impl 就 bump `VERSION`(破坏性也用 patch 级即可,如本次 1.0.0→1.0.1),并在
-> 本节追加一条;升级流程见 §4。
+### 版本规范
+
+改了 impl 就必须 bump `VERSION`(编译期常量,需重部署 impl + 升级 beacon 才在链上生效),
+并在上面的变更记录追加一条。大/小版本判据:
+
+- **大版本号(major,第一位 `X.0.0`)**:storage 布局不兼容、必须**新部署(新 proxy)+ 协调
+  链下迁移**、或协议级重设计的破坏性改动——**不能靠 beacon 原地升级**。例:canonical-binding
+  重写(旧自实现 → 绑官方 8004)。
+- **小版本号(后两位 `1.x.y`)**:能通过 **beacon 原地升级(storage 兼容)** 完成的改动。默认
+  走 **patch 级 +1**(如 client-less ServeProof:`1.0.0 → 1.0.1`,虽是接口变化但 storage
+  兼容、可原地升);仅当想标记一个较大特性集时才由人手动跳 **minor**(`1.1.0`)。
+
+一句话判据:**要不要新 proxy / 迁 storage?要 → 大版本;能 beacon 原地升 → 小版本。**
+升级流程见 §4。
 
 ## 8. 备注 / 后续
 
