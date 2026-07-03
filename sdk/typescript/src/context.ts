@@ -14,7 +14,7 @@ import {
   type WalletClient,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { ZERO_G_GALILEO_TESTNET, RPC_URL, type ContractAddresses } from './constants';
+import { ZERO_G_TESTNET, RPC_URL, type ContractAddresses } from './constants';
 
 /** Public config for `new AgenticID(config)`. */
 export interface AgenticIDConfig {
@@ -58,7 +58,7 @@ export interface Ctx {
 const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider'];
 
 export function buildCtx(config: AgenticIDConfig): Ctx {
-  const chain = (config.chain ?? ZERO_G_GALILEO_TESTNET) as Chain;
+  const chain = (config.chain ?? ZERO_G_TESTNET) as Chain;
   const rpcUrl = config.rpcUrl ?? RPC_URL;
 
   // Resolve the signer + wallet client. A bring-your-own walletClient wins; else

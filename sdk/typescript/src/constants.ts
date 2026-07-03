@@ -4,9 +4,10 @@
  */
 
 /**
- * 0G Galileo Testnet chain configuration.
+ * 0G testnet (Galileo) chain definition — a viem `Chain` (network metadata:
+ * chainId, native currency, RPC, explorer), not a contract address.
  */
-export const ZERO_G_GALILEO_TESTNET = {
+export const ZERO_G_TESTNET = {
   id: 16602,
   name: '0G Galileo Testnet',
   nativeCurrency: { name: '0G', symbol: '0G', decimals: 18 },

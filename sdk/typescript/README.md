@@ -52,7 +52,7 @@ const ag = new AgenticID({
 `AgenticIDConfig`: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
 
 - **`account`** — a private key or a viem `Account`. Supplying it is enough to sign writes; the SDK constructs the wallet client for you.
-- **`walletClient`** (advanced) — bring your own instead of `account`, e.g. an injected browser wallet. `ZERO_G_GALILEO_TESTNET` and `RPC_URL` are exported for that case.
+- **`walletClient`** (advanced) — bring your own instead of `account`, e.g. an injected browser wallet. `ZERO_G_TESTNET` and `RPC_URL` are exported for that case.
 
 The snippets below assume these bindings:
 
@@ -195,7 +195,7 @@ Contract addresses are a **deployment artifact, not baked into the SDK** — an 
 
 **Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
-The stable protocol-level constants **are** exported: `ZERO_G_GALILEO_TESTNET` (viem chain), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
+The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` (viem chain), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
 ## Notes
 

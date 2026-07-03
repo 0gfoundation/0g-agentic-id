@@ -63,7 +63,7 @@ export type {
 // Protocol-level, stable. Contract addresses are NOT exported — they're a
 // deployment artifact (see contracts/DEPLOYMENT.md §6); pass them explicitly.
 export {
-  ZERO_G_GALILEO_TESTNET,
+  ZERO_G_TESTNET,
   RPC_URL,
   CHAIN_ID,
   RECEIPT_WAIT,
