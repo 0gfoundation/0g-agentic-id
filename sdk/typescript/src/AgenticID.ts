@@ -14,8 +14,8 @@
  *
  * @example
  * ```typescript
- * import { AgenticID, DEV_ADDRESSES } from '@0g/agenticid-sdk';
- * const ag = new AgenticID({ rpcUrl, addresses: DEV_ADDRESSES, attestorUrl, walletClient, account });
+ * import { AgenticID } from '@0g/agenticid-sdk';
+ * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * await ag.agent.transferFrom(from, to, 33n);
  * const { proof } = await ag.reputation.capture(() => fetch(`${url}/chat`, ...));
  * await ag.ack();

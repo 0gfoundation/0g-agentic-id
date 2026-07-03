@@ -19,10 +19,13 @@ export const ZERO_G_GALILEO_TESTNET = {
 } as const;
 
 /**
- * Contract address set. Pass one explicitly to `new AgenticID({ addresses })`
- * (no baked-in `environment` enum — addresses are given directly so the SDK
- * can't drift from what's actually deployed). The known sets below are exported
- * for convenience.
+ * Contract address set — pass one explicitly to `new AgenticID({ addresses })`.
+ *
+ * Addresses are a deployment artifact, NOT baked into the SDK: an RPC + these
+ * addresses fully determine the target contracts, and keeping them out of the
+ * library means it can't drift from what's actually deployed (a proxy upgrade or
+ * redeploy would silently stale a bundled constant). Copy the set you target
+ * from contracts/DEPLOYMENT.md §6, or load it from your own config/env.
  */
 export interface ContractAddresses {
   /** AgenticID proxy contract address */
@@ -36,32 +39,6 @@ export interface ContractAddresses {
   /** SandboxServing — prepaid sandbox balance (deposit) */
   sandboxServing: `0x${string}`;
 }
-
-/**
- * Dev deployment addresses (0G Galileo Testnet) — the set the dev-host attestor
- * + live agents use. See contracts/DEPLOYMENT.md §6.2.
- */
-export const DEV_ADDRESSES: ContractAddresses = {
-  // dev environment (CANONICAL_BINDING.md §5.2) — the set the dev-host attestor
-  // + live agents use. Reputation impl upgraded to the client-less ServeProof.
-  agenticID: '0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A',
-  teeDataVerifier: '0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7',
-  reputationRegistry: '0x884c2809888Bfd789919331eA1fB2DA9C31363d2',
-  // Shared infra (0g-kms / 0g-sandbox), same across environments on testnet.
-  tappRegistry: '0x95a0BF4148b30F6F8D86870534c51df46Da5511c',
-  sandboxServing: '0x3d4d8a05e9471E19E2068C49D5AB6f528494cf6f',
-};
-
-/**
- * Testnet environment contract addresses (0G Galileo Testnet).
- */
-export const TESTNET_ADDRESSES: ContractAddresses = {
-  agenticID: '0xbea77c9aBd0aA46e812444583947718593bBD139',
-  teeDataVerifier: '0x1b6bba3db8a04B20702Feb62E30Caa831ca1e1f1',
-  reputationRegistry: '0x8bC1E129aEb0Baa306715BC1CBB720Eb2A4324AA',
-  tappRegistry: '0x95a0BF4148b30F6F8D86870534c51df46Da5511c',
-  sandboxServing: '0x3d4d8a05e9471E19E2068C49D5AB6f528494cf6f',
-};
 
 /**
  * Default RPC URL for the 0G Galileo Testnet (override via `AgenticID({ rpcUrl })`).

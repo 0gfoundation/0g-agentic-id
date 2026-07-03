@@ -9,8 +9,8 @@
  *
  * @example
  * ```typescript
- * import { AgenticID, DEV_ADDRESSES } from '@0g/agenticid-sdk';
- * const ag = new AgenticID({ rpcUrl, addresses: DEV_ADDRESSES, attestorUrl, walletClient, account });
+ * import { AgenticID } from '@0g/agenticid-sdk';
+ * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * ```
  */
 
@@ -60,10 +60,10 @@ export type {
 } from './types';
 
 // ── Constants ──
+// Protocol-level, stable. Contract addresses are NOT exported — they're a
+// deployment artifact (see contracts/DEPLOYMENT.md §6); pass them explicitly.
 export {
   ZERO_G_GALILEO_TESTNET,
-  DEV_ADDRESSES,
-  TESTNET_ADDRESSES,
   RPC_URL,
   CHAIN_ID,
   RECEIPT_WAIT,

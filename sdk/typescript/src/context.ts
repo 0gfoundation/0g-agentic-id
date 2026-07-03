@@ -22,7 +22,7 @@ export interface AgenticIDConfig {
   rpcUrl?: string;
   /** viem chain. Defaults to 0G Galileo (chainId 16602). */
   chain?: Chain;
-  /** Contract addresses — required, passed explicitly (e.g. `DEV_ADDRESSES`). */
+  /** Contract addresses — required; passed explicitly (from DEPLOYMENT.md §6 / your config). */
   addresses: ContractAddresses;
   /** Attestor base URL — required for agent.deploy / agent.clone. */
   attestorUrl?: string;

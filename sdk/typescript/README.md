@@ -24,14 +24,25 @@ npm install @0g/agenticid-sdk viem
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
 ```ts
-import { AgenticID, DEV_ADDRESSES } from '@0g/agenticid-sdk';
+import { AgenticID, type ContractAddresses } from '@0g/agenticid-sdk';
+
+// Addresses are a deployment artifact — copy the set you target from
+// contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
+// addresses fully determine the target contracts.
+const addresses: ContractAddresses = {
+  agenticID:          '0x…',
+  reputationRegistry: '0x…',
+  teeDataVerifier:    '0x…',
+  tappRegistry:       '0x…',
+  sandboxServing:     '0x…',
+};
 
 // read-only:
-const ro = new AgenticID({ addresses: DEV_ADDRESSES });
+const ro = new AgenticID({ addresses });
 
 // with a signer (for writes):
 const ag = new AgenticID({
-  addresses: DEV_ADDRESSES,               // required — a known set or your own (see Addresses below)
+  addresses,
   account: process.env.PRIVATE_KEY,       // a private key (0x…) or a viem Account; enables writes
   attestorUrl: process.env.ATTESTOR_URL,  // only for agent.deploy / agent.clone
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
@@ -177,12 +188,11 @@ The trust-root component set defaults to `['0g-attestor','0g-kms','0g-sandbox-pr
 
 ## Addresses
 
-Pass a known set or your own. Exported: `DEV_ADDRESSES`, `TESTNET_ADDRESSES` (see contracts/DEPLOYMENT.md §6). Chain: 0G Galileo Testnet (`chainId 16602`, `RPC_URL`).
+Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-```ts
-import { DEV_ADDRESSES } from '@0g/agenticid-sdk';
-// { agenticID, reputationRegistry, teeDataVerifier, tappRegistry, sandboxServing }
-```
+**Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env.
+
+The stable protocol-level constants **are** exported: `ZERO_G_GALILEO_TESTNET` (viem chain), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
 ## Notes
 
