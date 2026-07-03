@@ -20,6 +20,23 @@ export const ZERO_G_TESTNET = {
 } as const;
 
 /**
+ * 0G mainnet chain definition — a viem `Chain` (values match viem's
+ * `zeroGMainnet`). NOTE: AgenticID is testnet-only today — no mainnet contract
+ * deployment exists yet; this is here for when the protocol goes to mainnet.
+ */
+export const ZERO_G_MAINNET = {
+  id: 16661,
+  name: '0G Mainnet',
+  nativeCurrency: { name: '0G', symbol: '0G', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://evmrpc.0g.ai'] },
+  },
+  blockExplorers: {
+    default: { name: '0G BlockChain Explorer', url: 'https://chainscan.0g.ai' },
+  },
+} as const;
+
+/**
  * Contract address set — pass one explicitly to `new AgenticID({ addresses })`.
  *
  * Addresses are a deployment artifact, NOT baked into the SDK: an RPC + these

@@ -64,6 +64,7 @@ export type {
 // deployment artifact (see contracts/DEPLOYMENT.md §6); pass them explicitly.
 export {
   ZERO_G_TESTNET,
+  ZERO_G_MAINNET,
   RPC_URL,
   CHAIN_ID,
   RECEIPT_WAIT,
