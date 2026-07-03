@@ -71,7 +71,6 @@ import { parseEther } from 'viem';
 
 // deploy — signs the deploy + sandbox-create envelopes and POSTs them to the attestor
 const dep = await ag.agent.deploy({
-  idempotencyKey: 'my-deploy-001',                 // caller-chosen; makes the deploy retry-safe
   name: 'Sage',
   description: 'a helpful agent',
   iData: [                                         // intelligent data — one entry per role
@@ -91,8 +90,13 @@ const newAgentId = await ag.agent.waitForDeploy(dep.seal_id);   // → 34n once 
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
-const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner, idempotencyKey: 'my-clone-001' });
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner });
 // cl → { seal_id, agent_seal_addr }  — also async; lands Offline for the new owner (poll as above)
+
+// idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
+// your own STABLE key to make a retry dedupe server-side (same key → the attestor
+// returns the existing deploy/clone instead of minting a duplicate):
+// await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
 // transfer — plain ERC-721; the attestor tears down the old owner's runtime on transfer
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → tx hash "0x…"

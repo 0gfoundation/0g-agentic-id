@@ -17,7 +17,12 @@ export const DEPLOY_DOMAIN = 'AgenticID.Deploy.v1';
 export interface CloneParams {
   sourceAgentId: bigint;
   targetOwner: Address;
-  idempotencyKey: string;
+  /**
+   * Idempotency key. Optional — the SDK generates a random one per call. Pass
+   * your own stable key to make a retry dedupe server-side (same key → returns
+   * the existing clone instead of minting a duplicate).
+   */
+  idempotencyKey?: string;
 }
 
 /** One intelligent-data input (role + opaque JSON plaintext + extra description fields). */
@@ -28,7 +33,12 @@ export interface IDataInput {
 }
 
 export interface DeployParams {
-  idempotencyKey: string;
+  /**
+   * Idempotency key. Optional — the SDK generates a random one per call. Pass
+   * your own stable key to make a retry dedupe server-side (same key → returns
+   * the existing deploy instead of minting a duplicate).
+   */
+  idempotencyKey?: string;
   name: string;
   description: string;
   image?: string;
@@ -94,13 +104,14 @@ export class AttestorClient {
   async deploy(params: DeployParams): Promise<DeployCloneResponse> {
     const { walletClient, account } = requireWallet(this.ctx);
     const owner = account.address;
+    const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
     const iData = params.iData.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
     const canonical = JSON.stringify({
       domain: DEPLOY_DOMAIN,
-      idempotency_key: params.idempotencyKey,
+      idempotency_key: idempotencyKey,
       owner,
       name: params.name,
       description: params.description,
@@ -111,7 +122,7 @@ export class AttestorClient {
     const sandbox_envelope = await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180);
 
     return this.post('/deploy', {
-      idempotency_key: params.idempotencyKey,
+      idempotency_key: idempotencyKey,
       owner,
       owner_signature: ownerSig,
       owner_signed_message_b64: b64encode(canonical),
@@ -132,15 +143,16 @@ export class AttestorClient {
     if (params.sourceAgentId > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error('sourceAgentId too large for JSON number encoding');
     }
+    const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
     const canonical = JSON.stringify({
       domain: CLONE_DOMAIN,
-      idempotency_key: params.idempotencyKey,
+      idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     return this.post('/clone', {
-      idempotency_key: params.idempotencyKey,
+      idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
       owner_signature: signature,
