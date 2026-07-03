@@ -85,8 +85,9 @@ const dep = await ag.agent.deploy({
 });
 // dep → { seal_id: "0x…", agent_seal_addr: "0x…" }
 //   deploy is ASYNC: this kicks off storage → mint → setAgentURI → container in
-//   the background. Track completion by polling — getAgentIdBySealId(dep.seal_id)
-//   returns a non-zero id once minted (or GET /deployment/:seal_id on the attestor).
+//   the background. Wait for the mint (polls the chain, no WebSocket):
+const newAgentId = await ag.agent.waitForDeploy(dep.seal_id);   // → 34n once minted
+//   (tune with { timeoutMs, pollIntervalMs }; or poll getAgentIdBySealId / GET /deployment yourself)
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
