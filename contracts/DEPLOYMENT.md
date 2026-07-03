@@ -288,21 +288,29 @@ Changelog:
 - **Mainnet checklist:** `TEE_ORACLE` = real TEE signer; `TIMELOCK_DELAY` ≥ 2 days;
   `OWNER`/`PAUSER`/`PROPOSERS`/`EXECUTORS` = multisig.
 
-### Tracked follow-ups (open GitHub issues)
+### Tracked follow-ups (GitHub issues)
 
-All still open; some related work has landed (noted inline) but the full scope
-isn't complete:
+The seal-bound-transfer safety goals of #3–#6 are **implemented** — via the
+contracts (transfer/clone branching, `/clone`) + the attestor (Layer-2 sandbox
+teardown, container-binding clear, owner-gated lifecycle) — and live-verified. The
+issues remain open on GitHub mostly as housekeeping / because a specific proposed
+mechanism was superseded by the attestor approach. **#7 is the only genuinely open
+work.**
 
-- **#6** (epic) seal-bound transfer conveys no exclusive operation rights — *partial:
-  the transfer ownership-handover legs (clear runtime binding + owner-gate lifecycle
-  endpoints) are live; blocked on #5 for full closure.*
-- **#3** [contracts] dedicated seal-bound transfer/clone path — *partial: the
-  contract branching (re-enable `transferFrom`, revert `iTransferFrom`/`iCloneFrom`
-  for seal-bound) and the attestor `/clone` endpoint (PR #26) landed; issue open for
-  the remaining path work.*
-- **#4** [attestor] gate `/provision` on the current on-chain owner — *partial: the
-  lifecycle owner-gating landed; `/provision`-specific gating is not done.*
-- **#5** [sealed] fail-safe ownership heartbeat (self-kill) — *not started (deferred
-  to a TEE full node).*
+- **#6** (epic) seal-bound transfer conveys no exclusive operation rights — **done
+  (goal):** on transfer the attestor tears down the prior owner's sandbox +
+  `clear_container_binding` + gates lifecycle on the current on-chain owner.
+- **#3** [contracts] dedicated seal-bound transfer/clone path — **done:** seal-bound
+  re-enables `transferFrom`, `iTransferFrom`/`iCloneFrom` revert; attestor `/clone`
+  endpoint (PR #26).
+- **#4** [attestor] gate `/provision` on the current on-chain owner — **done (goal):**
+  achieved by clearing the container binding on transfer + Layer-2 teardown (a
+  resumed old container can't skip the `/provision` freshness re-check); no explicit
+  `ownerOf` check in `/provision` was needed.
+- **#5** [sealed] fail-safe ownership heartbeat (self-kill) — **done (goal), by a
+  different mechanism:** the attestor's indexer detects the transfer and enqueues
+  `SandboxTeardown` (`watcher.rs:on_transfer` → worker `admin_delete`). The
+  sealed-side self-kill heartbeat is redundant defense-in-depth, deferred to a TEE
+  full node.
 - **#7** [security/kms] KMS threshold derivation (removes the single-point
-  universal-decryptor) — *not started (roadmap).*
+  universal-decryptor) — **not started (roadmap).**
