@@ -29,11 +29,14 @@ contract AgenticIDReputationRegistry is
 {
     using ECDSA for bytes32;
 
-    /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.0.1 — `ServeProof` drops `client`; attribution is now `msg.sender`
-    ///      at giveFeedback (signed digest + giveFeedback ABI changed).
+    /// @notice Current implementation version. See contracts/UPGRADING.md for the
+    ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
+    ///         change via a beacon upgrade; patch = compatible fix).
+    /// @dev 1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
+    ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
+    ///      ABI changed).
     ///      1.0.0 — initial (client-bound ServeProof).
-    string public constant VERSION = "1.0.1";
+    string public constant VERSION = "1.1.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
 

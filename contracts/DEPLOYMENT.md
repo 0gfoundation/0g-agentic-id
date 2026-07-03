@@ -15,9 +15,9 @@
 Registry**(绑定语义见 §2)。`AgenticIDReputationRegistry` 扩展 ERC-8004 reputation,
 `giveFeedback` 要求 TEE 签名的 ServeProof(见 §2.2)。
 
-每个合约都有 `string public constant VERSION`,每次改 impl 应当同步 bump(§7 有当前
-版本与变更记录)。**注意:VERSION 是编译期常量,改源码后必须重新部署 impl + 升级
-beacon 才会在链上体现。**
+每个合约都有 `string public constant VERSION`,每次改 impl 应当同步 bump——**版本号规范
++ 升级流程见 [`UPGRADING.md`](UPGRADING.md)**,当前各合约版本与 changelog 见 §7。
+**注意:VERSION 是编译期常量,改源码后必须重新部署 impl + 升级 beacon 才会在链上体现。**
 
 暂停独立于升级:每个合约有 `pauser` 角色(**不**走 Timelock),`pause()` 秒级生效,
 阻断所有 `whenNotPaused` 写路径(`register` / `setAgentWallet` / `iTransferFrom` /
@@ -127,40 +127,10 @@ revert `AgenticIDNotTrustedAttestor`)+ `addValidFrameworkHash(<sealed image hash
 
 ## 4. 升级
 
-两阶段流程(dev 下 `TIMELOCK_DELAY=0` 也保持同样步骤,与 prod 一致)。**改了合约记得先
-bump `VERSION`**(§1),再走升级:
-
-```bash
-# Step 1: 部署新 impl(单独部署,最后统一 verify)
-forge create src/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry \
-  --rpc-url <RPC> --chain 16602 --private-key <PK> \
-  --legacy --gas-price 5000000000 --broadcast
-
-# Step 2: Proposer 排期
-export TIMELOCK=0x...
-export BEACON=0x<要升级的 beacon>    # 注意不是 proxy
-export NEW_IMPL=0x<上一步输出的>
-forge script script/ScheduleUpgrade.s.sol \
-  --rpc-url <RPC> --chain 16602 --private-key <PROPOSER_PK> \
-  --legacy --gas-price 5000000000 --broadcast --slow
-
-# Step 3: 等 Timelock delay(delay=0 也建议轮询确认 ready)
-ZERO=0x0000000000000000000000000000000000000000000000000000000000000000
-OP=$(cast call $TIMELOCK \
-  "hashOperation(address,uint256,bytes,bytes32,bytes32)(bytes32)" \
-  $BEACON 0 $(cast calldata "upgradeTo(address)" $NEW_IMPL) $ZERO $ZERO --rpc-url <RPC>)
-until [ "$(cast call $TIMELOCK 'isOperationReady(bytes32)(bool)' $OP --rpc-url <RPC>)" = "true" ]; do sleep 5; done
-
-# Step 4: Executor 执行(TIMELOCK/BEACON/NEW_IMPL 必须与 Step 2 完全一致)
-forge script script/ExecuteUpgrade.s.sol \
-  --rpc-url <RPC> --chain 16602 --private-key <EXECUTOR_PK> \
-  --legacy --gas-price 5000000000 --broadcast --slow
-```
-
-`ExecuteUpgrade` 内置 `require(beacon.implementation() == newImpl)` 自校验。升级后 proxy
-地址不变、storage 完全保留、impl 切到新地址。**升级机制对三个合约通用**,`test/
-Upgradeable.t.sol`(AgenticID + TEEDataVerifier)与 `test/UpgradeReputation.t.sol`
-(reputation,含 storage 存活 + 升级后行为)覆盖。
+**升级流程 + 版本号规范见 [`UPGRADING.md`](UPGRADING.md)**:小/中版本走 beacon 两阶段
+(`schedule → wait → execute`,proxy 地址/storage 不变);大版本(storage 不兼容)重部署 +
+迁移。升级机制对三个合约通用,`test/Upgradeable.t.sol`(AgenticID + TEEDataVerifier)与
+`test/UpgradeReputation.t.sol`(reputation,含 storage 存活 + 升级后行为)覆盖。
 
 ## 5. Verify
 
@@ -216,7 +186,7 @@ proxy+beacon+impl 三者都 verify 才能展开业务 ABI。
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | owner / pauser / oracle / deployer | `0xea695C312CE119dE347425B29AFf85371c9d1837` | |
 
-> ⚠️ test 的 reputation 仍是 **1.0.0(带 client)**,还没跟 dev 一样升到 1.0.1。要一致的话按 §4 升 `0x309Afe…` beacon。
+> ⚠️ test 的 reputation 仍是 **1.0.0(带 client)**,还没跟 dev 一样升到 1.1.0。要一致的话按 [`UPGRADING.md`](UPGRADING.md) 升 `0x309Afe…` beacon。
 
 **治理仅测试网:** owner=pauser=oracle=deployer EOA,`timelockDelay=0`,开放执行。主网需真
 多签 + 非 0 delay + 真 TEE oracle。
@@ -230,8 +200,8 @@ proxy+beacon+impl 三者都 verify 才能展开业务 ABI。
 | AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` | 1.0.0 |
 | AgenticID impl | `0x1E2AD04C5c9BbE2e5Dd3c257ac6fd82985461C54` | |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` | |
-| ReputationRegistry proxy | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.0.1**(client-less)|
-| ReputationRegistry impl | `0x110e36FeC4Ce88660D57EDeAbB302530159a8497` | |
+| ReputationRegistry proxy | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.1.0**(client-less)|
+| ReputationRegistry impl | `0xC93DAF00e08B4C086629aEd75387805A41f55321` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | 1.0.0 |
 | TEEDataVerifier impl | `0xD5F7602a4a690846cF7D6315d14BCd7535388EE0` | |
@@ -258,33 +228,22 @@ proxy+beacon+impl 三者都 verify 才能展开业务 ABI。
 |---|---|---|
 | AgenticID | 1.0.0 | 1.0.0 |
 | TEEDataVerifier | 1.0.0 | 1.0.0 |
-| AgenticIDReputationRegistry | **1.0.1** | 1.0.0 |
+| AgenticIDReputationRegistry | **1.1.0** | 1.0.0 |
 
 变更记录:
 
 - **AgenticIDReputationRegistry**
-  - `1.0.1`(dev impl `0x110e36Fe…`, 2026-07-03, PR #28)—— `ServeProof` 去掉 `client`,
-    归属改为 `giveFeedback` 时的 `msg.sender`;签名摘要与 `giveFeedback` ABI 随之改变。
-    (dev 上曾有一个未 bump VERSION 的中间 client-less impl `0x9dbC80…`,已被 1.0.1 取代;
+  - `1.1.0`(dev impl `0xC93DAF00…`, 2026-07-03, PR #28)—— **中版本**(ABI/行为变、storage
+    兼容、beacon 原地升级):`ServeProof` 去掉 `client`,归属改为 `giveFeedback` 时的
+    `msg.sender`;签名摘要与 `giveFeedback` ABI 随之改变。(此前 dev 上有两个已被取代的
+    client-less 中间 impl:`0x9dbC80…`(VERSION 未 bump)、`0x110e36Fe…`(一度误标 1.0.1);
     test 尚未升级,仍 `1.0.0` client-bound。)
   - `1.0.0`(impl `0xf053cF29…` dev / `0x731273A0…` test)—— 初版,client-bound ServeProof。
 - **AgenticID** `1.0.0` —— canonical-bound 初版。
 - **TEEDataVerifier** `1.0.0` —— 初版。
 
-### 版本规范
-
-改了 impl 就必须 bump `VERSION`(编译期常量,需重部署 impl + 升级 beacon 才在链上生效),
-并在上面的变更记录追加一条。大/小版本判据:
-
-- **大版本号(major,第一位 `X.0.0`)**:storage 布局不兼容、必须**新部署(新 proxy)+ 协调
-  链下迁移**、或协议级重设计的破坏性改动——**不能靠 beacon 原地升级**。例:canonical-binding
-  重写(旧自实现 → 绑官方 8004)。
-- **小版本号(后两位 `1.x.y`)**:能通过 **beacon 原地升级(storage 兼容)** 完成的改动。默认
-  走 **patch 级 +1**(如 client-less ServeProof:`1.0.0 → 1.0.1`,虽是接口变化但 storage
-  兼容、可原地升);仅当想标记一个较大特性集时才由人手动跳 **minor**(`1.1.0`)。
-
-一句话判据:**要不要新 proxy / 迁 storage?要 → 大版本;能 beacon 原地升 → 小版本。**
-升级流程见 §4。
+> **版本号规范 + 升级流程见 [`UPGRADING.md`](UPGRADING.md)。** 改了 impl 必须 bump `VERSION`
+> (编译期常量,需重部署 + 升级 beacon 才在链上生效)并在此追加一条 changelog。
 
 ## 8. 备注 / 后续
 
