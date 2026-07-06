@@ -47,25 +47,6 @@ type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number };
 /** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
 type MintedResponse = DeployCloneResponse & { agentId: bigint };
 
-/** A single data-weighted reputation score (off-chain). */
-export interface DataBoundScore {
-  /** Data-weighted average of the feedback values — the headline number.
-   *  0 when no considered feedback carries weight. */
-  score: number;
-  /** Non-revoked feedback entries considered. */
-  count: bigint;
-  /** 0..1 — how "current" the score is: realized weight ÷ max possible weight.
-   *  1 = every review was earned under today's data; →0 = mostly stale data. */
-  freshness: number;
-}
-
-/** How a feedback's dataHashes relate to the agent's current iData set. */
-function relationToCurrent(dataHashes: readonly string[], current: Set<string>): 'exact' | 'compatible' | 'stale' {
-  const fb = new Set(dataHashes.map((h) => h.toLowerCase()));
-  for (const h of fb) if (!current.has(h)) return 'stale';
-  return fb.size === current.size ? 'exact' : 'compatible';
-}
-
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
 export class AgentApi {
@@ -169,11 +150,9 @@ export class AgentApi {
 export class ReputationApi {
   private readonly rep: ReputationClient;
   private readonly session: ServeSession;
-  private readonly id: AgenticIDClient;
   constructor(ctx: Ctx) {
     this.rep = new ReputationClient(ctx);
     this.session = new ServeSession(ctx);
-    this.id = new AgenticIDClient(ctx);
   }
 
   // — serve-proof transport (framework-agnostic; captures X-Agent-Proof) —
@@ -189,52 +168,6 @@ export class ReputationApi {
   readFeedback(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<Feedback> { return this.rep.readFeedback(agentId, client, feedbackIndex); }
   readAllFeedback(params: ReadAllFeedbackParams): Promise<Feedback[]> { return this.rep.readAllFeedback(params); }
   getSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getSummary(params); }
-  /**
-   * Data-bound reputation score (off-chain) — collapses reputation to one number.
-   * The on-chain `getSummary` is id-bound: it lumps all of an agent's feedback
-   * regardless of what data the agent ran when each score was earned. This
-   * **weights each feedback by how relevant its data still is**:
-   *   - earned under exactly today's data (dataHashes == current) → weight 1
-   *   - the data it was earned under is still present (⊆ current) → weight 0.5
-   *   - stale (some of that data is gone/changed)                 → weight 0
-   * `score` is the weighted average of the values; `freshness` (0..1) is how much
-   * of the reputation reflects the current data. Weights are overridable. Reduces
-   * client-side over getClients → readFeedback → getServeData + intelligentDatasOf
-   * (O(total feedback) reads; an event-based path can scale it later). Revoked
-   * skipped; optional tag filters mirror getSummary.
-   */
-  async getDataBoundScore(agentId: bigint, opts: {
-    tag1?: string;
-    tag2?: string;
-    weights?: { current?: number; compatible?: number; stale?: number };
-  } = {}): Promise<DataBoundScore> {
-    const wCurrent = opts.weights?.current ?? 1;
-    const w = { exact: wCurrent, compatible: opts.weights?.compatible ?? 0.5, stale: opts.weights?.stale ?? 0 };
-    const current = new Set((await this.id.intelligentDatasOf(agentId)).map((d) => d.dataHash.toLowerCase()));
-    const clients = await this.rep.getClients(agentId);
-    let count = 0n, weightedSum = 0, totalWeight = 0;
-    for (const client of clients) {
-      const last = await this.rep.getLastIndex(agentId, client); // a client in getClients has ≥1 entry
-      for (let i = 0n; i <= last; i++) {
-        const fb = await this.rep.readFeedback(agentId, client, i);
-        if (fb.isRevoked) continue;
-        if (opts.tag1 && fb.tag1 !== opts.tag1) continue;
-        if (opts.tag2 && fb.tag2 !== opts.tag2) continue;
-        const rel = relationToCurrent((await this.rep.getServeData(agentId, client, i)).dataHashes, current);
-        const weight = w[rel];
-        const value = Number(fb.value) / 10 ** fb.valueDecimals; // real fixed-point value
-        count += 1n;
-        weightedSum += value * weight;
-        totalWeight += weight;
-      }
-    }
-    const maxWeight = Number(count) * wCurrent;
-    return {
-      score: totalWeight > 0 ? weightedSum / totalWeight : 0,
-      count,
-      freshness: maxWeight > 0 ? totalWeight / maxWeight : 0,
-    };
-  }
   getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   getClients(agentId: bigint): Promise<Address[]> { return this.rep.getClients(agentId); }
   getLastIndex(agentId: bigint, client: Address): Promise<bigint> { return this.rep.getLastIndex(agentId, client); }
