@@ -129,7 +129,7 @@ await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "
 
 ## `ag.reputation` — serve-proof + feedback
 
-The agent's serve API is framework-specific, so the SDK doesn't model it — you call the agent however it expects, and `capture` grabs the `X-Agent-Proof` header the sealed proxy stamps on every response. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
+The agent's serve API isn't defined by this SDK — it's whatever the agent's framework **and its own configuration** (persona, enabled skills, custom routes) expose, so it can differ from one agent to the next. The SDK treats it as opaque: you call the agent however it expects, and `capture` grabs the `X-Agent-Proof` header the sealed proxy stamps on every response. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
 
 ```ts
 import { keccak256, toBytes } from 'viem';

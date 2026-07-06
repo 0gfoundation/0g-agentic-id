@@ -4,10 +4,11 @@
  * endpoint (any framework, any path) and capture the TEE-signed ServeProof the
  * sealed proxy stamps on every response as the `X-Agent-Proof` header.
  *
- * The serve API is framework-specific, so this layer does NOT model it — you
- * make the call however the agent expects; ServeSession only extracts the proof
- * from the response. The proof is then submittable on-chain via
- * ReputationClient.giveFeedback (attribution is msg.sender; no client binding).
+ * The serve API isn't defined here — it's whatever the agent's framework and
+ * its own config expose, so it can differ per agent. This layer treats it as
+ * opaque: you make the call however the agent expects; ServeSession only
+ * extracts the proof from the response. The proof is then submittable on-chain
+ * via ReputationClient.giveFeedback (attribution is msg.sender; no client binding).
  *
  * Header format (from sealed/internal/proxy):
  *   X-Agent-Proof: 0x<65-byte sig hex>.<base64url(envelope JSON)>
