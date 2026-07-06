@@ -70,7 +70,7 @@ const buyer = '0xBbBb...';   // the address leaving feedback — whatever wallet
 import { parseEther } from 'viem';
 
 // deploy — signs the deploy + sandbox-create envelopes and POSTs them to the attestor
-const dep = await ag.agent.deploy({
+const params = {
   name: 'Sage',
   description: 'a helpful agent',
   iData: [                                         // intelligent data — one entry per role
@@ -81,19 +81,23 @@ const dep = await ag.agent.deploy({
     snapshot: process.env.SANDBOX_SNAPSHOT,        // the provider's base image / snapshot name
     apiKey:   process.env.AGENT_API_KEY,           // injected into the container as an env secret
   },
-});
-// dep → { seal_id: "0x…", agent_seal_addr: "0x…" }
-//   deploy is ASYNC: this kicks off storage → mint → setAgentURI → container in
-//   the background. The tokenId doesn't exist until the mint — wait for it
-//   (polls the chain, no WebSocket):
-const newAgentId = await ag.agent.waitForMint(dep.seal_id);   // → 34n once minted
-//   (tune with { timeoutMs, pollIntervalMs }; or poll getAgentIdBySealId / GET /deployment yourself)
+};
+
+// deploy/clone are ASYNC (submit → mint), like a tx's writeContract → waitForReceipt.
+// The first await returns once the attestor ACCEPTS the job; the tokenId doesn't
+// exist until the background mint (storage → on-chain mint → setAgentURI).
+
+// One-shot — `{ wait: true }` blocks on the mint and hands back the tokenId (agentId):
+const { seal_id, agent_seal_addr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+
+// Or fire-and-forget — get the seal_id now, wait (or poll) for the mint later:
+const dep = await ag.agent.deploy(params);            // → { seal_id, agent_seal_addr }
+const id = await ag.agent.waitForMint(dep.seal_id);   // → 34n once minted (tune { timeoutMs, pollIntervalMs })
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
-const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner });
-// cl → { seal_id, agent_seal_addr }  — also async; lands Offline for the new owner
-const clonedTokenId = await ag.agent.waitForMint(cl.seal_id);   // → the new agent's tokenId once minted
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
+// cl → { seal_id, agent_seal_addr, agentId }  — the new agent's tokenId; lands Offline for the new owner
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
 // your own STABLE key to make a retry dedupe server-side (same key → the attestor

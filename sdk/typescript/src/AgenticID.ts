@@ -42,6 +42,11 @@ function assertSealBound(seal: Address, op: string): void {
   }
 }
 
+/** waitForMint tuning shared by the deploy/clone `wait` option. */
+type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number };
+/** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
+type MintedResponse = DeployCloneResponse & { agentId: bigint };
+
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
 export class AgentApi {
@@ -55,12 +60,33 @@ export class AgentApi {
   }
 
   // — lifecycle —
-  deploy(params: DeployParams): Promise<DeployCloneResponse> {
-    return this.attestor.deploy(params);
+  /**
+   * Deploy a new agent. Async: returns `{ seal_id, agent_seal_addr }` once the
+   * attestor accepts the job. Pass `{ wait: true }` to also block on the
+   * background mint (via waitForMint) and get the new `agentId` in the result.
+   */
+  deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
+  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
+  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+    const res = await this.attestor.deploy(params);
+    if (!opts?.wait) return res;
+    const agentId = await this.waitForMint(res.seal_id, opts);
+    return { ...res, agentId };
   }
-  async clone(params: CloneParams): Promise<DeployCloneResponse> {
+
+  /**
+   * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
+   * `{ seal_id, agent_seal_addr }` on acceptance; `{ wait: true }` also blocks on
+   * the mint and returns the new `agentId`.
+   */
+  clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
+  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
+  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
-    return this.attestor.clone(params);
+    const res = await this.attestor.clone(params);
+    if (!opts?.wait) return res;
+    const agentId = await this.waitForMint(res.seal_id, opts);
+    return { ...res, agentId };
   }
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
