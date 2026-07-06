@@ -47,6 +47,34 @@ type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number };
 /** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
 type MintedResponse = DeployCloneResponse & { agentId: bigint };
 
+/** One bucket of a data-bound summary. `sum` is normalized to 18 decimals (like
+ *  the on-chain getSummary); `avg` is the real-value mean (sum / 1e18 / count). */
+export interface DataBoundBucket { count: bigint; sum: bigint; avg: number }
+/** Reputation split by how each feedback's serve-data relates to the agent's
+ *  CURRENT iData:
+ *   - `current`    — earned under exactly today's data (dataHashes == current set)
+ *   - `compatible` — the data it was earned under is still present (⊆ current)
+ *   - `all`        — every entry (equals the id-bound 8004 getSummary total) */
+export interface DataBoundSummary {
+  current: DataBoundBucket;
+  compatible: DataBoundBucket;
+  all: DataBoundBucket;
+  sumDecimals: 18;
+}
+
+/** Scale a fixed-point value to 18 decimals (mirrors the contract's _normalizeTo18). */
+function normalize18(value: bigint, decimals: number): bigint {
+  const d = 18 - decimals;
+  if (d === 0) return value;
+  return d > 0 ? value * 10n ** BigInt(d) : value / 10n ** BigInt(-d);
+}
+/** How a feedback's dataHashes relate to the agent's current iData set. */
+function relationToCurrent(dataHashes: readonly string[], current: Set<string>): 'exact' | 'compatible' | 'stale' {
+  const fb = new Set(dataHashes.map((h) => h.toLowerCase()));
+  for (const h of fb) if (!current.has(h)) return 'stale';
+  return fb.size === current.size ? 'exact' : 'compatible';
+}
+
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
 export class AgentApi {
@@ -150,9 +178,11 @@ export class AgentApi {
 export class ReputationApi {
   private readonly rep: ReputationClient;
   private readonly session: ServeSession;
+  private readonly id: AgenticIDClient;
   constructor(ctx: Ctx) {
     this.rep = new ReputationClient(ctx);
     this.session = new ServeSession(ctx);
+    this.id = new AgenticIDClient(ctx);
   }
 
   // — serve-proof transport (framework-agnostic; captures X-Agent-Proof) —
@@ -168,6 +198,40 @@ export class ReputationApi {
   readFeedback(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<Feedback> { return this.rep.readFeedback(agentId, client, feedbackIndex); }
   readAllFeedback(params: ReadAllFeedbackParams): Promise<Feedback[]> { return this.rep.readAllFeedback(params); }
   getSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getSummary(params); }
+  /**
+   * Data-bound summary (off-chain). The on-chain `getSummary` is id-bound — it
+   * lumps all of an agent's feedback regardless of what data it was running when
+   * each score was earned. This splits by how each entry's serve-data relates to
+   * the agent's CURRENT iData: `current` (exact match), `compatible` (⊆ current),
+   * `all` (= the id-bound total). Reduces client-side over
+   * getClients → readFeedback → getServeData + intelligentDatasOf — O(total
+   * feedback) reads (fine for typical agents; an event-based path can scale it
+   * later). Revoked entries are skipped; optional tag filters mirror getSummary.
+   */
+  async getDataBoundSummary(agentId: bigint, opts: { tag1?: string; tag2?: string } = {}): Promise<DataBoundSummary> {
+    const current = new Set((await this.id.intelligentDatasOf(agentId)).map((d) => d.dataHash.toLowerCase()));
+    const clients = await this.rep.getClients(agentId);
+    const b = { current: { c: 0n, s: 0n }, compatible: { c: 0n, s: 0n }, all: { c: 0n, s: 0n } };
+    const add = (x: { c: bigint; s: bigint }, v: bigint) => { x.c += 1n; x.s += v; };
+    for (const client of clients) {
+      const last = await this.rep.getLastIndex(agentId, client); // a client in getClients has ≥1 entry
+      for (let i = 0n; i <= last; i++) {
+        const fb = await this.rep.readFeedback(agentId, client, i);
+        if (fb.isRevoked) continue;
+        if (opts.tag1 && fb.tag1 !== opts.tag1) continue;
+        if (opts.tag2 && fb.tag2 !== opts.tag2) continue;
+        const v = normalize18(fb.value, fb.valueDecimals);
+        const rel = relationToCurrent((await this.rep.getServeData(agentId, client, i)).dataHashes, current);
+        add(b.all, v);
+        if (rel !== 'stale') add(b.compatible, v);
+        if (rel === 'exact') add(b.current, v);
+      }
+    }
+    const mk = (x: { c: bigint; s: bigint }): DataBoundBucket => ({
+      count: x.c, sum: x.s, avg: x.c === 0n ? 0 : Number(x.s) / 1e18 / Number(x.c),
+    });
+    return { current: mk(b.current), compatible: mk(b.compatible), all: mk(b.all), sumDecimals: 18 };
+  }
   getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   getClients(agentId: bigint): Promise<Address[]> { return this.rep.getClients(agentId); }
   getLastIndex(agentId: bigint, client: Address): Promise<bigint> { return this.rep.getLastIndex(agentId, client); }

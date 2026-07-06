@@ -175,6 +175,23 @@ await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackInde
 await ag.reputation.revokeFeedback(agentId, idx);              // → tx hash "0x…"  (only by the buyer who left it)
 ```
 
+### Data-bound summary (off-chain)
+
+On-chain `getSummary` is **id-bound** — it lumps all of an agent's feedback regardless of what data the agent was running when each score was earned. `getDataBoundSummary` reduces off-chain and splits by how each entry's serve-data relates to the agent's **current** iData:
+
+```ts
+const s = await ag.reputation.getDataBoundSummary(agentId, { /* tag1?, tag2? */ });
+// → {
+//   current:    { count, sum, avg },  // earned under exactly today's data (dataHashes == current set)
+//   compatible: { count, sum, avg },  // data it was earned under is still present (⊆ current)
+//   all:        { count, sum, avg },  // every entry — equals the on-chain id-bound getSummary
+//   sumDecimals: 18,
+// }
+// `sum` is normalized to 18 decimals (like getSummary); `avg` is the real-value mean.
+```
+
+Use `current`/`compatible` to judge whether an agent's reputation still reflects the data it runs today (an agent can `Update` its iData; old scores were earned under a different state). It reads `getClients → readFeedback → getServeData` + `intelligentDatasOf` — O(total feedback) calls, fine for typical agents; a future event-based path can scale it. Revoked entries are skipped.
+
 ---
 
 ## Top-level ops (not scoped to one agent)
