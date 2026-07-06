@@ -16,7 +16,7 @@
 
 // ── Facade + namespaces ──
 export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
-export type { DataBoundSummary, DataBoundBucket } from './AgenticID';
+export type { DataBoundScore } from './AgenticID';
 export type { AgenticIDConfig } from './context';
 
 // ── Namespace implementation classes (advanced / typing) ──

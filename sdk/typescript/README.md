@@ -175,22 +175,24 @@ await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackInde
 await ag.reputation.revokeFeedback(agentId, idx);              // → tx hash "0x…"  (only by the buyer who left it)
 ```
 
-### Data-bound summary (off-chain)
+### Data-bound score (off-chain)
 
-On-chain `getSummary` is **id-bound** — it lumps all of an agent's feedback regardless of what data the agent was running when each score was earned. `getDataBoundSummary` reduces off-chain and splits by how each entry's serve-data relates to the agent's **current** iData:
+On-chain `getSummary` is **id-bound** — it lumps all of an agent's feedback regardless of what data the agent ran when each score was earned. `getDataBoundScore` collapses reputation to **one intuitive number** by weighting each feedback by how relevant its data still is:
 
 ```ts
-const s = await ag.reputation.getDataBoundSummary(agentId, { /* tag1?, tag2? */ });
-// → {
-//   current:    { count, sum, avg },  // earned under exactly today's data (dataHashes == current set)
-//   compatible: { count, sum, avg },  // data it was earned under is still present (⊆ current)
-//   all:        { count, sum, avg },  // every entry — equals the on-chain id-bound getSummary
-//   sumDecimals: 18,
-// }
-// `sum` is normalized to 18 decimals (like getSummary); `avg` is the real-value mean.
+const s = await ag.reputation.getDataBoundScore(agentId);
+// → { score: 4.6, count: 25n, freshness: 0.8 }
+//   score     — data-weighted average of the feedback values (the headline)
+//   count     — non-revoked entries considered
+//   freshness — 0..1: how much of the score reflects today's data (1 = all current)
+
+// weights are overridable (defaults below); optional tag1/tag2 filters mirror getSummary
+await ag.reputation.getDataBoundScore(agentId, {
+  weights: { current: 1, compatible: 0.5, stale: 0 },
+});
 ```
 
-Use `current`/`compatible` to judge whether an agent's reputation still reflects the data it runs today (an agent can `Update` its iData; old scores were earned under a different state). It reads `getClients → readFeedback → getServeData` + `intelligentDatasOf` — O(total feedback) calls, fine for typical agents; a future event-based path can scale it. Revoked entries are skipped.
+Each feedback is weighted by how its serve-data relates to the agent's **current** iData: earned under exactly today's data → `current` weight; the data is still present (⊆ current) → `compatible` weight; some of it is gone/changed → `stale` weight (0 by default = ignored). So an agent that `Update`d its data sees old scores discounted, and low `freshness` flags "this reputation was mostly earned under different data." Reads `getClients → readFeedback → getServeData` + `intelligentDatasOf` — O(total feedback) calls, fine for typical agents; a future event-based path can scale it. Revoked entries are skipped.
 
 ---
 
