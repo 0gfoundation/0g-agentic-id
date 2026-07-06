@@ -84,14 +84,16 @@ const dep = await ag.agent.deploy({
 });
 // dep → { seal_id: "0x…", agent_seal_addr: "0x…" }
 //   deploy is ASYNC: this kicks off storage → mint → setAgentURI → container in
-//   the background. Wait for the mint (polls the chain, no WebSocket):
-const newAgentId = await ag.agent.waitForDeploy(dep.seal_id);   // → 34n once minted
+//   the background. The tokenId doesn't exist until the mint — wait for it
+//   (polls the chain, no WebSocket):
+const newAgentId = await ag.agent.waitForMint(dep.seal_id);   // → 34n once minted
 //   (tune with { timeoutMs, pollIntervalMs }; or poll getAgentIdBySealId / GET /deployment yourself)
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
 const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner });
-// cl → { seal_id, agent_seal_addr }  — also async; lands Offline for the new owner (poll as above)
+// cl → { seal_id, agent_seal_addr }  — also async; lands Offline for the new owner
+const clonedTokenId = await ag.agent.waitForMint(cl.seal_id);   // → the new agent's tokenId once minted
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
 // your own STABLE key to make a retry dedupe server-side (same key → the attestor

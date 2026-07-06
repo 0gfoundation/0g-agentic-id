@@ -77,15 +77,16 @@ export class AgentApi {
   }
 
   /**
-   * Wait for a deploy/clone to mint on-chain, returning the new agentId.
-   * deploy/clone are async — this polls `getAgentIdBySealId(sealId)` (0 until
-   * minted) with no WebSocket. Throws on timeout.
+   * Wait for a deploy OR clone to mint on-chain, returning the new agent's
+   * tokenId (agentId). Both are async and return only a `seal_id` up front — the
+   * tokenId doesn't exist until the background mint. This polls
+   * `getAgentIdBySealId(sealId)` (0 until minted), no WebSocket. Throws on timeout.
    *
    * @example
-   * const { seal_id } = await ag.agent.deploy(params);
-   * const agentId = await ag.agent.waitForDeploy(seal_id);   // → 34n once minted
+   * const cl = await ag.agent.clone({ sourceAgentId, targetOwner });
+   * const tokenId = await ag.agent.waitForMint(cl.seal_id);   // → 34n once minted
    */
-  async waitForDeploy(
+  async waitForMint(
     sealId: Hash,
     opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
   ): Promise<bigint> {
@@ -101,7 +102,7 @@ export class AgentApi {
       }
       if (agentId !== 0n) return agentId;
       if (Date.now() >= deadline) {
-        throw new Error(`waitForDeploy: seal ${sealId} not minted within ${timeoutMs}ms`);
+        throw new Error(`waitForMint: seal ${sealId} not minted within ${timeoutMs}ms`);
       }
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
