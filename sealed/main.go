@@ -727,12 +727,24 @@ func handleDrift(
 			logger.Logf("drift: ReconcileFramework: %v", err)
 			return
 		}
+		// Reload only if reconcile actually changed the installed framework.
+		// Framework drift is often chain-side only: version-less bindings
+		// (attestor default) make "chain has no version, disk runs
+		// whitelistMax" the NORMAL first-boot state, and until the first
+		// chain.Update lands, every tick re-detects it. Reloading on a
+		// no-op reconcile restarted the agent process every 30s for as
+		// long as the storage upload kept failing (observed live: an
+		// unfunded agentSeal wallet turned that into a restart loop).
+		newFW, err := adapter.EvolutionFor(ctx, "framework")
+		if err == nil && sha256Hex(newFW) == sha256Hex(plaintexts["framework"]) {
+			logger.Logf("drift: framework reconcile was a no-op (chain-side drift only); skipping reload")
+			break
+		}
 		if err := mgr.Reload(ctx); err != nil {
 			logger.Logf("drift: manager.Reload: %v", err)
 			return
 		}
 		logger.Logf("drift: framework reconciled + reloaded")
-		newFW, err := adapter.EvolutionFor(ctx, "framework")
 		if err == nil {
 			plaintexts["framework"] = newFW
 			agent.UpdateCurrentSnapshot("framework", sha256Hex(newFW))
