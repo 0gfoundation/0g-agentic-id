@@ -72,6 +72,8 @@ sealed/
 │   │   ├── openclaw/             openclaw 适配器实现
 │   │   ├── claudecode/           claude-code 适配器（CLI 框架,经 HTTP bridge 托管）
 │   │   └── conformance/          可执行不变量套件,每个 adapter 在测试里跑
+│   ├── inference/                框架无关的 provider 知识(0g router 端点、按模型的线格式,
+│   │                             读 router 实时目录);adapter 只做 Route → 自家配置方言的翻译
 │   ├── manifest/                 directory-manifest 格式 + 确定性 tar.gz
 │   ├── state/                    Agent 共享状态（chainSnapshot + currentSnapshot + phase）
 │   ├── manager/                  agent 进程生命周期 + 监工

@@ -601,3 +601,11 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     `env.ANTHROPIC_BASE_URL` 路由到 0G router——该框架的可验证推理
     信任层就此补全。base URL 通过 env 子键白名单上链(路由去向属于
     身份,可审计),凭据留在 sandbox env,永不进链上明文。
+19. 第 18 条的生态变化随即在线上打爆了 openclaw adapter(它的 0g
+    增强硬编码 OpenAI 线格式;claude-* 在 router 上只有 Anthropic
+    格式 → 部署全绿、首次推理 400)。根因是分层:provider 知识按
+    adapter 重复存放,必然漂移。现在收敛到 `internal/inference` 一处
+    ——`ResolveZG` 读 router 公开模型目录(`supported_formats` +
+    上下文/输出上限,目录不可达时启发式兜底),adapter 只把解析好的
+    Route 翻译成自家配置方言。给未来 adapter 的规则:**永远不要编码
+    "provider 提供什么",只编码"怎么告诉你的框架"**。

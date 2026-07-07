@@ -23,11 +23,11 @@ import (
 //   - persona.SystemPrompt → <workspace>/CLAUDE.md (the always-loaded
 //     context file — the owner-authored part; the platform marker section
 //     is appended separately at Start)
-//   - persona.Inference    → ~/.claude/settings.json "model", but ONLY
-//     for provider "anthropic". Claude Code is Anthropic-native; a
-//     persona pinning any other provider is logged and its model skipped
-//     (settings keep the framework default) rather than writing a model
-//     name Claude Code can't resolve.
+//   - persona.Inference    → ~/.claude/settings.json. Claude Code speaks
+//     the Anthropic protocol, so two providers are routable: "anthropic"
+//     (model pin only) and "0g-compute" (model + env.ANTHROPIC_BASE_URL
+//     → the 0G router's Anthropic-format endpoint). Anything else is
+//     logged and skipped — see applyPersonaModel.
 //
 // Same lifecycle as the openclaw twin: persona is not in Roles(), so the
 // first wholesale chain.Update drops it from chain and the path-driven

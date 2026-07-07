@@ -677,3 +677,13 @@ parts of it:
     URL is chain-tracked through an env sub-allowlist (routing is
     identity, auditable), while credentials stay in the sandbox env and
     never reach chain plaintext.
+19. Item 18's ecosystem shift promptly broke the openclaw adapter live
+    (its 0g augmentation hardcoded the OpenAI wire format; claude-* is
+    Anthropic-format-only on the router → deploy green, first inference
+    400). Root cause was layering: provider knowledge was duplicated
+    per-adapter and drifted. It now lives once in `internal/inference` —
+    `ResolveZG` reads the router's public model catalog
+    (`supported_formats` + limits, heuristic fallback on outage), and
+    adapters only translate the resolved Route into their own config
+    dialect. Rule for future adapters: never encode WHAT a provider
+    serves; only encode HOW your framework is told about it.

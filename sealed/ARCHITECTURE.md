@@ -77,6 +77,9 @@ sealed/
 │   │   ├── openclaw/             openclaw adapter implementation
 │   │   ├── claudecode/           claude-code adapter (CLI framework behind an HTTP bridge)
 │   │   └── conformance/          executable invariant suite every adapter runs in its tests
+│   ├── inference/                framework-agnostic provider knowledge (0g router endpoints,
+│   │                             wire format per model via the live catalog); adapters only
+│   │                             translate a resolved Route into their config dialect
 │   ├── manifest/                 directory-manifest format + deterministic tar.gz
 │   ├── state/                    shared Agent state (chainSnapshot + currentSnapshot + phase)
 │   ├── manager/                  agent process lifecycle + supervision
