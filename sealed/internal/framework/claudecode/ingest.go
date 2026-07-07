@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 )
 
@@ -88,10 +89,11 @@ func (a *Adapter) ingestPersona(ctx context.Context, plaintext []byte) error {
 	return nil
 }
 
-// zgComputeAnthropicBaseURL is 0g-compute's Anthropic-protocol endpoint.
+// zgComputeAnthropicBaseURL aliases the shared platform constant
+// (internal/inference — single source for all 0g router knowledge).
 // Claude Code appends /v1/messages itself; x-api-key auth carries the
 // owner's 0g-compute key (delivered via the sandbox env, never on chain).
-const zgComputeAnthropicBaseURL = "https://router-api.0g.ai"
+const zgComputeAnthropicBaseURL = inference.ZGAnthropicBaseURL
 
 // applyPersonaModel merges the persona's inference pin into settings.json.
 //
