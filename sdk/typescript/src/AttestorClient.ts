@@ -43,6 +43,15 @@ export interface DeployParams {
   description: string;
   image?: string;
   iData: IDataInput[];
+  /**
+   * Agent-framework name, e.g. "openclaw" (default) or "claude-code".
+   * Opaque to the attestor: validated against `GET /config`'s
+   * `supported_frameworks` before mint and written verbatim into the
+   * on-chain framework binding, which is what selects the runtime
+   * adapter. Signature-covered — changing it invalidates the owner
+   * signature.
+   */
+  framework?: string;
   /** Sandbox "create" payload the attestor relays to the provider. */
   sandbox: { snapshot: string; apiKey: string; sealed?: boolean; resourceId?: string };
   /** Seconds the sandbox envelope stays valid. Default 180. */
@@ -117,6 +126,7 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
+      framework: params.framework ?? null,
     });
     const ownerSig = await walletClient.signMessage({ account, message: canonical });
     const sandbox_envelope = await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180);
@@ -130,6 +140,7 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
+      framework: params.framework ?? null,
       sandbox_envelope,
     });
   }
