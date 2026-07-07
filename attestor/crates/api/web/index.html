@@ -4510,12 +4510,13 @@ function fireProbe(sealIdHex) {
 // Serve verification rendered as a 3-row checklist that animates one row at
 // a time so the user can see each cryptographic step resolve. Rows are
 // pre-declared so layout doesn't reflow as checks land:
-//   ⟳ Signer identity         — envelope sig recovers to on-chain agent_seal
-//   ⟳ Response body integrity — keccak(body) matches envelope.resp_body_hash
+//   ⟳ Signer identity         — proof sig recovers to on-chain agent_seal
+//   ⟳ Response body integrity — recomputed taskHash matches envelope.task_hash
 //   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
-// envelope = `{ resp_body_hash, data_hashes, ts, ... }`, sig is EIP-191
-// personal_sign over the envelope JSON bytes.
+// envelope = `{ agent_id, timestamp, deadline, task_hash, data_hashes[], framework_hash }`.
+// sig is EIP-191 over keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)) — the contract's ServeProof digest.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
@@ -4738,9 +4739,19 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
       const parts = proofHeader.split('.');
       if (parts.length !== 2) throw new Error('malformed X-Agent-Proof (expected sig.envelope)');
       const [sig, envB64] = parts;
-      const envelopeJson = b64urlDecode(envB64);
-      envelope = JSON.parse(envelopeJson);
-      recovered = ethers.verifyMessage(envelopeJson, sig);
+      envelope = JSON.parse(b64urlDecode(envB64));
+      // Reconstruct the contract's signed digest: keccak256(abi.encode(agentId,
+      // timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
+      // frameworkHash)), then EIP-191 — matches AgenticIDReputationRegistry._verifyServeProof
+      // and the sealed proxy's writeServeProof.
+      const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+      const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
+      const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+        ['uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
+        [BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+         envelope.task_hash, dhHash, envelope.framework_hash],
+      ));
+      recovered = ethers.verifyMessage(ethers.getBytes(proofHash), sig);
       sigInfo = { full: recovered, short: `${recovered.slice(0,6)}…${recovered.slice(-4)}` };
     } catch (e) {
       setRow('identity', 'failed', `envelope: ${e.message || e}`);
@@ -4767,38 +4778,37 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     paint('verifying', '', 'Verifying response body…', null, null, null);
     await sleep(500);
 
-    const actualBodyHash = ethers.keccak256(ethers.toUtf8Bytes(text)).toLowerCase();
-    const claimedHash = String(envelope.resp_body_hash || '').toLowerCase();
-    if (claimedHash !== actualBodyHash) {
-      setRow('body', 'failed', `keccak(body)=${actualBodyHash.slice(0,10)}… ≠ envelope.resp_body_hash`);
+    // taskHash binds the transcript: keccak256(method ‖ uri ‖ keccak(reqBody) ‖
+    // keccak(respBody) ‖ status). /hello is a GET with an empty request body.
+    const uriPath = (() => { try { const u = new URL(url); return u.pathname + u.search; } catch { return '/hello'; } })();
+    const localTask = ethers.keccak256(ethers.concat([
+      ethers.toUtf8Bytes('GET'),
+      ethers.toUtf8Bytes(uriPath),
+      ethers.keccak256('0x'),                       // keccak(reqBody), empty
+      ethers.keccak256(ethers.toUtf8Bytes(text)),   // keccak(respBody)
+      ethers.toUtf8Bytes(String(r.status)),
+    ])).toLowerCase();
+    const claimedTask = String(envelope.task_hash || '').toLowerCase();
+    if (claimedTask !== localTask) {
+      setRow('body', 'failed', `taskHash ${localTask.slice(0,10)}… ≠ envelope.task_hash`);
       setRow('data', 'skipped');
       paint('failed', '✗', 'Body tampered',
-        'Response body hash does not match the signed envelope',
+        'Response transcript hash does not match the signed proof',
         sigInfo, humanMsg);
       return;
     }
-    setRow('body', 'passed', `keccak(body)=${actualBodyHash.slice(0,10)}… ✓ envelope`);
+    setRow('body', 'passed', `taskHash ${localTask.slice(0,10)}… ✓ (body bound)`);
 
     // ── Check 3: on-chain data hashes ──
     setRow('data', 'running');
     paint('verifying', '', 'Cross-checking on-chain data…', null, null, null);
     await sleep(500);
 
-    // envelope.data_hashes is `{role: {content_hash, data_hash?}}` —
-    // every dim the agent is tracking, including ones absent from chain
-    // (in which case data_hash is omitted). Two-level verification per dim:
-    //   * declared role missing on chain → chain-default, PASS
-    //     (chain intentionally omitted this dim; agent runs adapter
-    //     defaults; content_hash is signed but not cross-checkable here)
-    //   * declared role present on chain, data_hash matches → PASS
-    //   * declared role present on chain, data_hash differs/missing → FAIL
-    const declared = (envelope && typeof envelope.data_hashes === 'object'
-                      && envelope.data_hashes !== null
-                      && !Array.isArray(envelope.data_hashes))
-      ? envelope.data_hashes
-      : null;
-    const declaredEntries = declared ? Object.entries(declared) : [];
-    if (declaredEntries.length === 0) {
+    // data_hashes is now bytes32[] — the on-chain storage roots the TEE was
+    // running when it produced this response. Every one must be present in
+    // intelligentDatasOf(agentId).
+    const declared = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+    if (declared.length === 0) {
       setRow('data', 'skipped', 'envelope declared no data hashes');
     } else {
       try {
@@ -4813,52 +4823,25 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           provider,
         );
         const datas = await c.intelligentDatasOf(BigInt(agentId));
-        // Build role → on-chain dataHash. dataDescription is a JSON
-        // string the attestor writes at mint time; unparseable entries
-        // (e.g. legacy or attestor bug) are silently skipped — they
-        // simply can't be matched by role and fall into the
-        // "chain-absent" branch below.
-        const onchainByRole = new Map();
-        for (const d of datas) {
-          try {
-            const parsed = JSON.parse(d.dataDescription);
-            const role = parsed && typeof parsed === 'object' ? parsed.role : null;
-            if (typeof role === 'string' && role) {
-              onchainByRole.set(role, String(d.dataHash).toLowerCase());
-            }
-          } catch (_) { /* not JSON; skip */ }
-        }
-
-        // Display the dim's content_hash in the dim row (always present);
-        // dimsHtml truncates it itself with slice(0,10)+'…'+slice(-6).
-        // For legacy proofs (info is a string), fall back to that string.
-        const dims = declaredEntries.map(([role, info]) => {
-          const content = (info && typeof info === 'object') ? String(info.content_hash || '').toLowerCase() : '';
-          const declaredData = (info && typeof info === 'object')
-            ? String(info.data_hash || '').toLowerCase()
-            : String(info || '').toLowerCase();
-          const displayHash = content || declaredData || '';
-          const oc = onchainByRole.get(role);
-          if (oc === undefined) {
-            return { role, hash: displayHash, status: 'passed', note: 'chain-default · absent' };
-          }
-          if (declaredData && oc === declaredData) {
-            return { role, hash: displayHash, status: 'passed', note: 'matches chain' };
-          }
-          return { role, hash: displayHash, status: 'failed',
-                   note: `chain has ${oc.slice(0,10)}…${oc.slice(-6)}` };
+        const onChain = new Set(datas.map(d => String(d.dataHash).toLowerCase()));
+        const dims = declared.map((h, i) => {
+          const hl = String(h).toLowerCase();
+          const ok = onChain.has(hl);
+          return { role: `data[${i}]`, hash: hl,
+                   status: ok ? 'passed' : 'failed',
+                   note: ok ? 'on chain' : 'NOT on chain' };
         });
         const failedDims = dims.filter(d => d.status === 'failed').length;
         if (failedDims > 0) {
           setRow('data', 'failed',
-            `${failedDims}/${dims.length} dim${failedDims===1?'':'s'} mismatch`, dims);
+            `${failedDims}/${dims.length} not on chain`, dims);
           paint('failed', '✗', 'Data hash mismatch',
-            'Agent declared a data hash that contradicts chain',
+            'Agent declared a data hash not present on chain',
             sigInfo, humanMsg);
           return;
         }
         setRow('data', 'passed',
-          `${dims.length}/${dims.length} dim${dims.length===1?'':'s'} verified`, dims);
+          `${dims.length}/${dims.length} on chain`, dims);
       } catch (e) {
         setRow('data', 'failed', e.message || String(e));
         paint('failed', '✗', 'On-chain verification failed', null, null, null);

@@ -23,10 +23,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -141,6 +143,7 @@ func (s *Server) handleOpenclawLog(w http.ResponseWriter, _ *http.Request) {
 // regress for agents that haven't declared anything yet.
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
+	agentID, frameworkHash := s.agent.ProofIdentity()
 	if priv == nil {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -187,7 +190,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -200,6 +203,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // equals the on-chain NFT owner cached at bootstrap.
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
+	agentID, frameworkHash := s.agent.ProofIdentity()
 	if priv == nil || owner == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -279,7 +283,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -288,6 +292,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
+	agentID, frameworkHash := s.agent.ProofIdentity()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -354,7 +359,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
-	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode); err != nil {
+	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -405,58 +410,127 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 
 // ── Serve-proof signing ─────────────────────────────────────────────────────
 
+// serveProofDeadlineWindow is how long (seconds) a serve-proof stays
+// submittable on chain after issuance — the buyer must call giveFeedback
+// before it lapses.
+const serveProofDeadlineWindow = 3600
+
 // serveProof is the canonical envelope signed by agent_seal_priv and packed
-// into X-Agent-Proof. DataHashes keys every dim the agent currently tracks
-// ("framework", "persona", "knowledge", "skills", "ops") -- including ones
-// that have no chain pin yet -- so a verifier can do two independent
-// checks per dim:
+// into X-Agent-Proof. It mirrors the on-chain
+// AgenticIDReputationRegistry.ServeProof tuple (minus the signature, which
+// travels alongside in the header). There is NO client binding: attribution
+// is via msg.sender at giveFeedback submission; the proof is a bearer
+// attestation the consumer SDK submits from its own wallet.
 //
-//	content_hash : sha256 of the local plaintext (always present). Commits
-//	               the in-memory state including adapter defaults; lets a
-//	               verifier with the same plaintext recompute and match.
-//	data_hash    : 0g-storage root on chain. omitempty -- absent when the
-//	               dim hasn't been uploaded yet, otherwise verifiers
-//	               compare directly against AgenticID.intelligentDatasOf().
+//	agent_id       : on-chain token id (uint256 decimal string)
+//	timestamp      : issuance unix time
+//	deadline       : submission expiry
+//	task_hash      : keccak256 over the request/response transcript — opaque to
+//	                 the contract, kept so a buyer can audit *which* interaction
+//	data_hashes    : the on-chain 0g-storage roots the TEE was running (compare
+//	                 against AgenticID.intelligentDatasOf); dims not yet on chain
+//	                 are omitted
+//	framework_hash : the sealed image measurement (AgenticID Framework code)
 type serveProof struct {
-	Method       string                     `json:"method"`
-	URI          string                     `json:"uri"`
-	ReqBodyHash  string                     `json:"req_body_hash"`
-	Status       int                        `json:"status"`
-	RespBodyHash string                     `json:"resp_body_hash"`
-	DataHashes   map[string]state.DimHashes `json:"data_hashes"`
-	Ts           int64                      `json:"ts"`
+	AgentID       string   `json:"agent_id"`
+	Timestamp     int64    `json:"timestamp"`
+	Deadline      int64    `json:"deadline"`
+	TaskHash      string   `json:"task_hash"`
+	DataHashes    []string `json:"data_hashes"`
+	FrameworkHash string   `json:"framework_hash"`
 }
 
-// writeServeProof signs the canonical envelope with agent_seal_priv and emits
-// a single header packing the signature and base64-url envelope JSON, JWT-style:
+// writeServeProof signs the contract-shaped envelope with agent_seal_priv and
+// emits a single header packing the signature and base64-url envelope JSON:
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// Body is left untouched so verifiers recompute keccak256(body) and compare
-// against proof.resp_body_hash.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int) error {
-	proof := serveProof{
-		Method:       r.Method,
-		URI:          r.URL.RequestURI(),
-		ReqBodyHash:  "0x" + hex.EncodeToString(crypto.Keccak256(reqBody)),
-		Status:       statusCode,
-		RespBodyHash: "0x" + hex.EncodeToString(crypto.Keccak256(body)),
-		DataHashes:   dataHashes,
-		Ts:           time.Now().Unix(),
+// The signature is over keccak256(abi.encode(agentId, timestamp, deadline,
+// taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)), wrapped
+// EIP-191 — exactly what AgenticIDReputationRegistry._verifyServeProof checks.
+//
+// When the agent has no on-chain identity yet (agentID/frameworkHash empty, e.g.
+// local dev without a chain), the body is written without a proof header — a
+// reputation proof would be meaningless.
+func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash string) error {
+	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
+	fwBytes, fwErr := hexToBytes32(frameworkHash)
+	if !ok || fwErr != nil || agentIDBig.Sign() == 0 {
+		// No on-chain identity — serve the body without a serve-proof.
+		w.Header().Del("Content-Length")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		w.WriteHeader(statusCode)
+		_, _ = w.Write(body)
+		return nil
 	}
-	proofJSON, err := json.Marshal(proof)
+
+	// taskHash binds the exact request/response transcript. Opaque to the
+	// contract; carried for the buyer to audit which interaction earned this.
+	taskHash := crypto.Keccak256(
+		[]byte(r.Method), []byte(r.URL.RequestURI()),
+		crypto.Keccak256(reqBody), crypto.Keccak256(body),
+		[]byte(strconv.Itoa(statusCode)),
+	)
+
+	// dataHashes → the on-chain roots, sorted by role for determinism; dims
+	// without a chain pin (empty DataHash) are skipped.
+	roles := make([]string, 0, len(dataHashes))
+	for role := range dataHashes {
+		roles = append(roles, role)
+	}
+	sort.Strings(roles)
+	dhHex := make([]string, 0, len(roles))
+	var packed []byte // abi.encodePacked(bytes32[])
+	for _, role := range roles {
+		dh := dataHashes[role].DataHash
+		if dh == "" {
+			continue
+		}
+		b, err := hexToBytes32(dh)
+		if err != nil {
+			return fmt.Errorf("data_hash[%s]: %w", role, err)
+		}
+		dhHex = append(dhHex, "0x"+hex.EncodeToString(b))
+		packed = append(packed, b...)
+	}
+
+	now := time.Now().Unix()
+	deadline := now + serveProofDeadlineWindow
+
+	env := serveProof{
+		AgentID:       agentID,
+		Timestamp:     now,
+		Deadline:      deadline,
+		TaskHash:      "0x" + hex.EncodeToString(taskHash),
+		DataHashes:    dhHex,
+		FrameworkHash: frameworkHash,
+	}
+	proofJSON, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal serve-proof: %w", err)
 	}
 
-	prefix := fmt.Sprintf("\x19Ethereum Signed Message:\n%d", len(proofJSON))
-	hash := crypto.Keccak256([]byte(prefix), proofJSON)
+	// abi.encode of (uint256, uint256, uint256, bytes32, bytes32, bytes32) —
+	// all static 32-byte words, so it's a plain concatenation.
+	encoded := bytes.Join([][]byte{
+		word256(agentIDBig),
+		word256(big.NewInt(now)),
+		word256(big.NewInt(deadline)),
+		taskHash,
+		crypto.Keccak256(packed),
+		fwBytes,
+	}, nil)
+	proofHash := crypto.Keccak256(encoded)
+
+	// EIP-191: keccak256("\x19Ethereum Signed Message:\n32" || proofHash),
+	// matching OpenZeppelin MessageHashUtils.toEthSignedMessageHash(bytes32).
+	ethHash := crypto.Keccak256([]byte("\x19Ethereum Signed Message:\n32"), proofHash)
 
 	privKey, err := crypto.ToECDSA(priv)
 	if err != nil {
 		return fmt.Errorf("agent priv: %w", err)
 	}
-	sig, err := crypto.Sign(hash, privKey)
+	sig, err := crypto.Sign(ethHash, privKey)
 	if err != nil {
 		return fmt.Errorf("sign: %w", err)
 	}
@@ -470,4 +544,23 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
 	return nil
+}
+
+// word256 left-pads a non-negative big.Int to a 32-byte big-endian word.
+func word256(x *big.Int) []byte {
+	out := make([]byte, 32)
+	x.FillBytes(out)
+	return out
+}
+
+// hexToBytes32 parses a "0x"-prefixed 32-byte hex string.
+func hexToBytes32(s string) ([]byte, error) {
+	b, err := hex.DecodeString(strings.TrimPrefix(s, "0x"))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != 32 {
+		return nil, fmt.Errorf("expected 32 bytes, got %d", len(b))
+	}
+	return b, nil
 }

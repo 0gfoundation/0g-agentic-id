@@ -201,6 +201,7 @@ type RuntimeContext struct {
 
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable
+	FrameworkHash string // "0x"+sha256 sealed image hash; signed into serve-proofs as the AgenticID Framework code hash
 }
 
 // StartResult is what an adapter returns when its agent process is up and

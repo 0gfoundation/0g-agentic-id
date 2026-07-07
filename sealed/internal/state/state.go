@@ -80,6 +80,11 @@ type Agent struct {
 	upstreamURL   string
 	sealID        string
 	owner         string
+	// Serve-proof identity (Phase 2 chain bootstrap outputs). agentID is the
+	// on-chain token id (decimal string); frameworkHash is the sealed image
+	// hash ("0x"+sha256), i.e. the AgenticID Framework code running in the TEE.
+	agentID       string
+	frameworkHash string
 
 	// Two snapshots; see package doc.
 	chainSnapshot   Snapshot
@@ -126,14 +131,24 @@ func (a *Agent) SetPhase(p Phase) {
 // UpdateCurrentSnapshot.
 //
 // Transitions phase to PhaseRunning.
-func (a *Agent) Set(priv []byte, upstream, sealID, owner string) {
+func (a *Agent) Set(priv []byte, upstream, sealID, owner, agentID, frameworkHash string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.agentSealPriv = priv
 	a.upstreamURL = upstream
 	a.sealID = sealID
 	a.owner = owner
+	a.agentID = agentID
+	a.frameworkHash = frameworkHash
 	a.phase = PhaseRunning
+}
+
+// ProofIdentity returns the serve-proof identity fields (agentID decimal
+// string, frameworkHash "0x"+sha256). Empty when not minted / no image hash.
+func (a *Agent) ProofIdentity() (agentID, frameworkHash string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.agentID, a.frameworkHash
 }
 
 // Clear resets identity fields and snapshots. Used when the agent process
@@ -145,6 +160,8 @@ func (a *Agent) Clear() {
 	a.upstreamURL = ""
 	a.sealID = ""
 	a.owner = ""
+	a.agentID = ""
+	a.frameworkHash = ""
 	a.chainSnapshot = Snapshot{PerDim: map[string]DimEntry{}}
 	a.currentSnapshot = Snapshot{PerDim: map[string]DimEntry{}}
 	a.phase = PhaseBootstrapping

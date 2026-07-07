@@ -7,7 +7,6 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {
     AgenticIDReputationRegistry,
-    ReputationClientMismatch,
     ReputationNoAgentSeal,
     ReputationInvalidProofSignature,
     ReputationInvalidIndex,
@@ -69,7 +68,7 @@ contract ReputationTest is AgenticIDTestBase {
     /// @dev Build + sign a ServeProof with the controlled sealWallet.
     function _mkServeProof(
         uint256 agentId,
-        address client_,
+        address, // client dropped from the proof; positional arg kept for call sites
         bytes32 taskHash,
         bytes32[] memory dataHashes,
         bytes32 frameworkHash,
@@ -79,7 +78,6 @@ contract ReputationTest is AgenticIDTestBase {
         bytes32 inner = keccak256(
             abi.encode(
                 agentId,
-                client_,
                 block.timestamp,
                 deadline,
                 taskHash,
@@ -89,7 +87,6 @@ contract ReputationTest is AgenticIDTestBase {
         );
         return ServeProof({
             agentId: agentId,
-            client: client_,
             timestamp: block.timestamp,
             deadline: deadline,
             taskHash: taskHash,
@@ -186,20 +183,22 @@ contract ReputationTest is AgenticIDTestBase {
 
     // ── Client / caller mismatch ──────────────────────────────────────────────
 
-    function test_giveFeedback_revertsOnClientMismatch() public {
+    // A proof carries no client binding: any address may submit it (bearer).
+    // Attribution is msg.sender at submission; single-use via the sig nonce.
+    function test_giveFeedback_anySubmitterAccepted() public {
         (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
 
         bytes32[] memory dataHashes = new bytes32[](1);
         dataHashes[0] = dataHash;
 
-        // proof.client says `client`, but `client2` calls giveFeedback.
         ServeProof memory proof = _mkServeProof(
             agentId, client, TASK_HASH, dataHashes, FRAMEWORK_HASH,
             block.timestamp + 1 hours, sealWallet.privateKey
         );
 
+        // client2 submits a proof not "addressed" to anyone — accepted,
+        // recorded under client2 (msg.sender).
         vm.prank(client2);
-        vm.expectRevert(ReputationClientMismatch.selector);
         reputation.giveFeedback(
             agentId, 90, 0, "q", "l",
             "https://api.example.com", "ipfs://f", keccak256("f"),

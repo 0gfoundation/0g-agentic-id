@@ -10,7 +10,6 @@ import {IAgenticIDReputationRegistry, ServeProof, AgenticIDProofRequired} from "
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
 import {NonceRegistryUpgradeable} from "./utils/NonceRegistryUpgradeable.sol";
 
-error ReputationClientMismatch();
 error ReputationNoAgentSeal();
 error ReputationInvalidProofSignature();
 error ReputationInvalidIndex(uint256 index, uint256 length);
@@ -30,8 +29,14 @@ contract AgenticIDReputationRegistry is
 {
     using ECDSA for bytes32;
 
-    /// @notice Current implementation version. Bump on every upgrade.
-    string public constant VERSION = "1.0.0";
+    /// @notice Current implementation version. See contracts/UPGRADING.md for the
+    ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
+    ///         change via a beacon upgrade; patch = compatible fix).
+    /// @dev 1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
+    ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
+    ///      ABI changed).
+    ///      1.0.0 — initial (client-bound ServeProof).
+    string public constant VERSION = "1.1.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
 
@@ -150,8 +155,6 @@ contract AgenticIDReputationRegistry is
         bytes32 feedbackHash,
         ServeProof calldata proof
     ) external whenNotPaused {
-        if (proof.client != msg.sender) revert ReputationClientMismatch();
-
         _verifyServeProof(proof);
 
         ReputationStorage storage $ = _getReputationStorage();
@@ -390,7 +393,6 @@ contract AgenticIDReputationRegistry is
         // scoping is tracked separately; see the KMS threshold-derivation issue.)
         bytes32 proofHash = keccak256(abi.encode(
             proof.agentId,
-            proof.client,
             proof.timestamp,
             proof.deadline,
             proof.taskHash,
