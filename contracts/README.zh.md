@@ -211,7 +211,6 @@ Client 向 Agent TEE 发起一次真实业务调用。Agent TEE 完成后在 TEE
 ```solidity
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     uint256   deadline;              // 过期即 revert
     bytes32   taskHash;              // 任务哈希（输入/输出/合同），由 client 选；验证者只 ecrecover、不强制语义
@@ -221,9 +220,9 @@ struct ServeProof {
 }
 ```
 
-签名内容：
+**没有 `client` 字段**：归属由提交时的 `msg.sender` 决定,proof 是不记名凭证,买家用自己的钱包提交(靠签名 nonce 保证一次性)。签名内容：
 ```
-inner = keccak256(abi.encode(agentId, client, timestamp, deadline,
+inner = keccak256(abi.encode(agentId, timestamp, deadline,
                              taskHash,
                              keccak256(abi.encodePacked(dataHashes)),
                              frameworkHash))
@@ -242,11 +241,10 @@ AgenticIDReputationRegistry.giveFeedback(
 ```
 
 合约做的事：
-1. `proof.client == msg.sender`
-2. 重建 `inner`，ecrecover 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名
-3. 通过 NonceRegistry 登记 `key = keccak256("SERVEPROOF", agentId, signature)`，同时校验 `deadline`
-4. push `FeedbackEntry`，记 `clients`/`isClient`
-5. emit `NewFeedback` + `FeedbackWithProof`
+1. 重建 `inner`，ecrecover 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名
+2. 通过 NonceRegistry 登记 `key = keccak256("SERVEPROOF", agentId, signature)`，同时校验 `deadline`（每张 proof 只能兑一次）
+3. 以 `msg.sender` 名义 push `FeedbackEntry`，记 `clients`/`isClient`
+4. emit `NewFeedback` + `FeedbackWithProof`
 
 **防 sybil 的核心**：没有 agentSeal 就没有有效的 ServeProof，而 agentSeal_priv 只有 Agent TEE 持有。客户伪造不出 ServeProof，也没法不调 agent 就自己打分。
 

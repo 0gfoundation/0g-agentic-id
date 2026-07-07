@@ -284,7 +284,6 @@ real, verifiable work.
 ```solidity
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -295,9 +294,10 @@ struct ServeProof {
 ```
 
 `giveFeedback` reconstructs the signed payload on chain, runs `ecrecover`,
-and compares against `getAgentSeal(agentId)`. Because `agentSeal_priv` is
-held only by the Agent TEE, the client can neither forge a ServeProof nor
-self-rate without calling the agent. Details in
+and compares against `getAgentSeal(agentId)`. Because `agentSeal_priv` is held
+only by the Agent TEE, no one can forge a ServeProof, and each proof is
+single-use (signature nonce). There is no `client` field — attribution is
+`msg.sender` at submission. Details in
 [`contracts/README.md`](contracts/README.md) §5.
 
 ### 6 · Transferring an agent = transferring its capabilities

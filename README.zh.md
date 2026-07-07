@@ -233,7 +233,6 @@ AgentSeal 签名的服务证明（ServeProof）**。没有真实交互，就没�
 ```solidity
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -244,8 +243,9 @@ struct ServeProof {
 ```
 
 `giveFeedback` 在链上重建签名内容、`ecrecover` 后与 `getAgentSeal(agentId)`
-比对——`agentSeal_priv` 只有 Agent TEE 持有，客户既伪造不出 ServeProof，也
-没法不调 agent 就自己打分。详见 [`contracts/README.md`](contracts/README.md) §5。
+比对——`agentSeal_priv` 只有 Agent TEE 持有，谁都伪造不出 ServeProof，且每张
+proof 一次性（签名 nonce）。没有 `client` 字段——归属由提交时的 `msg.sender`
+决定。详见 [`contracts/README.md`](contracts/README.md) §5。
 
 ### 6 · 转让 agent = 转让它的能力
 
