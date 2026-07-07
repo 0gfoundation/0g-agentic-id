@@ -88,15 +88,16 @@ What remains genuinely out-of-repo:
 1. **Image allowlist governance**: the universal image's hash must be in
    attestor's allowlist; rebuilds (new sealed binary, new warm-cache
    entries, version-whitelist bumps) mean a new allowlist entry.
-2. **Attestor mint support**: attestor must accept a `framework` name at
-   deploy (validated against its supported-names list — the check must
-   run *before* the irreversible mint) and write it into the binding it
-   synthesizes. attestor stays framework-agnostic: the name is an opaque
-   string; the binding it mints is version-less (`{"name",
-   "schema_version"}` — adapters resolve the empty version to their
-   whitelistMax), and the seed content is the neutral `persona` role
-   (§5.4). Owner-side "which roles must be filled at mint" rules also
-   live there.
+2. **Attestor mint support**: the deploy API is WYSIWYS — clients ship
+   the agent's COMPLETE iData (the owner signs the exact minted bytes;
+   attestor synthesizes nothing) and a `role="framework"` binding entry
+   is required, its `name` validated against the supported-names list
+   *before* the irreversible mint. attestor stays framework-agnostic:
+   the name is an opaque string, bindings are version-less
+   (`{"name","schema_version"}` — adapters resolve the empty version to
+   their whitelistMax), and default-content ergonomics live in the
+   clients (SDK `defaultIData()`, the console's deploy form) which build
+   the binding + `persona` seed (§5.4) pair.
 
 ### 2.2 Companion and optional interfaces
 
@@ -687,3 +688,10 @@ parts of it:
     adapters only translate the resolved Route into their own config
     dialect. Rule for future adapters: never encode WHAT a provider
     serves; only encode HOW your framework is told about it.
+20. The deploy API went WYSIWYS: the `framework` request field (item 14's
+    signature-covered param) lasted one round before real use exposed its
+    flaw — a user-supplied binding in i_data could disagree with (and
+    bypass) it, because there were two sources of truth. Now clients ship
+    complete iData, the binding inside it is the only selector, and the
+    owner signs the exact minted bytes instead of inputs to a server-side
+    template. Synthesis moved to the clients (SDK `defaultIData()`).

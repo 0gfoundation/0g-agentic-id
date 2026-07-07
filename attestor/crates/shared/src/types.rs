@@ -117,22 +117,17 @@ pub struct DeployRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
 
-    /// 0..N iData entries. Empty Vec is valid — attestor synthesizes the
-    /// neutral defaults (version-less framework binding + persona seed;
-    /// see `i_data_derive`).
+    /// The agent's complete iData, exactly as it will be encrypted and
+    /// minted (WYSIWYS: what the owner signs is what gets sealed — the
+    /// attestor synthesizes NOTHING). Must contain a `role="framework"`
+    /// binding entry whose `name` is validated against
+    /// `Config.supported_frameworks` before the irreversible mint; every
+    /// other role is opaque to the attestor. Clients that want the old
+    /// "just name + description" ergonomics use the SDK's
+    /// `defaultIData()` helper, which builds the same two entries the
+    /// server used to synthesize.
     #[serde(default)]
     pub i_data: Vec<IDataInput>,
-
-    /// Agent-framework name, e.g. "openclaw" / "claude-code". Optional;
-    /// defaults to "openclaw". Attestor treats it as an OPAQUE string:
-    /// validated against `Config.supported_frameworks` BEFORE the
-    /// irreversible mint, written verbatim into the framework binding it
-    /// synthesizes, and never interpreted further — all framework
-    /// semantics live in the sealed adapters. Signature-covered via
-    /// `CanonicalDeploy.framework` (a tampered framework would mint an
-    /// identity the owner didn't sign for).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub framework: Option<String>,
 
     /// User-signed envelope authorizing sandbox `create`. Relayed as-is
     /// by the worker when it calls `POST {sandbox}/api/sandbox`.
@@ -841,15 +836,6 @@ pub struct ReceiptSummary {
     pub agent_id: Option<AgentId>,
 }
 
-/// DEFAULT_FRAMEWORK is the framework assumed when a deploy request omits
-/// `framework` — the backwards-compatible v0 default. An opaque name like
-/// every other framework name attestor handles.
-pub const DEFAULT_FRAMEWORK: &str = "openclaw";
-
-fn default_framework_name() -> String {
-    DEFAULT_FRAMEWORK.to_string()
-}
-
 // ── Jobs ────────────────────────────────────────────────────────────────
 //
 // JobPayload travels plaintext in-memory; `PostgresJobQueue` wraps it in
@@ -864,14 +850,10 @@ pub enum JobPayload {
     Deploy {
         seal_id: SealId,
         owner: Address,
-        /// May be empty; worker synthesizes the neutral defaults
-        /// (framework binding + persona seed) when so.
+        /// Complete, owner-signed iData — validated at the deploy edge
+        /// (framework binding present + supported); the worker encrypts
+        /// and mints it verbatim (WYSIWYS, no synthesis).
         i_data: Vec<IDataInput>,
-        /// Validated framework name (deploy route checked it against
-        /// `supported_frameworks` pre-enqueue). Serde default keeps
-        /// already-queued pre-field payloads deserializable.
-        #[serde(default = "default_framework_name")]
-        framework: String,
         /// Public display fields propagated from `DeployRequest`. The worker
         /// assembles them into the AgentCard JSON after mint.
         name: String,

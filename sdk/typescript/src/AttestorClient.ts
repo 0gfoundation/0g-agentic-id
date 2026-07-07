@@ -32,6 +32,47 @@ export interface IDataInput {
   extra?: Record<string, unknown>;
 }
 
+/** Inputs for {@link defaultIData}. */
+export interface DefaultIDataParams {
+  /** Framework name for the binding; default "openclaw". */
+  framework?: string;
+  name: string;
+  description: string;
+  /** Persona inference pin; default anthropic/claude-opus-4-6. */
+  inference?: { provider: string; model: string };
+}
+
+/**
+ * The canonical two-entry default iData — the same shape the attestor
+ * used to synthesize server-side before the WYSIWYS API change:
+ *
+ *   - a VERSION-LESS framework binding `{name, schema_version}` (the
+ *     sealed adapter resolves the missing version to its validated
+ *     whitelistMax), and
+ *   - the `persona` protocol seed `{system_prompt, inference}` that every
+ *     adapter translates into its own config (FRAMEWORK_ADAPTER.md §5.4).
+ *
+ * Owners sign these exact bytes: defaults are now part of the signed
+ * content rather than a server-side template.
+ */
+export function defaultIData(p: DefaultIDataParams): IDataInput[] {
+  return [
+    {
+      role: 'framework',
+      plaintext: { name: p.framework ?? 'openclaw', schema_version: 1 },
+      extra: {},
+    },
+    {
+      role: 'persona',
+      plaintext: {
+        system_prompt: `You are ${p.name}. ${p.description}\n`,
+        inference: p.inference ?? { provider: 'anthropic', model: 'claude-opus-4-6' },
+      },
+      extra: {},
+    },
+  ];
+}
+
 export interface DeployParams {
   /**
    * Idempotency key. Optional — the SDK generates a random one per call. Pass
@@ -42,16 +83,27 @@ export interface DeployParams {
   name: string;
   description: string;
   image?: string;
-  iData: IDataInput[];
   /**
-   * Agent-framework name, e.g. "openclaw" (default) or "claude-code".
-   * Opaque to the attestor: validated against `GET /config`'s
-   * `supported_frameworks` before mint and written verbatim into the
-   * on-chain framework binding, which is what selects the runtime
-   * adapter. Signature-covered — changing it invalidates the owner
-   * signature.
+   * The agent's complete iData, exactly as it will be encrypted and
+   * minted — WYSIWYS: the bytes you sign here are the bytes that get
+   * sealed; the attestor synthesizes nothing. Must include a
+   * `role="framework"` binding (`{name, schema_version}`). Omit (or pass
+   * empty) and the SDK builds `defaultIData()` for you from
+   * name/description/framework/inference below.
+   */
+  iData?: IDataInput[];
+  /**
+   * Agent-framework name for the SDK-built default iData ("openclaw"
+   * default, or e.g. "claude-code"). CLIENT-SIDE ONLY: it feeds
+   * `defaultIData()` when `iData` is omitted — the API has no framework
+   * field; the on-chain binding inside i_data is the single source of
+   * truth (validated against `GET /config`'s `supported_frameworks`
+   * before mint). Ignored when you pass your own `iData`.
    */
   framework?: string;
+  /** Inference pin for the SDK-built default persona (defaults to
+   *  anthropic/claude-opus-4-6). Ignored when you pass your own `iData`. */
+  inference?: { provider: string; model: string };
   /** Sandbox "create" payload the attestor relays to the provider. */
   sandbox: { snapshot: string; apiKey: string; sealed?: boolean; resourceId?: string };
   /** Seconds the sandbox envelope stays valid. Default 180. */
@@ -126,7 +178,15 @@ export class AttestorClient {
     const { walletClient, account } = requireWallet(this.ctx);
     const owner = account.address;
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
-    const iData = params.iData.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
+    const source = params.iData?.length
+      ? params.iData
+      : defaultIData({
+          framework: params.framework,
+          name: params.name,
+          description: params.description,
+          inference: params.inference,
+        });
+    const iData = source.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).
@@ -138,7 +198,6 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
-      framework: params.framework ?? null,
     });
     const ownerSig = await walletClient.signMessage({ account, message: canonical });
     const sandbox_envelope = await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180);
@@ -152,7 +211,6 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
-      framework: params.framework ?? null,
       sandbox_envelope,
     });
   }

@@ -73,10 +73,13 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  iData: [                                         // intelligent data — one entry per role
-    { role: 'framework', plaintext: { name: 'openclaw' } },
-    { role: 'persona',   plaintext: { system: 'you are a helpful assistant' } },
-  ],
+  // iData is the agent's COMPLETE minted content (WYSIWYS — the bytes you
+  // sign are the bytes that get sealed; the attestor synthesizes nothing).
+  // Omit it and the SDK builds defaultIData() for you; `framework` /
+  // `inference` below tune that default. A role="framework" binding is
+  // required either way — the deploy edge rejects iData without one.
+  framework: 'claude-code',                        // → the binding in the SDK-built default
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
   sandbox: {
     snapshot: process.env.SANDBOX_SNAPSHOT,        // the provider's base image / snapshot name
     apiKey:   process.env.AGENT_API_KEY,           // injected into the container as an env secret

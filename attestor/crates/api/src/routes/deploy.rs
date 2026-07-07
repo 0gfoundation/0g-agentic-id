@@ -23,51 +23,19 @@ pub async fn handle(
     if req.description.trim().is_empty() {
         return Err(ApiError::bad_request("description is required"));
     }
-    // `i_data` is allowed to be empty — the worker synthesizes the neutral
-    // defaults (framework binding + persona seed) so the contract always
-    // sees ≥1 IntelligentData.
-
-    // Framework name: opaque to the attestor, but existence-checked HERE,
-    // before the irreversible mint — a name the sealed image doesn't
-    // register would mint an agent that can never boot. Frontend pickers
-    // read the same list from GET /config; this is the enforcing copy.
-    let framework = req
-        .framework
-        .clone()
-        .unwrap_or_else(|| attestor_shared::DEFAULT_FRAMEWORK.to_string());
-    if !state.cfg.supported_frameworks.contains(&framework) {
-        return Err(ApiError::bad_request(format!(
-            "unsupported framework {framework:?}; supported: {}",
-            state.cfg.supported_frameworks.join(", ")
-        )));
-    }
-    // A user-supplied framework binding overrides the synthesized one in
-    // normalize_i_data — so validate ITS name too, or the param check is
-    // bypassable and an unsupported binding mints a bricked agent. When
-    // both the param and a binding are present they must agree; the
-    // planned raw-iData API (WYSIWYS) will collapse this to a single
-    // source of truth.
-    if let Some(entry) = req.i_data.iter().find(|e| e.role == "framework") {
-        match entry.plaintext.get("name").and_then(|v| v.as_str()) {
-            Some(n) if !state.cfg.supported_frameworks.iter().any(|f| f == n) => {
-                return Err(ApiError::bad_request(format!(
-                    "i_data framework binding names unsupported framework {n:?}; supported: {}",
-                    state.cfg.supported_frameworks.join(", ")
-                )));
-            }
-            Some(n) if n != framework => {
-                return Err(ApiError::bad_request(format!(
-                    "i_data framework binding names {n:?} but the request selects {framework:?}; make them agree or omit one"
-                )));
-            }
-            Some(_) => {}
-            None => {
-                return Err(ApiError::bad_request(
-                    "i_data framework binding must carry a string `name`",
-                ));
-            }
-        }
-    }
+    // WYSIWYS: `i_data` IS the minted content — the attestor synthesizes
+    // nothing. The single source of truth for "which framework" is the
+    // binding inside it, existence-checked HERE, before the irreversible
+    // mint (a missing/unsupported binding mints an agent whose container
+    // can never resolve an adapter). Frontend pickers and the SDK read
+    // the same supported list from GET /config; this is the enforcing
+    // copy. Everything else in i_data is opaque owner content.
+    let framework =
+        attestor_shared::i_data_validate::validate_framework_binding(
+            &req.i_data,
+            &state.cfg.supported_frameworks,
+        )
+        .map_err(ApiError::bad_request)?;
 
     // Owner authorization: verify EIP-191 signature over the canonical
     // deploy payload AND that every outer field matches what was signed.
@@ -75,7 +43,7 @@ pub async fn handle(
     verify_deploy_signature(&req, state.crypto.as_ref())
         .map_err(|e| ApiError::bad_request(format!("owner_signature: {e}")))?;
 
-    tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), "deploy request");
+    tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), framework = %framework, "deploy request");
 
     // ── Sandbox envelope: validate at edge so bogus requests don't burn a
     //    worker slot. Sandbox itself re-verifies; this is defense-in-depth.
@@ -171,7 +139,6 @@ pub async fn handle(
             seal_id,
             owner: req.owner,
             i_data: req.i_data,
-            framework,
             name: req.name.clone(),
             description: req.description.clone(),
             image: req.image.clone(),

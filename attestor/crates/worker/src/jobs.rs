@@ -3,7 +3,6 @@
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
-    i_data_derive::normalize_i_data,
     oss::OssClient,
     sandbox::SandboxError,
     AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
@@ -42,7 +41,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             owner,
             i_data,
-            framework,
             name,
             description,
             image,
@@ -55,7 +53,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 seal_id,
                 owner,
                 i_data,
-                &framework,
                 name,
                 description,
                 image,
@@ -752,17 +749,14 @@ async fn handle_deploy(
     seal_id: SealId,
     owner: Address,
     i_data_inputs: Vec<IDataInput>,
-    framework: &str,
     name: String,
     description: String,
     image: Option<String>,
     sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
-    // Neutral normalization: user entries win per-role; missing roles get
-    // the framework-agnostic defaults (version-less binding naming
-    // `framework` + persona seed). The deploy route already validated the
-    // name against supported_frameworks.
-    let i_data_inputs = normalize_i_data(i_data_inputs, framework, &name, &description);
+    // WYSIWYS: the owner-signed i_data is encrypted and minted verbatim —
+    // no synthesis, no per-role merging. The deploy edge already enforced
+    // the framework binding.
 
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
@@ -1513,6 +1507,23 @@ mod tests {
         TestCtx { ctx, chain, storage, sandbox, deployments, events }
     }
 
+    /// WYSIWYS: handle_deploy mints i_data verbatim, so tests feed it the
+    /// same two-entry shape clients build (binding + persona).
+    fn default_test_i_data() -> Vec<IDataInput> {
+        vec![
+            IDataInput {
+                role: "framework".into(),
+                plaintext: serde_json::json!({"name": "openclaw", "schema_version": 1}),
+                extra: Default::default(),
+            },
+            IDataInput {
+                role: "persona".into(),
+                plaintext: serde_json::json!({"system_prompt": "You are Sage. DeFi helper\n"}),
+                extra: Default::default(),
+            },
+        ]
+    }
+
     fn dummy_seal() -> SealId {
         B256::repeat_byte(0x77)
     }
@@ -1629,8 +1640,7 @@ mod tests {
             &t.ctx,
             seal,
             Address::from([0x66; 20]),
-            Vec::new(),
-            "openclaw",
+            default_test_i_data(),
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
@@ -1683,8 +1693,7 @@ mod tests {
             &t.ctx,
             seal,
             Address::from([0x66; 20]),
-            Vec::new(),
-            "openclaw",
+            default_test_i_data(),
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,

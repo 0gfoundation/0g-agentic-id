@@ -9,7 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod events_bus;
-pub mod i_data_derive;
+pub mod i_data_validate;
 pub mod jobs;
 pub mod kms;
 pub mod mocks;

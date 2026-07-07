@@ -49,6 +49,11 @@ computed explicitly via `estimate_gas` + a 20% buffer.
 
 ### Foundry scripts must hardcode gas-price
 
+> Scope note: this bites Foundry/cast (which trusts the node's 1-wei tip
+> verbatim). viem-based clients (the TypeScript SDK) estimate fees above
+> the minimum on their own — verified by real SDK writes (deposit /
+> giveFeedback / transferFrom) landing without overrides.
+
 For the same reason, `forge script` / `forge create` commands need explicit
 `--priority-gas-price 2000000000 --gas-price 5000000000`, otherwise they either
 estimate 1 wei and get rejected, or take 0G's default estimate (too low) and

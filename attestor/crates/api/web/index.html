@@ -1361,7 +1361,7 @@ details.log[open] summary{color:var(--text2)}
         <select id="framework">
           <option value="openclaw">OpenClaw</option>
         </select>
-        <small class="field-hint">More frameworks coming soon — for now every agent runs on OpenClaw.</small>
+        <small class="field-hint">Which runtime interprets this agent's iData — written into the on-chain framework binding.</small>
       </div>
     </section>
 
@@ -1906,6 +1906,17 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (r.ok) State.config = await r.json();
   } catch (e) {
     toast('Failed to load /config: ' + e.message, 'error');
+  }
+  // Framework picker is data-driven: /config.supported_frameworks is the
+  // same list the deploy edge enforces pre-mint, so the UI can't express
+  // an invalid choice. Falls back to the static openclaw option when the
+  // attestor predates the field.
+  if (State.config && Array.isArray(State.config.supported_frameworks) && State.config.supported_frameworks.length) {
+    const sel = $('#framework');
+    sel.innerHTML = State.config.supported_frameworks
+      .map((f) => `<option value="${f}">${f}</option>`) 
+      .join('');
+    enhanceAllSelects();
   }
   // Seed the deploy form's Model select with the default provider's
   // model list. onProviderChange handles subsequent switches; this
@@ -2882,22 +2893,28 @@ window.submitDeploy = async function () {
       return;
     }
 
-    // Persona dim — overrides the attestor's default_i_data persona by
-    // role. The `system_prompt` is rebuilt frontend-side using the same
-    // template the backend's default would use (You are <name>. <desc>),
-    // so even though we replace the entire dim, the prompt content
-    // matches what the user would have gotten by leaving everything
-    // default. Per-role merge in normalize_i_data keeps the framework
-    // dim untouched.
-    const personaPlaintext = {
-      system_prompt: `You are ${name}. ${description}\n`,
-      inference: { provider, model },
-    };
-    const iData = [{
-      role: 'persona',
-      plaintext: personaPlaintext,
-      extra: {},
-    }];
+    // WYSIWYS: the attestor synthesizes nothing — this form builds the
+    // complete iData the owner signs, and those exact bytes get encrypted
+    // and minted. Two entries, same shape the SDK's defaultIData() emits:
+    // a version-less framework binding (the sealed adapter resolves the
+    // missing package_version to its validated whitelistMax) and the
+    // persona protocol seed every adapter translates into its own config.
+    const framework = $('#framework').value || 'openclaw';
+    const iData = [
+      {
+        role: 'framework',
+        plaintext: { name: framework, schema_version: 1 },
+        extra: {},
+      },
+      {
+        role: 'persona',
+        plaintext: {
+          system_prompt: `You are ${name}. ${description}\n`,
+          inference: { provider, model },
+        },
+        extra: {},
+      },
+    ];
 
     const { canonical: ownerCanonical, sig: ownerSig } =
       await signOwnerCanonical(idempKey, name, description, image, iData);

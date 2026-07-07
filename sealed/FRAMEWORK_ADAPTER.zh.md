@@ -79,12 +79,14 @@ sealed 的四个组件各自通过一个窄切面消费它:
 1. **镜像 allowlist 治理**:通用镜像的 hash 要进 attestor 的
    allowlist;重新构建(新 sealed 二进制、新热缓存条目、版本
    allowlist 提升)= 新 allowlist 条目。
-2. **attestor 的 mint 支持**:attestor 在部署时接受一个 `framework`
-   名字(对支持名单校验——必须在不可逆的 mint **之前**),写进它合成
-   的 binding。attestor 保持框架无关:名字是不透明字符串;它 mint 的
-   binding 是无版本的(`{"name","schema_version"}`——adapter 把空
-   版本解析为自己的 whitelistMax),种子内容是中性的 `persona` role
-   (§5.4)。owner 侧"mint 时必须填哪些 role"的规则也在那边。
+2. **attestor 的 mint 支持**:部署 API 是 WYSIWYS 的——客户端交付
+   agent 的**完整 iData**(owner 签的就是上链的字节,attestor 不做
+   任何合成),`role="framework"` binding 条目为必填,其 `name` 在
+   不可逆的 mint **之前**对支持名单校验。attestor 保持框架无关:
+   名字是不透明字符串,binding 无版本(`{"name","schema_version"}`
+   ——adapter 把空版本解析为自己的 whitelistMax),默认内容的便利性
+   归客户端(SDK 的 `defaultIData()`、控制台的部署表单),它们负责
+   构造 binding + `persona` 种子(§5.4)这一对。
 
 ### 2.2 配套接口与可选能力接口
 
@@ -609,3 +611,8 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     上下文/输出上限,目录不可达时启发式兜底),adapter 只把解析好的
     Route 翻译成自家配置方言。给未来 adapter 的规则:**永远不要编码
     "provider 提供什么",只编码"怎么告诉你的框架"**。
+20. 部署 API 走向 WYSIWYS:第 14 条那个签名覆盖的 `framework` 参数只
+    活了一轮——真实使用暴露了它的缺陷:用户自带的 i_data binding 可以
+    与之不一致(并绕过它),因为存在两个真源。现在客户端交付完整
+    iData,其中的 binding 是唯一选择器,owner 签的是上链的字节本体而
+    不是服务端模板的输入。合成移到客户端(SDK `defaultIData()`)。
