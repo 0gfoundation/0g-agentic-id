@@ -117,7 +117,7 @@ below to attribute it to the right layer:
 | Symptom | Faulting layer | Action |
 |---|---|---|
 | `serve-proof` signature fails to verify | sealed / TEE compromised | **Critical** — investigate sealed code + the TEE attestation chain |
-| Signature verifies, but `req_body_hash` doesn't match the request body you sent | request tampered in transit (MITM) or a sealed bug | **Critical** — investigate the transport layer + sealed code |
+| Signature verifies, but `task_hash` doesn't match the request/response you sent (`task_hash` folds method‖uri‖req-body‖resp-body‖status) | request tampered in transit (MITM) or a sealed bug | **Critical** — investigate the transport layer + sealed code |
 | Signature verifies, `data_hashes` don't match `AgenticID.intelligentDatasOf(tokenId)` | sealed state-binding bug | **Critical** — sealed lied about the agent's state at response time |
 | Everything verifies, but the response **content is wrong / harmful** | agent quality issue | **Not a sealed bug.** Report to the reputation system; the score will reflect it |
 | The agent's persona has drifted in a suspicious way | suspected owner manipulation | **Not a sealed bug.** Verifiers should down-weight content; on-chain history (`EntryUpdated` events) shows the drift timeline |

@@ -59,12 +59,14 @@ header by the sealed proxy. The envelope signed:
 
 ```
 {
-  method, uri, req_body_hash, status,
-  resp_body_hash, data_hashes, ts
+  agent_id, timestamp, deadline,
+  task_hash, data_hashes, framework_hash
 }
 ```
 
-Signed under EIP-191 with `agent_seal_priv`, JWT-style packed into
+where `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
+keccak256(respBody) ‖ status)` folds the request/response transcript. Signed
+under EIP-191 with `agent_seal_priv`, JWT-style packed into
 `0x<sig>.<base64-envelope>` and written into the header.
 
 A port you bind yourself is not on this signing channel. Responses
