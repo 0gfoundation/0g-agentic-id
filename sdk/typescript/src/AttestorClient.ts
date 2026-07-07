@@ -74,7 +74,19 @@ function b64encode(s: string): string {
 
 function randHex(bytes: number): string {
   const a = new Uint8Array(bytes);
-  (globalThis as { crypto: { getRandomValues(x: Uint8Array): Uint8Array } }).crypto.getRandomValues(a);
+  type WebCrypto = { getRandomValues(x: Uint8Array): Uint8Array };
+  // Browsers and Node >= 19 expose WebCrypto globally; older Node needs
+  // the node:crypto fallback (caught by real execution on Node 16, where
+  // the previous unguarded access crashed deploy() before any request).
+  let cryptoObj = (globalThis as { crypto?: WebCrypto }).crypto;
+  if (!cryptoObj?.getRandomValues && typeof require === 'function') {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    cryptoObj = (require('crypto') as { webcrypto?: WebCrypto }).webcrypto;
+  }
+  if (!cryptoObj?.getRandomValues) {
+    throw new Error('AttestorClient: no WebCrypto available (need a browser or Node >= 15 with crypto.webcrypto)');
+  }
+  cryptoObj.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
