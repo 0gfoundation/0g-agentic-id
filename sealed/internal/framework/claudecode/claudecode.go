@@ -57,15 +57,13 @@ const (
 )
 
 // Compile-time contract checks: the full Framework interface plus every
-// optional capability this adapter opts into. claudecode deliberately does
-// NOT implement framework.ServicesManifestProvider — Claude Code has no
-// agent-declared services manifest, and /hello omitting the services
-// field is exactly the intended degradation.
+// optional capability this adapter opts into.
 var (
-	_ framework.Framework             = (*Adapter)(nil)
-	_ framework.VersionReconciler     = (*Adapter)(nil)
-	_ framework.SubprocessLogProvider = (*Adapter)(nil)
-	_ framework.SettleDelayer         = (*Adapter)(nil)
+	_ framework.Framework                = (*Adapter)(nil)
+	_ framework.VersionReconciler        = (*Adapter)(nil)
+	_ framework.SubprocessLogProvider    = (*Adapter)(nil)
+	_ framework.SettleDelayer            = (*Adapter)(nil)
+	_ framework.ServicesManifestProvider = (*Adapter)(nil)
 )
 
 // frameworkBinding is the plaintext of role="framework". Same 3-field
@@ -284,6 +282,13 @@ func (a *Adapter) MonitorExit(onExit func(err error)) {
 
 // SubprocessLogPath implements framework.SubprocessLogProvider.
 func (a *Adapter) SubprocessLogPath() string { return subprocessLogPath }
+
+// ServicesFilePath implements framework.ServicesManifestProvider so
+// /hello advertises the bridge's fixed HTTP surface (chat console +
+// query API). Unlike openclaw's agent-authored services.json, the bridge
+// endpoints are static, so spawn.go writes this manifest once at Start
+// (see writeServicesManifest) rather than the agent maintaining it.
+func (a *Adapter) ServicesFilePath() string { return servicesFilePath() }
 
 // SettleDelay implements framework.SettleDelayer. Claude Code doesn't
 // rewrite settings.json on first boot the way openclaw rewrites its

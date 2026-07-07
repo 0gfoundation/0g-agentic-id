@@ -116,6 +116,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		logger.Logf("warn: upsert CLAUDE.md sealed section: %v", err)
 	}
 
+	if err := writeServicesManifest(); err != nil {
+		logger.Logf("warn: write services manifest: %v", err)
+	}
+
 	cmd, err := spawnBridge(rt, adminToken)
 	if err != nil {
 		return framework.StartResult{}, err
@@ -229,6 +233,37 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 		}
 	}
 	return fmt.Errorf("%s did not accept connections within %s", addr, timeout)
+}
+
+// writeServicesManifest publishes the bridge's fixed HTTP surface so
+// proxy's /hello advertises it (A2A discoverability). Static because the
+// bridge endpoints don't change per agent — unlike openclaw, where the
+// agent authors its own services.json. Idempotent: overwritten verbatim
+// each Start, and it lives outside every chain-tracked role.
+func writeServicesManifest() error {
+	if err := os.MkdirAll(claudeHome, 0o755); err != nil {
+		return err
+	}
+	manifest := map[string]any{
+		"services": []map[string]any{
+			{
+				"path":        "/",
+				"method":      "GET",
+				"description": "Chat console (HTML) for conversing with the agent in a browser.",
+			},
+			{
+				"path":          "/v1/query",
+				"method":        "POST",
+				"description":   "Send a prompt to the agent. Body {prompt, session_id?}; returns Claude Code's JSON result including session_id for multi-turn.",
+				"input_example": `{"prompt":"summarize the risks in this contract"}`,
+			},
+		},
+	}
+	b, err := json.Marshal(manifest)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(servicesFilePath(), b, 0o644)
 }
 
 func randomTokenHex(nbytes int) (string, error) {

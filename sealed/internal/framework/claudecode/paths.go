@@ -38,3 +38,8 @@ var bridgeScriptPath = "/opt/claude-bridge/server.js"
 // subprocessLogPath is where spawn.go pipes the bridge's (and therefore
 // claude's) stdout/stderr; served by proxy on /log/agent.
 const subprocessLogPath = "/tmp/claudecode.log"
+
+// servicesFilePath is the static services manifest spawn.go writes at
+// Start; proxy's /hello embeds it. Under claudeHome so tests redirect it
+// with the same var as everything else.
+func servicesFilePath() string { return claudeHome + "/services.json" }

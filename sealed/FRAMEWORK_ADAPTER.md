@@ -695,3 +695,10 @@ parts of it:
     complete iData, the binding inside it is the only selector, and the
     owner signs the exact minted bytes instead of inputs to a server-side
     template. Synthesis moved to the clients (SDK `defaultIData()`).
+21. claudecode gained a browser chat console (openclaw has a dashboard;
+    Claude Code is a CLI with none). The bridge serves it at `GET /`, so
+    the sealed proxy exposes it at the agent's public root — every page
+    and reply still carries X-Agent-Proof. The adapter now also
+    implements `ServicesManifestProvider` with a static manifest (the
+    bridge's endpoints are fixed, unlike openclaw's agent-authored
+    services.json), so `/hello` advertises the chat + query API.

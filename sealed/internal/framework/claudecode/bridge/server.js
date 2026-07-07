@@ -144,11 +144,106 @@ function handleAdmin(req, res, url) {
   return send(res, 404, { error: 'unknown admin endpoint' });
 }
 
+// Self-contained chat console (no external assets — the sealed proxy's
+// CSP and the loopback-only bridge both preclude them). Talks to the same
+// /v1/query the API exposes; the admin token (from the owner's
+// /_seal/auth flow) unlocks session reset + runtime info.
+const CHAT_PAGE = `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude Code · 0G AgenticID</title>
+<style>
+  :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--user:#1f6feb;--ok:#3fb950}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
+  header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .badge{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
+  header .spacer{flex:1}
+  header input{background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 9px;font-size:12px;width:230px}
+  header button{background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+  header button:hover{border-color:var(--accent)}
+  #log{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
+  .msg{max-width:min(760px,92%);padding:11px 15px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
+  .u{align-self:flex-end;background:var(--user);color:#fff;border-bottom-right-radius:3px}
+  .a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:3px}
+  .meta{align-self:center;font-size:12px;color:var(--dim)}
+  .a.err{border-color:#f85149;color:#ff7b72}
+  footer{border-top:1px solid var(--line);padding:12px 18px;display:flex;gap:10px}
+  #box{flex:1;resize:none;background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:10px 12px;font:inherit;max-height:160px}
+  #send{background:var(--user);color:#fff;border:none;border-radius:8px;padding:0 20px;font-weight:600;cursor:pointer}
+  #send:disabled{opacity:.5;cursor:default}
+  code{background:#0b0f14;padding:1px 5px;border-radius:4px}
+</style></head>
+<body>
+<header>
+  <h1>Claude Code</h1>
+  <span class="badge" id="proofBadge" title="Every response is signed by the agent's TEE key">✓ X-Agent-Proof</span>
+  <span class="spacer"></span>
+  <input id="token" placeholder="admin token (optional)" autocomplete="off">
+  <button id="reset" title="Forget the current session">New session</button>
+  <button id="info" title="Runtime info (needs admin token)">Info</button>
+</header>
+<div id="log">
+  <div class="meta">This agent's identity is anchored on-chain and it runs inside a TEE. Ask it anything.</div>
+</div>
+<footer>
+  <textarea id="box" rows="1" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send">Send</button>
+</footer>
+<script>
+  var log=document.getElementById('log'),box=document.getElementById('box'),send=document.getElementById('send');
+  var sessionId=null, busy=false;
+  function add(text,cls){var d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+  function meta(text){var d=document.createElement('div');d.className='meta';d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;}
+  async function ask(){
+    var prompt=box.value.trim(); if(!prompt||busy) return;
+    busy=true; send.disabled=true; box.value='';
+    add(prompt,'u');
+    var thinking=add('…','a');
+    try{
+      var body={prompt:prompt}; if(sessionId) body.session_id=sessionId;
+      var r=await fetch('/v1/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var j=await r.json();
+      if(j.session_id) sessionId=j.session_id;
+      if(j.is_error){thinking.className='msg a err';thinking.textContent=j.result||('error: '+(j.error||r.status));}
+      else{thinking.textContent=(typeof j.result==='string'?j.result:JSON.stringify(j,null,2));}
+    }catch(e){thinking.className='msg a err';thinking.textContent='request failed: '+e.message;}
+    busy=false; send.disabled=false; box.focus();
+  }
+  send.onclick=ask;
+  box.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}});
+  box.addEventListener('input',function(){box.style.height='auto';box.style.height=Math.min(box.scrollHeight,160)+'px';});
+  document.getElementById('reset').onclick=async function(){
+    var t=document.getElementById('token').value.trim();
+    if(!t){sessionId=null;meta('session cleared (local)');return;}
+    try{var r=await fetch('/admin/session/reset',{method:'POST',headers:{Authorization:'Bearer '+t}});
+      if(r.ok){sessionId=null;meta('session reset');}else{meta('reset failed: '+r.status);}}catch(e){meta('reset failed: '+e.message);}
+  };
+  document.getElementById('info').onclick=async function(){
+    var t=document.getElementById('token').value.trim();
+    try{var r=await fetch('/admin/info',{headers:t?{Authorization:'Bearer '+t}:{}});var j=await r.json();
+      meta(r.ok?('claude '+j.claude_version+' · session '+(j.session_id||'none')+' · up '+j.uptime_s+'s'):('info: '+(j.error||r.status)));}
+    catch(e){meta('info failed: '+e.message);}
+  };
+  box.focus();
+</script>
+</body></html>`;
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
   if (req.method === 'GET' && url.pathname === '/healthz') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('ok');
+  }
+  // Chat console: openclaw ships its own dashboard, Claude Code is a CLI
+  // with none, so the bridge serves a minimal one. Reached via the sealed
+  // proxy at the agent's public root (GET /) — every response the browser
+  // gets still carries X-Agent-Proof, so the console is as verifiable as
+  // the API it drives.
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(CHAT_PAGE);
   }
   if (req.method === 'POST' && url.pathname === '/v1/query') {
     return void handleQuery(req, res).catch((e) =>
