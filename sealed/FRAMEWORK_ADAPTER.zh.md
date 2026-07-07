@@ -616,3 +616,9 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     与之不一致(并绕过它),因为存在两个真源。现在客户端交付完整
     iData,其中的 binding 是唯一选择器,owner 签的是上链的字节本体而
     不是服务端模板的输入。合成移到客户端(SDK `defaultIData()`)。
+21. claudecode 加了浏览器聊天控制台(openclaw 有 dashboard,Claude
+    Code 是 CLI 没有)。bridge 在 `GET /` 提供它,于是 sealed proxy
+    把它暴露在 agent 的 public root——每个页面和回复照样带
+    X-Agent-Proof。adapter 同时实现了 `ServicesManifestProvider`,用
+    一份静态 manifest(bridge 端点固定,不像 openclaw 由 agent 自己
+    写 services.json),`/hello` 因此广播聊天 + query API。
