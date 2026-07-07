@@ -2,7 +2,9 @@
 // frameworks (openclaw, eliza, ...) behind a uniform interface used by the
 // rest of the sealed bootstrap pipeline.
 //
-// See sealed/ARCHITECTURE.zh.md §3 for the full contract specification.
+// See sealed/FRAMEWORK_ADAPTER.md for the full contract specification
+// (per-method semantics, invariants, call-site map, porting checklist);
+// sealed/ARCHITECTURE.md §3 has the architectural overview.
 //
 // In the current single-config implementation the only meaningful dimension
 // is "config" (mapped from the existing iData role); knowledge / skills / ops
@@ -51,8 +53,9 @@ type Framework interface {
 	Name() string
 
 	// Version returns the runtime-detected framework version (best-effort,
-	// may exec a CLI to probe). Used in serve-proof metadata and reporter
-	// status payloads.
+	// may exec a CLI to probe). Declared for serve-proof metadata and
+	// reporter status payloads; not consumed by core code yet (the openclaw
+	// adapter probes its own version inside EvolutionFor("framework")).
 	Version(ctx context.Context) (string, error)
 
 	// Roles returns every role this adapter declares — INCLUDING the
@@ -167,6 +170,53 @@ type Framework interface {
 // Reload over Stop+Start when available.
 type Reloadable interface {
 	Reload(ctx context.Context, changedDim string) error
+}
+
+// ── Optional capability interfaces ───────────────────────────────────────────
+//
+// Discovered while porting the second adapter (claudecode): several
+// behaviours main.go used to invoke on the concrete *openclaw.Adapter are
+// really per-framework capabilities. They live here as optional interfaces
+// so the core stays framework-agnostic: callers type-assert and degrade
+// gracefully when an adapter doesn't implement one.
+
+// VersionReconciler is implemented by adapters that can force the installed
+// framework back to a version sealed trusts (typically the max of a version
+// allowlist). main.go's drift handler invokes it when the protocol-reserved
+// "framework" role drifts, before reloading the agent process.
+//
+// Adapters that cannot reconcile (no package manager, pinned-image
+// framework) simply don't implement this; the drift handler then commits
+// the observed version on chain as-is and logs that no reconcile ran.
+type VersionReconciler interface {
+	ReconcileFramework(ctx context.Context) error
+}
+
+// ServicesManifestProvider is implemented by adapters whose framework
+// maintains an agent-declared services manifest file (a JSON list of
+// HTTP services the agent currently publishes). proxy's /hello embeds
+// the parsed list in the signed envelope. Adapters without the concept
+// don't implement this and /hello omits the services field.
+type ServicesManifestProvider interface {
+	ServicesFilePath() string
+}
+
+// SubprocessLogProvider is implemented by adapters that pipe their agent
+// process's stdout/stderr to a known file. proxy serves it live on
+// /log/agent (and the legacy /log/openclaw alias). Without this, the
+// subprocess log pages report "not available".
+type SubprocessLogProvider interface {
+	SubprocessLogPath() string
+}
+
+// SettleDelayer is implemented by adapters whose framework rewrites its
+// own config once on first boot (applying defaults to sections Restore
+// didn't populate). Bootstrap waits this long after Start before capturing
+// the watcher baseline so those self-applied defaults aren't reported as
+// drift. Adapters without the behaviour don't implement this; bootstrap
+// falls back to a conservative default.
+type SettleDelayer interface {
+	SettleDelay() time.Duration
 }
 
 // ErrUnsupportedDim is returned by EvolutionFor / Restore when an adapter

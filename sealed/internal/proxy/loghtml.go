@@ -40,15 +40,20 @@ func (s *Server) handleLogHTML(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, renderLogHTML("sealed bootstrap log", logger.Lines()))
 }
 
-func (s *Server) handleOpenclawLogHTML(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAgentLogHTML(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	body, err := os.ReadFile("/tmp/openclaw.log")
+	logPath := s.getAgentLogPath()
+	if logPath == "" {
+		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{"agent log not available: framework adapter not resolved yet or no subprocess log path"}))
+		return
+	}
+	body, err := os.ReadFile(logPath)
 	if err != nil {
-		fmt.Fprint(w, renderLogHTML("openclaw log (unavailable)", []string{fmt.Sprintf("openclaw log not available: %v", err)}))
+		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{fmt.Sprintf("agent log not available: %v", err)}))
 		return
 	}
 	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
-	fmt.Fprint(w, renderLogHTML("openclaw log", lines))
+	fmt.Fprint(w, renderLogHTML("agent log", lines))
 }
 
 // parseLine splits the leading timestamp prefix from the rest and picks

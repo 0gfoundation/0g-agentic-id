@@ -44,6 +44,13 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 // is interpreted as "chain has no entry"; in that case the binding falls
 // back to adapter-derived defaults (current name + whitelistMax version +
 // schema_version=1). Present-but-malformed plaintext fails loud.
+//
+// An empty/absent package_version in a present binding also resolves to
+// whitelistMax: version knowledge lives with the code that validates
+// versions (this adapter), so attestor can mint a version-less binding
+// {"name","schema_version"} without speaking any framework's release
+// scheme. The first watcher tick then pins the concrete installed
+// version on chain (one expected drift-commit for version-less mints).
 func (a *Adapter) restoreFramework(plaintext []byte) error {
 	var fb frameworkBinding
 	if len(plaintext) == 0 {
@@ -61,6 +68,9 @@ func (a *Adapter) restoreFramework(plaintext []byte) error {
 		}
 		if fb.SchemaVersion != 1 {
 			return fmt.Errorf("unsupported schema_version: %d (this reader supports 1)", fb.SchemaVersion)
+		}
+		if fb.PackageVersion == "" {
+			fb.PackageVersion = whitelistMax()
 		}
 	}
 	a.mu.Lock()

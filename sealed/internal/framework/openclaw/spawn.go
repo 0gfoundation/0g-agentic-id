@@ -192,7 +192,13 @@ func writeRuntimeSections(authToken string) error {
 // `openclaw --version`. CLI output: "OpenClaw 2026.4.26 (be8c246)" -> "2026.4.26".
 // Empty on probe error (binary not installed yet -- happens during pre-Start
 // seed in main.go).
-func probeOpenclawVersion(ctx context.Context) string {
+//
+// Package var, not func: EvolutionFor("framework") layers this live probe
+// over the restored binding, so a real openclaw on the test machine's PATH
+// makes round-trip results environment-dependent unless tests stub it.
+// The conformance suite caught exactly that on a dev machine with a local
+// openclaw install.
+var probeOpenclawVersion = func(ctx context.Context) string {
 	out, err := exec.CommandContext(ctx, "openclaw", "--version").Output()
 	if err != nil {
 		return ""
