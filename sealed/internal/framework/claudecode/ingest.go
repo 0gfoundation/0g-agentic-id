@@ -88,24 +88,51 @@ func (a *Adapter) ingestPersona(ctx context.Context, plaintext []byte) error {
 	return nil
 }
 
-// applyPersonaModel merges the persona's model pin into settings.json.
-// Non-anthropic providers are skipped with a warning — Claude Code has no
-// notion of alternate inference providers, and writing e.g. an OpenAI
-// model name into `model` would fail at first chat with a worse error
-// than "kept the default".
+// zgComputeAnthropicBaseURL is 0g-compute's Anthropic-protocol endpoint.
+// Claude Code appends /v1/messages itself; x-api-key auth carries the
+// owner's 0g-compute key (delivered via the sandbox env, never on chain).
+const zgComputeAnthropicBaseURL = "https://router-api.0g.ai"
+
+// applyPersonaModel merges the persona's inference pin into settings.json.
+//
+//   - "anthropic":  model only; Claude Code talks to Anthropic directly.
+//   - "0g-compute": model + env.ANTHROPIC_BASE_URL → the 0G router's
+//     Anthropic-compatible endpoint — inference runs inside 0g-compute's
+//     TEE, completing the verifiable-inference layer for this framework.
+//     The base URL lands in the chain-tracked settings.json role (see
+//     evoSettingsJSON's env sub-allowlist), so WHERE the agent's
+//     inference traffic goes is owner-signed and auditable; the API key
+//     itself rides the sandbox env and never touches chain plaintext.
+//   - anything else: skipped with a warning — writing a model name
+//     Claude Code can't resolve fails at first chat with a worse error
+//     than "kept the default".
 func applyPersonaModel(inf personaInferenceIn) error {
-	if inf.Provider != "anthropic" {
+	switch inf.Provider {
+	case "anthropic":
+		if inf.Model == "" {
+			return nil
+		}
+		return updateSettingsJSON(func(cfg map[string]any) {
+			cfg["model"] = inf.Model
+		})
+	case "0g-compute":
+		return updateSettingsJSON(func(cfg map[string]any) {
+			if inf.Model != "" {
+				cfg["model"] = inf.Model
+			}
+			env, _ := cfg["env"].(map[string]any)
+			if env == nil {
+				env = map[string]any{}
+			}
+			env["ANTHROPIC_BASE_URL"] = zgComputeAnthropicBaseURL
+			cfg["env"] = env
+		})
+	default:
 		if inf.Provider != "" || inf.Model != "" {
-			logger.Logf("claude-code.HandleLegacy[persona]: provider %q unsupported (anthropic-native); keeping default model", inf.Provider)
+			logger.Logf("claude-code.HandleLegacy[persona]: provider %q unsupported (anthropic protocol only); keeping default model", inf.Provider)
 		}
 		return nil
 	}
-	if inf.Model == "" {
-		return nil
-	}
-	return updateSettingsJSON(func(cfg map[string]any) {
-		cfg["model"] = inf.Model
-	})
 }
 
 // updateSettingsJSON is the read-merge-write helper for

@@ -63,12 +63,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("claude-code: no framework binding restored before Start")
 	}
 
-	// Model comes from settings.json (the chain-tracked config), not from
-	// RuntimeContext — claude reads it itself; we only surface it in the
-	// injected runtime snapshot. Claude Code is Anthropic-native: provider
-	// is fixed and 0g-compute routing is not available for this adapter
-	// (the 0G router speaks the OpenAI protocol).
-	model := readModelFromSettings()
+	// Inference routing comes from settings.json (the chain-tracked
+	// config), not from RuntimeContext — claude reads model + env itself;
+	// we only surface the resolved picture in the injected runtime
+	// snapshot. env.ANTHROPIC_BASE_URL pointing at the 0G router means
+	// inference runs inside 0g-compute's TEE (Anthropic-compatible
+	// endpoint), completing the verifiable-inference trust layer.
+	provider, model, zgRouted := readInferenceFromSettings()
 
 	adminToken := cachedToken
 	if !initialized {
@@ -100,9 +101,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		AttestorURL:      rt.AttestorURL,
 		PublicURL:        rt.PublicURL,
 		SealSignSock:     rt.SealSignSock,
-		Provider:         "anthropic",
+		Provider:         provider,
 		Model:            model,
-		ZGComputeRouted:  false,
+		ZGComputeRouted:  zgRouted,
 		BootTime:         time.Now(),
 	}
 	rs.Whitelist = make([]platform.WhitelistEntry, len(supportedClaudeCodeVersions))
@@ -136,21 +137,28 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}, nil
 }
 
-// readModelFromSettings best-effort extracts the top-level "model" string
-// from settings.json. Empty on any failure — claude falls back to its own
-// default and the injected runtime snapshot says "unknown".
-func readModelFromSettings() string {
+// readInferenceFromSettings best-effort extracts the resolved inference
+// routing from settings.json: the model pin plus whether
+// env.ANTHROPIC_BASE_URL routes to 0g-compute's Anthropic endpoint.
+// Zero values on any failure — claude falls back to its own defaults and
+// the injected runtime snapshot says "unknown".
+func readInferenceFromSettings() (provider, model string, zgRouted bool) {
+	provider = "anthropic"
 	data, err := os.ReadFile(settingsJSONPath())
 	if err != nil {
-		return ""
+		return provider, "", false
 	}
 	var cfg struct {
-		Model string `json:"model"`
+		Model string            `json:"model"`
+		Env   map[string]string `json:"env"`
 	}
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		return ""
+		return provider, "", false
 	}
-	return cfg.Model
+	if cfg.Env["ANTHROPIC_BASE_URL"] == zgComputeAnthropicBaseURL {
+		return "0g-compute", cfg.Model, true
+	}
+	return provider, cfg.Model, false
 }
 
 // spawnBridge launches the node bridge with a strict env whitelist — the

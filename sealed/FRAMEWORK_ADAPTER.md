@@ -669,3 +669,11 @@ parts of it:
     carries a single hash. Net effect: attestor is fully
     framework-agnostic — its only remaining framework knowledge is a
     list of opaque names.
+18. Finding 12 resolved by the ecosystem: 0g-compute shipped an
+    Anthropic-compatible endpoint (with Claude models), so claudecode
+    now routes `persona.inference.provider = "0g-compute"` through the
+    0G router via `settings.json env.ANTHROPIC_BASE_URL` — completing
+    the verifiable-inference trust layer for this framework. The base
+    URL is chain-tracked through an env sub-allowlist (routing is
+    identity, auditable), while credentials stay in the sandbox env and
+    never reach chain plaintext.

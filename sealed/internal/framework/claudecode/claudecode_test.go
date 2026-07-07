@@ -209,14 +209,14 @@ func TestPersonaIngestion(t *testing.T) {
 	}
 }
 
-// TestPersonaIngestionSkipsForeignProvider: claude-code is Anthropic-
-// native; a persona pinning another provider keeps the default model
-// rather than writing an unresolvable name.
+// TestPersonaIngestionSkipsForeignProvider: a persona pinning a provider
+// this adapter can't route keeps the default model rather than writing an
+// unresolvable name.
 func TestPersonaIngestionSkipsForeignProvider(t *testing.T) {
 	ctx := context.Background()
 	a := newTestAdapter(t)
 
-	persona := []byte(`{"system_prompt":"hi\n","inference":{"provider":"0g-compute","model":"glm-5.2"}}`)
+	persona := []byte(`{"system_prompt":"hi\n","inference":{"provider":"openai","model":"gpt-5"}}`)
 	if err := a.HandleLegacy(ctx, "persona", persona); err != nil {
 		t.Fatal(err)
 	}
@@ -227,6 +227,67 @@ func TestPersonaIngestionSkipsForeignProvider(t *testing.T) {
 		if _, ok := cfg["model"]; ok {
 			t.Errorf("foreign provider's model leaked into settings: %s", data)
 		}
+	}
+}
+
+// TestPersonaIngestion0gCompute: provider "0g-compute" routes claude to
+// the 0G router's Anthropic-compatible endpoint via settings env — the
+// base URL is chain-tracked (auditable inference routing), and the
+// runtime snapshot reports the routed picture.
+func TestPersonaIngestion0gCompute(t *testing.T) {
+	ctx := context.Background()
+	a := newTestAdapter(t)
+
+	persona := []byte(`{"system_prompt":"hi\n","inference":{"provider":"0g-compute","model":"claude-sonnet-5"}}`)
+	if err := a.HandleLegacy(ctx, "persona", persona); err != nil {
+		t.Fatal(err)
+	}
+
+	provider, model, routed := readInferenceFromSettings()
+	if provider != "0g-compute" || model != "claude-sonnet-5" || !routed {
+		t.Errorf("resolved inference = %s/%s routed=%v; want 0g-compute/claude-sonnet-5 routed=true", provider, model, routed)
+	}
+
+	// The base URL must survive into the chain payload (auditable), and
+	// evolution must be stable across ticks.
+	evo, err := a.EvolutionFor(ctx, "settings.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"env":{"ANTHROPIC_BASE_URL":"` + zgComputeAnthropicBaseURL + `"},"model":"claude-sonnet-5"}`
+	if string(evo) != want {
+		t.Errorf("settings evolution:\n got  = %s\n want = %s", evo, want)
+	}
+}
+
+// TestSettingsEnvSubAllowlist: credentials inside settings env never
+// reach chain plaintext; only the routing sub-allowlist survives.
+func TestSettingsEnvSubAllowlist(t *testing.T) {
+	ctx := context.Background()
+	a := newTestAdapter(t)
+
+	dirty := []byte(`{
+		"model": "claude-sonnet-5",
+		"env": {
+			"ANTHROPIC_BASE_URL": "https://router-api.0g.ai",
+			"ANTHROPIC_API_KEY": "sk-secret-leak",
+			"ANTHROPIC_AUTH_TOKEN": "tok-secret"
+		}
+	}`)
+	if err := a.Restore(ctx, "settings.json", dirty); err != nil {
+		t.Fatal(err)
+	}
+	evo, err := a.EvolutionFor(ctx, "settings.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"sk-secret-leak", "tok-secret", "API_KEY", "AUTH_TOKEN"} {
+		if bytes.Contains(evo, []byte(leak)) {
+			t.Errorf("chain payload leaks %q: %s", leak, evo)
+		}
+	}
+	if !bytes.Contains(evo, []byte("ANTHROPIC_BASE_URL")) {
+		t.Errorf("routing base URL should be chain-tracked; got %s", evo)
 	}
 }
 

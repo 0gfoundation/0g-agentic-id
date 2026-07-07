@@ -63,21 +63,32 @@ func (a *Adapter) evoFramework(ctx context.Context) ([]byte, error) {
 //   - permissions: the allow/deny/ask rule set; defines what the agent
 //     may do, i.e. behavioural identity
 //   - outputStyle: response persona configuration
+//   - env:         SUB-ALLOWLISTED (see ownedEnvKeys) — inference routing
+//     is identity, credentials are not
 //
 // Deliberately excluded:
 //
-//   - env / apiKeyHelper / awsAuthRefresh: routinely carry credentials or
-//     machine-local paths; secrets must never reach chain plaintext
+//   - apiKeyHelper / awsAuthRefresh: carry credentials or machine-local
+//     paths; secrets must never reach chain plaintext
 //   - hooks: behaviour-defining in principle, but hook commands embed
 //     local paths and often credentials; excluded from v1, revisit with a
 //     sanitising encoder
 //   - feedbackSurveyState and other runtime bookkeeping Claude Code
 //     writes for itself: per-boot noise, the phantom-drift generator an
 //     allowlist exists to keep out
-var ownedSettingsKeys = []string{"model", "outputStyle", "permissions"}
+var ownedSettingsKeys = []string{"env", "model", "outputStyle", "permissions"}
+
+// ownedEnvKeys is the sub-allowlist inside settings.json's env block.
+// ANTHROPIC_BASE_URL is WHERE the agent's inference traffic goes —
+// identity-relevant and auditable (a 0g-compute-routed agent proves it on
+// chain; a hijacked base URL would be visible). Everything else in env is
+// presumed credential-bearing (ANTHROPIC_API_KEY, AUTH_TOKEN, …) and
+// stays local.
+var ownedEnvKeys = []string{"ANTHROPIC_BASE_URL"}
 
 // evoSettingsJSON reads ~/.claude/settings.json, keeps only the owned
-// keys, and returns canonical bytes (json.Marshal sorts map keys).
+// keys (env filtered to its sub-allowlist), and returns canonical bytes
+// (json.Marshal sorts map keys).
 func (a *Adapter) evoSettingsJSON() ([]byte, error) {
 	data, err := os.ReadFile(settingsJSONPath())
 	if os.IsNotExist(err) {
@@ -94,9 +105,25 @@ func (a *Adapter) evoSettingsJSON() ([]byte, error) {
 	}
 	out := make(map[string]any, len(ownedSettingsKeys))
 	for _, k := range ownedSettingsKeys {
-		if v, ok := cfg[k]; ok {
-			out[k] = v
+		v, ok := cfg[k]
+		if !ok {
+			continue
 		}
+		if k == "env" {
+			env, _ := v.(map[string]any)
+			kept := make(map[string]any, len(ownedEnvKeys))
+			for _, ek := range ownedEnvKeys {
+				if ev, ok := env[ek]; ok {
+					kept[ek] = ev
+				}
+			}
+			if len(kept) == 0 {
+				continue // no owned env keys → omit the block entirely
+			}
+			out[k] = kept
+			continue
+		}
+		out[k] = v
 	}
 	return json.Marshal(out)
 }

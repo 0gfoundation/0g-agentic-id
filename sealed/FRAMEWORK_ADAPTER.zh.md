@@ -595,3 +595,9 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     热缓存、claudecode bridge `go:embed` 进二进制、attestor allowlist
     只挂一个 hash。净效果:attestor 完全框架无关——它对框架的全部
     知识只剩一张不透明名字清单。
+18. 第 12 条毛边被生态解决:0g-compute 上线了 Anthropic 兼容端点
+    (含 Claude 系模型),claudecode 现在把
+    `persona.inference.provider = "0g-compute"` 经 `settings.json` 的
+    `env.ANTHROPIC_BASE_URL` 路由到 0G router——该框架的可验证推理
+    信任层就此补全。base URL 通过 env 子键白名单上链(路由去向属于
+    身份,可审计),凭据留在 sandbox env,永不进链上明文。
