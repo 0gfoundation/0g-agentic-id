@@ -14,7 +14,8 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 `0g-agent-nft` 仓库 |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
-| openclaw | 当前唯一接入的 agent framework；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284 |
+| openclaw | 默认 agent framework（链上 binding 点名时选中,或作为无 binding 的 fallback）；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284 |
+| claude-code | 第二个接入的 framework（binding `name: "claude-code"`）；按次调用的 CLI，经 HTTP bridge 托管，监听 127.0.0.1:3285（bridge 内嵌在 sealed 二进制里,见 `internal/framework/claudecode/bridge/`）|
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -34,6 +35,7 @@ Phase 2  chain bootstrap  WaitForMint(sealId) → agentId
                           IntelligentDatasOf(agentId) → []IntelligentData
                           SealedKeysOf(agentId) → map[dataHash][]sealedKey
                           逐条 download (0g-storage) + AES-GCM decrypt
+                          按 binding 的 name 解析 framework adapter
                           ↓
 Phase 3  framework        Restore (A→B→C 三轮) → seedCurrentSnapshots (phase 1) →
                           mgr.Start (spawn openclaw + writeRuntimeSections +
@@ -66,8 +68,10 @@ sealed/
 │   ├── provision/                /provision RA 请求 + 响应解封装
 │   ├── report/                   /status 上报到 attestor
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
-│   ├── framework/                framework 适配器抽象
-│   │   └── openclaw/             openclaw 适配器实现
+│   ├── framework/                framework 适配器抽象 + 可选能力接口
+│   │   ├── openclaw/             openclaw 适配器实现
+│   │   ├── claudecode/           claude-code 适配器（CLI 框架,经 HTTP bridge 托管）
+│   │   └── conformance/          可执行不变量套件,每个 adapter 在测试里跑
 │   ├── manifest/                 directory-manifest 格式 + 确定性 tar.gz
 │   ├── state/                    Agent 共享状态（chainSnapshot + currentSnapshot + phase）
 │   ├── manager/                  agent 进程生命周期 + 监工
@@ -88,31 +92,54 @@ sealed/
 - **manager**：`Start(ctx, params)` 调 adapter.Start spawn agent + 起 supervisor goroutine，agent 死了清状态 + 触发 onFailed
 - **uploader**：`Apply(plaintexts)` 拿 watcher 收集的"每个 role 当前 plaintext"，跟 chainSnapshot 比对，调 `pushLeaf` 或 `pushManifest` 上传 0g-storage，再签 `chain.Update`
 - **watcher**：30s ticker，跑 `EvolutionFor` 收每个 role 的现在 plaintext，调 `UpdateCurrentSnapshot` 算 drift，有 drift 就触发 OnDrift（接到 uploader.Apply）
-- **proxy**：:8080 上的 fasthttp，承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 openclaw :3284，(3) `/log.html` / `/log/openclaw.html` 实时日志页
+- **proxy**：:8080 上的 fasthttp，承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 framework upstream（openclaw :3284 / claude-code bridge :3285），(3) `/log.html` / `/log/agent.html` 实时日志页
 
 ## 3. 核心抽象：Framework adapter
 
-外面（main / watcher / uploader）只认 `framework.Framework` 接口，
-不知道 openclaw 长什么样。这是为后续接其他 framework 留的口子。
+外面（main / watcher / uploader / proxy）只认 `framework.Framework`
+接口，不知道 openclaw 长什么样。这就是接其他 framework 的口子。
+
+> **想接入别的 agent 框架？** 完整的 adapter 契约——逐方法语义、
+> 不变量、调用点地图、manifest 格式、以及"哪些还接死在 openclaw 上"
+> 的如实清单——在 [FRAMEWORK_ADAPTER.zh.md](FRAMEWORK_ADAPTER.zh.md)。
+> 本节只是架构概览。
 
 ```go
 type Framework interface {
     Name() string
-    Version(ctx) (string, error)
-    Roles() []RoleSpec                                            // 声明本 adapter 拥有的所有 dim
-    Defaults(role string) []byte                                  // 返回该 role 的 canonical 空状态
-    Restore(ctx, role, plaintext []byte) error                    // 把 plaintext 落到内存/磁盘
-    RestoreEntry(ctx, role, path, plaintext) error                // DirectoryManifest 子条目
-    LoadEntry(ctx, role, path) ([]byte, error)                    // 反向：读子条目的 canonical plaintext
-    EvolutionFor(ctx, role) ([]byte, error)                       // 读现在磁盘/内存 → canonical plaintext
-    HandleLegacy(ctx, role, plaintext) error                      // 不在 Roles() 里的老 role（如 persona）
-    ReconcileFramework(ctx) error                                 // npm install 把 openclaw 拉到 whitelistMax
-    Start(ctx, StartParams) (StartResult, error)                  // spawn agent 子进程
-    Liveness(ctx) error                                            // 监工探针
+    Version(ctx) (string, error)                     // best-effort 探测（core 暂未消费）
+    Roles() []RoleSpec                               // 声明本 adapter 拥有的所有 dim
+    Defaults(role string) []byte                     // 返回该 role 的 canonical 空状态
+    Restore(ctx, role, plaintext []byte) error       // 把 plaintext 落到内存/磁盘
+    LoadEntry(ctx, role, path) ([]byte, error)       // 读一个 manifest 子条目的 canonical plaintext
+    RestoreEntry(ctx, role, path, plaintext) error   // 反向：写一个 manifest 子条目
+    EvolutionFor(ctx, role) ([]byte, error)          // 读现在磁盘/内存 → canonical plaintext
+    HandleLegacy(ctx, role, plaintext) error         // 不在 Roles() 里的链上 role（如 persona）
+    Start(ctx, RuntimeContext) (StartResult, error)  // spawn agent 子进程
+    AuthResponse(ctx) (any, error)                   // /_seal/auth 的 owner 专属载荷
+    Stop(ctx, gracefulTimeout) error                 // SIGTERM → SIGKILL
+    Liveness(ctx) error                              // 监工探针
     Readiness(ctx) error
-    MonitorExit(onExit func(err error))                            // 进程退出 callback
 }
 ```
+
+必选接口之外：
+
+- **`MonitorExit(onExit func(err error))`** ——`manager.Adapter` 额外
+  要求的（进程死亡 callback，让监工不用轮询）。`main.go` 启动时
+  assert；真实 adapter 都实现它。
+- **可选能力接口**（`VersionReconciler`、`ServicesManifestProvider`、
+  `SubprocessLogProvider`、`SettleDelayer`）——core type-assert,
+  adapter 缺哪个就优雅降级哪个。表格见 FRAMEWORK_ADAPTER.zh.md §2.2。
+
+激活的 adapter 由**链上 framework binding 的 `name`** 决定——Phase 2
+解密完 iData 后,`main.resolveAdapter` 经 `framework.Get` 查注册表选出
+(每个打包进二进制的 adapter 在自己的 `New()` 里自注册)。
+`AGENT_FRAMEWORK` env 只是链上无 binding 时的 fallback(本地 dev);
+两者不一致时 binding 赢。
+
+（`framework.Reloadable` 声明了可选热重载钩子，但目前没有消费方；
+`manager.Reload` 永远走 Stop + Start。）
 
 **两个 Shape**（见 `framework.go:21-32`）：
 
@@ -278,7 +305,7 @@ internal/framework/openclaw/
 | `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回一个短期 framework dashboard token + path |
 | `/<其他>` | 用户、agent dashboard 前端 | 反代到 openclaw 127.0.0.1:3284 |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
-| `/log/openclaw` + `/log/openclaw.html` | 运维 | openclaw 子进程的 stdout/stderr（实时）|
+| `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
 | `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` —— 用 `agent_seal_priv` 签名 |
 
 sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关键
@@ -302,6 +329,7 @@ sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关�
 | `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
+| `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
 | `API_KEY` | LLM provider key，由 attestor 在 deploy / Recreate envelope 里转发；spawn.go 翻译成 provider 专属的 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等 |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
 

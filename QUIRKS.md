@@ -107,6 +107,36 @@ The sandbox billing path checks that the signer's wallet has an on-chain balance
 (a rough sanity check), so a randomly generated, unfunded keypair calling the
 sandbox API is rejected. E2E tests need a funded wallet.
 
+### sealed adapter version probes must be swappable package-level vars
+
+Adapters live-probe the installed framework version inside
+`EvolutionFor("framework")` (`openclaw --version` / `claude --version`).
+Dev machines plausibly have these CLIs actually installed — the probe
+result overrides the version in the restored binding and makes
+round-trip tests environment-dependent (the conformance suite blew up on
+its very first run, on a mac with openclaw 2026.3.8 installed).
+
+Rule: write the probe as a package-level `var probeXxx = func(...)` and
+stub it to return `""` in tests. New adapters copy the `claudecode`
+`probeVersion` pattern.
+
+### Marker injection/strip must be lossless — don't reintroduce newline normalization
+
+The historical `platform.UpsertMarkedSection` "ensured a blank line
+before the section" by appending newlines to the owner content. That
+normalization is not invertible (`"abc"` and `"abc\n"` produce the same
+file), so `StripInjected` had to guess — it trimmed ALL trailing
+newlines, eating the owner's final `\n`. Consequence: every injected
+file phantom-drifted exactly **once per agent lifetime** on first boot
+(a wasted `chain.Update`, plus silently rewritten owner bytes) before
+converging.
+
+The current wire format is lossless: the separator (exactly one `\n`)
+belongs to the section, owner bytes are preserved verbatim, and
+`StripInjected(UpsertMarkedSection(x)) == x` holds strictly. Before
+touching this code, run both adapters' conformance + injection
+round-trip tests.
+
 ---
 
 ## Fault localization (serve-proof / sealed runtime)

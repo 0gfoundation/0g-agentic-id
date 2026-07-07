@@ -361,6 +361,17 @@ bootstrap → framework → status report）、chainSnapshot vs currentSnapshot
 "演化即上链"数据流、leaf 与 DirectoryManifest 两种 iData shape，以及
 framework adapter 抽象层（当前 openclaw 是唯一接入）。
 
+**[`sealed/FRAMEWORK_ADAPTER.zh.md`](sealed/FRAMEWORK_ADAPTER.zh.md) — framework adapter 接入契约**
+
+把其他 agent 框架（eliza、autogen、自研编排器……）接进 sealed 运行时
+的集成契约：`framework.Framework` 接口逐方法的语义与不变量（Restore
+交换律、EvolutionFor 确定性与 round-trip 稳定、Defaults ↔ 链上缺席
+等价）、binding 驱动的 adapter 选择、强制的 `persona` 种子 role
+翻译、DirectoryManifest 格式与 empty-ptr/filled-ptr 陷阱、adapter
+各方法被调用的完整生命周期时间线、conformance 测试套件,以及移植第二
+个 adapter（claude-code）的实录。框架知识全部住在这里——attestor 只
+把框架名当不透明字符串经手。
+
 **[`sealed/AGENT_DOCTRINE.zh.md`](sealed/AGENT_DOCTRINE.zh.md) — agent 钢印手册**
 
 sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒绝做的
