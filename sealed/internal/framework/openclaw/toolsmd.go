@@ -1,10 +1,6 @@
 package openclaw
 
 import (
-	"bytes"
-	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"seal-verify/internal/platform"
@@ -37,68 +33,28 @@ import (
 // stay platform-neutral while the on-disk files keep per-boot platform
 // content for the LLM.
 
+// The marker delivery primitive moved to internal/platform/markers.go when
+// the second adapter (claudecode) needed byte-identical strip rules. The
+// package-local names below are thin aliases so this adapter's call sites
+// and tests read the same as before the move.
+
 const (
-	platformMarkerStart = "<!-- 0g-platform-injected:start -->"
-	platformMarkerEnd   = "<!-- 0g-platform-injected:end -->"
+	platformMarkerStart = platform.MarkerStart
+	platformMarkerEnd   = platform.MarkerEnd
 )
 
-// upsertMarkedSection writes (or replaces) a marker-delimited body in
-// path. Owner / agent content outside the markers is preserved.
-//
-// Empty body → strip the existing section entirely and leave whatever
-// remains. Used by upsertToolsMD / upsertIdentityMD / upsertSoulMD.
 func upsertMarkedSection(path, body string) error {
-	existing, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read %s: %w", path, err)
-	}
-	cleaned := stripPlatformInjection(existing)
-
-	var out []byte
-	if body == "" {
-		out = cleaned
-	} else {
-		section := platformMarkerStart + "\n" + body + platformMarkerEnd + "\n"
-		if len(cleaned) > 0 && !bytes.HasSuffix(cleaned, []byte("\n")) {
-			cleaned = append(cleaned, '\n')
-		}
-		if len(cleaned) > 0 {
-			cleaned = append(cleaned, '\n')
-		}
-		out = append(cleaned, []byte(section)...)
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
-	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
-	}
-	return nil
+	return platform.UpsertMarkedSection(path, body)
 }
 
 // stripPlatformInjection removes the marker-delimited section, returning
-// the agent-owned content only. Files without markers pass through
-// unchanged. Used by:
+// the agent-owned content only. Used by:
 //
 //   - upsertMarkedSection before re-injecting (idempotent updates)
 //   - evolution_paths.go evoWorkspace before hashing every md
 //   - restore_paths.go LoadEntry to return canonical plaintext
 func stripPlatformInjection(content []byte) []byte {
-	s := bytes.Index(content, []byte(platformMarkerStart))
-	if s < 0 {
-		return content
-	}
-	rest := content[s:]
-	e := bytes.Index(rest, []byte(platformMarkerEnd))
-	if e < 0 {
-		return bytes.TrimRight(content[:s], "\n")
-	}
-	before := bytes.TrimRight(content[:s], "\n")
-	after := bytes.TrimLeft(rest[e+len(platformMarkerEnd):], "\n")
-	if len(after) == 0 {
-		return before
-	}
-	return append(append(before, '\n', '\n'), after...)
+	return platform.StripInjected(content)
 }
 
 // upsertToolsMD writes (or replaces) the sealed-managed section in

@@ -20,13 +20,18 @@ func TestStripPlatformInjection_NoMarker(t *testing.T) {
 }
 
 func TestStripPlatformInjection_FullSection(t *testing.T) {
+	// The "\n\n" before the marker is one owner newline + the section's
+	// own separator; strip removes exactly the separator and preserves
+	// the owner's trailing newline byte-exactly. (The historical trim-all
+	// behaviour ate the owner's "\n" and phantom-drifted every injected
+	// file once per agent lifetime.)
 	in := []byte("# TOOLS\n\nOwner content.\n\n" +
 		platformMarkerStart + "\n" +
 		"## Environment\n" +
 		"injected stuff\n" +
 		platformMarkerEnd + "\n")
 	out := stripPlatformInjection(in)
-	want := "# TOOLS\n\nOwner content."
+	want := "# TOOLS\n\nOwner content.\n"
 	if string(out) != want {
 		t.Errorf("strip mismatch\n want: %q\n  got: %q", want, string(out))
 	}
@@ -51,7 +56,9 @@ func TestStripPlatformInjection_MissingEndMarker(t *testing.T) {
 		platformMarkerStart + "\n" +
 		"injected stuff with no end\n")
 	out := stripPlatformInjection(in)
-	want := "# TOOLS\n\nOwner content."
+	// Truncated section: everything from the separator on is dropped,
+	// owner trailing newline preserved (lossless contract).
+	want := "# TOOLS\n\nOwner content.\n"
 	if string(out) != want {
 		t.Errorf("truncated strip mismatch\n want: %q\n  got: %q", want, string(out))
 	}
