@@ -275,11 +275,12 @@ No real interaction, no legitimate review. Score farming is structurally
 impossible — you can't forge a signature that only a live TEE runtime can
 produce.
 
-Reputation also **binds to the specific iData in effect at the moment of
-service**, not to the agent's static tokenId. Upgrade the model or change
-the config, and that new version starts accumulating reputation from zero.
-Whatever has accumulated belongs to a specific configuration that did
-real, verifiable work.
+Each feedback also **records the exact iData in effect when it was earned**
+(the `dataHashes` in the proof), so reputation is auditable against what the
+agent was actually running — not just its static tokenId. Aggregating reputation
+*by* that data version — so a reconfigured agent's old scores are discounted — is
+designed (see [`REPUTATION_MODEL.md`](REPUTATION_MODEL.md)); today's on-chain
+`getSummary` is still id-bound (per tokenId).
 
 ```solidity
 struct ServeProof {

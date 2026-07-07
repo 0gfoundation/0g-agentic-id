@@ -226,9 +226,11 @@ AgenticID 扩展了 **ERC-8004**，加了一条关键要求：**每条评价都�
 AgentSeal 签名的服务证明（ServeProof）**。没有真实交互，就没有合法评价。
 刷分在结构上做不到——你伪造不出一个只有活着的 TEE 运行时才能生成的签名。
 
-声誉还**绑定到服务发生那一刻生效的具体 iData**，而不是 agent 静态的 tokenId。
-升级模型或改配置，那个新版本就从零开始积累声誉。积累下来的东西，属于一个完成
-了真实、可验证工作的具体配置。
+每条反馈还**记录了它挣分那一刻生效的具体 iData**（proof 里的 `dataHashes`），
+所以声誉可以对照"agent 当时实际在跑什么"来审计，而不只是它静态的 tokenId。至于
+按这个数据版本**分版本聚合**声誉（让改过配置的 agent 旧分被打折）——那是设计
+（见 [`REPUTATION_MODEL.md`](REPUTATION_MODEL.md)）；当前链上的 `getSummary` 仍是
+id-bound（按 tokenId）。
 
 ```solidity
 struct ServeProof {

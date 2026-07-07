@@ -45,9 +45,8 @@ Everything in this document rests on **one** load-bearing property:
 Take this invariant away and the rest collapses:
 
 - If the owner could read the private key, they could sign forged
-  `serve-proof`s offline with arbitrary `req_body_hash`,
-  `resp_body_hash`, or `data_hashes` — no actual request would need to
-  reach sealed at all.
+  `serve-proof`s offline with an arbitrary `task_hash` or `data_hashes`
+  — no actual request would need to reach sealed at all.
 - Schema-bound signing endpoints become irrelevant; the owner just
   signs whatever they want directly.
 - All wallet protections become irrelevant. The owner drains both
@@ -362,21 +361,25 @@ Each `X-Agent-Proof` header carries a signed envelope of the form:
 
 ```json
 {
-  "method":         "GET",
-  "uri":            "/hello",
-  "req_body_hash":  "0x<keccak256(request body)>",
-  "status":         200,
-  "resp_body_hash": "0x<keccak256(response body)>",
-  "data_hashes":    {
-    "framework": {"content_hash": "...", "data_hash": "0x..."},
-    "persona":   {"content_hash": "...", "data_hash": "0x..."},
-    ...
-  },
-  "ts":             1778580000
+  "agent_id":       "42",
+  "timestamp":      1778580000,
+  "deadline":       1778580300,
+  "task_hash":      "0x<keccak256 over the request/response transcript>",
+  "data_hashes":    ["0x<iData root>", "..."],
+  "framework_hash": "0x<sealed image measurement>"
 }
 ```
 
-signed by `agent_seal_priv` using EIP-191.
+signed by `agent_seal_priv` using EIP-191 (the 65-byte signature travels
+alongside the envelope in the `X-Agent-Proof` header). The request/response
+transcript is **committed via `task_hash`**, not exposed as separate fields:
+
+```
+task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody) ‖ status)
+```
+
+This is the on-chain `ServeProof` shape (client-less; attribution is `msg.sender`
+at `giveFeedback`, single-use via the signature nonce).
 
 Together with the TEE attestation chain (image_hash → open-source build),
 verifying this signature gives you the following **strong, cryptographic**
@@ -386,12 +389,12 @@ guarantees:
 |---|-----------|-----------|
 | 1 | **Code authenticity**: output was produced by the open-source code corresponding to `image_hash` | TEE attestation; `image_hash` published on chain at mint |
 | 2 | **Execution integrity**: the host (Daytona / attestor) did not tamper with execution | TDX / hardware enclave |
-| 3 | **Request binding**: response is for THIS request, not a substituted one | `req_body_hash` in signed envelope |
-| 4 | **Response binding**: `resp_body_hash` matches the body bytes; bytes are not replaceable post-signing | `resp_body_hash` in signed envelope |
-| 5 | **State binding**: at response time, the agent's 5-dim iData state was exactly these hashes | `data_hashes` in signed envelope, cross-checkable against `AgenticID.intelligentDatasOf(tokenId)` |
+| 3 | **Request binding**: response is for THIS request, not a substituted one | request (method/uri/body) folded into `task_hash` in the signed envelope |
+| 4 | **Response binding**: the response body matches; bytes are not replaceable post-signing | response (status/body) folded into `task_hash` in the signed envelope |
+| 5 | **State binding**: at response time, the agent's iData state was exactly these hashes | `data_hashes` in signed envelope, cross-checkable against `AgenticID.intelligentDatasOf(tokenId)` |
 | 6 | **Identity binding**: signer is the `agent_seal_addr` registered on chain for this `tokenId` | `ecrecover(sig)` on signed hash |
-| 7 | **Non-repudiation**: neither owner nor agent can later deny the request happened | `req_body_hash` is keccak of actual bytes |
-| 8 | **Time binding**: signing timestamp is part of the envelope | `ts` field |
+| 7 | **Non-repudiation**: neither owner nor agent can later deny the request happened | `task_hash` is keccak over the actual request/response bytes |
+| 8 | **Time binding**: signing timestamp + submission deadline are in the envelope | `timestamp` / `deadline` fields |
 
 ---
 
@@ -419,11 +422,11 @@ required.
 **Group B: content layer (#3 #4 #5 #7 #8 — additional precondition:
 the signing capability is not being abused)**
 
-- **#3 Request binding** (`req_body_hash`)
-- **#4 Response binding** (`resp_body_hash`)
+- **#3 Request binding** (request folded into `task_hash`)
+- **#4 Response binding** (response folded into `task_hash`)
 - **#5 State binding** (`data_hashes`)
 - **#7 Non-repudiation** (depends on #3)
-- **#8 Time binding** (`ts`)
+- **#8 Time binding** (`timestamp` / `deadline`)
 
 These five are also hard cryptographic assertions signed by
 `agent_seal_priv` — `keccak256(envelope)` uniquely determines those

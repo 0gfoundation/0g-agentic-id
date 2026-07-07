@@ -40,7 +40,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 把这条不变量拿走，剩下的全塌：
 
 - 如果 owner 能读到私钥，他们可以在线下签出伪造的 `serve-proof`，
-  填任意的 `req_body_hash` / `resp_body_hash` / `data_hashes` ——
+  填任意的 `task_hash` / `data_hashes` ——
   根本不需要任何真实请求到达 sealed
 - schema 绑定的签名 endpoint 变得无关紧要 —— owner 直接签他们想签
   的任何东西
@@ -317,21 +317,25 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 
 ```json
 {
-  "method":         "GET",
-  "uri":            "/hello",
-  "req_body_hash":  "0x<keccak256(request body)>",
-  "status":         200,
-  "resp_body_hash": "0x<keccak256(response body)>",
-  "data_hashes":    {
-    "framework": {"content_hash": "...", "data_hash": "0x..."},
-    "persona":   {"content_hash": "...", "data_hash": "0x..."},
-    ...
-  },
-  "ts":             1778580000
+  "agent_id":       "42",
+  "timestamp":      1778580000,
+  "deadline":       1778580300,
+  "task_hash":      "0x<对请求/响应 transcript 的 keccak256>",
+  "data_hashes":    ["0x<iData root>", "..."],
+  "framework_hash": "0x<sealed 镜像度量>"
 }
 ```
 
-由 `agent_seal_priv` 用 EIP-191 签名。
+由 `agent_seal_priv` 用 EIP-191 签名(65 字节签名与 envelope 一起放在
+`X-Agent-Proof` header 里)。请求/响应 transcript **折进 `task_hash`**,不再作为
+独立字段暴露:
+
+```
+task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody) ‖ status)
+```
+
+这就是链上 `ServeProof` 的形状(无 client;归属由 `giveFeedback` 时的 `msg.sender`
+决定,靠签名 nonce 保证一次性)。
 
 配合 TEE attestation 链（image_hash → 开源构建），验证这条签名能
 拿到以下**强、密码学**保证：
@@ -340,12 +344,12 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 |---|---|---|
 | 1 | **代码真实性** —— 输出由 `image_hash` 对应的开源代码产生 | TEE attestation；`image_hash` 在 mint 时发布上链 |
 | 2 | **执行完整性** —— host（attestor/sandbox）没有篡改执行 | TDX / 硬件 enclave |
-| 3 | **请求绑定** —— 响应针对**这条**请求，不是被替换过的 | signed envelope 里的 `req_body_hash` |
-| 4 | **响应绑定** —— `resp_body_hash` 匹配 body 字节；签完之后字节不可换 | signed envelope 里的 `resp_body_hash` |
-| 5 | **状态绑定** —— 响应时刻，agent 的 5 维 iData 状态就是这些 hash | signed envelope 里的 `data_hashes`，可与 `AgenticID.intelligentDatasOf(tokenId)` 交叉校验 |
+| 3 | **请求绑定** —— 响应针对**这条**请求，不是被替换过的 | 请求(method/uri/body)折进 signed envelope 的 `task_hash` |
+| 4 | **响应绑定** —— 响应 body 匹配；签完之后字节不可换 | 响应(status/body)折进 signed envelope 的 `task_hash` |
+| 5 | **状态绑定** —— 响应时刻，agent 的 iData 状态就是这些 hash | signed envelope 里的 `data_hashes`，可与 `AgenticID.intelligentDatasOf(tokenId)` 交叉校验 |
 | 6 | **身份绑定** —— 签名者就是这个 `tokenId` 在链上注册的 `agent_seal_addr` | 对签名 hash 做 `ecrecover(sig)` |
-| 7 | **不可抵赖** —— owner 和 agent 之后都没法否认请求发生过 | `req_body_hash` 是真实字节的 keccak |
-| 8 | **时间绑定** —— 签名时间戳是 envelope 的一部分 | `ts` 字段 |
+| 7 | **不可抵赖** —— owner 和 agent 之后都没法否认请求发生过 | `task_hash` 是真实请求/响应字节的 keccak |
+| 8 | **时间绑定** —— 签名时间戳 + 提交 deadline 都在 envelope 里 | `timestamp` / `deadline` 字段 |
 
 ---
 
@@ -367,11 +371,11 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 
 **Group B：内容层（#3 #4 #5 #7 #8 —— 多一个"签名能力不被滥用"前提）**
 
-- **#3 请求绑定**（`req_body_hash`）
-- **#4 响应绑定**（`resp_body_hash`）
+- **#3 请求绑定**（请求折进 `task_hash`）
+- **#4 响应绑定**（响应折进 `task_hash`）
 - **#5 状态绑定**（`data_hashes`）
 - **#7 不可抵赖**（依赖 #3）
-- **#8 时间绑定**（`ts`）
+- **#8 时间绑定**（`timestamp` / `deadline`）
 
 这五条也是 `agent_seal_priv` 密码学签出来的硬断言 —— `keccak256(envelope)`
 唯一对应那几个字段值，验签通过就说明 priv 持有方**声明过**这些值。
