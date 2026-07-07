@@ -35,6 +35,12 @@ pub struct ConfigResponse {
     pub sandbox_provider_addr: Option<String>,
     pub sandbox_serving_addr: Option<String>,
     pub sandbox_snapshot: String,
+
+    /// Framework names deploys may select. Frontend renders the deploy
+    /// picker from this so invalid choices can't be expressed; the deploy
+    /// route enforces the same list pre-mint (this copy is UX, that copy
+    /// is the boundary).
+    pub supported_frameworks: Vec<String>,
 }
 
 pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -61,5 +67,6 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .sandbox_serving_addr
             .map(|a| format!("{:#x}", a)),
         sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
+        supported_frameworks: state.cfg.supported_frameworks.clone(),
     })
 }

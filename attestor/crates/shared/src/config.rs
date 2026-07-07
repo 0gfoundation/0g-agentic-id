@@ -94,8 +94,19 @@ pub struct Config {
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
-    /// sealed-runtime image without code changes.
+    /// sealed-runtime image without code changes. One universal image
+    /// serves every framework — which framework runs is decided by the
+    /// agent's on-chain binding, not the image.
     pub sandbox_snapshot: String,
+
+    /// Framework names deploys may select — the attestor's ONLY
+    /// framework knowledge, and it is a list of opaque strings: validated
+    /// pre-mint at the deploy edge, written verbatim into the synthesized
+    /// binding, listed by GET /config for the UI picker. Must be a subset
+    /// of the adapters the sealed binary in `sandbox_snapshot` registers;
+    /// keep the two in sync at image-release time (a name sealed doesn't
+    /// know mints a bricked agent).
+    pub supported_frameworks: Vec<String>,
 
     /// EIP-1559 priority fee (tip, gwei) set on every attestor-sent tx.
     /// Must be ≥ the chain's minimum (0G testnet enforces 2 gwei).
@@ -220,6 +231,14 @@ impl Config {
                 .and_then(|s| s.parse().ok()),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
+            supported_frameworks: env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")
+                .map(|s| {
+                    s.split(',')
+                        .map(|f| f.trim().to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["openclaw".to_string(), "claude-code".to_string()]),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),

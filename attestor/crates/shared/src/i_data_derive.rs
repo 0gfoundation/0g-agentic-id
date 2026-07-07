@@ -1,29 +1,80 @@
-//! Post-intake normalization of user-supplied `i_data` entries.
+//! Post-intake normalization of user-supplied `i_data` entries — the
+//! framework-agnostic replacement for the old per-framework
+//! `AgentProfile` system.
 //!
-//! Per-role merge: user entries override the registry-fallback
-//! profile's defaults by `role`. Default roles the user didn't supply
-//! are preserved; user roles unknown to the profile are appended at
-//! the end. Empty user input → defaults verbatim. Sub-field merging
-//! inside a single dim's plaintext is deliberately NOT done — if a
-//! user wants to override `persona`, they send the FULL persona JSON;
-//! the profile's `default_i_data` is only consulted role-by-role.
-//! Keeps normalize purely structural; per-profile plaintext shape
-//! stays the profile's concern.
+//! attestor synthesizes exactly two neutral defaults when the user omits
+//! a role, and understands neither beyond their protocol shape:
+//!
+//!   `role="framework"` — a VERSION-LESS binding `{name, schema_version}`.
+//!     `name` is the opaque framework string the deploy request selected
+//!     (validated against `supported_frameworks` at the API edge). The
+//!     sealed adapter resolves the missing version to its own validated
+//!     whitelistMax — version knowledge lives with the code that
+//!     validates versions, not here.
+//!
+//!   `role="persona"` — the protocol seed `{system_prompt, inference}`.
+//!     Every sealed adapter is contractually required to translate it
+//!     into its own config artifacts (FRAMEWORK_ADAPTER.md §5.4), which
+//!     is what lets this synthesis stay framework-neutral.
+//!
+//! Per-role merge: user entries override the defaults by `role`; roles
+//! the user didn't supply are preserved; user roles outside the default
+//! set are appended. Sub-field merging inside a single dim's plaintext is
+//! deliberately NOT done — a user overriding `persona` sends the FULL
+//! persona JSON.
 
-use crate::agent_profile::ProfileRegistry;
 use crate::types::IDataInput;
 use std::collections::HashMap;
+
+/// Protocol schema version stamped into the framework binding. Bumped
+/// only when the binding shape itself changes.
+pub const BINDING_SCHEMA_VERSION: u32 = 1;
+
+/// Product-level inference defaults for the persona seed. These are
+/// deploy defaults, not framework knowledge — adapters that can't honour
+/// them (e.g. a non-anthropic-capable framework) log and keep their own
+/// default per the seed-ingestion contract.
+pub const DEFAULT_INFERENCE_PROVIDER: &str = "anthropic";
+pub const DEFAULT_INFERENCE_MODEL: &str = "claude-opus-4-6";
+
+/// The neutral default iData set: version-less framework binding +
+/// persona seed. `framework` is treated as an opaque name.
+pub fn default_i_data(framework: &str, name: &str, description: &str) -> Vec<IDataInput> {
+    let binding = serde_json::json!({
+        "name":           framework,
+        "schema_version": BINDING_SCHEMA_VERSION,
+    });
+    let persona = serde_json::json!({
+        "system_prompt": format!("You are {name}. {description}\n"),
+        "inference": {
+            "provider": DEFAULT_INFERENCE_PROVIDER,
+            "model":    DEFAULT_INFERENCE_MODEL,
+        },
+    });
+    vec![
+        IDataInput {
+            role: "framework".into(),
+            plaintext: binding,
+            extra: Default::default(),
+        },
+        IDataInput {
+            role: "persona".into(),
+            plaintext: persona,
+            extra: Default::default(),
+        },
+    ]
+}
 
 /// Normalize the user's raw i_data into a worker-safe form.
 ///
 /// Pure function — no I/O, trivially testable.
 pub fn normalize_i_data(
     raw: Vec<IDataInput>,
+    framework: &str,
     name: &str,
     description: &str,
-    registry: &ProfileRegistry,
 ) -> Vec<IDataInput> {
-    let defaults = registry.fallback().default_i_data(name, description);
+    let defaults = default_i_data(framework, name, description);
     if raw.is_empty() {
         return defaults;
     }
@@ -46,18 +97,38 @@ pub fn normalize_i_data(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_profile::OpenClawProfile;
-    use std::sync::Arc;
 
-    fn registry() -> ProfileRegistry {
-        ProfileRegistry::new(Arc::new(OpenClawProfile))
+    #[test]
+    fn empty_raw_produces_neutral_defaults() {
+        let out = normalize_i_data(Vec::new(), "claude-code", "Sage", "helper");
+        let roles: Vec<&str> = out.iter().map(|e| e.role.as_str()).collect();
+        assert_eq!(roles, vec!["framework", "persona"]);
     }
 
     #[test]
-    fn empty_raw_produces_profile_defaults() {
-        let out = normalize_i_data(Vec::new(), "Sage", "helper", &registry());
-        let roles: Vec<&str> = out.iter().map(|e| e.role.as_str()).collect();
-        assert_eq!(roles, vec!["framework", "persona"]);
+    fn binding_is_version_less_and_carries_opaque_name() {
+        // attestor must not speak any framework's release scheme: the
+        // binding names the framework and nothing else; the sealed
+        // adapter fills whitelistMax for the missing version.
+        let out = default_i_data("claude-code", "Sage", "helper");
+        let fw = &out.iter().find(|e| e.role == "framework").unwrap().plaintext;
+        assert_eq!(fw["name"], "claude-code");
+        assert_eq!(fw["schema_version"], 1);
+        assert!(
+            fw.get("package_version").is_none(),
+            "binding must be version-less; got {fw}"
+        );
+    }
+
+    #[test]
+    fn persona_embeds_name_description_and_inference() {
+        let out = default_i_data("openclaw", "Sage", "DeFi helper");
+        let p = &out.iter().find(|e| e.role == "persona").unwrap().plaintext;
+        let prompt = p["system_prompt"].as_str().expect("system_prompt is a string");
+        assert!(prompt.contains("Sage"));
+        assert!(prompt.contains("DeFi helper"));
+        assert_eq!(p["inference"]["provider"], DEFAULT_INFERENCE_PROVIDER);
+        assert_eq!(p["inference"]["model"], DEFAULT_INFERENCE_MODEL);
     }
 
     #[test]
@@ -73,7 +144,7 @@ mod tests {
             plaintext: user_persona.clone(),
             extra: Default::default(),
         }];
-        let out = normalize_i_data(raw, "Sage", "helper", &registry());
+        let out = normalize_i_data(raw, "openclaw", "Sage", "helper");
         assert_eq!(out.len(), 2, "framework + persona");
         // Default framework preserved (didn't accidentally drop it)
         let framework = out.iter().find(|e| e.role == "framework").expect("framework dim");
@@ -86,15 +157,15 @@ mod tests {
 
     #[test]
     fn user_unknown_role_is_appended() {
-        // Forward-compat: future profiles or power users may add roles
-        // outside the default set (e.g. role="memory"). They land at the
-        // tail, defaults stay intact.
+        // Forward-compat: power users may add roles outside the default
+        // set (e.g. role="memory"). They land at the tail, defaults stay
+        // intact.
         let raw = vec![IDataInput {
             role: "memory".into(),
             plaintext: serde_json::json!({"notes": "hi"}),
             extra: Default::default(),
         }];
-        let out = normalize_i_data(raw, "Sage", "helper", &registry());
+        let out = normalize_i_data(raw, "openclaw", "Sage", "helper");
         assert_eq!(out.len(), 3, "framework + persona + memory");
         let roles: Vec<&str> = out.iter().map(|e| e.role.as_str()).collect();
         assert!(roles.contains(&"framework"));
@@ -122,7 +193,7 @@ mod tests {
                 extra: Default::default(),
             },
         ];
-        let out = normalize_i_data(raw, "Sage", "helper", &registry());
+        let out = normalize_i_data(raw, "openclaw", "Sage", "helper");
         assert_eq!(out.len(), 2);
         assert_eq!(
             out.iter().find(|e| e.role == "framework").unwrap().plaintext["name"],

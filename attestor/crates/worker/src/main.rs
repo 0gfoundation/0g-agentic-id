@@ -4,7 +4,6 @@
 mod jobs;
 
 use attestor_shared::{
-    agent_profile::{OpenClawProfile, ProfileRegistry},
     chain::connect_http as chain_connect_http,
     crypto::{InMemoryMasterKey, RealCrypto},
     events_bus::PostgresEventBus,
@@ -111,10 +110,6 @@ async fn main() -> anyhow::Result<()> {
         )
     })?;
 
-    // Framework profile registry — OpenClaw is the v0 fallback. Add
-    // future profiles via `.register()` before freezing into Arc.
-    let registry = Arc::new(ProfileRegistry::new(Arc::new(OpenClawProfile)));
-
     let ctx = Ctx {
         cfg: cfg.clone(),
         crypto,
@@ -124,7 +119,6 @@ async fn main() -> anyhow::Result<()> {
         deployments,
         events,
         oss,
-        registry,
     };
 
     // background sweep task — three responsibilities, same 60s tick:

@@ -3,7 +3,6 @@
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
-    agent_profile::ProfileRegistry,
     i_data_derive::normalize_i_data,
     oss::OssClient,
     sandbox::SandboxError,
@@ -35,9 +34,6 @@ pub struct Ctx {
     /// OSS client for AgentCard uploads. Required — deploy fails if
     /// not configured (no more placeholder URIs).
     pub oss: Arc<OssClient>,
-    /// Framework profile registry — picks defaults per user's
-    /// `framework.name`, falls back to OpenClaw.
-    pub registry: Arc<ProfileRegistry>,
 }
 
 pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
@@ -46,6 +42,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             owner,
             i_data,
+            framework,
             name,
             description,
             image,
@@ -58,6 +55,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 seal_id,
                 owner,
                 i_data,
+                &framework,
                 name,
                 description,
                 image,
@@ -754,19 +752,17 @@ async fn handle_deploy(
     seal_id: SealId,
     owner: Address,
     i_data_inputs: Vec<IDataInput>,
+    framework: &str,
     name: String,
     description: String,
     image: Option<String>,
     sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
-    // v0: normalize_i_data drops user input and replaces with the
-    // fallback profile's defaults (framework + persona).
-    let i_data_inputs = normalize_i_data(
-        i_data_inputs,
-        &name,
-        &description,
-        ctx.registry.as_ref(),
-    );
+    // Neutral normalization: user entries win per-role; missing roles get
+    // the framework-agnostic defaults (version-less binding naming
+    // `framework` + persona seed). The deploy route already validated the
+    // name against supported_frameworks.
+    let i_data_inputs = normalize_i_data(i_data_inputs, framework, &name, &description);
 
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
@@ -1103,16 +1099,10 @@ async fn run_phase2(
     let sandbox_id = d.sandbox_id.clone().unwrap_or_default();
     let agent_seal_addr = d.agent_seal_addr;
 
-    // v0 always uses the registry's fallback profile (OpenClaw) for
-    // capabilities + extra attributes — per-deployment framework picks
-    // are a future concern (will read framework.name from the framework
-    // dim plaintext at that point).
-    let profile = ctx.registry.fallback();
     let agent_card = build_agent_card(AgentCardInputs {
         name,
         description,
         image,
-        profile,
         agent_id,
         agent_seal_addr,
         chain_id: ctx.cfg.chain_id,
@@ -1432,7 +1422,6 @@ async fn run_container_track(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, U256};
-    use attestor_shared::agent_profile::{openclaw::OpenClawProfile, ProfileRegistry};
     use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
     use attestor_shared::events::WsEvent;
     use attestor_shared::mocks::{
@@ -1478,6 +1467,7 @@ mod tests {
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
             sandbox_snapshot: "0g-test-sealed".into(),
+            supported_frameworks: vec!["openclaw".into(), "claude-code".into()],
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,
@@ -1509,7 +1499,6 @@ mod tests {
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
         let events = Arc::new(InMemoryEventBus::new());
         let oss = OssClient::for_test();
-        let registry = Arc::new(ProfileRegistry::new(Arc::new(OpenClawProfile)));
 
         let ctx = Ctx {
             cfg: test_config(),
@@ -1520,7 +1509,6 @@ mod tests {
             deployments: deployments.clone(),
             events: events.clone(),
             oss,
-            registry,
         };
         TestCtx { ctx, chain, storage, sandbox, deployments, events }
     }
@@ -1642,6 +1630,7 @@ mod tests {
             seal,
             Address::from([0x66; 20]),
             Vec::new(),
+            "openclaw",
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
@@ -1695,6 +1684,7 @@ mod tests {
             seal,
             Address::from([0x66; 20]),
             Vec::new(),
+            "openclaw",
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,

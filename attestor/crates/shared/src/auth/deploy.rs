@@ -23,6 +23,13 @@ pub struct CanonicalDeploy {
     pub image: Option<String>,
     #[serde(default)]
     pub i_data: Vec<IDataInput>,
+    /// Framework selection is identity-relevant (it becomes the minted
+    /// binding's `name`), so it must be signature-covered: a request that
+    /// sets `framework` is only valid if the signed payload sets the same
+    /// value. Optional for backwards compat — payloads signed before the
+    /// field existed verify unchanged (None == None).
+    #[serde(default)]
+    pub framework: Option<String>,
 }
 
 impl Canonical for CanonicalDeploy {
@@ -61,6 +68,9 @@ pub fn verify_deploy_signature(
     }
     if canon.image != req.image {
         anyhow::bail!("owner envelope: image mismatch");
+    }
+    if canon.framework != req.framework {
+        anyhow::bail!("owner envelope: framework mismatch");
     }
     // i_data comparison via re-serialization — both sides go through
     // the same serde path so structurally equivalent inputs match
@@ -121,6 +131,7 @@ mod tests {
             description: description.to_string(),
             image,
             i_data,
+            framework: None,
             sandbox_envelope: SandboxEnvelope {
                 wallet_address: signer.address(),
                 signed_message_b64: String::new(),
@@ -143,6 +154,18 @@ mod tests {
         req.name = "Evil".to_string();
         let err = verify_deploy_signature(&req, crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("name mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn tampered_framework_rejected() {
+        // Framework becomes the minted binding's name — a MITM flipping it
+        // would mint an identity the owner didn't sign for. The signed
+        // payload (framework absent → None) must match the request.
+        let signer = PrivateKeySigner::random();
+        let mut req = build(&signer, "idem-1", "Sage", "hi", None, Vec::new());
+        req.framework = Some("claude-code".to_string());
+        let err = verify_deploy_signature(&req, crypto().as_ref()).unwrap_err();
+        assert!(err.to_string().contains("framework mismatch"), "got: {err}");
     }
 
     #[test]
@@ -183,6 +206,7 @@ mod tests {
             description: "hi".to_string(),
             image: None,
             i_data: Vec::new(),
+            framework: None,
             sandbox_envelope: SandboxEnvelope {
                 wallet_address: signer.address(),
                 signed_message_b64: String::new(),
