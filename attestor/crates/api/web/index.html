@@ -489,15 +489,14 @@ small.hint{display:block;color:var(--text2);font-size:var(--fs-sm);margin-top:10
 .seal-f .hash b.reseal{animation:reseal .6s var(--ease-out)}
 @keyframes reseal{0%{color:oklch(78% 0.16 145);text-shadow:0 0 12px oklch(72% 0.16 145 / 0.7)}100%{color:oklch(72% 0.15 315);text-shadow:none}}
 .seal-cap{font-size:var(--fs-xs);color:var(--muted);margin-top:10px;line-height:var(--lh-snug)}
-.chain-seal{margin-bottom:18px}
 
 /* Three-pillar feature cards */
 .home-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:36px}
-.home-feature{position:relative;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px;box-shadow:var(--sh-sm);transition:transform .3s var(--ease-spring),box-shadow .3s var(--ease-out),border-color var(--t-fast);overflow:hidden;isolation:isolate}
+.home-feature{position:relative;background:linear-gradient(180deg,var(--surf-top) 0%,var(--surf) 32%);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px;box-shadow:var(--sh-sm);transition:transform .3s var(--ease-spring),box-shadow .3s var(--ease-out),border-color var(--t-fast);overflow:hidden;isolation:isolate}
 /* big watermark numeral */
-.home-feature::after{content:attr(data-num);position:absolute;top:14px;right:18px;font-family:var(--mono);font-size:64px;font-weight:800;color:var(--surf2);letter-spacing:var(--ls-display);line-height:1;pointer-events:none;transition:color .4s var(--ease-out),transform .4s var(--ease-spring);z-index:0}
+.home-feature::after{content:none}
 /* radial spotlight that follows the card on hover */
-.home-feature .glow{position:absolute;inset:-30%;background:radial-gradient(circle at 30% 20%,oklch(70% 0.16 315 / .14),transparent 55%);opacity:0;transition:opacity .4s var(--ease-out);pointer-events:none;z-index:0}
+.home-feature .glow{display:none}
 /* top accent strip — slides in on hover */
 .home-feature::before{content:'';position:absolute;left:0;right:0;top:0;height:2px;background:var(--p);transform:scaleX(0);transform-origin:left;transition:transform .5s var(--ease-spring);z-index:1}
 .home-feature > *{position:relative;z-index:2}
@@ -4154,29 +4153,6 @@ function paintDetail(dep) {
 
     <div class="detail-grid">
       <div>
-        ${(() => {
-          // Dark identity receipt — the on-chain counterpart to deploy's
-          // "you will sign this". Same seal-panel visual language: what the
-          // owner signed at deploy is now live on chain, sealed to the TEE.
-          const shortHex = (h) => { if (!h) return '—'; const s = String(h).startsWith('0x') ? h : '0x' + h; return s.length > 16 ? s.slice(0, 8) + '…' + s.slice(-6) : s; };
-          const lock = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>`;
-          return `
-          <div class="seal-panel chain-seal">
-            <div class="seal-h">
-              <span class="t">Signed &amp; on chain</span>
-              <span class="lk">${lock} iData</span>
-            </div>
-            <div class="seal-b">
-              <div class="r"><span class="k">seal_id</span><span class="v accent">${shortHex(sealId)}</span></div>
-              <div class="r"><span class="k">agent_seal</span><span class="v">${shortHex(agentSealAddr)}</span></div>
-              <div class="r"><span class="k">owner</span><span class="v">${shortHex(dep.owner)}</span></div>
-              ${dep.agent_id ? `<div class="r"><span class="k">token_id</span><span class="v">#${escapeHtml(dep.agent_id)}</span></div>` : ''}
-            </div>
-            <div class="seal-f">
-              <div class="hash">runtime config sealed to the TEE — owner-signed, verifiable on 0G</div>
-            </div>
-          </div>`;
-        })()}
         ${serveBlock}
         <div class="section-title" style="margin-top:0">AgentCard</div>
         <div class="card" style="padding:14px 18px">
