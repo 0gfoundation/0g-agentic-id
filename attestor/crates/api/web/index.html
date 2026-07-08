@@ -4840,11 +4840,24 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           provider,
         );
         const datas = await c.intelligentDatasOf(BigInt(agentId));
-        const onChain = new Set(datas.map(d => String(d.dataHash).toLowerCase()));
+        // Map each on-chain dataHash → its role. The role lives in
+        // dataDescription (JSON {role, storage_ptr}); this is
+        // framework-agnostic — openclaw, claude-code, any adapter names
+        // its dims the same way, so the verifier reads the label off
+        // chain instead of hardcoding per-framework dim lists (or
+        // falling back to positional data[i]).
+        const roleByHash = new Map();
+        for (const d of datas) {
+          const hl = String(d.dataHash).toLowerCase();
+          let role = '';
+          try { role = JSON.parse(d.dataDescription).role || ''; } catch (_) { role = d.dataDescription || ''; }
+          roleByHash.set(hl, role);
+        }
+        const onChain = new Set(roleByHash.keys());
         const dims = declared.map((h, i) => {
           const hl = String(h).toLowerCase();
           const ok = onChain.has(hl);
-          return { role: `data[${i}]`, hash: hl,
+          return { role: (ok && roleByHash.get(hl)) ? roleByHash.get(hl) : `data[${i}]`, hash: hl,
                    status: ok ? 'passed' : 'failed',
                    note: ok ? 'on chain' : 'NOT on chain' };
         });
