@@ -12,7 +12,7 @@
 // Env:
 //   BRIDGE_PORT         listen port (adapter passes 3285)
 //   BRIDGE_WORKDIR      cwd for every claude invocation (the agent workspace)
-//   BRIDGE_ADMIN_TOKEN  bearer token gating /admin/* (surfaced to the
+//   BRIDGE_ADMIN_TOKEN  owner token gating /v1/query + /admin/* (surfaced to the
 //                       verified owner via sealed's /_seal/auth)
 //   ANTHROPIC_API_KEY   passed through to claude
 //
@@ -77,12 +77,26 @@ function send(res, status, obj) {
   res.end(body);
 }
 
-function isAdmin(req) {
+// The bridge admin token IS the owner-authentication token: it's the
+// value the owner gets from the sealed proxy's /_seal/auth flow
+// (adapter.AuthResponse returns it). Every capability that spends the
+// owner's inference key or mutates the owner's agent state is gated on
+// it — that's /v1/query as much as /admin/*. Without this, anyone with
+// the public URL could drain the owner's 0g-compute balance and corrupt
+// the agent's session/memory. This is a control surface, not a public
+// serve surface (a public serve endpoint would need per-call
+// payment/rate-limiting/ephemeral sessions — a separate feature).
+function isOwner(req) {
   const auth = req.headers['authorization'] || '';
   return ADMIN_TOKEN !== '' && auth === `Bearer ${ADMIN_TOKEN}`;
 }
 
 async function handleQuery(req, res) {
+  if (!isOwner(req)) {
+    return send(res, 401, {
+      error: 'owner authentication required — open this agent from the console (Manage) or pass the owner token as Bearer',
+    });
+  }
   let body;
   try {
     body = JSON.parse((await readBody(req)) || '{}');
@@ -125,7 +139,7 @@ async function handleQuery(req, res) {
 }
 
 function handleAdmin(req, res, url) {
-  if (!isAdmin(req)) return send(res, 401, { error: 'missing or bad admin token' });
+  if (!isOwner(req)) return send(res, 401, { error: 'owner authentication required' });
   if (req.method === 'POST' && url.pathname === '/admin/session/reset') {
     lastSessionId = null;
     return send(res, 200, { ok: true });
@@ -144,70 +158,123 @@ function handleAdmin(req, res, url) {
   return send(res, 404, { error: 'unknown admin endpoint' });
 }
 
-// Self-contained chat console (no external assets — the sealed proxy's
-// CSP and the loopback-only bridge both preclude them). Talks to the same
-// /v1/query the API exposes; the admin token (from the owner's
-// /_seal/auth flow) unlocks session reset + runtime info.
+// Self-contained OWNER control console (no external assets — the sealed
+// proxy's CSP and the loopback-only bridge both preclude them). This is
+// the owner's steering surface — driving the agent spends the owner's
+// inference key and mutates the owner's agent state — so every query
+// needs the owner token. The HTML shell is public; the capability is
+// not. The token arrives via the URL fragment (#token=…, the same way
+// openclaw's dashboard receives its token from the console's /_seal/auth
+// handshake) or can be pasted manually.
 const CHAT_PAGE = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Claude Code · 0G AgenticID</title>
 <style>
-  :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--user:#1f6feb;--ok:#3fb950}
+  /* Palette + type mirror the 0G AgenticID console (oklch, magenta-315
+     accent, Bricolage/Geist Mono named first, system fallback since the
+     CSP + loopback bridge can't fetch web fonts). Light + dark via
+     prefers-color-scheme, same tokens as the console. */
+  :root{
+    --p:oklch(50% 0.22 315); --pbg:oklch(96% 0.06 315); --pbd:oklch(84% 0.12 315);
+    --text:oklch(11% 0 0); --text2:oklch(36% 0.005 275); --muted:oklch(56% 0.005 275);
+    --bg:oklch(97.5% 0.003 275); --surf:oklch(100% 0 0); --surf2:oklch(96% 0.004 275);
+    --border:oklch(88% 0.005 275); --wash:oklch(94% 0.06 315 / 0.32);
+    --green:oklch(42% 0.18 145); --gbg:oklch(95% 0.05 145); --gbd:oklch(82% 0.10 145);
+    --red:oklch(52% 0.20 25); --rbg:oklch(96% 0.04 25); --rbd:oklch(84% 0.11 25);
+    --sans:'Bricolage Grotesque',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+    --mono:'Geist Mono',ui-monospace,'SF Mono',Menlo,monospace;
+    --r-sm:6px; --r:10px; --r-lg:14px; --t:150ms cubic-bezier(.2,.7,.3,1);
+    --sh:0 4px 20px oklch(0% 0 0 / .08); --sh-sm:0 1px 2px oklch(0% 0 0 / .05);
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --p:oklch(70% 0.20 315); --pbg:oklch(28% 0.10 315 / .6); --pbd:oklch(40% 0.14 315);
+    --text:oklch(96% 0.01 300); --text2:oklch(78% 0.015 300); --muted:oklch(58% 0.015 300);
+    --bg:oklch(16% 0.015 300); --surf:oklch(20% 0.015 300); --surf2:oklch(24% 0.015 300);
+    --border:oklch(26% 0.012 300); --wash:oklch(48% 0.20 315 / .18);
+    --green:oklch(72% 0.18 145); --gbg:oklch(26% 0.10 145 / .55); --gbd:oklch(40% 0.14 145);
+    --red:oklch(70% 0.18 25); --rbg:oklch(30% 0.10 25 / .5); --rbd:oklch(45% 0.14 25);
+    --sh:0 4px 20px oklch(0% 0 0 / .45);
+  }}
   *{box-sizing:border-box}
-  body{margin:0;font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column}
-  header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-  header h1{font-size:15px;margin:0;font-weight:600}
-  header .badge{font-size:12px;color:var(--dim);border:1px solid var(--line);border-radius:999px;padding:2px 10px}
-  header .spacer{flex:1}
-  header input{background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 9px;font-size:12px;width:230px}
-  header button{background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
-  header button:hover{border-color:var(--accent)}
-  #log{flex:1;overflow-y:auto;padding:20px;display:flex;flex-direction:column;gap:14px}
-  .msg{max-width:min(760px,92%);padding:11px 15px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-  .u{align-self:flex-end;background:var(--user);color:#fff;border-bottom-right-radius:3px}
-  .a{align-self:flex-start;background:var(--panel);border:1px solid var(--line);border-bottom-left-radius:3px}
-  .meta{align-self:center;font-size:12px;color:var(--dim)}
-  .a.err{border-color:#f85149;color:#ff7b72}
-  footer{border-top:1px solid var(--line);padding:12px 18px;display:flex;gap:10px}
-  #box{flex:1;resize:none;background:var(--panel);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:10px 12px;font:inherit;max-height:160px}
-  #send{background:var(--user);color:#fff;border:none;border-radius:8px;padding:0 20px;font-weight:600;cursor:pointer}
-  #send:disabled{opacity:.5;cursor:default}
-  code{background:#0b0f14;padding:1px 5px;border-radius:4px}
+  body{margin:0;font-family:var(--sans);font-size:15px;line-height:1.55;color:var(--text);height:100vh;display:flex;flex-direction:column;
+    background:radial-gradient(1100px 640px at 8% -140px,var(--wash),transparent 60%),var(--bg)}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:0 clamp(16px,4vw,32px);height:60px;
+    border-bottom:1px solid var(--border);background:color-mix(in oklch,var(--surf) 82%,transparent);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}
+  header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:-.01em}
+  .chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+    color:var(--green);background:var(--gbg);border:1px solid var(--gbd);border-radius:9999px;padding:3px 11px}
+  .spacer{flex:1}
+  #token{font-family:var(--mono);font-size:12px;width:200px;padding:7px 11px;color:var(--text);background:var(--surf);
+    border:1px solid var(--border);border-radius:var(--r-sm);transition:border-color var(--t),box-shadow var(--t)}
+  #token:focus{outline:none;border-color:var(--pbd);box-shadow:0 0 0 3px var(--pbg)}
+  #token::placeholder{color:var(--muted);font-family:var(--mono)}
+  .ghost{font-family:var(--sans);font-size:12px;font-weight:600;padding:6px 13px;color:var(--text2);cursor:pointer;
+    background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);transition:border-color var(--t),color var(--t)}
+  .ghost:hover{border-color:var(--pbd);color:var(--text)}
+  main{flex:1;overflow-y:auto;scrollbar-width:thin}
+  #log{max-width:860px;margin:0 auto;padding:26px clamp(16px,4vw,32px);display:flex;flex-direction:column;gap:16px}
+  .msg{max-width:82%;padding:12px 16px;border-radius:var(--r-lg);white-space:pre-wrap;word-wrap:break-word;box-shadow:var(--sh-sm);animation:rise .25s var(--t)}
+  .u{align-self:flex-end;background:var(--p);color:oklch(99% 0 0);border-bottom-right-radius:var(--r-sm)}
+  .a{align-self:flex-start;background:var(--surf);border:1px solid var(--border);color:var(--text);border-bottom-left-radius:var(--r-sm)}
+  .a.err{background:var(--rbg);border-color:var(--rbd);color:var(--red)}
+  .meta{align-self:center;max-width:640px;text-align:center;font-size:13px;color:var(--muted);line-height:1.5}
+  @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  footer{border-top:1px solid var(--border);background:color-mix(in oklch,var(--surf) 82%,transparent);backdrop-filter:blur(8px)}
+  .composer{max-width:860px;margin:0 auto;padding:14px clamp(16px,4vw,32px);display:flex;gap:10px;align-items:flex-end}
+  #box{flex:1;resize:none;font-family:var(--sans);font-size:15px;line-height:1.5;padding:11px 14px;max-height:180px;color:var(--text);
+    background:var(--surf);border:1px solid var(--border);border-radius:var(--r);transition:border-color var(--t),box-shadow var(--t)}
+  #box:focus{outline:none;border-color:var(--pbd);box-shadow:0 0 0 3px var(--pbg)}
+  #box::placeholder{color:var(--muted)}
+  #send{flex-shrink:0;font-family:var(--sans);font-weight:700;font-size:14px;padding:0 22px;height:44px;cursor:pointer;color:oklch(99% 0 0);
+    background:var(--p);border:1px solid var(--p);border-radius:var(--r);transition:transform var(--t),box-shadow var(--t),opacity var(--t)}
+  #send:hover:not(:disabled){box-shadow:0 4px 16px var(--pbg);transform:translateY(-1px)}
+  #send:disabled{opacity:.45;cursor:default}
+  code{font-family:var(--mono);font-size:.88em;background:var(--surf2);padding:1.5px 6px;border-radius:4px}
 </style></head>
 <body>
 <header>
-  <h1>Claude Code</h1>
-  <span class="badge" id="proofBadge" title="Every response is signed by the agent's TEE key">✓ X-Agent-Proof</span>
+  <h1>Claude&nbsp;Code</h1>
+  <span class="chip" title="Every response is signed by the agent's TEE key — verifiable on chain">✓&nbsp;X-Agent-Proof</span>
   <span class="spacer"></span>
-  <input id="token" placeholder="admin token (optional)" autocomplete="off">
-  <button id="reset" title="Forget the current session">New session</button>
-  <button id="info" title="Runtime info (needs admin token)">Info</button>
+  <input id="token" placeholder="owner token" autocomplete="off" spellcheck="false">
+  <button class="ghost" id="reset" title="Forget the current session">New session</button>
+  <button class="ghost" id="info" title="Runtime info">Info</button>
 </header>
-<div id="log">
-  <div class="meta">This agent's identity is anchored on-chain and it runs inside a TEE. Ask it anything.</div>
-</div>
-<footer>
-  <textarea id="box" rows="1" placeholder="Message the agent…  (Enter to send, Shift+Enter for newline)"></textarea>
+<main><div id="log">
+  <div class="meta" id="hint">This agent's identity is anchored on-chain and it runs inside a TEE. This console is the owner's control surface — driving the agent spends the owner's inference key, so it needs the owner token (open from the console's <strong>Manage</strong> button, or paste it above).</div>
+</div></main>
+<footer><div class="composer">
+  <textarea id="box" rows="1" placeholder="Message the agent…   Enter to send · Shift+Enter for newline"></textarea>
   <button id="send">Send</button>
-</footer>
+</div></footer>
 <script>
-  var log=document.getElementById('log'),box=document.getElementById('box'),send=document.getElementById('send');
+  var log=document.getElementById('log'),box=document.getElementById('box'),send=document.getElementById('send'),tokenEl=document.getElementById('token');
   var sessionId=null, busy=false;
+  // Token arrives via #token=… (set by the console's /_seal/auth handshake,
+  // same pattern as openclaw's dashboard) or is pasted manually.
+  (function(){var t=new URLSearchParams(location.hash.replace(/^#/,'')).get('token');if(t){tokenEl.value=t;
+    try{history.replaceState(null,'',''+location.pathname+location.search);}catch(e){}}})();
+  function token(){return tokenEl.value.trim();}
+  function authHeaders(extra){var h=extra||{};var t=token();if(t)h.Authorization='Bearer '+t;return h;}
   function add(text,cls){var d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
   function meta(text){var d=document.createElement('div');d.className='meta';d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;}
   async function ask(){
     var prompt=box.value.trim(); if(!prompt||busy) return;
+    if(!token()){meta('owner token required — driving the agent spends the owner key. Open from the console (Manage) or paste the token above.');tokenEl.focus();return;}
     busy=true; send.disabled=true; box.value='';
     add(prompt,'u');
     var thinking=add('…','a');
     try{
       var body={prompt:prompt}; if(sessionId) body.session_id=sessionId;
-      var r=await fetch('/v1/query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var r=await fetch('/v1/query',{method:'POST',headers:authHeaders({'Content-Type':'application/json'}),body:JSON.stringify(body)});
       var j=await r.json();
-      if(j.session_id) sessionId=j.session_id;
-      if(j.is_error){thinking.className='msg a err';thinking.textContent=j.result||('error: '+(j.error||r.status));}
-      else{thinking.textContent=(typeof j.result==='string'?j.result:JSON.stringify(j,null,2));}
+      if(r.status===401){thinking.className='msg a err';thinking.textContent='not authenticated as owner: '+(j.error||'401');}
+      else if(j.session_id){sessionId=j.session_id;}
+      if(r.status!==401){
+        if(j.is_error){thinking.className='msg a err';thinking.textContent=j.result||('error: '+(j.error||r.status));}
+        else{thinking.textContent=(typeof j.result==='string'?j.result:JSON.stringify(j,null,2));}
+      }
     }catch(e){thinking.className='msg a err';thinking.textContent='request failed: '+e.message;}
     busy=false; send.disabled=false; box.focus();
   }
@@ -215,18 +282,16 @@ const CHAT_PAGE = `<!doctype html>
   box.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}});
   box.addEventListener('input',function(){box.style.height='auto';box.style.height=Math.min(box.scrollHeight,160)+'px';});
   document.getElementById('reset').onclick=async function(){
-    var t=document.getElementById('token').value.trim();
-    if(!t){sessionId=null;meta('session cleared (local)');return;}
-    try{var r=await fetch('/admin/session/reset',{method:'POST',headers:{Authorization:'Bearer '+t}});
+    if(!token()){sessionId=null;meta('session cleared (local only — no owner token)');return;}
+    try{var r=await fetch('/admin/session/reset',{method:'POST',headers:authHeaders()});
       if(r.ok){sessionId=null;meta('session reset');}else{meta('reset failed: '+r.status);}}catch(e){meta('reset failed: '+e.message);}
   };
   document.getElementById('info').onclick=async function(){
-    var t=document.getElementById('token').value.trim();
-    try{var r=await fetch('/admin/info',{headers:t?{Authorization:'Bearer '+t}:{}});var j=await r.json();
+    try{var r=await fetch('/admin/info',{headers:authHeaders()});var j=await r.json();
       meta(r.ok?('claude '+j.claude_version+' · session '+(j.session_id||'none')+' · up '+j.uptime_s+'s'):('info: '+(j.error||r.status)));}
     catch(e){meta('info failed: '+e.message);}
   };
-  box.focus();
+  if(token()) box.focus(); else tokenEl.focus();
 </script>
 </body></html>`;
 

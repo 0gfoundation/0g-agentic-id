@@ -57,13 +57,17 @@ const (
 )
 
 // Compile-time contract checks: the full Framework interface plus every
-// optional capability this adapter opts into.
+// optional capability this adapter opts into. Deliberately NOT
+// framework.ServicesManifestProvider — /hello advertises PUBLIC serve
+// endpoints, and this framework exposes none yet: /v1/query is the
+// owner's control surface (gated), not a public serve endpoint (which
+// would need per-call payment/rate-limiting/ephemeral sessions). So
+// /hello omits the services field, the intended degradation.
 var (
-	_ framework.Framework                = (*Adapter)(nil)
-	_ framework.VersionReconciler        = (*Adapter)(nil)
-	_ framework.SubprocessLogProvider    = (*Adapter)(nil)
-	_ framework.SettleDelayer            = (*Adapter)(nil)
-	_ framework.ServicesManifestProvider = (*Adapter)(nil)
+	_ framework.Framework             = (*Adapter)(nil)
+	_ framework.VersionReconciler     = (*Adapter)(nil)
+	_ framework.SubprocessLogProvider = (*Adapter)(nil)
+	_ framework.SettleDelayer         = (*Adapter)(nil)
 )
 
 // frameworkBinding is the plaintext of role="framework". Same 3-field
@@ -156,9 +160,11 @@ func (a *Adapter) Defaults(role string) []byte {
 	return nil
 }
 
-// AuthResponse implements framework.Framework. Claude Code has no web
-// dashboard; owner auth grants the bridge's admin token, which unlocks
-// the bridge's /admin/* control endpoints (session reset, runtime info).
+// AuthResponse implements framework.Framework. Owner auth grants the
+// bridge's owner token; the console opens the chat control console at
+// dashboard_url with the token in the fragment — same shape openclaw
+// returns, so the attestor console's owner-manage entry is uniform
+// across frameworks. That token gates /v1/query + /admin/* on the bridge.
 //
 // Caller (proxy.handleAuth) has already verified the requester is the
 // on-chain owner.
@@ -167,11 +173,11 @@ func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
 	token := a.adminToken
 	a.mu.RUnlock()
 	if token == "" {
-		return nil, fmt.Errorf("claude-code: admin token not provisioned (Start has not run successfully)")
+		return nil, fmt.Errorf("claude-code: owner token not provisioned (Start has not run successfully)")
 	}
 	return map[string]any{
-		"token":     token,
-		"admin_url": "/admin/",
+		"token":         token,
+		"dashboard_url": "/#token=" + token,
 	}, nil
 }
 
@@ -282,13 +288,6 @@ func (a *Adapter) MonitorExit(onExit func(err error)) {
 
 // SubprocessLogPath implements framework.SubprocessLogProvider.
 func (a *Adapter) SubprocessLogPath() string { return subprocessLogPath }
-
-// ServicesFilePath implements framework.ServicesManifestProvider so
-// /hello advertises the bridge's fixed HTTP surface (chat console +
-// query API). Unlike openclaw's agent-authored services.json, the bridge
-// endpoints are static, so spawn.go writes this manifest once at Start
-// (see writeServicesManifest) rather than the agent maintaining it.
-func (a *Adapter) ServicesFilePath() string { return servicesFilePath() }
 
 // SettleDelay implements framework.SettleDelayer. Claude Code doesn't
 // rewrite settings.json on first boot the way openclaw rewrites its
