@@ -72,3 +72,18 @@ func TestValidateServices_allOrNothing(t *testing.T) {
 		t.Error("expected the whole batch rejected when one entry is invalid")
 	}
 }
+
+func TestMatchService(t *testing.T) {
+	s := &Server{services: []ServiceEntry{
+		{Path: "/api/fortune", Method: "POST", Backend: "http://127.0.0.1:9090"},
+	}}
+	if e, ok := s.matchService("/api/fortune"); !ok || e.Backend != "http://127.0.0.1:9090" {
+		t.Errorf("expected match, got ok=%v entry=%+v", ok, e)
+	}
+	if _, ok := s.matchService("/api/unknown"); ok {
+		t.Error("unregistered path should not match")
+	}
+	if _, ok := s.matchService("/hello"); ok {
+		t.Error("reserved path should not match an agent service")
+	}
+}

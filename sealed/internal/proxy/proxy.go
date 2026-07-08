@@ -359,6 +359,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A registered agent service takes precedence over the framework
+	// upstream: a request whose path matches one is routed to that
+	// service's loopback backend instead. Everything below (header copy,
+	// forward, serve-proof signing) is identical either way — attribution
+	// comes from leaving through :8080, not from which backend answered.
+	if svc, ok := s.matchService(r.URL.Path); ok {
+		if !strings.EqualFold(svc.Method, r.Method) {
+			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
+			return
+		}
+		upstream = svc.Backend
+	}
+
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
 	if isWebSocketUpgrade(r) {
 		wsReverseProxy(upstream).ServeHTTP(w, r)

@@ -118,6 +118,20 @@ func (s *Server) getServices() []ServiceEntry {
 	return out
 }
 
+// matchService returns the registered service whose path exactly equals the
+// request path (query string excluded by the caller). Exact match for now;
+// subpath/prefix routing is a later refinement.
+func (s *Server) matchService(path string) (ServiceEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.services {
+		if e.Path == path {
+			return e, true
+		}
+	}
+	return ServiceEntry{}, false
+}
+
 // handleServices serves the agent-only registry on the internal sign socket:
 //
 //	POST /services  — replace the whole agent-registered set (overwrite
