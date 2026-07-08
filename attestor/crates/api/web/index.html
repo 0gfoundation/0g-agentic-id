@@ -205,7 +205,8 @@ summary:focus-visible{outline:2px solid var(--p);outline-offset:3px}
 .view.active{display:block;animation:fadeIn var(--t-base) var(--ease-out)}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 
-.hero{margin-bottom:var(--sp-6)}
+.hero{margin-bottom:var(--sp-6);position:relative}
+.hero::before{content:'';position:absolute;inset:-40% -10% 10% -12%;z-index:-1;pointer-events:none;background:radial-gradient(42% 70% at 10% 18%,var(--bg-wash),transparent 72%);filter:blur(8px)}
 .hero h1{font-family:var(--display);font-size:var(--fs-2xl);font-weight:500;letter-spacing:var(--ls-heading);line-height:var(--lh-tight);margin-bottom:var(--sp-2);color:var(--text);font-variation-settings:var(--vs-display)}
 .hero h1 em{font-style:italic;color:var(--p);font-variation-settings:var(--vs-display-italic)}
 .hero p{color:var(--text2);font-size:var(--fs-base);line-height:var(--lh-relaxed,1.6);max-width:62ch}
@@ -527,9 +528,9 @@ small.hint{display:block;color:var(--text2);font-size:var(--fs-sm);margin-top:10
 /* Stats — number-as-protagonist; one subtle accent only.
    Drop per-stat colors, drop floating icon badges, drop radial spotlights.
    The four cards read as one coherent block instead of four small UIs. */
-.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;margin-bottom:32px;box-shadow:var(--sh-sm)}
-.home-stat{background:var(--surf);padding:22px 22px 20px;transition:background var(--t-base) var(--ease-out);position:relative}
-.home-stat:hover{background:var(--surf2)}
+.home-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-bottom:32px}
+.home-stat{background:linear-gradient(180deg,var(--surf-top) 0%,var(--surf) 32%);border:1px solid var(--border);border-radius:var(--r-lg);padding:22px 22px 20px;box-shadow:var(--sh-sm);transition:transform var(--t-base) var(--ease-spring),box-shadow var(--t-base) var(--ease-out),border-color var(--t-fast);position:relative}
+.home-stat:hover{transform:translateY(-3px);box-shadow:var(--sh);border-color:var(--pbd)}
 .home-stat-num{font-size:34px;font-weight:800;letter-spacing:var(--ls-heading);color:var(--text);font-variant-numeric:tabular-nums;line-height:1;display:flex;align-items:baseline;gap:10px}
 .home-stat-lbl{margin-top:10px;font-size:var(--fs-xs);color:var(--muted);text-transform:uppercase;letter-spacing:var(--ls-eyebrow);font-weight:600;font-family:var(--mono);display:flex;align-items:center;gap:6px}
 .home-stat-lbl svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0;opacity:.6}
@@ -1309,13 +1310,6 @@ details.log[open] summary{color:var(--text2)}
       <span class="home-eyebrow"><span class="pulse-dot"></span> 0G testnet · live</span>
       <h1 class="rise"><span class="w"><span>Sovereign</span></span> <span class="w"><span><em>agents</em>,</span></span><br/><span class="w"><span>provably</span></span> <span class="w"><span>yours.</span></span></h1>
       <p class="tagline">An on-chain identity registry for autonomous AI agents — each agent owns its keys, runs in an attested TEE, and signs every response so anyone can verify it's the real one.</p>
-      <div class="pillars">
-        <span><svg viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6l8-3z"/><path d="M9 12l2 2 4-4.5"/></svg> Self-owned identity</span>
-        <span class="sep">·</span>
-        <span><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/></svg> Autonomous runtime</span>
-        <span class="sep">·</span>
-        <span><svg viewBox="0 0 24 24"><path d="M3 14c2 0 2.4-4 4-4 1.8 0 1.6 6 3.5 6 1.8 0 2-9 4-9 1.8 0 1.6 5 3.5 5 .8 0 1.4-1 2-2"/><path d="M5 19h14"/></svg> Verifiable behavior</span>
-      </div>
       <div class="home-cta">
         <a class="btn btn-primary" href="#/deploy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:2px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Deploy an agent</a>
         <a class="btn btn-ghost" href="#/agents">Browse agents</a>
@@ -1396,7 +1390,7 @@ details.log[open] summary{color:var(--text2)}
   <!-- VIEW: Discovery ───────────────────────────────────────────── -->
   <div class="view" id="viewDiscovery">
     <div class="hero">
-      <h1>Agent Registry</h1>
+      <h1>Agent <em>Registry</em>.</h1>
       <p>Discover and explore agents deployed through this attestor on the AgenticID registry.</p>
     </div>
     <div class="activity-line" id="activityLine" style="display:none">
