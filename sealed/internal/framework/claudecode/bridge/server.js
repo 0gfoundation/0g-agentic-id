@@ -35,6 +35,11 @@ const { execFile } = require('child_process');
 const PORT = parseInt(process.env.BRIDGE_PORT || '3285', 10);
 const WORKDIR = process.env.BRIDGE_WORKDIR || process.cwd();
 const ADMIN_TOKEN = process.env.BRIDGE_ADMIN_TOKEN || '';
+// Platform identity + doctrine, injected by sealed into claude's
+// AUTHORITATIVE system prompt (not CLAUDE.md, which is advisory memory).
+// Appended to every `claude -p` so the agent binds its on-chain identity
+// and sign-refusal rules as instruction.
+const APPEND_SYSTEM_PROMPT = process.env.BRIDGE_APPEND_SYSTEM_PROMPT || '';
 
 const MAX_BODY = 1 << 20; // 1 MiB
 const QUERY_TIMEOUT_MS = 10 * 60 * 1000;
@@ -109,6 +114,7 @@ async function handleQuery(req, res) {
   }
 
   const args = ['-p', prompt, '--output-format', 'json'];
+  if (APPEND_SYSTEM_PROMPT) args.push('--append-system-prompt', APPEND_SYSTEM_PROMPT);
   const session = body.session_id || lastSessionId;
   if (session) args.push('--resume', String(session));
 

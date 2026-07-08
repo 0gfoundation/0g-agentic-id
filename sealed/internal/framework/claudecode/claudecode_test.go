@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 
 	"seal-verify/internal/framework"
@@ -67,7 +68,38 @@ func TestConformance(t *testing.T) {
 // against the strip invariant: injecting the sealed section must not
 // change what EvolutionFor reports for workspace/, and re-injecting must
 // be idempotent on the agent-owned content.
-func TestInjectionRoundTrip(t *testing.T) {
+// Platform identity/doctrine goes to claude's --append-system-prompt
+// (the authoritative channel), NOT CLAUDE.md. composeSystemPrompt must
+// carry the identity facts, and the agent's CLAUDE.md must be left
+// entirely to the agent (no platform injection touching the chain-tracked
+// workspace/ hash).
+func TestSystemPromptCarriesIdentity(t *testing.T) {
+	pc := platform.Build(platform.RuntimeSnapshot{
+		AgentSeal:    "0x00000000000000000000000000000000DeaDBeef",
+		AgentID:      "42",
+		SealSignSock: "/run/seal-sign.sock",
+		PublicURL:    "http://8080-test.sandbox.example",
+		WhitelistMax: whitelistMax(),
+	})
+	sp := composeSystemPrompt(pc)
+	if sp == "" {
+		t.Fatal("composeSystemPrompt empty for a populated snapshot")
+	}
+	// The identity anchor (agentSeal address) and the sign socket must be
+	// present — that's what the model needs to adopt its identity + know
+	// how to sign.
+	for _, want := range []string{"DeaDBeef", "/run/seal-sign.sock"} {
+		if !strings.Contains(sp, want) {
+			t.Errorf("system prompt missing %q:\n%s", want, sp)
+		}
+	}
+}
+
+// CLAUDE.md is the agent's own memory — platform content never lands
+// there, so writing owner content and evolving is a clean round-trip
+// (no marker, nothing stripped). Guards against regressing back to
+// CLAUDE.md injection.
+func TestClaudeMDIsAgentOwned(t *testing.T) {
 	ctx := context.Background()
 	a := newTestAdapter(t)
 
@@ -78,48 +110,12 @@ func TestInjectionRoundTrip(t *testing.T) {
 	if err := a.RestoreEntry(ctx, "workspace/", "CLAUDE.md", owned); err != nil {
 		t.Fatal(err)
 	}
-	before, err := a.EvolutionFor(ctx, "workspace/")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	pc := platform.Build(platform.RuntimeSnapshot{
-		AgentSeal:    "0x00000000000000000000000000000000DeaDBeef",
-		AgentID:      "42",
-		SealSignSock: "/run/seal-sign.sock",
-		PublicURL:    "http://8080-test.sandbox.example",
-		WhitelistMax: whitelistMax(),
-	})
-	for i := 0; i < 2; i++ { // twice: injection must be idempotent
-		if err := upsertClaudeMD(claudeMDPath(), pc); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	onDisk, err := os.ReadFile(claudeMDPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(onDisk, []byte(platform.MarkerStart)) {
-		t.Fatal("injection did not land in CLAUDE.md")
-	}
-
-	after, err := a.EvolutionFor(ctx, "workspace/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, after) {
-		t.Errorf("workspace/ hash changed after platform injection:\n before = %s\n after  = %s", before, after)
-	}
-
-	// LoadEntry must mirror the strip: the chain payload for CLAUDE.md is
-	// the agent-owned content only.
 	entry, err := a.LoadEntry(ctx, "workspace/", "CLAUDE.md")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(entry, owned) {
-		t.Errorf("LoadEntry(CLAUDE.md) leaked injected content:\n got  = %q\n want = %q", entry, owned)
+		t.Errorf("CLAUDE.md not agent-owned verbatim:\n got  = %q\n want = %q", entry, owned)
 	}
 }
 

@@ -112,11 +112,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 	rs.WhitelistMax = whitelistMax()
 
-	if err := upsertClaudeMD(claudeMDPath(), platform.Build(rs)); err != nil {
-		logger.Logf("warn: upsert CLAUDE.md sealed section: %v", err)
-	}
+	// Platform identity + doctrine go to claude's AUTHORITATIVE channel
+	// (--append-system-prompt via the bridge), not CLAUDE.md — CLAUDE.md
+	// is memory, and content there is treated as advisory/injection. See
+	// claudemd.go.
+	systemPrompt := composeSystemPrompt(platform.Build(rs))
 
-	cmd, err := spawnBridge(rt, adminToken)
+	cmd, err := spawnBridge(rt, adminToken, systemPrompt)
 	if err != nil {
 		return framework.StartResult{}, err
 	}
@@ -164,7 +166,7 @@ func readInferenceFromSettings() (provider, model string, zgRouted bool) {
 // spawnBridge launches the node bridge with a strict env whitelist — the
 // bridge (and every claude it execs) must never see SANDBOX_SEAL_KEY or
 // the other bootstrap env vars.
-func spawnBridge(rt framework.RuntimeContext, adminToken string) (*exec.Cmd, error) {
+func spawnBridge(rt framework.RuntimeContext, adminToken, systemPrompt string) (*exec.Cmd, error) {
 	if err := materializeBridge(); err != nil {
 		return nil, err
 	}
@@ -186,6 +188,12 @@ func spawnBridge(rt framework.RuntimeContext, adminToken string) (*exec.Cmd, err
 		fmt.Sprintf("BRIDGE_PORT=%d", upstreamPort),
 		"BRIDGE_WORKDIR=" + workspaceDir(),
 		"BRIDGE_ADMIN_TOKEN=" + adminToken,
+	}
+	// The authoritative system-prompt channel: the bridge passes this to
+	// every `claude -p` via --append-system-prompt, so the AgenticID
+	// identity + doctrine bind as instruction, not advisory memory.
+	if systemPrompt != "" {
+		env = append(env, "BRIDGE_APPEND_SYSTEM_PROMPT="+systemPrompt)
 	}
 	if rt.APIKey != "" {
 		env = append(env, "ANTHROPIC_API_KEY="+rt.APIKey)
