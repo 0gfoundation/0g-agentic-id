@@ -489,6 +489,7 @@ small.hint{display:block;color:var(--text2);font-size:var(--fs-sm);margin-top:10
 .seal-f .hash b.reseal{animation:reseal .6s var(--ease-out)}
 @keyframes reseal{0%{color:oklch(78% 0.16 145);text-shadow:0 0 12px oklch(72% 0.16 145 / 0.7)}100%{color:oklch(72% 0.15 315);text-shadow:none}}
 .seal-cap{font-size:var(--fs-xs);color:var(--muted);margin-top:10px;line-height:var(--lh-snug)}
+.chain-seal{margin-bottom:18px}
 
 /* Three-pillar feature cards */
 .home-features{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px;margin-bottom:36px}
@@ -3433,7 +3434,7 @@ async function loadHome() {
 
     const list = $('#homeRecent');
     if (!top.length) {
-      list.innerHTML = `<div class="empty"><h2>No agents yet</h2><p>Be the first to deploy through this attestor.</p><a class="btn btn-primary" href="#/deploy">+ Deploy an agent</a></div>`;
+      list.innerHTML = `<div class="empty"><h2>No agents yet</h2><p>Be the first to deploy through this attestor.</p><a class="btn btn-primary" href="#/deploy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:2px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Deploy an agent</a></div>`;
       return;
     }
     list.innerHTML = `<div class="agent-grid">${top.map(d => renderAgentRow(d)).join('')}</div>`;
@@ -3506,11 +3507,11 @@ window.filterDiscovery = function () {
       ? `<div class="empty">
            <h2 style="margin-bottom:6px">No agents yet</h2>
            <p>Deploy your first agent — it'll show up here.</p>
-           <button class="btn btn-primary" onclick="navigate('#/deploy')">+ New agent</button>
+           <button class="btn btn-primary" onclick="navigate('#/deploy')"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:2px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>New agent</button>
          </div>`
       : q
-        ? `<div class="empty"><h2>No matches</h2><p>Try a different search term.</p></div>`
-        : `<div class="empty"><h2>No agents discovered</h2><p>This attestor hasn't deployed anything yet.</p></div>`;
+        ? `<div class="empty"><h2>No matches</h2><p>No agent matches that search. Try a different name, description, or address.</p></div>`
+        : `<div class="empty"><h2>No agents yet</h2><p>This attestor hasn't deployed anything yet. Be the first — it takes about two minutes and one signature.</p><a class="btn btn-primary" href="#/deploy"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:2px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Deploy an agent</a></div>`;
     list.innerHTML = empty;
     count.textContent = '';
     return;
@@ -4153,6 +4154,29 @@ function paintDetail(dep) {
 
     <div class="detail-grid">
       <div>
+        ${(() => {
+          // Dark identity receipt — the on-chain counterpart to deploy's
+          // "you will sign this". Same seal-panel visual language: what the
+          // owner signed at deploy is now live on chain, sealed to the TEE.
+          const shortHex = (h) => { if (!h) return '—'; const s = String(h).startsWith('0x') ? h : '0x' + h; return s.length > 16 ? s.slice(0, 8) + '…' + s.slice(-6) : s; };
+          const lock = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>`;
+          return `
+          <div class="seal-panel chain-seal">
+            <div class="seal-h">
+              <span class="t">Signed &amp; on chain</span>
+              <span class="lk">${lock} iData</span>
+            </div>
+            <div class="seal-b">
+              <div class="r"><span class="k">seal_id</span><span class="v accent">${shortHex(sealId)}</span></div>
+              <div class="r"><span class="k">agent_seal</span><span class="v">${shortHex(agentSealAddr)}</span></div>
+              <div class="r"><span class="k">owner</span><span class="v">${shortHex(dep.owner)}</span></div>
+              ${dep.agent_id ? `<div class="r"><span class="k">token_id</span><span class="v">#${escapeHtml(dep.agent_id)}</span></div>` : ''}
+            </div>
+            <div class="seal-f">
+              <div class="hash">runtime config sealed to the TEE — owner-signed, verifiable on 0G</div>
+            </div>
+          </div>`;
+        })()}
         ${serveBlock}
         <div class="section-title" style="margin-top:0">AgentCard</div>
         <div class="card" style="padding:14px 18px">
