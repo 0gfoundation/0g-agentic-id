@@ -203,15 +203,25 @@ const CHAT_PAGE = `<!doctype html>
     border-bottom:1px solid var(--border);background:color-mix(in oklch,var(--surf) 82%,transparent);backdrop-filter:blur(8px);position:sticky;top:0;z-index:10}
   header h1{font-size:15px;margin:0;font-weight:600;letter-spacing:-.01em}
   .chip{display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
-    color:var(--green);background:var(--gbg);border:1px solid var(--gbd);border-radius:9999px;padding:3px 11px}
+    border-radius:9999px;padding:3px 11px;border:1px solid transparent}
+  .chip.proof{color:var(--green);background:var(--gbg);border-color:var(--gbd)}
+  .chip.auth{cursor:pointer;color:var(--muted);background:var(--surf2);border-color:var(--border)}
+  .chip.auth.ok{color:var(--p);background:var(--pbg);border-color:var(--pbd);cursor:default}
   .spacer{flex:1}
-  #token{font-family:var(--mono);font-size:12px;width:200px;padding:7px 11px;color:var(--text);background:var(--surf);
-    border:1px solid var(--border);border-radius:var(--r-sm);transition:border-color var(--t),box-shadow var(--t)}
-  #token:focus{outline:none;border-color:var(--pbd);box-shadow:0 0 0 3px var(--pbg)}
-  #token::placeholder{color:var(--muted);font-family:var(--mono)}
   .ghost{font-family:var(--sans);font-size:12px;font-weight:600;padding:6px 13px;color:var(--text2);cursor:pointer;
     background:var(--surf);border:1px solid var(--border);border-radius:var(--r-sm);transition:border-color var(--t),color var(--t)}
   .ghost:hover{border-color:var(--pbd);color:var(--text)}
+  /* Just-in-time token entry — hidden by default so the owner credential
+     is never persistently on screen. Revealed only when the owner clicks
+     the lock chip (CLI/manual path); collapses after submit. The normal
+     path never touches it: the token arrives via #token= from the
+     console. */
+  #auth{display:none;align-items:center;gap:8px}
+  #auth.show{display:inline-flex}
+  #tokenIn{font-family:var(--mono);font-size:12px;width:210px;padding:6px 10px;color:var(--text);background:var(--surf);
+    border:1px solid var(--pbd);border-radius:var(--r-sm);box-shadow:0 0 0 3px var(--pbg)}
+  #tokenIn:focus{outline:none}
+  #tokenIn::placeholder{color:var(--muted)}
   main{flex:1;overflow-y:auto;scrollbar-width:thin}
   #log{max-width:860px;margin:0 auto;padding:26px clamp(16px,4vw,32px);display:flex;flex-direction:column;gap:16px}
   .msg{max-width:82%;padding:12px 16px;border-radius:var(--r-lg);white-space:pre-wrap;word-wrap:break-word;box-shadow:var(--sh-sm);animation:rise .25s var(--t)}
@@ -235,33 +245,43 @@ const CHAT_PAGE = `<!doctype html>
 <body>
 <header>
   <h1>Claude&nbsp;Code</h1>
-  <span class="chip" title="Every response is signed by the agent's TEE key — verifiable on chain">✓&nbsp;X-Agent-Proof</span>
+  <span class="chip proof" title="Every response is signed by the agent's TEE key — verifiable on chain">✓&nbsp;X-Agent-Proof</span>
+  <span class="chip auth" id="authChip" title="Owner control — driving the agent spends the owner key">🔓&nbsp;locked</span>
   <span class="spacer"></span>
-  <input id="token" placeholder="owner token" autocomplete="off" spellcheck="false">
+  <span id="auth"><input id="tokenIn" placeholder="paste owner token" autocomplete="off" spellcheck="false"><button class="ghost" id="tokenGo">Unlock</button></span>
   <button class="ghost" id="reset" title="Forget the current session">New session</button>
   <button class="ghost" id="info" title="Runtime info">Info</button>
 </header>
 <main><div id="log">
-  <div class="meta" id="hint">This agent's identity is anchored on-chain and it runs inside a TEE. This console is the owner's control surface — driving the agent spends the owner's inference key, so it needs the owner token (open from the console's <strong>Manage</strong> button, or paste it above).</div>
+  <div class="meta" id="hint">This agent's identity is anchored on-chain and it runs inside a TEE, and every reply is signed. This console is the owner's control surface — driving the agent spends the owner's inference key, so it opens authenticated from the console's <strong>Manage</strong> button. Click <strong>🔓 locked</strong> to paste an owner token manually.</div>
 </div></main>
 <footer><div class="composer">
   <textarea id="box" rows="1" placeholder="Message the agent…   Enter to send · Shift+Enter for newline"></textarea>
   <button id="send">Send</button>
 </div></footer>
 <script>
-  var log=document.getElementById('log'),box=document.getElementById('box'),send=document.getElementById('send'),tokenEl=document.getElementById('token');
-  var sessionId=null, busy=false;
-  // Token arrives via #token=… (set by the console's /_seal/auth handshake,
-  // same pattern as openclaw's dashboard) or is pasted manually.
-  (function(){var t=new URLSearchParams(location.hash.replace(/^#/,'')).get('token');if(t){tokenEl.value=t;
-    try{history.replaceState(null,'',''+location.pathname+location.search);}catch(e){}}})();
-  function token(){return tokenEl.value.trim();}
-  function authHeaders(extra){var h=extra||{};var t=token();if(t)h.Authorization='Bearer '+t;return h;}
+  var log=document.getElementById('log'),box=document.getElementById('box'),send=document.getElementById('send');
+  var authChip=document.getElementById('authChip'),authBox=document.getElementById('auth'),tokenIn=document.getElementById('tokenIn');
+  var sessionId=null, busy=false, TOKEN='';
+  // The owner token lives in memory only — never rendered, never persisted.
+  // It arrives via the #token= fragment (set by the console's /_seal/auth
+  // handshake, same as openclaw's dashboard) and the fragment is wiped
+  // from the address bar immediately. The lock chip reveals a paste field
+  // just-in-time for the CLI/manual path; nothing hangs on screen.
+  (function(){var t=new URLSearchParams(location.hash.replace(/^#/,'')).get('token');
+    if(t){TOKEN=t.trim();try{history.replaceState(null,'',location.pathname+location.search);}catch(e){}}})();
+  function setAuth(t){TOKEN=(t||'').trim();
+    if(TOKEN){authChip.className='chip auth ok';authChip.textContent='🔒 owner';authBox.className='';}
+    else{authChip.className='chip auth';authChip.textContent='🔓 locked';}}
+  function authHeaders(extra){var h=extra||{};if(TOKEN)h.Authorization='Bearer '+TOKEN;return h;}
   function add(text,cls){var d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
   function meta(text){var d=document.createElement('div');d.className='meta';d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;}
+  authChip.onclick=function(){if(TOKEN)return;authBox.className=authBox.className?'':'show';if(authBox.className)tokenIn.focus();};
+  document.getElementById('tokenGo').onclick=function(){if(tokenIn.value.trim()){setAuth(tokenIn.value);tokenIn.value='';meta('authenticated as owner');box.focus();}};
+  tokenIn.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();document.getElementById('tokenGo').click();}});
   async function ask(){
     var prompt=box.value.trim(); if(!prompt||busy) return;
-    if(!token()){meta('owner token required — driving the agent spends the owner key. Open from the console (Manage) or paste the token above.');tokenEl.focus();return;}
+    if(!TOKEN){meta('owner authentication required — driving the agent spends the owner key. Open this agent from the console (Manage), or click 🔓 locked to paste an owner token.');authChip.click();return;}
     busy=true; send.disabled=true; box.value='';
     add(prompt,'u');
     var thinking=add('…','a');
@@ -282,7 +302,7 @@ const CHAT_PAGE = `<!doctype html>
   box.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();ask();}});
   box.addEventListener('input',function(){box.style.height='auto';box.style.height=Math.min(box.scrollHeight,160)+'px';});
   document.getElementById('reset').onclick=async function(){
-    if(!token()){sessionId=null;meta('session cleared (local only — no owner token)');return;}
+    if(!TOKEN){sessionId=null;meta('session cleared (local only — authenticate as owner to reset server-side)');return;}
     try{var r=await fetch('/admin/session/reset',{method:'POST',headers:authHeaders()});
       if(r.ok){sessionId=null;meta('session reset');}else{meta('reset failed: '+r.status);}}catch(e){meta('reset failed: '+e.message);}
   };
@@ -291,7 +311,7 @@ const CHAT_PAGE = `<!doctype html>
       meta(r.ok?('claude '+j.claude_version+' · session '+(j.session_id||'none')+' · up '+j.uptime_s+'s'):('info: '+(j.error||r.status)));}
     catch(e){meta('info failed: '+e.message);}
   };
-  if(token()) box.focus(); else tokenEl.focus();
+  setAuth(TOKEN); box.focus();
 </script>
 </body></html>`;
 
