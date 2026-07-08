@@ -5,10 +5,13 @@
 This document is the integration contract for **agent framework authors**:
 what you must implement to run your framework (eliza, autogen, a custom
 orchestrator, ...) inside a Sealed Sandbox, what sealed provides around
-your process, and what still requires out-of-repo work. Two adapters ship
-in-tree and double as reference implementations: `openclaw` (server-shaped
-framework) and `claudecode` (CLI-shaped framework behind an HTTP bridge);
-§12 is the field report from porting the second one.
+your process, and what still requires out-of-repo work. One adapter ships
+in-tree and doubles as the reference implementation: `openclaw`
+(server-shaped framework). A second, `claudecode` (CLI-shaped framework
+behind an HTTP bridge), was built as a seam probe and then **retired** — a
+per-request CLI can't host the owner-built public services this platform
+is for (see §12 for the full field report; the adapter code was removed,
+but the port's lessons are the reason much of this contract exists).
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -547,9 +550,10 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
 1. Implement `framework.Framework` + `MonitorExit` in
    `internal/framework/<yourfw>/`, self-registering via
    `framework.Register` in your `New()`; add the one registration line
-   in `main.go`. Use `claudecode/` as the template for CLI-shaped
-   frameworks (embedded-bridge pattern) and `openclaw/` for server-shaped
-   ones.
+   in `main.go`. Use `openclaw/` as the template for server-shaped
+   frameworks. For CLI-shaped frameworks (embedded-bridge pattern), the
+   retired `claudecode/` adapter in git history + §12 are the reference —
+   but note §12's caveat: a per-request CLI can't host public services.
 2. Declare your role set, including the reserved `framework` leaf (with
    the empty-version → whitelistMax rule); decide Leaf vs
    DirectoryManifest per role.
@@ -579,7 +583,15 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    `claudecode/claudemd.go` — CLAUDE.md gets the whole PlatformContext
    as a single marker section).
 
-## 12. Port report: integrating claude-code (2026-07)
+## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
+
+> **Status: retired.** The claudecode adapter was removed from the shipping
+> tree. It proved the seam is real, but a per-invocation CLI behind a bridge
+> cannot host the owner-built, externally-callable services that are the
+> point of a "working agent" here (openclaw's server model can). Rather than
+> ship a half-capability whose injected platform guidance advertised
+> services it couldn't expose, we pulled it. This report stays as the field
+> guide for the next CLI-shaped framework; the code lives in git history.
 
 The claudecode adapter was written deliberately as a seam probe: a
 framework structurally unlike openclaw (per-invocation CLI behind a

@@ -22,14 +22,12 @@ ARG NODE_VERSION=22.14.0
 # Fix PATH for non-interactive exec (toolbox process/execute does not load .bashrc).
 ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
 
-# Warm-cache the bundled frameworks (adapters re-pin exact versions at
-# first Start; see each adapter's whitelist.go for the validated sets).
-RUN npm install -g openclaw @anthropic-ai/claude-code
+# Warm-cache the bundled framework (the adapter re-pins the exact version
+# at first Start; see openclaw's whitelist.go for the validated set).
+RUN npm install -g openclaw
 
 # openclaw-specific pre-config: allow non-loopback Host header origin
 # fallback (sandbox containers have no loopback UI access from the host).
-# Harmless when the agent turns out to be claude-code — the file is
-# outside every chain-tracked role.
 RUN openclaw config set gateway.controlUi.dangerouslyAllowHostHeaderOriginFallback true
 
 # No CMD: this image is booted by the sealed bootstrap binary, which the

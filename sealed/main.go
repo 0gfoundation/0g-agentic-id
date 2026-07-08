@@ -31,7 +31,6 @@ import (
 	"seal-verify/internal/config"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
-	"seal-verify/internal/framework/claudecode"
 	"seal-verify/internal/framework/openclaw"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
@@ -91,8 +90,13 @@ func main() {
 	// deployment actually uses is resolved AFTER the chain bootstrap, from
 	// the on-chain framework binding (see resolveAdapter); registration is
 	// cheap and touches no disk.
+	//
+	// Only openclaw ships today. The adapter interface + platform seam are
+	// framework-agnostic (see FRAMEWORK_ADAPTER.md); a claude-code adapter
+	// was prototyped to validate the seam and retired — a per-request CLI
+	// couldn't host owner-built public services, the shape this platform is
+	// for. That port's lessons live on as a case study in the doc.
 	openclaw.New()
-	claudecode.New()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()

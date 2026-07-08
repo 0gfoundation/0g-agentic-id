@@ -58,7 +58,7 @@ mod tests {
     use super::*;
 
     fn supported() -> Vec<String> {
-        vec!["openclaw".into(), "claude-code".into()]
+        vec!["openclaw".into()]
     }
 
     fn binding(name: &str) -> IDataInput {
@@ -79,9 +79,9 @@ mod tests {
 
     #[test]
     fn valid_binding_passes_and_returns_name() {
-        let name = validate_framework_binding(&[binding("claude-code"), persona()], &supported())
+        let name = validate_framework_binding(&[binding("openclaw"), persona()], &supported())
             .expect("valid");
-        assert_eq!(name, "claude-code");
+        assert_eq!(name, "openclaw");
     }
 
     #[test]
@@ -90,7 +90,7 @@ mod tests {
         // whose container can never resolve an adapter.
         let err = validate_framework_binding(&[persona()], &supported()).unwrap_err();
         assert!(err.contains("must contain"), "got: {err}");
-        assert!(err.contains("openclaw, claude-code"), "lists supported: {err}");
+        assert!(err.contains("openclaw"), "lists supported: {err}");
     }
 
     #[test]

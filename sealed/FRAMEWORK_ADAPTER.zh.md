@@ -4,9 +4,12 @@
 
 这份文档是给 **agent 框架作者** 的接入契约:要把你的框架(eliza、
 autogen、自研编排器……)跑进 Sealed Sandbox,需要实现什么、sealed 会
-在你的进程周围提供什么,以及哪些工作仍在仓库之外。树内有两个 adapter
-可以当参照实现:`openclaw`(服务型框架)和 `claudecode`(CLI 型框架,
-经 HTTP bridge 托管);§12 是移植第二个时的实录。
+在你的进程周围提供什么,以及哪些工作仍在仓库之外。树内有一个 adapter
+作参照实现:`openclaw`(服务型框架)。第二个 `claudecode`(CLI 型框架,
+经 HTTP bridge 托管)是当初用来验证 seam 的探针,**已下线**——每次请求
+现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
+(openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
+这份契约里很多条款的由来,见 §12 实录。
 
 权威来源是代码:接口定义在
 [`internal/framework/framework.go`](internal/framework/framework.go);
@@ -522,7 +525,14 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    这只是一个 delivery 函数(见 `claudecode/claudemd.go`——整个
    PlatformContext 作为单个 marker 段落进 CLAUDE.md)。
 
-## 12. 移植实录:接入 claude-code(2026-07)
+## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
+
+> **状态:已下线。** claudecode adapter 已从出货树移除。它证明了 seam 是
+> 真的,但一个"每次调用现拉起、挂在 bridge 后面的 CLI"托不住这里"干活
+> agent"的核心能力——owner 委托、可对外调用的服务(openclaw 的常驻
+> server 模型可以)。与其出一个"注入的平台 guidance 吹嘘了它并不具备的
+> 服务能力"的半成品,不如撤掉。本实录保留,作为下一个 CLI 型框架的实战
+> 指南;代码在 git 历史里。
 
 claudecode adapter 是刻意当作接缝探针来写的:选一个结构上和 openclaw
 截然不同的框架(bridge 背后的按次调用 CLI、单一 context 文件、没有

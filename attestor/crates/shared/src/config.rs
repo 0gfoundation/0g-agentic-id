@@ -238,7 +238,7 @@ impl Config {
                         .filter(|f| !f.is_empty())
                         .collect()
                 })
-                .unwrap_or_else(|| vec!["openclaw".to_string(), "claude-code".to_string()]),
+                .unwrap_or_else(|| vec!["openclaw".to_string()]),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
