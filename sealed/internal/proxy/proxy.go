@@ -38,7 +38,6 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
-	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
 
@@ -58,7 +57,6 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	servicesPath string         // agent-declared services manifest; empty disables /hello services field
 	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
 	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
 }
@@ -76,24 +74,21 @@ func New(agent *state.Agent, publicURL string) *Server {
 // SetAdapter late-binds the resolved framework adapter and derives the
 // per-adapter optional paths from its capability interfaces:
 //
-//   - framework.ServicesManifestProvider → the services manifest /hello
-//     embeds (e.g. ~/.openclaw/services.json)
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
 //
 // Called once by main after the on-chain framework binding names the
-// adapter. Handlers read the trio under the lock.
+// adapter. Handlers read under the lock.
+//
+// Service exposure is no longer per-adapter: agents register services
+// with sealed over POST $SEAL_SIGN_SOCK/services (see services.go), and
+// /hello is built from that registry — no framework-designated manifest.
 func (s *Server) SetAdapter(fw framework.Framework) {
-	servicesPath := ""
-	if p, ok := fw.(framework.ServicesManifestProvider); ok {
-		servicesPath = p.ServicesFilePath()
-	}
 	agentLogPath := ""
 	if p, ok := fw.(framework.SubprocessLogProvider); ok {
 		agentLogPath = p.SubprocessLogPath()
 	}
 	s.mu.Lock()
 	s.adapter = fw
-	s.servicesPath = servicesPath
 	s.agentLogPath = agentLogPath
 	s.mu.Unlock()
 }
@@ -102,12 +97,6 @@ func (s *Server) getAdapter() framework.Framework {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.adapter
-}
-
-func (s *Server) getServicesPath() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.servicesPath
 }
 
 func (s *Server) getAgentLogPath() string {
@@ -196,11 +185,10 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, _ *http.Request) {
 // resp_body_hash, data_hashes, ts) so verifiers can confirm the response
 // originated from this attested instance.
 //
-// `services` is loaded from the adapter-designated manifest file
-// (s.servicesPath) on each call — fresh per request, no caching. Read
-// failures (file missing, parse error) collapse to an empty array; /hello
-// itself always succeeds when the agent is armed, so verifier UX doesn't
-// regress for agents that haven't declared anything yet.
+// `services` is built from sealed's service registry (agent-registered
+// via POST /services) on each call — fresh per request, no caching. An
+// agent that hasn't registered anything yields `services: []`; /hello
+// itself always succeeds when the agent is armed.
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
@@ -215,28 +203,10 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fresh read on every /hello so verifiers see the agent's current
-	// declared surface. The authoritative source is sealed's own service
-	// registry (agent-registered via POST /services). During the transition
-	// off per-framework manifests, we also merge any legacy adapter
-	// services.json entries whose path the registry doesn't already cover
-	// (step 5 retires that source). Empty slice (not nil) keeps the JSON
-	// shape stable as `services: []`.
+	// declared surface, sourced from sealed's own service registry
+	// (agent-registered via POST /services). Empty slice (not nil) keeps
+	// the JSON shape stable as `services: []`.
 	services := servicesForHello(s.getServices())
-	if servicesPath := s.getServicesPath(); servicesPath != "" {
-		if loaded, err := report.LoadServices(servicesPath); err != nil {
-			logger.Logf("handleHello: LoadServices(%s): %v (ignoring legacy manifest)", servicesPath, err)
-		} else {
-			seen := make(map[string]bool, len(services))
-			for _, x := range services {
-				seen[x.Path] = true
-			}
-			for _, x := range loaded {
-				if !seen[x.Path] {
-					services = append(services, x)
-				}
-			}
-		}
-	}
 
 	// Message is the agent's self-introduction in its own voice. Reads
 	// as 2 or 3 sentences: identity → owner → (if services present)
