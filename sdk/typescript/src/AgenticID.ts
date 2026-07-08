@@ -102,6 +102,49 @@ export class AgentApi {
     return walletClient.sendTransaction({ to: agentSeal, value: amountWei, account, chain: this.ctx.chain });
   }
 
+  // — runtime: interacting with a live agent —
+
+  /**
+   * Greet a running agent and verify it in one call: GET {agentUrl}/hello,
+   * capture the X-Agent-Proof header, and check the proof against chain
+   * (signer == on-chain agentSeal, deadline, declared data hashes all on
+   * chain — via {@link ServeSession}). Returns the agent's self-report
+   * plus a structured verification. The whole "is this agent who it
+   * claims, running what chain says" check, without hand-rolling the
+   * fetch + parse + verify.
+   */
+  async sayHi(agentUrl: string): Promise<{
+    hello: { agent: Address; owner: Address; public_url: string; message: string; services: unknown[] };
+    proof: ServeProof | null;
+    verification: import('./ServeSession').ProofVerification | null;
+  }> {
+    const base = agentUrl.replace(/\/$/, '');
+    const { response, proof } = await captureProof(() => fetch(`${base}/hello`));
+    if (!response.ok) throw new Error(`sayHi: /hello returned HTTP ${response.status}`);
+    const hello = (await response.json()) as {
+      agent: Address; owner: Address; public_url: string; message: string; services: unknown[];
+    };
+    const verification = proof ? await new ServeSession(this.ctx).verifyProof(proof) : null;
+    return { hello, proof, verification };
+  }
+
+  /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */
+  stop(sealId: Hash, sandboxId: string): Promise<void> {
+    return this.attestor.lifecycle('stop', { sealId, sandboxId });
+  }
+  /** Start a stopped agent's sandbox (owner-signed). */
+  start(sealId: Hash, sandboxId: string): Promise<void> {
+    return this.attestor.lifecycle('start', { sealId, sandboxId });
+  }
+  /**
+   * Reset (recreate) an agent's container, preserving its on-chain
+   * identity — a fresh boot that re-reads iData from chain and reselects
+   * the framework adapter from the binding. Owner-signed.
+   */
+  reset(sealId: Hash, opts?: { snapshot?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, snapshot: opts?.snapshot });
+  }
+
   /**
    * Wait for a deploy OR clone to mint on-chain, returning the new agent's
    * tokenId (agentId). Both are async and return only a `seal_id` up front — the

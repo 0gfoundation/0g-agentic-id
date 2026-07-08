@@ -150,16 +150,26 @@ export class AttestorClient {
     return this.ctx.attestorUrl.replace(/\/$/, '');
   }
 
-  /** Sandbox "create" envelope, signed by the owner (relayed to the provider). */
-  private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+  /**
+   * Owner-signed sandbox action envelope. The sandbox runtime verifies
+   * every lifecycle action against the owner wallet; field order must
+   * match its `signedRequest` struct exactly
+   * ({action, expires_at, nonce, payload, resource_id}) or the recovered
+   * signer won't match.
+   */
+  private async signEnvelope(
+    action: string,
+    resourceId: string,
+    payload: Record<string, unknown>,
+    ttlSec: number,
+  ) {
     const { walletClient, account } = requireWallet(this.ctx);
-    // Field order must match the sandbox `signedRequest` struct.
     const canonical = JSON.stringify({
-      action: 'create',
+      action,
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
-      payload: { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
-      resource_id: sandbox.resourceId ?? '',
+      payload,
+      resource_id: resourceId,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     return {
@@ -167,6 +177,50 @@ export class AttestorClient {
       signed_message_b64: b64encode(canonical),
       wallet_signature: signature,
     };
+  }
+
+  /** Sandbox "create" envelope for deploy (relayed to the provider). */
+  private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+    return this.signEnvelope(
+      'create',
+      sandbox.resourceId ?? '',
+      { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      ttlSec,
+    );
+  }
+
+  /**
+   * Lifecycle op on a deployed agent's sandbox. `stop`/`start` act on the
+   * existing container (resourceId = sandbox_id); `reset` is an
+   * unconditional recreate (action="create", empty resource_id) that
+   * preserves the on-chain identity and replaces only the container —
+   * the way to force a fresh boot (e.g. after a new sealed image, or
+   * stuck-state recovery). All are owner-signed; the attestor + sandbox
+   * both re-verify.
+   */
+  async lifecycle(
+    op: 'stop' | 'start' | 'reset',
+    params: { sealId: `0x${string}`; sandboxId?: string; snapshot?: string; envelopeTtlSec?: number },
+  ): Promise<void> {
+    const { account } = requireWallet(this.ctx);
+    const ttl = params.envelopeTtlSec ?? 180;
+    let envelope;
+    if (op === 'reset') {
+      envelope = await this.signEnvelope('create', '', { snapshot: params.snapshot ?? '', sealed: true }, ttl);
+    } else {
+      if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+      envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
+    }
+    const path = op === 'reset' ? '/reset' : `/${op}`;
+    const res = await fetch(`${this.baseUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+    }
   }
 
   /**
