@@ -617,8 +617,35 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     iData,其中的 binding 是唯一选择器,owner 签的是上链的字节本体而
     不是服务端模板的输入。合成移到客户端(SDK `defaultIData()`)。
 21. claudecode 加了浏览器聊天控制台(openclaw 有 dashboard,Claude
-    Code 是 CLI 没有)。bridge 在 `GET /` 提供它,于是 sealed proxy
-    把它暴露在 agent 的 public root——每个页面和回复照样带
-    X-Agent-Proof。adapter 同时实现了 `ServicesManifestProvider`,用
-    一份静态 manifest(bridge 端点固定,不像 openclaw 由 agent 自己
-    写 services.json),`/hello` 因此广播聊天 + query API。
+    Code 是 CLI 没有),bridge 在 `GET /` 提供。部分被 23–24 条取代:
+    控制台是 owner 控制面(需鉴权),services-manifest 广播已撤(暂无
+    public serve 面)。
+
+**部署加固轮(2026-07 稍后)** ——线上 testnet 跑已部署二进制暴露的,
+均已修复:
+
+22. **framework binding 被从链上删 → 重建后身份丢失。** isDefault-omit
+    优化(内容==Defaults 就从链上省略)命中了 `framework` role:无版本
+    binding 解析成 whitelistMax 后恰好等于 Defaults("framework"),首次
+    演化把它删了。容器重建时链上无 binding → resolveAdapter fallback
+    默认框架,claude-code agent 静默变 openclaw。修复:`framework` 是
+    身份锚,豁免 omit,永远留链上。(已收敛的旧 agent 无法自愈——
+    binding 已丢,需重新部署。)
+23. **聊天控制台加鉴权 + token 纯内存。** `/v1/query` 花 owner 的推理
+    key、改 agent 状态,是 owner 控制面而非 public serve 端点——现在按
+    owner token 门控(来自 /_seal/auth)。token 纯内存,经 `#token=`
+    fragment 传入(openclaw dashboard 模式),不再有常驻可见框。真正的
+    public serve 面(任何人调用+验证做声誉)需计费/限流,是独立特性;
+    services-manifest 广播(第 21 条)相应撤销。
+24. **身份/教义改经 `--append-system-prompt` 注入,不再进 CLAUDE.md。**
+    CLAUDE.md 是 Claude Code 的*记忆*不是 system prompt,注入的身份被
+    当 advisory,安全调优的模型拒绝采纳(线上拒认自己的 agentSeal 身份)。
+    权威通道是 `claude -p --append-system-prompt`(openclaw 用
+    SOUL/IDENTITY 拼 system prompt 的等价物)。CLAUDE.md 现在纯归 agent。
+    通用教训:每个 adapter 必须把平台 context 注入到其框架的**权威**
+    指令通道,不是记忆通道——且要**验证模型真的采纳了身份**,别假设
+    注入就生效。
+25. **SDK 加了 agent-runtime 面**(`agent.sayHi` + `stop`/`start`/
+    `reset`),和运行中 agent 交互(serve-proof 验证、恢复/重载)成为
+    一等公民并有回归(`sdk/typescript/scripts/agent-e2e.cjs`),不再是
+    ad-hoc curl。

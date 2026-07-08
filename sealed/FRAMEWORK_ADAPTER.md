@@ -696,9 +696,45 @@ parts of it:
     owner signs the exact minted bytes instead of inputs to a server-side
     template. Synthesis moved to the clients (SDK `defaultIData()`).
 21. claudecode gained a browser chat console (openclaw has a dashboard;
-    Claude Code is a CLI with none). The bridge serves it at `GET /`, so
-    the sealed proxy exposes it at the agent's public root — every page
-    and reply still carries X-Agent-Proof. The adapter now also
-    implements `ServicesManifestProvider` with a static manifest (the
-    bridge's endpoints are fixed, unlike openclaw's agent-authored
-    services.json), so `/hello` advertises the chat + query API.
+    Claude Code is a CLI with none), served by the bridge at `GET /`.
+    Superseded in part by items 23–24: the console is the OWNER control
+    surface (gated), and the services-manifest advertisement was
+    reverted (no public serve surface yet).
+
+**Deployment-hardening round (later 2026-07)** — live testnet use of
+the deployed binaries surfaced these; all shipped:
+
+22. **Framework binding dropped from chain → identity loss on recreate.**
+    The isDefault-omit optimization (role content == Defaults ⇒ omit
+    from chain) hit the `framework` role: a version-less binding resolved
+    to whitelistMax equals Defaults("framework"), so the first evolution
+    dropped it. On container recreate, no binding on chain →
+    resolveAdapter fell back to the default framework, and a claude-code
+    agent silently came back as openclaw. Fix: the `framework` role is
+    the identity anchor and is exempt from omit — it always persists on
+    chain. (This is why an already-converged pre-fix agent can't
+    self-heal: its binding is already gone; redeploy.)
+23. **Chat console gated + token memory-only.** `/v1/query` spends the
+    owner's inference key and mutates agent state, so it's the owner
+    control surface, not a public serve endpoint — now gated on the
+    owner token (from /_seal/auth). The token is memory-only, delivered
+    via the `#token=` fragment (openclaw-dashboard pattern), never a
+    persistent on-screen field. A true public serve surface (anyone
+    calls + verifies for reputation) needs payment/rate-limiting and is
+    a separate feature; the services-manifest advertisement (item 21)
+    was reverted accordingly.
+24. **Identity/doctrine injected via `--append-system-prompt`, not
+    CLAUDE.md.** CLAUDE.md is Claude Code's *memory*, not its system
+    prompt, so injected identity read as advisory and a safety-tuned
+    model disclaimed it (rejected its own agentSeal identity live). The
+    authoritative channel is `claude -p --append-system-prompt` (the
+    claude-code analogue of openclaw building the system prompt from
+    SOUL/IDENTITY). CLAUDE.md is now purely agent-owned. General lesson:
+    each adapter must inject the platform context into ITS framework's
+    *authoritative* instruction channel, not a memory/context channel —
+    verify the model actually adopts the identity, don't assume the
+    injection binds.
+25. **SDK gained an agent-runtime surface** (`agent.sayHi` +
+    `stop`/`start`/`reset`) so interacting with a live agent
+    (serve-proof verify, recovery/reload) is first-class and regression-
+    tested (`sdk/typescript/scripts/agent-e2e.cjs`), not ad-hoc curl.
