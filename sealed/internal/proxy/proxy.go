@@ -58,8 +58,9 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	servicesPath string // agent-declared services manifest; empty disables /hello services field
-	agentLogPath string // adapter's subprocess log file; empty renders "not available"
+	servicesPath string         // agent-declared services manifest; empty disables /hello services field
+	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
+	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the

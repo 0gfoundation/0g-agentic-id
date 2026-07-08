@@ -78,10 +78,11 @@ func (s *Server) ListenInternal(sockPath string) {
 	mux.HandleFunc("/sign/personal_sign", s.handleSignPersonalSign)
 	mux.HandleFunc("/sign/typed_data", s.handleSignTypedData)
 	mux.HandleFunc("/sign/transaction", s.handleSignTransaction)
+	mux.HandleFunc("/services", s.handleServices)
 
 	go func() {
 		logger.Logf("OK   sign socket listening at unix://%s "+
-			"(/sign/personal_sign | /sign/typed_data | /sign/transaction)", sockPath)
+			"(/sign/personal_sign | /sign/typed_data | /sign/transaction | /services)", sockPath)
 		_ = http.Serve(l, mux)
 	}()
 }
