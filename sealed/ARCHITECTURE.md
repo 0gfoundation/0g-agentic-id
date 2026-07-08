@@ -17,8 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See `0g-agent-nft` repo for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed uploads/downloads via the `0g-storage-client` CLI |
-| openclaw | The default agent framework (selected when the on-chain binding names it, or as the no-binding fallback); an npm package, installed and spawned as a subprocess by sealed, listening on `127.0.0.1:3284` |
-| claude-code | Second wired-in framework (binding `name: "claude-code"`); a per-invocation CLI supervised via an HTTP bridge on `127.0.0.1:3285` (embedded in the sealed binary, see `internal/framework/claudecode/bridge/`) |
+| openclaw | The sole wired-in agent framework (selected when the on-chain binding names it, or as the no-binding fallback); an npm package, installed and spawned as a subprocess by sealed, listening on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); a second framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -74,8 +73,7 @@ sealed/
 │   ├── report/                   /status reporting to attestor
 │   ├── logger/                   structured logging (the shared writer logger.Logf, exposed by proxy as /log.html)
 │   ├── framework/                framework adapter abstraction + optional capability interfaces
-│   │   ├── openclaw/             openclaw adapter implementation
-│   │   ├── claudecode/           claude-code adapter (CLI framework behind an HTTP bridge)
+│   │   ├── openclaw/             openclaw adapter implementation (the only shipping adapter)
 │   │   └── conformance/          executable invariant suite every adapter runs in its tests
 │   ├── inference/                framework-agnostic provider knowledge (0g router endpoints,
 │   │                             wire format per model via the live catalog); adapters only
