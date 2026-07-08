@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"seal-verify/internal/logger"
+	"seal-verify/internal/report"
 )
 
 // ServiceEntry is one agent-declared external service.
@@ -115,6 +116,22 @@ func (s *Server) getServices() []ServiceEntry {
 	defer s.mu.RUnlock()
 	out := make([]ServiceEntry, len(s.services))
 	copy(out, s.services)
+	return out
+}
+
+// servicesForHello maps the internal registry entries to the public /hello
+// shape, dropping the internal loopback backend — external callers reach a
+// service through :8080, never its backend port directly.
+func servicesForHello(entries []ServiceEntry) []report.Service {
+	out := make([]report.Service, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, report.Service{
+			Path:         e.Path,
+			Method:       e.Method,
+			Description:  e.Description,
+			InputExample: e.InputExample,
+		})
+	}
 	return out
 }
 

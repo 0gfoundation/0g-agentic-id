@@ -73,6 +73,21 @@ func TestValidateServices_allOrNothing(t *testing.T) {
 	}
 }
 
+func TestServicesForHello_mapsAndDropsBackend(t *testing.T) {
+	out := servicesForHello([]ServiceEntry{
+		{Path: "/api/x", Method: "POST", Description: "d", InputExample: `{"a":1}`, Backend: "http://127.0.0.1:9090"},
+	})
+	if len(out) != 1 {
+		t.Fatalf("want 1, got %d", len(out))
+	}
+	got := out[0]
+	if got.Path != "/api/x" || got.Method != "POST" || got.Description != "d" || got.InputExample != `{"a":1}` {
+		t.Errorf("field mapping wrong: %+v", got)
+	}
+	// report.Service has no Backend field at all — the internal loopback
+	// address is dropped by construction (compile-time guarantee).
+}
+
 func TestMatchService(t *testing.T) {
 	s := &Server{services: []ServiceEntry{
 		{Path: "/api/fortune", Method: "POST", Backend: "http://127.0.0.1:9090"},

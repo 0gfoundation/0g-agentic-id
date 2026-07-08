@@ -215,14 +215,26 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fresh read on every /hello so verifiers see the agent's current
-	// declared surface. Empty slice (not nil) keeps the JSON shape
-	// stable as `services: []` rather than omitting the field.
-	services := []report.Service{}
+	// declared surface. The authoritative source is sealed's own service
+	// registry (agent-registered via POST /services). During the transition
+	// off per-framework manifests, we also merge any legacy adapter
+	// services.json entries whose path the registry doesn't already cover
+	// (step 5 retires that source). Empty slice (not nil) keeps the JSON
+	// shape stable as `services: []`.
+	services := servicesForHello(s.getServices())
 	if servicesPath := s.getServicesPath(); servicesPath != "" {
 		if loaded, err := report.LoadServices(servicesPath); err != nil {
-			logger.Logf("handleHello: LoadServices(%s): %v (returning empty)", servicesPath, err)
-		} else if loaded != nil {
-			services = loaded
+			logger.Logf("handleHello: LoadServices(%s): %v (ignoring legacy manifest)", servicesPath, err)
+		} else {
+			seen := make(map[string]bool, len(services))
+			for _, x := range services {
+				seen[x.Path] = true
+			}
+			for _, x := range loaded {
+				if !seen[x.Path] {
+					services = append(services, x)
+				}
+			}
 		}
 	}
 
