@@ -77,7 +77,11 @@ components hold only the interface (or a narrow subset of it) and need
   binary is one registration line in `main.go`.
 - **Per-framework behaviours** are optional capability interfaces the
   core type-asserts and degrades without (§2.2): version reconcile,
-  services manifest, subprocess log page, settle delay.
+  subprocess log page, settle delay. (Service exposure is NOT one of
+  these — it's a sealed platform capability now, not per-framework:
+  agents register services via `POST $SEAL_SIGN_SOCK/services` and sealed
+  routes + signs them through `/hello` and the proxy; adapters declare no
+  manifest.)
 - **One universal image**: `images/sealed/` bakes node + the sealed
   binary, with the bundled frameworks npm-installed as a warm cache
   only — each adapter re-pins its binding version at first Start, and
@@ -120,7 +124,6 @@ and degrades gracefully when absent):
 | Interface | Method | Consumed by | Without it |
 |---|---|---|---|
 | `VersionReconciler` | `ReconcileFramework(ctx)` | drift handler, on `framework` role drift | drift is committed on chain as-is (audit stays honest, enforcement off) |
-| `ServicesManifestProvider` | `ServicesFilePath()` | proxy `/hello` | services field omitted |
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | log page reports unavailable |
 | `SettleDelayer` | `SettleDelay()` | bootstrap baseline capture | conservative 5s default |
 
@@ -465,8 +468,9 @@ You get these for free; design your framework's surface assuming them:
   each role's `content_hash` + `data_hash`. Your upstream serves plain
   HTTP on localhost; WebSocket upgrades pass through unsigned.
 - **`GET /hello`** — signed self-introduction: agent identity, current
-  `data_hashes`, `public_url`, and (if you provide a services manifest
-  path) the agent-declared service list.
+  `data_hashes`, `public_url`, and the agent-declared service list (built
+  from sealed's service registry — agents register via
+  `POST $SEAL_SIGN_SOCK/services`, not a per-framework manifest file).
 - **`POST /_seal/auth`** — the owner-auth flow of §5.6.
 - **`unix:///run/seal-sign.sock`** — `POST /sign/personal_sign`,
   `/sign/typed_data`, `/sign/transaction`; container-local only. This is
@@ -628,9 +632,10 @@ already been moved and which remain.
    optional `framework.VersionReconciler`, with a defined degradation
    (commit drift as-is) for adapters that can't reconcile.
 5. Services-manifest path and subprocess-log path were openclaw literals
-   in `main.go`/`proxy` → now `ServicesManifestProvider` /
-   `SubprocessLogProvider`; `/log/openclaw` survives as an alias of
-   `/log/agent`.
+   in `main.go`/`proxy` → became `SubprocessLogProvider` (and, at the
+   time, a `ServicesManifestProvider` — since retired: service exposure
+   moved into sealed's own registry, no longer per-framework);
+   `/log/openclaw` survives as an alias of `/log/agent`.
 6. The settle delay was an openclaw-tuned constant in `main.go` → now
    `SettleDelayer` (claudecode declares 1s; openclaw keeps 5s).
 7. Marker utilities lived in the openclaw package while the *content*
