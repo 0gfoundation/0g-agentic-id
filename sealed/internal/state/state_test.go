@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -180,7 +181,7 @@ func TestClear_ResetsSnapshots(t *testing.T) {
 
 func TestSnapshot_ReturnsCurrentHashes(t *testing.T) {
 	a := New()
-	a.Set([]byte("priv"), "http://up", "sid", "owner")
+	a.Set([]byte("priv"), "http://up", "sid", "owner", "42", "0x"+strings.Repeat("ab", 32))
 	a.SeedChainSnapshot("config", "h1", "0xr1")
 	a.UpdateCurrentSnapshot("config", "h2")
 

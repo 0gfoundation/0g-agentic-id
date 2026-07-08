@@ -363,9 +363,11 @@ attestor 那侧靠 15min 阈值兜底。
 
 ### serve-proof 的 `data_hash` 来源
 
-每条 serve-proof envelope 里 `data_hashes[role]` 带两字段：
-- `content_hash` = sha256(本地 plaintext)
-- `data_hash` = 该加密包在 0g-storage 的 root hash（链上引用的那个）
+serve-proof envelope 的 `data_hashes` 是一个 **`data_hash` root 的扁平列表**（TEE 当下
+在跑的那些）。内部,`currentSnapshot` 里每个 role 记两字段：
+- `content_hash` = sha256(本地 plaintext) —— 只用于 drift 检测,**不**进 envelope
+- `data_hash` = 该加密包在 0g-storage 的 root hash（链上引用的那个）—— 进 envelope 的
+  `data_hashes` 的就是它
 
 drift 检测只用 `content_hash`，但 serve-proof 要带 `data_hash` 给 verifier
 做"链上引用 == 我现在跑的"的交叉校验。`data_hash` 的来源有两条路：

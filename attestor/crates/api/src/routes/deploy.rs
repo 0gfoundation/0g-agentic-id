@@ -145,7 +145,7 @@ pub async fn handle(
         .events
         .publish(WsEvent::PhaseChanged {
             seal_id,
-            phase: DeploymentPhase::Pending,
+            phase: DeploymentPhase::Deploying,
         })
         .await?;
 

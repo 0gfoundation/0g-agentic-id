@@ -1415,7 +1415,7 @@ details.log[open] summary{color:var(--text2)}
         <span class="val" id="outSeal"></span>
       </div>
 
-      <div class="phase-label">Phase 1 — three concurrent tasks</div>
+      <div class="phase-label">Identity — on-chain agent</div>
       <ul class="tasks">
         <li class="task idle" data-task="storage">
           <span class="task-icon">1</span>
@@ -1431,21 +1431,21 @@ details.log[open] summary{color:var(--text2)}
             <div class="task-state">waiting</div>
           </div>
         </li>
-        <li class="task idle" data-task="sandbox">
+        <li class="task idle" data-task="uri">
           <span class="task-icon">3</span>
           <div class="task-info">
-            <div class="task-title">Provision agent sandbox</div>
+            <div class="task-title">Set agent URI on chain</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
       </ul>
 
-      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+      <div class="phase-label" style="margin-top:14px">Runtime — agent sandbox</div>
       <ul class="tasks">
-        <li class="task idle" data-task="uri">
+        <li class="task idle" data-task="sandbox">
           <span class="task-icon">4</span>
           <div class="task-info">
-            <div class="task-title">Set agent URI on chain</div>
+            <div class="task-title">Provision agent sandbox</div>
             <div class="task-state">waiting</div>
           </div>
         </li>
@@ -3023,8 +3023,11 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
-    // container failure → phase 2 won't run.
-    cancelDownstream(['uri', 'running']);
+    // Container failure is a RUNTIME failure only — it cancels just
+    // `running`. Identity (uri) is independent and still finalizes (the
+    // agent ends up minted + carded + Offline, recoverable via Bring
+    // online), so we must NOT cancel `uri` here.
+    cancelDownstream(['running']);
   }
 
   if (t === 'agent_u_r_i_updated') setTask('uri', 'done', 'tx submitted');
@@ -3040,7 +3043,11 @@ function handleDeployEvent(evt, sealId) {
 // ───────────────────────────────────────────────────────────────────
 // Progress helpers — unified vertical task list
 // ───────────────────────────────────────────────────────────────────
-const TASK_ORDER = ['storage', 'mint', 'sandbox', 'uri', 'running'];
+// Two independent tracks: Identity (storage → mint → uri, on-chain) and
+// Runtime (sandbox → running). The URI write no longer waits on the
+// sandbox — identity finalizes regardless of whether the container came
+// up — so `uri` sits in the identity group, ahead of `sandbox`.
+const TASK_ORDER = ['storage', 'mint', 'uri', 'sandbox', 'running'];
 
 function resetProgress() {
   TASK_ORDER.forEach((n, i) => {
@@ -3297,7 +3304,7 @@ function shortAddr(addr) {
 // detail page so /retry's progress is visible without leaving the
 // page — the deploy console's task list is for fresh deploys only.
 function renderTaskProgress(dep) {
-  const phase = dep.phase || 'pending';
+  const phase = dep.phase || 'deploying';
   if (phase === 'running' || phase === 'stopped') return '';
 
   // Map a stage to (cls, icon, text). The fail-with-reason case takes
@@ -3333,32 +3340,42 @@ function renderTaskProgress(dep) {
   const sFailed = dep.storage_stage && dep.storage_stage.state === 'failed';
   const mFailed = dep.mint_stage && dep.mint_stage.state === 'failed';
   const cFailed = dep.container_stage && dep.container_stage.state === 'failed';
-  const phase1Failed = sFailed || mFailed || cFailed;
+  // Identity (storage→mint→uri) and Runtime (sandbox→running) are
+  // independent. `uri` is skipped only when IDENTITY failed — a container
+  // failure no longer blocks the on-chain finalize. `running` needs a live
+  // container, so it's skipped when identity OR the container failed.
+  const identityFailed = sFailed || mFailed;
 
   let uriOverride = null;
   if (dep.agent_uri) uriOverride = { cls: 'done', icon: '✓', text: 'on-chain' };
-  else if (phase1Failed) uriOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+  else if (identityFailed) uriOverride = { cls: 'fail', icon: '✗', text: 'skipped — identity step failed' };
 
   let runningOverride = null;
   if (phase === 'running') runningOverride = { cls: 'done', icon: '✓', text: 'live' };
-  else if (phase1Failed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
+  else if (identityFailed || cFailed) runningOverride = { cls: 'fail', icon: '✗', text: 'skipped — earlier step failed' };
 
-  // Always render all 5 tasks — completed ones show with ✓ instead of
-  // disappearing. This matches the deploy console's checklist style:
-  // users get the full picture of where the deploy got, not a shrinking
-  // list that "ate" success markers.
-  return `
-    <section class="phase-tracker">
-      <div class="phase-label" style="margin-top:0">Phase 1 — three concurrent tracks</div>
+  // Once identity is finalized (agent_uri on chain) it's permanent and
+  // uninteresting — the hero's "on-chain" mint-chip already signals it, so
+  // the completed Identity checklist is just clutter. Hide that group once
+  // done and show only the Runtime group (the part that still needs the
+  // user — e.g. an Offline agent waiting on Bring online). Until identity
+  // completes (or if it failed), show it so the user sees where it got.
+  const identityComplete = !!dep.agent_uri;
+  const identityGroup = identityComplete ? '' : `
+      <div class="phase-label" style="margin-top:0">Identity — on-chain agent</div>
       <ul class="tasks">
         ${renderStage(1, 'Encrypt & upload to 0G storage', dep.storage_stage)}
         ${renderStage(2, 'Mint AgenticID on chain',         dep.mint_stage)}
-        ${renderStage(3, 'Provision agent sandbox',         dep.container_stage)}
-      </ul>
-      <div class="phase-label" style="margin-top:14px">Phase 2 — finalize</div>
+        ${renderStage(3, 'Set agent URI on chain',          null, uriOverride)}
+      </ul>`;
+
+  return `
+    <section class="phase-tracker">
+      ${identityGroup}
+      <div class="phase-label" style="margin-top:${identityComplete ? '0' : '14px'}">Runtime — agent sandbox</div>
       <ul class="tasks">
-        ${renderStage(4, 'Set agent URI on chain',     null, uriOverride)}
-        ${renderStage(5, 'Sandbox reports running',    null, runningOverride)}
+        ${renderStage(4, 'Provision agent sandbox',         dep.container_stage)}
+        ${renderStage(5, 'Sandbox reports running',         null, runningOverride)}
       </ul>
     </section>`;
 }
@@ -3377,23 +3394,36 @@ function renderTaskProgress(dep) {
 // failed" banner long after the container has come back online.
 function failureReason(dep) {
   if (!dep) return '';
-  if (dep.phase !== 'failed') return '';
-  // Priority matches the recovery-bucket priority:
-  //   storage / mint failures  ← root cause; deploy never made it to
-  //                              container, so c=Failed (if any) is a
-  //                              downstream symptom (provision timeout,
-  //                              etc.). Surface the upstream reason.
-  //   container failure        ← genuine container/runtime issue
-  //   last_provision_error     ← only when above don't have a reason
-  //                              (e.g. /provision rejected before any
-  //                              stage transitioned to Failed)
   const stageReason = (s) =>
     s && s.state === 'failed' && s.reason ? s.reason : '';
-  return stageReason(dep.storage_stage)
-    || stageReason(dep.mint_stage)
-    || stageReason(dep.container_stage)
-    || dep.last_provision_error
-    || '';
+  if (dep.phase === 'failed') {
+    // Deploy never completed. Priority matches the root-cause ordering:
+    //   storage / mint failures  ← root cause; deploy never made it to
+    //                              container, so c=Failed (if any) is a
+    //                              downstream symptom (provision timeout,
+    //                              etc.). Surface the upstream reason.
+    //   container failure        ← genuine container/runtime issue
+    //   last_provision_error     ← only when above don't have a reason
+    //                              (e.g. /provision rejected before any
+    //                              stage transitioned to Failed)
+    return stageReason(dep.storage_stage)
+      || stageReason(dep.mint_stage)
+      || stageReason(dep.container_stage)
+      || dep.last_provision_error
+      || '';
+  }
+  if (dep.phase === 'offline') {
+    // Minted agent with no running container. A genuine container failure
+    // (crash, provision timeout, image_hash rejection) carries a reason; a
+    // clean offline — owner stop→reset, or transfer (which resets
+    // container_stage to NotStarted) — carries none, so the banner stays
+    // silent. Offline-after-transfer is a "needs re-provision" prompt, not
+    // an error. Deliberately does NOT fall back to the sticky
+    // last_provision_error here, to avoid a stale reason haunting an agent
+    // that's offline for a benign reason.
+    return stageReason(dep.container_stage);
+  }
+  return '';
 }
 
 // Known-permanent /provision rejection markers. Recreating without a
@@ -3403,7 +3433,7 @@ function failureReason(dep) {
 // root cause is addressed) but surface a hint pointing at what to do.
 const PERMANENT_PROVISION_MARKERS = [
   ['image_hash not in validFrameworkHashes',
-   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring back online.'],
+   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring online.'],
   ['signer mismatch',
    'Sandbox TEE signer doesn\'t match attestor config. Coordinate with infra; recreate alone won\'t fix it.'],
   ['container_pubkey must be',
@@ -3419,7 +3449,7 @@ function permanentFailureHint(dep) {
 }
 
 function renderAgentRow(d) {
-  const phase = d.phase || 'pending';
+  const phase = d.phase || 'deploying';
   const card = d.agent_card || {};
   const name = card.name || '(unnamed)';
   const description = card.description || '';
@@ -3445,9 +3475,13 @@ function renderAgentRow(d) {
       </div>
       <div><span class="col-chain">⬢ 0G testnet</span></div>
       ${(() => {
-        const p = d.phase || 'pending';
+        const p = d.phase || 'deploying';
         const cls = p === 'running' ? 's-running' : p === 'failed' ? 's-failed' : 's-offline';
-        const txt = p === 'running' ? 'Running' : p === 'failed' ? 'Failed' : 'Offline';
+        const txt = p === 'running'   ? 'Running'
+                  : p === 'failed'    ? 'Failed'
+                  : p === 'stopped'   ? 'Stopped'
+                  : p === 'deploying' ? 'Deploying'
+                  : 'Offline';
         const r = failureReason(d);
         const title = r ? ` title="${escapeHtml(r)}"` : '';
         return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
@@ -3529,7 +3563,7 @@ async function renderDetail(sealId) {
 function paintDetail(dep) {
   const root = $('#detailContent');
   const sealId = '0x' + (typeof dep.seal_id === 'string' ? dep.seal_id.replace(/^0x/, '') : '');
-  const phase = dep.phase || 'pending';
+  const phase = dep.phase || 'deploying';
   const card = dep.agent_card || {};
   const name = card.name || '(unnamed)';
   const description = card.description || '';
@@ -3568,82 +3602,47 @@ function paintDetail(dep) {
   const ownerMatches = State.ownerAddr && dep.owner &&
     State.ownerAddr.toLowerCase() === dep.owner.toLowerCase();
 
-  // ── 6-bucket state classification ─────────────────────────────────
+  // ── State → owner-action mapping ──────────────────────────────────
   //
-  // Inputs (only what the row carries — the backend is the source of
-  // truth, including the provision_deadline sweep that flips stuck
-  // Submitted to Failed once the timeout passes):
-  //
-  //   phase           : derive_phase(s, m, c) on the row
-  //   s/m/c           : individual stage states
-  //   sandbox_id      : present once `sandbox.create` succeeded
-  //   provisioned_at  : present once /provision succeeded
-  //
-  // Buckets — exactly one applies, in this priority order:
-  //
-  //   ① live        — phase=running                  (Stop + Dashboard)
-  //   ② paused      — phase=stopped                  (Bring back online → start)
-  //   ③ incomplete  — s or m Failed                  (Continue deploy, no sig)
-  //   ④ stuck       — c Failed                       (Bring back online → create)
-  //   ⑤ provisioning — phase=ready, has_sb, !prov    (no action — still booting)
-  //   ⑥ mid-deploy  — anything else (pending / provisioning) (no action)
-  //
-  // Why the order: `incomplete` checks individual s/m before `stuck`
-  // checks c so a deployment that fails on multiple tracks gets the
-  // softer recovery path first (idempotent retry), then escalates to
-  // sandbox recreate after.
-  const stageFailed = (s) => s && s.state === 'failed';
-  const sFailed = stageFailed(dep.storage_stage);
-  const mFailed = stageFailed(dep.mint_stage);
-  const cFailed = stageFailed(dep.container_stage);
-  const isProvisioned = !!(dep.provisioned_at && dep.container_pubkey);
+  // The backend derive_phase(s, m, c) collapses the storage/mint/container
+  // stages into one of five phases; the frontend reads that phase and maps
+  // it straight to CTAs — no second-layer re-classification. The detailed
+  // "why" (crash vs timeout vs image_hash vs transfer) rides in the failure
+  // banner's reason, not in extra states.
   const hasSandbox = !!sandboxId;
 
-  // Two recovery labels — distinguish only by what's broken, not by
-  // backend dispatch (which is identical: sign CREATE envelope, POST
-  // /retry, worker decides what to actually run).
+  // Phase is the single source of truth (5 states). No second-layer
+  // re-derivation from sandbox_id / provisioned_at / per-stage flags —
+  // derive_phase already collapsed all of that into one string, and the
+  // owner CTAs map onto it 1:1:
   //
-  //   isLive       → Manage(Stop, Reset) + View
-  //   isIncomplete → Retry button (primary; phase-1 didn't finish)
-  //   isOffline + paused → Manage(Resume, Reset) — symmetric with Live
-  //   isOffline + broken → Restore button (neutral; sandbox.create
-  //                        + prompts for LLM API key) + Manage(Reset).
-  //                        Neutral styling because Restore preserves
-  //                        on-chain memory/skills — it's a recovery,
-  //                        not a destructive reset.
+  //   running   → Manage(Stop, Reset) + View(dashboard)
+  //   stopped   → Manage(Resume, Reset) — owner-paused, sandbox resumable
+  //   offline   → Restore CTA (spin up a fresh sandbox; on-chain memory
+  //               and skills are preserved) + Manage(Reset) if a sandbox
+  //               record still exists. Covers crash / provision timeout /
+  //               image_hash rejection / post-transfer "needs re-provision".
+  //   failed    → Retry CTA — storage/mint never finished; deploy from top.
+  //   deploying → in flight; no owner action (just watch task progress).
   const isLive       = phase === 'running';
-  const isIncomplete = ownerMatches && (sFailed || mFailed);
-  const isOffline    = ownerMatches && !isLive && !isIncomplete && (
-       cFailed
-    || phase === 'stopped'
-    || (phase === 'ready' && hasSandbox && !isProvisioned)
-  );
+  const isPaused     = phase === 'stopped';
+  const isOffline    = phase === 'offline';
+  const isIncomplete = phase === 'failed';
 
-  const canStop = ownerMatches && sandboxId && isLive;
+  const canStop   = ownerMatches && isLive && hasSandbox;
   // Resume lives in the Manage dropdown as Stop's mirror — same place,
-  // same weight. Only the `paused` flavor of offline qualifies; the
-  // broken flavors (cFailed, stuck booting) get the Restore CTA in
-  // the action row instead. /probe and the heartbeat sweep both write
-  // StageStatus::Failed (not Stopped) when the sandbox is gone, so
-  // phase=stopped now strictly means "user-initiated stop" and the
-  // simple equality check suffices.
-  const canResume = ownerMatches && isOffline && phase === 'stopped';
+  // same weight. Only an owner-paused agent (phase=stopped) qualifies;
+  // /probe and the heartbeat sweep write the container stage to Failed
+  // (→ phase=offline), not Stopped, when the sandbox is gone, so
+  // phase=stopped strictly means "user-initiated stop".
+  const canResume = ownerMatches && isPaused;
 
   // Reset — kills the existing sandbox and respawns one. Reserved for
-  // agents that actually came up: Live (force re-pull on a same-tag image
-  // bump) and paused (Resume just resurrects existing bytes; Reset rebuilds).
-  // Both require `hasSandbox`.
-  //
-  // NOT offered on a failed deploy. If mint/storage failed the agent never
-  // came online, so "reset a running agent" is meaningless — that path takes
-  // Retry, and a half-created sandbox (if any) is rebuilt by /retry →
-  // SandboxRecreate. This keeps every failure state consistent: storage/mint
-  // failed → Retry, container failed / stuck booting → Restore, and Reset
-  // stays exclusively a live/paused action.
-  const canReset = ownerMatches && hasSandbox && (
-    isLive
-    || (isOffline && phase === 'stopped')
-  );
+  // agents that actually came up: live (force re-pull on a same-tag image
+  // bump) and paused (Resume resurrects existing bytes; Reset rebuilds).
+  // Both require an existing sandbox record. Offline takes Restore and
+  // failed takes Retry, so Reset stays a live/paused-only action.
+  const canReset  = ownerMatches && hasSandbox && (isLive || isPaused);
 
   const ownerShort = dep.owner ? dep.owner.slice(0, 6) + '…' + dep.owner.slice(-4) : '—';
   // agentSeal addr: stored in registrations[0].agentAddress per AgentCard
@@ -3653,15 +3652,18 @@ function paintDetail(dep) {
     || dep.agent_seal_addr
     || '';
 
-  // Three pill states: Running / Failed / Offline. Same recovery
-  // action for the latter two (Start button), but failure deserves
-  // a red signal so the user notices "something broke" before they
-  // need to read the banner. Stopped + ready collapse into Offline.
+  // Pill mirrors the 5-state phase 1:1. Green = healthy/running, red =
+  // failed deploy (something broke before the agent ever came online),
+  // gray covers the benign/in-flight rest (deploying, stopped, offline).
+  // The exact label still distinguishes them so the user reads state at
+  // a glance; the failure banner below carries the detailed reason.
   const pillClass = phase === 'running' ? 'solid-green'
                   : phase === 'failed'  ? 'solid-red'
                   : 'solid-gray';
-  const pillLabel = phase === 'running' ? 'Running'
-                  : phase === 'failed'  ? 'Failed'
+  const pillLabel = phase === 'running'   ? 'Running'
+                  : phase === 'failed'    ? 'Failed'
+                  : phase === 'stopped'   ? 'Stopped'
+                  : phase === 'deploying' ? 'Deploying'
                   : 'Offline';
 
   // Owner action buttons. Per-state CTA (Stop / Start / Retry) + Reset
@@ -3701,7 +3703,7 @@ function paintDetail(dep) {
     <div class="actions">
       ${viewDropdown}
       ${isIncomplete ? `<button class="icon-btn primary" onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Retry</button>` : ''}
-      ${(isOffline && phase !== 'stopped') ? `<button class="icon-btn" title="Spin up a fresh sandbox container. On-chain memory and skills are preserved." onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Restore</button>` : ''}
+      ${isOffline ? `<button class="icon-btn primary" title="Spin up a fresh sandbox container. On-chain memory and skills are preserved." onclick="bringOnline('${escapeHtml(sealId)}', '${escapeHtml(sandboxId || '')}', false)"><span class="ico">${ICO.refresh}</span> Bring online</button>` : ''}
       ${manageDropdown}
     </div>`;
 
@@ -3889,11 +3891,15 @@ function paintDetail(dep) {
       const reason = failureReason(dep);
       if (!reason) return '';
       const hint = permanentFailureHint(dep);
+      // Offline = a minted agent whose container later went down; calling
+      // that "Deployment failed" would be misleading. Only phase=failed
+      // (deploy never completed) earns that title.
+      const bannerTitle = dep.phase === 'offline' ? 'Agent offline' : 'Deployment failed';
       return `
         <div class="failure-banner">
           <span class="ico" style="color:var(--red);flex-shrink:0">${ICO.warn || '!'}</span>
           <div>
-            <div class="failure-banner-title">Deployment failed</div>
+            <div class="failure-banner-title">${bannerTitle}</div>
             <div class="failure-banner-reason">${escapeHtml(reason)}</div>
             ${hint ? `<div class="failure-banner-hint">${escapeHtml(hint)}</div>` : ''}
           </div>
@@ -4120,12 +4126,25 @@ function renderSealStatus(balance, sealAddr, agentName) {
   }
 }
 
-// Curated short copy for the pinned warning bubble. Self-update-themed
-// because the only owner-recoverable condition wired today is "agent_seal
-// out of gas while trying to publish a drift tx" — i.e. the agent
-// literally cannot evolve until topped up. Random pick on each apply
-// keeps repeat visits from feeling mechanical.
-const CONTAINER_WARNING_LINES = [
+// Curated short copy for the pinned warning bubble.
+//
+// Two warning sources funnel into ContainerWarning events, but only one
+// belongs on the avatar:
+//
+//   1. sealed runtime: agentSeal wallet is dry — drift-publish tx fails.
+//      The agent literally cannot evolve until the owner funds the
+//      agent_seal address. This IS about the avatar's wallet → pin it.
+//
+//   2. attestor worker: owner's sandbox prepaid balance is insufficient
+//      — sandbox.start / sandbox.create returned 402. That's the owner's
+//      account, not the agent's seal, and it lands the agent in Offline
+//      where the failure banner already says so + offers top-up. Not the
+//      avatar's concern → applyContainerWarning bails on it.
+//
+// The reason string distinguishes them: sandbox-balance warnings contain
+// "sandbox balance"; sealed drift warnings carry the raw RPC error
+// (e.g. "insufficient funds for gas * price + value").
+const CONTAINER_WARNING_LINES_SEAL = [
   'Out of gas — can’t evolve 🧬',
   'Need gas to self-update 💸',
   'Wallet empty — drift on hold',
@@ -4147,13 +4166,32 @@ function applyContainerWarning(sealAddr, agentName) {
     // there's no active warning (so the balance plea can take over).
     return;
   }
-  plea.textContent = CONTAINER_WARNING_LINES[
-    Math.floor(Math.random() * CONTAINER_WARNING_LINES.length)
+
+  // Sandbox prepaid balance is the OWNER's account — not the agent_seal
+  // wallet the avatar represents — so a sandbox-balance 402 must NOT pin
+  // the avatar plea. That case lands the agent in Offline, where the
+  // failure banner already surfaces "insufficient sandbox balance" with a
+  // top-up action; doubling it onto the avatar reads as the *agent* being
+  // broke, which it isn't. Leave the bubble to renderSealStatus (balance
+  // plea) and bail. Only agentSeal-gas warnings — the agent literally
+  // can't pay to publish a drift tx — belong on the avatar.
+  const isSandboxBalance = /sandbox balance/i.test(w.reason || '');
+  if (isSandboxBalance) {
+    plea.classList.remove('seal-plea--alert');
+    return;
+  }
+
+  const lines = CONTAINER_WARNING_LINES_SEAL;
+  plea.textContent = lines[
+    Math.floor(Math.random() * lines.length)
   ];
   plea.title = w.reason || '';
   plea.classList.add('seal-plea--alert');
   plea.classList.remove('seal-plea--low');
   plea.hidden = false;
+
+  // agentSeal gas → agent-seal top-up modal (owner sends OG directly to
+  // the agent's seal address for drift-tx gas).
   if (sealAddr) {
     plea.onclick = () => depositToAgentSeal(sealAddr, agentName);
     plea.onkeydown = (e) => {
@@ -4243,10 +4281,10 @@ window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandb
 //      container in place. Same sandbox_id, no re-boot, just a
 //      Daytona resume. ~seconds.
 //
-//   useStart=false (failed / ready / cFailed / sFailed / mFailed) →
-//      sign CREATE envelope, POST /retry → ResumeDeploy → optionally
-//      re-runs storage/mint, then SandboxRecreate (kill+spawn) when
-//      c is unhealthy. New sandbox_id, full container re-boot.
+//   useStart=false (phase=offline → Bring online, or phase=failed →
+//      Retry) → sign CREATE envelope, POST /retry → ResumeDeploy →
+//      optionally re-runs storage/mint, then SandboxRecreate (kill+spawn)
+//      when the container is unhealthy. New sandbox_id, full re-boot.
 //
 // Per-seal in-flight guard (_lifecycleInflight) defends against
 // jittery double-clicks on either path.
@@ -4259,6 +4297,16 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
   }
   _lifecycleInflight.add(guardKey);
   try {
+    // Same pre-flight gates as deploy: bringing a sandbox up (create) or
+    // resuming one (start) needs the owner's trust roots acked AND prepaid
+    // sandbox balance ≥ threshold. Surface the ack + top-up modals up
+    // front rather than letting the worker 402 and bounce the agent back
+    // into Offline. Both calls are no-ops when already satisfied; a falsey
+    // return means the user dismissed the modal, so abort (finally still
+    // releases the in-flight guard).
+    if (!await ensureTrustRootsAcked()) return;
+    if (!await ensureSandboxBalance()) return;
+
     const action = useStart ? 'start' : 'create';
     // start: bind envelope to existing sandbox_id (Daytona auth checks
     //        canonical.resource_id matches the URL :id). Empty payload.
@@ -4462,12 +4510,13 @@ function fireProbe(sealIdHex) {
 // Serve verification rendered as a 3-row checklist that animates one row at
 // a time so the user can see each cryptographic step resolve. Rows are
 // pre-declared so layout doesn't reflow as checks land:
-//   ⟳ Signer identity         — envelope sig recovers to on-chain agent_seal
-//   ⟳ Response body integrity — keccak(body) matches envelope.resp_body_hash
+//   ⟳ Signer identity         — proof sig recovers to on-chain agent_seal
+//   ⟳ Response body integrity — recomputed taskHash matches envelope.task_hash
 //   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
-// envelope = `{ resp_body_hash, data_hashes, ts, ... }`, sig is EIP-191
-// personal_sign over the envelope JSON bytes.
+// envelope = `{ agent_id, timestamp, deadline, task_hash, data_hashes[], framework_hash }`.
+// sig is EIP-191 over keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)) — the contract's ServeProof digest.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
@@ -4690,9 +4739,19 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
       const parts = proofHeader.split('.');
       if (parts.length !== 2) throw new Error('malformed X-Agent-Proof (expected sig.envelope)');
       const [sig, envB64] = parts;
-      const envelopeJson = b64urlDecode(envB64);
-      envelope = JSON.parse(envelopeJson);
-      recovered = ethers.verifyMessage(envelopeJson, sig);
+      envelope = JSON.parse(b64urlDecode(envB64));
+      // Reconstruct the contract's signed digest: keccak256(abi.encode(agentId,
+      // timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
+      // frameworkHash)), then EIP-191 — matches AgenticIDReputationRegistry._verifyServeProof
+      // and the sealed proxy's writeServeProof.
+      const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+      const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
+      const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+        ['uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
+        [BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+         envelope.task_hash, dhHash, envelope.framework_hash],
+      ));
+      recovered = ethers.verifyMessage(ethers.getBytes(proofHash), sig);
       sigInfo = { full: recovered, short: `${recovered.slice(0,6)}…${recovered.slice(-4)}` };
     } catch (e) {
       setRow('identity', 'failed', `envelope: ${e.message || e}`);
@@ -4719,38 +4778,37 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     paint('verifying', '', 'Verifying response body…', null, null, null);
     await sleep(500);
 
-    const actualBodyHash = ethers.keccak256(ethers.toUtf8Bytes(text)).toLowerCase();
-    const claimedHash = String(envelope.resp_body_hash || '').toLowerCase();
-    if (claimedHash !== actualBodyHash) {
-      setRow('body', 'failed', `keccak(body)=${actualBodyHash.slice(0,10)}… ≠ envelope.resp_body_hash`);
+    // taskHash binds the transcript: keccak256(method ‖ uri ‖ keccak(reqBody) ‖
+    // keccak(respBody) ‖ status). /hello is a GET with an empty request body.
+    const uriPath = (() => { try { const u = new URL(url); return u.pathname + u.search; } catch { return '/hello'; } })();
+    const localTask = ethers.keccak256(ethers.concat([
+      ethers.toUtf8Bytes('GET'),
+      ethers.toUtf8Bytes(uriPath),
+      ethers.keccak256('0x'),                       // keccak(reqBody), empty
+      ethers.keccak256(ethers.toUtf8Bytes(text)),   // keccak(respBody)
+      ethers.toUtf8Bytes(String(r.status)),
+    ])).toLowerCase();
+    const claimedTask = String(envelope.task_hash || '').toLowerCase();
+    if (claimedTask !== localTask) {
+      setRow('body', 'failed', `taskHash ${localTask.slice(0,10)}… ≠ envelope.task_hash`);
       setRow('data', 'skipped');
       paint('failed', '✗', 'Body tampered',
-        'Response body hash does not match the signed envelope',
+        'Response transcript hash does not match the signed proof',
         sigInfo, humanMsg);
       return;
     }
-    setRow('body', 'passed', `keccak(body)=${actualBodyHash.slice(0,10)}… ✓ envelope`);
+    setRow('body', 'passed', `taskHash ${localTask.slice(0,10)}… ✓ (body bound)`);
 
     // ── Check 3: on-chain data hashes ──
     setRow('data', 'running');
     paint('verifying', '', 'Cross-checking on-chain data…', null, null, null);
     await sleep(500);
 
-    // envelope.data_hashes is `{role: {content_hash, data_hash?}}` —
-    // every dim the agent is tracking, including ones absent from chain
-    // (in which case data_hash is omitted). Two-level verification per dim:
-    //   * declared role missing on chain → chain-default, PASS
-    //     (chain intentionally omitted this dim; agent runs adapter
-    //     defaults; content_hash is signed but not cross-checkable here)
-    //   * declared role present on chain, data_hash matches → PASS
-    //   * declared role present on chain, data_hash differs/missing → FAIL
-    const declared = (envelope && typeof envelope.data_hashes === 'object'
-                      && envelope.data_hashes !== null
-                      && !Array.isArray(envelope.data_hashes))
-      ? envelope.data_hashes
-      : null;
-    const declaredEntries = declared ? Object.entries(declared) : [];
-    if (declaredEntries.length === 0) {
+    // data_hashes is now bytes32[] — the on-chain storage roots the TEE was
+    // running when it produced this response. Every one must be present in
+    // intelligentDatasOf(agentId).
+    const declared = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+    if (declared.length === 0) {
       setRow('data', 'skipped', 'envelope declared no data hashes');
     } else {
       try {
@@ -4765,52 +4823,25 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           provider,
         );
         const datas = await c.intelligentDatasOf(BigInt(agentId));
-        // Build role → on-chain dataHash. dataDescription is a JSON
-        // string the attestor writes at mint time; unparseable entries
-        // (e.g. legacy or attestor bug) are silently skipped — they
-        // simply can't be matched by role and fall into the
-        // "chain-absent" branch below.
-        const onchainByRole = new Map();
-        for (const d of datas) {
-          try {
-            const parsed = JSON.parse(d.dataDescription);
-            const role = parsed && typeof parsed === 'object' ? parsed.role : null;
-            if (typeof role === 'string' && role) {
-              onchainByRole.set(role, String(d.dataHash).toLowerCase());
-            }
-          } catch (_) { /* not JSON; skip */ }
-        }
-
-        // Display the dim's content_hash in the dim row (always present);
-        // dimsHtml truncates it itself with slice(0,10)+'…'+slice(-6).
-        // For legacy proofs (info is a string), fall back to that string.
-        const dims = declaredEntries.map(([role, info]) => {
-          const content = (info && typeof info === 'object') ? String(info.content_hash || '').toLowerCase() : '';
-          const declaredData = (info && typeof info === 'object')
-            ? String(info.data_hash || '').toLowerCase()
-            : String(info || '').toLowerCase();
-          const displayHash = content || declaredData || '';
-          const oc = onchainByRole.get(role);
-          if (oc === undefined) {
-            return { role, hash: displayHash, status: 'passed', note: 'chain-default · absent' };
-          }
-          if (declaredData && oc === declaredData) {
-            return { role, hash: displayHash, status: 'passed', note: 'matches chain' };
-          }
-          return { role, hash: displayHash, status: 'failed',
-                   note: `chain has ${oc.slice(0,10)}…${oc.slice(-6)}` };
+        const onChain = new Set(datas.map(d => String(d.dataHash).toLowerCase()));
+        const dims = declared.map((h, i) => {
+          const hl = String(h).toLowerCase();
+          const ok = onChain.has(hl);
+          return { role: `data[${i}]`, hash: hl,
+                   status: ok ? 'passed' : 'failed',
+                   note: ok ? 'on chain' : 'NOT on chain' };
         });
         const failedDims = dims.filter(d => d.status === 'failed').length;
         if (failedDims > 0) {
           setRow('data', 'failed',
-            `${failedDims}/${dims.length} dim${failedDims===1?'':'s'} mismatch`, dims);
+            `${failedDims}/${dims.length} not on chain`, dims);
           paint('failed', '✗', 'Data hash mismatch',
-            'Agent declared a data hash that contradicts chain',
+            'Agent declared a data hash not present on chain',
             sigInfo, humanMsg);
           return;
         }
         setRow('data', 'passed',
-          `${dims.length}/${dims.length} dim${dims.length===1?'':'s'} verified`, dims);
+          `${dims.length}/${dims.length} on chain`, dims);
       } catch (e) {
         setRow('data', 'failed', e.message || String(e));
         paint('failed', '✗', 'On-chain verification failed', null, null, null);

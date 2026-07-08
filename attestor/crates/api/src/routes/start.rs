@@ -14,6 +14,7 @@
 //! Frontend decides which to sign by reading `provisioned_at` +
 //! `container_pubkey` on the deployment; we don't 409 here, just dispatch.
 
+use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::sandbox::CanonicalSignedMessage;
@@ -36,32 +37,36 @@ pub async fn handle(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
 
-    if d.owner != req.owner {
-        return Err(ApiError::unauthorized("owner mismatch"));
-    }
-
     // Peek at the signed envelope's action so we can dispatch start vs
-    // recreate. Full signature/owner verification is the worker's job
-    // (HttpSandbox::create / lifecycle_call do that on the way out).
+    // recreate. Validate the action first (cheap, → 400) before the auth
+    // check, so a misclick fails as a bad request rather than unauthorized.
     let msg_bytes = base64::engine::general_purpose::STANDARD
         .decode(req.sandbox_envelope.signed_message_b64.as_bytes())
         .map_err(|e| ApiError::bad_request(format!("envelope base64: {e}")))?;
     let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
         .map_err(|e| ApiError::bad_request(format!("envelope JSON: {e}")))?;
+    let action = canonical.action.as_str();
+    if action != "start" && action != "create" {
+        return Err(ApiError::bad_request(format!(
+            "envelope action must be 'start' or 'create', got {action:?}"
+        )));
+    }
 
-    let payload = match canonical.action.as_str() {
-        "start" => JobPayload::SandboxStart {
+    // Real owner authorization: the envelope must be signed by the current
+    // on-chain owner (covers both the resume and recreate dispatch below).
+    // The previous `req.owner == d.owner` check trusted an unsigned,
+    // attacker-supplied field and was forgeable — see {lifecycle_auth}.
+    authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
+
+    let payload = if action == "start" {
+        JobPayload::SandboxStart {
             seal_id: req.seal_id,
             sandbox_envelope: req.sandbox_envelope,
-        },
-        "create" => JobPayload::SandboxRecreate {
+        }
+    } else {
+        JobPayload::SandboxRecreate {
             seal_id: req.seal_id,
             sandbox_envelope: req.sandbox_envelope,
-        },
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "envelope action must be 'start' or 'create', got {other:?}"
-            )));
         }
     };
     state.jobs.submit(payload).await?;
@@ -126,6 +131,23 @@ mod tests {
         }
     }
 
+    const OWNER_PRIV: [u8; 32] = [0x11; 32];
+    const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
+
+    /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
+    fn signed_req(
+        seal_id: SealId,
+        priv_bytes: &[u8; 32],
+        action: &str,
+    ) -> attestor_shared::LifecycleRequest {
+        let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
+        attestor_shared::LifecycleRequest {
+            seal_id,
+            owner: env.wallet_address,
+            sandbox_envelope: env,
+        }
+    }
+
     struct Setup {
         state: AppState,
         deployments: Arc<InMemoryDeploymentRepo>,
@@ -144,7 +166,9 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let events = Arc::new(InMemoryEventBus::new());
 
-        let owner = Address::from([0x11; 20]);
+        // owner address = address of OWNER_PRIV. agent_id is None here, so
+        // the gate falls back to this deployment owner.
+        let owner = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create").wallet_address;
         let seal_id = B256::repeat_byte(0xaa);
         let now = Utc::now();
         let d = Deployment {
@@ -218,7 +242,7 @@ mod tests {
     #[tokio::test]
     async fn action_start_enqueues_sandbox_start() {
         let s = make_setup();
-        let req = lifecycle_req(s.seal_id, s.owner, "start");
+        let req = signed_req(s.seal_id, &OWNER_PRIV, "start");
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("handler should accept");
@@ -234,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn action_create_enqueues_sandbox_recreate() {
         let s = make_setup();
-        let req = lifecycle_req(s.seal_id, s.owner, "create");
+        let req = signed_req(s.seal_id, &OWNER_PRIV, "create");
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .expect("handler should accept");
@@ -318,11 +342,10 @@ mod tests {
     async fn owner_mismatch_is_401() {
         // A user knowing someone else's seal_id signing a `create`
         // envelope and POSTing it must NOT be able to spin a fresh
-        // sandbox under that deployment. This is the authorization
-        // backstop — frontend doesn't enforce it; we do.
+        // sandbox under that deployment. The attacker signs a valid
+        // envelope, but is not the deployment owner — the gate rejects it.
         let s = make_setup();
-        let other = Address::from([0x99; 20]);
-        let req = lifecycle_req(s.seal_id, other, "create");
+        let req = signed_req(s.seal_id, &ATTACKER_PRIV, "create");
         let err = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
             .err()

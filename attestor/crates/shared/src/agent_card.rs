@@ -56,12 +56,21 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
     attributes.extend(i.profile.extra_attributes());
 
     // ── url: http://{cp}-{sid}.{host}.nip.io:{port}{path} ───────────────
-    let url = build_agent_url(
-        i.sandbox_proxy_addr,
-        i.sandbox_id,
-        i.agent_serve_port,
-        i.agent_serve_path,
-    );
+    // Empty when the agent has no running sandbox yet — identity (mint +
+    // card + setAgentURI) is written independently of the runtime, so a
+    // freshly-minted-but-not-yet-running agent has a card with no endpoint.
+    // The runtime track fills it in (refresh_agent_card_url, OSS-only, no
+    // chain write) once a sandbox exists.
+    let url = if i.sandbox_id.is_empty() {
+        String::new()
+    } else {
+        build_agent_url(
+            i.sandbox_proxy_addr,
+            i.sandbox_id,
+            i.agent_serve_port,
+            i.agent_serve_path,
+        )
+    };
 
     // ── registrations: [{ agentId, chainId, agentAddress }] ─────────────
     // alloy `Address` Display renders the EIP-55 checksummed "0x..." form.
@@ -177,6 +186,39 @@ mod tests {
         // an http://…:80 that only works via a redirect.
         let url = build_agent_url("art.0g.ai", "sb", 8080, "/hello");
         assert_eq!(url, "https://8080-sb.art.0g.ai/hello");
+    }
+
+    #[test]
+    fn agent_card_emits_empty_url_when_sandbox_id_empty() {
+        // Identity is written independently of the runtime: a minted agent
+        // with no sandbox yet gets a card with an empty `url` (filled later
+        // by refresh_agent_card_url). The identity fields must still be
+        // fully populated.
+        let profile = OpenClawProfile;
+        let seal_addr = Address::from_slice(&[0x42u8; 20]);
+        let seed = [9u8; 32];
+        let card = build_agent_card(AgentCardInputs {
+            name: "Sage",
+            description: "DeFi helper",
+            image: None,
+            profile: &profile,
+            agent_id: U256::from(9u64),
+            agent_seal_addr: seal_addr,
+            chain_id: 16602,
+            seal_id: &seed,
+            sandbox_id: "", // no running sandbox
+            sandbox_proxy_addr: "47.236.111.154.nip.io:4000",
+            agent_serve_port: 8080,
+            agent_serve_path: "/hello",
+        });
+        assert_eq!(card["url"].as_str(), Some(""), "url must be empty with no sandbox");
+        // Identity fields intact.
+        assert_eq!(card["name"].as_str(), Some("Sage"));
+        assert_eq!(card["registrations"][0]["agentId"].as_str(), Some("9"));
+        assert_eq!(
+            card["registrations"][0]["agentAddress"].as_str(),
+            Some(seal_addr.to_string().as_str())
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"strings"
 	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
@@ -489,6 +490,9 @@ func startAgent(
 
 			// Sealed runtime metadata.
 			SealedVersion: sealedVersion,
+			// AgenticID Framework code hash = the sealed image measurement.
+			// ImageHash is "sha256:<hex>"; the contract wants a bytes32.
+			FrameworkHash: "0x" + strings.TrimPrefix(cfg.Attestation.ImageHash, "sha256:"),
 		},
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,

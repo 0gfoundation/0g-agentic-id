@@ -15,6 +15,7 @@
 //! attestor-authored on-chain writes (mint, setAgentURI) which require
 //! the attestor's own EOA — owner can't be tricked into anything.
 
+use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{JobPayload, RetryRequest};
@@ -34,14 +35,38 @@ pub async fn handle(
         .get(req.seal_id)
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
-    if d.owner != req.owner {
-        return Err(ApiError::unauthorized("owner mismatch"));
+    // When a create envelope is attached, the worker may escalate
+    // ResumeDeploy → SandboxRecreate (a fresh container), so that envelope
+    // must be signed by the current on-chain owner — see {lifecycle_auth}.
+    // Without an envelope the worker only performs idempotent,
+    // attestor-authored on-chain writes (mint resubmit, setAgentURI) — no
+    // container is created and no seal is handed out — so the cheaper owner
+    // field check is retained for that path.
+    match &req.sandbox_envelope {
+        Some(env) => authorize_lifecycle(&state, &d, env).await?,
+        None => {
+            if d.owner != req.owner {
+                return Err(ApiError::unauthorized("owner mismatch"));
+            }
+        }
     }
+
+    // Carry the pre-mint resume context in the job itself. Only meaningful
+    // before mint: the artifacts (ciphertext/root/sealed_key) are derived from
+    // a random dataKey and can't be recomputed, so a pre-mint resume needs
+    // them. Once minted, the authoritative iData lives on chain, so we send
+    // nothing and the worker reads it from there.
+    let artifacts = if d.agent_id.is_none() {
+        d.i_data.clone()
+    } else {
+        Vec::new()
+    };
 
     state
         .jobs
         .submit(JobPayload::ResumeDeploy {
             seal_id: req.seal_id,
+            artifacts,
             sandbox_envelope: req.sandbox_envelope,
         })
         .await?;
@@ -58,10 +83,27 @@ mod tests {
         MockChain,
     };
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, JobPayload, SealId, StageStatus,
+        derive_phase, Config, Deployment, DeploymentRepo, IDataArtifact, JobPayload, SealId,
+        StageStatus, StorageRoot,
     };
+    use alloy::primitives::{Bytes, U256};
     use chrono::Utc;
     use std::sync::Arc;
+
+    fn test_artifact() -> IDataArtifact {
+        IDataArtifact {
+            role: "framework".into(),
+            description: "{}".into(),
+            storage_root: StorageRoot {
+                root_hash: B256::repeat_byte(0x33),
+                indexer: "indexer".into(),
+                size: 32,
+            },
+            sealed_key: Bytes::from_static(b"sealed"),
+            data_hash: B256::repeat_byte(0x33),
+            ciphertext: Bytes::from_static(b"ct"),
+        }
+    }
 
     fn test_config() -> Config {
         Config {
@@ -103,6 +145,9 @@ mod tests {
         }
     }
 
+    const OWNER_PRIV: [u8; 32] = [0x33; 32];
+    const ATTACKER_PRIV: [u8; 32] = [0x99; 32];
+
     struct Setup {
         state: AppState,
         deployments: Arc<InMemoryDeploymentRepo>,
@@ -121,7 +166,10 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let events = Arc::new(InMemoryEventBus::new());
 
-        let owner = Address::from([0x33; 20]);
+        // owner address = address of OWNER_PRIV (so an OWNER_PRIV-signed
+        // create envelope authorizes the escalation path). agent_id is None
+        // here, so the gate falls back to this deployment owner.
+        let owner = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create").wallet_address;
         let seal_id = B256::repeat_byte(0xbb);
         let now = Utc::now();
         let d = Deployment {
@@ -179,6 +227,85 @@ mod tests {
             JobPayload::ResumeDeploy { seal_id, .. } => assert_eq!(*seal_id, s.seal_id),
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn retry_carries_i_data_as_artifacts_when_unminted() {
+        // Pre-mint: the resume context can't be recomputed (random dataKey),
+        // so /retry must carry the deployment's current i_data in the job.
+        let s = make_setup(); // agent_id: None
+        {
+            let mut g = s.deployments.by_seal.lock().unwrap();
+            g.get_mut(&s.seal_id).unwrap().i_data = vec![test_artifact()];
+        }
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let submitted = s.jobs.submitted.lock().unwrap();
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { artifacts, .. } => {
+                assert_eq!(artifacts.len(), 1, "pre-mint retry must carry the snapshot");
+            }
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_sends_empty_artifacts_when_minted() {
+        // Post-mint: authoritative iData is on chain, so /retry carries none.
+        let s = make_setup();
+        {
+            let mut g = s.deployments.by_seal.lock().unwrap();
+            let d = g.get_mut(&s.seal_id).unwrap();
+            d.i_data = vec![test_artifact()];
+            d.agent_id = Some(U256::from(9u64)); // minted
+        }
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let submitted = s.jobs.submitted.lock().unwrap();
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { artifacts, .. } => {
+                assert!(artifacts.is_empty(), "post-mint retry reads chain, carries nothing");
+            }
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_envelope_requires_current_owner() {
+        // When a create envelope is attached, the worker may escalate to a
+        // fresh sandbox, so the envelope must be signed by the current owner.
+        // An attacker's valid envelope (with a forged `owner` field) is
+        // refused; the owner's is accepted.
+        let s = make_setup();
+
+        let attacker_env = attestor_shared::mocks::signed_envelope(&ATTACKER_PRIV, "create");
+        let bad = RetryRequest {
+            seal_id: s.seal_id,
+            owner: attacker_env.wallet_address,
+            sandbox_envelope: Some(attacker_env),
+        };
+        let err = handle(axum::extract::State(s.state.clone()), Json(bad))
+            .await
+            .err()
+            .expect("attacker envelope must be rejected");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+
+        let owner_env = attestor_shared::mocks::signed_envelope(&OWNER_PRIV, "create");
+        let good = RetryRequest {
+            seal_id: s.seal_id,
+            owner: owner_env.wallet_address,
+            sandbox_envelope: Some(owner_env),
+        };
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(good))
+            .await
+            .expect("owner envelope must be accepted");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -80,6 +80,7 @@ cargo run -p attestor-indexer# 第三个终端
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
+| `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
 | `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置 | owner envelope |
 | `POST /probe` | 同步探活，flip 失联容器到 `Failed` | 无 |
 

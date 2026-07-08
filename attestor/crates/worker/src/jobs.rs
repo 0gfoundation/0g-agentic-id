@@ -6,6 +6,7 @@ use attestor_shared::{
     agent_profile::ProfileRegistry,
     i_data_derive::normalize_i_data,
     oss::OssClient,
+    sandbox::SandboxError,
     AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
     IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
     SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
@@ -101,22 +102,31 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // online" → SandboxRecreate (action=create) for a fresh
             // sandbox.
             if let Err(e) = ctx.sandbox.start(seal_id, &sandbox_envelope).await {
-                // Insufficient sandbox balance (HTTP 402) is owner-recoverable:
-                // top up and Resume again. Unlike a genuine runtime fault it must
-                // NOT flip Failed or admin_delete the sandbox — that would force a
-                // full Recreate over a transient funding gap. Leave the deployment
-                // Stopped (the /start route never changed it, so it's still
-                // resumable) and surface a top-up hint instead.
-                if e.to_string().contains("insufficient balance") {
-                    tracing::warn!(?seal_id, error = %e, "sandbox.start: insufficient balance; staying Stopped for retry after top-up");
+                // Classify by the provider's HTTP status (SandboxError), not
+                // by string-matching the body. A transient/recoverable
+                // condition — a state-transition conflict, the ~90s post-stop
+                // backup lock (returned as 400/409 "operation in progress"), a
+                // rate limit, an upstream RPC hiccup, or a top-up-able balance
+                // gap — must NOT flip Failed or admin_delete: the sandbox is
+                // healthy (or will be once the condition clears) and still
+                // resumable. Leave the deployment Stopped (the /start route
+                // never changed it) and surface a hint; the next user-driven
+                // Resume retries. Only a genuinely fatal error falls through to
+                // the recreate path below.
+                let transient = e
+                    .downcast_ref::<SandboxError>()
+                    .map(|se| se.is_transient())
+                    .unwrap_or(false);
+                if transient {
+                    let reason = if e.to_string().to_lowercase().contains("balance") {
+                        "insufficient sandbox balance — top up to resume".to_string()
+                    } else {
+                        "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
+                    };
+                    tracing::warn!(?seal_id, error = %e, "sandbox.start: transient condition; staying Stopped for retry");
                     ctx.events
-                        .publish(WsEvent::ContainerWarning {
-                            seal_id,
-                            reason: "insufficient sandbox balance — top up to resume".to_string(),
-                        })
+                        .publish(WsEvent::ContainerWarning { seal_id, reason })
                         .await?;
-                    // Not retry-worthy: the next user-driven Resume (post top-up)
-                    // enqueues a fresh start job.
                     return Ok(());
                 }
                 let now = Utc::now();
@@ -211,6 +221,25 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     );
                     // intentionally fall through to the success-path
                     // bookkeeping below
+                } else if e
+                    .downcast_ref::<SandboxError>()
+                    .map(|se| se.is_transient())
+                    .unwrap_or(false)
+                {
+                    // Transient (lock held, rate limit, upstream hiccup): the
+                    // stop didn't take, but the container is still healthy and
+                    // running — flipping Failed would mark a live agent dead.
+                    // Leave the stage as-is (still Running) and let the user
+                    // retry Stop.
+                    tracing::warn!(?seal_id, error = %e, "sandbox.stop: transient condition; leaving agent running for retry");
+                    ctx.events
+                        .publish(WsEvent::ContainerWarning {
+                            seal_id,
+                            reason: "sandbox temporarily busy — try Stop again in a moment"
+                                .to_string(),
+                        })
+                        .await?;
+                    return Ok(());
                 } else {
                     let now = Utc::now();
                     let reason = format!("sandbox stop: {e}");
@@ -250,10 +279,79 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => handle_sandbox_recreate(ctx, seal_id, sandbox_envelope).await,
-        JobPayload::ResumeDeploy { seal_id, sandbox_envelope } => {
-            handle_resume_deploy(ctx, seal_id, sandbox_envelope).await
+        JobPayload::ResumeDeploy { seal_id, artifacts, sandbox_envelope } => {
+            handle_resume_deploy(ctx, seal_id, artifacts, sandbox_envelope).await
+        }
+        JobPayload::SandboxTeardown { seal_id } => handle_sandbox_teardown(ctx, seal_id).await,
+        JobPayload::Clone {
+            new_seal_id,
+            source_seal_id,
+            target_owner,
+            name,
+            description,
+            image,
+        } => {
+            handle_clone(
+                ctx,
+                new_seal_id,
+                source_seal_id,
+                target_owner,
+                name,
+                description,
+                image,
+            )
+            .await
         }
     }
+}
+
+/// Layer 2 of seal-bound-transfer ownership: tear down the prior owner's
+/// running container after the token was transferred. Enqueued by the
+/// indexer's `on_transfer`. Uses the attestor's admin signer (no owner
+/// envelope) to `admin_delete` the sandbox. Best-effort: a failure here just
+/// means the container lingers until the sandbox runtime GCs it — the sealed
+/// fail-safe self-kill (deferred #5) is the guarantee, this is cleanup.
+async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<()> {
+    let sandbox_id = match ctx.deployments.get(seal_id).await? {
+        Some(d) => d.sandbox_id,
+        None => {
+            tracing::warn!(?seal_id, "teardown: deployment vanished, nothing to do");
+            return Ok(());
+        }
+    };
+    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+        tracing::info!(?seal_id, "teardown: no sandbox_id, nothing to delete");
+        return Ok(());
+    };
+    tracing::info!(
+        ?seal_id,
+        sandbox_id = %sb,
+        "ownership transfer: tearing down prior owner's sandbox"
+    );
+    if let Err(e) = ctx.sandbox.admin_delete(&sb).await {
+        tracing::warn!(
+            ?seal_id,
+            sandbox_id = %sb,
+            error = %e,
+            "teardown: admin_delete failed (non-fatal; runtime GC will reap)"
+        );
+    }
+    // Reset the container track so the deployment shows Ready (provisioned on
+    // chain + storage, no running container), NOT Stopped (implies resumable —
+    // the sandbox is deleted) or Failed (implies a crash). A transfer leaves
+    // the agent awaiting the NEW owner to bring it online via a fresh deploy.
+    // This clears the now-stale sandbox_id / provisioned_at and drops it out
+    // of the phase='running' health sweep so it can't be flipped to Failed.
+    if let Err(e) = ctx.deployments.reset_container_track(seal_id).await {
+        tracing::warn!(?seal_id, error = %e, "teardown: reset_container_track failed (non-fatal)");
+    }
+    if let Ok(Some(d)) = ctx.deployments.get(seal_id).await {
+        let _ = ctx
+            .events
+            .publish(WsEvent::PhaseChanged { seal_id, phase: d.phase })
+            .await;
+    }
+    Ok(())
 }
 
 /// Soft-retry: walks the deployment row and re-runs any track whose
@@ -264,6 +362,11 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
 async fn handle_resume_deploy(
     ctx: &Ctx,
     seal_id: SealId,
+    // Pre-mint resume context carried by the job (from `/retry`). Empty once
+    // minted — post-mint the authoritative iData is read from chain, so these
+    // aren't needed. Not read from the deployment row: that snapshot is only a
+    // transient pre-mint holder and is blanked after phase 2.
+    artifacts: Vec<IDataArtifact>,
     sandbox_envelope: Option<SandboxEnvelope>,
 ) -> anyhow::Result<()> {
     let d = ctx
@@ -277,7 +380,7 @@ async fn handle_resume_deploy(
         tracing::info!(?seal_id, "resume: re-running storage track");
         // run_storage_track skips entries whose ciphertext was cleared
         // (confirmed earlier) and re-uploads only what's still pending.
-        run_storage_track(ctx, seal_id, &d.i_data).await?;
+        run_storage_track(ctx, seal_id, &artifacts).await?;
     }
 
     // ── Mint track retry ──
@@ -298,20 +401,19 @@ async fn handle_resume_deploy(
                 .await?;
         } else {
             // Mint never made it on chain. Resubmit using the artifacts
-            // already persisted — same dataHashes / sealedKeys / agentSeal.
+            // carried by the job — same dataHashes / sealedKeys / agentSeal.
             let mint_params = MintParams {
                 to: d.owner,
                 agent_uri: String::new(),
                 metadata: Vec::new(),
-                intelligent_datas: d
-                    .i_data
+                intelligent_datas: artifacts
                     .iter()
                     .map(|a| IntelligentData {
                         description: a.description.clone(),
                         data_hash: a.data_hash,
                     })
                     .collect(),
-                sealed_keys: d.i_data.iter().map(|a| a.sealed_key.clone()).collect(),
+                sealed_keys: artifacts.iter().map(|a| a.sealed_key.clone()).collect(),
                 agent_seal: d.agent_seal_addr,
                 seal_id,
             };
@@ -322,18 +424,35 @@ async fn handle_resume_deploy(
     // Re-load deployment after potential storage/mint retries above.
     let d = ctx.deployments.get(seal_id).await?.expect("just had it");
 
-    // ── c-health escalation (covers BOTH phase-2-already-done and
-    //    phase-2-pending cases). If c is Failed/Stopped, the sandbox
-    //    isn't actually serving even when agent_uri is on chain, so we
-    //    need to recreate. SandboxRecreate handles either subcase
-    //    internally:
+    // ── Container escalation → SandboxRecreate. Fires when there's no
+    //    serving container AND no existing sandbox to drive phase 2 with:
+    //      - Failed / Stopped       → the sandbox died or was paused and
+    //                                 then lost; respawn a fresh one.
+    //      - NotStarted, no sandbox → minted agent whose container never
+    //                                 came up (deploy interrupted after
+    //                                 mint), or a post-transfer reset
+    //                                 (Layer-2 teardown clears
+    //                                 container_stage to NotStarted and
+    //                                 drops sandbox_id). Without this arm
+    //                                 such a deployment is a dead end: the
+    //                                 phase-2 block below requires
+    //                                 sandbox_id.is_some(), so /retry would
+    //                                 silently no-op.
+    //    NotStarted *with* a sandbox_id is NOT escalated — that's the
+    //    "phase 2 pending on an existing sandbox" case, handled by the
+    //    phase-2 block below (recreating would needlessly kill a live box).
+    //    SandboxRecreate handles every subcase internally:
     //      - agent_uri empty  → run_phase2 with the new sandbox_id
     //      - agent_uri set    → refresh_agent_card_url with new id
+    //    create (vs start) is correct even when no sandbox exists:
+    //    handle_sandbox_recreate treats a None old_sandbox_id as a fresh
+    //    spawn and skips orphan cleanup.
     //    Without the envelope we can't (Daytona auth), so log + return.
-    if matches!(
+    let needs_fresh_sandbox = matches!(
         d.container_stage,
         StageStatus::Failed { .. } | StageStatus::Stopped { .. }
-    ) {
+    ) || (matches!(d.container_stage, StageStatus::NotStarted) && d.sandbox_id.is_none());
+    if needs_fresh_sandbox {
         if let Some(env) = sandbox_envelope {
             tracing::info!(
                 ?seal_id,
@@ -429,33 +548,37 @@ async fn handle_sandbox_recreate(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            // Insufficient balance (HTTP 402): no sandbox was created, so
-            // there's nothing to resume — but it's owner-recoverable, not a
-            // dead end. Land in the Failed bucket (which offers "bring back
-            // online" = recreate) and surface a top-up hint rather than a raw
-            // error. No bail → no retry loop hammering create at zero balance.
-            if e.to_string().contains("insufficient balance") {
-                let reason =
-                    "insufficient sandbox balance — top up, then bring back online".to_string();
-                tracing::warn!(?seal_id, error = %e, "sandbox recreate: insufficient balance; awaiting top-up");
-                ctx.deployments
-                    .set_container_stage(
-                        seal_id,
-                        StageStatus::Failed { at: now, reason: reason.clone() },
-                    )
-                    .await?;
-                ctx.events
-                    .publish(WsEvent::ContainerWarning { seal_id, reason })
-                    .await?;
-                return Ok(());
-            }
-            let reason = format!("sandbox recreate: {e}");
+            // No sandbox was created either way; the agent stays recoverable
+            // (Failed → Offline for a minted agent, offering "bring online").
+            // Classify by status: a TRANSIENT condition (balance gap, lock,
+            // rate limit, upstream hiccup) is owner-recoverable — warn + no
+            // bail (so we don't hammer create in a retry loop). A FATAL error
+            // surfaces as ContainerFailed + bails.
+            let transient = e
+                .downcast_ref::<SandboxError>()
+                .map(|se| se.is_transient())
+                .unwrap_or(false);
+            let balance = e.to_string().to_lowercase().contains("balance");
+            let reason = if transient && balance {
+                "insufficient sandbox balance — top up, then bring back online".to_string()
+            } else if transient {
+                "sandbox temporarily unavailable — try bring online again in a moment".to_string()
+            } else {
+                format!("sandbox recreate: {e}")
+            };
             ctx.deployments
                 .set_container_stage(
                     seal_id,
                     StageStatus::Failed { at: now, reason: reason.clone() },
                 )
                 .await?;
+            if transient {
+                tracing::warn!(?seal_id, error = %e, "sandbox recreate: transient condition; awaiting retry");
+                ctx.events
+                    .publish(WsEvent::ContainerWarning { seal_id, reason })
+                    .await?;
+                return Ok(());
+            }
             ctx.events
                 .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
                 .await?;
@@ -747,14 +870,17 @@ async fn handle_deploy(
     let (storage_res, mint_res, container_res) =
         tokio::join!(storage_fut, mint_fut, container_fut);
 
-    // If any phase-1 track failed, kill the sandbox before bailing.
-    // sandbox.create may have succeeded inside container_track even when
-    // mint/storage failed elsewhere — that container is now an orphan
-    // (deploy can't reach phase 2, the user's only recovery is /retry
-    // which doesn't touch container, or recreate from scratch). Either
-    // way the existing sandbox is useless and just burns sandbox quota.
-    let any_failed = storage_res.is_err() || mint_res.is_err() || container_res.is_err();
-    if any_failed {
+    // Identity vs runtime: only storage/mint constitute the on-chain
+    // IDENTITY. A container-track failure must NOT fail the deploy — the
+    // agent is still minted, and `run_phase2` finalizes its card/URI with
+    // an empty `url` (the runtime fills it in later via Bring online). The
+    // agent lands Offline (minted, no running container), recoverable.
+    let identity_failed = storage_res.is_err() || mint_res.is_err();
+    if identity_failed {
+        // Identity failed → there's no agent to finalize. Any sandbox that
+        // container_track managed to create is now an orphan (no on-chain
+        // identity points at it); kill it before bailing so it doesn't
+        // burn sandbox quota.
         if let Ok(Some(d)) = ctx.deployments.get(seal_id).await {
             if let Some(sb) = d.sandbox_id.filter(|s| !s.is_empty()) {
                 if let Err(e) = ctx.sandbox.admin_delete(&sb).await {
@@ -762,21 +888,20 @@ async fn handle_deploy(
                         ?seal_id,
                         sandbox_id = %sb,
                         error = %e,
-                        "admin_delete after phase-1 failure failed (non-fatal)"
+                        "admin_delete after identity failure failed (non-fatal)"
                     );
                 } else {
                     tracing::info!(
                         ?seal_id,
                         sandbox_id = %sb,
-                        "admin_delete: cleaned orphan sandbox after phase-1 failure"
+                        "admin_delete: cleaned orphan sandbox after identity failure"
                     );
                 }
             }
-            // Also flip c=Failed + clear provision_deadline so the
-            // worker sweep doesn't fire 5min later and overwrite the
-            // real failure reason (mint/storage) with a misleading
-            // "provision timeout". Only do this when c was still in
-            // an active state — a genuine container_failed should keep
+            // Flip c=Failed + clear provision_deadline so the sweep doesn't
+            // fire 5min later and overwrite the real failure reason
+            // (mint/storage) with a misleading "provision timeout". Only
+            // when c was still active — a genuine container_failed keeps
             // its own reason.
             if matches!(d.container_stage, StageStatus::Submitted { .. } | StageStatus::NotStarted) {
                 let now = Utc::now();
@@ -786,7 +911,7 @@ async fn handle_deploy(
                         seal_id,
                         StageStatus::Failed {
                             at: now,
-                            reason: "skipped — phase 1 failed".to_string(),
+                            reason: "skipped — identity (storage/mint) failed".to_string(),
                         },
                     )
                     .await;
@@ -796,14 +921,22 @@ async fn handle_deploy(
                     .await;
             }
         }
+        // Propagate the identity error; both tracks already recorded their
+        // own stage updates. Never `container_res?` — a container failure
+        // is not an identity failure.
+        storage_res?;
+        mint_res?;
+        return Ok(()); // unreachable: one of the two above is Err
     }
 
-    // Propagate first error; all 3 already recorded their own stage updates.
-    storage_res?;
-    mint_res?;
-    container_res?;
+    // Identity succeeded. A container-only failure is intentionally NOT
+    // propagated — run_container_track already recorded its Failed stage
+    // (with reason), and the agent stays Offline. Finalize identity either
+    // way: with the sandbox_id when the container came up (real url), or
+    // with an empty url when it didn't (filled later by Bring online).
+    let _ = container_res;
 
-    // Phase 2: AgentCard → OSS → setAgentURI → ciphertext cleanup.
+    // Identity finalize: AgentCard → OSS → setAgentURI → ciphertext cleanup.
     run_phase2(
         ctx,
         seal_id,
@@ -814,6 +947,129 @@ async fn handle_deploy(
     .await?;
 
     let _ = deployment; // silence unused
+    Ok(())
+}
+
+/// Clone: mint a brand-new agent (`new_seal_id`) for `target_owner`, reusing
+/// the source agent's iData. Each source `data_key` is re-sealed from the
+/// source agentSeal to the clone's new agentSeal (deterministic KMS
+/// derivation lets us re-derive the source priv to unseal, then seal to the
+/// new pub); `storage_root`/`data_hash`/`description` are reused verbatim — the
+/// source ciphertext on 0g-storage is shared, nothing is re-uploaded. Then
+/// mint via `run_mint_track` and finalize identity via `run_phase2`; the clone
+/// lands Offline for `target_owner` to bring online later.
+///
+/// A pre-mint re-seal failure flips `mint_stage = Failed` (phase → Failed, so
+/// the dead clone is visible, not stuck Deploying) and bails. Clone failures
+/// aren't retryable via `/retry` in v0 — re-POST `/clone` with a new key.
+async fn handle_clone(
+    ctx: &Ctx,
+    new_seal_id: SealId,
+    source_seal_id: SealId,
+    target_owner: Address,
+    name: String,
+    description: String,
+    image: Option<String>,
+) -> anyhow::Result<()> {
+    let source = ctx
+        .deployments
+        .get(source_seal_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("clone: source deployment vanished"))?;
+    let source_agent_id = source
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("clone: source is not minted"))?;
+
+    // Read the AUTHORITATIVE current iData + sealed keys from CHAIN — not the
+    // attestor DB snapshot, which is frozen at deploy time and goes stale once
+    // the agent evolves its iData on chain (0g-agentic-id#27). The clone must
+    // copy what the source agent actually runs now.
+    let idatas = ctx.chain.intelligent_datas_of(source_agent_id).await?;
+    let sealed = ctx.chain.sealed_keys_of(source_agent_id).await?;
+    if idatas.is_empty() {
+        anyhow::bail!("clone: source has no on-chain iData");
+    }
+    if idatas.len() != sealed.len() {
+        anyhow::bail!(
+            "clone: on-chain iData/sealedKeys length mismatch ({} vs {})",
+            idatas.len(),
+            sealed.len()
+        );
+    }
+
+    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id)?;
+
+    // Re-seal every dataKey from the source agentSeal to the clone's new
+    // agentSeal (KMS re-derives the source priv to unseal). Storage roots and
+    // dataHashes in `idatas` are reused verbatim — same ciphertext on chain,
+    // nothing re-uploaded. Pre-mint: on failure mark mint Failed + bail.
+    let resealed: anyhow::Result<Vec<Bytes>> = (|| {
+        let source_kp = ctx.crypto.derive_agent_seal(source_seal_id)?;
+        let mut out = Vec::with_capacity(sealed.len());
+        for sk in &sealed {
+            let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
+            out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
+        }
+        Ok(out)
+    })();
+    let sealed_keys = match resealed {
+        Ok(v) => v,
+        Err(e) => {
+            let now = Utc::now();
+            let reason = format!("clone re-seal: {e}");
+            tracing::warn!(?new_seal_id, ?source_seal_id, error = %e, "clone: re-seal failed");
+            let _ = ctx
+                .deployments
+                .set_mint_stage(
+                    new_seal_id,
+                    StageStatus::Failed { at: now, reason: reason.clone() },
+                )
+                .await;
+            anyhow::bail!(reason);
+        }
+    };
+
+    // Stub card (UI/recovery fallback); run_phase2 overwrites it with the full
+    // AgentCard. The clone's iData is authoritative on chain — we deliberately
+    // do NOT persist an i_data snapshot in the clone's deployment row.
+    let stub_card = serde_json::json!({
+        "name": name,
+        "description": description,
+        "image": image,
+    });
+    ctx.deployments
+        .set_agent_uri_and_card(new_seal_id, String::new(), stub_card)
+        .await?;
+
+    // Storage reuses the source's on-chain roots — nothing to upload, so mark
+    // Confirmed directly (no run_storage_track).
+    let now = Utc::now();
+    ctx.deployments
+        .set_storage_stage(new_seal_id, StageStatus::Confirmed { at: now })
+        .await?;
+    ctx.events
+        .publish(WsEvent::StorageConfirmed {
+            seal_id: new_seal_id,
+        })
+        .await?;
+
+    // Mint the clone to the target owner: the source's CURRENT on-chain iData
+    // (descriptions + dataHashes) with keys re-sealed to the clone's agentSeal.
+    let mint_params = MintParams {
+        to: target_owner,
+        agent_uri: String::new(),
+        metadata: Vec::new(),
+        intelligent_datas: idatas,
+        sealed_keys,
+        agent_seal: new_kp.address,
+        seal_id: new_seal_id,
+    };
+    run_mint_track(ctx, new_seal_id, mint_params).await?;
+
+    // Identity finalize (card + setAgentURI, empty url). Container never
+    // runs → clone lands Offline; target owner brings it online later.
+    run_phase2(ctx, new_seal_id, &name, &description, image.as_deref()).await?;
+
     Ok(())
 }
 
@@ -839,10 +1095,12 @@ async fn run_phase2(
     let agent_id: AgentId = d
         .agent_id
         .ok_or_else(|| anyhow::anyhow!("phase 2: agent_id not recorded"))?;
-    let sandbox_id = d
-        .sandbox_id
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("phase 2: sandbox_id not recorded"))?;
+    // Identity finalize is independent of the runtime: the card's only
+    // sandbox-dependent field is `url`, and that's empty (filled later by
+    // refresh_agent_card_url, OSS-only) when no container exists yet. So we
+    // do NOT require a sandbox_id here — a container failure must not block
+    // minting the on-chain identity.
+    let sandbox_id = d.sandbox_id.clone().unwrap_or_default();
     let agent_seal_addr = d.agent_seal_addr;
 
     // v0 always uses the registry's fallback profile (OpenClaw) for
@@ -893,27 +1151,22 @@ async fn run_phase2(
         })
         .await?;
 
-    // Phase 2 succeeded — agent is fully ready. Clear ciphertext from
-    // each artifact (storage_root + sealed_key + data_hash stay; only
-    // the bulk encrypted bytes go). Best-effort: a leftover ciphertext
-    // is wasted DB bytes, not a correctness bug.
-    let cleared: Vec<IDataArtifact> = d
-        .i_data
-        .iter()
-        .map(|a| IDataArtifact {
-            ciphertext: Bytes::new(),
-            ..a.clone()
-        })
-        .collect();
+    // Phase 2 succeeded — agent is fully ready. Blank the whole iData
+    // snapshot: it was only a pre-mint resume scratch, and now the
+    // authoritative iData lives on chain (intelligentDatasOf/sealedKeysOf).
+    // Keeping a copy here would go stale once the agent evolves its iData on
+    // chain — exactly what caused the clone-from-stale-snapshot bug.
+    // Best-effort: a leftover snapshot is wasted DB bytes, not a correctness
+    // bug (all reads now go to chain or the resume job payload).
     if let Err(e) = ctx
         .deployments
-        .update_i_data_artifacts(seal_id, cleared)
+        .update_i_data_artifacts(seal_id, Vec::new())
         .await
     {
         tracing::warn!(
             ?seal_id,
             error = %e,
-            "failed to clear ciphertext after phase 2 (non-fatal)"
+            "failed to blank iData snapshot after phase 2 (non-fatal)"
         );
     }
 
@@ -1121,13 +1374,20 @@ async fn run_container_track(
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
-            // Insufficient balance (HTTP 402): the frontend gates on balance
-            // before deploy, so this is rare (a drain between check and
-            // create), but surface a clear top-up message instead of a raw
-            // 402 dump so the owner knows to fund and retry rather than
-            // reading it as a hard system failure.
-            let reason = if e.to_string().contains("insufficient balance") {
+            // Container failed to come up. The identity track still finalizes
+            // (agent minted → Offline, recoverable via Bring online), so this
+            // isn't a hard deploy failure. Classify the reason by status so
+            // the Offline banner tells the owner what to do: a transient
+            // condition (balance gap, lock, rate limit, upstream hiccup) →
+            // retry hint; anything else → the raw create error.
+            let transient = e
+                .downcast_ref::<SandboxError>()
+                .map(|se| se.is_transient())
+                .unwrap_or(false);
+            let reason = if transient && e.to_string().to_lowercase().contains("balance") {
                 "insufficient sandbox balance — top up and deploy again".to_string()
+            } else if transient {
+                "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
                 format!("sandbox create: {e}")
             };
@@ -1181,8 +1441,8 @@ mod tests {
     };
     use attestor_shared::oss::OssClient;
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, IDataArtifact, SandboxEnvelope,
-        StorageRoot,
+        derive_phase, Config, Deployment, DeploymentPhase, DeploymentRepo, IDataArtifact,
+        SandboxEnvelope, StorageRoot,
     };
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use chrono::Utc;
@@ -1356,6 +1616,246 @@ mod tests {
         }
     }
 
+    // ── handle_deploy: identity vs runtime split ──────────────────────
+
+    #[tokio::test]
+    async fn deploy_finalizes_identity_when_container_create_fails() {
+        // Container create fails, but storage + mint succeed. Identity is
+        // independent of the runtime, so the agent must still be minted +
+        // carded (setAgentURI once), land Offline, and carry a card with an
+        // empty url. Recoverable via Bring online — NOT a failed deploy.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        t.sandbox.create_fails.store(true, Ordering::SeqCst);
+
+        handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            Vec::new(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            dummy_envelope("create"),
+        )
+        .await
+        .expect("deploy must succeed despite a container failure");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        // Identity finalized.
+        assert!(d.agent_id.is_some(), "agent must be minted");
+        assert!(!d.agent_uri.is_empty(), "agent_uri (stable OSS key) must be written");
+        assert_eq!(
+            t.chain.set_uri_calls.load(Ordering::SeqCst),
+            1,
+            "setAgentURI must run exactly once"
+        );
+        // Runtime failed → Offline, card url empty.
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "container stage must be Failed"
+        );
+        assert_eq!(d.phase, DeploymentPhase::Offline, "minted + container failed = Offline");
+        assert_eq!(
+            d.agent_card.get("url").and_then(|v| v.as_str()),
+            Some(""),
+            "card url must be empty with no sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_bails_and_reaps_orphan_when_mint_fails() {
+        // Mint (identity) fails while the container track created a sandbox.
+        // The deploy must bail (identity is the point), the orphan sandbox
+        // must be admin_deleted, and setAgentURI must NOT run.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::NotStarted,
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        t.chain.register_fails.store(true, Ordering::SeqCst); // mint fails
+
+        let res = handle_deploy(
+            &t.ctx,
+            seal,
+            Address::from([0x66; 20]),
+            Vec::new(),
+            "Sage".to_string(),
+            "DeFi helper".to_string(),
+            None,
+            dummy_envelope("create"),
+        )
+        .await;
+
+        assert!(res.is_err(), "identity failure must fail the deploy");
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            1,
+            "orphan sandbox must be reaped"
+        );
+        assert_eq!(
+            t.chain.set_uri_calls.load(Ordering::SeqCst),
+            0,
+            "setAgentURI must NOT run when identity failed"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.phase, DeploymentPhase::Failed, "mint failure = Failed");
+    }
+
+    // ── handle_clone ──────────────────────────────────────────────────
+
+    /// Seed a fresh (all-NotStarted, no-iData) deployment row with a custom
+    /// seal/agentSeal/owner — as the /clone route would insert for a clone.
+    fn seed_fresh_row(
+        repo: &InMemoryDeploymentRepo,
+        seal: SealId,
+        agent_seal_addr: Address,
+        owner: Address,
+    ) {
+        let now = Utc::now();
+        repo.seed(Deployment {
+            seal_id: seal,
+            agent_seal_addr,
+            owner,
+            agent_id: None,
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            phase: derive_phase(
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+                &StageStatus::NotStarted,
+            ),
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    #[tokio::test]
+    async fn handle_clone_reseals_and_mints_to_target() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        // Source's AUTHORITATIVE on-chain iData: a known dataKey sealed to the
+        // SOURCE agentSeal. Clone reads this from the chain (not the DB).
+        let known_key = vec![0x9u8; 32];
+        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(sealed)],
+        );
+        // Source deployment only needs to exist + be minted (agent_id set);
+        // its DB i_data is intentionally NOT used by clone anymore.
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
+
+        handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None)
+            .await
+            .expect("clone must succeed");
+
+        // Minted to the target owner with the clone's new agentSeal, and the
+        // minted sealed_key re-seals correctly: decrypting it with the NEW
+        // agentSeal priv yields the SAME source dataKey (data reused).
+        let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(to, target, "must mint to target_owner");
+        assert_eq!(agent_seal, new_kp.address, "must mint with the clone's agentSeal");
+        assert_eq!(keys.len(), 1);
+        let got = t.ctx.crypto.ecies_decrypt(&keys[0], &new_kp.priv_key).unwrap();
+        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey under the clone agentSeal");
+        // Storage reuse: NO upload happened (source roots reused via chain iData).
+        assert_eq!(
+            t.storage.upload_calls.load(Ordering::SeqCst),
+            0,
+            "clone must reuse source storage, not re-upload"
+        );
+        // Identity finalized → Offline; setAgentURI ran once.
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
+        assert!(clone.agent_id.is_some(), "clone must be minted");
+        assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_clone_reseal_failure_marks_mint_failed() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        // Corrupt on-chain sealed_key → ecies_decrypt fails → pre-mint failure.
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(vec![0u8; 10])],
+        );
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
+
+        let res = handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None).await;
+        assert!(res.is_err(), "re-seal failure must bail");
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert!(
+            matches!(clone.mint_stage, StageStatus::Failed { .. }),
+            "pre-mint failure must flip mint_stage=Failed, got {:?}",
+            clone.mint_stage
+        );
+        assert_eq!(
+            t.chain.register_calls.load(Ordering::SeqCst),
+            0,
+            "mint must not run when re-seal failed"
+        );
+    }
+
     // ── handle_resume_deploy ──────────────────────────────────────────
 
     /// Mark phase 2 as already complete on the seeded deployment. Some
@@ -1392,7 +1892,7 @@ mod tests {
         mark_phase2_done(&t.deployments, seal);
         t.chain.seed_minted(seal, seeded_agent_id);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -1419,12 +1919,16 @@ mod tests {
         let t = make_test_ctx();
         let seal = dummy_seal();
         let agent_seal_addr = Address::from([0x55; 20]);
-        // Need at least one i_data so MintParams is non-trivial.
-        let art = artifact_with_ciphertext(0x01);
+        // Need at least one artifact so MintParams is non-trivial. The job
+        // carries these (post-`/retry`); the deployment snapshot is irrelevant.
+        let arts = vec![IDataArtifact {
+            ciphertext: Bytes::new(),
+            ..artifact_with_ciphertext(0x01)
+        }];
         seed_deployment(
             &t.deployments,
             seal,
-            vec![IDataArtifact { ciphertext: Bytes::new(), ..art }], // already cleared
+            arts.clone(),
             StageStatus::Confirmed { at: Utc::now() },
             StageStatus::Failed { at: Utc::now(), reason: "first attempt".into() },
             None,
@@ -1433,7 +1937,7 @@ mod tests {
         mark_phase2_done(&t.deployments, seal);
         // chain.seal_to_agent intentionally NOT seeded.
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -1452,11 +1956,11 @@ mod tests {
         // storage track only — must NOT touch chain.register_with_seal.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let art = artifact_with_ciphertext(0x02);
+        let arts = vec![artifact_with_ciphertext(0x02)];
         seed_deployment(
             &t.deployments,
             seal,
-            vec![art],
+            arts.clone(),
             StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(99u64)),
@@ -1464,7 +1968,7 @@ mod tests {
         );
         mark_phase2_done(&t.deployments, seal);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
 
         assert_eq!(
             t.storage.upload_calls.load(Ordering::SeqCst),
@@ -1478,6 +1982,38 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(matches!(d.storage_stage, StageStatus::Confirmed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_uses_payload_artifacts_not_deployment_snapshot() {
+        // Regression guard for the context-relocation change: the deployment
+        // row's i_data is empty (it's only a transient pre-mint holder, blanked
+        // after phase 2), yet resume must still re-run the storage track from
+        // the artifacts carried by the job payload. If the handler regressed to
+        // reading d.i_data, upload_calls would be 0.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(), // snapshot empty on purpose
+            StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            Some("sb-1".into()),
+        );
+        mark_phase2_done(&t.deployments, seal);
+
+        let arts = vec![artifact_with_ciphertext(0x0a)];
+        handle_resume_deploy(&t.ctx, seal, arts, None)
+            .await
+            .expect("resume must succeed");
+
+        assert_eq!(
+            t.storage.upload_calls.load(Ordering::SeqCst),
+            1,
+            "storage must run from the payload artifacts even with d.i_data empty"
+        );
     }
 
     #[tokio::test]
@@ -1500,7 +2036,7 @@ mod tests {
         );
         write_stub_card(&t.deployments, seal, "Sage");
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("phase 2 reconstruction must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("phase 2 reconstruction must succeed");
 
         // setAgentURI must have run exactly once.
         assert_eq!(
@@ -1564,7 +2100,7 @@ mod tests {
         d.agent_card = serde_json::json!({"name": "Sage"});
         t.deployments.seed(d);
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("noop resume");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("noop resume");
 
         assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
         assert_eq!(t.storage.upload_calls.load(Ordering::SeqCst), 0);
@@ -1593,7 +2129,7 @@ mod tests {
         write_stub_card(&t.deployments, seal, "Sage");
         t.chain.seed_minted(seal, U256::from(7u64));
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
 
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         // Mint recovered.
@@ -1604,17 +2140,18 @@ mod tests {
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
         // No mint resubmission (chain short-circuit).
         assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
-        // Ciphertext was cleared at end of phase 2.
+        // iData snapshot blanked at end of phase 2 (authoritative copy is
+        // now on chain; a lingering snapshot would go stale).
         assert!(
-            d.i_data.iter().all(|a| a.ciphertext.is_empty()),
-            "phase 2 must clear ciphertext after agent ready"
+            d.i_data.is_empty(),
+            "phase 2 must blank the iData snapshot after agent ready"
         );
     }
 
     #[tokio::test]
     async fn resume_deploy_unknown_seal_id_errors() {
         let t = make_test_ctx();
-        let err = handle_resume_deploy(&t.ctx, B256::repeat_byte(0xaa), None)
+        let err = handle_resume_deploy(&t.ctx, B256::repeat_byte(0xaa), Vec::new(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -1818,6 +2355,7 @@ mod tests {
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(402);
         *t.sandbox.fail_msg.lock().unwrap() =
             Some("sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
 
@@ -1854,6 +2392,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_start_operation_in_progress_stays_stopped() {
+        // daytona runs a ~90s backup after a stop and holds the sandbox lock
+        // during it, so a Resume in that window gets "An operation is already
+        // in progress for this resource". That's a TRANSIENT lock — the
+        // sandbox is healthy and resumable once the backup finishes. The
+        // deployment must stay Stopped, the sandbox must NOT be reaped, and a
+        // ContainerWarning (not ContainerFailed) is emitted. Regression guard
+        // for the bug where this transient lock destroyed a good container.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(7u64)),
+            Some("sb-backing-up".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(400);
+        *t.sandbox.fail_msg.lock().unwrap() = Some(
+            "Sandbox failed to start: An operation is already in progress for this resource".into(),
+        );
+
+        run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await
+        .expect("a transient in-progress lock must not be a hard error");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Stopped { .. }),
+            "must stay Stopped (resumable), got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "must NOT reap the sandbox over a transient backup lock"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            "expected a ContainerWarning retry hint"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            "must NOT emit ContainerFailed on a transient lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_fatal_error_flips_failed_and_reaps() {
+        // The classifier's other half: a genuinely fatal start error (404 the
+        // sandbox is gone, a real 400 validation error, 403, …) IS terminal —
+        // flip Failed + admin_delete so the UI moves Stopped → Offline and
+        // offers Recreate. Only transient statuses are spared.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(9u64)),
+            Some("sb-gone".into()),
+        );
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+            )
+            .await
+            .unwrap();
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(404);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox not found".into());
+
+        let res = run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("start"),
+            },
+        )
+        .await;
+
+        assert!(res.is_err(), "a fatal start error must bail");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Failed { .. }),
+            "fatal error must flip Failed, got {:?}",
+            d.container_stage
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            1,
+            "fatal error must reap the dead sandbox"
+        );
+        let events = t.events.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            "fatal error must emit ContainerFailed"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_recreate_insufficient_balance_warns_not_hard_fail() {
         // 402 on recreate: no sandbox was created, so it lands in the Failed
         // (bring-back-online) bucket — but with a ContainerWarning top-up
@@ -1871,6 +2530,7 @@ mod tests {
             Some("sb-old".into()),
         );
         t.sandbox.create_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(402);
         *t.sandbox.fail_msg.lock().unwrap() =
             Some("sandbox create: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
 
@@ -2408,7 +3068,7 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
 
         // Critical: setAgentURI must NOT have been called — that would
         // upload the stale URL to chain.
@@ -2450,8 +3110,61 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resume_deploy_creates_sandbox_when_minted_but_never_started() {
+        // The "Bring online" case: storage + mint Confirmed, but the
+        // container never came up — container_stage NotStarted and NO
+        // sandbox_id (a deploy interrupted after mint, or a post-transfer
+        // Layer-2 teardown that reset the container track). /retry carries
+        // a create envelope; resume must escalate to SandboxRecreate and
+        // spawn a fresh sandbox. Before the fix this silently no-op'd
+        // (the phase-2 block requires sandbox_id.is_some()), which is what
+        // made "Bring online" do nothing.
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        let art = artifact_with_ciphertext(0x75);
+        seed_deployment(
+            &t.deployments,
+            seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(42u64)),
+            None, // no sandbox — container never started
+        );
+        write_stub_card(&t.deployments, seal, "Sage");
+        let new_id = "sb-fresh-online";
+        let _ = std::mem::replace(
+            &mut *t.sandbox.create_id.lock().unwrap(),
+            new_id.to_string(),
+        );
+
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), Some(dummy_envelope("create")))
+            .await
+            .expect("resume must Ok");
+
+        // A fresh sandbox was created (not start), and no orphan delete
+        // fired (there was no prior sandbox to reap).
+        assert_eq!(
+            t.sandbox.create_calls.load(Ordering::SeqCst),
+            1,
+            "expected exactly one sandbox.create"
+        );
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            0,
+            "no orphan to delete when sandbox_id was None"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some(new_id));
+        assert!(
+            matches!(d.container_stage, StageStatus::Submitted { .. }),
+            "container stage must be Submitted after recreate"
+        );
     }
 
     // ── handle_sandbox_recreate phase-2 fallback ──────────────────────

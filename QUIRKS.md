@@ -1,102 +1,127 @@
-# 已知坑与 workaround
+# Known quirks and workarounds
 
-把项目所有"细节的坑"集中在这里，跨子项目都查这一份。新加的 workaround
-请同样移到这里，正文文档只保留对应小节的反向链接。
+All the project's "gotchas" are collected here, in one place to check across
+subprojects. When you add a new workaround, move it here too and leave only a
+back-link to the relevant section in the prose docs.
 
 ---
 
-## Foundry / Solidity 编译
+## Foundry / Solidity compilation
 
-### `via_ir = true` 是必需的
+### `via_ir = true` is required
 
-`giveFeedback` 参数多、栈深，关掉 `via_ir` 会编译失败（"stack too deep"）。
-`foundry.toml` 已经默认开启，不要改。
+`giveFeedback` has many parameters and a deep stack; turning off `via_ir` fails
+to compile ("stack too deep"). It's already enabled by default in
+`foundry.toml` — don't change it.
 
-### forge-std 钉在 v1.12.0
+### forge-std pinned to v1.12.0
 
-`forge-std` 在 v1.13.0+ 改了内部 memory 布局，跟 Solidity 0.8.24 + `via_ir`
-组合时触发已知 codegen bug。解钉前置条件：solc 升级到 ≥ 0.8.27（多个 via_ir
-bug 已修）。
+`forge-std` changed its internal memory layout in v1.13.0+, which triggers a
+known codegen bug when combined with Solidity 0.8.24 + `via_ir`. Precondition
+for unpinning: bump solc to ≥ 0.8.27 (several via_ir bugs are fixed there).
 
-### 测试里的 `via_ir + vm.warp` 陷阱
+### The `via_ir + vm.warp` trap in tests
 
-跟上面的 codegen bug 同源：在测试里用 `vm.warp(...)` 推时间后，**不要**继续
-读那之前用 `block.timestamp` 派生的 local 变量。优化器会 rematerialize 那条
-读取，产出错误的值（典型表现：deadline 算出来翻倍）。
+Same root cause as the codegen bug above: after advancing time with
+`vm.warp(...)` in a test, **do not** keep reading a local that was derived from
+`block.timestamp` before the warp. The optimizer rematerializes that read and
+produces the wrong value (typical symptom: a deadline computed as double what
+it should be).
 
-正确做法：`vm.warp` 之前把 `block.timestamp` 一类的值 freeze 进 local，warp
-之后只引用这些 freeze 过的 local，不要再 `block.timestamp + delta` 这样写。
+Correct approach: freeze `block.timestamp`-style values into a local *before*
+`vm.warp`, and after the warp only reference those frozen locals — don't write
+`block.timestamp + delta` again.
 
 ---
 
 ## 0G Galileo Testnet RPC
 
-### `eth_maxPriorityFeePerGas` 返回 1 wei
+### `eth_maxPriorityFeePerGas` returns 1 wei
 
-按 RPC 标准走 `with_recommended_fillers()` 自动估 EIP-1559 fee 会拿到 1 wei
-priority fee，结果 mempool 直接拒（"tip cap below minimum 2 gwei"）。
+Estimating EIP-1559 fees the standard way via `with_recommended_fillers()`
+yields a 1 wei priority fee, which the mempool rejects outright ("tip cap below
+minimum 2 gwei").
 
-attestor 的 alloy chain client（`attestor/crates/shared/src/chain.rs`）已经
-绕过去了——skip `GasFiller`，每笔 tx 手动 `set_max_priority_fee_per_gas` +
-`set_max_fee_per_gas`，gas limit 用 `estimate_gas` + 20% buffer 显式估出来。
+The attestor's alloy chain client (`attestor/crates/shared/src/chain.rs`)
+already works around this — it skips `GasFiller` and, per transaction, manually
+calls `set_max_priority_fee_per_gas` + `set_max_fee_per_gas`, with the gas limit
+computed explicitly via `estimate_gas` + a 20% buffer.
 
-### Foundry 脚本要硬编码 gas-price
+### Foundry scripts must hardcode gas-price
 
-同样的原因，`forge script` / `forge create` 命令需要显式 `--priority-gas-price
-2000000000 --gas-price 5000000000`，否则要么估出 1 wei 被拒，要么走 0G 默认估
-得过低排不上。
+For the same reason, `forge script` / `forge create` commands need explicit
+`--priority-gas-price 2000000000 --gas-price 5000000000`, otherwise they either
+estimate 1 wei and get rejected, or take 0G's default estimate (too low) and
+never get included.
 
-### 部署 / 升级文档里随处可见的这两个数字就是这个 workaround
+### Those two numbers all over the deploy / upgrade docs are this workaround
 
-参见 [`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) 的 deploy / upgrade
-命令块。
+See the deploy / upgrade command blocks in
+[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md).
+
+### Receipt-availability lag → `waitForTransaction` false alarms
+
+After a tx lands, `eth_getTransactionReceipt` often lags a few blocks before
+returning, and the RPC briefly 404s right after the tx is broadcast. The result:
+viem's `waitForTransactionReceipt` false-alarms "transaction receipt could not
+be found" on a tx that **actually landed**. The TS SDK works around this with a
+`RECEIPT_WAIT` config (`timeout 120s`, `pollingInterval 2s`, `retryCount 12`,
+`retryDelay 2s`; see `sdk/typescript/src/constants.ts`). If it still times out,
+the tx has most likely landed anyway — confirm by reading on-chain state
+(balance / index / etc.), don't trust the receipt alone.
 
 ---
 
-## Etherscan 兼容 verifier（0G 端点）
+## Etherscan-compatible verifier (0G endpoint)
 
-### `forge verify-contract --watch` 卡轮询
+### `forge verify-contract --watch` hangs polling
 
-0G 的 Etherscan-兼容 verifier 在某些状态下不返回 forge 期望的轮询响应，
-`--watch` 会一直转圈。
+0G's Etherscan-compatible verifier, in some states, doesn't return the polling
+response forge expects, so `--watch` spins forever.
 
-`script/verify.sh` 不带 `--watch`，提交后命令立刻干净退出。状态查询通过
-后续的 `getsourcecode` 调用幂等 check。
+`script/verify.sh` runs without `--watch`, so the command exits cleanly right
+after submitting. Status is checked idempotently via a follow-up `getsourcecode`
+call.
 
 ---
 
-## 其它
+## Misc
 
-### 0g-storage Rust SDK 依赖 patch
+### 0g-storage Rust SDK dependency patch
 
-`zg-storage-client` 上游引用的 `core2` 在 crates.io 被撤包。attestor
-workspace 通过 `[patch.crates-io]` 重定向到 `tcharding` fork 才能编过：
+The `core2` crate that `zg-storage-client` pulls in upstream was yanked from
+crates.io. The attestor workspace only compiles once a `[patch.crates-io]`
+redirect points it at the `tcharding` fork:
 
 ```toml
 [patch.crates-io]
 core2 = { git = "https://github.com/tcharding/core2", branch = "..." }
 ```
 
-Go CLI（`0g-storage-client`）也仍是可替换方案——sealed 用的就是 Go CLI。
+The Go CLI (`0g-storage-client`) also remains a viable alternative — that's what
+sealed uses.
 
-### 0g-sandbox 计费拒收随机密钥
+### 0g-sandbox billing rejects random keys
 
-sandbox 计费路径会校验签名者钱包在链上有余额（rough sanity check），随机
-生成、未充值的 keypair 调 sandbox API 会被拒。E2E 测试需要用充过值的钱包。
+The sandbox billing path checks that the signer's wallet has an on-chain balance
+(a rough sanity check), so a randomly generated, unfunded keypair calling the
+sandbox API is rejected. E2E tests need a funded wallet.
 
 ---
 
-## 故障定位（serve-proof / sealed 运行时）
+## Fault localization (serve-proof / sealed runtime)
 
-verifier 或运维看到一个"看着不对劲"的现象时，按下表落到对应那一层：
+When a verifier or operator sees something that "looks wrong", use the table
+below to attribute it to the right layer:
 
-| 症状 | 出错的层 | 行动 |
+| Symptom | Faulting layer | Action |
 |---|---|---|
-| `serve-proof` 签名验不过 | sealed / TEE 被攻陷 | **关键** —— 排查 sealed 代码、TEE attestation 链 |
-| 签名验过，但 `req_body_hash` 不匹配你发出的请求 body | 请求在传输中被替换（MITM）或 sealed bug | **关键** —— 排查传输层 + sealed 代码 |
-| 签名验过，`data_hashes` 不匹配 `AgenticID.intelligentDatasOf(tokenId)` | sealed 的状态绑定 bug | **关键** —— sealed 在响应时刻撒谎说 agent 状态是什么 |
-| 一切都验过，但响应**内容错 / 有害** | agent 质量问题 | **不是 sealed bug。** 报给声誉系统；声誉分会反映 |
-| agent 的 persona 以可疑方式漂移了 | 怀疑 owner 操纵 | **不是 sealed bug。** verifier 应当降低内容权重；链上历史（`EntryUpdated` events）展示漂移时间线 |
-| agent 不响应 | 容器宕了、owner 关了、gas 烧光 | 运维问题；owner 负责让容器活着并有 gas |
+| `serve-proof` signature fails to verify | sealed / TEE compromised | **Critical** — investigate sealed code + the TEE attestation chain |
+| Signature verifies, but `task_hash` doesn't match the request/response you sent (`task_hash` folds method‖uri‖req-body‖resp-body‖status) | request tampered in transit (MITM) or a sealed bug | **Critical** — investigate the transport layer + sealed code |
+| Signature verifies, `data_hashes` don't match `AgenticID.intelligentDatasOf(tokenId)` | sealed state-binding bug | **Critical** — sealed lied about the agent's state at response time |
+| Everything verifies, but the response **content is wrong / harmful** | agent quality issue | **Not a sealed bug.** Report to the reputation system; the score will reflect it |
+| The agent's persona has drifted in a suspicious way | suspected owner manipulation | **Not a sealed bug.** Verifiers should down-weight content; on-chain history (`EntryUpdated` events) shows the drift timeline |
+| The agent doesn't respond | container down, owner shut it off, gas exhausted | Ops issue; the owner is responsible for keeping the container alive and funded |
 
-trust model 的层次划分参见 [`sealed/TRUST_MODEL.zh.md`](sealed/TRUST_MODEL.zh.md)。
+See [`sealed/TRUST_MODEL.zh.md`](sealed/TRUST_MODEL.zh.md) for the trust model's
+layering.

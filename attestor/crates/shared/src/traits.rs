@@ -3,7 +3,7 @@
 
 use crate::events::WsEvent;
 use crate::types::*;
-use alloy::primitives::{Address, B256, TxHash};
+use alloy::primitives::{Address, Bytes, B256, TxHash};
 use async_trait::async_trait;
 
 // ── Chain ───────────────────────────────────────────────────────────────
@@ -38,6 +38,13 @@ pub trait ChainClient: Send + Sync {
         &self,
         agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>>;
+
+    /// ERC-7857 `sealedKeysOf(agentId)` view — the per-iData sealed data
+    /// keys (ECIES to the agent's agentSeal), in the same order as
+    /// `intelligentDatasOf`. This is the AUTHORITATIVE current state (the
+    /// agent may have evolved its iData on chain since deploy), so clone
+    /// reads sealed keys from here rather than the deploy-time DB snapshot.
+    async fn sealed_keys_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<Bytes>>;
 
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
@@ -168,6 +175,15 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()>;
 
+    /// Reset the container track after the sandbox is torn down on ownership
+    /// transfer: container_stage → NotStarted, sandbox_id → NULL,
+    /// provisioned_at → NULL. With storage + mint still Confirmed this yields
+    /// phase `Ready` ("provisioned on chain + storage, no running container —
+    /// the new owner brings it online via a fresh deploy"), rather than
+    /// `Stopped` (implies resumable; the sandbox is deleted) or `Failed`
+    /// (implies a crash). Recomputes + persists phase.
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()>;
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
 
     /// Persist 0g-sandbox's resource id after container track submits.
@@ -183,6 +199,14 @@ pub trait DeploymentRepo: Send + Sync {
         pubkey: Vec<u8>,
         mac: Vec<u8>,
     ) -> anyhow::Result<()>;
+
+    /// Clear the container `(pubkey, mac)` binding, keyed by agent_id.
+    /// Called on ownership transfer: the inherited binding is what lets a
+    /// resumed container skip the attestation freshness window, so dropping
+    /// it forces the next /provision to re-establish a binding via a fresh
+    /// attestation. A stale prior owner's container (reused SANDBOX_SEAL_KEY,
+    /// old `issued_at`) then fails freshness and cannot re-provision.
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()>;
 
     /// Stamp the deployment row when `POST /provision` succeeds — proves
     /// the container authenticated via sandbox attestation and received

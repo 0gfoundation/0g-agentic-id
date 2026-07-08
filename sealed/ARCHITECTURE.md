@@ -380,9 +380,13 @@ threshold is the backstop.
 
 ### Where serve-proof's `data_hash` comes from
 
-Each serve-proof envelope carries two fields under `data_hashes[role]`:
-- `content_hash` = sha256(local plaintext)
-- `data_hash` = the root hash of the encrypted blob on 0g-storage (what the chain references)
+The serve-proof envelope's `data_hashes` is a **flat list of the `data_hash`
+roots** the TEE was running. Internally, each role in `currentSnapshot` tracks
+two fields:
+- `content_hash` = sha256(local plaintext) — used for drift detection only, **not**
+  carried in the envelope
+- `data_hash` = the root hash of the encrypted blob on 0g-storage (what the chain
+  references) — this is what goes into the envelope's `data_hashes`
 
 Drift detection uses only `content_hash`, but serve-proof has to
 carry `data_hash` so verifiers can cross-check that "what's on chain

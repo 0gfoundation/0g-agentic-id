@@ -216,6 +216,41 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         self.update_stage(seal_id, "container_stage", stage).await
     }
 
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE deployments
+             SET container_stage = $1, sandbox_id = NULL, provisioned_at = NULL, updated_at = now()
+             WHERE seal_id = $2",
+        )
+        .bind(serde_json::to_value(StageStatus::NotStarted)?)
+        .bind(seal_id.as_slice())
+        .execute(&mut *tx)
+        .await?;
+
+        // Recompute phase from all stages (container now NotStarted → Ready
+        // when storage + mint are Confirmed).
+        let row = sqlx::query(
+            "SELECT storage_stage, mint_stage, container_stage FROM deployments WHERE seal_id = $1",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_one(&mut *tx)
+        .await?;
+        let s: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let m: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let c: StageStatus = serde_json::from_value(row.try_get("container_stage")?)?;
+        let phase = derive_phase(&s, &m, &c);
+
+        sqlx::query("UPDATE deployments SET phase = $1 WHERE seal_id = $2")
+            .bind(phase.serde_tag())
+            .bind(seal_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE deployments SET agent_id = $1, updated_at = now() WHERE seal_id = $2",
@@ -252,6 +287,18 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(&pubkey)
         .bind(&mac)
         .bind(seal_id.as_slice())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE deployments
+             SET container_pubkey = NULL, container_pubkey_mac = NULL, updated_at = now()
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id_to_text(&agent_id))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -463,7 +510,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                  SET last_provision_error    = $1,
                      last_provision_error_at = $2,
                      container_stage         = $3,
-                     phase                   = 'failed',
+                     phase                   = 'offline',
                      updated_at              = $2
                  WHERE seal_id = $4",
             )
@@ -507,7 +554,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let rows = sqlx::query(
             "UPDATE deployments
              SET container_stage = $1,
-                 phase           = 'failed',
+                 phase           = 'offline',
                  updated_at      = $2
              WHERE provision_deadline IS NOT NULL
                AND provision_deadline < $2
@@ -555,12 +602,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
     ) -> anyhow::Result<Vec<SealId>> {
         // Atomic select-and-flip mirroring flip_provision_timeouts. The
         // container went silent on its own (sandbox killed it, sealed
-        // crashed, network partition past tolerance) — that's a
-        // runtime failure, not a user-initiated stop, so we write
-        // StageStatus::Failed + phase='failed'. The UI's existing
-        // cFailed/isOffline path drives the user to Recreate; Stopped
-        // would incorrectly offer Resume against a sandbox that is no
-        // longer reachable.
+        // crashed, network partition past tolerance) — that's a runtime
+        // failure of a *minted* agent, not a user-initiated stop, so we write
+        // StageStatus::Failed (carries the reason) + phase='offline'. Offline
+        // drives the user to bring it back online (create); Stopped would
+        // incorrectly offer Resume against a sandbox that is no longer
+        // reachable, and Failed would mislabel a minted agent as a dead deploy.
         let stage = serde_json::to_value(StageStatus::Failed {
             at: now,
             reason: reason.clone(),
@@ -569,7 +616,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         let rows = sqlx::query(
             "UPDATE deployments
              SET container_stage = $1,
-                 phase           = 'failed',
+                 phase           = 'offline',
                  updated_at      = $2
              WHERE last_heartbeat IS NOT NULL
                AND last_heartbeat < $3
@@ -735,11 +782,10 @@ pub async fn save_checkpoint(pool: &PgPool, name: &str, block: i64) -> anyhow::R
 impl DeploymentPhase {
     pub fn serde_tag(&self) -> &'static str {
         match self {
-            Self::Pending => "pending",
-            Self::Provisioning => "provisioning",
-            Self::Ready => "ready",
+            Self::Deploying => "deploying",
             Self::Running => "running",
             Self::Stopped => "stopped",
+            Self::Offline => "offline",
             Self::Failed => "failed",
         }
     }

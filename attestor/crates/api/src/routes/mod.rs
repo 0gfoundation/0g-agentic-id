@@ -8,10 +8,12 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 mod avatar;
+mod clone;
 mod config;
 mod deploy;
 mod deployment;
 mod deployments;
+mod lifecycle_auth;
 mod probe;
 mod provision;
 mod reset;
@@ -35,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/config", get(config::handle))
         .route("/deploy", post(deploy::handle))
+        .route("/clone", post(clone::handle))
         .route("/provision", post(provision::handle))
         .route("/probe", post(probe::handle))
         .route("/status", post(status::handle))

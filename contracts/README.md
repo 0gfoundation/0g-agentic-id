@@ -233,7 +233,6 @@ the Agent TEE constructs the following inside the TEE:
 ```solidity
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     uint256   deadline;              // revert past expiry
     bytes32   taskHash;              // task hash (input/output/contract), chosen by the client; the verifier only ecrecovers, doesn't enforce semantics
@@ -243,9 +242,11 @@ struct ServeProof {
 }
 ```
 
-Signed payload:
+There is **no `client` field**: attribution is `msg.sender` at submission time, and
+the proof is a bearer attestation the buyer submits from its own wallet (single-use
+via the signature nonce). Signed payload:
 ```
-inner = keccak256(abi.encode(agentId, client, timestamp, deadline,
+inner = keccak256(abi.encode(agentId, timestamp, deadline,
                              taskHash,
                              keccak256(abi.encodePacked(dataHashes)),
                              frameworkHash))
@@ -264,11 +265,10 @@ AgenticIDReputationRegistry.giveFeedback(
 ```
 
 What the contract does:
-1. Checks `proof.client == msg.sender`.
-2. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)` to verify the signature.
-3. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline`.
-4. Pushes a `FeedbackEntry` and records `clients` / `isClient`.
-5. Emits `NewFeedback` and `FeedbackWithProof`.
+1. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)` to verify the signature.
+2. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline` (each proof redeemable once).
+3. Pushes a `FeedbackEntry` under `msg.sender` and records `clients` / `isClient`.
+4. Emits `NewFeedback` and `FeedbackWithProof`.
 
 **The sybil-resistance core**: no agentSeal means no valid ServeProof, and only the Agent TEE holds `agentSeal_priv`. Clients cannot forge a ServeProof, nor self-rate without calling the agent.
 

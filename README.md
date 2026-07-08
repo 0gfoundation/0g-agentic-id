@@ -275,16 +275,16 @@ No real interaction, no legitimate review. Score farming is structurally
 impossible — you can't forge a signature that only a live TEE runtime can
 produce.
 
-Reputation also **binds to the specific iData in effect at the moment of
-service**, not to the agent's static tokenId. Upgrade the model or change
-the config, and that new version starts accumulating reputation from zero.
-Whatever has accumulated belongs to a specific configuration that did
-real, verifiable work.
+Each feedback also **records the exact iData in effect when it was earned**
+(the `dataHashes` in the proof), so reputation is auditable against what the
+agent was actually running — not just its static tokenId. Aggregating reputation
+*by* that data version — so a reconfigured agent's old scores are discounted — is
+designed (see [`REPUTATION_MODEL.md`](REPUTATION_MODEL.md)); today's on-chain
+`getSummary` is still id-bound (per tokenId).
 
 ```solidity
 struct ServeProof {
     uint256   agentId;
-    address   client;
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -295,9 +295,10 @@ struct ServeProof {
 ```
 
 `giveFeedback` reconstructs the signed payload on chain, runs `ecrecover`,
-and compares against `getAgentSeal(agentId)`. Because `agentSeal_priv` is
-held only by the Agent TEE, the client can neither forge a ServeProof nor
-self-rate without calling the agent. Details in
+and compares against `getAgentSeal(agentId)`. Because `agentSeal_priv` is held
+only by the Agent TEE, no one can forge a ServeProof, and each proof is
+single-use (signature nonce). There is no `client` field — attribution is
+`msg.sender` at submission. Details in
 [`contracts/README.md`](contracts/README.md) §5.
 
 ### 6 · Transferring an agent = transferring its capabilities

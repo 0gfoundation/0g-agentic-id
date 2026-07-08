@@ -134,6 +134,31 @@ pub struct DeployResponse {
     pub subscribe_url: String,
 }
 
+/// `POST /clone` — the SOURCE agent's owner asks the attestor to mint a
+/// brand-new agent (new seal/agentSeal/tokenId) for `target_owner`, reusing
+/// the source's iData. Authorized by an owner signature over
+/// `auth::clone::CanonicalClone`; the attestor additionally checks the signer
+/// equals the live on-chain `ownerOf(source_agent_id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneRequest {
+    pub idempotency_key: String,
+    /// The already-minted source agent to clone from.
+    pub source_agent_id: AgentId,
+    /// Who the clone is minted to.
+    pub target_owner: Address,
+    /// EIP-191 signature by the source owner over the canonical clone payload.
+    pub owner_signature: Bytes,
+    pub owner_signed_message_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloneResponse {
+    /// The NEW clone's seal_id (not the source's).
+    pub seal_id: SealId,
+    pub agent_seal_addr: Address,
+    pub subscribe_url: String,
+}
+
 // ── Stage state machine (per track) ─────────────────────────────────────
 //
 // Three parallel tracks: storage / mint / container. Each is its own
@@ -180,12 +205,26 @@ impl StageStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentPhase {
-    Pending,       // deploy accepted, no track started
-    Provisioning,  // some track in-flight, none failed, not yet Ready/Running
-    Ready,         // storage + mint both Confirmed, container not yet Running
-    Running,       // container Confirmed (agent serving)
-    Stopped,       // container Stopped after running
-    Failed,        // any track Failed
+    // Deploy in flight: storage / mint / container provisioning, nothing
+    // failed, container not yet running. (Collapses the old Pending +
+    // Provisioning + booting-Ready — granular per-track progress is shown
+    // separately via the storage/mint/container stages, not the phase.)
+    Deploying,
+    // Container Confirmed — the agent is serving.
+    Running,
+    // Container Stopped — owner-initiated pause; the sandbox is preserved and
+    // resumable via `start`. (The sweeps write Offline, not Stopped, when the
+    // sandbox is actually gone, so Stopped strictly means "user stopped it".)
+    Stopped,
+    // Minted + data uploaded, but no running container — the container failed,
+    // timed out, crashed, or was torn down on ownership transfer. The agent
+    // exists on chain; the (new) owner brings it online via a fresh create.
+    // The cause is carried in `container_stage`'s Failed/Stopped `reason`, which
+    // the UI maps to the right message + bring-online sub-routing.
+    Offline,
+    // Deploy never completed: storage or mint Failed. Recover via retry.
+    // (Container-level failure is Offline, not Failed — the agent is minted.)
+    Failed,
 }
 
 pub fn derive_phase(
@@ -193,28 +232,32 @@ pub fn derive_phase(
     mint: &StageStatus,
     container: &StageStatus,
 ) -> DeploymentPhase {
-    if storage.is_failed() || mint.is_failed() || container.is_failed() {
+    // Deploy never completed: a storage/mint failure dominates → Failed
+    // (retry). A *container* failure is NOT Failed — the agent is already
+    // minted, so it falls through to Offline below.
+    if storage.is_failed() || mint.is_failed() {
         return DeploymentPhase::Failed;
-    }
-    if matches!(container, StageStatus::Stopped { .. }) {
-        return DeploymentPhase::Stopped;
     }
     if matches!(container, StageStatus::Confirmed { .. }) {
         return DeploymentPhase::Running;
     }
+    if matches!(container, StageStatus::Stopped { .. }) {
+        return DeploymentPhase::Stopped;
+    }
+    // Minted + data uploaded (storage + mint both Confirmed): the agent exists
+    // on chain. If the container failed or was reset/torn-down (NotStarted) it
+    // needs to be brought online → Offline; if it's still coming up
+    // (Submitted) it's Deploying.
     if matches!(storage, StageStatus::Confirmed { .. })
         && matches!(mint, StageStatus::Confirmed { .. })
     {
-        return DeploymentPhase::Ready;
+        return match container {
+            StageStatus::Failed { .. } | StageStatus::NotStarted => DeploymentPhase::Offline,
+            _ => DeploymentPhase::Deploying,
+        };
     }
-    let any_started = !matches!(storage, StageStatus::NotStarted)
-        || !matches!(mint, StageStatus::NotStarted)
-        || !matches!(container, StageStatus::NotStarted);
-    if any_started {
-        DeploymentPhase::Provisioning
-    } else {
-        DeploymentPhase::Pending
-    }
+    // storage / mint still in flight (nothing failed yet) → Deploying.
+    DeploymentPhase::Deploying
 }
 
 // ── Deployment aggregate (persisted) ────────────────────────────────────
@@ -343,7 +386,38 @@ pub struct SandboxInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::U256;
+    use alloy::primitives::{Address, B256, U256};
+
+    #[test]
+    fn job_payload_clone_serde_roundtrip() {
+        // PostgresJobQueue seals+serializes JobPayload; a missing/renamed
+        // field would only surface at runtime. Lock the Clone shape here.
+        let p = JobPayload::Clone {
+            new_seal_id: B256::repeat_byte(1),
+            source_seal_id: B256::repeat_byte(2),
+            target_owner: Address::from([3u8; 20]),
+            name: "Sage".into(),
+            description: "d".into(),
+            image: None,
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: JobPayload = serde_json::from_str(&json).unwrap();
+        match back {
+            JobPayload::Clone {
+                new_seal_id,
+                source_seal_id,
+                target_owner,
+                name,
+                ..
+            } => {
+                assert_eq!(new_seal_id, B256::repeat_byte(1));
+                assert_eq!(source_seal_id, B256::repeat_byte(2));
+                assert_eq!(target_owner, Address::from([3u8; 20]));
+                assert_eq!(name, "Sage");
+            }
+            other => panic!("expected Clone, got {other:?}"),
+        }
+    }
 
     fn empty_deployment() -> Deployment {
         let now = Utc::now();
@@ -355,7 +429,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
-            phase: DeploymentPhase::Pending,
+            phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,
             mint_stage: StageStatus::NotStarted,
             container_stage: StageStatus::NotStarted,
@@ -548,23 +622,48 @@ mod tests {
     }
 
     #[test]
-    fn derive_phase_ready_when_phase1_done_but_container_pending() {
+    fn derive_phase_deploying_when_container_coming_up() {
+        // storage + mint done, container Submitted (booting) → Deploying.
         let phase = derive_phase(
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Submitted { tx_hash: None, at: Utc::now() },
         );
-        assert_eq!(phase, DeploymentPhase::Ready);
+        assert_eq!(phase, DeploymentPhase::Deploying);
     }
 
     #[test]
-    fn derive_phase_pending_when_nothing_started() {
+    fn derive_phase_deploying_when_nothing_started() {
         let phase = derive_phase(
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,
         );
-        assert_eq!(phase, DeploymentPhase::Pending);
+        assert_eq!(phase, DeploymentPhase::Deploying);
+    }
+
+    #[test]
+    fn derive_phase_offline_when_minted_container_failed() {
+        // Minted agent whose container failed/crashed → Offline (NOT Failed —
+        // the agent exists on chain; bring it back online via create).
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Failed { at: Utc::now(), reason: "agent unreachable".into() },
+        );
+        assert_eq!(phase, DeploymentPhase::Offline);
+    }
+
+    #[test]
+    fn derive_phase_offline_when_minted_container_reset() {
+        // Container track reset to NotStarted on ownership transfer
+        // (reset_container_track) while storage + mint stay Confirmed → Offline.
+        let phase = derive_phase(
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::Confirmed { at: Utc::now() },
+            &StageStatus::NotStarted,
+        );
+        assert_eq!(phase, DeploymentPhase::Offline);
     }
 
     // ── JobPayload variant serde — guards against silent variant rename ─
@@ -576,7 +675,11 @@ mod tests {
     // exact wire format.
     #[test]
     fn job_payload_resume_deploy_kind_is_resume_deploy() {
-        let p = JobPayload::ResumeDeploy { seal_id: B256::ZERO, sandbox_envelope: None };
+        let p = JobPayload::ResumeDeploy {
+            seal_id: B256::ZERO,
+            artifacts: Vec::new(),
+            sandbox_envelope: None,
+        };
         let v: serde_json::Value = serde_json::to_value(&p).unwrap();
         assert_eq!(v["kind"], "resume_deploy");
     }
@@ -790,8 +893,40 @@ pub enum JobPayload {
     /// honouring Daytona's per-action wallet auth requirement.
     ResumeDeploy {
         seal_id: SealId,
+        /// Pre-mint resume context, carried by the job itself. Populated by
+        /// `/retry` from the deployment's `i_data` only when the agent isn't
+        /// minted yet; empty once minted (post-mint the authoritative iData is
+        /// read from chain). Sealed at rest in the job envelope, same as
+        /// `Deploy`'s inputs.
+        #[serde(default)]
+        artifacts: Vec<IDataArtifact>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox_envelope: Option<SandboxEnvelope>,
+    },
+    /// Force-tear-down a seal-bound agent's sandbox after its token was
+    /// transferred (Layer 2 of the seal-bound-transfer ownership work).
+    /// Enqueued by the indexer's `on_transfer`; the worker `admin_delete`s
+    /// the container so the prior owner's still-running instance stops.
+    /// No envelope — uses the attestor's admin signer, not an owner envelope.
+    /// No-op when the deployment has no sandbox_id (non-seal / never-provisioned).
+    SandboxTeardown {
+        seal_id: SealId,
+    },
+    /// Clone an existing agent's iData into a brand-new agent owned by
+    /// `target_owner`. The worker re-seals each iData `data_key` from the
+    /// source agentSeal to the clone's new agentSeal (source storage roots
+    /// are reused, not re-uploaded), mints via `registerWithSeal`, and
+    /// finalizes identity — the clone lands Offline (its owner brings it
+    /// online later). `name`/`description`/`image` are resolved at the
+    /// route (override or copied from the source card).
+    Clone {
+        new_seal_id: SealId,
+        source_seal_id: SealId,
+        target_owner: Address,
+        name: String,
+        description: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image: Option<String>,
     },
 }
 

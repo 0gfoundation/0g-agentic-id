@@ -55,12 +55,14 @@ Envelope 签:
 
 ```
 {
-  method, uri, req_body_hash, status,
-  resp_body_hash, data_hashes, ts
+  agent_id, timestamp, deadline,
+  task_hash, data_hashes, framework_hash
 }
 ```
 
-用 `agent_seal_priv` 以 EIP-191 签名,JWT 风格打包成
+其中 `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
+keccak256(respBody) ‖ status)` 把请求/响应 transcript 折进去。用
+`agent_seal_priv` 以 EIP-191 签名,JWT 风格打包成
 `0x<sig>.<base64-envelope>` 写进 header。
 
 自开的 port 不在签名通道上,响应没有 `X-Agent-Proof`,密码学上

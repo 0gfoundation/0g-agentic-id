@@ -13,9 +13,42 @@ use crate::traits::{
 use crate::types::*;
 use alloy::primitives::{keccak256, Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
+use crate::sandbox::CanonicalSignedMessage;
+use base64::Engine as _;
+use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+/// Build a validly EIP-191-signed sandbox lifecycle envelope for tests,
+/// signed by `priv_bytes`. The returned envelope's `wallet_address` is the
+/// signer's derived address — pass it as the deployment owner and/or the
+/// `MockChain::set_owner_of` value to exercise the lifecycle owner gate.
+pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
+    let sk = SigningKey::from_bytes(priv_bytes.into()).expect("valid signing key");
+    let encoded = sk.verifying_key().to_encoded_point(false);
+    let addr = Address::from_slice(&keccak256(&encoded.as_bytes()[1..])[12..]);
+
+    let canonical = CanonicalSignedMessage {
+        action: action.into(),
+        expires_at: 9_999_999_999,
+        nonce: "00000000000000000000000000000000".into(),
+        payload: serde_json::Value::Object(Default::default()),
+        resource_id: String::new(),
+    };
+    let msg_bytes = serde_json::to_vec(&canonical).expect("serialize canonical");
+    let digest = crate::sandbox::eip191_digest(&msg_bytes);
+    let (sig, rec_id): (Signature, RecoveryId) = sk.sign_prehash(&digest).expect("sign prehash");
+    let mut sig_65 = [0u8; 65];
+    sig_65[..64].copy_from_slice(&sig.to_bytes());
+    sig_65[64] = Into::<u8>::into(rec_id) + 27;
+
+    SandboxEnvelope {
+        wallet_address: addr,
+        signed_message_b64: base64::engine::general_purpose::STANDARD.encode(&msg_bytes),
+        wallet_signature: Bytes::from(sig_65.to_vec()),
+    }
+}
 
 // ── ChainClient mock ─────────────────────────────────────────────────────
 
@@ -24,6 +57,14 @@ pub struct MockChain {
     seal_to_agent: Mutex<HashMap<SealId, AgentId>>,
     tx_to_receipt: Mutex<HashMap<TxHash, ReceiptSummary>>,
     tx_counter: AtomicU64,
+    /// Address returned by `owner_of` (for any agent_id). Defaults to ZERO;
+    /// set via `set_owner_of` to exercise the lifecycle owner gate in tests.
+    owner: Mutex<Address>,
+    /// On-chain iData + sealed keys returned by `intelligent_datas_of` /
+    /// `sealed_keys_of` (for any agent_id). Seed via `seed_idata` to exercise
+    /// clone reading the authoritative chain state.
+    idata: Mutex<Vec<IntelligentData>>,
+    sealed_keys: Mutex<Vec<Bytes>>,
 }
 
 impl MockChain {
@@ -33,7 +74,22 @@ impl MockChain {
             seal_to_agent: Mutex::new(HashMap::new()),
             tx_to_receipt: Mutex::new(HashMap::new()),
             tx_counter: AtomicU64::new(1),
+            owner: Mutex::new(Address::ZERO),
+            idata: Mutex::new(Vec::new()),
+            sealed_keys: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Set the address `owner_of` returns (test-only).
+    pub fn set_owner_of(&self, addr: Address) {
+        *self.owner.lock().unwrap() = addr;
+    }
+
+    /// Seed the on-chain iData + sealed keys returned for any agent_id
+    /// (test-only) — exercises clone reading the authoritative chain state.
+    pub fn seed_idata(&self, idata: Vec<IntelligentData>, sealed_keys: Vec<Bytes>) {
+        *self.idata.lock().unwrap() = idata;
+        *self.sealed_keys.lock().unwrap() = sealed_keys;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -88,7 +144,7 @@ impl ChainClient for MockChain {
     }
 
     async fn owner_of(&self, _agent_id: AgentId) -> anyhow::Result<Address> {
-        Ok(Address::ZERO)
+        Ok(*self.owner.lock().unwrap())
     }
 
     async fn is_valid_framework_hash(&self, _hash: ImageHash) -> anyhow::Result<bool> {
@@ -112,7 +168,11 @@ impl ChainClient for MockChain {
         &self,
         _agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>> {
-        Ok(Vec::new())
+        Ok(self.idata.lock().unwrap().clone())
+    }
+
+    async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+        Ok(self.sealed_keys.lock().unwrap().clone())
     }
 
     async fn set_agent_uri(
@@ -266,6 +326,10 @@ pub struct ConfigurableSandbox {
     /// "configured to fail" — lets tests inject a specific error such as the
     /// sandbox's 402 "insufficient balance" body.
     pub fail_msg: Mutex<Option<String>>,
+    /// HTTP status the injected failure carries, so tests can exercise the
+    /// SandboxError transient/fatal classification (e.g. 402 balance, 400
+    /// "in progress", 409 conflict, 5xx). `None` → a statusless error.
+    pub fail_status: Mutex<Option<u16>>,
     pub create_calls: AtomicU64,
     pub start_calls: AtomicU64,
     pub stop_calls: AtomicU64,
@@ -282,6 +346,7 @@ impl ConfigurableSandbox {
             stop_fails: AtomicBool::new(false),
             admin_delete_fails: AtomicBool::new(false),
             fail_msg: Mutex::new(None),
+            fail_status: Mutex::new(None),
             create_calls: AtomicU64::new(0),
             start_calls: AtomicU64::new(0),
             stop_calls: AtomicU64::new(0),
@@ -300,13 +365,24 @@ impl ConfigurableSandbox {
         self
     }
 
-    /// The error create/start return when their fail flag is set — the
-    /// injected `fail_msg` if any, else the generic placeholder.
+    /// The error create/start return when their fail flag is set — a
+    /// `SandboxError` carrying the injected `fail_msg`/`fail_status` (so
+    /// tests exercise the real status-based classification), else a generic
+    /// statusless placeholder.
     fn fail_error(&self) -> anyhow::Error {
-        match self.fail_msg.lock().unwrap().clone() {
-            Some(m) => anyhow::anyhow!(m),
-            None => anyhow::anyhow!("configured to fail"),
+        let msg = self
+            .fail_msg
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "configured to fail".to_string());
+        let status = *self.fail_status.lock().unwrap();
+        crate::sandbox::SandboxError {
+            op: "mock".to_string(),
+            status,
+            message: msg,
         }
+        .into()
     }
 }
 
@@ -395,6 +471,13 @@ pub struct ConfigurableChain {
     pub set_uri_calls: AtomicU64,
     pub set_uri_fails: AtomicBool,
     pub last_set_uri: Mutex<Option<(AgentId, String)>>,
+    /// Last `registerWithSeal` params (to, agent_seal, sealed_keys) so tests
+    /// can assert who a mint/clone was minted to.
+    pub last_register: Mutex<Option<(Address, Address, Vec<Bytes>)>>,
+    /// On-chain iData + sealed keys for `intelligent_datas_of`/`sealed_keys_of`
+    /// (for any agent_id). Seed via `seed_idata` to exercise clone.
+    idata: Mutex<Vec<IntelligentData>>,
+    sealed_keys: Mutex<Vec<Bytes>>,
     next_agent_id: AtomicU64,
     tx_counter: AtomicU64,
     receipts: Mutex<HashMap<TxHash, ReceiptSummary>>,
@@ -409,6 +492,9 @@ impl ConfigurableChain {
             set_uri_calls: AtomicU64::new(0),
             set_uri_fails: AtomicBool::new(false),
             last_set_uri: Mutex::new(None),
+            last_register: Mutex::new(None),
+            idata: Mutex::new(Vec::new()),
+            sealed_keys: Mutex::new(Vec::new()),
             next_agent_id: AtomicU64::new(1),
             tx_counter: AtomicU64::new(1),
             receipts: Mutex::new(HashMap::new()),
@@ -417,6 +503,13 @@ impl ConfigurableChain {
 
     pub fn seed_minted(&self, seal_id: SealId, agent_id: AgentId) {
         self.seal_to_agent.lock().unwrap().insert(seal_id, agent_id);
+    }
+
+    /// Seed the on-chain iData + sealed keys returned for any agent_id
+    /// (test-only) — exercises clone reading the authoritative chain state.
+    pub fn seed_idata(&self, idata: Vec<IntelligentData>, sealed_keys: Vec<Bytes>) {
+        *self.idata.lock().unwrap() = idata;
+        *self.sealed_keys.lock().unwrap() = sealed_keys;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -437,6 +530,8 @@ impl Default for ConfigurableChain {
 impl ChainClient for ConfigurableChain {
     async fn register_with_seal(&self, params: MintParams) -> anyhow::Result<TxHash> {
         self.register_calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_register.lock().unwrap() =
+            Some((params.to, params.agent_seal, params.sealed_keys.clone()));
         if self.register_fails.load(Ordering::SeqCst) {
             anyhow::bail!("configured to fail");
         }
@@ -496,7 +591,11 @@ impl ChainClient for ConfigurableChain {
         &self,
         _agent_id: AgentId,
     ) -> anyhow::Result<Vec<IntelligentData>> {
-        Ok(Vec::new())
+        Ok(self.idata.lock().unwrap().clone())
+    }
+
+    async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+        Ok(self.sealed_keys.lock().unwrap().clone())
     }
 
     async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
@@ -690,17 +789,44 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
 
     async fn set_storage_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_storage_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.storage_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.storage_stage = stage;
+            // Recompute phase from all stages, matching the Postgres
+            // `update_stage` helper (which does this atomically in a tx).
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
     }
 
     async fn set_mint_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_mint_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.mint_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.mint_stage = stage;
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
     }
 
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
         self.set_container_stage_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.container_stage = stage)
+        self.mut_with(seal_id, |d| {
+            d.container_stage = stage;
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        })
+    }
+
+    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
+        self.mut_with(seal_id, |d| {
+            d.container_stage = StageStatus::NotStarted;
+            d.sandbox_id = None;
+            d.provisioned_at = None;
+            d.phase = crate::types::derive_phase(
+                &d.storage_stage,
+                &d.mint_stage,
+                &d.container_stage,
+            );
+        })
     }
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
@@ -723,6 +849,17 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| {
             d.container_pubkey = Some(Bytes::from(pubkey));
             d.container_pubkey_mac = Some(Bytes::from(mac));
+        })
+    }
+
+    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        self.mut_with(seal, |d| {
+            d.container_pubkey = None;
+            d.container_pubkey_mac = None;
         })
     }
 

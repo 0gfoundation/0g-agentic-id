@@ -16,6 +16,71 @@ use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, Signi
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
+/// Error from a sandbox-provider HTTP call, carrying the HTTP status so
+/// callers can classify transient/recoverable vs fatal conditions WITHOUT
+/// string-matching the body. The 0g-sandbox provider is a transparent proxy
+/// over daytona and returns no structured error code — only an HTTP status +
+/// a free-text body — so status is the primary signal and `message` is the
+/// raw body for context/logging.
+#[derive(Debug, Clone)]
+pub struct SandboxError {
+    /// Operation that failed: "create" | "start" | "stop" | "admin_delete" | …
+    pub op: String,
+    /// HTTP status from the provider, when the call reached it. `None` for a
+    /// pre-flight/transport failure (which is treated as non-transient).
+    pub status: Option<u16>,
+    /// Raw response body (or transport error text).
+    pub message: String,
+}
+
+impl SandboxError {
+    pub fn new(op: impl Into<String>, status: u16, message: impl Into<String>) -> Self {
+        Self {
+            op: op.into(),
+            status: Some(status),
+            message: message.into(),
+        }
+    }
+
+    /// True when the condition is transient/recoverable and the caller must
+    /// NOT destroy the sandbox — it's healthy now or will be once the
+    /// condition clears (a state-transition lock, the ~90s post-stop backup,
+    /// a rate limit, an upstream RPC hiccup, or a top-up-able balance gap).
+    /// Classification is by HTTP status; see the 0g-sandbox provider error
+    /// map. The two body checks below are only because the provider can't
+    /// disambiguate by status alone (it has no structured error codes and
+    /// flattens daytona's conflict to 400 — both tracked upstream).
+    pub fn is_transient(&self) -> bool {
+        match self.status {
+            // Conflict (state transition / lock held), request timeout, rate
+            // limit → wait and retry.
+            Some(408) | Some(409) | Some(429) => true,
+            // Provider / upstream faults (RPC check failures = 502, broker
+            // deposit timeout = 504, etc.) → retry.
+            Some(s) if s >= 500 => true,
+            // 402: a balance gap is top-up-recoverable; a "not acknowledged"
+            // 402 is fatal (owner must acknowledge on chain first).
+            Some(402) => !self.message.to_lowercase().contains("acknowledg"),
+            // 400 is normally a fatal validation error — EXCEPT daytona
+            // flattens its "operation already in progress" conflict to 400
+            // (should be 409; tracked upstream). Only that one is transient.
+            Some(400) => self.message.to_lowercase().contains("in progress"),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SandboxError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(s) => write!(f, "sandbox {}: {} — {}", self.op, s, self.message),
+            None => write!(f, "sandbox {}: {}", self.op, self.message),
+        }
+    }
+}
+
+impl std::error::Error for SandboxError {}
+
 // ── Canonical signed message schema (matches go-sandbox signedRequest) ──
 //
 // Field order matters: Go's json.Marshal emits fields in struct declaration
@@ -233,7 +298,7 @@ impl SandboxClient for HttpSandbox {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("sandbox create: {status} — {body}");
+            return Err(SandboxError::new("create", status.as_u16(), body).into());
         }
 
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
@@ -340,7 +405,7 @@ impl SandboxClient for HttpSandbox {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("sandbox admin_delete: {status} — {body}");
+            return Err(SandboxError::new("admin_delete", status.as_u16(), body).into());
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
         Ok(())
@@ -410,7 +475,7 @@ impl SandboxClient for HttpSandbox {
         }
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("sandbox get_sandbox: {status} — {body}");
+            return Err(SandboxError::new("get_sandbox", status.as_u16(), body).into());
         }
         let info: SandboxInfo = res
             .json()
@@ -480,7 +545,7 @@ impl HttpSandbox {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            anyhow::bail!("sandbox {verb}: {status} — {body}");
+            return Err(SandboxError::new(verb, status.as_u16(), body).into());
         }
         tracing::info!(?seal_id, sandbox_id = %canonical.resource_id, %verb, "sandbox: lifecycle ok");
         Ok(())
