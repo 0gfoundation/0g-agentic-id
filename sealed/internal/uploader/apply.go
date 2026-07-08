@@ -95,7 +95,16 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 		contentSum := sha256.Sum256(plaintext)
 		contentHashHex := hex.EncodeToString(contentSum[:])
 		defaultSum := sha256.Sum256(u.adapter.Defaults(r.Name))
-		isDefault := contentSum == defaultSum
+		// The "framework" role is the on-chain identity selector: sealed
+		// picks the adapter at boot from binding.name (main.resolveAdapter).
+		// It must ALWAYS persist on chain, even when it equals the adapter
+		// default — otherwise the isDefault-omit optimization drops it, and
+		// a version-less binding whose resolved version happens to equal
+		// whitelistMax hits exactly that. Consequence when it was dropped:
+		// on container recreate the binding is gone, bootstrap falls back
+		// to the default framework, and a claude-code agent silently comes
+		// back up as openclaw. Never omit the identity anchor.
+		isDefault := contentSum == defaultSum && r.Name != "framework"
 
 		chainEntry := findChainEntry(chainEntries, r.Name)
 		cachedChainHash := u.agent.ChainEntry(r.Name).ContentHash
