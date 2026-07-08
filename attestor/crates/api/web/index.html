@@ -701,6 +701,37 @@ details.log[open] summary{color:var(--text2)}
 
 /* ── Detail page (8004scan-style hero) ──────────────────────────── */
 /* ── Detail hero (horizontal) ─────────────────────────────────── */
+/* ── Registry / recent: agent cards (replaces the old table rows) ── */
+.agent-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:var(--sp-4)}
+.agent-card{display:flex;flex-direction:column;gap:var(--sp-3);padding:var(--sp-5);border:1px solid var(--border);border-radius:var(--r-lg);background:linear-gradient(var(--surf-top),var(--surf));box-shadow:var(--sh-sm);cursor:pointer;transition:transform var(--t-base) var(--ease-spring),box-shadow var(--t-base),border-color var(--t-base);animation:row-enter 440ms var(--ease-spring) backwards}
+.agent-card:hover{transform:translateY(-3px);box-shadow:var(--sh);border-color:var(--pbd)}
+.agent-card:nth-child(1){animation-delay:0ms}.agent-card:nth-child(2){animation-delay:40ms}
+.agent-card:nth-child(3){animation-delay:80ms}.agent-card:nth-child(4){animation-delay:120ms}
+.agent-card:nth-child(5){animation-delay:160ms}.agent-card:nth-child(6){animation-delay:200ms}
+.agent-card:nth-child(7){animation-delay:240ms}.agent-card:nth-child(8){animation-delay:280ms}
+.agent-card:nth-child(n+9){animation-delay:320ms}
+.ac-top{display:flex;align-items:center;gap:var(--sp-3)}
+.ac-avatar{width:46px;height:46px;flex:none;border-radius:var(--r);border:1px solid var(--border);background:var(--surf2);overflow:hidden;image-rendering:pixelated;transition:transform var(--t-base) var(--ease-spring)}
+.ac-avatar img{width:100%;height:100%;object-fit:cover;image-rendering:pixelated;display:block}
+.agent-card:hover .ac-avatar{transform:scale(1.08) rotate(-3deg)}
+.agent-card.is-running .ac-avatar{outline:2px solid var(--green);outline-offset:2px;box-shadow:0 0 12px oklch(42% 0.18 145 / 0.35);animation:list-avatar-glow 2.6s ease-in-out infinite}
+.agent-card.is-failed .ac-avatar{outline:2px solid var(--red);outline-offset:2px;box-shadow:0 0 10px oklch(48% 0.20 25 / 0.3)}
+.ac-id{min-width:0;flex:1;display:flex;flex-direction:column;gap:2px}
+.ac-name{font-weight:600;font-size:var(--fs-base);letter-spacing:var(--ls-heading);display:flex;align-items:center;gap:7px;min-width:0}
+.ac-name .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ac-name .id-tag{flex:none;font-family:var(--mono);font-size:var(--fs-xs);font-weight:600;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:5px;padding:0 5px}
+.ac-addr{font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted)}
+.ac-desc{font-size:var(--fs-sm);color:var(--text2);line-height:var(--lh-snug);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.ac-pill{margin-left:auto;align-self:flex-start;display:inline-flex;align-items:center;gap:6px;font-family:var(--mono);font-size:var(--fs-xs);font-weight:600;letter-spacing:.02em;padding:3px 10px;border-radius:999px;border:1px solid;white-space:nowrap}
+.ac-pill .ac-dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.ac-pill.live{color:var(--green);background:var(--gbg);border-color:var(--gbd)}
+.ac-pill.live .ac-dot{animation:pulse 2s ease-in-out infinite}
+.ac-pill.pending{color:var(--orange);background:var(--obg);border-color:var(--obd)}
+.ac-pill.failed{color:var(--red);background:var(--rbg);border-color:var(--rbd)}
+.ac-pill.stopped{color:var(--muted);background:var(--surf2);border-color:var(--border)}
+.ac-foot{display:flex;justify-content:space-between;align-items:center;gap:var(--sp-2);margin-top:auto;padding-top:var(--sp-3);border-top:1px solid var(--border);font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted)}
+.ac-foot .ac-chain{display:inline-flex;align-items:center;gap:5px;color:var(--p)}
+
 .detail-hero{position:relative;background:var(--surf);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px 26px;margin-bottom:14px;box-shadow:var(--sh-sm);display:grid;grid-template-columns:auto 1fr auto;gap:22px;align-items:flex-start}
 /* Phase-tinted backdrop wash — soft radial in the top-left, lightly
    colored by phase. `clip-path` keeps the gradient inside the card's
@@ -1357,8 +1388,8 @@ details.log[open] summary{color:var(--text2)}
       <span class="home-section-title">Recent activity</span>
       <a href="#/agents" class="home-section-more">View all →</a>
     </div>
-    <div class="agent-table" id="homeRecent">
-      <div class="agent-row body" style="grid-template-columns:1fr;justify-items:center;color:var(--muted);padding:24px"><span>Loading…</span></div>
+    <div id="homeRecent">
+      <div class="empty" style="border:none;background:none;padding:24px;color:var(--muted)"><span>Loading…</span></div>
     </div>
   </div>
 
@@ -1386,7 +1417,7 @@ details.log[open] summary{color:var(--text2)}
       </div>
       <button class="btn btn-ghost" onclick="loadDiscovery()" style="font-size:var(--fs-xs);padding:6px 14px;display:inline-flex;align-items:center;gap:6px"><span class="ico"><svg viewBox="0 0 16 16"><path d="M3 8a5 5 0 0 1 8.7-3.4L13 6"/><path d="M13 3v3h-3"/><path d="M13 8a5 5 0 0 1-8.7 3.4L3 10"/><path d="M3 13v-3h3"/></svg></span> Refresh</button>
     </div>
-    <div class="agent-table" id="agentList"></div>
+    <div id="agentList"></div>
     <div class="count" id="agentCount" style="text-align:center;margin-top:14px;font-family:var(--mono);font-size:var(--fs-xs);color:var(--muted);letter-spacing:var(--ls-eyebrow)"></div>
   </div>
 
@@ -3405,17 +3436,8 @@ async function loadHome() {
       list.innerHTML = `<div class="empty"><h2>No agents yet</h2><p>Be the first to deploy through this attestor.</p><a class="btn btn-primary" href="#/deploy">+ Deploy an agent</a></div>`;
       return;
     }
-    list.innerHTML = `
-      <div class="agent-row head">
-        <div>Name</div>
-        <div>Chain</div>
-        <div>Status</div>
-        <div>Owner</div>
-        <div style="text-align:right">Created</div>
-      </div>
-      ${top.map(d => renderAgentRow(d)).join('')}
-    `;
-    $$('#homeRecent .agent-row.body').forEach(el => {
+    list.innerHTML = `<div class="agent-grid">${top.map(d => renderAgentRow(d)).join('')}</div>`;
+    $$('#homeRecent .agent-card').forEach(el => {
       el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
     });
   } catch (e) {
@@ -3494,17 +3516,8 @@ window.filterDiscovery = function () {
     return;
   }
 
-  list.innerHTML = `
-    <div class="agent-row head">
-      <div>Name</div>
-      <div class="col-chain-head">Chain</div>
-      <div class="col-status-head">Status</div>
-      <div class="col-owner-head">Owner</div>
-      <div style="text-align:right">Created</div>
-    </div>
-    ${view.map(d => renderAgentRow(d)).join('')}
-  `;
-  $$('.agent-row.body').forEach(el => {
+  list.innerHTML = `<div class="agent-grid">${view.map(d => renderAgentRow(d)).join('')}</div>`;
+  $$('#agentList .agent-card').forEach(el => {
     el.onclick = () => navigate(`#/agent/${el.dataset.seal}`);
   });
   count.textContent = `${view.length} of ${items.length} agent${items.length === 1 ? '' : 's'}`;
@@ -3688,37 +3701,36 @@ function renderAgentRow(d) {
   const aid = d.agent_id || '';
   const sealHex = d.seal_id && d.seal_id.startsWith('0x') ? d.seal_id : '0x' + (d.seal_id || '').replace(/^0x/, '');
 
-  const avatar = image
-    ? `<div class="avatar"><img src="${escapeHtml(image)}" alt="${escapeHtml(name)} avatar"/></div>`
-    : `<div class="avatar"><img src="/avatar/default.svg" alt="${escapeHtml(name)} default avatar"/></div>`;
+  const src = image ? escapeHtml(image) : '/avatar/default.svg';
+  const avatar = `<div class="ac-avatar"><img src="${src}" alt="${escapeHtml(name)} avatar"/></div>`;
+
+  // phase → pill class/label + card modifier (drives the avatar glow).
+  const p = phase;
+  const pillCls = p === 'running' ? 'live' : p === 'failed' ? 'failed' : p === 'deploying' ? 'pending' : 'stopped';
+  const pillTxt = p === 'running'   ? 'Running'
+                : p === 'failed'    ? 'Failed'
+                : p === 'stopped'   ? 'Stopped'
+                : p === 'deploying' ? 'Deploying'
+                : 'Offline';
+  const cardMod = p === 'running' ? ' is-running' : p === 'failed' ? ' is-failed' : '';
+  const r = failureReason(d);
+  const pillTitle = r ? ` title="${escapeHtml(r)}"` : '';
 
   return `
-    <div class="agent-row body" data-seal="${sealHex}">
-      <div class="col-name">
+    <div class="agent-card${cardMod}" data-seal="${sealHex}">
+      <div class="ac-top">
         ${avatar}
-        <div class="name-block">
-          <div class="name-line">
-            <span class="name">${escapeHtml(name)}</span>
-            ${aid ? `<span class="id-tag">#${escapeHtml(aid)}</span>` : ''}
-          </div>
-          ${description ? `<div class="desc">${escapeHtml(description)}</div>` : ''}
+        <div class="ac-id">
+          <div class="ac-name"><span class="nm">${escapeHtml(name)}</span>${aid ? `<span class="id-tag">#${escapeHtml(aid)}</span>` : ''}</div>
+          <div class="ac-addr" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
         </div>
+        <span class="ac-pill ${pillCls}"${pillTitle}><span class="ac-dot"></span>${pillTxt}</span>
       </div>
-      <div><span class="col-chain">⬢ 0G testnet</span></div>
-      ${(() => {
-        const p = d.phase || 'deploying';
-        const cls = p === 'running' ? 's-running' : p === 'failed' ? 's-failed' : 's-offline';
-        const txt = p === 'running'   ? 'Running'
-                  : p === 'failed'    ? 'Failed'
-                  : p === 'stopped'   ? 'Stopped'
-                  : p === 'deploying' ? 'Deploying'
-                  : 'Offline';
-        const r = failureReason(d);
-        const title = r ? ` title="${escapeHtml(r)}"` : '';
-        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
-      })()}
-      <div class="col-owner" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
-      <div class="col-created" style="text-align:right">${ageString(d.created_at)}</div>
+      ${description ? `<div class="ac-desc">${escapeHtml(description)}</div>` : ''}
+      <div class="ac-foot">
+        <span class="ac-chain">⬢ 0G testnet</span>
+        <span>${ageString(d.created_at)}</span>
+      </div>
     </div>`;
 }
 
