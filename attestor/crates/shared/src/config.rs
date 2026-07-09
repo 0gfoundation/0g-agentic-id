@@ -99,6 +99,18 @@ pub struct Config {
     /// agent's on-chain binding, not the image.
     pub sandbox_snapshot: String,
 
+    /// Public-port allowlist injected into every sandbox `create` body as
+    /// 0g-sandbox's `publicPorts` (0g-sandbox#57). When non-empty, only these
+    /// ports are publicly reachable via the preview proxy; all others fall
+    /// back to Daytona auth (SSH 22222 / toolbox 2280 / any stray container
+    /// port). Sealed agents serve on `agent_serve_port` (8080), so the
+    /// operator MUST include it. Empty (default) = don't send the field =
+    /// today's all-ports-public behavior, which is also the ONLY safe setting
+    /// against a provider still on stock Daytona (it 502s an unknown field).
+    /// This is the env switch for the feature: turn it on only once the
+    /// provider runs the 0g-daytona fork images.
+    pub sandbox_public_ports: Vec<u16>,
+
     /// Framework names deploys may select — the attestor's ONLY
     /// framework knowledge, and it is a list of opaque strings: validated
     /// pre-mint at the deploy edge, written verbatim into the synthesized
@@ -231,6 +243,13 @@ impl Config {
                 .and_then(|s| s.parse().ok()),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
+            sandbox_public_ports: env_opt("ATTESTOR_SANDBOX_PUBLIC_PORTS")
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|p| p.trim().parse::<u16>().ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
             supported_frameworks: env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")
                 .map(|s| {
                     s.split(',')

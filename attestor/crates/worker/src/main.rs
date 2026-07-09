@@ -93,6 +93,10 @@ async fn main() -> anyhow::Result<()> {
                     format!("{:#x}", cfg.agentic_id_addr),
                 ),
             ],
+            // Public-port allowlist (ATTESTOR_SANDBOX_PUBLIC_PORTS): when set,
+            // create bodies carry `publicPorts` so only the agent-serving
+            // port is publicly reachable. Empty = all-ports-public (default).
+            cfg.sandbox_public_ports.clone(),
             admin_signer,
         ))
     };
