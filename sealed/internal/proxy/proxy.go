@@ -203,10 +203,9 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fresh read on every /hello so verifiers see the agent's current
-	// declared surface, sourced from sealed's own service registry
-	// (agent-registered via POST /services). Empty slice (not nil) keeps
-	// the JSON shape stable as `services: []`.
-	services := servicesForHello(s.getServices())
+	// declared surface. Entry #0 is always /hello itself; the rest come
+	// from sealed's service registry (agent-registered via POST /services).
+	services := s.helloServiceList()
 
 	// Message is the agent's self-introduction in its own voice. Reads
 	// as 2 or 3 sentences: identity → owner → (if services present)
@@ -215,7 +214,9 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	// so all three sentences + the list scan as one continuous voice
 	// rather than a verification panel followed by a separate catalog.
 	helloMessage := fmt.Sprintf("I am %s. My owner is %s.", agentAddr, owner)
-	if len(services) > 0 {
+	// #0 (/hello) is always present, so only lead into a capability list
+	// when the agent has registered services of its own beyond it.
+	if len(services) > 1 {
 		helloMessage += " Here's what I can do for you:"
 	}
 	resp := map[string]any{

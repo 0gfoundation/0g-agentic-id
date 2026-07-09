@@ -88,6 +88,22 @@ func TestServicesForHello_mapsAndDropsBackend(t *testing.T) {
 	// address is dropped by construction (compile-time guarantee).
 }
 
+func TestHelloServiceList_hasHelloAsEntryZero(t *testing.T) {
+	// Empty registry: the list is still non-empty — /hello is #0.
+	empty := (&Server{}).helloServiceList()
+	if len(empty) != 1 || empty[0].Path != "/hello" || empty[0].Method != "GET" {
+		t.Fatalf("want [#0 /hello GET], got %+v", empty)
+	}
+	// With an agent service: #0 /hello first, then the registered one.
+	s := &Server{services: []ServiceEntry{
+		{Path: "/api/fortune", Method: "POST", Backend: "http://127.0.0.1:9090"},
+	}}
+	got := s.helloServiceList()
+	if len(got) != 2 || got[0].Path != "/hello" || got[1].Path != "/api/fortune" {
+		t.Fatalf("want [/hello, /api/fortune], got %+v", got)
+	}
+}
+
 func TestMatchService(t *testing.T) {
 	s := &Server{services: []ServiceEntry{
 		{Path: "/api/fortune", Method: "POST", Backend: "http://127.0.0.1:9090"},

@@ -135,6 +135,24 @@ func servicesForHello(entries []ServiceEntry) []report.Service {
 	return out
 }
 
+// helloSelfEntry is service #0: /hello advertises itself. Always present,
+// so the service list is never empty and the always-on signed endpoint is
+// visible as the worked example of the mechanism. Backed by sealed itself
+// (not an agent loopback), so it needs no registration.
+func helloSelfEntry() report.Service {
+	return report.Service{
+		Path:        "/hello",
+		Method:      "GET",
+		Description: "Signed self-introduction — this agent's identity, on-chain data hashes, and its declared services.",
+	}
+}
+
+// helloServiceList is the array /hello advertises: entry #0 (/hello itself)
+// followed by the agent-registered services.
+func (s *Server) helloServiceList() []report.Service {
+	return append([]report.Service{helloSelfEntry()}, servicesForHello(s.getServices())...)
+}
+
 // matchService returns the registered service whose path exactly equals the
 // request path (query string excluded by the caller). Exact match for now;
 // subpath/prefix routing is a later refinement.
