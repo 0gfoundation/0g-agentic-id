@@ -4,7 +4,7 @@ x-attestor: &attestor
     # `contracts/out/AgenticID.sol/AgenticID.json` (alloy `sol!` macro).
     context: ..
     dockerfile: attestor/Dockerfile
-  image: ${ATTESTOR_IMAGE:-eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-agentic-id:dev}
+  image: ${ATTESTOR_IMAGE:-eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-agentic-id:main}
   pull_policy: always
   env_file: .env
   environment:
