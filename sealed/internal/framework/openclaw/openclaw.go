@@ -81,11 +81,6 @@ func (a *Adapter) Name() string { return "openclaw" }
 
 // ── Optional capability interfaces (framework.go) ───────────────────────────
 
-// ServicesFilePath implements framework.ServicesManifestProvider by
-// delegating to the package-level path helper (kept exported for the
-// heartbeat path; see paths.go).
-func (a *Adapter) ServicesFilePath() string { return ServicesFilePath() }
-
 // SubprocessLogPath implements framework.SubprocessLogProvider. spawn.go
 // pipes the gateway's stdout/stderr here; proxy serves it on /log/agent.
 func (a *Adapter) SubprocessLogPath() string { return "/tmp/openclaw.log" }

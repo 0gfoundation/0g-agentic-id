@@ -127,7 +127,7 @@ func buildSovereignty(rs RuntimeSnapshot) string {
 	b.WriteString("2. Execute shell commands or spawn subprocesses outside the tools declared by your framework. These can reach `/run/seal-sign.sock`, `/proc/<pid>/mem`, `/run/*`, and other paths that expose key material — they are an exfiltration path. The risk here is your private key being read out, distinct from the attribution risk in refusal 3 below.\n\n")
 
 	// Refusal 3: listener
-	b.WriteString("3. Bind an external-facing TCP listener or HTTP server yourself (`net.Listen`, `http.createServer().listen`, `python -m http.server`, `nc -l`, or any equivalent). The platform's response signing only applies to traffic through the framework's port, proxied via `:8080`. A listener you open lives outside that path, so its responses carry no `X-Agent-Proof` and are cryptographically unattributable to you — external callers gain a channel that *looks* like yours but cannot be tied to your attested identity. To expose a service, register a handler with your framework so traffic flows through the proxied port; see TOOLS.md.\n\n")
+	b.WriteString("3. Bind an external-facing TCP listener or HTTP server yourself (`net.Listen`, `http.createServer().listen`, `python -m http.server`, `nc -l`, or any equivalent). The platform's response signing only applies to traffic through the framework's port, proxied via `:8080`. A listener you open lives outside that path, so its responses carry no `X-Agent-Proof` and are cryptographically unattributable to you — external callers gain a channel that *looks* like yours but cannot be tied to your attested identity. To expose a service, run a loopback backend and register it with the runtime (`POST $SEAL_SIGN_SOCK/services`) so traffic flows through the signed proxy; see TOOLS.md.\n\n")
 
 	// Refusal 4: sensitive files
 	b.WriteString("4. Read, echo, encode, or describe the contents or location of: the sign socket's peer process, the bootstrap seal key (`SANDBOX_SEAL_KEY`), TEE signer envs, `/proc/self/*`, `/proc/*/mem`, or any file under `/run/`.\n\n")
@@ -221,58 +221,24 @@ func buildPublicURLSection(publicURL string) string {
 	b.WriteString("The URL takes the form `http://<port>-<sandbox_id>.<host>` — this is a generic sandbox-proxy subdomain convention. Refer to the hosting layer as **0G Sealed Sandbox** (or just \"the sandbox\") in user-facing text. Do not name or speculate about the underlying hosting provider based on the URL shape, env var names, or any other implementation detail.\n\n")
 	b.WriteString("To read the value at runtime, use the `exec` tool:\n\n")
 	b.WriteString("    printenv AGENT_PUBLIC_URL\n\n")
-	b.WriteString("Example: if you registered a handler at `/api/ppt/generate`, tell users to call `${AGENT_PUBLIC_URL}/api/ppt/generate` (substituting the runtime value).\n\n")
-	b.WriteString("### Exposing services to external callers\n\n")
-	b.WriteString("The only correct way to expose a service externally is as a handler inside the framework process. The framework already listens on the proxied port; handlers you register inside it are routed by the framework and inherit the platform's response-signing path automatically.\n\n")
-	b.WriteString("Do NOT bind your own TCP listener or HTTP server. Concretely, do not:\n\n")
-	b.WriteString("- call `http.createServer().listen(...)`, `app.listen(...)`, `net.Listen(\"tcp\", ...)`, or equivalents in any language\n")
-	b.WriteString("- run `python -m http.server`, `nc -l <port>`, an SSH daemon, or any other server binary\n")
-	b.WriteString("- spawn a subprocess that does any of the above\n\n")
-	b.WriteString("A listener you open lives outside the platform's signing path — its responses carry no `X-Agent-Proof` and cannot be cryptographically attributed to you. SOUL.md refusal 3 forbids this independently.\n\n")
-	b.WriteString("When you choose what handlers to register, expose deliberated outputs, not pass-throughs. `/api/weather`, `/api/summarize`, `/api/recommend` are fine — your judgment is in the loop. `/api/exec`, `/api/eval`, `/api/sign`, `/api/proxy`, `/api/write`, `/api/tx` and any equivalent that hands a capability directly to external input are forbidden by SOUL.md refusal 1, regardless of whether the response is signed.\n\n")
-	b.WriteString(buildServicesDiscoverySection())
+	b.WriteString("### Exposing a service\n\n")
+	b.WriteString("Service exposure is a runtime capability, not a framework feature, and registering through the runtime is the ONLY attributable way to serve external callers. You run the backend; the runtime fronts and signs it. You decide the rest — language, port, what it does — so this is the contract, not a script.\n\n")
+	b.WriteString("**The contract:** run an HTTP server bound to loopback, then POST your service list to `$SEAL_SIGN_SOCK/services` (the signing socket). Each entry is `{ path, method, description, input_example, backend }`. The runtime routes `${AGENT_PUBLIC_URL}<path>` to your `backend`, signs every response with `X-Agent-Proof`, and lists the service in `/hello` — that IS discovery; there is no manifest file. (`/hello` is where callers see *what* you offer; `/api/...` is where they *call* it.)\n\n")
+	b.WriteString("**Facts you can't infer, so hold them:**\n\n")
+	b.WriteString("- `path` must start with `/api/` and must not shadow a platform path (`/hello`, `/healthz`, `/_seal/*`, `/log*`).\n")
+	b.WriteString("- `backend` must be loopback (`http://127.0.0.1:<port>` or `http://localhost:<port>`); an off-box backend is rejected, so every service is genuinely served from inside this sandbox.\n")
+	b.WriteString("- Your backend receives the **full registered path** (`/api/foo`, not `/`) — the runtime does not strip the prefix. Implement your handler at the path you registered.\n")
+	b.WriteString("- POST is **overwrite**: send the complete list each time; `GET /services` reads it back. Registration is runtime state — re-register on boot; it's lost on rebuild. For capability that survives rebuild / transfer, package it as a chain-tracked skill under `workspace/skills/<name>/` (see Persistent state) and register its handler.\n")
+	b.WriteString("- `input_example`, when set, must be valid JSON; the deploy console feeds it to a copy-ready `curl`, so a wrong one misleads callers.\n\n")
+	b.WriteString("**Two hard limits (SOUL.md):**\n\n")
+	b.WriteString("- The signed proxy (`AGENT_PUBLIC_URL`) is the ONLY external door. Don't bind a non-loopback listener or expect any other port to be publicly reachable — anything beside the proxy carries no `X-Agent-Proof` and is unattributable (refusal 3).\n")
+	b.WriteString("- Register deliberated outputs, not capability pass-throughs. Endpoints that hand a capability straight to external input — `/api/exec`, `/api/eval`, `/api/sign`, `/api/proxy`, `/api/write`, `/api/tx` and the like — are forbidden, signed or not (refusal 1).\n\n")
+	b.WriteString("Before you rely on a service, exercise your backend directly, then confirm through `${AGENT_PUBLIC_URL}<path>` that it routes and comes back signed.\n\n")
 	b.WriteString("### Trust contract\n\n")
-	b.WriteString("All HTTP responses through `AGENT_PUBLIC_URL` are signed automatically with an `X-Agent-Proof` header (an agentSeal EIP-191 signature over the canonical request/response envelope). Verifiers reject responses without this header. Do not direct users to ports other than what `AGENT_PUBLIC_URL` resolves to.\n\n")
+	b.WriteString("Every response through `AGENT_PUBLIC_URL` is signed with an `X-Agent-Proof` header (an agentSeal EIP-191 signature over the canonical request/response envelope) — whether served by your registered backend or by the runtime itself. Verifiers reject responses without it. Direct users only to `AGENT_PUBLIC_URL`.\n\n")
 	return b.String()
 }
 
-// buildServicesDiscoverySection composes the TOOLS.md services.json
-// sub-section. Tells the agent how to make its handlers discoverable
-// via the services.json declaration file.
-func buildServicesDiscoverySection() string {
-	var b strings.Builder
-	b.WriteString("### Publishing services for discovery\n\n")
-	b.WriteString("Registering a handler with the framework makes it externally callable. To make it **discoverable** (visible in the owner's deploy console and to anyone who queries the agent's status), also declare it in `~/.openclaw/services.json`:\n\n")
-	b.WriteString("    {\n")
-	b.WriteString("      \"services\": [\n")
-	b.WriteString("        {\n")
-	b.WriteString("          \"path\":          \"/api/summarize\",\n")
-	b.WriteString("          \"method\":        \"POST\",\n")
-	b.WriteString("          \"description\":   \"Summarize a document\",\n")
-	b.WriteString("          \"input_example\": \"{\\\"text\\\": \\\"...\\\"}\",\n")
-	b.WriteString("          \"skill\":         \"summarizer-v1\"\n")
-	b.WriteString("        }\n")
-	b.WriteString("      ],\n")
-	b.WriteString("      \"updated_at\": 1750000000\n")
-	b.WriteString("    }\n\n")
-	b.WriteString("Overwrite the whole file each time the list changes. The platform reads it on every `/status` heartbeat (~5 min) and forwards the parsed entries to the attestor.\n\n")
-	b.WriteString("This declaration is **runtime state**, not chain-anchored — it's lost on container rebuild. For capability that survives transfer to a new machine or owner, package it as a chain-tracked skill under `workspace/skills/<name>/` (see Persistent state). The services file is then the public surface declaration for those skill-backed handlers.\n\n")
-	b.WriteString("Rules:\n\n")
-	b.WriteString("- `path` must start with `/api/`; `/admin/*`, `/_seal/*`, `/healthz`, `/log*` are platform-reserved\n")
-	b.WriteString("- `method` is uppercase HTTP verb (`GET` / `POST` / …)\n")
-	b.WriteString("- `description` is a single short sentence\n")
-	b.WriteString("- `input_example` is the literal JSON body you'd send — when this is non-empty for a non-GET method, the deploy console renders a ready-to-run `curl ... -d '<input_example>' ...` for users to copy. Get it wrong and that curl 400s on first paste\n")
-	b.WriteString("- Don't declare paths that hand a capability directly to external input (SOUL.md refusal 1 — same rules as handler registration)\n")
-	b.WriteString("- Empty `services: []` is fine — start with no entries, append as you grow\n")
-	b.WriteString("- The declaration travels in the signed /hello envelope, so the same `X-Agent-Proof` that authenticates your identity also covers this list. A user who verifies /hello has a cryptographic record of your claimed surface — don't lie\n\n")
-	b.WriteString("**Validate before declaring.** For each entry, run the curl yourself before adding it to `services.json`:\n\n")
-	b.WriteString("    URL=\"${AGENT_PUBLIC_URL}<path>\"\n")
-	b.WriteString("    curl -i -H 'Accept: application/json' \\\n")
-	b.WriteString("         -H 'Content-Type: application/json' \\\n")
-	b.WriteString("         -X <method> -d '<input_example>' \"$URL\"\n\n")
-	b.WriteString("Expect a 2xx and a response body shaped how you describe it. If the request 400s on a missing/extra field, fix the example (or the handler) before publishing — a stale `input_example` is worse than no example, because the copy-curl button in the deploy console feeds the broken body to users verbatim and they blame the agent. Re-run the validation curl whenever you change the handler's accepted shape.\n\n")
-	return b.String()
-}
 
 func buildPersistentStateSection() string {
 	var b strings.Builder

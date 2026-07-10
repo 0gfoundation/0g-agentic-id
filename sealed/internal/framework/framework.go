@@ -192,14 +192,12 @@ type VersionReconciler interface {
 	ReconcileFramework(ctx context.Context) error
 }
 
-// ServicesManifestProvider is implemented by adapters whose framework
-// maintains an agent-declared services manifest file (a JSON list of
-// HTTP services the agent currently publishes). proxy's /hello embeds
-// the parsed list in the signed envelope. Adapters without the concept
-// don't implement this and /hello omits the services field.
-type ServicesManifestProvider interface {
-	ServicesFilePath() string
-}
+// Service exposure used to be a per-adapter capability (a
+// ServicesManifestProvider pointing at e.g. ~/.openclaw/services.json).
+// It was lifted into sealed: agents register services over
+// POST $SEAL_SIGN_SOCK/services and proxy builds /hello from that
+// registry (see proxy/services.go), so adapters no longer declare a
+// manifest path.
 
 // SubprocessLogProvider is implemented by adapters that pipe their agent
 // process's stdout/stderr to a known file. proxy serves it live on

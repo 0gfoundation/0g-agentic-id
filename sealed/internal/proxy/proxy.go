@@ -38,7 +38,6 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
-	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
 
@@ -58,8 +57,8 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	servicesPath string // agent-declared services manifest; empty disables /hello services field
-	agentLogPath string // adapter's subprocess log file; empty renders "not available"
+	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
+	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the
@@ -75,24 +74,21 @@ func New(agent *state.Agent, publicURL string) *Server {
 // SetAdapter late-binds the resolved framework adapter and derives the
 // per-adapter optional paths from its capability interfaces:
 //
-//   - framework.ServicesManifestProvider → the services manifest /hello
-//     embeds (e.g. ~/.openclaw/services.json)
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
 //
 // Called once by main after the on-chain framework binding names the
-// adapter. Handlers read the trio under the lock.
+// adapter. Handlers read under the lock.
+//
+// Service exposure is no longer per-adapter: agents register services
+// with sealed over POST $SEAL_SIGN_SOCK/services (see services.go), and
+// /hello is built from that registry — no framework-designated manifest.
 func (s *Server) SetAdapter(fw framework.Framework) {
-	servicesPath := ""
-	if p, ok := fw.(framework.ServicesManifestProvider); ok {
-		servicesPath = p.ServicesFilePath()
-	}
 	agentLogPath := ""
 	if p, ok := fw.(framework.SubprocessLogProvider); ok {
 		agentLogPath = p.SubprocessLogPath()
 	}
 	s.mu.Lock()
 	s.adapter = fw
-	s.servicesPath = servicesPath
 	s.agentLogPath = agentLogPath
 	s.mu.Unlock()
 }
@@ -101,12 +97,6 @@ func (s *Server) getAdapter() framework.Framework {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.adapter
-}
-
-func (s *Server) getServicesPath() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.servicesPath
 }
 
 func (s *Server) getAgentLogPath() string {
@@ -195,11 +185,10 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, _ *http.Request) {
 // resp_body_hash, data_hashes, ts) so verifiers can confirm the response
 // originated from this attested instance.
 //
-// `services` is loaded from the adapter-designated manifest file
-// (s.servicesPath) on each call — fresh per request, no caching. Read
-// failures (file missing, parse error) collapse to an empty array; /hello
-// itself always succeeds when the agent is armed, so verifier UX doesn't
-// regress for agents that haven't declared anything yet.
+// `services` is built from sealed's service registry (agent-registered
+// via POST /services) on each call — fresh per request, no caching. An
+// agent that hasn't registered anything yields `services: []`; /hello
+// itself always succeeds when the agent is armed.
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
@@ -214,16 +203,9 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Fresh read on every /hello so verifiers see the agent's current
-	// declared surface. Empty slice (not nil) keeps the JSON shape
-	// stable as `services: []` rather than omitting the field.
-	services := []report.Service{}
-	if servicesPath := s.getServicesPath(); servicesPath != "" {
-		if loaded, err := report.LoadServices(servicesPath); err != nil {
-			logger.Logf("handleHello: LoadServices(%s): %v (returning empty)", servicesPath, err)
-		} else if loaded != nil {
-			services = loaded
-		}
-	}
+	// declared surface. Entry #0 is always /hello itself; the rest come
+	// from sealed's service registry (agent-registered via POST /services).
+	services := s.helloServiceList()
 
 	// Message is the agent's self-introduction in its own voice. Reads
 	// as 2 or 3 sentences: identity → owner → (if services present)
@@ -232,7 +214,9 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	// so all three sentences + the list scan as one continuous voice
 	// rather than a verification panel followed by a separate catalog.
 	helloMessage := fmt.Sprintf("I am %s. My owner is %s.", agentAddr, owner)
-	if len(services) > 0 {
+	// #0 (/hello) is always present, so only lead into a capability list
+	// when the agent has registered services of its own beyond it.
+	if len(services) > 1 {
 		helloMessage += " Here's what I can do for you:"
 	}
 	resp := map[string]any{
@@ -356,6 +340,19 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
+	}
+
+	// A registered agent service takes precedence over the framework
+	// upstream: a request whose path matches one is routed to that
+	// service's loopback backend instead. Everything below (header copy,
+	// forward, serve-proof signing) is identical either way — attribution
+	// comes from leaving through :8080, not from which backend answered.
+	if svc, ok := s.matchService(r.URL.Path); ok {
+		if !strings.EqualFold(svc.Method, r.Method) {
+			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
+			return
+		}
+		upstream = svc.Backend
 	}
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.

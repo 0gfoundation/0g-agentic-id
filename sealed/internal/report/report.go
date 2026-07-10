@@ -4,9 +4,9 @@
 // hashed with raw keccak256 (NOT EIP-191), V=27/28. Signed by agent_seal_priv.
 //
 // Services declarations are NOT shipped here — /hello carries them
-// instead (proxy.handleHello reads ~/.openclaw/services.json on each call
-// and embeds the array in the signed envelope). Service struct +
-// LoadServices live in services.go so the /hello path can reuse them.
+// instead (proxy.handleHello builds the array from sealed's service
+// registry and embeds it in the signed envelope). The Service wire type
+// lives in services.go so the /hello path can reuse it.
 package report
 
 import (
