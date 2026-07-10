@@ -78,7 +78,7 @@ const params = {
   // Omit it and the SDK builds defaultIData() for you; `framework` /
   // `inference` below tune that default. A role="framework" binding is
   // required either way — the deploy edge rejects iData without one.
-  framework: 'claude-code',                        // → the binding in the SDK-built default
+  framework: 'openclaw',                           // → the binding in the SDK-built default; must be a name the attestor's GET /config advertises
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
   sandbox: {
     snapshot: process.env.SANDBOX_SNAPSHOT,        // the provider's base image / snapshot name

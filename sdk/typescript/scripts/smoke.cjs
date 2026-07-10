@@ -5,7 +5,7 @@
 // Node without global WebCrypto) or wire-format drift against the API.
 //
 // Usage:
-//   OWNER_PRIV=0x… ATTESTOR_URL=http://… [FRAMEWORK=claude-code] \
+//   OWNER_PRIV=0x… ATTESTOR_URL=http://… [FRAMEWORK=openclaw] \
 //   [FULL=1 API_KEY=…] node scripts/smoke.cjs
 //
 // Default: negative-path only (unsupported framework → 400) — exercises
