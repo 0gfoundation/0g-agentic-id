@@ -58,6 +58,18 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 	authToken := cachedToken
 
+	// Resolve the 0g-compute route ONCE per boot. The config dialect
+	// (augmentation) and the exported key env name below must come from
+	// the same answer — two independent ResolveZG calls could disagree
+	// across a catalog flap (config says anthropic-messages, env exports
+	// OPENAI_API_KEY → openclaw keyless at inference) and each miss is a
+	// separate catalog fetch with an 8s timeout.
+	var zgRoute *inference.Route
+	if provider == "0g-compute" {
+		r := inference.ResolveZG(ctx, model)
+		zgRoute = &r
+	}
+
 	if !initialized {
 		newToken, err := randomTokenHex(32)
 		if err != nil {
@@ -73,7 +85,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		// as a provider name; sealed rewrites that to "openai" with the
 		// 0G router endpoint + compat flags so openclaw can dial it.
 		// No-op for any other provider name.
-		if err := applyZGComputeAugmentation(ctx, provider, model); err != nil {
+		if err := applyZGComputeAugmentation(provider, model, zgRoute); err != nil {
 			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
@@ -98,7 +110,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// The env NAME follows the wire format, not the provider label: on
 	// 0g-compute a claude-* model rides the Anthropic-format endpoint and
 	// openclaw's anthropic client reads ANTHROPIC_API_KEY.
-	apiKeyEnv := apiKeyEnvName(ctx, provider, model)
+	apiKeyEnv := apiKeyEnvName(provider, zgRoute)
 	if err := exportAPIKey(apiKeyEnv, rt.APIKey); err != nil {
 		return framework.StartResult{}, err
 	}
@@ -217,16 +229,19 @@ var probeOpenclawVersion = func(ctx context.Context) string {
 
 // apiKeyEnvName resolves which env var openclaw's client will read the
 // inference key from. Direct providers map by name; 0g-compute maps by
-// the model's wire format (shared inference.ResolveZG — the same
-// resolution the config augmentation uses).
-func apiKeyEnvName(ctx context.Context, provider, model string) string {
+// the model's wire format, taken from the route Start resolved once for
+// the whole boot (the same one the config augmentation used — the two
+// must agree or openclaw ends up keyless).
+func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
 	switch provider {
 	case "anthropic":
 		return "ANTHROPIC_API_KEY"
 	case "openai":
 		return "OPENAI_API_KEY"
 	case "0g-compute":
-		return inference.ResolveZG(ctx, model).EnvKey
+		if zgRoute != nil {
+			return zgRoute.EnvKey
+		}
 	}
 	return ""
 }

@@ -79,11 +79,20 @@ func ResolveZG(ctx context.Context, model string) Route {
 		return r
 	}
 	// Fallback heuristic — keep boot working through a catalog outage.
+	logger.Logf("inference: 0g catalog unavailable for %q; falling back to name heuristic", model)
+	return heuristicRoute(model)
+}
+
+// heuristicRoute picks a wire format from the model NAME alone —
+// claude* models are Anthropic-native, everything else rides OpenAI —
+// with conservative limits. Every path that can't get a usable format
+// from the catalog must land here (outage, model unlisted, formats
+// field missing/renamed): hardcoding OpenAI on any of them re-creates
+// the exact first-inference 400 this resolver exists to prevent.
+func heuristicRoute(model string) Route {
 	if strings.HasPrefix(strings.ToLower(model), "claude") {
-		logger.Logf("inference: 0g catalog unavailable for %q; falling back to anthropic-format heuristic", model)
 		return anthropicRoute(200000, 64000)
 	}
-	logger.Logf("inference: 0g catalog unavailable for %q; falling back to openai-format heuristic", model)
 	return openAIRoute(128000, 8192)
 }
 
@@ -103,10 +112,12 @@ func routeForFormats(formats []string, model string) Route {
 	case hasAnthropic:
 		return anthropicRoute(200000, 64000)
 	default:
-		// Catalog lists the model but with no format we speak; heuristic
-		// + router 400 will surface the real story.
-		logger.Logf("inference: 0g model %q lists no known wire format %v; defaulting to openai", model, formats)
-		return openAIRoute(128000, 8192)
+		// Catalog lists the model but with no format we speak — most
+		// likely router-side schema drift (supported_formats renamed or
+		// omitted). Use the same name heuristic as a catalog outage;
+		// the router's own 400 remains the final arbiter.
+		logger.Logf("inference: 0g model %q lists no known wire format %v; using name heuristic", model, formats)
+		return heuristicRoute(model)
 	}
 }
 

@@ -1,7 +1,6 @@
 package openclaw
 
 import (
-	"context"
 	"encoding/json"
 
 	"seal-verify/internal/inference"
@@ -80,11 +79,13 @@ func isZGComputeRouted(provider string) bool {
 // models.providers entry openclaw needs to route to the 0G router.
 // No-op for any provider other than "0g-compute".
 //
-// The wire format is resolved per model via the shared
-// inference.ResolveZG (router catalog + heuristic fallback): claude-*
-// models are served on the router's Anthropic-format endpoint ONLY —
-// hardcoding the OpenAI format here is exactly what 400'd live
+// The wire format comes from the route Start resolved once per boot
+// (shared inference.ResolveZG — router catalog + heuristic fallback):
+// claude-* models are served on the router's Anthropic-format endpoint
+// ONLY — hardcoding the OpenAI format here is exactly what 400'd live
 // ("model 'claude-sonnet-5' is not available on the openai API format").
+// The same route also picks the exported key env name (spawn.go), so
+// config dialect and key can't disagree.
 //
 // Called from Start AFTER Restore has written the owner's openclaw.json
 // to disk. Treats this as runtime augmentation: owner specifies
@@ -92,13 +93,12 @@ func isZGComputeRouted(provider string) bool {
 // transparently. The persisted file ends up with the providers entry too
 // (next EvolutionFor will see it) but watcher's post-Start settle pass
 // captures that as the new baseline so no spurious drift fires.
-func applyZGComputeAugmentation(ctx context.Context, provider, model string) error {
-	if provider != "0g-compute" {
+func applyZGComputeAugmentation(provider, model string, route *inference.Route) error {
+	if provider != "0g-compute" || route == nil {
 		return nil
 	}
-	route := inference.ResolveZG(ctx, model)
 	return updateOpenclawJSON(func(cfg map[string]any) {
-		applyZGComputeToConfig(cfg, model, route)
+		applyZGComputeToConfig(cfg, model, *route)
 	})
 }
 

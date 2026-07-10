@@ -58,3 +58,17 @@ func TestResolveZG_UnlistedModelUsesHeuristic(t *testing.T) {
 		t.Errorf("unlisted claude model = %+v; want anthropic heuristic", r)
 	}
 }
+
+func TestResolveZG_ListedModelWithoutFormatsUsesHeuristic(t *testing.T) {
+	// Router-side schema drift: the model IS in the catalog but
+	// supported_formats is missing/renamed/empty. Hardcoding OpenAI here
+	// would re-create the original first-inference 400 for every claude
+	// model — the name heuristic must apply, same as an outage.
+	withCatalog(t, `{"data":[{"id":"claude-sonnet-5","context_length":1000000},{"id":"glm-5.2"}]}`)
+	if r := ResolveZG(context.Background(), "claude-sonnet-5"); r.Format != WireAnthropic {
+		t.Errorf("formats-less claude model = %+v; want anthropic heuristic", r)
+	}
+	if r := ResolveZG(context.Background(), "glm-5.2"); r.Format != WireOpenAI {
+		t.Errorf("formats-less glm model = %+v; want openai heuristic", r)
+	}
+}
