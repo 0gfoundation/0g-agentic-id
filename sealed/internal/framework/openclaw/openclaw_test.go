@@ -54,13 +54,16 @@ func TestStripPlatformInjection_SectionWithFollowing(t *testing.T) {
 func TestStripPlatformInjection_MissingEndMarker(t *testing.T) {
 	in := []byte("# TOOLS\n\nOwner content.\n\n" +
 		platformMarkerStart + "\n" +
-		"injected stuff with no end\n")
+		"agent text after an unpaired marker\n")
 	out := stripPlatformInjection(in)
-	// Truncated section: everything from the separator on is dropped,
-	// owner trailing newline preserved (lossless contract).
-	want := "# TOOLS\n\nOwner content.\n"
-	if string(out) != want {
-		t.Errorf("truncated strip mismatch\n want: %q\n  got: %q", want, string(out))
+	// A start with no end is owner content, not a section: the agent can
+	// quote the marker (it reads it in its context files every turn), and
+	// the old truncate-to-EOF behaviour silently destroyed everything
+	// below the quote. A genuinely truncated sealed write can't be
+	// observed here — Restore rewrites the file from chain plaintext
+	// before the first upsert of a boot.
+	if string(out) != string(in) {
+		t.Errorf("unpaired start must strip nothing\n want: %q\n  got: %q", string(in), string(out))
 	}
 }
 
@@ -157,11 +160,11 @@ func TestUpsertPlatformSection_EmptyContextStripsSection(t *testing.T) {
 func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 	tmp := t.TempDir() + "/TOOLS.md"
 	rs := platform.RuntimeSnapshot{
-		PublicURL:     "http://x.example.com",
-		AgentSeal:     "0xTest",
-		SealSignSock:  "/run/seal-sign.sock",
-		Whitelist:     []platform.WhitelistEntry{{Version: "2026.5.6"}, {Version: "2026.6.8"}},
-		WhitelistMax:  "2026.6.8",
+		PublicURL:    "http://x.example.com",
+		AgentSeal:    "0xTest",
+		SealSignSock: "/run/seal-sign.sock",
+		Whitelist:    []platform.WhitelistEntry{{Version: "2026.5.6"}, {Version: "2026.6.8"}},
+		WhitelistMax: "2026.6.8",
 	}
 	pc := platform.Build(rs)
 	if err := upsertToolsMD(tmp, pc); err != nil {

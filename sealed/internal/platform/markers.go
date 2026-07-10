@@ -46,6 +46,10 @@ const (
 //
 // Empty body → strip the existing section entirely and leave whatever
 // remains. Creates parent directories as needed.
+//
+// The body is normalized to end in "\n" so both markers always sit on
+// lines of their own — StripInjected only recognizes line-anchored
+// markers (see below), so the writer must uphold that shape.
 func UpsertMarkedSection(path, body string) error {
 	existing, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -57,6 +61,9 @@ func UpsertMarkedSection(path, body string) error {
 	if body == "" {
 		out = cleaned
 	} else {
+		if body[len(body)-1] != '\n' {
+			body += "\n"
+		}
 		section := MarkerStart + "\n" + body + MarkerEnd + "\n"
 		out = cleaned
 		if len(out) > 0 {
@@ -77,13 +84,38 @@ func UpsertMarkedSection(path, body string) error {
 // agent-owned content only — the exact inverse of UpsertMarkedSection's
 // wire format. Files without markers pass through unchanged.
 //
+// A marker counts as a section boundary only when it sits on a line of
+// its own (start of content or preceded by '\n', and followed by '\n'
+// or end of content) — exactly how UpsertMarkedSection writes it. The
+// marker strings are visible to the agent in its own context files
+// every turn, so agent prose that merely QUOTES a marker mid-line must
+// be owner content, not a boundary: a first-index scan here once
+// treated such a quote as the section start and silently deleted
+// everything from the quote to the real section's end marker — a loss
+// that was then written back to disk and hashed on chain, permanently.
+// Hence:
+//   - the start marker is matched from the END of the content (the
+//     real section is the one the writer appended last), and
+//   - a start with no matching end strips nothing (owner content),
+//     instead of truncating to EOF.
+//
+// Still ambiguous by construction: an agent-written EXACT reproduction
+// of the wire format — both markers, each on a line of its own — is
+// indistinguishable from a real section and will be treated as one.
+// Mentioning a marker mid-line (the realistic case) is safe.
+//
 // Adapters MUST run this on every chain-tracked file that may carry an
 // injection, both when hashing (EvolutionFor) and when returning entry
 // plaintext (LoadEntry) — the two paths must agree byte-for-byte or the
 // watcher reports phantom drift.
 func StripInjected(content []byte) []byte {
-	s := bytes.Index(content, []byte(MarkerStart))
+	s := lastAnchored(content, []byte(MarkerStart))
 	if s < 0 {
+		return content
+	}
+	rest := content[s:]
+	e := firstAnchored(rest, []byte(MarkerEnd))
+	if e < 0 {
 		return content
 	}
 	// The byte before MarkerStart is the section's own "\n" separator
@@ -92,11 +124,6 @@ func StripInjected(content []byte) []byte {
 	// a boot (Restore rewrites them from chain plaintext before the first
 	// upsert), so no legacy-format tolerance is needed here.
 	before := bytes.TrimSuffix(content[:s], []byte("\n"))
-	rest := content[s:]
-	e := bytes.Index(rest, []byte(MarkerEnd))
-	if e < 0 {
-		return before
-	}
 	// Drop the "\n" upsert writes after MarkerEnd; anything beyond it is
 	// owner/agent content and passes through verbatim.
 	after := bytes.TrimPrefix(rest[e+len(MarkerEnd):], []byte("\n"))
@@ -104,4 +131,47 @@ func StripInjected(content []byte) []byte {
 		return before
 	}
 	return append(append([]byte{}, before...), after...)
+}
+
+// lastAnchored returns the offset of the last line-anchored occurrence
+// of marker in content, or -1.
+func lastAnchored(content, marker []byte) int {
+	for hi := len(content); hi > 0; {
+		i := bytes.LastIndex(content[:hi], marker)
+		if i < 0 {
+			return -1
+		}
+		if lineAnchored(content, i, len(marker)) {
+			return i
+		}
+		hi = i
+	}
+	return -1
+}
+
+// firstAnchored returns the offset of the first line-anchored occurrence
+// of marker in content, or -1.
+func firstAnchored(content, marker []byte) int {
+	for lo := 0; ; {
+		i := bytes.Index(content[lo:], marker)
+		if i < 0 {
+			return -1
+		}
+		i += lo
+		if lineAnchored(content, i, len(marker)) {
+			return i
+		}
+		lo = i + 1
+	}
+}
+
+// lineAnchored reports whether content[i:i+n] occupies a line of its
+// own: at offset 0 or preceded by '\n', and followed by '\n' or the end
+// of the content.
+func lineAnchored(content []byte, i, n int) bool {
+	if i > 0 && content[i-1] != '\n' {
+		return false
+	}
+	j := i + n
+	return j >= len(content) || content[j] == '\n'
 }
