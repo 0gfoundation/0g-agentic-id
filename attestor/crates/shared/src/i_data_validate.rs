@@ -8,12 +8,16 @@
 //! of the trust surface). Default-content ergonomics moved to the clients
 //! (SDK `defaultIData()`, the console's deploy form).
 //!
-//! What remains here is the one check the attestor must own because it
-//! guards the irreversible mint: the framework binding. A missing or
-//! unsupported binding mints an agent whose container can never boot
-//! (sealed selects its adapter by `binding.name`), so it is rejected
-//! BEFORE the mint. Everything else in i_data is opaque owner content —
-//! the attestor neither parses nor judges it.
+//! What remains here is the one check the attestor must own: the
+//! framework binding. The attestor needs exactly one unambiguous,
+//! supported framework name per deploy — it is what `GET /config`
+//! advertises and what the operator's sealed image actually bundles — so
+//! a missing, duplicated, or unsupported name is rejected up front.
+//! Whether the iData *content* lets the container boot is sealed's
+//! contract, not the attestor's (sealed is an updatable consumer of the
+//! minted bytes; what is valid to it can change across releases).
+//! Everything else in i_data is opaque owner content — the attestor
+//! neither parses nor judges it.
 
 use crate::types::IDataInput;
 
@@ -86,8 +90,8 @@ mod tests {
 
     #[test]
     fn missing_binding_rejected() {
-        // The brick-guard: minting without a binding produces an agent
-        // whose container can never resolve an adapter.
+        // Without a binding the attestor has no framework name to serve
+        // the deploy with.
         let err = validate_framework_binding(&[persona()], &supported()).unwrap_err();
         assert!(err.contains("must contain"), "got: {err}");
         assert!(err.contains("openclaw"), "lists supported: {err}");
@@ -118,7 +122,7 @@ mod tests {
 
     #[test]
     fn duplicate_binding_rejected() {
-        // sealed hard-fails duplicate roles at boot; catch it pre-mint.
+        // Two bindings would leave the adapter choice ambiguous.
         let err =
             validate_framework_binding(&[binding("openclaw"), binding("openclaw")], &supported())
                 .unwrap_err();
