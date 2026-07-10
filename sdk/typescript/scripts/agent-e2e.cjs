@@ -7,16 +7,22 @@
 //                              X-Agent-Proof against chain
 //   • data tracking          — intelligentDatasOf() snapshot; the
 //                              framework binding must always be present
-//   • auto-update (evolution)— top up agentSeal, poll until the on-chain
-//                              iData set changes (watcher → chain.Update)
 //   • recovery / reload      — reset() recreates the container; the agent
 //                              must come back with the SAME identity and
 //                              the same on-chain iData (reads chain, not a
 //                              stale snapshot)
 //
+// NOT covered (yet): auto-update / evolution — triggering a disk change
+// and polling for the resulting chain.Update needs agentSeal gas and a
+// deterministic mutation channel; tracked as a follow-up issue.
+//
+// Costs real money: the reset leg creates a sandbox billed to the owner
+// wallet (unfunded keys are rejected), and every leg needs a live
+// testnet agent.
+//
 // Usage:
 //   OWNER_PRIV=0x… ATTESTOR_URL=http://… AGENT_URL=http://… \
-//   SEAL_ID=0x… AGENT_ID=51 [ZG_KEY=…] node scripts/agent-e2e.cjs
+//   SEAL_ID=0x… AGENT_ID=51 node scripts/agent-e2e.cjs
 'use strict';
 const { AgenticID, parseServeProofHeader, verifyServeProofSignature } = require('../dist/index.js');
 const { execSync } = require('child_process');
