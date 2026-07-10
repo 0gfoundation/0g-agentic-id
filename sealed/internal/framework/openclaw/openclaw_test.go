@@ -247,6 +247,41 @@ func TestAdapter_RestoreFramework_RejectsWrongFrameworkName(t *testing.T) {
 	}
 }
 
+// restoredVersion runs a framework Restore with the given pinned version
+// and returns the package_version that landed in cfg — i.e. what Start
+// would npm-install.
+func restoredVersion(t *testing.T, pin string) string {
+	t.Helper()
+	a := &Adapter{}
+	binding := []byte(`{"name":"openclaw","package_version":"` + pin + `","schema_version":1}`)
+	if err := a.Restore(context.Background(), "framework", binding); err != nil {
+		t.Fatalf("Restore(%q): %v", pin, err)
+	}
+	return a.cfg.framework.PackageVersion
+}
+
+// A pin outside the whitelist is coerced to the nearest validated
+// version at install — sealed never npm-installs a release it hasn't
+// been validated against (previously the pin was installed as-is and
+// only pulled back on a later drift).
+func TestAdapter_RestoreFramework_CoercesUnvalidatedPin(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.5.7"})
+	if got := restoredVersion(t, "2026.9.9"); got != "2026.5.7" {
+		t.Errorf("pin above max: got %q, want whitelistMax 2026.5.7", got)
+	}
+	if got := restoredVersion(t, "2025.1.1"); got != "2026.5.6" {
+		t.Errorf("pin below all: got %q, want oldest validated 2026.5.6", got)
+	}
+}
+
+// Whitelisted pins are honored — including ones below whitelistMax.
+func TestAdapter_RestoreFramework_HonorsWhitelistedPin(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.5.7"})
+	if got := restoredVersion(t, "2026.5.6"); got != "2026.5.6" {
+		t.Errorf("whitelisted below-max pin: got %q, want 2026.5.6", got)
+	}
+}
+
 func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
