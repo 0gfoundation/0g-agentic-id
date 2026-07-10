@@ -139,10 +139,12 @@ export class AgentApi {
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
    * identity — a fresh boot that re-reads iData from chain and reselects
-   * the framework adapter from the binding. Owner-signed.
+   * the framework adapter from the binding. Owner-signed. Pass `apiKey`
+   * so the fresh container can reach its inference provider — the
+   * attestor doesn't cache the LLM key across recreates.
    */
-  reset(sealId: Hash, opts?: { snapshot?: string }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, snapshot: opts?.snapshot });
+  reset(sealId: Hash, opts?: { snapshot?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, snapshot: opts?.snapshot, apiKey: opts?.apiKey });
   }
 
   /**

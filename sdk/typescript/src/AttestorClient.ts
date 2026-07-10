@@ -200,13 +200,31 @@ export class AttestorClient {
    */
   async lifecycle(
     op: 'stop' | 'start' | 'reset',
-    params: { sealId: `0x${string}`; sandboxId?: string; snapshot?: string; envelopeTtlSec?: number },
+    params: {
+      sealId: `0x${string}`;
+      sandboxId?: string;
+      snapshot?: string;
+      /** Inference API key for `reset` — the fresh container needs a fresh
+       *  env (the attestor doesn't cache the LLM key). Without it the agent
+       *  comes back alive but can't call its model. */
+      apiKey?: string;
+      envelopeTtlSec?: number;
+    },
   ): Promise<void> {
     const { account } = requireWallet(this.ctx);
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
     if (op === 'reset') {
-      envelope = await this.signEnvelope('create', '', { snapshot: params.snapshot ?? '', sealed: true }, ttl);
+      envelope = await this.signEnvelope(
+        'create',
+        '',
+        {
+          snapshot: params.snapshot ?? '',
+          sealed: true,
+          ...(params.apiKey ? { env: { API_KEY: params.apiKey } } : {}),
+        },
+        ttl,
+      );
     } else {
       if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
       envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
