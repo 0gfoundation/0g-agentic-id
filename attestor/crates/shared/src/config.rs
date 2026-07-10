@@ -255,8 +255,12 @@ impl Config {
                     s.split(',')
                         .map(|f| f.trim().to_string())
                         .filter(|f| !f.is_empty())
-                        .collect()
+                        .collect::<Vec<_>>()
                 })
+                // An empty PARSE RESULT (var set to "" or only commas) falls
+                // back to the default too — an empty list would silently
+                // reject every deploy while the UI still offers openclaw.
+                .filter(|v: &Vec<String>| !v.is_empty())
                 .unwrap_or_else(|| vec!["openclaw".to_string()]),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
