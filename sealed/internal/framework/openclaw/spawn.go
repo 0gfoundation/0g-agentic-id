@@ -136,10 +136,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		ZGComputeRouted:  isZGComputeRouted(provider),
 		BootTime:         time.Now(),
 	}
-	rs.Whitelist = make([]platform.WhitelistEntry, len(supportedOpenclawVersions))
-	for i, v := range supportedOpenclawVersions {
-		rs.Whitelist[i] = platform.WhitelistEntry{Version: v}
-	}
 	rs.WhitelistMax = whitelistMax()
 
 	pc := platform.Build(rs)
@@ -341,4 +337,3 @@ func randomTokenHex(nbytes int) (string, error) {
 	}
 	return hex.EncodeToString(buf), nil
 }
-

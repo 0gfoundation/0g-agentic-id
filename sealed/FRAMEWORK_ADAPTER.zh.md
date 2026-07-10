@@ -527,6 +527,13 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    这只是一个 delivery 函数(见 git 历史里已下线的
    `claudecode/claudemd.go`——整个 PlatformContext 作为单个 marker
    段落进 CLAUDE.md)。
+9. 自己撰写你框架的上下文事实,和平台段落一起注入。`platform.Build`
+   刻意只讲教条和平台机制——不出现任何框架的路径、升级命令、配置语义、
+   工具名(有测试焊死)。以下必须由**你自己**的注入文本告诉 agent:
+   哪些磁盘路径会上链、持久的东西该放哪、你的版本白名单/回正行为、
+   配置 hash 语义。不写,你的 agent 就会把记忆写到不追踪的地方、下次
+   重建就丢——向 agent 交代它自己框架的真相是 adapter 的责任,不是
+   平台的。openclaw 的在 `openclaw/platformtext.go`。
 
 ## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
 

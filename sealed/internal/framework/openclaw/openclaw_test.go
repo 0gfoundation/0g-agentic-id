@@ -154,16 +154,18 @@ func TestUpsertPlatformSection_EmptyContextStripsSection(t *testing.T) {
 	}
 }
 
-// TestUpsertPlatformSection_IncludesConstraints verifies that the new
-// Constraints section (version whitelist, drift behavior) is injected
-// into TOOLS.md alongside the Capabilities section.
+// TestUpsertPlatformSection_IncludesConstraints verifies that TOOLS.md
+// carries BOTH the platform constraints (drift mechanics) and the
+// adapter-authored framework facts (version whitelist from
+// supportedOpenclawVersions, config allowlist, persistent-state layout)
+// — the authorship split of the platform/adapter refactor.
 func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.6.8"})
 	tmp := t.TempDir() + "/TOOLS.md"
 	rs := platform.RuntimeSnapshot{
 		PublicURL:    "http://x.example.com",
 		AgentSeal:    "0xTest",
 		SealSignSock: "/run/seal-sign.sock",
-		Whitelist:    []platform.WhitelistEntry{{Version: "2026.5.6"}, {Version: "2026.6.8"}},
 		WhitelistMax: "2026.6.8",
 	}
 	pc := platform.Build(rs)
@@ -179,6 +181,16 @@ func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 	}
 	if !strings.Contains(body, "2026.6.8") {
 		t.Errorf("missing whitelist max version: %q", body)
+	}
+	// Adapter-authored facts must not have been lost in the move.
+	if !strings.Contains(body, "npm install openclaw@<max>") {
+		t.Errorf("missing openclaw reconcile fact: %q", body)
+	}
+	if !strings.Contains(body, "`~/.openclaw/openclaw.json`") {
+		t.Errorf("missing persistent-state tracked paths: %q", body)
+	}
+	if !strings.Contains(body, "Config allowlist") {
+		t.Errorf("missing config allowlist fact: %q", body)
 	}
 }
 

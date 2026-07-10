@@ -69,10 +69,15 @@ func stripPlatformInjection(content []byte) []byte {
 func upsertToolsMD(path string, pc platform.PlatformContext) error {
 	var sections []string
 	if pc.Capabilities != "" {
-		sections = append(sections, pc.Capabilities)
+		// Platform capabilities, then OUR persistent-state layout —
+		// platform no longer knows any framework's paths (see
+		// platformtext.go for the authorship split).
+		sections = append(sections, pc.Capabilities, persistentStateText())
 	}
 	if pc.Constraints != "" {
-		sections = append(sections, pc.Constraints)
+		// Platform constraints (drift mechanics), then OUR version
+		// whitelist + config-allowlist facts.
+		sections = append(sections, pc.Constraints, frameworkConstraintsText())
 	}
 	if pc.Runtime != "" {
 		sections = append(sections, pc.Runtime)

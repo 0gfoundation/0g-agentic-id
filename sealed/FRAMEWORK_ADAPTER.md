@@ -592,6 +592,18 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    `platform.Build` content this is one delivery function (see the
    retired `claudecode/claudemd.go` in git history — CLAUDE.md got the
    whole PlatformContext as a single marker section).
+9. Author your framework's OWN context facts and inject them alongside
+   the platform sections. `platform.Build` deliberately speaks only
+   about doctrine and platform mechanics — it names no framework's
+   paths, upgrade command, config semantics, or tool names (a test pins
+   this). YOU must tell your agent, in your own injected text: which of
+   its on-disk paths are chain-tracked and where durable things go,
+   what your version whitelist / reconcile behavior is, and any
+   config-hash semantics. Skip this and your agent will write its
+   memory somewhere untracked and lose it on the next rebuild — telling
+   the agent the truth about its own framework is the adapter's
+   responsibility, not the platform's. openclaw's are in
+   `openclaw/platformtext.go`.
 
 ## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
 
