@@ -70,12 +70,12 @@ sealed 的四个组件各自通过一个窄切面消费它:
   记一条 warning。把你的 adapter 加进二进制只需在 `main.go` 加一行
   注册。
 - **框架相关行为** 走可选能力接口(§2.2),core type-assert 后优雅
-  降级:版本回正、services 清单、子进程日志页、settle 延迟。
+  降级:版本回正、子进程日志页、settle 延迟。
 - **一个通用镜像**:`images/sealed/` 只烧 node + sealed 二进制,打包
   的框架以 npm 预装作为**热缓存**——每个 adapter 在首次 Start 时按
-  binding 重新钉版本;CLI 框架的 shim(claudecode bridge)`go:embed`
-  在二进制里、Start 时落盘。接入新的 node 系框架不需要新镜像,顶多
-  加一行热缓存。
+  binding 重新钉版本;CLI 框架如带 shim,`go:embed` 在二进制里、
+  Start 时落盘(已下线的 claudecode bridge 就是这个模式)。接入新的
+  node 系框架不需要新镜像,顶多加一行热缓存。
 
 仍然真正在仓库之外的:
 
@@ -108,11 +108,10 @@ sealed 的四个组件各自通过一个窄切面消费它:
 | 接口 | 方法 | 消费方 | 缺失时 |
 |---|---|---|---|
 | `VersionReconciler` | `ReconcileFramework(ctx)` | drift handler,`framework` role 漂移时 | 漂移原样上链(审计诚实,强制关闭) |
-| `ServicesManifestProvider` | `ServicesFilePath()` | proxy `/hello` | services 字段省略 |
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | 日志页报不可用 |
 | `SettleDelayer` | `SettleDelay()` | bootstrap 基线采集 | 保守的 5s 默认值 |
 
-实现了哪个就写哪个的编译期断言(见 `claudecode.go` 顶部)——可选接口
+实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
 
 移植后仍然是死表面的部分:
@@ -296,8 +295,9 @@ Restore **之后** 运行,所以摄入能可靠覆盖默认值。必须幂等;�
 role 必须记日志并忽略(返回 nil),绝不报错——链上可能带实验性
 role,为它拒绝启动比部分迁移更糟。
 
-**`persona` 是协议级种子 role,摄入它是强制契约。** attestor 是框架
-无关的:mint 时它只合成一条中性种子——
+**`persona` 是协议级种子 role,摄入它是强制契约。** attestor 框架
+无关且什么都不合成(WYSIWYS——owner 签什么就铸什么);由部署客户端
+(SDK `defaultIData()`、控制台表单)构造这一条中性种子——
 
 ```json
 {"system_prompt": "You are <name>. <description>\n",
@@ -306,8 +306,8 @@ role,为它拒绝启动比部分迁移更糟。
 
 ——从不书写任何框架的配置 schema。翻译是你的 adapter 的职责:把
 `system_prompt` 和推理钉选映射到你自己的路径驱动产物上(openclaw →
-SOUL.md + openclaw.json 的 model/auth;claudecode → CLAUDE.md +
-settings.json 的 `model`)。忽略 `persona` 的 adapter 会把 owner 在
+SOUL.md + openclaw.json 的 model/auth;已下线的 claudecode 移植 →
+CLAUDE.md + settings.json 的 `model`)。忽略 `persona` 的 adapter 会把 owner 在
 mint 时写的 prompt 和模型选择静默丢掉——claudecode 移植初版恰好带着
 这个 bug 出厂,这条规则因此成文。框架无法兑现钉选的某部分时(比如非
 原生的推理 provider),记日志、保留自己的默认值,不要写下框架解析不了
@@ -390,8 +390,8 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 
 5 秒 settle 延迟的存在是因为框架通常会在首次启动时重写一遍自己的
 配置补默认值。基线在那 *之后* 采集,框架自己补的默认值才不会被报成
-漂移。你的框架 settle 更慢的话,旋钮是 `main.go` 的
-`openclawSettleDelay` 常量。
+漂移。你的框架 settle 更慢的话,实现 `SettleDelayer` 能力接口
+(§2.2)——`main.go` 的 `defaultSettleDelay` 只是缺省值。
 
 ## 7. `RuntimeContext`:sealed 交给你 `Start` 的东西
 
@@ -421,8 +421,8 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
   EIP-191 签名,envelope 含每个 role 的 `content_hash` + `data_hash`。
   你的上游只需在 localhost 上提供明文 HTTP;WebSocket 升级不签名直通。
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
-  `public_url`,以及(如果你提供了 services 清单路径)agent 自声明的
-  服务列表。
+  `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
+  注册过)agent 自声明的服务列表。
 - **`POST /_seal/auth`** ——§5.6 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是
@@ -475,8 +475,8 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-两个树内 adapter 都在跑它(`openclaw/conformance_test.go`、
-`claudecode/claudecode_test.go`);它对 openclaw 的第一次运行就当场
+树内 adapter 在跑它(`openclaw/conformance_test.go`;已下线的
+claudecode 移植当时也跑);它对 openclaw 的第一次运行就当场
 抓出两个真实 bug(§12)——把 conformance 红灯当成白捡的生产事故看待。
 
 套件结构性强制的两条血泪规则:
@@ -490,7 +490,8 @@ func TestConformance(t *testing.T) {
 
 conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 后断言 `EvolutionFor` 和 `LoadEntry` 输出不变——见
-`claudecode_test.go:TestInjectionRoundTrip`)、密钥类键的 allowlist
+`platform/markers_test.go` 与 openclaw 的 `evolution_paths_test.go`)、
+密钥类键的 allowlist
 过滤、异框架 binding 拒绝。
 
 想在真实循环里接入你的 adapter:本地不设 `ATTESTOR_URL` 跑 sealed
@@ -502,8 +503,9 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 
 1. 在 `internal/framework/<yourfw>/` 实现 `framework.Framework` +
    `MonitorExit`,在你的 `New()` 里 `framework.Register` 自注册;在
-   `main.go` 加一行注册。CLI 型框架照 `claudecode/`(内嵌 bridge
-   模式),服务型框架照 `openclaw/`。
+   `main.go` 加一行注册。CLI 型框架照 git 历史里已下线的
+   `claudecode/`(内嵌 bridge 模式,另见 §12 的下线原因),服务型框架
+   照 `openclaw/`。
 2. 声明你的 role 集,包括保留的 `framework` leaf(含空版本 →
    whitelistMax 规则);逐 role 决定 Leaf 还是 DirectoryManifest。
 3. 实现 `HandleLegacy["persona"]`——强制的协议种子翻译(§5.4)。
@@ -522,8 +524,9 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 8. 装一套等价于 openclaw SOUL 段的拒签教义(见
    [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md)),别让签名 socket
    变成 prompt 注入请求的开放签名器。有共享的 `platform.Build` 内容,
-   这只是一个 delivery 函数(见 `claudecode/claudemd.go`——整个
-   PlatformContext 作为单个 marker 段落进 CLAUDE.md)。
+   这只是一个 delivery 函数(见 git 历史里已下线的
+   `claudecode/claudemd.go`——整个 PlatformContext 作为单个 marker
+   段落进 CLAUDE.md)。
 
 ## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
 

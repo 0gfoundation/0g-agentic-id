@@ -85,8 +85,9 @@ components hold only the interface (or a narrow subset of it) and need
 - **One universal image**: `images/sealed/` bakes node + the sealed
   binary, with the bundled frameworks npm-installed as a warm cache
   only — each adapter re-pins its binding version at first Start, and
-  CLI-framework shims (the claudecode bridge) are `go:embed`ded in the
-  binary and materialized at Start. Supporting a new node-ecosystem
+  a CLI-framework shim, when an adapter ships one, is `go:embed`ded in
+  the binary and materialized at Start (the retired claudecode bridge
+  worked this way). Supporting a new node-ecosystem
   framework does not require a new image, just (optionally) one more
   warm-cache line.
 
@@ -127,8 +128,8 @@ and degrades gracefully when absent):
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | log page reports unavailable |
 | `SettleDelayer` | `SettleDelay()` | bootstrap baseline capture | conservative 5s default |
 
-Declare compile-time assertions for everything you implement (see the
-top of `claudecode.go`) — silent non-implementation of an optional
+Declare compile-time assertions for everything you implement
+(`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
 interface is a feature quietly off.
 
 Still-dead surface, unchanged by the port:
@@ -331,18 +332,21 @@ nil), never an error — chains may carry experimental roles, and refusing
 to boot over one is worse than a partial migration.
 
 **`persona` is the protocol seed role, and ingesting it is mandatory.**
-attestor is framework-agnostic: at mint it synthesizes exactly one
-neutral seed —
+The attestor is framework-agnostic and synthesizes nothing (WYSIWYS —
+what the owner signs is what gets minted); the deploy client (SDK
+`defaultIData()`, the console form) builds exactly one neutral seed —
 
 ```json
 {"system_prompt": "You are <name>. <description>\n",
  "inference": {"provider": "anthropic", "model": "claude-opus-4-6"}}
 ```
 
-— and never speaks any framework's config schema. Your adapter is the
+— and the attestor never speaks any framework's config schema. Your
+adapter is the
 translator: map `system_prompt` and the inference pin onto your own
 path-driven artifacts (openclaw → SOUL.md + openclaw.json model/auth;
-claudecode → CLAUDE.md + settings.json `model`). An adapter that ignores
+the retired claudecode port → CLAUDE.md + settings.json `model`). An
+adapter that ignores
 `persona` silently drops the owner's mint-time prompt and model choice —
 the claudecode port shipped with exactly this bug before the rule was
 written down. If your framework can't honour part of the pin (e.g. a
@@ -435,8 +439,9 @@ steady state:
 The 5-second settle delay exists because frameworks typically rewrite
 their config once on first boot to fill in defaults. The baseline is
 captured *after* that, so framework-applied defaults aren't reported as
-drift. If your framework settles slower, that constant
-(`openclawSettleDelay`, `main.go`) is the knob.
+drift. If your framework settles slower, implement the `SettleDelayer`
+capability (§2.2) — `main.go`'s `defaultSettleDelay` is only the
+fallback.
 
 ## 7. `RuntimeContext`: what sealed hands your `Start`
 
@@ -525,8 +530,8 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-Both bundled adapters run it (`openclaw/conformance_test.go`,
-`claudecode/claudecode_test.go`); its first run against openclaw
+The bundled adapter runs it (`openclaw/conformance_test.go`; the
+retired claudecode port ran it too); its first run against openclaw
 immediately caught two real bugs (§12), so treat a red conformance test
 as a production incident you got for free.
 
@@ -541,7 +546,8 @@ Two hard-won rules the suite enforces structurally:
 
 Beyond conformance, add adapter-specific tests for: injection strip
 round-trip (inject, then assert `EvolutionFor` and `LoadEntry` outputs
-unchanged — see `claudecode_test.go:TestInjectionRoundTrip`), allowlist
+unchanged — see `platform/markers_test.go` and openclaw's
+`evolution_paths_test.go`), allowlist
 filtering of secret-bearing keys, and foreign-binding rejection.
 
 Wire your adapter into the real loop locally by running sealed without
@@ -583,9 +589,9 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
 8. Install a sign-refusal doctrine equivalent to openclaw's SOUL section
    (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md)) so the sign socket isn't
    an open signer for prompt-injected requests. With the shared
-   `platform.Build` content this is one delivery function (see
-   `claudecode/claudemd.go` — CLAUDE.md gets the whole PlatformContext
-   as a single marker section).
+   `platform.Build` content this is one delivery function (see the
+   retired `claudecode/claudemd.go` in git history — CLAUDE.md got the
+   whole PlatformContext as a single marker section).
 
 ## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
 

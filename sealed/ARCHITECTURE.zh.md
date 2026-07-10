@@ -14,8 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 `0g-agent-nft` 仓库 |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
-| openclaw | 默认 agent framework（链上 binding 点名时选中,或作为无 binding 的 fallback）；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284 |
-| claude-code | 第二个接入的 framework（binding `name: "claude-code"`）；按次调用的 CLI，经 HTTP bridge 托管，监听 127.0.0.1:3285（bridge 内嵌在 sealed 二进制里,见 `internal/framework/claudecode/bridge/`）|
+| openclaw | 唯一打包的 agent framework（链上 binding 点名时选中,或作为无 binding 的 fallback）；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；第二个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -70,7 +69,6 @@ sealed/
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
 │   ├── framework/                framework 适配器抽象 + 可选能力接口
 │   │   ├── openclaw/             openclaw 适配器实现
-│   │   ├── claudecode/           claude-code 适配器（CLI 框架,经 HTTP bridge 托管）
 │   │   └── conformance/          可执行不变量套件,每个 adapter 在测试里跑
 │   ├── inference/                框架无关的 provider 知识(0g router 端点、按模型的线格式,
 │   │                             读 router 实时目录);adapter 只做 Route → 自家配置方言的翻译
@@ -94,7 +92,7 @@ sealed/
 - **manager**：`Start(ctx, params)` 调 adapter.Start spawn agent + 起 supervisor goroutine，agent 死了清状态 + 触发 onFailed
 - **uploader**：`Apply(plaintexts)` 拿 watcher 收集的"每个 role 当前 plaintext"，跟 chainSnapshot 比对，调 `pushLeaf` 或 `pushManifest` 上传 0g-storage，再签 `chain.Update`
 - **watcher**：30s ticker，跑 `EvolutionFor` 收每个 role 的现在 plaintext，调 `UpdateCurrentSnapshot` 算 drift，有 drift 就触发 OnDrift（接到 uploader.Apply）
-- **proxy**：:8080 上的 fasthttp，承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 framework upstream（openclaw :3284 / claude-code bridge :3285），(3) `/log.html` / `/log/agent.html` 实时日志页
+- **proxy**：:8080 上的 fasthttp，承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 framework upstream（openclaw :3284），(3) `/log.html` / `/log/agent.html` 实时日志页
 
 ## 3. 核心抽象：Framework adapter
 
@@ -130,8 +128,8 @@ type Framework interface {
 - **`MonitorExit(onExit func(err error))`** ——`manager.Adapter` 额外
   要求的（进程死亡 callback，让监工不用轮询）。`main.go` 启动时
   assert；真实 adapter 都实现它。
-- **可选能力接口**（`VersionReconciler`、`ServicesManifestProvider`、
-  `SubprocessLogProvider`、`SettleDelayer`）——core type-assert,
+- **可选能力接口**（`VersionReconciler`、`SubprocessLogProvider`、
+  `SettleDelayer`）——core type-assert,
   adapter 缺哪个就优雅降级哪个。表格见 FRAMEWORK_ADAPTER.zh.md §2.2。
 
 激活的 adapter 由**链上 framework binding 的 `name`** 决定——Phase 2

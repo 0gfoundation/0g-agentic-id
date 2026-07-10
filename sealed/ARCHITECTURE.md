@@ -137,7 +137,7 @@ Next to the required interface:
   `manager.Adapter` (process-death callback so the supervisor doesn't
   poll). `main.go` asserts it at startup; every real adapter implements it.
 - **Optional capability interfaces** (`VersionReconciler`,
-  `ServicesManifestProvider`, `SubprocessLogProvider`, `SettleDelayer`) —
+  `SubprocessLogProvider`, `SettleDelayer`) —
   the core type-asserts and degrades gracefully when an adapter doesn't
   implement one. See FRAMEWORK_ADAPTER.md §2.2 for the table.
 

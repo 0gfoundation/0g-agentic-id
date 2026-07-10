@@ -199,8 +199,10 @@ pub struct HttpSandbox {
     extra_env: Vec<(String, String)>,
     /// Public-port allowlist injected into the create body as `publicPorts`
     /// (0g-sandbox#57). Empty = field omitted = all-ports-public (today's
-    /// behavior, and the only safe setting against stock Daytona). Same trust
-    /// boundary as `seal_id`/`ATTESTOR_URL`: attestor-set, not deployer-set.
+    /// behavior, and the only safe setting against stock Daytona). Injected
+    /// as a DEFAULT only: an explicit `publicPorts` in the owner-signed
+    /// payload wins (unlike `seal_id`/`ATTESTOR_URL`, which always
+    /// override deployer input).
     public_ports: Vec<u16>,
     /// Attestor's TEE EOA, used to sign envelopes for admin-only sandbox
     /// endpoints (orphan `force-stop`). The address must be in the

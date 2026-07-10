@@ -8,9 +8,9 @@
 # The npm installs below are warm-cache only — they make first boot fast
 # and keep cold boots working through an npm outage. Removing one does
 # not remove support for that framework; it just moves the install to
-# first Start. The claudecode HTTP bridge is NOT baked here: it is
-# go:embed'ded in the sealed binary and materialized at Start, so it is
-# covered by the image measurement of the binary itself.
+# first Start. (A CLI-framework shim, when an adapter ships one, is
+# go:embed'ded in the sealed binary rather than baked here — the retired
+# claudecode bridge worked this way.)
 #
 # Build on the billing server:
 #   docker build -t sealed-sandbox:1.0.0 -f images/sealed/Dockerfile images/sealed/

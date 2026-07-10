@@ -122,8 +122,8 @@ round-trip tests environment-dependent (the conformance suite blew up on
 its very first run, on a mac with openclaw 2026.3.8 installed).
 
 Rule: write the probe as a package-level `var probeXxx = func(...)` and
-stub it to return `""` in tests. New adapters copy the `claudecode`
-`probeVersion` pattern.
+stub it to return `""` in tests. New adapters copy openclaw's
+`probeOpenclawVersion` pattern.
 
 ### Marker injection/strip must be lossless — don't reintroduce newline normalization
 
@@ -139,8 +139,8 @@ converging.
 The current wire format is lossless: the separator (exactly one `\n`)
 belongs to the section, owner bytes are preserved verbatim, and
 `StripInjected(UpsertMarkedSection(x)) == x` holds strictly. Before
-touching this code, run both adapters' conformance + injection
-round-trip tests.
+touching this code, run the conformance + injection round-trip tests
+(`openclaw/conformance_test.go`, `platform/markers_test.go`).
 
 ---
 
