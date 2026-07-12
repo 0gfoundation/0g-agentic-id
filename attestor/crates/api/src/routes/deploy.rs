@@ -25,11 +25,12 @@ pub async fn handle(
     }
     // WYSIWYS: `i_data` IS the minted content — the attestor synthesizes
     // nothing. The single source of truth for "which framework" is the
-    // binding inside it, existence-checked HERE, before the irreversible
-    // mint (a missing/unsupported binding mints an agent whose container
-    // can never resolve an adapter). Frontend pickers and the SDK read
-    // the same supported list from GET /config; this is the enforcing
-    // copy. Everything else in i_data is opaque owner content.
+    // binding inside it, checked HERE because the attestor needs one
+    // unambiguous, supported name to serve the deploy (whether the
+    // content boots is sealed's contract — see i_data_validate).
+    // Frontend pickers and the SDK read the same supported list from
+    // GET /config; this is the enforcing copy. Everything else in
+    // i_data is opaque owner content.
     let framework =
         attestor_shared::i_data_validate::validate_framework_binding(
             &req.i_data,
