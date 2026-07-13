@@ -437,6 +437,20 @@ dual `chainSnapshot` vs `currentSnapshot` drift detection, the
 wholesale `chain.Update`), the leaf vs DirectoryManifest iData shapes, and
 the framework adapter abstraction (today openclaw is the only one wired in).
 
+**[`sealed/FRAMEWORK_ADAPTER.md`](sealed/FRAMEWORK_ADAPTER.md) — the framework adapter contract**
+
+The integration contract for plugging another agent framework (eliza,
+autogen, a custom orchestrator, ...) into the sealed runtime: the
+`framework.Framework` interface method by method with its invariants
+(Restore commutativity, EvolutionFor determinism and round-trip
+stability, the Defaults ↔ absent-on-chain equivalence), the
+binding-driven adapter selection, the mandatory `persona` seed-role
+translation, the DirectoryManifest format and the empty-ptr/filled-ptr
+pitfall, the full lifecycle timeline of adapter calls, the conformance
+test suite, and the field report from porting the second adapter
+(claude-code). Framework knowledge lives entirely here — attestor
+handles framework names as opaque strings.
+
 **[`sealed/AGENT_DOCTRINE.md`](sealed/AGENT_DOCTRINE.md) — the agent doctrine handbook**
 
 The "doctrine" sealed runtime injects into the agent system prompt: the

@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See `0g-agent-nft` repo for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed uploads/downloads via the `0g-storage-client` CLI |
-| openclaw | Currently the only wired-in agent framework; an npm package, installed and spawned as a subprocess by sealed, listening on `127.0.0.1:3284` |
+| openclaw | The sole wired-in agent framework (selected when the on-chain binding names it, or as the no-binding fallback); an npm package, installed and spawned as a subprocess by sealed, listening on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); a second framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -37,6 +37,7 @@ Phase 2  chain bootstrap  WaitForMint(sealId) → agentId
                           IntelligentDatasOf(agentId) → []IntelligentData
                           SealedKeysOf(agentId) → map[dataHash][]sealedKey
                           per-row download (0g-storage) + AES-GCM decrypt
+                          resolve framework adapter from the binding's name
                           ↓
 Phase 3  framework        Restore (3 rounds A→B→C) → seedCurrentSnapshots (phase 1) →
                           mgr.Start (spawn openclaw + writeRuntimeSections +
@@ -71,8 +72,12 @@ sealed/
 │   ├── provision/                /provision RA request + response envelope unpacking
 │   ├── report/                   /status reporting to attestor
 │   ├── logger/                   structured logging (the shared writer logger.Logf, exposed by proxy as /log.html)
-│   ├── framework/                framework adapter abstraction
-│   │   └── openclaw/             openclaw adapter implementation
+│   ├── framework/                framework adapter abstraction + optional capability interfaces
+│   │   ├── openclaw/             openclaw adapter implementation (the only shipping adapter)
+│   │   └── conformance/          executable invariant suite every adapter runs in its tests
+│   ├── inference/                framework-agnostic provider knowledge (0g router endpoints,
+│   │                             wire format per model via the live catalog); adapters only
+│   │                             translate a resolved Route into their config dialect
 │   ├── manifest/                 directory-manifest format + deterministic tar.gz
 │   ├── state/                    shared Agent state (chainSnapshot + currentSnapshot + phase)
 │   ├── manager/                  agent process lifecycle + supervision
@@ -97,28 +102,53 @@ sealed/
 
 ## 3. Core abstraction: the Framework adapter
 
-The outside (main / watcher / uploader) sees only the
+The outside (main / watcher / uploader / proxy) sees only the
 `framework.Framework` interface and has no knowledge of openclaw's
-internals. This is the seam for plugging in other frameworks later.
+internals. This is the seam for plugging in other frameworks.
+
+> **Integrating another agent framework?** The full adapter contract —
+> per-method semantics, invariants, call-site map, manifest format, and
+> an honest list of what's still openclaw-wired — lives in
+> [FRAMEWORK_ADAPTER.md](FRAMEWORK_ADAPTER.md). This section is only the
+> architectural overview.
 
 ```go
 type Framework interface {
     Name() string
-    Version(ctx) (string, error)
-    Roles() []RoleSpec                                            // declares all dims this adapter owns
-    Defaults(role string) []byte                                  // returns the canonical empty state for that role
-    Restore(ctx, role, plaintext []byte) error                    // lands plaintext to memory/disk
-    RestoreEntry(ctx, role, path, plaintext) error                // DirectoryManifest sub-entry
-    LoadEntry(ctx, role, path) ([]byte, error)                    // inverse: read the canonical plaintext of a sub-entry
-    EvolutionFor(ctx, role) ([]byte, error)                       // read current disk/memory → canonical plaintext
-    HandleLegacy(ctx, role, plaintext) error                      // legacy roles not in Roles() (e.g. persona)
-    ReconcileFramework(ctx) error                                 // npm install to bring openclaw up to whitelistMax
-    Start(ctx, StartParams) (StartResult, error)                  // spawn the agent subprocess
-    Liveness(ctx) error                                            // supervisor probes
+    Version(ctx) (string, error)                     // best-effort probe (not consumed by core yet)
+    Roles() []RoleSpec                               // declares all dims this adapter owns
+    Defaults(role string) []byte                     // canonical empty state for a role
+    Restore(ctx, role, plaintext []byte) error       // lands plaintext to memory/disk
+    LoadEntry(ctx, role, path) ([]byte, error)       // read one manifest sub-entry's canonical plaintext
+    RestoreEntry(ctx, role, path, plaintext) error   // inverse: write one manifest sub-entry
+    EvolutionFor(ctx, role) ([]byte, error)          // read current disk/memory → canonical plaintext
+    HandleLegacy(ctx, role, plaintext) error         // chain roles not in Roles() (e.g. persona)
+    Start(ctx, RuntimeContext) (StartResult, error)  // spawn the agent subprocess
+    AuthResponse(ctx) (any, error)                   // owner-only payload for /_seal/auth
+    Stop(ctx, gracefulTimeout) error                 // SIGTERM → SIGKILL
+    Liveness(ctx) error                              // supervisor probes
     Readiness(ctx) error
-    MonitorExit(onExit func(err error))                            // process-exit callback
 }
 ```
+
+Next to the required interface:
+
+- **`MonitorExit(onExit func(err error))`** — required additionally by
+  `manager.Adapter` (process-death callback so the supervisor doesn't
+  poll). `main.go` asserts it at startup; every real adapter implements it.
+- **Optional capability interfaces** (`VersionReconciler`,
+  `SubprocessLogProvider`, `SettleDelayer`) —
+  the core type-asserts and degrades gracefully when an adapter doesn't
+  implement one. See FRAMEWORK_ADAPTER.md §2.2 for the table.
+
+The active adapter is selected by the **on-chain framework binding's
+`name`** once Phase 2 has decrypted the iData (every bundled adapter
+self-registers in its `New()`; `main.resolveAdapter` looks the name up
+via `framework.Get`). The `AGENT_FRAMEWORK` env is only the fallback for
+chains without a binding (local dev); the binding wins on disagreement.
+
+(`framework.Reloadable` is declared as an optional hot-reload hook but
+has no consumer yet; `manager.Reload` always does Stop + Start.)
 
 **Two Shapes** (see `framework.go:21-32`):
 
@@ -289,7 +319,7 @@ container's `:8080`.
 | `/_seal/auth` | **owner's wallet** | owner signs `0GSealAuth:{sealId}:{ts}` with EIP-191; sealed verifies the signer == on-chain owner and returns a short-lived framework dashboard token + path |
 | `/<anything else>` | end users, agent dashboard frontend | reverse-proxied to openclaw `127.0.0.1:3284` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
-| `/log/openclaw` + `/log/openclaw.html` | ops | openclaw subprocess stdout/stderr (live) |
+| `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`; signs with `agent_seal_priv` |
 
 The sign socket is the critical trust boundary between sealed and the
@@ -316,6 +346,7 @@ Environment variables are sealed's main configuration surface
 | `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
+| `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
 | `API_KEY` | LLM provider key, forwarded by attestor in deploy / Recreate envelope; spawn.go translates it into provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` etc. |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | used to build `AGENT_PUBLIC_URL`, in the form `http://8080-<sandbox_id>.<proxy_domain>`; the agent's own exposed port is hard-coded `:8080` by sealed proxy |
 

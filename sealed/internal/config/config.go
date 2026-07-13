@@ -12,6 +12,8 @@
 //   CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //   AGENTIC_ID_ADDR             (optional) AgenticID contract address
 //   INDEXER_URL                 (optional) 0g-storage indexer fallback URL
+//   AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
+//                               framework binding (local dev); the binding is authoritative
 //
 // After provisioning succeeds, SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION /
 // API_KEY MUST be cleared from the environment to deny a malicious or
@@ -46,6 +48,13 @@ type Bootstrap struct {
 	ChainRPC        string
 	ContractAddr    string
 	FallbackIndexer string
+
+	// Framework is the raw AGENT_FRAMEWORK env value (may be empty). The
+	// authoritative adapter selector is the on-chain framework binding
+	// (main.resolveAdapter); this env is only the fallback for chains
+	// without a binding — local dev, pre-binding deployments. attestor
+	// does NOT inject it.
+	Framework string
 
 	// PublicURL is the externally-reachable URL prefix for this sandbox,
 	// composed from DAYTONA_SANDBOX_ID + SANDBOX_PROXY_DOMAIN. Empty when
@@ -100,6 +109,7 @@ func Load() (*Bootstrap, error) {
 		ChainRPC:        os.Getenv("CHAIN_RPC_URL"),
 		ContractAddr:    os.Getenv("AGENTIC_ID_ADDR"),
 		FallbackIndexer: os.Getenv("INDEXER_URL"),
+		Framework:       strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
 		PublicURL:       composePublicURL(),
 	}, nil
 }

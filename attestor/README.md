@@ -151,6 +151,8 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_SERVING_ADDR` | SandboxServing contract address. The frontend deploy gate uses it to check owner balance ≥ 0.1 OG |
 | `ATTESTOR_SANDBOX_ENDPOINT` | 0g-sandbox HTTP endpoint |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
+| `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
+| `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 

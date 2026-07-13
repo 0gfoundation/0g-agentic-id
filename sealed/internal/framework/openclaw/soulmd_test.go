@@ -121,7 +121,7 @@ func TestPlatformBuildSovereignty_ContainsRequiredTokens(t *testing.T) {
 	for _, want := range []string{
 		"independent agent",
 		"home",
-		"IDENTITY.md",
+		"injected identity section",
 		"agentSeal",
 		testAgentSeal,
 		"principal-agent",

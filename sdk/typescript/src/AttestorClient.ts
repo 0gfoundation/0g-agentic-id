@@ -32,6 +32,47 @@ export interface IDataInput {
   extra?: Record<string, unknown>;
 }
 
+/** Inputs for {@link defaultIData}. */
+export interface DefaultIDataParams {
+  /** Framework name for the binding; default "openclaw". */
+  framework?: string;
+  name: string;
+  description: string;
+  /** Persona inference pin; default anthropic/claude-opus-4-6. */
+  inference?: { provider: string; model: string };
+}
+
+/**
+ * The canonical two-entry default iData — the same shape the attestor
+ * used to synthesize server-side before the WYSIWYS API change:
+ *
+ *   - a VERSION-LESS framework binding `{name, schema_version}` (the
+ *     sealed adapter resolves the missing version to its validated
+ *     whitelistMax), and
+ *   - the `persona` protocol seed `{system_prompt, inference}` that every
+ *     adapter translates into its own config (FRAMEWORK_ADAPTER.md §5.4).
+ *
+ * Owners sign these exact bytes: defaults are now part of the signed
+ * content rather than a server-side template.
+ */
+export function defaultIData(p: DefaultIDataParams): IDataInput[] {
+  return [
+    {
+      role: 'framework',
+      plaintext: { name: p.framework ?? 'openclaw', schema_version: 1 },
+      extra: {},
+    },
+    {
+      role: 'persona',
+      plaintext: {
+        system_prompt: `You are ${p.name}. ${p.description}\n`,
+        inference: p.inference ?? { provider: 'anthropic', model: 'claude-opus-4-6' },
+      },
+      extra: {},
+    },
+  ];
+}
+
 export interface DeployParams {
   /**
    * Idempotency key. Optional — the SDK generates a random one per call. Pass
@@ -42,7 +83,27 @@ export interface DeployParams {
   name: string;
   description: string;
   image?: string;
-  iData: IDataInput[];
+  /**
+   * The agent's complete iData, exactly as it will be encrypted and
+   * minted — WYSIWYS: the bytes you sign here are the bytes that get
+   * sealed; the attestor synthesizes nothing. Must include a
+   * `role="framework"` binding (`{name, schema_version}`). Omit (or pass
+   * empty) and the SDK builds `defaultIData()` for you from
+   * name/description/framework/inference below.
+   */
+  iData?: IDataInput[];
+  /**
+   * Agent-framework name for the SDK-built default iData ("openclaw"
+   * default, or e.g. "claude-code"). CLIENT-SIDE ONLY: it feeds
+   * `defaultIData()` when `iData` is omitted — the API has no framework
+   * field; the on-chain binding inside i_data is the single source of
+   * truth (validated against `GET /config`'s `supported_frameworks`
+   * before mint). Ignored when you pass your own `iData`.
+   */
+  framework?: string;
+  /** Inference pin for the SDK-built default persona (defaults to
+   *  anthropic/claude-opus-4-6). Ignored when you pass your own `iData`. */
+  inference?: { provider: string; model: string };
   /** Sandbox "create" payload the attestor relays to the provider. */
   sandbox: { snapshot: string; apiKey: string; sealed?: boolean; resourceId?: string };
   /** Seconds the sandbox envelope stays valid. Default 180. */
@@ -65,7 +126,19 @@ function b64encode(s: string): string {
 
 function randHex(bytes: number): string {
   const a = new Uint8Array(bytes);
-  (globalThis as { crypto: { getRandomValues(x: Uint8Array): Uint8Array } }).crypto.getRandomValues(a);
+  type WebCrypto = { getRandomValues(x: Uint8Array): Uint8Array };
+  // Browsers and Node >= 19 expose WebCrypto globally; older Node needs
+  // the node:crypto fallback (caught by real execution on Node 16, where
+  // the previous unguarded access crashed deploy() before any request).
+  let cryptoObj = (globalThis as { crypto?: WebCrypto }).crypto;
+  if (!cryptoObj?.getRandomValues && typeof require === 'function') {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    cryptoObj = (require('crypto') as { webcrypto?: WebCrypto }).webcrypto;
+  }
+  if (!cryptoObj?.getRandomValues) {
+    throw new Error('AttestorClient: no WebCrypto available (need a browser or Node >= 15 with crypto.webcrypto)');
+  }
+  cryptoObj.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -77,16 +150,26 @@ export class AttestorClient {
     return this.ctx.attestorUrl.replace(/\/$/, '');
   }
 
-  /** Sandbox "create" envelope, signed by the owner (relayed to the provider). */
-  private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+  /**
+   * Owner-signed sandbox action envelope. The sandbox runtime verifies
+   * every lifecycle action against the owner wallet; field order must
+   * match its `signedRequest` struct exactly
+   * ({action, expires_at, nonce, payload, resource_id}) or the recovered
+   * signer won't match.
+   */
+  private async signEnvelope(
+    action: string,
+    resourceId: string,
+    payload: Record<string, unknown>,
+    ttlSec: number,
+  ) {
     const { walletClient, account } = requireWallet(this.ctx);
-    // Field order must match the sandbox `signedRequest` struct.
     const canonical = JSON.stringify({
-      action: 'create',
+      action,
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
-      payload: { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
-      resource_id: sandbox.resourceId ?? '',
+      payload,
+      resource_id: resourceId,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     return {
@@ -94,6 +177,68 @@ export class AttestorClient {
       signed_message_b64: b64encode(canonical),
       wallet_signature: signature,
     };
+  }
+
+  /** Sandbox "create" envelope for deploy (relayed to the provider). */
+  private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+    return this.signEnvelope(
+      'create',
+      sandbox.resourceId ?? '',
+      { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      ttlSec,
+    );
+  }
+
+  /**
+   * Lifecycle op on a deployed agent's sandbox. `stop`/`start` act on the
+   * existing container (resourceId = sandbox_id); `reset` is an
+   * unconditional recreate (action="create", empty resource_id) that
+   * preserves the on-chain identity and replaces only the container —
+   * the way to force a fresh boot (e.g. after a new sealed image, or
+   * stuck-state recovery). All are owner-signed; the attestor + sandbox
+   * both re-verify.
+   */
+  async lifecycle(
+    op: 'stop' | 'start' | 'reset',
+    params: {
+      sealId: `0x${string}`;
+      sandboxId?: string;
+      snapshot?: string;
+      /** Inference API key for `reset` — the fresh container needs a fresh
+       *  env (the attestor doesn't cache the LLM key). Without it the agent
+       *  comes back alive but can't call its model. */
+      apiKey?: string;
+      envelopeTtlSec?: number;
+    },
+  ): Promise<void> {
+    const { account } = requireWallet(this.ctx);
+    const ttl = params.envelopeTtlSec ?? 180;
+    let envelope;
+    if (op === 'reset') {
+      envelope = await this.signEnvelope(
+        'create',
+        '',
+        {
+          snapshot: params.snapshot ?? '',
+          sealed: true,
+          ...(params.apiKey ? { env: { API_KEY: params.apiKey } } : {}),
+        },
+        ttl,
+      );
+    } else {
+      if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
+      envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
+    }
+    const path = op === 'reset' ? '/reset' : `/${op}`;
+    const res = await fetch(`${this.baseUrl()}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+    }
   }
 
   /**
@@ -105,7 +250,15 @@ export class AttestorClient {
     const { walletClient, account } = requireWallet(this.ctx);
     const owner = account.address;
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
-    const iData = params.iData.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
+    const source = params.iData?.length
+      ? params.iData
+      : defaultIData({
+          framework: params.framework,
+          name: params.name,
+          description: params.description,
+          inference: params.inference,
+        });
+    const iData = source.map((d) => ({ role: d.role, plaintext: d.plaintext, extra: d.extra ?? {} }));
 
     // Owner canonical — must match CanonicalDeploy (order is irrelevant; the
     // attestor deserializes then re-checks each field).

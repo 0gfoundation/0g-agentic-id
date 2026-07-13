@@ -1,7 +1,6 @@
 //! Shared types, traits, implementations for the Attestor backend.
 
 pub mod agent_card;
-pub mod agent_profile;
 pub mod auth;
 pub mod avatar;
 pub mod chain;
@@ -10,7 +9,7 @@ pub mod crypto;
 pub mod error;
 pub mod events;
 pub mod events_bus;
-pub mod i_data_derive;
+pub mod i_data_validate;
 pub mod jobs;
 pub mod kms;
 pub mod mocks;

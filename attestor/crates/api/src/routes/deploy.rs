@@ -23,8 +23,20 @@ pub async fn handle(
     if req.description.trim().is_empty() {
         return Err(ApiError::bad_request("description is required"));
     }
-    // `i_data` is allowed to be empty — the worker synthesizes a default
-    // OpenClaw config entry so the contract always sees ≥1 IntelligentData.
+    // WYSIWYS: `i_data` IS the minted content — the attestor synthesizes
+    // nothing. The single source of truth for "which framework" is the
+    // binding inside it, checked HERE because the attestor needs one
+    // unambiguous, supported name to serve the deploy (whether the
+    // content boots is sealed's contract — see i_data_validate).
+    // Frontend pickers and the SDK read the same supported list from
+    // GET /config; this is the enforcing copy. Everything else in
+    // i_data is opaque owner content.
+    let framework =
+        attestor_shared::i_data_validate::validate_framework_binding(
+            &req.i_data,
+            &state.cfg.supported_frameworks,
+        )
+        .map_err(ApiError::bad_request)?;
 
     // Owner authorization: verify EIP-191 signature over the canonical
     // deploy payload AND that every outer field matches what was signed.
@@ -32,7 +44,7 @@ pub async fn handle(
     verify_deploy_signature(&req, state.crypto.as_ref())
         .map_err(|e| ApiError::bad_request(format!("owner_signature: {e}")))?;
 
-    tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), "deploy request");
+    tracing::info!(owner = %req.owner, key = %req.idempotency_key, n_idata = req.i_data.len(), framework = %framework, "deploy request");
 
     // ── Sandbox envelope: validate at edge so bogus requests don't burn a
     //    worker slot. Sandbox itself re-verifies; this is defense-in-depth.

@@ -133,6 +133,8 @@ mod tests {
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
             sandbox_snapshot: "0g-test-sealed".into(),
+            sandbox_public_ports: vec![],
+            supported_frameworks: vec!["openclaw".into()],
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,

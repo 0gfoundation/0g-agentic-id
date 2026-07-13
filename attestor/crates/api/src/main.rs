@@ -68,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
-            // api never spawns containers, so extra_env is irrelevant.
+            // api never spawns containers, so extra_env / public_ports are
+            // irrelevant (create lives in the worker) — pass empties.
+            Vec::new(),
             Vec::new(),
             admin_signer,
         ))

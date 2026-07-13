@@ -334,21 +334,7 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 
 /* ── Coming-soon badge ──────────────────────────────────────────── */
 .coming-soon{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:var(--fs-xs);font-weight:600;letter-spacing:var(--ls-eyebrow);text-transform:uppercase;color:var(--orange);background:var(--obg);border:1px solid var(--obd);border-radius:9999px;padding:2px 10px;margin-left:8px;vertical-align:middle}
-.card-disabled{opacity:.55;pointer-events:none}
-.card-disabled textarea{background:var(--surf2)}
-
-/* File-drop placeholder — purely visual; lives inside card-disabled so
-   no actual upload handling. Dashed border + centered icon/text reads
-   as "drop file here" to anyone who's seen a Web upload widget. */
-.file-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:44px 18px;background:linear-gradient(180deg,var(--surf2) 0%,oklch(98% 0.005 275) 100%);border:2px dashed var(--border);border-radius:var(--r);color:var(--muted);font-family:var(--sans);font-size:var(--fs-sm);line-height:1.5;text-align:center;cursor:pointer;transition:background var(--t-fast),border-color var(--t-fast),transform var(--t-fast),box-shadow var(--t-fast)}
-.file-drop:hover{background:linear-gradient(180deg,var(--pbg) 0%,oklch(98% 0.02 315) 100%);border-color:var(--pbd);color:var(--text2);transform:translateY(-1px);box-shadow:0 6px 20px oklch(50% 0.22 315 / 0.12)}
-.file-drop .file-drop-icon{width:40px;height:40px;color:var(--muted);transition:transform var(--t-base) var(--ease-spring),color var(--t-fast)}
-.file-drop:hover .file-drop-icon{transform:translateY(-5px) scale(1.1);color:var(--p)}
-.file-drop .file-drop-icon svg{width:100%;height:100%;stroke:currentColor;fill:none;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
-.file-drop .file-drop-main{font-size:var(--fs-sm);font-weight:600;color:var(--text);letter-spacing:var(--ls-label)}
-.file-drop .file-drop-sub{font-size:var(--fs-xs);font-family:var(--mono);color:var(--muted);letter-spacing:var(--ls-normal)}
-.file-drop .file-drop-main{font-weight:500;color:var(--text2)}
-.file-drop .file-drop-sub{font-size:var(--fs-xs);color:var(--muted)}
+.optional-tag{display:inline-flex;align-items:center;font-family:var(--mono);font-size:var(--fs-xs);font-weight:600;letter-spacing:var(--ls-eyebrow);text-transform:uppercase;color:var(--muted);background:var(--surf2);border:1px solid var(--border);border-radius:9999px;padding:2px 10px;margin-left:auto;align-self:center}
 
 .btn{display:inline-block;font:inherit;font-family:var(--sans);font-weight:600;font-size:var(--fs-sm);padding:10px 18px;border-radius:var(--r-sm);border:1px solid transparent;cursor:pointer;text-decoration:none;line-height:1.2;transition:background var(--t-fast),transform 160ms var(--ease-spring),box-shadow var(--t-fast),border-color var(--t-fast)}
 /* Primary CTA — solid brand color with depth via shadow only.
@@ -1359,9 +1345,9 @@ details.log[open] summary{color:var(--text2)}
       <div class="field">
         <label for="framework">Framework</label>
         <select id="framework">
-          <option value="openclaw">OpenClaw</option>
+          <option value="">Loading…</option>
         </select>
-        <small class="field-hint">More frameworks coming soon — for now every agent runs on OpenClaw.</small>
+        <small class="field-hint">Which runtime interprets this agent's iData — written into the on-chain framework binding.</small>
       </div>
     </section>
 
@@ -1389,17 +1375,11 @@ details.log[open] summary{color:var(--text2)}
       </div>
     </section>
 
-    <section class="card card-disabled">
-      <h2>Import openclaw <span class="coming-soon">coming soon</span></h2>
+    <section class="card">
+      <h2>System prompt <span class="optional-tag">optional</span></h2>
       <div class="field">
-        <div class="file-drop">
-          <div class="file-drop-icon">
-            <svg viewBox="0 0 24 24"><path d="M12 3v12"/><path d="m7 8 5-5 5 5"/><path d="M5 16v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/></svg>
-          </div>
-          <div class="file-drop-main">Drop openclaw package here, or click to browse</div>
-          <div class="file-drop-sub">.tar.gz · contains framework / persona / skills / ops</div>
-        </div>
-        <small class="field-hint">Power-user mode: bypass profile defaults and import a packaged openclaw config.</small>
+        <textarea id="systemPrompt" rows="4" placeholder="Leave blank to use: You are &lt;name&gt;. &lt;description&gt;"></textarea>
+        <small class="field-hint">The agent's core instructions. Framework-agnostic — it becomes the <code>persona</code> seed the runtime translates into the framework's own config. Blank uses the default built from name + description.</small>
       </div>
     </section>
 
@@ -1906,6 +1886,23 @@ window.addEventListener('DOMContentLoaded', async () => {
     if (r.ok) State.config = await r.json();
   } catch (e) {
     toast('Failed to load /config: ' + e.message, 'error');
+  }
+  // Framework picker is data-driven: /config.supported_frameworks is the
+  // same list the deploy edge enforces pre-mint, so the UI can't express
+  // an invalid choice. Falls back to the static openclaw option when the
+  // attestor predates the field.
+  {
+    // Framework slug → display label. Unknown slugs fall back to a
+    // title-cased form so a newly-supported framework still reads nicely
+    // without a frontend change.
+    const FW_LABELS = { 'openclaw': 'OpenClaw', 'claude-code': 'Claude Code' };
+    const label = (f) => FW_LABELS[f] || f.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+    const list = (State.config && Array.isArray(State.config.supported_frameworks) && State.config.supported_frameworks.length)
+      ? State.config.supported_frameworks
+      : ['openclaw']; // fallback when the attestor predates /config.supported_frameworks
+    const sel = $('#framework');
+    sel.innerHTML = list.map((f) => `<option value="${f}">${label(f)}</option>`).join('');
+    enhanceAllSelects();
   }
   // Seed the deploy form's Model select with the default provider's
   // model list. onProviderChange handles subsequent switches; this
@@ -2882,22 +2879,35 @@ window.submitDeploy = async function () {
       return;
     }
 
-    // Persona dim — overrides the attestor's default_i_data persona by
-    // role. The `system_prompt` is rebuilt frontend-side using the same
-    // template the backend's default would use (You are <name>. <desc>),
-    // so even though we replace the entire dim, the prompt content
-    // matches what the user would have gotten by leaving everything
-    // default. Per-role merge in normalize_i_data keeps the framework
-    // dim untouched.
-    const personaPlaintext = {
-      system_prompt: `You are ${name}. ${description}\n`,
-      inference: { provider, model },
-    };
-    const iData = [{
-      role: 'persona',
-      plaintext: personaPlaintext,
-      extra: {},
-    }];
+    // WYSIWYS: the attestor synthesizes nothing — this form builds the
+    // complete iData the owner signs, and those exact bytes get encrypted
+    // and minted. Two entries, same shape the SDK's defaultIData() emits:
+    // a version-less framework binding (the sealed adapter resolves the
+    // missing package_version to its validated whitelistMax) and the
+    // persona protocol seed every adapter translates into its own config.
+    const framework = $('#framework').value || 'openclaw';
+    // system_prompt: the owner's custom prompt if they wrote one, else the
+    // neutral default. Stays persona-level (framework-agnostic) — the
+    // adapter translates persona into its own config at first boot, so the
+    // owner never needs to know the framework's iData shape.
+    const customPrompt = ($('#systemPrompt')?.value || '').trim();
+    const systemPrompt = customPrompt ? (customPrompt.endsWith('\n') ? customPrompt : customPrompt + '\n')
+                                      : `You are ${name}. ${description}\n`;
+    const iData = [
+      {
+        role: 'framework',
+        plaintext: { name: framework, schema_version: 1 },
+        extra: {},
+      },
+      {
+        role: 'persona',
+        plaintext: {
+          system_prompt: systemPrompt,
+          inference: { provider, model },
+        },
+        extra: {},
+      },
+    ];
 
     const { canonical: ownerCanonical, sig: ownerSig } =
       await signOwnerCanonical(idempKey, name, description, image, iData);
@@ -4823,11 +4833,24 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
           provider,
         );
         const datas = await c.intelligentDatasOf(BigInt(agentId));
-        const onChain = new Set(datas.map(d => String(d.dataHash).toLowerCase()));
+        // Map each on-chain dataHash → its role. The role lives in
+        // dataDescription (JSON {role, storage_ptr}); this is
+        // framework-agnostic — openclaw, claude-code, any adapter names
+        // its dims the same way, so the verifier reads the label off
+        // chain instead of hardcoding per-framework dim lists (or
+        // falling back to positional data[i]).
+        const roleByHash = new Map();
+        for (const d of datas) {
+          const hl = String(d.dataHash).toLowerCase();
+          let role = '';
+          try { role = JSON.parse(d.dataDescription).role || ''; } catch (_) { role = d.dataDescription || ''; }
+          roleByHash.set(hl, role);
+        }
+        const onChain = new Set(roleByHash.keys());
         const dims = declared.map((h, i) => {
           const hl = String(h).toLowerCase();
           const ok = onChain.has(hl);
-          return { role: `data[${i}]`, hash: hl,
+          return { role: (ok && roleByHash.get(hl)) ? roleByHash.get(hl) : `data[${i}]`, hash: hl,
                    status: ok ? 'passed' : 'failed',
                    note: ok ? 'on chain' : 'NOT on chain' };
         });
