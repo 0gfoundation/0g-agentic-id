@@ -6,7 +6,7 @@
 //! On a fresh DB (no checkpoint) the indexer starts from
 //! `cfg.indexer_start_block` (if set) or `latest - LOOKBACK_BLOCKS`.
 //! When it encounters an `AgentSealSet` whose `agentSeal` matches the
-//! local `derive(masterKey, sealId)`, it reconstructs the deployment
+//! per-seal KMS derivation, it reconstructs the deployment
 //! row from on-chain view calls.
 
 use alloy::primitives::{Address, U256};
@@ -255,7 +255,7 @@ impl Watcher {
         );
 
         // Is this ours? Derive locally and compare.
-        let derived = match self.crypto.derive_agent_seal(ev.sealId) {
+        let derived = match self.crypto.derive_agent_seal(ev.sealId).await {
             Ok(kp) => kp.address,
             Err(e) => {
                 tracing::warn!(error = %e, "derive_agent_seal failed");
@@ -632,7 +632,7 @@ fn _unused() -> U256 {
 mod tests {
     use super::*;
     use alloy::primitives::{Bytes, B256};
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{InMemoryDeploymentRepo, InMemoryEventBus, InMemoryJobQueue};
 
     fn test_watcher(
@@ -648,7 +648,7 @@ mod tests {
             provider,
             contract_addr: Address::ZERO,
             canonical_addr: Address::ZERO,
-            crypto: Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32])))),
+            crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
             deployments,
             events,
             jobs,

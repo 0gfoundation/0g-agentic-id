@@ -78,7 +78,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, Bytes, B256};
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain,
@@ -159,9 +159,7 @@ mod tests {
     }
 
     fn make_setup() -> Setup {
-        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0u8; 32],
-        ))));
+        let crypto = Arc::new(RealCrypto::new_for_test([0u8; 32]));
         let chain = Arc::new(MockChain::new());
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
         let idempotency = Arc::new(InMemoryIdempotencyStore::new());

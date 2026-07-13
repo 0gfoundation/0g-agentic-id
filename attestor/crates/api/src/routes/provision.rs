@@ -192,6 +192,7 @@ pub async fn handle(
     let seal_kp = state
         .crypto
         .derive_agent_seal(req.seal_id)
+        .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     let encrypted = state
         .crypto

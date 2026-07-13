@@ -580,6 +580,11 @@ message ContainerStatus {
 // GetSecretResource Messages
 message GetSecretResourceRequest {
   string app_id = 1;
+  // Optional hex-encoded derivation material, forwarded verbatim to KMS
+  // /app-key (0g-kms#1). Empty = app-scoped key (today's behavior). For
+  // AgenticID = chainId (u64 BE) | contract (20B) | sealId (32B). Passthrough
+  // tracked as 0g-tapp#33; field number to be confirmed with tapp-server.
+  string material = 2;
 }
 
 message GetSecretResourceResponse {

@@ -6,15 +6,19 @@
 //! - Keccak-256 (sha3 crate)
 //! - EIP-191 signer recovery (personal_sign digest → address)
 //!
-//! v0 derives `agentSeal_priv` as `HKDF-SHA256(masterKey, sealId)` with an
-//! ephemeral in-memory master secret. Production swaps `MasterKeyProvider`
-//! for a KMS-backed one.
+//! `agentSeal_priv` is derived PER SEAL from the KMS: the attestor sends
+//! `material = chainId‖contract‖sealId` and gets back 32 bytes used directly
+//! as the secp256k1 private key. The attestor holds no fleet-wide master —
+//! only an app-scoped key (`app_key`, empty material) cached at construction
+//! for the sync helpers (job-encryption key, binding MAC).
 
+use crate::kms::KmsClient;
 use crate::traits::CryptoModule;
 use crate::types::{AgentSealKeyPair, SealId};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use alloy::primitives::{keccak256, Address};
+use async_trait::async_trait;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
@@ -22,44 +26,62 @@ use rand::{thread_rng, RngCore};
 use sha2::Sha256;
 use std::sync::Arc;
 
-/// Source of the 32-byte master secret used to derive `agentSeal` keypairs.
-/// v0: in-memory, generated once per process. Prod: KMS-backed.
-pub trait MasterKeyProvider: Send + Sync {
-    fn master_key(&self) -> [u8; 32];
-}
-
-pub struct InMemoryMasterKey {
-    key: [u8; 32],
-}
-
-impl InMemoryMasterKey {
-    pub fn random() -> Self {
-        let mut key = [0u8; 32];
-        thread_rng().fill_bytes(&mut key);
-        Self { key }
-    }
-
-    pub fn from_bytes(key: [u8; 32]) -> Self {
-        Self { key }
-    }
-}
-
-impl MasterKeyProvider for InMemoryMasterKey {
-    fn master_key(&self) -> [u8; 32] {
-        self.key
-    }
+/// Builds the opaque KMS derivation material for one seal:
+/// `chainId(u64 BE, 8) ‖ contract(20) ‖ sealId(32)`. Fixed-width, no
+/// delimiters — unambiguous by construction. This is CONSENSUS with the
+/// KMS: changing a single byte re-derives every agentSeal (a fleet break),
+/// so it is frozen and covered by a test.
+pub fn seal_material(chain_id: u64, contract: Address, seal_id: SealId) -> Vec<u8> {
+    let mut m = Vec::with_capacity(8 + 20 + 32);
+    m.extend_from_slice(&chain_id.to_be_bytes());
+    m.extend_from_slice(contract.as_slice());
+    m.extend_from_slice(seal_id.as_slice());
+    m
 }
 
 pub struct RealCrypto {
-    master: Arc<dyn MasterKeyProvider>,
+    /// App-scoped key (KMS empty-material), cached once at construction so the
+    /// sync helpers (`hmac_binding`, and the job key derived in main) don't
+    /// take a KMS round-trip. NOT an agentSeal source.
+    app_key: [u8; 32],
+    /// KMS handle for per-seal agentSeal derivation.
+    kms: Arc<dyn KmsClient>,
+    /// Material inputs (public, from chain config).
+    chain_id: u64,
+    contract: Address,
 }
 
 impl RealCrypto {
-    pub fn new(master: Arc<dyn MasterKeyProvider>) -> Self {
-        Self { master }
+    pub fn new(
+        app_key: [u8; 32],
+        kms: Arc<dyn KmsClient>,
+        chain_id: u64,
+        contract: Address,
+    ) -> Self {
+        Self {
+            app_key,
+            kms,
+            chain_id,
+            contract,
+        }
+    }
+
+    /// Test/dev constructor: a `MockKmsClient`-backed crypto whose app key
+    /// equals `secret` and whose agentSeal derivation goes through the mock
+    /// (HKDF over the seal material). Deterministic and material-sensitive,
+    /// so it matches prod semantics without a KMS cluster. chain/contract are
+    /// placeholders — fine for tests that don't assert a specific address.
+    pub fn new_for_test(secret: [u8; 32]) -> Self {
+        Self::new(
+            secret,
+            Arc::new(crate::kms::MockKmsClient::from_bytes(secret)),
+            0,
+            Address::ZERO,
+        )
     }
 }
 
+#[async_trait]
 impl CryptoModule for RealCrypto {
     fn generate_seal_id(&self) -> SealId {
         let mut bytes = [0u8; 32];
@@ -67,13 +89,12 @@ impl CryptoModule for RealCrypto {
         SealId::from_slice(&bytes)
     }
 
-    fn derive_agent_seal(&self, seal_id: SealId) -> anyhow::Result<AgentSealKeyPair> {
-        // HKDF-SHA256(master, salt=sealId, info="agentSeal")
-        let master = self.master.master_key();
-        let hkdf = Hkdf::<Sha256>::new(Some(seal_id.as_slice()), &master);
-        let mut priv_bytes = [0u8; 32];
-        hkdf.expand(b"agentSeal", &mut priv_bytes)
-            .map_err(|e| anyhow::anyhow!("hkdf expand: {e}"))?;
+    async fn derive_agent_seal(&self, seal_id: SealId) -> anyhow::Result<AgentSealKeyPair> {
+        // Per-seal KMS derivation: material binds chainId‖contract‖sealId, so
+        // the same seal on the same chain/contract always yields the same key,
+        // and the master never enters attestor memory.
+        let material = seal_material(self.chain_id, self.contract, seal_id);
+        let priv_bytes = self.kms.derive(&material).await?;
 
         let signing_key = SigningKey::from_bytes((&priv_bytes).into())
             .map_err(|e| anyhow::anyhow!("invalid priv key: {e}"))?;
@@ -141,11 +162,10 @@ impl CryptoModule for RealCrypto {
     }
 
     fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32] {
-        // HKDF-derive a per-info binding key from the master secret, then
+        // HKDF-derive a per-info binding key from the app-scoped KMS key, then
         // HMAC-SHA256 the data with it. Domain separation lives in `info`
         // (e.g. `"agentic-id.container-pubkey-binding.v1"`).
-        let master = self.master.master_key();
-        let hkdf = Hkdf::<Sha256>::new(None, &master);
+        let hkdf = Hkdf::<Sha256>::new(None, &self.app_key);
         let mut binding_key = [0u8; 32];
         hkdf.expand(info, &mut binding_key)
             .expect("HKDF-SHA256 expand to 32 bytes is infallible");
@@ -192,21 +212,43 @@ impl CryptoModule for RealCrypto {
 mod tests {
     use super::*;
 
-    #[test]
-    fn derive_agent_seal_deterministic() {
-        let master = Arc::new(InMemoryMasterKey::from_bytes([7u8; 32]));
-        let crypto = RealCrypto::new(master);
+    #[tokio::test]
+    async fn derive_agent_seal_deterministic() {
+        let crypto = RealCrypto::new_for_test([7u8; 32]);
         let seal_id = SealId::repeat_byte(42);
-        let a = crypto.derive_agent_seal(seal_id).unwrap();
-        let b = crypto.derive_agent_seal(seal_id).unwrap();
+        let a = crypto.derive_agent_seal(seal_id).await.unwrap();
+        let b = crypto.derive_agent_seal(seal_id).await.unwrap();
         assert_eq!(a.address, b.address);
         assert_eq!(a.priv_key, b.priv_key);
     }
 
+    #[tokio::test]
+    async fn derive_agent_seal_is_per_seal() {
+        let crypto = RealCrypto::new_for_test([7u8; 32]);
+        let a = crypto
+            .derive_agent_seal(SealId::repeat_byte(1))
+            .await
+            .unwrap();
+        let b = crypto
+            .derive_agent_seal(SealId::repeat_byte(2))
+            .await
+            .unwrap();
+        assert_ne!(a.address, b.address, "distinct seals → distinct keys");
+    }
+
+    #[test]
+    fn seal_material_is_fixed_width_and_distinct_per_seal() {
+        let m1 = seal_material(16602, Address::ZERO, SealId::repeat_byte(1));
+        let m2 = seal_material(16602, Address::ZERO, SealId::repeat_byte(2));
+        assert_eq!(m1.len(), 8 + 20 + 32);
+        assert_ne!(m1, m2);
+        // chainId is part of the binding.
+        assert_ne!(m1, seal_material(1, Address::ZERO, SealId::repeat_byte(1)));
+    }
+
     #[test]
     fn aes_gcm_roundtrip() {
-        let master = Arc::new(InMemoryMasterKey::random());
-        let crypto = RealCrypto::new(master);
+        let crypto = RealCrypto::new_for_test([9u8; 32]);
         let key = crypto.random_key_32();
         let pt = b"hello attestor".to_vec();
         let ct = crypto.aes_gcm_encrypt(&pt, &key).unwrap();
@@ -215,12 +257,11 @@ mod tests {
         assert_eq!(out, pt);
     }
 
-    #[test]
-    fn ecies_roundtrip() {
-        let master = Arc::new(InMemoryMasterKey::random());
-        let crypto = RealCrypto::new(master);
+    #[tokio::test]
+    async fn ecies_roundtrip() {
+        let crypto = RealCrypto::new_for_test([3u8; 32]);
         let seal_id = SealId::repeat_byte(1);
-        let kp = crypto.derive_agent_seal(seal_id).unwrap();
+        let kp = crypto.derive_agent_seal(seal_id).await.unwrap();
         let pt = b"secret payload".to_vec();
         let ct = crypto.ecies_encrypt(&pt, &kp.pub_key).unwrap();
         let out = crypto.ecies_decrypt(&ct, &kp.priv_key).unwrap();

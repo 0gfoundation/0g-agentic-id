@@ -1,21 +1,33 @@
 //! KMS client abstraction + dev mock + tapp-server gRPC impl.
 //!
-//! Provides the 32-byte app-scoped secret from which the attestor derives:
-//!   - agentSeal keypairs (per sealId, HKDF)
-//!   - job encryption key (HKDF, used by api/worker to avoid plaintext iData
-//!     sitting in `jobs.payload`)
+//! Two derivations, deliberately split so no single resident key can
+//! reconstruct the agent fleet:
+//!   - `app_key()` — the app-scoped 32-byte secret (empty material),
+//!     fetched once at startup. Used for the job-queue encryption key and
+//!     the provision binding MAC — attestor-local data, NOT agent identity.
+//!     Its leak exposes neither the master nor any agentSeal.
+//!   - `derive(material)` — a per-`material` key, called for every agentSeal
+//!     (material = chainId‖contract‖sealId; see `crypto::seal_material`).
+//!     In production this is a threshold-BLS DPRF at the KMS (0g-kms#1): the
+//!     master is never reconstructed and, being one-way, one leaked agentSeal
+//!     exposes no sibling. The attestor no longer holds a fleet-wide master.
 //!
 //! All three binaries (api/worker/indexer) must resolve to the **same**
-//! 32-byte key — otherwise derived subkeys diverge and decrypt fails.
-//! `MockKmsClient` hardcodes a dev value; `TappKmsClient` goes over local
-//! gRPC to tapp-server's `GetSecretResource`, which internally signs the
+//! upstream KMS — otherwise derived keys diverge and decrypt/verify fails.
+//! `MockKmsClient` derives locally from a dev secret; `TappKmsClient` goes
+//! over local gRPC to tapp-server's `GetSecretResource`, which signs the
 //! KMS request, decrypts the ECIES response, and hands us plaintext.
 
 use async_trait::async_trait;
 
 #[async_trait]
 pub trait KmsClient: Send + Sync {
-    async fn master_key(&self) -> anyhow::Result<[u8; 32]>;
+    /// App-scoped key (empty material). Fetched once at startup.
+    async fn app_key(&self) -> anyhow::Result<[u8; 32]>;
+
+    /// Per-`material` derivation — one agentSeal per call. `material` is the
+    /// opaque binding built by `crypto::seal_material`.
+    async fn derive(&self, material: &[u8]) -> anyhow::Result<[u8; 32]>;
 }
 
 /// Dev-only mock backed by a caller-supplied 32-byte key.
@@ -39,6 +51,10 @@ impl MockKmsClient {
         Self { key: Self::DEV_MASTER_KEY }
     }
 
+    pub fn from_bytes(key: [u8; 32]) -> Self {
+        Self { key }
+    }
+
     pub fn from_hex(hex_str: &str) -> anyhow::Result<Self> {
         let trimmed = hex_str.trim_start_matches("0x");
         let bytes = hex::decode(trimmed)
@@ -54,12 +70,24 @@ impl MockKmsClient {
 
 #[async_trait]
 impl KmsClient for MockKmsClient {
-    async fn master_key(&self) -> anyhow::Result<[u8; 32]> {
+    async fn app_key(&self) -> anyhow::Result<[u8; 32]> {
         Ok(self.key)
+    }
+
+    /// Mirrors the real DPRF's per-material isolation with a local HKDF:
+    /// deterministic, material-sensitive (distinct materials → distinct
+    /// keys), so tests and local dev exercise per-seal derivation without a
+    /// KMS cluster. NOT the real construction — dev only.
+    async fn derive(&self, material: &[u8]) -> anyhow::Result<[u8; 32]> {
+        let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(material), &self.key);
+        let mut out = [0u8; 32];
+        hkdf.expand(b"mock-dprf.v1", &mut out)
+            .map_err(|e| anyhow::anyhow!("mock derive hkdf expand: {e}"))?;
+        Ok(out)
     }
 }
 
-/// HKDF-SHA256 subkey derivation from the master secret.
+/// HKDF-SHA256 subkey derivation from the app-scoped KMS key.
 /// `info` scopes the derivation (e.g. `b"attestor.job_encryption_key.v1"`).
 pub fn derive_subkey(master_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
     use hkdf::Hkdf;
@@ -72,19 +100,39 @@ pub fn derive_subkey(master_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
 
 pub const JOB_ENCRYPTION_KEY_INFO: &[u8] = b"attestor.job_encryption_key.v1";
 
+/// Startup guard against the silent-fallback hazard: derive two distinct
+/// materials and require distinct keys. If they match, the KMS path is
+/// collapsing every seal to one key — the tell-tale of a tapp-server that
+/// predates the `material` passthrough (0g-tapp#33) and drops the field.
+/// Every agentSeal would otherwise derive identically; fail loud at boot
+/// instead. Cheap, and a no-op-cost sanity check even against a good KMS.
+pub async fn verify_material_honored(kms: &dyn KmsClient) -> anyhow::Result<()> {
+    let a = kms.derive(b"0g-kms-selfcheck:a").await?;
+    let b = kms.derive(b"0g-kms-selfcheck:b").await?;
+    if a == b {
+        anyhow::bail!(
+            "KMS returned identical keys for different material — the KMS path \
+             is not honoring `material` (likely a tapp-server without the \
+             0g-tapp#33 passthrough). Refusing to start: every agentSeal would \
+             derive to the same key. Upgrade tapp-server before this attestor."
+        );
+    }
+    Ok(())
+}
+
 // ── tapp-server gRPC (GetSecretResource, LOCAL ACCESS ONLY) ────────────
 
 use crate::tapp_grpc;
 use crate::Config;
 use tonic::transport::Channel;
 
-/// Fetches the KMS-managed app secret via tapp-server's `GetSecretResource`
+/// Fetches KMS-derived key material via tapp-server's `GetSecretResource`
 /// RPC. tapp-server signs the upstream KMS request with its in-memory key,
 /// decrypts the ECIES response, and returns the 32-byte plaintext to us
 /// over the local gRPC socket — no crypto work required on this side.
 ///
-/// The gRPC channel is reused across calls; `master_key()` runs once at
-/// startup in practice.
+/// The gRPC channel is reused across calls; `app_key()` runs once at
+/// startup, `derive()` once per agentSeal (deploy/provision/clone/transfer).
 pub struct TappKmsClient {
     channel: Channel,
     app_id: String,
@@ -96,21 +144,30 @@ impl TappKmsClient {
         let app_id = tapp_grpc::require_app_id(cfg)?;
         Ok(Self { channel, app_id })
     }
-}
 
-#[async_trait]
-impl KmsClient for TappKmsClient {
-    async fn master_key(&self) -> anyhow::Result<[u8; 32]> {
+    /// One `GetSecretResource` call (with retry/backoff) for the given
+    /// `material`. Empty material = the app-scoped key. `material` is sent
+    /// hex-encoded; tapp-server forwards it verbatim to KMS `/app-key`.
+    ///
+    /// NOTE (silent-fallback hazard): a tapp-server that predates the
+    /// `material` passthrough (0g-tapp#33) will ignore the field (protobuf
+    /// drops unknown fields) and return the app-scoped key for EVERY
+    /// material — so every agentSeal would derive identically. The startup
+    /// self-check in the binaries (two materials must differ) guards this;
+    /// do not remove it until every tapp-server is known-upgraded.
+    async fn fetch(&self, material: &[u8]) -> anyhow::Result<[u8; 32]> {
         use tapp_grpc::proto::tapp_service_client::TappServiceClient;
         use tapp_grpc::proto::GetSecretResourceRequest;
 
         let mut client = TappServiceClient::new(self.channel.clone());
         let mut last_err = anyhow::anyhow!("GetSecretResource never attempted");
+        let material_hex = hex::encode(material);
 
         for attempt in 1u32..=10 {
             match client
                 .get_secret_resource(GetSecretResourceRequest {
                     app_id: self.app_id.clone(),
+                    material: material_hex.clone(),
                 })
                 .await
             {
@@ -146,16 +203,66 @@ impl KmsClient for TappKmsClient {
     }
 }
 
+#[async_trait]
+impl KmsClient for TappKmsClient {
+    async fn app_key(&self) -> anyhow::Result<[u8; 32]> {
+        self.fetch(&[]).await
+    }
+
+    async fn derive(&self, material: &[u8]) -> anyhow::Result<[u8; 32]> {
+        self.fetch(material).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn mock_kms_is_deterministic() {
-        let a = MockKmsClient::dev().master_key().await.unwrap();
-        let b = MockKmsClient::dev().master_key().await.unwrap();
-        assert_eq!(a, b, "mock KMS must return the same key on each call");
+    async fn mock_kms_app_key_is_deterministic() {
+        let a = MockKmsClient::dev().app_key().await.unwrap();
+        let b = MockKmsClient::dev().app_key().await.unwrap();
+        assert_eq!(a, b, "mock KMS must return the same app key on each call");
         assert_eq!(a, MockKmsClient::DEV_MASTER_KEY);
+    }
+
+    /// A KMS that ignores material (returns the app key for everything) —
+    /// simulates an un-upgraded tapp-server dropping the passthrough field.
+    struct MaterialIgnoringKms([u8; 32]);
+    #[async_trait]
+    impl KmsClient for MaterialIgnoringKms {
+        async fn app_key(&self) -> anyhow::Result<[u8; 32]> {
+            Ok(self.0)
+        }
+        async fn derive(&self, _material: &[u8]) -> anyhow::Result<[u8; 32]> {
+            Ok(self.0) // BUG being guarded: same key regardless of material
+        }
+    }
+
+    #[tokio::test]
+    async fn material_selfcheck_passes_for_honoring_kms() {
+        assert!(verify_material_honored(&MockKmsClient::dev()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn material_selfcheck_rejects_material_ignoring_kms() {
+        let err = verify_material_honored(&MaterialIgnoringKms([5u8; 32]))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("material"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn mock_kms_derive_is_deterministic_and_material_scoped() {
+        let kms = MockKmsClient::dev();
+        let a1 = kms.derive(b"material-a").await.unwrap();
+        let a2 = kms.derive(b"material-a").await.unwrap();
+        assert_eq!(a1, a2, "same material → same key");
+        let b = kms.derive(b"material-b").await.unwrap();
+        assert_ne!(a1, b, "different material → different key");
+        // Per-seal derivation must not collapse to the app key.
+        assert_ne!(a1, kms.app_key().await.unwrap());
     }
 
     #[test]
@@ -173,15 +280,15 @@ mod tests {
     /// same job_key, encrypt on api side, decrypt on worker side.
     #[test]
     fn job_encryption_roundtrip_simulates_api_worker_handoff() {
-        use crate::crypto::{InMemoryMasterKey, RealCrypto};
+        use crate::crypto::RealCrypto;
         use crate::traits::CryptoModule;
         use std::sync::Arc;
 
         let master = MockKmsClient::DEV_MASTER_KEY;
         let job_key = derive_subkey(&master, JOB_ENCRYPTION_KEY_INFO);
 
-        let api = RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master)));
-        let worker = RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master)));
+        let api = RealCrypto::new_for_test(master);
+        let worker = RealCrypto::new_for_test(master);
 
         let plaintext_value = serde_json::json!({
             "framework": {"name": "openclaw", "version": "0.1.0"},
@@ -205,7 +312,7 @@ mod tests {
 
     #[test]
     fn decryption_fails_with_wrong_key() {
-        use crate::crypto::{InMemoryMasterKey, RealCrypto};
+        use crate::crypto::RealCrypto;
         use crate::traits::CryptoModule;
         use std::sync::Arc;
 
@@ -213,7 +320,7 @@ mod tests {
         let job_key = derive_subkey(&master, JOB_ENCRYPTION_KEY_INFO);
         let wrong_key = derive_subkey(&master, b"different.info");
 
-        let crypto = RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master)));
+        let crypto = RealCrypto::new_for_test(master);
         let ciphertext = crypto.aes_gcm_encrypt(b"secret", &job_key).unwrap();
         assert!(
             crypto.aes_gcm_decrypt(&ciphertext, &wrong_key).is_err(),

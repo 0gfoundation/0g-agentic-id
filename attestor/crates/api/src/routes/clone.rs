@@ -81,7 +81,7 @@ pub async fn handle(
 
     // New seal + agentSeal for the clone.
     let new_seal_id = state.crypto.generate_seal_id();
-    let seal_kp = state.crypto.derive_agent_seal(new_seal_id)?;
+    let seal_kp = state.crypto.derive_agent_seal(new_seal_id).await?;
 
     // Idempotency: a replay returns the prior clone's identity.
     if let Some(existing) = state
@@ -182,7 +182,7 @@ mod tests {
     use alloy::signers::SignerSync;
     use attestor_shared::auth::clone::CanonicalClone;
     use attestor_shared::auth::Canonical;
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain, MockSandbox,
@@ -247,7 +247,7 @@ mod tests {
 
     /// Seed a minted source agent with one iData artifact; return the setup.
     fn make_setup() -> Setup {
-        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32]))));
+        let crypto = Arc::new(RealCrypto::new_for_test([0u8; 32]));
         let chain = Arc::new(MockChain::new());
         // The route now gates on LIVE on-chain iData, so seed one entry.
         chain.seed_idata(

@@ -766,7 +766,7 @@ async fn handle_deploy(
         .ok_or_else(|| anyhow::anyhow!("deployment not found for seal_id"))?;
 
     // Re-derive agent seal to get pubkey (priv is discarded right after).
-    let seal_kp = ctx.crypto.derive_agent_seal(seal_id)?;
+    let seal_kp = ctx.crypto.derive_agent_seal(seal_id).await?;
     let agent_seal_pub = seal_kp.pub_key.clone();
 
     // Encrypt each iData; ciphertext is persisted alongside the artifact
@@ -987,21 +987,26 @@ async fn handle_clone(
         );
     }
 
-    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id)?;
+    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id).await?;
 
     // Re-seal every dataKey from the source agentSeal to the clone's new
     // agentSeal (KMS re-derives the source priv to unseal). Storage roots and
     // dataHashes in `idatas` are reused verbatim — same ciphertext on chain,
     // nothing re-uploaded. Pre-mint: on failure mark mint Failed + bail.
-    let resealed: anyhow::Result<Vec<Bytes>> = (|| {
-        let source_kp = ctx.crypto.derive_agent_seal(source_seal_id)?;
-        let mut out = Vec::with_capacity(sealed.len());
-        for sk in &sealed {
-            let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
-            out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
-        }
-        Ok(out)
-    })();
+    // The source-seal KMS derive is async, so it's folded into the same
+    // Result as the (sync) ecies loop — any failure lands in the match below.
+    let resealed: anyhow::Result<Vec<Bytes>> =
+        match ctx.crypto.derive_agent_seal(source_seal_id).await {
+            Ok(source_kp) => (|| {
+                let mut out = Vec::with_capacity(sealed.len());
+                for sk in &sealed {
+                    let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
+                    out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
+                }
+                Ok(out)
+            })(),
+            Err(e) => Err(e),
+        };
     let sealed_keys = match resealed {
         Ok(v) => v,
         Err(e) => {
@@ -1416,7 +1421,7 @@ async fn run_container_track(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, U256};
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::events::WsEvent;
     use attestor_shared::mocks::{
         ConfigurableChain, ConfigurableSandbox, ConfigurableStorage, InMemoryDeploymentRepo,
@@ -1485,9 +1490,7 @@ mod tests {
     }
 
     fn make_test_ctx() -> TestCtx {
-        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0u8; 32],
-        ))));
+        let crypto = Arc::new(RealCrypto::new_for_test([0u8; 32]));
         let chain = Arc::new(ConfigurableChain::new());
         let storage = Arc::new(ConfigurableStorage::new("indexer.example"));
         let sandbox = Arc::new(ConfigurableSandbox::new());
@@ -1763,8 +1766,8 @@ mod tests {
         let new_seal = B256::repeat_byte(0x22);
         let target = Address::from([0xbb; 20]);
 
-        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).unwrap();
-        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         // Source's AUTHORITATIVE on-chain iData: a known dataKey sealed to the
         // SOURCE agentSeal. Clone reads this from the chain (not the DB).
         let known_key = vec![0x9u8; 32];
@@ -1821,7 +1824,7 @@ mod tests {
         let source_seal = B256::repeat_byte(0x11);
         let new_seal = B256::repeat_byte(0x22);
         let target = Address::from([0xbb; 20]);
-        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         // Corrupt on-chain sealed_key → ecies_decrypt fails → pre-mint failure.
         t.chain.seed_idata(
             vec![IntelligentData {

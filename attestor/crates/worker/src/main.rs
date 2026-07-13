@@ -5,7 +5,7 @@ mod jobs;
 
 use attestor_shared::{
     chain::connect_http as chain_connect_http,
-    crypto::{InMemoryMasterKey, RealCrypto},
+    crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
     kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
@@ -36,12 +36,18 @@ async fn main() -> anyhow::Result<()> {
     let tee = build_tee_provider(&cfg).await?;
     let app_priv = tee.app_private_key().await?;
 
-    // Resolve master key from KMS (same source as api).
+    // Resolve app-scoped key from KMS (same source as api).
     let kms = build_kms_client(&cfg).await?;
-    let master_key = kms.master_key().await?;
-    let job_key = derive_subkey(&master_key, JOB_ENCRYPTION_KEY_INFO);
+    attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
+    let app_key = kms.app_key().await?;
+    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
-    let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
+    let crypto = Arc::new(RealCrypto::new(
+        app_key,
+        kms.clone(),
+        cfg.chain_id,
+        cfg.agentic_id_addr,
+    ));
     // Worker doesn't call is_sandbox_node today, but threading the same
     // wiring keeps both binaries' ChainClient identically configured —
     // avoids surprises if a future worker job needs the TappRegistry view.
