@@ -2942,11 +2942,37 @@ window.submitDeploy = async function () {
       sandbox_envelope: sandboxEnvelope,
     };
 
-    const resp = await fetch('/deploy', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(deployBody),
-    });
+    // Immediate feedback: the POST can take a while (the attestor derives the
+    // agentSeal via a KMS round-trip before it responds), so show a pending
+    // state right away instead of a dead, disabled button.
+    const deployBtnEl = $('#deployBtn');
+    const deployBtnLabel = deployBtnEl ? deployBtnEl.textContent : null;
+    if (deployBtnEl) deployBtnEl.textContent = 'Submitting…';
+    toast('Submitting deploy — waiting for the attestor…');
+
+    // Bound the wait: without a timeout a hung attestor (e.g. blocked on a
+    // slow KMS derive) leaves the browser spinning forever with no signal.
+    // Abort after 90s and tell the user plainly, then let them retry.
+    const ac = new AbortController();
+    const deployTimer = setTimeout(() => ac.abort(), 90000);
+    let resp;
+    try {
+      resp = await fetch('/deploy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(deployBody),
+        signal: ac.signal,
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') {
+        throw new Error('Deploy timed out after 90s — the attestor did not respond '
+          + '(it may be waiting on the KMS key derivation). Nothing was minted; try again.');
+      }
+      throw new Error(`/deploy request failed: ${e && e.message ? e.message : e}`);
+    } finally {
+      clearTimeout(deployTimer);
+      if (deployBtnEl && deployBtnLabel !== null) deployBtnEl.textContent = deployBtnLabel;
+    }
     if (!resp.ok) {
       throw new Error(`/deploy ${resp.status}: ${await resp.text()}`);
     }
