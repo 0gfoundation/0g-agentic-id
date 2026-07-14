@@ -58,7 +58,7 @@ pub fn verify_clone_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{InMemoryMasterKey, RealCrypto};
+    use crate::crypto::RealCrypto;
     use crate::sandbox::eip191_digest;
     use alloy::primitives::{Bytes, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
@@ -67,9 +67,7 @@ mod tests {
     use std::sync::Arc;
 
     fn crypto() -> Arc<dyn CryptoModule> {
-        Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0x42u8; 32],
-        ))))
+        Arc::new(RealCrypto::new_for_test([0x42u8; 32]))
     }
 
     fn build(

@@ -76,7 +76,7 @@ pub async fn handle(
 
     // generate sealId + agentSeal
     let seal_id = state.crypto.generate_seal_id();
-    let seal_kp = state.crypto.derive_agent_seal(seal_id)?;
+    let seal_kp = state.crypto.derive_agent_seal(seal_id).await?;
     tracing::info!(?seal_id, agent_seal = %seal_kp.address, "generated seal");
 
     // reserve idempotency key

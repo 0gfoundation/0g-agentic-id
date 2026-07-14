@@ -66,16 +66,14 @@ pub fn verify_status_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{InMemoryMasterKey, RealCrypto};
+    use crate::crypto::RealCrypto;
     use alloy::primitives::{Bytes, B256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
     use std::sync::Arc;
 
     fn crypto() -> Arc<dyn CryptoModule> {
-        Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0x42u8; 32],
-        ))))
+        Arc::new(RealCrypto::new_for_test([0x42u8; 32]))
     }
 
     fn build(

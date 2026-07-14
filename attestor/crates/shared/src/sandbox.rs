@@ -588,7 +588,7 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{InMemoryMasterKey, RealCrypto};
+    use crate::crypto::RealCrypto;
     use alloy::primitives::{Address, Bytes};
     use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
@@ -659,7 +659,7 @@ mod tests {
     }
 
     fn crypto_for_tests() -> RealCrypto {
-        RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32])))
+        RealCrypto::new_for_test([0u8; 32])
     }
 
     #[test]

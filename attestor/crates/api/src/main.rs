@@ -6,7 +6,7 @@ mod state;
 
 use attestor_shared::{
     chain::connect_http as chain_connect_http,
-    crypto::{InMemoryMasterKey, RealCrypto},
+    crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
     kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
@@ -38,10 +38,16 @@ async fn main() -> anyhow::Result<()> {
     // to the same key — MOCK_KMS=true returns a hardcoded dev key, false
     // goes over local gRPC to tapp-server's GetSecretResource.
     let kms = build_kms_client(&cfg).await?;
-    let master_key = kms.master_key().await?;
-    let job_key = derive_subkey(&master_key, JOB_ENCRYPTION_KEY_INFO);
+    attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
+    let app_key = kms.app_key().await?;
+    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
-    let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
+    let crypto = Arc::new(RealCrypto::new(
+        app_key,
+        kms.clone(),
+        cfg.chain_id,
+        cfg.agentic_id_addr,
+    ));
     let chain: Arc<dyn ChainClient> = chain_connect_http(
         &cfg.chain_rpc,
         cfg.agentic_id_addr,
