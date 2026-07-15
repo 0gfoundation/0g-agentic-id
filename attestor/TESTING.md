@@ -71,6 +71,14 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API node scripts/smoke.cjs
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
   SEAL_ID=0x… AGENT_ID=<id> node scripts/agent-e2e.cjs
 
+# lifecycle: clone (sibling for a 2nd wallet, same iData / fresh keys),
+# client-less feedback carrying the live ServeProof, ERC-721 transfer +
+# indexer owner sync, and the post-transfer owner gate (old owner
+# rejected, new owner can recreate). Needs REPUTATION_ADDR = the
+# client-less registry bound to this AgenticID.
+OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
+  SEAL_ID=0x… AGENT_ID=<id> REPUTATION_ADDR=0x… node scripts/lifecycle-e2e.cjs
+
 # auto-update (evolution): tops up the agentSeal and asserts sealed
 # commits the framework version pin on chain (deterministic, no LLM).
 # The hash flip proves the WRITE path (only agentSeal can author an
