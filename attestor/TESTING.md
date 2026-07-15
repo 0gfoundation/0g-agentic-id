@@ -16,6 +16,10 @@ It deploys a fresh source, then runs verify-agent → agent-e2e →
 evolution-probe → lifecycle-e2e → transfer-live against it. The
 individual scripts below are the building blocks it calls.
 
+Last verified on the -dev testnet: **3 consecutive full rounds green**
+(~13 min each), absorbing live 0G-Storage / KMS / indexer jitter without
+a false failure.
+
 | Tier | Cost | What it proves |
 |---|---|---|
 | T0 unit/integration | free, seconds | logic + wiring, mocks only |
