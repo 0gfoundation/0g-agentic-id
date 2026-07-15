@@ -41,7 +41,9 @@ The KMS mock derives per-material locally, so the per-seal derivation path
   `app not found on-chain` means it isn't).
 - a funded owner key: native OG for gas, SandboxServing balance ≥ 0.1 OG
   deposited toward the provider, trust-roots acked (the deploy console
-  handles both gates interactively).
+  handles both gates interactively; via the SDK pass componentAppIds
+  from GET /config — the built-in defaults are the non-dev app names and
+  acknowledgeApps reverts "app not found" otherwise).
 
 **Steps** (from the attestor host or anywhere with curl/jq/cast):
 
@@ -78,6 +80,17 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
 # client-less registry bound to this AgenticID.
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
   SEAL_ID=0x… AGENT_ID=<id> REPUTATION_ADDR=0x… node scripts/lifecycle-e2e.cjs
+
+# clone LIVE: clone to self, bring the clone ONLINE, and prove it
+# decrypts its re-sealed iData (dataKey re-sealed to the clone's fresh
+# agentSeal) and serves — the crypto lifecycle-e2e checks only on-chain.
+#   ai.agent.clone({sourceAgentId, targetOwner: self}) → reset(cloneSeal,
+#   {apiKey}) → verify-agent.sh AGENT_ID=<clone> (decrypt: 0 FAIL)
+
+# transfer LIVE: self-contained — generates a second wallet, funds it,
+# acks + deposits AS that wallet, deploys a source, transfers it, and the
+# NEW owner recreates it and it's reachable with the same identity.
+OWNER_PRIV=0x<funded> ATTESTOR_URL=$API node scripts/transfer-live.cjs
 
 # auto-update (evolution): tops up the agentSeal and asserts sealed
 # commits the framework version pin on chain (deterministic, no LLM).
