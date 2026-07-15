@@ -34,7 +34,19 @@ async function patient(fn, hash, label) {
   for (let i = 0; i < 5; i++) { try { return await fn(hash); } catch { console.log(`  (receipt ${label} retry ${i + 1}/5)`); await sleep(10000); } }
   throw new Error(`receipt never appeared: ${label} ${hash}`);
 }
-const hdr = (base) => (execSync(`curl -sm20 -D - -o /dev/null '${base}/hello'`, { encoding: 'utf8' }).match(/^x-agent-proof:\s*(.+)$/mi) || [])[1]?.trim() || null;
+async function hdr(base) {
+  // A just-flipped-to-running container needs a moment for the proxy to
+  // route + serve-proof to arm; nip.io also flakes. Retry a few times.
+  for (let i = 0; i < 8; i++) {
+    try {
+      const raw = execSync(`curl -sm20 -D - -o /dev/null '${base}/hello'`, { encoding: 'utf8' });
+      const h = (raw.match(/^x-agent-proof:\s*(.+)$/mi) || [])[1]?.trim();
+      if (h) return h;
+    } catch { /* transport hiccup — retry */ }
+    await sleep(8000);
+  }
+  return null;
+}
 
 function mk(priv, cfg) {
   const Z = '0x0000000000000000000000000000000000000000';
@@ -96,6 +108,18 @@ function mk(priv, cfg) {
   await patient((h) => A.agent.waitForTransaction(h), tTx, 'transfer');
   check('ownerOf == B after transfer', (await B.agent.ownerOf(agentId)).toLowerCase() === acctB.address.toLowerCase());
 
+  // Wait for the transfer's Layer-2 SandboxTeardown to reap the prior
+  // owner's container FIRST. Recreating before it lands races the teardown,
+  // which resolves its target sandbox_id at exec time and would delete the
+  // new container instead (issue #37). Real UIs are past this window by the
+  // time a human clicks "bring online"; a script must wait explicitly.
+  console.log('· waiting for the transfer teardown to reap the old container…');
+  for (let i = 0; i < 24; i++) {
+    const r = await rowOf(agentId);
+    if (r && (!r.sandbox_id || r.phase === 'offline')) break;
+    await sleep(5000);
+  }
+
   // ── B brings the transferred agent back up ────────────────────────────
   console.log('· B recreates the transferred agent…');
   await B.agent.reset(sealId, { apiKey: API_KEY });
@@ -114,11 +138,15 @@ function mk(priv, cfg) {
 
   // ── reachable + identity preserved under B ────────────────────────────
   const base = `http://${cfg.agent_serve_port}-${row.sandbox_id}.${proxy}`;
-  const proofHeader = hdr(base);
-  check('/hello reachable + X-Agent-Proof under new owner', !!proofHeader);
-  const proof = B.reputation.parseServeProofHeader(proofHeader);
-  check('same agentSeal identity after transfer+recreate', proof.agentId === agentId,
-    `proof.agentId=${proof.agentId}, sealAddr=${sealAddr}`);
+  const proofHeader = await hdr(base);
+  check('/hello reachable + X-Agent-Proof under new owner', !!proofHeader, base);
+  if (proofHeader) {
+    const proof = B.reputation.parseServeProofHeader(proofHeader);
+    check('same agentSeal identity after transfer+recreate', proof.agentId === agentId,
+      `proof.agentId=${proof.agentId}, sealAddr=${sealAddr}`);
+  } else {
+    check('same agentSeal identity after transfer+recreate', false, 'no proof header to parse');
+  }
 
   console.log(fails === 0 ? '\n✅ transfer-live: all checks passed'
                           : `\n❌ transfer-live: ${fails} checks failed`);
