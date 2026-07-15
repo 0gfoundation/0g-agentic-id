@@ -72,7 +72,12 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
   SEAL_ID=0x… AGENT_ID=<id> node scripts/agent-e2e.cjs
 
 # auto-update (evolution): tops up the agentSeal and asserts sealed
-# commits the framework version pin on chain (deterministic, no LLM)
+# commits the framework version pin on chain (deterministic, no LLM).
+# The hash flip proves the WRITE path (only agentSeal can author an
+# Update, and the probe's sole input is gas); close the loop by
+# resetting AFTER the probe — the new container restores from the
+# evolved chain state, and its bootstrap log decrypting every entry
+# proves the committed blob is valid and restorable (READ path).
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
   node scripts/evolution-probe.cjs
 ```
