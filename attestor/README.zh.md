@@ -193,3 +193,7 @@ cargo test --test '*'               # 仅集成测试
 ```
 
 集成测试用 InMemory 实现（`mocks.rs`）绕过 Postgres / chain / sandbox 依赖，单测从 6s 起。
+
+完整回归流程（本地全 mock、testnet 实测、故障速查表）见
+[TESTING.md](TESTING.md)——`scripts/e2e.sh` 负责部署，
+`scripts/verify-agent.sh` 负责验证。

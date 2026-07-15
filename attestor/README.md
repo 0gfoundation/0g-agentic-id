@@ -204,3 +204,7 @@ cargo test --test '*'               # integration tests only
 Integration tests use InMemory implementations (`mocks.rs`) to
 bypass Postgres, chain, and sandbox dependencies. A single test
 starts in ~6s.
+
+For the full regression procedure (local stack, live testnet, and the
+failure-triage table), see [TESTING.md](TESTING.md) —
+`scripts/e2e.sh` deploys, `scripts/verify-agent.sh` verifies.
