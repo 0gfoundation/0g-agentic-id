@@ -215,11 +215,23 @@ export class AttestorClient {
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
     if (op === 'reset') {
+      // Default the snapshot from the attestor's /config — an empty snapshot
+      // makes the sandbox provider 400 the recreate ("sealed containers
+      // require an image or snapshot"), and operators bump the current name
+      // via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source of truth
+      // (same as the deploy console).
+      let snapshot = params.snapshot;
+      if (!snapshot) {
+        const cfg: any = await fetch(`${this.baseUrl()}/config`)
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null);
+        snapshot = (cfg && cfg.sandbox_snapshot) || '';
+      }
       envelope = await this.signEnvelope(
         'create',
         '',
         {
-          snapshot: params.snapshot ?? '',
+          snapshot,
           sealed: true,
           ...(params.apiKey ? { env: { API_KEY: params.apiKey } } : {}),
         },

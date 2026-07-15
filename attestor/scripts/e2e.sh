@@ -37,8 +37,17 @@ EXPIRES_AT=$(($(date +%s) + 180))
 # The payload is whatever the user wants sandbox to receive as the HTTP body.
 # Attestor doesn't inspect it — only relays. For the smoke test a minimal
 # object is fine; in real flows this would carry snapshot ref / env vars.
+# Snapshot comes from the attestor's /config (operators bump
+# ATTESTOR_SANDBOX_SNAPSHOT); hardcoding it here rots — a stale name makes
+# sandbox create 400 ("snapshot not found") while storage/mint succeed,
+# minting an offline agent. Fall back to the legacy default only if /config
+# is unreadable (older attestor).
+SNAPSHOT=$(curl -fsS -m 10 "$API/config" | jq -r '.sandbox_snapshot // empty' || true)
+SNAPSHOT="${SNAPSHOT:-0g-test-sealed}"
+echo "snapshot    = $SNAPSHOT (from $API/config)"
+
 PAYLOAD=$(jq -cn \
-  --arg snapshot "0g-test-sealed" \
+  --arg snapshot "$SNAPSHOT" \
   '{snapshot:$snapshot, sealed:true, env:{API_KEY:"sk-test-abc123xyz"}}')
 
 # Canonical JSON with strict field order. `-c` is mandatory: any whitespace
@@ -142,7 +151,10 @@ banner "2. Poll /deployment/:id until phase ∈ {running, failed}"
 # We wait for the full handshake: container completed bootstrap and posted
 # back, attestor flipped phase to running. Up to ~2 minutes — storage
 # upload + container bootstrap together can take this long.
-for i in $(seq 1 120); do
+# First boot pulls image layers + npm-installs the framework — regularly
+# >2 min on a cold provider. 300s keeps the deploy-side poll from declaring
+# failure on a container that is merely still booting.
+for i in $(seq 1 300); do
   state=$(curl -fsS "$API/deployment/$SEAL_ID")
   phase=$(echo "$state" | jq -r .phase)
   storage=$(echo "$state" | jq -r .storage_stage.state)

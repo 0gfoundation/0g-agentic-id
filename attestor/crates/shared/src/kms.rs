@@ -163,44 +163,62 @@ impl TappKmsClient {
         let mut last_err = anyhow::anyhow!("GetSecretResource never attempted");
         let material_hex = hex::encode(material);
 
-        for attempt in 1u32..=10 {
-            match client
-                .get_secret_resource(GetSecretResourceRequest {
-                    app_id: self.app_id.clone(),
-                    material: material_hex.clone(),
-                })
-                .await
-            {
-                Ok(r) => {
+        for attempt in 1u32..=Self::MAX_ATTEMPTS {
+            // Bound each call. tonic has no default deadline, so without this
+            // a tapp/KMS that accepts the request but never responds hangs the
+            // caller FOREVER — and in a request handler, axum then cancels the
+            // whole future on client disconnect, leaving no trace (observed:
+            // a minutes-long KMS derive made /deploy silently drop the seal).
+            // A timeout turns "hang" into a retryable error, and after the
+            // last attempt into a clean surfaced failure.
+            let call = client.get_secret_resource(GetSecretResourceRequest {
+                app_id: self.app_id.clone(),
+                material: material_hex.clone(),
+            });
+            let outcome = tokio::time::timeout(Self::CALL_TIMEOUT, call).await;
+
+            let err = match outcome {
+                Ok(Ok(r)) => {
                     let resp = r.into_inner();
                     if !resp.success {
                         anyhow::bail!("GetSecretResource failed: {}", resp.message);
                     }
                     if resp.secret.len() != 32 {
-                        anyhow::bail!(
-                            "GetSecretResource bad secret length: {}",
-                            resp.secret.len()
-                        );
+                        anyhow::bail!("GetSecretResource bad secret length: {}", resp.secret.len());
                     }
                     let mut out = [0u8; 32];
                     out.copy_from_slice(&resp.secret);
                     return Ok(out);
                 }
-                Err(e) => {
-                    let delay = std::time::Duration::from_secs(attempt as u64);
-                    tracing::warn!(
-                        attempt,
-                        error = %e,
-                        "GetSecretResource failed, retrying in {}s",
-                        delay.as_secs()
-                    );
-                    last_err = anyhow::anyhow!("GetSecretResource RPC failed: {}", e);
-                    tokio::time::sleep(delay).await;
-                }
+                Ok(Err(e)) => anyhow::anyhow!("GetSecretResource RPC failed: {}", e),
+                Err(_) => anyhow::anyhow!(
+                    "GetSecretResource timed out after {}s (tapp/KMS unresponsive — \
+                     if the KMS DPRF derive is legitimately this slow, that is the \
+                     bug to fix, not this timeout)",
+                    Self::CALL_TIMEOUT.as_secs()
+                ),
+            };
+
+            let delay = std::time::Duration::from_secs(attempt as u64);
+            tracing::warn!(attempt, error = %err, "GetSecretResource failed, retrying in {}s", delay.as_secs());
+            last_err = err;
+            if attempt < Self::MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
             }
         }
         Err(last_err)
     }
+}
+
+impl TappKmsClient {
+    /// Per-call ceiling on the tapp/KMS round-trip. Generous enough for a
+    /// healthy DPRF derive, low enough that a request handler fails in
+    /// bounded time instead of hanging.
+    const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+    /// Retry budget. Worst case ≈ MAX_ATTEMPTS × CALL_TIMEOUT + backoff before
+    /// a surfaced failure — kept small so /deploy and /provision fail loud
+    /// rather than tying up a request for minutes.
+    const MAX_ATTEMPTS: u32 = 3;
 }
 
 #[async_trait]
