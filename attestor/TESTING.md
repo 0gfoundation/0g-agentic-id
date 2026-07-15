@@ -3,6 +3,19 @@
 Three tiers, cheapest first. Run the tier that matches what you changed;
 run all three before anything ships to a shared environment.
 
+**One command** (drives every live leg, prints a pass/fail table — no id
+juggling):
+
+```bash
+OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 \
+  REPUTATION_ADDR=0x<client-less registry> \
+  [RUN_UNIT=1] [SKIP_TRANSFER=1] bash attestor/scripts/regression.sh
+```
+
+It deploys a fresh source, then runs verify-agent → agent-e2e →
+evolution-probe → lifecycle-e2e → transfer-live against it. The
+individual scripts below are the building blocks it calls.
+
 | Tier | Cost | What it proves |
 |---|---|---|
 | T0 unit/integration | free, seconds | logic + wiring, mocks only |

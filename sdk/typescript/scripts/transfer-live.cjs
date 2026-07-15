@@ -102,7 +102,15 @@ function mk(priv, cfg) {
   let row;
   for (let i = 0; i < 40; i++) { row = await rowOf(agentId); if (row && row.phase === 'running') break; await sleep(10000); }
   check('agent running again under new owner B', row && row.phase === 'running', `phase=${row && row.phase}`);
-  check('deployment row owner == B', row && row.owner.toLowerCase() === acctB.address.toLowerCase());
+  // The row's owner is set by the indexer from the Transfer event, which
+  // lags the recreate — poll rather than read once.
+  let rowOwner = row && row.owner.toLowerCase();
+  for (let i = 0; i < 24 && rowOwner !== acctB.address.toLowerCase(); i++) {
+    await sleep(5000);
+    const r = await rowOf(agentId);
+    rowOwner = r && r.owner.toLowerCase();
+  }
+  check('deployment row owner == B (indexer synced)', rowOwner === acctB.address.toLowerCase(), `row.owner=${rowOwner}`);
 
   // ── reachable + identity preserved under B ────────────────────────────
   const base = `http://${cfg.agent_serve_port}-${row.sandbox_id}.${proxy}`;
