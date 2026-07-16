@@ -66,6 +66,7 @@ function mkClient(privKey, cfg) {
   return new AgenticID({
     attestorUrl: ATTESTOR_URL,
     account: privKey,
+    componentAppIds: [cfg.attestor_app_id, cfg.kms_app_id, cfg.sandbox_app_id].filter(Boolean),
     addresses: {
       agenticID: cfg.agentic_id_addr,
       teeDataVerifier: Z,
@@ -87,10 +88,12 @@ function mkClient(privKey, cfg) {
   console.log(`· wallet B = ${acctB.address} (ephemeral, funded from owner)`);
   {
     const wc = createWalletClient({ account: privateKeyToAccount(OWNER_PRIV), transport: http(cfg.chain_rpc) });
-    const tx = await wc.sendTransaction({ to: acctB.address, value: parseEther('0.05'), chain: null });
+    const tx = await wc.sendTransaction({ to: acctB.address, value: parseEther('0.3'), chain: null });
     await patientWait((h) => A.agent.waitForTransaction(h), tx, 'fund wallet B');
   }
   const B = mkClient(privB, cfg);
+  const rowOf = async (id) => (await (await fetch(ATTESTOR_URL + '/deployments')).json())
+    .find((r) => r.agent_id && BigInt(r.agent_id) === id);
 
   // ── 1. clone: A clones AGENT_ID to B ──────────────────────────────────
   if (process.env.SKIP_CLONE === '1') {
@@ -178,13 +181,25 @@ function mkClient(privKey, cfg) {
   // sandbox_id is cleared. The right gate probe is therefore reset()
   // (recreate — needs no existing sandbox_id): the OLD owner must be
   // rejected and the NEW owner must be able to bring the agent back up.
-  console.log('· owner gate — old owner rejected, new owner can recreate…');
+  console.log('· owner gate — old owner rejected; new owner brings it back to RUNNING…');
   let oldOwnerRejected = false;
   try { await A.agent.reset(SEAL_ID); } catch (e) { oldOwnerRejected = true; }
   check('old owner reset() rejected after transfer', oldOwnerRejected);
-  let newOwnerAccepted = true;
-  try { await B.agent.reset(SEAL_ID); } catch (e) { newOwnerAccepted = false; console.error('  reset as B:', e.message); }
-  check('new owner reset() accepted', newOwnerAccepted);
+
+  // "Accepted" is not enough — the standard for a usable agent is that it
+  // actually comes back RUNNING. B must therefore ack + deposit (billing
+  // gate), recreate, and reach running; otherwise the recreate 402s in the
+  // worker ("TEE signer not acknowledged") and the row silently stays
+  // offline. Wait for the transfer teardown to settle first (issue #37).
+  const ackTx = await B.ack();
+  if (ackTx) await patientWait((h) => B.agent.waitForTransaction(h), ackTx, 'B ack');
+  const depTx = await B.deposit({ provider: cfg.sandbox_provider_addr, amountWei: parseEther('0.15') });
+  await patientWait((h) => B.agent.waitForTransaction(h), depTx, 'B deposit');
+  for (let i = 0; i < 24; i++) { const r = await rowOf(AGENT_ID); if (r && (!r.sandbox_id || r.phase === 'offline')) break; await sleep(5000); }
+  await B.agent.reset(SEAL_ID, { apiKey: process.env.API_KEY || 'sk-lifecycle-e2e' });
+  let brow;
+  for (let i = 0; i < 40; i++) { brow = await rowOf(AGENT_ID); if (brow && brow.phase === 'running') break; await sleep(10000); }
+  check('new owner brought the agent back to RUNNING', brow && brow.phase === 'running', `phase=${brow && brow.phase}`);
 
   console.log(failures === 0 ? '\n✅ lifecycle-e2e: all checks passed'
                              : `\n❌ lifecycle-e2e: ${failures} checks failed`);
