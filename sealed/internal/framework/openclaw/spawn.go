@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
 )
@@ -57,6 +58,18 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 	authToken := cachedToken
 
+	// Resolve the 0g-compute route ONCE per boot. The config dialect
+	// (augmentation) and the exported key env name below must come from
+	// the same answer — two independent ResolveZG calls could disagree
+	// across a catalog flap (config says anthropic-messages, env exports
+	// OPENAI_API_KEY → openclaw keyless at inference) and each miss is a
+	// separate catalog fetch with an 8s timeout.
+	var zgRoute *inference.Route
+	if provider == "0g-compute" {
+		r := inference.ResolveZG(ctx, model)
+		zgRoute = &r
+	}
+
 	if !initialized {
 		newToken, err := randomTokenHex(32)
 		if err != nil {
@@ -72,7 +85,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		// as a provider name; sealed rewrites that to "openai" with the
 		// 0G router endpoint + compat flags so openclaw can dial it.
 		// No-op for any other provider name.
-		if err := applyZGComputeAugmentation(provider, model); err != nil {
+		if err := applyZGComputeAugmentation(provider, model, zgRoute); err != nil {
 			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
@@ -94,7 +107,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 	// Always export the inference provider API key into bootstrap's env so
 	// spawnGateway's whitelist can pass it to the new openclaw subprocess.
-	if err := exportAPIKey(provider, rt.APIKey); err != nil {
+	// The env NAME follows the wire format, not the provider label: on
+	// 0g-compute a claude-* model rides the Anthropic-format endpoint and
+	// openclaw's anthropic client reads ANTHROPIC_API_KEY.
+	apiKeyEnv := apiKeyEnvName(provider, zgRoute)
+	if err := exportAPIKey(apiKeyEnv, rt.APIKey); err != nil {
 		return framework.StartResult{}, err
 	}
 
@@ -119,10 +136,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		ZGComputeRouted:  isZGComputeRouted(provider),
 		BootTime:         time.Now(),
 	}
-	rs.Whitelist = make([]platform.WhitelistEntry, len(supportedOpenclawVersions))
-	for i, v := range supportedOpenclawVersions {
-		rs.Whitelist[i] = platform.WhitelistEntry{Version: v}
-	}
 	rs.WhitelistMax = whitelistMax()
 
 	pc := platform.Build(rs)
@@ -144,7 +157,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			rt.AgentSeal, rt.PublicURL, rt.SealSignSock)
 	}
 
-	cmd, err := spawnGateway(provider, rt)
+	cmd, err := spawnGateway(apiKeyEnv, rt)
 	if err != nil {
 		return framework.StartResult{}, err
 	}
@@ -192,7 +205,13 @@ func writeRuntimeSections(authToken string) error {
 // `openclaw --version`. CLI output: "OpenClaw 2026.4.26 (be8c246)" -> "2026.4.26".
 // Empty on probe error (binary not installed yet -- happens during pre-Start
 // seed in main.go).
-func probeOpenclawVersion(ctx context.Context) string {
+//
+// Package var, not func: EvolutionFor("framework") layers this live probe
+// over the restored binding, so a real openclaw on the test machine's PATH
+// makes round-trip results environment-dependent unless tests stub it.
+// The conformance suite caught exactly that on a dev machine with a local
+// openclaw install.
+var probeOpenclawVersion = func(ctx context.Context) string {
 	out, err := exec.CommandContext(ctx, "openclaw", "--version").Output()
 	if err != nil {
 		return ""
@@ -204,21 +223,27 @@ func probeOpenclawVersion(ctx context.Context) string {
 	return fields[1]
 }
 
-func exportAPIKey(provider, apiKey string) error {
-	if apiKey == "" {
-		return nil
-	}
-	envName := ""
+// apiKeyEnvName resolves which env var openclaw's client will read the
+// inference key from. Direct providers map by name; 0g-compute maps by
+// the model's wire format, taken from the route Start resolved once for
+// the whole boot (the same one the config augmentation used — the two
+// must agree or openclaw ends up keyless).
+func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
 	switch provider {
 	case "anthropic":
-		envName = "ANTHROPIC_API_KEY"
-	case "openai", "0g-compute":
-		// 0G Compute is OpenAI-protocol-compatible; the endpoint switch
-		// happens in openclaw config (models.providers.openai.baseUrl),
-		// not via env. The same OPENAI_API_KEY carries the credential.
-		envName = "OPENAI_API_KEY"
+		return "ANTHROPIC_API_KEY"
+	case "openai":
+		return "OPENAI_API_KEY"
+	case "0g-compute":
+		if zgRoute != nil {
+			return zgRoute.EnvKey
+		}
 	}
-	if envName == "" {
+	return ""
+}
+
+func exportAPIKey(envName, apiKey string) error {
+	if apiKey == "" || envName == "" {
 		return nil
 	}
 	if err := os.Setenv(envName, apiKey); err != nil {
@@ -243,7 +268,7 @@ func installOpenclaw(packageVersion string) error {
 	return nil
 }
 
-func spawnGateway(provider string, rt framework.RuntimeContext) (*exec.Cmd, error) {
+func spawnGateway(apiKeyEnv string, rt framework.RuntimeContext) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile("/tmp/openclaw.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open openclaw.log: %w", err)
@@ -261,15 +286,8 @@ func spawnGateway(provider string, rt framework.RuntimeContext) (*exec.Cmd, erro
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 	}
-	if rt.APIKey != "" {
-		switch provider {
-		case "anthropic":
-			envWhitelist = append(envWhitelist, "ANTHROPIC_API_KEY="+rt.APIKey)
-		case "openai", "0g-compute":
-			// Same env name for both. Endpoint routing for 0g lives in
-			// openclaw config (models.providers.openai.baseUrl), not env.
-			envWhitelist = append(envWhitelist, "OPENAI_API_KEY="+rt.APIKey)
-		}
+	if rt.APIKey != "" && apiKeyEnv != "" {
+		envWhitelist = append(envWhitelist, apiKeyEnv+"="+rt.APIKey)
 	}
 	if rt.PublicURL != "" {
 		envWhitelist = append(envWhitelist, "AGENT_PUBLIC_URL="+rt.PublicURL)
@@ -319,4 +337,3 @@ func randomTokenHex(nbytes int) (string, error) {
 	}
 	return hex.EncodeToString(buf), nil
 }
-

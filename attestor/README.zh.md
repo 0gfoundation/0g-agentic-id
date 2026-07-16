@@ -6,8 +6,8 @@
 Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 `agent_seal_priv`、把每个 agent 的 iData 加密上传到 0G Storage，并把
 链上索引实时同步给前端。在 trust chain 里它处于**链 ↔ TEE 之间的
-中介**位置，本身也作为一个 Tapp app 注册在 TappRegistry 上（怎么
-拿 `master_secret`、怎么派 `agent_seal_priv` 见
+中介**位置，本身也作为一个 Tapp app 注册在 TappRegistry 上（每把
+`agent_seal_priv` 怎么由 KMS per-seal 派生、为什么没有常驻 master 见
 [`../sealed/TRUST_MODEL.zh.md`](../sealed/TRUST_MODEL.zh.md)）。
 
 三个 binary 共享一份 Postgres、对外暴露 HTTP + WebSocket：
@@ -19,6 +19,17 @@ Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
   deadline + heartbeat staleness）
 - **indexer** — 链上事件监听 + AgentCard 重建；Postgres 落库后通过
   EventBus 推 WS 给前端
+
+目前三个 binary 跑在一个节点上，但设计并不绑定单机：队列用
+`FOR UPDATE SKIP LOCKED` 领活（`shared/src/jobs.rs`），任意多个
+worker 可以共享；job payload 和 provision 绑定 MAC 用的是 KMS
+**app-scoped** key，同一个 Tapp app 的任何节点都解得开；agentSeal
+由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
+本地没有密钥状态。多节点**尚未实际跑过**——还差三件事：每个节点的
+TEE EOA 进 `AgenticID.trustedAttestors`（并养 gas）、Postgres 从
+per-host compose 里抽出来共享、以及 **indexer 保持单实例**（链上
+checkpoint 是单写者，两个 indexer 会重复消费事件）。归属
+node-federation 工作流。
 
 ## Workspace
 
@@ -131,7 +142,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_APP_ID` | attestor 自己在 TappRegistry 注册的 appId |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | 信任的另外两个 Tapp app（trust-roots ack 用）|
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（拿 TEE EOA key + KMS app secret）；docker 里通过 `host.docker.internal` 解到宿主 |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（拿 TEE EOA key + KMS 派生 key：app-scoped 及带 `material` 的 per-seal）；docker 里通过 `host.docker.internal` 解到宿主 |
 | `MOCK_TEE` / `MOCK_KMS` | dev mock 开关 |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | `MOCK_TEE=true` 时必填；私钥需推得出地址（启动校验）|
 | `MOCK_APP_SECRET` | `MOCK_KMS=true` 时必填，32 字节 hex；三个 binary 必须读到**同一个值**否则派生分叉 |
@@ -144,6 +155,8 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SANDBOX_SERVING_ADDR` | SandboxServing 合约地址（前端 deploy gate 查 owner 余额 ≥ 0.1 OG 用）|
 | `ATTESTOR_SANDBOX_ENDPOINT` | 0g-sandbox HTTP endpoint |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | 实例化新 agent 用的 sealed runtime snapshot 名（升 image 时改这里）|
+| `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
+| `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
 | `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
 
@@ -191,3 +204,7 @@ cargo test --test '*'               # 仅集成测试
 ```
 
 集成测试用 InMemory 实现（`mocks.rs`）绕过 Postgres / chain / sandbox 依赖，单测从 6s 起。
+
+完整回归流程（本地全 mock、testnet 实测、故障速查表）见
+[TESTING.md](TESTING.md)——`scripts/e2e.sh` 负责部署，
+`scripts/verify-agent.sh` 负责验证。

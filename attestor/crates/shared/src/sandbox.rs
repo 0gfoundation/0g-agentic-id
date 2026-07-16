@@ -171,6 +171,21 @@ impl AdminSigner {
     }
 }
 
+/// Inject the `publicPorts` allowlist (0g-sandbox#57) into a create body.
+/// No-op when `ports` is empty (field omitted → all-ports-public) or when the
+/// body already set its own `publicPorts` (an explicit deployer choice wins
+/// over the attestor default). Pulled out of `create()` so it's unit-testable
+/// without an HTTP round-trip.
+fn apply_public_ports(obj: &mut serde_json::Map<String, serde_json::Value>, ports: &[u16]) {
+    if ports.is_empty() || obj.contains_key("publicPorts") {
+        return;
+    }
+    obj.insert(
+        "publicPorts".into(),
+        serde_json::Value::Array(ports.iter().map(|p| serde_json::Value::from(*p)).collect()),
+    );
+}
+
 pub struct HttpSandbox {
     base_url: String,
     /// Public URL that containers use to reach this attestor. Injected into
@@ -182,6 +197,13 @@ pub struct HttpSandbox {
     /// trust them as the canonical chain / storage / contract config (a
     /// malicious deployer can't make the container talk to a fake chain).
     extra_env: Vec<(String, String)>,
+    /// Public-port allowlist injected into the create body as `publicPorts`
+    /// (0g-sandbox#57). Empty = field omitted = all-ports-public (today's
+    /// behavior, and the only safe setting against stock Daytona). Injected
+    /// as a DEFAULT only: an explicit `publicPorts` in the owner-signed
+    /// payload wins (unlike `seal_id`/`ATTESTOR_URL`, which always
+    /// override deployer input).
+    public_ports: Vec<u16>,
     /// Attestor's TEE EOA, used to sign envelopes for admin-only sandbox
     /// endpoints (orphan `force-stop`). The address must be in the
     /// sandbox's `ADMIN_ADDRESSES` allowlist. None disables admin calls
@@ -195,12 +217,14 @@ impl HttpSandbox {
         base_url: impl Into<String>,
         attestor_public_url: impl Into<String>,
         extra_env: Vec<(String, String)>,
+        public_ports: Vec<u16>,
         admin_signer: Option<AdminSigner>,
     ) -> Self {
         Self {
             base_url: base_url.into(),
             attestor_public_url: attestor_public_url.into(),
             extra_env,
+            public_ports,
             admin_signer,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -248,6 +272,15 @@ impl SandboxClient for HttpSandbox {
         })?;
 
         obj.insert("seal_id".into(), serde_json::Value::String(seal_hex));
+
+        // Optional public-port allowlist. When configured
+        // (ATTESTOR_SANDBOX_PUBLIC_PORTS), inject it like seal_id so only the
+        // agent-serving port(s) stay publicly reachable — SSH/toolbox/any
+        // stray port falls back to Daytona auth. Skipped when the signed
+        // payload already carries its own `publicPorts` (an explicit deployer
+        // choice wins) or when unconfigured (empty → field omitted →
+        // all-ports-public, safe against providers still on stock Daytona).
+        apply_public_ports(obj, &self.public_ports);
 
         let env_val = obj
             .entry("env".to_string())
@@ -555,7 +588,7 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{InMemoryMasterKey, RealCrypto};
+    use crate::crypto::RealCrypto;
     use alloy::primitives::{Address, Bytes};
     use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
     use std::sync::Arc;
@@ -626,7 +659,34 @@ mod tests {
     }
 
     fn crypto_for_tests() -> RealCrypto {
-        RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes([0u8; 32])))
+        RealCrypto::new_for_test([0u8; 32])
+    }
+
+    #[test]
+    fn apply_public_ports_injects_when_configured() {
+        let mut obj = serde_json::Map::new();
+        obj.insert("snapshot".into(), serde_json::json!("img"));
+        apply_public_ports(&mut obj, &[8080, 3000]);
+        assert_eq!(obj.get("publicPorts"), Some(&serde_json::json!([8080, 3000])));
+    }
+
+    #[test]
+    fn apply_public_ports_noop_when_empty() {
+        // Empty config → field omitted → all-ports-public (today's behavior,
+        // and the only shape a stock-Daytona provider won't 502 on).
+        let mut obj = serde_json::Map::new();
+        apply_public_ports(&mut obj, &[]);
+        assert!(!obj.contains_key("publicPorts"));
+    }
+
+    #[test]
+    fn apply_public_ports_preserves_explicit_payload() {
+        // A deployer who signed their own publicPorts wins over the attestor
+        // default — we never overwrite it.
+        let mut obj = serde_json::Map::new();
+        obj.insert("publicPorts".into(), serde_json::json!([9090]));
+        apply_public_ports(&mut obj, &[8080]);
+        assert_eq!(obj.get("publicPorts"), Some(&serde_json::json!([9090])));
     }
 
     #[test]

@@ -80,23 +80,23 @@ signers must mirror these exactly:
 `client`** (attribution is `msg.sender` at giveFeedback; signed digest =
 `keccak256(abi.encode(agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`).
 Cross-chain / cross-contract replay is prevented at the **key layer**: agentSeal is
-(to be) derived per `(chainId, agenticID, sealId)`, so the same agentId on another
-deployment resolves to a different agentSeal and the recovered signer won't match —
-keeping the off-chain `sealed` signer's envelope free of chainId/contract fields.
-Key-layer scoping is tracked in the KMS threshold issue (#7); until it lands
-ServeProof has no cross-deployment protection.
+derived per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS
+derivation, agentic-id#38), so the same agentId on another deployment resolves to a
+different agentSeal and the recovered signer won't match — keeping the off-chain
+`sealed` signer's envelope free of chainId/contract fields.
 
 Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
 `chainId ‖ erc7857`; the `sealed` runtime is unchanged.
 
-### 2.3 agentSeal derivation (attestor — recommended, off-chain)
+### 2.3 agentSeal derivation (attestor — DONE, off-chain)
 
-Independent of the on-chain change. Today `agent_seal_priv = HKDF(master, seal_id)`
-binds neither chain nor contract → the same key exists across deployments.
-Recommended: `HKDF(master, info = chainId ‖ agenticID_proxy_addr ‖ seal_id)`. The
-attestor knows both before minting; compatible with hardware-swap recovery. Skip
-only if cross-chain unified agent identity is an explicit goal (then §2.2 envelope
-domain separation becomes mandatory rather than defense-in-depth).
+Independent of the on-chain change. **Implemented** (agentic-id#38): each
+`agent_seal_priv` is derived by KMS (threshold DPRF, 0g-kms#1) with material =
+`chainId ‖ agenticID_proxy_addr ‖ seal_id` — chain- and contract-bound, no
+resident master in the attestor, compatible with hardware-swap recovery. The
+trade-off stands: this forgoes cross-chain unified agent identity (if that ever
+becomes a goal, §2.2 envelope domain separation becomes mandatory rather than
+defense-in-depth).
 
 ### 2.4 Transfer / clone — seal-bound vs non-seal
 
@@ -313,4 +313,7 @@ work.**
   sealed-side self-kill heartbeat is redundant defense-in-depth, deferred to a TEE
   full node.
 - **#7** [security/kms] KMS threshold derivation (removes the single-point
-  universal-decryptor) — **not started (roadmap).**
+  universal-decryptor) — **done:** 0g-kms#1 (threshold-BLS DPRF; the master
+  exists only as cluster shares) + agentic-id#38 (attestor derives each
+  agentSeal per seal, material = `chainId ‖ contract ‖ sealId`; no resident
+  master).

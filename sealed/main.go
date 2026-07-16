@@ -86,8 +86,17 @@ type storageDescription struct {
 }
 
 func main() {
-	// Register adapters (side-effect of New()).
-	openclawAdapter := openclaw.New()
+	// Register every bundled adapter (side-effect of New()). Which one this
+	// deployment actually uses is resolved AFTER the chain bootstrap, from
+	// the on-chain framework binding (see resolveAdapter); registration is
+	// cheap and touches no disk.
+	//
+	// Only openclaw ships today. The adapter interface + platform seam are
+	// framework-agnostic (see FRAMEWORK_ADAPTER.md); a claude-code adapter
+	// was prototyped to validate the seam and retired — a per-request CLI
+	// couldn't host owner-built public services, the shape this platform is
+	// for. That port's lessons live on as a case study in the doc.
+	openclaw.New()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()
@@ -101,13 +110,16 @@ func main() {
 
 	// Start the HTTP server now (after we know our public URL but before the
 	// rest of bootstrap so /healthz and /log are reachable while the chain
-	// scan + agent spawn are still in flight).
+	// scan + agent spawn are still in flight). The framework adapter is
+	// late-bound (SetAdapter) once Phase 2 has read the framework binding
+	// from chain; until then adapter-backed endpoints degrade to 503 /
+	// empty, same as the pre-armed agent state.
 	//
 	// :8080  → public mux (proxy + serve-proof)
 	// unix:///run/seal-sign.sock → agent-only sign endpoint. Starts even
 	//   before provision completes; handlers return 503 until agent_seal_priv
 	//   is loaded into state.Agent.
-	sealedProxy := proxy.New(agent, openclawAdapter, cfg.PublicURL, openclaw.ServicesFilePath())
+	sealedProxy := proxy.New(agent, cfg.PublicURL)
 	sealedProxy.Listen()
 	sealedProxy.ListenInternal(sealSignSockPath)
 	if cfg.APIKey != "" {
@@ -126,7 +138,7 @@ func main() {
 		logger.Logf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
 			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
 	} else {
-		runMainPipeline(cfg, agent, openclawAdapter)
+		runMainPipeline(cfg, agent, sealedProxy)
 	}
 
 	logger.Logf("")
@@ -140,7 +152,7 @@ func main() {
 // runMainPipeline encapsulates Phases 1-4. Errors are logged and reported
 // but never crash the process (main keeps the HTTP server up so /log is
 // reachable even when bootstrap can't complete).
-func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, adapter *openclaw.Adapter) {
+func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *proxy.Server) {
 	logger.Logf("--- Provisioning from attestor: %s ---", cfg.AttestorURL)
 	agentSealPriv := provision.FromAttestor(cfg.AttestorURL, cfg.SealKeyBytes, cfg.Attestation)
 	if agentSealPriv == nil {
@@ -160,6 +172,19 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, adapter *opencla
 		return
 	}
 
+	// The on-chain framework binding is the authoritative adapter
+	// selector — the agent's identity, not deploy config, decides which
+	// framework interprets its iData. AGENT_FRAMEWORK survives only as
+	// the fallback for chains without a binding (local dev, pre-binding
+	// deployments).
+	adapter, err := resolveAdapter(res.entries, cfg.Framework)
+	if err != nil {
+		logger.Logf("FAIL framework resolve: %v", err)
+		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "framework resolve: "+err.Error())
+		return
+	}
+	sealedProxy.SetAdapter(adapter)
+
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
 	// onFailed is invoked by the manager exactly once if the supervisor
@@ -177,6 +202,70 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, adapter *opencla
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
 
 	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "running", "")
+}
+
+// ── framework adapter resolution ─────────────────────────────────────────────
+
+// bindingFrameworkName extracts the `name` field from the decrypted
+// on-chain framework binding. Returns "" when the framework role is
+// absent or its plaintext doesn't parse (logged; the env fallback then
+// applies and the selected adapter's own Restore validation still gates
+// the malformed binding).
+func bindingFrameworkName(entries []decryptedEntry) string {
+	e := findEntry(entries, "framework")
+	if e == nil {
+		return ""
+	}
+	var fb struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(e.Plaintext, &fb); err != nil {
+		logger.Logf("warn: framework binding unparseable (%v); falling back to AGENT_FRAMEWORK", err)
+		return ""
+	}
+	return strings.TrimSpace(fb.Name)
+}
+
+// pickFrameworkName applies the selection precedence:
+//
+//	on-chain binding name  >  AGENT_FRAMEWORK env  >  "openclaw"
+//
+// The binding is authoritative because it IS the agent's identity — a
+// deploy-config knob must never reinterpret minted iData under a
+// different framework. The env survives only for chains without a
+// binding (local dev, pre-binding deployments). Returns the chosen name
+// plus a human-readable source for logs.
+func pickFrameworkName(bindingName, envName string) (name, source string) {
+	if bindingName != "" {
+		return bindingName, "on-chain framework binding"
+	}
+	if envName != "" {
+		return envName, "AGENT_FRAMEWORK env (no on-chain binding)"
+	}
+	return "openclaw", "default (no binding, no AGENT_FRAMEWORK)"
+}
+
+// resolveAdapter turns the Phase 2 outputs into a supervisable adapter.
+// Fails loud on an unregistered name — a binding naming a framework this
+// binary doesn't bundle means the deployment is broken, and starting an
+// arbitrary other framework over the agent's iData would forge identity.
+func resolveAdapter(entries []decryptedEntry, envName string) (manager.Adapter, error) {
+	bindingName := bindingFrameworkName(entries)
+	if bindingName != "" && envName != "" && !strings.EqualFold(bindingName, envName) {
+		logger.Logf("warn: AGENT_FRAMEWORK=%q disagrees with on-chain binding %q — binding wins", envName, bindingName)
+	}
+	name, source := pickFrameworkName(bindingName, envName)
+
+	fw, err := framework.Get(name)
+	if err != nil {
+		return nil, fmt.Errorf("framework %q (from %s): %w", name, source, err)
+	}
+	adapter, ok := fw.(manager.Adapter)
+	if !ok {
+		return nil, fmt.Errorf("framework %q does not implement MonitorExit (required for supervision)", name)
+	}
+	logger.Logf("framework adapter: %s (selected from %s)", adapter.Name(), source)
+	return adapter, nil
 }
 
 // chainBootstrapResult bundles the outputs of Phase 2.
@@ -341,7 +430,7 @@ func decryptEntry(ctx context.Context, idx int, d chain.IntelligentData, sealedK
 // retries are exhausted.
 func startAgent(
 	cfg *config.Bootstrap,
-	adapter *openclaw.Adapter,
+	adapter manager.Adapter,
 	agent *state.Agent,
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
@@ -501,16 +590,22 @@ func startAgent(
 		return err
 	}
 
-	// Once openclaw has spawned, give it a few seconds to apply its own
-	// defaults to whatever sections we didn't pre-populate (e.g. memory
+	// Once the agent has spawned, give the framework a moment to apply its
+	// own defaults to whatever sections we didn't pre-populate (e.g. memory
 	// engine, session config, plugins on a fresh install). Then re-seed:
 	// the post-settle disk state is the baseline the watcher compares
-	// against so openclaw's natural defaults aren't reported as drift.
+	// against so the framework's natural defaults aren't reported as drift.
+	// Adapters whose framework rewrites config on first boot declare their
+	// own delay via framework.SettleDelayer.
 	//
 	// During the gap between mgr.Start returning and re-seeding, /hello
 	// continues to serve the pre-seed values. Slightly stale but valid.
-	logger.Logf("--- iData seed phase 2: waiting %s for openclaw to settle ---", openclawSettleDelay)
-	time.Sleep(openclawSettleDelay)
+	settle := defaultSettleDelay
+	if sd, ok := any(adapter).(framework.SettleDelayer); ok {
+		settle = sd.SettleDelay()
+	}
+	logger.Logf("--- iData seed phase 2: waiting %s for %s to settle ---", settle, adapter.Name())
+	time.Sleep(settle)
 	logger.Logf("--- iData seed phase 2: post-settle baseline capture ---")
 	if err := seedCurrentSnapshots(ctx, adapter, agent); err != nil {
 		return fmt.Errorf("re-seed after settle: %w", err)
@@ -598,7 +693,7 @@ func handleDrift(
 	ctx context.Context,
 	plaintexts map[string][]byte,
 	drifted []string,
-	adapter *openclaw.Adapter,
+	adapter manager.Adapter,
 	agent *state.Agent,
 	mgr *manager.Manager,
 	upload *uploader.Uploader,
@@ -616,20 +711,44 @@ func handleDrift(
 		if dim != "framework" {
 			continue
 		}
-		// framework drift = a different openclaw binary version landed on
-		// disk. openclaw can't swap itself out, so sealed npm-installs
-		// whitelistMax + reloads. Then refresh plaintexts["framework"] so
-		// Apply pushes the post-reconcile version.
-		if err := adapter.ReconcileFramework(ctx); err != nil {
+		// framework drift = a different framework binary version landed on
+		// disk. The running process can't swap itself out, so adapters that
+		// support it reconcile back to their allowlisted target version,
+		// then we reload so the new binary actually takes effect. Then
+		// refresh plaintexts["framework"] so Apply pushes the
+		// post-reconcile version.
+		//
+		// Adapters without framework.VersionReconciler can't pull the
+		// version back; the observed drift is committed on chain as-is,
+		// which keeps the audit trail honest even when enforcement isn't
+		// possible.
+		rec, canReconcile := any(adapter).(framework.VersionReconciler)
+		if !canReconcile {
+			logger.Logf("drift: adapter %s has no version reconciler; committing framework drift as-is", adapter.Name())
+			break
+		}
+		if err := rec.ReconcileFramework(ctx); err != nil {
 			logger.Logf("drift: ReconcileFramework: %v", err)
 			return
+		}
+		// Reload only if reconcile actually changed the installed framework.
+		// Framework drift is often chain-side only: version-less bindings
+		// (attestor default) make "chain has no version, disk runs
+		// whitelistMax" the NORMAL first-boot state, and until the first
+		// chain.Update lands, every tick re-detects it. Reloading on a
+		// no-op reconcile restarted the agent process every 30s for as
+		// long as the storage upload kept failing (observed live: an
+		// unfunded agentSeal wallet turned that into a restart loop).
+		newFW, err := adapter.EvolutionFor(ctx, "framework")
+		if err == nil && sha256Hex(newFW) == sha256Hex(plaintexts["framework"]) {
+			logger.Logf("drift: framework reconcile was a no-op (chain-side drift only); skipping reload")
+			break
 		}
 		if err := mgr.Reload(ctx); err != nil {
 			logger.Logf("drift: manager.Reload: %v", err)
 			return
 		}
 		logger.Logf("drift: framework reconciled + reloaded")
-		newFW, err := adapter.EvolutionFor(ctx, "framework")
 		if err == nil {
 			plaintexts["framework"] = newFW
 			agent.UpdateCurrentSnapshot("framework", sha256Hex(newFW))
@@ -680,12 +799,13 @@ func handleDrift(
 	}
 }
 
-// openclawSettleDelay is how long bootstrap waits after mgr.Start succeeds
-// before snapshotting the disk state as the watcher's drift baseline.
-// openclaw may rewrite openclaw.json once on first boot to apply defaults
+// defaultSettleDelay is how long bootstrap waits after mgr.Start succeeds
+// before snapshotting the disk state as the watcher's drift baseline, for
+// adapters that don't declare their own via framework.SettleDelayer.
+// Frameworks may rewrite their config once on first boot to apply defaults
 // to sections we didn't populate; capturing too early treats those
 // auto-applied defaults as false drift on the first watcher tick.
-const openclawSettleDelay = 5 * time.Second
+const defaultSettleDelay = 5 * time.Second
 
 // seedCurrentSnapshots reads disk via adapter.EvolutionFor for each
 // declared role, hashes the output, and pushes it into currentSnapshot.
@@ -695,7 +815,7 @@ const openclawSettleDelay = 5 * time.Second
 //
 // Used by both phase 1 (pre-Start) and phase 2 (post-settle) seeding —
 // they share the same "snapshot disk truth into currentSnapshot" logic.
-func seedCurrentSnapshots(ctx context.Context, adapter *openclaw.Adapter, agent *state.Agent) error {
+func seedCurrentSnapshots(ctx context.Context, adapter framework.Framework, agent *state.Agent) error {
 	for _, r := range adapter.Roles() {
 		bytes, err := adapter.EvolutionFor(ctx, r.Name)
 		if err != nil {
@@ -745,7 +865,7 @@ func findEntry(entries []decryptedEntry, role string) *decryptedEntry {
 // (bootstrap) can report a clean error rather than half-restore the role.
 func restoreManifestEntries(
 	ctx context.Context,
-	adapter *openclaw.Adapter,
+	adapter framework.Framework,
 	role string,
 	manifestPT []byte,
 	dataKey []byte,

@@ -37,9 +37,23 @@ EXPIRES_AT=$(($(date +%s) + 180))
 # The payload is whatever the user wants sandbox to receive as the HTTP body.
 # Attestor doesn't inspect it — only relays. For the smoke test a minimal
 # object is fine; in real flows this would carry snapshot ref / env vars.
+# Snapshot comes from the attestor's /config (operators bump
+# ATTESTOR_SANDBOX_SNAPSHOT); hardcoding it here rots — a stale name makes
+# sandbox create 400 ("snapshot not found") while storage/mint succeed,
+# minting an offline agent. Fall back to the legacy default only if /config
+# is unreadable (older attestor).
+SNAPSHOT=$(curl -fsS -m 10 "$API/config" | jq -r '.sandbox_snapshot // empty' || true)
+SNAPSHOT="${SNAPSHOT:-0g-test-sealed}"
+echo "snapshot    = $SNAPSHOT (from $API/config)"
+
+# Inference key injected into the container. Honors $API_KEY (regression.sh
+# exports it); a dummy default is fine for identity/decrypt/serve-proof
+# checks but real chat needs a real 0g-compute key.
+API_KEY="${API_KEY:-sk-test-abc123xyz}"
 PAYLOAD=$(jq -cn \
-  --arg snapshot "0g-test-sealed" \
-  '{snapshot:$snapshot, sealed:true, env:{API_KEY:"sk-test-abc123xyz"}}')
+  --arg snapshot "$SNAPSHOT" \
+  --arg apikey "$API_KEY" \
+  '{snapshot:$snapshot, sealed:true, env:{API_KEY:$apikey}}')
 
 # Canonical JSON with strict field order. `-c` is mandatory: any whitespace
 # will shift the bytes vs what base64 encodes, and the signature will no
@@ -73,10 +87,20 @@ echo "nonce       = $NONCE"
 # ── 1. POST /deploy ────────────────────────────────────────────────────
 banner "1. POST /deploy"
 # Top-level display fields replace the old opaque `agent_card`. `i_data`
-# may be empty — attestor synthesizes a default OpenClaw config entry
-# when so. Here we pass `[]` to exercise that path.
+# is the complete minted content (WYSIWYS) — built below with the
+# required framework binding.
 AGENT_NAME="E2EAgent"
 AGENT_DESCRIPTION="smoke test"
+
+# WYSIWYS: the attestor synthesizes no iData — the client ships the
+# complete set, and a role="framework" binding is REQUIRED (validated
+# against /config's supported_frameworks before the mint). This is the
+# same two-entry default the SDK's defaultIData() builds.
+IDATA=$(jq -cn --arg name "$AGENT_NAME" --arg desc "$AGENT_DESCRIPTION" '[
+  {role:"framework", plaintext:{name:"openclaw", schema_version:1}, extra:{}},
+  {role:"persona", plaintext:{system_prompt:("You are "+$name+". "+$desc+"\n"),
+    inference:{provider:"anthropic", model:"claude-opus-4-6"}}, extra:{}}
+]')
 
 # Build the canonical owner-signed payload. Field order here doesn't need
 # to match server struct order (serde parses unordered); what MUST match
@@ -91,7 +115,7 @@ OWNER_CANONICAL=$(jq -cn \
   --arg name "$AGENT_NAME" \
   --arg description "$AGENT_DESCRIPTION" \
   --argjson image null \
-  --argjson i_data '[]' \
+  --argjson i_data "$IDATA" \
   '{domain:$domain, idempotency_key:$idempotency_key, owner:$owner, name:$name, description:$description, image:$image, i_data:$i_data}')
 
 OWNER_SIG=$(cast wallet sign --private-key "$OWNER_PRIV" "$OWNER_CANONICAL")
@@ -104,7 +128,7 @@ deploy_payload=$(jq -cn \
   --arg owner_signed_message_b64 "$OWNER_SIGNED_B64" \
   --arg name "$AGENT_NAME" \
   --arg description "$AGENT_DESCRIPTION" \
-  --argjson i_data '[]' \
+  --argjson i_data "$IDATA" \
   --argjson sandbox_envelope "$ENVELOPE" \
   '{
      idempotency_key:           $idempotency_key,
@@ -132,7 +156,10 @@ banner "2. Poll /deployment/:id until phase ∈ {running, failed}"
 # We wait for the full handshake: container completed bootstrap and posted
 # back, attestor flipped phase to running. Up to ~2 minutes — storage
 # upload + container bootstrap together can take this long.
-for i in $(seq 1 120); do
+# First boot pulls image layers + npm-installs the framework — regularly
+# >2 min on a cold provider. 300s keeps the deploy-side poll from declaring
+# failure on a container that is merely still booting.
+for i in $(seq 1 300); do
   state=$(curl -fsS "$API/deployment/$SEAL_ID")
   phase=$(echo "$state" | jq -r .phase)
   storage=$(echo "$state" | jq -r .storage_stage.state)

@@ -20,13 +20,18 @@ func TestStripPlatformInjection_NoMarker(t *testing.T) {
 }
 
 func TestStripPlatformInjection_FullSection(t *testing.T) {
+	// The "\n\n" before the marker is one owner newline + the section's
+	// own separator; strip removes exactly the separator and preserves
+	// the owner's trailing newline byte-exactly. (The historical trim-all
+	// behaviour ate the owner's "\n" and phantom-drifted every injected
+	// file once per agent lifetime.)
 	in := []byte("# TOOLS\n\nOwner content.\n\n" +
 		platformMarkerStart + "\n" +
 		"## Environment\n" +
 		"injected stuff\n" +
 		platformMarkerEnd + "\n")
 	out := stripPlatformInjection(in)
-	want := "# TOOLS\n\nOwner content."
+	want := "# TOOLS\n\nOwner content.\n"
 	if string(out) != want {
 		t.Errorf("strip mismatch\n want: %q\n  got: %q", want, string(out))
 	}
@@ -49,11 +54,16 @@ func TestStripPlatformInjection_SectionWithFollowing(t *testing.T) {
 func TestStripPlatformInjection_MissingEndMarker(t *testing.T) {
 	in := []byte("# TOOLS\n\nOwner content.\n\n" +
 		platformMarkerStart + "\n" +
-		"injected stuff with no end\n")
+		"agent text after an unpaired marker\n")
 	out := stripPlatformInjection(in)
-	want := "# TOOLS\n\nOwner content."
-	if string(out) != want {
-		t.Errorf("truncated strip mismatch\n want: %q\n  got: %q", want, string(out))
+	// A start with no end is owner content, not a section: the agent can
+	// quote the marker (it reads it in its context files every turn), and
+	// the old truncate-to-EOF behaviour silently destroyed everything
+	// below the quote. A genuinely truncated sealed write can't be
+	// observed here — Restore rewrites the file from chain plaintext
+	// before the first upsert of a boot.
+	if string(out) != string(in) {
+		t.Errorf("unpaired start must strip nothing\n want: %q\n  got: %q", string(in), string(out))
 	}
 }
 
@@ -144,17 +154,19 @@ func TestUpsertPlatformSection_EmptyContextStripsSection(t *testing.T) {
 	}
 }
 
-// TestUpsertPlatformSection_IncludesConstraints verifies that the new
-// Constraints section (version whitelist, drift behavior) is injected
-// into TOOLS.md alongside the Capabilities section.
+// TestUpsertPlatformSection_IncludesConstraints verifies that TOOLS.md
+// carries BOTH the platform constraints (drift mechanics) and the
+// adapter-authored framework facts (version whitelist from
+// supportedOpenclawVersions, config allowlist, persistent-state layout)
+// — the authorship split of the platform/adapter refactor.
 func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.6.8"})
 	tmp := t.TempDir() + "/TOOLS.md"
 	rs := platform.RuntimeSnapshot{
-		PublicURL:     "http://x.example.com",
-		AgentSeal:     "0xTest",
-		SealSignSock:  "/run/seal-sign.sock",
-		Whitelist:     []platform.WhitelistEntry{{Version: "2026.5.6"}, {Version: "2026.6.8"}},
-		WhitelistMax:  "2026.6.8",
+		PublicURL:    "http://x.example.com",
+		AgentSeal:    "0xTest",
+		SealSignSock: "/run/seal-sign.sock",
+		WhitelistMax: "2026.6.8",
 	}
 	pc := platform.Build(rs)
 	if err := upsertToolsMD(tmp, pc); err != nil {
@@ -169,6 +181,16 @@ func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 	}
 	if !strings.Contains(body, "2026.6.8") {
 		t.Errorf("missing whitelist max version: %q", body)
+	}
+	// Adapter-authored facts must not have been lost in the move.
+	if !strings.Contains(body, "npm install openclaw@<max>") {
+		t.Errorf("missing openclaw reconcile fact: %q", body)
+	}
+	if !strings.Contains(body, "`~/.openclaw/openclaw.json`") {
+		t.Errorf("missing persistent-state tracked paths: %q", body)
+	}
+	if !strings.Contains(body, "Config allowlist") {
+		t.Errorf("missing config allowlist fact: %q", body)
 	}
 }
 
@@ -234,6 +256,41 @@ func TestAdapter_RestoreFramework_RejectsWrongFrameworkName(t *testing.T) {
 	bad := []byte(`{"name":"langchain","package_version":"x","schema_version":1}`)
 	if err := a.Restore(context.Background(), "framework", bad); err == nil {
 		t.Errorf("expected error on framework name mismatch, got nil")
+	}
+}
+
+// restoredVersion runs a framework Restore with the given pinned version
+// and returns the package_version that landed in cfg — i.e. what Start
+// would npm-install.
+func restoredVersion(t *testing.T, pin string) string {
+	t.Helper()
+	a := &Adapter{}
+	binding := []byte(`{"name":"openclaw","package_version":"` + pin + `","schema_version":1}`)
+	if err := a.Restore(context.Background(), "framework", binding); err != nil {
+		t.Fatalf("Restore(%q): %v", pin, err)
+	}
+	return a.cfg.framework.PackageVersion
+}
+
+// A pin outside the whitelist is coerced to the nearest validated
+// version at install — sealed never npm-installs a release it hasn't
+// been validated against (previously the pin was installed as-is and
+// only pulled back on a later drift).
+func TestAdapter_RestoreFramework_CoercesUnvalidatedPin(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.5.7"})
+	if got := restoredVersion(t, "2026.9.9"); got != "2026.5.7" {
+		t.Errorf("pin above max: got %q, want whitelistMax 2026.5.7", got)
+	}
+	if got := restoredVersion(t, "2025.1.1"); got != "2026.5.6" {
+		t.Errorf("pin below all: got %q, want oldest validated 2026.5.6", got)
+	}
+}
+
+// Whitelisted pins are honored — including ones below whitelistMax.
+func TestAdapter_RestoreFramework_HonorsWhitelistedPin(t *testing.T) {
+	useTestWhitelist(t, []string{"2026.5.6", "2026.5.7"})
+	if got := restoredVersion(t, "2026.5.6"); got != "2026.5.6" {
+		t.Errorf("whitelisted below-max pin: got %q, want 2026.5.6", got)
 	}
 }
 

@@ -40,7 +40,7 @@ func TestUpsertIdentityMD_FreshFileSeedsHeader(t *testing.T) {
 		t.Errorf("seed heading (%d) must come before marker (%d): %q", headingIdx, markerIdx, body)
 	}
 	// Key facts must be present so the LLM gets the runtime identity claim.
-	for _, want := range []string{"agentSeal", "AGENT_SEAL", testAgentSeal, "TOOLS.md", "SOUL.md"} {
+	for _, want := range []string{"agentSeal", "AGENT_SEAL", testAgentSeal, "injected capabilities section", "injected sovereignty section"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("missing token %q in IDENTITY.md body: %q", want, body)
 		}
@@ -129,8 +129,8 @@ func TestPlatformBuildIdentity_ContainsRequiredTokens(t *testing.T) {
 		"TEE",
 		"TDX",
 		"private key",
-		"TOOLS.md",
-		"SOUL.md",
+		"injected capabilities section",
+		"injected sovereignty section",
 		"sealed-injected",
 	} {
 		if !strings.Contains(body, want) {

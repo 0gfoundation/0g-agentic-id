@@ -1,12 +1,12 @@
 //! Attestor indexer. Polls the AgenticID contract for log events and
 //! reflects them into the DB + event bus. Also reconstructs missing
 //! deployment rows when encountering `AgentSealSet` events whose
-//! `agentSeal` matches our `derive(masterKey, sealId)`.
+//! `agentSeal` matches the per-seal KMS derivation (chainId‖contract‖sealId).
 
 mod watcher;
 
 use attestor_shared::{
-    crypto::{InMemoryMasterKey, RealCrypto},
+    crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
     kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
@@ -33,14 +33,20 @@ async fn main() -> anyhow::Result<()> {
     // detect "this AgentSealSet event belongs to us". Indexer never sends
     // chain txs, so it doesn't need the TEE EOA key.
     let kms = build_kms_client(&cfg).await?;
-    let master_key = kms.master_key().await?;
-    let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(master_key))));
+    attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
+    let app_key = kms.app_key().await?;
+    let crypto = Arc::new(RealCrypto::new(
+        app_key,
+        kms.clone(),
+        cfg.chain_id,
+        cfg.agentic_id_addr,
+    ));
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
     // Enqueue SandboxTeardown on transfer (Layer 2). Same job_key derivation
     // as the worker so the encrypted payloads round-trip.
-    let job_key = derive_subkey(&master_key, JOB_ENCRYPTION_KEY_INFO);
+    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
 
     let watcher = watcher::Watcher::new(&cfg, pool, crypto, deployments, events, jobs).await?;

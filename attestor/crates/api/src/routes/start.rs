@@ -78,7 +78,7 @@ pub async fn handle(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, Bytes, B256};
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain,
@@ -119,6 +119,8 @@ mod tests {
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
             sandbox_snapshot: "0g-test-sealed".into(),
+            sandbox_public_ports: vec![],
+            supported_frameworks: vec!["openclaw".into()],
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,
@@ -157,9 +159,7 @@ mod tests {
     }
 
     fn make_setup() -> Setup {
-        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0u8; 32],
-        ))));
+        let crypto = Arc::new(RealCrypto::new_for_test([0u8; 32]));
         let chain = Arc::new(MockChain::new());
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
         let idempotency = Arc::new(InMemoryIdempotencyStore::new());

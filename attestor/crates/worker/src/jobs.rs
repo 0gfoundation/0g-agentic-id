@@ -3,8 +3,6 @@
 use alloy::primitives::{Address, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
-    agent_profile::ProfileRegistry,
-    i_data_derive::normalize_i_data,
     oss::OssClient,
     sandbox::SandboxError,
     AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
@@ -35,9 +33,6 @@ pub struct Ctx {
     /// OSS client for AgentCard uploads. Required — deploy fails if
     /// not configured (no more placeholder URIs).
     pub oss: Arc<OssClient>,
-    /// Framework profile registry — picks defaults per user's
-    /// `framework.name`, falls back to OpenClaw.
-    pub registry: Arc<ProfileRegistry>,
 }
 
 pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
@@ -759,14 +754,9 @@ async fn handle_deploy(
     image: Option<String>,
     sandbox_envelope: SandboxEnvelope,
 ) -> anyhow::Result<()> {
-    // v0: normalize_i_data drops user input and replaces with the
-    // fallback profile's defaults (framework + persona).
-    let i_data_inputs = normalize_i_data(
-        i_data_inputs,
-        &name,
-        &description,
-        ctx.registry.as_ref(),
-    );
+    // WYSIWYS: the owner-signed i_data is encrypted and minted verbatim —
+    // no synthesis, no per-role merging. The deploy edge already enforced
+    // the framework binding.
 
     // Load the deployment to get agent_seal_addr + pubkey.
     let deployment = ctx
@@ -776,7 +766,7 @@ async fn handle_deploy(
         .ok_or_else(|| anyhow::anyhow!("deployment not found for seal_id"))?;
 
     // Re-derive agent seal to get pubkey (priv is discarded right after).
-    let seal_kp = ctx.crypto.derive_agent_seal(seal_id)?;
+    let seal_kp = ctx.crypto.derive_agent_seal(seal_id).await?;
     let agent_seal_pub = seal_kp.pub_key.clone();
 
     // Encrypt each iData; ciphertext is persisted alongside the artifact
@@ -997,21 +987,26 @@ async fn handle_clone(
         );
     }
 
-    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id)?;
+    let new_kp = ctx.crypto.derive_agent_seal(new_seal_id).await?;
 
     // Re-seal every dataKey from the source agentSeal to the clone's new
     // agentSeal (KMS re-derives the source priv to unseal). Storage roots and
     // dataHashes in `idatas` are reused verbatim — same ciphertext on chain,
     // nothing re-uploaded. Pre-mint: on failure mark mint Failed + bail.
-    let resealed: anyhow::Result<Vec<Bytes>> = (|| {
-        let source_kp = ctx.crypto.derive_agent_seal(source_seal_id)?;
-        let mut out = Vec::with_capacity(sealed.len());
-        for sk in &sealed {
-            let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
-            out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
-        }
-        Ok(out)
-    })();
+    // The source-seal KMS derive is async, so it's folded into the same
+    // Result as the (sync) ecies loop — any failure lands in the match below.
+    let resealed: anyhow::Result<Vec<Bytes>> =
+        match ctx.crypto.derive_agent_seal(source_seal_id).await {
+            Ok(source_kp) => (|| {
+                let mut out = Vec::with_capacity(sealed.len());
+                for sk in &sealed {
+                    let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
+                    out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
+                }
+                Ok(out)
+            })(),
+            Err(e) => Err(e),
+        };
     let sealed_keys = match resealed {
         Ok(v) => v,
         Err(e) => {
@@ -1103,16 +1098,10 @@ async fn run_phase2(
     let sandbox_id = d.sandbox_id.clone().unwrap_or_default();
     let agent_seal_addr = d.agent_seal_addr;
 
-    // v0 always uses the registry's fallback profile (OpenClaw) for
-    // capabilities + extra attributes — per-deployment framework picks
-    // are a future concern (will read framework.name from the framework
-    // dim plaintext at that point).
-    let profile = ctx.registry.fallback();
     let agent_card = build_agent_card(AgentCardInputs {
         name,
         description,
         image,
-        profile,
         agent_id,
         agent_seal_addr,
         chain_id: ctx.cfg.chain_id,
@@ -1432,8 +1421,7 @@ async fn run_container_track(
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, U256};
-    use attestor_shared::agent_profile::{openclaw::OpenClawProfile, ProfileRegistry};
-    use attestor_shared::crypto::{InMemoryMasterKey, RealCrypto};
+    use attestor_shared::crypto::RealCrypto;
     use attestor_shared::events::WsEvent;
     use attestor_shared::mocks::{
         ConfigurableChain, ConfigurableSandbox, ConfigurableStorage, InMemoryDeploymentRepo,
@@ -1478,6 +1466,8 @@ mod tests {
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
             sandbox_snapshot: "0g-test-sealed".into(),
+            sandbox_public_ports: vec![],
+            supported_frameworks: vec!["openclaw".into()],
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,
@@ -1500,16 +1490,13 @@ mod tests {
     }
 
     fn make_test_ctx() -> TestCtx {
-        let crypto = Arc::new(RealCrypto::new(Arc::new(InMemoryMasterKey::from_bytes(
-            [0u8; 32],
-        ))));
+        let crypto = Arc::new(RealCrypto::new_for_test([0u8; 32]));
         let chain = Arc::new(ConfigurableChain::new());
         let storage = Arc::new(ConfigurableStorage::new("indexer.example"));
         let sandbox = Arc::new(ConfigurableSandbox::new());
         let deployments = Arc::new(InMemoryDeploymentRepo::new());
         let events = Arc::new(InMemoryEventBus::new());
         let oss = OssClient::for_test();
-        let registry = Arc::new(ProfileRegistry::new(Arc::new(OpenClawProfile)));
 
         let ctx = Ctx {
             cfg: test_config(),
@@ -1520,9 +1507,25 @@ mod tests {
             deployments: deployments.clone(),
             events: events.clone(),
             oss,
-            registry,
         };
         TestCtx { ctx, chain, storage, sandbox, deployments, events }
+    }
+
+    /// WYSIWYS: handle_deploy mints i_data verbatim, so tests feed it the
+    /// same two-entry shape clients build (binding + persona).
+    fn default_test_i_data() -> Vec<IDataInput> {
+        vec![
+            IDataInput {
+                role: "framework".into(),
+                plaintext: serde_json::json!({"name": "openclaw", "schema_version": 1}),
+                extra: Default::default(),
+            },
+            IDataInput {
+                role: "persona".into(),
+                plaintext: serde_json::json!({"system_prompt": "You are Sage. DeFi helper\n"}),
+                extra: Default::default(),
+            },
+        ]
     }
 
     fn dummy_seal() -> SealId {
@@ -1641,7 +1644,7 @@ mod tests {
             &t.ctx,
             seal,
             Address::from([0x66; 20]),
-            Vec::new(),
+            default_test_i_data(),
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
@@ -1694,7 +1697,7 @@ mod tests {
             &t.ctx,
             seal,
             Address::from([0x66; 20]),
-            Vec::new(),
+            default_test_i_data(),
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
@@ -1763,8 +1766,8 @@ mod tests {
         let new_seal = B256::repeat_byte(0x22);
         let target = Address::from([0xbb; 20]);
 
-        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).unwrap();
-        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         // Source's AUTHORITATIVE on-chain iData: a known dataKey sealed to the
         // SOURCE agentSeal. Clone reads this from the chain (not the DB).
         let known_key = vec![0x9u8; 32];
@@ -1821,7 +1824,7 @@ mod tests {
         let source_seal = B256::repeat_byte(0x11);
         let new_seal = B256::repeat_byte(0x22);
         let target = Address::from([0xbb; 20]);
-        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         // Corrupt on-chain sealed_key → ecies_decrypt fails → pre-mint failure.
         t.chain.seed_idata(
             vec![IntelligentData {

@@ -145,14 +145,14 @@ Contract logic expresses only half the protocol. The other half relies on three 
 
 | Role | Secret it holds | Responsibility |
 |---|---|---|
-| **Attestor TEE** | `masterKey` (provided by KMS) | Generates `agentSeal_priv = derive(masterKey, sealId)`; at mint, generates `dataKey` and seals it to `agentSeal_pub`; later provisions `agentSeal_priv` to an RA'd Agent TEE |
+| **Attestor TEE** | KMS-derived keys only (no resident master) | Obtains each `agentSeal_priv` from KMS, derived per seal from `chainId ‖ contract ‖ sealId`; at mint, generates `dataKey` and seals it to `agentSeal_pub`; later provisions `agentSeal_priv` to an RA'd Agent TEE |
 | **Agent TEE** | per-agent `agentSeal_priv` + `dataKey` | Runs the agent business; decrypts model/config with `dataKey`; signs ServeProof; during transfer, verifies AccessProof and hands the ECIES-encrypted `dataKey` to the Oracle TEE |
 | **Oracle TEE** | `teeOracleAddress_priv` (signs OwnershipProof) + `Oracle_ECIES_priv` (ECIES-decrypts to extract `dataKey`) | During transfer: ECIES-decrypts to get `dataKey` → re-seals with `buyer_pubkey` → signs OwnershipProof; immediately discards `dataKey` |
 
 Key security properties:
 - `dataKey` flows only between TEEs and **never appears on chain in plaintext nor in any EOA wallet**.
 - Single-TEE failures have bounded blast radius. If the Agent TEE goes down, the attestor re-provisions; if the Oracle TEE goes down, transfers pause but a restart recovers (no persistent state).
-- A KMS outage is a protocol-level event, mitigated by `masterKey` cluster fault-tolerance: 0g-kms is a multi-node cluster, and k of n healthy is enough.
+- A KMS outage is a protocol-level event, mitigated by cluster fault-tolerance: 0g-kms is a multi-node threshold cluster (the master exists only as shares), and k of n healthy is enough.
 
 ---
 
@@ -161,7 +161,7 @@ Key security properties:
 ### Path A: attestor-mint
 
 **Off-chain steps** (inside Attestor TEE):
-1. Generate `sealId` (random or per-policy), derive `agentSeal_priv = derive(masterKey, sealId)` and `agentSeal_addr`
+1. Generate `sealId` (random or per-policy); KMS derives `agentSeal_priv` from `chainId ‖ contract ‖ sealId`, giving `agentSeal_addr`
 2. For each IntelligentData_i to be put on chain:
    - Generate `dataKey_i`
    - Encrypt the plaintext with `dataKey_i`, upload the ciphertext to off-chain storage

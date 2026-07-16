@@ -8,8 +8,8 @@ Attestor sends mint txs on behalf of owners, provisions
 agent's iData to 0G Storage, and streams the on-chain index to the
 frontend in real time. It sits **at the bridge between chain and
 TEE** in the trust chain, and is itself registered as a Tapp app in
-TappRegistry. How it obtains `master_secret` and derives
-`agent_seal_priv` is covered in
+TappRegistry. How each `agent_seal_priv` is derived per seal by KMS
+(no resident master) is covered in
 [`../sealed/TRUST_MODEL.md`](../sealed/TRUST_MODEL.md).
 
 Three binaries share a single Postgres and expose HTTP + WebSocket:
@@ -24,6 +24,19 @@ Three binaries share a single Postgres and expose HTTP + WebSocket:
 - **indexer**: on-chain event listener and AgentCard rebuilder.
   After persisting to Postgres, it pushes updates to the frontend
   over WS via the EventBus.
+
+Today one node runs all three, but the design is not single-machine
+bound. The queue claims jobs with `FOR UPDATE SKIP LOCKED`
+(`shared/src/jobs.rs`), so any number of workers can share it; job
+payloads and the provision-binding MAC use the KMS **app-scoped** key,
+so every node of the same Tapp app can open them; and each agentSeal
+is derived per seal by KMS on demand, so any node can provision any
+agent with no node-local key state. Multi-node has **not** been run
+yet — what it still needs: each node's TEE EOA in
+`AgenticID.trustedAttestors` (plus gas), a shared Postgres outside the
+per-host compose, and the **indexer kept to a single instance** (its
+chain checkpoint is single-writer; two indexers would double-process
+events). Tracked as the node-federation workstream.
 
 ## Workspace
 
@@ -138,7 +151,7 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_APP_ID` | Attestor's own appId registered on TappRegistry |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | The other two Tapp apps to trust (used for the trust-roots ack) |
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the TEE EOA key and KMS app secret. Inside docker, resolved via `host.docker.internal` |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the TEE EOA key and KMS-derived keys (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
 | `MOCK_TEE` / `MOCK_KMS` | Dev mock switches |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | Required when `MOCK_TEE=true`. The priv key must derive the address (validated on startup) |
 | `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived subkeys diverge |
@@ -151,6 +164,8 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_SERVING_ADDR` | SandboxServing contract address. The frontend deploy gate uses it to check owner balance ≥ 0.1 OG |
 | `ATTESTOR_SANDBOX_ENDPOINT` | 0g-sandbox HTTP endpoint |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
+| `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
+| `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 
@@ -202,3 +217,7 @@ cargo test --test '*'               # integration tests only
 Integration tests use InMemory implementations (`mocks.rs`) to
 bypass Postgres, chain, and sandbox dependencies. A single test
 starts in ~6s.
+
+For the full regression procedure (local stack, live testnet, and the
+failure-triage table), see [TESTING.md](TESTING.md) —
+`scripts/e2e.sh` deploys, `scripts/verify-agent.sh` verifies.

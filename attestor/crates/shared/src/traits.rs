@@ -58,13 +58,17 @@ pub trait ChainClient: Send + Sync {
     ) -> anyhow::Result<TxHash>;
 }
 
-// ── Crypto (CPU-bound, sync) ────────────────────────────────────────────
+// ── Crypto ──────────────────────────────────────────────────────────────
+// Mostly CPU-bound/sync, EXCEPT `derive_agent_seal`, which is a per-seal KMS
+// round-trip (the master never resides in the attestor).
+#[async_trait]
 pub trait CryptoModule: Send + Sync {
     fn generate_seal_id(&self) -> SealId;
 
-    /// `agentSeal_priv = derive(masterKey, sealId)`. For v0 uses an
-    /// HKDF from an in-memory master secret; production backs to a KMS.
-    fn derive_agent_seal(&self, seal_id: SealId) -> anyhow::Result<AgentSealKeyPair>;
+    /// `agentSeal_priv = KMS.derive(chainId‖contract‖sealId)`. A KMS call per
+    /// seal — the attestor holds no fleet-wide master. Same seal on the same
+    /// chain/contract is deterministic (safe to call again on retry/recreate).
+    async fn derive_agent_seal(&self, seal_id: SealId) -> anyhow::Result<AgentSealKeyPair>;
 
     fn aes_gcm_encrypt(&self, plaintext: &[u8], key: &[u8; 32]) -> anyhow::Result<Vec<u8>>;
     fn aes_gcm_decrypt(&self, ciphertext: &[u8], key: &[u8; 32]) -> anyhow::Result<Vec<u8>>;
@@ -77,7 +81,7 @@ pub trait CryptoModule: Send + Sync {
     fn keccak256(&self, data: &[u8]) -> [u8; 32];
 
     /// HMAC-SHA256 over `data` with a binding key derived per `info` from
-    /// the attestor master secret via HKDF (`HKDF(master, info) → key`,
+    /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
     /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
     /// separator string so the same master secret can back independent
     /// MACs (`"agentic-id.container-pubkey-binding.v1"` etc.) without

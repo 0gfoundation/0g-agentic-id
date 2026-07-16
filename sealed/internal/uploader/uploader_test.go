@@ -292,30 +292,65 @@ func TestApply_AllRolesInSync_SkipsTx(t *testing.T) {
 	}
 }
 
-// Disk equals adapter Defaults: role is omitted from newDatas. If chain
-// had it, the entry gets dropped on the next Apply. §16.10 invariant.
+// findEntry returns the chain entry for a role, or nil. Test helper.
+func findEntry(entries []chain.IntelligentData, role string) *chain.IntelligentData {
+	for i := range entries {
+		if roleOf(entries[i].DataDescription) == role {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// Disk equals adapter Defaults: a CONTENT role is omitted from newDatas.
+// If chain had it, the entry gets dropped on the next Apply. §16.10.
+// (Uses a content role, not "framework" — the framework binding is the
+// identity anchor and is exempt from omit; see the next test.)
 func TestApply_DiskEqualsDefaults_OmitsFromChain(t *testing.T) {
 	h := newHarness(t, []framework.RoleSpec{
 		{Name: "framework", Shape: framework.Leaf},
+		{Name: "config", Shape: framework.Leaf},
 	})
-	// Force Defaults to equal "default-fw".
-	h.adapter.defaults["framework"] = []byte("default-fw")
+	h.adapter.defaults["framework"] = []byte(`{"name":"openclaw","schema_version":1}`)
+	h.stubLeafRole("framework", []byte(`{"name":"openclaw","schema_version":1}`))
+	h.adapter.defaults["config"] = []byte("default-cfg")
 	// Put something non-default on chain via first Apply.
-	h.stubLeafRole("framework", []byte("active-fw"))
+	h.stubLeafRole("config", []byte("active-cfg"))
 	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
 		t.Fatalf("Apply (seed chain): %v", err)
 	}
-	if len(h.chain.entries) != 1 {
-		t.Fatalf("expected chain to have framework entry after seed; got %d", len(h.chain.entries))
+	if findEntry(h.chain.entries, "config") == nil {
+		t.Fatalf("expected chain to have config entry after seed")
 	}
 
-	// Now disk drifts back to defaults — Apply should drop the chain entry.
-	h.stubLeafRole("framework", []byte("default-fw"))
+	// config drifts back to defaults — Apply should drop its chain entry.
+	h.stubLeafRole("config", []byte("default-cfg"))
 	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
 		t.Fatalf("Apply (drop to default): %v", err)
 	}
-	if len(h.chain.entries) != 0 {
-		t.Errorf("chain entries after default Apply = %d; want 0 (default ↔ no chain entry)", len(h.chain.entries))
+	if findEntry(h.chain.entries, "config") != nil {
+		t.Errorf("config still on chain after reverting to default; want dropped")
+	}
+}
+
+// The framework binding is the on-chain identity selector — it MUST stay
+// on chain even when it equals the adapter default. Regression guard for
+// the bug where a version-less binding resolving to whitelistMax equalled
+// Defaults("framework"), got omitted, and a recreated claude-code
+// container fell back to openclaw because its binding had vanished.
+func TestApply_FrameworkRole_NeverOmittedAsDefault(t *testing.T) {
+	h := newHarness(t, []framework.RoleSpec{
+		{Name: "framework", Shape: framework.Leaf},
+	})
+	// Disk content is byte-equal to Defaults("framework").
+	binding := []byte(`{"name":"claude-code","package_version":"2.1.198","schema_version":1}`)
+	h.adapter.defaults["framework"] = binding
+	h.stubLeafRole("framework", binding)
+	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if findEntry(h.chain.entries, "framework") == nil {
+		t.Fatal("framework binding omitted from chain — identity anchor lost; a recreated agent would fall back to the default framework")
 	}
 }
 

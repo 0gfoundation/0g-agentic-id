@@ -49,6 +49,11 @@ computed explicitly via `estimate_gas` + a 20% buffer.
 
 ### Foundry scripts must hardcode gas-price
 
+> Scope note: this bites Foundry/cast (which trusts the node's 1-wei tip
+> verbatim). viem-based clients (the TypeScript SDK) estimate fees above
+> the minimum on their own — verified by real SDK writes (deposit /
+> giveFeedback / transferFrom) landing without overrides.
+
 For the same reason, `forge script` / `forge create` commands need explicit
 `--priority-gas-price 2000000000 --gas-price 5000000000`, otherwise they either
 estimate 1 wei and get rejected, or take 0G's default estimate (too low) and
@@ -106,6 +111,36 @@ sealed uses.
 The sandbox billing path checks that the signer's wallet has an on-chain balance
 (a rough sanity check), so a randomly generated, unfunded keypair calling the
 sandbox API is rejected. E2E tests need a funded wallet.
+
+### sealed adapter version probes must be swappable package-level vars
+
+Adapters live-probe the installed framework version inside
+`EvolutionFor("framework")` (`openclaw --version` / `claude --version`).
+Dev machines plausibly have these CLIs actually installed — the probe
+result overrides the version in the restored binding and makes
+round-trip tests environment-dependent (the conformance suite blew up on
+its very first run, on a mac with openclaw 2026.3.8 installed).
+
+Rule: write the probe as a package-level `var probeXxx = func(...)` and
+stub it to return `""` in tests. New adapters copy openclaw's
+`probeOpenclawVersion` pattern.
+
+### Marker injection/strip must be lossless — don't reintroduce newline normalization
+
+The historical `platform.UpsertMarkedSection` "ensured a blank line
+before the section" by appending newlines to the owner content. That
+normalization is not invertible (`"abc"` and `"abc\n"` produce the same
+file), so `StripInjected` had to guess — it trimmed ALL trailing
+newlines, eating the owner's final `\n`. Consequence: every injected
+file phantom-drifted exactly **once per agent lifetime** on first boot
+(a wasted `chain.Update`, plus silently rewritten owner bytes) before
+converging.
+
+The current wire format is lossless: the separator (exactly one `\n`)
+belongs to the section, owner bytes are preserved verbatim, and
+`StripInjected(UpsertMarkedSection(x)) == x` holds strictly. Before
+touching this code, run the conformance + injection round-trip tests
+(`openclaw/conformance_test.go`, `platform/markers_test.go`).
 
 ---
 

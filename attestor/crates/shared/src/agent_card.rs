@@ -7,7 +7,6 @@
 //! iData. No framework.version at the card level either — version refers
 //! to the *AgentCard schema* version, not the runtime framework.
 
-use crate::agent_profile::AgentProfile;
 use crate::avatar;
 use crate::types::AgentId;
 use alloy::primitives::Address;
@@ -22,7 +21,6 @@ pub struct AgentCardInputs<'a> {
     pub name: &'a str,
     pub description: &'a str,
     pub image: Option<&'a str>,
-    pub profile: &'a dyn AgentProfile,
 
     // Chain identity
     pub agent_id: AgentId,
@@ -48,12 +46,14 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
         .map(str::to_string)
         .unwrap_or_else(|| avatar::seed_to_data_url(i.seal_id));
 
-    // ── attributes: universal species tag + profile-specific additions ──
-    let mut attributes: Vec<Value> = vec![json!({
+    // ── attributes: universal species tag ───────────────────────────────
+    // Framework-specific facets used to come from the AgentProfile system;
+    // that moved into the sealed adapters when attestor went
+    // framework-agnostic. The card stays neutral.
+    let attributes: Vec<Value> = vec![json!({
         "trait_type": "species",
         "value":      "agent",
     })];
-    attributes.extend(i.profile.extra_attributes());
 
     // ── url: http://{cp}-{sid}.{host}.nip.io:{port}{path} ───────────────
     // Empty when the agent has no running sandbox yet — identity (mint +
@@ -90,9 +90,21 @@ pub fn build_agent_card(i: AgentCardInputs<'_>) -> Value {
         // ── ERC-8004 / A2A AgentCard ──
         "url":           url,
         "version":       AGENT_CARD_SCHEMA_VERSION,
-        "capabilities":  i.profile.default_capabilities(),
+        "capabilities":  default_capabilities(),
         "registrations": registrations,
         "trustModels":   json!(["tee-attestation"]),
+    })
+}
+
+/// `AgentCard.capabilities` — the three canonical A2A booleans, same for
+/// every agent this attestor mints. Per-framework capability flags belong
+/// to the framework's own surface (services manifest via /hello), not the
+/// minted card.
+fn default_capabilities() -> Value {
+    json!({
+        "streaming": true,
+        "pushNotifications": false,
+        "stateTransitionHistory": false,
     })
 }
 
@@ -154,7 +166,6 @@ pub async fn agent_is_healthy(healthz_url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_profile::OpenClawProfile;
     use alloy::primitives::U256;
 
     #[test]
@@ -194,14 +205,12 @@ mod tests {
         // with no sandbox yet gets a card with an empty `url` (filled later
         // by refresh_agent_card_url). The identity fields must still be
         // fully populated.
-        let profile = OpenClawProfile;
         let seal_addr = Address::from_slice(&[0x42u8; 20]);
         let seed = [9u8; 32];
         let card = build_agent_card(AgentCardInputs {
             name: "Sage",
             description: "DeFi helper",
             image: None,
-            profile: &profile,
             agent_id: U256::from(9u64),
             agent_seal_addr: seal_addr,
             chain_id: 16602,
@@ -223,14 +232,12 @@ mod tests {
 
     #[test]
     fn agent_card_carries_both_erc721_and_8004_fields() {
-        let profile = OpenClawProfile;
         let seal_addr = Address::from_slice(&[0x42u8; 20]);
         let seed = [7u8; 32];
         let inputs = AgentCardInputs {
             name: "Sage",
             description: "DeFi helper",
             image: None,
-            profile: &profile,
             agent_id: U256::from(7u64),
             agent_seal_addr: seal_addr,
             chain_id: 16602,
@@ -273,14 +280,12 @@ mod tests {
     }
 
     #[test]
-    fn user_image_overrides_profile_default() {
-        let profile = OpenClawProfile;
+    fn user_image_overrides_avatar_default() {
         let seed = [0u8; 32];
         let inputs = AgentCardInputs {
             name: "A",
             description: "B",
             image: Some("https://my.custom.logo/png"),
-            profile: &profile,
             agent_id: U256::from(1u64),
             agent_seal_addr: Address::ZERO,
             chain_id: 1,

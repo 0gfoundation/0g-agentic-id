@@ -2,6 +2,8 @@ package openclaw
 
 import (
 	"encoding/json"
+
+	"seal-verify/internal/inference"
 )
 
 // Inference resolution helpers used at Start time to read provider+model
@@ -74,8 +76,16 @@ func isZGComputeRouted(provider string) bool {
 }
 
 // applyZGComputeAugmentation rewrites openclaw.json in place to add the
-// models.providers entry openclaw needs to route to 0G's OpenAI-compatible
-// endpoint. No-op for any provider other than "0g-compute".
+// models.providers entry openclaw needs to route to the 0G router.
+// No-op for any provider other than "0g-compute".
+//
+// The wire format comes from the route Start resolved once per boot
+// (shared inference.ResolveZG — router catalog + heuristic fallback):
+// claude-* models are served on the router's Anthropic-format endpoint
+// ONLY — hardcoding the OpenAI format here is exactly what 400'd live
+// ("model 'claude-sonnet-5' is not available on the openai API format").
+// The same route also picks the exported key env name (spawn.go), so
+// config dialect and key can't disagree.
 //
 // Called from Start AFTER Restore has written the owner's openclaw.json
 // to disk. Treats this as runtime augmentation: owner specifies
@@ -83,12 +93,12 @@ func isZGComputeRouted(provider string) bool {
 // transparently. The persisted file ends up with the providers entry too
 // (next EvolutionFor will see it) but watcher's post-Start settle pass
 // captures that as the new baseline so no spurious drift fires.
-func applyZGComputeAugmentation(provider, model string) error {
-	if provider != "0g-compute" {
+func applyZGComputeAugmentation(provider, model string, route *inference.Route) error {
+	if provider != "0g-compute" || route == nil {
 		return nil
 	}
 	return updateOpenclawJSON(func(cfg map[string]any) {
-		applyZGComputeToConfig(cfg, model)
+		applyZGComputeToConfig(cfg, model, *route)
 	})
 }
 
@@ -97,17 +107,21 @@ func applyZGComputeAugmentation(provider, model string) error {
 // definition shape. Authoritative shape per openclaw's plugin-sdk type
 // defs (ModelProviderConfig + ModelDefinitionConfig).
 //
-// Routing details:
-//   - openclaw provider name is rewritten to "openai" because 0G is
-//     OpenAI-protocol-compatible
-//   - baseUrl forces the 0G router endpoint
-//   - apiKey references env (the same OPENAI_API_KEY sealed exports)
-//   - compat.requiresStringContent is critical: 0G rejects OpenAI's
-//     multimodal array form ({type:"text",...}) so content must serialise
-//     as a plain string
-func applyZGComputeToConfig(cfg map[string]any, model string) {
-	const clawProvider = "openai"
-	const baseURL = "https://router-api.0g.ai/v1"
+// The route decides the dialect:
+//   - OpenAI wire: provider "openai", api "openai-completions".
+//     compat.requiresStringContent is critical — 0G rejects OpenAI's
+//     multimodal array form ({type:"text",...}) so content must
+//     serialise as a plain string.
+//   - Anthropic wire: provider "anthropic", api "anthropic-messages"
+//     (claude-* on the router). No compat block — the anthropic client
+//     path speaks string content natively.
+func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Route) {
+	clawProvider := "openai"
+	api := "openai-completions"
+	if route.Format == inference.WireAnthropic {
+		clawProvider = "anthropic"
+		api = "anthropic-messages"
+	}
 
 	primary := clawProvider + "/" + model
 	_ = setAgentsDefaults(cfg, "model", json.RawMessage(mustMarshal(map[string]any{
@@ -120,9 +134,11 @@ func applyZGComputeToConfig(cfg map[string]any, model string) {
 		"reasoning":     false,
 		"input":         []string{"text"},
 		"cost":          map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-		"contextWindow": 128000,
-		"maxTokens":     8192,
-		"compat": map[string]any{
+		"contextWindow": route.ContextWindow,
+		"maxTokens":     route.MaxTokens,
+	}
+	if route.Format == inference.WireOpenAI {
+		modelDef["compat"] = map[string]any{
 			"requiresStringContent":    true,
 			"supportsStore":            false,
 			"supportsDeveloperRole":    false,
@@ -130,15 +146,15 @@ func applyZGComputeToConfig(cfg map[string]any, model string) {
 			"supportsUsageInStreaming": false,
 			"supportsStrictMode":       false,
 			"maxTokensField":           "max_tokens",
-		},
+		}
 	}
 	providerEntry := map[string]any{
-		"baseUrl": baseURL,
-		"api":     "openai-completions",
+		"baseUrl": route.BaseURL,
+		"api":     api,
 		"apiKey": map[string]any{
 			"source":   "env",
 			"provider": "default",
-			"id":       "OPENAI_API_KEY",
+			"id":       route.EnvKey,
 		},
 		"models": []any{modelDef},
 	}

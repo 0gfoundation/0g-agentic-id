@@ -79,6 +79,18 @@ func New() *Adapter {
 // Name implements framework.Framework.
 func (a *Adapter) Name() string { return "openclaw" }
 
+// ── Optional capability interfaces (framework.go) ───────────────────────────
+
+// SubprocessLogPath implements framework.SubprocessLogProvider. spawn.go
+// pipes the gateway's stdout/stderr here; proxy serves it on /log/agent.
+func (a *Adapter) SubprocessLogPath() string { return "/tmp/openclaw.log" }
+
+// SettleDelay implements framework.SettleDelayer. openclaw rewrites
+// openclaw.json once on first boot (memory engine, session config, plugin
+// defaults); 5s is enough for that write to land before the watcher
+// baseline is captured.
+func (a *Adapter) SettleDelay() time.Duration { return 5 * time.Second }
+
 // Version probes the installed openclaw CLI. Best-effort; returns "" on error.
 func (a *Adapter) Version(ctx context.Context) (string, error) {
 	out, err := exec.CommandContext(ctx, "openclaw", "--version").Output()
