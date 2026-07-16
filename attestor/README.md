@@ -25,6 +25,19 @@ Three binaries share a single Postgres and expose HTTP + WebSocket:
   After persisting to Postgres, it pushes updates to the frontend
   over WS via the EventBus.
 
+Today one node runs all three, but the design is not single-machine
+bound. The queue claims jobs with `FOR UPDATE SKIP LOCKED`
+(`shared/src/jobs.rs`), so any number of workers can share it; job
+payloads and the provision-binding MAC use the KMS **app-scoped** key,
+so every node of the same Tapp app can open them; and each agentSeal
+is derived per seal by KMS on demand, so any node can provision any
+agent with no node-local key state. Multi-node has **not** been run
+yet — what it still needs: each node's TEE EOA in
+`AgenticID.trustedAttestors` (plus gas), a shared Postgres outside the
+per-host compose, and the **indexer kept to a single instance** (its
+chain checkpoint is single-writer; two indexers would double-process
+events). Tracked as the node-federation workstream.
+
 ## Workspace
 
 ```

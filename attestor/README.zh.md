@@ -20,6 +20,17 @@ Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 - **indexer** — 链上事件监听 + AgentCard 重建；Postgres 落库后通过
   EventBus 推 WS 给前端
 
+目前三个 binary 跑在一个节点上，但设计并不绑定单机：队列用
+`FOR UPDATE SKIP LOCKED` 领活（`shared/src/jobs.rs`），任意多个
+worker 可以共享；job payload 和 provision 绑定 MAC 用的是 KMS
+**app-scoped** key，同一个 Tapp app 的任何节点都解得开；agentSeal
+由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
+本地没有密钥状态。多节点**尚未实际跑过**——还差三件事：每个节点的
+TEE EOA 进 `AgenticID.trustedAttestors`（并养 gas）、Postgres 从
+per-host compose 里抽出来共享、以及 **indexer 保持单实例**（链上
+checkpoint 是单写者，两个 indexer 会重复消费事件）。归属
+node-federation 工作流。
+
 ## Workspace
 
 ```
