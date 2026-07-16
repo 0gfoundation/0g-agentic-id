@@ -6,8 +6,8 @@
 Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 `agent_seal_priv`、把每个 agent 的 iData 加密上传到 0G Storage，并把
 链上索引实时同步给前端。在 trust chain 里它处于**链 ↔ TEE 之间的
-中介**位置，本身也作为一个 Tapp app 注册在 TappRegistry 上（怎么
-拿 `master_secret`、怎么派 `agent_seal_priv` 见
+中介**位置，本身也作为一个 Tapp app 注册在 TappRegistry 上（每把
+`agent_seal_priv` 怎么由 KMS per-seal 派生、为什么没有常驻 master 见
 [`../sealed/TRUST_MODEL.zh.md`](../sealed/TRUST_MODEL.zh.md)）。
 
 三个 binary 共享一份 Postgres、对外暴露 HTTP + WebSocket：
@@ -131,7 +131,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_APP_ID` | attestor 自己在 TappRegistry 注册的 appId |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | 信任的另外两个 Tapp app（trust-roots ack 用）|
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（拿 TEE EOA key + KMS app secret）；docker 里通过 `host.docker.internal` 解到宿主 |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（拿 TEE EOA key + KMS 派生 key：app-scoped 及带 `material` 的 per-seal）；docker 里通过 `host.docker.internal` 解到宿主 |
 | `MOCK_TEE` / `MOCK_KMS` | dev mock 开关 |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | `MOCK_TEE=true` 时必填；私钥需推得出地址（启动校验）|
 | `MOCK_APP_SECRET` | `MOCK_KMS=true` 时必填，32 字节 hex；三个 binary 必须读到**同一个值**否则派生分叉 |

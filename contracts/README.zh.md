@@ -127,14 +127,14 @@ AgenticID
 
 | 角色 | 持有的秘密 | 职责 |
 |---|---|---|
-| **Attestor TEE** | `masterKey`（KMS 提供）| 生成 `agentSeal_priv = derive(masterKey, sealId)`；mint 时生成 `dataKey` 并封给 `agentSeal_pub`；后续给经 RA 的 Agent TEE provision `agentSeal_priv` |
+| **Attestor TEE** | 只持有 KMS 派生的 key（无常驻 master）| 每把 `agentSeal_priv` 由 KMS 按 `chainId ‖ contract ‖ sealId` per-seal 派生后取得；mint 时生成 `dataKey` 并封给 `agentSeal_pub`；后续给经 RA 的 Agent TEE provision `agentSeal_priv` |
 | **Agent TEE** | `agentSeal_priv`（单个 agent 的）+ `dataKey` | 跑 agent 业务、用 `dataKey` 解密模型/配置；签 ServeProof；转让时验 AccessProof 后把 `dataKey`（ECIES 加密）交给 Oracle TEE |
 | **Oracle TEE** | `teeOracleAddress_priv`（签 OwnershipProof）+ `Oracle_ECIES_priv`（解 ECIES 拿 `dataKey`）| 转让时解 ECIES 拿 `dataKey` → 用 `buyer_pubkey` 重封 → 签 OwnershipProof；立即丢弃 `dataKey` |
 
 关键安全属性：
 - `dataKey` 只在 TEE 内流动，**从不出现在链上明文或 EOA 钱包**
 - TEE 单点故障影响有限：Agent TEE 挂 → attestor 再 provision；Oracle TEE 挂 → 转让暂停但重启可恢复（无持久状态）
-- KMS 挂 → protocol 级事件，靠 `masterKey` 集群容灾保证（0g-kms 多节点集群，k/n 健康即可）
+- KMS 挂 → protocol 级事件，靠集群容灾保证（0g-kms 多节点门限集群，master 只以分片存在，k/n 健康即可）
 
 ---
 
@@ -143,7 +143,7 @@ AgenticID
 ### 路径 A — attestor-mint
 
 **链下步骤**（Attestor TEE 内）：
-1. 生成 `sealId`（随机或按策略派生），推出 `agentSeal_priv = derive(masterKey, sealId)` 和 `agentSeal_addr`
+1. 生成 `sealId`（随机或按策略派生）；由 KMS 按 `chainId ‖ contract ‖ sealId` 派生 `agentSeal_priv`，得到 `agentSeal_addr`
 2. 对每条将要上链的 IntelligentData_i：
    - 生成 `dataKey_i`
    - 用 `dataKey_i` 加密 plaintext，上传密文到链下存储

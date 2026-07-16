@@ -8,8 +8,8 @@ Attestor sends mint txs on behalf of owners, provisions
 agent's iData to 0G Storage, and streams the on-chain index to the
 frontend in real time. It sits **at the bridge between chain and
 TEE** in the trust chain, and is itself registered as a Tapp app in
-TappRegistry. How it obtains `master_secret` and derives
-`agent_seal_priv` is covered in
+TappRegistry. How each `agent_seal_priv` is derived per seal by KMS
+(no resident master) is covered in
 [`../sealed/TRUST_MODEL.md`](../sealed/TRUST_MODEL.md).
 
 Three binaries share a single Postgres and expose HTTP + WebSocket:
@@ -138,7 +138,7 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_APP_ID` | Attestor's own appId registered on TappRegistry |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | The other two Tapp apps to trust (used for the trust-roots ack) |
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the TEE EOA key and KMS app secret. Inside docker, resolved via `host.docker.internal` |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the TEE EOA key and KMS-derived keys (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
 | `MOCK_TEE` / `MOCK_KMS` | Dev mock switches |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | Required when `MOCK_TEE=true`. The priv key must derive the address (validated on startup) |
 | `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived subkeys diverge |

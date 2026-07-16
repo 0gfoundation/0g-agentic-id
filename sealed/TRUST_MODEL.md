@@ -78,8 +78,8 @@ security regression**. It is the one rule that cannot bend.
 Before `serve-proof` can mean anything, the private key has to land in a
 TEE whose code identity can be reasoned about. The chain that delivers
 it spans four layers: **TappRegistry** as identity ground truth, KMS
-issuing the attestor's master secret, attestor deriving the per-agent
-seal, and 0g-Sandbox signing image attestations that gate the
+deriving each per-agent seal on the attestor's behalf, attestor
+brokering the hand-off, and 0g-Sandbox signing image attestations that gate the
 container's `/provision` call. Each layer is independently verifiable.
 Together they answer one question: "why should a verifier believe this
 private key only ever existed inside honest, on-chain-registered code?"
@@ -134,7 +134,7 @@ question into the open; **the final decision rests with the user**.
 Everything below in this doc assumes you've already done that step:
 the apps you've ack'd are in fact the code you reviewed.
 
-### Layer 1: KMS to Attestor master secret
+### Layer 1: KMS to Attestor — authenticated derivation, no resident master
 
 Inside its own TEE, the **Attestor** signs a KMS challenge with its
 TDX-bound node signer key. From that **one** signature KMS:
@@ -144,11 +144,15 @@ TDX-bound node signer key. From that **one** signature KMS:
 2. reads the corresponding `app_id` straight off that registration
    entry.
 
-KMS then derives the per-app **master secret** from that `app_id` and
-returns it encrypted to the Attestor. The `app_id` binding comes
-entirely from the on-chain registration — KMS never accepts a
-self-declared code identity from the Attestor. The mapping is read
-back from TappRegistry, not asserted by the caller.
+KMS is a **threshold cluster** (distributed PRF over BLS12-381,
+0g-kms#1): the per-app master exists only as shares spread across the
+cluster's nodes — no single KMS node, and never the Attestor, holds it
+whole. On each authenticated request, KMS derives **one subordinate
+key** from `(app_id, caller-supplied material)` and returns only that
+derived key. The `app_id` binding comes entirely from the on-chain
+registration — KMS never accepts a self-declared code identity from
+the Attestor. The mapping is read back from TappRegistry, not asserted
+by the caller.
 
 This also makes plain why the user must ack **both** KMS **and**
 Attestor separately:
@@ -160,45 +164,56 @@ Attestor separately:
   identity. Without this ack, nobody has reviewed the verification
   program at all.
 - **The ack of Attestor** backstops **the code that receives the
-  master secret**. KMS does **not** verify what code the Attestor
+  derived keys**. KMS does **not** verify what code the Attestor
   actually runs — it only sees which code that `app_id` points to in
-  TappRegistry. KMS's confidence that "this code deserves the master
-  secret" comes **entirely** from the user having ack'd that `app_id`.
+  TappRegistry. KMS's confidence that "this code deserves the derived
+  keys" comes **entirely** from the user having ack'd that `app_id`.
 
 Neither ack substitutes for the other. Without the KMS ack the
-derivation logic is unreviewed; without the Attestor ack the master
-secret is handed to unreviewed code.
+derivation logic is unreviewed; without the Attestor ack the derived
+keys are handed to unreviewed code.
 
-The master secret is:
+What the Attestor actually receives from KMS:
 
-- **App-scoped**: derived per `app_id` (KMS is deterministic in
-  `app_id` → secret). The same `app_id` always derives the same master
-  secret, regardless of which TDX machine runs Attestor.
-- **TEE-resident**: lives only in Attestor's TEE memory, never written
-  to disk, never crossing the gRPC boundary in plaintext.
-- **The KMS-side seed** for every `agent_seal_priv` AgenticID will ever
-  derive.
+- **One app-scoped key** (empty derivation material), fetched at
+  startup and used only for encrypting the job queue at rest and for
+  the provision-binding MAC (Layer 3). It is **not** a seed for any
+  agent key.
+- **Individual `agent_seal_priv` keys**, derived per seal on demand
+  (Layer 2). Derivation is one-way inside the KMS cluster: holding one
+  derived key reveals nothing about any sibling, and no fleet-wide
+  secret ever sits in Attestor memory.
 
-Two consequences worth stating explicitly:
+Three consequences worth stating explicitly:
 
 1. **Hardware swaps preserve keys.** Replacing the TDX machine Attestor
-   runs on does not change the keys it can derive. The master secret
-   persists across hardware swaps as long as the code identity stays
-   registered.
+   runs on does not change the keys KMS will derive for it. The same
+   `app_id` + the same material always yields the same key, as long as
+   the code identity stays registered.
 2. **Per-app isolation.** Compromising any one Attestor TDX instance
    does not compromise other Tapp apps' secrets. KMS isolates per-app
-   master secrets cryptographically; one compromised TEE cannot pivot
+   derivations cryptographically; one compromised TEE cannot pivot
    to siblings.
+3. **Bounded blast radius in time.** An attacker who compromises the
+   Attestor's TEE at some moment obtains only the seals in flight at
+   that moment — there is no resident master whose theft would expose
+   every agent past and future.
 
-### Layer 2: Per-agent `agent_seal_priv` (Attestor to seal)
+### Layer 2: Per-agent `agent_seal_priv` (KMS to seal, brokered by Attestor)
 
 When a deploy request lands, Attestor:
 
 1. Generates a random 32-byte `seal_id` (the on-chain handle for this
    agent's identity slot).
-2. Derives `agent_seal_priv = HKDF(master_secret, info = seal_id)`,
+2. Asks KMS to derive `agent_seal_priv` with material =
+   `chainId (8B BE) ‖ AgenticID contract address (20B) ‖ seal_id (32B)`,
    fully deterministic — no entropy from the request, no per-call
-   state beyond the input.
+   state beyond the input. The chain and contract in the material mean
+   the same `seal_id` on another chain or another AgenticID deployment
+   resolves to a **different** key, so cross-deployment signature
+   replay fails at the key layer. Attestor self-checks at startup that
+   KMS actually honors the material (two distinct materials must yield
+   distinct keys) and refuses to boot otherwise.
 3. Publishes `agent_seal_pub` on chain via `setAgentSeal(agentId,
    agent_seal_pub)` at mint time. The binding becomes immutable (see
    [Set-once seal semantics](#set-once-seal-semantics-why-the-binding-is-safe)
@@ -208,8 +223,8 @@ When a deploy request lands, Attestor:
    a copy.
 
 If the Sealed container later restarts or is replaced (hardware swap,
-recovery flow), Attestor re-derives the *same* `agent_seal_priv` from
-the same `seal_id` and re-provisions it. The on-chain binding doesn't
+recovery flow), Attestor asks KMS for the same material again, gets the
+*same* `agent_seal_priv`, and re-provisions it. The on-chain binding doesn't
 have to change because the cryptographic identity behind it doesn't
 change.
 
@@ -236,7 +251,7 @@ Attestor's validation has three independent gates:
 |---|---|---|
 | **Sandbox identity** | `recover(sandbox_signature)` ∈ `TappRegistry.getNodeList(sandbox_app_id)` | TappRegistry, queried live — tolerant of key rotation on the sandbox side without any attestor restart |
 | **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
-| **Freshness OR binding** | `\|now − issued_at\| ≤ 300s`, OR `(container_pubkey, mac)` matches the binding stored from a previous successful provision (HMAC over `seal_id ‖ pubkey` under Attestor's master secret) | Local DB + master secret |
+| **Freshness OR binding** | `\|now − issued_at\| ≤ 300s`, OR `(container_pubkey, mac)` matches the binding stored from a previous successful provision (HMAC over `seal_id ‖ pubkey` under Attestor's app-scoped KMS key) | Local DB + app-scoped key |
 
 **The first gate** makes the same "user ack does the work" pattern
 from Layer 1 visible again: **Attestor never validates what code the
@@ -276,8 +291,8 @@ The binding stored on Attestor's side lets restarts skip the 5-minute
 freshness window: if the same 0g-Sandbox-spawned container restarts and
 presents the same `container_pubkey`, Attestor accepts on the binding
 alone. The HMAC prevents an attacker with DB write access (but no
-master secret) from forging valid bindings — the (`container_pubkey`,
-`mac`) pair is unforgeable without Attestor's master.
+app-scoped key) from forging valid bindings — the (`container_pubkey`,
+`mac`) pair is unforgeable without Attestor's app-scoped KMS key.
 
 ---
 
@@ -297,12 +312,13 @@ invariants:
   owner change.
 
 The cryptographic justification, the reason this isn't a footgun, is
-that `agent_seal_priv` is HKDF-derived from `(master_secret, sealId)`,
-both of which are stable across hardware swaps within Attestor's app
-lifetime. Any future TEE that can authenticate to KMS as the same
-Attestor app can re-provision the *same* `agent_seal_priv` for the
-*same* `agentId`. The on-chain binding can be fixed permanently because
-the cryptographic identity behind it is permanent.
+that `agent_seal_priv` is derived by KMS from the Attestor's app
+identity and `chainId ‖ contract ‖ sealId`, all of which are stable
+across hardware swaps within Attestor's app lifetime. Any future TEE
+that can authenticate to KMS as the same Attestor app can have the
+*same* `agent_seal_priv` re-derived for the *same* `agentId`. The
+on-chain binding can be fixed permanently because the cryptographic
+identity behind it is permanent.
 
 Combined with `agent_seal_priv` never leaving TEE memory ([foundational
 invariant](#foundational-invariant-owner-never-holds-agent_seal_priv)),

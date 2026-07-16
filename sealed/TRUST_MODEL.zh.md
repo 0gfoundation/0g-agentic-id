@@ -70,8 +70,8 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 
 在 `serve-proof` 能有任何含义之前，私钥必须落到一个**可以推理其
 代码身份**的 TEE 里。投递它的链路跨越四层 —— **TappRegistry** 作为
-身份的根、KMS 颁发 attestor 的主密钥、attestor 派生 per-agent 的
-seal、0g-Sandbox 签名 image attestation 闸住容器的 `/provision`
+身份的根、KMS 替 attestor 派生 per-agent 的 seal、attestor 居中
+移交、0g-Sandbox 签名 image attestation 闸住容器的 `/provision`
 调用。每一层都可独立验证；合起来回答了"verifier 为什么应当相信这
 把私钥只在诚实的、链上注册过的代码内部存在过"。
 
@@ -117,7 +117,7 @@ AgenticID 把这件事接到部署流程里：**每次部署新 agent 之前**�
 下面所有推理都假设你这边已经走完这一步 —— 那些 ack 过的 app 真就是
 你审过的代码。
 
-### Layer 1 —— KMS → Attestor 主密钥
+### Layer 1 —— KMS → Attestor：认证派生，没有常驻主密钥
 
 **Attestor** 在自己的 TEE 内部用它的 TDX-bound node signer key 给
 KMS 签一个 challenge。KMS 收到这**一个**签名之后：
@@ -126,10 +126,13 @@ KMS 签一个 challenge。KMS 收到这**一个**签名之后：
    **必须正注册为某个 app 的某个节点**；
 2. 同一条注册条目里写明对应的 `app_id`。
 
-校验通过后，KMS 用这个 `app_id` 派生 per-app 的**主密钥**，加密
-返回给 Attestor。整个流程里 `app_id` 的归属判断**只看链上注册**
-—— KMS 不接受 Attestor 自己声明的代码身份，对应关系由 TappRegistry
-反推出来。
+KMS 是一个**门限集群**（BLS12-381 上的分布式 PRF，0g-kms#1）：
+per-app 的主密钥只以分片形式散在集群各节点上 —— 没有任何单个 KMS
+节点、更没有 Attestor，持有过完整的主密钥。每次认证通过的请求，
+KMS 从 `(app_id, 调用方提供的 material)` 派生**一把下级 key**，
+只把这把派生 key 返回。整个流程里 `app_id` 的归属判断**只看链上
+注册** —— KMS 不接受 Attestor 自己声明的代码身份，对应关系由
+TappRegistry 反推出来。
 
 这里也顺带说清"为什么用户对 KMS 和 Attestor 都要 ack"：
 
@@ -137,40 +140,48 @@ KMS 签一个 challenge。KMS 收到这**一个**签名之后：
   会严格走"signer 必须链上注册"这套校验、并且只按链上 `app_id`
   派生 —— 不会被请求里夹带的"代码身份声明"绕过。这一层不 ack，
   等于 KMS 的整个验证程序根本没人审过。
-- **Attestor 的 ack** 兜底**拿到主密钥的那段代码**。KMS 自己**不**
+- **Attestor 的 ack** 兜底**拿到派生 key 的那段代码**。KMS 自己**不**
   校验 Attestor 跑的是什么代码 —— 它只看 TappRegistry 里那条
-  `app_id` 注册条目指着哪段代码。"那段代码值得拿主密钥"这件事，
+  `app_id` 注册条目指着哪段代码。"那段代码值得拿派生 key"这件事，
   KMS 的信心**完全来自用户对那个 `app_id` 的 ack**。
 
 两条不能互相替代：缺 KMS 的 ack，派生逻辑没人审；缺 Attestor 的
-ack，等于把主密钥下发给一段没人审过的代码。
+ack，等于把派生 key 下发给一段没人审过的代码。
 
-主密钥是：
+Attestor 实际从 KMS 拿到的是：
 
-- **App-scoped**：per `app_id` 派生（KMS 对 `app_id` → secret 是
-  确定性的）；不论哪一台 TDX 机器跑 Attestor，同一个 `app_id` 永
-  远派生出同一个主密钥。
-- **TEE-resident**：只活在 Attestor 的 TEE 内存里；从不写盘，从
-  不以明文跨越 gRPC 边界。
-- **KMS 侧的种子**：AgenticID 将派生的每一个 `agent_seal_priv`
-  都从它而出。
+- **一把 app-scoped key**（派生 material 为空），启动时取一次，
+  只用于 job 队列落盘加密和 provision 绑定的 MAC（Layer 3）。
+  它**不是**任何 agent key 的种子。
+- **一把把独立的 `agent_seal_priv`**，per seal 按需派生（Layer 2）。
+  派生在 KMS 集群内部完成且单向：拿到一把派生 key 推不出任何兄弟
+  key，Attestor 内存里也从不存在全局密钥。
 
-两个值得明说的后果：
+三个值得明说的后果：
 
 1. **换硬件不丢钥匙**：换掉 Attestor 所跑的 TDX 机器并不会改变
-   它能派生的 key —— 只要代码身份还注册在那里，主密钥跨越硬件
-   更换持续存在。
+   KMS 会为它派生的 key —— 只要代码身份还注册在那里，同一个
+   `app_id` + 同一份 material 永远得到同一把 key。
 2. **Per-app 隔离**：攻陷某一台 Attestor TDX 实例并不会攻陷其他
-   Tapp app 的密钥。KMS 在密码学上隔离 per-app 主密钥；一个被
+   Tapp app 的密钥。KMS 在密码学上隔离 per-app 派生；一个被
    攻陷的 TEE 没法横向到兄弟节点。
+3. **时间上的爆炸半径有界**：某一时刻攻陷 Attestor TEE 的攻击者，
+   只能拿到那一刻正在经手的 seal —— 不存在一把"偷走即暴露过去和
+   未来所有 agent"的常驻主密钥。
 
-### Layer 2 —— Per-agent `agent_seal_priv`（Attestor → seal）
+### Layer 2 —— Per-agent `agent_seal_priv`（KMS → seal，Attestor 居中移交）
 
 一个部署请求落地时，Attestor 会：
 
 1. 生成一个随机的 32-byte `seal_id`。
-2. 派生 `agent_seal_priv = HKDF(master_secret, info = seal_id)`，
-   全确定性 —— 不引入请求中的熵，除输入外没有 per-call 状态。
+2. 请 KMS 以 material =
+   `chainId (8B BE) ‖ AgenticID 合约地址 (20B) ‖ seal_id (32B)`
+   派生 `agent_seal_priv`，全确定性 —— 不引入请求中的熵，除输入外
+   没有 per-call 状态。material 里绑定链和合约意味着：同一个
+   `seal_id` 在另一条链或另一套 AgenticID 部署上解析出的是
+   **另一把** key，跨部署的签名重放在密钥层就失败。Attestor 启动时
+   还会自检 KMS 确实用到了 material（两份不同 material 必须得到
+   不同 key），否则拒绝启动。
 3. 在 mint 时通过 `setAgentSeal(agentId, agent_seal_pub)` 把
    `agent_seal_pub` 发布到链上 —— 这条绑定从此不可变（详见下文
    [Set-once seal 语义](#set-once-seal-语义为什么这条绑定是安全的)）。
@@ -178,8 +189,9 @@ ack，等于把主密钥下发给一段没人审过的代码。
    `agent_seal_priv` 从自己的内存里丢弃**。Attestor 不保留副本。
 
 如果 Sealed 容器后续重启或被替换（换硬件、恢复流程），Attestor
-会用同样的 `seal_id` 重新派生出**相同的** `agent_seal_priv`，并
-重新 provision。链上绑定不必改，因为绑定背后的密码学身份没变。
+会拿同样的 material 再向 KMS 要一次，得到**相同的**
+`agent_seal_priv`，并重新 provision。链上绑定不必改，因为绑定
+背后的密码学身份没变。
 
 ### Layer 3 —— Sandbox 签名的 image attestation → `/provision`
 
@@ -204,7 +216,7 @@ Attestor 的校验有三道独立闸门：
 |---|---|---|
 | **Sandbox 身份** | `recover(sandbox_signature)` ∈ `TappRegistry.getNodeList(sandbox_app_id)` | TappRegistry，live 查询 —— sandbox 侧 key rotation 时 attestor 不用重启 |
 | **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
-| **新鲜度 OR 绑定** | `\|now − issued_at\| ≤ 300s`，OR `(container_pubkey, mac)` 命中此前一次成功 provision 留下的绑定（HMAC over `seal_id ‖ pubkey`，用 Attestor 的主密钥）| 本地 DB + 主密钥 |
+| **新鲜度 OR 绑定** | `\|now − issued_at\| ≤ 300s`，OR `(container_pubkey, mac)` 命中此前一次成功 provision 留下的绑定（HMAC over `seal_id ‖ pubkey`，用 Attestor 的 app-scoped KMS key）| 本地 DB + app-scoped key |
 
 **第一道闸门**又一次把信任落回**用户对 0g-Sandbox 的 ack** ——
 Layer 1 那条"两条 ack 各自兜底"的逻辑在这里再演一遍：**Attestor
@@ -237,9 +249,9 @@ hash"这件事落下来。补法是在 AgenticID 合约侧给 `validFrameworkHas
 
 Attestor 侧保存的绑定让重启可以跳过 5 分钟新鲜度窗口：同一个
 0g-Sandbox spawn 出的容器重启、提交相同的 `container_pubkey` 时，
-Attestor 仅凭绑定就接受。HMAC 防止只有 DB 写权限（但没有主密钥）
-的攻击者伪造合法绑定 —— 没有 Attestor 主密钥就无法伪造
-(`container_pubkey`, `mac`) 这一对。
+Attestor 仅凭绑定就接受。HMAC 防止只有 DB 写权限（但没有
+app-scoped key）的攻击者伪造合法绑定 —— 没有 Attestor 的
+app-scoped KMS key 就无法伪造 (`container_pubkey`, `mac`) 这一对。
 
 ---
 
@@ -258,11 +270,12 @@ Attestor 仅凭绑定就接受。HMAC 防止只有 DB 写权限（但没有主�
   都活得长。
 
 这件事在密码学上能站住、不是个 footgun 的理由是：`agent_seal_priv`
-由 `(master_secret, sealId)` HKDF 派生，两者在 Attestor 这个 app
-生命周期里跨硬件更换都稳定。任何未来能以"同一个 Attestor app"身份
-向 KMS 认证的 TEE，都可以为**同一个** `agentId` 重新 provision
-出**同一把** `agent_seal_priv`。链上绑定之所以可以永久钉死，是因为
-绑定背后的密码学身份是永久的。
+由 KMS 从 Attestor 的 app 身份和 `chainId ‖ contract ‖ sealId`
+派生，这几样在 Attestor 这个 app 生命周期里跨硬件更换都稳定。任何
+未来能以"同一个 Attestor app"身份向 KMS 认证的 TEE，都可以为
+**同一个** `agentId` 重新派生出**同一把** `agent_seal_priv` 并
+provision。链上绑定之所以可以永久钉死，是因为绑定背后的密码学
+身份是永久的。
 
 合上 `agent_seal_priv` 永不离开 TEE 内存这一条
 （[根本不变量](#根本不变量owner-永远不持有-agent_seal_priv)），

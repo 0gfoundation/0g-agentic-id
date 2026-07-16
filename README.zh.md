@@ -73,7 +73,7 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 | ID | 类型 | 是什么 |
 |---|---|---|
 | `agentId` ≡ `tokenId` | uint256 | ERC-721 NFT 的 id，链上 agent 的主键 |
-| `sealId` | bytes32 | attestor mint 时随机生成的 32 字节句柄；HKDF 派 `agent_seal_priv` 的输入；`sealId → agentId` 一对一 |
+| `sealId` | bytes32 | attestor mint 时随机生成的 32 字节句柄；KMS 派生 `agent_seal_priv` 的 material（`chainId ‖ contract ‖ sealId`）组成部分；`sealId → agentId` 一对一 |
 
 **AgentSeal / agentSeal / agent_seal_***——同一对密钥的不同表达层：
 
@@ -173,9 +173,11 @@ Tapp 应用。它的注册条目包含三样东西：
 - **硬件绑定身份**——由 Tapp 为每个运行实例分配，跟具体 TDX 设备相关；
   Tapp 重启或更换硬件后该身份会变化，需要重新注册。
 
-KMS 分发 app master key 时检查链上注册身份与请求里的签名身份是否匹配，匹配
+KMS 处理派生请求时检查链上注册身份与请求里的签名身份是否匹配，匹配
 才派生并下发——所以只有注册过、且当前真在合法 TDX 上跑的那一份 Attestor
-才能拿到 master key。AgentSeal 的派生从这把 key 开始。
+才能拿到派生出的 key。每一把 AgentSeal 都在 KMS 集群内部（门限 DPRF）
+从 attestor 的 app 身份 + `chainId ‖ contract ‖ sealId` 派生；attestor
+内存里从不存在全局 master key。
 
 > 链上侧：`agentSeal` / `sealId` 是 **set-once 永久绑定**——一个 agentId 只能
 > 设一次，转让也不清除。换硬件时 attestor 给新的 Agent TEE 重新 provision 同一
@@ -389,9 +391,10 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
 - **Tapp 基础设施** —— attestor / KMS / sandbox 三个组件作为 Tapp 应用
   部署、在 TappRegistry 登记代码身份 + 节点签名；"强审计"哲学（不预设
   代码不变，但每个跑过的版本都上链可查）
-- **密钥派生链** —— attestor 的 master secret 怎么从 KMS 拿、为什么跟
+- **密钥派生链** —— KMS 怎么替 attestor 派生密钥、为什么跟
   用户 EOA 钱包是**两个互不相通的密钥空间**；每个 agent 的
-  `agent_seal_priv = HKDF(master, sealId)` **确定性派生**；sandbox 签
+  `agent_seal_priv` 由 KMS 按 `chainId ‖ contract ‖ sealId`
+  **确定性派生**；sandbox 签
   image attestation + attestor 三重校验（TappRegistry 节点身份 +
   `validFrameworkHashes` 白名单 + 新鲜度）+ ECIES 下发到容器 ephemeral
   pubkey，只有那个 TEE 能解
