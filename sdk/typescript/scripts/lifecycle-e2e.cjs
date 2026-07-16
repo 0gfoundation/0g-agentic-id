@@ -88,12 +88,25 @@ function mkClient(privKey, cfg) {
   console.log(`· wallet B = ${acctB.address} (ephemeral, funded from owner)`);
   {
     const wc = createWalletClient({ account: privateKeyToAccount(OWNER_PRIV), transport: http(cfg.chain_rpc) });
-    const tx = await wc.sendTransaction({ to: acctB.address, value: parseEther('0.3'), chain: null });
+    const tx = await wc.sendTransaction({ to: acctB.address, value: parseEther('0.45'), chain: null });
     await patientWait((h) => A.agent.waitForTransaction(h), tx, 'fund wallet B');
   }
   const B = mkClient(privB, cfg);
   const rowOf = async (id) => (await (await fetch(ATTESTOR_URL + '/deployments')).json())
     .find((r) => r.agent_id && BigInt(r.agent_id) === id);
+  const API_KEY = process.env.API_KEY || 'sk-lifecycle-e2e';
+  const proxy = cfg.sandbox_proxy_addr, port = cfg.agent_serve_port;
+
+  // Provision B up-front (ack + deposit) so it can actually BRING AGENTS UP —
+  // both the clone (below) and the transferred source (gate). Without this a
+  // recreate 402s ('TEE signer not acknowledged') and the row stays offline.
+  {
+    const ackTx = await B.ack();
+    if (ackTx) await patientWait((h) => B.agent.waitForTransaction(h), ackTx, 'B ack');
+    const depTx = await B.deposit({ provider: cfg.sandbox_provider_addr, amountWei: parseEther('0.25') });
+    await patientWait((h) => B.agent.waitForTransaction(h), depTx, 'B deposit');
+    check('wallet B provisioned (acked + deposited)', (await B.getBalance(acctB.address, cfg.sandbox_provider_addr)) >= parseEther('0.1'));
+  }
 
   // ── 1. clone: A clones AGENT_ID to B ──────────────────────────────────
   if (process.env.SKIP_CLONE === '1') {
@@ -127,6 +140,22 @@ function mkClient(privKey, cfg) {
     }
     check('clone deployment row lands offline (new owner brings it online)',
       !!row && row.phase === 'offline', `phase=${row && row.phase}`);
+  }
+
+  // Usable == RUNNING: bring the clone online under B and prove it boots on
+  // its OWN fresh agentSeal and serves a valid proof — i.e. the re-sealed
+  // dataKey actually decrypts at runtime, not just matching hashes on chain.
+  console.log('· bringing the clone online…');
+  await B.agent.reset(cloned.seal_id, { apiKey: API_KEY });
+  let crow;
+  for (let i = 0; i < 40; i++) { crow = await rowOf(cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
+  check('clone reaches RUNNING under new owner', crow && crow.phase === 'running', `phase=${crow && crow.phase}`);
+  if (crow && crow.sandbox_id) {
+    const cbase = `http://${port}-${crow.sandbox_id}.${proxy}`;
+    let ch = null;
+    for (let i = 0; i < 8 && !ch; i++) { ch = curlHelloHeader(cbase); if (!ch) await sleep(8000); }
+    check('clone /hello serves a proof for the clone identity', !!ch && A.reputation.parseServeProofHeader(ch).agentId === cloneId,
+      ch ? `agentId=${A.reputation.parseServeProofHeader(ch).agentId}` : 'no proof');
   }
   } // end clone leg
 
@@ -191,12 +220,8 @@ function mkClient(privKey, cfg) {
   // gate), recreate, and reach running; otherwise the recreate 402s in the
   // worker ("TEE signer not acknowledged") and the row silently stays
   // offline. Wait for the transfer teardown to settle first (issue #37).
-  const ackTx = await B.ack();
-  if (ackTx) await patientWait((h) => B.agent.waitForTransaction(h), ackTx, 'B ack');
-  const depTx = await B.deposit({ provider: cfg.sandbox_provider_addr, amountWei: parseEther('0.15') });
-  await patientWait((h) => B.agent.waitForTransaction(h), depTx, 'B deposit');
   for (let i = 0; i < 24; i++) { const r = await rowOf(AGENT_ID); if (r && (!r.sandbox_id || r.phase === 'offline')) break; await sleep(5000); }
-  await B.agent.reset(SEAL_ID, { apiKey: process.env.API_KEY || 'sk-lifecycle-e2e' });
+  await B.agent.reset(SEAL_ID, { apiKey: API_KEY });
   let brow;
   for (let i = 0; i < 40; i++) { brow = await rowOf(AGENT_ID); if (brow && brow.phase === 'running') break; await sleep(10000); }
   check('new owner brought the agent back to RUNNING', brow && brow.phase === 'running', `phase=${brow && brow.phase}`);

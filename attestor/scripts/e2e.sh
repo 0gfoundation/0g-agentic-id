@@ -46,9 +46,14 @@ SNAPSHOT=$(curl -fsS -m 10 "$API/config" | jq -r '.sandbox_snapshot // empty' ||
 SNAPSHOT="${SNAPSHOT:-0g-test-sealed}"
 echo "snapshot    = $SNAPSHOT (from $API/config)"
 
+# Inference key injected into the container. Honors $API_KEY (regression.sh
+# exports it); a dummy default is fine for identity/decrypt/serve-proof
+# checks but real chat needs a real 0g-compute key.
+API_KEY="${API_KEY:-sk-test-abc123xyz}"
 PAYLOAD=$(jq -cn \
   --arg snapshot "$SNAPSHOT" \
-  '{snapshot:$snapshot, sealed:true, env:{API_KEY:"sk-test-abc123xyz"}}')
+  --arg apikey "$API_KEY" \
+  '{snapshot:$snapshot, sealed:true, env:{API_KEY:$apikey}}')
 
 # Canonical JSON with strict field order. `-c` is mandatory: any whitespace
 # will shift the bytes vs what base64 encodes, and the signature will no
