@@ -1,3 +1,6 @@
+# Build as a NEW tag (0g-sandbox:base-ubuntu22-node24) — do NOT overwrite
+# base-ubuntu22: other images may build FROM the old tag and would silently
+# inherit the node bump.
 FROM ubuntu:22.04
 
 # openclaw 2026.7.1 requires node >=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0
