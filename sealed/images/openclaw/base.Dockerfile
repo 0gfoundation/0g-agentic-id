@@ -1,6 +1,7 @@
 FROM ubuntu:22.04
 
-ARG NODE_VERSION=22.14.0
+# openclaw 2026.7.1 requires node >=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0
+ARG NODE_VERSION=24.15.0
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System packages ────────────────────────────────────────────────────────────

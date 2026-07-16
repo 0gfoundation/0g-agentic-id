@@ -10,7 +10,7 @@
 #
 #   cd sealed && docker build -t openclaw-sealed:0.1.0 .
 #
-# The base image (eliza/0g-sandbox:openclaw-1.0.0) is built separately
+# The base image (eliza/0g-sandbox:openclaw-1.1.0) is built separately
 # from sealed/images/openclaw/ — see that directory's Dockerfiles. You
 # only need to rebuild the base when bumping node / openclaw versions.
 
@@ -32,7 +32,7 @@ COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 
 # Stage 3 — runtime: openclaw base already has node + openclaw + nvm PATH set.
-FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:openclaw-1.0.0
+FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:openclaw-1.1.0
 
 # Pre-install a pinned openclaw version and warm up its "bundled runtime
 # deps" (the npm packages openclaw fetches the first time `gateway run`
@@ -45,7 +45,7 @@ FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:openclaw
 # is effectively a no-op (cache hit). Users who want a different version
 # still pay the full dynamic install cost on first boot — that's the
 # explicit tradeoff for runtime version flexibility.
-ARG OPENCLAW_BAKED_VERSION=2026.4.26
+ARG OPENCLAW_BAKED_VERSION=2026.7.1
 RUN npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
  && mkdir -p /root/.openclaw \
  && printf '%s' \
