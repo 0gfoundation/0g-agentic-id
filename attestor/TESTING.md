@@ -20,6 +20,14 @@ Last verified on the -dev testnet: **3 consecutive full rounds green**
 (~13 min each), absorbing live 0G-Storage / KMS / indexer jitter without
 a false failure.
 
+2026-07-17, openclaw 2026.7.1 image (node 24, baked 7.1): full round
+green, plus the two upgrade gates — a fresh deploy restores + installs
+7.1, and a WYSIWYS deploy pinned to 2026.5.7 boots ON the new image
+honoring the pin (installs 5.7, framework dim converges with zero chain
+writes; the init-time framework "DRIFT" line is a transient — the probe
+sees the baked binary until Restore's install lands, and the watcher
+only starts after that, so no reconcile race).
+
 | Tier | Cost | What it proves |
 |---|---|---|
 | T0 unit/integration | free, seconds | logic + wiring, mocks only |
