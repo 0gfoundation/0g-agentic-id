@@ -3586,7 +3586,13 @@ function renderAgentRow(d) {
                   : 'Offline';
         const r = failureReason(d);
         const title = r ? ` title="${escapeHtml(r)}"` : '';
-        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
+        // Failure reason INLINE (truncated), not hover-only — a list of
+        // red dots that all read "Failed" until you mouse over each one
+        // hides exactly the information a stuck user is looking for.
+        const reasonLine = r && p !== 'running' && p !== 'deploying'
+          ? `<small class="status-reason" style="display:block;color:var(--muted);font-size:var(--fs-xs);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px">${escapeHtml(r)}</small>`
+          : '';
+        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}${reasonLine}</span></div>`;
       })()}
       <div class="col-owner" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
       <div class="col-created" style="text-align:right">${ageString(d.created_at)}</div>

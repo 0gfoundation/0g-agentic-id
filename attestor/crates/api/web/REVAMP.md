@@ -18,8 +18,7 @@ clone UI)往后排。
 - [ ] UI 状态收敛:消灭手拨 style.display,改单一 render(state);
       历史 bug(#11 失败态按钮、KMS 慢无反馈)都是这个根因。
       做法:按视图逐个收敛(deploy 进度 → 列表 → 详情),小步 PR
-- [ ] 异步失败可见性:列表页 failed/offline 行内直接给原因短语
-      (现在藏在 hover title 里)
+- [x] 异步失败可见性:failed/offline 行内直显原因短语(截断+完整版仍在 hover)
 - [ ] ack 版本变更时解释"为什么又要 ack"(显示 app 更新版本号)
 
 ### P1(暂缓)— 功能空洞:transfer / clone 没有 UI
