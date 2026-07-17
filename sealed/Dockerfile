@@ -10,7 +10,7 @@
 #
 #   cd sealed && docker build -t openclaw-sealed:0.1.0 .
 #
-# The base image (eliza/0g-sandbox:openclaw-1.1.0) is built separately
+# The base image (eliza/0g-sealed:openclaw-1.1.0) is built separately
 # from sealed/images/openclaw/ — see that directory's Dockerfiles. You
 # only need to rebuild the base when bumping node / openclaw versions.
 
@@ -32,7 +32,7 @@ COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 
 # Stage 3 — runtime: openclaw base already has node + openclaw + nvm PATH set.
-FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:openclaw-1.1.0
+FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:openclaw-1.1.0
 
 # Pre-install a pinned openclaw version and warm up its "bundled runtime
 # deps" (the npm packages openclaw fetches the first time `gateway run`

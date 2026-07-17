@@ -1,7 +1,7 @@
 # Build on the billing server: docker build -t openclaw-sandbox:1.1.0 -f images/openclaw/Dockerfile images/openclaw/
-# Requires base image from: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22-node24
+# Requires base image from: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:base-ubuntu22-node24
 # (rebuild the base first when NODE_VERSION changes — the ARG here only fixes PATH)
-FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22-node24
+FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:base-ubuntu22-node24
 
 ARG NODE_VERSION=24.15.0
 
