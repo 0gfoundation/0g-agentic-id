@@ -353,15 +353,13 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 .btn-danger:active:not(:disabled){transform:translateY(1px);box-shadow:none}
 .btn-danger:disabled{opacity:.5;cursor:not-allowed}
 small.hint{display:block;color:var(--text2);font-size:var(--fs-sm);margin-top:10px;line-height:1.55}
-/* Deploy preflight card — compact per-item rows on a warning tint. */
-.preflight-card{background:var(--obg);border:1px solid var(--obd);padding:0}
-.preflight-item{display:flex;align-items:center;gap:12px;padding:12px 16px}
-.preflight-item + .preflight-item{border-top:1px solid var(--obd)}
-.preflight-item .ico{flex-shrink:0;font-size:15px;line-height:1}
-.preflight-item .txt{flex:1;min-width:0}
-.preflight-item .txt b{font-size:var(--fs-sm)}
-.preflight-item .txt small{display:block;color:var(--muted);font-size:var(--fs-xs);margin-top:1px}
-.preflight-item .btn{flex-shrink:0;padding:6px 12px;font-size:var(--fs-xs)}
+/* Deploy gate hint — the single line next to the Deploy button that names
+   the unmet prerequisite. Its links ARE the call to action: accent color,
+   dashed underline that solidifies on hover. */
+#deployGateHint{display:inline-flex;align-items:center;gap:6px;color:var(--text2);font-size:var(--fs-sm)}
+#deployGateHint::before{content:'ℹ';font-size:12px;color:var(--muted);border:1px solid var(--border);border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+#deployGateHint a{color:var(--p);font-weight:600;text-decoration:none;border-bottom:1px dashed var(--pbd);transition:border-color var(--t-fast),color var(--t-fast)}
+#deployGateHint a:hover{color:var(--pd);border-bottom:1px solid var(--pd)}
 
 /* ── Phase chips ────────────────────────────────────────────────── */
 .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:9999px;font-size:var(--fs-xs);font-weight:600;font-family:var(--mono);letter-spacing:var(--ls-eyebrow);text-transform:uppercase}
@@ -1324,15 +1322,6 @@ details.log[open] summary{color:var(--text2)}
       <h1>Deploy a new <em>agent</em>.</h1>
       <p>Mint on-chain identity, encrypt config to 0G storage, spin up a sandboxed runtime.</p>
     </div>
-
-    <!-- Preflight strip: surfaces the two deploy prerequisites (trust-roots
-         ack + prepaid balance) the moment the page opens, so the user fixes
-         them BEFORE filling the form instead of being interrupted by modals
-         at submit. Hidden until the wallet is connected; each unmet item
-         renders as a row with its fix-up button. -->
-    <section class="card preflight-card" id="deployPreflight" style="display:none">
-      <div id="deployPreflightRows"></div>
-    </section>
 
     <section class="card">
       <h2>Identity</h2>
@@ -2648,43 +2637,7 @@ async function loadSandboxBalance(ownerAddr) {
 // status + Acknowledge inside the popover. Anywhere that mutates
 // `State.sandboxBalance` or `State.trustRoots` should call
 // `renderWalletUI()` to keep both in sync.
-// Deploy-page preflight strip: mirrors the wallet popover's two gate rows
-// (trust roots + balance) at the top of the deploy form, so the user sees
-// and fixes prerequisites BEFORE filling the form — instead of being
-// interrupted by the same modals at submit. Data comes from the exact
-// State the submit gates read; no extra chain calls.
-function renderDeployPreflight() {
-  const host = $('#deployPreflight');
-  const rows = $('#deployPreflightRows');
-  if (!host || !rows) return;
-  if (!State.ownerAddr) { host.style.display = 'none'; return; }
-
-  const items = [];
-  const tr = State.trustRoots;
-  if (tr && !tr.disabled && !tr.errors?.length && !tr.allAcked) {
-    const done = tr.slots.length - tr.missingAppIds.length;
-    items.push(
-      `<div class="preflight-item"><span class="ico">🛡️</span>
-         <span class="txt"><b>Trust roots</b><small>${done}/${tr.slots.length} acknowledged</small></span>
-         <button class="btn" onclick="openAckModalForReview()">Acknowledge</button>
-       </div>`,
-    );
-  }
-  if (sandboxServingEnabled() && State.sandboxBalance !== null && State.sandboxBalance < TOP_UP_THRESHOLD_WEI) {
-    items.push(
-      `<div class="preflight-item"><span class="ico">💰</span>
-         <span class="txt"><b>Sandbox balance</b><small>${escapeHtml((+ethers.formatEther(State.sandboxBalance)).toFixed(4))} OG — min 0.1</small></span>
-         <button class="btn" onclick="openTopUpModal()">Top up</button>
-       </div>`,
-    );
-  }
-  if (items.length === 0) { host.style.display = 'none'; return; }
-  rows.innerHTML = items.join('');
-  host.style.display = '';
-}
-
 function renderWalletUI() {
-  renderDeployPreflight();
   updateDeployGate();
   if (!State.ownerAddr) return;
   // Chip text — short address optionally suffixed with rounded balance.
