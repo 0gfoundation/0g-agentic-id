@@ -1920,8 +1920,34 @@ function handleHash() {
   // Tear down stale WS subscriptions when navigating away.
   if (route !== 'detail' && State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
   if (route !== 'detail' && State.detailProbeTimer) { clearInterval(State.detailProbeTimer); State.detailProbeTimer = null; }
+
+  // List views go stale the moment they render (deploys progress, agents
+  // stop, transfers land) and the WS stream is per-seal — so while a
+  // list view is on screen, silently re-fetch it every 15s. Detail pages
+  // have their own WS + probe; everything else polls nothing.
+  if (route === 'discovery') startListPolling(loadDiscovery);
+  else if (route === 'home') startListPolling(loadHome);
+  else stopListPolling();
 }
 window.addEventListener('hashchange', handleHash);
+
+let _listPollTimer = null;
+let _listPollFn = null;
+function startListPolling(fn) {
+  _listPollFn = fn;
+  if (_listPollTimer) clearInterval(_listPollTimer);
+  _listPollTimer = setInterval(() => {
+    if (!document.hidden && _listPollFn) _listPollFn();
+  }, 15000);
+}
+function stopListPolling() {
+  if (_listPollTimer) { clearInterval(_listPollTimer); _listPollTimer = null; }
+  _listPollFn = null;
+}
+// Coming back to the tab refreshes immediately instead of waiting a tick.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && _listPollFn) _listPollFn();
+});
 
 // Re-fetch whatever view the user is currently looking at — used after
 // wallet connect / account switch / disconnect so owner-aware bits
@@ -3330,7 +3356,7 @@ async function loadDiscovery() {
   $$('#discoveryFilter [data-filter]').forEach(b => b.classList.toggle('on', b.dataset.filter === State.discoveryFilter));
   $('#discoveryFilter [data-filter="mine"]').disabled = !State.ownerAddr;
 
-  count.textContent = 'loading…';
+  if (!State.discoveryItems?.length) count.textContent = 'loading…';
   try {
     const url = (State.discoveryFilter === 'mine' && State.ownerAddr)
       ? `/deployments?owner=${State.ownerAddr}`
