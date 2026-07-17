@@ -16,6 +16,7 @@ import (
 var supportedOpenclawVersions = []string{
 	"2026.5.6",
 	"2026.5.7",
+	"2026.7.1",
 }
 
 // whitelistMax returns the version sealed targets when reconciling
