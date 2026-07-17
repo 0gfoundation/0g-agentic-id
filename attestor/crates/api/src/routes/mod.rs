@@ -14,6 +14,7 @@ mod deploy;
 mod deployment;
 mod deployments;
 mod lifecycle_auth;
+mod preflight;
 mod probe;
 mod provision;
 mod reset;

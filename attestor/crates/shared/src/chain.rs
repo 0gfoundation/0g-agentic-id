@@ -42,6 +42,16 @@ sol!(
     #[sol(rpc)]
     interface TappRegistry {
         function getNodeList(string calldata appId) external view returns (address[] memory);
+        function isAcknowledged(address user, string calldata appId) external view returns (bool);
+    }
+);
+
+// SandboxServing — same inline-interface treatment as TappRegistry; only
+// the balance read the deploy-edge preflight needs.
+sol!(
+    #[sol(rpc)]
+    interface SandboxServing {
+        function getBalance(address user, address provider) external view returns (uint256);
     }
 );
 
@@ -289,6 +299,26 @@ where
         let r = TappRegistry::new(*registry_addr, self.provider.clone());
         let nodes = r.getNodeList(app_id.clone()).call().await?._0;
         Ok(nodes.iter().any(|n| *n == addr))
+    }
+
+    async fn is_acknowledged(
+        &self,
+        registry: Address,
+        user: Address,
+        app_id: &str,
+    ) -> anyhow::Result<bool> {
+        let r = TappRegistry::new(registry, self.provider.clone());
+        Ok(r.isAcknowledged(user, app_id.to_string()).call().await?._0)
+    }
+
+    async fn sandbox_balance(
+        &self,
+        serving: Address,
+        user: Address,
+        provider: Address,
+    ) -> anyhow::Result<alloy::primitives::U256> {
+        let s = SandboxServing::new(serving, self.provider.clone());
+        Ok(s.getBalance(user, provider).call().await?._0)
     }
 
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String> {

@@ -44,6 +44,15 @@ export interface AgenticIDConfig {
   componentAppIds?: string[];
 }
 
+/** The slice of the attestor's GET /config the SDK auto-configures from. */
+export interface AttestorPublicConfig {
+  attestor_app_id?: string;
+  kms_app_id?: string;
+  sandbox_app_id?: string;
+  sandbox_provider_addr?: `0x${string}`;
+  sandbox_serving_addr?: `0x${string}`;
+}
+
 /** Resolved context shared by the internal clients. */
 export interface Ctx {
   publicClient: PublicClient;
@@ -53,6 +62,15 @@ export interface Ctx {
   addresses: ContractAddresses;
   attestorUrl?: string;
   componentAppIds: string[];
+  /** True when the caller passed componentAppIds explicitly — explicit
+   *  config always beats the attestor /config auto-discovery. */
+  componentAppIdsExplicit: boolean;
+  /** Lazy, cached fetch of the attestor's GET /config (null when no
+   *  attestorUrl is configured or the fetch fails). Environment-specific
+   *  values (component appIds, sandbox provider) default from here so
+   *  callers don't hand-copy them per deployment — the hardcoded-default
+   *  footgun that made ack() revert "app not found" on non-prod envs. */
+  attestorConfig: () => Promise<AttestorPublicConfig | null>;
 }
 
 const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider'];
@@ -76,6 +94,18 @@ export function buildCtx(config: AgenticIDConfig): Ctx {
     walletClient = createWalletClient({ account, chain, transport: http(rpcUrl) });
   }
 
+  // One shared, memoized /config fetch per Ctx. Failure memoizes null —
+  // callers fall back to explicit config / built-in defaults.
+  let cfgPromise: Promise<AttestorPublicConfig | null> | undefined;
+  const attestorUrl = config.attestorUrl?.replace(/\/$/, '');
+  const attestorConfig = () => {
+    if (!attestorUrl) return Promise.resolve(null);
+    cfgPromise ??= fetch(`${attestorUrl}/config`)
+      .then((r) => (r.ok ? (r.json() as Promise<AttestorPublicConfig>) : null))
+      .catch(() => null);
+    return cfgPromise;
+  };
+
   return {
     chain,
     addresses: config.addresses,
@@ -83,6 +113,8 @@ export function buildCtx(config: AgenticIDConfig): Ctx {
     walletClient,
     account,
     componentAppIds: config.componentAppIds ?? DEFAULT_COMPONENT_APP_IDS,
+    componentAppIdsExplicit: config.componentAppIds !== undefined,
+    attestorConfig,
     publicClient: createPublicClient({ chain, transport: http(rpcUrl) }),
   };
 }

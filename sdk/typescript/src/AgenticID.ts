@@ -43,7 +43,10 @@ function assertSealBound(seal: Address, op: string): void {
 }
 
 /** waitForMint tuning shared by the deploy/clone `wait` option. */
-type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number };
+type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: boolean };
+
+/** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
+const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 /** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
 type MintedResponse = DeployCloneResponse & { agentId: bigint };
 
@@ -52,11 +55,52 @@ type MintedResponse = DeployCloneResponse & { agentId: bigint };
 export class AgentApi {
   private readonly id: AgenticIDClient;
   private readonly attestor: AttestorClient;
+  private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
   constructor(ctx: Ctx) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
     this.attestor = new AttestorClient(ctx);
+    this.infra = new SandboxClient(ctx);
+  }
+
+  /**
+   * Deploy/clone preflight: fail HERE, synchronously and with the fix
+   * named, instead of the request being accepted and dying minutes later
+   * as an async worker 402 with no context. Each check self-disables when
+   * its surface isn't configured (zero address / unknown provider), and
+   * read errors fail open — the attestor re-checks at accept anyway.
+   * Opt out per call with `{ preflight: false }`.
+   */
+  private async preflightOwnerReady(): Promise<void> {
+    const who = this.ctx.account?.address;
+    if (!who) return; // browser-wallet flows preflight in their own UI
+    if (this.ctx.addresses.tappRegistry !== ZERO) {
+      try {
+        const { allAcked, missing } = await this.infra.ackStatus(who);
+        if (!allAcked) {
+          throw new Error(
+            `trust roots not acknowledged for ${who}: ${missing.join(', ')} — call ack() once, then retry`,
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('trust roots')) throw e;
+        // chain read failed — fail open, attestor re-checks at accept
+      }
+    }
+    if (this.ctx.addresses.sandboxServing !== ZERO) {
+      try {
+        const bal = await this.infra.getBalance(who);
+        if (bal < MIN_SANDBOX_BALANCE_WEI) {
+          throw new Error(
+            `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('sandbox balance')) throw e;
+        // provider unknown or read failed — fail open (same backstop)
+      }
+    }
   }
 
   // — lifecycle —
@@ -68,6 +112,7 @@ export class AgentApi {
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
   async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+    if (opts?.preflight !== false) await this.preflightOwnerReady();
     const res = await this.attestor.deploy(params);
     if (!opts?.wait) return res;
     const agentId = await this.waitForMint(res.seal_id, opts);
@@ -82,6 +127,7 @@ export class AgentApi {
   clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
   async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+    if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
     const res = await this.attestor.clone(params);
     if (!opts?.wait) return res;
@@ -240,8 +286,8 @@ export class AgenticID {
   ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> { return this.infra.ackStatus(user); }
 
   // — prepaid sandbox balance —
-  /** Fund a prepaid sandbox balance against a provider (payable). Recipient defaults to the caller. */
-  deposit(params: { provider: Address; amountWei: bigint; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
-  /** Read a user's prepaid sandbox balance against a provider (wei). */
-  getBalance(user: Address, provider: Address): Promise<bigint> { return this.infra.getBalance(user, provider); }
+  /** Fund a prepaid sandbox balance (payable). Recipient defaults to the caller; provider to the attestor /config's. */
+  deposit(params: { amountWei: bigint; provider?: Address; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
+  /** Read a prepaid sandbox balance (wei). User defaults to the account; provider to the attestor /config's. */
+  getBalance(user?: Address, provider?: Address): Promise<bigint> { return this.infra.getBalance(user, provider); }
 }

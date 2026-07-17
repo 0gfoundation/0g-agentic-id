@@ -1316,6 +1316,15 @@ details.log[open] summary{color:var(--text2)}
       <p>Mint on-chain identity, encrypt config to 0G storage, spin up a sandboxed runtime.</p>
     </div>
 
+    <!-- Preflight strip: surfaces the two deploy prerequisites (trust-roots
+         ack + prepaid balance) the moment the page opens, so the user fixes
+         them BEFORE filling the form instead of being interrupted by modals
+         at submit. Hidden until the wallet is connected; each unmet item
+         renders as a row with its fix-up button. -->
+    <section class="card" id="deployPreflight" style="display:none">
+      <div id="deployPreflightRows"></div>
+    </section>
+
     <section class="card">
       <h2>Identity</h2>
       <div class="row">
@@ -1901,7 +1910,7 @@ window.addEventListener('DOMContentLoaded', async () => {
       ? State.config.supported_frameworks
       : ['openclaw']; // fallback when the attestor predates /config.supported_frameworks
     const sel = $('#framework');
-    sel.innerHTML = list.map((f) => `<option value="${f}">${label(f)}</option>`).join('');
+    sel.innerHTML = list.map((f) => `<option value="${escapeHtml(f)}">${escapeHtml(label(f))}</option>`).join('');
     enhanceAllSelects();
   }
   // Seed the deploy form's Model select with the default provider's
@@ -2109,8 +2118,10 @@ async function fetchZgComputeModels() {
 }
 
 function renderModelOptions(sel, models) {
+  // models can come from the EXTERNAL 0g router catalog — escape them:
+  // a compromised catalog must not be able to inject markup here.
   sel.innerHTML = models
-    .map(m => `<option value="${m}">${m}</option>`)
+    .map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`)
     .join('');
 }
 
@@ -2153,7 +2164,7 @@ window.handleAvatarFile = function (e) {
   reader.onload = (ev) => {
     const dataUrl = ev.target.result;
     State.deployAvatarDataUrl = dataUrl;
-    $('#avatarPreview').innerHTML = `<img src="${dataUrl}" alt=""/>`;
+    $('#avatarPreview').innerHTML = `<img src="${escapeHtml(dataUrl)}" alt=""/>`;
     $('#avatarMeta').textContent = `${file.name} · ${(file.size / 1024).toFixed(1)} KB`;
     $('#avatarClearBtn').disabled = false;
   };
@@ -2583,7 +2594,45 @@ async function loadSandboxBalance(ownerAddr) {
 // status + Acknowledge inside the popover. Anywhere that mutates
 // `State.sandboxBalance` or `State.trustRoots` should call
 // `renderWalletUI()` to keep both in sync.
+// Deploy-page preflight strip: mirrors the wallet popover's two gate rows
+// (trust roots + balance) at the top of the deploy form, so the user sees
+// and fixes prerequisites BEFORE filling the form — instead of being
+// interrupted by the same modals at submit. Data comes from the exact
+// State the submit gates read; no extra chain calls.
+function renderDeployPreflight() {
+  const host = $('#deployPreflight');
+  const rows = $('#deployPreflightRows');
+  if (!host || !rows) return;
+  if (!State.ownerAddr) { host.style.display = 'none'; return; }
+
+  const items = [];
+  const tr = State.trustRoots;
+  if (tr && !tr.disabled && !tr.errors?.length && !tr.allAcked) {
+    const missing = tr.missingAppIds.length;
+    items.push(
+      `<div class="row" style="align-items:center;justify-content:space-between;gap:12px">
+         <div><b>Acknowledge trust roots</b><br/>
+           <small class="hint">${tr.slots.length - missing}/${tr.slots.length} components acknowledged — deploys require all of them.</small></div>
+         <button class="btn" onclick="openAckModalForReview()">Review &amp; acknowledge</button>
+       </div>`,
+    );
+  }
+  if (sandboxServingEnabled() && State.sandboxBalance !== null && State.sandboxBalance < TOP_UP_THRESHOLD_WEI) {
+    items.push(
+      `<div class="row" style="align-items:center;justify-content:space-between;gap:12px">
+         <div><b>Top up sandbox balance</b><br/>
+           <small class="hint">Balance ${escapeHtml((+ethers.formatEther(State.sandboxBalance)).toFixed(4))} OG — deploys require at least 0.1 OG prepaid.</small></div>
+         <button class="btn" onclick="openTopUpModal()">Top up</button>
+       </div>`,
+    );
+  }
+  if (items.length === 0) { host.style.display = 'none'; return; }
+  rows.innerHTML = items.join('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0"/>');
+  host.style.display = '';
+}
+
 function renderWalletUI() {
+  renderDeployPreflight();
   if (!State.ownerAddr) return;
   // Chip text — short address optionally suffixed with rounded balance.
   const short = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
@@ -2976,8 +3025,12 @@ window.submitDeploy = async function () {
     if (!resp.ok) {
       throw new Error(`/deploy ${resp.status}: ${await resp.text()}`);
     }
-    const { seal_id } = await resp.json();
+    const { seal_id, agent_seal_addr } = await resp.json();
     State.deployingSealId = seal_id;
+    // Kept for the completion CTA: fund the agentSeal so evolution can
+    // commit on chain — surfaced proactively instead of waiting for the
+    // agent's out-of-gas plea.
+    State.deployingSealAddr = agent_seal_addr || null;
     $('#outSeal').textContent = seal_id;
     $('#cardProgress').style.display = 'block';
     $('#cardProgress').scrollIntoView({ behavior: 'smooth' });
@@ -3071,8 +3124,21 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'container_running') {
     setTask('running', 'done', 'live');
     $('#deployBtn').disabled = false;
-    $('#goDetailRow').innerHTML = `<small class="hint">Redirecting to agent detail…</small>`;
-    setTimeout(() => navigate(`#/agent/${sealId}`), 1500);
+    // Proactive evolution-gas CTA: the agentSeal wallet starts at 0, so
+    // the agent can serve but cannot commit its evolution on chain until
+    // the owner funds it. Say so NOW, at the success moment — the
+    // begging-avatar warning only appears after the first failed commit.
+    const sealAddr = State.deployingSealAddr;
+    const name = ($('#name')?.value || '').trim();
+    $('#goDetailRow').innerHTML = `
+      <div class="row" style="align-items:center;justify-content:space-between;gap:12px">
+        <small class="hint">Agent is live. One optional step: fund its evolution wallet
+        (agentSeal) with a little OG so it can commit memory updates on chain.</small>
+        <span style="display:flex;gap:8px;flex-shrink:0">
+          ${sealAddr ? `<button class="btn" onclick="openSealTopUpModal('${escapeHtml(sealAddr)}', ${escapeHtml(JSON.stringify(name))})">Fund evolution gas</button>` : ''}
+          <button class="btn btn-primary" onclick="navigate('#/agent/${escapeHtml(sealId)}')">View agent →</button>
+        </span>
+      </div>`;
   }
 }
 

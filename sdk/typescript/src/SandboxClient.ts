@@ -26,13 +26,40 @@ export class SandboxClient {
   private get tappRegistry(): Address { return this.ctx.addresses.tappRegistry; }
   private get sandboxServing(): Address { return this.ctx.addresses.sandboxServing; }
 
+  /**
+   * Component appIds to ack: explicit config wins, else the attestor's
+   * GET /config (each environment names its own apps — the built-in
+   * defaults are prod names and made ack() revert "app not found" on
+   * -dev), else the built-in defaults.
+   */
+  async resolveAppIds(): Promise<string[]> {
+    if (this.ctx.componentAppIdsExplicit) return this.ctx.componentAppIds;
+    const cfg = await this.ctx.attestorConfig();
+    if (cfg) {
+      const ids = [cfg.attestor_app_id, cfg.kms_app_id, cfg.sandbox_app_id]
+        .filter((s): s is string => !!s && s.length > 0);
+      if (ids.length > 0) return ids;
+    }
+    return this.ctx.componentAppIds;
+  }
+
+  /** Sandbox provider address: explicit arg wins, else attestor /config. */
+  async resolveProvider(provider?: Address): Promise<Address> {
+    if (provider) return provider;
+    const cfg = await this.ctx.attestorConfig();
+    if (cfg?.sandbox_provider_addr) return cfg.sandbox_provider_addr;
+    throw new Error(
+      'sandbox provider address unknown — pass `provider` explicitly or set attestorUrl (it is read from GET /config)',
+    );
+  }
+
   // ── ack ──────────────────────────────────────────────────────────────────
 
   /** Which of the configured component appIds `user` still needs to acknowledge. */
   async ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> {
     const addr = user ?? this.ctx.account?.address;
     if (!addr) throw new Error('no user address (pass one or set account)');
-    const appIds = this.ctx.componentAppIds;
+    const appIds = await this.resolveAppIds();
     const flags = await Promise.all(
       appIds.map((appId) =>
         this.ctx.publicClient.readContract({
@@ -67,20 +94,29 @@ export class SandboxClient {
 
   // ── deposit ──────────────────────────────────────────────────────────────
 
-  /** Read a user's prepaid sandbox balance against a provider (wei). */
-  async getBalance(user: Address, provider: Address): Promise<bigint> {
+  /**
+   * Read a user's prepaid sandbox balance against a provider (wei).
+   * Both args optional: `user` defaults to the configured account,
+   * `provider` to the attestor /config's provider.
+   */
+  async getBalance(user?: Address, provider?: Address): Promise<bigint> {
+    const addr = user ?? this.ctx.account?.address;
+    if (!addr) throw new Error('no user address (pass one or set account)');
     return this.ctx.publicClient.readContract({
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'getBalance',
-      args: [user, provider],
+      args: [addr, await this.resolveProvider(provider)],
     }) as Promise<bigint>;
   }
 
-  /** Fund a prepaid sandbox balance (SandboxServing.deposit, payable). Recipient defaults to the caller. */
+  /**
+   * Fund a prepaid sandbox balance (SandboxServing.deposit, payable).
+   * Recipient defaults to the caller; provider to the attestor /config's.
+   */
   async deposit(params: {
-    provider: Address;
     amountWei: bigint;
+    provider?: Address;
     recipient?: Address;
   }): Promise<WriteContractReturnType> {
     const { walletClient, account } = requireWallet(this.ctx);
@@ -88,7 +124,7 @@ export class SandboxClient {
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'deposit',
-      args: [params.recipient ?? account.address, params.provider],
+      args: [params.recipient ?? account.address, await this.resolveProvider(params.provider)],
       value: params.amountWei,
       account,
       chain: this.ctx.chain,
