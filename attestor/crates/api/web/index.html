@@ -1818,11 +1818,18 @@ function updateDeployGate() {
   const unacked = !!(State.ownerAddr && tr && !tr.disabled && !tr.errors?.length && !tr.allAcked);
   btn.disabled = !State.signer || unacked;
   if (hint) {
+    // Static strings + fixed handlers only — the hint is an action, not a
+    // dead sentence: every blocked state links straight to its fix.
+    const lowBalance = !!(State.ownerAddr && sandboxServingEnabled()
+      && State.sandboxBalance !== null && State.sandboxBalance < TOP_UP_THRESHOLD_WEI);
     if (!State.signer) {
-      hint.textContent = 'Connect a wallet to deploy.';
+      hint.innerHTML = '<a href="#" onclick="connectWallet();return false">Connect a wallet</a> to deploy.';
       hint.style.display = '';
     } else if (unacked) {
-      hint.textContent = 'Deploying requires acknowledging the TEE trust roots first (see above) — browsing works without it.';
+      hint.innerHTML = 'Deploying requires <a href="#" onclick="openAckModalForReview();return false">acknowledging the TEE trust roots</a> first — browsing works without it.';
+      hint.style.display = '';
+    } else if (lowBalance) {
+      hint.innerHTML = 'Prepaid sandbox balance is below 0.1 OG — <a href="#" onclick="openTopUpModal();return false">top up</a> before deploying.';
       hint.style.display = '';
     } else {
       hint.style.display = 'none';
