@@ -1323,6 +1323,11 @@ details.log[open] summary{color:var(--text2)}
       <p>Mint on-chain identity, encrypt config to 0G storage, spin up a sandboxed runtime.</p>
     </div>
 
+    <!-- Form mode vs progress mode: once a deploy is ACCEPTED the whole
+         form hides and only the progress card remains — a de-facto
+         dedicated tracking screen, so a second Deploy click is
+         impossible while one is in flight. -->
+    <div id="deployFormWrap">
     <section class="card">
       <h2>Identity</h2>
       <div class="row">
@@ -1395,6 +1400,7 @@ details.log[open] summary{color:var(--text2)}
       <small class="hint" id="deployGateHint" style="display:none;margin-left:10px"></small>
       <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope. If trust roots aren't acknowledged or sandbox balance is below 0.1 OG, you'll be asked to handle that first.</small>
     </section>
+    </div><!-- /deployFormWrap -->
 
     <section class="card" id="cardProgress" style="display:none">
       <h2>Deploy progress</h2>
@@ -1808,6 +1814,18 @@ function navigate(hash) {
 // unacked (unknown/loading doesn't block — the attestor's 402 preflight
 // backstops), with the reason spelled out next to it. Re-run whenever
 // wallet/ack state changes so acking re-enables live.
+// Return from progress-only mode to the form (inputs preserved). Used by
+// "Deploy another" on success and the failure handlers — does not touch
+// the background job, it only switches what this page shows.
+window.backToDeployForm = function () {
+  const fw = $('#deployFormWrap'); if (fw) fw.style.display = '';
+  $('#cardProgress').style.display = 'none';
+  $('#goDetailRow').innerHTML = '';
+  resetProgress();
+  updateDeployGate();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+};
+
 function updateDeployGate() {
   const btn = $('#deployBtn');
   const hint = $('#deployGateHint');
@@ -1863,6 +1881,7 @@ function handleHash() {
     // marks (red ✗, error reason text) would otherwise linger inside the
     // hidden card and re-flash when a new deploy unhides it.
     $('#cardProgress').style.display = 'none';
+    const fw = $('#deployFormWrap'); if (fw) fw.style.display = '';
     $('#goDetailRow').innerHTML = '';
     $('#slowHint').classList.remove('show');
     resetProgress();
@@ -3038,6 +3057,7 @@ window.submitDeploy = async function () {
     // agent's out-of-gas plea.
     State.deployingSealAddr = agent_seal_addr || null;
     $('#outSeal').textContent = seal_id;
+    $('#deployFormWrap').style.display = 'none';
     $('#cardProgress').style.display = 'block';
     $('#cardProgress').scrollIntoView({ behavior: 'smooth' });
     resetProgress();
@@ -3112,12 +3132,14 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'mint_failed') {
     setTask('mint', 'fail', evt.reason || 'failed');
     cancelDownstream(['sandbox', 'uri', 'running']);
+    $('#goDetailRow').innerHTML = `<button class="btn" onclick="backToDeployForm()">← Edit &amp; redeploy</button>`;
   }
 
   if (t === 'container_starting') setTask('sandbox', 'active', 'creating sandbox…');
   if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
+    $('#goDetailRow').innerHTML = `<button class="btn" onclick="backToDeployForm()">← Back to form</button> <small class="hint" style="display:inline;margin-left:8px">Identity may still finalize — the agent will appear in the list as Offline, recoverable via Bring online.</small>`;
     // Container failure is a RUNTIME failure only — it cancels just
     // `running`. Identity (uri) is independent and still finalizes (the
     // agent ends up minted + carded + Offline, recoverable via Bring
@@ -3141,6 +3163,7 @@ function handleDeployEvent(evt, sealId) {
         <small class="hint">Agent is live. Optional: fund its evolution wallet so it can commit memory on chain.</small>
         <span style="display:flex;gap:8px;flex-shrink:0">
           ${sealAddr ? `<button class="btn" onclick="openSealTopUpModal('${escapeHtml(sealAddr)}', ${escapeHtml(JSON.stringify(name))})">Fund evolution gas</button>` : ''}
+          <button class="btn" onclick="backToDeployForm()">Deploy another</button>
           <button class="btn btn-primary" onclick="navigate('#/agent/${escapeHtml(sealId)}')">View agent →</button>
         </span>
       </div>`;
