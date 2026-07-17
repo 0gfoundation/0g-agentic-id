@@ -1394,6 +1394,7 @@ details.log[open] summary{color:var(--text2)}
 
     <section class="card">
       <button class="btn btn-primary" id="deployBtn" disabled onclick="submitDeploy()">Deploy</button>
+      <small class="hint" id="deployGateHint" style="display:none;margin-left:10px"></small>
       <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope. If trust roots aren't acknowledged or sandbox balance is below 0.1 OG, you'll be asked to handle that first.</small>
     </section>
 
@@ -1805,8 +1806,34 @@ function navigate(hash) {
   else handleHash();
 }
 
+// Deploy gate: the button stays disabled while trust roots are KNOWN
+// unacked (unknown/loading doesn't block — the attestor's 402 preflight
+// backstops), with the reason spelled out next to it. Re-run whenever
+// wallet/ack state changes so acking re-enables live.
+function updateDeployGate() {
+  const btn = $('#deployBtn');
+  const hint = $('#deployGateHint');
+  if (!btn) return;
+  const tr = State.trustRoots;
+  const unacked = !!(State.ownerAddr && tr && !tr.disabled && !tr.errors?.length && !tr.allAcked);
+  btn.disabled = !State.signer || unacked;
+  if (hint) {
+    if (!State.signer) {
+      hint.textContent = 'Connect a wallet to deploy.';
+      hint.style.display = '';
+    } else if (unacked) {
+      hint.textContent = 'Deploying requires acknowledging the TEE trust roots first (see above) — browsing works without it.';
+      hint.style.display = '';
+    } else {
+      hint.style.display = 'none';
+    }
+  }
+}
+
 function handleHash() {
   const h = location.hash || '#/';
+  // Leaving the deploy page re-arms the once-per-entry ack prompt.
+  if (h !== '#/deploy') State.ackPromptedForDeploy = false;
   $$('.view').forEach(v => v.classList.remove('active'));
   $$('.nav a').forEach(a => a.classList.remove('active'));
   // Any selects added by dynamic renders since last navigation get
@@ -1837,10 +1864,21 @@ function handleHash() {
     if (State.slowHintTimer) { clearTimeout(State.slowHintTimer); State.slowHintTimer = null; }
     State.deployingSealId = null;
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
-    $('#deployBtn').disabled = !State.signer;
+    updateDeployGate();
     activeNav = 'deploy';
     // Indicators live in the topbar wallet popover now; no per-route
     // refresh needed — applyAccount already kicks both off on connect.
+    // Ack is intent-anchored: entering the deploy page IS the intent, so
+    // if the wallet is connected and trust roots are known-unacked, open
+    // the ack modal ONCE per entry (closable — the disabled Deploy button
+    // + preflight strip carry the state afterwards). Never at site entry:
+    // ack is informed consent, not a cookie banner.
+    const tr = State.trustRoots;
+    if (State.ownerAddr && tr && !tr.disabled && !tr.errors?.length && !tr.allAcked
+        && !State.ackPromptedForDeploy) {
+      State.ackPromptedForDeploy = true;
+      openAckModalForReview();
+    }
   } else if (h === '#/agents') {
     route = 'discovery';
     $('#viewDiscovery').classList.add('active');
@@ -2633,6 +2671,7 @@ function renderDeployPreflight() {
 
 function renderWalletUI() {
   renderDeployPreflight();
+  updateDeployGate();
   if (!State.ownerAddr) return;
   // Chip text — short address optionally suffixed with rounded balance.
   const short = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
@@ -2901,7 +2940,7 @@ window.submitDeploy = async function () {
   // A dev/mock attestor with appIds unset returns true immediately.
   const acked = await ensureTrustRootsAcked();
   if (!acked) {
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     return;
   }
 
@@ -2909,7 +2948,7 @@ window.submitDeploy = async function () {
   // top-up modal otherwise.
   const funded = await ensureSandboxBalance();
   if (!funded) {
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     return;
   }
 
@@ -2924,7 +2963,7 @@ window.submitDeploy = async function () {
 
     if (!name || !description) {
       toast('Name and description are required', 'error');
-      $('#deployBtn').disabled = false;
+      updateDeployGate();
       return;
     }
 
@@ -3054,7 +3093,7 @@ window.submitDeploy = async function () {
     subscribeDeployWS(seal_id);
   } catch (e) {
     toast(String(e.message || e), 'error');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
   }
 };
 
@@ -3089,7 +3128,7 @@ function handleDeployEvent(evt, sealId) {
       setTask(n, 'fail', 'skipped — earlier step failed');
     }
     $('#slowHint').classList.remove('show');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
   }
 
   if (t === 'storage_submitted') setTask('storage', 'active', 'tx submitted, awaiting confirm…');
@@ -3123,7 +3162,7 @@ function handleDeployEvent(evt, sealId) {
 
   if (t === 'container_running') {
     setTask('running', 'done', 'live');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     // Proactive evolution-gas CTA: the agentSeal wallet starts at 0, so
     // the agent can serve but cannot commit its evolution on chain until
     // the owner funds it. Say so NOW, at the success moment — the

@@ -19,6 +19,7 @@ clone UI)往后排。
       历史 bug(#11 失败态按钮、KMS 慢无反馈)都是这个根因。
       做法:按视图逐个收敛(deploy 进度 → 列表 → 详情),小步 PR
 - [x] 异步失败可见性:failed/offline 行内直显原因短语(截断+完整版仍在 hover)
+- [x] ack 意图锚定:进 Deploy 页(已连钱包且未 ack)自动弹一次 ack 模态;未 ack 时 Deploy 按钮禁用并说明原因。站点入口不弹(知情同意不是 cookie 横幅)
 - [ ] ack 版本变更时解释"为什么又要 ack"(显示 app 更新版本号)
 
 ### P1(暂缓)— 功能空洞:transfer / clone 没有 UI
