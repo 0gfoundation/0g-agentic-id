@@ -169,6 +169,7 @@ the sandbox (it keeps running and billing until the provider GCs it).
 
 | Symptom | Layer | Meaning |
 |---|---|---|
+| `/deploy`, `/clone` or `/reset` returns 402 immediately, code `trust_roots_not_acked` or `insufficient_sandbox_balance` | preflight (by design) | the owner wallet hasn't acked the component set / holds < 0.1 OG prepaid — fix with `ack()` / `deposit()` (console: the matching dialog) and retry; this replaces the old silent async worker 402 |
 | binaries boot-loop, `GetAppSecretKey`/`GetSecretResource`: `app not found on-chain` | registration | the environment's `app_id` isn't registered in the tapp/KMS registry — register/update it on-chain first |
 | binary refuses to boot: `KMS returned identical keys for different material` | tapp version | tapp-server predates the `material` passthrough (0g-tapp#35) — upgrade tapp before this attestor |
 | `/deploy` 500 after ~1 min, worker logs `GetSecretResource timed out` | KMS | KMS DPRF derive is slow/stuck (cluster degraded / waiting on threshold) — fix the cluster; the attestor timeout only makes it visible |

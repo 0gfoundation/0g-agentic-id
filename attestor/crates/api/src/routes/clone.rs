@@ -62,6 +62,11 @@ pub async fn handle(
     verify_clone_signature(&req, owner, state.crypto.as_ref())
         .map_err(|e| ApiError::unauthorized(format!("owner_signature: {e}")))?;
 
+    // Same deploy-edge preflight as /deploy: the clone's sandbox is billed
+    // to the signing owner, so their ack + balance must hold NOW — not
+    // minutes later in a worker 402.
+    super::preflight::check_owner_ready(&state, owner).await?;
+
     // The clone copies the source card verbatim — no caller overrides. A name
     // is required, so reject if the source card has none.
     let card = &source.agent_card;

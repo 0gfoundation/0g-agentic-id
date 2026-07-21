@@ -68,6 +68,14 @@ pub struct MockChain {
 }
 
 impl MockChain {
+    // Preflight knobs — MockChain is always permissive; ConfigurableChain
+    // carries the real toggles for gate tests.
+    fn preflight_acked(&self) -> bool {
+        true
+    }
+    fn preflight_balance(&self) -> U256 {
+        U256::MAX
+    }
     pub fn new() -> Self {
         Self {
             next_agent_id: AtomicU64::new(1),
@@ -158,6 +166,26 @@ impl ChainClient for MockChain {
     async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
         // Mock defaults to passing; tests needing rejection use ConfigurableChain.
         Ok(true)
+    }
+
+    async fn is_acknowledged(
+        &self,
+        _registry: Address,
+        _user: Address,
+        _app_id: &str,
+    ) -> anyhow::Result<bool> {
+        // Permissive by default; the preflight gate tests flip
+        // ConfigurableChain::acked to exercise rejection.
+        Ok(self.preflight_acked())
+    }
+
+    async fn sandbox_balance(
+        &self,
+        _serving: Address,
+        _user: Address,
+        _provider: Address,
+    ) -> anyhow::Result<alloy::primitives::U256> {
+        Ok(self.preflight_balance())
     }
 
     async fn token_uri(&self, _agent_id: AgentId) -> anyhow::Result<String> {
@@ -474,6 +502,10 @@ pub struct ConfigurableChain {
     /// Last `registerWithSeal` params (to, agent_seal, sealed_keys) so tests
     /// can assert who a mint/clone was minted to.
     pub last_register: Mutex<Option<(Address, Address, Vec<Bytes>)>>,
+    /// Preflight gate knobs: trust-roots ack + prepaid sandbox balance
+    /// returned by `is_acknowledged` / `sandbox_balance`. Default permissive.
+    pub acked: AtomicBool,
+    pub balance_wei: Mutex<U256>,
     /// On-chain iData + sealed keys for `intelligent_datas_of`/`sealed_keys_of`
     /// (for any agent_id). Seed via `seed_idata` to exercise clone.
     idata: Mutex<Vec<IntelligentData>>,
@@ -498,7 +530,23 @@ impl ConfigurableChain {
             next_agent_id: AtomicU64::new(1),
             tx_counter: AtomicU64::new(1),
             receipts: Mutex::new(HashMap::new()),
+            acked: AtomicBool::new(true),
+            balance_wei: Mutex::new(U256::MAX),
         }
+    }
+
+    // Preflight knobs (deploy-edge ack/balance gate). Default permissive.
+    fn preflight_acked(&self) -> bool {
+        self.acked.load(Ordering::SeqCst)
+    }
+    fn preflight_balance(&self) -> U256 {
+        *self.balance_wei.lock().unwrap()
+    }
+    pub fn set_acked(&self, v: bool) {
+        self.acked.store(v, Ordering::SeqCst);
+    }
+    pub fn set_sandbox_balance(&self, wei: U256) {
+        *self.balance_wei.lock().unwrap() = wei;
     }
 
     pub fn seed_minted(&self, seal_id: SealId, agent_id: AgentId) {
@@ -581,6 +629,26 @@ impl ChainClient for ConfigurableChain {
     async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
         // Mock defaults to passing; tests needing rejection use ConfigurableChain.
         Ok(true)
+    }
+
+    async fn is_acknowledged(
+        &self,
+        _registry: Address,
+        _user: Address,
+        _app_id: &str,
+    ) -> anyhow::Result<bool> {
+        // Permissive by default; the preflight gate tests flip
+        // ConfigurableChain::acked to exercise rejection.
+        Ok(self.preflight_acked())
+    }
+
+    async fn sandbox_balance(
+        &self,
+        _serving: Address,
+        _user: Address,
+        _provider: Address,
+    ) -> anyhow::Result<alloy::primitives::U256> {
+        Ok(self.preflight_balance())
     }
 
     async fn token_uri(&self, _agent_id: AgentId) -> anyhow::Result<String> {

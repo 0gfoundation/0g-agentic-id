@@ -69,6 +69,13 @@ pub async fn handle(
     // {lifecycle_auth}.
     authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
 
+    // The recreate's sandbox is billed to the envelope signer (the owner
+    // just authorized above) — preflight ack + balance so a transferred
+    // agent's NEW owner learns "you haven't acked / deposited" right here,
+    // not from a worker 402 after "accepted". (The exact failure mode our
+    // lifecycle e2e used to hit.)
+    super::preflight::check_owner_ready(&state, req.sandbox_envelope.wallet_address).await?;
+
     state
         .jobs
         .submit(JobPayload::SandboxRecreate {

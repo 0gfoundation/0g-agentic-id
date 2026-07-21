@@ -196,11 +196,13 @@ await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   w
 await ag.ack();              // → tx hash "0x…", or null if nothing was missing
 
 // prepaid sandbox balance (SandboxServing)
-await ag.getBalance(owner, provider);                          // → 500000000000000000n   (wei, i.e. 0.5)
-await ag.deposit({ provider, amountWei: parseEther('0.5') });  // → tx hash "0x…"   fund the prepaid balance
+await ag.getBalance();                              // → 500000000000000000n   (wei; user defaults to the account, provider to the attestor /config's)
+await ag.deposit({ amountWei: parseEther('0.5') }); // → tx hash "0x…"   fund the prepaid balance (provider auto-resolved the same way)
 ```
 
-The trust-root component set defaults to `['0g-attestor','0g-kms','0g-sandbox-provider']`; override with `componentAppIds` in the config. (Agent-seal gas top-up is on the `agent` namespace above.)
+The trust-root component set auto-resolves from the attestor's `GET /config` when `attestorUrl` is set (each environment names its own apps), falling back to `['0g-attestor','0g-kms','0g-sandbox-provider']`; an explicit `componentAppIds` in the config always wins. (Agent-seal gas top-up is on the `agent` namespace above.)
+
+`agent.deploy()` / `agent.clone()` **preflight** both prerequisites (all components acked + prepaid balance ≥ 0.1 OG) and throw a synchronous, actionable error naming the missing step — pass `{ preflight: false }` to skip. The attestor enforces the same two checks at accept (HTTP 402, codes `trust_roots_not_acked` / `insufficient_sandbox_balance`).
 
 ---
 

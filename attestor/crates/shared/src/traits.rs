@@ -29,6 +29,29 @@ pub trait ChainClient: Send + Sync {
     /// — the attestor requires it to be configured.
     async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool>;
 
+    /// TappRegistry.isAcknowledged(user, appId) — whether `user` has acked
+    /// `app_id` at its CURRENT ackVersion. Used by the deploy-edge
+    /// preflight so "trust roots not acked" fails synchronously with
+    /// context instead of surfacing minutes later as an async worker
+    /// error. `registry` rides per-call (from config) so the chain client
+    /// stays stateless about it.
+    async fn is_acknowledged(
+        &self,
+        registry: Address,
+        user: Address,
+        app_id: &str,
+    ) -> anyhow::Result<bool>;
+
+    /// SandboxServing.getBalance(user, provider) — the prepaid sandbox
+    /// balance (wei) `user` holds against `provider`. Same preflight use;
+    /// `serving` rides per-call like `registry` above.
+    async fn sandbox_balance(
+        &self,
+        serving: Address,
+        user: Address,
+        provider: Address,
+    ) -> anyhow::Result<alloy::primitives::U256>;
+
     /// ERC-721 `tokenURI(agentId)`. Used by indexer reconstruction.
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String>;
 

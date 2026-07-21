@@ -37,6 +37,17 @@ impl ApiError {
         }
     }
 
+    /// 402 with a stable code — the deploy-edge preflight uses these so
+    /// clients can route "not acked" / "not funded" to the right fix-up
+    /// UI instead of parsing prose.
+    pub fn precondition(code: &'static str, msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYMENT_REQUIRED,
+            code,
+            message: msg.into(),
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
