@@ -217,11 +217,12 @@ export class AgentApi {
    * provision.
    *
    * The returned `token` is a full owner/operator credential for the
-   * gateway (not a narrow scope) — treat it accordingly. Today the only
-   * confirmed use is opening `dashboardUrl` in a browser; the gateway's
-   * OpenAI-compatible HTTP API (`/v1/chat/completions` etc., which would
-   * accept this same token via `Authorization: Bearer`) is disabled by
-   * default on the sealed side and isn't wired up yet.
+   * gateway (not a narrow scope) — treat it accordingly. It unlocks both
+   * surfaces: open `dashboardUrl` in a browser, or call the gateway's
+   * OpenAI-compatible HTTP API headlessly with `Authorization: Bearer
+   * <token>` — `POST {agentUrl}/v1/chat/completions` with
+   * `model: "openclaw/default"` chats with the agent, `GET /v1/models`
+   * lists targets (the sealed runtime enables this endpoint).
    */
   async authenticate(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
     const { walletClient, account } = requireWallet(this.ctx);

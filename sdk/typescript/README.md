@@ -294,15 +294,23 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
   ```ts
   const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-  // open dashboardUrl in a browser — confirmed working today.
-  //
   // `token` is a full owner/operator credential for the openclaw gateway
-  // (not a narrow scope). In principle it also authenticates openclaw's
-  // OpenAI-compatible HTTP API (`Authorization: Bearer <token>` against
-  // `/v1/chat/completions` etc.) for headless, no-browser chat — but that
-  // endpoint is disabled by default on the sealed side today
-  // (`gateway.http.endpoints.chatCompletions.enabled`), so this path isn't
-  // wired up yet.
+  // (not a narrow scope). Two ways to use it:
+
+  // 1. Browser: open dashboardUrl (the token rides the #fragment).
+
+  // 2. Headless chat — the gateway serves an OpenAI-compatible HTTP API
+  //    (enabled by the sealed runtime), same Bearer token:
+  const r = await fetch(`${agentUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'openclaw/default',
+      messages: [{ role: 'user', content: 'What can you do?' }],
+    }),
+  });
+  const { choices } = await r.json();   // choices[0].message.content — a real inference reply
+  // GET /v1/models lists targets; requests without the token get 401.
   ```
 
   Under the hood: EIP-191-sign `0GSealAuth:<sealId>:<ts>`, exchange it at
