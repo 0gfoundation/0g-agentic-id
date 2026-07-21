@@ -219,6 +219,62 @@ The trust-root component set auto-resolves from the attestor's `GET /config` whe
 
 ---
 
+## The runtime image, framework, and iData shapes
+
+The sandbox `snapshot` (from `GET /config`, currently `0g-sealed`) is the
+sealed runtime image bundling the **openclaw** framework adapter — the only
+framework shipping today (`/config.supported_frameworks` is the source of
+truth). WYSIWYS: the iData you sign is exactly what gets encrypted and
+minted; the attestor synthesizes nothing.
+
+```ts
+iData: [
+  // REQUIRED: the framework binding. Version-less resolves to the image's
+  // validated openclaw release; pinning a whitelisted version is honored.
+  { role: 'framework', plaintext: { name: 'openclaw', schema_version: 1 }, extra: {} },
+  // The protocol persona seed — every adapter translates this into its own
+  // config. system_prompt is your agent's character; inference picks the
+  // provider/model ('anthropic' | 'openai' | '0g-compute' via the router).
+  { role: 'persona', plaintext: {
+      system_prompt: 'You are …\n',
+      inference: { provider: '0g-compute', model: 'claude-opus-4-8' },
+    }, extra: {} },
+]
+```
+
+`sandbox.apiKey` is required in practice — without it the agent boots but
+cannot reach its model. It travels inside the owner-signed envelope into
+the TEE container's environment; the attestor never stores it (which is
+why `reset()` needs it again).
+
+## What does my agent cost to run?
+
+```ts
+await ag.agent.runtimeCosts(agentId);
+// → {
+//   prepaidBalanceWei:      368500000000011380n,   // owner's prepaid sandbox balance
+//   sealGasWei:             0n,                    // evolution fuel (agentSeal wallet)
+//   pricing: { pricePerCPUPerMin, pricePerMemGBPerMin, createFee },
+//   costPerMinWei:          4000000000000000n,     // for the container spec (default 2C/4GB)
+//   estimatedRunwayMinutes: 92,                    // balance ÷ cost/min
+// }
+// Pass { cpu, memGb } if your container spec differs. Per-agent metered
+// spend needs provider-side usage records — not on chain yet.
+```
+
+## Interacting with a running agent (no console needed)
+
+- **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
+  my registered services. Every response carries a signed `X-Agent-Proof`.
+- **Owner-registered services** — plain HTTP against the paths listed in
+  `/hello`'s `services`; each response is proof-signed (that is what you
+  `capture()` and rate).
+- **Chat (openclaw console)** — owner-only: sign
+  `0GSealAuth:0x<sealId>:<unix-ts>` (EIP-191), send it as
+  `X-Auth-Message` / `X-Auth-Signature` headers to `POST {agentUrl}/_seal/auth`,
+  receive the gateway token, then talk to the openclaw gateway with it.
+  (SDK helper for this handshake is planned; today it is a manual flow.)
+
 ## Addresses
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
