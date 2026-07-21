@@ -279,6 +279,42 @@ export class AgenticID {
     this.infra = new SandboxClient(ctx);
   }
 
+  /**
+   * Bootstrap a client from ONE URL: the attestor's GET /config is the
+   * environment's self-description (contract set, chain RPC, component
+   * appIds), so `attestorUrl` alone fully determines an environment —
+   * switching environments is switching URLs, with no hand-copied
+   * address set to go stale. Explicit `overrides` win over /config for
+   * callers who verify addresses out-of-band rather than trusting the
+   * attestor. Addresses absent from /config resolve to the zero address
+   * (their module reads as "not deployed here").
+   */
+  static async fromAttestor(
+    attestorUrl: string,
+    opts?: Omit<AgenticIDConfig, 'addresses' | 'attestorUrl'> & { overrides?: Partial<import('./constants').ContractAddresses> },
+  ): Promise<AgenticID> {
+    const base = attestorUrl.replace(/\/$/, '');
+    const r = await fetch(`${base}/config`);
+    if (!r.ok) throw new Error(`fromAttestor: GET ${base}/config returned HTTP ${r.status}`);
+    const cfg = (await r.json()) as Record<string, string | undefined>;
+    const Z = '0x0000000000000000000000000000000000000000' as Address;
+    const addr = (v: string | undefined): Address => (v && v.length === 42 ? (v as Address) : Z);
+    const { overrides, ...rest } = opts ?? {};
+    return new AgenticID({
+      ...rest,
+      attestorUrl: base,
+      rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
+      addresses: {
+        agenticID: addr(cfg.agentic_id_addr),
+        reputationRegistry: addr(cfg.reputation_registry_addr),
+        teeDataVerifier: addr(cfg.tee_data_verifier_addr),
+        tappRegistry: addr(cfg.tapp_registry_addr),
+        sandboxServing: addr(cfg.sandbox_serving_addr),
+        ...overrides,
+      },
+    });
+  }
+
   // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —
   /** Acknowledge the TEE trust-root component set in one batched tx; null if already done. */
   ack(): Promise<WriteContractReturnType | null> { return this.infra.ack(); }
