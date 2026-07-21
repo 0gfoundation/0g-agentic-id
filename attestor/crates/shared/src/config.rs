@@ -98,6 +98,13 @@ pub struct Config {
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
+    /// Console features this instance ENABLES, lowercase names ("deploy",
+    /// "discovery", ...). None = everything on (dev default). Lets a
+    /// public-facing attestor serve a browse-only console; NOTE this
+    /// gates UI affordances only — the HTTP API stays open for SDK
+    /// parity (server-side write gates are the 402 preflight + owner
+    /// signatures, not this).
+    pub console_features: Option<Vec<String>>,
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
@@ -252,6 +259,9 @@ impl Config {
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),
+            console_features: env_opt("ATTESTOR_CONSOLE_FEATURES").map(|v| {
+                v.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect()
+            }),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
             sandbox_public_ports: env_opt("ATTESTOR_SANDBOX_PUBLIC_PORTS")
