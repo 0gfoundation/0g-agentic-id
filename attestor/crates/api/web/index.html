@@ -1805,24 +1805,8 @@ function navigate(hash) {
   else handleHash();
 }
 
-// Feature gating, server-driven: /config.console_features (null = all on).
-function featureOn(name) {
-  const f = State.config && State.config.console_features;
-  return !Array.isArray(f) || f.includes(name);
-}
-function applyConsoleFeatures() {
-  const navDeploy = document.querySelector('.nav a[data-route="deploy"]');
-  if (navDeploy) navDeploy.style.display = featureOn('deploy') ? '' : 'none';
-  const navAgents = document.querySelector('.nav a[data-route="agents"]');
-  if (navAgents) navAgents.style.display = featureOn('discovery') ? '' : 'none';
-}
-
 function handleHash() {
   const h = location.hash || '#/';
-  // Server-driven feature gate: routes for disabled features bounce home.
-  if ((h === '#/deploy' && !featureOn('deploy')) || (h === '#/agents' && !featureOn('discovery'))) {
-    location.hash = '#/'; return;
-  }
   $$('.view').forEach(v => v.classList.remove('active'));
   $$('.nav a').forEach(a => a.classList.remove('active'));
   // Any selects added by dynamic renders since last navigation get
@@ -1909,7 +1893,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     const r = await fetch('/config');
     if (r.ok) State.config = await r.json();
-    applyConsoleFeatures();
   } catch (e) {
     toast('Failed to load /config: ' + e.message, 'error');
   }

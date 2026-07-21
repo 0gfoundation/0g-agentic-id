@@ -42,9 +42,6 @@ pub struct ConfigResponse {
     pub reputation_registry_addr: Option<String>,
     pub tee_data_verifier_addr: Option<String>,
 
-    /// Console feature switches (null = all enabled). UI-only gating.
-    pub console_features: Option<Vec<String>>,
-
     /// Framework names deploys may select. Frontend renders the deploy
     /// picker from this so invalid choices can't be expressed; the deploy
     /// route enforces the same list pre-mint (this copy is UX, that copy
@@ -84,7 +81,6 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .cfg
             .tee_data_verifier_addr
             .map(|a| format!("{:#x}", a)),
-        console_features: state.cfg.console_features.clone(),
         supported_frameworks: state.cfg.supported_frameworks.clone(),
     })
 }
