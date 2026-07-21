@@ -351,6 +351,8 @@ export class AgenticID {
   // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —
   /** Acknowledge the TEE trust-root component set in one batched tx; null if already done. */
   ack(): Promise<WriteContractReturnType | null> { return this.infra.ack(); }
+  /** TappRegistry details for every trust-root component (code hashes, ackVersion, nodes) — the data ack() signs off on. */
+  components(user?: Address) { return this.infra.components(user); }
   /** Which configured components `user` (or the connected account) still needs to acknowledge. */
   ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> { return this.infra.ackStatus(user); }
 

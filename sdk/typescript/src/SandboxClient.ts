@@ -92,6 +92,45 @@ export class SandboxClient {
     });
   }
 
+  /**
+   * Full TappRegistry picture of every trust-root component this
+   * environment depends on — the "what am I actually acknowledging"
+   * data (code hashes, current ackVersion, registered nodes) that
+   * ack() asks the user to sign off on. One entry per component appId.
+   */
+  async components(user?: Address): Promise<Array<{
+    appId: string;
+    acked: boolean | null;
+    ackVersion: bigint;
+    owner: Address;
+    registeredAt: bigint;
+    composeHash: `0x${string}`;
+    imageHashes: `0x${string}`[];
+    nodes: Address[];
+  }>> {
+    const addr = user ?? this.ctx.account?.address ?? null;
+    const appIds = await this.resolveAppIds();
+    return Promise.all(appIds.map(async (appId) => {
+      const read = (functionName: string, args: unknown[]) =>
+        this.ctx.publicClient.readContract({
+          address: this.tappRegistry, abi: tappRegistryAbi,
+          functionName: functionName as never, args: args as never,
+        });
+      const [info, ackVersion, nodes, acked] = await Promise.all([
+        read('getAppInfo', [appId]) as Promise<{ composeHash: `0x${string}`; volumesHash: `0x${string}`; imageHashes: `0x${string}`[]; owner: Address; registeredAt: bigint }>,
+        read('getAckVersion', [appId]) as Promise<bigint>,
+        read('getNodeList', [appId]) as Promise<Address[]>,
+        addr ? (read('isAcknowledged', [addr, appId]) as Promise<boolean>) : Promise.resolve(null),
+      ]);
+      return {
+        appId, acked, ackVersion,
+        owner: info.owner, registeredAt: info.registeredAt,
+        composeHash: info.composeHash, imageHashes: info.imageHashes,
+        nodes,
+      };
+    }));
+  }
+
   // ── deposit ──────────────────────────────────────────────────────────────
 
   /**
