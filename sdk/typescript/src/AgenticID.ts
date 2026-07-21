@@ -312,18 +312,6 @@ export class ReputationApi {
   verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
 
   // — feedback —
-  /**
-   * One-call "experience it, then rate it": performs the request, captures
-   * the X-Agent-Proof it returns, and submits on-chain feedback backed by
-   * that proof. agentId comes from the proof itself. `url` should be the
-   * agent endpoint you want rated (e.g. `${agentUrl}/hello`).
-   */
-  async rate(url: string, value: bigint, opts?: Omit<GiveFeedbackParams, 'agentId' | 'value' | 'serveProof'>): Promise<WriteContractReturnType> {
-    const { response, proof } = await captureProof(() => fetch(url));
-    if (!response.ok) throw new Error(`rate: ${url} returned HTTP ${response.status}`);
-    if (!proof) throw new Error('rate: response carried no X-Agent-Proof header — is this a sealed agent endpoint?');
-    return this.rep.giveFeedback({ agentId: proof.agentId, value, serveProof: proof, endpoint: url, ...opts });
-  }
   giveFeedback(params: GiveFeedbackParams): Promise<WriteContractReturnType> { return this.rep.giveFeedback(params); }
   revokeFeedback(agentId: bigint, feedbackIndex: bigint): Promise<WriteContractReturnType> { return this.rep.revokeFeedback(agentId, feedbackIndex); }
   appendResponse(params: AppendResponseParams): Promise<WriteContractReturnType> { return this.rep.appendResponse(params); }

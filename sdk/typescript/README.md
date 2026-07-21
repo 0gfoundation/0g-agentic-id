@@ -171,8 +171,8 @@ await ag.reputation.verifyProof(proof);
 const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // full control when you want it: add valueDecimals / tag1 / tag2 /
 // endpoint / feedbackURI / feedbackHash.
-// Or the one-liner — request, capture the proof, and rate in one call:
-await ag.reputation.rate(`${agentUrl}/chat`, 5n);
+// The proof should come from the interaction you are actually rating —
+// capture() it during your real call, then submit.
 // txHash → "0x…"
 
 // read back
