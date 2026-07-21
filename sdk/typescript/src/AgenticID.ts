@@ -148,6 +148,39 @@ export class AgentApi {
     return walletClient.sendTransaction({ to: agentSeal, value: amountWei, account, chain: this.ctx.chain });
   }
 
+  /**
+   * What this agent costs to keep running, from on-chain data alone:
+   * the owner's prepaid balance, the provider's price schedule, the
+   * agent's evolution-gas balance, and the runway those imply. `spec`
+   * defaults to the standard sealed container (2 CPU / 4 GB) — pass the
+   * actual shape if yours differs. Per-agent metered spend needs
+   * provider-side usage records and is not available on chain yet.
+   */
+  async runtimeCosts(agentId: bigint, spec?: { cpu?: number; memGb?: number }): Promise<{
+    prepaidBalanceWei: bigint;
+    sealGasWei: bigint;
+    pricing: { pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint };
+    costPerMinWei: bigint;
+    estimatedRunwayMinutes: number | null;
+  }> {
+    const cpu = BigInt(spec?.cpu ?? 2);
+    const memGb = BigInt(spec?.memGb ?? 4);
+    const [prepaidBalanceWei, svc, sealAddr] = await Promise.all([
+      this.infra.getBalance(),
+      this.infra.services(),
+      this.id.getAgentSeal(agentId),
+    ]);
+    const sealGasWei = await this.ctx.publicClient.getBalance({ address: sealAddr });
+    const costPerMinWei = cpu * svc.pricePerCPUPerMin + memGb * svc.pricePerMemGBPerMin;
+    return {
+      prepaidBalanceWei,
+      sealGasWei,
+      pricing: { pricePerCPUPerMin: svc.pricePerCPUPerMin, pricePerMemGBPerMin: svc.pricePerMemGBPerMin, createFee: svc.createFee },
+      costPerMinWei,
+      estimatedRunwayMinutes: costPerMinWei > 0n ? Number(prepaidBalanceWei / costPerMinWei) : null,
+    };
+  }
+
   // — runtime: interacting with a live agent —
 
   /**

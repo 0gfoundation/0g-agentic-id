@@ -823,6 +823,19 @@ export const sandboxServingAbi = [
   },
   {
     type: 'function',
+    name: 'services',
+    stateMutability: 'view',
+    inputs: [{ name: 'provider', type: 'address' }],
+    outputs: [
+      { name: 'url', type: 'string' },
+      { name: 'appId', type: 'string' },
+      { name: 'pricePerCPUPerMin', type: 'uint256' },
+      { name: 'pricePerMemGBPerMin', type: 'uint256' },
+      { name: 'createFee', type: 'uint256' },
+    ],
+  },
+  {
+    type: 'function',
     name: 'isTEEAcknowledged',
     stateMutability: 'view',
     inputs: [

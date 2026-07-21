@@ -110,6 +110,16 @@ export class SandboxClient {
     }) as Promise<bigint>;
   }
 
+  /** Provider's registered service entry (endpoint + price schedule). Provider defaults from /config. */
+  async services(provider?: Address): Promise<{ url: string; appId: string; pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint }> {
+    const p = await this.resolveProvider(provider);
+    const [url, appId, pricePerCPUPerMin, pricePerMemGBPerMin, createFee] =
+      (await this.ctx.publicClient.readContract({
+        address: this.sandboxServing, abi: sandboxServingAbi, functionName: 'services', args: [p],
+      })) as [string, string, bigint, bigint, bigint];
+    return { url, appId, pricePerCPUPerMin, pricePerMemGBPerMin, createFee };
+  }
+
   /**
    * Fund a prepaid sandbox balance (SandboxServing.deposit, payable).
    * Recipient defaults to the caller; provider to the attestor /config's.
