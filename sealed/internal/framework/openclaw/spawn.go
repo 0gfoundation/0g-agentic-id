@@ -185,6 +185,14 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 // `gateway.controlUi.*` flags relax openclaw's CORS / device-auth checks
 // because the sealed sandbox proxy at :8080 is the trust boundary --
 // openclaw doesn't need its own.
+//
+// `gateway.http.endpoints.chatCompletions` is openclaw's OpenAI-compatible
+// HTTP surface (/v1/chat/completions etc.), disabled by default upstream.
+// It's gated behind the same gateway.auth token as the control UI -- a
+// valid token is already an owner/operator credential there (per
+// openclaw's own docs), so enabling it doesn't raise the trust bar we've
+// already accepted for authenticate()'s dashboard handshake. This is what
+// lets a caller without a browser actually talk to the agent.
 func writeRuntimeSections(authToken string) error {
 	return updateOpenclawJSON(func(cfg map[string]any) {
 		cfg["gateway"] = map[string]any{
@@ -196,6 +204,13 @@ func writeRuntimeSections(authToken string) error {
 				"dangerouslyAllowHostHeaderOriginFallback": true,
 				"dangerouslyDisableDeviceAuth":             true,
 				"allowInsecureAuth":                        true,
+			},
+			"http": map[string]any{
+				"endpoints": map[string]any{
+					"chatCompletions": map[string]any{
+						"enabled": true,
+					},
+				},
 			},
 		}
 	})
