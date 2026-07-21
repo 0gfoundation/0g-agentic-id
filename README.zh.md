@@ -345,7 +345,7 @@ Monorepo 四个子项目：
 | [`contracts/`](contracts/README.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
 | [`attestor/`](attestor/README.md) | 后端服务（Attestor / Oracle TEE、API、worker、indexer）| Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
-| [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0g/agenticid-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0glabs/agenticid-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
 
 ### 进一步阅读
 

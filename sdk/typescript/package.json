@@ -1,12 +1,14 @@
 {
-  "name": "@0g/agenticid-sdk",
-  "version": "1.0.0",
-  "description": "TypeScript SDK for the 0G AgenticID protocol — register, manage, and interact with on-chain AI agent identities",
+  "name": "@0glabs/agenticid-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the 0G AgenticID protocol \u2014 register, manage, and interact with on-chain AI agent identities",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "src"
+    "src",
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
@@ -33,5 +35,17 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/0gfoundation/0g-agentic-id.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/0gfoundation/0g-agentic-id/tree/main/sdk/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/0gfoundation/0g-agentic-id/issues"
   }
 }

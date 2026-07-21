@@ -1,4 +1,4 @@
-# @0g/agenticid-sdk
+# @0glabs/agenticid-sdk
 
 TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
 
@@ -16,7 +16,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 ## Install
 
 ```bash
-npm install @0g/agenticid-sdk viem
+npm install @0glabs/agenticid-sdk viem
 ```
 
 ## Setup
@@ -24,7 +24,7 @@ npm install @0g/agenticid-sdk viem
 **Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs:
 
 ```ts
-import { AgenticID } from '@0g/agenticid-sdk';
+import { AgenticID } from '@0glabs/agenticid-sdk';
 
 const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
   account: process.env.PRIVATE_KEY,   // omit for read-only
@@ -38,7 +38,7 @@ const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
 ```ts
-import { AgenticID, type ContractAddresses } from '@0g/agenticid-sdk';
+import { AgenticID, type ContractAddresses } from '@0glabs/agenticid-sdk';
 
 // Addresses are a deployment artifact — copy the set you target from
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
