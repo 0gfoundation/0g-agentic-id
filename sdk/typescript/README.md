@@ -166,24 +166,23 @@ const data = await response.json();                   // your normal response bo
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
 
-// 3. submit feedback — recorded under buyer (msg.sender)
-const txHash = await ag.reputation.giveFeedback({
-  agentId, value: 5n, valueDecimals: 0,              // value is int128; 5 with 0 decimals = "5"
-  tag1: 'quality', tag2: 'latency',
-  endpoint: `${agentUrl}/chat`,
-  feedbackURI: 'ipfs://Qm…', feedbackHash: keccak256(toBytes('great answer')),
-  serveProof: proof,
-});
+// 3. submit feedback — recorded under buyer (msg.sender). Three fields
+// required; everything else defaults (decimals 0, empty tags/endpoint/URI):
+const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// full control when you want it: add valueDecimals / tag1 / tag2 /
+// endpoint / feedbackURI / feedbackHash.
+// Or the one-liner — request, capture the proof, and rate in one call:
+await ag.reputation.rate(`${agentUrl}/chat`, 5n);
 // txHash → "0x…"
 
 // read back
 const idx = await ag.reputation.getLastIndex(agentId, buyer);   // → 2n   latest index for this buyer
 await ag.reputation.readFeedback(agentId, buyer, idx);
 // → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "latency", isRevoked: false }
-await ag.reputation.getSummary({ agentId, clientAddresses: [buyer], tag1: '', tag2: '' });
-// → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }   ('' tag = no filter)
+await ag.reputation.getSummary({ agentId });   // filters all optional
+// → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }
 await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
-await ag.reputation.readAllFeedback({ agentId, clientAddresses: [buyer], tag1: '', tag2: '', includeRevoked: true });
+await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
 // → [ { value, valueDecimals, tag1, tag2, isRevoked }, … ]
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  addresses that left feedback
 
