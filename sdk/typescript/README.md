@@ -100,8 +100,8 @@ const params = {
   framework: 'openclaw',                           // → the binding in the SDK-built default; must be a name the attestor's GET /config advertises
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
   sandbox: {
-    snapshot: process.env.SANDBOX_SNAPSHOT,        // the provider's base image / snapshot name
-    apiKey:   process.env.AGENT_API_KEY,           // injected into the container as an env secret
+    sealedImage: process.env.SEALED_IMAGE,         // the sealed runtime image name (0g-sandbox calls this field `snapshot` on the wire)
+    apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
   },
 };
 
@@ -226,11 +226,12 @@ The trust-root component set auto-resolves from the attestor's `GET /config` whe
 
 ## The runtime image, framework, and iData shapes
 
-The sandbox `snapshot` (from `GET /config`, currently `0g-sealed`) is the
-sealed runtime image bundling the **openclaw** framework adapter — the only
-framework shipping today (`/config.supported_frameworks` is the source of
-truth). WYSIWYS: the iData you sign is exactly what gets encrypted and
-minted; the attestor synthesizes nothing.
+The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
+`0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
+is the sealed runtime image bundling the **openclaw** framework adapter —
+the only framework shipping today (`/config.supported_frameworks` is the
+source of truth). WYSIWYS: the iData you sign is exactly what gets
+encrypted and minted; the attestor synthesizes nothing.
 
 ```ts
 iData: [
@@ -292,8 +293,16 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 - **Chat / control UI (owner-only)** — one call does the handshake:
 
   ```ts
-  const { token, dashboardUrl } = await ag.agent.dashboardAuth(agentUrl, agentId);
-  // open dashboardUrl in a browser, or talk to the openclaw gateway with the token
+  const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
+  // open dashboardUrl in a browser — confirmed working today.
+  //
+  // `token` is a full owner/operator credential for the openclaw gateway
+  // (not a narrow scope). In principle it also authenticates openclaw's
+  // OpenAI-compatible HTTP API (`Authorization: Bearer <token>` against
+  // `/v1/chat/completions` etc.) for headless, no-browser chat — but that
+  // endpoint is disabled by default on the sealed side today
+  // (`gateway.http.endpoints.chatCompletions.enabled`), so this path isn't
+  // wired up yet.
   ```
 
   Under the hood: EIP-191-sign `0GSealAuth:<sealId>:<ts>`, exchange it at

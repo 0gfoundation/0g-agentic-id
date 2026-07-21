@@ -105,7 +105,14 @@ export interface DeployParams {
    *  anthropic/claude-opus-4-6). Ignored when you pass your own `iData`. */
   inference?: { provider: string; model: string };
   /** Sandbox "create" payload the attestor relays to the provider. */
-  sandbox: { snapshot: string; apiKey: string; sealed?: boolean; resourceId?: string };
+  sandbox: {
+    /** The sealed runtime image name (0g-sandbox's own field is called
+     *  `snapshot`; the SDK sends it verbatim under that wire name). */
+    sealedImage: string;
+    apiKey: string;
+    sealed?: boolean;
+    resourceId?: string;
+  };
   /** Seconds the sandbox envelope stays valid. Default 180. */
   envelopeTtlSec?: number;
 }
@@ -184,7 +191,7 @@ export class AttestorClient {
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      { snapshot: sandbox.sealedImage, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
       ttlSec,
     );
   }
@@ -203,7 +210,9 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
-      snapshot?: string;
+      /** The sealed runtime image name (0g-sandbox's own field is called
+       *  `snapshot`; only relevant for `reset`). */
+      sealedImage?: string;
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
        *  comes back alive but can't call its model. */
@@ -215,12 +224,12 @@ export class AttestorClient {
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
     if (op === 'reset') {
-      // Default the snapshot from the attestor's /config — an empty snapshot
+      // Default the image from the attestor's /config — an empty snapshot
       // makes the sandbox provider 400 the recreate ("sealed containers
       // require an image or snapshot"), and operators bump the current name
       // via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source of truth
       // (same as the deploy console).
-      let snapshot = params.snapshot;
+      let snapshot = params.sealedImage;
       if (!snapshot) {
         const cfg: any = await fetch(`${this.baseUrl()}/config`)
           .then((r) => (r.ok ? r.json() : null))

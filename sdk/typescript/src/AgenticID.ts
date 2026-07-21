@@ -210,13 +210,20 @@ export class AgentApi {
   }
 
   /**
-   * The owner handshake for headless access to the agent's control UI
-   * (openclaw gateway): signs `0GSealAuth:<sealId>:<ts>` (EIP-191) and
-   * exchanges it at {agentUrl}/_seal/auth for the gateway credential.
-   * Owner-only — the container verifies the signer against the on-chain
-   * owner cached at provision.
+   * The owner handshake for headless access to the agent's gateway: signs
+   * `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchanges it at
+   * {agentUrl}/_seal/auth for the gateway credential. Owner-only — the
+   * container verifies the signer against the on-chain owner cached at
+   * provision.
+   *
+   * The returned `token` is a full owner/operator credential for the
+   * gateway (not a narrow scope) — treat it accordingly. Today the only
+   * confirmed use is opening `dashboardUrl` in a browser; the gateway's
+   * OpenAI-compatible HTTP API (`/v1/chat/completions` etc., which would
+   * accept this same token via `Authorization: Bearer`) is disabled by
+   * default on the sealed side and isn't wired up yet.
    */
-  async dashboardAuth(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
+  async authenticate(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
     const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
@@ -226,7 +233,7 @@ export class AgentApi {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
-    if (!r.ok) throw new Error(`dashboardAuth: HTTP ${r.status}: ${await r.text()}`);
+    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
     const payload = (await r.json()) as { token: string; dashboard_url?: string };
     return { token: payload.token, dashboardUrl: base + (payload.dashboard_url ?? '/') };
   }
@@ -300,8 +307,8 @@ export class AgentApi {
    * attestor never stores it, which is also WHY it must be passed
    * again on every recreate.
    */
-  reset(sealId: Hash, opts?: { snapshot?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, snapshot: opts?.snapshot, apiKey: opts?.apiKey });
+  reset(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**

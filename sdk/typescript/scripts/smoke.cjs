@@ -34,7 +34,7 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
       sandboxServing: cfg.sandbox_serving_addr ?? '0x0000000000000000000000000000000000000000',
     },
   });
-  const sandbox = { snapshot: cfg.sandbox_snapshot, apiKey: process.env.API_KEY ?? 'sk-smoke-dummy' };
+  const sandbox = { sealedImage: cfg.sandbox_snapshot, apiKey: process.env.API_KEY ?? 'sk-smoke-dummy' };
 
   // Negative: unsupported binding must 400 at the pre-mint gate.
   try {
