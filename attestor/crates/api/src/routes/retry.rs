@@ -132,6 +132,8 @@ mod tests {
             sandbox_app_id: None,
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
+            reputation_registry_addr: None,
+            tee_data_verifier_addr: None,
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             supported_frameworks: vec!["openclaw".into()],

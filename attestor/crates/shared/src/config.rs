@@ -91,6 +91,13 @@ pub struct Config {
     /// SandboxServing contract address. Separate from TappRegistry; holds
     /// the per-provider business state (price schedule, service URL).
     pub sandbox_serving_addr: Option<Address>,
+    /// ReputationRegistry (client-less) bound to this AgenticID. Served on
+    /// GET /config purely so clients (SDK env bootstrap) can discover the
+    /// full environment from one URL — the attestor itself never calls it.
+    pub reputation_registry_addr: Option<Address>,
+    /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
+    /// purpose as `reputation_registry_addr`.
+    pub tee_data_verifier_addr: Option<Address>,
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
@@ -240,6 +247,10 @@ impl Config {
             sandbox_provider_addr: env_opt("ATTESTOR_SANDBOX_PROVIDER_ADDR")
                 .and_then(|s| s.parse().ok()),
             sandbox_serving_addr: env_opt("ATTESTOR_SANDBOX_SERVING_ADDR")
+                .and_then(|s| s.parse().ok()),
+            reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
+                .and_then(|s| s.parse().ok()),
+            tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),

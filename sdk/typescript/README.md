@@ -21,6 +21,20 @@ npm install @0g/agenticid-sdk viem
 
 ## Setup
 
+**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs:
+
+```ts
+import { AgenticID } from '@0g/agenticid-sdk';
+
+const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
+  account: process.env.PRIVATE_KEY,   // omit for read-only
+});
+// Verifying addresses out-of-band instead of trusting the attestor?
+// pass `overrides: { agenticID: '0x…', … }` — explicit always wins.
+```
+
+**Explicit construction** (hand-picked addresses, no attestor round-trip):
+
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
 ```ts

@@ -36,6 +36,12 @@ pub struct ConfigResponse {
     pub sandbox_serving_addr: Option<String>,
     pub sandbox_snapshot: String,
 
+    // Protocol-domain siblings of agentic_id_addr, served so ONE URL
+    // describes the whole environment (SDK bootstrap) — the attestor
+    // itself never calls either contract.
+    pub reputation_registry_addr: Option<String>,
+    pub tee_data_verifier_addr: Option<String>,
+
     /// Framework names deploys may select. Frontend renders the deploy
     /// picker from this so invalid choices can't be expressed; the deploy
     /// route enforces the same list pre-mint (this copy is UX, that copy
@@ -67,6 +73,14 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .sandbox_serving_addr
             .map(|a| format!("{:#x}", a)),
         sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
+        reputation_registry_addr: state
+            .cfg
+            .reputation_registry_addr
+            .map(|a| format!("{:#x}", a)),
+        tee_data_verifier_addr: state
+            .cfg
+            .tee_data_verifier_addr
+            .map(|a| format!("{:#x}", a)),
         supported_frameworks: state.cfg.supported_frameworks.clone(),
     })
 }
