@@ -156,29 +156,79 @@ export class AgentApi {
    * actual shape if yours differs. Per-agent metered spend needs
    * provider-side usage records and is not available on chain yet.
    */
-  async runtimeCosts(agentId: bigint, spec?: { cpu?: number; memGb?: number }): Promise<{
-    prepaidBalanceWei: bigint;
-    sealGasWei: bigint;
+  /**
+   * What WOULD an agent cost — no agent needed (pre-deploy planning).
+   * Provider pricing + cost/min for the spec (default 2C/4GB), plus the
+   * caller's prepaid balance and implied runway when an account is set.
+   */
+  async estimateCosts(spec?: { cpu?: number; memGb?: number }): Promise<{
+    prepaidBalanceWei: bigint | null;
     pricing: { pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint };
     costPerMinWei: bigint;
     estimatedRunwayMinutes: number | null;
   }> {
     const cpu = BigInt(spec?.cpu ?? 2);
     const memGb = BigInt(spec?.memGb ?? 4);
-    const [prepaidBalanceWei, svc, sealAddr] = await Promise.all([
-      this.infra.getBalance(),
-      this.infra.services(),
-      this.id.getAgentSeal(agentId),
-    ]);
-    const sealGasWei = await this.ctx.publicClient.getBalance({ address: sealAddr });
+    const svc = await this.infra.services();
     const costPerMinWei = cpu * svc.pricePerCPUPerMin + memGb * svc.pricePerMemGBPerMin;
+    let prepaidBalanceWei: bigint | null = null;
+    if (this.ctx.account) {
+      try { prepaidBalanceWei = await this.infra.getBalance(); } catch { /* stays null */ }
+    }
     return {
       prepaidBalanceWei,
-      sealGasWei,
       pricing: { pricePerCPUPerMin: svc.pricePerCPUPerMin, pricePerMemGBPerMin: svc.pricePerMemGBPerMin, createFee: svc.createFee },
       costPerMinWei,
-      estimatedRunwayMinutes: costPerMinWei > 0n ? Number(prepaidBalanceWei / costPerMinWei) : null,
+      estimatedRunwayMinutes:
+        prepaidBalanceWei !== null && costPerMinWei > 0n ? Number(prepaidBalanceWei / costPerMinWei) : null,
     };
+  }
+
+  /** estimateCosts() plus the given agent's evolution-gas balance. */
+  async runtimeCosts(agentId: bigint, spec?: { cpu?: number; memGb?: number }): Promise<{
+    prepaidBalanceWei: bigint | null;
+    sealGasWei: bigint;
+    pricing: { pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint };
+    costPerMinWei: bigint;
+    estimatedRunwayMinutes: number | null;
+  }> {
+    const [est, sealAddr] = await Promise.all([this.estimateCosts(spec), this.id.getAgentSeal(agentId)]);
+    const sealGasWei = await this.ctx.publicClient.getBalance({ address: sealAddr });
+    return { ...est, sealGasWei };
+  }
+
+  /**
+   * Model catalog of the 0g-compute router (the `provider: '0g-compute'`
+   * inference path). Public endpoint, no key needed — use it to populate
+   * a model picker before deploy.
+   */
+  async listModels(): Promise<string[]> {
+    const r = await fetch('https://router-api.0g.ai/v1/models');
+    if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
+    const body = (await r.json()) as { data?: Array<{ id?: string }> };
+    return (body.data ?? []).map((m) => m.id).filter((x): x is string => !!x);
+  }
+
+  /**
+   * The owner handshake for headless access to the agent's control UI
+   * (openclaw gateway): signs `0GSealAuth:<sealId>:<ts>` (EIP-191) and
+   * exchanges it at {agentUrl}/_seal/auth for the gateway credential.
+   * Owner-only — the container verifies the signer against the on-chain
+   * owner cached at provision.
+   */
+  async dashboardAuth(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const base = agentUrl.replace(/\/$/, '');
+    const r = await fetch(`${base}/_seal/auth`, {
+      method: 'POST',
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+    });
+    if (!r.ok) throw new Error(`dashboardAuth: HTTP ${r.status}: ${await r.text()}`);
+    const payload = (await r.json()) as { token: string; dashboard_url?: string };
+    return { token: payload.token, dashboardUrl: base + (payload.dashboard_url ?? '/') };
   }
 
   // — runtime: interacting with a live agent —

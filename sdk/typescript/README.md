@@ -33,7 +33,12 @@ const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
 // pass `overrides: { agenticID: '0x…', … }` — explicit always wins.
 ```
 
-**Explicit construction** (hand-picked addresses, no attestor round-trip):
+The trust model already rests on the TEE attestor you acknowledged — its
+/config is as trustworthy as everything else it does, so this is the one
+construction path you need. (Advanced: `new AgenticID({ addresses, … })`
+still exists for hand-picked addresses — audit tooling, or reading a
+chain with no attestor running — and `overrides` lets you pin any single
+address without giving up the bootstrap.)
 
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
@@ -242,6 +247,18 @@ iData: [
 ]
 ```
 
+**What the attestor does NOT check**: beyond the framework *name* (must be
+in `/config.supported_frameworks`), deploy iData content is unvalidated by
+design — minting is the owner's freedom; whether the content actually
+boots is the **sealed runtime's contract**. Today's sealed image bundles
+the **openclaw** adapter, whose persona seed supports `inference.provider`
+of `anthropic`, `openai`, or `0g-compute` (the 0G router). For the router's
+live model catalog:
+
+```ts
+await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
+```
+
 `sandbox.apiKey` is required in practice — without it the agent boots but
 cannot reach its model. It travels inside the owner-signed envelope into
 the TEE container's environment; the attestor never stores it (which is
@@ -250,7 +267,10 @@ why `reset()` needs it again).
 ## What does my agent cost to run?
 
 ```ts
-await ag.agent.runtimeCosts(agentId);
+// Before you even have an agent — pre-deploy planning:
+await ag.agent.estimateCosts();          // pricing + cost/min (+ your balance/runway if account set)
+
+await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolution-gas balance
 // → {
 //   prepaidBalanceWei:      368500000000011380n,   // owner's prepaid sandbox balance
 //   sealGasWei:             0n,                    // evolution fuel (agentSeal wallet)
@@ -269,11 +289,16 @@ await ag.agent.runtimeCosts(agentId);
 - **Owner-registered services** — plain HTTP against the paths listed in
   `/hello`'s `services`; each response is proof-signed (that is what you
   `capture()` and rate).
-- **Chat (openclaw console)** — owner-only: sign
-  `0GSealAuth:0x<sealId>:<unix-ts>` (EIP-191), send it as
-  `X-Auth-Message` / `X-Auth-Signature` headers to `POST {agentUrl}/_seal/auth`,
-  receive the gateway token, then talk to the openclaw gateway with it.
-  (SDK helper for this handshake is planned; today it is a manual flow.)
+- **Chat / control UI (owner-only)** — one call does the handshake:
+
+  ```ts
+  const { token, dashboardUrl } = await ag.agent.dashboardAuth(agentUrl, agentId);
+  // open dashboardUrl in a browser, or talk to the openclaw gateway with the token
+  ```
+
+  Under the hood: EIP-191-sign `0GSealAuth:<sealId>:<ts>`, exchange it at
+  `POST {agentUrl}/_seal/auth`; the container verifies the signer is the
+  on-chain owner.
 
 ## Addresses
 
