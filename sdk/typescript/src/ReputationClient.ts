@@ -61,12 +61,12 @@ export class ReputationClient {
       args: [
         params.agentId,
         params.value,
-        params.valueDecimals,
-        params.tag1,
-        params.tag2,
-        params.endpoint,
-        params.feedbackURI,
-        params.feedbackHash,
+        params.valueDecimals ?? 0,
+        params.tag1 ?? '',
+        params.tag2 ?? '',
+        params.endpoint ?? '',
+        params.feedbackURI ?? '',
+        params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
         {
           agentId: sp.agentId,
           timestamp: sp.timestamp,
@@ -165,10 +165,10 @@ export class ReputationClient {
       functionName: 'readAllFeedback',
       args: [
         params.agentId,
-        params.clientAddresses,
-        params.tag1,
-        params.tag2,
-        params.includeRevoked,
+        (params.clientAddresses ?? []),
+        (params.tag1 ?? ''),
+        (params.tag2 ?? ''),
+        (params.includeRevoked ?? false),
       ],
     });
     const [, , values, valueDecimals, tag1s, tag2s, revokedStatuses] = result as [
@@ -195,7 +195,7 @@ export class ReputationClient {
       address: this.address,
       abi: reputationRegistryAbi,
       functionName: 'getSummary',
-      args: [params.agentId, params.clientAddresses, params.tag1, params.tag2],
+      args: [params.agentId, (params.clientAddresses ?? []), (params.tag1 ?? ''), (params.tag2 ?? '')],
     });
     const [count, summaryValue, summaryValueDecimals] = result as [bigint, bigint, number];
     return { count, summaryValue, summaryValueDecimals };

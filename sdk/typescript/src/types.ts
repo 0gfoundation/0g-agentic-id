@@ -233,20 +233,20 @@ export interface GiveFeedbackParams {
   agentId: bigint;
   /** Feedback value */
   value: bigint;
-  /** Decimals for the value */
-  valueDecimals: number;
-  /** First tag */
-  tag1: string;
-  /** Second tag */
-  tag2: string;
-  /** Endpoint URL */
-  endpoint: string;
-  /** URI of the feedback data */
-  feedbackURI: string;
-  /** Hash of the feedback data */
-  feedbackHash: `0x${string}`;
-  /** Serve proof from the agent */
+  /** Serve proof from the agent — the "I was actually served" credential; never optional */
   serveProof: ServeProof;
+  /** Decimals for the value. Default 0. */
+  valueDecimals?: number;
+  /** First tag. Default "". */
+  tag1?: string;
+  /** Second tag. Default "". */
+  tag2?: string;
+  /** Endpoint URL the rating refers to. Default "". */
+  endpoint?: string;
+  /** URI of a detailed feedback document. Default "". */
+  feedbackURI?: string;
+  /** Hash of that document. Default zero hash. */
+  feedbackHash?: `0x${string}`;
 }
 
 /**
@@ -271,14 +271,14 @@ export interface AppendResponseParams {
 export interface ReadAllFeedbackParams {
   /** Agent ID */
   agentId: bigint;
-  /** Client addresses to filter by */
-  clientAddresses: `0x${string}`[];
-  /** First tag filter */
-  tag1: string;
-  /** Second tag filter */
-  tag2: string;
-  /** Whether to include revoked feedback */
-  includeRevoked: boolean;
+  /** Client addresses to filter by. Default: no filter. */
+  clientAddresses?: `0x${string}`[];
+  /** First tag filter. Default: no filter. */
+  tag1?: string;
+  /** Second tag filter. Default: no filter. */
+  tag2?: string;
+  /** Include revoked feedback. Default false. */
+  includeRevoked?: boolean;
 }
 
 /**
@@ -287,10 +287,10 @@ export interface ReadAllFeedbackParams {
 export interface GetSummaryParams {
   /** Agent ID */
   agentId: bigint;
-  /** Client addresses to include */
-  clientAddresses: `0x${string}`[];
-  /** First tag filter */
-  tag1: string;
-  /** Second tag filter */
-  tag2: string;
+  /** Client addresses to include. Default: all. */
+  clientAddresses?: `0x${string}`[];
+  /** First tag filter. Default: no filter. */
+  tag1?: string;
+  /** Second tag filter. Default: no filter. */
+  tag2?: string;
 }

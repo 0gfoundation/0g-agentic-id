@@ -207,6 +207,32 @@ export class AgentApi {
     return { hello, proof, verification };
   }
 
+  private attestorBase(): string {
+    if (!this.ctx.attestorUrl) throw new Error('attestorUrl is required for listDeployments');
+    return this.ctx.attestorUrl.replace(/\/$/, '');
+  }
+
+  /**
+   * Normalized view of the attestor's /deployments listing. The raw rows
+   * speak hex ("agent_id": "0x77") and snake_case; this returns bigint
+   * agentIds and camelCase so they compose with every other SDK call.
+   */
+  async listDeployments(): Promise<Array<{
+    agentId: bigint | null; sealId: Hash; phase: string;
+    sandboxId: string | null; owner: Address; name: string | null; createdAt: string | null;
+  }>> {
+    const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
+      sealId: r.seal_id as Hash,
+      phase: (r.phase as string) ?? 'unknown',
+      sandboxId: (r.sandbox_id as string) ?? null,
+      owner: r.owner as Address,
+      name: ((r.agent_card as Record<string, unknown>)?.name as string) ?? null,
+      createdAt: (r.created_at as string) ?? null,
+    }));
+  }
+
   /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */
   stop(sealId: Hash, sandboxId: string): Promise<void> {
     return this.attestor.lifecycle('stop', { sealId, sandboxId });
@@ -286,6 +312,18 @@ export class ReputationApi {
   verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
 
   // — feedback —
+  /**
+   * One-call "experience it, then rate it": performs the request, captures
+   * the X-Agent-Proof it returns, and submits on-chain feedback backed by
+   * that proof. agentId comes from the proof itself. `url` should be the
+   * agent endpoint you want rated (e.g. `${agentUrl}/hello`).
+   */
+  async rate(url: string, value: bigint, opts?: Omit<GiveFeedbackParams, 'agentId' | 'value' | 'serveProof'>): Promise<WriteContractReturnType> {
+    const { response, proof } = await captureProof(() => fetch(url));
+    if (!response.ok) throw new Error(`rate: ${url} returned HTTP ${response.status}`);
+    if (!proof) throw new Error('rate: response carried no X-Agent-Proof header — is this a sealed agent endpoint?');
+    return this.rep.giveFeedback({ agentId: proof.agentId, value, serveProof: proof, endpoint: url, ...opts });
+  }
   giveFeedback(params: GiveFeedbackParams): Promise<WriteContractReturnType> { return this.rep.giveFeedback(params); }
   revokeFeedback(agentId: bigint, feedbackIndex: bigint): Promise<WriteContractReturnType> { return this.rep.revokeFeedback(agentId, feedbackIndex); }
   appendResponse(params: AppendResponseParams): Promise<WriteContractReturnType> { return this.rep.appendResponse(params); }
