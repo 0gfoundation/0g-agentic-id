@@ -30,9 +30,16 @@ const INDEX_HTML: &[u8] = include_bytes!("../../web/index.html");
 const ETHERS_JS: &[u8] = include_bytes!("../../web/ethers.umd.min.js");
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(serve_index))
-        .route("/static/ethers.js", get(serve_ethers))
+    // Headless mode (ATTESTOR_CONSOLE_ENABLED=false): the web console is
+    // simply not routed — "/" and /static 404, the whole HTTP API below
+    // stays up for SDK users. One switch, all or nothing.
+    let mut r = Router::new();
+    if state.cfg.console_enabled {
+        r = r
+            .route("/", get(serve_index))
+            .route("/static/ethers.js", get(serve_ethers));
+    }
+    r
         .route("/avatar/default.svg", get(avatar::default_avatar))
         .route("/avatar/:seed", get(avatar::keyed_avatar))
         .route("/health", get(health))
