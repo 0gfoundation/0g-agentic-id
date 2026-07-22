@@ -98,7 +98,7 @@ const params = {
   // `inference` below tune that default. A role="framework" binding is
   // required either way — the deploy edge rejects iData without one.
   framework: 'openclaw',                           // → the binding in the SDK-built default; must be a name the attestor's GET /config advertises
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // optional — omitting it defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
   sandbox: {
     sealedImage: process.env.SEALED_IMAGE,         // the sealed runtime image name (0g-sandbox calls this field `snapshot` on the wire)
     apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
