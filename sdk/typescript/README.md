@@ -236,17 +236,28 @@ const provider = '0x2222222222222222222222222222222222222222';  // the sandbox p
 
 // trust-root acknowledgment (TappRegistry, spans attestor + kms + sandbox-provider)
 await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   what `owner` still needs to ack
-await ag.ack();              // → tx hash "0x…", or null if nothing was missing
+const ackTx = await ag.ack();   // → tx hash "0x…", or null if nothing was missing
+if (ackTx) await ag.waitForTransaction(ackTx);   // see the read-after-write note below
 
 // prepaid sandbox balance (SandboxServing)
 await ag.getBalance();                              // → 500000000000000000n   (wei; user defaults to the account, provider to the attestor /config's)
 await ag.getBalance({ user: owner });               // also takes a deposit-style options object (positional still works)
-await ag.deposit({ amountWei: parseEther('0.5') }); // → tx hash "0x…"   fund the prepaid balance (provider auto-resolved the same way)
+const depositTx = await ag.deposit({ amountWei: parseEther('0.5') }); // → tx hash "0x…"
+await ag.waitForTransaction(depositTx);
 ```
 
 The trust-root component set auto-resolves from the attestor's `GET /config` when `attestorUrl` is set (each environment names its own apps), falling back to `['0g-attestor','0g-kms','0g-sandbox-provider']`; an explicit `componentAppIds` in the config always wins. (Agent-seal gas top-up is on the `agent` namespace above.)
 
 `agent.deploy()` / `agent.clone()` **preflight** both prerequisites (all components acked + prepaid balance ≥ 0.1 OG) and throw a synchronous, actionable error naming the missing step — pass `{ preflight: false }` to skip. The attestor enforces the same two checks at accept (HTTP 402, codes `trust_roots_not_acked` / `insufficient_sandbox_balance`).
+
+**Read-after-write races the pending tx**: `ack()` / `deposit()` / `topUpAgentSeal()` / `giveFeedback()` are bare `writeContract` calls — they return the hash immediately, not after mining. Reading state right after (`ackStatus()` / `getBalance()` / `readFeedback()`) can see the pre-tx value. Each namespace has its own `waitForTransaction(txHash)` (top-level `ag`, `ag.agent`, `ag.reputation`) — await it before reading:
+
+```ts
+const tx = await ag.deposit({ amountWei: parseEther('1') });
+await ag.waitForTransaction(tx);   // now getBalance() sees the new value
+```
+
+`deploy()`/`clone()`'s `{ wait: true }` already waits (for the mint, a stronger guarantee) — this pattern isn't needed there.
 
 ---
 

@@ -23,6 +23,7 @@
  */
 
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
+import { RECEIPT_WAIT } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
@@ -421,12 +422,25 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
+  private readonly ctx: Ctx;
 
   constructor(config: AgenticIDConfig) {
     const ctx = buildCtx(config);
+    this.ctx = ctx;
     this.agent = new AgentApi(ctx);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
+  }
+
+  /**
+   * Block until a top-level tx (ack/deposit) is mined. `ack()`/`deposit()`
+   * return the hash immediately, like any writeContract — reading state
+   * right after (ackStatus/getBalance) can race the still-pending tx and
+   * see the old value. `ag.agent`/`ag.reputation` have their own
+   * equivalents for txs made through those namespaces.
+   */
+  waitForTransaction(txHash: Hash): Promise<TransactionReceipt> {
+    return this.ctx.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
   }
 
   /**
