@@ -126,7 +126,7 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // returns the existing deploy/clone instead of minting a duplicate):
 // await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
-// transfer — plain ERC-721; the attestor tears down the old owner's runtime on transfer
+// transfer — ERC-7857; the attestor tears down the old owner's runtime on transfer
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → tx hash "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → tx hash "0x…"
 
