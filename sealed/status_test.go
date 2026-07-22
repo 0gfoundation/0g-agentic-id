@@ -43,6 +43,18 @@ func TestSeverityOf_CaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestSeverityOf_GasExhaustedBareRevertIsWarning(t *testing.T) {
+	// A near-empty seal wallet can fail as a data-less revert rather than
+	// "insufficient funds": eth_estimateGas caps the gas budget at what the
+	// balance affords, execution runs out mid-way. Reproduced against a
+	// real 0.0008 OG balance.
+	err := errors.New("Failed to submit file: Failed to send transaction to append log entry: " +
+		"failed to send transaction: execution reverted; data: 0x")
+	if got := severityOf(err); got != "warning" {
+		t.Errorf("severityOf(gas-exhausted bare revert) = %q; want warning", got)
+	}
+}
+
 func TestSeverityOf_GenericErrorIsError(t *testing.T) {
 	// Unknown / system-level errors stay "error" so the 5-failure escalation
 	// still defends against silent system failures.
