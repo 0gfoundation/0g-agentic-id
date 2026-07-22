@@ -476,6 +476,18 @@ export class AgenticID {
   // — prepaid sandbox balance —
   /** Fund a prepaid sandbox balance (payable). Recipient defaults to the caller; provider to the attestor /config's. */
   deposit(params: { amountWei: bigint; provider?: Address; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
-  /** Read a prepaid sandbox balance (wei). User defaults to the account; provider to the attestor /config's. */
-  getBalance(user?: Address, provider?: Address): Promise<bigint> { return this.infra.getBalance(user, provider); }
+  /**
+   * Read a prepaid sandbox balance (wei). User defaults to the account;
+   * provider to the attestor /config's. Takes an options object like
+   * {@link deposit} (`getBalance({ user, provider })`); the positional form
+   * `getBalance(user, provider)` also works.
+   */
+  getBalance(opts?: { user?: Address; provider?: Address }): Promise<bigint>;
+  getBalance(user?: Address, provider?: Address): Promise<bigint>;
+  getBalance(userOrOpts?: Address | { user?: Address; provider?: Address }, provider?: Address): Promise<bigint> {
+    if (userOrOpts && typeof userOrOpts === 'object') {
+      return this.infra.getBalance(userOrOpts.user, userOrOpts.provider);
+    }
+    return this.infra.getBalance(userOrOpts, provider);
+  }
 }

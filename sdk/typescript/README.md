@@ -200,9 +200,9 @@ const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof
 // full control when you want it: add valueDecimals / tag1 / tag2 /
 // endpoint / feedbackURI / feedbackHash.
 // The proof should come from the interaction you are actually rating —
-// capture() it during your real call, then submit. Mind the proof's
-// `deadline` (~300s from serve): verify + submit must land on chain before
-// it, and a 0G receipt can take 120s+ — don't sit on a captured proof.
+// capture() it during your real call, then submit. The proof's `deadline`
+// is serve-time +3600s (one hour) — ample for verify + a 120s+ 0G receipt,
+// but don't submit it the next day: the contract rejects expired proofs.
 // txHash → "0x…"
 
 // read back
@@ -240,6 +240,7 @@ await ag.ack();              // → tx hash "0x…", or null if nothing was miss
 
 // prepaid sandbox balance (SandboxServing)
 await ag.getBalance();                              // → 500000000000000000n   (wei; user defaults to the account, provider to the attestor /config's)
+await ag.getBalance({ user: owner });               // also takes a deposit-style options object (positional still works)
 await ag.deposit({ amountWei: parseEther('0.5') }); // → tx hash "0x…"   fund the prepaid balance (provider auto-resolved the same way)
 ```
 
@@ -272,6 +273,13 @@ iData: [
     }, extra: {} },
 ]
 ```
+
+**persona is a one-shot seed, not durable data**: framework + persona above
+are the MINT input; once running, the sealed runtime translates persona
+into the framework's own config and keeps sealing entries under ITS OWN
+role names (openclaw: `framework` / `openclaw.json` / `workspace/`; on-chain
+Update replaces the whole array). Matching `role === 'persona'` against a
+live agent's `intelligentDatasOf` will find nothing.
 
 **What the attestor does NOT check**: beyond the framework *name* (must be
 in `/config.supported_frameworks`), deploy iData content is unvalidated by
@@ -417,4 +425,11 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` (viem cha
 
 ## Advanced
 
-Raw ABIs (`agenticIDAbi`, `reputationRegistryAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) are exported. The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
+Raw ABIs (`agenticIDAbi`, `reputationRegistryAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) are exported.
+
+**Serve-proof canonical digest** (for independent verifiers): the signature
+is the agentSeal's EIP-191 personal_sign over
+`keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
+keccak256(abi.encodePacked(dataHashes)), frameworkHash))` — deadline is
+timestamp + 3600. `buildServeProofMessageHash` is the TS implementation;
+the Go side lives in `sealed/internal/proxy/proxy.go`. The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
