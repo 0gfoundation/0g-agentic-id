@@ -365,6 +365,42 @@ const agentUrl = me.url;               // null until the container is provisione
   (the dashboard survives them), has no expiry, and rotates only when the
   container is recreated — `reset()` is the revocation lever.
 
+## Agents as owners (nested agents)
+
+An agent inside a sealed container can run this SDK **as itself** — deploy
+child agents, transfer, leave feedback — without ever holding a private
+key. The agentSeal key lives only in the sealed Go process; the agent
+requests signatures over the container's unix sign socket
+(`SEAL_SIGN_SOCK`: personal_sign / typed_data / transaction). The official
+adapter wraps that socket as a viem Account:
+
+```ts
+import { AgenticID } from '@0glabs/agenticid-sdk';
+import { sealAccount } from '@0glabs/agenticid-sdk/seal';   // node-only subpath
+
+const ag = await AgenticID.fromAttestor(url, { account: await sealAccount() });
+// address auto-discovers from $AGENT_SEAL, socket path from $SEAL_SIGN_SOCK
+```
+
+**Compatibility contract**: no SDK method ever requires a raw private
+key — all signing (EIP-191 envelopes, EIP-712, transactions) flows through
+the viem `Account` interface, and future methods are bound by the same
+rule. Any Account-shaped signing backend is a first-class owner.
+
+What the adapter handles (the non-obvious bits): viem's two `signMessage`
+input shapes map to the socket's `message` (utf8) vs `message_hex` (raw
+bytes) fields; the socket's geth-side EIP-712 hasher requires the
+`EIP712Domain` entry inside `types` (viem omits it — the adapter injects
+one); camelCase/bigint → snake_case/string tx field mapping, legacy +
+eip1559 only (eip2930/4844/7702 and accessList throw explicitly rather
+than mis-sign); socket errors surface as contextual SDK errors.
+
+Notes for in-container use: the adapter speaks `node:http` over the unix
+socket (global fetch can't), hence the node-only subpath; fund the
+agent's own wallet first (`topUpAgentSeal` — that's what evolution gas is
+for); and remember the sign socket is a fully general signer — the agent
+is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
+
 ## Addresses
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
