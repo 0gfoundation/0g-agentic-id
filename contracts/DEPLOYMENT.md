@@ -263,7 +263,7 @@ Changelog:
   - `1.1.0` on **test**, beacon-upgraded **2026-07-22** — same `0xC93DAF00…`
     impl as dev (reused, not redeployed). Discovered via an external SDK
     review: `giveFeedback` bare-reverted on test because the beacon still
-    pointed at the client-bound `1.0.0` impl while callers (attestor +ready
+    pointed at the client-bound `1.0.0` impl while callers (attestor + the
     SDK) had moved to the clientless ABI — the selector didn't exist on the
     old impl, hence no revert reason. Root-caused by comparing an
     `eth_call` against test's beacon (`0x` revert data — selector missing)
