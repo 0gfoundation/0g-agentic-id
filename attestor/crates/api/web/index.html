@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>0G AgenticID</title>
 <script src="/static/ethers.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Fraunces:ital,opsz,wght,SOFT,WONK@0,9..144,300..800,0..100,0..1;1,9..144,300..800,0..100,0..1&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Fonts are vendored (see web/fonts/) — no external font CDN: first paint
+     doesn't depend on a third-party host that is slow/blocked in some regions. -->
+<link href="/static/fonts.css" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -353,6 +353,13 @@ textarea:disabled{background:var(--surf2);color:var(--muted);cursor:not-allowed}
 .btn-danger:active:not(:disabled){transform:translateY(1px);box-shadow:none}
 .btn-danger:disabled{opacity:.5;cursor:not-allowed}
 small.hint{display:block;color:var(--text2);font-size:var(--fs-sm);margin-top:10px;line-height:1.55}
+/* Deploy gate hint — the single line next to the Deploy button that names
+   the unmet prerequisite. Its links ARE the call to action: accent color,
+   dashed underline that solidifies on hover. */
+#deployGateHint{display:inline-flex;align-items:center;gap:6px;color:var(--text2);font-size:var(--fs-sm)}
+#deployGateHint::before{content:'ℹ';font-size:12px;color:var(--muted);border:1px solid var(--border);border-radius:50%;width:16px;height:16px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0}
+#deployGateHint a{color:var(--p);font-weight:600;text-decoration:none;border-bottom:1px dashed var(--pbd);transition:border-color var(--t-fast),color var(--t-fast)}
+#deployGateHint a:hover{color:var(--pd);border-bottom:1px solid var(--pd)}
 
 /* ── Phase chips ────────────────────────────────────────────────── */
 .chip{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:9999px;font-size:var(--fs-xs);font-weight:600;font-family:var(--mono);letter-spacing:var(--ls-eyebrow);text-transform:uppercase}
@@ -1316,15 +1323,11 @@ details.log[open] summary{color:var(--text2)}
       <p>Mint on-chain identity, encrypt config to 0G storage, spin up a sandboxed runtime.</p>
     </div>
 
-    <!-- Preflight strip: surfaces the two deploy prerequisites (trust-roots
-         ack + prepaid balance) the moment the page opens, so the user fixes
-         them BEFORE filling the form instead of being interrupted by modals
-         at submit. Hidden until the wallet is connected; each unmet item
-         renders as a row with its fix-up button. -->
-    <section class="card" id="deployPreflight" style="display:none">
-      <div id="deployPreflightRows"></div>
-    </section>
-
+    <!-- Form mode vs progress mode: once a deploy is ACCEPTED the whole
+         form hides and only the progress card remains — a de-facto
+         dedicated tracking screen, so a second Deploy click is
+         impossible while one is in flight. -->
+    <div id="deployFormWrap">
     <section class="card">
       <h2>Identity</h2>
       <div class="row">
@@ -1394,8 +1397,10 @@ details.log[open] summary{color:var(--text2)}
 
     <section class="card">
       <button class="btn btn-primary" id="deployBtn" disabled onclick="submitDeploy()">Deploy</button>
+      <small class="hint" id="deployGateHint" style="display:none;margin-left:10px"></small>
       <small class="hint">Connect your wallet first. MetaMask will prompt twice — owner deploy + sandbox envelope. If trust roots aren't acknowledged or sandbox balance is below 0.1 OG, you'll be asked to handle that first.</small>
     </section>
+    </div><!-- /deployFormWrap -->
 
     <section class="card" id="cardProgress" style="display:none">
       <h2>Deploy progress</h2>
@@ -1805,8 +1810,53 @@ function navigate(hash) {
   else handleHash();
 }
 
+// Deploy gate: the button stays disabled while trust roots are KNOWN
+// unacked (unknown/loading doesn't block — the attestor's 402 preflight
+// backstops), with the reason spelled out next to it. Re-run whenever
+// wallet/ack state changes so acking re-enables live.
+// Return from progress-only mode to the form (inputs preserved). Used by
+// "Deploy another" on success and the failure handlers — does not touch
+// the background job, it only switches what this page shows.
+window.backToDeployForm = function () {
+  const fw = $('#deployFormWrap'); if (fw) fw.style.display = '';
+  $('#cardProgress').style.display = 'none';
+  $('#goDetailRow').innerHTML = '';
+  resetProgress();
+  updateDeployGate();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+};
+
+function updateDeployGate() {
+  const btn = $('#deployBtn');
+  const hint = $('#deployGateHint');
+  if (!btn) return;
+  const tr = State.trustRoots;
+  const unacked = !!(State.ownerAddr && tr && !tr.disabled && !tr.errors?.length && !tr.allAcked);
+  btn.disabled = !State.signer || unacked;
+  if (hint) {
+    // Static strings + fixed handlers only — the hint is an action, not a
+    // dead sentence: every blocked state links straight to its fix.
+    const lowBalance = !!(State.ownerAddr && sandboxServingEnabled()
+      && State.sandboxBalance !== null && State.sandboxBalance < TOP_UP_THRESHOLD_WEI);
+    if (!State.signer) {
+      hint.innerHTML = '<a href="#" onclick="connectWallet();return false">Connect a wallet</a> to deploy.';
+      hint.style.display = '';
+    } else if (unacked) {
+      hint.innerHTML = 'Trust roots not acknowledged — <a href="#" onclick="openAckModalForReview();return false">review &amp; sign</a>.';
+      hint.style.display = '';
+    } else if (lowBalance) {
+      hint.innerHTML = 'Balance below 0.1 OG — <a href="#" onclick="openTopUpModal();return false">top up</a>.';
+      hint.style.display = '';
+    } else {
+      hint.style.display = 'none';
+    }
+  }
+}
+
 function handleHash() {
   const h = location.hash || '#/';
+  // Leaving the deploy page re-arms the once-per-entry ack prompt.
+  if (h !== '#/deploy') State.ackPromptedForDeploy = false;
   $$('.view').forEach(v => v.classList.remove('active'));
   $$('.nav a').forEach(a => a.classList.remove('active'));
   // Any selects added by dynamic renders since last navigation get
@@ -1831,16 +1881,28 @@ function handleHash() {
     // marks (red ✗, error reason text) would otherwise linger inside the
     // hidden card and re-flash when a new deploy unhides it.
     $('#cardProgress').style.display = 'none';
+    const fw = $('#deployFormWrap'); if (fw) fw.style.display = '';
     $('#goDetailRow').innerHTML = '';
     $('#slowHint').classList.remove('show');
     resetProgress();
     if (State.slowHintTimer) { clearTimeout(State.slowHintTimer); State.slowHintTimer = null; }
     State.deployingSealId = null;
     if (State.ws) { try { State.ws.close(); } catch {} State.ws = null; }
-    $('#deployBtn').disabled = !State.signer;
+    updateDeployGate();
     activeNav = 'deploy';
     // Indicators live in the topbar wallet popover now; no per-route
     // refresh needed — applyAccount already kicks both off on connect.
+    // Ack is intent-anchored: entering the deploy page IS the intent, so
+    // if the wallet is connected and trust roots are known-unacked, open
+    // the ack modal ONCE per entry (closable — the disabled Deploy button
+    // + preflight strip carry the state afterwards). Never at site entry:
+    // ack is informed consent, not a cookie banner.
+    const tr = State.trustRoots;
+    if (State.ownerAddr && tr && !tr.disabled && !tr.errors?.length && !tr.allAcked
+        && !State.ackPromptedForDeploy) {
+      State.ackPromptedForDeploy = true;
+      openAckModalForReview();
+    }
   } else if (h === '#/agents') {
     route = 'discovery';
     $('#viewDiscovery').classList.add('active');
@@ -1858,8 +1920,34 @@ function handleHash() {
   // Tear down stale WS subscriptions when navigating away.
   if (route !== 'detail' && State.detailWs) { try { State.detailWs.close(); } catch {} State.detailWs = null; }
   if (route !== 'detail' && State.detailProbeTimer) { clearInterval(State.detailProbeTimer); State.detailProbeTimer = null; }
+
+  // List views go stale the moment they render (deploys progress, agents
+  // stop, transfers land) and the WS stream is per-seal — so while a
+  // list view is on screen, silently re-fetch it every 15s. Detail pages
+  // have their own WS + probe; everything else polls nothing.
+  if (route === 'discovery') startListPolling(loadDiscovery);
+  else if (route === 'home') startListPolling(loadHome);
+  else stopListPolling();
 }
 window.addEventListener('hashchange', handleHash);
+
+let _listPollTimer = null;
+let _listPollFn = null;
+function startListPolling(fn) {
+  _listPollFn = fn;
+  if (_listPollTimer) clearInterval(_listPollTimer);
+  _listPollTimer = setInterval(() => {
+    if (!document.hidden && _listPollFn) _listPollFn();
+  }, 15000);
+}
+function stopListPolling() {
+  if (_listPollTimer) { clearInterval(_listPollTimer); _listPollTimer = null; }
+  _listPollFn = null;
+}
+// Coming back to the tab refreshes immediately instead of waiting a tick.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && _listPollFn) _listPollFn();
+});
 
 // Re-fetch whatever view the user is currently looking at — used after
 // wallet connect / account switch / disconnect so owner-aware bits
@@ -2594,45 +2682,8 @@ async function loadSandboxBalance(ownerAddr) {
 // status + Acknowledge inside the popover. Anywhere that mutates
 // `State.sandboxBalance` or `State.trustRoots` should call
 // `renderWalletUI()` to keep both in sync.
-// Deploy-page preflight strip: mirrors the wallet popover's two gate rows
-// (trust roots + balance) at the top of the deploy form, so the user sees
-// and fixes prerequisites BEFORE filling the form — instead of being
-// interrupted by the same modals at submit. Data comes from the exact
-// State the submit gates read; no extra chain calls.
-function renderDeployPreflight() {
-  const host = $('#deployPreflight');
-  const rows = $('#deployPreflightRows');
-  if (!host || !rows) return;
-  if (!State.ownerAddr) { host.style.display = 'none'; return; }
-
-  const items = [];
-  const tr = State.trustRoots;
-  if (tr && !tr.disabled && !tr.errors?.length && !tr.allAcked) {
-    const missing = tr.missingAppIds.length;
-    items.push(
-      `<div class="row" style="align-items:center;justify-content:space-between;gap:12px">
-         <div><b>Acknowledge trust roots</b><br/>
-           <small class="hint">${tr.slots.length - missing}/${tr.slots.length} components acknowledged — deploys require all of them.</small></div>
-         <button class="btn" onclick="openAckModalForReview()">Review &amp; acknowledge</button>
-       </div>`,
-    );
-  }
-  if (sandboxServingEnabled() && State.sandboxBalance !== null && State.sandboxBalance < TOP_UP_THRESHOLD_WEI) {
-    items.push(
-      `<div class="row" style="align-items:center;justify-content:space-between;gap:12px">
-         <div><b>Top up sandbox balance</b><br/>
-           <small class="hint">Balance ${escapeHtml((+ethers.formatEther(State.sandboxBalance)).toFixed(4))} OG — deploys require at least 0.1 OG prepaid.</small></div>
-         <button class="btn" onclick="openTopUpModal()">Top up</button>
-       </div>`,
-    );
-  }
-  if (items.length === 0) { host.style.display = 'none'; return; }
-  rows.innerHTML = items.join('<hr style="border:none;border-top:1px solid var(--border);margin:10px 0"/>');
-  host.style.display = '';
-}
-
 function renderWalletUI() {
-  renderDeployPreflight();
+  updateDeployGate();
   if (!State.ownerAddr) return;
   // Chip text — short address optionally suffixed with rounded balance.
   const short = State.ownerAddr.slice(0, 6) + '…' + State.ownerAddr.slice(-4);
@@ -2901,7 +2952,7 @@ window.submitDeploy = async function () {
   // A dev/mock attestor with appIds unset returns true immediately.
   const acked = await ensureTrustRootsAcked();
   if (!acked) {
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     return;
   }
 
@@ -2909,7 +2960,7 @@ window.submitDeploy = async function () {
   // top-up modal otherwise.
   const funded = await ensureSandboxBalance();
   if (!funded) {
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     return;
   }
 
@@ -2924,7 +2975,7 @@ window.submitDeploy = async function () {
 
     if (!name || !description) {
       toast('Name and description are required', 'error');
-      $('#deployBtn').disabled = false;
+      updateDeployGate();
       return;
     }
 
@@ -3032,6 +3083,7 @@ window.submitDeploy = async function () {
     // agent's out-of-gas plea.
     State.deployingSealAddr = agent_seal_addr || null;
     $('#outSeal').textContent = seal_id;
+    $('#deployFormWrap').style.display = 'none';
     $('#cardProgress').style.display = 'block';
     $('#cardProgress').scrollIntoView({ behavior: 'smooth' });
     resetProgress();
@@ -3054,7 +3106,7 @@ window.submitDeploy = async function () {
     subscribeDeployWS(seal_id);
   } catch (e) {
     toast(String(e.message || e), 'error');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
   }
 };
 
@@ -3089,7 +3141,7 @@ function handleDeployEvent(evt, sealId) {
       setTask(n, 'fail', 'skipped — earlier step failed');
     }
     $('#slowHint').classList.remove('show');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
   }
 
   if (t === 'storage_submitted') setTask('storage', 'active', 'tx submitted, awaiting confirm…');
@@ -3106,12 +3158,14 @@ function handleDeployEvent(evt, sealId) {
   if (t === 'mint_failed') {
     setTask('mint', 'fail', evt.reason || 'failed');
     cancelDownstream(['sandbox', 'uri', 'running']);
+    $('#goDetailRow').innerHTML = `<button class="btn" onclick="backToDeployForm()">← Edit &amp; redeploy</button>`;
   }
 
   if (t === 'container_starting') setTask('sandbox', 'active', 'creating sandbox…');
   if (t === 'container_running')  { setTask('sandbox', 'done', 'running'); $('#slowHint').classList.remove('show'); }
   if (t === 'container_failed' || t === 'container_stopped') {
     setTask('sandbox', 'fail', evt.reason || t);
+    $('#goDetailRow').innerHTML = `<button class="btn" onclick="backToDeployForm()">← Back to form</button> <small class="hint" style="display:inline;margin-left:8px">Identity may still finalize — the agent will appear in the list as Offline, recoverable via Bring online.</small>`;
     // Container failure is a RUNTIME failure only — it cancels just
     // `running`. Identity (uri) is independent and still finalizes (the
     // agent ends up minted + carded + Offline, recoverable via Bring
@@ -3123,7 +3177,7 @@ function handleDeployEvent(evt, sealId) {
 
   if (t === 'container_running') {
     setTask('running', 'done', 'live');
-    $('#deployBtn').disabled = false;
+    updateDeployGate();
     // Proactive evolution-gas CTA: the agentSeal wallet starts at 0, so
     // the agent can serve but cannot commit its evolution on chain until
     // the owner funds it. Say so NOW, at the success moment — the
@@ -3132,10 +3186,10 @@ function handleDeployEvent(evt, sealId) {
     const name = ($('#name')?.value || '').trim();
     $('#goDetailRow').innerHTML = `
       <div class="row" style="align-items:center;justify-content:space-between;gap:12px">
-        <small class="hint">Agent is live. One optional step: fund its evolution wallet
-        (agentSeal) with a little OG so it can commit memory updates on chain.</small>
+        <small class="hint">Agent is live. Optional: fund its evolution wallet so it can commit memory on chain.</small>
         <span style="display:flex;gap:8px;flex-shrink:0">
           ${sealAddr ? `<button class="btn" onclick="openSealTopUpModal('${escapeHtml(sealAddr)}', ${escapeHtml(JSON.stringify(name))})">Fund evolution gas</button>` : ''}
+          <button class="btn" onclick="backToDeployForm()">Deploy another</button>
           <button class="btn btn-primary" onclick="navigate('#/agent/${escapeHtml(sealId)}')">View agent →</button>
         </span>
       </div>`;
@@ -3302,7 +3356,7 @@ async function loadDiscovery() {
   $$('#discoveryFilter [data-filter]').forEach(b => b.classList.toggle('on', b.dataset.filter === State.discoveryFilter));
   $('#discoveryFilter [data-filter="mine"]').disabled = !State.ownerAddr;
 
-  count.textContent = 'loading…';
+  if (!State.discoveryItems?.length) count.textContent = 'loading…';
   try {
     const url = (State.discoveryFilter === 'mine' && State.ownerAddr)
       ? `/deployments?owner=${State.ownerAddr}`
@@ -3586,7 +3640,13 @@ function renderAgentRow(d) {
                   : 'Offline';
         const r = failureReason(d);
         const title = r ? ` title="${escapeHtml(r)}"` : '';
-        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}</span></div>`;
+        // Failure reason INLINE (truncated), not hover-only — a list of
+        // red dots that all read "Failed" until you mouse over each one
+        // hides exactly the information a stuck user is looking for.
+        const reasonLine = r && p !== 'running' && p !== 'deploying'
+          ? `<small class="status-reason" style="display:block;color:var(--muted);font-size:var(--fs-xs);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px">${escapeHtml(r)}</small>`
+          : '';
+        return `<div class="col-status ${cls}"${title}><span class="status-dot"></span><span>${txt}${reasonLine}</span></div>`;
       })()}
       <div class="col-owner" title="${escapeHtml(d.owner || '')}">${escapeHtml(shortAddr(d.owner))}</div>
       <div class="col-created" style="text-align:right">${ageString(d.created_at)}</div>

@@ -28,6 +28,15 @@ writes; the init-time framework "DRIFT" line is a transient — the probe
 sees the baked binary until Restore's install lands, and the watcher
 only starts after that, so no reconcile race).
 
+2026-07-20, rebuilt -dev environment (new SandboxServing + provider +
+snapshot registration) running the deploy-flow-smoothing build: full
+round green (transfer-live's source-boot timeout on the FIRST round was
+provider cold-cache warmup — it passed standalone right after). The
+402 preflight, SDK /config auto-discovery, and zero-arg
+deposit()/getBalance() were all exercised for real by the environment
+switch itself: the old wallet's stale ack/balance failed synchronously
+with exact remediation named, then passed after ack() + deposit().
+
 | Tier | Cost | What it proves |
 |---|---|---|
 | T0 unit/integration | free, seconds | logic + wiring, mocks only |
