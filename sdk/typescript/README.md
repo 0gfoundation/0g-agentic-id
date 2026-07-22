@@ -27,7 +27,7 @@ npm install @0glabs/agenticid-sdk viem
 import { AgenticID } from '@0glabs/agenticid-sdk';
 
 const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
-  account: process.env.PRIVATE_KEY,   // omit for read-only
+  account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
 });
 // Verifying addresses out-of-band instead of trusting the attestor?
 // pass `overrides: { agenticID: '0x…', … }` — explicit always wins.
@@ -69,7 +69,7 @@ const ro = new AgenticID({ addresses });
 // with a signer (for writes):
 const ag = new AgenticID({
   addresses,
-  account: process.env.PRIVATE_KEY,       // a private key (0x…) or a viem Account; enables writes
+  account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
   attestorUrl: process.env.ATTESTOR_URL,  // only for agent.deploy / agent.clone
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
@@ -146,7 +146,10 @@ await ag.agent.getAgentSeal(agentId);       // → "0x…"    the agent's on-cha
 await ag.agent.getSealId(agentId);          // → "0x…"    bytes32 seal id (the same value deploy returned as `sealId`)
 await ag.agent.getAgentIdBySealId(sealId);  // → 33n      reverse lookup (sealId from deploy above)
 await ag.agent.isSealIdBound(sealId);       // → true
-await ag.agent.intelligentDatasOf(agentId); // → [ { dataDescription: "framework", dataHash: "0x…" }, … ]
+await ag.agent.intelligentDatasOf(agentId);
+// → [ { dataDescription: '{"role":"framework","storage_ptr":{…},"encryption":"AES-GCM-256"}', dataHash: '0x…' }, … ]
+//   dataDescription is a JSON STRING (role + storage pointer + cipher) —
+//   extract the role via JSON.parse(d.dataDescription).role, don't compare it to 'framework' directly
 await ag.agent.sealedKeysOf(agentId);       // → [ "0x04…", … ]   one sealed key per iData entry
 await ag.agent.balanceOf(owner);            // → 5n       agents owned by `owner`
 
