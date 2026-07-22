@@ -38,7 +38,7 @@ export interface DefaultIDataParams {
   framework?: string;
   name: string;
   description: string;
-  /** Persona inference pin; default anthropic/claude-opus-4-6. */
+  /** Persona inference pin; default 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model). */
   inference?: { provider: string; model: string };
 }
 
@@ -66,7 +66,7 @@ export function defaultIData(p: DefaultIDataParams): IDataInput[] {
       role: 'persona',
       plaintext: {
         system_prompt: `You are ${p.name}. ${p.description}\n`,
-        inference: p.inference ?? { provider: 'anthropic', model: 'claude-opus-4-6' },
+        inference: p.inference ?? { provider: '0g-compute', model: '0gm-1.0-35b-a3b' },
       },
       extra: {},
     },
@@ -102,7 +102,7 @@ export interface DeployParams {
    */
   framework?: string;
   /** Inference pin for the SDK-built default persona (defaults to
-   *  anthropic/claude-opus-4-6). Ignored when you pass your own `iData`. */
+   *  0g-compute/0gm-1.0-35b-a3b). Ignored when you pass your own `iData`. */
   inference?: { provider: string; model: string };
   /** Sandbox "create" payload the attestor relays to the provider. */
   sandbox: {
