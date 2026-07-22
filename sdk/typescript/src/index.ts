@@ -16,6 +16,7 @@
 
 // ── Facade + namespaces ──
 export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
+export type { DeployAccepted } from './AgenticID';
 export { defaultIData } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
 export type { AgenticIDConfig } from './context';

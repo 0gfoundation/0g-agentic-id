@@ -48,7 +48,20 @@ type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: b
 /** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
 const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 /** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
-type MintedResponse = DeployCloneResponse & { agentId: bigint };
+/**
+ * Facade-normalized deploy/clone acceptance — camelCase like every other
+ * SDK return (the attestor's wire JSON speaks snake_case; the mapping
+ * happens here so callers never see mixed casing).
+ */
+export interface DeployAccepted {
+  sealId: Hash;
+  agentSealAddr: Address;
+}
+type MintedResponse = DeployAccepted & { agentId: bigint };
+
+function acceptedOf(res: DeployCloneResponse): DeployAccepted {
+  return { sealId: res.seal_id, agentSealAddr: res.agent_seal_addr };
+}
 
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
@@ -105,34 +118,34 @@ export class AgentApi {
 
   // — lifecycle —
   /**
-   * Deploy a new agent. Async: returns `{ seal_id, agent_seal_addr }` once the
+   * Deploy a new agent. Async: returns `{ sealId, agentSealAddr }` once the
    * attestor accepts the job. Pass `{ wait: true }` to also block on the
    * background mint (via waitForMint) and get the new `agentId` in the result.
    */
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
-  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
+  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
-    const res = await this.attestor.deploy(params);
-    if (!opts?.wait) return res;
-    const agentId = await this.waitForMint(res.seal_id, opts);
-    return { ...res, agentId };
+    const accepted = acceptedOf(await this.attestor.deploy(params));
+    if (!opts?.wait) return accepted;
+    const agentId = await this.waitForMint(accepted.sealId, opts);
+    return { ...accepted, agentId };
   }
 
   /**
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
-   * `{ seal_id, agent_seal_addr }` on acceptance; `{ wait: true }` also blocks on
+   * `{ sealId, agentSealAddr }` on acceptance; `{ wait: true }` also blocks on
    * the mint and returns the new `agentId`.
    */
   clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
-  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
+  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
-    const res = await this.attestor.clone(params);
-    if (!opts?.wait) return res;
-    const agentId = await this.waitForMint(res.seal_id, opts);
-    return { ...res, agentId };
+    const accepted = acceptedOf(await this.attestor.clone(params));
+    if (!opts?.wait) return accepted;
+    const agentId = await this.waitForMint(accepted.sealId, opts);
+    return { ...accepted, agentId };
   }
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
@@ -274,21 +287,39 @@ export class AgentApi {
    * Normalized view of the attestor's /deployments listing. The raw rows
    * speak hex ("agent_id": "0x77") and snake_case; this returns bigint
    * agentIds and camelCase so they compose with every other SDK call.
+   *
+   * `url` is the agent's public base URL (feed it to sayHi/authenticate/
+   * the /v1 chat API) — null until the container is provisioned.
+   * `lastProvisionError` is WHY a deployment is stuck (e.g. "image_hash
+   * not in validFrameworkHashes") — always check it before debugging a
+   * deployment that never reaches `running`. It records the MOST RECENT
+   * failure and is not cleared by a later success, so read it together
+   * with `phase`.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string;
-    sandboxId: string | null; owner: Address; name: string | null; createdAt: string | null;
+    sandboxId: string | null; url: string | null; owner: Address; name: string | null;
+    createdAt: string | null; lastProvisionError: string | null;
   }>> {
     const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
-    return rows.map((r) => ({
-      agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
-      sealId: r.seal_id as Hash,
-      phase: (r.phase as string) ?? 'unknown',
-      sandboxId: (r.sandbox_id as string) ?? null,
-      owner: r.owner as Address,
-      name: ((r.agent_card as Record<string, unknown>)?.name as string) ?? null,
-      createdAt: (r.created_at as string) ?? null,
-    }));
+    return rows.map((r) => {
+      const card = (r.agent_card as Record<string, unknown>) ?? {};
+      // The card's url points at the /hello card endpoint; the base (origin)
+      // is what every other interaction wants.
+      let url: string | null = null;
+      try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
+      return {
+        agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
+        sealId: r.seal_id as Hash,
+        phase: (r.phase as string) ?? 'unknown',
+        sandboxId: (r.sandbox_id as string) ?? null,
+        url,
+        owner: r.owner as Address,
+        name: (card.name as string) ?? null,
+        createdAt: (r.created_at as string) ?? null,
+        lastProvisionError: (r.last_provision_error as string) ?? null,
+      };
+    });
   }
 
   /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */

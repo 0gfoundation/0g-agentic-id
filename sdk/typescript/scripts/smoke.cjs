@@ -57,5 +57,5 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
     framework: process.env.FRAMEWORK ?? 'openclaw',
     sandbox,
   }, { wait: true, timeoutMs: 120000 });
-  console.log('FULL OK: seal_id=%s agentId=%s', r.seal_id, r.agentId);
+  console.log('FULL OK: sealId=%s agentId=%s', r.sealId, r.agentId);
 })().catch((e) => { console.error('FATAL:', e); process.exit(1); });

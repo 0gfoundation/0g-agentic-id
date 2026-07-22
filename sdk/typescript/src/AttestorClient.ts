@@ -107,8 +107,10 @@ export interface DeployParams {
   /** Sandbox "create" payload the attestor relays to the provider. */
   sandbox: {
     /** The sealed runtime image name (0g-sandbox's own field is called
-     *  `snapshot`; the SDK sends it verbatim under that wire name). */
-    sealedImage: string;
+     *  `snapshot`; the SDK sends it verbatim under that wire name).
+     *  Omit (or pass '') to use the attestor /config's current image —
+     *  the operator-maintained default. */
+    sealedImage?: string;
     apiKey: string;
     sealed?: boolean;
     resourceId?: string;
@@ -186,12 +188,29 @@ export class AttestorClient {
     };
   }
 
+  /**
+   * Resolve the sealed image name: an explicit value wins; otherwise the
+   * attestor /config's current image. An empty snapshot in the create
+   * envelope makes the sandbox provider fail the request ("sealed
+   * containers require an image or snapshot") — and operators bump the
+   * current name via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source
+   * of truth (same default the deploy console uses).
+   */
+  private async resolveSealedImage(explicit?: string): Promise<string> {
+    if (explicit) return explicit;
+    const cfg: any = await fetch(`${this.baseUrl()}/config`)
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    return (cfg && cfg.sandbox_snapshot) || '';
+  }
+
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
   private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+    const snapshot = await this.resolveSealedImage(sandbox.sealedImage);
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot: sandbox.sealedImage, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      { snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
       ttlSec,
     );
   }
@@ -224,18 +243,7 @@ export class AttestorClient {
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
     if (op === 'reset') {
-      // Default the image from the attestor's /config — an empty snapshot
-      // makes the sandbox provider 400 the recreate ("sealed containers
-      // require an image or snapshot"), and operators bump the current name
-      // via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source of truth
-      // (same as the deploy console).
-      let snapshot = params.sealedImage;
-      if (!snapshot) {
-        const cfg: any = await fetch(`${this.baseUrl()}/config`)
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null);
-        snapshot = (cfg && cfg.sandbox_snapshot) || '';
-      }
+      const snapshot = await this.resolveSealedImage(params.sealedImage);
       envelope = await this.signEnvelope(
         'create',
         '',

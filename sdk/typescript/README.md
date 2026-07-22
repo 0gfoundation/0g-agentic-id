@@ -100,7 +100,10 @@ const params = {
   framework: 'openclaw',                           // → the binding in the SDK-built default; must be a name the attestor's GET /config advertises
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // optional — omitting it defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
   sandbox: {
-    sealedImage: process.env.SEALED_IMAGE,         // the sealed runtime image name (0g-sandbox calls this field `snapshot` on the wire)
+    // sealedImage is optional — omit it to use the attestor /config's current
+    // image (the operator-maintained default; same fallback reset() uses).
+    // Pass a name only to pin/rollback (0g-sandbox calls this field `snapshot` on the wire):
+    sealedImage: process.env.SEALED_IMAGE,
     apiKey:      process.env.AGENT_API_KEY,        // injected into the container as an env secret
   },
 };
@@ -110,16 +113,16 @@ const params = {
 // exist until the background mint (storage → on-chain mint → setAgentURI).
 
 // One-shot — `{ wait: true }` blocks on the mint and hands back the tokenId (agentId):
-const { seal_id, agent_seal_addr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
 
-// Or fire-and-forget — get the seal_id now, wait (or poll) for the mint later:
-const dep = await ag.agent.deploy(params);            // → { seal_id, agent_seal_addr }
-const id = await ag.agent.waitForMint(dep.seal_id);   // → 34n once minted (tune { timeoutMs, pollIntervalMs })
+// Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
+const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
+const id = await ag.agent.waitForMint(dep.sealId);    // → 34n once minted (tune { timeoutMs, pollIntervalMs })
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
 const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
-// cl → { seal_id, agent_seal_addr, agentId }  — the new agent's tokenId; lands Offline for the new owner
+// cl → { sealId, agentSealAddr, agentId }  — the new agent's tokenId; lands Offline for the new owner
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
 // your own STABLE key to make a retry dedupe server-side (same key → the attestor
@@ -133,8 +136,8 @@ await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → tx hash "0x�
 // reads
 await ag.agent.ownerOf(agentId);            // → "0x…"    current owner
 await ag.agent.getAgentSeal(agentId);       // → "0x…"    the agent's on-chain signing key (address)
-const sealId = await ag.agent.getSealId(agentId);  // → "0x…" bytes32 seal id
-await ag.agent.getAgentIdBySealId(sealId);  // → 33n      reverse lookup
+await ag.agent.getSealId(agentId);          // → "0x…"    bytes32 seal id (the same value deploy returned as `sealId`)
+await ag.agent.getAgentIdBySealId(sealId);  // → 33n      reverse lookup (sealId from deploy above)
 await ag.agent.isSealIdBound(sealId);       // → true
 await ag.agent.intelligentDatasOf(agentId); // → [ { dataDescription: "framework", dataHash: "0x…" }, … ]
 await ag.agent.sealedKeysOf(agentId);       // → [ "0x04…", … ]   one sealed key per iData entry
@@ -144,6 +147,16 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
 ```
+
+**Which identifier does what** — three IDs refer to the same agent from different angles:
+
+| Identifier | What it is | Used by |
+|---|---|---|
+| `agentId` (bigint) | the ERC-721 tokenId — the on-chain identity | most reads, transfer, clone, authenticate, runtimeCosts |
+| `sealId` (bytes32) | the seal binding's hash id — what the attestor keys its deployment records by | stop / start / reset, waitForMint, deployment rows |
+| `agentSeal` (address) | the agent's own signing key as an address — its wallet | topUpAgentSeal, serve-proof signer checks |
+
+Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentSeal(agentId)`.
 
 `transfer`/`clone` reject non-seal-bound agents today with a clear error (they'd need `iTransferFrom`/`iCloneFrom`).
 
@@ -161,7 +174,7 @@ const agentUrl = 'https://<agent-serve-endpoint>';   // wherever the agent's con
 // 1. call the agent + capture the serve-proof (you shape the request; the SDK only
 //    reads the X-Agent-Proof header the sealed proxy stamps on the response)
 const { response, proof } = await ag.reputation.capture(() =>
-  fetch(`${agentUrl}/chat`, { method: 'POST', body: JSON.stringify({ q: 'hi' }) }));
+  fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
 const data = await response.json();                   // your normal response body
 // proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_000_300n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
@@ -177,7 +190,9 @@ const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof
 // full control when you want it: add valueDecimals / tag1 / tag2 /
 // endpoint / feedbackURI / feedbackHash.
 // The proof should come from the interaction you are actually rating —
-// capture() it during your real call, then submit.
+// capture() it during your real call, then submit. Mind the proof's
+// `deadline` (~300s from serve): verify + submit must land on chain before
+// it, and a 0G receipt can take 120s+ — don't sit on a captured proof.
 // txHash → "0x…"
 
 // read back
@@ -243,7 +258,7 @@ iData: [
   // provider/model ('anthropic' | 'openai' | '0g-compute' via the router).
   { role: 'persona', plaintext: {
       system_prompt: 'You are …\n',
-      inference: { provider: '0g-compute', model: 'claude-opus-4-8' },
+      inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
     }, extra: {} },
 ]
 ```
@@ -285,8 +300,28 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
 ## Interacting with a running agent (no console needed)
 
+**Where `agentUrl` comes from** — every running agent has a public base URL
+(scheme and host are deployment-specific: the dev proxy serves plain http,
+the hosted environment https). `listDeployments()` hands it to you:
+
+```ts
+const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+// me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
+const agentUrl = me.url;               // null until the container is provisioned
+// If phase never reaches 'running', me.lastProvisionError says why —
+// e.g. "image_hash not in validFrameworkHashes".
+```
+
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
   my registered services. Every response carries a signed `X-Agent-Proof`.
+  Or let the SDK do the fetch + proof check in one call:
+
+  ```ts
+  const { hello, verification } = await ag.agent.sayHi(agentUrl);
+  // hello → { agent, owner, public_url, message, services }
+  // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
+  ```
+
 - **Owner-registered services** — plain HTTP against the paths listed in
   `/hello`'s `services`; each response is proof-signed (that is what you
   `capture()` and rate).
@@ -315,7 +350,10 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
   Under the hood: EIP-191-sign `0GSealAuth:<sealId>:<ts>`, exchange it at
   `POST {agentUrl}/_seal/auth`; the container verifies the signer is the
-  on-chain owner.
+  on-chain owner and that `<ts>` is within ±300s. Token lifecycle: it is
+  generated at the container's first boot, stays stable across restarts
+  (the dashboard survives them), has no expiry, and rotates only when the
+  container is recreated — `reset()` is the revocation lever.
 
 ## Addresses
 
@@ -327,7 +365,7 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` (viem cha
 
 ## Notes
 
-- **No client binding in serve-proofs.** Feedback is attributed to `msg.sender` at `giveFeedback`; a proof is a bearer attestation (single-use via the signature nonce). Serve runs over plain HTTP, so treat proofs as sensitive.
+- **No client binding in serve-proofs.** Feedback is attributed to `msg.sender` at `giveFeedback`; a proof is a bearer attestation (single-use via the signature nonce). Treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
 - **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries). If it still times out, the tx likely landed — confirm by reading state.
 - On-chain types: `value`/`summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint).
 
