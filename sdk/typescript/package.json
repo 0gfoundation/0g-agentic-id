@@ -18,6 +18,7 @@
     "dist",
     "src",
     "README.md",
+    "README.zh.md",
     "LICENSE"
   ],
   "scripts": {

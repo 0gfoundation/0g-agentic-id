@@ -1,0 +1,511 @@
+# @0glabs/agenticid-sdk
+
+[English](README.md) | 中文
+
+0G AgenticID 协议的 TypeScript SDK——为链上自主 AI Agent 提供完整的信任链：ERC-8004（身份 + 声誉）+ ERC-7857（带密封密钥的智能数据）。基于 [viem](https://viem.sh) 构建。
+
+## 一分钟总览
+
+只有一个入口类 `AgenticID`，按意图分成两个命名空间，外加几个顶层操作：
+
+| 入口 | 功能 |
+|---|---|
+| `ag.agent` | Agent 生命周期——**部署 / 克隆 / 转让**——链上读取（owner、agentSeal、iData……）、agentSeal gas 充值、启停重置、费用估算、headless 交互 |
+| `ag.reputation` | 捕获 TEE 签名的服务证明（serve-proof）、验证、提交/读取链上评价 |
+| `ag.ack()` / `ag.ackStatus()` | 确认 TEE 信任根组件集（覆盖 attestor + kms + sandbox-provider，不针对单个 agent） |
+| `ag.deposit()` / `ag.getBalance()` | 充值 / 查询 sandbox 预付费余额 |
+
+所有后端（AgenticID / ReputationRegistry / TappRegistry / SandboxServing 四组合约 + attestor 的 HTTP 接口）都藏在门面后面，调用者不需要知道哪个操作走链、哪个走 HTTP。
+
+## 安装
+
+```bash
+npm install @0glabs/agenticid-sdk viem
+```
+
+**测前准备**：钱包需要测试网 OG——gas（deploy/评价等链上写入）+ sandbox 预付费（建议 ≥0.5 OG，createFee 0.06 + 运行分钟费）。水龙头：<https://faucet.0g.ai>。
+
+## 初始化
+
+**推荐路径——一个 URL 引导一切。** attestor 的 `GET /config` 自描述其所在环境（合约地址集、链 RPC、组件 appId），所以一个 URL 就锁定了环境；切环境就是换 URL：
+
+```ts
+import { AgenticID } from '@0glabs/agenticid-sdk';
+
+const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
+  account: process.env.PRIVATE_KEY as `0x${string}`,   // 不传 = 只读实例；env 值是 string|undefined，strict 下要断言
+});
+// 想自己核对地址而不信任 attestor 报的？
+// 传 `overrides: { agenticID: '0x…', … }` —— 显式指定永远优先。
+```
+
+为什么可以信 `/config`：整个信任模型的根就是你 ack 过的 TEE attestor——它的 `/config` 和它做的其他一切同等可信，所以这是你需要的唯一构造路径。
+
+`/config` 真实响应长这样（agenticid.0g.ai，节选；字段是 snake_case，SDK 负责映射成 `ContractAddresses` 的 camelCase）：
+
+```json
+{
+  "chain_rpc": "https://evmrpc-testnet.0g.ai",
+  "chain_id": 16602,
+  "agentic_id_addr": "0x34493302287308f565cf3409daadedf4c8895648",
+  "tapp_registry_addr": "0x2ce80374318b1d7fb3345724457a182e0ad165c9",
+  "sandbox_serving_addr": "0x3490b9053ac46f7bf71a1cebffcb2be2c1405b41",
+  "reputation_registry_addr": "0xede70197313d0b603612dfc9801162d1ada3d196",
+  "tee_data_verifier_addr": "0x9d48fcce51b4b39fcb6e4bd0840f75a987cef980",
+  "sandbox_snapshot": "0g-sealed",
+  "supported_frameworks": ["openclaw"]
+}
+```
+
+**环境缺合约时的降级行为**（一般性规则，具体环境以它当下的 `/config` 为准）：`/config` 里为 null/缺失的地址会被映射成零地址，`fromAttestor` **构造照常成功**（读链、部署等其他能力不受影响）；只有当你调用到依赖该合约的方法时，才会**立即抛出指名道姓的错误**（如 `reputation: this environment has no ReputationRegistry deployed …`），不会让你撞上一个难懂的 ABI 解码错误。临时补救可用 `overrides` 显式传入缺失地址。（高级用法：`new AgenticID({ addresses, … })` 仍然存在，用于手工指定地址的场景——审计工具、或链上有数据但 attestor 没跑的时候；`overrides` 则让你在不放弃引导的前提下钉死任意单个地址。）
+
+**只构造一次。** 读操作只需要合约地址；写操作再加一个签名私钥。SDK 内部自己构建 viem 客户端——你不用手搓 wallet client，RPC 默认指向 0G Galileo 测试网，可省略。
+
+```ts
+import { AgenticID, type ContractAddresses } from '@0glabs/agenticid-sdk';
+
+// 地址是部署产物，不烧进 SDK——从 contracts/DEPLOYMENT.md §6 抄你要的那套，
+// 或从你自己的配置/环境变量加载。RPC + 这五个地址完全确定目标合约。
+const addresses: ContractAddresses = {
+  agenticID:          '0x…',
+  reputationRegistry: '0x…',
+  teeDataVerifier:    '0x…',
+  tappRegistry:       '0x…',
+  sandboxServing:     '0x…',
+};
+
+// 只读——不需要任何 URL：链上读取是 RPC 直连合约（RPC 有内置默认值，
+// 指向 0G Galileo 测试网），attestor 不参与。
+const ro = new AgenticID({ addresses });
+
+// 带签名（可写）：
+const ag = new AgenticID({
+  addresses,
+  account: process.env.PRIVATE_KEY as `0x${string}`,   // 私钥（0x…）或 viem Account；有它就能写
+  attestorUrl: process.env.ATTESTOR_URL,  // 生命周期操作（deploy/clone/启停/reset/listDeployments）需要
+  // rpcUrl 可选——默认 0G Galileo 测试网 RPC
+});
+```
+
+依赖是三层递进的：**读链 = 只要地址**（RPC 有默认）；**写链** = 再加 `account`；**动容器 / 查部署状态** = 再加 `attestorUrl`（部署进度 deploying/running/offline 是 attestor 数据库的状态，链上没有；attestorUrl 同时供若干默认值解析——sandbox provider 地址、组件 appId 列表、当前镜像名——没有它这些方法也能用，只是参数得显式传全）。
+
+`AgenticIDConfig` 全字段：`{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`。
+
+- **`account`** —— 私钥或 viem `Account`。给了它就能签写操作，wallet client 由 SDK 代建。
+- **`walletClient`**（高级）—— 用你自己的替代 `account`，比如浏览器注入钱包。配套导出了 `ZERO_G_TESTNET` 和 `RPC_URL`。
+
+下文示例假定这些绑定：
+
+```ts
+const agentId = 33n;         // 一个已存在的 agent（ERC-721 tokenId）
+const owner = '0xAaAa...';   // 该 agent 的 owner（通常就是你签名钱包的地址）
+const buyer = '0xBbBb...';   // 留评价的地址——即 `ag` 用来签名的钱包（归属按 msg.sender）
+```
+
+---
+
+## `ag.agent` —— 生命周期 + 读取
+
+```ts
+import { parseEther } from 'viem';
+
+// deploy——签好 deploy 信封 + sandbox-create 信封，POST 给 attestor
+const params = {
+  name: 'Sage',
+  description: 'a helpful agent',
+  // iData 是 agent 被铸造的完整内容（WYSIWYS——你签的字节就是被密封的字节，
+  // attestor 不合成任何东西）。省略则 SDK 用 defaultIData() 代建，
+  // 下面的 framework / inference 用来调这个默认值。无论哪种方式，
+  // role="framework" 的绑定都必须存在——deploy 入口会拒绝缺失它的 iData。
+  framework: 'openclaw',                           // → SDK 代建默认值里的绑定；必须是 attestor GET /config 宣告的名字
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // 可选——不传默认 0g-compute/0gm-1.0-35b-a3b（0G 路由自家模型）
+  sandbox: {
+    // sealedImage 可省略——省略（或传空）时自动用 attestor /config 的当前镜像
+    // （运维维护的默认值，和 reset() 同一兜底）。只在钉版本/回退时才显式传：
+    sealedImage: process.env.SEALED_IMAGE,
+    apiKey:      process.env.AGENT_API_KEY,        // 作为环境密钥注入容器
+  },
+};
+
+// deploy/clone 是异步两段式（提交 → 铸造），类似交易的 writeContract → waitForReceipt。
+// 第一个 await 在 attestor 受理任务时就返回；tokenId 要等后台铸造
+// （存储 → 链上 mint → setAgentURI）完成才存在。
+
+// 一步到位——`{ wait: true }` 阻塞到铸造完成，直接拿 tokenId（agentId）：
+const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+
+// 或者先拿 sealId、稍后再等（或轮询）铸造：
+const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
+const id = await ag.agent.waitForMint(dep.sealId);    // → 铸好后返回 34n（可调 { timeoutMs, pollIntervalMs }）
+
+// clone——源 owner 为另一个 owner 铸一份副本（attestor 对密封数据重新加密）
+const newOwner = '0x1111111111111111111111111111111111111111';
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
+// cl → { sealId, agentSealAddr, agentId }——新 agent 的 tokenId；新 owner 名下初始为 Offline
+
+// idempotencyKey 在 deploy/clone 上可选——SDK 每次调用自动生成。传你自己的
+// 稳定键可让重试在服务端去重（同键 → attestor 返回已有的 deploy/clone，
+// 不会重复铸造）：
+// await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
+
+// transfer——ERC-7857 转让；attestor 在转让时拆除旧 owner 的运行时
+await ag.agent.transferFrom(owner, newOwner, agentId);      // → 交易哈希 "0x…"
+await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → 交易哈希 "0x…"
+
+// 读取
+await ag.agent.ownerOf(agentId);            // → "0x…"    当前 owner
+await ag.agent.getAgentSeal(agentId);       // → "0x…"    agent 的链上签名密钥（地址形式）
+await ag.agent.getSealId(agentId);          // → "0x…"    bytes32 seal id（与上面 deploy 返回的 sealId 同值）
+await ag.agent.getAgentIdBySealId(sealId);  // → 33n      反向查询
+await ag.agent.isSealIdBound(sealId);       // → true
+await ag.agent.intelligentDatasOf(agentId);
+// → [ { dataDescription: '{"role":"framework","storage_ptr":{"root_hash":"0x…","indexer":"…","size":95},"encryption":"AES-GCM-256"}',
+//       dataHash: '0x…' }, … ]
+//   注意 dataDescription 是一整段 JSON 字符串（role + 存储指针 + 加密算法）——
+//   取 role 要 JSON.parse(d.dataDescription).role，不能直接 === 'framework'
+await ag.agent.sealedKeysOf(agentId);       // → [ "0x04…", … ]   每条 iData 一把密封密钥
+await ag.agent.balanceOf(owner);            // → 5n       `owner` 名下的 agent 数量
+
+// 给 agent 自己的密钥打 gas，让它能自付链上写入（进化燃料）
+const agentSeal = await ag.agent.getAgentSeal(agentId);
+await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → 交易哈希 "0x…"
+```
+
+**运行时启停**（owner 签名，身份不变）：
+
+```ts
+await ag.agent.stop(sealId, sandboxId);     // 停容器
+await ag.agent.start(sealId, sandboxId);    // 重新拉起
+await ag.agent.reset(sealId, { apiKey });   // 重建容器：从链上重读 iData、重选框架适配器。
+                                            // apiKey 事实必传——attestor 不缓存模型密钥，
+                                            // 不传的话 agent 能起来但调不了模型。
+                                            // sealedImage 可选，缺省从 /config 取当前镜像名。
+await ag.agent.listDeployments();
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+//   phase：'deploying'（在途）| 'running'（服务中）| 'stopped'（owner 主动停，可 start 回来）
+//         | 'offline'（容器没了——失败/超时/转让拆除；链上身份还在，reset 重建）| 'failed'（铸造失败，retry）；
+//   url：agent 的公网基址（喂给 sayHi/authenticate/聊天 API 的那个），容器起来前是 null；
+//   lastProvisionError：部署失败的原因——容器 provision 失败（如 "image_hash not in
+//   validFrameworkHashes"）或铸造/存储管线失败（如 "mint submit: … replacement transaction
+//   underpriced"，SDK 会从失败 stage 的 reason 兜底取出）。它记录最近一次失败、成功后
+//   不清空，所以只在 phase 是 offline/failed 终态时当结论读。
+//   注意这是无鉴权的公开接口（返回该 attestor 的全部部署，不只你名下的）——内容
+//   （agentId/owner/名字/URL）在链上事件和 agent card 里本就公开，设计如此。
+```
+
+**三种标识符对照**——同一个 agent 的三个视角：
+
+| 标识符 | 是什么 | 谁在用 |
+|---|---|---|
+| `agentId`（bigint） | ERC-721 tokenId——链上身份本体 | 绝大多数读取、transfer、clone、authenticate、runtimeCosts |
+| `sealId`（bytes32） | seal 绑定的哈希 id——attestor 部署记录的主键 | stop / start / reset、waitForMint、部署行 |
+| `agentSeal`（address） | agent 自己的签名密钥（地址形式）——它的钱包 | topUpAgentSeal、服务证明的签名者核验 |
+
+三者随时互转：`getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentSeal(agentId)`。
+
+---
+
+## `ag.reputation` —— 服务证明 + 评价
+
+每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。唯一的不变量是挡在前面的 **sealed 代理**：无论 agent 服务什么，代理都会在每个响应上盖 `X-Agent-Proof` 头。所以 SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
+
+```ts
+import { keccak256, toBytes } from 'viem';
+
+// agent 的公网基址来自 listDeployments() 返回行的 url 字段（详见"与运行中的 agent 交互"一节）：
+const { url: agentUrl } = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+
+// 1. 调用 agent + 捕获服务证明（请求由你自己组织；SDK 只读
+//    sealed 代理盖在响应上的 X-Agent-Proof 头）
+const { response, proof } = await ag.reputation.capture(() =>
+  fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
+const data = await response.json();                   // 正常的业务响应体
+// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_000_300n,
+//           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
+// （等价入口：ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue)）
+
+// 2. 花 gas 之前先验证（签名者 == 链上 agentSeal、未过期、dataHashes ⊆ 链上 iData）
+await ag.reputation.verifyProof(proof);
+// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
+
+// 3. 提交评价——记在 buyer（msg.sender）名下。必填三项，其余全部默认
+//   （decimals 0，tags/endpoint/URI 为空）：
+const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// 需要精细控制时可加：valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash。
+// proof 应该来自你实际在评价的那次交互——真实调用时 capture()，然后提交。
+// proof 的 deadline = 服务时刻 +3600 秒（1 小时）：verify + 0G 上链（回执可能
+// 120 秒+）时间绰绰有余，但别隔天再提交——过期后合约侧会拒。
+
+// 读回
+const idx = await ag.reputation.getLastIndex(agentId, buyer);   // → 2n   该 buyer 的最新序号
+await ag.reputation.readFeedback(agentId, buyer, idx);
+// → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "latency", isRevoked: false }
+await ag.reputation.getSummary({ agentId });   // 过滤条件全部可选
+// → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }
+await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
+await ag.reputation.readAllFeedback({ agentId });   // 可用 clientAddresses / tags / includeRevoked 收窄
+await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  留过评价的地址
+
+// owner 回应某条评价；留评价的客户端可撤销
+await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
+await ag.reputation.revokeFeedback(agentId, idx);              // → 交易哈希 "0x…"（仅限当初留评价的 buyer）
+```
+
+> **数据绑定声誉**（按评价是否在 agent *当前*数据下挣得来加权，而不是像 `getSummary` 那样把全部历史混在一起）已完成设计但**尚未进 SDK**——它属于事件索引器阶段。模型见仓库的 `REPUTATION_MODEL.md`。
+
+---
+
+## 顶层操作（不针对单个 agent）
+
+信任根确认和 sandbox 预付费不是 agent 级的事，所以直接挂在门面上。
+
+```ts
+import { parseEther } from 'viem';
+
+// 信任根确认（TappRegistry，覆盖 attestor + kms + sandbox-provider）
+await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   `owner` 还缺哪些 ack
+const ackTx = await ag.ack();   // → 交易哈希 "0x…"；已全部 ack 则返回 null
+if (ackTx) await ag.waitForTransaction(ackTx);   // 见下方"写后立即读"的提醒
+
+// sandbox 预付费余额（SandboxServing）
+await ag.getBalance();                              // → 500000000000000000n（wei；user 默认当前账户，provider 默认 attestor /config 里的）
+await ag.getBalance({ user: owner });               // 也接受和 deposit 一致的对象参数（位置参数同样可用）
+const depositTx = await ag.deposit({ amountWei: parseEther('0.5') }); // → 交易哈希 "0x…"
+await ag.waitForTransaction(depositTx);
+```
+
+信任根组件集在设置了 `attestorUrl` 时自动从 `GET /config` 解析（每个环境有自己的 app 命名），兜底为 `['0g-attestor','0g-kms','0g-sandbox-provider']`；配置里显式给 `componentAppIds` 则永远优先。
+
+`agent.deploy()` / `agent.clone()` 会**预检**两个前提（组件全部 ack + 预付费余额 ≥ 0.1 OG），不满足就同步抛出指名道姓的错误——传 `{ preflight: false }` 可跳过。attestor 在受理时也做同样两项检查（HTTP 402，错误码 `trust_roots_not_acked` / `insufficient_sandbox_balance`）。
+
+**写后立即读会撞竞态**：`ack()` / `deposit()` / `topUpAgentSeal()` / `giveFeedback()` 都是裸 `writeContract`——拿到交易哈希就返回，不等上链。紧跟着读状态（`ackStatus()` / `getBalance()` / `readFeedback()`）可能还读到旧值。三个命名空间各有自己的 `waitForTransaction(txHash)`（顶层 `ag`、`ag.agent`、`ag.reputation`），写操作后先 `await` 它再读：
+
+```ts
+const tx = await ag.deposit({ amountWei: parseEther('1') });
+await ag.waitForTransaction(tx);   // 现在再读 getBalance() 才是新值
+```
+
+`deploy()`/`clone()` 的 `{ wait: true }` 已经内置了等待（等的是铸造完成，语义更强），不需要这个模式。
+
+---
+
+## 运行时镜像、框架与 iData 格式
+
+`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，当前是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。WYSIWYS：你签的 iData 就是被加密和铸造的内容，attestor 不合成任何东西。
+
+```ts
+iData: [
+  // 必填：框架绑定。不写版本号则解析到镜像内已验证的 openclaw 版本；
+  // 钉一个白名单内的版本也会被尊重。
+  { role: 'framework', plaintext: { name: 'openclaw', schema_version: 1 }, extra: {} },
+  // 协议 persona 种子——每个适配器把它翻译成自己的配置。
+  // system_prompt 是 agent 的人设；inference 选 provider/model
+  // （'anthropic' | 'openai' | '0g-compute'，后者走 0G 路由）。
+  { role: 'persona', plaintext: {
+      system_prompt: 'You are …\n',
+      inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
+    }, extra: {} },
+]
+```
+
+**persona 是一次性种子，不是长期数据**：上面的 framework + persona 是**铸造输入**；agent 跑起来后，sealed 运行时把 persona 翻译进框架自己的配置，并持续把**自己命名的条目**密封上链（openclaw 是 `framework` / `openclaw.json` / `workspace/`；链上 Update 是整数组替换）。所以在**存活 agent** 的 `intelligentDatasOf` 里按 `role === 'persona'` 精确匹配会扑空——role 集合以运行时实际密封的为准。
+
+**attestor 不校验什么**：除了框架**名字**（必须在 `/config.supported_frameworks` 里），deploy 的 iData 内容有意不做校验——铸什么是 owner 的自由，内容能不能跑起来是 **sealed 运行时的契约**。当前 sealed 镜像内置 openclaw 适配器，persona 种子支持的 `inference.provider`：`anthropic` / `openai` / `0g-compute`（0G 路由）。路由的实时模型目录：
+
+```ts
+await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
+```
+
+`sandbox.apiKey` **事实必传**——不传的话 agent 能起来但够不着模型。它随 owner 签名的信封进入 TEE 容器的环境变量；attestor 从不落盘（这也是 `reset()` 每次都要重传它的原因）。
+
+## 我的 agent 跑起来要花多少钱？
+
+```ts
+// 还没有 agent 也能算——部署前做预算：
+await ag.agent.estimateCosts();          // 价目 + 每分钟成本（连了账户还给余额和续航）
+
+await ag.agent.runtimeCosts(agentId);    // = estimateCosts + 该 agent 的进化 gas 余额
+// → {
+//   prepaidBalanceWei:      368500000000011380n,   // owner 的 sandbox 预付费余额
+//   sealGasWei:             0n,                    // 进化燃料（agentSeal 钱包）
+//   pricing: { pricePerCPUPerMin, pricePerMemGBPerMin, createFee },
+//   costPerMinWei:          4000000000000000n,     // 按容器规格（默认 2C/4GB）
+//   estimatedRunwayMinutes: 92,                    // 余额 ÷ 每分钟成本
+// }
+// 容器规格不同就传 { cpu, memGb }。按 agent 计量的实际消耗需要
+// provider 侧的用量记录——尚未上链。
+```
+
+> 参考价（dev 测试网）：createFee 0.06 OG，CPU 0.001 OG/核·分钟，内存 0.0005 OG/GB·分钟——默认规格约 0.004 OG/分钟。
+
+## 与运行中的 agent 交互（无需控制台）
+
+**agentUrl 从哪来**——每个运行中的 agent 都有一个公网基址（协议和域名取决于部署环境：dev 代理是 http，托管环境是 https），`listDeployments()` 直接给你：
+
+```ts
+const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+const agentUrl = me.url;   // 容器起来前是 null
+// 到不了 running 就看 me.lastProvisionError——它写着原因。
+```
+
+- **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、注册了哪些服务。每个响应都带签名的 `X-Agent-Proof`。也可以让 SDK 一次做完"请求 + 证明校验"：
+
+  ```ts
+  const { hello, verification } = await ag.agent.sayHi(agentUrl);
+  // hello → { agent, owner, public_url, message, services }
+  // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
+  ```
+
+- **owner 注册的服务** —— 按 `/hello` 里 `services` 列的路径直接发 HTTP；每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
+- **聊天 / 控制台（仅 owner）** —— 一次调用完成握手：
+
+  ```ts
+  const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
+  // `token` 是 openclaw gateway 的完整 owner/operator 凭证（不是窄权限）。两种用法：
+
+  // 1. 浏览器：打开 dashboardUrl（token 挂在 #fragment 上）。
+
+  // 2. headless 聊天——gateway 提供 OpenAI 兼容 HTTP API
+  //    （sealed 运行时已开启），同一个 Bearer token：
+  const r = await fetch(`${agentUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'openclaw/default',
+      messages: [{ role: 'user', content: 'What can you do?' }],
+    }),
+  });
+  const { choices } = await r.json();   // choices[0].message.content——真实推理回复
+  // GET /v1/models 列出可用目标；不带 token 的请求得到 401。
+  ```
+
+  握手原理：EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取凭证；容器校验签名者就是链上 owner，且 `<ts>` 必须在 ±300 秒窗口内。**token 生命周期**：容器首次启动时生成，跨重启保持稳定（控制台不会被登出）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
+
+## Agent 作为 owner（嵌套 agent）
+
+平台的自然能力：**sealed 容器里的 agent 可以用自己的 agentSeal 身份跑这个 SDK**——部署子 agent、转让、评价，全套 owner 操作。它没有（也不该有）裸私钥：agentSeal 私钥只存在于 sealed Go 进程里，agent 通过容器内的 unix-socket 签名服务（`SEAL_SIGN_SOCK`，三个端点 personal_sign / typed_data / transaction）请求签名。SDK 提供官方适配器把这个 socket 包装成 viem Account：
+
+```ts
+import { AgenticID } from '@0glabs/agenticid-sdk';
+import { sealAccount } from '@0glabs/agenticid-sdk/seal';   // node-only 子路径
+
+const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
+  account: await sealAccount(),   // 地址自动读 $AGENT_SEAL，socket 路径自动读 $SEAL_SIGN_SOCK
+});
+// 之后一切照旧——ag.agent.deploy(...)、ag.reputation.giveFeedback(...) 都以 agentSeal 身份签名
+```
+
+**兼容性契约（正式承诺）**：SDK 的任何方法都**永不要求裸私钥**——所有签名（EIP-191 信封、EIP-712、交易）一律经由 viem `Account` 接口。这意味着任何能实现 Account 接口的签名后端（seal socket、浏览器钱包、HSM）都是完整的一等公民，未来新增的方法也受此约束。
+
+适配器处理好的非显然点（自己手写时容易踩的坑）：
+- `signMessage` 双入参形态：`string` → socket 的 `message`（UTF-8），`{ raw }` → `message_hex`（原始字节）——映射反了签出来的是另一条消息；
+- EIP-712：socket 侧（geth apitypes）要求 `types` 里**必须有 `EIP712Domain` 条目**，而 viem 惯例省略它——适配器按 domain 字段自动注入；
+- 交易字段映射 camelCase/bigint → snake_case/字符串；只支持 `legacy` 和 `eip1559`（socket 的能力边界），eip2930/4844/7702 和 accessList **显式抛错**而不是静默错签；
+- socket 错误（JSON `{error}`）转成带语境的 SDK 错误；socket 连不上时的报错会提示"你是否在 sealed 容器内"。
+
+容器内跑 SDK 的注意事项：
+- 适配器用 `node:http` 走 unix socket（全局 `fetch` 不支持 unix socket），因此 **node-only**——从 `/seal` 子路径导入，主入口保持浏览器可用；
+- 签名前先给 agent 的钱包备 gas：agentSeal 地址发交易要自己付 gas，owner 用 `topUpAgentSeal()` 充（"进化燃料"就是这个用途）；
+- 信任边界：sign socket 是**全能签名器**，把 owner 可控的字节转发进去就能伪造任何签名——agent 自己是守门人（详见 sealed/TRUST_MODEL.md）。
+
+## 合约地址
+
+合约地址是**部署产物，不烧进 SDK**——RPC + 五个地址完全确定目标合约；地址不进库，代理升级或重新部署就不会让打包常量悄悄过期。
+
+**唯一事实来源：仓库 `contracts/DEPLOYMENT.md` §6。** 同一条链（0G Galileo 测试网，`chainId 16602`）上并行跑着多套 canonical-bound 部署——选与你 `attestorUrl` 指向的 attestor 相匹配的那套（例如 dev 部署配 dev 主机上的 attestor）。把那五个地址抄进 `ContractAddresses`（形状见上文），或从你自己的配置/环境变量加载。
+
+稳定的协议级常量**有**导出：`ZERO_G_TESTNET`（viem chain）、`RPC_URL`、`CHAIN_ID`、`RECEIPT_WAIT`。
+
+## 注意事项
+
+- **服务证明不绑定客户端。** 评价按 `giveFeedback` 时的 `msg.sender` 归属；证明是持有者凭证（签名 nonce 保证单次使用）。无论走什么传输都请把证明当敏感信息对待——服务面的协议取决于部署环境（dev 代理是明文 http，托管环境是 https）。
+- **0G 回执时序。** `waitForTransaction` 针对 0G 调过参（120 秒超时 + 重试）。如果仍超时，交易大概率已落地——读状态确认。
+- 链上类型：`value` / `summaryValue` 是 `int128`（bigint），`feedbackIndex` 是 `uint64`（bigint）。
+
+## 高级用法
+
+原始 ABI（`agenticIDAbi`、`reputationRegistryAbi`、`tappRegistryAbi`、`sandboxServingAbi`）和服务证明原语（`buildServeProofMessageHash`、`signServeProof`、`verifyServeProofSignature`）均有导出。
+
+**serve-proof 签名的规范化格式**（想独立实现验证、不依赖 `verifyProof` 的人用）——签名是 agentSeal 对下式的 EIP-191 personal_sign：
+
+```
+digest = keccak256(abi.encode(
+  agentId,                  // uint256
+  timestamp,                // uint256（unix 秒）
+  deadline,                 // uint256（= timestamp + 3600）
+  taskHash,                 // bytes32
+  keccak256(abi.encodePacked(dataHashes)),  // bytes32：dataHashes 数组先打包哈希
+  frameworkHash             // bytes32（sealed 镜像 hash）
+))
+```
+
+`buildServeProofMessageHash` 就是这个公式的 TS 实现；对照 `sealed/internal/proxy/proxy.go` 的 Go 侧实现。各合约客户端（`AgenticIDClient`、`ReputationClient`、`SandboxClient`、`AttestorClient`、`ServeSession`）是命名空间背后的内部构件。
+
+---
+
+## 附：从零到对话的完整路径（dev 实测过的流程）
+
+```ts
+import { AgenticID } from '@0glabs/agenticid-sdk';
+import { parseEther } from 'viem';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// 三个占位符按你的环境提供：
+declare const ATTESTOR_URL: string, PRIVATE_KEY: `0x${string}`, ROUTER_API_KEY: string;
+
+// 0. 引导 + 前提。写操作都要等回执再往下走（见"写后立即读"一节）——
+//    新账户 ack/deposit 不等回执就 deploy，会撞 preflight 的余额/ack 检查。
+const ag = await AgenticID.fromAttestor(ATTESTOR_URL, { account: PRIVATE_KEY });
+const ackTx = await ag.ack();                            // 信任根确认（一次性）
+if (ackTx) await ag.waitForTransaction(ackTx);
+const depTx = await ag.deposit({ amountWei: parseEther('1') });   // sandbox 预付费
+await ag.waitForTransaction(depTx);
+await ag.agent.estimateCosts();                          // 算一下账（可选）
+
+// 1. 部署（sealedImage 整个省略——SDK 从 /config 取当前镜像）
+const { agentId, sealId } = await ag.agent.deploy({
+  name: 'MyAgent',
+  description: 'my first sealed agent',
+  sandbox: { apiKey: ROUTER_API_KEY },   // inference 也省略——默认 0g-compute/0gm-1.0-35b-a3b
+}, { wait: true });
+
+// 2. 轮询到容器 running，顺便拿到 sandboxId 和 agentUrl。
+//    provision 实测通常 1~2 分钟（拉镜像 + 容器初始化），这里预算 5 分钟。
+//    phase 语义：deploying 是在途；offline / failed 是终态——只有终态才把
+//    lastProvisionError 当结论（它记录最近一次失败、成功后不清空，
+//    在途时读它会把已自动重试掉的瞬时失败误判成死刑）。
+let me;
+for (let i = 0; i < 60; i++) {
+  me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+  if (me?.phase === 'running') break;                    // find() 可能 undefined（索引落后），?. 兜住
+  if (me?.phase === 'offline' || me?.phase === 'failed') {
+    throw new Error(`provision 终态失败: ${me.lastProvisionError ?? me.phase}`);
+  }
+  await sleep(5000);
+}
+if (!me || me.phase !== 'running' || !me.url || !me.sandboxId) {
+  throw new Error(`超时未就绪: phase=${me?.phase ?? '未入索引'}, err=${me?.lastProvisionError ?? '-'}`);
+}
+const agentUrl = me.url;        // 直接属性访问——TS 沿用上面守卫的窄化（解构拿到的仍是 string|null）
+const sandboxId = me.sandboxId;
+
+// 3. 验证身份 + 对话
+const { verification } = await ag.agent.sayHi(agentUrl);   // 返回 ProofVerification | null（响应没带证明头时为 null）
+if (!verification?.ok) throw new Error(verification ? verification.reasons.join('; ') : '响应没有 X-Agent-Proof 头');
+const { token } = await ag.agent.authenticate(agentUrl, agentId);
+// → 用 token 调 `${agentUrl}/v1/chat/completions`（见正文示例），或开 dashboardUrl
+
+// 4. 服务 + 评价闭环（proof 的 deadline 是 +3600 秒，1 小时内上链即可）。
+//    需要环境有 ReputationRegistry（看 /config 的 reputation_registry_addr）——
+//    没有的话这一步会抛 "reputation: this environment has no …"，
+//    可用 fromAttestor 的 overrides 显式给地址（见初始化一节）。
+const { proof } = await ag.reputation.capture(() => fetch(`${agentUrl}/hello`));
+if (!proof) throw new Error('响应没有 X-Agent-Proof 头');   // capture 返回 Proof | null
+const v = await ag.reputation.verifyProof(proof);   // 返回 { ok, reasons }，不会自己抛错
+if (!v.ok) throw new Error(v.reasons.join('; '));
+const fbTx = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+await ag.reputation.waitForTransaction(fbTx);   // 等回执后 readFeedback/getSummary 才能读到这条
+
+// 5. 不用了就停（身份和数据都在链上，随时 start/reset 回来）
+await ag.agent.stop(sealId, sandboxId);
+```

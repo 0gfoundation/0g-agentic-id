@@ -1,5 +1,7 @@
 # @0glabs/agenticid-sdk
 
+English | [中文](README.zh.md)
+
 TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
 
 One entry point, `AgenticID`, with two intent namespaces plus a few top-level ops:
