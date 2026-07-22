@@ -309,6 +309,16 @@ export class AgentApi {
       // is what every other interaction wants.
       let url: string | null = null;
       try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
+      // The attestor only writes last_provision_error for container-provision
+      // failures; mint/storage-pipeline failures record their reason on the
+      // per-track stage objects instead (mint_stage/storage_stage.reason). A
+      // phase=failed row with a null lastProvisionError is a dead end for an
+      // external caller (no attestor-log access), so fold the failed stages'
+      // reasons in as the fallback.
+      const stageReason = (stage: unknown): string | null => {
+        const s = stage as { state?: string; reason?: string } | null;
+        return s?.state === 'failed' && s.reason ? s.reason : null;
+      };
       return {
         agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
         sealId: r.seal_id as Hash,
@@ -318,7 +328,8 @@ export class AgentApi {
         owner: r.owner as Address,
         name: (card.name as string) ?? null,
         createdAt: (r.created_at as string) ?? null,
-        lastProvisionError: (r.last_provision_error as string) ?? null,
+        lastProvisionError:
+          (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
       };
     });
   }

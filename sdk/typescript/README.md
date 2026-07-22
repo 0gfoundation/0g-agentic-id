@@ -337,8 +337,11 @@ the hosted environment https). `listDeployments()` hands it to you:
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 // me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
 const agentUrl = me.url;               // null until the container is provisioned
-// If phase never reaches 'running', me.lastProvisionError says why —
-// e.g. "image_hash not in validFrameworkHashes".
+// If phase never reaches 'running' (or ends 'failed'), me.lastProvisionError
+// says why — container-provision failures (e.g. "image_hash not in
+// validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
+// submit: … replacement transaction underpriced" — folded in from the
+// failed stage's reason).
 ```
 
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
