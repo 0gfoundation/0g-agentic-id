@@ -35,7 +35,14 @@ const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
 
 The trust model already rests on the TEE attestor you acknowledged — its
 /config is as trustworthy as everything else it does, so this is the one
-construction path you need. (Advanced: `new AgenticID({ addresses, … })`
+construction path you need.
+
+Not every environment deploys every contract. An address absent from
+/config maps to the zero address: `fromAttestor` still constructs (chain
+reads, deploy, etc. all work), and the affected namespace fails fast with
+a named error only when actually invoked — e.g. an environment without a
+ReputationRegistry throws `reputation: this environment has no
+ReputationRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
 still exists for hand-picked addresses — audit tooling, or reading a
 chain with no attestor running — and `overrides` lets you pin any single
 address without giving up the bootstrap.)
