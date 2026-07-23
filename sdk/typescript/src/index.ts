@@ -14,6 +14,17 @@
  * ```
  */
 
+// Node < 18 has no global fetch; without this guard the first bootstrap
+// (fromAttestor) or chain read fails with a bare "fetch is not defined" from
+// deep in the call stack. package.json `engines` isn't enforced by npm by
+// default, so turn the miss into an actionable message at import time.
+if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
+  throw new Error(
+    '@0glabs/agenticid-sdk requires a global fetch (Node >= 18). ' +
+      'On Node 16/17 either upgrade Node or polyfill globalThis.fetch.',
+  );
+}
+
 // ── Facade + namespaces ──
 export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
 export type { DeployAccepted } from './AgenticID';

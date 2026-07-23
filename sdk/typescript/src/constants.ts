@@ -77,12 +77,18 @@ export const CHAIN_ID = 16602;
 export const RECEIPT_WAIT = {
   timeout: 120_000,
   pollingInterval: 2_000,
-  // retryCount bounds a SEPARATE budget from timeout: how long viem tolerates
-  // "transaction/receipt not found" answers (retryCount × retryDelay). 0G's
-  // load-balanced RPC can serve not-found from lagging nodes well past 24s
-  // for an already-mined tx, so align this budget with the overall timeout
-  // (60 × 2s = 120s) instead of giving up early with a false
-  // TransactionReceiptNotFoundError.
+  // 0G's load-balanced RPC serves not-found for already-mined txs from
+  // lagging nodes. viem's replacement-detection branch is the real hazard:
+  // once `getTransaction` succeeds, a later not-found `getTransactionReceipt`
+  // no longer takes the retry-tolerant path — it treats the original tx as
+  // its own "replacement" and re-fetches the receipt WITH NO RETRY WRAPPER,
+  // so a single lagging node rejects the whole wait with a raw
+  // TransactionReceiptNotFoundError (retryCount never applies). We don't rely
+  // on repriced/cancelled detection, so turn the branch off: a not-found
+  // receipt then just waits for the next poll tick until `timeout`.
+  checkReplacement: false,
+  // Backstop for the plain not-found path (retryCount × retryDelay tolerance),
+  // aligned with the overall timeout (60 × 2s = 120s).
   retryCount: 60,
   retryDelay: 2_000,
 } as const;

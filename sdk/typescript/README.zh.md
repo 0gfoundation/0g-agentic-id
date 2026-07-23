@@ -439,7 +439,18 @@ digest = keccak256(abi.encode(
 ))
 ```
 
-`buildServeProofMessageHash` 就是这个公式的 TS 实现；对照 `sealed/internal/proxy/proxy.go` 的 Go 侧实现。各合约客户端（`AgenticIDClient`、`ReputationClient`、`SandboxClient`、`AttestorClient`、`ServeSession`）是命名空间背后的内部构件。
+`buildServeProofMessageHash` 就是这个公式的 TS 实现；对照 `sealed/internal/proxy/proxy.go` 的 Go 侧实现。
+
+`signServeProof` 传给回调的 digest **已经过 EIP-191 包装**（即 `buildServeProofSigningHash` 的输出），所以要裸签、别再包一层：
+
+```ts
+// 正确——对最终 digest 裸签
+const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
+// 错误——account.signMessage({ message: { raw: hash } }) 会二次包 EIP-191，
+// verifyServeProofSignature 会验不过。
+```
+
+各合约客户端（`AgenticIDClient`、`ReputationClient`、`SandboxClient`、`AttestorClient`、`ServeSession`）是命名空间背后的内部构件。
 
 ---
 

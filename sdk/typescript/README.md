@@ -448,4 +448,16 @@ is the agentSeal's EIP-191 personal_sign over
 `keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
 keccak256(abi.encodePacked(dataHashes)), frameworkHash))` — deadline is
 timestamp + 3600. `buildServeProofMessageHash` is the TS implementation;
-the Go side lives in `sealed/internal/proxy/proxy.go`. The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
+the Go side lives in `sealed/internal/proxy/proxy.go`.
+
+`signServeProof`'s callback receives the **already-EIP-191-wrapped** digest
+(the `buildServeProofSigningHash` output), so sign it raw — don't re-wrap:
+
+```ts
+// correct — raw sign of the final digest
+const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
+// WRONG — account.signMessage({ message: { raw: hash } }) double-wraps EIP-191
+// and fails verifyServeProofSignature.
+```
+
+The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
