@@ -76,6 +76,18 @@ func severityOf(err error) string {
 	case strings.Contains(s, "insufficient funds"),
 		strings.Contains(s, "insufficient balance"):
 		return "warning"
+	// A near-empty seal wallet doesn't always fail as "insufficient
+	// funds" — eth_estimateGas can cap the gas budget at what the
+	// balance affords, and execution then runs out of gas mid-way,
+	// surfacing as a bare, reasonless revert. The only caller of
+	// severityOf is upload.Apply's drift-publish tx (signed by this
+	// agent's own seal wallet), so a data-less revert here is the same
+	// owner-recoverable condition as the funds-check above, just a
+	// different shape. Confirmed by reproducing byte-for-byte against a
+	// 0.0008 OG balance (fails) vs 0.0058 OG (succeeds) with the same
+	// 0g-storage-client build and params.
+	case strings.Contains(s, "execution reverted; data: 0x"):
+		return "warning"
 	// Future owner-recoverable patterns slot in here without changing
 	// the rest of the pipeline:
 	//   strings.Contains(s, "api key") → bad/expired LLM provider key

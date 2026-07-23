@@ -86,10 +86,10 @@ function mk(priv, cfg) {
 
   // ── deploy a source owned by A, wait running ──────────────────────────
   console.log('· deploying a source agent owned by A…');
-  const snapshot = cfg.sandbox_snapshot;
+  const sealedImage = cfg.sandbox_snapshot;
   const dep = await A.agent.deploy({
     name: 'XferSrc', description: 'transfer-live source',
-    sandbox: { snapshot, apiKey: API_KEY },
+    sandbox: { sealedImage, apiKey: API_KEY },
   }, { wait: true });
   const agentId = dep.agentId;
   const sealId = await A.agent.getSealId(agentId);

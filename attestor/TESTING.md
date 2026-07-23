@@ -28,6 +28,15 @@ writes; the init-time framework "DRIFT" line is a transient — the probe
 sees the baked binary until Restore's install lands, and the watcher
 only starts after that, so no reconcile race).
 
+2026-07-20, rebuilt -dev environment (new SandboxServing + provider +
+snapshot registration) running the deploy-flow-smoothing build: full
+round green (transfer-live's source-boot timeout on the FIRST round was
+provider cold-cache warmup — it passed standalone right after). The
+402 preflight, SDK /config auto-discovery, and zero-arg
+deposit()/getBalance() were all exercised for real by the environment
+switch itself: the old wallet's stale ack/balance failed synchronously
+with exact remediation named, then passed after ack() + deposit().
+
 | Tier | Cost | What it proves |
 |---|---|---|
 | T0 unit/integration | free, seconds | logic + wiring, mocks only |
@@ -169,6 +178,7 @@ the sandbox (it keeps running and billing until the provider GCs it).
 
 | Symptom | Layer | Meaning |
 |---|---|---|
+| `/deploy`, `/clone` or `/reset` returns 402 immediately, code `trust_roots_not_acked` or `insufficient_sandbox_balance` | preflight (by design) | the owner wallet hasn't acked the component set / holds < 0.1 OG prepaid — fix with `ack()` / `deposit()` (console: the matching dialog) and retry; this replaces the old silent async worker 402 |
 | binaries boot-loop, `GetAppSecretKey`/`GetSecretResource`: `app not found on-chain` | registration | the environment's `app_id` isn't registered in the tapp/KMS registry — register/update it on-chain first |
 | binary refuses to boot: `KMS returned identical keys for different material` | tapp version | tapp-server predates the `material` passthrough (0g-tapp#35) — upgrade tapp before this attestor |
 | `/deploy` 500 after ~1 min, worker logs `GetSecretResource timed out` | KMS | KMS DPRF derive is slow/stuck (cluster degraded / waiting on threshold) — fix the cluster; the attestor timeout only makes it visible |

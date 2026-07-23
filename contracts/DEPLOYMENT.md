@@ -201,8 +201,8 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | **AgenticID proxy** | `0x34493302287308f565CF3409DAAdEDF4C8895648` | 1.0.0 |
 | AgenticID impl | `0x852D34434AE4C3aD28e58272ab9fa871ebeE24c9` | |
 | AgenticID beacon | `0x201E35B8566EDC26057348D8419Bc8cBCa609c0E` | |
-| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.0.0 (client-bound, not yet upgraded) |
-| ReputationRegistry impl | `0x731273A04D123B22aCd650FA7529831F4F1331A4` | |
+| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.1.0 (clientless ServeProof — beacon-upgraded 2026-07-22, see §7) |
+| ReputationRegistry impl | `0xC93DAF00e08B4C086629aEd75387805A41f55321` | |
 | ReputationRegistry beacon | `0x309AfEca706659e415FCb0CcF53B25F18859BB99` | |
 | **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.0.0 |
 | TEEDataVerifier impl | `0x306d12BA4b2A3862AdEe45a12C97376a889d937f` | |
@@ -210,9 +210,6 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | TimelockController | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` | |
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | owner / pauser / oracle / deployer | `0xea695C312CE119dE347425B29AFf85371c9d1837` | |
-
-> ⚠️ test's reputation is still **1.0.0 (client-bound)** — not yet upgraded to
-> dev's 1.1.0. To match, upgrade the `0x309Afe…` beacon per [`UPGRADING.md`](UPGRADING.md).
 
 **Governance is testnet-only:** owner=pauser=oracle=deployer EOA, `timelockDelay=0`,
 open execution. Mainnet needs a real multisig + non-zero delay + a real TEE oracle.
@@ -258,18 +255,33 @@ Current impl versions (verified on chain, 2026-07-03):
 |---|---|---|
 | AgenticID | 1.0.0 | 1.0.0 |
 | TEEDataVerifier | 1.0.0 | 1.0.0 |
-| AgenticIDReputationRegistry | **1.1.0** | 1.0.0 |
+| AgenticIDReputationRegistry | **1.1.0** | **1.1.0** |
 
 Changelog:
 
 - **AgenticIDReputationRegistry**
+  - `1.1.0` on **test**, beacon-upgraded **2026-07-22** — same `0xC93DAF00…`
+    impl as dev (reused, not redeployed). Discovered via an external SDK
+    review: `giveFeedback` bare-reverted on test because the beacon still
+    pointed at the client-bound `1.0.0` impl while callers (attestor + the
+    SDK) had moved to the clientless ABI — the selector didn't exist on the
+    old impl, hence no revert reason. Root-caused by comparing an
+    `eth_call` against test's beacon (`0x` revert data — selector missing)
+    with the same call against dev's (real revert data — function exists).
+    Fixed via the standard two-phase beacon upgrade (`ScheduleUpgrade` /
+    `ExecuteUpgrade`, proposer `0xea69…`, `minDelay=0`):
+    schedule tx `0x56b3444a500a309216a34d82687e32deca6ed22bf0ca773480a5b79a99503f0e`,
+    execute tx `0xaf3749197e90e31fcf7dc8ad02d9a2e482108c5fb6d4878a92b7e3434b8a5470`.
+    Post-upgrade verified: `VERSION() == "1.1.0"` on test, and a real
+    `/hello` serve-proof's `giveFeedback` call now succeeds via `eth_call`
+    (previously bare-reverted).
   - `1.1.0` (dev impl `0xC93DAF00…`, 2026-07-03, PR #28) — **minor** (ABI/behavior
     change, storage-compatible, beacon upgrade): `ServeProof` drops `client`;
     attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ABI changed). (Two superseded client-less dev impls preceded it: `0x9dbC80…`
-    (VERSION not bumped) and `0x110e36Fe…` (briefly mislabeled 1.0.1); test is not
-    yet upgraded, still `1.0.0` client-bound.)
-  - `1.0.0` (impl `0xf053cF29…` dev / `0x731273A0…` test) — initial, client-bound ServeProof.
+    (VERSION not bumped) and `0x110e36Fe…` (briefly mislabeled 1.0.1).)
+  - `1.0.0` (impl `0xf053cF29…` dev / `0x731273A0…` test, superseded on test by the
+    2026-07-22 upgrade above) — initial, client-bound ServeProof.
 - **AgenticID** `1.0.0` — initial canonical-bound.
 - **TEEDataVerifier** `1.0.0` — initial.
 

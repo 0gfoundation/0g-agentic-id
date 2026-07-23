@@ -42,7 +42,20 @@ export class ReputationClient {
   private get walletClient(): WalletClient | undefined { return this.ctx.walletClient; }
   private get account(): Account | undefined { return this.ctx.account; }
   private get chain(): Chain { return this.ctx.chain; }
-  private get address(): Address { return this.ctx.addresses.reputationRegistry; }
+  private get address(): Address {
+    const a = this.ctx.addresses.reputationRegistry;
+    // Zero = "not deployed in this environment" (fromAttestor maps an absent
+    // /config address to zero). Fail fast with the real reason instead of
+    // letting the contract call die on an undecodable empty response.
+    if (a === '0x0000000000000000000000000000000000000000') {
+      throw new Error(
+        'reputation: this environment has no ReputationRegistry deployed ' +
+        '(the attestor /config reports no reputation_registry_addr) — ' +
+        'the ag.reputation.* methods are unavailable here',
+      );
+    }
+    return a;
+  }
 
   // ── Give Feedback ──
 
@@ -61,12 +74,12 @@ export class ReputationClient {
       args: [
         params.agentId,
         params.value,
-        params.valueDecimals,
-        params.tag1,
-        params.tag2,
-        params.endpoint,
-        params.feedbackURI,
-        params.feedbackHash,
+        params.valueDecimals ?? 0,
+        params.tag1 ?? '',
+        params.tag2 ?? '',
+        params.endpoint ?? '',
+        params.feedbackURI ?? '',
+        params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
         {
           agentId: sp.agentId,
           timestamp: sp.timestamp,
@@ -165,10 +178,10 @@ export class ReputationClient {
       functionName: 'readAllFeedback',
       args: [
         params.agentId,
-        params.clientAddresses,
-        params.tag1,
-        params.tag2,
-        params.includeRevoked,
+        (params.clientAddresses ?? []),
+        (params.tag1 ?? ''),
+        (params.tag2 ?? ''),
+        (params.includeRevoked ?? false),
       ],
     });
     const [, , values, valueDecimals, tag1s, tag2s, revokedStatuses] = result as [
@@ -195,7 +208,7 @@ export class ReputationClient {
       address: this.address,
       abi: reputationRegistryAbi,
       functionName: 'getSummary',
-      args: [params.agentId, params.clientAddresses, params.tag1, params.tag2],
+      args: [params.agentId, (params.clientAddresses ?? []), (params.tag1 ?? ''), (params.tag2 ?? '')],
     });
     const [count, summaryValue, summaryValueDecimals] = result as [bigint, bigint, number];
     return { count, summaryValue, summaryValueDecimals };

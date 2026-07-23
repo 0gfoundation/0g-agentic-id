@@ -23,6 +23,7 @@
  */
 
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
+import { RECEIPT_WAIT } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
@@ -43,50 +44,109 @@ function assertSealBound(seal: Address, op: string): void {
 }
 
 /** waitForMint tuning shared by the deploy/clone `wait` option. */
-type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number };
+type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: boolean };
+
+/** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
+const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 /** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
-type MintedResponse = DeployCloneResponse & { agentId: bigint };
+/**
+ * Facade-normalized deploy/clone acceptance — camelCase like every other
+ * SDK return (the attestor's wire JSON speaks snake_case; the mapping
+ * happens here so callers never see mixed casing).
+ */
+export interface DeployAccepted {
+  sealId: Hash;
+  agentSealAddr: Address;
+}
+type MintedResponse = DeployAccepted & { agentId: bigint };
+
+function acceptedOf(res: DeployCloneResponse): DeployAccepted {
+  return { sealId: res.seal_id, agentSealAddr: res.agent_seal_addr };
+}
 
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
  *  seal branch is reserved for non-seal agents. */
 export class AgentApi {
   private readonly id: AgenticIDClient;
   private readonly attestor: AttestorClient;
+  private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
   constructor(ctx: Ctx) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
     this.attestor = new AttestorClient(ctx);
+    this.infra = new SandboxClient(ctx);
+  }
+
+  /**
+   * Deploy/clone preflight: fail HERE, synchronously and with the fix
+   * named, instead of the request being accepted and dying minutes later
+   * as an async worker 402 with no context. Each check self-disables when
+   * its surface isn't configured (zero address / unknown provider), and
+   * read errors fail open — the attestor re-checks at accept anyway.
+   * Opt out per call with `{ preflight: false }`.
+   */
+  private async preflightOwnerReady(): Promise<void> {
+    const who = this.ctx.account?.address;
+    if (!who) return; // browser-wallet flows preflight in their own UI
+    if (this.ctx.addresses.tappRegistry !== ZERO) {
+      try {
+        const { allAcked, missing } = await this.infra.ackStatus(who);
+        if (!allAcked) {
+          throw new Error(
+            `trust roots not acknowledged for ${who}: ${missing.join(', ')} — call ack() once, then retry`,
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('trust roots')) throw e;
+        // chain read failed — fail open, attestor re-checks at accept
+      }
+    }
+    if (this.ctx.addresses.sandboxServing !== ZERO) {
+      try {
+        const bal = await this.infra.getBalance(who);
+        if (bal < MIN_SANDBOX_BALANCE_WEI) {
+          throw new Error(
+            `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
+          );
+        }
+      } catch (e) {
+        if (e instanceof Error && e.message.includes('sandbox balance')) throw e;
+        // provider unknown or read failed — fail open (same backstop)
+      }
+    }
   }
 
   // — lifecycle —
   /**
-   * Deploy a new agent. Async: returns `{ seal_id, agent_seal_addr }` once the
+   * Deploy a new agent. Async: returns `{ sealId, agentSealAddr }` once the
    * attestor accepts the job. Pass `{ wait: true }` to also block on the
    * background mint (via waitForMint) and get the new `agentId` in the result.
    */
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
-  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
-    const res = await this.attestor.deploy(params);
-    if (!opts?.wait) return res;
-    const agentId = await this.waitForMint(res.seal_id, opts);
-    return { ...res, agentId };
+  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
+  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+    if (opts?.preflight !== false) await this.preflightOwnerReady();
+    const accepted = acceptedOf(await this.attestor.deploy(params));
+    if (!opts?.wait) return accepted;
+    const agentId = await this.waitForMint(accepted.sealId, opts);
+    return { ...accepted, agentId };
   }
 
   /**
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
-   * `{ seal_id, agent_seal_addr }` on acceptance; `{ wait: true }` also blocks on
+   * `{ sealId, agentSealAddr }` on acceptance; `{ wait: true }` also blocks on
    * the mint and returns the new `agentId`.
    */
   clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployCloneResponse>;
-  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployCloneResponse | MintedResponse> {
+  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
+  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+    if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
-    const res = await this.attestor.clone(params);
-    if (!opts?.wait) return res;
-    const agentId = await this.waitForMint(res.seal_id, opts);
-    return { ...res, agentId };
+    const accepted = acceptedOf(await this.attestor.clone(params));
+    if (!opts?.wait) return accepted;
+    const agentId = await this.waitForMint(accepted.sealId, opts);
+    return { ...accepted, agentId };
   }
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
@@ -100,6 +160,97 @@ export class AgentApi {
   topUpAgentSeal(agentSeal: Address, amountWei: bigint): Promise<`0x${string}`> {
     const { walletClient, account } = requireWallet(this.ctx);
     return walletClient.sendTransaction({ to: agentSeal, value: amountWei, account, chain: this.ctx.chain });
+  }
+
+  /**
+   * What this agent costs to keep running, from on-chain data alone:
+   * the owner's prepaid balance, the provider's price schedule, the
+   * agent's evolution-gas balance, and the runway those imply. `spec`
+   * defaults to the standard sealed container (2 CPU / 4 GB) — pass the
+   * actual shape if yours differs. Per-agent metered spend needs
+   * provider-side usage records and is not available on chain yet.
+   */
+  /**
+   * What WOULD an agent cost — no agent needed (pre-deploy planning).
+   * Provider pricing + cost/min for the spec (default 2C/4GB), plus the
+   * caller's prepaid balance and implied runway when an account is set.
+   */
+  async estimateCosts(spec?: { cpu?: number; memGb?: number }): Promise<{
+    prepaidBalanceWei: bigint | null;
+    pricing: { pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint };
+    costPerMinWei: bigint;
+    estimatedRunwayMinutes: number | null;
+  }> {
+    const cpu = BigInt(spec?.cpu ?? 2);
+    const memGb = BigInt(spec?.memGb ?? 4);
+    const svc = await this.infra.services();
+    const costPerMinWei = cpu * svc.pricePerCPUPerMin + memGb * svc.pricePerMemGBPerMin;
+    let prepaidBalanceWei: bigint | null = null;
+    if (this.ctx.account) {
+      try { prepaidBalanceWei = await this.infra.getBalance(); } catch { /* stays null */ }
+    }
+    return {
+      prepaidBalanceWei,
+      pricing: { pricePerCPUPerMin: svc.pricePerCPUPerMin, pricePerMemGBPerMin: svc.pricePerMemGBPerMin, createFee: svc.createFee },
+      costPerMinWei,
+      estimatedRunwayMinutes:
+        prepaidBalanceWei !== null && costPerMinWei > 0n ? Number(prepaidBalanceWei / costPerMinWei) : null,
+    };
+  }
+
+  /** estimateCosts() plus the given agent's evolution-gas balance. */
+  async runtimeCosts(agentId: bigint, spec?: { cpu?: number; memGb?: number }): Promise<{
+    prepaidBalanceWei: bigint | null;
+    sealGasWei: bigint;
+    pricing: { pricePerCPUPerMin: bigint; pricePerMemGBPerMin: bigint; createFee: bigint };
+    costPerMinWei: bigint;
+    estimatedRunwayMinutes: number | null;
+  }> {
+    const [est, sealAddr] = await Promise.all([this.estimateCosts(spec), this.id.getAgentSeal(agentId)]);
+    const sealGasWei = await this.ctx.publicClient.getBalance({ address: sealAddr });
+    return { ...est, sealGasWei };
+  }
+
+  /**
+   * Model catalog of the 0g-compute router (the `provider: '0g-compute'`
+   * inference path). Public endpoint, no key needed — use it to populate
+   * a model picker before deploy.
+   */
+  async listModels(): Promise<string[]> {
+    const r = await fetch('https://router-api.0g.ai/v1/models');
+    if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
+    const body = (await r.json()) as { data?: Array<{ id?: string }> };
+    return (body.data ?? []).map((m) => m.id).filter((x): x is string => !!x);
+  }
+
+  /**
+   * The owner handshake for headless access to the agent's gateway: signs
+   * `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchanges it at
+   * {agentUrl}/_seal/auth for the gateway credential. Owner-only — the
+   * container verifies the signer against the on-chain owner cached at
+   * provision.
+   *
+   * The returned `token` is a full owner/operator credential for the
+   * gateway (not a narrow scope) — treat it accordingly. It unlocks both
+   * surfaces: open `dashboardUrl` in a browser, or call the gateway's
+   * OpenAI-compatible HTTP API headlessly with `Authorization: Bearer
+   * <token>` — `POST {agentUrl}/v1/chat/completions` with
+   * `model: "openclaw/default"` chats with the agent, `GET /v1/models`
+   * lists targets (the sealed runtime enables this endpoint).
+   */
+  async authenticate(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const base = agentUrl.replace(/\/$/, '');
+    const r = await fetch(`${base}/_seal/auth`, {
+      method: 'POST',
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+    });
+    if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
+    const payload = (await r.json()) as { token: string; dashboard_url?: string };
+    return { token: payload.token, dashboardUrl: base + (payload.dashboard_url ?? '/') };
   }
 
   // — runtime: interacting with a live agent —
@@ -128,6 +279,61 @@ export class AgentApi {
     return { hello, proof, verification };
   }
 
+  private attestorBase(): string {
+    if (!this.ctx.attestorUrl) throw new Error('attestorUrl is required for listDeployments');
+    return this.ctx.attestorUrl.replace(/\/$/, '');
+  }
+
+  /**
+   * Normalized view of the attestor's /deployments listing. The raw rows
+   * speak hex ("agent_id": "0x77") and snake_case; this returns bigint
+   * agentIds and camelCase so they compose with every other SDK call.
+   *
+   * `url` is the agent's public base URL (feed it to sayHi/authenticate/
+   * the /v1 chat API) — null until the container is provisioned.
+   * `lastProvisionError` is WHY a deployment is stuck (e.g. "image_hash
+   * not in validFrameworkHashes") — always check it before debugging a
+   * deployment that never reaches `running`. It records the MOST RECENT
+   * failure and is not cleared by a later success, so read it together
+   * with `phase`.
+   */
+  async listDeployments(): Promise<Array<{
+    agentId: bigint | null; sealId: Hash; phase: string;
+    sandboxId: string | null; url: string | null; owner: Address; name: string | null;
+    createdAt: string | null; lastProvisionError: string | null;
+  }>> {
+    const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
+    return rows.map((r) => {
+      const card = (r.agent_card as Record<string, unknown>) ?? {};
+      // The card's url points at the /hello card endpoint; the base (origin)
+      // is what every other interaction wants.
+      let url: string | null = null;
+      try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
+      // The attestor only writes last_provision_error for container-provision
+      // failures; mint/storage-pipeline failures record their reason on the
+      // per-track stage objects instead (mint_stage/storage_stage.reason). A
+      // phase=failed row with a null lastProvisionError is a dead end for an
+      // external caller (no attestor-log access), so fold the failed stages'
+      // reasons in as the fallback.
+      const stageReason = (stage: unknown): string | null => {
+        const s = stage as { state?: string; reason?: string } | null;
+        return s?.state === 'failed' && s.reason ? s.reason : null;
+      };
+      return {
+        agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
+        sealId: r.seal_id as Hash,
+        phase: (r.phase as string) ?? 'unknown',
+        sandboxId: (r.sandbox_id as string) ?? null,
+        url,
+        owner: r.owner as Address,
+        name: (card.name as string) ?? null,
+        createdAt: (r.created_at as string) ?? null,
+        lastProvisionError:
+          (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
+      };
+    });
+  }
+
   /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */
   stop(sealId: Hash, sandboxId: string): Promise<void> {
     return this.attestor.lifecycle('stop', { sealId, sandboxId });
@@ -139,12 +345,14 @@ export class AgentApi {
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
    * identity — a fresh boot that re-reads iData from chain and reselects
-   * the framework adapter from the binding. Owner-signed. Pass `apiKey`
-   * so the fresh container can reach its inference provider — the
-   * attestor doesn't cache the LLM key across recreates.
+   * the framework adapter from the binding. Owner-signed. `apiKey` is
+   * required in practice: without it the agent boots but cannot call
+   * its model. It rides the encrypted envelope into the TEE — the
+   * attestor never stores it, which is also WHY it must be passed
+   * again on every recreate.
    */
-  reset(sealId: Hash, opts?: { snapshot?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, snapshot: opts?.snapshot, apiKey: opts?.apiKey });
+  reset(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**
@@ -225,23 +433,86 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
+  private readonly ctx: Ctx;
 
   constructor(config: AgenticIDConfig) {
     const ctx = buildCtx(config);
+    this.ctx = ctx;
     this.agent = new AgentApi(ctx);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
   }
 
+  /**
+   * Block until a top-level tx (ack/deposit) is mined. `ack()`/`deposit()`
+   * return the hash immediately, like any writeContract — reading state
+   * right after (ackStatus/getBalance) can race the still-pending tx and
+   * see the old value. `ag.agent`/`ag.reputation` have their own
+   * equivalents for txs made through those namespaces.
+   */
+  waitForTransaction(txHash: Hash): Promise<TransactionReceipt> {
+    return this.ctx.publicClient.waitForTransactionReceipt({ hash: txHash, ...RECEIPT_WAIT });
+  }
+
+  /**
+   * Bootstrap a client from ONE URL: the attestor's GET /config is the
+   * environment's self-description (contract set, chain RPC, component
+   * appIds), so `attestorUrl` alone fully determines an environment —
+   * switching environments is switching URLs, with no hand-copied
+   * address set to go stale. Explicit `overrides` win over /config for
+   * callers who verify addresses out-of-band rather than trusting the
+   * attestor. Addresses absent from /config resolve to the zero address
+   * (their module reads as "not deployed here").
+   */
+  static async fromAttestor(
+    attestorUrl: string,
+    opts?: Omit<AgenticIDConfig, 'addresses' | 'attestorUrl'> & { overrides?: Partial<import('./constants').ContractAddresses> },
+  ): Promise<AgenticID> {
+    const base = attestorUrl.replace(/\/$/, '');
+    const r = await fetch(`${base}/config`);
+    if (!r.ok) throw new Error(`fromAttestor: GET ${base}/config returned HTTP ${r.status}`);
+    const cfg = (await r.json()) as Record<string, string | undefined>;
+    const Z = '0x0000000000000000000000000000000000000000' as Address;
+    const addr = (v: string | undefined): Address => (v && v.length === 42 ? (v as Address) : Z);
+    const { overrides, ...rest } = opts ?? {};
+    return new AgenticID({
+      ...rest,
+      attestorUrl: base,
+      rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
+      addresses: {
+        agenticID: addr(cfg.agentic_id_addr),
+        reputationRegistry: addr(cfg.reputation_registry_addr),
+        teeDataVerifier: addr(cfg.tee_data_verifier_addr),
+        tappRegistry: addr(cfg.tapp_registry_addr),
+        sandboxServing: addr(cfg.sandbox_serving_addr),
+        ...overrides,
+      },
+    });
+  }
+
   // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —
   /** Acknowledge the TEE trust-root component set in one batched tx; null if already done. */
   ack(): Promise<WriteContractReturnType | null> { return this.infra.ack(); }
+  /** TappRegistry details for every trust-root component (code hashes, ackVersion, nodes) — the data ack() signs off on. */
+  components(user?: Address) { return this.infra.components(user); }
   /** Which configured components `user` (or the connected account) still needs to acknowledge. */
   ackStatus(user?: Address): Promise<{ allAcked: boolean; missing: string[] }> { return this.infra.ackStatus(user); }
 
   // — prepaid sandbox balance —
-  /** Fund a prepaid sandbox balance against a provider (payable). Recipient defaults to the caller. */
-  deposit(params: { provider: Address; amountWei: bigint; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
-  /** Read a user's prepaid sandbox balance against a provider (wei). */
-  getBalance(user: Address, provider: Address): Promise<bigint> { return this.infra.getBalance(user, provider); }
+  /** Fund a prepaid sandbox balance (payable). Recipient defaults to the caller; provider to the attestor /config's. */
+  deposit(params: { amountWei: bigint; provider?: Address; recipient?: Address }): Promise<WriteContractReturnType> { return this.infra.deposit(params); }
+  /**
+   * Read a prepaid sandbox balance (wei). User defaults to the account;
+   * provider to the attestor /config's. Takes an options object like
+   * {@link deposit} (`getBalance({ user, provider })`); the positional form
+   * `getBalance(user, provider)` also works.
+   */
+  getBalance(opts?: { user?: Address; provider?: Address }): Promise<bigint>;
+  getBalance(user?: Address, provider?: Address): Promise<bigint>;
+  getBalance(userOrOpts?: Address | { user?: Address; provider?: Address }, provider?: Address): Promise<bigint> {
+    if (userOrOpts && typeof userOrOpts === 'object') {
+      return this.infra.getBalance(userOrOpts.user, userOrOpts.provider);
+    }
+    return this.infra.getBalance(userOrOpts, provider);
+  }
 }

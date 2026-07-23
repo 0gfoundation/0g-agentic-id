@@ -34,7 +34,7 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
       sandboxServing: cfg.sandbox_serving_addr ?? '0x0000000000000000000000000000000000000000',
     },
   });
-  const sandbox = { snapshot: cfg.sandbox_snapshot, apiKey: process.env.API_KEY ?? 'sk-smoke-dummy' };
+  const sandbox = { sealedImage: cfg.sandbox_snapshot, apiKey: process.env.API_KEY ?? 'sk-smoke-dummy' };
 
   // Negative: unsupported binding must 400 at the pre-mint gate.
   try {
@@ -57,5 +57,5 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
     framework: process.env.FRAMEWORK ?? 'openclaw',
     sandbox,
   }, { wait: true, timeoutMs: 120000 });
-  console.log('FULL OK: seal_id=%s agentId=%s', r.seal_id, r.agentId);
+  console.log('FULL OK: sealId=%s agentId=%s', r.sealId, r.agentId);
 })().catch((e) => { console.error('FATAL:', e); process.exit(1); });

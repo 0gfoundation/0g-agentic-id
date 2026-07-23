@@ -146,7 +146,7 @@ function mkClient(privKey, cfg) {
   // its OWN fresh agentSeal and serves a valid proof — i.e. the re-sealed
   // dataKey actually decrypts at runtime, not just matching hashes on chain.
   console.log('· bringing the clone online…');
-  await B.agent.reset(cloned.seal_id, { apiKey: API_KEY });
+  await B.agent.reset(cloned.sealId, { apiKey: API_KEY });
   let crow;
   for (let i = 0; i < 40; i++) { crow = await rowOf(cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
   check('clone reaches RUNNING under new owner', crow && crow.phase === 'running', `phase=${crow && crow.phase}`);

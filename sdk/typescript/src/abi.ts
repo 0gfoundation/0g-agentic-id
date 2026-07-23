@@ -794,6 +794,28 @@ export const tappRegistryAbi = [
     inputs: [{ name: 'appId', type: 'string' }],
     outputs: [{ name: '', type: 'uint256' }],
   },
+  {
+    type: 'function',
+    name: 'getAppInfo',
+    stateMutability: 'view',
+    inputs: [{ name: 'appId', type: 'string' }],
+    outputs: [{
+      name: '', type: 'tuple', components: [
+        { name: 'composeHash', type: 'bytes' },
+        { name: 'volumesHash', type: 'bytes' },
+        { name: 'imageHashes', type: 'bytes[]' },
+        { name: 'owner', type: 'address' },
+        { name: 'registeredAt', type: 'uint256' },
+      ],
+    }],
+  },
+  {
+    type: 'function',
+    name: 'getNodeList',
+    stateMutability: 'view',
+    inputs: [{ name: 'appId', type: 'string' }],
+    outputs: [{ name: '', type: 'address[]' }],
+  },
 ] as const;
 
 /**
@@ -820,6 +842,19 @@ export const sandboxServingAbi = [
       { name: 'provider', type: 'address' },
     ],
     outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'services',
+    stateMutability: 'view',
+    inputs: [{ name: 'provider', type: 'address' }],
+    outputs: [
+      { name: 'url', type: 'string' },
+      { name: 'appId', type: 'string' },
+      { name: 'pricePerCPUPerMin', type: 'uint256' },
+      { name: 'pricePerMemGBPerMin', type: 'uint256' },
+      { name: 'createFee', type: 'uint256' },
+    ],
   },
   {
     type: 'function',

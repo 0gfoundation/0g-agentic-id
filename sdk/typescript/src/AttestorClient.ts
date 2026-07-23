@@ -38,7 +38,7 @@ export interface DefaultIDataParams {
   framework?: string;
   name: string;
   description: string;
-  /** Persona inference pin; default anthropic/claude-opus-4-6. */
+  /** Persona inference pin; default 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model). */
   inference?: { provider: string; model: string };
 }
 
@@ -66,7 +66,7 @@ export function defaultIData(p: DefaultIDataParams): IDataInput[] {
       role: 'persona',
       plaintext: {
         system_prompt: `You are ${p.name}. ${p.description}\n`,
-        inference: p.inference ?? { provider: 'anthropic', model: 'claude-opus-4-6' },
+        inference: p.inference ?? { provider: '0g-compute', model: '0gm-1.0-35b-a3b' },
       },
       extra: {},
     },
@@ -102,10 +102,19 @@ export interface DeployParams {
    */
   framework?: string;
   /** Inference pin for the SDK-built default persona (defaults to
-   *  anthropic/claude-opus-4-6). Ignored when you pass your own `iData`. */
+   *  0g-compute/0gm-1.0-35b-a3b). Ignored when you pass your own `iData`. */
   inference?: { provider: string; model: string };
   /** Sandbox "create" payload the attestor relays to the provider. */
-  sandbox: { snapshot: string; apiKey: string; sealed?: boolean; resourceId?: string };
+  sandbox: {
+    /** The sealed runtime image name (0g-sandbox's own field is called
+     *  `snapshot`; the SDK sends it verbatim under that wire name).
+     *  Omit (or pass '') to use the attestor /config's current image —
+     *  the operator-maintained default. */
+    sealedImage?: string;
+    apiKey: string;
+    sealed?: boolean;
+    resourceId?: string;
+  };
   /** Seconds the sandbox envelope stays valid. Default 180. */
   envelopeTtlSec?: number;
 }
@@ -179,12 +188,29 @@ export class AttestorClient {
     };
   }
 
+  /**
+   * Resolve the sealed image name: an explicit value wins; otherwise the
+   * attestor /config's current image. An empty snapshot in the create
+   * envelope makes the sandbox provider fail the request ("sealed
+   * containers require an image or snapshot") — and operators bump the
+   * current name via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source
+   * of truth (same default the deploy console uses).
+   */
+  private async resolveSealedImage(explicit?: string): Promise<string> {
+    if (explicit) return explicit;
+    const cfg: any = await fetch(`${this.baseUrl()}/config`)
+      .then((r) => (r.ok ? r.json() : null))
+      .catch(() => null);
+    return (cfg && cfg.sandbox_snapshot) || '';
+  }
+
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
   private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+    const snapshot = await this.resolveSealedImage(sandbox.sealedImage);
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot: sandbox.snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      { snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
       ttlSec,
     );
   }
@@ -203,7 +229,9 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
-      snapshot?: string;
+      /** The sealed runtime image name (0g-sandbox's own field is called
+       *  `snapshot`; only relevant for `reset`). */
+      sealedImage?: string;
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
        *  comes back alive but can't call its model. */
@@ -215,18 +243,7 @@ export class AttestorClient {
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
     if (op === 'reset') {
-      // Default the snapshot from the attestor's /config — an empty snapshot
-      // makes the sandbox provider 400 the recreate ("sealed containers
-      // require an image or snapshot"), and operators bump the current name
-      // via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source of truth
-      // (same as the deploy console).
-      let snapshot = params.snapshot;
-      if (!snapshot) {
-        const cfg: any = await fetch(`${this.baseUrl()}/config`)
-          .then((r) => (r.ok ? r.json() : null))
-          .catch(() => null);
-        snapshot = (cfg && cfg.sandbox_snapshot) || '';
-      }
+      const snapshot = await this.resolveSealedImage(params.sealedImage);
       envelope = await this.signEnvelope(
         'create',
         '',
