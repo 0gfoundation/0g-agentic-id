@@ -1,0 +1,320 @@
+package hermes
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+
+	"seal-verify/internal/framework"
+	"seal-verify/internal/inference"
+	"seal-verify/internal/logger"
+)
+
+// Start brings hermes up, in two flavours (mirrors the openclaw twin):
+//
+//   - First call (initialized=false): pin the framework version from the
+//     framework dim (git checkout + uv sync against the image's warm
+//     checkout), apply the 0g-compute → custom-endpoint rewrite, generate
+//     the API server key, then spawn. iData-derived config was already
+//     written by Restore — Start does NOT re-compose it.
+//
+//   - Subsequent calls (supervisor restart): just spawn. No re-install, no
+//     config rewrite — agent self-modifications survive restart untouched.
+//
+// The API server key is generated on first init and cached in
+// a.apiServerKey; AuthResponse hands it to a verified owner.
+//
+// Follow-up (deliberately not in v1): openclaw-style platform-context
+// injection (IDENTITY/SOUL/TOOLS sealed sections). Hermes agents don't yet
+// learn about SEAL_SIGN_SOCK / services from their workspace files; they
+// still receive the env vars.
+func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
+	a.mu.RLock()
+	cfg := a.cfg
+	cachedKey := a.apiServerKey
+	initialized := a.initialized
+	a.mu.RUnlock()
+	if cfg == nil {
+		return framework.StartResult{}, fmt.Errorf("hermes: no config restored before Start")
+	}
+
+	// Resolve inference provider+model from the on-disk config.yaml that
+	// path-driven Restore just wrote. Empty values are not a hard fail —
+	// hermes reports missing model config clearly at first inference.
+	provider, model, err := resolveInferenceFromConfigYAML()
+	if err != nil {
+		return framework.StartResult{}, fmt.Errorf("read config.yaml: %w", err)
+	}
+	if provider == "" || model == "" {
+		logger.Logf("warn: config.yaml has no model.provider/model.default; hermes will fail at first chat")
+	}
+
+	// Resolve the 0g-compute route ONCE per boot — the config rewrite and
+	// the exported key env name below must come from the same answer.
+	var zgRoute *inference.Route
+	if provider == "0g-compute" {
+		r := inference.ResolveZG(ctx, model)
+		zgRoute = &r
+	}
+
+	apiServerKey := cachedKey
+	if !initialized {
+		newKey, err := randomTokenHex(32)
+		if err != nil {
+			return framework.StartResult{}, fmt.Errorf("generate hermes api server key: %w", err)
+		}
+		apiServerKey = newKey
+
+		// 0g-compute runtime rewrite: owner specifies "0g-compute" as the
+		// provider; sealed rewrites that to hermes's custom-endpoint form
+		// (provider=custom + base_url) so hermes can dial the 0G router.
+		// No-op for any other provider name.
+		if err := applyZGComputeAugmentation(provider, model, zgRoute); err != nil {
+			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
+		}
+
+		if err := installHermes(cfg.framework.PackageVersion); err != nil {
+			return framework.StartResult{}, err
+		}
+	} else {
+		if _, err := exec.Command("hermes", "--version").Output(); err != nil {
+			return framework.StartResult{}, fmt.Errorf("hermes binary missing on restart: %w", err)
+		}
+		logger.Logf("hermes restart: skipping install + config rewrite (preserving agent self-modifications)")
+	}
+
+	apiKeyEnv := apiKeyEnvName(provider, zgRoute)
+
+	cmd, err := spawnGateway(apiKeyEnv, apiServerKey, rt)
+	if err != nil {
+		return framework.StartResult{}, err
+	}
+	a.mu.Lock()
+	a.cmd = cmd
+	a.apiServerKey = apiServerKey
+	a.initialized = true
+	a.mu.Unlock()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", upstreamPort)
+	if err := waitForListen(ctx, addr, startTimeout); err != nil {
+		return framework.StartResult{}, fmt.Errorf("hermes api server not listening: %w", err)
+	}
+
+	return framework.StartResult{
+		Upstream: fmt.Sprintf("http://%s", addr),
+		PID:      cmd.Process.Pid,
+	}, nil
+}
+
+// resolveInferenceFromConfigYAML reads model.provider + model.default from
+// the on-disk config.yaml.
+func resolveInferenceFromConfigYAML() (provider, model string, err error) {
+	cfg, err := loadConfigYAML()
+	if err != nil {
+		return "", "", err
+	}
+	m, _ := cfg["model"].(map[string]any)
+	if m == nil {
+		return "", "", nil
+	}
+	provider, _ = m["provider"].(string)
+	model, _ = m["default"].(string)
+	return provider, model, nil
+}
+
+// applyZGComputeAugmentation rewrites config.yaml for the 0g-compute
+// provider: hermes has no native 0g-compute provider, but its custom
+// endpoint mode ("when base_url is set, hermes calls that endpoint
+// directly") speaks OpenAI wire format — which is what the 0G router's
+// /v1 base serves. The rewrite lands in the owned "model" subtree, so the
+// first watcher tick commits the resolved form on chain (one expected
+// drift-commit, same convergence pattern as the version-less binding);
+// subsequent boots restore the already-resolved config and this becomes
+// a no-op.
+//
+// Anthropic-format-only models (route.Format != openai) cannot ride the
+// custom endpoint; fail loud at deploy time rather than 400 at first chat.
+func applyZGComputeAugmentation(provider, model string, route *inference.Route) error {
+	if provider != "0g-compute" {
+		return nil
+	}
+	if route == nil {
+		return fmt.Errorf("0g-compute provider with no resolved route")
+	}
+	if route.Format != inference.WireOpenAI {
+		return fmt.Errorf("model %q routes %s-format on 0g-compute; the hermes adapter supports openai-format models only (pick an openai-format model)", model, route.Format)
+	}
+	return updateConfigYAML(func(cfg map[string]any) {
+		m, _ := cfg["model"].(map[string]any)
+		if m == nil {
+			m = map[string]any{}
+		}
+		m["provider"] = "custom"
+		m["base_url"] = route.BaseURL
+		m["default"] = model
+		cfg["model"] = m
+	})
+}
+
+// apiKeyEnvName resolves which env var hermes's client reads the inference
+// key from. The custom endpoint path (and therefore 0g-compute) reads
+// OPENAI_API_KEY; named providers map by name. Key material itself never
+// touches disk on our side — stripSecrets guards the capture path against
+// the agent writing one.
+func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
+	switch provider {
+	case "anthropic":
+		return "ANTHROPIC_API_KEY"
+	case "openai", "custom":
+		return "OPENAI_API_KEY"
+	case "0g-compute":
+		if zgRoute != nil {
+			return zgRoute.EnvKey
+		}
+	}
+	return ""
+}
+
+// installHermes pins the framework to a git release tag: checkout + uv
+// sync inside the image's warm checkout. Hermes has no npm/pip package;
+// this IS its version-pinning mechanism (`hermes update` is just a
+// friendlier `git pull` + sync). `uv sync --locked` hash-verifies against
+// uv.lock, so the dependency tree is pinned by the same tag.
+func installHermes(tag string) error {
+	if _, err := os.Stat(hermesInstallDir); err != nil {
+		return fmt.Errorf("hermes checkout missing at %s (not baked into this image?): %w", hermesInstallDir, err)
+	}
+	if v := strings.TrimSpace(tag); v != "" {
+		logger.Logf("pinning hermes to %s...", v)
+		if out, err := exec.Command("git", "-C", hermesInstallDir, "checkout", "--quiet", v).CombinedOutput(); err != nil {
+			// Tag may postdate the baked checkout: fetch tags once and retry.
+			logger.Logf("hermes: local checkout lacks %s, fetching tags: %s", v, strings.TrimSpace(string(out)))
+			if out, err := exec.Command("git", "-C", hermesInstallDir, "fetch", "--tags", "--quiet", "origin").CombinedOutput(); err != nil {
+				return fmt.Errorf("git fetch --tags: %v: %s", err, strings.TrimSpace(string(out)))
+			}
+			if out, err := exec.Command("git", "-C", hermesInstallDir, "checkout", "--quiet", v).CombinedOutput(); err != nil {
+				return fmt.Errorf("git checkout %s: %v: %s", v, err, strings.TrimSpace(string(out)))
+			}
+		}
+	}
+	logger.Logf("uv sync --locked (fast against the baked cache)...")
+	sync := exec.Command("uv", "sync", "--locked")
+	sync.Dir = hermesInstallDir
+	if out, err := sync.CombinedOutput(); err != nil {
+		return fmt.Errorf("uv sync --locked: %v: %s", err, tail(string(out), 400))
+	}
+	if out, err := exec.Command("hermes", "--version").Output(); err == nil {
+		logger.Logf("OK   installed: %s", firstLine(string(out)))
+	}
+	return nil
+}
+
+// probeHermesVersion returns just the release tag from `hermes --version`.
+// CLI output: "Hermes Agent v0.19.0 (2026.7.20) · upstream 8fc27820" →
+// "v0.19.0". Empty on probe error.
+//
+// Package var, not func: EvolutionFor("framework") layers this live probe
+// over the restored binding, so tests must stub it (a real hermes on the
+// dev machine's PATH would make round-trips environment-dependent).
+var probeHermesVersion = func(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "hermes", "--version").Output()
+	if err != nil {
+		return ""
+	}
+	for _, f := range strings.Fields(firstLine(string(out))) {
+		if len(f) > 1 && f[0] == 'v' && strings.Contains(f, ".") {
+			return f
+		}
+	}
+	return ""
+}
+
+func spawnGateway(apiKeyEnv, apiServerKey string, rt framework.RuntimeContext) (*exec.Cmd, error) {
+	logFile, err := os.OpenFile("/tmp/hermes.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open hermes.log: %w", err)
+	}
+	cmd := exec.Command("hermes", "gateway", "run")
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	// Strict env whitelist — do NOT inherit bootstrap's env so a leaked
+	// SANDBOX_SEAL_KEY can't be read from inside the agent process. The
+	// API server settings are env-only in hermes v0.19 (config.yaml
+	// support upstream-pending), which suits us: they never touch disk.
+	envWhitelist := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"API_SERVER_ENABLED=true",
+		"API_SERVER_KEY=" + apiServerKey,
+	}
+	if rt.APIKey != "" && apiKeyEnv != "" {
+		envWhitelist = append(envWhitelist, apiKeyEnv+"="+rt.APIKey)
+	}
+	if rt.PublicURL != "" {
+		envWhitelist = append(envWhitelist, "AGENT_PUBLIC_URL="+rt.PublicURL)
+	}
+	if rt.SealSignSock != "" {
+		envWhitelist = append(envWhitelist, "SEAL_SIGN_SOCK="+rt.SealSignSock)
+	}
+	if rt.AgentSeal != "" {
+		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
+	}
+	cmd.Env = envWhitelist
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("start hermes gateway: %w", err)
+	}
+	logger.Logf("OK   hermes gateway spawned, pid=%d (log: /tmp/hermes.log)", cmd.Process.Pid)
+	return cmd, nil
+}
+
+// waitForListen polls TCP-connect to addr until success or timeout.
+func waitForListen(ctx context.Context, addr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	backoff := 200 * time.Millisecond
+	logger.Logf("waitForListen %s (up to %s)...", addr, timeout)
+	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+		if err == nil {
+			_ = conn.Close()
+			logger.Logf("OK   %s accepting connections", addr)
+			return nil
+		}
+		time.Sleep(backoff)
+		if backoff < 2*time.Second {
+			backoff *= 2
+		}
+	}
+	return fmt.Errorf("%s did not accept connections within %s", addr, timeout)
+}
+
+func randomTokenHex(nbytes int) (string, error) {
+	buf := make([]byte, nbytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(line)
+}
+
+func tail(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return "…" + s[len(s)-n:]
+}
