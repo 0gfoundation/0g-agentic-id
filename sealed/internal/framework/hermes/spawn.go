@@ -181,6 +181,19 @@ func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
 	return ""
 }
 
+// uvSyncArgs is the exact dependency set the adapter (and the image bake —
+// keep images/hermes/Dockerfile in lockstep) syncs. `uv sync` is an exact
+// sync: a package not covered by these args gets REMOVED, so the two call
+// sites diverging silently strips dependencies at first boot.
+//
+// --extra sms is not about SMS: upstream has no dedicated extra for the
+// API server, whose HTTP layer needs aiohttp ("API Server: aiohttp not
+// installed" → :8642 never binds — first live T2 failure). aiohttp ships
+// only inside platform extras, and sms's payload is exactly aiohttp and
+// nothing else, so it's the minimal way to say "core + aiohttp" while
+// staying inside the uv.lock pin set.
+var uvSyncArgs = []string{"sync", "--locked", "--extra", "sms"}
+
 // installHermes pins the framework to a git release tag: checkout + uv
 // sync inside the image's warm checkout. Hermes has no npm/pip package;
 // this IS its version-pinning mechanism (`hermes update` is just a
@@ -203,11 +216,11 @@ func installHermes(tag string) error {
 			}
 		}
 	}
-	logger.Logf("uv sync --locked (fast against the baked cache)...")
-	sync := exec.Command("uv", "sync", "--locked")
+	logger.Logf("uv %s (fast against the baked cache)...", strings.Join(uvSyncArgs, " "))
+	sync := exec.Command("uv", uvSyncArgs...)
 	sync.Dir = hermesInstallDir
 	if out, err := sync.CombinedOutput(); err != nil {
-		return fmt.Errorf("uv sync --locked: %v: %s", err, tail(string(out), 400))
+		return fmt.Errorf("uv %s: %v: %s", strings.Join(uvSyncArgs, " "), err, tail(string(out), 400))
 	}
 	if out, err := exec.Command("hermes", "--version").Output(); err == nil {
 		logger.Logf("OK   installed: %s", firstLine(string(out)))

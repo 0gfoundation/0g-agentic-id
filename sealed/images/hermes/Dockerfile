@@ -67,10 +67,14 @@ ENV HOME=/root
 # NB: hermes git tags are CalVer (v2026.7.20 = the release marketed as
 # "v0.19.0"); the semantic names have no tags.
 ARG HERMES_BAKED_VERSION=v2026.7.20
+# --extra sms = "core + aiohttp", which the API server's HTTP layer needs
+# (upstream has no api-server extra; sms's payload is exactly aiohttp).
+# MUST match uvSyncArgs in sealed/internal/framework/hermes/spawn.go —
+# uv sync is an exact sync, so a mismatch strips the package at first boot.
 RUN git clone --depth 1 --branch ${HERMES_BAKED_VERSION} \
       https://github.com/NousResearch/hermes-agent.git /usr/local/lib/hermes-agent \
  && cd /usr/local/lib/hermes-agent \
- && uv sync --locked \
+ && uv sync --locked --extra sms \
  && ln -s /usr/local/lib/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes
 
 # One CLI warm-up run: proves the venv symlink at build time and pays the

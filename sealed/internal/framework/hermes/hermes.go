@@ -149,8 +149,11 @@ func (a *Adapter) Defaults(role string) []byte {
 }
 
 // AuthResponse implements framework.Framework. Returns the hermes headless
-// credentials: the API server bearer key plus the chat path, so a verified
-// owner can drive /v1/chat/completions through the sealed proxy.
+// credentials so a verified owner can drive /v1/chat/completions through
+// the sealed proxy. The credential field is named "token": that's the
+// cross-framework contract the SDK's authenticate() consumes (openclaw
+// returns the same field for its gateway token) — a framework-specific
+// name here silently breaks headless auth for that framework's agents.
 //
 // Caller (proxy.handleAuth) is responsible for verifying the requester is
 // the on-chain owner before invoking.
@@ -162,8 +165,8 @@ func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
 		return nil, fmt.Errorf("hermes: api server key not provisioned (Start has not run successfully)")
 	}
 	return map[string]any{
-		"api_server_key": key,
-		"chat_path":      "/v1/chat/completions",
+		"token":     key,
+		"chat_path": "/v1/chat/completions",
 	}, nil
 }
 
