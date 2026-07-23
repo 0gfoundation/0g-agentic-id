@@ -13,7 +13,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance |
 
-> Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade. `transfer`/`clone` handle seal-bound agents today; non-seal agents (via `iTransferFrom`/`iCloneFrom`) are a future internal branch.
+> Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't need to know which call goes on-chain and which goes over HTTP.
 
 ## Install
 
@@ -72,15 +72,25 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
-  attestorUrl: process.env.ATTESTOR_URL,  // only for agent.deploy / agent.clone
+  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/listDeployments)
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
 ```
 
-`AgenticIDConfig`: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
+**What you pass grows with what you do** — three tiers:
 
-- **`account`** — a private key or a viem `Account`. Supplying it is enough to sign writes; the SDK constructs the wallet client for you.
-- **`walletClient`** (advanced) — bring your own instead of `account`, e.g. an injected browser wallet. `ZERO_G_TESTNET` and `RPC_URL` are exported for that case.
+| You want to… | Pass | Why |
+|---|---|---|
+| **read the chain** (owner, balance, agent data) | `addresses` only | reads hit contracts directly; the RPC has a built-in default |
+| **write to the chain** (deploy, transfer, feedback) | `+ account` | writes need a signature |
+| **manage containers / see deploy status** (stop/start, `deploying`→`running`) | `+ attestorUrl` | that status lives in the attestor's DB, not on chain |
+
+`attestorUrl` also lets the SDK auto-resolve a few values from the attestor's `/config` (sandbox-provider address, trust-root appIds, current sealed image). Without it those methods still work — you just pass those arguments explicitly.
+
+`AgenticIDConfig` full shape: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
+
+- **`account`** — a private key or a viem `Account`. That alone enables writes; the SDK builds the signing (wallet) client for you.
+- **`walletClient`** (advanced) — supply your own signer instead of handing over a key, e.g. a browser wallet where MetaMask does the signing and the key never enters your code. `ZERO_G_TESTNET` and `RPC_URL` are exported to help build one.
 
 The snippets below assume these bindings:
 
@@ -94,6 +104,8 @@ const buyer = '0xBbBb...';   // the address leaving feedback — whatever wallet
 
 ## `ag.agent` — lifecycle + reads
 
+> **What iData is**: the encrypted content minted on chain for an agent — its persona, framework binding, etc. You don't hand-write it to deploy: give `name` / `description` / `inference` and the SDK calls `defaultIData()` to assemble the standard two entries (a framework binding + a persona). Pass your own `iData` for full control (shape in [The runtime image, framework, and iData shapes](#the-runtime-image-framework-and-idata-shapes)). The walkthrough below uses the convenient default path.
+
 ```ts
 import { parseEther } from 'viem';
 
@@ -101,13 +113,10 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  // iData is the agent's COMPLETE minted content (WYSIWYS — the bytes you
-  // sign are the bytes that get sealed; the attestor synthesizes nothing).
-  // Omit it and the SDK builds defaultIData() for you; `framework` /
-  // `inference` below tune that default. A role="framework" binding is
-  // required either way — the deploy edge rejects iData without one.
-  framework: 'openclaw',                           // → the binding in the SDK-built default; must be a name the attestor's GET /config advertises
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // optional — omitting it defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
+  framework: 'openclaw',                           // which framework; must be a name the attestor's GET /config advertises
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
+  // ↑ these two are just inputs to defaultIData(). For full control over
+  //   the minted content, pass iData: [...] instead (see the iData section).
   sandbox: {
     // sealedImage is optional — omit it to use the attestor /config's current
     // image (the operator-maintained default; same fallback reset() uses).
@@ -170,8 +179,6 @@ await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "
 
 Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentSeal(agentId)`.
 
-`transfer`/`clone` reject non-seal-bound agents today with a clear error (they'd need `iTransferFrom`/`iCloneFrom`).
-
 ---
 
 ## `ag.reputation` — serve-proof + feedback
@@ -188,7 +195,7 @@ const agentUrl = 'https://<agent-serve-endpoint>';   // wherever the agent's con
 const { response, proof } = await ag.reputation.capture(() =>
   fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
 const data = await response.json();                   // your normal response body
-// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_000_300n,
+// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
 // (equivalent: ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue))
 
@@ -269,23 +276,36 @@ The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
 `0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
 is the sealed runtime image bundling the **openclaw** framework adapter —
 the only framework shipping today (`/config.supported_frameworks` is the
-source of truth). WYSIWYS: the iData you sign is exactly what gets
-encrypted and minted; the attestor synthesizes nothing.
+source of truth).
+
+**The shape of iData**: an array of `{ role, plaintext, extra }` entries —
+`role` labels what the entry is for, `plaintext` is the content itself.
+Deploy assembles two for you by default (the example below is exactly what
+`defaultIData()` produces): a `framework` binding telling the runtime which
+framework to run, and a `persona` carrying the character + model choice.
+WYSIWYS (What You Sign Is What You Seal): the iData you sign is byte-for-byte
+what gets encrypted and minted on chain; the attestor adds/removes nothing.
 
 ```ts
 iData: [
-  // REQUIRED: the framework binding. Version-less resolves to the image's
-  // validated openclaw release; pinning a whitelisted version is honored.
+  // Entry 1 — REQUIRED: the framework binding. Version-less resolves to the
+  //           image's validated openclaw release; a whitelisted pin is honored.
   { role: 'framework', plaintext: { name: 'openclaw', schema_version: 1 }, extra: {} },
-  // The protocol persona seed — every adapter translates this into its own
-  // config. system_prompt is your agent's character; inference picks the
-  // provider/model ('anthropic' | 'openai' | '0g-compute' via the router).
+  // Entry 2 — the persona seed; the runtime translates it into the framework's
+  //           own config. system_prompt is your agent's character; inference
+  //           picks the provider/model ('anthropic' | 'openai' | '0g-compute').
   { role: 'persona', plaintext: {
       system_prompt: 'You are …\n',
       inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
     }, extra: {} },
 ]
 ```
+
+> The walkthrough's `framework` + `inference` + `name`/`description` are the
+> **shortcut inputs** to this default iData — the SDK feeds them to
+> `defaultIData()` to build these two entries. Hand-write the full `iData`
+> array only when you need to deviate (a third data entry, a custom role,
+> hand-tuned plaintext).
 
 **persona is a one-shot seed, not durable data**: framework + persona above
 are the MINT input; once running, the sealed runtime translates persona
@@ -359,35 +379,48 @@ const agentUrl = me.url;               // null until the container is provisione
 - **Owner-registered services** — plain HTTP against the paths listed in
   `/hello`'s `services`; each response is proof-signed (that is what you
   `capture()` and rate).
-- **Chat / control UI (owner-only)** — one call does the handshake:
+- **Owner handshake** — `ag.agent.authenticate(agentUrl, agentId)` proves
+  you're the on-chain owner (EIP-191-sign `0GSealAuth:<sealId>:<ts>`,
+  exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and hands
+  back `{ token, dashboardUrl }`. The **handshake is protocol-universal**;
+  the **token's meaning is framework-specific** — the sealed layer just
+  relays whatever the running framework's adapter chose to return (see the
+  openclaw block below for what it is today).
 
-  ```ts
-  const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-  // `token` is a full owner/operator credential for the openclaw gateway
-  // (not a narrow scope). Two ways to use it:
+### Framework-specific surface (openclaw today)
 
-  // 1. Browser: open dashboardUrl (the token rides the #fragment).
+Everything above is the same for every sealed agent regardless of
+framework. What you can *do* with the agent beyond identity + proofs
+depends on the framework the agent was minted with. The only framework
+shipping today is **openclaw**, whose adapter makes `authenticate()`'s
+token an openclaw gateway credential and exposes an OpenAI-compatible chat
+API. A future framework would return a different token and a different (or
+no) chat surface — so treat this block as openclaw's, not the protocol's.
 
-  // 2. Headless chat — the gateway serves an OpenAI-compatible HTTP API
-  //    (enabled by the sealed runtime), same Bearer token:
-  const r = await fetch(`${agentUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: 'openclaw/default',
-      messages: [{ role: 'user', content: 'What can you do?' }],
-    }),
-  });
-  const { choices } = await r.json();   // choices[0].message.content — a real inference reply
-  // GET /v1/models lists targets; requests without the token get 401.
-  ```
+```ts
+const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
+// `token` here is a full owner/operator credential for the openclaw gateway
+// (not a narrow scope). Two ways to use it:
 
-  Under the hood: EIP-191-sign `0GSealAuth:<sealId>:<ts>`, exchange it at
-  `POST {agentUrl}/_seal/auth`; the container verifies the signer is the
-  on-chain owner and that `<ts>` is within ±300s. Token lifecycle: it is
-  generated at the container's first boot, stays stable across restarts
-  (the dashboard survives them), has no expiry, and rotates only when the
-  container is recreated — `reset()` is the revocation lever.
+// 1. Browser: open dashboardUrl (the token rides the #fragment).
+
+// 2. Headless chat — openclaw's gateway serves an OpenAI-compatible HTTP
+//    API (enabled by the sealed runtime), same Bearer token:
+const r = await fetch(`${agentUrl}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+  body: JSON.stringify({
+    model: 'openclaw/default',
+    messages: [{ role: 'user', content: 'What can you do?' }],
+  }),
+});
+const { choices } = await r.json();   // choices[0].message.content — a real inference reply
+// GET /v1/models lists targets; requests without the token get 401.
+```
+
+openclaw token lifecycle: generated at the container's first boot, stable
+across restarts (the dashboard survives them), no expiry, rotates only when
+the container is recreated — `reset()` is the revocation lever.
 
 ## Agents as owners (nested agents)
 
@@ -411,13 +444,10 @@ key — all signing (EIP-191 envelopes, EIP-712, transactions) flows through
 the viem `Account` interface, and future methods are bound by the same
 rule. Any Account-shaped signing backend is a first-class owner.
 
-What the adapter handles (the non-obvious bits): viem's two `signMessage`
-input shapes map to the socket's `message` (utf8) vs `message_hex` (raw
-bytes) fields; the socket's geth-side EIP-712 hasher requires the
-`EIP712Domain` entry inside `types` (viem omits it — the adapter injects
-one); camelCase/bigint → snake_case/string tx field mapping, legacy +
-eip1559 only (eip2930/4844/7702 and accessList throw explicitly rather
-than mis-sign); socket errors surface as contextual SDK errors.
+(The adapter absorbs the socket-protocol details for you: the two
+message-signing shapes, the EIP-712 format mismatch, tx field conversion,
+and throwing on unsupported tx types rather than mis-signing. See
+`src/seal.ts` if you want the specifics.)
 
 Notes for in-container use: the adapter speaks `node:http` over the unix
 socket (global fetch can't), hence the node-only subpath; fund the

@@ -82,22 +82,30 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // 私钥（0x…）或 viem Account；有它就能写
-  attestorUrl: process.env.ATTESTOR_URL,  // 生命周期操作（deploy/clone/启停/reset/listDeployments）需要
+  attestorUrl: process.env.ATTESTOR_URL,  // 管容器 + 看部署进度都要（deploy/clone/启停/reset/listDeployments）
   // rpcUrl 可选——默认 0G Galileo 测试网 RPC
 });
 ```
 
-依赖是三层递进的：**读链 = 只要地址**（RPC 有默认）；**写链** = 再加 `account`；**动容器 / 查部署状态** = 再加 `attestorUrl`（部署进度 deploying/running/offline 是 attestor 数据库的状态，链上没有；attestorUrl 同时供若干默认值解析——sandbox provider 地址、组件 appId 列表、当前镜像名——没有它这些方法也能用，只是参数得显式传全）。
+**你要做的事越"重"，构造时要给的东西越多**——分三档：
+
+| 你想…… | 传入 | 为什么 |
+|---|---|---|
+| **读链**（查 owner、余额、agent 数据） | 只要 `addresses` | 读链是直接问合约；RPC 有内置默认值 |
+| **写链**（部署、转让、评价） | `+ account` | 写操作要签名 |
+| **管容器 / 看部署进度**（启停、`deploying`→`running`） | `+ attestorUrl` | 部署进度在 attestor 的数据库里，链上没有 |
+
+给了 `attestorUrl` 还有个附带好处：SDK 能自动从 attestor 的 `/config` 拉出几个值（sandbox-provider 地址、信任根 appId、当前 sealed 镜像名）。不给也行，只是这些参数得你自己显式传。
 
 `AgenticIDConfig` 全字段：`{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`。
 
-- **`account`** —— 私钥或 viem `Account`。给了它就能签写操作，wallet client 由 SDK 代建。
-- **`walletClient`**（高级）—— 用你自己的替代 `account`，比如浏览器注入钱包。配套导出了 `ZERO_G_TESTNET` 和 `RPC_URL`。
+- **`account`** —— 私钥或 viem `Account`。给了它就能签写操作，签名用的 wallet client 由 SDK 代建。
+- **`walletClient`**（高级）—— 不想把私钥交给 SDK 时，给一个自己的签名器代替 `account`——比如浏览器里用 MetaMask，签名由钱包插件完成、私钥不进你代码。配套导出了 `ZERO_G_TESTNET` 和 `RPC_URL` 供你搭建。
 
 下文示例假定这些绑定：
 
 ```ts
-const agentId = 33n;         // 一个已存在的 agent（ERC-721 tokenId）
+const agentId = 33n;         // 一个已存在的 agent
 const owner = '0xAaAa...';   // 该 agent 的 owner（通常就是你签名钱包的地址）
 const buyer = '0xBbBb...';   // 留评价的地址——即 `ag` 用来签名的钱包（归属按 msg.sender）
 ```
@@ -106,6 +114,8 @@ const buyer = '0xBbBb...';   // 留评价的地址——即 `ag` 用来签名的
 
 ## `ag.agent` —— 生命周期 + 读取
 
+> **iData 是什么**：agent 被铸造进链上的那份加密内容——它的人设、框架绑定等。deploy 时你**不用手写它**：给 `name` / `description` / `inference`，SDK 用 `defaultIData()` 替你拼出标准的两条（框架绑定 + persona 人设）。想完全掌控就自己传 `iData`（完整格式见下方[「运行时镜像、框架与 iData 格式」](#运行时镜像框架与-idata-格式)一节）。下面用的是省心的默认路径。
+
 ```ts
 import { parseEther } from 'viem';
 
@@ -113,12 +123,10 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  // iData 是 agent 被铸造的完整内容（WYSIWYS——你签的字节就是被密封的字节，
-  // attestor 不合成任何东西）。省略则 SDK 用 defaultIData() 代建，
-  // 下面的 framework / inference 用来调这个默认值。无论哪种方式，
-  // role="framework" 的绑定都必须存在——deploy 入口会拒绝缺失它的 iData。
-  framework: 'openclaw',                           // → SDK 代建默认值里的绑定；必须是 attestor GET /config 宣告的名字
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // 可选——不传默认 0g-compute/0gm-1.0-35b-a3b（0G 路由自家模型）
+  framework: 'openclaw',                           // 用哪个框架；必须是 attestor GET /config 宣告的名字
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // 用哪个模型；可选，不传默认 0g-compute/0gm-1.0-35b-a3b
+  //   这两个字段只是 defaultIData() 的输入。要自己完全掌控铸造内容，
+  //   就传 iData: [...] 代替它们（见下方 iData 格式一节）。
   sandbox: {
     // sealedImage 可省略——省略（或传空）时自动用 attestor /config 的当前镜像
     // （运维维护的默认值，和 reset() 同一兜底）。只在钉版本/回退时才显式传：
@@ -197,7 +205,7 @@ await ag.agent.listDeployments();
 
 | 标识符 | 是什么 | 谁在用 |
 |---|---|---|
-| `agentId`（bigint） | ERC-721 tokenId——链上身份本体 | 绝大多数读取、transfer、clone、authenticate、runtimeCosts |
+| `agentId`（bigint） | ERC-7857 tokenId——链上身份本体 | 绝大多数读取、transfer、clone、authenticate、runtimeCosts |
 | `sealId`（bytes32） | seal 绑定的哈希 id——attestor 部署记录的主键 | stop / start / reset、waitForMint、部署行 |
 | `agentSeal`（address） | agent 自己的签名密钥（地址形式）——它的钱包 | topUpAgentSeal、服务证明的签名者核验 |
 
@@ -220,7 +228,7 @@ const { url: agentUrl } = (await ag.agent.listDeployments()).find((d) => d.agent
 const { response, proof } = await ag.reputation.capture(() =>
   fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
 const data = await response.json();                   // 正常的业务响应体
-// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_000_300n,
+// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
 // （等价入口：ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue)）
 
@@ -291,22 +299,26 @@ await ag.waitForTransaction(tx);   // 现在再读 getBalance() 才是新值
 
 ## 运行时镜像、框架与 iData 格式
 
-`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，当前是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。WYSIWYS：你签的 iData 就是被加密和铸造的内容，attestor 不合成任何东西。
+`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，当前是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。
+
+**iData 的形状**：一个数组，每个元素是一条 `{ role, plaintext, extra }`——`role` 是这条内容的用途标签，`plaintext` 是内容本身。deploy 默认帮你拼两条（下面这个例子就是 `defaultIData()` 的产物）：一条 `framework` 绑定告诉运行时用哪个框架，一条 `persona` 装人设和模型选择。WYSIWYS（What You Sign Is What You Seal）：你签名的这份 iData 逐字节就是被加密、被铸上链的内容，attestor 不替你增删任何东西。
 
 ```ts
 iData: [
-  // 必填：框架绑定。不写版本号则解析到镜像内已验证的 openclaw 版本；
-  // 钉一个白名单内的版本也会被尊重。
+  // 第 1 条 · 必填：框架绑定。不写版本号则解析到镜像内已验证的 openclaw 版本；
+  //         钉一个白名单内的版本也会被尊重。
   { role: 'framework', plaintext: { name: 'openclaw', schema_version: 1 }, extra: {} },
-  // 协议 persona 种子——每个适配器把它翻译成自己的配置。
-  // system_prompt 是 agent 的人设；inference 选 provider/model
-  // （'anthropic' | 'openai' | '0g-compute'，后者走 0G 路由）。
+  // 第 2 条 · persona 人设种子——运行时把它翻译成框架自己的配置。
+  //         system_prompt 是 agent 的人设；inference 选 provider/model
+  //         （'anthropic' | 'openai' | '0g-compute'，后者走 0G 路由）。
   { role: 'persona', plaintext: {
       system_prompt: 'You are …\n',
       inference: { provider: '0g-compute', model: 'claude-sonnet-5' },
     }, extra: {} },
 ]
 ```
+
+> 上面走查用的 `framework` + `inference` + `name`/`description` 就是这份默认 iData 的**快捷输入**——SDK 拿它们喂给 `defaultIData()` 拼出这两条。只有需要偏离默认（加第三条数据、自定义 role、精调 plaintext）时才手写整个 `iData` 数组。
 
 **persona 是一次性种子，不是长期数据**：上面的 framework + persona 是**铸造输入**；agent 跑起来后，sealed 运行时把 persona 翻译进框架自己的配置，并持续把**自己命名的条目**密封上链（openclaw 是 `framework` / `openclaw.json` / `workspace/`；链上 Update 是整数组替换）。所以在**存活 agent** 的 `intelligentDatasOf` 里按 `role === 'persona'` 精确匹配会扑空——role 集合以运行时实际密封的为准。
 
@@ -357,29 +369,33 @@ const agentUrl = me.url;   // 容器起来前是 null
   ```
 
 - **owner 注册的服务** —— 按 `/hello` 里 `services` 列的路径直接发 HTTP；每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
-- **聊天 / 控制台（仅 owner）** —— 一次调用完成握手：
+- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回 `{ token, dashboardUrl }`。**握手机制是协议通用的**；但**token 的含义是框架特定的**——sealed 层只是把当前运行框架的适配器决定返回的东西原样转交（今天是什么见下方 openclaw 块）。
 
-  ```ts
-  const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-  // `token` 是 openclaw gateway 的完整 owner/operator 凭证（不是窄权限）。两种用法：
+### 框架特定接口（当前 = openclaw）
 
-  // 1. 浏览器：打开 dashboardUrl（token 挂在 #fragment 上）。
+以上都是每个 sealed agent 与框架无关的通用能力。而"你能拿这个 agent 做什么"——身份和证明之外的部分——取决于它被铸造时用的框架。今天唯一在售的框架是 **openclaw**：它的适配器让 `authenticate()` 的 token 成为一个 openclaw gateway 凭证，并暴露一套 OpenAI 兼容聊天 API。换一个框架，token 会不一样、聊天接口可能不同甚至没有——所以下面这块属于 openclaw，不属于协议本身。
 
-  // 2. headless 聊天——gateway 提供 OpenAI 兼容 HTTP API
-  //    （sealed 运行时已开启），同一个 Bearer token：
-  const r = await fetch(`${agentUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: 'openclaw/default',
-      messages: [{ role: 'user', content: 'What can you do?' }],
-    }),
-  });
-  const { choices } = await r.json();   // choices[0].message.content——真实推理回复
-  // GET /v1/models 列出可用目标；不带 token 的请求得到 401。
-  ```
+```ts
+const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
+// 这里的 `token` 是 openclaw gateway 的完整 owner/operator 凭证（不是窄权限）。两种用法：
 
-  握手原理：EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取凭证；容器校验签名者就是链上 owner，且 `<ts>` 必须在 ±300 秒窗口内。**token 生命周期**：容器首次启动时生成，跨重启保持稳定（控制台不会被登出）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
+// 1. 浏览器：打开 dashboardUrl（token 挂在 #fragment 上）。
+
+// 2. headless 聊天——openclaw 的 gateway 提供 OpenAI 兼容 HTTP API
+//    （sealed 运行时已开启），同一个 Bearer token：
+const r = await fetch(`${agentUrl}/v1/chat/completions`, {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+  body: JSON.stringify({
+    model: 'openclaw/default',
+    messages: [{ role: 'user', content: 'What can you do?' }],
+  }),
+});
+const { choices } = await r.json();   // choices[0].message.content——真实推理回复
+// GET /v1/models 列出可用目标；不带 token 的请求得到 401。
+```
+
+openclaw token 生命周期：容器首次启动时生成，跨重启保持稳定（控制台不会被登出）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
 
 ## Agent 作为 owner（嵌套 agent）
 
@@ -397,11 +413,7 @@ const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
 
 **兼容性契约（正式承诺）**：SDK 的任何方法都**永不要求裸私钥**——所有签名（EIP-191 信封、EIP-712、交易）一律经由 viem `Account` 接口。这意味着任何能实现 Account 接口的签名后端（seal socket、浏览器钱包、HSM）都是完整的一等公民，未来新增的方法也受此约束。
 
-适配器处理好的非显然点（自己手写时容易踩的坑）：
-- `signMessage` 双入参形态：`string` → socket 的 `message`（UTF-8），`{ raw }` → `message_hex`（原始字节）——映射反了签出来的是另一条消息；
-- EIP-712：socket 侧（geth apitypes）要求 `types` 里**必须有 `EIP712Domain` 条目**，而 viem 惯例省略它——适配器按 domain 字段自动注入；
-- 交易字段映射 camelCase/bigint → snake_case/字符串；只支持 `legacy` 和 `eip1559`（socket 的能力边界），eip2930/4844/7702 和 accessList **显式抛错**而不是静默错签；
-- socket 错误（JSON `{error}`）转成带语境的 SDK 错误；socket 连不上时的报错会提示"你是否在 sealed 容器内"。
+（适配器替你处理好了 socket 协议的各种细节：两种消息签名形态、EIP-712 的格式差异、交易字段转换、以及对不支持的交易类型显式报错而非错签。想深挖看 `src/seal.ts`。）
 
 容器内跑 SDK 的注意事项：
 - 适配器用 `node:http` 走 unix socket（全局 `fetch` 不支持 unix socket），因此 **node-only**——从 `/seal` 子路径导入，主入口保持浏览器可用；
