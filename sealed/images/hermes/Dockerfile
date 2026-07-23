@@ -64,19 +64,21 @@ ENV HOME=/root
 # checkout+sync cost at first boot (runtime flexibility tradeoff, same as
 # openclaw's npm path). --depth 1 keeps the layer small; the adapter fetches
 # tags on demand if a future whitelist entry postdates this clone.
-ARG HERMES_BAKED_VERSION=v0.19.0
+# NB: hermes git tags are CalVer (v2026.7.20 = the release marketed as
+# "v0.19.0"); the semantic names have no tags.
+ARG HERMES_BAKED_VERSION=v2026.7.20
 RUN git clone --depth 1 --branch ${HERMES_BAKED_VERSION} \
       https://github.com/NousResearch/hermes-agent.git /usr/local/lib/hermes-agent \
  && cd /usr/local/lib/hermes-agent \
  && uv sync --locked \
  && ln -s /usr/local/lib/hermes-agent/.venv/bin/hermes /usr/local/bin/hermes
 
-# One CLI warm-up run: triggers first-run init (bundled-skill seeding into
-# ~/.hermes/skills/ + .bundled_manifest, config template) and bytecode
-# compilation, so first real boot doesn't pay it. The seeded state dir is
-# kept — the adapter's skills exclusion reads .bundled_manifest and its
-# Restore is designed to land on top of exactly this state. Only the .env
-# template goes (empty of secrets, but the file is ours to own at runtime).
+# One CLI warm-up run: proves the venv symlink at build time and pays the
+# bytecode compilation once. Verified NOT to seed ~/.hermes (bundled-skill
+# seeding + .bundled_manifest happen at first gateway start, inside the
+# adapter's SettleDelay window before the watcher baseline is captured).
+# The rm is belt-and-braces for future hermes versions that might write a
+# .env template here.
 RUN hermes --version \
  && rm -f /root/.hermes/.env
 

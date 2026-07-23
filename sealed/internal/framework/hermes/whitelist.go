@@ -10,12 +10,18 @@ import (
 // image release flow — adding a tag here without rebuilding the sealed
 // image leaves us claiming compat we haven't tested.
 //
+// Naming: hermes double-names its releases — a semantic marketing name
+// ("v0.19.0") and the actual CalVer git tag ("v2026.7.20"). Only the
+// CalVer form exists as a tag (verified via ls-remote), so THAT is what
+// this list, the binding's package_version, and probeHermesVersion all
+// speak; the semantic name appears nowhere in the protocol.
+//
 // Stored as a slice (not a map) so the order encodes "preferred order":
 // the LAST entry is whitelistMax, the version sealed reconciles to on
 // any framework dim drift. Hermes releases ~bi-weekly minors; expect this
 // list to move faster than openclaw's.
 var supportedHermesVersions = []string{
-	"v0.19.0",
+	"v2026.7.20", // semantic name v0.19.0
 }
 
 // whitelistMax returns the version sealed targets when reconciling

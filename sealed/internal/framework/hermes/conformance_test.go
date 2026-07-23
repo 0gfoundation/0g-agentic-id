@@ -47,7 +47,7 @@ func TestConformance(t *testing.T) {
 		Fixtures: []conformance.Fixture{
 			{
 				Role: "framework",
-				Leaf: []byte(`{"name":"hermes","package_version":"v0.19.0","schema_version":1}`),
+				Leaf: []byte(`{"name":"hermes","package_version":"v2026.7.20","schema_version":1}`),
 			},
 			{
 				// Canonical encoding: compact JSON, sorted keys, only the

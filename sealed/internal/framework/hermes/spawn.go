@@ -215,9 +215,14 @@ func installHermes(tag string) error {
 	return nil
 }
 
-// probeHermesVersion returns just the release tag from `hermes --version`.
-// CLI output: "Hermes Agent v0.19.0 (2026.7.20) · upstream 8fc27820" →
-// "v0.19.0". Empty on probe error.
+// probeHermesVersion returns the CalVer release tag from `hermes
+// --version`. CLI output double-names the release: "Hermes Agent v0.19.0
+// (2026.7.20) · upstream 8fc27820" — the parenthesized token is the git
+// tag minus its "v" (the "v0.19.0" is a marketing name with NO
+// corresponding tag), so this returns "v2026.7.20". Empty on probe error
+// or unrecognized output — empty keeps the binding's value, which is
+// strictly safer than returning the un-checkout-able semantic name (that
+// would wedge the watcher in a permanent drift↔reconcile loop).
 //
 // Package var, not func: EvolutionFor("framework") layers this live probe
 // over the restored binding, so tests must stub it (a real hermes on the
@@ -228,8 +233,9 @@ var probeHermesVersion = func(ctx context.Context) string {
 		return ""
 	}
 	for _, f := range strings.Fields(firstLine(string(out))) {
-		if len(f) > 1 && f[0] == 'v' && strings.Contains(f, ".") {
-			return f
+		inner := strings.TrimSuffix(strings.TrimPrefix(f, "("), ")")
+		if inner != f && inner != "" && inner[0] >= '0' && inner[0] <= '9' && strings.Contains(inner, ".") {
+			return "v" + inner
 		}
 	}
 	return ""
