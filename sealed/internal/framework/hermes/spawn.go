@@ -267,11 +267,23 @@ func spawnGateway(apiKeyEnv, apiServerKey string, rt framework.RuntimeContext) (
 	// SANDBOX_SEAL_KEY can't be read from inside the agent process. The
 	// API server settings are env-only in hermes v0.19 (config.yaml
 	// support upstream-pending), which suits us: they never touch disk.
+	//
+	// API_SERVER_CORS_ORIGINS=* is load-bearing, not permissive sloppiness:
+	// the sealed proxy sets `Origin: http://127.0.0.1:8642` on every
+	// forwarded request (it's how openclaw's controlUi accepts them), and
+	// hermes's API server 403s any request that carries an Origin absent
+	// from this allow-list — BEFORE auth, empty body, every path incl.
+	// /v1/health (verified live: agent 138, and reproduced in a local
+	// container). CORS is not the trust boundary here — the Bearer
+	// API_SERVER_KEY check is (hermes api_server.py says as much), and it
+	// still runs after CORS, so `*` opens the browser-origin gate without
+	// weakening auth (verified: wrong key → 401 even with Origin + `*`).
 	envWhitelist := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 		"API_SERVER_ENABLED=true",
 		"API_SERVER_KEY=" + apiServerKey,
+		"API_SERVER_CORS_ORIGINS=*",
 	}
 	if rt.APIKey != "" && apiKeyEnv != "" {
 		envWhitelist = append(envWhitelist, apiKeyEnv+"="+rt.APIKey)
