@@ -73,9 +73,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 		// 0g-compute runtime rewrite: owner specifies "0g-compute" as the
 		// provider; sealed rewrites that to hermes's custom-endpoint form
-		// (provider=custom + base_url) so hermes can dial the 0G router.
-		// No-op for any other provider name.
-		if err := applyZGComputeAugmentation(provider, model, zgRoute); err != nil {
+		// (provider=custom + base_url + api_key) so hermes can dial the 0G
+		// router. No-op for any other provider name.
+		if err := applyZGComputeAugmentation(provider, model, rt.APIKey, zgRoute); err != nil {
 			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
@@ -89,7 +89,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		logger.Logf("hermes restart: skipping install + config rewrite (preserving agent self-modifications)")
 	}
 
-	apiKeyEnv := apiKeyEnvName(provider, zgRoute)
+	apiKeyEnv := apiKeyEnvName(provider)
 
 	cmd, err := spawnGateway(apiKeyEnv, apiServerKey, rt)
 	if err != nil {
@@ -138,9 +138,19 @@ func resolveInferenceFromConfigYAML() (provider, model string, err error) {
 // subsequent boots restore the already-resolved config and this becomes
 // a no-op.
 //
+// The inference key goes into model.api_key HERE, on disk, NOT via an env
+// var: hermes's `custom` provider declares env_vars=() (verified in
+// plugins/model-providers/custom) — it reads the key ONLY from
+// model.api_key, ignoring OPENAI_API_KEY entirely (that fallback is for
+// the native `openai` provider). Injecting via env produced a live 401
+// from the router: hermes dialed it keyless. Writing the key to config on
+// disk inside the TEE container is where it must live for hermes to use
+// it; it never reaches chain because evoConfigYAML's stripSecrets removes
+// api_key on the capture path (deterministically, so no phantom drift).
+//
 // Anthropic-format-only models (route.Format != openai) cannot ride the
 // custom endpoint; fail loud at deploy time rather than 400 at first chat.
-func applyZGComputeAugmentation(provider, model string, route *inference.Route) error {
+func applyZGComputeAugmentation(provider, model, apiKey string, route *inference.Route) error {
 	if provider != "0g-compute" {
 		return nil
 	}
@@ -158,25 +168,25 @@ func applyZGComputeAugmentation(provider, model string, route *inference.Route) 
 		m["provider"] = "custom"
 		m["base_url"] = route.BaseURL
 		m["default"] = model
+		if apiKey != "" {
+			m["api_key"] = apiKey
+		}
 		cfg["model"] = m
 	})
 }
 
 // apiKeyEnvName resolves which env var hermes's client reads the inference
-// key from. The custom endpoint path (and therefore 0g-compute) reads
-// OPENAI_API_KEY; named providers map by name. Key material itself never
-// touches disk on our side — stripSecrets guards the capture path against
-// the agent writing one.
-func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
+// key from, for the NATIVE providers that honour one. 0g-compute is NOT
+// here: it maps to the `custom` provider, whose env_vars=() means it reads
+// the key only from config.yaml model.api_key — so that path delivers the
+// key via applyZGComputeAugmentation, not env (this returns "", so no env
+// var is set). Returns "" for any provider without a fixed env key.
+func apiKeyEnvName(provider string) string {
 	switch provider {
 	case "anthropic":
 		return "ANTHROPIC_API_KEY"
-	case "openai", "custom":
+	case "openai":
 		return "OPENAI_API_KEY"
-	case "0g-compute":
-		if zgRoute != nil {
-			return zgRoute.EnvKey
-		}
 	}
 	return ""
 }
