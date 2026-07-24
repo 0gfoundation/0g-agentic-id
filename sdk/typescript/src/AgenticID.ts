@@ -30,6 +30,7 @@ import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
+import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
   ServeProof, GiveFeedbackParams, AppendResponseParams, ReadAllFeedbackParams,
   GetSummaryParams, Feedback, FeedbackSummary, ServeData,
@@ -224,21 +225,28 @@ export class AgentApi {
   }
 
   /**
-   * The owner handshake for headless access to the agent's gateway: signs
-   * `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchanges it at
-   * {agentUrl}/_seal/auth for the gateway credential. Owner-only — the
+   * The owner handshake: signs `0GSealAuth:<sealId>:<ts>` (EIP-191) and
+   * exchanges it at {agentUrl}/_seal/auth for the gateway credential, then
+   * reads the agent's `/hello` to learn what it exposes. Owner-only — the
    * container verifies the signer against the on-chain owner cached at
    * provision.
    *
-   * The returned `token` is a full owner/operator credential for the
-   * gateway (not a narrow scope) — treat it accordingly. It unlocks both
-   * surfaces: open `dashboardUrl` in a browser, or call the gateway's
-   * OpenAI-compatible HTTP API headlessly with `Authorization: Bearer
-   * <token>` — `POST {agentUrl}/v1/chat/completions` with
-   * `model: "openclaw/default"` chats with the agent, `GET /v1/models`
-   * lists targets (the sealed runtime enables this endpoint).
+   * Returns an {@link AgentClient}: a full owner/operator credential
+   * (`session.token`, not a narrow scope — treat it accordingly) bound to
+   * the agent's own declaration of its surface. The session decides how to
+   * use it from what the agent declared, not from framework-specific
+   * knowledge baked into the SDK:
+   *   - `session.open?.()` — a browser URL with the token in the fragment,
+   *     present only if the agent declares a dashboard route;
+   *   - `session.chat?.(messages)` — an OpenAI-compatible chat call, present
+   *     only if the agent declares a chat route;
+   *   - `session.fetch(path, init)` — the general escape hatch for any path,
+   *     attaching the bearer token when the matched route asks for it.
+   *
+   * A headless agent (no dashboard) simply won't have `open`; an agent with
+   * no chat route won't have `chat`. Nothing is ever synthesized.
    */
-  async authenticate(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
+  async authenticate(agentUrl: string, agentId: bigint): Promise<AgentClient> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
     const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
@@ -249,8 +257,22 @@ export class AgentApi {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
-    const payload = (await r.json()) as { token: string; dashboard_url?: string };
-    return { token: payload.token, dashboardUrl: base + (payload.dashboard_url ?? '/') };
+    const { token } = (await r.json()) as { token: string };
+
+    // Discover the agent's declared surface. `routes`/`services` are absent
+    // on pre-route sealed builds — degrade to an empty surface (fetch still
+    // works; open/chat just won't be offered).
+    let services: AgentServiceEntry[] = [];
+    let routes: AgentRoute[] = [];
+    try {
+      const hello = (await (await fetch(`${base}/hello`)).json()) as {
+        services?: AgentServiceEntry[]; routes?: AgentRoute[];
+      };
+      services = hello.services ?? [];
+      routes = hello.routes ?? [];
+    } catch { /* discovery is best-effort; token still usable via fetch */ }
+
+    return makeAgentClient({ base, token, services, routes });
   }
 
   // — runtime: interacting with a live agent —
@@ -265,16 +287,21 @@ export class AgentApi {
    * fetch + parse + verify.
    */
   async sayHi(agentUrl: string): Promise<{
-    hello: { agent: Address; owner: Address; public_url: string; message: string; services: unknown[] };
+    hello: {
+      agent: Address; owner: Address; public_url: string; message: string;
+      services: AgentServiceEntry[]; routes: AgentRoute[];
+    };
     proof: ServeProof | null;
     verification: import('./ServeSession').ProofVerification | null;
   }> {
     const base = agentUrl.replace(/\/$/, '');
     const { response, proof } = await captureProof(() => fetch(`${base}/hello`));
     if (!response.ok) throw new Error(`sayHi: /hello returned HTTP ${response.status}`);
-    const hello = (await response.json()) as {
-      agent: Address; owner: Address; public_url: string; message: string; services: unknown[];
+    const raw = (await response.json()) as {
+      agent: Address; owner: Address; public_url: string; message: string;
+      services?: AgentServiceEntry[]; routes?: AgentRoute[];
     };
+    const hello = { ...raw, services: raw.services ?? [], routes: raw.routes ?? [] };
     const verification = proof ? await new ServeSession(this.ctx).verifyProof(proof) : null;
     return { hello, proof, verification };
   }
@@ -296,6 +323,11 @@ export class AgentApi {
    * deployment that never reaches `running`. It records the MOST RECENT
    * failure and is not cleared by a later success, so read it together
    * with `phase`.
+   *
+   * When `phase` is `"failed"`, try {@link AgentApi.retry} FIRST — it resumes
+   * the failed stages on the same identity. Redeploying instead orphans the
+   * already-minted agent; reset only helps once the container stage is
+   * reached.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string;
@@ -353,6 +385,22 @@ export class AgentApi {
    */
   reset(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
     return this.attestor.lifecycle('reset', { sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  }
+
+  /**
+   * Soft-retry a stuck deployment (owner-signed), preserving its identity.
+   * This is the FIRST recovery step for a `phase: "failed"` row (see
+   * {@link listDeployments}) — it re-runs the failed idempotent stages
+   * (storage upload, mint re-fetch, setAgentURI, …) against the same sealId,
+   * where redeploying would orphan an already-minted agent.
+   *
+   * Without opts it does idempotent stages only. Pass `apiKey` (and
+   * optionally `sealedImage`) to let it continue past those into container
+   * creation — like {@link reset}, the LLM key must be re-supplied because
+   * the attestor never stores it.
+   */
+  retry(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.retry({ sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**

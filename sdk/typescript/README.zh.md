@@ -358,44 +358,48 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + 该 agent 的进�
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 const agentUrl = me.url;   // 容器起来前是 null
 // 到不了 running 就看 me.lastProvisionError——它写着原因。
+
+// phase 是 'failed' 时先 retry()、别重新 deploy（重 deploy 会孤儿掉已铸造的身份）。
+// retry 在同一个 sealId 上重跑失败的幂等阶段：
+if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
-- **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、注册了哪些服务。每个响应都带签名的 `X-Agent-Proof`。也可以让 SDK 一次做完"请求 + 证明校验"：
+- **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、暴露了哪些接口。每个响应都带签名的 `X-Agent-Proof`。也可以让 SDK 一次做完"请求 + 证明校验"：
 
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
-  // hello → { agent, owner, public_url, message, services }
+  // hello → { agent, owner, public_url, message, services, routes }
   // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
   ```
 
-- **owner 注册的服务** —— 按 `/hello` 里 `services` 列的路径直接发 HTTP；每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
-- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回 `{ token, dashboardUrl }`。**握手机制是协议通用的**；但**token 的含义是框架特定的**——sealed 层只是把当前运行框架的适配器决定返回的东西原样转交（今天是什么见下方 openclaw 块）。
+  身份卡里声明了两类接口：
+  - `services` —— agent 自己注册的端点（精确 `/api/*` 路径）：`{ path, method, description?, input_example? }`。直接发 HTTP，每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
+  - `routes` —— 框架声明的前缀：`{ prefix, kind?, auth?, signed, description? }`，例如 `/v1/` 上 `kind:"chat"` API（auth `bearer`）。`auth` 告诉你怎么带 owner token，`signed` 说明该前缀上的响应带不带 `X-Agent-Proof`。已发布的框架都是 chat-only；框架可以声明 UI route，但目前没有。
 
-### 框架特定接口（当前 = openclaw）
+- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回一个 **`AgentClient`**：owner 凭证 + agent 声明的接口面，能做什么完全由 agent 的声明推导出来，SDK 不写死任何框架特定知识。
 
-以上都是每个 sealed agent 与框架无关的通用能力。而"你能拿这个 agent 做什么"——身份和证明之外的部分——取决于它被铸造时用的框架。今天唯一在售的框架是 **openclaw**：它的适配器让 `authenticate()` 的 token 成为一个 openclaw gateway 凭证，并暴露一套 OpenAI 兼容聊天 API。换一个框架，token 会不一样、聊天接口可能不同甚至没有——所以下面这块属于 openclaw，不属于协议本身。
+  ```ts
+  const session = await ag.agent.authenticate(agentUrl, agentId);
+  // session.token            —— owner/operator 凭证（完整权限）
+  // session.routes/.services —— 声明的接口面（同 /hello）
 
-```ts
-const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-// 这里的 `token` 是 openclaw gateway 的完整 owner/operator 凭证（不是窄权限）。两种用法：
+  // 浏览器打开 UI —— 只有当 agent 声明了 UI(token-fragment)路由时才有;
+  // 已发布框架都是 chat-only,目前没有:
+  if (session.open) window.location.href = session.open();
 
-// 1. 浏览器：打开 dashboardUrl（token 挂在 #fragment 上）。
+  // headless 聊天 —— 只有当 agent 声明了 chat 路由时才有：
+  if (session.chat) {
+    const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
+    // choices[0].message.content —— 真实推理回复
+  }
 
-// 2. headless 聊天——openclaw 的 gateway 提供 OpenAI 兼容 HTTP API
-//    （sealed 运行时已开启），同一个 Bearer token：
-const r = await fetch(`${agentUrl}/v1/chat/completions`, {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-  body: JSON.stringify({
-    model: 'openclaw/default',
-    messages: [{ role: 'user', content: 'What can you do?' }],
-  }),
-});
-const { choices } = await r.json();   // choices[0].message.content——真实推理回复
-// GET /v1/models 列出可用目标；不带 token 的请求得到 401。
-```
+  // 通用逃生舱 —— 任何声明过的路径都能打；匹配到的路由要 bearer 时自动带 token：
+  const r = await session.fetch('/v1/models');
+  ```
 
-openclaw token 生命周期：容器首次启动时生成，跨重启保持稳定（控制台不会被登出）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
+  `session.open` / `session.chat` 存不存在，本身就是能力信号：有界面的 agent 有 `open`，headless 的没有。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
+
+openclaw token 生命周期：容器首次启动时生成，跨重启保持稳定（chat 会话保持鉴权）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
 
 ## Agent 作为 owner（嵌套 agent）
 
@@ -515,8 +519,8 @@ const sandboxId = me.sandboxId;
 // 3. 验证身份 + 对话
 const { verification } = await ag.agent.sayHi(agentUrl);   // 返回 ProofVerification | null（响应没带证明头时为 null）
 if (!verification?.ok) throw new Error(verification ? verification.reasons.join('; ') : '响应没有 X-Agent-Proof 头');
-const { token } = await ag.agent.authenticate(agentUrl, agentId);
-// → 用 token 调 `${agentUrl}/v1/chat/completions`（见正文示例），或开 dashboardUrl
+const session = await ag.agent.authenticate(agentUrl, agentId);
+// → session.chat?.(msgs) 聊天、session.open?.() 开 UI(仅当框架声明 UI route)、session.fetch(path) 打任意声明的路径（见正文示例）
 
 // 4. 服务 + 评价闭环（proof 的 deadline 是 +3600 秒，1 小时内上链即可）。
 //    需要环境有 ReputationRegistry（看 /config 的 reputation_registry_addr）——

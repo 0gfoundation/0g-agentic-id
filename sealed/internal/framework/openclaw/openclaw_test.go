@@ -82,7 +82,7 @@ func makeTestPlatformContext(publicURL string) platform.PlatformContext {
 func TestUpsertPlatformSection_FreshFile(t *testing.T) {
 	tmp := t.TempDir() + "/TOOLS.md"
 	pc := makeTestPlatformContext("http://8080-x.example.com:4000")
-	if err := upsertToolsMD(tmp, pc); err != nil {
+	if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -104,7 +104,7 @@ func TestUpsertPlatformSection_PreservesOwnerContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	pc := makeTestPlatformContext("http://x.example.com")
-	if err := upsertToolsMD(tmp, pc); err != nil {
+	if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -124,7 +124,7 @@ func TestUpsertPlatformSection_Idempotent(t *testing.T) {
 	}
 	pc := makeTestPlatformContext("http://8080-test.example.com")
 	for i := 0; i < 3; i++ {
-		if err := upsertToolsMD(tmp, pc); err != nil {
+		if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 			t.Fatalf("upsert iter %d: %v", i, err)
 		}
 	}
@@ -140,12 +140,12 @@ func TestUpsertPlatformSection_Idempotent(t *testing.T) {
 func TestUpsertPlatformSection_EmptyContextStripsSection(t *testing.T) {
 	tmp := t.TempDir() + "/TOOLS.md"
 	pc := makeTestPlatformContext("http://x.example.com")
-	if err := upsertToolsMD(tmp, pc); err != nil {
+	if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 		t.Fatal(err)
 	}
 	// Empty PlatformContext → all sections empty → strip.
 	emptyPC := platform.PlatformContext{}
-	if err := upsertToolsMD(tmp, emptyPC); err != nil {
+	if err := upsertToolsMD(tmp, emptyPC, ""); err != nil {
 		t.Fatalf("upsert with empty context: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -169,7 +169,7 @@ func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 		WhitelistMax: "2026.6.8",
 	}
 	pc := platform.Build(rs)
-	if err := upsertToolsMD(tmp, pc); err != nil {
+	if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)
@@ -208,7 +208,7 @@ func TestUpsertPlatformSection_IncludesRuntimeSnapshot(t *testing.T) {
 		FrameworkVersion: "2026.5.6",
 	}
 	pc := platform.Build(rs)
-	if err := upsertToolsMD(tmp, pc); err != nil {
+	if err := upsertToolsMD(tmp, pc, platform.RenderFrameworkFacts(New().FrameworkFacts())); err != nil {
 		t.Fatalf("upsert err: %v", err)
 	}
 	body := mustRead(t, tmp)

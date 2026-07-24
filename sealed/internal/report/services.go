@@ -21,3 +21,18 @@ type Service struct {
 	InputExample string `json:"input_example,omitempty"`
 	Skill        string `json:"skill,omitempty"`
 }
+
+// Route is one framework-declared path prefix, as surfaced in the `routes`
+// array of the signed /hello self-introduction. Distinct from Service: a
+// Service is an agent-registered (untrusted) exact path under /api/, whereas
+// a Route is declared by the audited framework adapter and may claim a prefix
+// (e.g. a dashboard owning "/"). Clients use `kind`/`auth` to pick how to
+// interact and present the /_seal/auth token; `signed` says whether responses
+// on the route carry an X-Agent-Proof.
+type Route struct {
+	Prefix      string `json:"prefix"`
+	Kind        string `json:"kind,omitempty"`
+	Auth        string `json:"auth,omitempty"`
+	Signed      bool   `json:"signed"`
+	Description string `json:"description,omitempty"`
+}

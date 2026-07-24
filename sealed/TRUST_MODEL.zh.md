@@ -364,6 +364,30 @@ task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBo
 | 7 | **不可抵赖** —— owner 和 agent 之后都没法否认请求发生过 | `task_hash` 是真实请求/响应字节的 keccak |
 | 8 | **时间绑定** —— 签名时间戳 + 提交 deadline 都在 envelope 里 | `timestamp` / `deadline` 字段 |
 
+### 状态绑定需要一个**已激活**的 agent（为什么新 agent 的 `data_hashes` 可能为空）
+
+`data_hashes` 是 agent **当前** iData 的 0g-storage root，每一条都可与
+`intelligentDatasOf(tokenId)` 交叉校验。serve 路径只签"当前运行的 plaintext
+被链上某个 storage root 佐证"的那些 role —— 它**不会**签一个纯本地的 content
+hash（对方拿到也没法独立拉取内容验证）。data-bound 声誉的前提是数据可被独立取回。
+
+这对新 mint 的 agent 有个直接后果:iData 上链只能靠 `chain.Update`,由
+`agent_seal_priv` 签名 —— 是 agent **自己**维护自己的状态,这需要 agentSeal
+持有 gas。在 agentSeal 有 gas 提交之前,首次 boot 展开出来的框架特定 iData
+(config、persona、skills……)只存在于容器磁盘上,没有 storage root,因此
+**不在 `data_hashes` 里** —— envelope 带的是空列表。sayHi 依然验证身份、代码、
+响应完整性(保证 1-4、6-8),只有状态绑定这一行是空的。
+
+这是**刻意的语义边界,不是缺陷**:一个没有 gas 维护自己链上状态的 agent,
+还没有**激活**。serve-proof 诚实地报告"这个 agent 的 iData 状态尚未确立到
+链上",而不是去签一个无法验证的本地 hash。**给 agentSeal 充 gas 就是激活
+动作** —— 一旦它能提交,`data_hashes` 就补齐,状态绑定从此成立。
+
+(一个与 gas 无关的例外:SDK mint 的是 **version-less** 的 `framework` binding。
+即便这条 role —— attestor 在 mint 时写上链、不花 agent 的 gas —— 也会因为
+adapter 补上 `package_version` 后本地副本对不上,而同样被跳过,直到首次 drift
+提交。mint 时把 binding 写全版本,就能让 framework 这行从第一次响应起就成立。)
+
 ---
 
 ## 这 8 条保证的承重墙是 agent 钢印

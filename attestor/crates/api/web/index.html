@@ -4607,18 +4607,36 @@ window.resetAgent = async function (sealId, sandboxId) {
 // from the AgentCard. The result is shown as an animated badge above the
 // raw body — verifying spinner → ✓ verified (green pulse) / ✗ failed
 // (red shake) / ⚠ unverified (no header).
-// SIWE-style dashboard auth: owner signs `0GSealAuth:{sealId}:{ts}` with
-// MetaMask, attestor's frontend hands it to the agent's `/_seal/auth`
-// endpoint, agent verifies signer == on-chain owner and returns a
-// short-lived gateway token + the path to navigate to. We open the
-// dashboard with that token in the URL fragment so the SPA auto-logins
-// and the token never lands in server logs / Referer headers.
+// SIWE-style dashboard auth, route-driven. The agent declares its
+// interaction surfaces in `/hello`'s `routes`; we pick the one with
+// kind="dashboard". Owner signs `0GSealAuth:{sealId}:{ts}` with MetaMask,
+// hands it to `/_seal/auth`, agent verifies signer == on-chain owner and
+// returns a single owner `token`. For a token-fragment route we open
+// <base><prefix>#token=… so the SPA auto-logins and the token never lands
+// in server logs / Referer headers.
+//
+// This replaced the old `dashboard_url` field in the auth response: the
+// route declaration is the framework-agnostic source of truth (a framework
+// with no dashboard simply declares no such route, and this reports that
+// honestly instead of 404ing on a missing field).
 window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
   if (!State.signer) { toast('Connect wallet first', 'error'); return; }
   const btn = $('#btnDashboard');
   const oldText = btn ? btn.textContent : '';
   if (btn) { btn.disabled = true; btn.textContent = '⏳ Authenticating…'; }
   try {
+    // 1. Discover the dashboard route (framework-declared, from /hello).
+    const hello = await (await fetch(`${dashboardBaseUrl}/hello`, {
+      mode: 'cors', cache: 'no-store',
+    })).json();
+    const routes = Array.isArray(hello.routes) ? hello.routes : [];
+    const dash = routes.find(r => r && r.kind === 'dashboard');
+    if (!dash) throw new Error('this agent declares no dashboard route');
+    if (dash.auth !== 'token-fragment') {
+      throw new Error(`unsupported dashboard auth "${dash.auth}"`);
+    }
+
+    // 2. Owner handshake -> single owner token.
     const sealId = sealIdHex.startsWith('0x') ? sealIdHex : '0x' + sealIdHex;
     const ts = Math.floor(Date.now() / 1000);
     const message = `0GSealAuth:${sealId}:${ts}`;
@@ -4637,12 +4655,16 @@ window.openDashboard = async function (sealIdHex, dashboardBaseUrl) {
       const body = await r.text().catch(() => '');
       throw new Error(`HTTP ${r.status}${body ? ': ' + body : ''}`);
     }
-    const { dashboard_url } = await r.json();
-    if (!dashboard_url) throw new Error('auth response missing dashboard_url');
+    const { token } = await r.json();
+    if (!token) throw new Error('auth response missing token');
 
-    // Final URL: <base>/<dashboard_url>. Server returns it with a leading
-    // slash + fragment (e.g. `/#token=…`) so naive concatenation works.
-    window.open(dashboardBaseUrl + dashboard_url, '_blank', 'noopener');
+    // 3. token-fragment: open <base><prefix>#token=… (fragment stays
+    //    client-side; never sent to the server).
+    const prefix = dash.prefix || '/';
+    window.open(
+      `${dashboardBaseUrl}${prefix}#token=${encodeURIComponent(token)}`,
+      '_blank', 'noopener',
+    );
   } catch (e) {
     toast('Dashboard auth failed: ' + (e.message || e), 'error');
     // Fire-and-forget probe — attestor synchronously checks the

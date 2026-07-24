@@ -158,8 +158,10 @@ func (a *Adapter) Defaults(role string) []byte {
 	return nil
 }
 
-// AuthResponse implements framework.Framework. Returns the openclaw
-// control-UI payload: gateway token + dashboard URL fragment that loads it.
+// AuthResponse implements framework.Framework. Returns just the gateway
+// credential; WHERE and HOW to use it (dashboard at "/" via token-fragment,
+// chat at "/v1/" via bearer) is declared once in FrameworkRoutes and surfaced
+// in /hello, so the credential response no longer carries a per-framework URL.
 //
 // Caller (proxy.handleAuth) is responsible for verifying the requester is
 // the on-chain owner before invoking; adapter assumes the call is authorised.
@@ -170,10 +172,35 @@ func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
 	if token == "" {
 		return nil, fmt.Errorf("openclaw: auth token not provisioned (Start has not run successfully)")
 	}
-	return map[string]any{
-		"token":         token,
-		"dashboard_url": "/#token=" + token,
-	}, nil
+	return map[string]any{"token": token}, nil
+}
+
+// FrameworkRoutes implements framework.RouteProvider. openclaw exposes two
+// public surfaces on its gateway (upstreamPort): the control-UI dashboard at
+// the root, and an OpenAI-compatible API under /v1/. The dashboard is
+// unsigned (static UI shouldn't bear the agent's on-chain signature) and
+// loads its token from the URL fragment; the API is signed and takes a bearer
+// token. Longest-prefix matching sends /v1/* to the API route and everything
+// else to the dashboard.
+func (a *Adapter) FrameworkRoutes() []framework.Route {
+	// ONLY the chat API is exposed through the sealed proxy. The gateway's
+	// control UI (served at "/") is deliberately NOT declared: it embeds a
+	// web terminal (ghostty /pty) and a file browser, so behind the proxy it
+	// would hand a token-bearing owner a shell + arbitrary file read inside
+	// the TEE container — a backdoor around the whole sealed isolation +
+	// serve-proof model (an owner could read secrets / probe the sealed
+	// process / touch agentSeal material). Undeclared paths 404 at the proxy,
+	// so the control UI is unreachable. Owner interaction is the constrained
+	// chat API + SDK, which can't shell or read files.
+	return []framework.Route{
+		{
+			Prefix:      "/v1/",
+			Kind:        "chat",
+			Auth:        "bearer",
+			Signed:      true,
+			Description: "OpenAI-compatible chat/completions API.",
+		},
+	}
 }
 
 // Stop SIGTERMs the tracked process, waits up to gracefulTimeout, then

@@ -75,6 +75,24 @@ func Run(t *testing.T, cfg Config) {
 	t.Run("FixtureRoundTrip", func(t *testing.T) { fixtureRoundTrip(t, cfg, false) })
 	t.Run("RestoreCommutativity", func(t *testing.T) { fixtureRoundTrip(t, cfg, true) })
 	t.Run("UnknownRoleContract", func(t *testing.T) { unknownRoleContract(t, cfg) })
+	t.Run("FrameworkFactsNonEmpty", func(t *testing.T) { frameworkFactsNonEmpty(t, cfg) })
+}
+
+// frameworkFactsNonEmpty enforces §9 part 2: every adapter must author the
+// framework-specific half of the agent doc (its own tracked paths, version
+// whitelist, config allowlist). An empty return ships an agent that doesn't
+// know where its own memory persists — the exact gap that let a fresh
+// hermes agent stand a service up on localhost and lose track of durable
+// state. This is the "can't silently forget to inject it" backstop.
+func frameworkFactsNonEmpty(t *testing.T, cfg Config) {
+	facts := cfg.New(t).FrameworkFacts()
+	if facts.Home == "" {
+		t.Error("FrameworkFacts().Home is empty — the agent won't know its on-disk root")
+	}
+	if len(facts.Tracked) == 0 {
+		t.Error("FrameworkFacts().Tracked is empty — the agent won't know which of its " +
+			"paths persist to chain (§9 part 2); fill it in, see openclaw/hermes platformtext.go")
+	}
 }
 
 // rolesSanity checks the declared role set's structural rules: unique
