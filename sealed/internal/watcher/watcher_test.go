@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/platform"
 	"seal-verify/internal/state"
 )
 
@@ -21,6 +22,9 @@ type fakeAdapter struct {
 }
 
 func (f *fakeAdapter) Name() string                            { return "fake" }
+func (f *fakeAdapter) FrameworkFacts() platform.FrameworkFacts {
+	return platform.FrameworkFacts{Home: "~/.fake/", Tracked: []platform.PathNote{{Path: "~/.fake/state", Note: "fake"}}}
+}
 func (f *fakeAdapter) Version(context.Context) (string, error) { return "0", nil }
 func (f *fakeAdapter) Roles() []framework.RoleSpec {
 	out := make([]framework.RoleSpec, 0, len(f.dims))

@@ -412,6 +412,38 @@ guarantees:
 | 7 | **Non-repudiation**: neither owner nor agent can later deny the request happened | `task_hash` is keccak over the actual request/response bytes |
 | 8 | **Time binding**: signing timestamp + submission deadline are in the envelope | `timestamp` / `deadline` fields |
 
+### State binding requires an *activated* agent (why a fresh agent's `data_hashes` can be empty)
+
+`data_hashes` are the 0g-storage roots of the agent's **current** iData,
+each cross-checkable against `intelligentDatasOf(tokenId)`. The serve path
+signs a role's hash only when the agent's live plaintext is backed by an
+on-chain storage root — it will **not** sign a purely local content hash a
+counterparty cannot independently fetch and verify. Data-bound reputation
+is worthless if the data isn't retrievable.
+
+That has a consequence for a freshly minted agent. iData reaches chain only
+via `chain.Update`, signed by `agent_seal_priv` — the agent maintaining its
+**own** state, which costs gas the agentSeal must hold. Before the agentSeal
+has gas to commit, the framework-specific iData (config, persona, skills…)
+expanded on first boot lives only on the container's disk, has no storage
+root, and is therefore **absent from `data_hashes`** — the envelope carries
+an empty list. sayHi still verifies identity, code, and response integrity
+(guarantees 1–4, 6–8); only the State-binding row is empty.
+
+This is a deliberate semantic boundary, not a gap: an agent with no gas to
+maintain its own on-chain state has not yet *activated*. serve-proof
+honestly reports "this agent's iData state is not yet established on chain"
+rather than signing an unverifiable local hash. **Funding the agentSeal is
+the activation step** — once it can commit, `data_hashes` fills in and State
+binding holds from then on.
+
+(One caveat unrelated to gas: the SDK mints a *version-less* `framework`
+binding. Even that role — written to chain by the attestor at mint, needing
+no agent gas — fails to match the agent's local copy once the adapter fills
+in `package_version`, so it too is skipped until the first drift commit.
+Minting the binding version-complete would let the framework row hold from
+response one.)
+
 ---
 
 ## The load-bearing wall under these 8 guarantees is the agent doctrine

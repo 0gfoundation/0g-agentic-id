@@ -1,9 +1,10 @@
-# The universal sealed sandbox image — one image for every bundled
-# agent framework. Which framework actually runs is decided at boot by
-# the agent's on-chain framework binding (see sealed/main.go
-# resolveAdapter), not by the image: the sealed binary registers every
-# adapter, and each adapter npm-installs its binding-pinned framework
-# version at first Start.
+# The sealed sandbox image, node/openclaw flavour. Images are per
+# framework runtime (this one carries node; images/hermes/ carries
+# python/uv — see that Dockerfile's header for why they're split), but
+# which adapter actually runs is still decided at boot by the agent's
+# on-chain framework binding (see sealed/main.go resolveAdapter): the
+# sealed binary registers every adapter, and each adapter installs its
+# binding-pinned framework version at first Start.
 #
 # The npm installs below are warm-cache only — they make first boot fast
 # and keep cold boots working through an npm outage. Removing one does

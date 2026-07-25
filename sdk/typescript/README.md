@@ -95,7 +95,7 @@ const ag = new AgenticID({
 The snippets below assume these bindings:
 
 ```ts
-const agentId = 33n;   // an existing agent (ERC-721 tokenId)
+const agentId = 33n;   // an existing agent (ERC-7857 tokenId, ERC-721-compatible)
 const owner = '0xAaAa...';   // the address that owns the agent (often your own signer's address)
 const buyer = '0xBbBb...';   // the address leaving feedback — whatever wallet `ag` signs with (attribution is msg.sender)
 ```
@@ -173,7 +173,7 @@ await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "
 
 | Identifier | What it is | Used by |
 |---|---|---|
-| `agentId` (bigint) | the ERC-721 tokenId — the on-chain identity | most reads, transfer, clone, authenticate, runtimeCosts |
+| `agentId` (bigint) | the ERC-7857 tokenId (ERC-721-compatible) — the on-chain identity | most reads, transfer, clone, authenticate, runtimeCosts |
 | `sealId` (bytes32) | the seal binding's hash id — what the attestor keys its deployment records by | stop / start / reset, waitForMint, deployment rows |
 | `agentSeal` (address) | the agent's own signing key as an address — its wallet | topUpAgentSeal, serve-proof signer checks |
 
@@ -364,63 +364,70 @@ const agentUrl = me.url;               // null until the container is provisione
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
 // submit: … replacement transaction underpriced" — folded in from the
 // failed stage's reason).
+
+// A 'failed' row is recoverable — retry() FIRST, don't redeploy (that
+// orphans the already-minted identity). It re-runs the failed idempotent
+// stages against the same sealId:
+if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
-- **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
-  my registered services. Every response carries a signed `X-Agent-Proof`.
-  Or let the SDK do the fetch + proof check in one call:
+- **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
+  the surface I expose. Every response carries a signed `X-Agent-Proof`. Or
+  let the SDK do the fetch + proof check in one call:
 
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
-  // hello → { agent, owner, public_url, message, services }
+  // hello → { agent, owner, public_url, message, services, routes }
   // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
   ```
 
-- **Owner-registered services** — plain HTTP against the paths listed in
-  `/hello`'s `services`; each response is proof-signed (that is what you
-  `capture()` and rate).
+  The card carries two declared surfaces:
+  - `services` — the agent's own registered endpoints (exact `/api/*` paths):
+    `{ path, method, description?, input_example? }`. Plain HTTP against these;
+    each response is proof-signed (that is what you `capture()` and rate).
+  - `routes` — the framework's declared prefixes:
+    `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
+    at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;
+    `signed` says whether responses on that route carry an `X-Agent-Proof`.
+    Shipped frameworks are chat-only; a framework could declare a UI route,
+    but none currently do.
+
 - **Owner handshake** — `ag.agent.authenticate(agentUrl, agentId)` proves
   you're the on-chain owner (EIP-191-sign `0GSealAuth:<sealId>:<ts>`,
-  exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and hands
-  back `{ token, dashboardUrl }`. The **handshake is protocol-universal**;
-  the **token's meaning is framework-specific** — the sealed layer just
-  relays whatever the running framework's adapter chose to return (see the
-  openclaw block below for what it is today).
+  exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and returns
+  an **`AgentClient`**: the owner credential plus the agent's declared
+  surface, with affordances derived from what the agent declared — no
+  framework-specific knowledge baked into the SDK.
 
-### Framework-specific surface (openclaw today)
+  ```ts
+  const session = await ag.agent.authenticate(agentUrl, agentId);
+  // session.token           — the owner/operator credential (full scope)
+  // session.routes/.services — the declared surface (same as /hello)
 
-Everything above is the same for every sealed agent regardless of
-framework. What you can *do* with the agent beyond identity + proofs
-depends on the framework the agent was minted with. The only framework
-shipping today is **openclaw**, whose adapter makes `authenticate()`'s
-token an openclaw gateway credential and exposes an OpenAI-compatible chat
-API. A future framework would return a different token and a different (or
-no) chat surface — so treat this block as openclaw's, not the protocol's.
+  // Open a UI in a browser — present ONLY if the agent declares a UI
+  // (token-fragment) route; shipped frameworks are chat-only, so today this
+  // is absent:
+  if (session.open) window.location.href = session.open();
 
-```ts
-const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-// `token` here is a full owner/operator credential for the openclaw gateway
-// (not a narrow scope). Two ways to use it:
+  // Chat headlessly — present ONLY if the agent declares a chat route:
+  if (session.chat) {
+    const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
+    // choices[0].message.content — a real inference reply
+  }
 
-// 1. Browser: open dashboardUrl (the token rides the #fragment).
+  // General escape hatch — works for any declared path; attaches the bearer
+  // token automatically when the matched route asks for it:
+  const r = await session.fetch('/v1/models');
+  ```
 
-// 2. Headless chat — openclaw's gateway serves an OpenAI-compatible HTTP
-//    API (enabled by the sealed runtime), same Bearer token:
-const r = await fetch(`${agentUrl}/v1/chat/completions`, {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-  body: JSON.stringify({
-    model: 'openclaw/default',
-    messages: [{ role: 'user', content: 'What can you do?' }],
-  }),
-});
-const { choices } = await r.json();   // choices[0].message.content — a real inference reply
-// GET /v1/models lists targets; requests without the token get 401.
-```
+  The presence of `session.open` / `session.chat` is itself the capability
+  signal: a UI route yields `open`, a chat route yields `chat`. Shipped
+  frameworks declare chat only. Nothing is ever synthesized — the SDK
+  reflects only what the agent declared.
 
 openclaw token lifecycle: generated at the container's first boot, stable
-across restarts (the dashboard survives them), no expiry, rotates only when
-the container is recreated — `reset()` is the revocation lever.
+across restarts (the chat session stays authenticated), no expiry, rotates
+only when the container is recreated — `reset()` is the revocation lever.
 
 ## Agents as owners (nested agents)
 

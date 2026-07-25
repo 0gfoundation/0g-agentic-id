@@ -149,7 +149,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := upsertSoulMD(soulMDPath(), pc.Sovereignty); err != nil {
 		logger.Logf("warn: upsert SOUL.md sealed section: %v", err)
 	}
-	if err := upsertToolsMD(toolsMDPath(), pc); err != nil {
+	if err := upsertToolsMD(toolsMDPath(), pc, platform.RenderFrameworkFacts(a.FrameworkFacts())); err != nil {
 		logger.Logf("warn: upsert TOOLS.md sealed section: %v", err)
 	}
 	if rt.AgentSeal != "" || rt.PublicURL != "" || rt.SealSignSock != "" {

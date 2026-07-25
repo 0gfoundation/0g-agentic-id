@@ -331,7 +331,7 @@ mint 时写的 prompt 和模型选择静默丢掉——claudecode 移植初版�
   `RuntimeContext`。昂贵/一次性的工作(安装、token 生成)要用"首次
   启动"标记挡住,且重启时绝不覆盖 agent 的自我修改——平台原则是
   sealed 只负责让 agent 活着,不干涉 agent 对自己做过的事。
-- 框架凭据(dashboard token 等)**留在 adapter 私有状态里** ——只通过
+- 框架凭据(chat bearer token)**留在 adapter 私有状态里** ——只通过
   `AuthResponse` 暴露。
 
 `Stop(ctx, gracefulTimeout)`:SIGTERM,等到超时,SIGKILL。还要清扫
@@ -351,8 +351,8 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 `/_seal/auth` 的完整验证由 proxy 负责(owner 用 EIP-191 签
 `0GSealAuth:0x<sealId>:<ts>`;proxy 校验恢复出的地址 == 链上 owner,
 ±300s 时间窗),验证通过才调 `AuthResponse(ctx)`。你返回一个可 JSON
-编码的载荷,授予已验证的 owner 控制面访问权——openclaw 返回
-`{"token": …, "dashboard_url": "/#token=…"}`。Start 还没准备好凭据时
+编码的载荷,授予已验证的 owner 控制面访问权——openclaw 只返回
+`{"token": …}`(chat API 的 bearer;dashboard route 已移除)。Start 还没准备好凭据时
 返回错误(proxy 会转成 503)。绝不要在这里自己做鉴权;调用方已经做完了。
 
 ## 6. 生命周期时间线(每个方法何时被调)
@@ -454,13 +454,14 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 - [ ] `Start` 在上游接受连接后才返回;重启不重做首启工作、不覆盖 agent 自我修改。
 - [ ] `Stop` 不留占着上游端口的孤儿。
 - [ ] `MonitorExit` 每个 spawn 的进程恰好触发一次;exit-0 不由你的代码当 crash 处理(manager 负责)。
+- [ ] `FrameworkFacts()` 返回非空 `Tracked`——agent 被告知持久状态落在哪(§11 步骤 9)。
 
 ## 10. 测试你的 adapter
 
 从你的 adapter 包的测试里跑共享 conformance 套件
 (`internal/framework/conformance`)。它把 §9 的不变量落成可执行断言
 (role 结构检查、Defaults round-trip、fixture round-trip + 确定性 +
-LoadEntry hash 一致性、Restore 交换律、未知 role 错误契约):
+LoadEntry hash 一致性、Restore 交换律、未知 role 错误契约、FrameworkFacts 非空):
 
 ```go
 func TestConformance(t *testing.T) {
@@ -527,13 +528,34 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    这只是一个 delivery 函数(见 git 历史里已下线的
    `claudecode/claudemd.go`——整个 PlatformContext 作为单个 marker
    段落进 CLAUDE.md)。
-9. 自己撰写你框架的上下文事实,和平台段落一起注入。`platform.Build`
-   刻意只讲教条和平台机制——不出现任何框架的路径、升级命令、配置语义、
-   工具名(有测试焊死)。以下必须由**你自己**的注入文本告诉 agent:
-   哪些磁盘路径会上链、持久的东西该放哪、你的版本白名单/回正行为、
-   配置 hash 语义。不写,你的 agent 就会把记忆写到不追踪的地方、下次
-   重建就丢——向 agent 交代它自己框架的真相是 adapter 的责任,不是
-   平台的。openclaw 的在 `openclaw/platformtext.go`。
+9. 用必答的 `FrameworkFacts()` 方法填入你框架自己的事实——填**值**,不写文字。
+   `platform.RenderFrameworkFacts` 持有全部平台机制文字(sealing、gas、版本
+   回正、配置 drift),对每个框架逐字一致地渲染;你只返回一个
+   `platform.FrameworkFacts` 结构,填因框架而异的部分:`Home`、`Tracked`/
+   `Untracked` 路径(每条带一句说明)、`DurableHints`、版本白名单 +
+   `ReconcileHow` 命令、`ConfigFile` + `ConfigKeys`。
+   `platform.AssembleAgentDoc(pc, facts)` 把平台那几段和你渲染出的事实拼起来
+   ——单文件框架(hermes)整份注入一个 context 文件;openclaw 把平台段分散到
+   IDENTITY/SOUL/TOOLS,但事实同样经 `platform.RenderFrameworkFacts` 取得。
+   conformance 的 `FrameworkFactsNonEmpty` 会在你留空时让构建失败。这是构造上
+   防漏的:平台机制文字不归你写,所以你既不会把机制讲错、也不会悄悄漏掉一段
+   ——正是当初让新起的 hermes agent 把记忆写到不追踪路径的那个坑。openclaw 和
+   hermes 的填空在各自 `platformtext.go`;渲染出的带 `()` 占位模板见
+   [AGENT_BIBLE.md](AGENT_BIBLE.md)。
+10. **安全——为框架的任何控制/管理 UI 声明 route 之前,先审计它。**
+    `FrameworkRoutes` 决定 sealed proxy 向持 token 的 owner 暴露什么。
+    只声明**受限的、语义收窄的**接口(chat API 是安全默认——它无法开
+    shell 或读文件)。**在逐一审计过框架 web dashboard / 控制台底下的每个
+    端点之前,不要为它声明 route**:这类 UI 是给**完全信任的本地单用户**
+    设计的,几乎必然内嵌 web 终端(shell)、文件浏览器、和/或 code 执行。
+    一旦代理给远程 owner,就是绕过整个 TEE 隔离 + serve-proof 模型的后门
+    ——owner 能开 shell、读密钥(`.env`、config 的 api_key)、探 sealed
+    进程(`/proc/1`)、危及 agentSeal 材料(TRUST_MODEL 的"owner 无法离线
+    伪造 serve-proof"正是建立在 owner **拿不到**这种访问之上)。openclaw
+    (ghostty `/pty` + `BrowserFiles`)和 hermes(`/api/pty` + 文件端点)
+    都恰好带这套 UI;现在两者都只声明 chat。规则:**受限接口默认暴露;
+    框架完整 UI 只有在逐端点审计证明其下无 shell/文件/exec 可达后才暴露。**
+    拿不准就别声明 route——未声明的前缀在 proxy 层 404。
 
 ## 12. 移植实录:接入 claude-code(2026-07)—— 已下线,保留为案例
 

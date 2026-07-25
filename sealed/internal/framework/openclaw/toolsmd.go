@@ -66,18 +66,20 @@ func stripPlatformInjection(content []byte) []byte {
 //
 // If capabilities section is empty (no signSock / publicURL), strips
 // the existing injection entirely.
-func upsertToolsMD(path string, pc platform.PlatformContext) error {
+func upsertToolsMD(path string, pc platform.PlatformContext, facts string) error {
 	var sections []string
 	if pc.Capabilities != "" {
-		// Platform capabilities, then OUR persistent-state layout —
-		// platform no longer knows any framework's paths (see
-		// platformtext.go for the authorship split).
-		sections = append(sections, pc.Capabilities, persistentStateText())
+		sections = append(sections, pc.Capabilities)
+	}
+	// OUR framework facts (persistent-state layout + version/config
+	// constraints) right after platform capabilities — the same string
+	// FrameworkFacts() returns, sourced through that one method so the
+	// TOOLS.md content can never diverge from what conformance checks.
+	if facts != "" {
+		sections = append(sections, facts)
 	}
 	if pc.Constraints != "" {
-		// Platform constraints (drift mechanics), then OUR version
-		// whitelist + config-allowlist facts.
-		sections = append(sections, pc.Constraints, frameworkConstraintsText())
+		sections = append(sections, pc.Constraints)
 	}
 	if pc.Runtime != "" {
 		sections = append(sections, pc.Runtime)

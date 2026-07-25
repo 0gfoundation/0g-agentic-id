@@ -38,6 +38,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
 
@@ -57,8 +58,9 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
+	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
+	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
+	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the
@@ -75,6 +77,9 @@ func New(agent *state.Agent, publicURL string) *Server {
 // per-adapter optional paths from its capability interfaces:
 //
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
+//   - framework.RouteProvider         → the declared public routes the
+//     catch-all proxy forwards + signs (everything else 404s); absent ⇒
+//     legacy forward-all + sign-all
 //
 // Called once by main after the on-chain framework binding names the
 // adapter. Handlers read under the lock.
@@ -87,10 +92,64 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	if p, ok := fw.(framework.SubprocessLogProvider); ok {
 		agentLogPath = p.SubprocessLogPath()
 	}
+	var fwRoutes []framework.Route
+	if rp, ok := fw.(framework.RouteProvider); ok {
+		fwRoutes = rp.FrameworkRoutes()
+	}
 	s.mu.Lock()
 	s.adapter = fw
 	s.agentLogPath = agentLogPath
+	s.fwRoutes = fwRoutes
 	s.mu.Unlock()
+	if fwRoutes == nil {
+		logger.Logf("proxy: adapter %q declares no routes; legacy forward-all + sign-all in effect", fw.Name())
+	} else {
+		logger.Logf("proxy: adapter %q declared %d framework route(s)", fw.Name(), len(fwRoutes))
+	}
+}
+
+// matchFrameworkRoute returns the declared framework route whose prefix is the
+// longest match for path, and whether any matched. Used by handleProxy to
+// decide (a) whether to forward at all and (b) whether to sign the response.
+func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := -1
+	var bestRoute framework.Route
+	for _, rt := range s.fwRoutes {
+		if strings.HasPrefix(path, rt.Prefix) && len(rt.Prefix) > best {
+			best = len(rt.Prefix)
+			bestRoute = rt
+		}
+	}
+	return bestRoute, best >= 0
+}
+
+// hasFrameworkRoutes reports whether the adapter declared any routes. When
+// false, handleProxy keeps legacy behaviour (forward every path, sign every
+// response) so an adapter that hasn't adopted RouteProvider still works.
+func (s *Server) hasFrameworkRoutes() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.fwRoutes != nil
+}
+
+// frameworkRoutesForHello maps the declared routes to the public /hello wire
+// shape (report.Route). Empty when the adapter declared none.
+func (s *Server) frameworkRoutesForHello() []report.Route {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]report.Route, 0, len(s.fwRoutes))
+	for _, rt := range s.fwRoutes {
+		out = append(out, report.Route{
+			Prefix:      rt.Prefix,
+			Kind:        rt.Kind,
+			Auth:        rt.Auth,
+			Signed:      rt.Signed,
+			Description: rt.Description,
+		})
+	}
+	return out
 }
 
 func (s *Server) getAdapter() framework.Framework {
@@ -219,12 +278,18 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	if len(services) > 1 {
 		helloMessage += " Here's what I can do for you:"
 	}
+	// routes are the framework-declared prefixes (dashboard, chat, …) with
+	// their discovery hints (kind/auth) and signing disposition — distinct
+	// from the agent-registered `services` above. Empty for adapters that
+	// don't implement framework.RouteProvider.
+	routes := s.frameworkRoutesForHello()
 	resp := map[string]any{
 		"agent":      agentAddr,
 		"owner":      owner,
 		"public_url": s.publicURL, // empty when SANDBOX_PROXY_DOMAIN is unset
 		"message":    helloMessage,
 		"services":   services,
+		"routes":     routes,
 		"ts":         time.Now().Unix(),
 	}
 	body, err := json.Marshal(resp)
@@ -342,17 +407,35 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A registered agent service takes precedence over the framework
-	// upstream: a request whose path matches one is routed to that
-	// service's loopback backend instead. Everything below (header copy,
-	// forward, serve-proof signing) is identical either way — attribution
-	// comes from leaving through :8080, not from which backend answered.
+	// Routing precedence, most specific first:
+	//   1. an agent-registered service (exact path) → its loopback backend,
+	//      always signed;
+	//   2. a framework-declared route (longest-prefix) → the framework
+	//      upstream, signed per Route.Signed;
+	//   3. otherwise, if the adapter declared any routes, 404 — an undeclared
+	//      path is NOT blind-forwarded (bounds the public + signing surface).
+	// Legacy fallback: an adapter that declares no routes keeps the old
+	// behaviour — forward every path to the upstream and sign every response.
+	signed := true
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
 		upstream = svc.Backend
+	} else if s.hasFrameworkRoutes() {
+		rt, ok := s.matchFrameworkRoute(r.URL.Path)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		signed = rt.Signed
+		// A route may pin its own loopback backend (a framework whose
+		// surfaces are separate processes/ports); empty keeps the single
+		// StartResult upstream. Same mechanism as svc.Backend above.
+		if rt.Backend != "" {
+			upstream = rt.Backend
+		}
 	}
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
@@ -415,6 +498,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
+	}
+	if !signed {
+		// Unsigned route (e.g. a dashboard's static UI): relay the response
+		// verbatim, without an X-Agent-Proof. The agent's on-chain signature
+		// attests attributable API responses, not UI assets.
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(respBody)
+		return
 	}
 	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

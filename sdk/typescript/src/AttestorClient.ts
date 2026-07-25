@@ -271,6 +271,47 @@ export class AttestorClient {
   }
 
   /**
+   * Soft-retry a stuck deployment (owner-signed) instead of redeploying —
+   * which would orphan an already-minted identity. The attestor re-runs every
+   * failed idempotent stage (storage upload from persisted ciphertext, mint
+   * receipt re-fetch, setAgentURI, …) against the SAME seal_id.
+   *
+   * Without `apiKey`: posts `{ seal_id, owner }` — idempotent stages only, no
+   * container work (the cheap owner-field auth path). With `apiKey` (and
+   * optionally `sealedImage`): attaches the same encrypted "create" envelope
+   * deploy/reset use, so the worker may continue past the idempotent stages
+   * into container creation. The attestor never stores the LLM key, so — as
+   * with reset — continuing into a container needs it re-supplied.
+   */
+  async retry(params: {
+    sealId: `0x${string}`;
+    sealedImage?: string;
+    apiKey?: string;
+    envelopeTtlSec?: number;
+  }): Promise<void> {
+    const { account } = requireWallet(this.ctx);
+    const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
+    if (params.apiKey) {
+      const snapshot = await this.resolveSealedImage(params.sealedImage);
+      body.sandbox_envelope = await this.signEnvelope(
+        'create',
+        '',
+        { snapshot, sealed: true, env: { API_KEY: params.apiKey } },
+        params.envelopeTtlSec ?? 180,
+      );
+    }
+    const res = await fetch(`${this.baseUrl()}/retry`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`/retry failed: HTTP ${res.status} ${text}`);
+    }
+  }
+
+  /**
    * Deploy a new agent. The connected wallet is the owner. Returns the new
    * agent's identity; it drives storage → mint → setAgentURI and (given the
    * sandbox envelope) brings a container online.
