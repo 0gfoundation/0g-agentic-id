@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	github.com/ecies/go/v2 v2.0.11
 	github.com/ethereum/go-ethereum v1.17.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
