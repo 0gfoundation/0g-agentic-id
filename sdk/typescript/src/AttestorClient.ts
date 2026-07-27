@@ -383,16 +383,35 @@ export class AttestorClient {
     });
   }
 
+  // Transient-retry wrapper for the mint-driving POSTs (/deploy, /clone).
+  // Safe to retry because the SAME body carries the SAME idempotency_key, so
+  // the attestor dedupes server-side (a retry after a dropped response returns
+  // the existing agent, never a duplicate). We retry connection-level failures
+  // (reset / timeout — fetch rejects) and 5xx; a 4xx is a client/business
+  // rejection where retrying can't help, so it throws immediately.
   private async post(path: string, body: unknown): Promise<DeployCloneResponse> {
-    const res = await fetch(`${this.baseUrl()}${path}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) {
+    const payload = JSON.stringify(body);
+    const ATTEMPTS = 3;
+    let lastErr: unknown;
+    for (let i = 0; i < ATTEMPTS; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1))); // 0.5s, 1s
+      let res: Response;
+      try {
+        res = await fetch(`${this.baseUrl()}${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: payload,
+        });
+      } catch (e) {
+        lastErr = e; // connection-level failure — transient, retry
+        continue;
+      }
+      if (res.ok) return (await res.json()) as DeployCloneResponse;
       const text = await res.text().catch(() => '');
-      throw new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      const err = new Error(`${path} failed: HTTP ${res.status} ${text}`);
+      if (res.status < 500) throw err; // 4xx — client/business error, retry won't help
+      lastErr = err; // 5xx — server transient, retry
     }
-    return (await res.json()) as DeployCloneResponse;
+    throw lastErr;
   }
 }
