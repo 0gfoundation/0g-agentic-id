@@ -53,30 +53,34 @@ pub async fn handle(
 
     // ── Sandbox envelope: validate at edge so bogus requests don't burn a
     //    worker slot. Sandbox itself re-verifies; this is defense-in-depth.
-    if req.sandbox_envelope.wallet_address != req.owner {
-        return Err(ApiError::bad_request(
-            "sandbox envelope signer must match deploy owner",
-        ));
-    }
-    let canonical = verify_envelope(&req.sandbox_envelope, state.crypto.as_ref())
-        .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
-    if canonical.action != "create" {
-        return Err(ApiError::bad_request(format!(
-            "sandbox envelope action must be 'create', got {}",
-            canonical.action
-        )));
-    }
-    if !canonical.resource_id.is_empty() {
-        return Err(ApiError::bad_request(
-            "sandbox envelope resource_id must be empty for create",
-        ));
-    }
-    let now_secs = Utc::now().timestamp();
-    if canonical.expires_at <= now_secs {
-        return Err(ApiError::bad_request(format!(
-            "sandbox envelope already expired (expires_at={}, now={})",
-            canonical.expires_at, now_secs
-        )));
+    //    Optional: absent = mint-only deploy (no container provisioned; the
+    //    agent lands Offline and is brought online later via /start).
+    if let Some(env) = &req.sandbox_envelope {
+        if env.wallet_address != req.owner {
+            return Err(ApiError::bad_request(
+                "sandbox envelope signer must match deploy owner",
+            ));
+        }
+        let canonical = verify_envelope(env, state.crypto.as_ref())
+            .map_err(|e| ApiError::bad_request(format!("sandbox envelope: {e}")))?;
+        if canonical.action != "create" {
+            return Err(ApiError::bad_request(format!(
+                "sandbox envelope action must be 'create', got {}",
+                canonical.action
+            )));
+        }
+        if !canonical.resource_id.is_empty() {
+            return Err(ApiError::bad_request(
+                "sandbox envelope resource_id must be empty for create",
+            ));
+        }
+        let now_secs = Utc::now().timestamp();
+        if canonical.expires_at <= now_secs {
+            return Err(ApiError::bad_request(format!(
+                "sandbox envelope already expired (expires_at={}, now={})",
+                canonical.expires_at, now_secs
+            )));
+        }
     }
 
     // generate sealId + agentSeal

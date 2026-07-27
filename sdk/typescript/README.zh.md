@@ -82,7 +82,7 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // 私钥（0x…）或 viem Account；有它就能写
-  attestorUrl: process.env.ATTESTOR_URL,  // 管容器 + 看部署进度都要（deploy/clone/启停/reset/listDeployments）
+  attestorUrl: process.env.ATTESTOR_URL,  // 管容器 + 看部署进度都要（deploy/clone/启停/reset/retry/waitForRunning/listDeployments）
   // rpcUrl 可选——默认 0G Galileo 测试网 RPC
 });
 ```
@@ -144,6 +144,9 @@ const params = {
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
 // `{ wait: 'running' }` 会连【provision】一起等，并返回可直接访问的 base url：
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url 此刻可用
+// 仅 mint——省略 `sandbox` 就只铸造、不起容器：agent 落 Offline（已铸造、无运行时），
+// 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:true：
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: true });
 
 // 或者先拿 sealId、稍后再等（或轮询）铸造：
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -192,16 +195,20 @@ await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → 交易哈
 **运行时启停**（owner 签名，身份不变）：
 
 ```ts
-await ag.agent.stop(sealId, sandboxId);     // 停容器
-await ag.agent.start(sealId, sandboxId);    // 重新拉起
-await ag.agent.reset(sealId, { apiKey });   // 重建容器：从链上重读 iData、重选框架适配器。
+await ag.agent.stop(sealId, sandboxId);     // 停一个 running 容器
+await ag.agent.start(sealId, sandboxId);    // 恢复一个已 stop 的容器
+await ag.agent.start(sealId, { apiKey });   // 首次 provision：给 mint-only / 从未起过容器的 agent
+                                            // 起一个全新容器（apiKey 事实必传）——sandbox-less
+                                            // deploy 的语义搭档，跟 reset（重建已有）区分开。
+await ag.agent.reset(sealId, { apiKey });   // 重建一个已有容器：从链上重读 iData、重选框架适配器。
                                             // apiKey 事实必传——attestor 不缓存模型密钥，
                                             // 不传的话 agent 能起来但调不了模型。
                                             // sealedImage 可选，缺省从 /config 取当前镜像名。
 await ag.agent.listDeployments();
 // → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
 //   phase：'deploying'（在途）| 'running'（服务中）| 'stopped'（owner 主动停，可 start 回来）
-//         | 'offline'（容器没了——失败/超时/转让拆除；链上身份还在，reset 重建）| 'failed'（铸造失败，retry）；
+//         | 'offline'（没有 running 容器——首次未 provision(mint-only 部署)/失败/超时/转让拆除；
+//           链上身份还在，用 start({apiKey}) 首次起、或 reset 重建）| 'failed'（铸造失败，retry）；
 //   url：agent 的公网基址（喂给 sayHi/authenticate/聊天 API 的那个），容器起来前是 null；
 //   lastProvisionError：部署失败的原因——容器 provision 失败（如 "image_hash not in
 //   validFrameworkHashes"）或铸造/存储管线失败（如 "mint submit: … replacement transaction

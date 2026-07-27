@@ -131,6 +131,11 @@ export class AgentApi {
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
   async deploy(params: DeployParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+    if (opts?.wait === 'running' && !params.sandbox) {
+      throw new Error(
+        "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:true",
+      );
+    }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
     if (!opts?.wait) return accepted;
@@ -379,9 +384,20 @@ export class AgentApi {
   stop(sealId: Hash, sandboxId: string): Promise<void> {
     return this.attestor.lifecycle('stop', { sealId, sandboxId });
   }
-  /** Start a stopped agent's sandbox (owner-signed). */
-  start(sealId: Hash, sandboxId: string): Promise<void> {
-    return this.attestor.lifecycle('start', { sealId, sandboxId });
+  /**
+   * Bring an agent's container online (owner-signed). Two shapes:
+   *  - `start(sealId, sandboxId)` — resume a STOPPED container.
+   *  - `start(sealId, { apiKey, sealedImage? })` — FIRST provision of a
+   *    mint-only / never-provisioned agent (no sandbox yet): spins a fresh
+   *    container. `apiKey` is required in practice (the fresh container needs
+   *    the LLM key). The semantic counterpart to a sandbox-less `deploy` —
+   *    use this, not `reset` (which means "recreate an existing container").
+   */
+  start(sealId: Hash, sandboxId: string): Promise<void>;
+  start(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void>;
+  start(sealId: Hash, arg?: string | { sealedImage?: string; apiKey?: string }): Promise<void> {
+    if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
+    return this.attestor.lifecycle('start', { sealId, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
