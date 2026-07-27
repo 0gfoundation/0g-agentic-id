@@ -245,7 +245,10 @@ export class AttestorClient {
     const { account } = requireWallet(this.ctx);
     const ttl = params.envelopeTtlSec ?? 180;
     let envelope;
-    if (op === 'reset') {
+    // `reset`, OR a first-time `start` of a never-provisioned (mint-only)
+    // agent: both spin a FRESH container via the `create` envelope. A `start`
+    // WITH a sandboxId resumes an existing (stopped) container instead.
+    if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
       const snapshot = await this.resolveSealedImage(params.sealedImage);
       envelope = await this.signEnvelope(
         'create',
@@ -261,6 +264,8 @@ export class AttestorClient {
       if (!params.sandboxId) throw new Error(`${op}: sandboxId is required`);
       envelope = await this.signEnvelope(op, params.sandboxId, {}, ttl);
     }
+    // A no-sandboxId `start` still POSTs /start; the attestor dispatches on the
+    // envelope action (create → fresh provision, start → resume).
     const path = op === 'reset' ? '/reset' : `/${op}`;
     const res = await fetch(`${this.baseUrl()}${path}`, {
       method: 'POST',
