@@ -139,7 +139,7 @@ Service exposure is a runtime capability, not a framework feature, and registeri
 **Facts you can't infer, so hold them:**
 
 - `path` must start with `/api/` and must not shadow a platform path (`/hello`, `/healthz`, `/_seal/*`, `/log*`).
-- `backend` must be loopback (`http://127.0.0.1:<port>` or `http://localhost:<port>`); an off-box backend is rejected, so every service is genuinely served from inside this sandbox.
+- `backend` must be loopback (`http://127.0.0.1:<port>` or `http://localhost:<port>`) — **host:port ONLY, no path**; an off-box backend is rejected, so every service is genuinely served from inside this sandbox. Do NOT put the service path in `backend` (not `http://127.0.0.1:<port>/api/foo`): the runtime appends the request path when forwarding, so a path in `backend` double-prefixes into `/api/foo/api/foo` and your backend 404s. Registration now rejects a `backend` that carries a path.
 - Your backend receives the **full registered path** (`/api/foo`, not `/`) — the runtime does not strip the prefix. Implement your handler at the path you registered.
 - POST is **overwrite**: send the complete list each time; `GET /services` reads it back. Registration is runtime state — re-register on boot; it's lost on rebuild. For capability that survives rebuild / transfer, package it under one of your framework's chain-tracked paths (see the injected persistent-state notes) and register its handler.
 - `input_example`, when set, must be valid JSON; the deploy console feeds it to a copy-ready `curl`, so a wrong one misleads callers.

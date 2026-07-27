@@ -123,8 +123,10 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  framework: 'openclaw',                           // 用哪个框架；必须是 attestor GET /config 宣告的名字
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // 用哪个模型；可选，不传默认 0g-compute/0gm-1.0-35b-a3b
+  framework: 'openclaw',                           // 'openclaw' | 'hermes'——必须是 GET /config 宣告的名字。
+                                                   // hermes 要用自己的镜像：设 sandbox.sealedImage:'0g-sealed-hermes'（见框架一节）。
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // 用哪个模型；可选，不传默认 0g-compute/0gm-1.0-35b-a3b。
+                                                   // provider 目前实际以 '0g-compute'（0G 路由）为准；选 model 前先 ag.agent.listModels() 看实时目录。
   //   这两个字段只是 defaultIData() 的输入。要自己完全掌控铸造内容，
   //   就传 iData: [...] 代替它们（见下方 iData 格式一节）。
   sandbox: {
@@ -339,7 +341,7 @@ iData: [
 
 **persona 是一次性种子，不是长期数据**：上面的 framework + persona 是**铸造输入**；agent 跑起来后，sealed 运行时把 persona 翻译进框架自己的配置，并持续把**自己命名的条目**密封上链（openclaw 是 `framework` / `openclaw.json` / `workspace/`；链上 Update 是整数组替换）。所以在**存活 agent** 的 `intelligentDatasOf` 里按 `role === 'persona'` 精确匹配会扑空——role 集合以运行时实际密封的为准。
 
-**attestor 不校验什么**：除了框架**名字**（必须在 `/config.supported_frameworks` 里），deploy 的 iData 内容有意不做校验——铸什么是 owner 的自由，内容能不能跑起来是 **sealed 运行时的契约**。当前 sealed 镜像内置 openclaw 适配器，persona 种子支持的 `inference.provider`：`anthropic` / `openai` / `0g-compute`（0G 路由）。路由的实时模型目录：
+**attestor 不校验什么**：除了框架**名字**（必须在 `/config.supported_frameworks` 里），deploy 的 iData 内容有意不做校验——铸什么是 owner 的自由，内容能不能跑起来是 **sealed 运行时的契约**。sealed 镜像内置两个框架适配器——**openclaw**（默认镜像 `0g-sealed`）和 **hermes**（镜像 `0g-sealed-hermes`——deploy **和** reset 都要传 `sandbox.sealedImage: '0g-sealed-hermes'`，否则起错镜像、服务 404）。用 `framework: 'openclaw' | 'hermes'` 选，名字必须在 `/config.supported_frameworks` 里。openclaw 的 persona 种子支持的 `inference.provider`：`anthropic` / `openai` / `0g-compute`（0G 路由）。路由的实时模型目录：
 
 ```ts
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
