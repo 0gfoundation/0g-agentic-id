@@ -113,8 +113,11 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  framework: 'openclaw',                           // which framework; must be a name the attestor's GET /config advertises
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
+  framework: 'openclaw',                           // 'openclaw' | 'hermes' — must be a name GET /config advertises.
+                                                   // hermes needs its own image: set sandbox.sealedImage:'0g-sealed-hermes' (see framework section).
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b.
+                                                   // provider is effectively '0g-compute' (the 0G router) today; run ag.agent.listModels()
+                                                   // first to see the router's live catalog before picking `model`.
   // ↑ these two are just inputs to defaultIData(). For full control over
   //   the minted content, pass iData: [...] instead (see the iData section).
   sandbox: {
@@ -352,10 +355,14 @@ live agent's `intelligentDatasOf` will find nothing.
 **What the attestor does NOT check**: beyond the framework *name* (must be
 in `/config.supported_frameworks`), deploy iData content is unvalidated by
 design — minting is the owner's freedom; whether the content actually
-boots is the **sealed runtime's contract**. Today's sealed image bundles
-the **openclaw** adapter, whose persona seed supports `inference.provider`
-of `anthropic`, `openai`, or `0g-compute` (the 0G router). For the router's
-live model catalog:
+boots is the **sealed runtime's contract**. The sealed images bundle two
+framework adapters — **openclaw** (default image `0g-sealed`) and **hermes**
+(image `0g-sealed-hermes` — pass `sandbox.sealedImage: '0g-sealed-hermes'` at
+deploy *and* reset, or the agent boots the wrong image and 404s). Pick with
+`framework: 'openclaw' | 'hermes'`; the name must be in
+`/config.supported_frameworks`. openclaw's persona seed supports
+`inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
+router). For the router's live model catalog:
 
 ```ts
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
