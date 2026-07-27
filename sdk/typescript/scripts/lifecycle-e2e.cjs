@@ -161,7 +161,8 @@ function mkClient(privKey, cfg) {
 
   // ── 2. feedback: B (non-owner) rates the running source agent ─────────
   console.log('· giveFeedback() — wallet B rates the agent with its live ServeProof…');
-  const header = curlHelloHeader(AGENT_URL);
+  let header = null;
+  for (let i = 0; i < 8 && !header; i++) { header = curlHelloHeader(AGENT_URL); if (!header) await sleep(8000); }
   check('live ServeProof captured from /hello', !!header);
   const proof = A.reputation.parseServeProofHeader(header);
   check('proof names the source agent', proof.agentId === AGENT_ID, `proof.agentId=${proof.agentId}`);
