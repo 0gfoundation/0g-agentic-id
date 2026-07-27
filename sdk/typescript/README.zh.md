@@ -144,6 +144,9 @@ const params = {
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
 // `{ wait: 'running' }` 会连【provision】一起等，并返回可直接访问的 base url：
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url 此刻可用
+// 仅 mint——省略 `sandbox` 就只铸造、不起容器：agent 落 Offline（已铸造、无运行时），
+// 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:true：
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: true });
 
 // 或者先拿 sealId、稍后再等（或轮询）铸造：
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }

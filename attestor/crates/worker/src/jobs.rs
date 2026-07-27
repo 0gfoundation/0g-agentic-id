@@ -752,7 +752,7 @@ async fn handle_deploy(
     name: String,
     description: String,
     image: Option<String>,
-    sandbox_envelope: SandboxEnvelope,
+    sandbox_envelope: Option<SandboxEnvelope>,
 ) -> anyhow::Result<()> {
     // WYSIWYS: the owner-signed i_data is encrypted and minted verbatim —
     // no synthesis, no per-role merging. The deploy edge already enforced
@@ -852,13 +852,21 @@ async fn handle_deploy(
         seal_id,
     };
 
-    // Fire three concurrent tracks.
+    // Fire storage + mint concurrently. The container track runs ONLY when a
+    // sandbox envelope was provided; mint-only (envelope=None) skips provision
+    // entirely — the agent lands Offline (container_stage stays NotStarted),
+    // brought online later via /start.
     let storage_fut = run_storage_track(ctx, seal_id, &artifacts);
     let mint_fut = run_mint_track(ctx, seal_id, mint_params);
-    let container_fut = run_container_track(ctx, seal_id, &sandbox_envelope);
 
-    let (storage_res, mint_res, container_res) =
-        tokio::join!(storage_fut, mint_fut, container_fut);
+    let (storage_res, mint_res, container_res) = if let Some(env) = &sandbox_envelope {
+        let container_fut = run_container_track(ctx, seal_id, env);
+        let (s, m, c) = tokio::join!(storage_fut, mint_fut, container_fut);
+        (s, m, Some(c))
+    } else {
+        let (s, m) = tokio::join!(storage_fut, mint_fut);
+        (s, m, None::<anyhow::Result<()>>)
+    };
 
     // Identity vs runtime: only storage/mint constitute the on-chain
     // IDENTITY. A container-track failure must NOT fail the deploy — the

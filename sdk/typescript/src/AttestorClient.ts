@@ -104,8 +104,11 @@ export interface DeployParams {
   /** Inference pin for the SDK-built default persona (defaults to
    *  0g-compute/0gm-1.0-35b-a3b). Ignored when you pass your own `iData`. */
   inference?: { provider: string; model: string };
-  /** Sandbox "create" payload the attestor relays to the provider. */
-  sandbox: {
+  /** Sandbox "create" payload the attestor relays to the provider. OPTIONAL:
+   *  omit it entirely to MINT WITHOUT provisioning a container — the agent
+   *  lands Offline (minted, no runtime), brought online later via start().
+   *  The "mint-only" deploy. */
+  sandbox?: {
     /** The sealed runtime image name (0g-sandbox's own field is called
      *  `snapshot`; the SDK sends it verbatim under that wire name).
      *  Omit (or pass '') to use the attestor /config's current image —
@@ -205,7 +208,7 @@ export class AttestorClient {
   }
 
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
-  private async sandboxEnvelope(sandbox: DeployParams['sandbox'], ttlSec: number) {
+  private async sandboxEnvelope(sandbox: NonNullable<DeployParams['sandbox']>, ttlSec: number) {
     const snapshot = await this.resolveSealedImage(sandbox.sealedImage);
     return this.signEnvelope(
       'create',
@@ -342,7 +345,11 @@ export class AttestorClient {
       i_data: iData,
     });
     const ownerSig = await walletClient.signMessage({ account, message: canonical });
-    const sandbox_envelope = await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180);
+    // Provision only when a sandbox is given; omit it → mint-only deploy
+    // (attestor mints, no container — the agent lands Offline).
+    const sandbox_envelope = params.sandbox
+      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180)
+      : undefined;
 
     return this.post('/deploy', {
       idempotency_key: idempotencyKey,
@@ -353,7 +360,7 @@ export class AttestorClient {
       description: params.description,
       image: params.image ?? null,
       i_data: iData,
-      sandbox_envelope,
+      ...(sandbox_envelope ? { sandbox_envelope } : {}),
     });
   }
 

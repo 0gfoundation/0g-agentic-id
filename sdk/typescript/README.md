@@ -135,6 +135,10 @@ const params = {
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
 // `{ wait: 'running' }` also blocks on PROVISION and returns the reachable base url:
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url now hittable
+// Mint-only — omit `sandbox` to mint WITHOUT a container: the agent lands
+// Offline (minted, no runtime), bring it online later with start(). No
+// container means no url, so wait:'running' is rejected here — use wait:true:
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: true });
 
 // Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }

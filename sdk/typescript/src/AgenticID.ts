@@ -131,6 +131,11 @@ export class AgentApi {
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
   async deploy(params: DeployParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+    if (opts?.wait === 'running' && !params.sandbox) {
+      throw new Error(
+        "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:true",
+      );
+    }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
     if (!opts?.wait) return accepted;
