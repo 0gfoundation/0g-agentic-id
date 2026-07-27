@@ -72,7 +72,7 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
-  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/listDeployments)
+  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments)
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
 ```
@@ -184,6 +184,24 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 // send native gas to the agent's own key so it can self-fund its on-chain writes
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
+
+// runtime start / stop / reset (owner-signed; on-chain identity preserved):
+await ag.agent.stop(sealId, sandboxId);     // stop a running container
+await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
+await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
+                                            // never-provisioned agent online with a fresh
+                                            // container (apiKey required in practice). The
+                                            // semantic counterpart to a sandbox-less deploy;
+                                            // distinct from reset ("recreate an EXISTING one").
+await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
+                                            // from chain, reselect the framework adapter.
+                                            // apiKey required in practice (attestor doesn't
+                                            // cache the model key); sealedImage optional.
+await ag.agent.listDeployments();
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+//   phase: 'deploying' | 'running' | 'stopped' (owner-stopped, start() to resume)
+//        | 'offline' (no running container — never provisioned (mint-only) / failure / timeout /
+//          transfer-teardown; on-chain identity persists, use start({apiKey}) or reset) | 'failed'
 ```
 
 **Which identifier does what** — three IDs refer to the same agent from different angles:
