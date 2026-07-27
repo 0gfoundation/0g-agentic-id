@@ -139,8 +139,11 @@ const params = {
 // 第一个 await 在 attestor 受理任务时就返回；tokenId 要等后台铸造
 // （存储 → 链上 mint → setAgentURI）完成才存在。
 
-// 一步到位——`{ wait: true }` 阻塞到铸造完成，直接拿 tokenId（agentId）：
+// `{ wait: true }` 只阻塞到链上【铸造】完成——你拿到 agentId，但容器（和它的
+// url）还要 ~1-2 分钟才好，所以别急着用 url：
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+// `{ wait: 'running' }` 会连【provision】一起等，并返回可直接访问的 base url：
+const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url 此刻可用
 
 // 或者先拿 sealId、稍后再等（或轮询）铸造：
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -156,7 +159,14 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // 不会重复铸造）：
 // await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
-// transfer——ERC-7857 转让；attestor 在转让时拆除旧 owner 的运行时
+// transfer——ERC-7857 转让。旧 owner 容器的拆除是【异步】的：attestor 靠监听
+// 链上事件（indexer）来拆，所以会比交易慢一个 indexer 追块延迟。转让刚上链时
+// phase 可能还是 'running'，接着 '400'，最后才 'offline'——这不是 bug、也不是
+// 安全漏洞：链上权限门在转让那一刻立刻归新 owner（旧 owner 再也控制不了它，见
+// TRUST_MODEL），残留容器只是个够不着的空壳、正在被清理。转让后别拿 phase 当准，
+// 等到 'offline'，或直接让新 owner reset()/start() 一个新容器（身份不变）。这个
+// 靠 indexer 监听的拆除是【必须保留的兜底】：任何人都能直接在链上 transferFrom、
+// 绕开任何"先停"的路径，所以拆除只能是被动响应式的。
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → 交易哈希 "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → 交易哈希 "0x…"
 

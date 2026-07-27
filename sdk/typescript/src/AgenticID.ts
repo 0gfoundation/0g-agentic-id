@@ -60,6 +60,9 @@ export interface DeployAccepted {
   agentSealAddr: Address;
 }
 type MintedResponse = DeployAccepted & { agentId: bigint };
+/** deploy/clone result once the container is up (`{ wait: 'running' }`) — adds
+ *  the reachable base url, which `{ wait: true }` (mint-only) does not have yet. */
+type RunningResponse = MintedResponse & { url: string };
 
 function acceptedOf(res: DeployCloneResponse): DeployAccepted {
   return { sealId: res.seal_id, agentSealAddr: res.agent_seal_addr };
@@ -124,12 +127,16 @@ export class AgentApi {
    * attestor accepts the job. Pass `{ wait: true }` to also block on the
    * background mint (via waitForMint) and get the new `agentId` in the result.
    */
+  deploy(params: DeployParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
   deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+  async deploy(params: DeployParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
     if (!opts?.wait) return accepted;
+    // wait:true → block on the on-chain mint only (agentId, no url yet).
+    // wait:'running' → also block on provision (container up + reachable url).
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
@@ -139,13 +146,15 @@ export class AgentApi {
    * `{ sealId, agentSealAddr }` on acceptance; `{ wait: true }` also blocks on
    * the mint and returns the new `agentId`.
    */
+  clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
   clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
   clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+  async clone(params: CloneParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
     const accepted = acceptedOf(await this.attestor.clone(params));
     if (!opts?.wait) return accepted;
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
@@ -430,6 +439,42 @@ export class AgentApi {
       if (agentId !== 0n) return agentId;
       if (Date.now() >= deadline) {
         throw new Error(`waitForMint: seal ${sealId} not minted within ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+
+  /**
+   * Wait for a freshly-deployed/cloned agent's CONTAINER to come up, returning
+   * its agentId + reachable base url. {@link deploy}/{@link clone} with
+   * `{ wait: true }` only block on the on-chain mint — the agentId exists but
+   * the container (and its url) is still 1–2 min out; `{ wait: 'running' }`
+   * routes here to also block on provision. Polls {@link listDeployments};
+   * throws on `phase: "failed"` or timeout (default 300s, longer than mint
+   * because provision includes container start).
+   */
+  async waitForRunning(
+    sealId: Hash,
+    opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
+  ): Promise<{ agentId: bigint; url: string }> {
+    const timeoutMs = opts.timeoutMs ?? 300_000;
+    const pollIntervalMs = opts.pollIntervalMs ?? 5_000;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let row: Awaited<ReturnType<AgentApi['listDeployments']>>[number] | undefined;
+      try {
+        row = (await this.listDeployments()).find((r) => r.sealId === sealId);
+      } catch {
+        // transient attestor hiccup — treat as "not ready yet" and keep polling
+      }
+      if (row?.phase === 'running' && row.url && row.agentId != null) {
+        return { agentId: row.agentId, url: row.url };
+      }
+      if (row?.phase === 'failed') {
+        throw new Error(`waitForRunning: seal ${sealId} failed — ${row.lastProvisionError ?? 'unknown'}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`waitForRunning: seal ${sealId} not running within ${timeoutMs}ms (phase=${row?.phase ?? '?'})`);
       }
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }

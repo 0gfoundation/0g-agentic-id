@@ -130,8 +130,11 @@ const params = {
 // The first await returns once the attestor ACCEPTS the job; the tokenId doesn't
 // exist until the background mint (storage → on-chain mint → setAgentURI).
 
-// One-shot — `{ wait: true }` blocks on the mint and hands back the tokenId (agentId):
+// `{ wait: true }` blocks on the on-chain MINT only — you get the agentId, but the
+// container (and its url) is still ~1-2 min out, so don't reach for the url yet:
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+// `{ wait: 'running' }` also blocks on PROVISION and returns the reachable base url:
+const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url now hittable
 
 // Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -147,7 +150,17 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // returns the existing deploy/clone instead of minting a duplicate):
 // await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
-// transfer — ERC-7857; the attestor tears down the old owner's runtime on transfer
+// transfer — ERC-7857. Teardown of the old owner's container is ASYNC: the
+// attestor reaps it by watching the chain (indexer), so it lags the tx by the
+// indexer's catch-up delay. Right after transfer, phase may still read
+// 'running', then '400', then 'offline' — not a bug and not a security gap:
+// the on-chain owner-gate flips to the new owner at once (the old owner can no
+// longer control it — see TRUST_MODEL), the lingering container is just an
+// unreachable husk being cleaned up. Don't gate on phase right after transfer;
+// wait for 'offline', or let the new owner reset()/start() a fresh container
+// (identity persists). The indexer-watched reap is the backstop that stays:
+// anyone can transferFrom directly on chain, bypassing any "stop-first" path,
+// so teardown must be reactive.
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → tx hash "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → tx hash "0x…"
 
