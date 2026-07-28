@@ -95,8 +95,10 @@ function matchRoute(routes: AgentRoute[], path: string): AgentRoute | undefined 
 /**
  * Consume an OpenAI-compatible SSE `chat/completions` stream and reassemble it
  * into a single {@link ChatCompletion}. Concatenates every `choices[0].delta`
- * content fragment; ignores SSE comment/keepalive lines and the terminal
- * `data: [DONE]`. Tolerant of frames split across network reads.
+ * content fragment — falling back to `reasoning_content` for a delta that
+ * carries only that (a reasoning model streams its answer there), so a
+ * pure-reasoning reply isn't returned empty. Ignores SSE comment/keepalive
+ * lines and the terminal `data: [DONE]`. Tolerant of frames split across reads.
  */
 async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
   const reader = body.getReader();
@@ -117,9 +119,12 @@ async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<Chat
         const chunk = JSON.parse(data) as Record<string, unknown>;
         last = chunk;
         const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
-        const delta = choice?.delta as { role?: string; content?: string } | undefined;
+        const delta = choice?.delta as { role?: string; content?: string; reasoning_content?: string } | undefined;
         if (delta?.role) role = delta.role;
-        if (typeof delta?.content === 'string') content += delta.content;
+        const piece = typeof delta?.content === 'string' ? delta.content
+                    : typeof delta?.reasoning_content === 'string' ? delta.reasoning_content
+                    : '';
+        content += piece;
       } catch {
         // Non-JSON keepalive payload — ignore.
       }

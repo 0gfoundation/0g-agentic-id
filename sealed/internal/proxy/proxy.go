@@ -417,6 +417,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Legacy fallback: an adapter that declares no routes keeps the old
 	// behaviour — forward every path to the upstream and sign every response.
 	signed := true
+	frameworkRoute := false // true only for a framework-declared route match
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
@@ -430,6 +431,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		signed = rt.Signed
+		frameworkRoute = true
 		// A route may pin its own loopback backend (a framework whose
 		// surfaces are separate processes/ports); empty keeps the single
 		// StartResult upstream. Same mechanism as svc.Backend above.
@@ -483,13 +485,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// SSE streams can't be buffered + signed: the serve-proof signs a complete
+	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
 	// body, which a stream doesn't have until it ends. Relay it verbatim with
 	// per-chunk flushing so tokens reach the caller in real time — the same
-	// unsigned carve-out as the WebSocket upgrades above. This is what keeps a
-	// long reasoning turn alive: bytes keep flowing, so no idle-timeout window
+	// unsigned carve-out as the WebSocket upgrades above. This keeps a long
+	// reasoning turn alive: bytes keep flowing, so no idle-timeout window
 	// (framework SSE deltas + keepalives) ever opens on the connection.
-	if isEventStream(resp) {
+	//
+	// Gated on frameworkRoute, NOT on Content-Type alone: only a
+	// framework-declared route (the owner↔agent steering channel — chat/UI) may
+	// go unsigned. An agent-registered /api/* service (the outward, attributable
+	// surface) and the legacy forward-all path must stay buffered + signed, so
+	// they never lose their X-Agent-Proof merely by emitting text/event-stream —
+	// even if that means a long /api/* stream is buffered (and can still hit the
+	// idle cutoff; model such a service as short, discrete responses instead).
+	if shouldStreamRelay(frameworkRoute, resp) {
 		streamRelay(w, resp)
 		return
 	}
@@ -534,12 +544,26 @@ func isEventStream(resp *http.Response) bool {
 	return strings.HasPrefix(ct, "text/event-stream")
 }
 
+// shouldStreamRelay decides whether a response is relayed as an unsigned stream
+// rather than buffered + signed. Only a framework-declared route (the
+// owner↔agent steering channel: chat/UI) may stream: it has no attribution
+// consumer, so an unsigned stream is fine. Agent-registered /api/* services and
+// the legacy forward-all path never stream here — they stay buffered + signed
+// so the attributable surface keeps its X-Agent-Proof even when it emits SSE.
+func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
+	return frameworkRoute && isEventStream(resp)
+}
+
 // streamRelay copies an SSE upstream response straight through to the client,
 // flushing after every chunk so each `data:` frame reaches the caller as the
 // framework emits it. It carries no X-Agent-Proof: the serve-proof signs a
 // complete body, which a stream does not have until it ends (same carve-out as
 // WebSocket upgrades). A caller that needs an attributable, on-chain-replayable
 // ServeProof uses the non-streaming (buffered + signed) path instead.
+//
+// Caveat: status + headers are committed at WriteHeader (200) before any body
+// byte, so an upstream error mid-stream can only truncate the body — it can't
+// change the status. That is inherent to streaming, not specific to this relay.
 func streamRelay(w http.ResponseWriter, resp *http.Response) {
 	for k, vs := range resp.Header {
 		// corsMiddleware already set our Access-Control-*; duplicates make
@@ -556,7 +580,18 @@ func streamRelay(w http.ResponseWriter, resp *http.Response) {
 	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 
-	flusher, _ := w.(http.Flusher)
+	// NewResponseController unwraps middleware ResponseWriters to find the
+	// flusher, so a wrapper that forgets to forward Flush() doesn't silently
+	// re-buffer us. Flush the headers now so the client sees the response start
+	// immediately, independent of when the first upstream chunk lands.
+	rc := http.NewResponseController(w)
+	canFlush := rc.Flush() == nil
+	if !canFlush {
+		// No flusher in the chain: writes buffer to the end, re-opening the
+		// idle-timeout window we came here to avoid. Surface it rather than
+		// degrade silently.
+		logger.Logf("proxy: WARN SSE relay cannot flush (no http.Flusher in the writer chain); stream will buffer and may hit the upstream idle timeout")
+	}
 	buf := make([]byte, 16*1024)
 	for {
 		n, rerr := resp.Body.Read(buf)
@@ -564,8 +599,8 @@ func streamRelay(w http.ResponseWriter, resp *http.Response) {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return // client went away
 			}
-			if flusher != nil {
-				flusher.Flush()
+			if canFlush {
+				_ = rc.Flush()
 			}
 		}
 		if rerr != nil {

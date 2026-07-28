@@ -2,12 +2,81 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+// respWriterNoFlush implements http.ResponseWriter but NOT http.Flusher (and
+// offers no Unwrap), to exercise streamRelay's fallback when nothing in the
+// writer chain can flush.
+type respWriterNoFlush struct {
+	hdr  http.Header
+	buf  bytes.Buffer
+	code int
+}
+
+func (w *respWriterNoFlush) Header() http.Header {
+	if w.hdr == nil {
+		w.hdr = http.Header{}
+	}
+	return w.hdr
+}
+func (w *respWriterNoFlush) Write(b []byte) (int, error) { return w.buf.Write(b) }
+func (w *respWriterNoFlush) WriteHeader(code int)        { w.code = code }
+
+func sseResp() *http.Response {
+	return &http.Response{Header: http.Header{"Content-Type": {"text/event-stream"}}}
+}
+func jsonResp() *http.Response {
+	return &http.Response{Header: http.Header{"Content-Type": {"application/json"}}}
+}
+
+// The ① invariant from review: only a framework-declared route may stream
+// (unsigned). An agent /api/* service or the legacy forward-all path
+// (frameworkRoute == false) must NOT stream, so its SSE response falls through
+// to the buffered + signed path and keeps its X-Agent-Proof.
+func TestShouldStreamRelay_OnlyFrameworkRoutes(t *testing.T) {
+	cases := []struct {
+		name string
+		fw   bool
+		resp *http.Response
+		want bool
+	}{
+		{"framework route + SSE → stream", true, sseResp(), true},
+		{"framework route + JSON → buffered", true, jsonResp(), false},
+		{"agent /api/* service + SSE → buffered+signed", false, sseResp(), false},
+		{"legacy forward-all + SSE → buffered+signed", false, sseResp(), false},
+	}
+	for _, c := range cases {
+		if got := shouldStreamRelay(c.fw, c.resp); got != c.want {
+			t.Errorf("%s: shouldStreamRelay(%v, …) = %v, want %v", c.name, c.fw, got, c.want)
+		}
+	}
+}
+
+// ② fallback: with no flusher in the chain, streamRelay must NOT panic and must
+// still relay every byte (it just can't flush incrementally).
+func TestStreamRelay_NoFlusherStillRelaysVerbatim(t *testing.T) {
+	const payload = "data: hi\n\ndata: [DONE]\n\n"
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": {"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(payload)),
+	}
+	w := &respWriterNoFlush{}
+	streamRelay(w, resp) // must not panic even though w has no Flusher
+
+	if w.code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.code)
+	}
+	if got := w.buf.String(); got != payload {
+		t.Errorf("relayed = %q, want verbatim %q", got, payload)
+	}
+}
 
 func TestIsEventStream(t *testing.T) {
 	cases := []struct {
