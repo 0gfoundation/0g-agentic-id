@@ -93,6 +93,57 @@ function matchRoute(routes: AgentRoute[], path: string): AgentRoute | undefined 
 }
 
 /**
+ * Consume an OpenAI-compatible SSE `chat/completions` stream and reassemble it
+ * into a single {@link ChatCompletion}. Concatenates every `choices[0].delta`
+ * content fragment; ignores SSE comment/keepalive lines and the terminal
+ * `data: [DONE]`. Tolerant of frames split across network reads.
+ */
+async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let content = '';
+  let role = 'assistant';
+  let last: Record<string, unknown> = {};
+
+  const consumeFrame = (frame: string) => {
+    for (const line of frame.split('\n')) {
+      const t = line.replace(/^﻿/, '').trimStart();
+      // Skip SSE comments (":...") and non-data fields ("event:", "id:", ...).
+      if (!t.startsWith('data:')) continue;
+      const data = t.slice(5).trim();
+      if (data === '' || data === '[DONE]') continue;
+      try {
+        const chunk = JSON.parse(data) as Record<string, unknown>;
+        last = chunk;
+        const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
+        const delta = choice?.delta as { role?: string; content?: string } | undefined;
+        if (delta?.role) role = delta.role;
+        if (typeof delta?.content === 'string') content += delta.content;
+      } catch {
+        // Non-JSON keepalive payload — ignore.
+      }
+    }
+  };
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let sep: number;
+    // SSE events are delimited by a blank line ("\n\n"); "\r\n\r\n" tolerated.
+    while ((sep = buf.search(/\r?\n\r?\n/)) !== -1) {
+      const end = sep + (buf[sep] === '\r' ? 4 : 2);
+      consumeFrame(buf.slice(0, sep));
+      buf = buf.slice(end);
+    }
+  }
+  if (buf.trim()) consumeFrame(buf); // flush a trailing frame with no blank line
+
+  return { ...last, choices: [{ message: { role, content } }] } as ChatCompletion;
+}
+
+/**
  * Build an {@link AgentClient} from a credential and the agent's declared
  * surface. `open`/`chat` are attached only when a matching route exists, so
  * their presence is itself a capability signal.
@@ -132,13 +183,27 @@ export function makeAgentClient(params: {
     session.chat = async (messages, opts) => {
       // OpenAI-compatible convention: the completions endpoint sits at
       // `<prefix>chat/completions` (prefix ends with "/").
+      //
+      // Request `stream: true` so the response flows as SSE. A reasoning turn
+      // can take minutes; a buffered (non-streaming) reply sends no bytes until
+      // it finishes, so an idle-timeout hop in front of the agent (e.g. a load
+      // balancer, ~60s) cuts the connection. Streaming keeps bytes flowing, so
+      // the turn survives regardless of how long it runs. We still reassemble
+      // the full completion and return it, so the method's contract is
+      // unchanged. Streamed responses carry no X-Agent-Proof — for an
+      // attributable, on-chain-replayable ServeProof, POST with stream:false.
       const r = await session.fetch(`${chat.prefix}chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: opts?.model ?? 'default', messages }),
+        body: JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true }),
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
-      return (await r.json()) as ChatCompletion;
+      const ct = r.headers.get('content-type') ?? '';
+      if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
+        // Server ignored `stream` (or a proxy that can't stream): plain JSON.
+        return (await r.json()) as ChatCompletion;
+      }
+      return collectChatStream(r.body);
     };
   }
 

@@ -234,7 +234,7 @@ await ag.agent.listDeployments();
 
 ## `ag.reputation` —— 服务证明 + 评价
 
-每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。唯一的不变量是挡在前面的 **sealed 代理**：无论 agent 服务什么，代理都会在每个响应上盖 `X-Agent-Proof` 头。所以 SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
+每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。不变量是挡在前面的 **sealed 代理**：它在每个**整包(buffered)**响应上盖 `X-Agent-Proof` 头——这是可归属的 API 面。**流式**响应(SSE `stream: true` 的 chat、或 WebSocket)**不带** proof:签名覆盖的是完整 body,而流在结束前没有完整 body,所以这类响应原样透传、不签名。因此 `capture` 要在**非流式**调用上读那个头。SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -406,7 +406,11 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // 已发布框架都是 chat-only,目前没有:
   if (session.open) window.location.href = session.open();
 
-  // headless 聊天 —— 只有当 agent 声明了 chat 路由时才有：
+  // headless 聊天 —— 只有当 agent 声明了 chat 路由时才有。
+  // 底层默认走流式(`stream: true`):长推理任务期间字节持续流动,不会被
+  // agent 前面某一跳的 idle 超时掐断;SDK 会把完整回复重新拼好返回,所以
+  // 这里的用法不变。流式回复**不带** `X-Agent-Proof`——要可归属 / 可上链
+  // 的 ServeProof,请用非流式(`stream: false`)调用。
   if (session.chat) {
     const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content —— 真实推理回复

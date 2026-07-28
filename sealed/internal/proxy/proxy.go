@@ -483,6 +483,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// SSE streams can't be buffered + signed: the serve-proof signs a complete
+	// body, which a stream doesn't have until it ends. Relay it verbatim with
+	// per-chunk flushing so tokens reach the caller in real time — the same
+	// unsigned carve-out as the WebSocket upgrades above. This is what keeps a
+	// long reasoning turn alive: bytes keep flowing, so no idle-timeout window
+	// (framework SSE deltas + keepalives) ever opens on the connection.
+	if isEventStream(resp) {
+		streamRelay(w, resp)
+		return
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "read upstream body: "+err.Error(), http.StatusBadGateway)
@@ -510,6 +521,56 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// ── Server-Sent Events (streaming) helpers ──────────────────────────────────
+
+// isEventStream reports whether the upstream response is a Server-Sent Events
+// stream (an OpenAI-compatible `chat/completions` with `stream: true`, or any
+// other `text/event-stream` body).
+func isEventStream(resp *http.Response) bool {
+	ct := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+// streamRelay copies an SSE upstream response straight through to the client,
+// flushing after every chunk so each `data:` frame reaches the caller as the
+// framework emits it. It carries no X-Agent-Proof: the serve-proof signs a
+// complete body, which a stream does not have until it ends (same carve-out as
+// WebSocket upgrades). A caller that needs an attributable, on-chain-replayable
+// ServeProof uses the non-streaming (buffered + signed) path instead.
+func streamRelay(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		// corsMiddleware already set our Access-Control-*; duplicates make
+		// browsers reject the response.
+		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	// No Content-Length: length is unknown until the stream ends. Go falls
+	// back to chunked transfer-encoding, which is what SSE needs.
+	w.Header().Del("Content-Length")
+	w.WriteHeader(resp.StatusCode)
+
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client went away
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr != nil {
+			return // io.EOF (clean end) or upstream error — nothing left to relay
+		}
 	}
 }
 

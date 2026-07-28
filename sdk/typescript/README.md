@@ -221,7 +221,7 @@ Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentS
 
 ## `ag.reputation` — serve-proof + feedback
 
-Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The single invariant is the **sealed proxy** in front of it: whatever the agent serves, the proxy stamps an `X-Agent-Proof` header on every response. So the SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
+Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it: it stamps an `X-Agent-Proof` header on every **buffered** response — the attributable API surface. Streaming responses (an SSE `stream: true` chat, or a WebSocket) carry **no** proof: a signature covers a complete body, which a stream doesn't have until it ends, so these are relayed unsigned. `capture` therefore reads the header on a non-streaming call. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -451,7 +451,13 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // is absent:
   if (session.open) window.location.href = session.open();
 
-  // Chat headlessly — present ONLY if the agent declares a chat route:
+  // Chat headlessly — present ONLY if the agent declares a chat route.
+  // Streams under the hood (`stream: true`), so a long reasoning turn keeps
+  // bytes flowing and never trips an idle-timeout hop in front of the agent;
+  // the full completion is reassembled and returned, so this shape is
+  // unchanged. A streamed reply carries no `X-Agent-Proof` — for an
+  // attributable / on-chain-replayable ServeProof, call the endpoint
+  // non-streaming (`stream: false`) instead.
   if (session.chat) {
     const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content — a real inference reply
