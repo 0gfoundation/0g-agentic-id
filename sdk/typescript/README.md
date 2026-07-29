@@ -489,6 +489,15 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   const r = await agent.fetch('/v1/models');
   // …or capture the serve-proof in one call (the agent's /api/* services):
   const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
+
+  // Owner-only: read the agent's OWN process log (the framework subprocess's
+  // stdout/stderr, served at /log/agent). Present only when this ag holds the
+  // owner key — like chat, except it signs the wallet on every call (a fresh
+  // URL-bound `0GSealLog` owner signature), so a shared token isn't enough.
+  if (agent.logs) {
+    const tail = await agent.logs({ tail: 200 }); // last 200 lines; omit for the whole log
+    console.log(tail);
+  }
   ```
 
   The presence of `chat` / `chatStream` is itself the capability signal. Being

@@ -266,11 +266,17 @@ export class AgentApi {
   async client(idOrUrl: bigint | string): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
-    const agentId = typeof idOrUrl === 'bigint' ? idOrUrl : disc.agentId;
-    const reauth = agentId !== undefined && this.hasAccount()
-      ? () => this.mintToken(base, agentId)
-      : undefined;
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth });
+    const fromUrl = typeof idOrUrl === 'string';
+    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
+    // this URL via chain before this handle could ever sign for it.
+    if (fromUrl && agentId !== undefined && this.hasAccount()) {
+      await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    const owner = agentId !== undefined && this.hasAccount();
+    const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
+    const logAuth = owner ? () => this.signOwner('0GSealLog', base, agentId!) : undefined;
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth });
   }
 
   /**
@@ -282,12 +288,19 @@ export class AgentApi {
     requireWallet(this.ctx);
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
-    const agentId = typeof idOrUrl === 'bigint' ? idOrUrl : disc.agentId;
+    const fromUrl = typeof idOrUrl === 'string';
+    const agentId = fromUrl ? disc.agentId : idOrUrl;
     if (agentId === undefined) {
       throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
     }
+    // #62: reject a lying /hello (URL claims someone else's agentId) before signing.
+    if (fromUrl) await this.assertAgentIdBoundToUrl(agentId, base);
     const token = await this.mintToken(base, agentId); // eager → throws if not owner
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes, token, reauth: () => this.mintToken(base, agentId) });
+    return makeAgentClient({
+      base, services: disc.services, routes: disc.routes, token,
+      reauth: () => this.mintToken(base, agentId),
+      logAuth: () => this.signOwner('0GSealLog', base, agentId),
+    });
   }
 
   /**
@@ -301,18 +314,54 @@ export class AgentApi {
     return makeAgentClient({ base, services: disc.services, routes: disc.routes }); // no reauth → public
   }
 
-  /** Sign `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchange it at `{base}/_seal/auth` for a token. */
-  private async mintToken(base: string, agentId: bigint): Promise<string> {
+  /**
+   * Sign an owner control message `<tag>:<sealId>:<ts>:<audience>` (EIP-191).
+   * `audience` is the agent's serve base — issue #62 binds the signature to the
+   * endpoint it's meant for, so it can't be relayed to a different agent that
+   * happens to share the owner. Shared by {@link mintToken} (tag `0GSealAuth`)
+   * and the `/log/agent` reader (tag `0GSealLog`).
+   */
+  private async signOwner(tag: string, base: string, agentId: bigint): Promise<{ message: string; signature: string }> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
-    const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
+    // Audience is the origin (scheme://host[:port]) — that's what the runtime
+    // composes as its own public URL, so a base carrying a path still matches.
+    const audience = new URL(base).origin;
+    const message = `${tag}:${sealId}:${Math.floor(Date.now() / 1000)}:${audience}`;
     const signature = await walletClient.signMessage({ account, message });
+    return { message, signature };
+  }
+
+  /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
+  private async mintToken(base: string, agentId: bigint): Promise<string> {
+    const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);
     const r = await fetch(`${base}/_seal/auth`, {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
     return ((await r.json()) as { token: string }).token;
+  }
+
+  /**
+   * #62 defense-in-depth: verify a URL-derived agentId actually belongs to the
+   * URL we're talking to. Resolves the agent's canonical serve origin from chain
+   * (`tokenURI` → AgentCard `url`) and compares to `base`'s origin. A phishing
+   * endpoint whose `/hello` claims someone else's agentId is rejected here,
+   * before we sign anything for it. (The audience-bound signature also makes the
+   * real agent reject a relayed signature server-side — this just fails fast
+   * with a clear reason.)
+   */
+  private async assertAgentIdBoundToUrl(agentId: bigint, base: string): Promise<void> {
+    const chainOrigin = await this.resolveAgentUrl(agentId); // already an origin
+    const gotOrigin = new URL(base).origin;
+    if (chainOrigin.toLowerCase() !== gotOrigin.toLowerCase()) {
+      throw new Error(
+        `agentId/URL mismatch (possible phishing, issue #62): the endpoint at ${gotOrigin} ` +
+          `claims to be agent ${agentId}, but chain says agent ${agentId} serves at ${chainOrigin}. ` +
+          `Refusing to sign an owner message.`,
+      );
+    }
   }
 
   /** Resolve the serve base URL: a bigint agentId via on-chain tokenURI; a string URL as-is. */

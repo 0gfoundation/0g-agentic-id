@@ -216,8 +216,8 @@ type VersionReconciler interface {
 
 // SubprocessLogProvider is implemented by adapters that pipe their agent
 // process's stdout/stderr to a known file. proxy serves it live on
-// /log/agent (and the legacy /log/openclaw alias). Without this, the
-// subprocess log pages report "not available".
+// /log/agent (owner-only). Without this, the subprocess log pages report
+// "not available".
 type SubprocessLogProvider interface {
 	SubprocessLogPath() string
 }

@@ -105,6 +105,15 @@ export interface AgentClient {
    *   for await (const delta of client.chatStream(msgs)) process.stdout.write(delta);
    */
   chatStream?(messages: ChatMessage[], opts?: { model?: string }): AsyncGenerator<string>;
+  /**
+   * Present only when this handle holds the owner key: fetch the agent's own
+   * process log (the framework subprocess stdout/stderr the runtime serves at
+   * `/log/agent`). Owner-private — each call signs a fresh `0GSealLog` owner
+   * message bound to this agent's URL (audience-bound, see issue #62), so unlike
+   * `chat` it needs the wallet, not just a token. Returns the log as text; pass
+   * `tail` to keep only the last N lines.
+   */
+  logs?(opts?: { tail?: number }): Promise<string>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -195,7 +204,9 @@ async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<Chat
  *     present, the client can do owner ops; it mints the token lazily on first
  *     use and re-mints once on a 401 (the agent rotated it, e.g. after a reset).
  *   - `token` — a token to start from (optional; `reauth` still refreshes it).
- * With neither, the client is public: only `fetch` / `fetchWithProof`, which
+ *   - `logAuth` — signs a fresh `0GSealLog` owner message (for `/log/agent`).
+ *     Present only when the handle holds a wallet; gates `logs`.
+ * With none, the client is public: only `fetch` / `fetchWithProof`, which
  * never attach a token (the `/api/*` surface isn't owner-gated). Owner ops
  * (`chat`/`chatStream`) are attached iff the agent declares the route
  * AND the client can authenticate — that presence is the capability signal.
@@ -206,6 +217,7 @@ export function makeAgentClient(params: {
   routes: AgentRoute[];
   token?: string;
   reauth?: () => Promise<string>;
+  logAuth?: () => Promise<{ message: string; signature: string }>;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
   const { services, routes, reauth } = params;
@@ -297,6 +309,25 @@ export function makeAgentClient(params: {
         const d = chunkDelta(chunk);
         if (d.content) yield d.content;
       }
+    };
+  }
+
+  // Owner-only: read the agent's own process log. Gated on the wallet-backed
+  // signer (not `canAuth`) — /log/agent verifies a per-request owner signature,
+  // so a client holding only a shared bearer token can't read logs.
+  if (params.logAuth) {
+    const logAuth = params.logAuth;
+    client.logs = async (opts) => {
+      const { message, signature } = await logAuth();
+      const r = await fetch(`${base}/log/agent`, {
+        headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      });
+      if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${await r.text()}`);
+      const text = await r.text();
+      if (opts?.tail && opts.tail > 0) {
+        return text.split('\n').slice(-opts.tail).join('\n');
+      }
+      return text;
     };
   }
 

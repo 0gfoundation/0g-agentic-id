@@ -90,7 +90,7 @@ function mk(priv, cfg) {
   const dep = await A.agent.deploy({
     name: 'XferSrc', description: 'transfer-live source',
     sandbox: { sealedImage, apiKey: API_KEY },
-  }, { wait: true });
+  }, { wait: 'running' });
   const agentId = dep.agentId;
   const sealId = await A.agent.getSealId(agentId);
   console.log(`  source agentId=${agentId} seal=${sealId}`);
