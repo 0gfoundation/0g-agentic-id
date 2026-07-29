@@ -443,7 +443,9 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and returns
   an **`AgentClient`**: the owner credential plus the agent's declared
   surface, with affordances derived from what the agent declared — no
-  framework-specific knowledge baked into the SDK.
+  framework-specific knowledge baked into the SDK. Or call
+  `authenticate(agentId)` (identity only) — the SDK resolves the URL on chain
+  (`tokenURI` → the AgentCard's serve `url`), no attestor needed.
 
   ```ts
   const session = await ag.agent.authenticate(agentUrl, agentId);
@@ -486,9 +488,10 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 
 - **No-auth connect (third party)** — `ag.agent.connect(agentUrl)` returns the
   same **`AgentClient`** without any signature, discovered from the agent's
-  `/hello`. It carries no token, so the owner-only `open`/`chat`/`chatStream`
-  are absent; you call the agent's public `/api/*` services with the same
-  relative-path idiom and capture the proof in one step:
+  `/hello`. Takes an `agentUrl` or an `agentId` (resolved on chain, like
+  `authenticate`). It carries no token, so the owner-only
+  `open`/`chat`/`chatStream` are absent; you call the agent's public `/api/*`
+  services with the same relative-path idiom and capture the proof in one step:
 
   ```ts
   const agent = await ag.agent.connect(agentUrl);            // no wallet needed

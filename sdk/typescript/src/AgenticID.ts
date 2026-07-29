@@ -262,32 +262,25 @@ export class AgentApi {
    * A headless agent (no dashboard) simply won't have `open`; an agent with
    * no chat route won't have `chat`. Nothing is ever synthesized.
    */
-  async authenticate(agentUrl: string, agentId: bigint): Promise<AgentClient> {
+  async authenticate(agentId: bigint): Promise<AgentClient>;
+  async authenticate(agentUrl: string, agentId: bigint): Promise<AgentClient>;
+  async authenticate(a: string | bigint, b?: bigint): Promise<AgentClient> {
+    // Identity-first form `authenticate(agentId)` resolves the URL on chain;
+    // `authenticate(agentUrl, agentId)` uses the URL you already have.
+    const agentId = typeof a === 'bigint' ? a : (b as bigint);
+    const base = (typeof a === 'bigint' ? await this.resolveAgentUrl(a) : a).replace(/\/$/, '');
+
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
     const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
     const signature = await walletClient.signMessage({ account, message });
-    const base = agentUrl.replace(/\/$/, '');
     const r = await fetch(`${base}/_seal/auth`, {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
     const { token } = (await r.json()) as { token: string };
-
-    // Discover the agent's declared surface. `routes`/`services` are absent
-    // on pre-route sealed builds — degrade to an empty surface (fetch still
-    // works; open/chat just won't be offered).
-    let services: AgentServiceEntry[] = [];
-    let routes: AgentRoute[] = [];
-    try {
-      const hello = (await (await fetch(`${base}/hello`)).json()) as {
-        services?: AgentServiceEntry[]; routes?: AgentRoute[];
-      };
-      services = hello.services ?? [];
-      routes = hello.routes ?? [];
-    } catch { /* discovery is best-effort; token still usable via fetch */ }
-
+    const { services, routes } = await this.discoverSurface(base);
     return makeAgentClient({ base, token, services, routes });
   }
 
@@ -300,19 +293,52 @@ export class AgentApi {
    * proof }`), but the owner-only affordances `open` / `chat` are absent (they
    * need the owner token). Symmetric with {@link authenticate}, minus the
    * signature — no wallet required.
+   *
+   * Pass an `agentId` to resolve the URL on chain, or an `agentUrl` you already
+   * have.
    */
-  async connect(agentUrl: string): Promise<AgentClient> {
-    const base = agentUrl.replace(/\/$/, '');
-    let services: AgentServiceEntry[] = [];
-    let routes: AgentRoute[] = [];
+  async connect(agentIdOrUrl: string | bigint): Promise<AgentClient> {
+    const base = (typeof agentIdOrUrl === 'bigint'
+      ? await this.resolveAgentUrl(agentIdOrUrl)
+      : agentIdOrUrl).replace(/\/$/, '');
+    const { services, routes } = await this.discoverSurface(base);
+    return makeAgentClient({ base, token: '', services, routes });
+  }
+
+  /**
+   * Resolve an agent's live serve base URL from its on-chain identity — no
+   * attestor. Reads `tokenURI(agentId)` (the canonical AgentCard pointer on 0G
+   * storage), fetches the card, and returns the origin of its `url` (the serve
+   * endpoint, refreshed on storage as the container is (re)created). Throws if
+   * the agent isn't provisioned yet (no URI, or a card with no url).
+   */
+  private async resolveAgentUrl(agentId: bigint): Promise<string> {
+    const uri = await this.id.tokenURI(agentId);
+    if (!uri) throw new Error(`agent ${agentId}: no on-chain URI yet (not provisioned)`);
+    let card: Record<string, unknown>;
+    try {
+      card = (await (await fetch(uri)).json()) as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(`agent ${agentId}: fetch AgentCard (${uri}) failed: ${(e as Error).message}`);
+    }
+    const cardUrl = typeof card.url === 'string' ? card.url : '';
+    if (!cardUrl) throw new Error(`agent ${agentId}: AgentCard has no serve url (not running)`);
+    return new URL(cardUrl).origin;
+  }
+
+  /**
+   * Read the agent's `/hello` to learn its declared surface. Absent on
+   * pre-route sealed builds → empty surface (fetch/fetchWithProof still work).
+   */
+  private async discoverSurface(base: string): Promise<{ services: AgentServiceEntry[]; routes: AgentRoute[] }> {
     try {
       const hello = (await (await fetch(`${base}/hello`)).json()) as {
         services?: AgentServiceEntry[]; routes?: AgentRoute[];
       };
-      services = hello.services ?? [];
-      routes = hello.routes ?? [];
-    } catch { /* discovery is best-effort; fetch/fetchWithProof still work */ }
-    return makeAgentClient({ base, token: '', services, routes });
+      return { services: hello.services ?? [], routes: hello.routes ?? [] };
+    } catch {
+      return { services: [], routes: [] }; // best-effort; fetch/fetchWithProof still work
+    }
   }
 
   // — runtime: interacting with a live agent —

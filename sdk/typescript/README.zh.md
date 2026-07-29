@@ -397,7 +397,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   - `services` —— agent 自己注册的端点（精确 `/api/*` 路径）：`{ path, method, description?, input_example? }`。直接发 HTTP，每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
   - `routes` —— 框架声明的前缀：`{ prefix, kind?, auth?, signed, description? }`，例如 `/v1/` 上 `kind:"chat"` API（auth `bearer`）。`auth` 告诉你怎么带 owner token，`signed` 说明该前缀上的响应带不带 `X-Agent-Proof`。已发布的框架都是 chat-only；框架可以声明 UI route，但目前没有。
 
-- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回一个 **`AgentClient`**：owner 凭证 + agent 声明的接口面，能做什么完全由 agent 的声明推导出来，SDK 不写死任何框架特定知识。
+- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回一个 **`AgentClient`**：owner 凭证 + agent 声明的接口面，能做什么完全由 agent 的声明推导出来，SDK 不写死任何框架特定知识。也可以只传 `authenticate(agentId)`——SDK 会在链上解析出 URL(`tokenURI` → AgentCard 的 serve `url`),不需要 attestor。
 
   ```ts
   const session = await ag.agent.authenticate(agentUrl, agentId);
@@ -433,7 +433,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 
   `open` / `chat` / `chatStream` 存不存在,本身就是能力信号(它们需要 owner token)。已发布框架都是 chat-only。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
 
-- **免 auth connect(第三方)** —— `ag.agent.connect(agentUrl)` 不签名、从 agent 的 `/hello` 发现,返回同一个 **`AgentClient`**。它不带 token,所以 owner 专属的 `open`/`chat`/`chatStream` 都没有;你用同样的相对路径手感调 agent 的公开 `/api/*` service,并一步取证:
+- **免 auth connect(第三方)** —— `ag.agent.connect(agentUrl)` 不签名、从 agent 的 `/hello` 发现,返回同一个 **`AgentClient`**。可传 `agentUrl` 或 `agentId`(后者同 `authenticate`,链上解析)。它不带 token,所以 owner 专属的 `open`/`chat`/`chatStream` 都没有;你用同样的相对路径手感调 agent 的公开 `/api/*` service,并一步取证:
 
   ```ts
   const agent = await ag.agent.connect(agentUrl);            // 不需要钱包
