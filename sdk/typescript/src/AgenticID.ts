@@ -548,8 +548,8 @@ export class AgentApi {
   /**
    * Wait for a freshly-deployed/cloned agent's CONTAINER to come up, returning
    * its agentId + reachable base url. {@link deploy}/{@link clone} with
-   * `{ wait: true }` only block on the on-chain mint — the agentId exists but
-   * the container (and its url) is still 1–2 min out; `{ wait: 'running' }`
+   * `wait: 'minted'` only block on the on-chain mint — the agentId exists but
+   * the container (and its url) is still 1–2 min out; `wait: 'running'`
    * routes here to also block on provision. Polls {@link listDeployments};
    * throws on `phase: "failed"` or timeout (default 300s, longer than mint
    * because provision includes container start).
