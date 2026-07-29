@@ -226,16 +226,18 @@ Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the p
 ```ts
 import { keccak256, toBytes } from 'viem';
 
-const agentUrl = 'https://<agent-serve-endpoint>';   // wherever the agent's container serves
-
-// 1. call the agent + capture the serve-proof (you shape the request; the SDK only
-//    reads the X-Agent-Proof header the sealed proxy stamps on the response)
-const { response, proof } = await ag.reputation.capture(() =>
-  fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
+// 1. call one of the agent's signed /api/* services and capture its serve-proof.
+//    A public handle needs no wallet; `fetchWithProof` reads the X-Agent-Proof
+//    the sealed proxy stamps on /api/* responses. (The chat route is NOT signed
+//    — reputation comes from the agent's own /api/* services, not from chatting.)
+const agent = await ag.agent.connect(agentId);        // public handle; or ag.agent.client(agentId)
+const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
+});
 const data = await response.json();                   // your normal response body
 // proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
-// (equivalent: ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue))
+// low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
 // 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData)
 await ag.reputation.verifyProof(proof);
@@ -396,14 +398,16 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
 ## Interacting with a running agent (no console needed)
 
-**Where `agentUrl` comes from** — every running agent has a public base URL
-(scheme and host are deployment-specific: the dev proxy serves plain http,
-the hosted environment https). `listDeployments()` hands it to you:
+**You usually don't need the URL** — `ag.agent.client(agentId)` (and
+`authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
+serve `url`). Reach for `listDeployments()` when you want the URL explicitly or
+to see deploy **status** (phase, `lastProvisionError`). It needs `attestorUrl`
+(that status lives in the attestor's DB, not on chain) — no wallet/signature:
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-// me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
-const agentUrl = me.url;               // null until the container is provisioned
+// me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError } | undefined
+const agentUrl = me?.url;               // null until the container is provisioned
 // If phase never reaches 'running' (or ends 'failed'), me.lastProvisionError
 // says why — container-provision failures (e.g. "image_hash not in
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint

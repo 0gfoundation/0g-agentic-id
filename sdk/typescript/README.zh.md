@@ -239,17 +239,17 @@ await ag.agent.listDeployments();
 ```ts
 import { keccak256, toBytes } from 'viem';
 
-// agent 的公网基址来自 listDeployments() 返回行的 url 字段（详见"与运行中的 agent 交互"一节）：
-const { url: agentUrl } = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-
-// 1. 调用 agent + 捕获服务证明（请求由你自己组织；SDK 只读
-//    sealed 代理盖在响应上的 X-Agent-Proof 头）
-const { response, proof } = await ag.reputation.capture(() =>
-  fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
+// 1. 调用 agent 某个签名的 /api/* service,并一步取证。public 句柄不需要钱包;
+//    fetchWithProof 读 sealed 代理盖在 /api/* 响应上的 X-Agent-Proof。
+//    (chat 路由【不签名】——声誉来自 agent 自己的 /api/* service,不是聊天。)
+const agent = await ag.agent.connect(agentId);        // public 句柄;或 ag.agent.client(agentId)
+const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
+});
 const data = await response.json();                   // 正常的业务响应体
 // proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
-// （等价入口：ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue)）
+// 底层逃生舱(请求全由你自己组织):ag.reputation.capture(() => fetch(…))
 
 // 2. 花 gas 之前先验证（签名者 == 链上 agentSeal、未过期、dataHashes ⊆ 链上 iData）
 await ag.reputation.verifyProof(proof);
@@ -373,11 +373,11 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + 该 agent 的进�
 
 ## 与运行中的 agent 交互（无需控制台）
 
-**agentUrl 从哪来**——每个运行中的 agent 都有一个公网基址（协议和域名取决于部署环境：dev 代理是 http，托管环境是 https），`listDeployments()` 直接给你：
+**通常你根本不需要 URL**——`ag.agent.client(agentId)`(以及 `authenticate`/`connect`)会在链上解析出来(`tokenURI` → AgentCard 的 serve `url`)。想显式拿 URL、或看部署**状态**(phase、`lastProvisionError`)时才用 `listDeployments()`;它需要 `attestorUrl`(状态存在 attestor 的库里、不在链上)、**不需要钱包/签名**:
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-const agentUrl = me.url;   // 容器起来前是 null
+const agentUrl = me?.url;   // 容器起来前是 null;find 可能 undefined,用 ?. 兜住
 // 到不了 running 就看 me.lastProvisionError——它写着原因。
 
 // phase 是 'failed' 时先 retry()、别重新 deploy（重 deploy 会孤儿掉已铸造的身份）。
