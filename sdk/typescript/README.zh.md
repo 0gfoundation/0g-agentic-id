@@ -397,53 +397,45 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   - `services` —— agent 自己注册的端点（精确 `/api/*` 路径）：`{ path, method, description?, input_example? }`。直接发 HTTP，每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
   - `routes` —— 框架声明的前缀：`{ prefix, kind?, auth?, signed, description? }`，例如 `/v1/` 上 `kind:"chat"` API（auth `bearer`）。`auth` 告诉你怎么带 owner token，`signed` 说明该前缀上的响应带不带 `X-Agent-Proof`。已发布的框架都是 chat-only；框架可以声明 UI route，但目前没有。
 
-- **owner 握手** —— `ag.agent.authenticate(agentUrl, agentId)` 证明你是链上 owner（EIP-191 签 `0GSealAuth:<sealId>:<ts>`，到 `POST {agentUrl}/_seal/auth` 换取，`<ts>` 须在 ±300 秒内），返回一个 **`AgentClient`**：owner 凭证 + agent 声明的接口面，能做什么完全由 agent 的声明推导出来，SDK 不写死任何框架特定知识。也可以只传 `authenticate(agentId)`——SDK 会在链上解析出 URL(`tokenURI` → AgentCard 的 serve `url`),不需要 attestor。
+- **`ag.agent.client(agentId)`** —— 一个句柄(`AgentClient`)通吃所有调用方。能不能做 owner 操作,**继承自 `ag`**——就像 `ag` 的 account 决定能不能写链一样:带 owner key 的 `ag` → 有 `chat`/`chatStream`(owner token 按需铸造、轮换后自动重铸,你从不手动传/续 token);只读的 `ag` → 一个 public client(对 agent 的 `/api/*` service 用 `fetch`/`fetchWithProof`)。可传 `agentId`(链上 `tokenURI` → AgentCard 的 serve `url` 解析出地址,不需要 attestor)或你已有的 `agentUrl`。
 
   ```ts
-  const session = await ag.agent.authenticate(agentUrl, agentId);
-  // session.token            —— owner/operator 凭证（完整权限）
-  // session.routes/.services —— 声明的接口面（同 /hello）
+  const agent = await ag.agent.client(agentId);
+  // agent.routes / agent.services —— 声明的接口面(同 /hello)
 
-  // 浏览器打开 UI —— 只有当 agent 声明了 UI(token-fragment)路由时才有;
-  // 已发布框架都是 chat-only,目前没有:
-  if (session.open) window.location.href = session.open();
-
-  // headless 聊天 —— 只有当 agent 声明了 chat 路由时才有。
+  // 聊天 —— 只有当 agent 声明了 chat 路由、且这个 ag 有 key 时才有。
   // 底层默认走流式(`stream: true`):长推理任务期间字节持续流动,不会被
-  // agent 前面某一跳的 idle 超时掐断;SDK 会把完整回复重新拼好返回,所以
-  // 这里的用法不变。chat 是 owner↔agent 的操舵通道,**不签名**(无
-  // `X-Agent-Proof`)——声誉来自 agent 自己的 `/api/*` service,而不是
-  // owner 跟自己 agent 对话。
-  if (session.chat) {
-    const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
+  // agent 前面某一跳的 idle 超时掐断;SDK 会把完整回复重新拼好返回。
+  // chat 是 owner↔agent 的操舵通道,**不签名**(无 `X-Agent-Proof`)——
+  // 声誉来自 agent 自己的 `/api/*` service,而不是跟自己 agent 对话。
+  if (agent.chat) {
+    const { choices } = await agent.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content —— 真实推理回复
   }
 
   // 逐 token 实时版 —— 条件同 chat;yield 出每个内容增量:
-  if (session.chatStream) {
-    for await (const delta of session.chatStream([{ role: 'user', content: 'Hi' }]))
+  if (agent.chatStream) {
+    for await (const delta of agent.chatStream([{ role: 'user', content: 'Hi' }]))
       process.stdout.write(delta);
   }
 
-  // 通用逃生舱 —— 任何声明过的路径都能打；匹配到的路由要 bearer 时自动带 token：
-  const r = await session.fetch('/v1/models');
+  // 通用逃生舱 —— 任何声明过的路径都能打;匹配到的路由要 bearer、且 ag 能鉴权时自动带 token:
+  const r = await agent.fetch('/v1/models');
   // …或一步到位调用 + 取证(用于 agent 的 /api/* service):
-  const { response, proof } = await session.fetchWithProof('/api/summarize', { method: 'POST', body });
+  const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
   ```
 
-  `open` / `chat` / `chatStream` 存不存在,本身就是能力信号(它们需要 owner token)。已发布框架都是 chat-only。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
+  `chat` / `chatStream` 存不存在,本身就是能力信号。**你到底是不是 owner,只在真正跑 owner 操作时才验证**(非 owner 调 chat 会抛错);`/hello` 和 `/api/*` 不受影响。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
 
-- **免 auth connect(第三方)** —— `ag.agent.connect(agentUrl)` 不签名、从 agent 的 `/hello` 发现,返回同一个 **`AgentClient`**。可传 `agentUrl` 或 `agentId`(后者同 `authenticate`,链上解析)。它不带 token,所以 owner 专属的 `open`/`chat`/`chatStream` 都没有;你用同样的相对路径手感调 agent 的公开 `/api/*` service,并一步取证:
+- **`authenticate` / `connect`** 是 `client()` 之上的两个有主张的快捷方式:`ag.agent.authenticate(agentId)` **提前**把 owner token 铸出来(非 owner 当场失败,不拖到第一次 chat),需要钱包;`ag.agent.connect(agentId | agentUrl)` 是显式的 **public** 句柄(永不带 token),给第三方调 `/api/*` + 取证用:
 
   ```ts
-  const agent = await ag.agent.connect(agentUrl);            // 不需要钱包
-  const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+  const pub = await ag.agent.connect(agentId);               // 不需要钱包
+  const { proof } = await pub.fetchWithProof('/api/summarize', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
   if (proof) { /* 验证它,或作为链上 feedback 提交 */ }
   ```
-
-  于是 owner 和第三方共用**同一套**交互面——token 只决定哪些能力点亮。
 
 openclaw token 生命周期：容器首次启动时生成，跨重启保持稳定（chat 会话保持鉴权）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
 
@@ -565,8 +557,8 @@ const sandboxId = me.sandboxId;
 // 3. 验证身份 + 对话
 const { verification } = await ag.agent.sayHi(agentUrl);   // 返回 ProofVerification | null（响应没带证明头时为 null）
 if (!verification?.ok) throw new Error(verification ? verification.reasons.join('; ') : '响应没有 X-Agent-Proof 头');
-const session = await ag.agent.authenticate(agentUrl, agentId);
-// → session.chat?.(msgs) 聊天、session.open?.() 开 UI(仅当框架声明 UI route)、session.fetch(path) 打任意声明的路径（见正文示例）
+const agent = await ag.agent.client(agentId);
+// → agent.chat?.(msgs) 聊天、agent.chatStream?.(msgs) 逐 token、agent.fetch(path) / agent.fetchWithProof(path) 打任意声明的路径（见正文示例）
 
 // 4. 服务 + 评价闭环（proof 的 deadline 是 +3600 秒，1 小时内上链即可）。
 //    需要环境有 ReputationRegistry（看 /config 的 reputation_registry_addr）——

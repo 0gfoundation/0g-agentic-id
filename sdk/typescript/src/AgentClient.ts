@@ -6,13 +6,14 @@
  * to an agent's base URL plus the agent's own declaration of what it exposes
  * (the `services` and `routes` arrays from its signed `/hello`). It knows
  * nothing framework-specific — it decides how to attach the credential and
- * which affordances (`open`/`chat`/`chatStream`) to offer purely from what the
- * agent declared. Adding a framework, or an endpoint, needs no SDK change.
+ * which affordances (`chat`/`chatStream`) to offer purely from what the agent
+ * declared. Adding a framework, or an endpoint, needs no SDK change.
  *
  * The same handle serves both callers, the difference being only the token:
- *   - owner (`authenticate`) carries the owner token → `open`/`chat` available;
- *   - third party (`connect`) carries no token → calls the agent's public
- *     `/api/*` services via `fetch`/`fetchWithProof` and captures the proof.
+ *   - owner (with a signer) → the owner token is minted on demand → `chat`/
+ *     `chatStream` available;
+ *   - third party (no signer) → no token → calls the agent's public `/api/*`
+ *     services via `fetch`/`fetchWithProof` and captures the proof.
  */
 
 import { proofFromResponse } from './ServeSession';
@@ -40,7 +41,7 @@ export interface AgentRoute {
   prefix: string;
   /** discovery hint, e.g. "dashboard" | "chat" */
   kind?: string;
-  /** how to present the token: "token-fragment" | "bearer" | "none" */
+  /** how to present the token: "bearer" | "none" */
   auth?: string;
   signed: boolean;
   description?: string;
@@ -57,14 +58,18 @@ export interface ChatCompletion {
 }
 
 /**
- * A live handle to an agent. Always carries `base`, the declared
- * `services`/`routes`, and a `token` ("" for a no-auth/third-party handle).
- * `fetch`/`fetchWithProof` work for any path. `open`/`chat`/`chatStream` are
- * present only when the agent declares a matching route AND this handle holds
- * the owner token (they are owner affordances).
+ * A live handle to an agent. Always carries `base` and the declared
+ * `services`/`routes`. Owner affordances (`chat`/`chatStream`) are
+ * present only when this handle can authenticate — i.e. it was built with a
+ * signer (the `ag` that made it holds an owner key) AND the agent declares the
+ * matching route. Their tokens are managed internally: minted on first use and
+ * re-minted automatically if the agent rotates them (e.g. after a `reset`), so
+ * you never pass or refresh a token by hand. `fetch`/`fetchWithProof` work for
+ * any path and never need a token for the public `/api/*` surface. `token`
+ * reflects the currently-cached credential, if any.
  */
 export interface AgentClient {
-  readonly token: string;
+  readonly token?: string;
   readonly base: string;
   readonly services: AgentServiceEntry[];
   readonly routes: AgentRoute[];
@@ -84,13 +89,6 @@ export interface AgentClient {
    * carries none (e.g. the unsigned owner↔agent chat route).
    */
   fetchWithProof(path: string, init?: RequestInit): Promise<{ response: Response; proof: ServeProof | null }>;
-  /**
-   * Present only if the agent declares a `token-fragment` route (typically a
-   * dashboard) and this handle holds the owner token. Returns a
-   * browser-openable URL with the token in the URL fragment. `path` overrides
-   * which path to open (default: the route prefix).
-   */
-  open?(path?: string): string;
   /**
    * Present only if the agent declares a `kind: "chat"` route and this handle
    * holds the owner token. POSTs an OpenAI-shaped chat request to
@@ -191,34 +189,60 @@ async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<Chat
 }
 
 /**
- * Build an {@link AgentClient} from a base URL, a token (`""` for a no-auth
- * third-party handle), and the agent's declared surface. `open`/`chat`/
- * `chatStream` are attached only when a matching route exists AND a token is
- * present, so their presence is itself a capability signal.
+ * Build an {@link AgentClient} from a base URL, the agent's declared surface,
+ * and (optionally) a way to authenticate:
+ *   - `reauth` — mints a fresh owner token (sign + POST `/_seal/auth`). When
+ *     present, the client can do owner ops; it mints the token lazily on first
+ *     use and re-mints once on a 401 (the agent rotated it, e.g. after a reset).
+ *   - `token` — a token to start from (optional; `reauth` still refreshes it).
+ * With neither, the client is public: only `fetch` / `fetchWithProof`, which
+ * never attach a token (the `/api/*` surface isn't owner-gated). Owner ops
+ * (`chat`/`chatStream`) are attached iff the agent declares the route
+ * AND the client can authenticate — that presence is the capability signal.
  */
 export function makeAgentClient(params: {
   base: string;
-  token: string;
   services: AgentServiceEntry[];
   routes: AgentRoute[];
+  token?: string;
+  reauth?: () => Promise<string>;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
-  const { token, services, routes } = params;
+  const { services, routes, reauth } = params;
+  const canAuth = !!(reauth || params.token);
 
-  const doFetch = (path: string, init?: RequestInit) => {
+  let cached: string | undefined = params.token;
+  const ensureToken = async (): Promise<string | undefined> => {
+    if (cached) return cached;
+    if (reauth) cached = await reauth();
+    return cached;
+  };
+
+  const doFetch = async (path: string, init?: RequestInit): Promise<Response> => {
     const rel = path.startsWith('/') ? path : `/${path}`;
     const route = matchRoute(routes, rel);
-    const headers = new Headers(init?.headers);
-    // Attach the bearer only for a bearer route AND when we actually hold a
-    // token — a no-auth handle must not send an empty `Bearer `.
-    if (route?.auth === 'bearer' && token && !headers.has('Authorization')) {
-      headers.set('Authorization', `Bearer ${token}`);
+    const url = `${base}${rel}`;
+    // Attach a bearer only for a bearer route, and never over a caller-set one.
+    const needsBearer = route?.auth === 'bearer' && !new Headers(init?.headers).has('Authorization');
+
+    const send = (tok?: string) => {
+      const headers = new Headers(init?.headers);
+      if (tok) headers.set('Authorization', `Bearer ${tok}`);
+      return fetch(url, { ...init, headers });
+    };
+
+    let res = await send(needsBearer ? await ensureToken() : undefined);
+    // Self-heal: the agent rotated its token (e.g. after a reset) → 401. Drop
+    // the stale cache, re-mint once, and retry. Only when we own the auth.
+    if (res.status === 401 && needsBearer && reauth) {
+      cached = undefined;
+      res = await send(await ensureToken());
     }
-    return fetch(`${base}${rel}`, { ...init, headers });
+    return res;
   };
 
   const client: AgentClient = {
-    token,
+    get token() { return cached; },
     base,
     services,
     routes,
@@ -235,13 +259,8 @@ export function makeAgentClient(params: {
   const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
     JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true });
 
-  const dashboard = routes.find((r) => r.auth === 'token-fragment');
-  if (dashboard && token) {
-    client.open = (path?: string) => `${base}${path ?? dashboard.prefix}#token=${token}`;
-  }
-
   const chat = routes.find((r) => r.kind === 'chat');
-  if (chat && token) {
+  if (chat && canAuth) {
     // OpenAI-compatible convention: completions sit at `<prefix>chat/completions`.
     const path = `${chat.prefix}chat/completions`;
 

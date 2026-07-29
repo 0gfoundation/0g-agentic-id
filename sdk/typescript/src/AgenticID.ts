@@ -239,37 +239,62 @@ export class AgentApi {
   }
 
   /**
-   * The owner handshake: signs `0GSealAuth:<sealId>:<ts>` (EIP-191) and
-   * exchanges it at {agentUrl}/_seal/auth for the gateway credential, then
-   * reads the agent's `/hello` to learn what it exposes. Owner-only — the
-   * container verifies the signer against the on-chain owner cached at
-   * provision.
+   * Get an {@link AgentClient} for a running agent — one handle for every
+   * caller. Whether it can do owner ops is inherited from THIS `ag`, exactly
+   * like {@link AgenticID}'s account gates chain writes:
+   *   - `ag` built with an owner key → the client can `chat`/`chatStream`;
+   *     it mints the owner token lazily on first use and re-mints it on rotation
+   *     (e.g. after a `reset`), so you never pass or refresh a token by hand;
+   *   - read-only `ag` (no key) → a public client: `fetch`/`fetchWithProof`
+   *     against the agent's `/api/*` services, no owner ops.
    *
-   * Returns an {@link AgentClient}: a full owner/operator credential
-   * (`client.token`, not a narrow scope — treat it accordingly) bound to
-   * the agent's own declaration of its surface. The client decides how to
-   * use it from what the agent declared, not from framework-specific
-   * knowledge baked into the SDK:
-   *   - `client.open?.()` — a browser URL with the token in the fragment,
-   *     present only if the agent declares a dashboard route;
-   *   - `client.chat?.(messages)` / `client.chatStream?.(messages)` — an
-   *     OpenAI-compatible chat call, present only if the agent declares a
-   *     chat route;
-   *   - `client.fetch(path, init)` / `client.fetchWithProof(path, init)` —
-   *     the general escape hatch for any path, attaching the bearer token
-   *     when the matched route asks for it.
-   *
-   * A headless agent (no dashboard) simply won't have `open`; an agent with
-   * no chat route won't have `chat`. Nothing is ever synthesized.
+   * Being the ACTUAL owner is verified only when an owner op runs (chat throws
+   * for a non-owner); `/hello` and `/api/*` work regardless. Pass an `agentId`
+   * (URL resolved on chain via `tokenURI`) or an `agentUrl` you already have —
+   * owner ops need the `agentId`, so `client(agentUrl)` alone is public.
+   */
+  async client(agentId: bigint): Promise<AgentClient>;
+  async client(agentUrl: string, agentId?: bigint): Promise<AgentClient>;
+  async client(a: string | bigint, b?: bigint): Promise<AgentClient> {
+    const { agentId, base } = await this.resolveTarget(a, b);
+    const reauth = agentId !== undefined && this.hasAccount()
+      ? () => this.mintToken(base, agentId)
+      : undefined;
+    const { services, routes } = await this.discoverSurface(base);
+    return makeAgentClient({ base, services, routes, reauth });
+  }
+
+  /**
+   * Owner handshake, eager: like {@link client} on an `ag` with a key, but
+   * mints the token up front so a non-owner fails HERE, not at first chat.
+   * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   * Takes an `agentId` (URL resolved on chain) or an `agentUrl` + `agentId`.
    */
   async authenticate(agentId: bigint): Promise<AgentClient>;
   async authenticate(agentUrl: string, agentId: bigint): Promise<AgentClient>;
   async authenticate(a: string | bigint, b?: bigint): Promise<AgentClient> {
-    // Identity-first form `authenticate(agentId)` resolves the URL on chain;
-    // `authenticate(agentUrl, agentId)` uses the URL you already have.
-    const agentId = typeof a === 'bigint' ? a : (b as bigint);
-    const base = (typeof a === 'bigint' ? await this.resolveAgentUrl(a) : a).replace(/\/$/, '');
+    requireWallet(this.ctx);
+    const { agentId, base } = await this.resolveTarget(a, b);
+    if (agentId === undefined) throw new Error('authenticate needs an agentId');
+    const token = await this.mintToken(base, agentId); // eager → throws if not owner
+    const { services, routes } = await this.discoverSurface(base);
+    return makeAgentClient({ base, services, routes, token, reauth: () => this.mintToken(base, agentId) });
+  }
 
+  /**
+   * Explicit public handle — never attaches a token even if this `ag` holds a
+   * key. For a third party calling the agent's `/api/*` services and capturing
+   * the serve-proof (`client.fetchWithProof('/api/…')` → `{ response, proof }`).
+   * Takes an `agentId` (URL resolved on chain) or an `agentUrl`.
+   */
+  async connect(agentIdOrUrl: string | bigint): Promise<AgentClient> {
+    const { base } = await this.resolveTarget(agentIdOrUrl);
+    const { services, routes } = await this.discoverSurface(base);
+    return makeAgentClient({ base, services, routes }); // no reauth → public
+  }
+
+  /** Sign `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchange it at `{base}/_seal/auth` for a token. */
+  private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
     const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
@@ -279,30 +304,18 @@ export class AgentApi {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
-    const { token } = (await r.json()) as { token: string };
-    const { services, routes } = await this.discoverSurface(base);
-    return makeAgentClient({ base, token, services, routes });
+    return ((await r.json()) as { token: string }).token;
   }
 
-  /**
-   * Connect to an agent WITHOUT the owner handshake — for a third party who
-   * wants to call the agent's public `/api/*` services and capture the
-   * serve-proof. Reads the agent's `/hello` to discover its surface and
-   * returns a **token-less** {@link AgentClient}: `fetch` / `fetchWithProof`
-   * work for any path (e.g. `client.fetchWithProof('/api/…')` → `{ response,
-   * proof }`), but the owner-only affordances `open` / `chat` are absent (they
-   * need the owner token). Symmetric with {@link authenticate}, minus the
-   * signature — no wallet required.
-   *
-   * Pass an `agentId` to resolve the URL on chain, or an `agentUrl` you already
-   * have.
-   */
-  async connect(agentIdOrUrl: string | bigint): Promise<AgentClient> {
-    const base = (typeof agentIdOrUrl === 'bigint'
-      ? await this.resolveAgentUrl(agentIdOrUrl)
-      : agentIdOrUrl).replace(/\/$/, '');
-    const { services, routes } = await this.discoverSurface(base);
-    return makeAgentClient({ base, token: '', services, routes });
+  /** Normalize `(agentId | agentUrl[, agentId])` → the numeric id (if any) + base URL. */
+  private async resolveTarget(a: string | bigint, b?: bigint): Promise<{ agentId?: bigint; base: string }> {
+    if (typeof a === 'bigint') return { agentId: a, base: await this.resolveAgentUrl(a) };
+    return { agentId: b, base: a.replace(/\/$/, '') };
+  }
+
+  /** Whether this `ag` holds a signer — so the clients it builds can do owner ops. */
+  private hasAccount(): boolean {
+    return !!(this.ctx.walletClient && this.ctx.account);
   }
 
   /**

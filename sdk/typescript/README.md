@@ -438,71 +438,63 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
     Shipped frameworks are chat-only; a framework could declare a UI route,
     but none currently do.
 
-- **Owner handshake** — `ag.agent.authenticate(agentUrl, agentId)` proves
-  you're the on-chain owner (EIP-191-sign `0GSealAuth:<sealId>:<ts>`,
-  exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and returns
-  an **`AgentClient`**: the owner credential plus the agent's declared
-  surface, with affordances derived from what the agent declared — no
-  framework-specific knowledge baked into the SDK. Or call
-  `authenticate(agentId)` (identity only) — the SDK resolves the URL on chain
-  (`tokenURI` → the AgentCard's serve `url`), no attestor needed.
+- **`ag.agent.client(agentId)`** — one handle (`AgentClient`) for every caller.
+  Whether it can do owner ops is inherited from `ag`, exactly like `ag`'s
+  account gates chain writes: an `ag` with an owner key gets `chat`/`chatStream`
+  (the owner token is minted on demand and re-minted if the agent rotates it —
+  you never pass or refresh a token); a read-only `ag` gets a public client
+  (`fetch`/`fetchWithProof` against the agent's `/api/*` services). Pass an
+  `agentId` (URL resolved on chain via `tokenURI` → the AgentCard's serve
+  `url`, no attestor) or an `agentUrl` you already have.
 
   ```ts
-  const session = await ag.agent.authenticate(agentUrl, agentId);
-  // session.token           — the owner/operator credential (full scope)
-  // session.routes/.services — the declared surface (same as /hello)
+  const agent = await ag.agent.client(agentId);
+  // agent.routes / agent.services — the declared surface (same as /hello)
 
-  // Open a UI in a browser — present ONLY if the agent declares a UI
-  // (token-fragment) route; shipped frameworks are chat-only, so today this
-  // is absent:
-  if (session.open) window.location.href = session.open();
-
-  // Chat headlessly — present ONLY if the agent declares a chat route.
-  // Streams under the hood (`stream: true`), so a long reasoning turn keeps
-  // bytes flowing and never trips an idle-timeout hop in front of the agent;
-  // the full completion is reassembled and returned, so this shape is
-  // unchanged. The chat route is the owner↔agent steering channel and is
-  // NOT signed (no `X-Agent-Proof`) — reputation comes from the agent's own
-  // `/api/*` services, not from the owner talking to their own agent.
-  if (session.chat) {
-    const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
+  // Chat — present ONLY if the agent declares a chat route AND this ag has a
+  // key. Streams under the hood (`stream: true`), so a long reasoning turn
+  // keeps bytes flowing and never trips an idle-timeout hop in front of the
+  // agent; the full completion is reassembled and returned. The chat route is
+  // the owner↔agent steering channel and is NOT signed (no `X-Agent-Proof`) —
+  // reputation comes from the agent's own `/api/*` services, not from talking
+  // to your own agent.
+  if (agent.chat) {
+    const { choices } = await agent.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content — a real inference reply
   }
 
   // Live-typing variant — same conditions as chat; yields each content delta:
-  if (session.chatStream) {
-    for await (const delta of session.chatStream([{ role: 'user', content: 'Hi' }]))
+  if (agent.chatStream) {
+    for await (const delta of agent.chatStream([{ role: 'user', content: 'Hi' }]))
       process.stdout.write(delta);
   }
 
   // General escape hatch — works for any declared path; attaches the bearer
-  // token automatically when the matched route asks for it:
-  const r = await session.fetch('/v1/models');
+  // token automatically when the matched route asks for it (and the ag can auth):
+  const r = await agent.fetch('/v1/models');
   // …or capture the serve-proof in one call (the agent's /api/* services):
-  const { response, proof } = await session.fetchWithProof('/api/summarize', { method: 'POST', body });
+  const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
   ```
 
-  The presence of `open` / `chat` / `chatStream` is itself the capability
-  signal (they need the owner token). Shipped frameworks declare chat only.
-  Nothing is ever synthesized — the SDK reflects only what the agent declared.
+  The presence of `chat` / `chatStream` is itself the capability signal. Being
+  the actual owner is verified only when an owner op runs (chat throws for a
+  non-owner); `/hello` and `/api/*` work regardless. Nothing is synthesized —
+  the SDK reflects only what the agent declared.
 
-- **No-auth connect (third party)** — `ag.agent.connect(agentUrl)` returns the
-  same **`AgentClient`** without any signature, discovered from the agent's
-  `/hello`. Takes an `agentUrl` or an `agentId` (resolved on chain, like
-  `authenticate`). It carries no token, so the owner-only
-  `open`/`chat`/`chatStream` are absent; you call the agent's public `/api/*`
-  services with the same relative-path idiom and capture the proof in one step:
+- **`authenticate` / `connect`** are opinionated shortcuts over `client()`:
+  `ag.agent.authenticate(agentId)` mints the owner token up front (so a
+  non-owner fails right there, not at first chat) and requires a wallet;
+  `ag.agent.connect(agentId | agentUrl)` is an explicit **public** handle
+  (never attaches a token) for a third party calling `/api/*` and capturing the
+  proof:
 
   ```ts
-  const agent = await ag.agent.connect(agentUrl);            // no wallet needed
-  const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+  const pub = await ag.agent.connect(agentId);               // no wallet needed
+  const { proof } = await pub.fetchWithProof('/api/summarize', {
     method: 'POST', headers: { 'content-type': 'application/json' }, body,
   });
   if (proof) { /* verify it, or submit it as on-chain feedback */ }
   ```
-
-  So owner and third party share **one** interaction surface — the token just
-  decides which affordances light up.
 
 openclaw token lifecycle: generated at the container's first boot, stable
 across restarts (the chat session stays authenticated), no expiry, rotates
