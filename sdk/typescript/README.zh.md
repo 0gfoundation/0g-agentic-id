@@ -234,7 +234,7 @@ await ag.agent.listDeployments();
 
 ## `ag.reputation` —— 服务证明 + 评价
 
-每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。不变量是挡在前面的 **sealed 代理**:它只在 agent 的**对外可归属面**——即 agent 注册的 `/api/*` service(agent 自己的代码在服务外部任务)——上盖 `X-Agent-Proof` 头。它**不签** owner↔agent 的操舵通道(框架的 chat/UI,用 `/_seal/auth` 拿的 owner token 访问):给一个 owner 鉴权的通道签名,等于让 owner 给"和自己 agent 对话"铸造 proof(自助刷声誉)。流式(SSE / WebSocket)也不签——签名需要完整 body。所以 `capture` 要在对 agent 自己的 `/api/*` service 的(整包)调用上读那个头。SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
+每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。不变量是挡在前面的 **sealed 代理**:它只在 agent 的**对外可归属面**——即 agent 注册的 `/api/*` service(agent 自己的代码在服务外部任务)——上盖 `X-Agent-Proof` 头。它**不签** owner↔agent 的操舵通道(框架的 chat/UI,用 `/_seal/auth` 拿的 owner token 访问):给一个 owner 鉴权的通道签名,等于让 owner 给"和自己 agent 对话"铸造 proof(自助刷声誉)。所以 `capture` 要在对 agent 自己的 `/api/*` service 的调用上读那个头。SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
 
 ```ts
 import { keccak256, toBytes } from 'viem';
