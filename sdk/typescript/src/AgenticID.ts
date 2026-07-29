@@ -54,7 +54,6 @@ const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
  *   - omit       → return on **acceptance** ({@link DeployAccepted});
  *   - `'minted'` → also block on the on-chain **mint** (adds `agentId`);
  *   - `'running'`→ also block on **provision** (adds the reachable `url`).
- * (`true` is a deprecated alias for `'minted'`.)
  */
 export type WaitLevel = 'minted' | 'running';
 
@@ -75,13 +74,6 @@ type RunningResponse = MintedResponse & { url: string };
 
 function acceptedOf(res: DeployCloneResponse): DeployAccepted {
   return { sealId: res.seal_id, agentSealAddr: res.agent_seal_addr };
-}
-
-/** Normalize the deploy/clone `wait` option: legacy `true` → `'minted'`, `false`/absent → no wait. */
-function normalizeWait(wait: WaitLevel | boolean | undefined): WaitLevel | undefined {
-  if (wait === true) return 'minted';
-  if (wait === false || wait == null) return undefined;
-  return wait;
 }
 
 /** Agent lifecycle (deploy / clone / transfer) + reads. Seal-bound today; the
@@ -145,21 +137,20 @@ export class AgentApi {
    * provision (adds the reachable `url`). See {@link WaitLevel}.
    */
   deploy(params: DeployParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
-  deploy(params: DeployParams, opts: { wait: 'minted' | true } & WaitMintOpts): Promise<MintedResponse>;
-  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async deploy(params: DeployParams, opts?: { wait?: WaitLevel | boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
-    const wait = normalizeWait(opts?.wait);
-    if (wait === 'running' && !params.sandbox) {
+  deploy(params: DeployParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  deploy(params: DeployParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async deploy(params: DeployParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+    if (opts?.wait === 'running' && !params.sandbox) {
       throw new Error(
         "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:'minted'",
       );
     }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
-    if (!wait) return accepted;
+    if (!opts?.wait) return accepted;
     // 'minted'  → block on the on-chain mint only (agentId, no url yet).
     // 'running' → also block on provision (container up + reachable url).
-    if (wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
@@ -170,15 +161,14 @@ export class AgentApi {
    * the mint (adds `agentId`), `wait: 'running'` also blocks on provision.
    */
   clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
-  clone(params: CloneParams, opts: { wait: 'minted' | true } & WaitMintOpts): Promise<MintedResponse>;
-  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async clone(params: CloneParams, opts?: { wait?: WaitLevel | boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
-    const wait = normalizeWait(opts?.wait);
+  clone(params: CloneParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  clone(params: CloneParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async clone(params: CloneParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
     const accepted = acceptedOf(await this.attestor.clone(params));
-    if (!wait) return accepted;
-    if (wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
+    if (!opts?.wait) return accepted;
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }

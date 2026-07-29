@@ -151,7 +151,6 @@ const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' })
 // 仅 mint——省略 `sandbox` 就只铸造、不起容器：agent 落 Offline（已铸造、无运行时），
 // 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:'minted'：
 const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: 'minted' });
-// (`wait: true` 是 'minted' 的 deprecated 别名。)
 
 // 或者先拿 sealId、稍后再等（或轮询）铸造：
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
