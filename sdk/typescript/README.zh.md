@@ -234,7 +234,7 @@ await ag.agent.listDeployments();
 
 ## `ag.reputation` —— 服务证明 + 评价
 
-每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。不变量是挡在前面的 **sealed 代理**：它在每个**整包(buffered)**响应上盖 `X-Agent-Proof` 头——这是可归属的 API 面。**流式**响应(SSE `stream: true` 的 chat、或 WebSocket)**不带** proof:签名覆盖的是完整 body,而流在结束前没有完整 body,所以这类响应原样透传、不签名。因此 `capture` 要在**非流式**调用上读那个头。SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
+每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么，协议不做规定，agent 之间可以完全不同。不变量是挡在前面的 **sealed 代理**:它只在 agent 的**对外可归属面**——即 agent 注册的 `/api/*` service(agent 自己的代码在服务外部任务)——上盖 `X-Agent-Proof` 头。它**不签** owner↔agent 的操舵通道(框架的 chat/UI,用 `/_seal/auth` 拿的 owner token 访问):给一个 owner 鉴权的通道签名,等于让 owner 给"和自己 agent 对话"铸造 proof(自助刷声誉)。流式(SSE / WebSocket)也不签——签名需要完整 body。所以 `capture` 要在对 agent 自己的 `/api/*` service 的(整包)调用上读那个头。SDK 不对调用本身建模——你按 agent 期望的方式调用它，`capture` 只负责读那个头。归属按提交时的 `msg.sender`；证明本身**不**绑定客户端。
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -272,6 +272,7 @@ await ag.reputation.getSummary({ agentId });   // 过滤条件全部可选
 await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
 await ag.reputation.readAllFeedback({ agentId });   // 可用 clientAddresses / tags / includeRevoked 收窄
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  留过评价的地址
+await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n   列出的 responder 里有几个回应了 buyer 的第 idx 条评价
 
 // owner 回应某条评价；留评价的客户端可撤销
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -291,6 +292,7 @@ import { parseEther } from 'viem';
 
 // 信任根确认（TappRegistry，覆盖 attestor + kms + sandbox-provider）
 await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   `owner` 还缺哪些 ack
+await ag.components(owner);   // → 每个组件的链上详情：[{ appId, acked, ackVersion, owner, composeHash, imageHashes, nodes }, …]——ack() 背后"你在确认什么"的数据
 const ackTx = await ag.ack();   // → 交易哈希 "0x…"；已全部 ack 则返回 null
 if (ackTx) await ag.waitForTransaction(ackTx);   // 见下方"写后立即读"的提醒
 
@@ -318,7 +320,7 @@ await ag.waitForTransaction(tx);   // 现在再读 getBalance() 才是新值
 
 ## 运行时镜像、框架与 iData 格式
 
-`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，当前是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。
+`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，openclaw 是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了某个框架适配器的 sealed 运行时镜像。今天有两个适配器：**openclaw**（`0g-sealed`）和 **hermes**（`0g-sealed-hermes`，deploy **和** reset 都要用 `sandbox.sealedImage` 指定它）；具体哪些在某个环境里可用，以 `/config.supported_frameworks` 宣告的为准。
 
 **iData 的形状**：一个数组，每个元素是一条 `{ role, plaintext, extra }`——`role` 是这条内容的用途标签，`plaintext` 是内容本身。deploy 默认帮你拼两条（下面这个例子就是 `defaultIData()` 的产物）：一条 `framework` 绑定告诉运行时用哪个框架，一条 `persona` 装人设和模型选择。WYSIWYS（What You Sign Is What You Seal）：你签名的这份 iData 逐字节就是被加密、被铸上链的内容，attestor 不替你增删任何东西。
 
@@ -383,7 +385,7 @@ const agentUrl = me.url;   // 容器起来前是 null
 if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
-- **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、暴露了哪些接口。每个响应都带签名的 `X-Agent-Proof`。也可以让 SDK 一次做完"请求 + 证明校验"：
+- **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、暴露了哪些接口。整包（buffered）响应都带签名的 `X-Agent-Proof`（流式/SSE 回复不带——签名要完整 body）。也可以让 SDK 一次做完"请求 + 证明校验"：
 
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
@@ -409,8 +411,9 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // headless 聊天 —— 只有当 agent 声明了 chat 路由时才有。
   // 底层默认走流式(`stream: true`):长推理任务期间字节持续流动,不会被
   // agent 前面某一跳的 idle 超时掐断;SDK 会把完整回复重新拼好返回,所以
-  // 这里的用法不变。流式回复**不带** `X-Agent-Proof`——要可归属 / 可上链
-  // 的 ServeProof,请用非流式(`stream: false`)调用。
+  // 这里的用法不变。chat 是 owner↔agent 的操舵通道,**不签名**(无
+  // `X-Agent-Proof`)——声誉来自 agent 自己的 `/api/*` service,而不是
+  // owner 跟自己 agent 对话。
   if (session.chat) {
     const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content —— 真实推理回复

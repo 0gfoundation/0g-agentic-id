@@ -221,7 +221,7 @@ Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentS
 
 ## `ag.reputation` — serve-proof + feedback
 
-Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it: it stamps an `X-Agent-Proof` header on every **buffered** response — the attributable API surface. Streaming responses (an SSE `stream: true` chat, or a WebSocket) carry **no** proof: a signature covers a complete body, which a stream doesn't have until it ends, so these are relayed unsigned. `capture` therefore reads the header on a non-streaming call. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
+Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). Streams (SSE / WebSocket) are unsigned too — a signature needs a complete body. So `capture` reads the header on a (buffered) call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -262,6 +262,7 @@ await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHas
 await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
 // → [ { value, valueDecimals, tag1, tag2, isRevoked }, … ]
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  addresses that left feedback
+await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n   how many of the listed responders replied to buyer's feedback #idx
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -283,6 +284,7 @@ const provider = '0x2222222222222222222222222222222222222222';  // the sandbox p
 
 // trust-root acknowledgment (TappRegistry, spans attestor + kms + sandbox-provider)
 await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   what `owner` still needs to ack
+await ag.components(owner);  // → per-component detail from TappRegistry: [{ appId, acked, ackVersion, owner, composeHash, imageHashes, nodes }, …] — the "what am I acking" data behind ack()
 const ackTx = await ag.ack();   // → tx hash "0x…", or null if nothing was missing
 if (ackTx) await ag.waitForTransaction(ackTx);   // see the read-after-write note below
 
@@ -312,9 +314,10 @@ await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 
 The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
 `0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
-is the sealed runtime image bundling the **openclaw** framework adapter —
-the only framework shipping today (`/config.supported_frameworks` is the
-source of truth).
+is the sealed runtime image bundling a framework adapter. Two adapters ship
+today — **openclaw** (`0g-sealed`) and **hermes** (`0g-sealed-hermes`, pass it
+as `sandbox.sealedImage` at deploy *and* reset); which are live in a given
+environment is whatever `/config.supported_frameworks` advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
 `role` labels what the entry is for, `plaintext` is the content itself.
@@ -414,7 +417,8 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
-  the surface I expose. Every response carries a signed `X-Agent-Proof`. Or
+  the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
+  (a streamed/SSE reply doesn't — a signature needs a complete body). Or
   let the SDK do the fetch + proof check in one call:
 
   ```ts
@@ -455,9 +459,9 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // Streams under the hood (`stream: true`), so a long reasoning turn keeps
   // bytes flowing and never trips an idle-timeout hop in front of the agent;
   // the full completion is reassembled and returned, so this shape is
-  // unchanged. A streamed reply carries no `X-Agent-Proof` — for an
-  // attributable / on-chain-replayable ServeProof, call the endpoint
-  // non-streaming (`stream: false`) instead.
+  // unchanged. The chat route is the owner↔agent steering channel and is
+  // NOT signed (no `X-Agent-Proof`) — reputation comes from the agent's own
+  // `/api/*` services, not from the owner talking to their own agent.
   if (session.chat) {
     const { choices } = await session.chat([{ role: 'user', content: 'What can you do?' }]);
     // choices[0].message.content — a real inference reply

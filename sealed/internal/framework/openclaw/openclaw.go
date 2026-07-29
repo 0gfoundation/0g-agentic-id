@@ -194,10 +194,16 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 	// chat API + SDK, which can't shell or read files.
 	return []framework.Route{
 		{
-			Prefix:      "/v1/",
-			Kind:        "chat",
-			Auth:        "bearer",
-			Signed:      true,
+			Prefix: "/v1/",
+			Kind:   "chat",
+			Auth:   "bearer",
+			// Owner↔agent steering channel (bearer token from the owner-only
+			// /_seal/auth). Not signed: signing it would let the owner mint
+			// ServeProofs for chatting with their own agent (self-dealt
+			// reputation). The proxy enforces "framework routes are never
+			// signed" regardless of this flag; false here just keeps the
+			// declaration honest.
+			Signed:      false,
 			Description: "OpenAI-compatible chat/completions API.",
 		},
 	}

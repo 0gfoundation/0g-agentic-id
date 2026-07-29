@@ -78,8 +78,8 @@ func New(agent *state.Agent, publicURL string) *Server {
 //
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
 //   - framework.RouteProvider         → the declared public routes the
-//     catch-all proxy forwards + signs (everything else 404s); absent ⇒
-//     legacy forward-all + sign-all
+//     catch-all proxy forwards (everything else 404s — fail-closed). Framework
+//     routes are never signed; only agent-registered /api/* services are.
 //
 // Called once by main after the on-chain framework binding names the
 // adapter. Handlers read under the lock.
@@ -101,8 +101,8 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	s.agentLogPath = agentLogPath
 	s.fwRoutes = fwRoutes
 	s.mu.Unlock()
-	if fwRoutes == nil {
-		logger.Logf("proxy: adapter %q declares no routes; legacy forward-all + sign-all in effect", fw.Name())
+	if len(fwRoutes) == 0 {
+		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
 	} else {
 		logger.Logf("proxy: adapter %q declared %d framework route(s)", fw.Name(), len(fwRoutes))
 	}
@@ -125,17 +125,13 @@ func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
 	return bestRoute, best >= 0
 }
 
-// hasFrameworkRoutes reports whether the adapter declared any routes. When
-// false, handleProxy keeps legacy behaviour (forward every path, sign every
-// response) so an adapter that hasn't adopted RouteProvider still works.
-func (s *Server) hasFrameworkRoutes() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.fwRoutes != nil
-}
-
 // frameworkRoutesForHello maps the declared routes to the public /hello wire
 // shape (report.Route). Empty when the adapter declared none.
+//
+// Signed is reported false for every framework route regardless of what the
+// adapter declared: handleProxy never signs a framework route (owner↔agent
+// steering channel), so /hello must not advertise otherwise. This keeps the
+// wire honest at the enforcement layer, not at the adapter's discretion.
 func (s *Server) frameworkRoutesForHello() []report.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -145,7 +141,7 @@ func (s *Server) frameworkRoutesForHello() []report.Route {
 			Prefix:      rt.Prefix,
 			Kind:        rt.Kind,
 			Auth:        rt.Auth,
-			Signed:      rt.Signed,
+			Signed:      false,
 			Description: rt.Description,
 		})
 	}
@@ -416,21 +412,27 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//      path is NOT blind-forwarded (bounds the public + signing surface).
 	// Legacy fallback: an adapter that declares no routes keeps the old
 	// behaviour — forward every path to the upstream and sign every response.
-	signed := true
-	frameworkRoute := false // true only for a framework-declared route match
+	// Signing follows a proxy-owned invariant, NOT the adapter's declared
+	// Signed flag:
+	//   - agent-registered /api/* service → signed. The outward, attributable
+	//     surface: the agent's own code serving an external task.
+	//   - framework-declared route → NEVER signed. The owner↔agent steering /
+	//     UI channel (chat, dashboard). Its bearer credential comes from the
+	//     owner-only /_seal/auth handshake, so signing it would let the owner
+	//     mint ServeProofs for interactions with their own agent — self-dealt
+	//     reputation. Enforced here at the proxy, not delegated to the route's
+	//     Signed flag, so a mis-declaring adapter can't reopen the hole.
+	//   - neither → 404 (fail-closed); no forward-all fallback.
+	signed := false
+	frameworkRoute := false
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
+		signed = true
 		upstream = svc.Backend
-	} else if s.hasFrameworkRoutes() {
-		rt, ok := s.matchFrameworkRoute(r.URL.Path)
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		signed = rt.Signed
+	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
 		frameworkRoute = true
 		// A route may pin its own loopback backend (a framework whose
 		// surfaces are separate processes/ports); empty keeps the single
@@ -438,6 +440,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if rt.Backend != "" {
 			upstream = rt.Backend
 		}
+	} else {
+		// Not an agent service and not a declared framework route: serve
+		// nothing. (Previously a "legacy" forward-all + sign-all fallback for
+		// adapters that declared no routes — removed; every shipped adapter
+		// declares its routes, and fail-closed beats blind-forwarding an
+		// undeclared path to the framework.)
+		http.NotFound(w, r)
+		return
 	}
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.

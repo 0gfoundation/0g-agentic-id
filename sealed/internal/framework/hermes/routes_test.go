@@ -20,8 +20,10 @@ func TestFrameworkRoutes(t *testing.T) {
 		t.Fatalf("want exactly one route (chat), got %d: %+v", len(routes), routes)
 	}
 	chat := routes[0]
-	if chat.Prefix != "/v1/" || chat.Kind != "chat" || chat.Auth != "bearer" || !chat.Signed {
-		t.Errorf("chat route: want prefix=/v1/ kind=chat auth=bearer signed=true, got %+v", chat)
+	// signed=false: the chat route is the owner↔agent steering channel and is
+	// never signed (the proxy enforces this for all framework routes).
+	if chat.Prefix != "/v1/" || chat.Kind != "chat" || chat.Auth != "bearer" || chat.Signed {
+		t.Errorf("chat route: want prefix=/v1/ kind=chat auth=bearer signed=false, got %+v", chat)
 	}
 	for _, r := range routes {
 		if r.Kind == "dashboard" || r.Prefix == "/" {

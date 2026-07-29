@@ -14,9 +14,6 @@ func TestMatchFrameworkRoute_LongestPrefixWins(t *testing.T) {
 		{Prefix: "/v1/", Kind: "chat", Auth: "bearer", Signed: true},
 		{Prefix: "/", Kind: "dashboard", Auth: "token-fragment", Signed: false},
 	}}
-	if !s.hasFrameworkRoutes() {
-		t.Fatal("hasFrameworkRoutes should be true once routes are declared")
-	}
 	rt, ok := s.matchFrameworkRoute("/v1/chat/completions")
 	if !ok || rt.Kind != "chat" || !rt.Signed {
 		t.Fatalf("/v1/* should match the signed chat route, got ok=%v %+v", ok, rt)
@@ -45,12 +42,17 @@ func TestMatchFrameworkRoute_NoMatchWhenNoRootRoute(t *testing.T) {
 	}
 }
 
-// Legacy fallback: an adapter that never declared routes leaves fwRoutes nil,
-// and hasFrameworkRoutes reports false so handleProxy keeps forwarding+signing
-// every path.
-func TestHasFrameworkRoutes_NilIsLegacy(t *testing.T) {
-	if (&Server{}).hasFrameworkRoutes() {
-		t.Error("a Server with no declared routes must be legacy (forward-all)")
+// An adapter that declared no routes leaves fwRoutes nil: nothing matches, so
+// handleProxy 404s every framework path (fail-closed — the old forward-all
+// "legacy" fallback was removed). Agent /api/* services are matched earlier
+// and are unaffected.
+func TestMatchFrameworkRoute_NoRoutesMatchesNothing(t *testing.T) {
+	s := &Server{}
+	if _, ok := s.matchFrameworkRoute("/"); ok {
+		t.Error("no declared routes must match nothing (fail-closed)")
+	}
+	if _, ok := s.matchFrameworkRoute("/v1/chat/completions"); ok {
+		t.Error("no declared routes must match nothing (fail-closed)")
 	}
 }
 
@@ -63,7 +65,9 @@ func TestFrameworkRoutesForHello_Maps(t *testing.T) {
 		t.Fatalf("want 1 route, got %d", len(out))
 	}
 	got := out[0]
-	if got.Prefix != "/v1/" || got.Kind != "chat" || got.Auth != "bearer" || !got.Signed || got.Description != "api" {
+	// Signed is forced false for framework routes regardless of the declared
+	// value — the proxy never signs them, so /hello must not claim otherwise.
+	if got.Prefix != "/v1/" || got.Kind != "chat" || got.Auth != "bearer" || got.Signed || got.Description != "api" {
 		t.Errorf("route mapping wrong: %+v", got)
 	}
 }
