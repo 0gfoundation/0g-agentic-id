@@ -397,7 +397,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   - `services` —— agent 自己注册的端点（精确 `/api/*` 路径）：`{ path, method, description?, input_example? }`。直接发 HTTP，每个响应都有证明签名（这正是你 `capture()` 后拿去评价的对象）。
   - `routes` —— 框架声明的前缀：`{ prefix, kind?, auth?, signed, description? }`，例如 `/v1/` 上 `kind:"chat"` API（auth `bearer`）。`auth` 告诉你怎么带 owner token，`signed` 说明该前缀上的响应带不带 `X-Agent-Proof`。已发布的框架都是 chat-only；框架可以声明 UI route，但目前没有。
 
-- **`ag.agent.client(agentId)`** —— 一个句柄(`AgentClient`)通吃所有调用方。能不能做 owner 操作,**继承自 `ag`**——就像 `ag` 的 account 决定能不能写链一样:带 owner key 的 `ag` → 有 `chat`/`chatStream`(owner token 按需铸造、轮换后自动重铸,你从不手动传/续 token);只读的 `ag` → 一个 public client(对 agent 的 `/api/*` service 用 `fetch`/`fetchWithProof`)。可传 `agentId`(链上 `tokenURI` → AgentCard 的 serve `url` 解析出地址,不需要 attestor)或你已有的 `agentUrl`。
+- **`ag.agent.client(agentId)`** —— 一个句柄(`AgentClient`)通吃所有调用方。能不能做 owner 操作,**继承自 `ag`**——就像 `ag` 的 account 决定能不能写链一样:带 owner key 的 `ag` → 有 `chat`/`chatStream`(owner token 按需铸造、轮换后自动重铸,你从不手动传/续 token);只读的 `ag` → 一个 public client(对 agent 的 `/api/*` service 用 `fetch`/`fetchWithProof`)。**一个参数**——`agentId` 或 `agentUrl`,你有哪个传哪个,SDK 补齐另一半:传 `agentId` → 链上 `tokenURI` → AgentCard 的 serve `url`(不需要 attestor);传 `agentUrl` → 读 agent 的**签名** `/hello`,它的 `X-Agent-Proof` 信封里带着 agentId——所以**光有 URL 就够了**(owner 能力仍看 `ag` 有没有 key)。
 
   ```ts
   const agent = await ag.agent.client(agentId);

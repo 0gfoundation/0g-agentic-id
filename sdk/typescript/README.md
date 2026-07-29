@@ -443,9 +443,12 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   account gates chain writes: an `ag` with an owner key gets `chat`/`chatStream`
   (the owner token is minted on demand and re-minted if the agent rotates it —
   you never pass or refresh a token); a read-only `ag` gets a public client
-  (`fetch`/`fetchWithProof` against the agent's `/api/*` services). Pass an
-  `agentId` (URL resolved on chain via `tokenURI` → the AgentCard's serve
-  `url`, no attestor) or an `agentUrl` you already have.
+  (`fetch`/`fetchWithProof` against the agent's `/api/*` services). One
+  argument — an `agentId` OR an `agentUrl`, whichever you have; the SDK fills
+  in the other half: an `agentId` resolves the URL on chain (`tokenURI` → the
+  AgentCard's serve `url`, no attestor); an `agentUrl` reads the agent's signed
+  `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
+  is enough (owner ops still gated on `ag` having a key).
 
   ```ts
   const agent = await ag.agent.client(agentId);
