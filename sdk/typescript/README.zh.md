@@ -13,7 +13,7 @@
 | `ag.agent` | Agent 生命周期——**部署 / 克隆 / 转让**——链上读取（owner、agentSeal、iData……）、agentSeal gas 充值、启停重置、费用估算、headless 交互 |
 | `ag.reputation` | 捕获 TEE 签名的服务证明（serve-proof）、验证、提交/读取链上评价 |
 | `ag.ack()` / `ag.ackStatus()` | 确认 TEE 信任根组件集（覆盖 attestor + kms + sandbox-provider，不针对单个 agent） |
-| `ag.deposit()` / `ag.getBalance()` | 充值 / 查询 sandbox 预付费余额 |
+| `ag.deposit()` / `ag.getBalance()` | 充值 / 查询 sandbox 预付费余额——agent 按量付费的**运行**费(区别于 `topUpAgentSeal`:那是给 agent 自己的链上写入加油;见[顶层操作](#顶层操作不针对单个-agent)一节) |
 
 所有后端（AgenticID / ReputationRegistry / TappRegistry / SandboxServing 四组合约 + attestor 的 HTTP 接口）都藏在门面后面，调用者不需要知道哪个操作走链、哪个走 HTTP。
 
@@ -286,6 +286,12 @@ await ag.reputation.revokeFeedback(agentId, idx);              // → 交易哈�
 ## 顶层操作（不针对单个 agent）
 
 信任根确认和 sandbox 预付费不是 agent 级的事，所以直接挂在门面上。
+
+> **两笔不同的钱,别混:**
+> - **`ag.deposit()` → sandbox 预付费余额**(SandboxServing)。agent 的**运行/服务费**,**按量付费(pay-as-you-go)**:容器运行时由 sandbox provider 按分钟从这里扣。按充值方记账、不是按 agent;`getBalance()` 读它;deploy 预检它(≥ 0.1 OG)。
+> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → agentSeal 自己的 gas。** agent 的 TEE 钱包需要原生 OG 来**给它自己发起的链上交易付 gas**——主要是把它进化的状态/记忆上传到 0G storage("进化燃料")。充的是某个具体 agent 的 `agentSeal` 地址。
+>
+> 一句话:**deposit = 让它跑起来(算力),topUpAgentSeal = 给 agent 自己的链上写入加油(进化)。** `runtimeCosts(agentId)` 会把两者都报出来(`prepaidBalanceWei` vs `sealGasWei`)。
 
 ```ts
 import { parseEther } from 'viem';

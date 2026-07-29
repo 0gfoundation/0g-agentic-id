@@ -11,7 +11,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 | `ag.agent` | agent lifecycle — **deploy / clone / transfer** — reads (owner, agentSeal, iData…), and agent-seal gas top-up |
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
-| `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance |
+| `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance — the agent's pay-as-you-go **runtime** cost (distinct from `topUpAgentSeal`, which fuels the agent's own on-chain writes; see [Top-level ops](#top-level-ops-not-scoped-to-one-agent)) |
 
 > Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't need to know which call goes on-chain and which goes over HTTP.
 
@@ -278,6 +278,12 @@ await ag.reputation.revokeFeedback(agentId, idx);              // → tx hash "0
 ## Top-level ops (not scoped to one agent)
 
 Acknowledging the TEE trust-root set and funding the prepaid sandbox balance aren't agent-specific, so they sit directly on the facade.
+
+> **Two different balances — don't confuse them:**
+> - **`ag.deposit()` → the prepaid sandbox balance** (SandboxServing). The agent's **runtime / serving cost**, **pay-as-you-go**: the sandbox provider bills it per-minute while the container runs. Per depositor, not per-agent; `getBalance()` reads it; deploy preflights it (≥ 0.1 OG).
+> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → the agentSeal's own gas.** The agent's TEE wallet needs native OG to pay **gas for the on-chain transactions it makes itself** — chiefly uploading its evolving state/memory to 0G storage ("evolution gas"). Funds a specific agent's `agentSeal` address.
+>
+> In short: **deposit = keep it running (compute), topUpAgentSeal = fuel the agent's own on-chain writes (evolution).** `runtimeCosts(agentId)` reports both (`prepaidBalanceWei` vs `sealGasWei`).
 
 ```ts
 import { parseEther } from 'viem';
