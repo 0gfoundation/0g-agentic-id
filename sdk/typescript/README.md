@@ -467,15 +467,39 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
     // choices[0].message.content — a real inference reply
   }
 
+  // Live-typing variant — same conditions as chat; yields each content delta:
+  if (session.chatStream) {
+    for await (const delta of session.chatStream([{ role: 'user', content: 'Hi' }]))
+      process.stdout.write(delta);
+  }
+
   // General escape hatch — works for any declared path; attaches the bearer
   // token automatically when the matched route asks for it:
   const r = await session.fetch('/v1/models');
+  // …or capture the serve-proof in one call (the agent's /api/* services):
+  const { response, proof } = await session.fetchWithProof('/api/summarize', { method: 'POST', body });
   ```
 
-  The presence of `session.open` / `session.chat` is itself the capability
-  signal: a UI route yields `open`, a chat route yields `chat`. Shipped
-  frameworks declare chat only. Nothing is ever synthesized — the SDK
-  reflects only what the agent declared.
+  The presence of `open` / `chat` / `chatStream` is itself the capability
+  signal (they need the owner token). Shipped frameworks declare chat only.
+  Nothing is ever synthesized — the SDK reflects only what the agent declared.
+
+- **No-auth connect (third party)** — `ag.agent.connect(agentUrl)` returns the
+  same **`AgentClient`** without any signature, discovered from the agent's
+  `/hello`. It carries no token, so the owner-only `open`/`chat`/`chatStream`
+  are absent; you call the agent's public `/api/*` services with the same
+  relative-path idiom and capture the proof in one step:
+
+  ```ts
+  const agent = await ag.agent.connect(agentUrl);            // no wallet needed
+  const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body,
+  });
+  if (proof) { /* verify it, or submit it as on-chain feedback */ }
+  ```
+
+  So owner and third party share **one** interaction surface — the token just
+  decides which affordances light up.
 
 openclaw token lifecycle: generated at the container's first boot, stable
 across restarts (the chat session stays authenticated), no expiry, rotates

@@ -419,11 +419,31 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
     // choices[0].message.content —— 真实推理回复
   }
 
+  // 逐 token 实时版 —— 条件同 chat;yield 出每个内容增量:
+  if (session.chatStream) {
+    for await (const delta of session.chatStream([{ role: 'user', content: 'Hi' }]))
+      process.stdout.write(delta);
+  }
+
   // 通用逃生舱 —— 任何声明过的路径都能打；匹配到的路由要 bearer 时自动带 token：
   const r = await session.fetch('/v1/models');
+  // …或一步到位调用 + 取证(用于 agent 的 /api/* service):
+  const { response, proof } = await session.fetchWithProof('/api/summarize', { method: 'POST', body });
   ```
 
-  `session.open` / `session.chat` 存不存在，本身就是能力信号：有界面的 agent 有 `open`，headless 的没有。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
+  `open` / `chat` / `chatStream` 存不存在,本身就是能力信号(它们需要 owner token)。已发布框架都是 chat-only。SDK 从不凭空合成任何入口——只反映 agent 声明的东西。
+
+- **免 auth connect(第三方)** —— `ag.agent.connect(agentUrl)` 不签名、从 agent 的 `/hello` 发现,返回同一个 **`AgentClient`**。它不带 token,所以 owner 专属的 `open`/`chat`/`chatStream` 都没有;你用同样的相对路径手感调 agent 的公开 `/api/*` service,并一步取证:
+
+  ```ts
+  const agent = await ag.agent.connect(agentUrl);            // 不需要钱包
+  const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body,
+  });
+  if (proof) { /* 验证它,或作为链上 feedback 提交 */ }
+  ```
+
+  于是 owner 和第三方共用**同一套**交互面——token 只决定哪些能力点亮。
 
 openclaw token 生命周期：容器首次启动时生成，跨重启保持稳定（chat 会话保持鉴权）、没有过期时间，只在容器重建时轮换——所以吊销手段就是 `reset()`。
 

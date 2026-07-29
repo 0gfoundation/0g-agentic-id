@@ -1,14 +1,22 @@
 /**
  * @file AgentClient.ts
- * @description Discovery-driven session for interacting with a running agent.
+ * @description Discovery-driven handle for interacting with a running agent.
  *
- * `authenticate()` returns an {@link AgentClient}: a credential bound to an
- * agent's base URL plus the agent's own declaration of what it exposes (the
- * `services` and `routes` arrays from its signed `/hello`). The session knows
+ * `authenticate()` / `connect()` return an {@link AgentClient}: a handle bound
+ * to an agent's base URL plus the agent's own declaration of what it exposes
+ * (the `services` and `routes` arrays from its signed `/hello`). It knows
  * nothing framework-specific — it decides how to attach the credential and
- * which affordances (`open`/`chat`) to offer purely from what the agent
- * declared. Adding a framework, or an endpoint, needs no SDK change.
+ * which affordances (`open`/`chat`/`chatStream`) to offer purely from what the
+ * agent declared. Adding a framework, or an endpoint, needs no SDK change.
+ *
+ * The same handle serves both callers, the difference being only the token:
+ *   - owner (`authenticate`) carries the owner token → `open`/`chat` available;
+ *   - third party (`connect`) carries no token → calls the agent's public
+ *     `/api/*` services via `fetch`/`fetchWithProof` and captures the proof.
  */
+
+import { proofFromResponse } from './ServeSession';
+import type { ServeProof } from './types';
 
 /**
  * One agent-registered service, as listed in `/hello`'s `services` array.
@@ -49,11 +57,11 @@ export interface ChatCompletion {
 }
 
 /**
- * A live handle to an authenticated agent. Always carries `token`, `base`,
- * and the agent's declared `services`/`routes`. `fetch` is the general
- * escape hatch — it works for any declared (or undeclared) path, attaching
- * the token when the matched route asks for a bearer credential. `open` and
- * `chat` are present only when the agent declares a route that supports them.
+ * A live handle to an agent. Always carries `base`, the declared
+ * `services`/`routes`, and a `token` ("" for a no-auth/third-party handle).
+ * `fetch`/`fetchWithProof` work for any path. `open`/`chat`/`chatStream` are
+ * present only when the agent declares a matching route AND this handle holds
+ * the owner token (they are owner affordances).
  */
 export interface AgentClient {
   readonly token: string;
@@ -63,22 +71,42 @@ export interface AgentClient {
   /**
    * Fetch a path on the agent. `path` is relative to the agent base (leading
    * slash optional). If the longest-prefix route match declares
-   * `auth: "bearer"`, an `Authorization: Bearer <token>` header is added
-   * (unless the caller already set one).
+   * `auth: "bearer"` and this handle holds a token, an
+   * `Authorization: Bearer <token>` header is added (unless the caller already
+   * set one).
    */
   fetch(path: string, init?: RequestInit): Promise<Response>;
   /**
+   * Like {@link fetch}, but also reads the response's `X-Agent-Proof` (a
+   * TEE-signed serve-proof) when present. This is the primary way a third
+   * party calls one of the agent's `/api/*` services and captures the proof to
+   * verify or submit as on-chain feedback. `proof` is null when the response
+   * carries none (e.g. the unsigned owner↔agent chat route).
+   */
+  fetchWithProof(path: string, init?: RequestInit): Promise<{ response: Response; proof: ServeProof | null }>;
+  /**
    * Present only if the agent declares a `token-fragment` route (typically a
-   * dashboard). Returns a browser-openable URL with the token in the URL
-   * fragment. `path` overrides which path to open (default: the route prefix).
+   * dashboard) and this handle holds the owner token. Returns a
+   * browser-openable URL with the token in the URL fragment. `path` overrides
+   * which path to open (default: the route prefix).
    */
   open?(path?: string): string;
   /**
-   * Present only if the agent declares a `kind: "chat"` route. POSTs an
-   * OpenAI-shaped chat request to `<prefix>chat/completions` with the bearer
-   * token and returns the parsed completion.
+   * Present only if the agent declares a `kind: "chat"` route and this handle
+   * holds the owner token. POSTs an OpenAI-shaped chat request to
+   * `<prefix>chat/completions` and returns the full reply. Streams under the
+   * hood so a long reasoning turn doesn't hit an idle-timeout hop in front of
+   * the agent; the completion is reassembled before returning, so the shape is
+   * a plain {@link ChatCompletion}.
    */
   chat?(messages: ChatMessage[], opts?: { model?: string }): Promise<ChatCompletion>;
+  /**
+   * Like {@link chat}, but yields each content delta as it is generated — for
+   * a live-typing UI. Present under the same conditions as `chat`.
+   *
+   *   for await (const delta of client.chatStream(msgs)) process.stdout.write(delta);
+   */
+  chatStream?(messages: ChatMessage[], opts?: { model?: string }): AsyncGenerator<string>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -93,22 +121,18 @@ function matchRoute(routes: AgentRoute[], path: string): AgentRoute | undefined 
 }
 
 /**
- * Consume an OpenAI-compatible SSE `chat/completions` stream and reassemble it
- * into a single {@link ChatCompletion}. Concatenates every `choices[0].delta`
- * content fragment — falling back to `reasoning_content` for a delta that
- * carries only that (a reasoning model streams its answer there), so a
- * pure-reasoning reply isn't returned empty. Ignores SSE comment/keepalive
- * lines and the terminal `data: [DONE]`. Tolerant of frames split across reads.
+ * Stream an OpenAI-compatible SSE `chat/completions` body, yielding each parsed
+ * `data:` JSON chunk. Skips SSE comment/keepalive lines and the terminal
+ * `data: [DONE]`; tolerant of frames split across network reads. The shared
+ * core behind both `chat` (fold into one completion) and `chatStream` (map to
+ * content deltas).
  */
-async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+async function* iterSseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  let content = '';
-  let role = 'assistant';
-  let last: Record<string, unknown> = {};
 
-  const consumeFrame = (frame: string) => {
+  function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
       // Skip SSE comments (":...") and non-data fields ("event:", "id:", ...).
@@ -116,20 +140,12 @@ async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<Chat
       const data = t.slice(5).trim();
       if (data === '' || data === '[DONE]') continue;
       try {
-        const chunk = JSON.parse(data) as Record<string, unknown>;
-        last = chunk;
-        const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
-        const delta = choice?.delta as { role?: string; content?: string; reasoning_content?: string } | undefined;
-        if (delta?.role) role = delta.role;
-        const piece = typeof delta?.content === 'string' ? delta.content
-                    : typeof delta?.reasoning_content === 'string' ? delta.reasoning_content
-                    : '';
-        content += piece;
+        yield JSON.parse(data) as Record<string, unknown>;
       } catch {
         // Non-JSON keepalive payload — ignore.
       }
     }
-  };
+  }
 
   for (;;) {
     const { value, done } = await reader.read();
@@ -139,19 +155,46 @@ async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<Chat
     // SSE events are delimited by a blank line ("\n\n"); "\r\n\r\n" tolerated.
     while ((sep = buf.search(/\r?\n\r?\n/)) !== -1) {
       const end = sep + (buf[sep] === '\r' ? 4 : 2);
-      consumeFrame(buf.slice(0, sep));
+      yield* parseFrame(buf.slice(0, sep));
       buf = buf.slice(end);
     }
   }
-  if (buf.trim()) consumeFrame(buf); // flush a trailing frame with no blank line
+  if (buf.trim()) yield* parseFrame(buf); // flush a trailing frame with no blank line
+}
 
+/**
+ * The content fragment carried by one chunk: `choices[0].delta.content`, or
+ * `reasoning_content` for a delta that carries only that (a reasoning model
+ * streams its answer there), so a pure-reasoning reply isn't returned empty.
+ */
+function chunkDelta(chunk: Record<string, unknown>): { role?: string; content: string } {
+  const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
+  const delta = choice?.delta as { role?: string; content?: string; reasoning_content?: string } | undefined;
+  const content = typeof delta?.content === 'string' ? delta.content
+                : typeof delta?.reasoning_content === 'string' ? delta.reasoning_content
+                : '';
+  return { role: delta?.role, content };
+}
+
+/** Fold an SSE chat stream into a single reassembled {@link ChatCompletion}. */
+async function collectChatStream(body: ReadableStream<Uint8Array>): Promise<ChatCompletion> {
+  let content = '';
+  let role = 'assistant';
+  let last: Record<string, unknown> = {};
+  for await (const chunk of iterSseChunks(body)) {
+    last = chunk;
+    const d = chunkDelta(chunk);
+    if (d.role) role = d.role;
+    content += d.content;
+  }
   return { ...last, choices: [{ message: { role, content } }] } as ChatCompletion;
 }
 
 /**
- * Build an {@link AgentClient} from a credential and the agent's declared
- * surface. `open`/`chat` are attached only when a matching route exists, so
- * their presence is itself a capability signal.
+ * Build an {@link AgentClient} from a base URL, a token (`""` for a no-auth
+ * third-party handle), and the agent's declared surface. `open`/`chat`/
+ * `chatStream` are attached only when a matching route exists AND a token is
+ * present, so their presence is itself a capability signal.
  */
 export function makeAgentClient(params: {
   base: string;
@@ -162,56 +205,81 @@ export function makeAgentClient(params: {
   const base = params.base.replace(/\/$/, '');
   const { token, services, routes } = params;
 
-  const session: AgentClient = {
+  const doFetch = (path: string, init?: RequestInit) => {
+    const rel = path.startsWith('/') ? path : `/${path}`;
+    const route = matchRoute(routes, rel);
+    const headers = new Headers(init?.headers);
+    // Attach the bearer only for a bearer route AND when we actually hold a
+    // token — a no-auth handle must not send an empty `Bearer `.
+    if (route?.auth === 'bearer' && token && !headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
+    return fetch(`${base}${rel}`, { ...init, headers });
+  };
+
+  const client: AgentClient = {
     token,
     base,
     services,
     routes,
-    fetch(path, init) {
-      const rel = path.startsWith('/') ? path : `/${path}`;
-      const route = matchRoute(routes, rel);
-      const headers = new Headers(init?.headers);
-      if (route?.auth === 'bearer' && !headers.has('Authorization')) {
-        headers.set('Authorization', `Bearer ${token}`);
-      }
-      return fetch(`${base}${rel}`, { ...init, headers });
+    fetch: doFetch,
+    async fetchWithProof(path, init) {
+      const response = await doFetch(path, init);
+      return { response, proof: proofFromResponse(response) };
     },
   };
 
+  // stream:true so the reply flows as SSE — a reasoning turn can take minutes,
+  // and a buffered reply sends no bytes until it finishes, so an idle-timeout
+  // hop in front of the agent (e.g. a load balancer, ~60s) would cut it.
+  const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
+    JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true });
+
   const dashboard = routes.find((r) => r.auth === 'token-fragment');
-  if (dashboard) {
-    session.open = (path?: string) => `${base}${path ?? dashboard.prefix}#token=${token}`;
+  if (dashboard && token) {
+    client.open = (path?: string) => `${base}${path ?? dashboard.prefix}#token=${token}`;
   }
 
   const chat = routes.find((r) => r.kind === 'chat');
-  if (chat) {
-    session.chat = async (messages, opts) => {
-      // OpenAI-compatible convention: the completions endpoint sits at
-      // `<prefix>chat/completions` (prefix ends with "/").
-      //
-      // Request `stream: true` so the response flows as SSE. A reasoning turn
-      // can take minutes; a buffered (non-streaming) reply sends no bytes until
-      // it finishes, so an idle-timeout hop in front of the agent (e.g. a load
-      // balancer, ~60s) cuts the connection. Streaming keeps bytes flowing, so
-      // the turn survives regardless of how long it runs. We still reassemble
-      // the full completion and return it, so the method's contract is
-      // unchanged. The chat route is the owner↔agent steering channel and is
-      // never signed (no X-Agent-Proof), stream or not — reputation comes from
-      // the agent's own /api/* services, not from talking to your own agent.
-      const r = await session.fetch(`${chat.prefix}chat/completions`, {
+  if (chat && token) {
+    // OpenAI-compatible convention: completions sit at `<prefix>chat/completions`.
+    const path = `${chat.prefix}chat/completions`;
+
+    client.chat = async (messages, opts) => {
+      const r = await doFetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true }),
+        body: chatBody(messages, opts),
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        // Server ignored `stream` (or a proxy that can't stream): plain JSON.
-        return (await r.json()) as ChatCompletion;
+        return (await r.json()) as ChatCompletion; // server didn't stream → plain JSON
       }
       return collectChatStream(r.body);
     };
+
+    client.chatStream = async function* (messages, opts) {
+      const r = await doFetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: chatBody(messages, opts),
+      });
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      const ct = r.headers.get('content-type') ?? '';
+      if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
+        // Server didn't stream — yield the whole reply as one delta.
+        const full = (await r.json()) as ChatCompletion;
+        const c = full.choices?.[0]?.message?.content;
+        if (c) yield c;
+        return;
+      }
+      for await (const chunk of iterSseChunks(r.body)) {
+        const d = chunkDelta(chunk);
+        if (d.content) yield d.content;
+      }
+    };
   }
 
-  return session;
+  return client;
 }

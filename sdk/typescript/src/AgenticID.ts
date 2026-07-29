@@ -289,6 +289,30 @@ export class AgentApi {
     return makeAgentClient({ base, token, services, routes });
   }
 
+  /**
+   * Connect to an agent WITHOUT the owner handshake — for a third party who
+   * wants to call the agent's public `/api/*` services and capture the
+   * serve-proof. Reads the agent's `/hello` to discover its surface and
+   * returns a **token-less** {@link AgentClient}: `fetch` / `fetchWithProof`
+   * work for any path (e.g. `client.fetchWithProof('/api/…')` → `{ response,
+   * proof }`), but the owner-only affordances `open` / `chat` are absent (they
+   * need the owner token). Symmetric with {@link authenticate}, minus the
+   * signature — no wallet required.
+   */
+  async connect(agentUrl: string): Promise<AgentClient> {
+    const base = agentUrl.replace(/\/$/, '');
+    let services: AgentServiceEntry[] = [];
+    let routes: AgentRoute[] = [];
+    try {
+      const hello = (await (await fetch(`${base}/hello`)).json()) as {
+        services?: AgentServiceEntry[]; routes?: AgentRoute[];
+      };
+      services = hello.services ?? [];
+      routes = hello.routes ?? [];
+    } catch { /* discovery is best-effort; fetch/fetchWithProof still work */ }
+    return makeAgentClient({ base, token: '', services, routes });
+  }
+
   // — runtime: interacting with a live agent —
 
   /**
