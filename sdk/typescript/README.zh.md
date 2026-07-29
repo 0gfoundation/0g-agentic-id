@@ -520,7 +520,6 @@ const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
 import { AgenticID } from '@0glabs/agenticid-sdk';
 import { parseEther } from 'viem';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 // 三个占位符按你的环境提供：
 declare const ATTESTOR_URL: string, PRIVATE_KEY: `0x${string}`, ROUTER_API_KEY: string;
 
@@ -533,45 +532,28 @@ const depTx = await ag.deposit({ amountWei: parseEther('1') });   // sandbox 预
 await ag.waitForTransaction(depTx);
 await ag.agent.estimateCosts();                          // 算一下账（可选）
 
-// 1. 部署（sealedImage 整个省略——SDK 从 /config 取当前镜像）
-const { agentId, sealId } = await ag.agent.deploy({
+// 1. 部署,并【一步等到容器 running】。{ wait: 'running' } 阻塞到 mint + provision
+//    完成(实测 ~1~2 分钟),直接把可达的 url 一起返回——不用再手写轮询。
+//    sealedImage 省略 → SDK 从 /config 取当前镜像;inference 省略 → 默认 0g-compute/0gm-1.0-35b-a3b。
+const { agentId, url } = await ag.agent.deploy({
   name: 'MyAgent',
   description: 'my first sealed agent',
-  sandbox: { apiKey: ROUTER_API_KEY },   // inference 也省略——默认 0g-compute/0gm-1.0-35b-a3b
-}, { wait: true });
+  sandbox: { apiKey: ROUTER_API_KEY },
+}, { wait: 'running', timeoutMs: 300_000 });
 
-// 2. 轮询到容器 running，顺便拿到 sandboxId 和 agentUrl。
-//    provision 实测通常 1~2 分钟（拉镜像 + 容器初始化），这里预算 5 分钟。
-//    phase 语义：deploying 是在途；offline / failed 是终态——只有终态才把
-//    lastProvisionError 当结论（它记录最近一次失败、成功后不清空，
-//    在途时读它会把已自动重试掉的瞬时失败误判成死刑）。
-let me;
-for (let i = 0; i < 60; i++) {
-  me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-  if (me?.phase === 'running') break;                    // find() 可能 undefined（索引落后），?. 兜住
-  if (me?.phase === 'offline' || me?.phase === 'failed') {
-    throw new Error(`provision 终态失败: ${me.lastProvisionError ?? me.phase}`);
-  }
-  await sleep(5000);
+// 2. 拿 client 直接对话。ag 带 key → owner client;token 由 SDK 铸造 + 轮换后自动续,你不用管。
+const agent = await ag.agent.client(agentId);            // 也可 ag.agent.client(url)
+if (agent.chatStream) {
+  for await (const delta of agent.chatStream([{ role: 'user', content: 'hi' }]))
+    process.stdout.write(delta);
 }
-if (!me || me.phase !== 'running' || !me.url || !me.sandboxId) {
-  throw new Error(`超时未就绪: phase=${me?.phase ?? '未入索引'}, err=${me?.lastProvisionError ?? '-'}`);
-}
-const agentUrl = me.url;        // 直接属性访问——TS 沿用上面守卫的窄化（解构拿到的仍是 string|null）
-const sandboxId = me.sandboxId;
 
-// 3. 验证身份 + 对话
-const { verification } = await ag.agent.sayHi(agentUrl);   // 返回 ProofVerification | null（响应没带证明头时为 null）
-if (!verification?.ok) throw new Error(verification ? verification.reasons.join('; ') : '响应没有 X-Agent-Proof 头');
-const agent = await ag.agent.client(agentId);
-// → agent.chat?.(msgs) 聊天、agent.chatStream?.(msgs) 逐 token、agent.fetch(path) / agent.fetchWithProof(path) 打任意声明的路径（见正文示例）
-
-// 4. 服务 + 评价闭环（proof 的 deadline 是 +3600 秒，1 小时内上链即可）。
-//    需要环境有 ReputationRegistry（看 /config 的 reputation_registry_addr）——
-//    没有的话这一步会抛 "reputation: this environment has no …"，
-//    可用 fromAttestor 的 overrides 显式给地址（见初始化一节）。
-const { proof } = await ag.reputation.capture(() => fetch(`${agentUrl}/hello`));
-if (!proof) throw new Error('响应没有 X-Agent-Proof 头');   // capture 返回 Proof | null
+// 3. 取一条 serve-proof + 评价闭环(proof 的 deadline 是 +3600 秒,1 小时内上链即可)。
+//    刚部署的 agent 还没有自注册的 /api/* service,但 /hello 始终存在且【已签名】,
+//    所以对 /hello 取证是最省事的最小演示。需要环境有 ReputationRegistry
+//    (看 /config 的 reputation_registry_addr),否则这步会抛 "reputation: this environment has no …"。
+const { proof } = await agent.fetchWithProof('/hello');
+if (!proof) throw new Error('响应没有 X-Agent-Proof 头');
 const v = await ag.reputation.verifyProof(proof);   // 返回 { ok, reasons }，不会自己抛错
 if (!v.ok) throw new Error(v.reasons.join('; '));
 const fbTx = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
