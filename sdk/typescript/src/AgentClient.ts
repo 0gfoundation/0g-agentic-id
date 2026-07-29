@@ -195,8 +195,9 @@ export function makeAgentClient(params: {
       // balancer, ~60s) cuts the connection. Streaming keeps bytes flowing, so
       // the turn survives regardless of how long it runs. We still reassemble
       // the full completion and return it, so the method's contract is
-      // unchanged. Streamed responses carry no X-Agent-Proof — for an
-      // attributable, on-chain-replayable ServeProof, POST with stream:false.
+      // unchanged. The chat route is the owner↔agent steering channel and is
+      // never signed (no X-Agent-Proof), stream or not — reputation comes from
+      // the agent's own /api/* services, not from talking to your own agent.
       const r = await session.fetch(`${chat.prefix}chat/completions`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
