@@ -78,8 +78,8 @@ func New(agent *state.Agent, publicURL string) *Server {
 //
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
 //   - framework.RouteProvider         → the declared public routes the
-//     catch-all proxy forwards + signs (everything else 404s); absent ⇒
-//     legacy forward-all + sign-all
+//     catch-all proxy forwards (everything else 404s — fail-closed). Framework
+//     routes are never signed; only agent-registered /api/* services are.
 //
 // Called once by main after the on-chain framework binding names the
 // adapter. Handlers read under the lock.
@@ -101,8 +101,8 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	s.agentLogPath = agentLogPath
 	s.fwRoutes = fwRoutes
 	s.mu.Unlock()
-	if fwRoutes == nil {
-		logger.Logf("proxy: adapter %q declares no routes; legacy forward-all + sign-all in effect", fw.Name())
+	if len(fwRoutes) == 0 {
+		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
 	} else {
 		logger.Logf("proxy: adapter %q declared %d framework route(s)", fw.Name(), len(fwRoutes))
 	}
@@ -125,17 +125,13 @@ func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
 	return bestRoute, best >= 0
 }
 
-// hasFrameworkRoutes reports whether the adapter declared any routes. When
-// false, handleProxy keeps legacy behaviour (forward every path, sign every
-// response) so an adapter that hasn't adopted RouteProvider still works.
-func (s *Server) hasFrameworkRoutes() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.fwRoutes != nil
-}
-
 // frameworkRoutesForHello maps the declared routes to the public /hello wire
 // shape (report.Route). Empty when the adapter declared none.
+//
+// Signed is reported false for every framework route regardless of what the
+// adapter declared: handleProxy never signs a framework route (owner↔agent
+// steering channel), so /hello must not advertise otherwise. This keeps the
+// wire honest at the enforcement layer, not at the adapter's discretion.
 func (s *Server) frameworkRoutesForHello() []report.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -145,7 +141,7 @@ func (s *Server) frameworkRoutesForHello() []report.Route {
 			Prefix:      rt.Prefix,
 			Kind:        rt.Kind,
 			Auth:        rt.Auth,
-			Signed:      rt.Signed,
+			Signed:      false,
 			Description: rt.Description,
 		})
 	}
@@ -416,26 +412,42 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//      path is NOT blind-forwarded (bounds the public + signing surface).
 	// Legacy fallback: an adapter that declares no routes keeps the old
 	// behaviour — forward every path to the upstream and sign every response.
-	signed := true
+	// Signing follows a proxy-owned invariant, NOT the adapter's declared
+	// Signed flag:
+	//   - agent-registered /api/* service → signed. The outward, attributable
+	//     surface: the agent's own code serving an external task.
+	//   - framework-declared route → NEVER signed. The owner↔agent steering /
+	//     UI channel (chat, dashboard). Its bearer credential comes from the
+	//     owner-only /_seal/auth handshake, so signing it would let the owner
+	//     mint ServeProofs for interactions with their own agent — self-dealt
+	//     reputation. Enforced here at the proxy, not delegated to the route's
+	//     Signed flag, so a mis-declaring adapter can't reopen the hole.
+	//   - neither → 404 (fail-closed); no forward-all fallback.
+	signed := false
+	frameworkRoute := false
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
+		signed = true
 		upstream = svc.Backend
-	} else if s.hasFrameworkRoutes() {
-		rt, ok := s.matchFrameworkRoute(r.URL.Path)
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		signed = rt.Signed
+	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
+		frameworkRoute = true
 		// A route may pin its own loopback backend (a framework whose
 		// surfaces are separate processes/ports); empty keeps the single
 		// StartResult upstream. Same mechanism as svc.Backend above.
 		if rt.Backend != "" {
 			upstream = rt.Backend
 		}
+	} else {
+		// Not an agent service and not a declared framework route: serve
+		// nothing. (Previously a "legacy" forward-all + sign-all fallback for
+		// adapters that declared no routes — removed; every shipped adapter
+		// declares its routes, and fail-closed beats blind-forwarding an
+		// undeclared path to the framework.)
+		http.NotFound(w, r)
+		return
 	}
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
@@ -483,6 +495,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
+	// body, which a stream doesn't have until it ends. Relay it verbatim with
+	// per-chunk flushing so tokens reach the caller in real time — the same
+	// unsigned carve-out as the WebSocket upgrades above. This keeps a long
+	// reasoning turn alive: bytes keep flowing, so no idle-timeout window
+	// (framework SSE deltas + keepalives) ever opens on the connection.
+	//
+	// Gated on frameworkRoute, NOT on Content-Type alone: only a
+	// framework-declared route (the owner↔agent steering channel — chat/UI) may
+	// go unsigned. An agent-registered /api/* service (the outward, attributable
+	// surface) and the legacy forward-all path must stay buffered + signed, so
+	// they never lose their X-Agent-Proof merely by emitting text/event-stream —
+	// even if that means a long /api/* stream is buffered (and can still hit the
+	// idle cutoff; model such a service as short, discrete responses instead).
+	if shouldStreamRelay(frameworkRoute, resp) {
+		streamRelay(w, resp)
+		return
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "read upstream body: "+err.Error(), http.StatusBadGateway)
@@ -510,6 +541,81 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// ── Server-Sent Events (streaming) helpers ──────────────────────────────────
+
+// isEventStream reports whether the upstream response is a Server-Sent Events
+// stream (an OpenAI-compatible `chat/completions` with `stream: true`, or any
+// other `text/event-stream` body).
+func isEventStream(resp *http.Response) bool {
+	ct := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+// shouldStreamRelay decides whether a response is relayed as an unsigned stream
+// rather than buffered + signed. Only a framework-declared route (the
+// owner↔agent steering channel: chat/UI) may stream: it has no attribution
+// consumer, so an unsigned stream is fine. Agent-registered /api/* services and
+// the legacy forward-all path never stream here — they stay buffered + signed
+// so the attributable surface keeps its X-Agent-Proof even when it emits SSE.
+func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
+	return frameworkRoute && isEventStream(resp)
+}
+
+// streamRelay copies an SSE upstream response straight through to the client,
+// flushing after every chunk so each `data:` frame reaches the caller as the
+// framework emits it. It carries no X-Agent-Proof: the serve-proof signs a
+// complete body, which a stream does not have until it ends (same carve-out as
+// WebSocket upgrades). A caller that needs an attributable, on-chain-replayable
+// ServeProof uses the non-streaming (buffered + signed) path instead.
+//
+// Caveat: status + headers are committed at WriteHeader (200) before any body
+// byte, so an upstream error mid-stream can only truncate the body — it can't
+// change the status. That is inherent to streaming, not specific to this relay.
+func streamRelay(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		// corsMiddleware already set our Access-Control-*; duplicates make
+		// browsers reject the response.
+		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	// No Content-Length: length is unknown until the stream ends. Go falls
+	// back to chunked transfer-encoding, which is what SSE needs.
+	w.Header().Del("Content-Length")
+	w.WriteHeader(resp.StatusCode)
+
+	// NewResponseController unwraps middleware ResponseWriters to find the
+	// flusher, so a wrapper that forgets to forward Flush() doesn't silently
+	// re-buffer us. Flush the headers now so the client sees the response start
+	// immediately, independent of when the first upstream chunk lands.
+	rc := http.NewResponseController(w)
+	canFlush := rc.Flush() == nil
+	if !canFlush {
+		// No flusher in the chain: writes buffer to the end, re-opening the
+		// idle-timeout window we came here to avoid. Surface it rather than
+		// degrade silently.
+		logger.Logf("proxy: WARN SSE relay cannot flush (no http.Flusher in the writer chain); stream will buffer and may hit the upstream idle timeout")
+	}
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client went away
+			}
+			if canFlush {
+				_ = rc.Flush()
+			}
+		}
+		if rerr != nil {
+			return // io.EOF (clean end) or upstream error — nothing left to relay
+		}
 	}
 }
 
