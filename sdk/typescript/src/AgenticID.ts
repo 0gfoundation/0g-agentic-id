@@ -49,7 +49,14 @@ type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: b
 
 /** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
 const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
-/** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
+/**
+ * How long `deploy()` / `clone()` blocks before returning, in phase order:
+ *   - omit       → return on **acceptance** ({@link DeployAccepted});
+ *   - `'minted'` → also block on the on-chain **mint** (adds `agentId`);
+ *   - `'running'`→ also block on **provision** (adds the reachable `url`).
+ */
+export type WaitLevel = 'minted' | 'running';
+
 /**
  * Facade-normalized deploy/clone acceptance — camelCase like every other
  * SDK return (the attestor's wire JSON speaks snake_case; the mapping
@@ -59,9 +66,10 @@ export interface DeployAccepted {
   sealId: Hash;
   agentSealAddr: Address;
 }
+/** deploy/clone result once the background mint is awaited (`wait: 'minted'`). */
 type MintedResponse = DeployAccepted & { agentId: bigint };
-/** deploy/clone result once the container is up (`{ wait: 'running' }`) — adds
- *  the reachable base url, which `{ wait: true }` (mint-only) does not have yet. */
+/** deploy/clone result once the container is up (`wait: 'running'`) — adds the
+ *  reachable base url, which `wait: 'minted'` (mint-only) does not have yet. */
 type RunningResponse = MintedResponse & { url: string };
 
 function acceptedOf(res: DeployCloneResponse): DeployAccepted {
@@ -124,23 +132,24 @@ export class AgentApi {
   // — lifecycle —
   /**
    * Deploy a new agent. Async: returns `{ sealId, agentSealAddr }` once the
-   * attestor accepts the job. Pass `{ wait: true }` to also block on the
-   * background mint (via waitForMint) and get the new `agentId` in the result.
+   * attestor accepts the job. Pass `wait: 'minted'` to also block on the
+   * background mint (adds `agentId`) or `wait: 'running'` to also block on
+   * provision (adds the reachable `url`). See {@link WaitLevel}.
    */
   deploy(params: DeployParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
-  deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async deploy(params: DeployParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+  deploy(params: DeployParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  deploy(params: DeployParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async deploy(params: DeployParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.wait === 'running' && !params.sandbox) {
       throw new Error(
-        "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:true",
+        "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:'minted'",
       );
     }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
     if (!opts?.wait) return accepted;
-    // wait:true → block on the on-chain mint only (agentId, no url yet).
-    // wait:'running' → also block on provision (container up + reachable url).
+    // 'minted'  → block on the on-chain mint only (agentId, no url yet).
+    // 'running' → also block on provision (container up + reachable url).
     if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
@@ -148,13 +157,13 @@ export class AgentApi {
 
   /**
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
-   * `{ sealId, agentSealAddr }` on acceptance; `{ wait: true }` also blocks on
-   * the mint and returns the new `agentId`.
+   * `{ sealId, agentSealAddr }` on acceptance; `wait: 'minted'` also blocks on
+   * the mint (adds `agentId`), `wait: 'running'` also blocks on provision.
    */
   clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
-  clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async clone(params: CloneParams, opts?: { wait?: boolean | 'running' } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+  clone(params: CloneParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  clone(params: CloneParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async clone(params: CloneParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
     const accepted = acceptedOf(await this.attestor.clone(params));
@@ -239,54 +248,120 @@ export class AgentApi {
   }
 
   /**
-   * The owner handshake: signs `0GSealAuth:<sealId>:<ts>` (EIP-191) and
-   * exchanges it at {agentUrl}/_seal/auth for the gateway credential, then
-   * reads the agent's `/hello` to learn what it exposes. Owner-only — the
-   * container verifies the signer against the on-chain owner cached at
-   * provision.
+   * Get an {@link AgentClient} for a running agent — one handle for every
+   * caller, one argument: an `agentId` OR an `agentUrl` (whichever you have).
+   * The SDK fills in the other half:
+   *   - `agentId` → on-chain `tokenURI` → the AgentCard's serve URL;
+   *   - `agentUrl` → the agent's **signed** `/hello`, whose `X-Agent-Proof`
+   *     envelope carries the numeric agentId (so a URL alone is enough).
    *
-   * Returns an {@link AgentClient}: a full owner/operator credential
-   * (`session.token`, not a narrow scope — treat it accordingly) bound to
-   * the agent's own declaration of its surface. The session decides how to
-   * use it from what the agent declared, not from framework-specific
-   * knowledge baked into the SDK:
-   *   - `session.open?.()` — a browser URL with the token in the fragment,
-   *     present only if the agent declares a dashboard route;
-   *   - `session.chat?.(messages)` — an OpenAI-compatible chat call, present
-   *     only if the agent declares a chat route;
-   *   - `session.fetch(path, init)` — the general escape hatch for any path,
-   *     attaching the bearer token when the matched route asks for it.
-   *
-   * A headless agent (no dashboard) simply won't have `open`; an agent with
-   * no chat route won't have `chat`. Nothing is ever synthesized.
+   * Whether it can do owner ops is inherited from THIS `ag`, exactly like
+   * {@link AgenticID}'s account gates chain writes: an `ag` with an owner key
+   * gets `chat`/`chatStream` (the owner token is minted on first use and
+   * re-minted on rotation, e.g. after a `reset` — you never pass or refresh a
+   * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
+   * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
+   * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
    */
-  async authenticate(agentUrl: string, agentId: bigint): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string): Promise<AgentClient> {
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    const agentId = typeof idOrUrl === 'bigint' ? idOrUrl : disc.agentId;
+    const reauth = agentId !== undefined && this.hasAccount()
+      ? () => this.mintToken(base, agentId)
+      : undefined;
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth });
+  }
+
+  /**
+   * Owner handshake, eager: like {@link client} on an `ag` with a key, but
+   * mints the token up front so a non-owner fails HERE, not at first chat.
+   * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   */
+  async authenticate(idOrUrl: bigint | string): Promise<AgentClient> {
+    requireWallet(this.ctx);
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    const agentId = typeof idOrUrl === 'bigint' ? idOrUrl : disc.agentId;
+    if (agentId === undefined) {
+      throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
+    }
+    const token = await this.mintToken(base, agentId); // eager → throws if not owner
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, token, reauth: () => this.mintToken(base, agentId) });
+  }
+
+  /**
+   * Explicit public handle — never attaches a token even if this `ag` holds a
+   * key. For a third party calling the agent's `/api/*` services and capturing
+   * the serve-proof (`client.fetchWithProof('/api/…')` → `{ response, proof }`).
+   */
+  async connect(idOrUrl: bigint | string): Promise<AgentClient> {
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes }); // no reauth → public
+  }
+
+  /** Sign `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchange it at `{base}/_seal/auth` for a token. */
+  private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
     const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
     const signature = await walletClient.signMessage({ account, message });
-    const base = agentUrl.replace(/\/$/, '');
     const r = await fetch(`${base}/_seal/auth`, {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
-    const { token } = (await r.json()) as { token: string };
+    return ((await r.json()) as { token: string }).token;
+  }
 
-    // Discover the agent's declared surface. `routes`/`services` are absent
-    // on pre-route sealed builds — degrade to an empty surface (fetch still
-    // works; open/chat just won't be offered).
-    let services: AgentServiceEntry[] = [];
-    let routes: AgentRoute[] = [];
+  /** Resolve the serve base URL: a bigint agentId via on-chain tokenURI; a string URL as-is. */
+  private async resolveBase(idOrUrl: bigint | string): Promise<string> {
+    return typeof idOrUrl === 'bigint' ? this.resolveAgentUrl(idOrUrl) : idOrUrl.replace(/\/$/, '');
+  }
+
+  /** Whether this `ag` holds a signer — so the clients it builds can do owner ops. */
+  private hasAccount(): boolean {
+    return !!(this.ctx.walletClient && this.ctx.account);
+  }
+
+  /**
+   * Resolve an agent's live serve base URL from its on-chain identity — no
+   * attestor. Reads `tokenURI(agentId)` (the canonical AgentCard pointer on 0G
+   * storage), fetches the card, and returns the origin of its `url` (the serve
+   * endpoint, refreshed on storage as the container is (re)created). Throws if
+   * the agent isn't provisioned yet (no URI, or a card with no url).
+   */
+  private async resolveAgentUrl(agentId: bigint): Promise<string> {
+    const uri = await this.id.tokenURI(agentId);
+    if (!uri) throw new Error(`agent ${agentId}: no on-chain URI yet (not provisioned)`);
+    let card: Record<string, unknown>;
     try {
-      const hello = (await (await fetch(`${base}/hello`)).json()) as {
-        services?: AgentServiceEntry[]; routes?: AgentRoute[];
-      };
-      services = hello.services ?? [];
-      routes = hello.routes ?? [];
-    } catch { /* discovery is best-effort; token still usable via fetch */ }
+      card = (await (await fetch(uri)).json()) as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(`agent ${agentId}: fetch AgentCard (${uri}) failed: ${(e as Error).message}`);
+    }
+    const cardUrl = typeof card.url === 'string' ? card.url : '';
+    if (!cardUrl) throw new Error(`agent ${agentId}: AgentCard has no serve url (not running)`);
+    return new URL(cardUrl).origin;
+  }
 
-    return makeAgentClient({ base, token, services, routes });
+  /**
+   * Read the agent's signed `/hello` to learn its declared surface AND its
+   * numeric agentId — the latter from the response's `X-Agent-Proof` envelope,
+   * so a caller who has only the URL still gets the id needed to authenticate.
+   * Absent on pre-route / unprovisioned builds → empty surface + undefined id
+   * (fetch/fetchWithProof still work; owner ops just aren't offered).
+   */
+  private async discoverSurface(base: string): Promise<{ services: AgentServiceEntry[]; routes: AgentRoute[]; agentId?: bigint }> {
+    try {
+      const res = await fetch(`${base}/hello`);
+      const hello = (await res.json()) as { services?: AgentServiceEntry[]; routes?: AgentRoute[] };
+      const agentId = proofFromResponse(res)?.agentId; // /hello is signed; its envelope carries agent_id
+      return { services: hello.services ?? [], routes: hello.routes ?? [], agentId };
+    } catch {
+      return { services: [], routes: [] }; // best-effort; fetch/fetchWithProof still work
+    }
   }
 
   // — runtime: interacting with a live agent —
@@ -463,8 +538,8 @@ export class AgentApi {
   /**
    * Wait for a freshly-deployed/cloned agent's CONTAINER to come up, returning
    * its agentId + reachable base url. {@link deploy}/{@link clone} with
-   * `{ wait: true }` only block on the on-chain mint — the agentId exists but
-   * the container (and its url) is still 1–2 min out; `{ wait: 'running' }`
+   * `wait: 'minted'` only block on the on-chain mint — the agentId exists but
+   * the container (and its url) is still 1–2 min out; `wait: 'running'`
    * routes here to also block on provision. Polls {@link listDeployments};
    * throws on `phase: "failed"` or timeout (default 300s, longer than mint
    * because provision includes container start).

@@ -72,6 +72,18 @@ export class AgenticIDClient {
     }) as Promise<Hash>;
   }
 
+  /**
+   * The agent's on-chain URI (ERC-8004 canonical). Points at the agent's
+   * AgentCard (a JSON doc on 0G storage) whose `url` field is the live serve
+   * endpoint. Empty string until the attestor's two-phase setAgentURI fills it
+   * (i.e. before the agent is provisioned).
+   */
+  async tokenURI(tokenId: bigint): Promise<string> {
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'tokenURI', args: [tokenId],
+    }) as Promise<string>;
+  }
+
   async getAgentIdBySealId(sealId: Hash): Promise<bigint> {
     return this.ctx.publicClient.readContract({
       address: this.address, abi: agenticIDAbi, functionName: 'getAgentIdBySealId', args: [sealId],
