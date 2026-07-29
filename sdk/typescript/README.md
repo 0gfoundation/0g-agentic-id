@@ -281,9 +281,9 @@ Acknowledging the TEE trust-root set and funding the prepaid sandbox balance are
 
 > **Two different balances — don't confuse them:**
 > - **`ag.deposit()` → the prepaid sandbox balance** (SandboxServing). The agent's **runtime / serving cost**, **pay-as-you-go**: the sandbox provider bills it per-minute while the container runs. Per depositor, not per-agent; `getBalance()` reads it; deploy preflights it (≥ 0.1 OG).
-> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → the agentSeal's own gas.** The agent's TEE wallet needs native OG to pay **gas for the on-chain transactions it makes itself** — chiefly uploading its evolving state/memory to 0G storage ("evolution gas"). Funds a specific agent's `agentSeal` address.
+> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → the agentSeal's own gas** — the agent's **operating budget**. The agentSeal is the agent's TEE-held wallet; it pays gas for **everything the agent does on chain as itself**: uploading its evolving state/memory to 0G storage, *and* — when the agent runs this SDK under its own agentSeal ([agents as owners](#agents-as-owners-nested-agents)) — its own actions like deploying sub-agents, transfers, and feedback. It's the agent's activity budget, not just "evolution gas". Funds a specific agent's `agentSeal` address.
 >
-> In short: **deposit = keep it running (compute), topUpAgentSeal = fuel the agent's own on-chain writes (evolution).** `runtimeCosts(agentId)` reports both (`prepaidBalanceWei` vs `sealGasWei`).
+> In short: **deposit = keep it running (compute); topUpAgentSeal = the agent's own on-chain activity budget (evolution + anything it does as itself).** `runtimeCosts(agentId)` reports both (`prepaidBalanceWei` vs `sealGasWei`).
 
 ```ts
 import { parseEther } from 'viem';

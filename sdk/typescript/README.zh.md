@@ -289,9 +289,9 @@ await ag.reputation.revokeFeedback(agentId, idx);              // → 交易哈�
 
 > **两笔不同的钱,别混:**
 > - **`ag.deposit()` → sandbox 预付费余额**(SandboxServing)。agent 的**运行/服务费**,**按量付费(pay-as-you-go)**:容器运行时由 sandbox provider 按分钟从这里扣。按充值方记账、不是按 agent;`getBalance()` 读它;deploy 预检它(≥ 0.1 OG)。
-> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → agentSeal 自己的 gas。** agent 的 TEE 钱包需要原生 OG 来**给它自己发起的链上交易付 gas**——主要是把它进化的状态/记忆上传到 0G storage("进化燃料")。充的是某个具体 agent 的 `agentSeal` 地址。
+> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → agentSeal 自己的 gas**——agent 的**活动经费**。agentSeal 是 agent 的 TEE 钱包,给**它以自己身份发起的一切链上交易**付 gas:把进化的状态/记忆上传到 0G storage,**以及**——当 agent 用自己的 agentSeal 跑这个 SDK("agent 作为 owner")时——它自己的动作,比如部署子 agent、转让、评价。是 agent 的**运营预算**,不只是"进化燃料"。充的是某个具体 agent 的 `agentSeal` 地址。
 >
-> 一句话:**deposit = 让它跑起来(算力),topUpAgentSeal = 给 agent 自己的链上写入加油(进化)。** `runtimeCosts(agentId)` 会把两者都报出来(`prepaidBalanceWei` vs `sealGasWei`)。
+> 一句话:**deposit = 让它跑起来(算力);topUpAgentSeal = agent 自己的链上活动经费(进化 + 它以自己身份做的一切)。** `runtimeCosts(agentId)` 会把两者都报出来(`prepaidBalanceWei` vs `sealGasWei`)。
 
 ```ts
 import { parseEther } from 'viem';
