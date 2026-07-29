@@ -27,7 +27,7 @@ if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
 
 // ── Facade + namespaces ──
 export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
-export type { DeployAccepted } from './AgenticID';
+export type { DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
 export type { AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion } from './AgentClient';
 export { defaultIData } from './AttestorClient';

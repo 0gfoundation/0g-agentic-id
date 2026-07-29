@@ -141,14 +141,17 @@ const params = {
 // 第一个 await 在 attestor 受理任务时就返回；tokenId 要等后台铸造
 // （存储 → 链上 mint → setAgentURI）完成才存在。
 
-// `{ wait: true }` 只阻塞到链上【铸造】完成——你拿到 agentId，但容器（和它的
+// `wait` 决定阻塞到哪一档(按阶段):省略 → 受理;'minted' → 到铸造(多出 agentId);
+// 'running' → 到 provision(多出 url)。
+// `{ wait: 'minted' }` 只阻塞到链上【铸造】完成——你拿到 agentId，但容器（和它的
 // url）还要 ~1-2 分钟才好，所以别急着用 url：
-const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: 'minted' });  // agentId → 34n
 // `{ wait: 'running' }` 会连【provision】一起等，并返回可直接访问的 base url：
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url 此刻可用
 // 仅 mint——省略 `sandbox` 就只铸造、不起容器：agent 落 Offline（已铸造、无运行时），
-// 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:true：
-const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: true });
+// 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:'minted'：
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: 'minted' });
+// (`wait: true` 是 'minted' 的 deprecated 别名。)
 
 // 或者先拿 sealId、稍后再等（或轮询）铸造：
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -156,7 +159,7 @@ const id = await ag.agent.waitForMint(dep.sealId);    // → 铸好后返回 34n
 
 // clone——源 owner 为另一个 owner 铸一份副本（attestor 对密封数据重新加密）
 const newOwner = '0x1111111111111111111111111111111111111111';
-const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: 'minted' });
 // cl → { sealId, agentSealAddr, agentId }——新 agent 的 tokenId；新 owner 名下初始为 Offline
 
 // idempotencyKey 在 deploy/clone 上可选——SDK 每次调用自动生成。传你自己的
@@ -320,7 +323,7 @@ const tx = await ag.deposit({ amountWei: parseEther('1') });
 await ag.waitForTransaction(tx);   // 现在再读 getBalance() 才是新值
 ```
 
-`deploy()`/`clone()` 的 `{ wait: true }` 已经内置了等待（等的是铸造完成，语义更强），不需要这个模式。
+`deploy()`/`clone()` 的 `{ wait: 'minted' }` 已经内置了等待（等的是铸造完成，语义更强），不需要这个模式。
 
 ---
 

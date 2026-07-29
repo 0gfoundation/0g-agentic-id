@@ -133,15 +133,18 @@ const params = {
 // The first await returns once the attestor ACCEPTS the job; the tokenId doesn't
 // exist until the background mint (storage → on-chain mint → setAgentURI).
 
-// `{ wait: true }` blocks on the on-chain MINT only — you get the agentId, but the
-// container (and its url) is still ~1-2 min out, so don't reach for the url yet:
-const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+// `wait` picks how far to block (phase order): omit → accepted; 'minted' →
+// through the mint (adds agentId); 'running' → through provision (adds url).
+// `{ wait: 'minted' }` blocks on the on-chain MINT only — you get the agentId,
+// but the container (and its url) is still ~1-2 min out, so don't reach for it yet:
+const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: 'minted' });  // agentId → 34n
 // `{ wait: 'running' }` also blocks on PROVISION and returns the reachable base url:
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url now hittable
 // Mint-only — omit `sandbox` to mint WITHOUT a container: the agent lands
 // Offline (minted, no runtime), bring it online later with start(). No
-// container means no url, so wait:'running' is rejected here — use wait:true:
-const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: true });
+// container means no url, so wait:'running' is rejected here — use wait:'minted':
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: 'minted' });
+// (`wait: true` is a deprecated alias for 'minted'.)
 
 // Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -149,7 +152,7 @@ const id = await ag.agent.waitForMint(dep.sealId);    // → 34n once minted (tu
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
-const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: 'minted' });
 // cl → { sealId, agentSealAddr, agentId }  — the new agent's tokenId; lands Offline for the new owner
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
@@ -314,7 +317,7 @@ const tx = await ag.deposit({ amountWei: parseEther('1') });
 await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 ```
 
-`deploy()`/`clone()`'s `{ wait: true }` already waits (for the mint, a stronger guarantee) — this pattern isn't needed there.
+`deploy()`/`clone()`'s `{ wait: 'minted' }` already waits (for the mint, a stronger guarantee) — this pattern isn't needed there.
 
 ---
 
