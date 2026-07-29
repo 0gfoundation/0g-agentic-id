@@ -246,16 +246,18 @@ export class AgentApi {
    * provision.
    *
    * Returns an {@link AgentClient}: a full owner/operator credential
-   * (`session.token`, not a narrow scope — treat it accordingly) bound to
-   * the agent's own declaration of its surface. The session decides how to
+   * (`client.token`, not a narrow scope — treat it accordingly) bound to
+   * the agent's own declaration of its surface. The client decides how to
    * use it from what the agent declared, not from framework-specific
    * knowledge baked into the SDK:
-   *   - `session.open?.()` — a browser URL with the token in the fragment,
+   *   - `client.open?.()` — a browser URL with the token in the fragment,
    *     present only if the agent declares a dashboard route;
-   *   - `session.chat?.(messages)` — an OpenAI-compatible chat call, present
-   *     only if the agent declares a chat route;
-   *   - `session.fetch(path, init)` — the general escape hatch for any path,
-   *     attaching the bearer token when the matched route asks for it.
+   *   - `client.chat?.(messages)` / `client.chatStream?.(messages)` — an
+   *     OpenAI-compatible chat call, present only if the agent declares a
+   *     chat route;
+   *   - `client.fetch(path, init)` / `client.fetchWithProof(path, init)` —
+   *     the general escape hatch for any path, attaching the bearer token
+   *     when the matched route asks for it.
    *
    * A headless agent (no dashboard) simply won't have `open`; an agent with
    * no chat route won't have `chat`. Nothing is ever synthesized.
