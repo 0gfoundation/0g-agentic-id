@@ -143,10 +143,10 @@ const params = {
 
 // `wait` 决定阻塞到哪一档(按阶段):省略 → 受理;'minted' → 到铸造(多出 agentId);
 // 'running' → 到 provision(多出 url)。
-// `{ wait: 'minted' }` 只阻塞到链上【铸造】完成——你拿到 agentId，但容器（和它的
+// `{ wait: 'minted' }` 只阻塞到链上铸造完成——你拿到 agentId，但容器（和它的
 // url）还要 ~1-2 分钟才好，所以别急着用 url：
 const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: 'minted' });  // agentId → 34n
-// `{ wait: 'running' }` 会连【provision】一起等，并返回可直接访问的 base url：
+// `{ wait: 'running' }` 会连 provision 一起等，并返回可直接访问的 base url：
 const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url 此刻可用
 // 仅 mint——省略 `sandbox` 就只铸造、不起容器：agent 落 Offline（已铸造、无运行时），
 // 之后用 start() 拉起。没容器就没 url，所以这里 wait:'running' 会被拒——用 wait:'minted'：
@@ -166,13 +166,13 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // 不会重复铸造）：
 // await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
-// transfer——ERC-7857 转让。旧 owner 容器的拆除是【异步】的：attestor 靠监听
+// transfer——ERC-7857 转让。旧 owner 容器的拆除是异步的：attestor 靠监听
 // 链上事件（indexer）来拆，所以会比交易慢一个 indexer 追块延迟。转让刚上链时
 // phase 可能还是 'running'，接着 '400'，最后才 'offline'——这不是 bug、也不是
 // 安全漏洞：链上权限门在转让那一刻立刻归新 owner（旧 owner 再也控制不了它，见
 // TRUST_MODEL），残留容器只是个够不着的空壳、正在被清理。转让后别拿 phase 当准，
 // 等到 'offline'，或直接让新 owner reset()/start() 一个新容器（身份不变）。这个
-// 靠 indexer 监听的拆除是【必须保留的兜底】：任何人都能直接在链上 transferFrom、
+// 靠 indexer 监听的拆除是必须保留的兜底：任何人都能直接在链上 transferFrom、
 // 绕开任何"先停"的路径，所以拆除只能是被动响应式的。
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → 交易哈希 "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → 交易哈希 "0x…"
@@ -243,7 +243,7 @@ import { keccak256, toBytes } from 'viem';
 
 // 1. 调用 agent 某个签名的 /api/* service,并一步取证。public 句柄不需要钱包;
 //    fetchWithProof 读 sealed 代理盖在 /api/* 响应上的 X-Agent-Proof。
-//    (chat 路由【不签名】——声誉来自 agent 自己的 /api/* service,不是聊天。)
+//    (chat 路由不签名——声誉来自 agent 自己的 /api/* service,不是聊天。)
 const agent = await ag.agent.connect(agentId);        // public 句柄;或 ag.agent.client(agentId)
 const { response, proof } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
@@ -534,7 +534,7 @@ const depTx = await ag.deposit({ amountWei: parseEther('1') });   // sandbox 预
 await ag.waitForTransaction(depTx);
 await ag.agent.estimateCosts();                          // 算一下账（可选）
 
-// 1. 部署,并【一步等到容器 running】。{ wait: 'running' } 阻塞到 mint + provision
+// 1. 部署,并一步等到容器 running。{ wait: 'running' } 阻塞到 mint + provision
 //    完成(实测 ~1~2 分钟),直接把可达的 url 一起返回——不用再手写轮询。
 //    sealedImage 省略 → SDK 从 /config 取当前镜像;inference 省略 → 默认 0g-compute/0gm-1.0-35b-a3b。
 const { agentId, url } = await ag.agent.deploy({
@@ -551,7 +551,7 @@ if (agent.chatStream) {
 }
 
 // 3. 取一条 serve-proof + 评价闭环(proof 的 deadline 是 +3600 秒,1 小时内上链即可)。
-//    刚部署的 agent 还没有自注册的 /api/* service,但 /hello 始终存在且【已签名】,
+//    刚部署的 agent 还没有自注册的 /api/* service,但 /hello 始终存在且已签名,
 //    所以对 /hello 取证是最省事的最小演示。需要环境有 ReputationRegistry
 //    (看 /config 的 reputation_registry_addr),否则这步会抛 "reputation: this environment has no …"。
 const { proof } = await agent.fetchWithProof('/hello');
