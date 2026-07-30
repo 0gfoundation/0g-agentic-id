@@ -166,6 +166,10 @@ pub fn connect_http(
         .filler(NonceFiller::<CachedNonceManager>::default())
         .wallet(wallet)
         .on_http(url);
+    // Startup marker so a live process proves which nonce manager is compiled
+    // in — a missing/"Simple" line means the running binary predates the #54
+    // fix (stale image / wrong service deployed).
+    tracing::info!(sender = %sender, "chain client ready — mint nonce manager = CachedNonceManager (#54)");
     let chain = AlloyChain::new(
         provider,
         contract_addr,
