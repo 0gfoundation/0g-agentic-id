@@ -21,7 +21,7 @@
 if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
   throw new Error(
     '@0gfoundation/agentic-sdk requires a global fetch (Node >= 18). ' +
-      'On Node 16/17 either upgrade Node or polyfill globalThis.fetch.',
+      'On Node < 18 either upgrade Node or polyfill globalThis.fetch.',
   );
 }
 

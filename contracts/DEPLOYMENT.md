@@ -181,10 +181,14 @@ verified once; re-run after each upgrade (already-verified ones skip). Browser
 > Deployment log — append, don't overwrite. `broadcast/Deploy.s.sol/16602/run-latest.json`
 > is the truth for the most recent deploy. Addresses/wiring below were
 > **verified on chain 2026-07-03** (`VERSION` / `canonical()` /
-> `getIdentityRegistry()` / `beacon.implementation()` all match).
+> `getIdentityRegistry()` / `beacon.implementation()` all matched as of that
+> check); the one change since is the test ReputationRegistry beacon upgrade
+> to 1.1.0 on **2026-07-22**, verified post-upgrade (see §7).
 >
 > **Two canonical-bound environments run in parallel** — pick the set by env:
-> - **test** (§6.1) — AgenticID `0x3449…`, owner `0xea69…`.
+> - **test** (§6.1) — AgenticID `0x3449…`, owner `0xea69…`. **This is what the
+>   production attestor (`agenticid.0g.ai`) uses**: its `GET /config` serves
+>   `agentic_id_addr = 0x3449…` (checked live 2026-07-30).
 > - **dev** (§6.2) — AgenticID `0x5BB5…`, owner `0xB831…`. **This is what the
 >   dev-host attestor points at** (`ATTESTOR_AGENTIC_ID_ADDR`).
 >
@@ -209,7 +213,16 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` | |
 | TimelockController | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` | |
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
+| TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |
+| SandboxServing (attestor infra, external) | `0x3490B9053AC46F7Bf71A1ceBffcB2be2C1405b41` | from attestor `GET /config` |
 | owner / pauser / oracle / deployer | `0xea695C312CE119dE347425B29AFf85371c9d1837` | |
+
+TappRegistry / SandboxServing are attestor-deployment infrastructure (external
+contracts the attestor is configured with, **not** deployed by this repo's
+`Deploy.s.sol`); the addresses above are what the production attestor's
+`GET https://agenticid.0g.ai/config` serves (`tapp_registry_addr` /
+`sandbox_serving_addr`, checked live 2026-07-30). Together with the three
+proxies above they form the five-address `ContractAddresses` set the SDK needs.
 
 **Governance is testnet-only:** owner=pauser=oracle=deployer EOA, `timelockDelay=0`,
 open execution. Mainnet needs a real multisig + non-zero delay + a real TEE oracle.
@@ -233,6 +246,12 @@ owner `0xB831…`.
 | TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | |
 | owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` | |
 
+The dev environment's TappRegistry / SandboxServing addresses are not recorded
+in this repo (they're attestor-deployment infra, configured via
+`ATTESTOR_TAPP_REGISTRY_ADDR` / `ATTESTOR_SANDBOX_SERVING_ADDR`); read them
+from the dev-host attestor's `GET /config` (`tapp_registry_addr` /
+`sandbox_serving_addr`).
+
 ### 6.3 Superseded / do not use
 
 - **Pre-canonical-binding self-implemented** (old self-implemented AgenticID, not
@@ -249,7 +268,9 @@ owner `0xB831…`.
 
 ## 7. Contract versions & changelog
 
-Current impl versions (verified on chain, 2026-07-03):
+Current impl versions (dev verified on chain 2026-07-03; test matched that
+check except ReputationRegistry, which reached 1.1.0 via the **2026-07-22**
+beacon upgrade and was verified post-upgrade — see changelog):
 
 | Contract | dev VERSION | test VERSION |
 |---|---|---|

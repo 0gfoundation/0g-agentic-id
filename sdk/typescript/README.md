@@ -8,7 +8,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 
 | Surface | What |
 |---|---|
-| `ag.agent` | agent lifecycle — **deploy / clone / transfer** — reads (owner, agentSeal, iData…), and agent-seal gas top-up |
+| `ag.agent` | agent lifecycle — **deploy / clone / transfer** — chain reads (owner, agentSeal, iData…), agent-seal gas top-up, stop/start/reset, cost estimation, headless interaction |
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance |
@@ -20,6 +20,8 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 ```bash
 npm install @0gfoundation/agentic-sdk viem
 ```
+
+**Before you test**: your wallet needs testnet OG — gas (for on-chain writes like deploy/feedback) + the prepaid sandbox balance (recommend ≥0.5 OG: createFee 0.06 + per-minute runtime fees). Faucet: <https://faucet.0g.ai>.
 
 ## Setup
 
@@ -39,6 +41,22 @@ The trust model already rests on the TEE attestor you acknowledged — its
 /config is as trustworthy as everything else it does, so this is the one
 construction path you need.
 
+A real `/config` response looks like this (agenticid.0g.ai, excerpt; the fields are snake_case, the SDK maps them into `ContractAddresses`' camelCase):
+
+```json
+{
+  "chain_rpc": "https://evmrpc-testnet.0g.ai",
+  "chain_id": 16602,
+  "agentic_id_addr": "0x34493302287308f565cf3409daadedf4c8895648",
+  "tapp_registry_addr": "0x2ce80374318b1d7fb3345724457a182e0ad165c9",
+  "sandbox_serving_addr": "0x3490b9053ac46f7bf71a1cebffcb2be2c1405b41",
+  "reputation_registry_addr": "0xede70197313d0b603612dfc9801162d1ada3d196",
+  "tee_data_verifier_addr": "0x9d48fcce51b4b39fcb6e4bd0840f75a987cef980",
+  "sandbox_snapshot": "0g-sealed",
+  "supported_frameworks": ["openclaw"]
+}
+```
+
 Not every environment deploys every contract. An address absent from
 /config maps to the zero address: `fromAttestor` still constructs (chain
 reads, deploy, etc. all work), and the affected namespace fails fast with
@@ -55,7 +73,9 @@ Construct **once**. All you need for reads is contract addresses; for writes, ad
 import { AgenticID, type ContractAddresses } from '@0gfoundation/agentic-sdk';
 
 // Addresses are a deployment artifact — copy the set you target from
-// contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
+// contracts/DEPLOYMENT.md §6, or load from your own config/env. (tappRegistry /
+// sandboxServing equivalently come from the attestor's GET /config as
+// tapp_registry_addr / sandbox_serving_addr.) An RPC + these
 // addresses fully determine the target contracts.
 const addresses: ContractAddresses = {
   agenticID:          '0x…',
@@ -169,6 +189,34 @@ const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
 ```
 
+**Runtime lifecycle** (owner-signed; on-chain identity is unchanged):
+
+```ts
+await ag.agent.stop(sealId, sandboxId);     // stop the container
+await ag.agent.start(sealId, sandboxId);    // bring it back up
+await ag.agent.reset(sealId, { apiKey });   // recreate the container: re-reads iData from
+                                            // chain, reselects the framework adapter.
+                                            // apiKey is required in practice — the attestor
+                                            // doesn't cache model keys; without it the agent
+                                            // boots but can't reach its model.
+                                            // sealedImage optional — defaults to /config's current image.
+await ag.agent.listDeployments();
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+//   phase: 'deploying' (in flight) | 'running' (serving) | 'stopped' (owner-paused; start() resumes)
+//         | 'offline' (container gone — failure/timeout/transfer-teardown; on-chain identity
+//           survives, reset() rebuilds) | 'failed' (mint never completed; retry);
+//   url: the agent's public base URL (what you feed sayHi/authenticate/the chat API);
+//        null until the container is provisioned;
+//   lastProvisionError: why a deployment failed — non-null only while the row is
+//   failed (the failing pipeline stage's reason: storage / mint / container_stage,
+//   e.g. "mint submit: … replacement transaction underpriced") or offline due to a
+//   genuine container failure (e.g. "image_hash not in validFrameworkHashes");
+//   recovered rows report null.
+//   Note this is an unauthenticated public endpoint (it returns ALL of the attestor's
+//   deployments, not just yours) — the content (agentId/owner/name/URL) is already
+//   public in chain events and the agent card; that's by design.
+```
+
 **Which identifier does what** — three IDs refer to the same agent from different angles:
 
 | Identifier | What it is | Used by |
@@ -272,8 +320,11 @@ await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 
 ## The runtime image, framework, and iData shapes
 
-The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
-`0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
+The `sealedImage` (from `GET /config`'s `sandbox_snapshot` — the name is
+environment-specific: the production attestor currently serves `0g-sealed`,
+the dev/default config uses `0g-test-sealed`; your target attestor's
+`GET /config` is the source of truth and the SDK auto-discovers it.
+0g-sandbox's own wire field for it is still called `snapshot`)
 is the sealed runtime image bundling the **openclaw** framework adapter —
 the only framework shipping today (`/config.supported_frameworks` is the
 source of truth).
@@ -349,6 +400,8 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 // spend needs provider-side usage records — not on chain yet.
 ```
 
+> Reference pricing (dev testnet): createFee 0.06 OG, CPU 0.001 OG/core·min, memory 0.0005 OG/GB·min — about 0.004 OG/min for the default spec.
+
 ## Interacting with a running agent (no console needed)
 
 **Where `agentUrl` comes from** — every running agent has a public base URL
@@ -358,12 +411,13 @@ the hosted environment https). `listDeployments()` hands it to you:
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 // me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
-const agentUrl = me.url;               // null until the container is provisioned
-// If phase never reaches 'running' (or ends 'failed'), me.lastProvisionError
-// says why — container-provision failures (e.g. "image_hash not in
+const agentUrl = me?.url;              // null until the container is provisioned
+// If phase ends 'failed' or 'offline', me.lastProvisionError says why —
+// container-provision failures (e.g. "image_hash not in
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
-// submit: … replacement transaction underpriced" — folded in from the
-// failed stage's reason).
+// submit: … replacement transaction underpriced" — taken from the
+// failed stage's reason). It is phase-gated: non-null only for
+// failed/offline rows; recovered rows report null.
 ```
 
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
@@ -459,9 +513,9 @@ is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env. `tappRegistry` / `sandboxServing` equivalently come from the attestor's `GET /config` (`tapp_registry_addr` / `sandbox_serving_addr`).
 
-The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` (viem chain), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
+The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
 ## Notes
 
@@ -491,3 +545,75 @@ const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
 ```
 
 The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
+
+---
+
+## Appendix: the full zero-to-chat path (flow tested live on dev)
+
+```ts
+import { AgenticID } from '@0gfoundation/agentic-sdk';
+import { parseEther } from 'viem';
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Three placeholders — supply from your environment:
+declare const ATTESTOR_URL: string, PRIVATE_KEY: `0x${string}`, ROUTER_API_KEY: string;
+
+// 0. Bootstrap + prerequisites. Wait for each write's receipt before moving on
+//    (see the read-after-write section) — a fresh account that deploys right
+//    after ack/deposit without waiting hits the preflight balance/ack checks.
+const ag = await AgenticID.fromAttestor(ATTESTOR_URL, { account: PRIVATE_KEY });
+const ackTx = await ag.ack();                            // trust-root acknowledgment (one-time)
+if (ackTx) await ag.waitForTransaction(ackTx);
+const depTx = await ag.deposit({ amountWei: parseEther('1') });   // prepaid sandbox balance
+await ag.waitForTransaction(depTx);
+await ag.agent.estimateCosts();                          // budget check (optional)
+
+// 1. Deploy (sealedImage omitted entirely — the SDK takes the current image from /config)
+const { agentId, sealId } = await ag.agent.deploy({
+  name: 'MyAgent',
+  description: 'my first sealed agent',
+  sandbox: { apiKey: ROUTER_API_KEY },   // inference omitted too — defaults to 0g-compute/0gm-1.0-35b-a3b
+}, { wait: true });
+
+// 2. Poll until the container is running; pick up sandboxId and agentUrl on the way.
+//    Provision typically takes 1-2 minutes in practice (image pull + container init);
+//    budget 5 minutes here.
+//    phase semantics: 'deploying' is in flight; 'offline' / 'failed' are terminal.
+//    lastProvisionError is phase-gated by the SDK — non-null only on failed/offline
+//    rows (recovered rows report null), so a non-null value is a real conclusion.
+let me;
+for (let i = 0; i < 60; i++) {
+  me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+  if (me?.phase === 'running') break;                    // find() may be undefined (indexer may lag), ?. guards it
+  if (me?.phase === 'offline' || me?.phase === 'failed') {
+    throw new Error(`provision failed terminally: ${me.lastProvisionError ?? me.phase}`);
+  }
+  await sleep(5000);
+}
+if (!me || me.phase !== 'running' || !me.url || !me.sandboxId) {
+  throw new Error(`timed out: phase=${me?.phase ?? 'not indexed'}, err=${me?.lastProvisionError ?? '-'}`);
+}
+const agentUrl = me.url;        // direct property access — TS keeps the guard's narrowing (destructuring would give string|null)
+const sandboxId = me.sandboxId;
+
+// 3. Verify identity + chat
+const { verification } = await ag.agent.sayHi(agentUrl);   // returns ProofVerification | null (null when the response has no proof header)
+if (!verification?.ok) throw new Error(verification ? verification.reasons.join('; ') : 'response has no X-Agent-Proof header');
+const { token } = await ag.agent.authenticate(agentUrl, agentId);
+// → call `${agentUrl}/v1/chat/completions` with the token (see the main text), or open dashboardUrl
+
+// 4. Serve + feedback loop (the proof's deadline is +3600s — submit within the hour).
+//    Requires an environment with a ReputationRegistry (check /config's
+//    reputation_registry_addr) — without one this step throws
+//    "reputation: this environment has no …"; use fromAttestor's overrides
+//    to pass the address explicitly (see Setup).
+const { proof } = await ag.reputation.capture(() => fetch(`${agentUrl}/hello`));
+if (!proof) throw new Error('response has no X-Agent-Proof header');   // capture returns Proof | null
+const v = await ag.reputation.verifyProof(proof);   // returns { ok, reasons }, never throws by itself
+if (!v.ok) throw new Error(v.reasons.join('; '));
+const fbTx = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+await ag.reputation.waitForTransaction(fbTx);   // readFeedback/getSummary only see this entry after the receipt
+
+// 5. Stop when done (identity and data live on chain; start/reset bring it back anytime)
+await ag.agent.stop(sealId, sandboxId);
+```

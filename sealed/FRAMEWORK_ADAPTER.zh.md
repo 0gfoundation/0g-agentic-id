@@ -517,7 +517,11 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 6. 框架是 npm 可装的话,可选地往 `images/sealed/Dockerfile` 加一行
    热缓存;无论加不加,通用镜像重建后的 hash 都走 attestor 的
    allowlist 流程。只有新的运行时生态(Python、JVM)才会结构性地
-   增大镜像。
+   增大镜像。(关于实际线上路径的如实说明:今天真正在跑的 runtime
+   bootstrap 镜像——`sealed/Dockerfile`——FROM 的是 openclaw base
+   镜像(`images/openclaw/`),不是通用镜像;本条指令针对的是
+   `images/sealed/` 这个通用镜像目标,在你的部署把它作为 base
+   发布之后才落到实处。)
 7. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
    attestor 把名字当不透明字符串(mint 前校验、写进无版本 binding、
    UI 里列出),除此之外零改动(本仓库 `attestor/`)。

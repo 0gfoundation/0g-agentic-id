@@ -48,6 +48,8 @@ attestor/
 │   ├── api/                  HTTP + WS server + static web/ assets
 │   ├── worker/               async tasks + three sweep loops
 │   └── indexer/              on-chain event listener
+├── scripts/                  e2e / verify-agent / regression test scripts
+├── version-meld/             vendored crate fix wired in via [patch.crates-io] (Cargo.toml; the Dockerfile copies it into the build)
 ├── docker-compose.yml        api / worker / indexer / postgres full stack
 ├── Dockerfile                one image shared by the three binaries (cargo build --release, multiple entry points)
 └── .env.example              all runtime configuration
@@ -62,6 +64,14 @@ docker compose build                                # rebuild all three binaries
 docker compose up -d                                # bring up postgres + the 3 attestor binaries
 docker compose logs -f attestor-api                 # tail api logs
 ```
+
+Heads-up for local builds: the compose file sets `pull_policy: always`
+and `image:` defaults (`ATTESTOR_IMAGE`) to a VPC-internal Aliyun
+registry tag. Outside that VPC the default registry is unreachable, and
+where it *is* reachable, `up -d` re-pulls the registry image over the
+tag `docker compose build` just produced. To actually run your local
+build, set `ATTESTOR_IMAGE` to your locally-built tag (one the registry
+can't serve) or override `pull_policy` before `up -d`.
 
 Bare-metal (for dev/debug):
 
@@ -86,6 +96,10 @@ Grouped by category.
 | `GET /avatar/default.svg` | Default agent avatar (deterministic pixel art, shown in the deploy preview) |
 | `GET /avatar/:seed.svg` | Avatar derived from a 32-byte hex seed (used by agent cards, etc.) |
 
+When `ATTESTOR_CONSOLE_ENABLED=false` (headless mode), `GET /` and
+`/static/*` return 404 — only the avatar routes and the HTTP API below
+stay up.
+
 ### Health / config
 
 | Path | Purpose | Auth |
@@ -99,8 +113,8 @@ Grouped by category.
 |---|---|---|
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent | owner envelope |
-| `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` | none |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |
 
 ### Container handshake (agent runtime → attestor)
 
@@ -132,7 +146,8 @@ For contract deploy, upgrade, and verify steps, see
 
 ## Key configuration
 
-The full list lives in `.env.example` (~30 entries). The
+The full list lives in `.env.example` (~40 active entries, plus a
+handful of commented-out optional ones). The
 load-bearing ones, grouped:
 
 ### Chain
@@ -209,14 +224,14 @@ entries decide path and port:
 ## Tests
 
 ```bash
-cargo test                          # full suite
+cargo test --workspace              # full suite
 cargo test -p attestor-shared       # single crate
-cargo test --test '*'               # integration tests only
 ```
 
-Integration tests use InMemory implementations (`mocks.rs`) to
-bypass Postgres, chain, and sandbox dependencies. A single test
-starts in ~6s.
+All tests live in inline `#[cfg(test)]` modules (there are no separate
+`tests/` directories, so `--test '*'` matches nothing). They use the
+InMemory implementations in `mocks.rs` to bypass Postgres, chain, and
+sandbox dependencies. A single test starts in ~6s.
 
 For the full regression procedure (local stack, live testnet, and the
 failure-triage table), see [TESTING.md](TESTING.md) —

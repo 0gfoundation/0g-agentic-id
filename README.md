@@ -438,8 +438,8 @@ protocol), ERC-8004 (identity registration and reputation), AgenticID
 NonceRegistry (unified replay protection), along with their extension
 points and dependencies. Walks through the three main flows (`register`,
 `giveFeedback`, `iTransferFrom`) with their on-chain logic and ecrecover
-validation, plus 124 Foundry tests and full deploy, upgrade, and
-Etherscan-verify scripts.
+validation, plus 138 Foundry tests across 18 suites and full deploy, upgrade,
+and Etherscan-verify scripts.
 
 **[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**
 

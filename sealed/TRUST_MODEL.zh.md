@@ -56,7 +56,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 |---|---|
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
-| openclaw 子进程拿不到 | spawn.go 的 env whitelist 排除了 `agent_seal_priv`；只有 `*_API_KEY` 这类 env 变量穿越子进程边界 |
+| openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节 |
 | provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到容器的临时 `container_pubkey`；与之配对的 `container_privkey` 在 TEE 内部生成，从不跨越任何边界。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
@@ -182,8 +182,9 @@ Attestor 实际从 KMS 拿到的是：
    **另一把** key，跨部署的签名重放在密钥层就失败。Attestor 启动时
    还会自检 KMS 确实用到了 material（两份不同 material 必须得到
    不同 key），否则拒绝启动。
-3. 在 mint 时通过 `setAgentSeal(agentId, agent_seal_pub)` 把
-   `agent_seal_pub` 发布到链上 —— 这条绑定从此不可变（详见下文
+3. 在 mint 时通过 `setAgentSeal(agentId, agentSeal_, sealId)` 把
+   派生密钥的**地址**（`agent_seal_addr`，不是原始 pubkey）发布到
+   链上 —— 这条绑定从此不可变（详见下文
    [Set-once seal 语义](#set-once-seal-语义为什么这条绑定是安全的)）。
 4. **一旦 provisioning 移交（Layer 3）完成，立刻把
    `agent_seal_priv` 从自己的内存里丢弃**。Attestor 不保留副本。
@@ -294,14 +295,17 @@ TEE，期间一刻都不能在任何 TEE 之外以明文出现 —— 否则新 
 `iTransferFrom` 通过同一笔交易里携带的两段密码学证明强制这件事：
 
 - **AccessProof** —— 买方签
-  `keccak256(dataHash || buyer_targetPubkey || nonce || deadline)`，
+  `keccak256(chainId || erc7857 || dataHash || buyer_targetPubkey || nonce || deadline)`
+  （`erc7857` 是 AgenticID token 合约地址；这两个前缀是**必须的**，
+  用于对跨链 / 跨合约重放做域分隔），
   声明"我想要把这份数据 seal 到我的 pubkey"。recover 出来的签名者
   必须等于 `to`（或一个注册过的 delegate）。
 - **OwnershipProof** —— Oracle TEE 用卖方的 `agent_seal_priv` 解
   现有的 `sealedKey`，把同一份明文 `dataKey` 用 `buyer_targetPubkey`
   重新 ECIES 加密，并签：
-  `keccak256(dataHash || sealedKey_new || buyer_targetPubkey || nonce
-  || deadline)`。recover 出来的签名者必须等于链上注册过的
+  `keccak256(chainId || erc7857 || dataHash || sealedKey_new ||
+  buyer_targetPubkey || nonce || deadline)`（同样必须带
+  `chainId || erc7857` 前缀）。recover 出来的签名者必须等于链上注册过的
   `teeOracleAddress`。
 
 Oracle TEE 对 `dataKey` 是**无状态**的：解密、重新加密、签
@@ -332,7 +336,7 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 {
   "agent_id":       "42",
   "timestamp":      1778580000,
-  "deadline":       1778580300,
+  "deadline":       1778583600,
   "task_hash":      "0x<对请求/响应 transcript 的 keccak256>",
   "data_hashes":    ["0x<iData root>", "..."],
   "framework_hash": "0x<sealed 镜像度量>"

@@ -65,7 +65,9 @@ const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
 import { AgenticID, type ContractAddresses } from '@0gfoundation/agentic-sdk';
 
 // 地址是部署产物，不烧进 SDK——从 contracts/DEPLOYMENT.md §6 抄你要的那套，
-// 或从你自己的配置/环境变量加载。RPC + 这五个地址完全确定目标合约。
+// 或从你自己的配置/环境变量加载。（tappRegistry / sandboxServing 也可以等价地
+// 从 attestor 的 GET /config 取：tapp_registry_addr / sandbox_serving_addr。）
+// RPC + 这五个地址完全确定目标合约。
 const addresses: ContractAddresses = {
   agenticID:          '0x…',
   reputationRegistry: '0x…',
@@ -195,8 +197,9 @@ await ag.agent.listDeployments();
 //   url：agent 的公网基址（喂给 sayHi/authenticate/聊天 API 的那个），容器起来前是 null；
 //   lastProvisionError：部署失败的原因——容器 provision 失败（如 "image_hash not in
 //   validFrameworkHashes"）或铸造/存储管线失败（如 "mint submit: … replacement transaction
-//   underpriced"，SDK 会从失败 stage 的 reason 兜底取出）。它记录最近一次失败、成功后
-//   不清空，所以只在 phase 是 offline/failed 终态时当结论读。
+//   underpriced"，取自失败 stage（storage/mint/container_stage）的 reason）。SDK 已按
+//   phase 过滤：仅当 phase 是 failed（任一管线 stage 失败）或 offline（真实容器故障）
+//   时才非空；恢复后的行返回 null——非空即可当结论读。
 //   注意这是无鉴权的公开接口（返回该 attestor 的全部部署，不只你名下的）——内容
 //   （agentId/owner/名字/URL）在链上事件和 agent card 里本就公开，设计如此。
 ```
@@ -205,7 +208,7 @@ await ag.agent.listDeployments();
 
 | 标识符 | 是什么 | 谁在用 |
 |---|---|---|
-| `agentId`（bigint） | ERC-7857 tokenId——链上身份本体 | 绝大多数读取、transfer、clone、authenticate、runtimeCosts |
+| `agentId`（bigint） | ERC-721 tokenId——链上身份本体 | 绝大多数读取、transfer、clone、authenticate、runtimeCosts |
 | `sealId`（bytes32） | seal 绑定的哈希 id——attestor 部署记录的主键 | stop / start / reset、waitForMint、部署行 |
 | `agentSeal`（address） | agent 自己的签名密钥（地址形式）——它的钱包 | topUpAgentSeal、服务证明的签名者核验 |
 
@@ -221,7 +224,8 @@ await ag.agent.listDeployments();
 import { keccak256, toBytes } from 'viem';
 
 // agent 的公网基址来自 listDeployments() 返回行的 url 字段（详见"与运行中的 agent 交互"一节）：
-const { url: agentUrl } = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
+const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);   // find() 可能 undefined（索引落后），?. 兜住
+const agentUrl = me?.url;
 
 // 1. 调用 agent + 捕获服务证明（请求由你自己组织；SDK 只读
 //    sealed 代理盖在响应上的 X-Agent-Proof 头）
@@ -299,7 +303,7 @@ await ag.waitForTransaction(tx);   // 现在再读 getBalance() 才是新值
 
 ## 运行时镜像、框架与 iData 格式
 
-`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取，当前是 `0g-sealed`；0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。
+`sealedImage`（从 `GET /config` 的 `sandbox_snapshot` 取——镜像名因环境而异：生产 attestor 当前给的是 `0g-sealed`，dev/代码默认值是 `0g-test-sealed`；以你目标 attestor 的 `GET /config` 为准，SDK 会自动发现。0g-sandbox 自己的线上协议字段仍叫 `snapshot`）是打包了 **openclaw** 框架适配器的 sealed 运行时镜像——也是今天唯一在售的框架（`/config.supported_frameworks` 是唯一事实来源）。
 
 **iData 的形状**：一个数组，每个元素是一条 `{ role, plaintext, extra }`——`role` 是这条内容的用途标签，`plaintext` 是内容本身。deploy 默认帮你拼两条（下面这个例子就是 `defaultIData()` 的产物）：一条 `framework` 绑定告诉运行时用哪个框架，一条 `persona` 装人设和模型选择。WYSIWYS（What You Sign Is What You Seal）：你签名的这份 iData 逐字节就是被加密、被铸上链的内容，attestor 不替你增删任何东西。
 
@@ -356,8 +360,9 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + 该 agent 的进�
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-const agentUrl = me.url;   // 容器起来前是 null
-// 到不了 running 就看 me.lastProvisionError——它写着原因。
+const agentUrl = me?.url;   // 容器起来前是 null
+// phase 落到 failed / offline 终态时看 me.lastProvisionError——它写着原因
+// （SDK 已按 phase 过滤：仅 failed/offline 时非空，恢复后的行是 null）。
 ```
 
 - **`GET {agentUrl}/hello`** —— 公开身份卡：我是谁、owner 是谁、注册了哪些服务。每个响应都带签名的 `X-Agent-Proof`。也可以让 SDK 一次做完"请求 + 证明校验"：
@@ -424,9 +429,9 @@ const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
 
 合约地址是**部署产物，不烧进 SDK**——RPC + 五个地址完全确定目标合约；地址不进库，代理升级或重新部署就不会让打包常量悄悄过期。
 
-**唯一事实来源：仓库 `contracts/DEPLOYMENT.md` §6。** 同一条链（0G Galileo 测试网，`chainId 16602`）上并行跑着多套 canonical-bound 部署——选与你 `attestorUrl` 指向的 attestor 相匹配的那套（例如 dev 部署配 dev 主机上的 attestor）。把那五个地址抄进 `ContractAddresses`（形状见上文），或从你自己的配置/环境变量加载。
+**唯一事实来源：仓库 `contracts/DEPLOYMENT.md` §6。** 同一条链（0G Galileo 测试网，`chainId 16602`）上并行跑着多套 canonical-bound 部署——选与你 `attestorUrl` 指向的 attestor 相匹配的那套（例如 dev 部署配 dev 主机上的 attestor）。把那五个地址抄进 `ContractAddresses`（形状见上文），或从你自己的配置/环境变量加载。`tappRegistry` / `sandboxServing` 也可以等价地从 attestor 的 `GET /config` 取（`tapp_registry_addr` / `sandbox_serving_addr`）。
 
-稳定的协议级常量**有**导出：`ZERO_G_TESTNET`（viem chain）、`RPC_URL`、`CHAIN_ID`、`RECEIPT_WAIT`。
+稳定的协议级常量**有**导出：`ZERO_G_TESTNET` / `ZERO_G_MAINNET`（viem chain）、`RPC_URL`、`CHAIN_ID`、`RECEIPT_WAIT`。
 
 ## 注意事项
 
@@ -494,9 +499,9 @@ const { agentId, sealId } = await ag.agent.deploy({
 
 // 2. 轮询到容器 running，顺便拿到 sandboxId 和 agentUrl。
 //    provision 实测通常 1~2 分钟（拉镜像 + 容器初始化），这里预算 5 分钟。
-//    phase 语义：deploying 是在途；offline / failed 是终态——只有终态才把
-//    lastProvisionError 当结论（它记录最近一次失败、成功后不清空，
-//    在途时读它会把已自动重试掉的瞬时失败误判成死刑）。
+//    phase 语义：deploying 是在途；offline / failed 是终态。
+//    lastProvisionError 由 SDK 按 phase 过滤——仅 failed/offline 终态才非空
+//    （恢复后的行是 null），非空即可当结论读。
 let me;
 for (let i = 0; i < 60; i++) {
   me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
