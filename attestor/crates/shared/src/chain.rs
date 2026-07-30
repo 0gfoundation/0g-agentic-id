@@ -16,7 +16,7 @@ use crate::traits::ChainClient;
 use crate::types::*;
 use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::providers::fillers::{CachedNonceManager, ChainIdFiller, NonceFiller};
+use alloy::providers::fillers::{ChainIdFiller, NonceFiller, SimpleNonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -103,6 +103,13 @@ where
     // wired. Both unset → is_sandbox_node returns Ok(None) and the caller
     // falls back to its env-configured single sandbox signer.
     tapp_registry: Option<(Address, String)>,
+    // Serializes the read-nonce→submit window for every write from `sender`.
+    // SimpleNonceManager reads the pending nonce fresh on each send; without
+    // this lock two concurrent sends read the same nonce and collide (#54:
+    // "nonce too low" / "replacement transaction underpriced"). Held only
+    // across submit (sub-second), NOT the receipt wait, so txs still pipeline.
+    // tokio Mutex (not std) because the guard is held across an `.await`.
+    submit_lock: tokio::sync::Mutex<()>,
     _t: PhantomData<T>,
 }
 
@@ -126,6 +133,7 @@ where
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             tapp_registry,
+            submit_lock: tokio::sync::Mutex::new(()),
             _t: PhantomData,
         })
     }
@@ -134,21 +142,19 @@ where
 /// Build an HTTP + wallet-fitted provider and return a type-erased chain
 /// client. We skip `GasFiller` (0G testnet's `eth_maxPriorityFeePerGas`
 /// returns 1 wei which the mempool rejects) and set EIP-1559 fees
-/// manually per tx. We use `CachedNonceManager`: it reads the account nonce
-/// from chain once, then hands out nonces from a locally-held, mutex-guarded
-/// counter, incrementing per send. That serializes concurrent/rapid sends
-/// from the mint key within this process so two mints can't grab the same
-/// nonce — fixes #54 ("nonce too low" / "replacement transaction underpriced"
-/// under a burst of deploys). `SimpleNonceManager` (re-reads pending every
-/// send, no local state) does NOT do this: concurrent sends read the same
-/// pending nonce and collide.
+/// manually per tx. We use `SimpleNonceManager`: it re-reads the account's
+/// pending nonce from chain on every send, so it always reflects reality —
+/// mempool backlog, retried/failed txs, restarts — and self-heals. Its one
+/// weakness is #54: two sends that read `pending` at the same instant get the
+/// same nonce and collide. We close that in `AlloyChain` with a `submit_lock`
+/// that serializes the read-nonce→submit window for every write from `sender`.
 ///
-/// Trade-off (per alloy docs): the counter is PER-PROCESS. The mint EOA must
-/// therefore not be driven concurrently from another process against a
-/// separate provider (e.g. a manual `cast send` with the same key while the
-/// attestor runs) — their counters don't share and would clash. In prod only
-/// the attestor uses its mint key, so this holds. It's also less
-/// reorg-resilient than Simple; a process restart re-reads the nonce.
+/// We deliberately do NOT use `CachedNonceManager` (local counter, never
+/// re-reads chain): for a long-lived key that serves every user's mint, any
+/// failed tx / restart / reorg desyncs its counter permanently and wedges ALL
+/// subsequent mints until a restart. Simple+lock gives the same collision
+/// safety while self-healing, at the cost of one nonce-read RPC per send —
+/// negligible next to gas-estimate + receipt-wait.
 pub fn connect_http(
     rpc_url: &str,
     contract_addr: Address,
@@ -163,13 +169,12 @@ pub fn connect_http(
     let url: reqwest::Url = rpc_url.parse()?;
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
-        .filler(NonceFiller::<CachedNonceManager>::default())
+        .filler(NonceFiller::<SimpleNonceManager>::default())
         .wallet(wallet)
         .on_http(url);
-    // Startup marker so a live process proves which nonce manager is compiled
-    // in — a missing/"Simple" line means the running binary predates the #54
-    // fix (stale image / wrong service deployed).
-    tracing::info!(sender = %sender, "chain client ready — mint nonce manager = CachedNonceManager (#54)");
+    // Startup marker so a live process proves which build/strategy is running
+    // (a missing line means the binary predates the #54 fix — stale image).
+    tracing::info!(sender = %sender, "chain client ready — mint nonce = SimpleNonceManager + submit_lock (#54)");
     let chain = AlloyChain::new(
         provider,
         contract_addr,
@@ -243,11 +248,16 @@ where
             "alloy: sending registerWithSeal"
         );
 
-        let pending = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(decode_err)?;
+        // Serialize the nonce-read→submit window (see `submit_lock`). Guard is
+        // released as soon as the tx is broadcast (pending nonce bumped), not
+        // held through the receipt wait, so mints still pipeline into mempool.
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -393,11 +403,13 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(decode_err)?;
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)
