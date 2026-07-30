@@ -16,7 +16,7 @@ use crate::traits::ChainClient;
 use crate::types::*;
 use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::providers::fillers::{ChainIdFiller, NonceFiller, SimpleNonceManager};
+use alloy::providers::fillers::{CachedNonceManager, ChainIdFiller, NonceFiller};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
@@ -134,10 +134,21 @@ where
 /// Build an HTTP + wallet-fitted provider and return a type-erased chain
 /// client. We skip `GasFiller` (0G testnet's `eth_maxPriorityFeePerGas`
 /// returns 1 wei which the mempool rejects) and set EIP-1559 fees
-/// manually per tx. We use `SimpleNonceManager` which queries
-/// `eth_getTransactionCount(addr, "pending")` for every send — the
-/// "pending" tag includes mempool txs, so this handles both same-process
-/// concurrent sends and cross-process EOA sharing (dev: `cast` + attestor).
+/// manually per tx. We use `CachedNonceManager`: it reads the account nonce
+/// from chain once, then hands out nonces from a locally-held, mutex-guarded
+/// counter, incrementing per send. That serializes concurrent/rapid sends
+/// from the mint key within this process so two mints can't grab the same
+/// nonce — fixes #54 ("nonce too low" / "replacement transaction underpriced"
+/// under a burst of deploys). `SimpleNonceManager` (re-reads pending every
+/// send, no local state) does NOT do this: concurrent sends read the same
+/// pending nonce and collide.
+///
+/// Trade-off (per alloy docs): the counter is PER-PROCESS. The mint EOA must
+/// therefore not be driven concurrently from another process against a
+/// separate provider (e.g. a manual `cast send` with the same key while the
+/// attestor runs) — their counters don't share and would clash. In prod only
+/// the attestor uses its mint key, so this holds. It's also less
+/// reorg-resilient than Simple; a process restart re-reads the nonce.
 pub fn connect_http(
     rpc_url: &str,
     contract_addr: Address,
@@ -152,7 +163,7 @@ pub fn connect_http(
     let url: reqwest::Url = rpc_url.parse()?;
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
-        .filler(NonceFiller::<SimpleNonceManager>::default())
+        .filler(NonceFiller::<CachedNonceManager>::default())
         .wallet(wallet)
         .on_http(url);
     let chain = AlloyChain::new(
