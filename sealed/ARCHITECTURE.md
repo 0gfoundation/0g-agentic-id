@@ -14,7 +14,7 @@ External components it integrates with:
 
 | Component | Relationship |
 |---|---|
-| attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See `0g-agent-nft` repo for details |
+| attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed uploads/downloads via the `0g-storage-client` CLI |
 | openclaw | The sole wired-in agent framework (selected when the on-chain binding names it, or as the no-binding fallback); an npm package, installed and spawned as a subprocess by sealed, listening on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); a second framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |

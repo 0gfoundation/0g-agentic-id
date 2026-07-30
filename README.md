@@ -415,7 +415,7 @@ This is a monorepo with four sub-projects:
 | [`contracts/`](contracts/README.md) | Solidity contracts, Foundry tests, deploy / upgrade / verify scripts | Foundry (forge / cast) |
 | [`attestor/`](attestor/README.md) | Backend services (Attestor / Oracle TEE, API, worker, indexer) | Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.md) | Agent runtime container (restores iData inside TEE, pushes evolution on chain, signs responses) | Go |
-| [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`@0glabs/agenticid-sdk`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`@0gfoundation/agentic-sdk`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
 
 ### Further reading
 

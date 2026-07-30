@@ -1,6 +1,6 @@
 /**
  * @file index.ts
- * @description Entry point for @0g/agenticid-sdk.
+ * @description Entry point for @0gfoundation/agentic-sdk.
  *
  * One facade (`AgenticID`): two intent namespaces — `agent` (lifecycle:
  * deploy/clone/transfer + reads + agent-seal gas) and `reputation` (serve-proof
@@ -9,7 +9,7 @@
  *
  * @example
  * ```typescript
- * import { AgenticID } from '@0g/agenticid-sdk';
+ * import { AgenticID } from '@0gfoundation/agentic-sdk';
  * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * ```
  */
@@ -20,7 +20,7 @@
 // default, so turn the miss into an actionable message at import time.
 if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
   throw new Error(
-    '@0glabs/agenticid-sdk requires a global fetch (Node >= 18). ' +
+    '@0gfoundation/agentic-sdk requires a global fetch (Node >= 18). ' +
       'On Node 16/17 either upgrade Node or polyfill globalThis.fetch.',
   );
 }
