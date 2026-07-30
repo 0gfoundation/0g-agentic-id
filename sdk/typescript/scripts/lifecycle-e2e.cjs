@@ -191,6 +191,42 @@ function mkClient(privKey, cfg) {
   check('feedback attributed to wallet B (client-less msg.sender)',
     !!mine && (await B.reputation.getClients(AGENT_ID)).map((a) => a.toLowerCase()).includes(acctB.address.toLowerCase()));
 
+  // ── 2b. /stop owner gate — a forged owner field must not pass ─────────
+  // The SDK always sets `owner` to its own address, so an honest non-owner
+  // call was rejected even by the old `req.owner == d.owner` string check.
+  // The actual hole was FORGING the unsigned owner field while signing the
+  // envelope with a different key — pre-gate, /stop accepted that. Probe it
+  // raw: envelope validly signed by B, body claims A. Must be 401, and no
+  // stop job may reach the sandbox (the source keeps serving below).
+  console.log('· /stop forged-owner probe — non-owner envelope must be rejected…');
+  {
+    const srow = await rowOf(AGENT_ID);
+    const canonical = JSON.stringify({
+      action: 'stop',
+      expires_at: Math.floor(Date.now() / 1000) + 180,
+      nonce: require('crypto').randomBytes(16).toString('hex'),
+      payload: {},
+      resource_id: (srow && srow.sandbox_id) || '',
+    });
+    const res = await fetch(ATTESTOR_URL + '/stop', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        seal_id: SEAL_ID,
+        owner: ownerA, // forged: claims the real owner
+        sandbox_envelope: {
+          wallet_address: acctB.address,
+          signed_message_b64: Buffer.from(canonical).toString('base64'),
+          wallet_signature: await acctB.signMessage({ message: canonical }),
+        },
+      }),
+    });
+    check('/stop with forged owner field rejected', res.status === 401, `status=${res.status}`);
+    const still = await rowOf(AGENT_ID);
+    check('source agent still running after forged /stop', !!still && still.phase === 'running',
+      `phase=${still && still.phase}`);
+  }
+
   // ── 3. transfer: A → B, indexer reflects the new owner ────────────────
   console.log('· transferFrom() — moving the source agent to wallet B…');
   const txT = await A.agent.transferFrom(ownerA, acctB.address, AGENT_ID);
