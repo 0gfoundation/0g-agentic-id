@@ -12,7 +12,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://github.com/0glabs/0g-agentic-id"
+repository = "https://github.com/0gfoundation/0g-agentic-id"
 
 [workspace.dependencies]
 # async runtime
