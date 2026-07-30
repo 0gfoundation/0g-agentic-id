@@ -293,9 +293,9 @@ export class AgentApi {
    * the /v1 chat API) — null until the container is provisioned.
    * `lastProvisionError` is WHY a deployment is stuck (e.g. "image_hash
    * not in validFrameworkHashes") — always check it before debugging a
-   * deployment that never reaches `running`. It records the MOST RECENT
-   * failure and is not cleared by a later success, so read it together
-   * with `phase`.
+   * deployment that never reaches `running`. It is non-null only when the
+   * row is currently failed (any pipeline stage) or offline due to a
+   * genuine container failure; recovered rows report null.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string;
@@ -309,27 +309,37 @@ export class AgentApi {
       // is what every other interaction wants.
       let url: string | null = null;
       try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
-      // The attestor only writes last_provision_error for container-provision
-      // failures; mint/storage-pipeline failures record their reason on the
-      // per-track stage objects instead (mint_stage/storage_stage.reason). A
-      // phase=failed row with a null lastProvisionError is a dead end for an
-      // external caller (no attestor-log access), so fold the failed stages'
-      // reasons in as the fallback.
+      // Failure reasons live on the per-track stage objects
+      // (storage/mint/container_stage.reason); last_provision_error is a
+      // sticky DB column (only set, never cleared) so it is only consulted
+      // for phase=failed, as a backstop — same gating and priority as the
+      // attestor console's failureReason(). phase=offline surfaces only a
+      // genuine container failure (a clean owner stop carries no reason);
+      // recovered rows report null rather than a stale sticky error.
       const stageReason = (stage: unknown): string | null => {
         const s = stage as { state?: string; reason?: string } | null;
         return s?.state === 'failed' && s.reason ? s.reason : null;
       };
+      const phase = (r.phase as string) ?? 'unknown';
+      const failureReason =
+        phase === 'failed'
+          ? stageReason(r.storage_stage) ??
+            stageReason(r.mint_stage) ??
+            stageReason(r.container_stage) ??
+            ((r.last_provision_error as string) ?? null)
+          : phase === 'offline'
+            ? stageReason(r.container_stage)
+            : null;
       return {
         agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
         sealId: r.seal_id as Hash,
-        phase: (r.phase as string) ?? 'unknown',
+        phase,
         sandboxId: (r.sandbox_id as string) ?? null,
         url,
         owner: r.owner as Address,
         name: (card.name as string) ?? null,
         createdAt: (r.created_at as string) ?? null,
-        lastProvisionError:
-          (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
+        lastProvisionError: failureReason,
       };
     });
   }
