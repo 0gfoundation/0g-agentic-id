@@ -1,4 +1,4 @@
-# @0glabs/agenticid-sdk
+# @0gfoundation/agentic-sdk
 
 English | [中文](README.zh.md)
 
@@ -18,7 +18,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 ## Install
 
 ```bash
-npm install @0glabs/agenticid-sdk viem
+npm install @0gfoundation/agentic-sdk viem
 ```
 
 ## Setup
@@ -26,7 +26,7 @@ npm install @0glabs/agenticid-sdk viem
 **Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs:
 
 ```ts
-import { AgenticID } from '@0glabs/agenticid-sdk';
+import { AgenticID } from '@0gfoundation/agentic-sdk';
 
 const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
@@ -52,7 +52,7 @@ address without giving up the bootstrap.)
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
 
 ```ts
-import { AgenticID, type ContractAddresses } from '@0glabs/agenticid-sdk';
+import { AgenticID, type ContractAddresses } from '@0gfoundation/agentic-sdk';
 
 // Addresses are a deployment artifact — copy the set you target from
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
@@ -432,8 +432,8 @@ requests signatures over the container's unix sign socket
 adapter wraps that socket as a viem Account:
 
 ```ts
-import { AgenticID } from '@0glabs/agenticid-sdk';
-import { sealAccount } from '@0glabs/agenticid-sdk/seal';   // node-only subpath
+import { AgenticID } from '@0gfoundation/agentic-sdk';
+import { sealAccount } from '@0gfoundation/agentic-sdk/seal';   // node-only subpath
 
 const ag = await AgenticID.fromAttestor(url, { account: await sealAccount() });
 // address auto-discovers from $AGENT_SEAL, socket path from $SEAL_SIGN_SOCK

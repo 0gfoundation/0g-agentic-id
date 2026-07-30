@@ -128,7 +128,7 @@ export function buildServeProof(
  *
  * @example
  * ```typescript
- * import { buildServeProof, signServeProof } from '@0g/agenticid-sdk';
+ * import { buildServeProof, signServeProof } from '@0gfoundation/agentic-sdk';
  *
  * const proof = await signServeProof(
  *   { agentId: 1n, timestamp: 1700000000n, deadline: 1700003600n,
