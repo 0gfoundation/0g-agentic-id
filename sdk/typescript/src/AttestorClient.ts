@@ -94,7 +94,9 @@ export interface DeployParams {
   iData?: IDataInput[];
   /**
    * Agent-framework name for the SDK-built default iData ("openclaw"
-   * default, or e.g. "claude-code"). CLIENT-SIDE ONLY: it feeds
+   * default). Must be one of the names your attestor's `GET /config`
+   * advertises in `supported_frameworks` (openclaw by default) — the
+   * attestor rejects unsupported names pre-mint. CLIENT-SIDE ONLY: it feeds
    * `defaultIData()` when `iData` is omitted — the API has no framework
    * field; the on-chain binding inside i_data is the single source of
    * truth (validated against `GET /config`'s `supported_frameworks`
@@ -139,16 +141,16 @@ function b64encode(s: string): string {
 function randHex(bytes: number): string {
   const a = new Uint8Array(bytes);
   type WebCrypto = { getRandomValues(x: Uint8Array): Uint8Array };
-  // Browsers and Node >= 19 expose WebCrypto globally; older Node needs
-  // the node:crypto fallback (caught by real execution on Node 16, where
-  // the previous unguarded access crashed deploy() before any request).
+  // Browsers and Node >= 19 expose WebCrypto globally; Node 18 (the
+  // engines floor) needs the node:crypto fallback — without it the
+  // unguarded access crashed deploy() before any request was sent.
   let cryptoObj = (globalThis as { crypto?: WebCrypto }).crypto;
   if (!cryptoObj?.getRandomValues && typeof require === 'function') {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     cryptoObj = (require('crypto') as { webcrypto?: WebCrypto }).webcrypto;
   }
   if (!cryptoObj?.getRandomValues) {
-    throw new Error('AttestorClient: no WebCrypto available (need a browser or Node >= 15 with crypto.webcrypto)');
+    throw new Error('AttestorClient: no WebCrypto available (need a browser or Node >= 18 with crypto.webcrypto)');
   }
   cryptoObj.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');

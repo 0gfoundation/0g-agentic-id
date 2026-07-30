@@ -62,7 +62,7 @@ How the implementation maintains this:
 |---|---|
 | Host can't read container memory | TDX hardware memory encryption + attestation |
 | Disk persistence is encrypted at rest | `agent_seal_priv` is never written to disk in plaintext; provisioned to memory only |
-| Openclaw subprocess doesn't have it | spawn.go env whitelist excludes `agent_seal_priv`; only `*_API_KEY` env vars cross the subprocess boundary |
+| Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME`, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
 | No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes |
 | Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the container's ephemeral `container_pubkey`; the matching `container_privkey` is generated inside the TEE and never crosses any boundary. Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
@@ -214,8 +214,9 @@ When a deploy request lands, Attestor:
    replay fails at the key layer. Attestor self-checks at startup that
    KMS actually honors the material (two distinct materials must yield
    distinct keys) and refuses to boot otherwise.
-3. Publishes `agent_seal_pub` on chain via `setAgentSeal(agentId,
-   agent_seal_pub)` at mint time. The binding becomes immutable (see
+3. Publishes the derived key's **address** (`agent_seal_addr`, not the
+   raw pubkey) on chain via `setAgentSeal(agentId, agentSeal_, sealId)`
+   at mint time. The binding becomes immutable (see
    [Set-once seal semantics](#set-once-seal-semantics-why-the-binding-is-safe)
    below).
 4. **Discards `agent_seal_priv` from its own memory** as soon as the
@@ -338,16 +339,20 @@ gets only a hollow NFT, not a working agent.
 `iTransferFrom` enforces this via two cryptographic proofs that both
 land in the same transaction:
 
-- **AccessProof**: buyer signs `keccak256(dataHash || buyer_targetPubkey
-  || nonce || deadline)`, declaring "I want this data sealed to my
+- **AccessProof**: buyer signs `keccak256(chainId || erc7857 || dataHash
+  || buyer_targetPubkey || nonce || deadline)` (where `erc7857` is the
+  AgenticID token contract address — both prefixes are mandatory,
+  domain-separating the proof against cross-chain / cross-contract
+  replay), declaring "I want this data sealed to my
   pubkey." The recovered signer must equal `to` (or a registered
   delegate).
 - **OwnershipProof**: Oracle TEE decrypts the existing `sealedKey`
   under the seller's `agent_seal_priv`, re-encrypts the same plaintext
   `dataKey` under `buyer_targetPubkey` (ECIES), and signs
-  `keccak256(dataHash || sealedKey_new || buyer_targetPubkey || nonce
-  || deadline)`. The recovered signer must equal the on-chain-
-  registered `teeOracleAddress`.
+  `keccak256(chainId || erc7857 || dataHash || sealedKey_new ||
+  buyer_targetPubkey || nonce || deadline)` (same mandatory
+  `chainId || erc7857` prefix). The recovered signer must equal the
+  on-chain-registered `teeOracleAddress`.
 
 The Oracle TEE is **stateless** with respect to `dataKey`. It decrypts,
 re-encrypts, signs the OwnershipProof, and discards the plaintext
@@ -379,7 +384,7 @@ Each `X-Agent-Proof` header carries a signed envelope of the form:
 {
   "agent_id":       "42",
   "timestamp":      1778580000,
-  "deadline":       1778580300,
+  "deadline":       1778583600,
   "task_hash":      "0x<keccak256 over the request/response transcript>",
   "data_hashes":    ["0x<iData root>", "..."],
   "framework_hash": "0x<sealed image measurement>"
