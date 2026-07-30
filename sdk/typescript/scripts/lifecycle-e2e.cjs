@@ -117,7 +117,7 @@ function mkClient(privKey, cfg) {
   const srcSealed = await A.agent.sealedKeysOf(AGENT_ID);
   const srcSeal = await A.agent.getAgentSeal(AGENT_ID);
 
-  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: true });
+  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: 'running' });
   const cloneId = cloned.agentId;
   check('clone minted', typeof cloneId === 'bigint' && cloneId > 0n, `agentId=${cloneId}`);
 

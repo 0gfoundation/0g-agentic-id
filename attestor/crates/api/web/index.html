@@ -3840,7 +3840,7 @@ function paintDetail(dep) {
       <div class="menu">
         ${(isLive && dashboardBaseUrl) ? `<a href="#" onclick="event.preventDefault(); this.closest('details').open=false; openDashboard('${escapeHtml(sealId)}', '${escapeHtml(dashboardBaseUrl)}')">Open dashboard</a>` : ''}
         <a target="_blank" rel="noopener" onclick="this.closest('details').open=false" href="${escapeHtml(dashboardBaseUrl)}/log.html">Startup log</a>
-        <a target="_blank" rel="noopener" onclick="this.closest('details').open=false" href="${escapeHtml(dashboardBaseUrl)}/log/openclaw.html">OpenClaw log</a>
+        <a target="_blank" rel="noopener" onclick="this.closest('details').open=false" href="${escapeHtml(dashboardBaseUrl)}/log/agent.html">Agent log</a>
       </div>
     </details>`;
   // Destructive ops collected under a single `Manage ▾` dropdown.

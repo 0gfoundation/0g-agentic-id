@@ -431,6 +431,14 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   const r = await agent.fetch('/v1/models');
   // …或一步到位调用 + 取证(用于 agent 的 /api/* service):
   const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
+
+  // 仅 owner:读 agent 自己的进程日志(框架子进程的 stdout/stderr,服务在
+  // /log/agent).只有这个 ag 持 owner key 时才有——和 chat 类似,但它每次调用
+  // 都用钱包现签一个绑定 URL 的 `0GSealLog` owner 签名,光有共享 token 不够.
+  if (agent.logs) {
+    const tail = await agent.logs({ tail: 200 }); // 最后 200 行;不传则取全量
+    console.log(tail);
+  }
   ```
 
   `chat` / `chatStream` 存不存在,本身就是能力信号.**你到底是不是 owner,只在真正跑 owner 操作时才验证**(非 owner 调 chat 会抛错);`/hello` 和 `/api/*` 不受影响.SDK 从不凭空合成任何入口——只反映 agent 声明的东西.

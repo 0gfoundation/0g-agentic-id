@@ -40,7 +40,19 @@ func (s *Server) handleLogHTML(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, renderLogHTML("sealed bootstrap log", logger.Lines()))
 }
 
-func (s *Server) handleAgentLogHTML(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAgentLogHTML(w http.ResponseWriter, r *http.Request) {
+	// Owner-only, same gate as /log/agent (the plaintext sibling): the agent's
+	// process output is owner-private. A browser can't attach the signature
+	// headers via a plain navigation, so this now requires a signed request
+	// (see verifyOwnerSig / tag "0GSealLog").
+	_, _, sealID, owner, _ := s.agent.Snapshot()
+	if owner == "" {
+		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner); !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	logPath := s.getAgentLogPath()
 	if logPath == "" {

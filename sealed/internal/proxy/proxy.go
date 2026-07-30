@@ -5,15 +5,19 @@
 //   GET  /healthz       - container liveness probe (always 200)
 //   GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
 //   GET  /log.html      - same log, color-coded HTML view for frontends
-//   GET  /log/openclaw  - openclaw process log (plaintext, NOT signed)
-//   GET  /log/openclaw.html - same log, color-coded HTML view
+//   GET  /log/agent     - framework subprocess log (plaintext, owner-only)
+//   GET  /log/agent.html - same log, color-coded HTML view (owner-only)
 //   GET  /hello         - signed A2A self-introduction (returns 503 until armed)
 //   POST /_seal/auth    - owner-only flow returning the framework auth token
 //   *    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
-// All signed responses (everything except /healthz, /log, /log/openclaw)
-// carry an X-Agent-Proof header packing both an EIP-191 signature and the
-// canonical envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
+// /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
+// X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
+// output, which is owner-private. /healthz and /log stay open.
+//
+// All signed responses (everything except /healthz, /log, /log/agent) carry an
+// X-Agent-Proof header packing both an EIP-191 signature and the canonical
+// envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
 package proxy
 
 import (
@@ -170,16 +174,12 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/log.html", s.handleLogHTML)
 	mux.HandleFunc("/log/agent", s.handleAgentLog)
 	mux.HandleFunc("/log/agent.html", s.handleAgentLogHTML)
-	// Legacy aliases from when openclaw was the only framework; existing
-	// frontends link these. Same handlers, adapter-resolved log path.
-	mux.HandleFunc("/log/openclaw", s.handleAgentLog)
-	mux.HandleFunc("/log/openclaw.html", s.handleAgentLogHTML)
 	mux.HandleFunc("/hello", s.handleHello)
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
-		fmt.Println("Listening on :8080  GET /healthz | /log | /log/openclaw | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
+		fmt.Println("Listening on :8080  GET /healthz | /log | /log/agent (owner-only) | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
 		_ = http.ListenAndServe(":8080", corsMiddleware(mux))
 	}()
 }
@@ -208,7 +208,15 @@ func (s *Server) handleLog(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, logger.Snapshot())
 }
 
-func (s *Server) handleAgentLog(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
+	_, _, sealID, owner, _ := s.agent.Snapshot()
+	if owner == "" {
+		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner); !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	logPath := s.getAgentLogPath()
 	if logPath == "" {
@@ -301,49 +309,61 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 
 // ── /_seal/auth ─────────────────────────────────────────────────────────────
 
-// handleAuth hands the framework-specific control-UI credential (e.g. the
-// openclaw gateway token) to a verified owner. Validates an EIP-191 signature
-// over "0GSealAuth:0x<sealID>:<unix-ts>" and confirms the recovered signer
-// equals the on-chain NFT owner cached at bootstrap.
-func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
-	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
-	agentID, frameworkHash := s.agent.ProofIdentity()
-	if priv == nil || owner == "" {
-		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
-		return
-	}
-
+// verifyOwnerSig validates the owner EIP-191 signature carried in the
+// X-Auth-Message / X-Auth-Signature request headers for a given message tag.
+//
+// The signed message is "<tag>:0x<sealID>:<ts>:<audience>", where <audience> is
+// the agent's own canonical serve URL (issue #62 — audience binding): a
+// signature the owner produced while talking to endpoint A cannot be replayed
+// to endpoint B, because B's audience won't match. sealID scopes it to this
+// agent; the ±authWindowSec window bounds freshness. Audience is enforced only
+// when the runtime knows its own public URL (empty in dev — SANDBOX_PROXY_DOMAIN
+// unset — where there is no external endpoint to phish).
+//
+// On success returns the server's current unix time; on any failure it writes
+// the HTTP error response and returns ok=false, so callers just `return`.
+func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, owner string) (int64, bool) {
 	msg := r.Header.Get("X-Auth-Message")
 	sigHex := r.Header.Get("X-Auth-Signature")
 	if msg == "" || sigHex == "" {
 		http.Error(w, "missing X-Auth-Message or X-Auth-Signature", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 
-	parts := strings.Split(msg, ":")
-	if len(parts) != 3 || parts[0] != "0GSealAuth" {
-		http.Error(w, "X-Auth-Message must be \"0GSealAuth:0x<sealID>:<ts>\"", http.StatusBadRequest)
-		return
+	// audience may itself contain ':' (scheme, host:port), so keep it whole as
+	// the 4th field rather than splitting the entire message on ':'.
+	parts := strings.SplitN(msg, ":", 4)
+	if len(parts) != 4 || parts[0] != tag {
+		http.Error(w, fmt.Sprintf("X-Auth-Message must be %q:0x<sealID>:<ts>:<audience>", tag), http.StatusBadRequest)
+		return 0, false
 	}
 	if !strings.EqualFold(parts[1], "0x"+sealID) {
 		http.Error(w, "seal_id mismatch", http.StatusUnauthorized)
-		return
+		return 0, false
 	}
 	ts, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		http.Error(w, "bad timestamp in X-Auth-Message", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	now := time.Now().Unix()
 	if ts > now+authWindowSec || ts < now-authWindowSec {
 		http.Error(w, "stale or future X-Auth-Message timestamp", http.StatusUnauthorized)
-		return
+		return 0, false
+	}
+	if s.publicURL != "" {
+		want := strings.TrimRight(s.publicURL, "/")
+		got := strings.TrimRight(parts[3], "/")
+		if !strings.EqualFold(got, want) {
+			http.Error(w, "audience mismatch: signature not bound to this agent's URL", http.StatusUnauthorized)
+			return 0, false
+		}
 	}
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(sigHex, "0x"))
 	if err != nil || len(sigBytes) != 65 {
 		http.Error(w, "X-Auth-Signature must be 65-byte hex", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	if sigBytes[64] >= 27 {
 		sigBytes[64] -= 27
@@ -353,11 +373,30 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	pub, err := crypto.SigToPub(hash, sigBytes)
 	if err != nil {
 		http.Error(w, "signature recover: "+err.Error(), http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	recovered := crypto.PubkeyToAddress(*pub).Hex()
 	if !strings.EqualFold(recovered, owner) {
 		http.Error(w, "signer is not the agent owner", http.StatusUnauthorized)
+		return 0, false
+	}
+	return now, true
+}
+
+// handleAuth hands the framework-specific control-UI credential (e.g. the
+// openclaw gateway token) to a verified owner. Validates an owner EIP-191
+// signature (tag "0GSealAuth", audience-bound — see verifyOwnerSig / issue #62)
+// and confirms the recovered signer equals the on-chain NFT owner cached at
+// bootstrap.
+func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
+	agentID, frameworkHash := s.agent.ProofIdentity()
+	if priv == nil || owner == "" {
+		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+	now, ok := s.verifyOwnerSig(w, r, "0GSealAuth", sealID, owner)
+	if !ok {
 		return
 	}
 

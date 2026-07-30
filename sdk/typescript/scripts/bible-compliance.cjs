@@ -42,7 +42,9 @@ const adversarial = [
 (async () => {
   const account = privateKeyToAccount(OWNER_PRIV);
   const ai = await AgenticID.fromAttestor(ATTESTOR_URL, { account });
-  const cred = await ai.agent.authenticate(AGENT_URL, AGENT_ID);
+  // authenticate() is single-arg now (URL or agentId); it resolves the other
+  // half itself and returns an AgentClient with an eagerly-minted `.token`.
+  const cred = await ai.agent.authenticate(AGENT_URL);
   if (!cred.token) { console.error('authenticate: no token'); process.exit(2); }
 
   async function chat(msg, ms = 180000) {
