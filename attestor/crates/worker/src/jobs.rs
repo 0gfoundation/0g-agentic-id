@@ -1659,7 +1659,7 @@ mod tests {
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
-            dummy_envelope("create"),
+            Some(dummy_envelope("create")),
         )
         .await
         .expect("deploy must succeed despite a container failure");
@@ -1712,7 +1712,7 @@ mod tests {
             "Sage".to_string(),
             "DeFi helper".to_string(),
             None,
-            dummy_envelope("create"),
+            Some(dummy_envelope("create")),
         )
         .await;
 
