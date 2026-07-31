@@ -73,12 +73,16 @@ sealed/
 │   ├── inference/                框架无关的 provider 知识(0g router 端点、按模型的线格式,
 │   │                             读 router 实时目录);adapter 只做 Route → 自家配置方言的翻译
 │   ├── manifest/                 directory-manifest 格式 + 确定性 tar.gz
+│   ├── platform/                 sealed 注入的教义/上下文文本：context.go 生成平台段内容
+│   │                             （身份 / 主权 / 能力……），由各 adapter 投递进自己的上下文
+│   │                             文件；markers.go 是共享的 marker 段 upsert/strip I/O
 │   ├── state/                    Agent 共享状态（chainSnapshot + currentSnapshot + phase）
 │   ├── manager/                  agent 进程生命周期 + 监工
 │   ├── uploader/                 drift → 0g-storage upload + 签名 chain.Update
 │   ├── watcher/                  30s tick 跑 EvolutionFor、触发 uploader.Apply
 │   └── proxy/                    :8080 反向代理 + 签名 + 日志页
-└── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
+├── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
+└── images/sealed/                通用 sealed sandbox 镜像（一个镜像装下所有内置框架；npm 安装只是热缓存）
 ```
 
 ### 各包职责一句话
@@ -92,7 +96,7 @@ sealed/
 - **manager**：`Start(ctx, params)` 调 adapter.Start spawn agent + 起 supervisor goroutine，agent 死了清状态 + 触发 onFailed
 - **uploader**：`Apply(plaintexts)` 拿 watcher 收集的"每个 role 当前 plaintext"，跟 chainSnapshot 比对，调 `pushLeaf` 或 `pushManifest` 上传 0g-storage，再签 `chain.Update`
 - **watcher**：30s ticker，跑 `EvolutionFor` 收每个 role 的现在 plaintext，调 `UpdateCurrentSnapshot` 算 drift，有 drift 就触发 OnDrift（接到 uploader.Apply）
-- **proxy**：:8080 上的 fasthttp，承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 framework upstream（openclaw :3284），(3) `/log.html` / `/log/agent.html` 实时日志页
+- **proxy**：:8080 上的标准库 `net/http`（`http.NewServeMux` + `ListenAndServe`），承担三个职责：(1) `/hello` 返回 agent 身份信息 + serve-proof，(2) 把对外请求转给 framework upstream（openclaw :3284），(3) `/log.html` / `/log/agent.html` 实时日志页（`/log/openclaw` 作为 legacy 别名保留）
 
 ## 3. 核心抽象：Framework adapter
 
@@ -270,11 +274,13 @@ internal/framework/openclaw/
 │                        spawn `openclaw gateway run` + version probe
 ├── disk.go              ~/.openclaw/openclaw.json 读写
 ├── identitymd.go        IDENTITY.md 的 sealed 段：agentSeal 身份事实 + 信任链
-├── soulmd.go            SOUL.md 的 sealed 段：主权宣言 + sign 拒绝规则 + 伪造识别
+├── soulmd.go            SOUL.md sealed 段的投递层（只做 marker I/O——主权宣言 /
+│                        拒签规则的内容本体由 internal/platform/context.go 生成）
 ├── toolsmd.go           TOOLS.md 的 sealed 段：sign 端点 + public URL + serve-proof；
-│                        共享 marker 工具（upsertMarkedSection / stripPlatformInjection）
+│                        对 internal/platform/markers.go marker 工具的包内别名
+│                        （upsertMarkedSection / stripPlatformInjection）
 ├── whitelist.go         supportedOpenclawVersions[] + whitelistMax()
-└── paths.go             $HOME/.openclaw/* 路径常量
+└── paths.go             写死的 /root/.openclaw/* 路径常量（var 只为让测试重定向）
 ```
 
 **5 个 declared role**（见 `openclaw.go:Roles()`）：
@@ -306,7 +312,7 @@ internal/framework/openclaw/
 | `/<其他>` | 用户、agent dashboard 前端 | 反代到 openclaw 127.0.0.1:3284 |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
-| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` —— 用 `agent_seal_priv` 签名 |
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）|
 
 sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关键
 信任边界：私钥不出 sealed 进程，agent 把要签的消息通过 unix socket

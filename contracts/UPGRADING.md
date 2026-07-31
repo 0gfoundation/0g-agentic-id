@@ -62,8 +62,11 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
 
 - Deploy fresh via [`DEPLOYMENT.md`](DEPLOYMENT.md) §3 `Deploy.s.sol` (or deploy a
   new impl+beacon+proxy standalone).
-- Migrate old data if needed; update every config that points at it (attestor
-  `.env` `ATTESTOR_*_ADDR`, SDK `constants.ts` addresses).
+- Migrate old data if needed; update every config that points at it: attestor
+  `.env` `ATTESTOR_*_ADDR`, the address tables in [`DEPLOYMENT.md`](DEPLOYMENT.md)
+  §6 (the source of truth SDK consumers copy their `ContractAddresses` from —
+  the SDK's `constants.ts` deliberately contains no addresses), and any
+  consumer config/env that carries the old addresses.
 - Move the old deployment to `DEPLOYMENT.md` §6.3 (superseded / do not use).
 
 ## 4. Post-upgrade checklist

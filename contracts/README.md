@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 124 tests / 15 suites)
+forge test                      # full test suite (currently 138 tests / 18 suites; 1 fork test skips without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -65,7 +65,7 @@ forge clean                     # clean out/
 
 ```toml
 [profile.default]
-src = "contracts"               # source dir (not the default src/)
+src = "src"                     # source dir (foundry default)
 libs = ["lib"]                  # OZ submodules
 solc = "0.8.24"                 # locked
 via_ir = true                   # ⚠️ required: giveFeedback's argument count causes stack too deep
@@ -86,7 +86,7 @@ stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 ## 2. Contract layout
 
 ```
-contracts/
+contracts/src/
 ├── AgenticID.sol                               main contract (identity + 7857 token + seal)
 ├── AgenticIDReputationRegistry.sol             reputation registry (ServeProof)
 ├── ERC7857Upgradeable.sol                      7857 core (iTransferFrom + proof check)
@@ -368,7 +368,7 @@ Contract logic (`ERC7857Upgradeable._proofCheck` and `BaseDataVerifier.verifyTra
 
 ## 7. Replay protection: NonceRegistry
 
-`contracts/utils/NonceRegistryUpgradeable.sol` is inherited by the **transfer
+`contracts/src/utils/NonceRegistryUpgradeable.sol` is inherited by the **transfer
 verifier** and the **reputation registry** (each keeps its own store). AgenticID
 itself does not consume nonces — `setAgentWallet` is forwarded to the canonical
 registry, which uses a ≤ 5-minute deadline (no nonce).
@@ -403,26 +403,30 @@ longest business deadline window.
 
 ## 9. Tests
 
-124 Foundry tests across 15 suites, all green under `forge test`. Coverage
-spans every `external` / `public` function and every documented error path.
+138 Foundry tests across 18 suites (137 pass, 1 fork test skips unless
+`FORK_RPC` is set), all green under `forge test`. Coverage spans every
+`external` / `public` function and every documented error path.
 
 | Suite | Cases | Coverage |
 |---|---|---|
 | `AgenticID.t.sol` | 10 | register / registerWithSeal / disabled overloads / attestor allowlist |
 | `AgentSeal.t.sol` | 6 | set-once / sealId collision / zero values / late-binding seal / non-attestor |
-| `TransferFlow.t.sol` | 17 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
-| `Clone.t.sol` | 8 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
+| `TransferFlow.t.sol` | 19 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
+| `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
 | `Reputation.t.sol` | 13 | giveFeedback ServeProof verification + revoke / appendResponse, all paths |
-| `DataStorage.t.sol` | 8 | update / updateAt + empty / out-of-range / non-owner |
+| `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |
-| `AgentWallet.t.sol` | 7 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
-| `AgentURIAndMetadata.t.sol` | 7 | setAgentURI / setMetadata + overwrite / nonexistent |
+| `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
+| `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + overwrite / nonexistent |
 | `VerifierAdmin.t.sol` | 7 | oracle rotation / pause (pauser role) / maxProofAge / onlyOwner |
-| `AgenticIDAdmin.t.sol` | 8 | attestor add/remove / frameworkHash / setVerifier / onlyOwner |
-| `Upgradeable.t.sol` | 8 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
+| `AgenticIDAdmin.t.sol` | 7 | attestor add/remove / frameworkHash / setVerifier / onlyOwner |
+| `Upgradeable.t.sol` | 9 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
+| `CanonicalBinding.t.sol` | 7 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id |
+| `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
+| `CanonicalForkIntegration.t.sol` | 1 | self-mint against the live canonical registry (runs only with `FORK_RPC` set; skips otherwise) |
 
 Shared scaffolding lives in `test/AgenticIDTestBase.sol`: two EIP-191 variants
 (hex-encoded for transfer proof, raw 32-byte for ServeProof and wallet sig),
@@ -435,7 +439,3 @@ inherits this base and adds the business assertions.
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
   runbook (10 contracts in a single deploy, Timelock two-stage upgrade, how
   `verify.sh` works, 0g Galileo testnet reference addresses).
-- **[`TODO.md`](TODO.md)** — known backlog on the contract layer, including
-  off-chain SDK end-to-end tests, fuzz and invariant hardening, and
-  protocol-layer suspended items (on-chain awareness of agent online state,
-  `targetPubkey` constraints).

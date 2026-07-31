@@ -54,12 +54,14 @@ computed explicitly via `estimate_gas` + a 20% buffer.
 > the minimum on their own — verified by real SDK writes (deposit /
 > giveFeedback / transferFrom) landing without overrides.
 
-For the same reason, `forge script` / `forge create` commands need explicit
-`--priority-gas-price 2000000000 --gas-price 5000000000`, otherwise they either
-estimate 1 wei and get rejected, or take 0G's default estimate (too low) and
-never get included.
+For the same reason, `forge script` / `forge create` commands need an explicit
+gas price, otherwise they either estimate 1 wei and get rejected, or take 0G's
+default estimate (too low) and never get included. Note the two-flag form
+(`--priority-gas-price 2000000000 --gas-price 5000000000`) is **not** a
+recommendation — forge 1.6 often rejects it; in practice use
+`--legacy --gas-price 5000000000 --slow`.
 
-### Those two numbers all over the deploy / upgrade docs are this workaround
+### The hardcoded gas-price flags all over the deploy / upgrade docs are this workaround
 
 See the deploy / upgrade command blocks in
 [`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md).
@@ -70,8 +72,12 @@ After a tx lands, `eth_getTransactionReceipt` often lags a few blocks before
 returning, and the RPC briefly 404s right after the tx is broadcast. The result:
 viem's `waitForTransactionReceipt` false-alarms "transaction receipt could not
 be found" on a tx that **actually landed**. The TS SDK works around this with a
-`RECEIPT_WAIT` config (`timeout 120s`, `pollingInterval 2s`, `retryCount 12`,
-`retryDelay 2s`; see `sdk/typescript/src/constants.ts`). If it still times out,
+`RECEIPT_WAIT` config (see `sdk/typescript/src/constants.ts`). The actual fix is
+`checkReplacement: false`: once viem's replacement-detection branch triggers, it
+re-fetches the receipt with **no retry wrapper**, so a single lagging node fails
+the whole wait regardless of the retry knobs. Those knobs (`timeout 120s`,
+`pollingInterval 2s`, `retryCount 60`, `retryDelay 2s`) are only a backstop for
+the plain not-found path. If it still times out,
 the tx has most likely landed anyway — confirm by reading on-chain state
 (balance / index / etc.), don't trust the receipt alone.
 
@@ -84,7 +90,7 @@ the tx has most likely landed anyway — confirm by reading on-chain state
 0G's Etherscan-compatible verifier, in some states, doesn't return the polling
 response forge expects, so `--watch` spins forever.
 
-`script/verify.sh` runs without `--watch`, so the command exits cleanly right
+`contracts/script/verify.sh` runs without `--watch`, so the command exits cleanly right
 after submitting. Status is checked idempotently via a follow-up `getsourcecode`
 call.
 
@@ -95,12 +101,14 @@ call.
 ### 0g-storage Rust SDK dependency patch
 
 The `core2` crate that `zg-storage-client` pulls in upstream was yanked from
-crates.io. The attestor workspace only compiles once a `[patch.crates-io]`
-redirect points it at the `tcharding` fork:
+crates.io, and the upstream `bbqsrc/core2` repo was wiped to a tombstone README.
+The attestor workspace vendors a pre-wipe copy in-tree at
+`attestor/version-meld/core2` and points the resolver at it via a
+`[patch.crates-io]` path patch:
 
 ```toml
 [patch.crates-io]
-core2 = { git = "https://github.com/tcharding/core2", branch = "..." }
+core2 = { path = "version-meld/core2" }
 ```
 
 The Go CLI (`0g-storage-client`) also remains a viable alternative — that's what
@@ -115,7 +123,7 @@ sandbox API is rejected. E2E tests need a funded wallet.
 ### sealed adapter version probes must be swappable package-level vars
 
 Adapters live-probe the installed framework version inside
-`EvolutionFor("framework")` (`openclaw --version` / `claude --version`).
+`EvolutionFor("framework")` (per-adapter; e.g. `openclaw --version`).
 Dev machines plausibly have these CLIs actually installed — the probe
 result overrides the version in the restored binding and makes
 round-trip tests environment-dependent (the conformance suite blew up on
@@ -140,7 +148,8 @@ The current wire format is lossless: the separator (exactly one `\n`)
 belongs to the section, owner bytes are preserved verbatim, and
 `StripInjected(UpsertMarkedSection(x)) == x` holds strictly. Before
 touching this code, run the conformance + injection round-trip tests
-(`openclaw/conformance_test.go`, `platform/markers_test.go`).
+(`sealed/internal/framework/openclaw/conformance_test.go`,
+`sealed/internal/platform/markers_test.go`).
 
 ---
 
@@ -158,5 +167,5 @@ below to attribute it to the right layer:
 | The agent's persona has drifted in a suspicious way | suspected owner manipulation | **Not a sealed bug.** Verifiers should down-weight content; on-chain history (`EntryUpdated` events) shows the drift timeline |
 | The agent doesn't respond | container down, owner shut it off, gas exhausted | Ops issue; the owner is responsible for keeping the container alive and funded |
 
-See [`sealed/TRUST_MODEL.zh.md`](sealed/TRUST_MODEL.zh.md) for the trust model's
+See [`sealed/TRUST_MODEL.md`](sealed/TRUST_MODEL.md) for the trust model's
 layering.

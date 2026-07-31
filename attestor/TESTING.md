@@ -59,11 +59,24 @@ All free, no network, no env. This is the minimum bar for every commit.
 cd attestor
 docker compose up -d postgres
 cp .env.example .env                           # MOCK_TEE/KMS/SANDBOX/STORAGE=true by default
+# Two groups of vars ship BLANK in .env.example and must be filled or the
+# binaries refuse to boot:
+#  - MOCK_APP_PRIVATE_KEY + MOCK_APP_ETH_ADDRESS (api and worker bail with
+#    "MOCK_APP_PRIVATE_KEY must be 32 bytes, got 0"): any 32-byte hex key
+#    plus its derived address — the pair is validated at startup. The
+#    anvil #0 pair from the file's own comment works:
+#      MOCK_APP_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+#      MOCK_APP_ETH_ADDRESS=0xf39Fd6e51aad88F6F4ce6aB8827279cfFFb92266
+#  - OSS_ACCESS_KEY_ID + OSS_ACCESS_KEY_SECRET + OSS_BUCKET (worker bails
+#    with "OSS client not configured"): there is no env-level OSS mock —
+#    the mint step PUTs the AgentCard JSON to the bucket even with every
+#    other mock on, so real (scoped/low-privilege) OSS creds are needed.
 cargo run -p attestor-api &  cargo run -p attestor-worker &  cargo run -p attestor-indexer &
 OWNER_PRIV=0x<any valid key> bash scripts/e2e.sh   # → expect "PASS — phase=running"
 ```
 
-Proves the async plumbing (deploy → job → mint → provision) with zero spend.
+Proves the async plumbing (deploy → job → mint → provision) with zero
+chain/sandbox spend (the only real I/O is the AgentCard PUT to OSS).
 The KMS mock derives per-material locally, so the per-seal derivation path
 (incl. the startup self-check) is exercised for real.
 
@@ -180,7 +193,7 @@ the sandbox (it keeps running and billing until the provider GCs it).
 |---|---|---|
 | `/deploy`, `/clone` or `/reset` returns 402 immediately, code `trust_roots_not_acked` or `insufficient_sandbox_balance` | preflight (by design) | the owner wallet hasn't acked the component set / holds < 0.1 OG prepaid — fix with `ack()` / `deposit()` (console: the matching dialog) and retry; this replaces the old silent async worker 402 |
 | binaries boot-loop, `GetAppSecretKey`/`GetSecretResource`: `app not found on-chain` | registration | the environment's `app_id` isn't registered in the tapp/KMS registry — register/update it on-chain first |
-| binary refuses to boot: `KMS returned identical keys for different material` | tapp version | tapp-server predates the `material` passthrough (0g-tapp#35) — upgrade tapp before this attestor |
+| binary refuses to boot: `KMS returned identical keys for different material` | tapp version | tapp-server predates the `material` passthrough (0g-tapp#33) — upgrade tapp before this attestor |
 | `/deploy` 500 after ~1 min, worker logs `GetSecretResource timed out` | KMS | KMS DPRF derive is slow/stuck (cluster degraded / waiting on threshold) — fix the cluster; the attestor timeout only makes it visible |
 | container log: `ECIES decrypt sealedKey: message authentication failed` + `/status` `signer mismatch` | KMS key-era drift | the KMS cluster was re-keyed (DKG reset / `MOCK_APP_SECRET` changed) between this agent's mint and its (re-)provision, so the re-derived agentSeal no longer matches — the agent is from a previous key era and cannot be revived; redeploy it |
 | container_stage failed: `snapshot "…" not found` (mint/storage fine) | config skew | `ATTESTOR_SANDBOX_SNAPSHOT` (or a hardcoded snapshot in a client) doesn't exist on the sandbox provider — align the name; agents minted this way sit `offline` and can be brought up via retry with a corrected envelope |

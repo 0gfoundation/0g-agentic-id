@@ -1,6 +1,6 @@
 //! POST /probe — on-demand container liveness check.
 //!
-//! The worker sweep (`flip_stale_heartbeats`) only fires every minute and
+//! The worker sweep (via `stale_running_candidates`) only fires every minute and
 //! waits 15 min before declaring a deployment dead. That's fine for
 //! background reaping but leaves a window where the UI shows "running"
 //! while Say-hi already returns 502. This route lets the frontend
@@ -24,10 +24,11 @@
 //! Stopped vs Failed: a sandbox that still exists but isn't running can be
 //! resumed in place (sandbox.start), so it maps to StageStatus::Stopped and
 //! the UI offers Resume. A sandbox that has disappeared (404) can only be
-//! Recreated, so it maps to Failed and the UI hides Resume. The probe has
-//! the sandbox's ground-truth state here, so it can tell the two apart —
-//! unlike the blind heartbeat sweep, which has no sandbox query and
-//! conservatively flips every stale runner to Failed.
+//! Recreated, so it maps to Failed and the UI hides Resume. The heartbeat
+//! sweep makes the same distinction on its own cadence — it queries the
+//! sandbox for each stale candidate and picks Skip / Stopped / Failed
+//! (+reap); the probe simply runs that reconciliation synchronously, on
+//! demand, for a single seal.
 //!
 //! No auth: anyone can ask attestor to probe a specific seal_id. The
 //! sandbox-side call uses attestor's admin signer, so the auth surface

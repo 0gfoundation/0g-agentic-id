@@ -35,7 +35,8 @@ async fn main() -> anyhow::Result<()> {
     let app_priv = tee.app_private_key().await?;
 
     // KMS master (app-scoped 32B secret). All three binaries must resolve
-    // to the same key — MOCK_KMS=true returns a hardcoded dev key, false
+    // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value
+    // in every binary; the process refuses to start without it), false
     // goes over local gRPC to tapp-server's GetSecretResource.
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
