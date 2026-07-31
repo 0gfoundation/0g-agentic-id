@@ -1,8 +1,8 @@
 # Data-bound reputation aggregation (design)
 
 Status: **design / north-star**. The simple first cut (`getDataBoundScore`, snapshot
-overlap) ships in the SDK today; the full model below is the target for the
-event-indexer phase. On-chain `getSummary` is **not** changed by any of this — it
+overlap) is designed but not yet in the SDK; the full model below is the target for
+the event-indexer phase. On-chain `getSummary` is **not** changed by any of this — it
 stays the ERC-8004 baseline.
 
 ## Problem
@@ -118,7 +118,7 @@ Simple is the default; per-tag / per-role weighting is opt-in.
 
 ## Data sources
 
-- **Version chain**: reconstruct from the AgenticID contract's iData `Update` events
+- **Version chain**: reconstruct from the AgenticID contract's iData `Updated` / `EntryUpdated` events
   (each update = a new version + block time); the current version is
   `intelligentDatasOf(agentId)`.
 - **Review → version**: attach each feedback to the version live at its `giveFeedback`
@@ -153,7 +153,7 @@ Simple is the default; per-tag / per-role weighting is opt-in.
 
 ## Phasing
 
-- **v1 (shipped)**: `getDataBoundScore` — snapshot overlap vs current iData, single
+- **v1 (designed, not yet shipped)**: `getDataBoundScore` — snapshot overlap vs current iData, single
   weighted average + `freshness`. Cheap read loop, no version chain. Good enough at
   low review volume.
 - **v2 (indexer)**: the Bayesian version-chain model above, once there's an event

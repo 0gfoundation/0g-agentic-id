@@ -583,7 +583,11 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    line to `images/sealed/Dockerfile`; either way the universal image
    rebuild's hash goes through the attestor allowlist process. A new
    runtime ecosystem (Python, JVM) is the only thing that structurally
-   grows the image.
+   grows the image. (Honest caveat about the live path: the runtime
+   bootstrap image actually shipping today — `sealed/Dockerfile` — builds
+   FROM the openclaw base image (`images/openclaw/`), not the universal
+   one; `images/sealed/` is the universal-image target this instruction
+   is scoped to, and applies once your deployment ships it as the base.)
 7. Add your framework's name to attestor's supported-names list so
    deploys can select it — attestor treats the name as an opaque string
    (validated pre-mint, written into the version-less binding, listed in

@@ -1,8 +1,8 @@
 # AgenticID Contracts
 
-Solidity 合约层实现了 **AgenticID 协议**：把 ERC-8004 身份/声誉 注册表和 ERC-7857
-智能 NFT 结合起来，为 TEE 内运行的 AI agent 提供可验证的链上身份、数据密钥原子
-交付、以及抗 sybil 的声誉系统。
+Solidity 合约层实现了 **AgenticID 协议**：托管绑定（custody-bind）到 canonical
+ERC-8004 身份注册表，并在其上叠加 ERC-7857 智能 NFT，为 TEE 内运行的 AI agent
+提供可验证的链上身份、数据密钥原子交付、以及抗 sybil 的声誉系统。
 
 ---
 
@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 124 tests / 15 suites）
+forge test                      # 跑全量测试（当前 138 tests / 18 suites；1 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -64,7 +64,7 @@ forge clean                     # 清 out/
 
 ```toml
 [profile.default]
-src = "contracts"               # 源码目录（不是默认的 src/）
+src = "src"                     # 源码目录（foundry 默认值）
 libs = ["lib"]                  # OZ submodules
 solc = "0.8.24"                 # 锁版本
 via_ir = true                   # ⚠️ 必需：giveFeedback 参数多会 stack too deep
@@ -85,11 +85,12 @@ remappings = [
 ## 2. 合约布局
 
 ```
-contracts/
-├── AgenticID.sol                               主合约（身份 + 7857 token）
-├── AgenticIDReputationRegistry.sol             声誉注册表
-├── ERC7857Upgradeable.sol                      7857 核心（iTransferFrom）
-├── ERC8004IdentityRegistryUpgradeable.sol      8004 身份（register/metadata/wallet）
+contracts/src/
+├── AgenticID.sol                               主合约（身份 + 7857 token + seal）
+├── AgenticIDReputationRegistry.sol             声誉注册表（ServeProof）
+├── ERC7857Upgradeable.sol                      7857 核心（iTransferFrom + proof 校验）
+├── ERC8004CanonicalBoundUpgradeable.sol        ERC-8004 身份，托管绑定到 canonical
+│                                               注册表（read-through / write-forward）
 ├── extensions/
 │   ├── ERC7857AuthorizeUpgradeable.sol         链下使用授权名单
 │   ├── ERC7857CloneableUpgradeable.sol         iCloneFrom
@@ -98,26 +99,39 @@ contracts/
 │   ├── BaseDataVerifier.sol                    transfer proof 基类（含 pauser 角色）
 │   └── TEEDataVerifier.sol                     TEE 签名的 ownership proof 实现
 ├── utils/
-│   └── NonceRegistryUpgradeable.sol            统一 nonce + deadline 防重放
+│   └── NonceRegistryUpgradeable.sol            防重放（verifier 和声誉注册表各自使用）
 ├── proxy/
 │   ├── BeaconProxy.sol                         OZ re-export（为了编译器拉进 artifact）
 │   └── UpgradeableBeacon.sol                   OZ re-export
 └── interfaces/
-    └── I*.sol                                  全部接口定义
+    ├── ICanonicalIdentityRegistry.sol          AgenticID 绑定的固定 canonical ERC-8004 注册表接口
+    └── I*.sol                                  其余全部接口定义
 ```
 
-AgenticID 通过 C3 linearization 把四条路径叠起来：
+### Canonical 绑定
+
+ERC-8004 身份**没有**在这里重新实现——而是托管绑定到固定的 canonical ERC-8004
+IdentityRegistry（0G 上：mainnet `0x8004A169…`、testnet `0x8004A818…`；
+`Deploy.s.sol` 按 chainId 选择）。注册时把 canonical token 铸给 **AgenticID
+合约本身**（托管），同时把**同一个 agentId** 的本地 ERC-721 token 铸给真正的
+owner。所以一个 agent 横跨两条记录：canonical 注册表（身份事实源，生态里的
+8004 工具直接读它；canonical token 永不离开托管）和本地 AgenticID token
+（可转让的 owner + 7857 / seal 扩展）。agentId 来自 canonical 注册表的全局
+0 起计数器，所有注册方共享。
+
+`AgenticID` 通过 C3 linearization 把这些路径叠起来：
 
 ```
 AgenticID
-  ├── ERC8004IdentityRegistryUpgradeable         (agentURI / metadata / agentWallet)
+  ├── ERC8004CanonicalBoundUpgradeable           (agentURI / metadata / agentWallet，经 canonical 托管)
   ├── ERC7857IDataStorageUpgradeable             (IntelligentData[])
   ├── ERC7857AuthorizeUpgradeable                (authorizedUsers[])
   ├── ERC7857CloneableUpgradeable                (iCloneFrom)
   └── OwnableUpgradeable                          (owner / attestor 管理)
 ```
 
-共享同一个 ERC-721 token 实例，一个 agent = 一个 tokenId = 一个 agentId。
+ERC-721 同时经 8004 和 7857 两条路径进来，C3 把它收敛成单实例：一个 agent =
+一个本地 tokenId = 一个 canonical agentId。
 
 ---
 
@@ -164,14 +178,17 @@ AgenticID.registerWithSeal(
 )
 ```
 
-前置要求 `msg.sender` 在 `trustedAttestors` 名单里（`onlyOwner` 维护）。
+前置要求：`msg.sender` 在 `trustedAttestors` 名单里（`onlyOwner` 维护），且
+sealed 运行时的 `image_hash` 在 `validFrameworkHashes` 里（由 attestor 在
+provision seal 之前链下校验）。这次调用把 canonical token 铸给 AgenticID
+合约（托管），把本地 token 铸给 `to`。
 
-**事件**：
-- `Registered(agentId, agentURI, to)` —— ERC-8004 身份注册
-- `Transfer(0x0, to, agentId)` —— ERC-721 mint
-- `MetadataSet × N`、`Updated(agentId, [], newDatas)`
-- `AgentSealSet(agentId, agentSeal_addr, sealId)`
-- `ITransferred(0x0, to, agentId, entries[])` —— sealedKey payload 发布
+**事件**——分布在两个合约上：
+- **canonical 注册表**上：`Registered(agentId, agentURI, owner=AgenticID)`、
+  `MetadataSet × N`、`URIUpdated`（身份记录；`owner` 是托管合约本身）
+- **AgenticID** 上：`Transfer(0x0, to, agentId)`（本地 mint）、
+  `Updated(agentId, [], newDatas)`、`AgentSealSet(agentId, agentSeal_addr, sealId)`、
+  `ITransferred(0x0, to, agentId, entries[])`（sealedKey payload 发布）
 
 **Agent TEE 稍后启动**：
 - 产生 RA quote 交给 attestor
@@ -191,14 +208,14 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 ### 关键不变量
 
-| 字段 | 一旦设置 | 转让后 |
+| 字段 | 如何设置 | 转让后 |
 |---|---|---|
 | `agentSeal` | 永不可变（`setAgentSeal` 只能调一次）| 保留 |
 | `sealId` | 永不可变 | 保留 |
-| `agentWallet` | 可重设（带 EIP-712 签名）| **清空** |
-| `authorizedUsers` | 可增删 | **清空** |
-| `agentURI` / `metadata` | owner 可改 | 保留 |
-| `IntelligentData[]` | **seal 已绑** → 仅 `agentSeal` 可改（`update`/`updateAt`，需 EIP-191 签名）；**seal 未绑** → owner 可改 | 保留 |
+| `agentWallet` | 转发给 canonical 注册表官方 4 参 `setAgentWallet`（`newWallet` 的 EIP-712 同意签名，owner = AgenticID 合约，deadline ≤ 5 分钟）| **清空** |
+| `authorizedUsers` | owner 可增删 | **清空** |
+| `agentURI` / `metadata` | owner（URI 亦可由 trusted attestor）经转发写到 canonical | 保留 |
+| `IntelligentData[]` | **seal 已绑** → 仅 `agentSeal` 可调 `update` / `updateAt`（纯 `msg.sender` 门禁）；**seal 未绑** → owner 可改 | 保留 |
 
 ---
 
@@ -220,7 +237,7 @@ struct ServeProof {
 }
 ```
 
-**没有 `client` 字段**：归属由提交时的 `msg.sender` 决定,proof 是不记名凭证,买家用自己的钱包提交(靠签名 nonce 保证一次性)。签名内容：
+**没有 `client` 字段**：归属由提交时的 `msg.sender` 决定，proof 是不记名凭证，买家用自己的钱包提交（靠签名 nonce 保证一次性）。签名内容：
 ```
 inner = keccak256(abi.encode(agentId, timestamp, deadline,
                              taskHash,
@@ -265,16 +282,26 @@ AgenticIDReputationRegistry.giveFeedback(
 
 ## 6. 流程 3: 转让与克隆
 
-### `iTransferFrom` —— 更换 ownership + 原子交付 dataKey
+转让行为按 agent 有无 seal（`getAgentSeal(tokenId) != 0`）分叉：
+
+- **seal 绑定 agent**（运营实体）：ownership 走标准 ERC-721 `transferFrom` /
+  `safeTransferFrom`——单纯换 owner。iData 始终锁在不可变 `agentSeal` 的 TEE
+  之下，无需重加密；运营权链下随 ownership 走（attestor 给新 owner 重新
+  provision）。seal 绑定的 token 调 `iTransferFrom` 和 `iCloneFrom` 都会
+  **revert**（`AgenticIDSealedAgentUseTransfer` / `AgenticIDCannotCloneSealedAgent`）。
+- **无 seal agent**（数据 blob）：普通 transfer 保持禁用；ownership 只能走下面
+  proof 门禁的 `iTransferFrom`，原子地把 dataKey 重加密给买家。`iCloneFrom` 可用。
+
+### `iTransferFrom`（无 seal）—— 更换 ownership + 原子交付 dataKey
 
 **链下准备**（对每条 IntelligentData 都走一次）：
 
 1. **Buyer 签 AccessProof**
    ```
-   inner = keccak256(abi.encodePacked(dataHash, buyer_targetPubkey, nonce_ap, deadline_ap))
+   inner = keccak256(abi.encodePacked(chainId, erc7857, dataHash, buyer_targetPubkey, nonce_ap, deadline_ap))
    ap.proof = personal_sign(inner, buyer_priv)
    ```
-   `buyer_targetPubkey` 有两种模式：空串 = 用 buyer 的以太坊 pubkey（64 字节未压缩）；非空 = 自选加密公钥。
+   `buyer_targetPubkey` 有两种模式：空串 = 用 buyer 的以太坊 pubkey（64 字节未压缩）；非空 = 自选加密公钥。`chainId` 和 `erc7857`（AgenticID token 合约地址）对两种 proof 做域分隔，签名无法在其他链或其他合约上重放。
 
 2. **Agent TEE ↔ Oracle TEE 协作**
    - Seller 把买家签的 AccessProof 提交给卖家 Agent TEE
@@ -285,7 +312,7 @@ AgenticIDReputationRegistry.giveFeedback(
    - Oracle TEE 解 ECIES 拿 `dataKey`，用 `buyer_targetPubkey` 重封 → `sealedKey_new`
    - Oracle TEE 签 OwnershipProof：
      ```
-     inner = keccak256(abi.encodePacked(dataHash, sealedKey_new,
+     inner = keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey_new,
                                         buyer_targetPubkey, nonce_op, deadline_op))
      op.proof = personal_sign(inner, teeOracleAddress_priv)
      ```
@@ -313,28 +340,34 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 - **纯读数据**：用 `buyer_targetPubkey` 对应的 priv 解 `sealedKey_new` 拿 `dataKey`，下载并解密 IntelligentData 本地用。不需要 TEE 也不需要 attestor。但不能签 ServeProof，声誉断线。
 - **接手运营 agent**：部署自己的 Agent TEE，经 attestor RA 领相同的 `agentSeal_priv`（set-once 保证地址不变），TEE 里同时拿到 `dataKey` 和 `agentSeal_priv`，继续对外服务、签新 ServeProof。
 
-### `iCloneFrom` —— 铸克隆 token，源不变
+### `iCloneFrom`（无 seal）—— 铸克隆 token，源不变
 
 `ERC7857CloneableUpgradeable.iCloneFrom(from, to, tokenId, proofs[])`
 
+- 只对**无 seal** 的源可用；源有 seal 时 revert
+  `AgenticIDCannotCloneSealedAgent`（克隆会把共享的 dataKey 重封给克隆目标，
+  泄露源的数据，且克隆体无法在自己的 seal 下运营——seal 绑定 agent 的分叉
+  应走 attestor）。
 - proof 校验流程**与 iTransferFrom 完全一致**（走同一个 `_proofCheck`）
-- 不动源 `tokenId`，`_incrementTokenId` 铸 `newTokenId` 给 `to`
-- 新 token 继承同一份 `IntelligentData[]`
-- 新 token **没有 seal**（`getAgentSeal(newTokenId) == 0`），attestor 需另行 `setAgentSeal` 才能让新 token 签 ServeProof
+- 不动源 `tokenId`，`_incrementTokenId` 注册一个新的 **canonical 身份**
+  （新全局 agentId，托管），把 `newTokenId` 铸给 `to`
+- 新 token 继承同一份 `IntelligentData[]`，**没有 seal**
+  （`getAgentSeal(newTokenId) == 0`）
 - emit `Cloned(tokenId, newTokenId, from, to, entries)`，不 emit `ITransferred`
 
 ---
 
-## 7. 防重放：统一的 NonceRegistry
+## 7. 防重放：NonceRegistry
 
-所有带签名的操作都过 `contracts/utils/NonceRegistryUpgradeable.sol`：
+`contracts/src/utils/NonceRegistryUpgradeable.sol` 被 **transfer verifier** 和
+**声誉注册表**继承（各自持有独立存储）。AgenticID 本体不消费 nonce——
+`setAgentWallet` 转发给 canonical 注册表，后者用 ≤ 5 分钟 deadline（无 nonce）。
 
-| 操作 | nonce key 派生 |
-|---|---|
-| transfer access proof | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
-| transfer ownership proof | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
-| ServeProof | `keccak256("SERVEPROOF", agentId, signature)` |
-| setAgentWallet | `keccak256("SET_AGENT_WALLET", agentId, newWallet, nonce)` |
+| 操作 | 消费方 | nonce key 派生 |
+|---|---|---|
+| transfer access proof | verifier | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
+| transfer ownership proof | verifier | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
+| ServeProof | 声誉注册表 | `keccak256("SERVEPROOF", agentId, signature)` |
 
 每个 nonce 消费时还会校验 `block.timestamp <= deadline`。Nonce 记录可经 `cleanExpiredNonces(keys)` 回收，前提是 `maxProofAge` 大于业务最长 deadline 窗口。
 
@@ -342,7 +375,13 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 8. 关键设计要点
 
+- **Canonical 托管绑定**。身份记录活在固定的 canonical ERC-8004 注册表上；
+  AgenticID 托管其 token（全局唯一 agentId，canonical 记录永不离开托管），
+  通过 read-through / write-forward 暴露同一个身份。生态里的 8004 工具读
+  canonical 注册表时原生看到 AgenticID agent；可转让的 owner 活在本地
+  AgenticID token 上。
 - **agentSeal / sealId：set-once 永久绑定**。一个 agentId 的 seal 只能设一次，转让也不清除。换硬件时 attestor 给新 Agent TEE provision 同一个 `agentSeal_priv` 即可。
+- **转让按 seal 分叉**。seal 绑定 agent 走标准 `transferFrom` 只转 ownership（数据始终锁在 TEE）；无 seal agent 走 proof 门禁的 `iTransferFrom`（dataKey 重加密给买家）。`iCloneFrom` 仅限无 seal。
 - **mint 对称性**：`register` 和 `registerWithSeal` 都 emit `ITransferred(0x0, to, agentId, entries[])`，indexer 对 mint 和 transfer 统一处理。
 - **dataKey 只在 TEE 内流动**：attestor 生成后丢弃、Agent TEE 持有、Oracle TEE 转让时短暂持有后丢弃。链上只见 sealedKey 密文。
 - **Oracle 加密 pubkey 在 TappRegistry**：通过 0g-Tapp 的 `TappRegistry` 合约（外部依赖、已上线）的 `getNode` / `getNodeList` 视图发布，不进 `TEEDataVerifier` 存储，保持 verifier 简洁。Agent TEE 转让时直接查 registry。
@@ -352,26 +391,30 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-124 个 Foundry tests / 15 suites，`forge test` 全绿。覆盖每个
-`external` / `public` 函数和每条文档化的 error 路径。
+138 个 Foundry tests / 18 suites（137 通过，1 个 fork 测试未设 `FORK_RPC`
+时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
+的 error 路径。
 
 | Suite | Cases | 覆盖 |
 |---|---|---|
 | `AgenticID.t.sol` | 10 | register / registerWithSeal / 禁用 overload / attestor 白名单 |
 | `AgentSeal.t.sol` | 6 | set-once / sealId 冲突 / 零值 / 补 seal / 非 attestor |
-| `TransferFlow.t.sol` | 17 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
-| `Clone.t.sol` | 8 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
+| `TransferFlow.t.sol` | 19 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
+| `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
 | `Reputation.t.sol` | 13 | giveFeedback ServeProof 验签 + revoke / appendResponse 全路径 |
-| `DataStorage.t.sol` | 8 | update / updateAt + 空 / 越界 / 非 owner |
+| `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |
-| `AgentWallet.t.sol` | 7 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
-| `AgentURIAndMetadata.t.sol` | 7 | setAgentURI / setMetadata + 覆写 / nonexistent |
+| `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
+| `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + 覆写 / nonexistent |
 | `VerifierAdmin.t.sol` | 7 | oracle 轮换 / pause（pauser 角色）/ maxProofAge / onlyOwner |
-| `AgenticIDAdmin.t.sol` | 8 | attestor 增删 / frameworkHash / setVerifier / onlyOwner |
-| `Upgradeable.t.sol` | 8 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
+| `AgenticIDAdmin.t.sol` | 7 | attestor 增删 / frameworkHash / setVerifier / onlyOwner |
+| `Upgradeable.t.sol` | 9 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
+| `CanonicalBinding.t.sol` | 7 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id |
+| `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
+| `CanonicalForkIntegration.t.sol` | 1 | 对着线上 canonical 注册表 self-mint（仅设了 `FORK_RPC` 才跑，否则跳过）|
 
 共享 scaffolding 在 `test/AgenticIDTestBase.sol`：两种 EIP-191 变体
 （hex-encoded 用于 transfer proof，raw-32-byte 用于 ServeProof / wallet sig）、
@@ -383,5 +426,3 @@ proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写�
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** —— 部署 / 升级 / Etherscan verify 全套
   runbook（10 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
   Galileo testnet 参考地址）。
-- **[`TODO.md`](TODO.md)** —— 合约层已知 backlog：链下 SDK 端到端测试、fuzz /
-  invariant 补强、协议层悬挂项（agent online 链上感知、`targetPubkey` 约束）等。

@@ -11,7 +11,9 @@
 #   cd sealed && docker build -t openclaw-sealed:0.1.0 .
 #
 # The base image (eliza/0g-sealed:openclaw-1.1.0) is built separately
-# from sealed/images/openclaw/ — see that directory's Dockerfiles. You
+# from sealed/images/openclaw/ — its Dockerfile builds the local tag
+# `openclaw-sandbox:1.1.0`; the eliza/0g-sealed:openclaw-1.1.0 registry
+# tag is applied when pushing that image to the registry. You
 # only need to rebuild the base when bumping node / openclaw versions.
 
 # Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).

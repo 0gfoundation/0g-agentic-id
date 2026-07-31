@@ -41,6 +41,8 @@ attestor/
 │   ├── api/                  HTTP + WS server + 静态 web/ 资源
 │   ├── worker/               异步任务 + 三类 sweep
 │   └── indexer/              链上事件监听
+├── scripts/                  e2e / verify-agent / regression 测试脚本
+├── version-meld/             vendored crate 修复，经 [patch.crates-io]（Cargo.toml）接入，Dockerfile 会拷进构建
 ├── docker-compose.yml        api / worker / indexer / postgres 全栈
 ├── Dockerfile                三 binary 共用镜像（cargo build --release 多入口）
 └── .env.example              所有运行时配置
@@ -55,6 +57,13 @@ docker compose build                                # 重 build 三个 binary
 docker compose up -d                                # 起 postgres + 3 个 attestor binary
 docker compose logs -f attestor-api                 # 看 api 日志
 ```
+
+本地构建注意：compose 里设了 `pull_policy: always`，且 `image:` 默认值
+（`ATTESTOR_IMAGE`）指向一个 VPC 内网 Aliyun registry tag——出了那个
+VPC 默认 registry 根本不可达；而在可达的环境里，`up -d` 会重新拉取
+registry 镜像、覆盖你刚 `docker compose build` 出来的本地产物。要真正
+跑本地构建，先把 `ATTESTOR_IMAGE` 设成本地构建的 tag（registry 上不存
+在的名字），或改掉 `pull_policy` 再 `up -d`。
 
 非容器（裸跑，开发调试用）：
 
@@ -79,6 +88,9 @@ cargo run -p attestor-indexer# 第三个终端
 | `GET /avatar/default.svg` | 默认 agent 头像（确定性 pixel-art，部署预览用）|
 | `GET /avatar/:seed.svg` | 按 32-byte hex seed 派生头像（agent card 等场景）|
 
+`ATTESTOR_CONSOLE_ENABLED=false`（headless 模式）时，`GET /` 和
+`/static/*` 返回 404——只有 avatar 路由和下面的 HTTP API 保持可用。
+
 ### 健康 / 配置
 
 | 路径 | 干什么 | 鉴权 |
@@ -92,8 +104,8 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置 | owner envelope |
-| `POST /probe` | 同步探活，flip 失联容器到 `Failed` | 无 |
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
 
 ### 容器对接（agent runtime → attestor）
 
@@ -124,7 +136,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 ## 关键配置
 
-完整列表在 `.env.example`（约 30 项），下面按类别列出 load-bearing 的。
+完整列表在 `.env.example`（约 40 项有效配置，另有若干注释掉的可选项），下面按类别列出 load-bearing 的。
 
 ### Chain 接入
 
@@ -198,12 +210,13 @@ cargo run -p attestor-indexer# 第三个终端
 ## 测试
 
 ```bash
-cargo test                          # 全量
+cargo test --workspace              # 全量
 cargo test -p attestor-shared       # 单 crate
-cargo test --test '*'               # 仅集成测试
 ```
 
-集成测试用 InMemory 实现（`mocks.rs`）绕过 Postgres / chain / sandbox 依赖，单测从 6s 起。
+所有测试都在内联 `#[cfg(test)]` 模块里（没有独立的 `tests/` 目录，
+`--test '*'` 匹配不到任何东西），用 InMemory 实现（`mocks.rs`）绕过
+Postgres / chain / sandbox 依赖，单测从 6s 起。
 
 完整回归流程（本地全 mock、testnet 实测、故障速查表）见
 [TESTING.md](TESTING.md)——`scripts/e2e.sh` 负责部署，

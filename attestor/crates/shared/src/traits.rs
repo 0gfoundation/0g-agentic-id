@@ -350,8 +350,15 @@ pub trait DeploymentRepo: Send + Sync {
 
     /// Atomically flip every running deployment whose last heartbeat
     /// is older than `now - threshold_secs` to `container_stage =
-    /// Stopped { reason }`. Returns the affected `seal_id`s so the
-    /// caller can publish `WsEvent::ContainerStopped`.
+    /// Failed { reason }` + phase `offline`. A silent container is a
+    /// runtime failure of a minted agent, not a user-initiated stop —
+    /// `Stopped` would wrongly offer Resume against an unreachable
+    /// sandbox (see the impl comment in `repo.rs`). Returns the
+    /// affected `seal_id`s so the caller can publish failure events.
+    ///
+    /// NOTE: currently has no production caller — the worker's sweep
+    /// uses `stale_running_candidates` below and reconciles each
+    /// candidate against the sandbox instead of blind-flipping.
     async fn flip_stale_heartbeats(
         &self,
         now: chrono::DateTime<chrono::Utc>,

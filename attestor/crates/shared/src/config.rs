@@ -307,7 +307,7 @@ impl Config {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),
             agent_serve_path: env_opt("ATTESTOR_AGENT_SERVE_PATH")
-                .unwrap_or_else(|| "/result".to_string()),
+                .unwrap_or_else(|| "/hello".to_string()),
             agent_dashboard_port: env_opt("ATTESTOR_AGENT_DASHBOARD_PORT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8080),

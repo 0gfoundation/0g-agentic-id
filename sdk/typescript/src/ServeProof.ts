@@ -122,8 +122,14 @@ export function buildServeProof(
 /**
  * Sign a ServeProof using a viem account or wallet client.
  *
+ * The hash handed to `sign` is already the final EIP-191 digest
+ * (`buildServeProofSigningHash`), so the callback must sign it raw —
+ * `account.sign({ hash })`. Do NOT use `signMessage({ message: { raw } })`:
+ * that wraps EIP-191 a second time and the proof fails
+ * `verifyServeProofSignature`.
+ *
  * @param params - The ServeProof parameters (without signature)
- * @param sign - A function that signs a hash (typically `account.signMessage` or `walletClient.signMessage`)
+ * @param sign - A function that raw-signs the final digest (e.g. `account.sign`)
  * @returns The complete ServeProof with signature
  *
  * @example
@@ -133,7 +139,7 @@ export function buildServeProof(
  * const proof = await signServeProof(
  *   { agentId: 1n, timestamp: 1700000000n, deadline: 1700003600n,
  *     taskHash: '0x...', dataHashes: ['0x...'], frameworkHash: '0x...' },
- *   async (hash) => account.signMessage({ message: { raw: hash } }),
+ *   async (hash) => account.sign({ hash }),
  * );
  * ```
  */

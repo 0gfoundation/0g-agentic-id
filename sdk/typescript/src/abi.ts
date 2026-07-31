@@ -717,62 +717,6 @@ export const reputationRegistryAbi = [
 ] as const;
 
 /**
- * ABI for the TEEDataVerifier contract.
- */
-export const teeDataVerifierAbi = [
-  {
-    type: 'function',
-    name: 'verifyServeProof',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'serveProof', type: 'tuple', components: [
-        { name: 'agentId', type: 'uint256' },
-        { name: 'client', type: 'address' },
-        { name: 'timestamp', type: 'uint256' },
-        { name: 'deadline', type: 'uint256' },
-        { name: 'taskHash', type: 'bytes32' },
-        { name: 'dataHashes', type: 'bytes32[]' },
-        { name: 'frameworkHash', type: 'bytes32' },
-        { name: 'signature', type: 'bytes' },
-      ] },
-    ],
-    outputs: [{ name: '', type: 'bool' }],
-  },
-  {
-    type: 'function',
-    name: 'verifyAccessProof',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'accessProof', type: 'tuple', components: [
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'targetPubkey', type: 'bytes' },
-        { name: 'nonce', type: 'bytes' },
-        { name: 'deadline', type: 'uint256' },
-        { name: 'proof', type: 'bytes' },
-      ] },
-    ],
-    outputs: [{ name: '', type: 'bool' }],
-  },
-  {
-    type: 'function',
-    name: 'verifyOwnershipProof',
-    stateMutability: 'view',
-    inputs: [
-      { name: 'ownershipProof', type: 'tuple', components: [
-        { name: 'oracleType', type: 'uint8' },
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'sealedKey', type: 'bytes' },
-        { name: 'targetPubkey', type: 'bytes' },
-        { name: 'nonce', type: 'bytes' },
-        { name: 'deadline', type: 'uint256' },
-        { name: 'proof', type: 'bytes' },
-      ] },
-    ],
-    outputs: [{ name: '', type: 'bool' }],
-  },
-] as const;
-
-/**
  * TappRegistry — trust-root acknowledgement. `ack` acknowledges the set of
  * TEE components (attestor, kms, sandbox) the deploy/sandbox flow depends on.
  */

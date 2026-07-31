@@ -1,8 +1,10 @@
 //! Real AgenticID chain client via alloy.
 //!
-//! `sol!` loads the canonical ABI JSON produced by `forge build` at
-//! `/root/0g-agentic-id/contracts/out/AgenticID.sol/AgenticID.json`,
-//! so the generated Rust encoders/decoders exactly match the on-chain
+//! `sol!` loads the canonical ABI JSON produced by `forge build` from
+//! the crate-relative path
+//! `../../../contracts/out/AgenticID.sol/AgenticID.json` (the Docker
+//! build stages that same file under `/build/contracts/out/`), so the
+//! generated Rust encoders/decoders exactly match the on-chain
 //! contract. No hand-written signatures.
 //!
 //! Gas: `with_recommended_fillers()` auto-estimates EIP-1559 fees, but on

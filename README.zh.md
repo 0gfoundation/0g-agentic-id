@@ -181,7 +181,7 @@ KMS 处理派生请求时检查链上注册身份与请求里的签名身份是�
 
 > 链上侧：`agentSeal` / `sealId` 是 **set-once 永久绑定**——一个 agentId 只能
 > 设一次，转让也不清除。换硬件时 attestor 给新的 Agent TEE 重新 provision 同一
-> 把 `agentSeal_priv` 即可，地址不变。见 [`contracts/README.md`](contracts/README.md) §4。
+> 把 `agentSeal_priv` 即可，地址不变。见 [`contracts/README.zh.md`](contracts/README.zh.md) §4。
 
 ### 4 · Sealed Sandbox：一个拥有自己的 agent
 
@@ -249,7 +249,7 @@ struct ServeProof {
 `giveFeedback` 在链上重建签名内容、`ecrecover` 后与 `getAgentSeal(agentId)`
 比对——`agentSeal_priv` 只有 Agent TEE 持有，谁都伪造不出 ServeProof，且每张
 proof 一次性（签名 nonce）。没有 `client` 字段——归属由提交时的 `msg.sender`
-决定。详见 [`contracts/README.md`](contracts/README.md) §5。
+决定。详见 [`contracts/README.zh.md`](contracts/README.zh.md) §5。
 
 ### 6 · 转让 agent = 转让它的能力
 
@@ -260,7 +260,7 @@ proof 一次性（签名 nonce）。没有 `client` 字段——归属由提交�
 机制上靠 dataKey 在 TEE 之间的原子交付：卖家 Agent TEE 解出 `dataKey`，经
 Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransferFrom`
 校验 AccessProof + OwnershipProof 双签名通过才换 ownership。`dataKey` **从
-不出现在链上明文或 EOA 钱包**。详见 [`contracts/README.md`](contracts/README.md) §6。
+不出现在链上明文或 EOA 钱包**。详见 [`contracts/README.zh.md`](contracts/README.zh.md) §6。
 
 ---
 
@@ -281,7 +281,7 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 
 - **Attestor** — 校验 Sandbox 的 `signerAddress`（against TappRegistry）与容器
   镜像哈希（against `validFrameworkHashes`）；经 KMS 派生 AgentSeal 密钥材料；
-  把 AgentSeal 公钥注册上链。（Rust，见 [`attestor/`](attestor/README.md)）
+  把 AgentSeal 公钥注册上链。（Rust，见 [`attestor/`](attestor/README.zh.md)）
 - **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器并签其镜像
   哈希；保证 agent 按链上功能数据运行。
 - **Agent 运行时（`sealed`）** — 跑在 Sandbox 里、受 RA 后下发密钥的容器：把
@@ -342,14 +342,14 @@ Monorepo 四个子项目：
 
 | 子项目 | 内容 | 工具链 |
 |---|---|---|
-| [`contracts/`](contracts/README.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
-| [`attestor/`](attestor/README.md) | 后端服务（Attestor / Oracle TEE、API、worker、indexer）| Rust (cargo workspace) |
+| [`contracts/`](contracts/README.zh.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
+| [`attestor/`](attestor/README.zh.md) | 后端服务（Attestor / Oracle TEE、API、worker、indexer）| Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
-| [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0gfoundation/agentic-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.zh.md) | 客户端 SDK（`@0gfoundation/agentic-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
 
 ### 进一步阅读
 
-**[`sdk/typescript/README.md`](sdk/typescript/README.md) — 客户端 SDK**
+**[`sdk/typescript/README.zh.md`](sdk/typescript/README.zh.md) — 客户端 SDK**
 
 单入口（`AgenticID`）的 TypeScript 门面，罩住整个协议：`ag.agent`
 （deploy / clone / transfer、各类读、agentSeal gas 充值）、
@@ -358,14 +358,14 @@ Monorepo 四个子项目：
 attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直接
 跑在 testnet 部署上。
 
-**[`contracts/README.md`](contracts/README.md) — 合约层**
+**[`contracts/README.zh.md`](contracts/README.zh.md) — 合约层**
 
 完整的 Solidity 布局：ERC-7857（功能数据 + 转让/克隆协议）、ERC-8004
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`giveFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 117
-个 Foundry 测试与部署 / 升级 / Etherscan verify 全套脚本。
+`giveFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 138
+个 Foundry 测试（18 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
 

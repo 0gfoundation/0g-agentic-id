@@ -10,10 +10,14 @@
 //! `getAgentIdBySealId(seal_id)` view; if a non-zero id comes back, the
 //! prior tx actually landed and we just record it.
 //!
-//! Authorisation: `req.owner` must match the deployment's owner. No
-//! per-call signature because the worker only performs idempotent,
-//! attestor-authored on-chain writes (mint, setAgentURI) which require
-//! the attestor's own EOA — owner can't be tricked into anything.
+//! Authorisation: two tiers, matching what the retry can do. When a
+//! create envelope is attached (the worker may escalate ResumeDeploy →
+//! SandboxRecreate, i.e. a fresh container), the envelope must be signed
+//! by the current on-chain owner (`authorize_lifecycle`). Without an
+//! envelope the worker only performs idempotent, attestor-authored
+//! on-chain writes (mint resubmit, setAgentURI) which require the
+//! attestor's own EOA — so the cheaper `req.owner == deployment.owner`
+//! field check suffices for that path.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
