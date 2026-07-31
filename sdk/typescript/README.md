@@ -72,7 +72,7 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
-  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments)
+  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments/listMyDeployments)
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
 ```
@@ -408,13 +408,18 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
 **You usually don't need the URL** — `ag.agent.client(agentId)` (and
 `authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
-serve `url`). Reach for `listDeployments()` when you want the URL explicitly or
-to see deploy **status** (phase, `lastProvisionError`). It needs `attestorUrl`
-(that status lives in the attestor's DB, not on chain) — no wallet/signature:
+serve `url`). Reach for `listDeployments()` when you want the URL or `phase`
+explicitly. It's the **public** listing (needs `attestorUrl`, no wallet), so it
+returns only non-sensitive fields; `owner`, `sandboxId` and `lastProvisionError`
+come back **null**. To see those for your OWN agents (and the `sandboxId` you
+pass to `stop`/`start`), use `listMyDeployments()`, which signs with your wallet:
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-// me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError } | undefined
+// me → { agentId, sealId, phase, url, name, createdAt } populated;
+//      owner, sandboxId, lastProvisionError come back NULL on this public listing.
+// For those (and to debug a stuck deploy), list your own with the wallet:
+const mine = await ag.agent.listMyDeployments();   // owner-signed; full detail
 const agentUrl = me?.url;               // null until the container is provisioned
 // If phase never reaches 'running' (or ends 'failed'), me.lastProvisionError
 // says why — container-provision failures (e.g. "image_hash not in

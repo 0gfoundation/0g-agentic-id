@@ -82,7 +82,7 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // 私钥(0x…)或 viem Account;有它就能写
-  attestorUrl: process.env.ATTESTOR_URL,  // 管容器 + 看部署进度都要(deploy/clone/启停/reset/retry/waitForRunning/listDeployments)
+  attestorUrl: process.env.ATTESTOR_URL,  // 管容器 + 看部署进度都要(deploy/clone/启停/reset/retry/waitForRunning/listDeployments/listMyDeployments)
   // rpcUrl 可选——默认 0G Galileo 测试网 RPC
 });
 ```
@@ -381,12 +381,15 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + 该 agent 的进�
 
 ## 与运行中的 agent 交互(无需控制台)
 
-**通常你根本不需要 URL**——`ag.agent.client(agentId)`(以及 `authenticate`/`connect`)会在链上解析出来(`tokenURI` → AgentCard 的 serve `url`).想显式拿 URL,或看部署**状态**(phase,`lastProvisionError`)时才用 `listDeployments()`;它需要 `attestorUrl`(状态存在 attestor 的库里,不在链上),**不需要钱包/签名**:
+**通常你根本不需要 URL**——`ag.agent.client(agentId)`(以及 `authenticate`/`connect`)会在链上解析出来(`tokenURI` → AgentCard 的 serve `url`).想显式拿 URL 或 `phase` 时才用 `listDeployments()`.它是**公开**列表(需要 `attestorUrl`,不需要钱包),所以只回非敏感字段——`owner`/`sandboxId`/`lastProvisionError` 都是 **null**.要看这些(以及传给 `stop`/`start` 的 `sandboxId`),用会用钱包签名的 `listMyDeployments()`:
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
 const agentUrl = me?.url;   // 容器起来前是 null;find 可能 undefined,用 ?. 兜住
-// 到不了 running 就看 me.lastProvisionError——它写着原因.
+// owner/sandboxId/lastProvisionError 在公开列表里是 null;要看原因(或调试卡住的部署),
+// 用会签名的 listMyDeployments() 列自己的 agent(带完整字段):
+const mine = (await ag.agent.listMyDeployments()).find((d) => d.agentId === agentId);
+// mine.lastProvisionError / mine.sandboxId 在这里才有值.
 
 // phase 是 'failed' 时先 retry(),别重新 deploy(重 deploy 会孤儿掉已铸造的身份).
 // retry 在同一个 sealId 上重跑失败的幂等阶段:
