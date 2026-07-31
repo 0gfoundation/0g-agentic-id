@@ -200,13 +200,13 @@ function mkClient(privKey, cfg) {
   // stop job may reach the sandbox (the source keeps serving below).
   console.log('· /stop forged-owner probe — non-owner envelope must be rejected…');
   {
-    const srow = await rowOf(AGENT_ID);
+    const srow = await rowOf(A, AGENT_ID);
     const canonical = JSON.stringify({
       action: 'stop',
       expires_at: Math.floor(Date.now() / 1000) + 180,
       nonce: require('crypto').randomBytes(16).toString('hex'),
       payload: {},
-      resource_id: (srow && srow.sandbox_id) || '',
+      resource_id: (srow && srow.sandboxId) || '',
     });
     const res = await fetch(ATTESTOR_URL + '/stop', {
       method: 'POST',
@@ -222,7 +222,7 @@ function mkClient(privKey, cfg) {
       }),
     });
     check('/stop with forged owner field rejected', res.status === 401, `status=${res.status}`);
-    const still = await rowOf(AGENT_ID);
+    const still = await rowOf(A, AGENT_ID);
     check('source agent still running after forged /stop', !!still && still.phase === 'running',
       `phase=${still && still.phase}`);
   }
