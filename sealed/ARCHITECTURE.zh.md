@@ -117,6 +117,7 @@ type Framework interface {
     HandleLegacy(ctx, role, plaintext) error         // 不在 Roles() 里的链上 role（如 persona）
     Start(ctx, RuntimeContext) (StartResult, error)  // spawn agent 子进程
     AuthResponse(ctx) (any, error)                   // /_seal/auth 的 owner 专属载荷
+    FrameworkFacts() platform.FrameworkFacts         // 共享 agent-doc 模板的填空值
     Stop(ctx, gracefulTimeout) error                 // SIGTERM → SIGKILL
     Liveness(ctx) error                              // 监工探针
     Readiness(ctx) error
@@ -302,8 +303,8 @@ internal/framework/openclaw/
 |---|---|---|
 | `/healthz` | sandbox proxy / 运维 | 流动性探测，返回 200 + 一行 status |
 | `/hello` | verifier、attestor、运维 | 返回 agent 身份 + currentSnapshot 的 `data_hashes`（serve-proof envelope 走 `X-Agent-Proof` 头）|
-| `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回一个短期 framework dashboard token + path |
-| `/<其他>` | 用户、agent dashboard 前端 | 反代到 openclaw 127.0.0.1:3284 |
+| `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回 framework gateway 凭据 `{token}`(chat API 的 bearer) |
+| `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权、响应带 proof 签名);未声明的路径一律 404——没有 catch-all 转发 |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
 | `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` —— 用 `agent_seal_priv` 签名 |

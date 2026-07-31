@@ -129,9 +129,13 @@ pub struct DeployRequest {
     #[serde(default)]
     pub i_data: Vec<IDataInput>,
 
-    /// User-signed envelope authorizing sandbox `create`. Relayed as-is
-    /// by the worker when it calls `POST {sandbox}/api/sandbox`.
-    pub sandbox_envelope: SandboxEnvelope,
+    /// User-signed envelope authorizing sandbox `create`. Relayed as-is by the
+    /// worker when it calls `POST {sandbox}/api/sandbox`. Optional: omit it to
+    /// MINT WITHOUT provisioning a container — the agent lands Offline (minted,
+    /// no runtime) and is brought online later via `/start`. The "mint-only"
+    /// deploy (SDK `provision: false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_envelope: Option<SandboxEnvelope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -860,7 +864,10 @@ pub enum JobPayload {
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
-        sandbox_envelope: SandboxEnvelope,
+        /// `None` = mint-only (no container provisioned; agent lands Offline,
+        /// brought online later via SandboxStart). `Some` provisions as usual.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_envelope: Option<SandboxEnvelope>,
     },
     /// Resume a previously stopped sandbox. Worker calls
     /// `SandboxClient::start(seal_id, envelope)` which relays to

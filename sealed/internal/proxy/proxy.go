@@ -5,15 +5,19 @@
 //   GET  /healthz       - container liveness probe (always 200)
 //   GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
 //   GET  /log.html      - same log, color-coded HTML view for frontends
-//   GET  /log/openclaw  - openclaw process log (plaintext, NOT signed)
-//   GET  /log/openclaw.html - same log, color-coded HTML view
+//   GET  /log/agent     - framework subprocess log (plaintext, owner-only)
+//   GET  /log/agent.html - same log, color-coded HTML view (owner-only)
 //   GET  /hello         - signed A2A self-introduction (returns 503 until armed)
 //   POST /_seal/auth    - owner-only flow returning the framework auth token
 //   *    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
-// All signed responses (everything except /healthz, /log, /log/openclaw)
-// carry an X-Agent-Proof header packing both an EIP-191 signature and the
-// canonical envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
+// /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
+// X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
+// output, which is owner-private. /healthz and /log stay open.
+//
+// All signed responses (everything except /healthz, /log, /log/agent) carry an
+// X-Agent-Proof header packing both an EIP-191 signature and the canonical
+// envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
 package proxy
 
 import (
@@ -38,6 +42,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
 
@@ -57,8 +62,9 @@ type Server struct {
 	// /log/agent reports unavailable.
 	mu           sync.RWMutex
 	adapter      framework.Framework
-	agentLogPath string         // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry // agent-registered external services (see services.go); nil until first POST /services
+	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
+	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
+	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the
@@ -75,6 +81,9 @@ func New(agent *state.Agent, publicURL string) *Server {
 // per-adapter optional paths from its capability interfaces:
 //
 //   - framework.SubprocessLogProvider → the log file /log/agent serves
+//   - framework.RouteProvider         → the declared public routes the
+//     catch-all proxy forwards (everything else 404s — fail-closed). Framework
+//     routes are never signed; only agent-registered /api/* services are.
 //
 // Called once by main after the on-chain framework binding names the
 // adapter. Handlers read under the lock.
@@ -87,10 +96,60 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	if p, ok := fw.(framework.SubprocessLogProvider); ok {
 		agentLogPath = p.SubprocessLogPath()
 	}
+	var fwRoutes []framework.Route
+	if rp, ok := fw.(framework.RouteProvider); ok {
+		fwRoutes = rp.FrameworkRoutes()
+	}
 	s.mu.Lock()
 	s.adapter = fw
 	s.agentLogPath = agentLogPath
+	s.fwRoutes = fwRoutes
 	s.mu.Unlock()
+	if len(fwRoutes) == 0 {
+		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
+	} else {
+		logger.Logf("proxy: adapter %q declared %d framework route(s)", fw.Name(), len(fwRoutes))
+	}
+}
+
+// matchFrameworkRoute returns the declared framework route whose prefix is the
+// longest match for path, and whether any matched. Used by handleProxy to
+// decide (a) whether to forward at all and (b) whether to sign the response.
+func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	best := -1
+	var bestRoute framework.Route
+	for _, rt := range s.fwRoutes {
+		if strings.HasPrefix(path, rt.Prefix) && len(rt.Prefix) > best {
+			best = len(rt.Prefix)
+			bestRoute = rt
+		}
+	}
+	return bestRoute, best >= 0
+}
+
+// frameworkRoutesForHello maps the declared routes to the public /hello wire
+// shape (report.Route). Empty when the adapter declared none.
+//
+// Signed is reported false for every framework route regardless of what the
+// adapter declared: handleProxy never signs a framework route (owner↔agent
+// steering channel), so /hello must not advertise otherwise. This keeps the
+// wire honest at the enforcement layer, not at the adapter's discretion.
+func (s *Server) frameworkRoutesForHello() []report.Route {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]report.Route, 0, len(s.fwRoutes))
+	for _, rt := range s.fwRoutes {
+		out = append(out, report.Route{
+			Prefix:      rt.Prefix,
+			Kind:        rt.Kind,
+			Auth:        rt.Auth,
+			Signed:      false,
+			Description: rt.Description,
+		})
+	}
+	return out
 }
 
 func (s *Server) getAdapter() framework.Framework {
@@ -115,16 +174,12 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/log.html", s.handleLogHTML)
 	mux.HandleFunc("/log/agent", s.handleAgentLog)
 	mux.HandleFunc("/log/agent.html", s.handleAgentLogHTML)
-	// Legacy aliases from when openclaw was the only framework; existing
-	// frontends link these. Same handlers, adapter-resolved log path.
-	mux.HandleFunc("/log/openclaw", s.handleAgentLog)
-	mux.HandleFunc("/log/openclaw.html", s.handleAgentLogHTML)
 	mux.HandleFunc("/hello", s.handleHello)
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
-		fmt.Println("Listening on :8080  GET /healthz | /log | /log/openclaw | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
+		fmt.Println("Listening on :8080  GET /healthz | /log | /log/agent (owner-only) | /hello (signed) | /_seal/auth (owner-only) | /* (agent proxy)")
 		_ = http.ListenAndServe(":8080", corsMiddleware(mux))
 	}()
 }
@@ -153,7 +208,15 @@ func (s *Server) handleLog(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, logger.Snapshot())
 }
 
-func (s *Server) handleAgentLog(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
+	_, _, sealID, owner, _ := s.agent.Snapshot()
+	if owner == "" {
+		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner); !ok {
+		return
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	logPath := s.getAgentLogPath()
 	if logPath == "" {
@@ -219,12 +282,18 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	if len(services) > 1 {
 		helloMessage += " Here's what I can do for you:"
 	}
+	// routes are the framework-declared prefixes (dashboard, chat, …) with
+	// their discovery hints (kind/auth) and signing disposition — distinct
+	// from the agent-registered `services` above. Empty for adapters that
+	// don't implement framework.RouteProvider.
+	routes := s.frameworkRoutesForHello()
 	resp := map[string]any{
 		"agent":      agentAddr,
 		"owner":      owner,
 		"public_url": s.publicURL, // empty when SANDBOX_PROXY_DOMAIN is unset
 		"message":    helloMessage,
 		"services":   services,
+		"routes":     routes,
 		"ts":         time.Now().Unix(),
 	}
 	body, err := json.Marshal(resp)
@@ -240,49 +309,61 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 
 // ── /_seal/auth ─────────────────────────────────────────────────────────────
 
-// handleAuth hands the framework-specific control-UI credential (e.g. the
-// openclaw gateway token) to a verified owner. Validates an EIP-191 signature
-// over "0GSealAuth:0x<sealID>:<unix-ts>" and confirms the recovered signer
-// equals the on-chain NFT owner cached at bootstrap.
-func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
-	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
-	agentID, frameworkHash := s.agent.ProofIdentity()
-	if priv == nil || owner == "" {
-		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
-		return
-	}
-
+// verifyOwnerSig validates the owner EIP-191 signature carried in the
+// X-Auth-Message / X-Auth-Signature request headers for a given message tag.
+//
+// The signed message is "<tag>:0x<sealID>:<ts>:<audience>", where <audience> is
+// the agent's own canonical serve URL (issue #62 — audience binding): a
+// signature the owner produced while talking to endpoint A cannot be replayed
+// to endpoint B, because B's audience won't match. sealID scopes it to this
+// agent; the ±authWindowSec window bounds freshness. Audience is enforced only
+// when the runtime knows its own public URL (empty in dev — SANDBOX_PROXY_DOMAIN
+// unset — where there is no external endpoint to phish).
+//
+// On success returns the server's current unix time; on any failure it writes
+// the HTTP error response and returns ok=false, so callers just `return`.
+func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, owner string) (int64, bool) {
 	msg := r.Header.Get("X-Auth-Message")
 	sigHex := r.Header.Get("X-Auth-Signature")
 	if msg == "" || sigHex == "" {
 		http.Error(w, "missing X-Auth-Message or X-Auth-Signature", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 
-	parts := strings.Split(msg, ":")
-	if len(parts) != 3 || parts[0] != "0GSealAuth" {
-		http.Error(w, "X-Auth-Message must be \"0GSealAuth:0x<sealID>:<ts>\"", http.StatusBadRequest)
-		return
+	// audience may itself contain ':' (scheme, host:port), so keep it whole as
+	// the 4th field rather than splitting the entire message on ':'.
+	parts := strings.SplitN(msg, ":", 4)
+	if len(parts) != 4 || parts[0] != tag {
+		http.Error(w, fmt.Sprintf("X-Auth-Message must be %q:0x<sealID>:<ts>:<audience>", tag), http.StatusBadRequest)
+		return 0, false
 	}
 	if !strings.EqualFold(parts[1], "0x"+sealID) {
 		http.Error(w, "seal_id mismatch", http.StatusUnauthorized)
-		return
+		return 0, false
 	}
 	ts, err := strconv.ParseInt(parts[2], 10, 64)
 	if err != nil {
 		http.Error(w, "bad timestamp in X-Auth-Message", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	now := time.Now().Unix()
 	if ts > now+authWindowSec || ts < now-authWindowSec {
 		http.Error(w, "stale or future X-Auth-Message timestamp", http.StatusUnauthorized)
-		return
+		return 0, false
+	}
+	if s.publicURL != "" {
+		want := strings.TrimRight(s.publicURL, "/")
+		got := strings.TrimRight(parts[3], "/")
+		if !strings.EqualFold(got, want) {
+			http.Error(w, "audience mismatch: signature not bound to this agent's URL", http.StatusUnauthorized)
+			return 0, false
+		}
 	}
 
 	sigBytes, err := hex.DecodeString(strings.TrimPrefix(sigHex, "0x"))
 	if err != nil || len(sigBytes) != 65 {
 		http.Error(w, "X-Auth-Signature must be 65-byte hex", http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	if sigBytes[64] >= 27 {
 		sigBytes[64] -= 27
@@ -292,11 +373,30 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	pub, err := crypto.SigToPub(hash, sigBytes)
 	if err != nil {
 		http.Error(w, "signature recover: "+err.Error(), http.StatusBadRequest)
-		return
+		return 0, false
 	}
 	recovered := crypto.PubkeyToAddress(*pub).Hex()
 	if !strings.EqualFold(recovered, owner) {
 		http.Error(w, "signer is not the agent owner", http.StatusUnauthorized)
+		return 0, false
+	}
+	return now, true
+}
+
+// handleAuth hands the framework-specific control-UI credential (e.g. the
+// openclaw gateway token) to a verified owner. Validates an owner EIP-191
+// signature (tag "0GSealAuth", audience-bound — see verifyOwnerSig / issue #62)
+// and confirms the recovered signer equals the on-chain NFT owner cached at
+// bootstrap.
+func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
+	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
+	agentID, frameworkHash := s.agent.ProofIdentity()
+	if priv == nil || owner == "" {
+		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+	now, ok := s.verifyOwnerSig(w, r, "0GSealAuth", sealID, owner)
+	if !ok {
 		return
 	}
 
@@ -342,17 +442,51 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A registered agent service takes precedence over the framework
-	// upstream: a request whose path matches one is routed to that
-	// service's loopback backend instead. Everything below (header copy,
-	// forward, serve-proof signing) is identical either way — attribution
-	// comes from leaving through :8080, not from which backend answered.
+	// Routing precedence, most specific first:
+	//   1. an agent-registered service (exact path) → its loopback backend,
+	//      always signed;
+	//   2. a framework-declared route (longest-prefix) → the framework
+	//      upstream, signed per Route.Signed;
+	//   3. otherwise, if the adapter declared any routes, 404 — an undeclared
+	//      path is NOT blind-forwarded (bounds the public + signing surface).
+	// Legacy fallback: an adapter that declares no routes keeps the old
+	// behaviour — forward every path to the upstream and sign every response.
+	// Signing follows a proxy-owned invariant, NOT the adapter's declared
+	// Signed flag:
+	//   - agent-registered /api/* service → signed. The outward, attributable
+	//     surface: the agent's own code serving an external task.
+	//   - framework-declared route → NEVER signed. The owner↔agent steering /
+	//     UI channel (chat, dashboard). Its bearer credential comes from the
+	//     owner-only /_seal/auth handshake, so signing it would let the owner
+	//     mint ServeProofs for interactions with their own agent — self-dealt
+	//     reputation. Enforced here at the proxy, not delegated to the route's
+	//     Signed flag, so a mis-declaring adapter can't reopen the hole.
+	//   - neither → 404 (fail-closed); no forward-all fallback.
+	signed := false
+	frameworkRoute := false
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
+		signed = true
 		upstream = svc.Backend
+	} else if rt, ok := s.matchFrameworkRoute(r.URL.Path); ok {
+		frameworkRoute = true
+		// A route may pin its own loopback backend (a framework whose
+		// surfaces are separate processes/ports); empty keeps the single
+		// StartResult upstream. Same mechanism as svc.Backend above.
+		if rt.Backend != "" {
+			upstream = rt.Backend
+		}
+	} else {
+		// Not an agent service and not a declared framework route: serve
+		// nothing. (Previously a "legacy" forward-all + sign-all fallback for
+		// adapters that declared no routes — removed; every shipped adapter
+		// declares its routes, and fail-closed beats blind-forwarding an
+		// undeclared path to the framework.)
+		http.NotFound(w, r)
+		return
 	}
 
 	// WS upgrades cannot be buffered + signed; hand off to httputil.
@@ -400,6 +534,25 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// An SSE stream can't be buffered + signed: the serve-proof signs a complete
+	// body, which a stream doesn't have until it ends. Relay it verbatim with
+	// per-chunk flushing so tokens reach the caller in real time — the same
+	// unsigned carve-out as the WebSocket upgrades above. This keeps a long
+	// reasoning turn alive: bytes keep flowing, so no idle-timeout window
+	// (framework SSE deltas + keepalives) ever opens on the connection.
+	//
+	// Gated on frameworkRoute, NOT on Content-Type alone: only a
+	// framework-declared route (the owner↔agent steering channel — chat/UI) may
+	// go unsigned. An agent-registered /api/* service (the outward, attributable
+	// surface) and the legacy forward-all path must stay buffered + signed, so
+	// they never lose their X-Agent-Proof merely by emitting text/event-stream —
+	// even if that means a long /api/* stream is buffered (and can still hit the
+	// idle cutoff; model such a service as short, discrete responses instead).
+	if shouldStreamRelay(frameworkRoute, resp) {
+		streamRelay(w, resp)
+		return
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "read upstream body: "+err.Error(), http.StatusBadGateway)
@@ -416,8 +569,92 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	if !signed {
+		// Unsigned route (e.g. a dashboard's static UI): relay the response
+		// verbatim, without an X-Agent-Proof. The agent's on-chain signature
+		// attests attributable API responses, not UI assets.
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(respBody)
+		return
+	}
 	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// ── Server-Sent Events (streaming) helpers ──────────────────────────────────
+
+// isEventStream reports whether the upstream response is a Server-Sent Events
+// stream (an OpenAI-compatible `chat/completions` with `stream: true`, or any
+// other `text/event-stream` body).
+func isEventStream(resp *http.Response) bool {
+	ct := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Type")))
+	return strings.HasPrefix(ct, "text/event-stream")
+}
+
+// shouldStreamRelay decides whether a response is relayed as an unsigned stream
+// rather than buffered + signed. Only a framework-declared route (the
+// owner↔agent steering channel: chat/UI) may stream: it has no attribution
+// consumer, so an unsigned stream is fine. Agent-registered /api/* services and
+// the legacy forward-all path never stream here — they stay buffered + signed
+// so the attributable surface keeps its X-Agent-Proof even when it emits SSE.
+func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
+	return frameworkRoute && isEventStream(resp)
+}
+
+// streamRelay copies an SSE upstream response straight through to the client,
+// flushing after every chunk so each `data:` frame reaches the caller as the
+// framework emits it. It carries no X-Agent-Proof: the serve-proof signs a
+// complete body, which a stream does not have until it ends (same carve-out as
+// WebSocket upgrades). A caller that needs an attributable, on-chain-replayable
+// ServeProof uses the non-streaming (buffered + signed) path instead.
+//
+// Caveat: status + headers are committed at WriteHeader (200) before any body
+// byte, so an upstream error mid-stream can only truncate the body — it can't
+// change the status. That is inherent to streaming, not specific to this relay.
+func streamRelay(w http.ResponseWriter, resp *http.Response) {
+	for k, vs := range resp.Header {
+		// corsMiddleware already set our Access-Control-*; duplicates make
+		// browsers reject the response.
+		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	// No Content-Length: length is unknown until the stream ends. Go falls
+	// back to chunked transfer-encoding, which is what SSE needs.
+	w.Header().Del("Content-Length")
+	w.WriteHeader(resp.StatusCode)
+
+	// NewResponseController unwraps middleware ResponseWriters to find the
+	// flusher, so a wrapper that forgets to forward Flush() doesn't silently
+	// re-buffer us. Flush the headers now so the client sees the response start
+	// immediately, independent of when the first upstream chunk lands.
+	rc := http.NewResponseController(w)
+	canFlush := rc.Flush() == nil
+	if !canFlush {
+		// No flusher in the chain: writes buffer to the end, re-opening the
+		// idle-timeout window we came here to avoid. Surface it rather than
+		// degrade silently.
+		logger.Logf("proxy: WARN SSE relay cannot flush (no http.Flusher in the writer chain); stream will buffer and may hit the upstream idle timeout")
+	}
+	buf := make([]byte, 16*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // client went away
+			}
+			if canFlush {
+				_ = rc.Flush()
+			}
+		}
+		if rerr != nil {
+			return // io.EOF (clean end) or upstream error — nothing left to relay
+		}
 	}
 }
 

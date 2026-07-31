@@ -14,15 +14,15 @@
 
 use crate::traits::ChainClient;
 use crate::types::*;
-use alloy::network::{Ethereum, EthereumWallet, TransactionBuilder};
+use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy::primitives::{Address, Bytes, TxHash, U256};
-use alloy::providers::fillers::{ChainIdFiller, NonceFiller, SimpleNonceManager};
+use alloy::providers::fillers::{ChainIdFiller, NonceFiller, NonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use alloy::sol_types::{SolCall, SolEvent};
-use alloy::transports::Transport;
+use alloy::transports::{Transport, TransportResult};
 use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -88,6 +88,29 @@ const GAS_LIMIT_BUFFER_DENOMINATOR: u128 = 100;
 
 const GWEI_TO_WEI: u128 = 1_000_000_000;
 
+/// Nonce source that reads the account's **pending** nonce (mempool-inclusive)
+/// instead of alloy's default `latest`. `SimpleNonceManager` calls
+/// `get_transaction_count(addr)`, which defaults to the `latest` block and so
+/// does NOT count a tx we just broadcast but haven't mined — serial sends then
+/// reuse the same nonce and collide (#54). Reading `pending` counts our own
+/// in-flight tx. Everything else (the fill pipeline) is alloy's `NonceFiller`;
+/// this only swaps the block tag. Stateless → self-heals every send (unlike
+/// `CachedNonceManager`, which never re-reads and wedges on any drift).
+#[derive(Clone, Debug, Default)]
+struct PendingNonceManager;
+
+#[async_trait]
+impl NonceManager for PendingNonceManager {
+    async fn get_next_nonce<P, T, N>(&self, provider: &P, address: Address) -> TransportResult<u64>
+    where
+        P: Provider<T, N>,
+        N: Network,
+        T: Transport + Clone,
+    {
+        provider.get_transaction_count(address).pending().await
+    }
+}
+
 /// Real chain client backed by alloy. Generic over Transport and Provider.
 pub struct AlloyChain<T, P>
 where
@@ -103,6 +126,13 @@ where
     // wired. Both unset → is_sandbox_node returns Ok(None) and the caller
     // falls back to its env-configured single sandbox signer.
     tapp_registry: Option<(Address, String)>,
+    // Serializes the read-nonce→submit window for every write from `sender`.
+    // SimpleNonceManager reads the pending nonce fresh on each send; without
+    // this lock two concurrent sends read the same nonce and collide (#54:
+    // "nonce too low" / "replacement transaction underpriced"). Held only
+    // across submit (sub-second), NOT the receipt wait, so txs still pipeline.
+    // tokio Mutex (not std) because the guard is held across an `.await`.
+    submit_lock: tokio::sync::Mutex<()>,
     _t: PhantomData<T>,
 }
 
@@ -126,6 +156,7 @@ where
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             tapp_registry,
+            submit_lock: tokio::sync::Mutex::new(()),
             _t: PhantomData,
         })
     }
@@ -134,10 +165,20 @@ where
 /// Build an HTTP + wallet-fitted provider and return a type-erased chain
 /// client. We skip `GasFiller` (0G testnet's `eth_maxPriorityFeePerGas`
 /// returns 1 wei which the mempool rejects) and set EIP-1559 fees
-/// manually per tx. We use `SimpleNonceManager` which queries
-/// `eth_getTransactionCount(addr, "pending")` for every send — the
-/// "pending" tag includes mempool txs, so this handles both same-process
-/// concurrent sends and cross-process EOA sharing (dev: `cast` + attestor).
+/// manually per tx. We use `PendingNonceManager` (above): it reads the
+/// account's **pending** nonce every send, so it counts our own just-broadcast
+/// txs and always reflects reality (backlog, retries, restarts) — stateless,
+/// self-healing. NB alloy's `SimpleNonceManager` reads the DEFAULT `latest`
+/// block, which does NOT count in-flight txs, so serial sends reuse a nonce and
+/// collide (that was #54). Its residual race — two concurrent sends reading
+/// `pending` before either broadcasts — is closed by `AlloyChain::submit_lock`,
+/// which orders read-after-broadcast per write.
+///
+/// We deliberately do NOT use `CachedNonceManager` (local counter, never
+/// re-reads chain): for a long-lived key serving every user's mint, any failed
+/// tx / restart / reorg desyncs its counter permanently and wedges ALL
+/// subsequent mints until restart. pending-read + lock gives the same collision
+/// safety while self-healing, at the cost of one RPC per send — negligible.
 pub fn connect_http(
     rpc_url: &str,
     contract_addr: Address,
@@ -152,9 +193,12 @@ pub fn connect_http(
     let url: reqwest::Url = rpc_url.parse()?;
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
-        .filler(NonceFiller::<SimpleNonceManager>::default())
+        .filler(NonceFiller::<PendingNonceManager>::default())
         .wallet(wallet)
         .on_http(url);
+    // Startup marker so a live process proves which build/strategy is running
+    // (a missing line means the binary predates the #54 fix — stale image).
+    tracing::info!(sender = %sender, "chain client ready — mint nonce = pending-read + submit_lock (#54)");
     let chain = AlloyChain::new(
         provider,
         contract_addr,
@@ -228,11 +272,16 @@ where
             "alloy: sending registerWithSeal"
         );
 
-        let pending = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(decode_err)?;
+        // Serialize the nonce-read→submit window (see `submit_lock`). Guard is
+        // released as soon as the tx is broadcast (pending nonce bumped), not
+        // held through the receipt wait, so mints still pipeline into mempool.
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -378,11 +427,13 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(decode_err)?;
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)

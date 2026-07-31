@@ -11,7 +11,7 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 | `ag.agent` | agent lifecycle — **deploy / clone / transfer** — reads (owner, agentSeal, iData…), and agent-seal gas top-up |
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
-| `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance |
+| `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance — the agent's pay-as-you-go **runtime** cost (distinct from `topUpAgentSeal`, which fuels the agent's own on-chain writes; see [Top-level ops](#top-level-ops-not-scoped-to-one-agent)) |
 
 > Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't need to know which call goes on-chain and which goes over HTTP.
 
@@ -72,7 +72,7 @@ const ro = new AgenticID({ addresses });
 const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
-  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/listDeployments)
+  attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments/listMyDeployments)
   // rpcUrl optional — defaults to the 0G Galileo testnet RPC
 });
 ```
@@ -95,7 +95,7 @@ const ag = new AgenticID({
 The snippets below assume these bindings:
 
 ```ts
-const agentId = 33n;   // an existing agent (ERC-721 tokenId)
+const agentId = 33n;   // an existing agent (ERC-7857 tokenId, ERC-721-compatible)
 const owner = '0xAaAa...';   // the address that owns the agent (often your own signer's address)
 const buyer = '0xBbBb...';   // the address leaving feedback — whatever wallet `ag` signs with (attribution is msg.sender)
 ```
@@ -113,8 +113,11 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  framework: 'openclaw',                           // which framework; must be a name the attestor's GET /config advertises
-  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b (the 0G router's own model)
+  framework: 'openclaw',                           // 'openclaw' | 'hermes' — must be a name GET /config advertises.
+                                                   // hermes needs its own image: set sandbox.sealedImage:'0g-sealed-hermes' (see framework section).
+  inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b.
+                                                   // provider is effectively '0g-compute' (the 0G router) today; run ag.agent.listModels()
+                                                   // first to see the router's live catalog before picking `model`.
   // ↑ these two are just inputs to defaultIData(). For full control over
   //   the minted content, pass iData: [...] instead (see the iData section).
   sandbox: {
@@ -130,8 +133,17 @@ const params = {
 // The first await returns once the attestor ACCEPTS the job; the tokenId doesn't
 // exist until the background mint (storage → on-chain mint → setAgentURI).
 
-// One-shot — `{ wait: true }` blocks on the mint and hands back the tokenId (agentId):
-const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: true });   // agentId → 34n
+// `wait` picks how far to block (phase order): omit → accepted; 'minted' →
+// through the mint (adds agentId); 'running' → through provision (adds url).
+// `{ wait: 'minted' }` blocks on the on-chain MINT only — you get the agentId,
+// but the container (and its url) is still ~1-2 min out, so don't reach for it yet:
+const { sealId, agentSealAddr, agentId } = await ag.agent.deploy(params, { wait: 'minted' });  // agentId → 34n
+// `{ wait: 'running' }` also blocks on PROVISION and returns the reachable base url:
+const { agentId: id2, url } = await ag.agent.deploy(params, { wait: 'running' });            // url now hittable
+// Mint-only — omit `sandbox` to mint WITHOUT a container: the agent lands
+// Offline (minted, no runtime), bring it online later with start(). No
+// container means no url, so wait:'running' is rejected here — use wait:'minted':
+const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }, { wait: 'minted' });
 
 // Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
@@ -139,7 +151,7 @@ const id = await ag.agent.waitForMint(dep.sealId);    // → 34n once minted (tu
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
-const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: true });
+const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: 'minted' });
 // cl → { sealId, agentSealAddr, agentId }  — the new agent's tokenId; lands Offline for the new owner
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
@@ -147,7 +159,17 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // returns the existing deploy/clone instead of minting a duplicate):
 // await ag.agent.deploy({ ...params, idempotencyKey: 'order-4711' });
 
-// transfer — ERC-7857; the attestor tears down the old owner's runtime on transfer
+// transfer — ERC-7857. Teardown of the old owner's container is ASYNC: the
+// attestor reaps it by watching the chain (indexer), so it lags the tx by the
+// indexer's catch-up delay. Right after transfer, phase may still read
+// 'running', then '400', then 'offline' — not a bug and not a security gap:
+// the on-chain owner-gate flips to the new owner at once (the old owner can no
+// longer control it — see TRUST_MODEL), the lingering container is just an
+// unreachable husk being cleaned up. Don't gate on phase right after transfer;
+// wait for 'offline', or let the new owner reset()/start() a fresh container
+// (identity persists). The indexer-watched reap is the backstop that stays:
+// anyone can transferFrom directly on chain, bypassing any "stop-first" path,
+// so teardown must be reactive.
 await ag.agent.transferFrom(owner, newOwner, agentId);      // → tx hash "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);  // → tx hash "0x…"
 
@@ -167,13 +189,31 @@ await ag.agent.balanceOf(owner);            // → 5n       agents owned by `own
 // send native gas to the agent's own key so it can self-fund its on-chain writes
 const agentSeal = await ag.agent.getAgentSeal(agentId);
 await ag.agent.topUpAgentSeal(agentSeal, parseEther('0.01'));   // → tx hash "0x…"
+
+// runtime start / stop / reset (owner-signed; on-chain identity preserved):
+await ag.agent.stop(sealId, sandboxId);     // stop a running container
+await ag.agent.start(sealId, sandboxId);    // resume a STOPPED container
+await ag.agent.start(sealId, { apiKey });   // FIRST provision: bring a mint-only /
+                                            // never-provisioned agent online with a fresh
+                                            // container (apiKey required in practice). The
+                                            // semantic counterpart to a sandbox-less deploy;
+                                            // distinct from reset ("recreate an EXISTING one").
+await ag.agent.reset(sealId, { apiKey });   // recreate an EXISTING container: re-read iData
+                                            // from chain, reselect the framework adapter.
+                                            // apiKey required in practice (attestor doesn't
+                                            // cache the model key); sealedImage optional.
+await ag.agent.listDeployments();
+// → [{ agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }, …]
+//   phase: 'deploying' | 'running' | 'stopped' (owner-stopped, start() to resume)
+//        | 'offline' (no running container — never provisioned (mint-only) / failure / timeout /
+//          transfer-teardown; on-chain identity persists, use start({apiKey}) or reset) | 'failed'
 ```
 
 **Which identifier does what** — three IDs refer to the same agent from different angles:
 
 | Identifier | What it is | Used by |
 |---|---|---|
-| `agentId` (bigint) | the ERC-721 tokenId — the on-chain identity | most reads, transfer, clone, authenticate, runtimeCosts |
+| `agentId` (bigint) | the ERC-7857 tokenId (ERC-721-compatible) — the on-chain identity | most reads, transfer, clone, authenticate, runtimeCosts |
 | `sealId` (bytes32) | the seal binding's hash id — what the attestor keys its deployment records by | stop / start / reset, waitForMint, deployment rows |
 | `agentSeal` (address) | the agent's own signing key as an address — its wallet | topUpAgentSeal, serve-proof signer checks |
 
@@ -183,21 +223,23 @@ Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentS
 
 ## `ag.reputation` — serve-proof + feedback
 
-Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The single invariant is the **sealed proxy** in front of it: whatever the agent serves, the proxy stamps an `X-Agent-Proof` header on every response. So the SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
+Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). So `capture` reads the header on a call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
 
-const agentUrl = 'https://<agent-serve-endpoint>';   // wherever the agent's container serves
-
-// 1. call the agent + capture the serve-proof (you shape the request; the SDK only
-//    reads the X-Agent-Proof header the sealed proxy stamps on the response)
-const { response, proof } = await ag.reputation.capture(() =>
-  fetch(`${agentUrl}/chat`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }) }));
+// 1. call one of the agent's signed /api/* services and capture its serve-proof.
+//    A public handle needs no wallet; `fetchWithProof` reads the X-Agent-Proof
+//    the sealed proxy stamps on /api/* responses. (The chat route is NOT signed
+//    — reputation comes from the agent's own /api/* services, not from chatting.)
+const agent = await ag.agent.connect(agentId);        // public handle; or ag.agent.client(agentId)
+const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
+});
 const data = await response.json();                   // your normal response body
 // proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
-// (equivalent: ag.reputation.proofFromResponse(response) / .parseServeProofHeader(headerValue))
+// low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
 // 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData)
 await ag.reputation.verifyProof(proof);
@@ -224,6 +266,7 @@ await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHas
 await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
 // → [ { value, valueDecimals, tag1, tag2, isRevoked }, … ]
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  addresses that left feedback
+await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n   how many of the listed responders replied to buyer's feedback #idx
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -238,6 +281,12 @@ await ag.reputation.revokeFeedback(agentId, idx);              // → tx hash "0
 
 Acknowledging the TEE trust-root set and funding the prepaid sandbox balance aren't agent-specific, so they sit directly on the facade.
 
+> **Two different balances — don't confuse them:**
+> - **`ag.deposit()` → the prepaid sandbox balance** (SandboxServing). The agent's **runtime / serving cost**, **pay-as-you-go**: the sandbox provider bills it per-minute while the container runs. Per depositor, not per-agent; `getBalance()` reads it; deploy preflights it (≥ 0.1 OG).
+> - **`ag.agent.topUpAgentSeal(agentSeal, …)` → the agentSeal's own gas** — the agent's **operating budget**. The agentSeal is the agent's TEE-held wallet; it pays gas for **everything the agent does on chain as itself**: uploading its evolving state/memory to 0G storage, *and* — when the agent runs this SDK under its own agentSeal ([agents as owners](#agents-as-owners-nested-agents)) — its own actions like deploying sub-agents, transfers, and feedback. It's the agent's activity budget, not just "evolution gas". Funds a specific agent's `agentSeal` address.
+>
+> In short: **deposit = keep it running (compute); topUpAgentSeal = the agent's own on-chain activity budget (evolution + anything it does as itself).** `runtimeCosts(agentId)` reports both (`prepaidBalanceWei` vs `sealGasWei`).
+
 ```ts
 import { parseEther } from 'viem';
 
@@ -245,6 +294,7 @@ const provider = '0x2222222222222222222222222222222222222222';  // the sandbox p
 
 // trust-root acknowledgment (TappRegistry, spans attestor + kms + sandbox-provider)
 await ag.ackStatus(owner);   // → { allAcked: false, missing: ["0g-kms"] }   what `owner` still needs to ack
+await ag.components(owner);  // → per-component detail from TappRegistry: [{ appId, acked, ackVersion, owner, composeHash, imageHashes, nodes }, …] — the "what am I acking" data behind ack()
 const ackTx = await ag.ack();   // → tx hash "0x…", or null if nothing was missing
 if (ackTx) await ag.waitForTransaction(ackTx);   // see the read-after-write note below
 
@@ -266,7 +316,7 @@ const tx = await ag.deposit({ amountWei: parseEther('1') });
 await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 ```
 
-`deploy()`/`clone()`'s `{ wait: true }` already waits (for the mint, a stronger guarantee) — this pattern isn't needed there.
+`deploy()`/`clone()`'s `{ wait: 'minted' }` already waits (for the mint, a stronger guarantee) — this pattern isn't needed there.
 
 ---
 
@@ -274,9 +324,10 @@ await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 
 The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
 `0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
-is the sealed runtime image bundling the **openclaw** framework adapter —
-the only framework shipping today (`/config.supported_frameworks` is the
-source of truth).
+is the sealed runtime image bundling a framework adapter. Two adapters ship
+today — **openclaw** (`0g-sealed`) and **hermes** (`0g-sealed-hermes`, pass it
+as `sandbox.sealedImage` at deploy *and* reset); which are live in a given
+environment is whatever `/config.supported_frameworks` advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
 `role` labels what the entry is for, `plaintext` is the content itself.
@@ -317,10 +368,14 @@ live agent's `intelligentDatasOf` will find nothing.
 **What the attestor does NOT check**: beyond the framework *name* (must be
 in `/config.supported_frameworks`), deploy iData content is unvalidated by
 design — minting is the owner's freedom; whether the content actually
-boots is the **sealed runtime's contract**. Today's sealed image bundles
-the **openclaw** adapter, whose persona seed supports `inference.provider`
-of `anthropic`, `openai`, or `0g-compute` (the 0G router). For the router's
-live model catalog:
+boots is the **sealed runtime's contract**. The sealed images bundle two
+framework adapters — **openclaw** (default image `0g-sealed`) and **hermes**
+(image `0g-sealed-hermes` — pass `sandbox.sealedImage: '0g-sealed-hermes'` at
+deploy *and* reset, or the agent boots the wrong image and 404s). Pick with
+`framework: 'openclaw' | 'hermes'`; the name must be in
+`/config.supported_frameworks`. openclaw's persona seed supports
+`inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
+router). For the router's live model catalog:
 
 ```ts
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
@@ -351,76 +406,128 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 
 ## Interacting with a running agent (no console needed)
 
-**Where `agentUrl` comes from** — every running agent has a public base URL
-(scheme and host are deployment-specific: the dev proxy serves plain http,
-the hosted environment https). `listDeployments()` hands it to you:
+**You usually don't need the URL** — `ag.agent.client(agentId)` (and
+`authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
+serve `url`). Reach for `listDeployments()` when you want the URL or `phase`
+explicitly. It's the **public** listing (needs `attestorUrl`, no wallet), so it
+returns only non-sensitive fields; `owner`, `sandboxId` and `lastProvisionError`
+come back **null**. To see those for your OWN agents (and the `sandboxId` you
+pass to `stop`/`start`), use `listMyDeployments()`, which signs with your wallet:
 
 ```ts
 const me = (await ag.agent.listDeployments()).find((d) => d.agentId === agentId);
-// me → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
-const agentUrl = me.url;               // null until the container is provisioned
+// me → { agentId, sealId, phase, url, name, createdAt } populated;
+//      owner, sandboxId, lastProvisionError come back NULL on this public listing.
+// For those (and to debug a stuck deploy), list your own with the wallet:
+const mine = await ag.agent.listMyDeployments();   // owner-signed; full detail
+const agentUrl = me?.url;               // null until the container is provisioned
 // If phase never reaches 'running' (or ends 'failed'), me.lastProvisionError
 // says why — container-provision failures (e.g. "image_hash not in
 // validFrameworkHashes") or mint/storage-pipeline failures (e.g. "mint
 // submit: … replacement transaction underpriced" — folded in from the
 // failed stage's reason).
+
+// A 'failed' row is recoverable — retry() FIRST, don't redeploy (that
+// orphans the already-minted identity). It re-runs the failed idempotent
+// stages against the same sealId:
+if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 ```
 
-- **`GET {agentUrl}/hello`** — public identity card: who I am, my owner,
-  my registered services. Every response carries a signed `X-Agent-Proof`.
-  Or let the SDK do the fetch + proof check in one call:
+- **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
+  the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
+  (a streamed/SSE reply doesn't — a signature needs a complete body). Or
+  let the SDK do the fetch + proof check in one call:
 
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
-  // hello → { agent, owner, public_url, message, services }
+  // hello → { agent, owner, public_url, message, services, routes }
   // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
   ```
 
-- **Owner-registered services** — plain HTTP against the paths listed in
-  `/hello`'s `services`; each response is proof-signed (that is what you
-  `capture()` and rate).
-- **Owner handshake** — `ag.agent.authenticate(agentUrl, agentId)` proves
-  you're the on-chain owner (EIP-191-sign `0GSealAuth:<sealId>:<ts>`,
-  exchanged at `POST {agentUrl}/_seal/auth`, `<ts>` within ±300s) and hands
-  back `{ token, dashboardUrl }`. The **handshake is protocol-universal**;
-  the **token's meaning is framework-specific** — the sealed layer just
-  relays whatever the running framework's adapter chose to return (see the
-  openclaw block below for what it is today).
+  The card carries two declared surfaces:
+  - `services` — the agent's own registered endpoints (exact `/api/*` paths):
+    `{ path, method, description?, input_example? }`. Plain HTTP against these;
+    each response is proof-signed (that is what you `capture()` and rate).
+  - `routes` — the framework's declared prefixes:
+    `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
+    at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;
+    `signed` says whether responses on that route carry an `X-Agent-Proof`.
+    Shipped frameworks are chat-only; a framework could declare a UI route,
+    but none currently do.
 
-### Framework-specific surface (openclaw today)
+- **`ag.agent.client(agentId)`** — one handle (`AgentClient`) for every caller.
+  Whether it can do owner ops is inherited from `ag`, exactly like `ag`'s
+  account gates chain writes: an `ag` with an owner key gets `chat`/`chatStream`
+  (the owner token is minted on demand and re-minted if the agent rotates it —
+  you never pass or refresh a token); a read-only `ag` gets a public client
+  (`fetch`/`fetchWithProof` against the agent's `/api/*` services). One
+  argument — an `agentId` OR an `agentUrl`, whichever you have; the SDK fills
+  in the other half: an `agentId` resolves the URL on chain (`tokenURI` → the
+  AgentCard's serve `url`, no attestor); an `agentUrl` reads the agent's signed
+  `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
+  is enough (owner ops still gated on `ag` having a key).
 
-Everything above is the same for every sealed agent regardless of
-framework. What you can *do* with the agent beyond identity + proofs
-depends on the framework the agent was minted with. The only framework
-shipping today is **openclaw**, whose adapter makes `authenticate()`'s
-token an openclaw gateway credential and exposes an OpenAI-compatible chat
-API. A future framework would return a different token and a different (or
-no) chat surface — so treat this block as openclaw's, not the protocol's.
+  ```ts
+  const agent = await ag.agent.client(agentId);
+  // agent.routes / agent.services — the declared surface (same as /hello)
 
-```ts
-const { token, dashboardUrl } = await ag.agent.authenticate(agentUrl, agentId);
-// `token` here is a full owner/operator credential for the openclaw gateway
-// (not a narrow scope). Two ways to use it:
+  // Chat — present ONLY if the agent declares a chat route AND this ag has a
+  // key. Streams under the hood (`stream: true`), so a long reasoning turn
+  // keeps bytes flowing and never trips an idle-timeout hop in front of the
+  // agent; the full completion is reassembled and returned. The chat route is
+  // the owner↔agent steering channel and is NOT signed (no `X-Agent-Proof`) —
+  // reputation comes from the agent's own `/api/*` services, not from talking
+  // to your own agent.
+  if (agent.chat) {
+    const { choices } = await agent.chat([{ role: 'user', content: 'What can you do?' }]);
+    // choices[0].message.content — a real inference reply
+  }
 
-// 1. Browser: open dashboardUrl (the token rides the #fragment).
+  // Live-typing variant — same conditions as chat; yields each content delta:
+  if (agent.chatStream) {
+    for await (const delta of agent.chatStream([{ role: 'user', content: 'Hi' }]))
+      process.stdout.write(delta);
+  }
 
-// 2. Headless chat — openclaw's gateway serves an OpenAI-compatible HTTP
-//    API (enabled by the sealed runtime), same Bearer token:
-const r = await fetch(`${agentUrl}/v1/chat/completions`, {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-  body: JSON.stringify({
-    model: 'openclaw/default',
-    messages: [{ role: 'user', content: 'What can you do?' }],
-  }),
-});
-const { choices } = await r.json();   // choices[0].message.content — a real inference reply
-// GET /v1/models lists targets; requests without the token get 401.
-```
+  // General escape hatch — works for any declared path; attaches the bearer
+  // token automatically when the matched route asks for it (and the ag can auth):
+  const r = await agent.fetch('/v1/models');
+  // …or capture the serve-proof in one call (the agent's /api/* services):
+  const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
+
+  // Owner-only: read the agent's OWN process log (the framework subprocess's
+  // stdout/stderr, served at /log/agent). Present only when this ag holds the
+  // owner key — like chat, except it signs the wallet on every call (a fresh
+  // URL-bound `0GSealLog` owner signature), so a shared token isn't enough.
+  if (agent.logs) {
+    const tail = await agent.logs({ tail: 200 }); // last 200 lines; omit for the whole log
+    console.log(tail);
+  }
+  ```
+
+  The presence of `chat` / `chatStream` is itself the capability signal. Being
+  the actual owner is verified only when an owner op runs (chat throws for a
+  non-owner); `/hello` and `/api/*` work regardless. Nothing is synthesized —
+  the SDK reflects only what the agent declared.
+
+- **`authenticate` / `connect`** are opinionated shortcuts over `client()`:
+  `ag.agent.authenticate(agentId)` mints the owner token up front (so a
+  non-owner fails right there, not at first chat) and requires a wallet;
+  `ag.agent.connect(agentId | agentUrl)` is an explicit **public** handle
+  (never attaches a token) for a third party calling `/api/*` and capturing the
+  proof:
+
+  ```ts
+  const pub = await ag.agent.connect(agentId);               // no wallet needed
+  const { proof } = await pub.fetchWithProof('/api/summarize', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body,
+  });
+  if (proof) { /* verify it, or submit it as on-chain feedback */ }
+  ```
 
 openclaw token lifecycle: generated at the container's first boot, stable
-across restarts (the dashboard survives them), no expiry, rotates only when
-the container is recreated — `reset()` is the revocation lever.
+across restarts (the chat session stays authenticated), no expiry, rotates
+only when the container is recreated — `reset()` is the revocation lever.
 
 ## Agents as owners (nested agents)
 

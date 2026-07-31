@@ -90,15 +90,16 @@ function mk(priv, cfg) {
   const dep = await A.agent.deploy({
     name: 'XferSrc', description: 'transfer-live source',
     sandbox: { sealedImage, apiKey: API_KEY },
-  }, { wait: true });
+  }, { wait: 'running' });
   const agentId = dep.agentId;
   const sealId = await A.agent.getSealId(agentId);
   console.log(`  source agentId=${agentId} seal=${sealId}`);
   // wait for the source container to report running
-  const rowOf = async (id) => (await (await fetch(ATTESTOR_URL + '/deployments')).json())
-    .find((r) => r.agent_id && BigInt(r.agent_id) === id);
-  for (let i = 0; i < 40; i++) { const r = await rowOf(agentId); if (r && r.phase === 'running') break; await sleep(10000); }
-  const srcRow = await rowOf(agentId);
+  // Owner-scoped now (#64): the row's owner/sandboxId only come back on the
+  // signed listMyDeployments(), so list as the CURRENT owner and match agentId.
+  const rowOf = async (client, id) => (await client.agent.listMyDeployments()).find((r) => r.agentId === id);
+  for (let i = 0; i < 40; i++) { const r = await rowOf(A, agentId); if (r && r.phase === 'running') break; await sleep(10000); }
+  const srcRow = await rowOf(A, agentId);
   check('source running before transfer', srcRow && srcRow.phase === 'running', `phase=${srcRow && srcRow.phase}`);
   const sealAddr = (await A.agent.getAgentSeal(agentId)).toLowerCase();
 
@@ -115,8 +116,8 @@ function mk(priv, cfg) {
   // time a human clicks "bring online"; a script must wait explicitly.
   console.log('· waiting for the transfer teardown to reap the old container…');
   for (let i = 0; i < 24; i++) {
-    const r = await rowOf(agentId);
-    if (r && (!r.sandbox_id || r.phase === 'offline')) break;
+    const r = await rowOf(B, agentId);   // owned by B after the transfer
+    if (r && (!r.sandboxId || r.phase === 'offline')) break;
     await sleep(5000);
   }
 
@@ -124,20 +125,21 @@ function mk(priv, cfg) {
   console.log('· B recreates the transferred agent…');
   await B.agent.reset(sealId, { apiKey: API_KEY });
   let row;
-  for (let i = 0; i < 40; i++) { row = await rowOf(agentId); if (row && row.phase === 'running') break; await sleep(10000); }
+  for (let i = 0; i < 40; i++) { row = await rowOf(B, agentId); if (row && row.phase === 'running') break; await sleep(10000); }
   check('agent running again under new owner B', row && row.phase === 'running', `phase=${row && row.phase}`);
-  // The row's owner is set by the indexer from the Transfer event, which
-  // lags the recreate — poll rather than read once.
-  let rowOwner = row && row.owner.toLowerCase();
-  for (let i = 0; i < 24 && rowOwner !== acctB.address.toLowerCase(); i++) {
+  // The row appearing in B's OWN signed listing IS the indexer having synced
+  // ownership to B — the attestor only returns a row on ?owner=B once the DB
+  // owner is B (#64). Poll: the Transfer-event indexer lags the recreate.
+  let ownedByB = !!row && row.owner?.toLowerCase() === acctB.address.toLowerCase();
+  for (let i = 0; i < 24 && !ownedByB; i++) {
     await sleep(5000);
-    const r = await rowOf(agentId);
-    rowOwner = r && r.owner.toLowerCase();
+    const r = await rowOf(B, agentId);
+    ownedByB = !!r && r.owner?.toLowerCase() === acctB.address.toLowerCase();
   }
-  check('deployment row owner == B (indexer synced)', rowOwner === acctB.address.toLowerCase(), `row.owner=${rowOwner}`);
+  check('deployment row owner == B (indexer synced)', ownedByB, `ownedByB=${ownedByB}`);
 
   // ── reachable + identity preserved under B ────────────────────────────
-  const base = `http://${cfg.agent_serve_port}-${row.sandbox_id}.${proxy}`;
+  const base = `http://${cfg.agent_serve_port}-${row.sandboxId}.${proxy}`;
   const proofHeader = await hdr(base);
   check('/hello reachable + X-Agent-Proof under new owner', !!proofHeader, base);
   if (proofHeader) {

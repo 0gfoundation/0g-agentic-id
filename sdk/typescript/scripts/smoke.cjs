@@ -56,6 +56,6 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
     name: 'smoke-full', description: 'sdk smoke full deploy',
     framework: process.env.FRAMEWORK ?? 'openclaw',
     sandbox,
-  }, { wait: true, timeoutMs: 120000 });
+  }, { wait: 'running', timeoutMs: 300000 });
   console.log('FULL OK: sealId=%s agentId=%s', r.sealId, r.agentId);
 })().catch((e) => { console.error('FATAL:', e); process.exit(1); });

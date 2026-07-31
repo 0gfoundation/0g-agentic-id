@@ -107,6 +107,18 @@ func validateLoopbackBackend(backend string) error {
 	if u.Port() == "" {
 		return fmt.Errorf("must include a port")
 	}
+	// Host:port ONLY — no path/query/fragment. The proxy forwards to
+	// `backend + request.RequestURI` (see proxy.go), so any path here
+	// double-prefixes the request (e.g. backend ".../api/x" + request
+	// "/api/x" → ".../api/x/api/x"), which the loopback backend then 404s.
+	// Reject at registration so the agent fails fast instead of silently
+	// serving 404/502.
+	if u.Path != "" && u.Path != "/" {
+		return fmt.Errorf("must be host:port only, no path (got %q) — sealed appends the request path when forwarding", u.Path)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("must be host:port only, no query or fragment")
+	}
 	return nil
 }
 

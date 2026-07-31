@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"seal-verify/internal/platform"
 )
 
 // Shape declares how a role's plaintext maps to 0g-storage blobs.
@@ -74,6 +76,19 @@ type Framework interface {
 	//     equals default → skip upload / delete chain entry"
 	Defaults(role string) []byte
 
+	// FrameworkFacts returns the framework-authored half of the agent doc
+	// (§9 part 2) as VALUES filling the shared template, not prose: which of
+	// ITS paths are chain-tracked and where durable state belongs, its
+	// version whitelist, its config-key allowlist. platform owns every
+	// sentence of platform mechanics and renders them identically for all
+	// frameworks (platform.RenderFrameworkFacts); this method supplies only
+	// what differs by framework, so an adapter can neither restate a platform
+	// mechanism wrong nor silently drop one.
+	//
+	// MUST return a non-empty Tracked set (conformance enforces it): an
+	// adapter with no tracked paths ships an agent that doesn't know where
+	// its own memory persists.
+	FrameworkFacts() platform.FrameworkFacts
 
 	// Restore applies the plaintext bytes for a single dimension to the
 	// adapter's in-memory composed state. Multiple Restore calls must
@@ -201,8 +216,8 @@ type VersionReconciler interface {
 
 // SubprocessLogProvider is implemented by adapters that pipe their agent
 // process's stdout/stderr to a known file. proxy serves it live on
-// /log/agent (and the legacy /log/openclaw alias). Without this, the
-// subprocess log pages report "not available".
+// /log/agent (owner-only). Without this, the subprocess log pages report
+// "not available".
 type SubprocessLogProvider interface {
 	SubprocessLogPath() string
 }
@@ -215,6 +230,56 @@ type SubprocessLogProvider interface {
 // falls back to a conservative default.
 type SettleDelayer interface {
 	SettleDelay() time.Duration
+}
+
+// Route is one path prefix a framework exposes through the sealed proxy.
+//
+// The proxy forwards a request to the framework upstream ONLY if its path
+// matches a declared route (longest-prefix wins); every other path 404s
+// instead of being blind-forwarded. This bounds the framework's public
+// surface — and, via Signed, the serve-proof signing surface — to what the
+// adapter deliberately declares, so a framework upgrade can't silently widen
+// either. Routes are trusted input: only the audited, in-tree adapter code
+// constructs them (contrast agent-registered /api/* services in
+// proxy/services.go, which are untrusted runtime input and always exact-match
+// + signed).
+type Route struct {
+	// Prefix is the public path prefix this route claims, e.g. "/" (a
+	// framework that owns the root, like a dashboard SPA) or "/v1/" (a
+	// scoped API surface). Matched by longest prefix.
+	Prefix string
+	// Kind is a discovery hint surfaced in /hello, e.g. "dashboard" or
+	// "chat". Opaque to the proxy; clients (the SDK session) use it to pick
+	// an interaction affordance.
+	Kind string
+	// Auth tells a client how to present the /_seal/auth token on this
+	// route: "token-fragment" (append #token=… and open in a browser),
+	// "bearer" (Authorization: Bearer …), or "none".
+	Auth string
+	// Signed selects whether responses on this route carry an X-Agent-Proof
+	// serve-proof. True for attributable API responses; false for static UI
+	// assets, which shouldn't bear the agent's on-chain signature.
+	Signed bool
+	// Backend is the loopback upstream this route forwards to, e.g.
+	// "http://127.0.0.1:9119". Empty = the adapter's single StartResult
+	// Upstream (the common case: one framework process owning every route,
+	// like openclaw's gateway). A non-empty value is for frameworks whose
+	// surfaces are separate processes on separate ports (e.g. hermes: chat
+	// API on :8642, dashboard on :9119) — the proxy then routes per matched
+	// route rather than to one upstream. Mirrors an agent service's
+	// per-backend routing, which the proxy already does.
+	Backend string
+	// Description is a one-line human summary for /hello.
+	Description string
+}
+
+// RouteProvider is implemented by adapters that declare their public HTTP
+// surface to the proxy. When an adapter implements it, the proxy routes only
+// declared prefixes (404ing the rest) and signs per Route.Signed. Adapters
+// that don't implement it fall back to legacy behaviour: every path is
+// forwarded to the upstream and every response is signed.
+type RouteProvider interface {
+	FrameworkRoutes() []Route
 }
 
 // ErrUnsupportedDim is returned by EvolutionFor / Restore when an adapter

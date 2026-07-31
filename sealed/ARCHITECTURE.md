@@ -125,6 +125,7 @@ type Framework interface {
     HandleLegacy(ctx, role, plaintext) error         // chain roles not in Roles() (e.g. persona)
     Start(ctx, RuntimeContext) (StartResult, error)  // spawn the agent subprocess
     AuthResponse(ctx) (any, error)                   // owner-only payload for /_seal/auth
+    FrameworkFacts() platform.FrameworkFacts         // fill-in values for the shared agent-doc template
     Stop(ctx, gracefulTimeout) error                 // SIGTERM → SIGKILL
     Liveness(ctx) error                              // supervisor probes
     Readiness(ctx) error
@@ -316,8 +317,8 @@ container's `:8080`.
 |---|---|---|
 | `/healthz` | sandbox proxy / ops | liveness probe; returns 200 + a one-liner status |
 | `/hello` | verifier, attestor, ops | returns the agent's identity + `data_hashes` of currentSnapshot (the serve-proof envelope travels in the `X-Agent-Proof` header) |
-| `/_seal/auth` | **owner's wallet** | owner signs `0GSealAuth:{sealId}:{ts}` with EIP-191; sealed verifies the signer == on-chain owner and returns a short-lived framework dashboard token + path |
-| `/<anything else>` | end users, agent dashboard frontend | reverse-proxied to openclaw `127.0.0.1:3284` |
+| `/_seal/auth` | **owner's wallet** | owner signs `0GSealAuth:{sealId}:{ts}` with EIP-191; sealed verifies the signer == on-chain owner and returns the framework gateway credential `{token}` (the chat-API bearer) |
+| `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth, responses proof-signed); every undeclared path 404s — there is no catch-all relay |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`; signs with `agent_seal_priv` |

@@ -377,7 +377,7 @@ Contract points:
   generation) must not repeat, and never clobber agent self-modifications
   on restart — the platform principle is that sealed keeps the agent
   alive but does not interfere with what the agent did to itself.
-- Framework credentials (dashboard tokens etc.) stay **private to the
+- Framework credentials (the chat bearer token) stay **private to the
   adapter** — surface them only via `AuthResponse`.
 
 `Stop(ctx, gracefulTimeout)`: SIGTERM, wait up to the timeout, SIGKILL.
@@ -398,8 +398,8 @@ the same check as Liveness if your framework has no warm-up phase.
 `0GSealAuth:0x<sealId>:<ts>` with EIP-191; proxy checks the recovered
 address against the on-chain owner, ±300s window) and only then calls
 `AuthResponse(ctx)`. You return a JSON-encodable payload granting the
-verified owner control-plane access — openclaw returns
-`{"token": …, "dashboard_url": "/#token=…"}`. Return an error if Start
+verified owner control-plane access — openclaw returns just
+`{"token": …}` (the chat-API bearer; the dashboard route was removed). Return an error if Start
 hasn't provisioned credentials yet (proxy turns it into a 503). Never do
 your own auth here; the caller has already done it.
 
@@ -507,6 +507,7 @@ into either an infinite re-upload loop or silent identity divergence.
 - [ ] `Start` returns only after upstream accepts connections; restart never redoes first-boot work or clobbers agent self-modifications.
 - [ ] `Stop` leaves no orphan holding the upstream port.
 - [ ] `MonitorExit` fires exactly once per spawned process; exit-0 is not treated as a crash by your code (the manager handles it).
+- [ ] `FrameworkFacts()` returns a non-empty `Tracked` set — the agent is told where its durable state persists (§11 step 9).
 
 ## 10. Testing your adapter
 
@@ -514,7 +515,8 @@ Run the shared conformance suite —
 `internal/framework/conformance` — from your adapter package's tests. It
 executes the §9 invariants (role sanity, Defaults round-trip, fixture
 round-trip + determinism + LoadEntry hash agreement, Restore
-commutativity, unknown-role error contract) against your real
+commutativity, unknown-role error contract, FrameworkFacts non-empty)
+against your real
 implementation:
 
 ```go
@@ -592,18 +594,43 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    `platform.Build` content this is one delivery function (see the
    retired `claudecode/claudemd.go` in git history — CLAUDE.md got the
    whole PlatformContext as a single marker section).
-9. Author your framework's OWN context facts and inject them alongside
-   the platform sections. `platform.Build` deliberately speaks only
-   about doctrine and platform mechanics — it names no framework's
-   paths, upgrade command, config semantics, or tool names (a test pins
-   this). YOU must tell your agent, in your own injected text: which of
-   its on-disk paths are chain-tracked and where durable things go,
-   what your version whitelist / reconcile behavior is, and any
-   config-hash semantics. Skip this and your agent will write its
-   memory somewhere untracked and lose it on the next rebuild — telling
-   the agent the truth about its own framework is the adapter's
-   responsibility, not the platform's. openclaw's are in
-   `openclaw/platformtext.go`.
+9. Fill in your framework's OWN facts via the required `FrameworkFacts()`
+   method — VALUES, not prose. `platform.RenderFrameworkFacts` owns every
+   sentence of platform mechanics (sealing, gas, version reconcile, config
+   drift) and renders them identically for every framework; you return a
+   `platform.FrameworkFacts` struct filling only what differs by framework:
+   `Home`, `Tracked`/`Untracked` paths (each with a note), `DurableHints`,
+   the version whitelist + `ReconcileHow` command, `ConfigFile` +
+   `ConfigKeys`. `platform.AssembleAgentDoc(pc, facts)` splices the platform
+   halves with your rendered facts — single-file frameworks (hermes) inject
+   the whole result into one context file; openclaw distributes the platform
+   halves across IDENTITY/SOUL/TOOLS but sources its facts through the same
+   method (`platform.RenderFrameworkFacts`). conformance's
+   `FrameworkFactsNonEmpty` fails the build if you leave it empty. This is
+   skip-proof by construction: the platform-mechanics prose isn't yours to
+   write, so you can neither restate a mechanism wrong nor silently omit one
+   — the gap that once let a fresh hermes agent write memory to an untracked
+   path. openclaw's and hermes's fill-in live in their `platformtext.go`; the
+   rendered template with `()` blanks is [AGENT_BIBLE.md](AGENT_BIBLE.md).
+10. **SECURITY — audit any control/management UI before declaring a route
+    for it.** `FrameworkRoutes` decides what the sealed proxy exposes to a
+    token-bearing owner. Declare ONLY constrained, semantically-narrow
+    surfaces (a chat API is the safe default — it can't shell or read
+    files). Do NOT declare a route for the framework's web dashboard /
+    control UI until you have audited every endpoint reachable under it:
+    these UIs are built for a *trusted local single user* and almost
+    always embed a web terminal (shell), a file browser, and/or code
+    execution. Proxied to a remote owner, that is a backdoor around the
+    entire TEE-isolation + serve-proof model — the owner could open a
+    shell, read secrets (`.env`, config api_key), probe the sealed process
+    (`/proc/1`), and put agentSeal material at risk (TRUST_MODEL's "owner
+    cannot forge serve-proofs offline" rests on the owner NOT having this
+    access). Both openclaw (ghostty `/pty` + `BrowserFiles`) and hermes
+    (`/api/pty` + file endpoints) shipped exactly this UI; both now declare
+    chat only. Rule: **constrained interfaces exposed by default; a full
+    framework UI only after a per-endpoint audit proves no shell / file /
+    exec is reachable through it.** When in doubt, don't declare the route
+    — an undeclared prefix 404s at the proxy.
 
 ## 12. Port report: integrating claude-code (2026-07) — retired, kept as case study
 

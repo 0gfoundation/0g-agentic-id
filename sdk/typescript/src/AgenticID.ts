@@ -30,6 +30,7 @@ import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
+import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
   ServeProof, GiveFeedbackParams, AppendResponseParams, ReadAllFeedbackParams,
   GetSummaryParams, Feedback, FeedbackSummary, ServeData,
@@ -48,7 +49,14 @@ type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: b
 
 /** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
 const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
-/** deploy/clone result once the background mint is awaited (`{ wait: true }`). */
+/**
+ * How long `deploy()` / `clone()` blocks before returning, in phase order:
+ *   - omit       → return on **acceptance** ({@link DeployAccepted});
+ *   - `'minted'` → also block on the on-chain **mint** (adds `agentId`);
+ *   - `'running'`→ also block on **provision** (adds the reachable `url`).
+ */
+export type WaitLevel = 'minted' | 'running';
+
 /**
  * Facade-normalized deploy/clone acceptance — camelCase like every other
  * SDK return (the attestor's wire JSON speaks snake_case; the mapping
@@ -58,7 +66,11 @@ export interface DeployAccepted {
   sealId: Hash;
   agentSealAddr: Address;
 }
+/** deploy/clone result once the background mint is awaited (`wait: 'minted'`). */
 type MintedResponse = DeployAccepted & { agentId: bigint };
+/** deploy/clone result once the container is up (`wait: 'running'`) — adds the
+ *  reachable base url, which `wait: 'minted'` (mint-only) does not have yet. */
+type RunningResponse = MintedResponse & { url: string };
 
 function acceptedOf(res: DeployCloneResponse): DeployAccepted {
   return { sealId: res.seal_id, agentSealAddr: res.agent_seal_addr };
@@ -120,31 +132,43 @@ export class AgentApi {
   // — lifecycle —
   /**
    * Deploy a new agent. Async: returns `{ sealId, agentSealAddr }` once the
-   * attestor accepts the job. Pass `{ wait: true }` to also block on the
-   * background mint (via waitForMint) and get the new `agentId` in the result.
+   * attestor accepts the job. Pass `wait: 'minted'` to also block on the
+   * background mint (adds `agentId`) or `wait: 'running'` to also block on
+   * provision (adds the reachable `url`). See {@link WaitLevel}.
    */
-  deploy(params: DeployParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  deploy(params: DeployParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async deploy(params: DeployParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+  deploy(params: DeployParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
+  deploy(params: DeployParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  deploy(params: DeployParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async deploy(params: DeployParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
+    if (opts?.wait === 'running' && !params.sandbox) {
+      throw new Error(
+        "deploy: wait:'running' needs a sandbox to provision — a mint-only deploy (no sandbox) has no container to wait on; use wait:'minted'",
+      );
+    }
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     const accepted = acceptedOf(await this.attestor.deploy(params));
     if (!opts?.wait) return accepted;
+    // 'minted'  → block on the on-chain mint only (agentId, no url yet).
+    // 'running' → also block on provision (container up + reachable url).
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
 
   /**
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
-   * `{ sealId, agentSealAddr }` on acceptance; `{ wait: true }` also blocks on
-   * the mint and returns the new `agentId`.
+   * `{ sealId, agentSealAddr }` on acceptance; `wait: 'minted'` also blocks on
+   * the mint (adds `agentId`), `wait: 'running'` also blocks on provision.
    */
-  clone(params: CloneParams, opts: { wait: true } & WaitMintOpts): Promise<MintedResponse>;
-  clone(params: CloneParams, opts?: { wait?: false } & WaitMintOpts): Promise<DeployAccepted>;
-  async clone(params: CloneParams, opts?: { wait?: boolean } & WaitMintOpts): Promise<DeployAccepted | MintedResponse> {
+  clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
+  clone(params: CloneParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
+  clone(params: CloneParams, opts?: { wait?: undefined } & WaitMintOpts): Promise<DeployAccepted>;
+  async clone(params: CloneParams, opts?: { wait?: WaitLevel } & WaitMintOpts): Promise<DeployAccepted | MintedResponse | RunningResponse> {
     if (opts?.preflight !== false) await this.preflightOwnerReady();
     assertSealBound(await this.id.getAgentSeal(params.sourceAgentId), 'clone');
     const accepted = acceptedOf(await this.attestor.clone(params));
     if (!opts?.wait) return accepted;
+    if (opts.wait === 'running') return { ...accepted, ...(await this.waitForRunning(accepted.sealId, opts)) };
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
@@ -224,33 +248,169 @@ export class AgentApi {
   }
 
   /**
-   * The owner handshake for headless access to the agent's gateway: signs
-   * `0GSealAuth:<sealId>:<ts>` (EIP-191) and exchanges it at
-   * {agentUrl}/_seal/auth for the gateway credential. Owner-only — the
-   * container verifies the signer against the on-chain owner cached at
-   * provision.
+   * Get an {@link AgentClient} for a running agent — one handle for every
+   * caller, one argument: an `agentId` OR an `agentUrl` (whichever you have).
+   * The SDK fills in the other half:
+   *   - `agentId` → on-chain `tokenURI` → the AgentCard's serve URL;
+   *   - `agentUrl` → the agent's **signed** `/hello`, whose `X-Agent-Proof`
+   *     envelope carries the numeric agentId (so a URL alone is enough).
    *
-   * The returned `token` is a full owner/operator credential for the
-   * gateway (not a narrow scope) — treat it accordingly. It unlocks both
-   * surfaces: open `dashboardUrl` in a browser, or call the gateway's
-   * OpenAI-compatible HTTP API headlessly with `Authorization: Bearer
-   * <token>` — `POST {agentUrl}/v1/chat/completions` with
-   * `model: "openclaw/default"` chats with the agent, `GET /v1/models`
-   * lists targets (the sealed runtime enables this endpoint).
+   * Whether it can do owner ops is inherited from THIS `ag`, exactly like
+   * {@link AgenticID}'s account gates chain writes: an `ag` with an owner key
+   * gets `chat`/`chatStream` (the owner token is minted on first use and
+   * re-minted on rotation, e.g. after a `reset` — you never pass or refresh a
+   * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
+   * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
+   * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
    */
-  async authenticate(agentUrl: string, agentId: bigint): Promise<{ token: string; dashboardUrl: string }> {
+  async client(idOrUrl: bigint | string): Promise<AgentClient> {
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    const fromUrl = typeof idOrUrl === 'string';
+    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
+    // this URL via chain before this handle could ever sign for it.
+    if (fromUrl && agentId !== undefined && this.hasAccount()) {
+      await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    const owner = agentId !== undefined && this.hasAccount();
+    const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
+    const logAuth = owner ? () => this.signOwner('0GSealLog', base, agentId!) : undefined;
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth });
+  }
+
+  /**
+   * Owner handshake, eager: like {@link client} on an `ag` with a key, but
+   * mints the token up front so a non-owner fails HERE, not at first chat.
+   * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   */
+  async authenticate(idOrUrl: bigint | string): Promise<AgentClient> {
+    requireWallet(this.ctx);
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    const fromUrl = typeof idOrUrl === 'string';
+    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    if (agentId === undefined) {
+      throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
+    }
+    // #62: reject a lying /hello (URL claims someone else's agentId) before signing.
+    if (fromUrl) await this.assertAgentIdBoundToUrl(agentId, base);
+    const token = await this.mintToken(base, agentId); // eager → throws if not owner
+    return makeAgentClient({
+      base, services: disc.services, routes: disc.routes, token,
+      reauth: () => this.mintToken(base, agentId),
+      logAuth: () => this.signOwner('0GSealLog', base, agentId),
+    });
+  }
+
+  /**
+   * Explicit public handle — never attaches a token even if this `ag` holds a
+   * key. For a third party calling the agent's `/api/*` services and capturing
+   * the serve-proof (`client.fetchWithProof('/api/…')` → `{ response, proof }`).
+   */
+  async connect(idOrUrl: bigint | string): Promise<AgentClient> {
+    const base = await this.resolveBase(idOrUrl);
+    const disc = await this.discoverSurface(base);
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes }); // no reauth → public
+  }
+
+  /**
+   * Sign an owner control message `<tag>:<sealId>:<ts>:<audience>` (EIP-191).
+   * `audience` is the agent's serve base — issue #62 binds the signature to the
+   * endpoint it's meant for, so it can't be relayed to a different agent that
+   * happens to share the owner. Shared by {@link mintToken} (tag `0GSealAuth`)
+   * and the `/log/agent` reader (tag `0GSealLog`).
+   */
+  private async signOwner(tag: string, base: string, agentId: bigint): Promise<{ message: string; signature: string }> {
     const { walletClient, account } = requireWallet(this.ctx);
     const sealId = await this.id.getSealId(agentId);
-    const message = `0GSealAuth:${sealId}:${Math.floor(Date.now() / 1000)}`;
+    // Audience is the origin (scheme://host[:port]) — that's what the runtime
+    // composes as its own public URL, so a base carrying a path still matches.
+    const audience = new URL(base).origin;
+    const message = `${tag}:${sealId}:${Math.floor(Date.now() / 1000)}:${audience}`;
     const signature = await walletClient.signMessage({ account, message });
-    const base = agentUrl.replace(/\/$/, '');
+    return { message, signature };
+  }
+
+  /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
+  private async mintToken(base: string, agentId: bigint): Promise<string> {
+    const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);
     const r = await fetch(`${base}/_seal/auth`, {
       method: 'POST',
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!r.ok) throw new Error(`authenticate: HTTP ${r.status}: ${await r.text()}`);
-    const payload = (await r.json()) as { token: string; dashboard_url?: string };
-    return { token: payload.token, dashboardUrl: base + (payload.dashboard_url ?? '/') };
+    return ((await r.json()) as { token: string }).token;
+  }
+
+  /**
+   * #62 defense-in-depth: verify a URL-derived agentId actually belongs to the
+   * URL we're talking to. Resolves the agent's canonical serve origin from chain
+   * (`tokenURI` → AgentCard `url`) and compares to `base`'s origin. A phishing
+   * endpoint whose `/hello` claims someone else's agentId is rejected here,
+   * before we sign anything for it. (The audience-bound signature also makes the
+   * real agent reject a relayed signature server-side — this just fails fast
+   * with a clear reason.)
+   */
+  private async assertAgentIdBoundToUrl(agentId: bigint, base: string): Promise<void> {
+    const chainOrigin = await this.resolveAgentUrl(agentId); // already an origin
+    const gotOrigin = new URL(base).origin;
+    if (chainOrigin.toLowerCase() !== gotOrigin.toLowerCase()) {
+      throw new Error(
+        `agentId/URL mismatch (possible phishing, issue #62): the endpoint at ${gotOrigin} ` +
+          `claims to be agent ${agentId}, but chain says agent ${agentId} serves at ${chainOrigin}. ` +
+          `Refusing to sign an owner message.`,
+      );
+    }
+  }
+
+  /** Resolve the serve base URL: a bigint agentId via on-chain tokenURI; a string URL as-is. */
+  private async resolveBase(idOrUrl: bigint | string): Promise<string> {
+    return typeof idOrUrl === 'bigint' ? this.resolveAgentUrl(idOrUrl) : idOrUrl.replace(/\/$/, '');
+  }
+
+  /** Whether this `ag` holds a signer — so the clients it builds can do owner ops. */
+  private hasAccount(): boolean {
+    return !!(this.ctx.walletClient && this.ctx.account);
+  }
+
+  /**
+   * Resolve an agent's live serve base URL from its on-chain identity — no
+   * attestor. Reads `tokenURI(agentId)` (the canonical AgentCard pointer on 0G
+   * storage), fetches the card, and returns the origin of its `url` (the serve
+   * endpoint, refreshed on storage as the container is (re)created). Throws if
+   * the agent isn't provisioned yet (no URI, or a card with no url).
+   */
+  private async resolveAgentUrl(agentId: bigint): Promise<string> {
+    const uri = await this.id.tokenURI(agentId);
+    if (!uri) throw new Error(`agent ${agentId}: no on-chain URI yet (not provisioned)`);
+    let card: Record<string, unknown>;
+    try {
+      card = (await (await fetch(uri)).json()) as Record<string, unknown>;
+    } catch (e) {
+      throw new Error(`agent ${agentId}: fetch AgentCard (${uri}) failed: ${(e as Error).message}`);
+    }
+    const cardUrl = typeof card.url === 'string' ? card.url : '';
+    if (!cardUrl) throw new Error(`agent ${agentId}: AgentCard has no serve url (not running)`);
+    return new URL(cardUrl).origin;
+  }
+
+  /**
+   * Read the agent's signed `/hello` to learn its declared surface AND its
+   * numeric agentId — the latter from the response's `X-Agent-Proof` envelope,
+   * so a caller who has only the URL still gets the id needed to authenticate.
+   * Absent on pre-route / unprovisioned builds → empty surface + undefined id
+   * (fetch/fetchWithProof still work; owner ops just aren't offered).
+   */
+  private async discoverSurface(base: string): Promise<{ services: AgentServiceEntry[]; routes: AgentRoute[]; agentId?: bigint }> {
+    try {
+      const res = await fetch(`${base}/hello`);
+      const hello = (await res.json()) as { services?: AgentServiceEntry[]; routes?: AgentRoute[] };
+      const agentId = proofFromResponse(res)?.agentId; // /hello is signed; its envelope carries agent_id
+      return { services: hello.services ?? [], routes: hello.routes ?? [], agentId };
+    } catch {
+      return { services: [], routes: [] }; // best-effort; fetch/fetchWithProof still work
+    }
   }
 
   // — runtime: interacting with a live agent —
@@ -265,16 +425,21 @@ export class AgentApi {
    * fetch + parse + verify.
    */
   async sayHi(agentUrl: string): Promise<{
-    hello: { agent: Address; owner: Address; public_url: string; message: string; services: unknown[] };
+    hello: {
+      agent: Address; owner: Address; public_url: string; message: string;
+      services: AgentServiceEntry[]; routes: AgentRoute[];
+    };
     proof: ServeProof | null;
     verification: import('./ServeSession').ProofVerification | null;
   }> {
     const base = agentUrl.replace(/\/$/, '');
     const { response, proof } = await captureProof(() => fetch(`${base}/hello`));
     if (!response.ok) throw new Error(`sayHi: /hello returned HTTP ${response.status}`);
-    const hello = (await response.json()) as {
-      agent: Address; owner: Address; public_url: string; message: string; services: unknown[];
+    const raw = (await response.json()) as {
+      agent: Address; owner: Address; public_url: string; message: string;
+      services?: AgentServiceEntry[]; routes?: AgentRoute[];
     };
+    const hello = { ...raw, services: raw.services ?? [], routes: raw.routes ?? [] };
     const verification = proof ? await new ServeSession(this.ctx).verifyProof(proof) : null;
     return { hello, proof, verification };
   }
@@ -296,51 +461,103 @@ export class AgentApi {
    * deployment that never reaches `running`. It records the MOST RECENT
    * failure and is not cleared by a later success, so read it together
    * with `phase`.
+   *
+   * When `phase` is `"failed"`, try {@link AgentApi.retry} FIRST — it resumes
+   * the failed stages on the same identity. Redeploying instead orphans the
+   * already-minted agent; reset only helps once the container stage is
+   * reached.
+   *
+   * This is the PUBLIC listing: the attestor now returns only non-sensitive
+   * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
+   * `lastProvisionError` come back **null** here. `agentId`/`sealId`/`phase`/
+   * `url`/`name` are still present (fine for discovery + `waitForRunning`).
+   * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
+   * fields for your own agents.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string;
-    sandboxId: string | null; url: string | null; owner: Address; name: string | null;
+    sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
     const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
-    return rows.map((r) => {
-      const card = (r.agent_card as Record<string, unknown>) ?? {};
-      // The card's url points at the /hello card endpoint; the base (origin)
-      // is what every other interaction wants.
-      let url: string | null = null;
-      try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
-      // The attestor only writes last_provision_error for container-provision
-      // failures; mint/storage-pipeline failures record their reason on the
-      // per-track stage objects instead (mint_stage/storage_stage.reason). A
-      // phase=failed row with a null lastProvisionError is a dead end for an
-      // external caller (no attestor-log access), so fold the failed stages'
-      // reasons in as the fallback.
-      const stageReason = (stage: unknown): string | null => {
-        const s = stage as { state?: string; reason?: string } | null;
-        return s?.state === 'failed' && s.reason ? s.reason : null;
-      };
-      return {
-        agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
-        sealId: r.seal_id as Hash,
-        phase: (r.phase as string) ?? 'unknown',
-        sandboxId: (r.sandbox_id as string) ?? null,
-        url,
-        owner: r.owner as Address,
-        name: (card.name as string) ?? null,
-        createdAt: (r.created_at as string) ?? null,
-        lastProvisionError:
-          (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
-      };
+    return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /**
+   * Owner-scoped, authenticated listing — your own agents WITH the fields the
+   * public {@link AgentApi.listDeployments} withholds (`owner`, `sandboxId`,
+   * `lastProvisionError`, stages). Signs `0GDeployments:<owner>:<ts>` with
+   * `ctx.account` and sends it as `X-Auth-Message`/`X-Auth-Signature`; the
+   * attestor verifies the signer controls `<owner>` before returning its rows.
+   * Requires a wallet. This is how you get a container's `sandboxId` for
+   * {@link AgentApi.stop}/{@link AgentApi.start}.
+   */
+  async listMyDeployments(): Promise<Awaited<ReturnType<AgentApi['listDeployments']>>> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const owner = account.address;
+    const message = `0GDeployments:${owner}:${Math.floor(Date.now() / 1000)}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
+    if (!res.ok) throw new Error(`listMyDeployments: HTTP ${res.status}: ${await res.text()}`);
+    const rows = (await res.json()) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /** Map one raw attestor deployment row to the normalized SDK shape. Shared
+   *  by the public {@link AgentApi.listDeployments} and the owner-scoped
+   *  {@link AgentApi.listMyDeployments}; fields absent on the public tier
+   *  (owner/sandboxId/lastProvisionError) simply come through as null. */
+  private normalizeDeploymentRow(r: Record<string, unknown>): {
+    agentId: bigint | null; sealId: Hash; phase: string;
+    sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
+    createdAt: string | null; lastProvisionError: string | null;
+  } {
+    const card = (r.agent_card as Record<string, unknown>) ?? {};
+    // The card's url points at the /hello card endpoint; the base (origin)
+    // is what every other interaction wants.
+    let url: string | null = null;
+    try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
+    // last_provision_error is only written for container-provision failures;
+    // mint/storage failures record their reason on the per-track stage objects,
+    // so fold those in as the fallback (owner tier only — public rows omit them).
+    const stageReason = (stage: unknown): string | null => {
+      const s = stage as { state?: string; reason?: string } | null;
+      return s?.state === 'failed' && s.reason ? s.reason : null;
+    };
+    return {
+      agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
+      sealId: r.seal_id as Hash,
+      phase: (r.phase as string) ?? 'unknown',
+      sandboxId: (r.sandbox_id as string) ?? null,
+      url,
+      owner: (r.owner as Address) ?? null,
+      name: (card.name as string) ?? null,
+      createdAt: (r.created_at as string) ?? null,
+      lastProvisionError:
+        (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
+    };
   }
 
   /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */
   stop(sealId: Hash, sandboxId: string): Promise<void> {
     return this.attestor.lifecycle('stop', { sealId, sandboxId });
   }
-  /** Start a stopped agent's sandbox (owner-signed). */
-  start(sealId: Hash, sandboxId: string): Promise<void> {
-    return this.attestor.lifecycle('start', { sealId, sandboxId });
+  /**
+   * Bring an agent's container online (owner-signed). Two shapes:
+   *  - `start(sealId, sandboxId)` — resume a STOPPED container.
+   *  - `start(sealId, { apiKey, sealedImage? })` — FIRST provision of a
+   *    mint-only / never-provisioned agent (no sandbox yet): spins a fresh
+   *    container. `apiKey` is required in practice (the fresh container needs
+   *    the LLM key). The semantic counterpart to a sandbox-less `deploy` —
+   *    use this, not `reset` (which means "recreate an existing container").
+   */
+  start(sealId: Hash, sandboxId: string): Promise<void>;
+  start(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void>;
+  start(sealId: Hash, arg?: string | { sealedImage?: string; apiKey?: string }): Promise<void> {
+    if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
+    return this.attestor.lifecycle('start', { sealId, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -353,6 +570,22 @@ export class AgentApi {
    */
   reset(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
     return this.attestor.lifecycle('reset', { sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  }
+
+  /**
+   * Soft-retry a stuck deployment (owner-signed), preserving its identity.
+   * This is the FIRST recovery step for a `phase: "failed"` row (see
+   * {@link listDeployments}) — it re-runs the failed idempotent stages
+   * (storage upload, mint re-fetch, setAgentURI, …) against the same sealId,
+   * where redeploying would orphan an already-minted agent.
+   *
+   * Without opts it does idempotent stages only. Pass `apiKey` (and
+   * optionally `sealedImage`) to let it continue past those into container
+   * creation — like {@link reset}, the LLM key must be re-supplied because
+   * the attestor never stores it.
+   */
+  retry(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.retry({ sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**
@@ -382,6 +615,42 @@ export class AgentApi {
       if (agentId !== 0n) return agentId;
       if (Date.now() >= deadline) {
         throw new Error(`waitForMint: seal ${sealId} not minted within ${timeoutMs}ms`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+  }
+
+  /**
+   * Wait for a freshly-deployed/cloned agent's CONTAINER to come up, returning
+   * its agentId + reachable base url. {@link deploy}/{@link clone} with
+   * `wait: 'minted'` only block on the on-chain mint — the agentId exists but
+   * the container (and its url) is still 1–2 min out; `wait: 'running'`
+   * routes here to also block on provision. Polls {@link listDeployments};
+   * throws on `phase: "failed"` or timeout (default 300s, longer than mint
+   * because provision includes container start).
+   */
+  async waitForRunning(
+    sealId: Hash,
+    opts: { timeoutMs?: number; pollIntervalMs?: number } = {},
+  ): Promise<{ agentId: bigint; url: string }> {
+    const timeoutMs = opts.timeoutMs ?? 300_000;
+    const pollIntervalMs = opts.pollIntervalMs ?? 5_000;
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      let row: Awaited<ReturnType<AgentApi['listDeployments']>>[number] | undefined;
+      try {
+        row = (await this.listDeployments()).find((r) => r.sealId === sealId);
+      } catch {
+        // transient attestor hiccup — treat as "not ready yet" and keep polling
+      }
+      if (row?.phase === 'running' && row.url && row.agentId != null) {
+        return { agentId: row.agentId, url: row.url };
+      }
+      if (row?.phase === 'failed') {
+        throw new Error(`waitForRunning: seal ${sealId} failed — ${row.lastProvisionError ?? 'unknown'}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`waitForRunning: seal ${sealId} not running within ${timeoutMs}ms (phase=${row?.phase ?? '?'})`);
       }
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
