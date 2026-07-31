@@ -466,42 +466,78 @@ export class AgentApi {
    * the failed stages on the same identity. Redeploying instead orphans the
    * already-minted agent; reset only helps once the container stage is
    * reached.
+   *
+   * This is the PUBLIC listing: the attestor now returns only non-sensitive
+   * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
+   * `lastProvisionError` come back **null** here. `agentId`/`sealId`/`phase`/
+   * `url`/`name` are still present (fine for discovery + `waitForRunning`).
+   * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
+   * fields for your own agents.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string;
-    sandboxId: string | null; url: string | null; owner: Address; name: string | null;
+    sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
     const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
-    return rows.map((r) => {
-      const card = (r.agent_card as Record<string, unknown>) ?? {};
-      // The card's url points at the /hello card endpoint; the base (origin)
-      // is what every other interaction wants.
-      let url: string | null = null;
-      try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
-      // The attestor only writes last_provision_error for container-provision
-      // failures; mint/storage-pipeline failures record their reason on the
-      // per-track stage objects instead (mint_stage/storage_stage.reason). A
-      // phase=failed row with a null lastProvisionError is a dead end for an
-      // external caller (no attestor-log access), so fold the failed stages'
-      // reasons in as the fallback.
-      const stageReason = (stage: unknown): string | null => {
-        const s = stage as { state?: string; reason?: string } | null;
-        return s?.state === 'failed' && s.reason ? s.reason : null;
-      };
-      return {
-        agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
-        sealId: r.seal_id as Hash,
-        phase: (r.phase as string) ?? 'unknown',
-        sandboxId: (r.sandbox_id as string) ?? null,
-        url,
-        owner: r.owner as Address,
-        name: (card.name as string) ?? null,
-        createdAt: (r.created_at as string) ?? null,
-        lastProvisionError:
-          (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
-      };
+    return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /**
+   * Owner-scoped, authenticated listing — your own agents WITH the fields the
+   * public {@link AgentApi.listDeployments} withholds (`owner`, `sandboxId`,
+   * `lastProvisionError`, stages). Signs `0GDeployments:<owner>:<ts>` with
+   * `ctx.account` and sends it as `X-Auth-Message`/`X-Auth-Signature`; the
+   * attestor verifies the signer controls `<owner>` before returning its rows.
+   * Requires a wallet. This is how you get a container's `sandboxId` for
+   * {@link AgentApi.stop}/{@link AgentApi.start}.
+   */
+  async listMyDeployments(): Promise<Awaited<ReturnType<AgentApi['listDeployments']>>> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const owner = account.address;
+    const message = `0GDeployments:${owner}:${Math.floor(Date.now() / 1000)}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
+    if (!res.ok) throw new Error(`listMyDeployments: HTTP ${res.status}: ${await res.text()}`);
+    const rows = (await res.json()) as Array<Record<string, unknown>>;
+    return rows.map((r) => this.normalizeDeploymentRow(r));
+  }
+
+  /** Map one raw attestor deployment row to the normalized SDK shape. Shared
+   *  by the public {@link AgentApi.listDeployments} and the owner-scoped
+   *  {@link AgentApi.listMyDeployments}; fields absent on the public tier
+   *  (owner/sandboxId/lastProvisionError) simply come through as null. */
+  private normalizeDeploymentRow(r: Record<string, unknown>): {
+    agentId: bigint | null; sealId: Hash; phase: string;
+    sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
+    createdAt: string | null; lastProvisionError: string | null;
+  } {
+    const card = (r.agent_card as Record<string, unknown>) ?? {};
+    // The card's url points at the /hello card endpoint; the base (origin)
+    // is what every other interaction wants.
+    let url: string | null = null;
+    try { url = card.url ? new URL(card.url as string).origin : null; } catch { /* malformed → null */ }
+    // last_provision_error is only written for container-provision failures;
+    // mint/storage failures record their reason on the per-track stage objects,
+    // so fold those in as the fallback (owner tier only — public rows omit them).
+    const stageReason = (stage: unknown): string | null => {
+      const s = stage as { state?: string; reason?: string } | null;
+      return s?.state === 'failed' && s.reason ? s.reason : null;
+    };
+    return {
+      agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
+      sealId: r.seal_id as Hash,
+      phase: (r.phase as string) ?? 'unknown',
+      sandboxId: (r.sandbox_id as string) ?? null,
+      url,
+      owner: (r.owner as Address) ?? null,
+      name: (card.name as string) ?? null,
+      createdAt: (r.created_at as string) ?? null,
+      lastProvisionError:
+        (r.last_provision_error as string) ?? stageReason(r.mint_stage) ?? stageReason(r.storage_stage),
+    };
   }
 
   /** Stop a running agent's sandbox (owner-signed). Identity is preserved. */

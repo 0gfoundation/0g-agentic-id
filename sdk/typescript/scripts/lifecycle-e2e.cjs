@@ -92,8 +92,9 @@ function mkClient(privKey, cfg) {
     await patientWait((h) => A.agent.waitForTransaction(h), tx, 'fund wallet B');
   }
   const B = mkClient(privB, cfg);
-  const rowOf = async (id) => (await (await fetch(ATTESTOR_URL + '/deployments')).json())
-    .find((r) => r.agent_id && BigInt(r.agent_id) === id);
+  // Owner-scoped (#64): owner/sandboxId only come back on the signed
+  // listMyDeployments(); list as the owning client and match agentId.
+  const rowOf = async (client, id) => (await client.agent.listMyDeployments()).find((r) => r.agentId === id);
   const API_KEY = process.env.API_KEY || 'sk-lifecycle-e2e';
   const proxy = cfg.sandbox_proxy_addr, port = cfg.agent_serve_port;
 
@@ -117,7 +118,9 @@ function mkClient(privKey, cfg) {
   const srcSealed = await A.agent.sealedKeysOf(AGENT_ID);
   const srcSeal = await A.agent.getAgentSeal(AGENT_ID);
 
-  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: 'running' });
+  // clone mints for B and lands OFFLINE (B brings it online below), so wait only
+  // for the mint — 'running' would never come and times out.
+  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: 'minted' });
   const cloneId = cloned.agentId;
   check('clone minted', typeof cloneId === 'bigint' && cloneId > 0n, `agentId=${cloneId}`);
 
@@ -135,8 +138,7 @@ function mkClient(privKey, cfg) {
     let row;
     for (let i = 0; i < 6 && !(row && row.phase); i++) {
       await sleep(5000);
-      const rows = await (await fetch(ATTESTOR_URL + '/deployments')).json();
-      row = rows.find((r) => r.agent_id && BigInt(r.agent_id) === cloneId);
+      row = await rowOf(B, cloneId);   // clone is owned by B (targetOwner)
     }
     check('clone deployment row lands offline (new owner brings it online)',
       !!row && row.phase === 'offline', `phase=${row && row.phase}`);
@@ -148,10 +150,10 @@ function mkClient(privKey, cfg) {
   console.log('· bringing the clone online…');
   await B.agent.reset(cloned.sealId, { apiKey: API_KEY });
   let crow;
-  for (let i = 0; i < 40; i++) { crow = await rowOf(cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
+  for (let i = 0; i < 40; i++) { crow = await rowOf(B, cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
   check('clone reaches RUNNING under new owner', crow && crow.phase === 'running', `phase=${crow && crow.phase}`);
-  if (crow && crow.sandbox_id) {
-    const cbase = `http://${port}-${crow.sandbox_id}.${proxy}`;
+  if (crow && crow.sandboxId) {
+    const cbase = `http://${port}-${crow.sandboxId}.${proxy}`;
     let ch = null;
     for (let i = 0; i < 8 && !ch; i++) { ch = curlHelloHeader(cbase); if (!ch) await sleep(8000); }
     check('clone /hello serves a proof for the clone identity', !!ch && A.reputation.parseServeProofHeader(ch).agentId === cloneId,
@@ -195,15 +197,14 @@ function mkClient(privKey, cfg) {
   await patientWait((h) => A.agent.waitForTransaction(h), txT, 'transferFrom');
   check('ownerOf flipped to B', (await A.agent.ownerOf(AGENT_ID)).toLowerCase() === acctB.address.toLowerCase());
 
-  let rowOwner = '';
+  let ownedByB = false;
   for (let i = 0; i < 24; i++) {           // indexer: 5s poll + confirmations
     await sleep(5000);
-    const rows = await (await fetch(ATTESTOR_URL + '/deployments')).json();
-    const row = rows.find((r) => r.seal_id === SEAL_ID);
-    rowOwner = row ? row.owner.toLowerCase() : '';
-    if (rowOwner === acctB.address.toLowerCase()) break;
+    const row = await rowOf(B, AGENT_ID);  // B's scoped list only returns it once DB owner == B (#64)
+    ownedByB = !!row && row.owner?.toLowerCase() === acctB.address.toLowerCase();
+    if (ownedByB) break;
   }
-  check('attestor row owner updated by indexer', rowOwner === acctB.address.toLowerCase(), `row.owner=${rowOwner}`);
+  check('attestor row owner updated by indexer', ownedByB, `ownedByB=${ownedByB}`);
 
   // ── 4. lifecycle owner gate after transfer ─────────────────────────────
   // Seal-bound transfer auto-tears-down the prior owner's container (the
@@ -221,10 +222,10 @@ function mkClient(privKey, cfg) {
   // gate), recreate, and reach running; otherwise the recreate 402s in the
   // worker ("TEE signer not acknowledged") and the row silently stays
   // offline. Wait for the transfer teardown to settle first (issue #37).
-  for (let i = 0; i < 24; i++) { const r = await rowOf(AGENT_ID); if (r && (!r.sandbox_id || r.phase === 'offline')) break; await sleep(5000); }
+  for (let i = 0; i < 24; i++) { const r = await rowOf(B, AGENT_ID); if (r && (!r.sandboxId || r.phase === 'offline')) break; await sleep(5000); }
   await B.agent.reset(SEAL_ID, { apiKey: API_KEY });
   let brow;
-  for (let i = 0; i < 40; i++) { brow = await rowOf(AGENT_ID); if (brow && brow.phase === 'running') break; await sleep(10000); }
+  for (let i = 0; i < 40; i++) { brow = await rowOf(B, AGENT_ID); if (brow && brow.phase === 'running') break; await sleep(10000); }
   check('new owner brought the agent back to RUNNING', brow && brow.phase === 'running', `phase=${brow && brow.phase}`);
 
   console.log(failures === 0 ? '\n✅ lifecycle-e2e: all checks passed'
