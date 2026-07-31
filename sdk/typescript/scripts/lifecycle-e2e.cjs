@@ -118,7 +118,9 @@ function mkClient(privKey, cfg) {
   const srcSealed = await A.agent.sealedKeysOf(AGENT_ID);
   const srcSeal = await A.agent.getAgentSeal(AGENT_ID);
 
-  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: 'running' });
+  // clone mints for B and lands OFFLINE (B brings it online below), so wait only
+  // for the mint — 'running' would never come and times out.
+  const cloned = await A.agent.clone({ sourceAgentId: AGENT_ID, targetOwner: acctB.address }, { wait: 'minted' });
   const cloneId = cloned.agentId;
   check('clone minted', typeof cloneId === 'bigint' && cloneId > 0n, `agentId=${cloneId}`);
 
