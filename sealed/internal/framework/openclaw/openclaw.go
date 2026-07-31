@@ -46,9 +46,14 @@ const (
 	// proxy on :8080 reverse-proxies to this.
 	upstreamPort = 3284
 
-	// startTimeout is how long Start will wait for openclaw to bind upstreamPort
-	// before giving up. With a fresh container this includes 30-60s of npm install.
-	startTimeout = 120 * time.Second
+	// startTimeout is how long Start waits for openclaw to bind upstreamPort
+	// AFTER spawn. npm install runs and completes before this wait (see
+	// spawn.go), so it is not counted here — this budget is purely the
+	// post-spawn gateway cold start (node load + gateway init). 120s was
+	// occasionally too tight on a loaded sandbox host; 180s gives headroom.
+	// On timeout, Start surfaces the tail of /tmp/openclaw.log so a startup
+	// crash is legible instead of a blind "not listening" timeout.
+	startTimeout = 180 * time.Second
 )
 
 // Adapter is the openclaw implementation of framework.Framework.
