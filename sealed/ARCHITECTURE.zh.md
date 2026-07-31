@@ -11,7 +11,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 
 | 组件 | 关系 |
 |---|---|
-| attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 `0g-agent-nft` 仓库 |
+| attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
 | openclaw | 唯一打包的 agent framework（链上 binding 点名时选中,或作为无 binding 的 fallback）；npm 包，由 sealed 安装并 spawn 成子进程，监听 127.0.0.1:3284。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；第二个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |

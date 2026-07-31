@@ -1,5 +1,5 @@
 {
-  "name": "@0glabs/agenticid-sdk",
+  "name": "@0gfoundation/agentic-sdk",
   "version": "0.1.0",
   "description": "TypeScript SDK for the 0G AgenticID protocol — register, manage, and interact with on-chain AI agent identities",
   "main": "dist/index.js",
