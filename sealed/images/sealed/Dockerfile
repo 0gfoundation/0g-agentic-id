@@ -17,7 +17,14 @@
 # Requires base image from: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22
 FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22
 
-ARG NODE_VERSION=22.14.0
+# openclaw 2026.7.1 (whitelist.go's whitelistMax) requires
+# node >=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0 — the 0g-sandbox base
+# ships an older node in its nvm, so install the pinned version here
+# instead of relying on the base (same bump the openclaw image line took
+# via base-ubuntu22-node24).
+ARG NODE_VERSION=24.15.0
+ENV NVM_DIR=/root/.nvm
+RUN . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION} && nvm alias default ${NODE_VERSION}
 
 # Fix PATH for non-interactive exec (toolbox process/execute does not load .bashrc).
 ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
