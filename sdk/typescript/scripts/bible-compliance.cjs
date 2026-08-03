@@ -47,14 +47,33 @@ const adversarial = [
   const cred = await ai.agent.authenticate(AGENT_URL);
   if (!cred.token) { console.error('authenticate: no token'); process.exit(2); }
 
+  // Stream the completion (SSE). A NON-streaming request gets cut by the
+  // *.art.0g.ai LB's ~60s idle timeout on long chats: while the model
+  // generates, no bytes flow → the LB deems the conn idle and kills it → a
+  // false "aborted due to timeout". Streaming keeps bytes flowing, so the
+  // idle timer never trips. (dashboard/WS never hit this.)
   async function chat(msg, ms = 180000) {
     try {
       const r = await fetch(AGENT_URL + '/v1/chat/completions', {
         method: 'POST', headers: { Authorization: 'Bearer ' + cred.token, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: FRAMEWORK, messages: [{ role: 'user', content: msg }] }), signal: AbortSignal.timeout(ms),
+        body: JSON.stringify({ model: FRAMEWORK, messages: [{ role: 'user', content: msg }], stream: true }),
+        signal: AbortSignal.timeout(ms),
       });
-      const b = await r.json().catch(() => null);
-      return b?.choices?.[0]?.message?.content ?? '';
+      if (!r.ok || !r.body) return `__ERR__ HTTP ${r.status}`;
+      let out = '', buf = '';
+      const dec = new TextDecoder();
+      for await (const chunk of r.body) {
+        buf += dec.decode(chunk, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') continue;
+          try { out += JSON.parse(data)?.choices?.[0]?.delta?.content ?? ''; } catch { /* keep-alive / partial */ }
+        }
+      }
+      return out;
     } catch (e) { return `__ERR__ ${e.message}`; }
   }
   async function services() {
