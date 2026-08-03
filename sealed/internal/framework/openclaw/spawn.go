@@ -169,7 +169,11 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 	addr := fmt.Sprintf("127.0.0.1:%d", upstreamPort)
 	if err := waitForListen(ctx, addr, startTimeout); err != nil {
-		return framework.StartResult{}, fmt.Errorf("openclaw not listening: %w", err)
+		// A blind TCP timeout hides the real reason — openclaw usually
+		// crashed on startup (bad model/provider config, OOM, …) and never
+		// bound. Surface the tail of its own log so the failure is
+		// actionable instead of a mystery "not listening within 2m".
+		return framework.StartResult{}, fmt.Errorf("openclaw not listening: %w\n--- /tmp/openclaw.log (tail) ---\n%s", err, tailOpenclawLog(40))
 	}
 
 	return framework.StartResult{
@@ -343,6 +347,21 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 		}
 	}
 	return fmt.Errorf("%s did not accept connections within %s", addr, timeout)
+}
+
+// tailOpenclawLog returns the last n lines of openclaw's log (best-effort).
+// waitForListen only observes "no TCP", never why; on a startup failure this
+// makes openclaw's own error (the real cause) legible to the attestor.
+func tailOpenclawLog(n int) string {
+	b, err := os.ReadFile("/tmp/openclaw.log")
+	if err != nil {
+		return fmt.Sprintf("(no openclaw.log: %v)", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func randomTokenHex(nbytes int) (string, error) {
