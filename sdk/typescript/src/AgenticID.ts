@@ -662,7 +662,20 @@ export class AgentApi {
         return { agentId: row.agentId, url: row.url };
       }
       if (row?.phase === 'failed') {
-        throw new Error(`waitForRunning: seal ${sealId} failed — ${row.lastProvisionError ?? 'unknown'}`);
+        // The public listing withholds the failure reason (owner-only since
+        // #64), so `row.lastProvisionError` is null here — which would report
+        // an unhelpful "failed — unknown" to the very owner who deployed. If a
+        // wallet is available, fetch the owner-scoped reason once (only on
+        // failure, not every poll). Best-effort: read-only clients or an auth
+        // failure fall back to 'unknown'.
+        let reason = row.lastProvisionError ?? null;
+        if (reason == null) {
+          try {
+            const mine = (await this.listMyDeployments()).find((r) => r.sealId === sealId);
+            reason = mine?.lastProvisionError ?? null;
+          } catch { /* no wallet / auth failed — keep null */ }
+        }
+        throw new Error(`waitForRunning: seal ${sealId} failed — ${reason ?? 'unknown'}`);
       }
       if (Date.now() >= deadline) {
         throw new Error(`waitForRunning: seal ${sealId} not running within ${timeoutMs}ms (phase=${row?.phase ?? '?'})`);
