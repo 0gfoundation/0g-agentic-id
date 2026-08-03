@@ -22,7 +22,7 @@
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use attestor_shared::{JobPayload, RetryRequest};
+use attestor_shared::{JobPayload, RetryRequest, StageStatus};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -55,12 +55,19 @@ pub async fn handle(
         }
     }
 
-    // Carry the pre-mint resume context in the job itself. Only meaningful
-    // before mint: the artifacts (ciphertext/root/sealed_key) are derived from
-    // a random dataKey and can't be recomputed, so a pre-mint resume needs
-    // them. Once minted, the authoritative iData lives on chain, so we send
-    // nothing and the worker reads it from there.
-    let artifacts = if d.agent_id.is_none() {
+    // Carry the resume context (ciphertext/root/sealed_key) in the job. It's
+    // derived from a random dataKey and can't be recomputed, so any track that
+    // still needs it must be handed the snapshot.
+    //
+    // The MINT track can rebuild from chain once minted (dataHash + sealed_key
+    // are on chain), but the STORAGE track cannot: the AES-GCM ciphertext is
+    // NOT on chain. So a post-mint retry whose storage never confirmed still
+    // needs the ciphertext — otherwise run_storage_track uploads nothing yet
+    // confirms, leaving the agent's iData permanently absent (bootstrap then
+    // fails to decrypt). Carry the snapshot whenever storage hasn't confirmed;
+    // it is only blanked after phase 2, so an unfinished deploy still holds it.
+    let storage_done = matches!(d.storage_stage, StageStatus::Confirmed { .. });
+    let artifacts = if d.agent_id.is_none() || !storage_done {
         d.i_data.clone()
     } else {
         Vec::new()
@@ -259,14 +266,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_sends_empty_artifacts_when_minted() {
-        // Post-mint: authoritative iData is on chain, so /retry carries none.
+    async fn retry_carries_ciphertext_when_minted_but_storage_failed() {
+        // Regression: mint + storage run concurrently, so "minted but storage
+        // Failed" is reachable. The ciphertext is NOT on chain, so a post-mint
+        // storage retry must still carry it — otherwise the storage track
+        // uploads nothing yet confirms, and the agent's iData is lost forever.
+        // (make_setup defaults storage_stage = Failed.)
         let s = make_setup();
         {
             let mut g = s.deployments.by_seal.lock().unwrap();
             let d = g.get_mut(&s.seal_id).unwrap();
             d.i_data = vec![test_artifact()];
-            d.agent_id = Some(U256::from(9u64)); // minted
+            d.agent_id = Some(U256::from(9u64)); // minted, but storage still Failed
         }
         let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
         handle(axum::extract::State(s.state.clone()), Json(req))
@@ -275,7 +286,33 @@ mod tests {
         let submitted = s.jobs.submitted.lock().unwrap();
         match &submitted[0] {
             JobPayload::ResumeDeploy { artifacts, .. } => {
-                assert!(artifacts.is_empty(), "post-mint retry reads chain, carries nothing");
+                assert_eq!(artifacts.len(), 1, "post-mint storage retry must carry the ciphertext");
+            }
+            other => panic!("expected ResumeDeploy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_sends_empty_artifacts_when_storage_confirmed() {
+        // Once storage has confirmed, nothing needs the snapshot: the mint
+        // track reads dataHash/sealed_key from chain and the container reads
+        // iData from chain — so /retry carries none.
+        let s = make_setup();
+        {
+            let mut g = s.deployments.by_seal.lock().unwrap();
+            let d = g.get_mut(&s.seal_id).unwrap();
+            d.i_data = vec![test_artifact()];
+            d.agent_id = Some(U256::from(9u64)); // minted
+            d.storage_stage = StageStatus::Confirmed { at: Utc::now() };
+        }
+        let req = RetryRequest { seal_id: s.seal_id, owner: s.owner, sandbox_envelope: None };
+        handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        let submitted = s.jobs.submitted.lock().unwrap();
+        match &submitted[0] {
+            JobPayload::ResumeDeploy { artifacts, .. } => {
+                assert!(artifacts.is_empty(), "storage-confirmed retry carries nothing");
             }
             other => panic!("expected ResumeDeploy, got {other:?}"),
         }

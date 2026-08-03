@@ -1175,6 +1175,23 @@ async fn run_storage_track(
     seal_id: SealId,
     artifacts: &[IDataArtifact],
 ) -> anyhow::Result<()> {
+    // Guard against a false confirm. If a retry arrives with no ciphertext to
+    // (re)upload while storage previously Failed, the loop below would skip
+    // everything and mark Confirmed — masking an agent whose iData never
+    // landed. Fail loudly instead so the deploy stays Failed and visible.
+    // (A fresh deploy with zero iData has storage_stage != Failed and still
+    // confirms correctly.)
+    if artifacts.is_empty() {
+        if let Some(d) = ctx.deployments.get(seal_id).await? {
+            if matches!(d.storage_stage, StageStatus::Failed { .. }) {
+                anyhow::bail!(
+                    "storage retry carries no ciphertext (iData snapshot missing); \
+                     cannot re-upload — refusing to confirm an empty storage track"
+                );
+            }
+        }
+    }
+
     let now = Utc::now();
     ctx.deployments
         .set_storage_stage(
