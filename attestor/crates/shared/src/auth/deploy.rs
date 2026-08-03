@@ -119,11 +119,11 @@ mod tests {
             description: description.to_string(),
             image,
             i_data,
-            sandbox_envelope: SandboxEnvelope {
+            sandbox_envelope: Some(SandboxEnvelope {
                 wallet_address: signer.address(),
                 signed_message_b64: String::new(),
                 wallet_signature: Bytes::new(),
-            },
+            }),
         }
     }
 
@@ -181,11 +181,11 @@ mod tests {
             description: "hi".to_string(),
             image: None,
             i_data: Vec::new(),
-            sandbox_envelope: SandboxEnvelope {
+            sandbox_envelope: Some(SandboxEnvelope {
                 wallet_address: signer.address(),
                 signed_message_b64: String::new(),
                 wallet_signature: Bytes::new(),
-            },
+            }),
         };
         let err = verify_deploy_signature(&req, crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("domain"), "got: {err}");
