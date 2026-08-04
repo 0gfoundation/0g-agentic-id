@@ -7,3 +7,6 @@ broadcast/
 .DS_Store
 *.swp
 
+# Local-only design/thinking specs — never committed or pushed
+/spec/
+
