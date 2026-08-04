@@ -22,7 +22,7 @@
 //
 // Usage:
 //   OWNER_PRIV=0x… ATTESTOR_URL=http://… AGENT_URL=http://… \
-//   SEAL_ID=0x… AGENT_ID=51 node scripts/agent-e2e.cjs
+//   SEAL_ID=0x… AGENT_ID=51 API_KEY=sk-… node scripts/agent-e2e.cjs
 'use strict';
 const { AgenticID, parseServeProofHeader, verifyServeProofSignature } = require('../dist/index.js');
 const { execSync } = require('child_process');
@@ -47,6 +47,10 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
 const AGENT_URL = need('AGENT_URL');
 const SEAL_ID = need('SEAL_ID');
 const AGENT_ID = BigInt(need('AGENT_ID'));
+// reset() recreates the container; apiKey rides the envelope into the TEE and
+// the attestor never stores it, so it MUST be re-supplied or the recreated
+// container boots keyless (can't call its model).
+const API_KEY = need('API_KEY');
 
 let failures = 0;
 const check = (name, ok, detail) => {
@@ -88,7 +92,7 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
 
   // ── recovery / reload: reset → recreate → same identity, same iData ───
   console.log('· reset() — recreating container…');
-  await ai.agent.reset(SEAL_ID);
+  await ai.agent.reset(SEAL_ID, { apiKey: API_KEY });
   // poll deployment back to running
   let phase = '';
   for (let i = 0; i < 40; i++) {
