@@ -38,9 +38,13 @@ const FONT_FRAUNCES_I: &[u8] = include_bytes!("../../web/fonts/fraunces-italic-v
 const FONT_GEIST_MONO: &[u8] = include_bytes!("../../web/fonts/geist-mono-var.woff2");
 
 pub fn router(state: AppState) -> Router {
-    // Headless mode (ATTESTOR_CONSOLE_ENABLED=false): the web console is
-    // simply not routed — "/" and /static (incl. fonts) 404, the whole
-    // HTTP API below stays up for SDK users. One switch, all or nothing.
+    // Headless mode (ATTESTOR_CONSOLE_ENABLED=false): the web console's HTML +
+    // /static assets are not served. But "/" MUST still return 200 — load
+    // balancers commonly health-check "/", and a 404 there makes them mark the
+    // backend unhealthy and pull it from rotation, 502-ing the *whole* domain
+    // including the API (observed on the SLB in front of agenticid.0g.ai). So
+    // headless serves a bare "ok" at "/"; the full HTTP API below is always
+    // routed and reachable direct-to-host regardless.
     let mut r = Router::new();
     if state.cfg.console_enabled {
         r = r
@@ -51,6 +55,8 @@ pub fn router(state: AppState) -> Router {
             .route("/static/fonts/fraunces-var.woff2", get(|| static_asset("font/woff2", FONT_FRAUNCES)))
             .route("/static/fonts/fraunces-italic-var.woff2", get(|| static_asset("font/woff2", FONT_FRAUNCES_I)))
             .route("/static/fonts/geist-mono-var.woff2", get(|| static_asset("font/woff2", FONT_GEIST_MONO)));
+    } else {
+        r = r.route("/", get(|| async { "ok" }));
     }
     r
         .route("/avatar/default.svg", get(avatar::default_avatar))
