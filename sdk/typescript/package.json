@@ -4,6 +4,9 @@
   "description": "TypeScript SDK for the 0G AgenticID protocol — register, manage, and interact with on-chain AI agent identities",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "bin": {
+    "0g-agenticid": "./dist/cli/main.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
