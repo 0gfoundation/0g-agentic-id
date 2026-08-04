@@ -575,3 +575,28 @@ await ag.reputation.waitForTransaction(fbTx);   // 等回执后 readFeedback/get
 // 5. 不用了就停(身份和数据都在链上,随时 start/reset 回来)
 await ag.agent.stop(sealId, sandboxId);
 ```
+
+## CLI：`0g-agenticid`（诊断工具）
+
+包内自带一个只读诊断 CLI——无需单独安装、零额外依赖（参数解析用 `node:util` 内置能力）：
+
+```bash
+npm install @0gfoundation/agentic-sdk
+npx 0g-agenticid --help
+```
+
+| 命令 | 作用 |
+|---|---|
+| `doctor` | 逐项检查部署前置条件——attestor 可达、RPC、钱包、gas、信任根 ack、沙箱余额 ≥ 0.1 OG——每个失败项都给出修复动作。全绿退出码 0，否则 3。 |
+| `status <agent>` | 单个 agent 全景：phase、三个坐标（agentId / sealId / agentSeal）、url、失败原因。`<agent>` 写十进制 agentId **或** `0x…` sealId 均可——CLI 自动互相换算。failed 部署的失败原因被公开列表隐藏时（#64），配置了私钥的 CLI 会自动走 owner 签名列表取回。 |
+| `list [--mine] [--phase p]` | 部署列表；`--mine`（owner 签名，需私钥）附带 owner 专属字段。空结果返回 `[]` + 退出码 0。 |
+
+配置只走环境变量：
+
+```bash
+export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # 必填——一个 URL 定环境
+export AGENTIC_PRIVATE_KEY=0x…                        # 可选——owner 面；刻意只支持 env、不提供 flag
+export AGENTIC_RPC_URL=https://…                      # 可选——覆盖 attestor 广播的 RPC
+```
+
+脚本与 agent 调用：加 `--json`——stdout 只输出一个 `{ok, data | error}` 信封（`error` = `{code, message, remedy?, details?}`，bigint 序列化为字符串），进度信息全部走 stderr。退出码有语义：**0** 成功 · **1** 未知 · **2** 用法错误 · **3** 可修复前置条件（执行 `error.remedy` 后重试）· **4** 超时 · **5** 鉴权。

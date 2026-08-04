@@ -598,3 +598,28 @@ const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
 ```
 
 The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
+
+## CLI: `0g-agenticid` (diagnostics)
+
+The package ships a read-only diagnostics CLI — no separate install, zero extra dependencies (arg parsing is `node:util`'s):
+
+```bash
+npm install @0gfoundation/agentic-sdk
+npx 0g-agenticid --help
+```
+
+| Command | What |
+|---|---|
+| `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
+| `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
+| `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
+
+Configuration is env-only:
+
+```bash
+export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # required — one URL selects the environment
+export AGENTIC_PRIVATE_KEY=0x…                        # optional — owner surfaces; env only, no flag by design
+export AGENTIC_RPC_URL=https://…                      # optional — overrides the attestor-advertised RPC
+```
+
+Scripts and agents: pass `--json` — stdout carries exactly one `{ok, data | error}` envelope (`error` = `{code, message, remedy?, details?}`, bigints serialized as strings) and progress goes to stderr. Exit codes are semantic: **0** ok · **1** unknown · **2** usage · **3** fixable precondition (run `error.remedy`, then retry) · **4** timeout · **5** auth.

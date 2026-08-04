@@ -12,6 +12,7 @@
  */
 
 import { buildClient } from '../sdk';
+import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
 
@@ -20,7 +21,17 @@ function shortSeal(s: string): string {
   return `${s.slice(0, 10)}…${s.slice(-6)}`;
 }
 
+/** The deployment phases derive_phase() can produce — the valid --phase values. */
+const PHASES = ['deploying', 'running', 'stopped', 'offline', 'failed'];
+
 export async function run(ctx: CommandContext): Promise<void> {
+  // Validate --phase BEFORE any network work: a typo'd phase must be a loud
+  // exit-2, not a plausible-looking empty success (agent-walkthrough finding).
+  if (ctx.flags.phase && !PHASES.includes(ctx.flags.phase)) {
+    throw new CliError('BAD_FLAG', `--phase must be one of ${PHASES.join('|')}, got "${ctx.flags.phase}"`, {
+      remedy: '0g-agenticid list --phase failed',
+    });
+  }
   // --mine is an owner-signed surface: withWallet makes a missing key fail
   // here as WALLET_REQUIRED (exit 3 + remedy), before any request is made.
   const ag = await buildClient(ctx.env, { withWallet: ctx.flags.mine });

@@ -36,7 +36,10 @@ USAGE
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
                    wallet, gas, trust-root ack, sandbox balance). Each failing
-                   item prints a remedy. Exit 0 all green, exit 3 otherwise.
+                   item prints a remedy. Exit 0 all green; exit 3 otherwise,
+                   carrying the FIRST failing check's code. Diagnostics only:
+                   the ack/deposit remedies are transactions (they need gas)
+                   executed via the deploy console or the SDK, not this CLI.
   status <agent>   One agent's full picture: phase, agentId/sealId/agentSeal,
                    url, failure reason. <agent> is a decimal agentId (33) or a
                    0x… sealId — the CLI converts between them for you.
@@ -47,7 +50,10 @@ COMMANDS
 OPTIONS
   --json           Machine output: stdout carries exactly one
                    {ok, data | error} envelope; all progress goes to stderr.
-                   error = {code, message, remedy?, details?}.
+                   error = {code, message, remedy?, details?}. Bigints are
+                   decimal strings; absent values are null, not omitted.
+                   doctor packs its per-check results (status pass|fail|skip)
+                   under (data|error.details).checks.
   --mine           (list) only deployments owned by AGENTIC_PRIVATE_KEY.
   --phase <p>      (list) filter: deploying|running|stopped|offline|failed.
   --help           Show this help.
@@ -61,8 +67,9 @@ ENVIRONMENT
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
 
 EXIT CODES
-  0 success · 1 unknown · 2 usage error · 3 fixable precondition (run the
-  error's remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
+  0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
+  on error.code to tell them apart) · 3 fixable precondition (run the error's
+  remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
 
 EXAMPLES
   0g-agenticid doctor
