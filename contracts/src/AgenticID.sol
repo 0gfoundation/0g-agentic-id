@@ -119,7 +119,15 @@ contract AgenticID is
     }
 
     /// @notice Current implementation version. Bump on every upgrade.
-    string public constant VERSION = "1.0.0";
+    /// @dev 1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
+    ///      sealed keys before the receiver callback and iTransferFrom/iCloneFrom
+    ///      are nonReentrant, so a re-entrant receiver can't desync ownership from
+    ///      the stored keys; the external setAgentSeal entrypoint is removed (a
+    ///      seal is bound only at mint via registerWithSeal). ABI change (dropped
+    ///      function) + new reentrancy-guard storage (ERC-7201 namespaced, no
+    ///      collision); no existing storage layout change.
+    ///      1.0.0 — initial.
+    string public constant VERSION = "1.1.0";
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
