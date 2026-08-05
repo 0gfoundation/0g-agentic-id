@@ -12,7 +12,9 @@ import {
     ReputationInvalidIndex,
     ReputationAlreadyRevoked,
     ReputationNotAgentOwner,
-    ReputationAlreadyResponded
+    ReputationAlreadyResponded,
+    ReputationValueOutOfRange,
+    ReputationValueDecimalsTooLarge
 } from "../src/AgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -156,6 +158,50 @@ contract ReputationTest is AgenticIDTestBase {
         address[] memory clients = reputation.getClients(agentId);
         assertEq(clients.length, 1, "one client recorded");
         assertEq(clients[0], client, "client recorded");
+    }
+
+    // ── Feedback value bounds (#87) ───────────────────────────────────────────
+
+    function _proofFor(uint256 agentId, bytes32 dataHash) internal view returns (ServeProof memory) {
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        return _mkServeProof(
+            agentId, client, TASK_HASH, dataHashes, FRAMEWORK_HASH,
+            block.timestamp + 1 hours, sealWallet.privateKey
+        );
+    }
+
+    function test_giveFeedback_revertsOnValueTooLarge() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        int128 tooBig = int128(1e9) + 1; // above MAX_ABS_VALUE
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(ReputationValueOutOfRange.selector, tooBig));
+        reputation.giveFeedback(
+            agentId, tooBig, 0, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"), _proofFor(agentId, dataHash)
+        );
+    }
+
+    function test_giveFeedback_revertsOnDecimalsTooLarge() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(ReputationValueDecimalsTooLarge.selector, uint8(19)));
+        reputation.giveFeedback(
+            agentId, 5, 19, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"), _proofFor(agentId, dataHash)
+        );
+    }
+
+    function test_getSummary_aggregatesBoundedValue() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _submitFeedback(agentId, client, 90, _proofFor(agentId, dataHash)); // value 90, decimals 0
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        (uint64 count, int128 summaryValue, uint8 dec) = reputation.getSummary(agentId, cs, "quality", "latency");
+        assertEq(count, 1, "one entry counted");
+        assertEq(summaryValue, int128(90) * int128(1e18), "normalized to 18 decimals");
+        assertEq(dec, 18, "summary decimals 18");
     }
 
     // ── No-seal rejection ─────────────────────────────────────────────────────
