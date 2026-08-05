@@ -12,7 +12,8 @@ import {
     ReputationInvalidIndex,
     ReputationAlreadyRevoked,
     ReputationNotAgentOwner,
-    ReputationAlreadyResponded
+    ReputationAlreadyResponded,
+    ReputationProofAgentMismatch
 } from "../src/AgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -156,6 +157,35 @@ contract ReputationTest is AgenticIDTestBase {
         address[] memory clients = reputation.getClients(agentId);
         assertEq(clients.length, 1, "one client recorded");
         assertEq(clients[0], client, "client recorded");
+    }
+
+    // ── Cross-agent proof rejection (#85) ─────────────────────────────────────
+
+    /// @dev A valid ServeProof for agent A must not write feedback under a
+    ///      different outer agentId. Regression for #85.
+    function test_giveFeedback_revertsOnAgentIdMismatch() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+
+        ServeProof memory proofForA = _mkServeProof(
+            agentId, client, TASK_HASH, dataHashes, FRAMEWORK_HASH,
+            block.timestamp + 1 hours, sealWallet.privateKey
+        );
+
+        uint256 otherId = agentId + 1; // a different id — need not even exist
+        vm.prank(client);
+        vm.expectRevert(
+            abi.encodeWithSelector(ReputationProofAgentMismatch.selector, otherId, agentId)
+        );
+        reputation.giveFeedback(
+            otherId, -100, 0, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"),
+            proofForA
+        );
+
+        // nothing landed on the targeted id
+        assertEq(reputation.getClients(otherId).length, 0, "no client recorded on mismatched id");
     }
 
     // ── No-seal rejection ─────────────────────────────────────────────────────

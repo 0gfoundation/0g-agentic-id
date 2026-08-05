@@ -17,6 +17,9 @@ error ReputationAlreadyRevoked();
 error ReputationNotAgentOwner();
 error ReputationAlreadyResponded();
 error ReputationNotPauser();
+/// @dev The outer `agentId` (where feedback is stored) does not match the
+/// agent the ServeProof attests to (`proof.agentId`, whose seal signs it).
+error ReputationProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -155,6 +158,12 @@ contract AgenticIDReputationRegistry is
         bytes32 feedbackHash,
         ServeProof calldata proof
     ) external whenNotPaused {
+        // Feedback is stored under the outer `agentId`, but the proof is verified
+        // against `proof.agentId` (the agent whose seal signs it). Require them to
+        // match — otherwise a valid proof for agent A could write feedback on any
+        // other agent B, including unminted IDs. A nonexistent target is rejected
+        // as a side effect: `_verifyServeProof` reverts when the seal is unset.
+        if (agentId != proof.agentId) revert ReputationProofAgentMismatch(agentId, proof.agentId);
         _verifyServeProof(proof);
 
         ReputationStorage storage $ = _getReputationStorage();
