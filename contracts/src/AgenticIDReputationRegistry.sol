@@ -41,11 +41,15 @@ contract AgenticIDReputationRegistry is
     /// @notice Current implementation version. See contracts/UPGRADING.md for the
     ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
     ///         change via a beacon upgrade; patch = compatible fix).
-    /// @dev 1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
+    /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
+    ///      `agentId == proof.agentId` (#85) and bounds `value`/`valueDecimals`
+    ///      so one entry can't brick getSummary (#87). New reverts only; storage
+    ///      layout unchanged.
+    ///      1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).
     ///      1.0.0 — initial (client-bound ServeProof).
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
 
