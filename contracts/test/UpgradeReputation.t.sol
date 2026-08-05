@@ -128,10 +128,10 @@ contract UpgradeReputationTest is AgenticIDTestBase {
         bytes32[] memory dataHashes = new bytes32[](1);
         dataHashes[0] = dataHash;
 
-        _give(agentId, dataHashes); // feedback at index 0
+        _give(agentId, dataHashes); // feedback at index 1
 
         // Sanity pre-upgrade.
-        (int128 v0,,,,) = reputation.readFeedback(agentId, client, 0);
+        (int128 v0,,,,) = reputation.readFeedback(agentId, client, 1);
         assertEq(int256(v0), 5);
 
         // Upgrade the beacon impl through the timelock.
@@ -141,14 +141,14 @@ contract UpgradeReputationTest is AgenticIDTestBase {
 
         // Storage survived: the pre-upgrade feedback still reads back.
         (int128 v1, , string memory tag1, , bool revoked) =
-            reputation.readFeedback(agentId, client, 0);
+            reputation.readFeedback(agentId, client, 1);
         assertEq(int256(v1), 5);
         assertEq(tag1, "quality");
         assertEq(revoked, false);
-        assertEq(reputation.getLastIndex(agentId, client), 0);
+        assertEq(reputation.getLastIndex(agentId, client), 1);
 
         // Post-upgrade behavior: a fresh client-less giveFeedback still works.
-        _give(agentId, dataHashes); // index 1
-        assertEq(reputation.getLastIndex(agentId, client), 1);
+        _give(agentId, dataHashes); // index 2
+        assertEq(reputation.getLastIndex(agentId, client), 2);
     }
 }

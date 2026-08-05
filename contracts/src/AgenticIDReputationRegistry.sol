@@ -26,6 +26,8 @@ error ReputationValueOutOfRange(int128 value);
 error ReputationValueDecimalsTooLarge(uint8 valueDecimals);
 /// @dev A tag/client summation exceeded int128 — unreachable given bounded writes (#87).
 error ReputationSummaryOverflow();
+/// @dev getSummary requires an explicit, non-empty clientAddresses set per ERC-8004 (#88).
+error ReputationClientsRequired();
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -43,9 +45,10 @@ contract AgenticIDReputationRegistry is
     ///         change via a beacon upgrade; patch = compatible fix).
     /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
     ///      `agentId == proof.agentId` (#85), bounds `value`/`valueDecimals` so one
-    ///      entry can't brick getSummary (#87), and (via NonceRegistry) rejects a
-    ///      proof whose deadline outlives the nonce retention (#94). New reverts
-    ///      only; storage layout unchanged.
+    ///      entry can't brick getSummary (#87), rejects (via NonceRegistry) a proof
+    ///      whose deadline outlives the nonce retention (#94), and aligns the read
+    ///      surface to ERC-8004 — feedbackIndex is now 1-based and getSummary
+    ///      requires a non-empty clientAddresses (#88). Storage layout unchanged.
     ///      1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).
@@ -196,7 +199,9 @@ contract AgenticIDReputationRegistry is
             $.clients[agentId].push(msg.sender);
         }
 
-        uint64 feedbackIndex = uint64($.feedbacks[agentId][msg.sender].length);
+        // feedbackIndex is 1-based per ERC-8004 (#88): first feedback is index 1,
+        // so 0 is a clean "no feedback" sentinel.
+        uint64 feedbackIndex = uint64($.feedbacks[agentId][msg.sender].length + 1);
 
         $.feedbacks[agentId][msg.sender].push(FeedbackEntry({
             value:             value,
@@ -226,11 +231,12 @@ contract AgenticIDReputationRegistry is
     function revokeFeedback(uint256 agentId, uint64 feedbackIndex) external whenNotPaused {
         ReputationStorage storage $ = _getReputationStorage();
         FeedbackEntry[] storage entries = $.feedbacks[agentId][msg.sender];
-        if (feedbackIndex >= entries.length)
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
             revert ReputationInvalidIndex(feedbackIndex, entries.length);
-        if (entries[feedbackIndex].isRevoked) revert ReputationAlreadyRevoked();
+        FeedbackEntry storage entry = entries[feedbackIndex - 1]; // 1-based → 0-based
+        if (entry.isRevoked) revert ReputationAlreadyRevoked();
 
-        entries[feedbackIndex].isRevoked = true;
+        entry.isRevoked = true;
         emit FeedbackRevoked(agentId, msg.sender, feedbackIndex);
     }
 
@@ -247,7 +253,7 @@ contract AgenticIDReputationRegistry is
             revert ReputationNotAgentOwner();
 
         FeedbackEntry[] storage entries = $.feedbacks[agentId][clientAddress];
-        if (feedbackIndex >= entries.length)
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
             revert ReputationInvalidIndex(feedbackIndex, entries.length);
         if ($.hasResponse[agentId][clientAddress][feedbackIndex][msg.sender])
             revert ReputationAlreadyResponded();
@@ -275,7 +281,10 @@ contract AgenticIDReputationRegistry is
         string memory tag2,
         bool    isRevoked
     ) {
-        FeedbackEntry storage e = _getReputationStorage().feedbacks[agentId][clientAddress][feedbackIndex];
+        FeedbackEntry[] storage entries = _getReputationStorage().feedbacks[agentId][clientAddress];
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
+            revert ReputationInvalidIndex(feedbackIndex, entries.length);
+        FeedbackEntry storage e = entries[feedbackIndex - 1]; // 1-based → 0-based
         return (e.value, e.valueDecimals, e.tag1, e.tag2, e.isRevoked);
     }
 
@@ -325,7 +334,7 @@ contract AgenticIDReputationRegistry is
             for (uint256 j = 0; j < entries.length; j++) {
                 if (!_matchesFilter(entries[j], tag1, tag2, includeRevoked)) continue;
                 clients_[idx]        = targets[i];
-                feedbackIndexes[idx] = uint64(j);
+                feedbackIndexes[idx] = uint64(j + 1); // 1-based per ERC-8004 (#88)
                 values[idx]          = entries[j].value;
                 valueDecimals[idx]   = entries[j].valueDecimals;
                 tag1s[idx]           = entries[j].tag1;
@@ -342,14 +351,12 @@ contract AgenticIDReputationRegistry is
         string calldata tag1,
         string calldata tag2
     ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals) {
+        // ERC-8004: clientAddresses MUST be provided (non-empty) so the caller
+        // picks whom to trust — an all-clients aggregate would fold in sybil
+        // feedback (#88).
+        if (clientAddresses.length == 0) revert ReputationClientsRequired();
         ReputationStorage storage $ = _getReputationStorage();
-        address[] memory targets;
-        if (clientAddresses.length > 0) {
-            targets = new address[](clientAddresses.length);
-            for (uint256 t = 0; t < clientAddresses.length; t++) targets[t] = clientAddresses[t];
-        } else {
-            targets = $.clients[agentId];
-        }
+        address[] memory targets = clientAddresses;
 
         summaryValueDecimals = 18;
         int256 acc;
@@ -389,13 +396,12 @@ contract AgenticIDReputationRegistry is
         return _getReputationStorage().clients[agentId];
     }
 
-    /// @notice Returns the number of feedback entries from `clientAddress` for `agentId`.
-    /// @dev Returns 0 when there are no entries. Callers can distinguish "no entries"
-    ///      from "one entry at index 0" by checking getClients(agentId) first, or by
-    ///      calling readFeedback and checking for a revert.
+    /// @notice Returns the 1-based index of the most recent feedback from
+    ///         `clientAddress` for `agentId`, or 0 if there is none (ERC-8004, #88).
+    /// @dev With 1-based feedbackIndex this equals the entry count: 0 = none,
+    ///      1 = one entry (at index 1), … — no none/first ambiguity.
     function getLastIndex(uint256 agentId, address clientAddress) external view returns (uint64) {
-        uint256 len = _getReputationStorage().feedbacks[agentId][clientAddress].length;
-        return len == 0 ? 0 : uint64(len - 1);
+        return uint64(_getReputationStorage().feedbacks[agentId][clientAddress].length);
     }
 
     // ── IAgenticIDReputationRegistry — serve data ─────────────────────────────
@@ -405,7 +411,10 @@ contract AgenticIDReputationRegistry is
         address clientAddress,
         uint64  feedbackIndex
     ) external view returns (bytes32[] memory dataHashes, bytes32 frameworkHash) {
-        FeedbackEntry storage e = _getReputationStorage().feedbacks[agentId][clientAddress][feedbackIndex];
+        FeedbackEntry[] storage entries = _getReputationStorage().feedbacks[agentId][clientAddress];
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
+            revert ReputationInvalidIndex(feedbackIndex, entries.length);
+        FeedbackEntry storage e = entries[feedbackIndex - 1]; // 1-based → 0-based
         return (e.dataHashes, e.frameworkHash);
     }
 

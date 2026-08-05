@@ -15,7 +15,8 @@ import {
     ReputationAlreadyResponded,
     ReputationProofAgentMismatch,
     ReputationValueOutOfRange,
-    ReputationValueDecimalsTooLarge
+    ReputationValueDecimalsTooLarge,
+    ReputationClientsRequired
 } from "../src/AgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -143,7 +144,7 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         (int128 value, uint8 decimals, string memory tag1, string memory tag2, bool revoked) =
-            reputation.readFeedback(agentId, client, 0);
+            reputation.readFeedback(agentId, client, 1);
         assertEq(value, 90, "feedback value stored");
         assertEq(decimals, 0, "decimals stored");
         assertEq(tag1, "quality", "tag1 stored");
@@ -151,7 +152,7 @@ contract ReputationTest is AgenticIDTestBase {
         assertTrue(!revoked, "not revoked");
 
         (bytes32[] memory storedHashes, bytes32 storedFw) =
-            reputation.getServeData(agentId, client, 0);
+            reputation.getServeData(agentId, client, 1);
         assertEq(storedHashes.length, 1, "serve data dataHashes length");
         assertEq(storedHashes[0], dataHash, "serve data dataHash");
         assertEq(storedFw, FRAMEWORK_HASH, "serve data frameworkHash");
@@ -232,6 +233,45 @@ contract ReputationTest is AgenticIDTestBase {
         assertEq(count, 1, "one entry counted");
         assertEq(summaryValue, int128(90) * int128(1e18), "normalized to 18 decimals");
         assertEq(dec, 18, "summary decimals 18");
+    }
+
+    // ── ERC-8004 read-surface conformance (#88) ───────────────────────────────
+
+    /// @dev feedbackIndex is 1-based (ERC-8004): the first feedback is index 1,
+    ///      and index 0 is never a valid handle.
+    function test_feedbackIndex_isOneBased() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _submitFeedback(agentId, client, 90, _proofFor(agentId, dataHash));
+
+        // index 1 reads the first entry…
+        (int128 value,,,,) = reputation.readFeedback(agentId, client, 1);
+        assertEq(int256(value), 90, "first feedback lives at index 1");
+
+        // …and index 0 is out of range.
+        vm.expectRevert(
+            abi.encodeWithSelector(ReputationInvalidIndex.selector, uint256(0), uint256(1))
+        );
+        reputation.readFeedback(agentId, client, 0);
+    }
+
+    /// @dev getLastIndex returns the count (== the last 1-based index), not
+    ///      length-1. Zero when the client has left no feedback.
+    function test_getLastIndex_returnsCount() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        assertEq(reputation.getLastIndex(agentId, client), 0, "no feedback -> 0");
+        _submitFeedback(agentId, client, 90, _proofFor(agentId, dataHash));
+        assertEq(reputation.getLastIndex(agentId, client), 1, "one feedback -> last index 1");
+    }
+
+    /// @dev ERC-8004 getSummary requires an explicit, non-empty clientAddresses;
+    ///      an empty set reverts rather than silently aggregating all clients.
+    function test_getSummary_revertsOnEmptyClients() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _submitFeedback(agentId, client, 90, _proofFor(agentId, dataHash));
+
+        address[] memory empty = new address[](0);
+        vm.expectRevert(ReputationClientsRequired.selector);
+        reputation.getSummary(agentId, empty, "quality", "latency");
     }
 
     // ── Deadline within nonce retention (#94) ─────────────────────────────────
@@ -396,9 +436,9 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         vm.prank(client);
-        reputation.revokeFeedback(agentId, 0);
+        reputation.revokeFeedback(agentId, 1);
 
-        (, , , , bool revoked) = reputation.readFeedback(agentId, client, 0);
+        (, , , , bool revoked) = reputation.readFeedback(agentId, client, 1);
         assertTrue(revoked, "feedback revoked");
     }
 
@@ -415,11 +455,11 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         vm.prank(client);
-        reputation.revokeFeedback(agentId, 0);
+        reputation.revokeFeedback(agentId, 1);
 
         vm.prank(client);
         vm.expectRevert(ReputationAlreadyRevoked.selector);
-        reputation.revokeFeedback(agentId, 0);
+        reputation.revokeFeedback(agentId, 1);
     }
 
     function test_revokeFeedback_revertsOnInvalidIndex() public {
@@ -447,10 +487,10 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         vm.prank(agentOwner);
-        reputation.appendResponse(agentId, client, 0, "ipfs://reply", keccak256("reply"));
+        reputation.appendResponse(agentId, client, 1, "ipfs://reply", keccak256("reply"));
 
         address[] memory none = new address[](0);
-        uint64 count = reputation.getResponseCount(agentId, client, 0, none);
+        uint64 count = reputation.getResponseCount(agentId, client, 1, none);
         assertEq(count, 1, "one response recorded");
     }
 
@@ -467,9 +507,9 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
 
         vm.startPrank(agentOwner);
-        reputation.appendResponse(agentId, client, 0, "ipfs://r1", keccak256("r1"));
+        reputation.appendResponse(agentId, client, 1, "ipfs://r1", keccak256("r1"));
         vm.expectRevert(ReputationAlreadyResponded.selector);
-        reputation.appendResponse(agentId, client, 0, "ipfs://r2", keccak256("r2"));
+        reputation.appendResponse(agentId, client, 1, "ipfs://r2", keccak256("r2"));
         vm.stopPrank();
     }
 
@@ -487,6 +527,6 @@ contract ReputationTest is AgenticIDTestBase {
 
         vm.prank(client);
         vm.expectRevert(ReputationNotAgentOwner.selector);
-        reputation.appendResponse(agentId, client, 0, "ipfs://r", keccak256("r"));
+        reputation.appendResponse(agentId, client, 1, "ipfs://r", keccak256("r"));
     }
 }
