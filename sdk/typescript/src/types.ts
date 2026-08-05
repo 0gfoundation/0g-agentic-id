@@ -55,6 +55,10 @@ export interface SealedKeyEntry {
 export interface ServeProof {
   /** The agent ID */
   agentId: bigint;
+  /** The only address allowed to redeem this proof — declared to the TEE via the
+   *  X-Client-Address request header and bound into the signature. The zero
+   *  address means no redeemer was declared (informational, unredeemable). */
+  submitter: `0x${string}`;
   /** Timestamp of service (unix seconds) */
   timestamp: bigint;
   /** Deadline for the proof's validity (unix seconds) */

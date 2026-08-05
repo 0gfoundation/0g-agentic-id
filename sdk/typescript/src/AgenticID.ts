@@ -276,7 +276,7 @@ export class AgentApi {
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
     const logAuth = owner ? () => this.signOwner('0GSealLog', base, agentId!) : undefined;
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth });
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth, clientAddress: this.ctx.account?.address });
   }
 
   /**
@@ -300,6 +300,7 @@ export class AgentApi {
       base, services: disc.services, routes: disc.routes, token,
       reauth: () => this.mintToken(base, agentId),
       logAuth: () => this.signOwner('0GSealLog', base, agentId),
+      clientAddress: this.ctx.account?.address,
     });
   }
 
@@ -311,7 +312,9 @@ export class AgentApi {
   async connect(idOrUrl: bigint | string): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes }); // no reauth → public
+    // Public handle (no token), but still declare the caller as redeemer so a
+    // captured serve-proof is bound to and redeemable by them.
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, clientAddress: this.ctx.account?.address });
   }
 
   /**

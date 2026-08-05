@@ -80,16 +80,19 @@ contract UpgradeReputationTest is AgenticIDTestBase {
         );
     }
 
-    /// @dev Client-less ServeProof signed by the controlled seal wallet.
+    /// @dev ServeProof signed by the controlled seal wallet, bound to `client`
+    ///      as the redeemer plus this chain and the identity registry.
     function _mkProof(uint256 agentId, bytes32[] memory dataHashes, uint256 deadline)
         internal view returns (ServeProof memory)
     {
         bytes32 inner = keccak256(abi.encode(
+            block.chainid, address(agenticId), client,
             agentId, block.timestamp, deadline, TASK_HASH,
             keccak256(abi.encodePacked(dataHashes)), FRAMEWORK_HASH
         ));
         return ServeProof({
             agentId: agentId,
+            submitter: client,
             timestamp: block.timestamp,
             deadline: deadline,
             taskHash: TASK_HASH,

@@ -209,6 +209,8 @@ func (m *Manager) armState(res framework.StartResult) {
 		m.params.Owner,
 		m.params.Runtime.AgentID,
 		m.params.Runtime.FrameworkHash,
+		m.params.Runtime.ChainID,
+		m.params.Runtime.ContractAddr,
 	)
 }
 

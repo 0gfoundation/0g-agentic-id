@@ -20,14 +20,17 @@ error ReputationNotPauser();
 /// @dev The outer `agentId` (where feedback is stored) does not match the
 /// agent the ServeProof attests to (`proof.agentId`, whose seal signs it).
 error ReputationProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
-/// @dev Feedback `value` outside [-MAX_ABS_VALUE, MAX_ABS_VALUE] (#87).
+/// @dev Feedback `value` outside [-MAX_ABS_VALUE, MAX_ABS_VALUE].
 error ReputationValueOutOfRange(int128 value);
-/// @dev `valueDecimals` above 18 — outside the 18-decimal normalization window (#87).
+/// @dev `valueDecimals` above 18 — outside the 18-decimal normalization window.
 error ReputationValueDecimalsTooLarge(uint8 valueDecimals);
-/// @dev A tag/client summation exceeded int128 — unreachable given bounded writes (#87).
+/// @dev A tag/client summation exceeded int128 — unreachable given bounded writes.
 error ReputationSummaryOverflow();
-/// @dev getSummary requires an explicit, non-empty clientAddresses set per ERC-8004 (#88).
+/// @dev getSummary requires an explicit, non-empty clientAddresses set per ERC-8004.
 error ReputationClientsRequired();
+/// @dev The proof was signed for a different redeemer — `proof.submitter` must
+/// equal the giveFeedback caller. Closes front-running / proof theft.
+error ReputationProofSubmitterMismatch(address submitter, address sender);
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -44,11 +47,16 @@ contract AgenticIDReputationRegistry is
     ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
     ///         change via a beacon upgrade; patch = compatible fix).
     /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
-    ///      `agentId == proof.agentId` (#85), bounds `value`/`valueDecimals` so one
-    ///      entry can't brick getSummary (#87), rejects (via NonceRegistry) a proof
-    ///      whose deadline outlives the nonce retention (#94), and aligns the read
-    ///      surface to ERC-8004 — feedbackIndex is now 1-based and getSummary
-    ///      requires a non-empty clientAddresses (#88). Storage layout unchanged.
+    ///      `agentId == proof.agentId`, bounds `value`/`valueDecimals` so one entry
+    ///      can't brick getSummary, rejects (via NonceRegistry) a proof whose
+    ///      deadline outlives the nonce retention, aligns the read surface to
+    ///      ERC-8004 — feedbackIndex is now 1-based and getSummary requires a
+    ///      non-empty clientAddresses — and binds every ServeProof to (chainId,
+    ///      identity registry, submitter) so a copied proof can't be front-run or
+    ///      replayed across chains/deployments. ServeProof gains a `submitter`
+    ///      field (ABI change); storage layout unchanged. Migration: old-envelope
+    ///      proofs stop verifying at the upgrade — blast radius is the proofs
+    ///      issued within serveProofDeadlineWindow (~1h) before rollout.
     ///      1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).
@@ -186,7 +194,7 @@ contract AgenticIDReputationRegistry is
         if (agentId != proof.agentId) revert ReputationProofAgentMismatch(agentId, proof.agentId);
         _verifyServeProof(proof);
 
-        // Bound the entry so it can't brick reads (#87): valueDecimals within the
+        // Bound the entry so it can't brick reads: valueDecimals within the
         // 18-decimal normalization window, and |value| capped so a single
         // normalized entry fits int128 and summaries stay finite.
         if (valueDecimals > 18) revert ReputationValueDecimalsTooLarge(valueDecimals);
@@ -199,7 +207,7 @@ contract AgenticIDReputationRegistry is
             $.clients[agentId].push(msg.sender);
         }
 
-        // feedbackIndex is 1-based per ERC-8004 (#88): first feedback is index 1,
+        // feedbackIndex is 1-based per ERC-8004: first feedback is index 1,
         // so 0 is a clean "no feedback" sentinel.
         uint64 feedbackIndex = uint64($.feedbacks[agentId][msg.sender].length + 1);
 
@@ -334,7 +342,7 @@ contract AgenticIDReputationRegistry is
             for (uint256 j = 0; j < entries.length; j++) {
                 if (!_matchesFilter(entries[j], tag1, tag2, includeRevoked)) continue;
                 clients_[idx]        = targets[i];
-                feedbackIndexes[idx] = uint64(j + 1); // 1-based per ERC-8004 (#88)
+                feedbackIndexes[idx] = uint64(j + 1); // 1-based per ERC-8004
                 values[idx]          = entries[j].value;
                 valueDecimals[idx]   = entries[j].valueDecimals;
                 tag1s[idx]           = entries[j].tag1;
@@ -353,7 +361,7 @@ contract AgenticIDReputationRegistry is
     ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals) {
         // ERC-8004: clientAddresses MUST be provided (non-empty) so the caller
         // picks whom to trust — an all-clients aggregate would fold in sybil
-        // feedback (#88).
+        // feedback.
         if (clientAddresses.length == 0) revert ReputationClientsRequired();
         ReputationStorage storage $ = _getReputationStorage();
         address[] memory targets = clientAddresses;
@@ -372,7 +380,7 @@ contract AgenticIDReputationRegistry is
             }
         }
         // Bounded writes keep this in range; the guard turns a would-be silent
-        // int128 truncation into a clean revert (unreachable in practice, #87).
+        // int128 truncation into a clean revert (unreachable in practice).
         if (acc < type(int128).min || acc > type(int128).max) revert ReputationSummaryOverflow();
         summaryValue = int128(acc);
     }
@@ -397,7 +405,7 @@ contract AgenticIDReputationRegistry is
     }
 
     /// @notice Returns the 1-based index of the most recent feedback from
-    ///         `clientAddress` for `agentId`, or 0 if there is none (ERC-8004, #88).
+    ///         `clientAddress` for `agentId`, or 0 if there is none (ERC-8004).
     /// @dev With 1-based feedbackIndex this equals the entry count: 0 = none,
     ///      1 = one entry (at index 1), … — no none/first ambiguity.
     function getLastIndex(uint256 agentId, address clientAddress) external view returns (uint64) {
@@ -425,19 +433,28 @@ contract AgenticIDReputationRegistry is
     ///      State-mutating despite the "verify" name — this is the single entrypoint
     ///      that guarantees each ServeProof can be redeemed at most once.
     function _verifyServeProof(ServeProof calldata proof) internal {
-        address agentSeal = IAgenticID(
-            _getReputationStorage().identityRegistry
-        ).getAgentSeal(proof.agentId);
+        // Only the address the proof was signed for may redeem it. This is the
+        // front-running / theft guard: a copied proof carries the honest
+        // client's `submitter`, so an attacker's own call fails here. Checked
+        // before signature recovery so a mismatched caller reverts cheaply.
+        if (proof.submitter != msg.sender)
+            revert ReputationProofSubmitterMismatch(proof.submitter, msg.sender);
+
+        address identityRegistry = _getReputationStorage().identityRegistry;
+        address agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
         if (agentSeal == address(0)) revert ReputationNoAgentSeal();
 
-        // No (chainId, contract) domain separation in the envelope on purpose:
-        // cross-chain / cross-contract replay of a ServeProof is prevented at the
-        // KEY layer — agentSeal is derived per (chainId, agenticID, sealId), so the
-        // same agentId on another chain/contract has a different agentSeal and the
-        // recovered signer won't match. Keeping the envelope minimal means the
-        // off-chain agentSeal signer needs no extra fields. (Seal derivation
-        // scoping is tracked separately; see the KMS threshold-derivation issue.)
+        // Domain + submitter separation: binding block.chainid and the
+        // identity registry this reputation contract is anchored to makes a proof
+        // non-portable across chains and across protocol deployments, and binding
+        // `submitter` makes it non-transferable. The digest is built only from
+        // fixed-width words (uint256/address/bytes32), so abi.encode has no
+        // encoding ambiguity. (The key layer also scopes agentSeal per deployment,
+        // but that is an off-chain property; this binds it on-chain regardless.)
         bytes32 proofHash = keccak256(abi.encode(
+            block.chainid,
+            identityRegistry,
+            proof.submitter,
             proof.agentId,
             proof.timestamp,
             proof.deadline,
@@ -473,8 +490,8 @@ contract AgenticIDReputationRegistry is
     }
 
     /// @dev Normalize a feedback value to 18 decimals, returning int256 so no
-    ///      single entry can overflow (values are further bounded at write time,
-    ///      #87). decimals above 18+77 round to zero rather than overflowing 10**().
+    ///      single entry can overflow (values are further bounded at write
+    ///      time). decimals above 18+77 round to zero rather than overflowing 10**().
     function _normalizeTo18(int128 value, uint8 decimals) private pure returns (int256) {
         if (decimals == 18) return value;
         if (decimals < 18) return int256(value) * int256(10 ** (18 - decimals));

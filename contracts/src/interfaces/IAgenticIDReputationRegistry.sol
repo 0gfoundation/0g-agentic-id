@@ -8,17 +8,29 @@ import {IERC8004ReputationRegistry} from "./IERC8004ReputationRegistry.sol";
 ///      this proof. dataHashes and frameworkHash are recorded as audit data —
 ///      they are part of the signed message and therefore trusted, but are NOT
 ///      re-verified against on-chain state at submission time.
-///      Signed payload: keccak256(abi.encode(agentId, timestamp, deadline,
-///          taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)).
+///      Signed payload: keccak256(abi.encode(block.chainid, identityRegistry,
+///          submitter, agentId, timestamp, deadline, taskHash,
+///          keccak256(abi.encodePacked(dataHashes)), frameworkHash)).
 ///      Replay protection: nonce key is keccak256("SERVEPROOF" ‖ agentId ‖ signature)
 ///      — the signature is unique per sealed payload so it doubles as the nonce.
 ///
-///      No `client` binding: attribution is via msg.sender at submission time
-///      (feedback is stored under the submitting address). The proof is a
-///      bearer attestation that the agent served *a* task; whoever holds it
-///      submits one feedback (single-use via the signature nonce).
+///      Domain + submitter binding: the digest fixes the proof to one
+///      chain (block.chainid), one protocol deployment (the identity registry
+///      the reputation contract is bound to), and one redeemer (`submitter`).
+///      A copied proof is worthless to anyone else — a different chain /
+///      identity registry makes the recovered signer mismatch, and a different
+///      caller fails `submitter == msg.sender`. `submitter` is the address the
+///      client declared to the TEE at signing time (echoed from the request);
+///      it is NOT identity-verified and does not need to be — the on-chain
+///      `submitter == msg.sender` check is itself proof of control, so only the
+///      declared address can ever redeem. Attribution (which address the entry
+///      is stored under) remains msg.sender at submission.
 struct ServeProof {
     uint256   agentId;
+    /// @dev The only address permitted to redeem this proof — the client that
+    ///      declared it to the TEE. Bound into the signature and enforced as
+    ///      `== msg.sender` at giveFeedback; closes front-running / proof theft.
+    address   submitter;
     uint256   timestamp;
     /// @dev Unix timestamp after which the proof is rejected at submission.
     uint256   deadline;
@@ -86,8 +98,9 @@ interface IAgenticIDReputationRegistry is IERC8004ReputationRegistry {
 
     /// @notice Submit feedback backed by a TEE-signed serve proof.
     /// @dev The contract verifies:
-    ///      1. proof.signature is valid against the agentSeal registered for agentId.
-    ///      2. proof.client == msg.sender.
+    ///      1. proof.signature is valid against the agentSeal registered for agentId,
+    ///         over a digest bound to this chain + identity registry.
+    ///      2. proof.submitter == msg.sender (only the declared client may redeem).
     ///      The agentSeal signature alone proves TEE origin and binds the proof to the
     ///      specific data and framework that performed the service; dataHashes and
     ///      frameworkHash are stored as-is for auditability.

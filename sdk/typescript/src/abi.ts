@@ -538,6 +538,7 @@ export const reputationRegistryAbi = [
       { name: 'feedbackHash', type: 'bytes32' },
       { name: 'ServeProof', type: 'tuple', components: [
         { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
         { name: 'timestamp', type: 'uint256' },
         { name: 'deadline', type: 'uint256' },
         { name: 'taskHash', type: 'bytes32' },

@@ -82,6 +82,7 @@ export class ReputationClient {
         params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
         {
           agentId: sp.agentId,
+          submitter: sp.submitter,
           timestamp: sp.timestamp,
           deadline: sp.deadline,
           taskHash: sp.taskHash,
