@@ -20,6 +20,12 @@ error ReputationNotPauser();
 /// @dev The outer `agentId` (where feedback is stored) does not match the
 /// agent the ServeProof attests to (`proof.agentId`, whose seal signs it).
 error ReputationProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
+/// @dev Feedback `value` outside [-MAX_ABS_VALUE, MAX_ABS_VALUE] (#87).
+error ReputationValueOutOfRange(int128 value);
+/// @dev `valueDecimals` above 18 — outside the 18-decimal normalization window (#87).
+error ReputationValueDecimalsTooLarge(uint8 valueDecimals);
+/// @dev A tag/client summation exceeded int128 — unreachable given bounded writes (#87).
+error ReputationSummaryOverflow();
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -42,6 +48,12 @@ contract AgenticIDReputationRegistry is
     string public constant VERSION = "1.1.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
+
+    /// @notice Max absolute feedback `value` (raw, pre-decimals). Bounds a single
+    ///         entry so its 18-decimal normalization can't overflow int128 and
+    ///         summaries stay finite — an int128 sum would take ~1.7e11 max
+    ///         entries. Generous for any real rating scale.
+    int128 private constant MAX_ABS_VALUE = 1e9;
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
@@ -165,6 +177,12 @@ contract AgenticIDReputationRegistry is
         // as a side effect: `_verifyServeProof` reverts when the seal is unset.
         if (agentId != proof.agentId) revert ReputationProofAgentMismatch(agentId, proof.agentId);
         _verifyServeProof(proof);
+
+        // Bound the entry so it can't brick reads (#87): valueDecimals within the
+        // 18-decimal normalization window, and |value| capped so a single
+        // normalized entry fits int128 and summaries stay finite.
+        if (valueDecimals > 18) revert ReputationValueDecimalsTooLarge(valueDecimals);
+        if (value < -MAX_ABS_VALUE || value > MAX_ABS_VALUE) revert ReputationValueOutOfRange(value);
 
         ReputationStorage storage $ = _getReputationStorage();
 
@@ -329,6 +347,7 @@ contract AgenticIDReputationRegistry is
         }
 
         summaryValueDecimals = 18;
+        int256 acc;
         for (uint256 i = 0; i < targets.length; i++) {
             FeedbackEntry[] storage entries = $.feedbacks[agentId][targets[i]];
             for (uint256 j = 0; j < entries.length; j++) {
@@ -337,9 +356,13 @@ contract AgenticIDReputationRegistry is
                 if (!_tagMatches(e.tag1, tag1)) continue;
                 if (!_tagMatches(e.tag2, tag2)) continue;
                 count++;
-                summaryValue += _normalizeTo18(e.value, e.valueDecimals);
+                acc += _normalizeTo18(e.value, e.valueDecimals);
             }
         }
+        // Bounded writes keep this in range; the guard turns a would-be silent
+        // int128 truncation into a clean revert (unreachable in practice, #87).
+        if (acc < type(int128).min || acc > type(int128).max) revert ReputationSummaryOverflow();
+        summaryValue = int128(acc);
     }
 
     function getResponseCount(
@@ -435,9 +458,14 @@ contract AgenticIDReputationRegistry is
         return keccak256(bytes(stored)) == keccak256(bytes(filter));
     }
 
-    function _normalizeTo18(int128 value, uint8 decimals) private pure returns (int128) {
+    /// @dev Normalize a feedback value to 18 decimals, returning int256 so no
+    ///      single entry can overflow (values are further bounded at write time,
+    ///      #87). decimals above 18+77 round to zero rather than overflowing 10**().
+    function _normalizeTo18(int128 value, uint8 decimals) private pure returns (int256) {
         if (decimals == 18) return value;
-        if (decimals < 18) return value * int128(int256(10 ** (18 - decimals)));
-        return value / int128(int256(10 ** (decimals - 18)));
+        if (decimals < 18) return int256(value) * int256(10 ** (18 - decimals));
+        uint256 shift = uint256(decimals) - 18;
+        if (shift > 77) return 0; // 10**78 exceeds uint256 max; the value underflows to 0 anyway
+        return int256(value) / int256(10 ** shift);
     }
 }
