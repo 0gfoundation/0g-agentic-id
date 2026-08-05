@@ -55,18 +55,6 @@ export const agenticIDAbi = [
     outputs: [{ name: 'agentId', type: 'uint256' }],
   },
 
-  // ── Seal Management ──
-  {
-    type: 'function',
-    name: 'setAgentSeal',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'agentId', type: 'uint256' },
-      { name: 'agentSeal_', type: 'address' },
-      { name: 'sealId', type: 'bytes32' },
-    ],
-    outputs: [],
-  },
   {
     type: 'function',
     name: 'tokenURI',

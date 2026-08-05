@@ -208,13 +208,13 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 `msg.sender == to`. The user decides which pubkey each `sealedKeys[i]` is sealed to (their own EOA key, some TEE, or any other choice). The contract **does not validate** the encryption target. If the caller loses the matching decryption key, future transfers cannot produce an OwnershipProof and the agent gets stuck.
 
-In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate reputation. To gain that capability, the owner can later have an attestor call `setAgentSeal(agentId, agentSeal_addr, sealId)`. The call is a one-shot operation and locks permanently afterwards.
+In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate reputation. This is permanent: a seal is bound only at mint via `registerWithSeal` (Path A). There is no retroactive "seal an existing agent" call — `sealId` asserts the data has been TEE-confined since creation, which cannot be granted after the fact to a self-minted agent whose data was uploaded in the clear. A seal-bound agent requires the attestor-mint path.
 
 ### Key invariants
 
 | Field | How it's set | After transfer |
 |---|---|---|
-| `agentSeal` | Immutable (`setAgentSeal` is one-shot) | Retained |
+| `agentSeal` | Bound once at mint (`registerWithSeal`); immutable | Retained |
 | `sealId` | Immutable | Retained |
 | `agentWallet` | Forwarded to the canonical registry's official 4-arg `setAgentWallet` (EIP-712 consent from `newWallet`, owner = AgenticID contract, deadline ≤ 5 min) | **Cleared** |
 | `authorizedUsers` | Owner can add/remove | **Cleared** |

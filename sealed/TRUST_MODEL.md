@@ -215,8 +215,8 @@ When a deploy request lands, Attestor:
    KMS actually honors the material (two distinct materials must yield
    distinct keys) and refuses to boot otherwise.
 3. Publishes the derived key's **address** (`agent_seal_addr`, not the
-   raw pubkey) on chain via `setAgentSeal(agentId, agentSeal_, sealId)`
-   at mint time. The binding becomes immutable (see
+   raw pubkey) on chain via `registerWithSeal(...)`, which binds the seal
+   in the same mint call. The binding becomes immutable (see
    [Set-once seal semantics](#set-once-seal-semantics-why-the-binding-is-safe)
    below).
 4. **Discards `agent_seal_priv` from its own memory** as soon as the
@@ -299,7 +299,7 @@ app-scoped key) from forging valid bindings — the (`container_pubkey`,
 
 ## Set-once seal semantics: why the binding is safe
 
-`AgenticID.setAgentSeal(agentId, sealAddr, sealId)` enforces three
+The seal binding inside `registerWithSeal` (`_setAgentSeal`) enforces three
 invariants:
 
 - **Set-once per agent**: once `agentSeal[agentId]` is non-zero, it can
@@ -325,6 +325,43 @@ Combined with `agent_seal_priv` never leaving TEE memory ([foundational
 invariant](#foundational-invariant-owner-never-holds-agent_seal_priv)),
 `agentSeal` becomes an identity that no party — owner, host, or
 Attestor operator — can forge, transfer, or revoke.
+
+### Ownership vs control: what a seal-bound transfer conveys
+
+This is a deliberate design property, stated here explicitly so it is not
+mistaken for a bug.
+
+For a **seal-bound** agent, write authority (`update` / `updateAt`) and
+ServeProof signing are gated on `agentSeal`, **not** on the token owner
+(`_authorizeIDataUpdate` overrides the base owner-only gate once a seal is
+bound). The agent's intelligent data belongs to the **agent itself** —
+TEE-confined since creation — not to whoever holds the token. The seal is
+the agent's own credential, not a human's.
+
+Two consequences follow, both intended:
+
+- **Transferring the token moves economic ownership, not execution
+  control.** A plain ERC-721 transfer of a seal-bound agent does not change
+  `agentSeal`, does not grant the new owner on-chain write authority, and
+  does not revoke the previous environment's credential on-chain. There is
+  no on-chain seal rotation — by design, because the seal is the agent's
+  permanent identity (see above), and because ownership transfer and
+  hardware swap are indistinguishable at the credential layer.
+- **Operational handover is an off-chain dependency on the Attestor, by
+  design.** In the 0G-hosted model the seller never physically holds the
+  TEE; after a transfer the Attestor tears down the old owner's container
+  (asynchronously) and re-provisions `agent_seal_priv` to the new owner's
+  attested environment. The new owner's ability to operate the agent rests
+  on that provisioning flow and on TEE encapsulation preventing key
+  extraction — **not** on an on-chain revocation. A trust-minimised
+  marketplace must account for this assumption rather than assume the token
+  alone conveys exclusive control.
+
+If you instead want data whose sole writer is the current token owner and
+whose control moves with the token, use a **seal-less** agent: a
+self-minted (`register()`) agent has no `agentSeal`, so `update` stays
+owner-gated. That is a different product from an autonomous, TEE-resident
+seal-bound agent, and the choice between them is the choice of trust model.
 
 ---
 

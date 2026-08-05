@@ -106,13 +106,17 @@ contract CanonicalBindingTest is AgenticIDTestBase {
         assertEq(agenticId.getAgentIdBySealId(SEAL_ID), 0, "reverse map returns 0 (the real agent)");
         assertTrue(agenticId.isSealIdBound(SEAL_ID), "existence flag distinguishes from unbound");
 
-        // Binding the same sealId to another (seal-less) agent must still be
-        // rejected, even though sealIdToAgentId[SEAL_ID] == 0 would look "empty"
-        // without the explicit existence flag.
-        (uint256 agentId2, ) = _selfMint(alice);
+        // Minting another agent with the same sealId must still be rejected,
+        // even though sealIdToAgentId[SEAL_ID] == 0 would look "empty" without
+        // the explicit existence flag.
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("cb-dup")});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = hex"cafe";
+        MetadataEntry[] memory meta = new MetadataEntry[](0);
         vm.prank(attestor);
         vm.expectRevert(abi.encodeWithSelector(AgenticIDSealIdTaken.selector, SEAL_ID, uint256(0)));
-        agenticId.setAgentSeal(agentId2, address(0xB1), SEAL_ID);
+        agenticId.registerWithSeal(alice, "", meta, datas, keys, address(0xB1), SEAL_ID);
     }
 
     // ── Clone also registers a fresh canonical identity ────────────────────────

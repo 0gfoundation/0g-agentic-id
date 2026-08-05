@@ -307,11 +307,12 @@ contract AgenticID is
     // running in TEE with `agentSeal_priv` — is best positioned to
     // author. Once a seal is bound, *only* the agentSeal can update.
     //
-    // Fallback: when agentSeal is zero (the brief window between mint
-    // and setAgentSeal, or legacy tokens that never got a seal bound),
-    // the original owner-only check applies — otherwise the token
-    // would be stuck with no one able to update it. Owner still
-    // controls transfer / authorize / setAgentURI in both branches.
+    // Fallback: when agentSeal is zero (a self-minted agent that was
+    // never sealed — the attestor path binds the seal atomically inside
+    // registerWithSeal, so no post-mint gap exists there), the original
+    // owner-only check applies — otherwise the token would be stuck with
+    // no one able to update it. Owner still controls transfer / authorize
+    // / setAgentURI in both branches.
 
     function update(
         uint256 tokenId,
@@ -463,15 +464,15 @@ contract AgenticID is
 
     // ── agentSeal ─────────────────────────────────────────────────────────────
 
-    function setAgentSeal(
-        uint256 agentId,
-        address agentSeal_,
-        bytes32 sealId
-    ) external whenNotPaused {
-        if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
-        _setAgentSeal(agentId, agentSeal_, sealId);
-    }
-
+    // A seal is bound ONLY at mint time, inside registerWithSeal. There is no
+    // external "bind a seal later" entrypoint: sealId asserts that the agent's
+    // data has lived inside the TEE since creation and never left, and that
+    // provenance cannot be granted retroactively to an agent whose data was
+    // minted in the clear. A standalone setAgentSeal also let a trusted attestor
+    // bind a seal to any pre-existing (even unminted) agent without owner
+    // consent — permanently, since seals are one-shot — so removing it closes
+    // that too. If an owner-initiated "seal an existing agent" flow is ever
+    // needed, it must be reintroduced as an owner-authorized operation.
     function _setAgentSeal(uint256 agentId, address agentSeal_, bytes32 sealId) internal {
         if (agentSeal_ == address(0) || sealId == bytes32(0)) revert AgenticIDZeroSeal();
 

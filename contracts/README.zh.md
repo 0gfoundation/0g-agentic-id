@@ -204,13 +204,13 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 `msg.sender == to`，用户自己决定 `sealedKeys[i]` 封给哪个公钥（自己的 EOA 密钥 / 某台 TEE / 自选）。合约**不验证** sealedKey 的加密目标——调用者丢了那把解密 key 会让后续 transfer 无法产生 OwnershipProof，agent 卡死。
 
-此时 agent 没有 `agentSeal`，不能签 ServeProof、不能积累声誉。想获得这个能力，owner 后续可以找 attestor 调 `setAgentSeal(agentId, agentSeal_addr, sealId)`——一次性操作，之后永久锁定。
+此时 agent 没有 `agentSeal`，不能签 ServeProof、不能积累声誉。而且这是永久的：seal 只在 mint 时通过 `registerWithSeal`（路径 A）绑定，没有事后"给已有 agent 补 seal"的调用——`sealId` 声明的是"数据自创建起就一直封在 TEE 内、从未外泄"，这份出身证明无法事后安到一个明文自助上链的 agent 上。要 seal-bound agent 就得走 attestor-mint 路径。
 
 ### 关键不变量
 
 | 字段 | 如何设置 | 转让后 |
 |---|---|---|
-| `agentSeal` | 永不可变（`setAgentSeal` 只能调一次）| 保留 |
+| `agentSeal` | mint 时经 `registerWithSeal` 绑定一次；不可变 | 保留 |
 | `sealId` | 永不可变 | 保留 |
 | `agentWallet` | 转发给 canonical 注册表官方 4 参 `setAgentWallet`（`newWallet` 的 EIP-712 同意签名，owner = AgenticID 合约，deadline ≤ 5 分钟）| **清空** |
 | `authorizedUsers` | owner 可增删 | **清空** |
