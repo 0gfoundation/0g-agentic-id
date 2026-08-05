@@ -17,7 +17,8 @@ import {
     ReputationValueOutOfRange,
     ReputationValueDecimalsTooLarge,
     ReputationClientsRequired,
-    ReputationProofSubmitterMismatch
+    ReputationProofSubmitterMismatch,
+    ReputationSelfFeedback
 } from "../src/AgenticIDReputationRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -390,6 +391,55 @@ contract ReputationTest is AgenticIDTestBase {
         _submitFeedback(agentId, client, 90, proof);
         (int128 value,,,,) = reputation.readFeedback(agentId, client, 1);
         assertEq(value, 90, "honest client's proof survived the front-run attempt");
+    }
+
+    // ── ERC-8004 self-feedback conformance ────────────────────────────────────
+
+    /// @dev The agent owner may not rate their own agent (ERC-8004 MUST). This
+    ///      is a conformance guard, not sybil resistance — a determined owner
+    ///      can still self-rate from an unrelated second wallet.
+    function test_giveFeedback_revertsWhenOwnerSelfRates() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+
+        // Proof bound to the owner as submitter, submitted by the owner.
+        ServeProof memory proof = _mkServeProof(
+            agentId, agentOwner, TASK_HASH, dataHashes, FRAMEWORK_HASH,
+            block.timestamp + 1 hours, sealWallet.privateKey
+        );
+        vm.prank(agentOwner);
+        vm.expectRevert(
+            abi.encodeWithSelector(ReputationSelfFeedback.selector, agentId, agentOwner)
+        );
+        reputation.giveFeedback(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"), proof
+        );
+    }
+
+    /// @dev An address the owner approved for the token is likewise blocked.
+    function test_giveFeedback_revertsWhenApprovedOperatorRates() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        address operator = makeAddr("operator");
+
+        vm.prank(agentOwner);
+        agenticId.setApprovalForAll(operator, true);
+
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        ServeProof memory proof = _mkServeProof(
+            agentId, operator, TASK_HASH, dataHashes, FRAMEWORK_HASH,
+            block.timestamp + 1 hours, sealWallet.privateKey
+        );
+        vm.prank(operator);
+        vm.expectRevert(
+            abi.encodeWithSelector(ReputationSelfFeedback.selector, agentId, operator)
+        );
+        reputation.giveFeedback(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"), proof
+        );
     }
 
     // ── Forged signature rejection ────────────────────────────────────────────

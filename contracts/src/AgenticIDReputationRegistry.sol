@@ -31,6 +31,10 @@ error ReputationClientsRequired();
 /// @dev The proof was signed for a different redeemer — `proof.submitter` must
 /// equal the giveFeedback caller. Closes front-running / proof theft.
 error ReputationProofSubmitterMismatch(address submitter, address sender);
+/// @dev ERC-8004: the feedback submitter must not be the agent owner or an
+/// approved operator. Conformance guard, not sybil resistance (a determined
+/// owner can still self-rate from an unrelated second wallet).
+error ReputationSelfFeedback(uint256 agentId, address submitter);
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -50,9 +54,11 @@ contract AgenticIDReputationRegistry is
     ///      `agentId == proof.agentId`, bounds `value`/`valueDecimals` so one entry
     ///      can't brick getSummary, rejects (via NonceRegistry) a proof whose
     ///      deadline outlives the nonce retention, aligns the read surface to
-    ///      ERC-8004 — feedbackIndex is now 1-based and getSummary requires a
-    ///      non-empty clientAddresses — and binds every ServeProof to (chainId,
-    ///      identity registry, submitter) so a copied proof can't be front-run or
+    ///      ERC-8004 — feedbackIndex is now 1-based, getSummary requires a
+    ///      non-empty clientAddresses, and the submitter must not be the agent
+    ///      owner or an approved operator (conformance guard, not sybil
+    ///      resistance) — and binds every ServeProof to (chainId, identity
+    ///      registry, submitter) so a copied proof can't be front-run or
     ///      replayed across chains/deployments. ServeProof gains a `submitter`
     ///      field (ABI change); storage layout unchanged. Migration: old-envelope
     ///      proofs stop verifying at the upgrade — blast radius is the proofs
@@ -193,6 +199,18 @@ contract AgenticIDReputationRegistry is
         // as a side effect: `_verifyServeProof` reverts when the seal is unset.
         if (agentId != proof.agentId) revert ReputationProofAgentMismatch(agentId, proof.agentId);
         _verifyServeProof(proof);
+
+        // ERC-8004 conformance: the submitter must not be the agent owner or an
+        // approved operator (spec MUST; mirrors the reference registry's
+        // isAuthorizedOrOwner). This is a conformance guard, NOT sybil
+        // resistance — the serve proof is obtainable from the unauthenticated
+        // /hello and, being bound only to a submitter address, a determined
+        // owner can still self-rate from an unrelated second wallet they
+        // control. Preventing genuine self-rating is impossible purely on-chain
+        // and needs an off-chain layer (rate-limiting per real identity,
+        // staking, proof-of-personhood). msg.sender == proof.submitter here
+        // (enforced above), so this checks the real redeemer.
+        if (_isOwnerOrApproved(agentId, msg.sender)) revert ReputationSelfFeedback(agentId, msg.sender);
 
         // Bound the entry so it can't brick reads: valueDecimals within the
         // 18-decimal normalization window, and |value| capped so a single
@@ -469,6 +487,18 @@ contract AgenticIDReputationRegistry is
         // Replay protection: signature is unique per sealed payload.
         bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, proof.agentId, proof.signature));
         _checkAndMarkNonce(nonceKey, proof.deadline);
+    }
+
+    /// @dev True if `addr` is the agent owner or an ERC-721 approved operator —
+    ///      mirrors the ERC-8004 reference registry's isAuthorizedOrOwner. The
+    ///      agent is known to exist here (its seal signed a verified proof), so
+    ///      ownerOf does not revert.
+    function _isOwnerOrApproved(uint256 agentId, address addr) private view returns (bool) {
+        IAgenticID id = IAgenticID(_getReputationStorage().identityRegistry);
+        address owner = id.ownerOf(agentId);
+        return addr == owner
+            || id.getApproved(agentId) == addr
+            || id.isApprovedForAll(owner, addr);
     }
 
     function _matchesFilter(
