@@ -42,9 +42,10 @@ contract AgenticIDReputationRegistry is
     ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
     ///         change via a beacon upgrade; patch = compatible fix).
     /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
-    ///      `agentId == proof.agentId` (#85) and bounds `value`/`valueDecimals`
-    ///      so one entry can't brick getSummary (#87). New reverts only; storage
-    ///      layout unchanged.
+    ///      `agentId == proof.agentId` (#85), bounds `value`/`valueDecimals` so one
+    ///      entry can't brick getSummary (#87), and (via NonceRegistry) rejects a
+    ///      proof whose deadline outlives the nonce retention (#94). New reverts
+    ///      only; storage layout unchanged.
     ///      1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).

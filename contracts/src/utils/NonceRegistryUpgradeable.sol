@@ -9,6 +9,11 @@ error NonceAlreadyUsed(bytes32 key);
 /// @notice The deadline has already passed.
 error NonceExpired(uint256 deadline, uint256 nowTimestamp);
 
+/// @notice The deadline outlives the nonce's retention (`now + maxAge`), so the
+///         permissionless cleanup could delete the record while the proof is still
+///         valid and reopen it to replay (#94).
+error NonceDeadlineTooFar(uint256 deadline, uint256 maxDeadline);
+
 /// @title NonceRegistryUpgradeable
 /// @notice Shared replay-protection primitive used by all proof-accepting contracts
 ///         in the protocol (transfer verifiers, reputation registry, identity
@@ -69,6 +74,12 @@ abstract contract NonceRegistryUpgradeable is Initializable {
     function _checkAndMarkNonce(bytes32 key, uint256 deadline) internal {
         if (block.timestamp > deadline) revert NonceExpired(deadline, block.timestamp);
         NonceRegistryStorage storage $ = _getNonceRegistryStorage();
+        // Enforce the cleanup invariant on-chain (#94): the consumption record must
+        // outlive the proof's deadline. Otherwise the permissionless cleanup could
+        // delete it (once `now > consumedAt + maxAge`) while the proof is still
+        // valid, reopening the nonce to replay.
+        uint256 maxDeadline = block.timestamp + $.maxAge;
+        if (deadline > maxDeadline) revert NonceDeadlineTooFar(deadline, maxDeadline);
         if ($.consumedAt[key] != 0) revert NonceAlreadyUsed(key);
         $.consumedAt[key] = block.timestamp;
     }

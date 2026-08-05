@@ -20,7 +20,7 @@ import {
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof, AgenticIDProofRequired} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
-import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
+import {NonceExpired, NonceAlreadyUsed, NonceDeadlineTooFar} from "../src/utils/NonceRegistryUpgradeable.sol";
 
 contract ReputationTest is AgenticIDTestBase {
     AgenticIDReputationRegistry internal reputation;
@@ -232,6 +232,29 @@ contract ReputationTest is AgenticIDTestBase {
         assertEq(count, 1, "one entry counted");
         assertEq(summaryValue, int128(90) * int128(1e18), "normalized to 18 decimals");
         assertEq(dec, 18, "summary decimals 18");
+    }
+
+    // ── Deadline within nonce retention (#94) ─────────────────────────────────
+
+    /// @dev A proof whose deadline outlives the nonce retention (maxAge) is
+    ///      rejected, so its consumption record can't be GC'd while still valid.
+    function test_giveFeedback_revertsOnDeadlineBeyondMaxAge() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+
+        uint256 tooFar = block.timestamp + MAX_PROOF_AGE + 1; // beyond retention
+        ServeProof memory proof = _mkServeProof(
+            agentId, client, TASK_HASH, dataHashes, FRAMEWORK_HASH, tooFar, sealWallet.privateKey
+        );
+        vm.prank(client);
+        vm.expectRevert(
+            abi.encodeWithSelector(NonceDeadlineTooFar.selector, tooFar, block.timestamp + MAX_PROOF_AGE)
+        );
+        reputation.giveFeedback(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "ipfs://f", keccak256("f"), proof
+        );
     }
 
     // ── No-seal rejection ─────────────────────────────────────────────────────
