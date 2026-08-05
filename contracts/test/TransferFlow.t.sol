@@ -12,6 +12,7 @@ import {
 import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.sol";
 import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
 import {IERC7857, SealedKeyEntry} from "../src/interfaces/IERC7857.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {
     OracleType,
     AccessProof,
@@ -588,5 +589,79 @@ contract TransferFlowTest is AgenticIDTestBase {
             0x23cf25e6103163928e91c5c7a4efe48f9a4405856f1b236f15beb4c5d754b0ff,
             "AccessProof digest drifted from the cross-component known-answer vector"
         );
+    }
+
+    // ── Receiver reentrancy ───────────────────────────────────────────────────
+
+    /// @dev A malicious receiver that re-enters iTransferFrom from its
+    ///      onERC721Received callback must not be able to desync ownership from
+    ///      the stored sealed keys. The re-entrant call trips nonReentrant and
+    ///      reverts, which bubbles up and rolls back the whole transfer, so
+    ///      ownerOf and sealedKeysOf can never disagree.
+    function test_iTransferFrom_reentrantReceiverIsBlocked() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        ReentrantReceiver mal = new ReentrantReceiver();
+        // A contract can't ECDSA-sign its own access proof, so it authorises a
+        // delegate EOA (custom-key mode: an arbitrary non-empty target key).
+        Vm.Wallet memory delegate = vm.createWallet("mal-delegate");
+        vm.prank(address(mal));
+        agenticId.setAccessDelegate(delegate.addr);
+
+        mal.arm(address(agenticId), address(0xC0FFEE));
+
+        bytes memory malKey = hex"c0ffee";
+        uint256 deadline = block.timestamp + 1 hours;
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, malKey, bytes("re-ap"), deadline, delegate.privateKey
+        );
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, malKey, bytes("re-op"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(); // re-entry trips nonReentrant → whole transfer reverts
+        agenticId.iTransferFrom(sellerWallet.addr, address(mal), agentId, proofs);
+
+        assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "token stayed with seller; no desync");
+    }
+}
+
+interface IReentryTarget {
+    function iTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        TransferValidityProof[] calldata proofs
+    ) external returns (SealedKeyEntry[] memory);
+}
+
+/// @dev On its first onERC721Received it re-enters iTransferFrom to forward the
+///      token onward — the receiver-reentrancy attack from the audit.
+contract ReentrantReceiver is IERC721Receiver {
+    IReentryTarget internal target;
+    address internal forwardTo;
+    bool internal armed;
+
+    function arm(address target_, address forwardTo_) external {
+        target = IReentryTarget(target_);
+        forwardTo = forwardTo_;
+        armed = true;
+    }
+
+    function onERC721Received(address, address, uint256 tokenId, bytes calldata)
+        external
+        returns (bytes4)
+    {
+        if (armed) {
+            armed = false;
+            // Empty proofs are fine: nonReentrant reverts on entry, before any
+            // proof is examined.
+            TransferValidityProof[] memory empty = new TransferValidityProof[](0);
+            target.iTransferFrom(address(this), forwardTo, tokenId, empty);
+        }
+        return IERC721Receiver.onERC721Received.selector;
     }
 }

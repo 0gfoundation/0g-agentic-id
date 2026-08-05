@@ -45,13 +45,18 @@ contract ERC7857CloneableUpgradeable is IERC7857Cloneable, ERC7857Upgradeable {
         address to,
         uint256 tokenId,
         TransferValidityProof[] calldata proofs
-    ) public virtual whenNotPaused returns (uint256 newTokenId) {
+    ) public virtual whenNotPaused nonReentrant returns (uint256 newTokenId) {
         // Authorization checked BEFORE proof verification
         if (_ownerOf(tokenId) != from) revert ERC721InvalidSender(from);
         _checkAuthorized(from, msg.sender, tokenId);
 
         SealedKeyEntry[] memory entries = _proofCheck(from, to, tokenId, proofs);
 
+        // _safeMint fires the receiver callback before _updateData commits the
+        // clone's keys below. Unlike iTransferFrom this can't be reordered — the
+        // data write needs the token to exist — and no desync was found (each
+        // nested call reserves a fresh newTokenId via _incrementTokenId, so they
+        // write disjoint state). nonReentrant closes it as defense in depth.
         newTokenId = _incrementTokenId();
         _safeMint(to, newTokenId);
 
