@@ -27,7 +27,15 @@ contract TEEDataVerifier is BaseDataVerifier {
     using ECDSA for bytes32;
 
     /// @notice Current implementation version. Bump on every upgrade.
-    string public constant VERSION = "1.0.0";
+    /// @dev 1.1.0 — proof preimages switch from abi.encodePacked to abi.encode
+    ///      (access + ownership). Adjacent dynamic fields (targetPubkey, nonce,
+    ///      sealedKey) were packed without length boundaries, so a signature over
+    ///      one field split verified for another — a re-split could seal the data
+    ///      to an attacker's key while the buyer took the token. Length-prefixing
+    ///      each dynamic value makes the boundary part of the signed digest.
+    ///      Off-chain signers (out of this repo) MUST match the new encoding.
+    ///      1.0.0 — initial (packed preimages).
+    string public constant VERSION = "1.1.0";
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -76,15 +84,20 @@ contract TEEDataVerifier is BaseDataVerifier {
     // ── Ownership proof ───────────────────────────────────────────────────────
 
     /// @dev Signed message:
-    ///      keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline)).
-    ///      Uses the same EIP-191 hex-encoded format as the access proof. `chainId`
-    ///      and `erc7857` domain-separate the oracle's OwnershipProof against
-    ///      cross-chain / cross-contract replay. NOTE: the off-chain oracle signer
-    ///      MUST prepend these two.
+    ///      keccak256(abi.encode(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline)).
+    ///      Uses abi.encode, NOT encodePacked: sealedKey, targetPubkey and nonce are
+    ///      three adjacent dynamic-length fields, so packing them lets a re-split of
+    ///      the same bytes make the stored sealedKey differ from the blob actually
+    ///      sealed (buyer-denial griefing). abi.encode length-prefixes each dynamic
+    ///      value so the boundaries are part of the signed digest. Same EIP-191
+    ///      hex-encoded format as the access proof. `chainId` and `erc7857`
+    ///      domain-separate the oracle's OwnershipProof against cross-chain /
+    ///      cross-contract replay. NOTE: the off-chain oracle signer MUST match this
+    ///      encoding exactly.
     function _verifyOwnershipProof(OwnershipProof calldata op, address erc7857) internal override {
         if (op.oracleType != OracleType.TEE) revert TEEDataVerifierWrongOracleType();
 
-        bytes32 inner = keccak256(abi.encodePacked(
+        bytes32 inner = keccak256(abi.encode(
             block.chainid, erc7857, op.dataHash, op.sealedKey, op.targetPubkey, op.nonce, op.deadline
         ));
         address signer = _eip191Hash(inner).recover(op.proof);

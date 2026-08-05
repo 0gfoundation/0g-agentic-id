@@ -473,4 +473,120 @@ contract TransferFlowTest is AgenticIDTestBase {
         );
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
     }
+
+    // ── Dynamic-field boundary re-split (encode, not packed) ──────────────────
+
+    /// @dev A buyer signature over one (targetPubkey, nonce) split must NOT be
+    ///      valid for a different split. The exploit: the buyer signs an honest
+    ///      empty-target proof whose nonce embeds the attacker's pubkey; the
+    ///      seller re-splits the identical bytes so targetPubkey becomes the
+    ///      attacker's key and the data would seal to the attacker while the
+    ///      buyer takes the token. Under packed encoding both splits hashed
+    ///      identically and the re-split was honored; under abi.encode the
+    ///      length prefix makes the two splits distinct digests, so the buyer's
+    ///      signature no longer recovers to the buyer and the transfer reverts.
+    function test_iTransferFrom_revertsOnAccessProofBoundaryReSplit() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        Vm.Wallet memory attacker = vm.createWallet("attacker");
+        bytes memory kAtt = _pubkey(attacker); // 64-byte pubkey
+        bytes memory apTail = hex"42";
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // Buyer signs the HONEST split: targetPubkey = "", nonce = kAtt ‖ apTail.
+        // (In Ethereum mode the empty target means "seal to my own key".)
+        bytes32 innerHonest = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash,
+            bytes(""), abi.encodePacked(kAtt, apTail), deadline
+        ));
+        bytes memory buyerSig = _sign(buyerWallet.privateKey, _eip191HexHash(innerHonest));
+
+        // Seller re-splits the identical bytes and presents targetPubkey = kAtt.
+        AccessProof memory apReSplit = AccessProof({
+            dataHash: dataHash,
+            targetPubkey: kAtt,     // moved boundary (was "")
+            nonce: apTail,          // moved boundary (was kAtt ‖ apTail)
+            deadline: deadline,
+            proof: buyerSig         // unchanged buyer signature
+        });
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, kAtt, bytes("op-resplit"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: apReSplit, ownershipProof: op});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(); // buyer sig recovers to a non-buyer address → rejected
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+
+        assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "token stayed with seller");
+    }
+
+    /// @dev Same class on the oracle side: re-splitting the (sealedKey,
+    ///      targetPubkey, nonce) run of the ownership proof must invalidate the
+    ///      oracle signature rather than let the stored sealedKey differ from
+    ///      what was signed.
+    function test_iTransferFrom_revertsOnOwnershipProofBoundaryReSplit() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        bytes memory buyerPubkey = _pubkey(buyerWallet);
+        uint256 deadline = block.timestamp + 1 hours;
+
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, "", bytes("ap-osplit"), deadline, buyerWallet.privateKey
+        );
+
+        // Oracle signs sealedKey = A ‖ B (concatenated); attacker re-splits so
+        // the stored sealedKey is just A. abi.encode makes these distinct digests.
+        bytes memory keyHead = hex"aaaa";
+        bytes memory keyTail = hex"bbbb";
+        bytes memory opNonce = bytes("op-osplit");
+        bytes32 innerHonest = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash,
+            abi.encodePacked(keyHead, keyTail), buyerPubkey, opNonce, deadline
+        ));
+        bytes memory oracleSig = _sign(oraclePk, _eip191HexHash(innerHonest));
+
+        OwnershipProof memory opReSplit = OwnershipProof({
+            oracleType: OracleType.TEE,
+            dataHash: dataHash,
+            sealedKey: keyHead,   // moved boundary (was keyHead ‖ keyTail)
+            targetPubkey: buyerPubkey,
+            nonce: opNonce,
+            deadline: deadline,
+            proof: oracleSig
+        });
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: opReSplit});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+    }
+
+    /// @dev Known-answer vector for the AccessProof digest, computed with fixed
+    ///      inputs (chain/contract/fields as literals, independent of the test
+    ///      chain). This is the canonical reference any off-chain buyer signer —
+    ///      which lives outside this repo — must reproduce. If the on-chain
+    ///      encoding drifts, this constant changes and the assertion fails.
+    function test_accessProofDigest_knownAnswerVector() public pure {
+        bytes memory targetPubkey = new bytes(64);
+        for (uint256 i = 0; i < 64; i++) targetPubkey[i] = 0x22;
+        bytes memory nonce = hex"3333";
+
+        bytes32 digest = keccak256(abi.encode(
+            uint256(16602),                                   // chainId
+            address(0x00000000000000000000000000000000000000A9), // erc7857
+            bytes32(0x1111111111111111111111111111111111111111111111111111111111111111), // dataHash
+            targetPubkey,
+            nonce,
+            uint256(1700003600)                               // deadline
+        ));
+
+        assertEq(
+            digest,
+            0x23cf25e6103163928e91c5c7a4efe48f9a4405856f1b236f15beb4c5d754b0ff,
+            "AccessProof digest drifted from the cross-component known-answer vector"
+        );
+    }
 }

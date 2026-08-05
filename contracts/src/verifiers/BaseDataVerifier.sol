@@ -137,15 +137,21 @@ abstract contract BaseDataVerifier is
     // ── Access proof ──────────────────────────────────────────────────────────
 
     /// @dev Signed message:
-    ///      keccak256(abi.encodePacked(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
-    ///      `chainId` and `erc7857` (the ERC-7857 token contract this transfer is
-    ///      for) domain-separate the proof so a buyer's AccessProof cannot be
-    ///      replayed against the same dataHash on another chain or another token
-    ///      contract. NOTE: the off-chain buyer signer MUST prepend these two.
+    ///      keccak256(abi.encode(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
+    ///      Uses abi.encode, NOT encodePacked: targetPubkey and nonce are adjacent
+    ///      dynamic-length fields, and packing them omits the length boundary so a
+    ///      signature over one (targetPubkey, nonce) split is equally valid for a
+    ///      different split — letting a re-split seal the data to an attacker's key.
+    ///      abi.encode length-prefixes each dynamic value, so the boundary is part
+    ///      of the signed digest. `chainId` and `erc7857` (the ERC-7857 token
+    ///      contract this transfer is for) domain-separate the proof so a buyer's
+    ///      AccessProof cannot be replayed against the same dataHash on another
+    ///      chain or another token contract. NOTE: the off-chain buyer signer MUST
+    ///      match this encoding exactly.
     function _verifyAccessProof(AccessProof calldata ap, address erc7857)
         internal view returns (address accessAssistant)
     {
-        bytes32 inner = keccak256(abi.encodePacked(
+        bytes32 inner = keccak256(abi.encode(
             block.chainid, erc7857, ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline
         ));
         accessAssistant = _eip191Hash(inner).recover(ap.proof);

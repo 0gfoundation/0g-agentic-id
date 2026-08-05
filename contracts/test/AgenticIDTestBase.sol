@@ -109,8 +109,8 @@ abstract contract AgenticIDTestBase is Test {
         uint256 deadline,
         uint256 signerPk
     ) internal view returns (AccessProof memory) {
-        // Mirror the verifier's domain-separated preimage: chainId ‖ erc7857 ‖ <fields>.
-        bytes32 inner = keccak256(abi.encodePacked(
+        // Mirror the verifier's domain-separated preimage: abi.encode(chainId, erc7857, <fields>).
+        bytes32 inner = keccak256(abi.encode(
             block.chainid, address(agenticId), dataHash, targetPubkey, nonce, deadline
         ));
         return AccessProof({
@@ -142,8 +142,8 @@ abstract contract AgenticIDTestBase is Test {
         uint256 deadline,
         uint256 signerPk
     ) internal view returns (OwnershipProof memory) {
-        // Mirror the verifier's domain-separated preimage: chainId ‖ erc7857 ‖ <fields>.
-        bytes32 inner = keccak256(abi.encodePacked(
+        // Mirror the verifier's domain-separated preimage: abi.encode(chainId, erc7857, <fields>).
+        bytes32 inner = keccak256(abi.encode(
             block.chainid, address(agenticId), dataHash, sealedKey, targetPubkey, nonce, deadline
         ));
         return OwnershipProof({
