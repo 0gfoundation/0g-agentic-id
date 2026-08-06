@@ -145,6 +145,31 @@ contract CanonicalBindingTest is AgenticIDTestBase {
         assertEq(canonical.ownerOf(srcId), address(agenticId), "source still custodied");
     }
 
+    // ── Stray canonical deposits are rejected (no permanent lock) ─────────────
+
+    function test_strayCanonicalDepositRejected() public {
+        address stranger = address(0x5747);
+        vm.prank(stranger);
+        uint256 strayId = canonical.register();
+
+        // Pushing an already-existing canonical token into custody must revert —
+        // there is no withdrawal path, so accepting it would lock it forever.
+        vm.prank(stranger);
+        vm.expectRevert();
+        canonical.safeTransferFrom(stranger, address(agenticId), strayId);
+
+        assertEq(canonical.ownerOf(strayId), stranger, "stray token stays with its owner");
+    }
+
+    // ── setAgentURI requires a local token even for an attestor ───────────────
+
+    function test_setAgentURI_revertsOnNonexistentTokenEvenForAttestor() public {
+        uint256 ghostId = 999_999;
+        vm.prank(attestor);
+        vm.expectRevert();
+        agenticId.setAgentURI(ghostId, "ipfs://attacker-controlled");
+    }
+
     // ── helper ──────────────────────────────────────────────────────────────────
 
     /// @dev test_custody_survivesLocalTransfer uses a seal-bound agent, which now

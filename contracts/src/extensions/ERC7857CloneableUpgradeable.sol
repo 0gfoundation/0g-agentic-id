@@ -9,7 +9,7 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
 contract ERC7857CloneableUpgradeable is IERC7857Cloneable, ERC7857Upgradeable {
 
-    /// @custom:storage-location erc7857:0g.storage.ERC7857Cloneable
+    /// @custom:storage-location erc7201:0g.storage.ERC7857Cloneable
     struct ERC7857CloneableStorage {
         uint256 nextTokenId;
     }

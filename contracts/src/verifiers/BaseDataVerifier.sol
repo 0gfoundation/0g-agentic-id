@@ -47,12 +47,18 @@ abstract contract BaseDataVerifier is
     bytes32 private constant _TRANSFER_ACCESS_TAG    = keccak256("ERC7857_TRANSFER_ACCESS");
     bytes32 private constant _TRANSFER_OWNERSHIP_TAG = keccak256("ERC7857_TRANSFER_OWNERSHIP");
 
-    /// @custom:storage-location erc7857:0g.storage.BaseDataVerifier
+    /// @custom:storage-location erc7201:0g.storage.BaseDataVerifier
     struct BaseDataVerifierStorage {
         address pauser;
     }
 
-    // keccak256(abi.encode(uint256(keccak256("0g.storage.BaseDataVerifier")) - 1)) & ~bytes32(uint256(0xff))
+    // NOTE: fixed literal, NOT the ERC-7201 derivation of the namespace above.
+    // The canonical derivation of "0g.storage.BaseDataVerifier" is
+    // 0xebd3f1ab6f96c5a8aa3a8f7ae4cb91de9050e806218c0e227b71fda38a32fd00; this
+    // slot differs. It is kept as-is because `pauser` already lives here on the
+    // live deployment — changing it would strand that state. The slot is
+    // otherwise unoccupied, so there is no collision. Pinned by
+    // StorageLayout.t.sol so the discrepancy stays intentional and visible.
     bytes32 private constant BaseDataVerifierStorageLocation =
         0x2a6e9d47b6f4c10d00c1ba6c2a83e5a99f9ffd6b1a85ca0f0b97a3c3c3a27c00;
 

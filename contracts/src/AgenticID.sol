@@ -102,7 +102,7 @@ contract AgenticID is
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// @custom:storage-location erc7857:0g.storage.AgenticID
+    /// @custom:storage-location erc7201:0g.storage.AgenticID
     struct AgenticIDStorage {
         mapping(uint256 => address) agentSeals;
         mapping(uint256 => bytes32) agentIdToSealId;
@@ -248,6 +248,11 @@ contract AgenticID is
         internal view virtual
         override(ERC8004CanonicalBoundUpgradeable)
     {
+        // The token must have a local counterpart before anyone — including a
+        // trusted attestor — may write its URI. Checked before the attestor
+        // short-circuit so an attestor can't rewrite the canonical URI of a
+        // token with no local record.
+        _requireOwned(agentId);
         if (_getAgenticIDStorage().trustedAttestors[msg.sender]) return;
         super._authorizeSetAgentURI(agentId);
     }

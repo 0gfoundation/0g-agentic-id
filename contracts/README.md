@@ -277,9 +277,20 @@ What the contract does:
 - `appendResponse(agentId, client, feedbackIndex, responseURI, responseHash)`: the agent owner responds to a specific feedback. Limited to one response per `(agentId, client, feedbackIndex, responder)`.
 - `revokeFeedback(agentId, feedbackIndex)`: the client revokes their own feedback.
 
-### Read interfaces (fully ERC-8004 compatible)
+### Read interfaces (ERC-8004 shaped, with named divergences)
 
-- `readFeedback(agentId, client, idx)` — single entry.
+The function **shapes** follow ERC-8004, but this is a private fork, not the
+canonical Reputation Registry, and the numbers it returns differ from the 8004
+reference implementation — a tool reading it transparently gets *different
+values*, not an error. Divergences, stated so integrators don't assume parity:
+- `getSummary` returns a **sum** (with count), where the reference returns an
+  **average**. ERC-8004 itself is agnostic on the aggregation (it happens
+  off-chain), but the reference registry averages — so don't treat our number
+  as the reference's.
+- summary values are normalized to a **fixed 18 decimals**.
+- `feedbackIndex` is **1-based** (matching the current ERC-8004 revision).
+
+- `readFeedback(agentId, client, idx)` — single entry (idx is 1-based).
 - `readAllFeedback(agentId, clients[], tag1, tag2, includeRevoked)` — filtered read.
 - `getSummary(agentId, clients[], tag1, tag2)` — normalized to 18 decimals, returns sum and count.
 - `getClients(agentId)` — all clients who have ever submitted feedback.
@@ -392,12 +403,20 @@ longest business deadline window.
   record never leaves custody) and exposes the same identity through read-through /
   write-forward. Ecosystem 8004 tooling reads the canonical registry and sees AgenticID
   agents natively; the transferable owner lives on the local AgenticID token.
+  - **Resolving the real owner (for integrators).** Because AgenticID custodies the
+    canonical token, `canonical.ownerOf(agentId)` returns the **AgenticID contract**
+    for every 0G agent, not the human owner — by design. To get the real owner, read
+    **`AgenticID.ownerOf(agentId)`** (the local token). External ERC-8004 consumers,
+    and any registry that enforces owner-based rules (e.g. anti-self-rating via
+    `ownerOf`), must resolve a 0G agent's owner through the AgenticID contract, not the
+    canonical singleton. The canonical singleton is shared and cannot be changed to
+    report otherwise.
 - **agentSeal / sealId: set-once, permanently bound.** An agentId's seal is set once and is not cleared on transfer. When the hardware changes, the attestor provisions the same `agentSeal_priv` to the new Agent TEE.
 - **Transfer splits on seal.** Seal-bound agents transfer ownership-only via standard `transferFrom` (data stays TEE-locked); non-seal agents transfer via proof-gated `iTransferFrom` (re-encrypts dataKey to the buyer). `iCloneFrom` is non-seal-only.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
 - **dataKey flows only between TEEs**: the attestor generates and discards it; the Agent TEE holds it; the Oracle TEE holds it briefly during transfer and discards it. Only the ciphertext (sealedKey) appears on chain.
 - **Oracle encryption pubkey lives in TappRegistry**: it is published via 0g-Tapp's `TappRegistry` contract (an external dependency, already deployed) through its `getNode` / `getNodeList` views. It does not live in `TEEDataVerifier` storage, which keeps the verifier clean. The Agent TEE queries the registry directly during a transfer.
-- **8004 read interfaces are fully compatible**: any tool that reads ERC-8004 identity/reputation works transparently against AgenticID agents. The write interfaces (the parameterless `register()` and the proof-less `giveFeedback`) are **deliberately disabled**, forcing callers to use the extended forms that carry IntelligentData or ServeProof.
+- **8004 compatibility is identity-canonical, reputation-forked.** Identity is bound to the canonical ERC-8004 registry (the 0x8004… singleton), so 8004 identity tooling and scanners see AgenticID agents natively. Reputation is a **private fork**, not bound to the canonical Reputation Registry — its read shapes are 8004-style but its aggregation diverges from the reference (see "Read interfaces" above), so it is **not** transparently interchangeable with the reference registry. The write interfaces (the parameterless `register()` and the proof-less `giveFeedback`) are **deliberately disabled**, forcing callers to use the extended forms that carry IntelligentData or ServeProof. Because those standard overloads revert, this contract does **not** advertise blanket ERC-8004 read compatibility via ERC-165 as a promise of interchangeability. Targeted ERC-8004 revision: **2026-01-25**.
 
 ---
 

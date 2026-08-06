@@ -18,7 +18,7 @@ import {
 
 contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, PausableUpgradeable, ReentrancyGuardUpgradeable {
 
-    /// @custom:storage-location erc7857:0g.storage.ERC7857
+    /// @custom:storage-location erc7201:0g.storage.ERC7857
     struct ERC7857Storage {
         mapping(address => address) accessDelegates;
         IERC7857DataVerifier verifier;

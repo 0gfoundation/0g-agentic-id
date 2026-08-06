@@ -37,7 +37,7 @@ error NonceDeadlineTooFar(uint256 deadline, uint256 maxDeadline);
 ///           valid alternative proof to replay.
 abstract contract NonceRegistryUpgradeable is Initializable {
 
-    /// @custom:storage-location erc7857:0g.storage.NonceRegistry
+    /// @custom:storage-location erc7201:0g.storage.NonceRegistry
     struct NonceRegistryStorage {
         /// @dev consumedAt[key] == 0 → unused; non-zero → timestamp of consumption
         mapping(bytes32 => uint256) consumedAt;

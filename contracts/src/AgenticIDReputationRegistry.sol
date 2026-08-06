@@ -92,7 +92,7 @@ contract AgenticIDReputationRegistry is
         bytes32   frameworkHash;
     }
 
-    /// @custom:storage-location erc7857:0g.storage.AgenticIDReputationRegistry
+    /// @custom:storage-location erc7201:0g.storage.AgenticIDReputationRegistry
     struct ReputationStorage {
         address identityRegistry;
 
@@ -314,6 +314,11 @@ contract AgenticIDReputationRegistry is
         return (e.value, e.valueDecimals, e.tag1, e.tag2, e.isRevoked);
     }
 
+    /// @dev O(total entries across the given clients), unbounded and unpaginated.
+    ///      Intended for off-chain / indexer reads (eth_call), not on-chain
+    ///      consumption: an agent with a very large feedback history (on the
+    ///      order of tens of thousands of entries) can exceed the block gas
+    ///      limit. On-chain callers should read bounded slices via readFeedback.
     function readAllFeedback(
         uint256 agentId,
         address[] calldata clientAddresses,
@@ -371,6 +376,10 @@ contract AgenticIDReputationRegistry is
         }
     }
 
+    /// @dev O(total entries across `clientAddresses`), unbounded and unpaginated
+    ///      — same indexer-only caveat as readAllFeedback: safe as an off-chain
+    ///      eth_call, but a very large history (~tens of thousands of entries)
+    ///      can exceed the block gas limit if a contract calls it on-chain.
     function getSummary(
         uint256 agentId,
         address[] calldata clientAddresses,

@@ -12,7 +12,7 @@ contract ERC7857AuthorizeUpgradeable is IERC7857Authorize, ERC7857Upgradeable {
 
     uint256 public constant MAX_AUTHORIZED_USERS = 100;
 
-    /// @custom:storage-location erc7857:0g.storage.ERC7857Authorize
+    /// @custom:storage-location erc7201:0g.storage.ERC7857Authorize
     struct ERC7857AuthorizeStorage {
         mapping(uint256 => EnumerableSet.AddressSet) authorizedUsers;
     }

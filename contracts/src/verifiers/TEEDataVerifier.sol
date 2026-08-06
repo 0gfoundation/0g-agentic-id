@@ -39,7 +39,7 @@ contract TEEDataVerifier is BaseDataVerifier {
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// @custom:storage-location erc7857:0g.storage.TEEDataVerifier
+    /// @custom:storage-location erc7201:0g.storage.TEEDataVerifier
     struct TEEDataVerifierStorage {
         address teeOracleAddress;
     }

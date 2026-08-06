@@ -39,7 +39,7 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// @custom:storage-location erc7857:0g.storage.ERC8004CanonicalBound
+    /// @custom:storage-location erc7201:0g.storage.ERC8004CanonicalBound
     struct ERC8004CanonicalBoundStorage {
         ICanonicalIdentityRegistry canonical;
     }
@@ -95,12 +95,16 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     // ── Custody: accept the canonical token minted to this contract ────────────
 
     /// @dev The canonical registry mints via `_safeMint`, so this contract must
-    ///      accept the token. Only tokens minted by the bound canonical registry
-    ///      are accepted; nothing else can deposit an ERC-721 here.
-    function onERC721Received(address, address, uint256, bytes calldata)
+    ///      accept that mint. Only the bound canonical registry may call this,
+    ///      and only for a mint into custody (`from == address(0)`, which is what
+    ///      our own registration triggers). A stray `safeTransferFrom` of an
+    ///      already-existing canonical token is rejected: there is no withdrawal
+    ///      path, so accepting one would lock it here permanently.
+    function onERC721Received(address, address from, uint256, bytes calldata)
         external view returns (bytes4)
     {
         require(msg.sender == address(_canonical()), "unexpected token");
+        require(from == address(0), "no stray deposits");
         return IERC721Receiver.onERC721Received.selector;
     }
 
