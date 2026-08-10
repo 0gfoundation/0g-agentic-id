@@ -26,6 +26,18 @@ API="${ATTESTOR_URL:-http://localhost:8080}"
 export API ATTESTOR_URL="$API" OWNER_PRIV
 export API_KEY="${API_KEY:-sk-regression-dummy}"
 
+# /deployments has two tiers: the public (no-param) list deliberately omits
+# sandbox_id / stages, so read the owner-scoped tier (EIP-191 owner signature)
+# to get the operational fields the live legs need.
+OWNER_ADDR=$(cast wallet address "$OWNER_PRIV")
+owner_deployments() {
+  local ts msg sig
+  ts=$(date +%s)
+  msg="0GDeployments:${OWNER_ADDR}:${ts}"
+  sig=$(cast wallet sign --private-key "$OWNER_PRIV" "$msg")
+  curl -fsS -H "X-Auth-Message: $msg" -H "X-Auth-Signature: $sig" "$API/deployments?owner=$OWNER_ADDR"
+}
+
 declare -a NAMES RESULTS
 step() { # step "name" cmd...
   local name="$1"; shift
@@ -59,7 +71,7 @@ fi
 
 if [ -n "${SEAL_ID:-}" ]; then
   NAMES+=("deploy source"); RESULTS+=("PASS")
-  ROW=$(curl -fsS "$API/deployments" | jq -c --arg s "$SEAL_ID" '.[] | select(.seal_id==$s)')
+  ROW=$(owner_deployments | jq -c --arg s "$SEAL_ID" '.[] | select(.seal_id==$s)')
   AGENT_HEX=$(echo "$ROW" | jq -r .agent_id)
   AGENT_ID=$((AGENT_HEX))
   SANDBOX=$(echo "$ROW" | jq -r .sandbox_id)
@@ -78,7 +90,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   # clone + feedback + transfer + owner gate (consumes the source via transfer, so LAST among source-bound legs).
   # Re-derive the URL first: agent-e2e's reset above recreated the container
   # with a NEW sandbox_id, so the deploy-time AGENT_URL is now stale.
-  SANDBOX=$(curl -fsS "$API/deployments" | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
+  SANDBOX=$(owner_deployments | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
   AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
   echo "source url refreshed post-reset: $AGENT_URL"
   if [ -n "${REPUTATION_ADDR:-}" ]; then
