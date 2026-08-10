@@ -80,16 +80,19 @@ contract UpgradeReputationTest is AgenticIDTestBase {
         );
     }
 
-    /// @dev Client-less ServeProof signed by the controlled seal wallet.
+    /// @dev ServeProof signed by the controlled seal wallet, bound to `client`
+    ///      as the redeemer plus this chain and the identity registry.
     function _mkProof(uint256 agentId, bytes32[] memory dataHashes, uint256 deadline)
         internal view returns (ServeProof memory)
     {
         bytes32 inner = keccak256(abi.encode(
+            block.chainid, address(agenticId), client,
             agentId, block.timestamp, deadline, TASK_HASH,
             keccak256(abi.encodePacked(dataHashes)), FRAMEWORK_HASH
         ));
         return ServeProof({
             agentId: agentId,
+            submitter: client,
             timestamp: block.timestamp,
             deadline: deadline,
             taskHash: TASK_HASH,
@@ -128,10 +131,10 @@ contract UpgradeReputationTest is AgenticIDTestBase {
         bytes32[] memory dataHashes = new bytes32[](1);
         dataHashes[0] = dataHash;
 
-        _give(agentId, dataHashes); // feedback at index 0
+        _give(agentId, dataHashes); // feedback at index 1
 
         // Sanity pre-upgrade.
-        (int128 v0,,,,) = reputation.readFeedback(agentId, client, 0);
+        (int128 v0,,,,) = reputation.readFeedback(agentId, client, 1);
         assertEq(int256(v0), 5);
 
         // Upgrade the beacon impl through the timelock.
@@ -141,14 +144,14 @@ contract UpgradeReputationTest is AgenticIDTestBase {
 
         // Storage survived: the pre-upgrade feedback still reads back.
         (int128 v1, , string memory tag1, , bool revoked) =
-            reputation.readFeedback(agentId, client, 0);
+            reputation.readFeedback(agentId, client, 1);
         assertEq(int256(v1), 5);
         assertEq(tag1, "quality");
         assertEq(revoked, false);
-        assertEq(reputation.getLastIndex(agentId, client), 0);
+        assertEq(reputation.getLastIndex(agentId, client), 1);
 
         // Post-upgrade behavior: a fresh client-less giveFeedback still works.
-        _give(agentId, dataHashes); // index 1
-        assertEq(reputation.getLastIndex(agentId, client), 1);
+        _give(agentId, dataHashes); // index 2
+        assertEq(reputation.getLastIndex(agentId, client), 2);
     }
 }

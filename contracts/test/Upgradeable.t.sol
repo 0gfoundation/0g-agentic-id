@@ -116,7 +116,7 @@ contract UpgradeableTest is Test {
         // New view callable through existing proxy → proves storage preserved and code swapped.
         assertEq(AgenticIDV2(address(agenticId)).version2Tag(), "v2");
         // Pre-existing state preserved (VERSION from the base impl).
-        assertEq(agenticId.VERSION(), "1.0.0");
+        assertEq(agenticId.VERSION(), "1.1.0");
     }
 
     function test_upgrade_verifierBeacon_throughTimelock_succeeds() public {
@@ -165,7 +165,7 @@ contract UpgradeableTest is Test {
         agenticId.pause();
 
         // View functions should not revert.
-        assertEq(agenticId.VERSION(), "1.0.0");
+        assertEq(agenticId.VERSION(), "1.1.0");
         assertEq(agenticId.pauser(), pauser);
         assertEq(agenticId.owner(), owner);
     }

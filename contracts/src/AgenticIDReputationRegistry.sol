@@ -17,6 +17,24 @@ error ReputationAlreadyRevoked();
 error ReputationNotAgentOwner();
 error ReputationAlreadyResponded();
 error ReputationNotPauser();
+/// @dev The outer `agentId` (where feedback is stored) does not match the
+/// agent the ServeProof attests to (`proof.agentId`, whose seal signs it).
+error ReputationProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
+/// @dev Feedback `value` outside [-MAX_ABS_VALUE, MAX_ABS_VALUE].
+error ReputationValueOutOfRange(int128 value);
+/// @dev `valueDecimals` above 18 — outside the 18-decimal normalization window.
+error ReputationValueDecimalsTooLarge(uint8 valueDecimals);
+/// @dev A tag/client summation exceeded int128 — unreachable given bounded writes.
+error ReputationSummaryOverflow();
+/// @dev getSummary requires an explicit, non-empty clientAddresses set per ERC-8004.
+error ReputationClientsRequired();
+/// @dev The proof was signed for a different redeemer — `proof.submitter` must
+/// equal the giveFeedback caller. Closes front-running / proof theft.
+error ReputationProofSubmitterMismatch(address submitter, address sender);
+/// @dev ERC-8004: the feedback submitter must not be the agent owner or an
+/// approved operator. Conformance guard, not sybil resistance (a determined
+/// owner can still self-rate from an unrelated second wallet).
+error ReputationSelfFeedback(uint256 agentId, address submitter);
 
 /// @title AgenticID Reputation Registry
 /// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
@@ -32,13 +50,32 @@ contract AgenticIDReputationRegistry is
     /// @notice Current implementation version. See contracts/UPGRADING.md for the
     ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
     ///         change via a beacon upgrade; patch = compatible fix).
-    /// @dev 1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
+    /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
+    ///      `agentId == proof.agentId`, bounds `value`/`valueDecimals` so one entry
+    ///      can't brick getSummary, rejects (via NonceRegistry) a proof whose
+    ///      deadline outlives the nonce retention, aligns the read surface to
+    ///      ERC-8004 — feedbackIndex is now 1-based, getSummary requires a
+    ///      non-empty clientAddresses, and the submitter must not be the agent
+    ///      owner or an approved operator (conformance guard, not sybil
+    ///      resistance) — and binds every ServeProof to (chainId, identity
+    ///      registry, submitter) so a copied proof can't be front-run or
+    ///      replayed across chains/deployments. ServeProof gains a `submitter`
+    ///      field (ABI change); storage layout unchanged. Migration: old-envelope
+    ///      proofs stop verifying at the upgrade — blast radius is the proofs
+    ///      issued within serveProofDeadlineWindow (~1h) before rollout.
+    ///      1.1.0 — ABI/behavior change (beacon upgrade): `ServeProof` drops `client`,
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).
     ///      1.0.0 — initial (client-bound ServeProof).
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
+
+    /// @notice Max absolute feedback `value` (raw, pre-decimals). Bounds a single
+    ///         entry so its 18-decimal normalization can't overflow int128 and
+    ///         summaries stay finite — an int128 sum would take ~1.7e11 max
+    ///         entries. Generous for any real rating scale.
+    int128 private constant MAX_ABS_VALUE = 1e9;
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
@@ -55,7 +92,7 @@ contract AgenticIDReputationRegistry is
         bytes32   frameworkHash;
     }
 
-    /// @custom:storage-location erc7857:0g.storage.AgenticIDReputationRegistry
+    /// @custom:storage-location erc7201:0g.storage.AgenticIDReputationRegistry
     struct ReputationStorage {
         address identityRegistry;
 
@@ -155,7 +192,31 @@ contract AgenticIDReputationRegistry is
         bytes32 feedbackHash,
         ServeProof calldata proof
     ) external whenNotPaused {
+        // Feedback is stored under the outer `agentId`, but the proof is verified
+        // against `proof.agentId` (the agent whose seal signs it). Require them to
+        // match — otherwise a valid proof for agent A could write feedback on any
+        // other agent B, including unminted IDs. A nonexistent target is rejected
+        // as a side effect: `_verifyServeProof` reverts when the seal is unset.
+        if (agentId != proof.agentId) revert ReputationProofAgentMismatch(agentId, proof.agentId);
         _verifyServeProof(proof);
+
+        // ERC-8004 conformance: the submitter must not be the agent owner or an
+        // approved operator (spec MUST; mirrors the reference registry's
+        // isAuthorizedOrOwner). This is a conformance guard, NOT sybil
+        // resistance — the serve proof is obtainable from the unauthenticated
+        // /hello and, being bound only to a submitter address, a determined
+        // owner can still self-rate from an unrelated second wallet they
+        // control. Preventing genuine self-rating is impossible purely on-chain
+        // and needs an off-chain layer (rate-limiting per real identity,
+        // staking, proof-of-personhood). msg.sender == proof.submitter here
+        // (enforced above), so this checks the real redeemer.
+        if (_isOwnerOrApproved(agentId, msg.sender)) revert ReputationSelfFeedback(agentId, msg.sender);
+
+        // Bound the entry so it can't brick reads: valueDecimals within the
+        // 18-decimal normalization window, and |value| capped so a single
+        // normalized entry fits int128 and summaries stay finite.
+        if (valueDecimals > 18) revert ReputationValueDecimalsTooLarge(valueDecimals);
+        if (value < -MAX_ABS_VALUE || value > MAX_ABS_VALUE) revert ReputationValueOutOfRange(value);
 
         ReputationStorage storage $ = _getReputationStorage();
 
@@ -164,7 +225,9 @@ contract AgenticIDReputationRegistry is
             $.clients[agentId].push(msg.sender);
         }
 
-        uint64 feedbackIndex = uint64($.feedbacks[agentId][msg.sender].length);
+        // feedbackIndex is 1-based per ERC-8004: first feedback is index 1,
+        // so 0 is a clean "no feedback" sentinel.
+        uint64 feedbackIndex = uint64($.feedbacks[agentId][msg.sender].length + 1);
 
         $.feedbacks[agentId][msg.sender].push(FeedbackEntry({
             value:             value,
@@ -194,11 +257,12 @@ contract AgenticIDReputationRegistry is
     function revokeFeedback(uint256 agentId, uint64 feedbackIndex) external whenNotPaused {
         ReputationStorage storage $ = _getReputationStorage();
         FeedbackEntry[] storage entries = $.feedbacks[agentId][msg.sender];
-        if (feedbackIndex >= entries.length)
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
             revert ReputationInvalidIndex(feedbackIndex, entries.length);
-        if (entries[feedbackIndex].isRevoked) revert ReputationAlreadyRevoked();
+        FeedbackEntry storage entry = entries[feedbackIndex - 1]; // 1-based → 0-based
+        if (entry.isRevoked) revert ReputationAlreadyRevoked();
 
-        entries[feedbackIndex].isRevoked = true;
+        entry.isRevoked = true;
         emit FeedbackRevoked(agentId, msg.sender, feedbackIndex);
     }
 
@@ -215,7 +279,7 @@ contract AgenticIDReputationRegistry is
             revert ReputationNotAgentOwner();
 
         FeedbackEntry[] storage entries = $.feedbacks[agentId][clientAddress];
-        if (feedbackIndex >= entries.length)
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
             revert ReputationInvalidIndex(feedbackIndex, entries.length);
         if ($.hasResponse[agentId][clientAddress][feedbackIndex][msg.sender])
             revert ReputationAlreadyResponded();
@@ -243,10 +307,18 @@ contract AgenticIDReputationRegistry is
         string memory tag2,
         bool    isRevoked
     ) {
-        FeedbackEntry storage e = _getReputationStorage().feedbacks[agentId][clientAddress][feedbackIndex];
+        FeedbackEntry[] storage entries = _getReputationStorage().feedbacks[agentId][clientAddress];
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
+            revert ReputationInvalidIndex(feedbackIndex, entries.length);
+        FeedbackEntry storage e = entries[feedbackIndex - 1]; // 1-based → 0-based
         return (e.value, e.valueDecimals, e.tag1, e.tag2, e.isRevoked);
     }
 
+    /// @dev O(total entries across the given clients), unbounded and unpaginated.
+    ///      Intended for off-chain / indexer reads (eth_call), not on-chain
+    ///      consumption: an agent with a very large feedback history (on the
+    ///      order of tens of thousands of entries) can exceed the block gas
+    ///      limit. On-chain callers should read bounded slices via readFeedback.
     function readAllFeedback(
         uint256 agentId,
         address[] calldata clientAddresses,
@@ -293,7 +365,7 @@ contract AgenticIDReputationRegistry is
             for (uint256 j = 0; j < entries.length; j++) {
                 if (!_matchesFilter(entries[j], tag1, tag2, includeRevoked)) continue;
                 clients_[idx]        = targets[i];
-                feedbackIndexes[idx] = uint64(j);
+                feedbackIndexes[idx] = uint64(j + 1); // 1-based per ERC-8004
                 values[idx]          = entries[j].value;
                 valueDecimals[idx]   = entries[j].valueDecimals;
                 tag1s[idx]           = entries[j].tag1;
@@ -304,22 +376,25 @@ contract AgenticIDReputationRegistry is
         }
     }
 
+    /// @dev O(total entries across `clientAddresses`), unbounded and unpaginated
+    ///      — same indexer-only caveat as readAllFeedback: safe as an off-chain
+    ///      eth_call, but a very large history (~tens of thousands of entries)
+    ///      can exceed the block gas limit if a contract calls it on-chain.
     function getSummary(
         uint256 agentId,
         address[] calldata clientAddresses,
         string calldata tag1,
         string calldata tag2
     ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals) {
+        // ERC-8004: clientAddresses MUST be provided (non-empty) so the caller
+        // picks whom to trust — an all-clients aggregate would fold in sybil
+        // feedback.
+        if (clientAddresses.length == 0) revert ReputationClientsRequired();
         ReputationStorage storage $ = _getReputationStorage();
-        address[] memory targets;
-        if (clientAddresses.length > 0) {
-            targets = new address[](clientAddresses.length);
-            for (uint256 t = 0; t < clientAddresses.length; t++) targets[t] = clientAddresses[t];
-        } else {
-            targets = $.clients[agentId];
-        }
+        address[] memory targets = clientAddresses;
 
         summaryValueDecimals = 18;
+        int256 acc;
         for (uint256 i = 0; i < targets.length; i++) {
             FeedbackEntry[] storage entries = $.feedbacks[agentId][targets[i]];
             for (uint256 j = 0; j < entries.length; j++) {
@@ -328,9 +403,13 @@ contract AgenticIDReputationRegistry is
                 if (!_tagMatches(e.tag1, tag1)) continue;
                 if (!_tagMatches(e.tag2, tag2)) continue;
                 count++;
-                summaryValue += _normalizeTo18(e.value, e.valueDecimals);
+                acc += _normalizeTo18(e.value, e.valueDecimals);
             }
         }
+        // Bounded writes keep this in range; the guard turns a would-be silent
+        // int128 truncation into a clean revert (unreachable in practice).
+        if (acc < type(int128).min || acc > type(int128).max) revert ReputationSummaryOverflow();
+        summaryValue = int128(acc);
     }
 
     function getResponseCount(
@@ -352,13 +431,12 @@ contract AgenticIDReputationRegistry is
         return _getReputationStorage().clients[agentId];
     }
 
-    /// @notice Returns the number of feedback entries from `clientAddress` for `agentId`.
-    /// @dev Returns 0 when there are no entries. Callers can distinguish "no entries"
-    ///      from "one entry at index 0" by checking getClients(agentId) first, or by
-    ///      calling readFeedback and checking for a revert.
+    /// @notice Returns the 1-based index of the most recent feedback from
+    ///         `clientAddress` for `agentId`, or 0 if there is none (ERC-8004).
+    /// @dev With 1-based feedbackIndex this equals the entry count: 0 = none,
+    ///      1 = one entry (at index 1), … — no none/first ambiguity.
     function getLastIndex(uint256 agentId, address clientAddress) external view returns (uint64) {
-        uint256 len = _getReputationStorage().feedbacks[agentId][clientAddress].length;
-        return len == 0 ? 0 : uint64(len - 1);
+        return uint64(_getReputationStorage().feedbacks[agentId][clientAddress].length);
     }
 
     // ── IAgenticIDReputationRegistry — serve data ─────────────────────────────
@@ -368,7 +446,10 @@ contract AgenticIDReputationRegistry is
         address clientAddress,
         uint64  feedbackIndex
     ) external view returns (bytes32[] memory dataHashes, bytes32 frameworkHash) {
-        FeedbackEntry storage e = _getReputationStorage().feedbacks[agentId][clientAddress][feedbackIndex];
+        FeedbackEntry[] storage entries = _getReputationStorage().feedbacks[agentId][clientAddress];
+        if (feedbackIndex == 0 || feedbackIndex > entries.length)
+            revert ReputationInvalidIndex(feedbackIndex, entries.length);
+        FeedbackEntry storage e = entries[feedbackIndex - 1]; // 1-based → 0-based
         return (e.dataHashes, e.frameworkHash);
     }
 
@@ -379,19 +460,28 @@ contract AgenticIDReputationRegistry is
     ///      State-mutating despite the "verify" name — this is the single entrypoint
     ///      that guarantees each ServeProof can be redeemed at most once.
     function _verifyServeProof(ServeProof calldata proof) internal {
-        address agentSeal = IAgenticID(
-            _getReputationStorage().identityRegistry
-        ).getAgentSeal(proof.agentId);
+        // Only the address the proof was signed for may redeem it. This is the
+        // front-running / theft guard: a copied proof carries the honest
+        // client's `submitter`, so an attacker's own call fails here. Checked
+        // before signature recovery so a mismatched caller reverts cheaply.
+        if (proof.submitter != msg.sender)
+            revert ReputationProofSubmitterMismatch(proof.submitter, msg.sender);
+
+        address identityRegistry = _getReputationStorage().identityRegistry;
+        address agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
         if (agentSeal == address(0)) revert ReputationNoAgentSeal();
 
-        // No (chainId, contract) domain separation in the envelope on purpose:
-        // cross-chain / cross-contract replay of a ServeProof is prevented at the
-        // KEY layer — agentSeal is derived per (chainId, agenticID, sealId), so the
-        // same agentId on another chain/contract has a different agentSeal and the
-        // recovered signer won't match. Keeping the envelope minimal means the
-        // off-chain agentSeal signer needs no extra fields. (Seal derivation
-        // scoping is tracked separately; see the KMS threshold-derivation issue.)
+        // Domain + submitter separation: binding block.chainid and the
+        // identity registry this reputation contract is anchored to makes a proof
+        // non-portable across chains and across protocol deployments, and binding
+        // `submitter` makes it non-transferable. The digest is built only from
+        // fixed-width words (uint256/address/bytes32), so abi.encode has no
+        // encoding ambiguity. (The key layer also scopes agentSeal per deployment,
+        // but that is an off-chain property; this binds it on-chain regardless.)
         bytes32 proofHash = keccak256(abi.encode(
+            block.chainid,
+            identityRegistry,
+            proof.submitter,
             proof.agentId,
             proof.timestamp,
             proof.deadline,
@@ -406,6 +496,18 @@ contract AgenticIDReputationRegistry is
         // Replay protection: signature is unique per sealed payload.
         bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, proof.agentId, proof.signature));
         _checkAndMarkNonce(nonceKey, proof.deadline);
+    }
+
+    /// @dev True if `addr` is the agent owner or an ERC-721 approved operator —
+    ///      mirrors the ERC-8004 reference registry's isAuthorizedOrOwner. The
+    ///      agent is known to exist here (its seal signed a verified proof), so
+    ///      ownerOf does not revert.
+    function _isOwnerOrApproved(uint256 agentId, address addr) private view returns (bool) {
+        IAgenticID id = IAgenticID(_getReputationStorage().identityRegistry);
+        address owner = id.ownerOf(agentId);
+        return addr == owner
+            || id.getApproved(agentId) == addr
+            || id.isApprovedForAll(owner, addr);
     }
 
     function _matchesFilter(
@@ -426,9 +528,14 @@ contract AgenticIDReputationRegistry is
         return keccak256(bytes(stored)) == keccak256(bytes(filter));
     }
 
-    function _normalizeTo18(int128 value, uint8 decimals) private pure returns (int128) {
+    /// @dev Normalize a feedback value to 18 decimals, returning int256 so no
+    ///      single entry can overflow (values are further bounded at write
+    ///      time). decimals above 18+77 round to zero rather than overflowing 10**().
+    function _normalizeTo18(int128 value, uint8 decimals) private pure returns (int256) {
         if (decimals == 18) return value;
-        if (decimals < 18) return value * int128(int256(10 ** (18 - decimals)));
-        return value / int128(int256(10 ** (decimals - 18)));
+        if (decimals < 18) return int256(value) * int256(10 ** (18 - decimals));
+        uint256 shift = uint256(decimals) - 18;
+        if (shift > 77) return 0; // 10**78 exceeds uint256 max; the value underflows to 0 anyway
+        return int256(value) / int256(10 ** shift);
     }
 }

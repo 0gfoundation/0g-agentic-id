@@ -9,6 +9,13 @@ import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Recei
 import {IERC8004IdentityRegistry, MetadataEntry} from "./interfaces/IERC8004IdentityRegistry.sol";
 import {ICanonicalIdentityRegistry} from "./interfaces/ICanonicalIdentityRegistry.sol";
 
+/// @dev onERC721Received got a token from a contract other than the bound
+///      canonical registry.
+error CanonicalUnexpectedToken();
+/// @dev A stray transfer of an existing canonical token into custody (from != 0).
+///      Only the registration mint is accepted — there is no withdrawal path.
+error CanonicalStrayDeposit();
+
 /// @title ERC8004CanonicalBoundUpgradeable
 /// @notice ERC-8004 identity layer for AgenticID, implemented as a **custody
 ///         binding** to a fixed, unmodifiable canonical ERC-8004 registry
@@ -39,7 +46,7 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
-    /// @custom:storage-location erc7857:0g.storage.ERC8004CanonicalBound
+    /// @custom:storage-location erc7201:0g.storage.ERC8004CanonicalBound
     struct ERC8004CanonicalBoundStorage {
         ICanonicalIdentityRegistry canonical;
     }
@@ -95,12 +102,16 @@ abstract contract ERC8004CanonicalBoundUpgradeable is
     // ── Custody: accept the canonical token minted to this contract ────────────
 
     /// @dev The canonical registry mints via `_safeMint`, so this contract must
-    ///      accept the token. Only tokens minted by the bound canonical registry
-    ///      are accepted; nothing else can deposit an ERC-721 here.
-    function onERC721Received(address, address, uint256, bytes calldata)
+    ///      accept that mint. Only the bound canonical registry may call this,
+    ///      and only for a mint into custody (`from == address(0)`, which is what
+    ///      our own registration triggers). A stray `safeTransferFrom` of an
+    ///      already-existing canonical token is rejected: there is no withdrawal
+    ///      path, so accepting one would lock it here permanently.
+    function onERC721Received(address, address from, uint256, bytes calldata)
         external view returns (bytes4)
     {
-        require(msg.sender == address(_canonical()), "unexpected token");
+        if (msg.sender != address(_canonical())) revert CanonicalUnexpectedToken();
+        if (from != address(0)) revert CanonicalStrayDeposit();
         return IERC721Receiver.onERC721Received.selector;
     }
 

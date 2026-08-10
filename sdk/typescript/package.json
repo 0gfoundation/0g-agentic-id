@@ -24,6 +24,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test:kav": "npm run build && node scripts/serveproof-kav.cjs",
     "clean": "rm -rf dist",
     "prepublishOnly": "npm run clean && npm run build"
   },

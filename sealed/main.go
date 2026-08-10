@@ -563,6 +563,13 @@ func startAgent(
 		agentSealAddr = ethcrypto.PubkeyToAddress(pk.PublicKey).Hex()
 	}
 
+	// Chain id for the serve-proof domain (fetched once at dial). Empty here
+	// only in the degenerate no-chain path, where no proof is signed anyway.
+	chainIDStr := ""
+	if res.client != nil && res.client.ChainID() != nil {
+		chainIDStr = res.client.ChainID().String()
+	}
+
 	mgr := manager.New(adapter, agent, manager.Config{
 		OnFailed: onFailed,
 	})
@@ -578,6 +585,7 @@ func startAgent(
 			Owner:        res.owner,
 			ChainRPC:     cfg.ChainRPC,
 			ContractAddr: cfg.ContractAddr,
+			ChainID:      chainIDStr,
 			AttestorURL:  cfg.AttestorURL,
 
 			// Sealed runtime metadata.

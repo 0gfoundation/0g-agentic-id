@@ -31,12 +31,15 @@ export const SERVE_PROOF_HEADER = 'X-Agent-Proof';
 
 interface RawEnvelope {
   agent_id: string;
+  submitter: `0x${string}`;
   timestamp: number;
   deadline: number;
   task_hash: `0x${string}`;
   data_hashes: `0x${string}`[];
   framework_hash: `0x${string}`;
 }
+
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000' as const;
 
 function b64urlDecode(s: string): string {
   const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
@@ -57,6 +60,7 @@ export function parseServeProofHeader(value: string): ServeProof {
   const env = JSON.parse(b64urlDecode(value.slice(dot + 1))) as RawEnvelope;
   return {
     agentId: BigInt(env.agent_id),
+    submitter: env.submitter ?? ZERO_ADDRESS,
     timestamp: BigInt(env.timestamp),
     deadline: BigInt(env.deadline),
     taskHash: env.task_hash,
@@ -142,9 +146,15 @@ export class ServeSession {
       functionName: 'getAgentSeal',
       args: [proof.agentId],
     })) as Address;
+    // The digest is domain-bound: the proof was signed against this chain and
+    // the identity registry the reputation contract is anchored to.
+    const chainId = BigInt(await this.publicClient.getChainId());
     const signerMatches =
       agentSeal !== '0x0000000000000000000000000000000000000000' &&
-      (await verifyServeProofSignature(proof, agentSeal));
+      (await verifyServeProofSignature(proof, agentSeal, {
+        chainId,
+        verifyingContract: this.agenticID,
+      }));
     if (!signerMatches) reasons.push('signature does not match the on-chain agentSeal');
 
     // dataHashes ⊆ intelligentDatasOf(agentId)

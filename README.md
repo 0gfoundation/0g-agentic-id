@@ -269,13 +269,21 @@ the relationship is closer to guardian-and-ward, teacher-and-student.**
 > mechanism 5), so a buyer doing due diligence can see "which version of
 > the runtime framework earned this reputation."
 
-### 5 · Reputation: ungameable
+### 5 · Reputation: proof-gated
 
 AgenticID extends **ERC-8004** with one key requirement: **every review
 must come bundled with an AgentSeal-signed service proof (ServeProof)**.
-No real interaction, no legitimate review. Score farming is structurally
-impossible — you can't forge a signature that only a live TEE runtime can
-produce.
+You can't fabricate a review out of thin air — a valid proof can only be
+produced by the live TEE runtime, so a review that was never backed by a
+real response is rejected.
+
+This raises the cost of fake reviews but is **not** full sybil resistance:
+the runtime issues a proof on every response, including the unauthenticated
+public `GET /hello`, so proofs are cheaply obtainable, and one entity can
+request service from many wallets it controls. Preventing that (genuine
+one-entity-one-voice) needs an off-chain layer — rate-limiting per real
+identity, staking, proof-of-personhood — which is out of scope for the
+on-chain contract.
 
 Each feedback also **records the exact iData in effect when it was earned**
 (the `dataHashes` in the proof), so reputation is auditable against what the

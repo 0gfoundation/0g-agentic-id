@@ -182,7 +182,7 @@ Attestor 实际从 KMS 拿到的是：
    **另一把** key，跨部署的签名重放在密钥层就失败。Attestor 启动时
    还会自检 KMS 确实用到了 material（两份不同 material 必须得到
    不同 key），否则拒绝启动。
-3. 在 mint 时通过 `setAgentSeal(agentId, agentSeal_, sealId)` 把
+3. 通过 `registerWithSeal(...)` 在同一次 mint 调用里绑定 seal，把
    派生密钥的**地址**（`agent_seal_addr`，不是原始 pubkey）发布到
    链上 —— 这条绑定从此不可变（详见下文
    [Set-once seal 语义](#set-once-seal-语义为什么这条绑定是安全的)）。
@@ -258,7 +258,7 @@ app-scoped KMS key 就无法伪造 (`container_pubkey`, `mac`) 这一对。
 
 ## Set-once seal 语义：为什么这条绑定是安全的
 
-`AgenticID.setAgentSeal(agentId, sealAddr, sealId)` 强制三条不变
+`registerWithSeal` 内部的 seal 绑定（`_setAgentSeal`）强制三条不变
 量：
 
 - **Per-agent 一次写入**：一旦 `agentSeal[agentId]` 非零，就再也
@@ -282,6 +282,35 @@ provision。链上绑定之所以可以永久钉死，是因为绑定背后的�
 （[根本不变量](#根本不变量owner-永远不持有-agent_seal_priv)），
 `agentSeal` 就成了一个没有任何一方 —— owner、host、Attestor
 operator —— 能伪造、转移或撤销的身份。
+
+### 所有权 vs 控制权：seal-bound 转让到底转了什么
+
+这是一条刻意的设计属性，写在这里说清楚，免得被当成 bug。
+
+对 **seal-bound** agent，写权限（`update` / `updateAt`）和 ServeProof
+签名门禁在 `agentSeal` 上，**不在** token owner 上（一旦绑了 seal，
+`_authorizeIDataUpdate` 会覆盖掉基类的 owner-only 门禁）。agent 的
+intelligent data 属于 **agent 自己** —— 自创建起就封在 TEE 内 ——
+不属于持有 token 的人。seal 是 agent 自己的凭证，不是某个人的。
+
+两条后果，都是有意为之：
+
+- **转 token 转的是经济所有权，不是执行控制权。** 对 seal-bound agent
+  做普通 ERC-721 转让，不会改 `agentSeal`、不会给新 owner 链上写权限、
+  也不会在链上撤销旧环境的凭证。链上没有 seal 轮换 —— 这是设计如此，
+  因为 seal 是 agent 的永久身份（见上），而且"所有权转让"和"硬件
+  迁移"在凭证层无法区分。
+- **操作权的交接是设计上对 Attestor 的链下依赖。** 在 0G 托管模型里
+  卖家从不实际持有 TEE；转让后 Attestor 会（异步地）拆掉旧 owner 的
+  容器、把 `agent_seal_priv` 重新 provision 到新 owner 经 RA 的环境。
+  新 owner 能不能操作这个 agent，靠的是这套 provisioning 流程 + TEE
+  封装防止 key 外泄 —— **不是**链上撤销。一个去信任的市场必须把这个
+  假设算进去，而不能默认"光持有 token 就等于独占控制权"。
+
+如果你想要的是"数据的唯一写入者就是当前 token owner、控制权随 token
+一起走"，那就用 **seal-less** agent：自助 `register()` 铸的 agent 没有
+`agentSeal`，`update` 就保持 owner 门禁。这跟一个自主的、常驻 TEE 的
+seal-bound agent 是两种不同的产品，选哪个就是选哪种信任模型。
 
 ---
 

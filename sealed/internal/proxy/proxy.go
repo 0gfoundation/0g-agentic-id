@@ -255,6 +255,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
+	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -302,7 +303,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -391,6 +392,7 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
+	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil || owner == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -427,7 +429,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -437,6 +439,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
+	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -578,7 +581,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(respBody)
 		return
 	}
-	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash); err != nil {
+	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -712,11 +715,17 @@ const serveProofDeadlineWindow = 3600
 // serveProof is the canonical envelope signed by agent_seal_priv and packed
 // into X-Agent-Proof. It mirrors the on-chain
 // AgenticIDReputationRegistry.ServeProof tuple (minus the signature, which
-// travels alongside in the header). There is NO client binding: attribution
-// is via msg.sender at giveFeedback submission; the proof is a bearer
-// attestation the consumer SDK submits from its own wallet.
+// travels alongside in the header). It is bound to a single redeemer via
+// `submitter` — the address the client declared in the X-Client-Address
+// request header — so a copied proof can't be front-run or spent by anyone
+// else. The chain id and identity-registry address are also part of the
+// signed digest (cross-chain / cross-deployment separation) but are NOT
+// carried in the envelope: the contract derives them from block.chainid and
+// its own storage, and the SDK from its configured deployment.
 //
 //	agent_id       : on-chain token id (uint256 decimal string)
+//	submitter      : the only address allowed to redeem this proof (0x0 if the
+//	                 caller declared none — then it's informational, unredeemable)
 //	timestamp      : issuance unix time
 //	deadline       : submission expiry
 //	task_hash      : keccak256 over the request/response transcript — opaque to
@@ -727,6 +736,7 @@ const serveProofDeadlineWindow = 3600
 //	framework_hash : the sealed image measurement (AgenticID Framework code)
 type serveProof struct {
 	AgentID       string   `json:"agent_id"`
+	Submitter     string   `json:"submitter"`
 	Timestamp     int64    `json:"timestamp"`
 	Deadline      int64    `json:"deadline"`
 	TaskHash      string   `json:"task_hash"`
@@ -734,22 +744,30 @@ type serveProof struct {
 	FrameworkHash string   `json:"framework_hash"`
 }
 
+// clientAddressHeader is the request header a client sets to declare the
+// address that will redeem the serve-proof (bound into the signature).
+const clientAddressHeader = "X-Client-Address"
+
 // writeServeProof signs the contract-shaped envelope with agent_seal_priv and
 // emits a single header packing the signature and base64-url envelope JSON:
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// The signature is over keccak256(abi.encode(agentId, timestamp, deadline,
-// taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)), wrapped
-// EIP-191 — exactly what AgenticIDReputationRegistry._verifyServeProof checks.
+// The signature is over keccak256(abi.encode(chainId, identityRegistry,
+// submitter, agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)), wrapped EIP-191 —
+// exactly what AgenticIDReputationRegistry._verifyServeProof checks. chainId +
+// identityRegistry give cross-chain / cross-deployment separation; submitter
+// (declared by the client in X-Client-Address) binds the proof to one redeemer.
 //
-// When the agent has no on-chain identity yet (agentID/frameworkHash empty, e.g.
-// local dev without a chain), the body is written without a proof header — a
-// reputation proof would be meaningless.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash string) error {
+// When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
+// empty, e.g. local dev without a chain), the body is written without a proof
+// header — a reputation proof would be meaningless.
+func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr string) error {
 	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
+	chainIDBig, chainOK := new(big.Int).SetString(chainID, 10)
 	fwBytes, fwErr := hexToBytes32(frameworkHash)
-	if !ok || fwErr != nil || agentIDBig.Sign() == 0 {
+	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 {
 		// No on-chain identity — serve the body without a serve-proof.
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -757,6 +775,12 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 		_, _ = w.Write(body)
 		return nil
 	}
+
+	// The client declares the address that will redeem this proof; empty/absent
+	// yields the zero address (an informational, unredeemable proof). The
+	// 32-byte word feeds the digest; submitterHex is echoed in the envelope.
+	submitterWord := addrWord(r.Header.Get(clientAddressHeader))
+	submitterHex := "0x" + hex.EncodeToString(submitterWord[12:])
 
 	// taskHash binds the exact request/response transcript. Opaque to the
 	// contract; carried for the buyer to audit which interaction earned this.
@@ -793,6 +817,7 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 
 	env := serveProof{
 		AgentID:       agentID,
+		Submitter:     submitterHex,
 		Timestamp:     now,
 		Deadline:      deadline,
 		TaskHash:      "0x" + hex.EncodeToString(taskHash),
@@ -804,9 +829,14 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 		return fmt.Errorf("marshal serve-proof: %w", err)
 	}
 
-	// abi.encode of (uint256, uint256, uint256, bytes32, bytes32, bytes32) —
-	// all static 32-byte words, so it's a plain concatenation.
+	// abi.encode of (uint256 chainId, address identityRegistry, address submitter,
+	// uint256 agentId, uint256 timestamp, uint256 deadline, bytes32 taskHash,
+	// bytes32 dataHashesHash, bytes32 frameworkHash) — all static 32-byte words,
+	// so it's a plain concatenation.
 	encoded := bytes.Join([][]byte{
+		word256(chainIDBig),
+		addrWord(identityAddr),
+		submitterWord,
 		word256(agentIDBig),
 		word256(big.NewInt(now)),
 		word256(big.NewInt(deadline)),
@@ -845,6 +875,17 @@ func word256(x *big.Int) []byte {
 	out := make([]byte, 32)
 	x.FillBytes(out)
 	return out
+}
+
+// addrWord left-pads a hex address (with or without "0x") into a 32-byte abi
+// word, matching Solidity's abi.encode(address). An empty or unparseable input
+// yields the zero word — the sentinel for "no redeemer declared".
+func addrWord(hexAddr string) []byte {
+	v, ok := new(big.Int).SetString(strings.TrimPrefix(strings.TrimSpace(hexAddr), "0x"), 16)
+	if !ok {
+		v = big.NewInt(0)
+	}
+	return word256(v)
 }
 
 // hexToBytes32 parses a "0x"-prefixed 32-byte hex string.

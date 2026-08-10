@@ -2,8 +2,11 @@
 
 Status: **design / north-star**. The simple first cut (`getDataBoundScore`, snapshot
 overlap) is designed but not yet in the SDK; the full model below is the target for
-the event-indexer phase. On-chain `getSummary` is **not** changed by any of this — it
-stays the ERC-8004 baseline.
+the event-indexer phase. On-chain `getSummary` is **not** changed by any of this.
+Note it is **not** the ERC-8004 reference baseline: it returns a **sum + count**
+(the reference registry averages), so this fork's on-chain aggregation is its own
+— see `contracts/README.md` for the named divergences. This document builds only
+on `getSummary` staying fixed, not on it matching the reference.
 
 ## Problem
 
@@ -28,8 +31,10 @@ re-rated" state honestly.
    (SDK / indexer); it's zero-gas, unlimited scale, and freely iterable. On-chain
    aggregation is only warranted when another contract must consume the score
    trustlessly — not our case today.
-2. **Don't touch `getSummary`.** It's the ERC-8004 read baseline; ecosystem tools
-   depend on it. This model is additive.
+2. **Don't touch `getSummary`.** It's the stable on-chain read this fork already
+   exposes (sum + count); keep it fixed so anything already reading it doesn't
+   break. It is **not** the ERC-8004 reference baseline (that averages), so this
+   is about our own stability, not cross-registry parity. This model is additive.
 3. **General model, simple defaults.** The model is fully parameterized, but its
    default parameters (all weights equal) collapse it to a plain average. Complexity
    is opt-in.

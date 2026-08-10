@@ -89,15 +89,11 @@ interface IAgenticID is IERC8004IdentityRegistry, IERC7857 {
 
     // ── agentSeal ─────────────────────────────────────────────────────────────
 
-    /// @notice Set the agentSeal for an agent whose seal has not yet been set.
-    /// @dev Only a trusted attestor may call this. One-time only: reverts if the agent
-    ///      already has an agentSeal, or if sealId is already bound to another agent.
-    ///      Use registerWithSeal to bind the seal at registration time in a single call.
-    function setAgentSeal(
-        uint256 agentId,
-        address agentSeal_,
-        bytes32 sealId
-    ) external;
+    // A seal is bound only at mint via registerWithSeal — there is no external
+    // "set the seal later" method. sealId asserts the agent's data has been
+    // TEE-confined since creation, which cannot be granted retroactively, and a
+    // standalone binder let a trusted attestor seize any agent without owner
+    // consent. Reintroduce only as an owner-authorized operation if ever needed.
 
     /// @notice Returns the current agentSeal address for an agent.
     /// @dev Returns address(0) if no seal has been registered.

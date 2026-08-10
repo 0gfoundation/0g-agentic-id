@@ -47,12 +47,18 @@ abstract contract BaseDataVerifier is
     bytes32 private constant _TRANSFER_ACCESS_TAG    = keccak256("ERC7857_TRANSFER_ACCESS");
     bytes32 private constant _TRANSFER_OWNERSHIP_TAG = keccak256("ERC7857_TRANSFER_OWNERSHIP");
 
-    /// @custom:storage-location erc7857:0g.storage.BaseDataVerifier
+    /// @custom:storage-location erc7201:0g.storage.BaseDataVerifier
     struct BaseDataVerifierStorage {
         address pauser;
     }
 
-    // keccak256(abi.encode(uint256(keccak256("0g.storage.BaseDataVerifier")) - 1)) & ~bytes32(uint256(0xff))
+    // NOTE: fixed literal, NOT the ERC-7201 derivation of the namespace above.
+    // The canonical derivation of "0g.storage.BaseDataVerifier" is
+    // 0xebd3f1ab6f96c5a8aa3a8f7ae4cb91de9050e806218c0e227b71fda38a32fd00; this
+    // slot differs. It is kept as-is because `pauser` already lives here on the
+    // live deployment — changing it would strand that state. The slot is
+    // otherwise unoccupied, so there is no collision. Pinned by
+    // StorageLayout.t.sol so the discrepancy stays intentional and visible.
     bytes32 private constant BaseDataVerifierStorageLocation =
         0x2a6e9d47b6f4c10d00c1ba6c2a83e5a99f9ffd6b1a85ca0f0b97a3c3c3a27c00;
 
@@ -137,15 +143,21 @@ abstract contract BaseDataVerifier is
     // ── Access proof ──────────────────────────────────────────────────────────
 
     /// @dev Signed message:
-    ///      keccak256(abi.encodePacked(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
-    ///      `chainId` and `erc7857` (the ERC-7857 token contract this transfer is
-    ///      for) domain-separate the proof so a buyer's AccessProof cannot be
-    ///      replayed against the same dataHash on another chain or another token
-    ///      contract. NOTE: the off-chain buyer signer MUST prepend these two.
+    ///      keccak256(abi.encode(chainId, erc7857, dataHash, targetPubkey, nonce, deadline)).
+    ///      Uses abi.encode, NOT encodePacked: targetPubkey and nonce are adjacent
+    ///      dynamic-length fields, and packing them omits the length boundary so a
+    ///      signature over one (targetPubkey, nonce) split is equally valid for a
+    ///      different split — letting a re-split seal the data to an attacker's key.
+    ///      abi.encode length-prefixes each dynamic value, so the boundary is part
+    ///      of the signed digest. `chainId` and `erc7857` (the ERC-7857 token
+    ///      contract this transfer is for) domain-separate the proof so a buyer's
+    ///      AccessProof cannot be replayed against the same dataHash on another
+    ///      chain or another token contract. NOTE: the off-chain buyer signer MUST
+    ///      match this encoding exactly.
     function _verifyAccessProof(AccessProof calldata ap, address erc7857)
         internal view returns (address accessAssistant)
     {
-        bytes32 inner = keccak256(abi.encodePacked(
+        bytes32 inner = keccak256(abi.encode(
             block.chainid, erc7857, ap.dataHash, ap.targetPubkey, ap.nonce, ap.deadline
         ));
         accessAssistant = _eip191Hash(inner).recover(ap.proof);

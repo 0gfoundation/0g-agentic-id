@@ -28,6 +28,13 @@ import type { ServeProof as ServeProofType } from './types';
  * Parameters for building a ServeProof message hash.
  */
 export interface BuildServeProofHashParams {
+  /** Chain id the proof is bound to (domain separation) */
+  chainId: bigint;
+  /** The AgenticID (identity registry) address the reputation contract is
+   *  anchored to — the verifying-contract domain */
+  verifyingContract: Address;
+  /** The only address allowed to redeem this proof */
+  submitter: Address;
   /** The agent ID */
   agentId: bigint;
   /** Timestamp of service (unix seconds) */
@@ -48,6 +55,9 @@ export interface BuildServeProofHashParams {
  * Solidity:
  * ```solidity
  * bytes32 messageHash = keccak256(abi.encode(
+ *     block.chainid,
+ *     identityRegistry,   // verifyingContract
+ *     submitter,
  *     agentId,
  *     timestamp,
  *     deadline,
@@ -57,11 +67,14 @@ export interface BuildServeProofHashParams {
  * ));
  * ```
  *
+ * chainId + verifyingContract give cross-chain / cross-deployment separation;
+ * submitter binds the proof to the single address allowed to redeem it.
+ *
  * @param params - The ServeProof hash parameters
  * @returns The keccak256 hash of the abi.encode payload
  */
 export function buildServeProofMessageHash(params: BuildServeProofHashParams): Hash {
-  const { agentId, timestamp, deadline, taskHash, dataHashes, frameworkHash } = params;
+  const { chainId, verifyingContract, submitter, agentId, timestamp, deadline, taskHash, dataHashes, frameworkHash } = params;
 
   // Step 1: keccak256(abi.encodePacked(dataHashes)) — concatenate bytes32 values
   const packedDataHashes: Hex = dataHashes.length > 0
@@ -69,9 +82,13 @@ export function buildServeProofMessageHash(params: BuildServeProofHashParams): H
     : '0x';
   const dataHashesHash = keccak256(packedDataHashes);
 
-  // Step 2: abi.encode(agentId, timestamp, deadline, taskHash, dataHashesHash, frameworkHash)
-  // Each field is a static 32-byte word: uint256 = 32, bytes32 = 32.
+  // Step 2: abi.encode(chainId, verifyingContract, submitter, agentId, timestamp,
+  // deadline, taskHash, dataHashesHash, frameworkHash). Each field is a static
+  // 32-byte word: uint256 = 32, address = 32 (left-padded), bytes32 = 32.
   const encoded = concat([
+    pad(toHex(chainId), { size: 32 }),
+    pad(verifyingContract as Hex, { size: 32 }),
+    pad(submitter as Hex, { size: 32 }),
     pad(toHex(agentId), { size: 32 }),
     pad(toHex(timestamp), { size: 32 }),
     pad(toHex(deadline), { size: 32 }),
@@ -134,23 +151,30 @@ export function buildServeProof(
  *
  * @example
  * ```typescript
- * import { buildServeProof, signServeProof } from '@0gfoundation/agentic-sdk';
+ * import { signServeProof } from '@0gfoundation/agentic-sdk';
  *
  * const proof = await signServeProof(
- *   { agentId: 1n, timestamp: 1700000000n, deadline: 1700003600n,
+ *   { chainId: 16602n, verifyingContract: '0x...', submitter: '0x...',
+ *     agentId: 1n, timestamp: 1700000000n, deadline: 1700003600n,
  *     taskHash: '0x...', dataHashes: ['0x...'], frameworkHash: '0x...' },
  *   async (hash) => account.sign({ hash }),
  * );
  * ```
  */
 export async function signServeProof(
-  params: Omit<ServeProofType, 'signature'>,
+  params: BuildServeProofHashParams,
   sign: (signingHash: Hash) => Promise<`0x${string}`>,
 ): Promise<ServeProofType> {
   const signingHash = buildServeProofSigningHash(params);
   const signature = await sign(signingHash);
   return {
-    ...params,
+    agentId: params.agentId,
+    submitter: params.submitter,
+    timestamp: params.timestamp,
+    deadline: params.deadline,
+    taskHash: params.taskHash,
+    dataHashes: params.dataHashes,
+    frameworkHash: params.frameworkHash,
     signature,
   };
 }
@@ -158,15 +182,31 @@ export async function signServeProof(
 /**
  * Verify that a ServeProof signature matches the expected agentSeal address.
  *
+ * The digest is domain-bound, so the caller supplies the chain id and the
+ * identity-registry (verifyingContract) the proof was issued against; the
+ * submitter comes from the proof itself.
+ *
  * @param proof - The complete ServeProof with signature
  * @param expectedSigner - The agentSeal address that should have signed
+ * @param domain - The chainId + verifyingContract the proof is bound to
  * @returns True if the signature is valid for the expected signer
  */
 export async function verifyServeProofSignature(
   proof: ServeProofType,
   expectedSigner: Address,
+  domain: { chainId: bigint; verifyingContract: Address },
 ): Promise<boolean> {
-  const signingHash = buildServeProofSigningHash(proof);
+  const signingHash = buildServeProofSigningHash({
+    chainId: domain.chainId,
+    verifyingContract: domain.verifyingContract,
+    submitter: proof.submitter,
+    agentId: proof.agentId,
+    timestamp: proof.timestamp,
+    deadline: proof.deadline,
+    taskHash: proof.taskHash,
+    dataHashes: proof.dataHashes,
+    frameworkHash: proof.frameworkHash,
+  });
   // A malformed signature (bad length / invalid v) is just a failed verification,
   // not an exception — a buyer verifying a hostile proof should get `false`.
   let recovered: Address;

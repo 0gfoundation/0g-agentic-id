@@ -218,9 +218,13 @@ export function makeAgentClient(params: {
   token?: string;
   reauth?: () => Promise<string>;
   logAuth?: () => Promise<{ message: string; signature: string }>;
+  /** Address that will redeem serve-proofs from this handle's responses. Sent
+   *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
+   *  protection). Omit for anonymous calls (proofs come back unredeemable). */
+  clientAddress?: string;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
-  const { services, routes, reauth } = params;
+  const { services, routes, reauth, clientAddress } = params;
   const canAuth = !!(reauth || params.token);
 
   let cached: string | undefined = params.token;
@@ -240,6 +244,11 @@ export function makeAgentClient(params: {
     const send = (tok?: string) => {
       const headers = new Headers(init?.headers);
       if (tok) headers.set('Authorization', `Bearer ${tok}`);
+      // Bind serve-proofs from this response to the redeemer, unless the caller
+      // set the header explicitly.
+      if (clientAddress && !headers.has('X-Client-Address')) {
+        headers.set('X-Client-Address', clientAddress);
+      }
       return fetch(url, { ...init, headers });
     };
 

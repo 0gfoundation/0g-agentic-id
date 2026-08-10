@@ -55,18 +55,6 @@ export const agenticIDAbi = [
     outputs: [{ name: 'agentId', type: 'uint256' }],
   },
 
-  // ── Seal Management ──
-  {
-    type: 'function',
-    name: 'setAgentSeal',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'agentId', type: 'uint256' },
-      { name: 'agentSeal_', type: 'address' },
-      { name: 'sealId', type: 'bytes32' },
-    ],
-    outputs: [],
-  },
   {
     type: 'function',
     name: 'tokenURI',
@@ -538,6 +526,7 @@ export const reputationRegistryAbi = [
       { name: 'feedbackHash', type: 'bytes32' },
       { name: 'ServeProof', type: 'tuple', components: [
         { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
         { name: 'timestamp', type: 'uint256' },
         { name: 'deadline', type: 'uint256' },
         { name: 'taskHash', type: 'bytes32' },
