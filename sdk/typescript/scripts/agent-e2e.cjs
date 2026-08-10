@@ -80,7 +80,10 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   check('X-Agent-Proof present', !!hi.proofHeader, hi.proofHeader ? 'header set' : 'missing');
   const proof = hi.proofHeader ? parseServeProofHeader(hi.proofHeader) : null;
   check('SDK parses serve-proof header', !!proof, proof ? `agentId=${proof.agentId}` : 'parse failed');
-  const sigOk = proof ? await verifyServeProofSignature(proof, hi.hello.agent) : false;
+  // verifyProof recomputes the domain-bound digest (chainId + identity
+  // registry) itself and checks the recovered signer against the on-chain
+  // agentSeal — the low-level verifyServeProofSignature now needs that domain.
+  const sigOk = proof ? (await ai.reputation.verifyProof(proof)).signerMatches : false;
   check('serve-proof signature verifies (signer == agentSeal)', sigOk === true);
 
   // ── data tracking + binding-persistence invariant ─────────────────────
