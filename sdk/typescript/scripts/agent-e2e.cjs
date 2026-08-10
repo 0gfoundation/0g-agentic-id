@@ -80,7 +80,10 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   check('X-Agent-Proof present', !!hi.proofHeader, hi.proofHeader ? 'header set' : 'missing');
   const proof = hi.proofHeader ? parseServeProofHeader(hi.proofHeader) : null;
   check('SDK parses serve-proof header', !!proof, proof ? `agentId=${proof.agentId}` : 'parse failed');
-  const sigOk = proof ? await verifyServeProofSignature(proof, hi.hello.agent) : false;
+  // verifyProof recomputes the domain-bound digest (chainId + identity
+  // registry) itself and checks the recovered signer against the on-chain
+  // agentSeal — the low-level verifyServeProofSignature now needs that domain.
+  const sigOk = proof ? (await ai.reputation.verifyProof(proof)).signerMatches : false;
   check('serve-proof signature verifies (signer == agentSeal)', sigOk === true);
 
   // ── data tracking + binding-persistence invariant ─────────────────────
@@ -93,15 +96,18 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   // ── recovery / reload: reset → recreate → same identity, same iData ───
   console.log('· reset() — recreating container…');
   await ai.agent.reset(SEAL_ID, { apiKey: API_KEY });
-  // poll deployment back to running
-  let phase = '';
+  // poll deployment back to running; capture the NEW sandbox_id — reset makes a
+  // fresh container (new sandbox → new URL), so the deploy-time AGENT_URL is stale.
+  let phase = ''; let newSandbox = '';
   for (let i = 0; i < 40; i++) {
     const d = await (await fetch(`${ATTESTOR_URL}/deployment/${SEAL_ID}`)).json();
     phase = d.phase;
+    if (d.sandbox_id) newSandbox = d.sandbox_id;
     if (phase === 'running') break;
     await new Promise((r) => setTimeout(r, 6000));
   }
   check('agent back to running after reset', phase === 'running', `phase=${phase}`);
+  const resetUrl = `http://${cfg.agent_serve_port}-${newSandbox}.${cfg.sandbox_proxy_addr}`;
 
   const after = await ai.agent.intelligentDatasOf(AGENT_ID);
   const rolesAfter = roles(after);
@@ -111,10 +117,11 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   check('framework identity survives reset', rolesAfter.includes('framework'),
     'roles=' + rolesAfter.join(','));
 
-  // re-verify serve-proof after recreate (agentSeal identity preserved)
-  const hi2 = curlHello(AGENT_URL);
+  // re-verify serve-proof after recreate (agentSeal identity preserved), from
+  // the refreshed URL — and via the domain-aware verifyProof (see above).
+  const hi2 = curlHello(resetUrl);
   const proof2 = hi2.proofHeader ? parseServeProofHeader(hi2.proofHeader) : null;
-  const sig2Ok = proof2 ? await verifyServeProofSignature(proof2, hi2.hello.agent) : false;
+  const sig2Ok = proof2 ? (await ai.reputation.verifyProof(proof2)).signerMatches : false;
   check('serve-proof still verifies after reset', sig2Ok === true);
   check('same agentSeal address after reset', hi2.hello.agent === hi.hello.agent,
     `${hi.hello.agent} → ${hi2.hello.agent}`);

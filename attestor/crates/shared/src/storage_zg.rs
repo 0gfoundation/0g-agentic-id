@@ -87,11 +87,45 @@ impl StorageClient for ZgStorage {
             skip_tx: true,
             ..Default::default()
         };
-        let tx_h256 = self
-            .indexer
-            .upload(self.w3_client.clone(), mem, &opt, None, None)
-            .await
-            .context("indexer upload")?;
+        // The storage flow tx is signed by the SAME key the attestor uses for
+        // the mint (registerWithSeal), and a deploy submits both concurrently.
+        // If the mint tx is still pending when this upload reads the account
+        // nonce, both claim the same nonce and the node rejects this one as an
+        // underpriced replacement ("replacement transaction underpriced"). It's
+        // a transient race: once the competing tx mines the account nonce
+        // advances, so a re-submit re-reads it and lands on the next slot.
+        // Retry with backoff long enough to outlast a pending mint.
+        const MAX_ATTEMPTS: u32 = 6;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_secs(3);
+        let mut attempt = 0u32;
+        let tx_h256 = loop {
+            attempt += 1;
+            match self
+                .indexer
+                .upload(self.w3_client.clone(), mem.clone(), &opt, None, None)
+                .await
+            {
+                Ok(h) => break h,
+                Err(e) => {
+                    let msg = format!("{e:#}").to_lowercase();
+                    let nonce_race = msg.contains("replacement transaction underpriced")
+                        || msg.contains("nonce too low")
+                        || msg.contains("already known");
+                    if nonce_race && attempt < MAX_ATTEMPTS {
+                        tracing::warn!(
+                            attempt,
+                            error = %format!("{e:#}"),
+                            "storage upload nonce race with a concurrent tx; retrying after backoff"
+                        );
+                        tokio::time::sleep(BACKOFF).await;
+                        continue;
+                    }
+                    // Surface the full cause chain (not just the "indexer
+                    // upload" context) so a non-race failure is diagnosable.
+                    return Err(e).with_context(|| format!("indexer upload (after {attempt} attempts)"));
+                }
+            }
+        };
 
         Ok(StorageUploadResult {
             root_hash: B256::from_slice(root_h256.as_bytes()),

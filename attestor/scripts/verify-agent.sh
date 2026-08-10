@@ -24,6 +24,10 @@ set -euo pipefail
 
 API="${API:-http://localhost:8080}"
 : "${AGENT_ID:?set AGENT_ID (decimal on-chain agent id)}"
+# sandbox_id / agent_seal_addr are owner-tier fields; the public /deployments
+# list omits them, so this check needs the owner key to sign the owner-scoped
+# request.
+: "${OWNER_PRIV:?set OWNER_PRIV (owner key; needed for the owner-scoped deployment row)}"
 
 fail=0
 say()  { printf '%s\n' "$*"; }
@@ -38,8 +42,15 @@ SERVE_PORT=$(echo "$CONFIG" | jq -r .agent_serve_port)
 
 # ── locate the deployment row via the attestor API ─────────────────────
 # agent_id is served as 0x-hex; accept a decimal AGENT_ID and match on value.
+# Use the owner-scoped tier (EIP-191 signature) so the row carries sandbox_id /
+# agent_seal_addr — the public list omits them.
 AGENT_HEX=$(printf '0x%x' "$AGENT_ID")
-ROW=$(curl -fsS -m 10 "$API/deployments" \
+OWNER_ADDR=$(cast wallet address "$OWNER_PRIV")
+AUTH_TS=$(date +%s)
+AUTH_MSG="0GDeployments:${OWNER_ADDR}:${AUTH_TS}"
+AUTH_SIG=$(cast wallet sign --private-key "$OWNER_PRIV" "$AUTH_MSG")
+ROW=$(curl -fsS -m 10 -H "X-Auth-Message: $AUTH_MSG" -H "X-Auth-Signature: $AUTH_SIG" \
+      "$API/deployments?owner=$OWNER_ADDR" \
   | jq -c --arg hex "$AGENT_HEX" --arg dec "$AGENT_ID" \
       '[.[] | select(((.agent_id // "")|ascii_downcase)==$hex or ((.agent_id // "")|tostring)==$dec)] | first // empty')
 [ -n "$ROW" ] || { bad "no deployment row for agent_id=$AGENT_ID at $API"; exit 1; }
