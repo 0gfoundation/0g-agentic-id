@@ -8,7 +8,7 @@
 
 use crate::Config;
 use anyhow::{anyhow, Result};
-use tonic::transport::Channel;
+use tonic::transport::{Channel, Endpoint, Uri};
 
 pub mod proto {
     tonic::include_proto!("tapp_service");
@@ -19,6 +19,24 @@ pub fn tapp_url(cfg: &Config) -> String {
 }
 
 pub async fn connect(cfg: &Config) -> Result<Channel> {
+    // A unix socket, when configured, keeps GetAppSecretKey/GetSecretResource
+    // off any TCP port. The placeholder URI is ignored by the connector; only
+    // the socket path matters. tonic 0.12 rides hyper 1.x, so the tokio stream
+    // is wrapped in hyper-util's TokioIo.
+    if let Some(sock) = cfg.tapp_socket.clone() {
+        return Endpoint::try_from("http://[::]:50051")
+            .map_err(|e| anyhow!("bad placeholder uri: {}", e))?
+            .connect_with_connector(tower::service_fn(move |_: Uri| {
+                let path = sock.clone();
+                async move {
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(
+                        tokio::net::UnixStream::connect(&path).await?,
+                    ))
+                }
+            }))
+            .await
+            .map_err(|e| anyhow!("cannot connect to tapp-server socket: {}", e));
+    }
     let url = tapp_url(cfg);
     Channel::from_shared(url.clone())
         .map_err(|e| anyhow!("invalid tapp-server URL {}: {}", url, e))?

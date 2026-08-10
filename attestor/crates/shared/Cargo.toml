@@ -46,6 +46,9 @@ base64.workspace = true
 # tapp-server gRPC (GetAppSecretKey, GetSecretResource)
 tonic.workspace = true
 prost.workspace = true
+# unix-socket connector for tapp-server gRPC (tonic 0.12 → hyper 1.x, needs TokioIo)
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 # 0g storage SDK (uploads + merkle root). Brings ethers 2.0 alongside our
 # alloy 0.3 — they coexist; we only convert H256 ↔ B256 at the boundary.
