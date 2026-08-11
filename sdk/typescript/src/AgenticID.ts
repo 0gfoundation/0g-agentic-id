@@ -610,7 +610,10 @@ export class AgentApi {
    * Wait for a deploy OR clone to mint on-chain, returning the new agent's
    * tokenId (agentId). Both are async and return only a `seal_id` up front — the
    * tokenId doesn't exist until the background mint. This polls
-   * `getAgentIdBySealId(sealId)` (0 until minted), no WebSocket. Throws on timeout.
+   * `getAgentIdBySealId(sealId)` (0 until minted), no WebSocket. Throws on
+   * `phase: "failed"` — surfacing the owner-scoped failure reason so a pre-mint
+   * failure (e.g. the storage stage) reports why instead of a blank timeout —
+   * or on timeout.
    *
    * @example
    * const cl = await ag.agent.clone({ sourceAgentId, targetOwner });
@@ -631,6 +634,27 @@ export class AgentApi {
         // transient RPC hiccup — treat as "not ready yet" and keep polling
       }
       if (agentId !== 0n) return agentId;
+      // A pre-mint failure (e.g. the storage stage) never advances agentId, so
+      // without this the loop just times out with no reason. Mirror
+      // waitForRunning: detect phase="failed" and surface the owner-scoped
+      // reason (the public listing withholds it since #64, so fall back to the
+      // signed listMyDeployments once, only on failure).
+      let row: Awaited<ReturnType<AgentApi['listDeployments']>>[number] | undefined;
+      try {
+        row = (await this.listDeployments()).find((r) => r.sealId === sealId);
+      } catch {
+        // transient attestor hiccup — treat as "not ready yet" and keep polling
+      }
+      if (row?.phase === 'failed') {
+        let reason = row.lastProvisionError ?? null;
+        if (reason == null) {
+          try {
+            const mine = (await this.listMyDeployments()).find((r) => r.sealId === sealId);
+            reason = mine?.lastProvisionError ?? null;
+          } catch { /* no wallet / auth failed — keep null */ }
+        }
+        throw new Error(`waitForMint: seal ${sealId} failed — ${reason ?? 'unknown'}`);
+      }
       if (Date.now() >= deadline) {
         throw new Error(`waitForMint: seal ${sealId} not minted within ${timeoutMs}ms`);
       }
