@@ -21,12 +21,12 @@ npm install @0gfoundation/0g-agenticid-sdk viem
 
 ## Setup
 
-**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs:
+**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestor is `https://agenticid.0g.ai`:
 
 ```ts
 import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
 
-const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
+const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
 });
 // Verifying addresses out-of-band instead of trusting the attestor?
