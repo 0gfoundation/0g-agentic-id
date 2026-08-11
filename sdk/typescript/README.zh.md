@@ -1,4 +1,4 @@
-# @0gfoundation/agentic-sdk
+# @0gfoundation/0g-agenticid-sdk
 
 [English](README.md) | 中文
 
@@ -20,7 +20,7 @@
 ## 安装
 
 ```bash
-npm install @0gfoundation/agentic-sdk viem
+npm install @0gfoundation/0g-agenticid-sdk viem
 ```
 
 **测前准备**:钱包需要测试网 OG——gas(deploy/评价等链上写入)+ sandbox 预付费(建议 ≥0.5 OG,createFee 0.06 + 运行分钟费).水龙头:<https://faucet.0g.ai>.
@@ -30,7 +30,7 @@ npm install @0gfoundation/agentic-sdk viem
 **推荐路径——一个 URL 引导一切.** attestor 的 `GET /config` 自描述其所在环境(合约地址集,链 RPC,组件 appId),所以一个 URL 就锁定了环境;切环境就是换 URL:
 
 ```ts
-import { AgenticID } from '@0gfoundation/agentic-sdk';
+import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
 
 const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // 不传 = 只读实例;env 值是 string|undefined,strict 下要断言
@@ -62,7 +62,7 @@ const ag = await AgenticID.fromAttestor('http://<attestor>:8080', {
 **只构造一次.** 读操作只需要合约地址;写操作再加一个签名私钥.SDK 内部自己构建 viem 客户端——你不用手搓 wallet client,RPC 默认指向 0G Galileo 测试网,可省略.
 
 ```ts
-import { AgenticID, type ContractAddresses } from '@0gfoundation/agentic-sdk';
+import { AgenticID, type ContractAddresses } from '@0gfoundation/0g-agenticid-sdk';
 
 // 地址是部署产物,不烧进 SDK——从 contracts/DEPLOYMENT.md §6 抄你要的那套,
 // 或从你自己的配置/环境变量加载.RPC + 这五个地址完全确定目标合约.
@@ -463,8 +463,8 @@ openclaw token 生命周期:容器首次启动时生成,跨重启保持稳定(ch
 平台的自然能力:**sealed 容器里的 agent 可以用自己的 agentSeal 身份跑这个 SDK**——部署子 agent,转让,评价,全套 owner 操作.它没有(也不该有)裸私钥:agentSeal 私钥只存在于 sealed Go 进程里,agent 通过容器内的 unix-socket 签名服务(`SEAL_SIGN_SOCK`,三个端点 personal_sign / typed_data / transaction)请求签名.SDK 提供官方适配器把这个 socket 包装成 viem Account:
 
 ```ts
-import { AgenticID } from '@0gfoundation/agentic-sdk';
-import { sealAccount } from '@0gfoundation/agentic-sdk/seal';   // node-only 子路径
+import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
+import { sealAccount } from '@0gfoundation/0g-agenticid-sdk/seal';   // node-only 子路径
 
 const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
   account: await sealAccount(),   // 地址自动读 $AGENT_SEAL,socket 路径自动读 $SEAL_SIGN_SOCK
@@ -533,7 +533,7 @@ const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
 ## 附:从零到对话的完整路径(dev 实测过的流程)
 
 ```ts
-import { AgenticID } from '@0gfoundation/agentic-sdk';
+import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
 import { parseEther } from 'viem';
 
 // 三个占位符按你的环境提供:
