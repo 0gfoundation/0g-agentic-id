@@ -147,7 +147,7 @@ const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }
 
 // Or fire-and-forget — get the sealId now, wait (or poll) for the mint later:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
-const id = await ag.agent.waitForMint(dep.sealId);    // → 34n once minted (tune { timeoutMs, pollIntervalMs })
+const id = await ag.agent.waitForMint(dep.sealId);    // → 34n once minted; throws on phase=failed (surfaces the owner-scoped reason) or timeout (tune { timeoutMs, pollIntervalMs })
 
 // clone — the source owner mints a copy for another owner (attestor re-keys the sealed data)
 const newOwner = '0x1111111111111111111111111111111111111111';
@@ -223,7 +223,7 @@ Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentS
 
 ## `ag.reputation` — serve-proof + feedback
 
-Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). So `capture` reads the header on a call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. Attribution is by `msg.sender` at submission; the proof carries **no** client binding.
+Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). So `capture` reads the header on a call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. On-chain **attribution** stays `msg.sender` at submission, but each proof is now bound to a **redeemer**: the proof's `submitter` (echoed from the caller's `X-Client-Address` request header) is the only address the contract lets redeem it, so a captured proof can't be front-run by another submitter.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -237,7 +237,7 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
 const data = await response.json();                   // your normal response body
-// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
+// proof → { agentId: 33n, submitter: "0x…", timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
 // low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
@@ -568,11 +568,11 @@ Contract addresses are a **deployment artifact, not baked into the SDK** — an 
 
 **Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
-The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` (viem chain), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
+The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
 ## Notes
 
-- **No client binding in serve-proofs.** Feedback is attributed to `msg.sender` at `giveFeedback`; a proof is a bearer attestation (single-use via the signature nonce). Treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
+- **Serve-proof binding.** On-chain attribution is `msg.sender` at `giveFeedback`; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
 - **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries). If it still times out, the tx likely landed — confirm by reading state.
 - On-chain types: `value`/`summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint).
 
@@ -582,10 +582,20 @@ Raw ABIs (`agenticIDAbi`, `reputationRegistryAbi`, `tappRegistryAbi`, `sandboxSe
 
 **Serve-proof canonical digest** (for independent verifiers): the signature
 is the agentSeal's EIP-191 personal_sign over
-`keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
+`keccak256(abi.encode(block.chainid, identityRegistry /* verifyingContract */,
+submitter, agentId, timestamp, deadline, taskHash,
 keccak256(abi.encodePacked(dataHashes)), frameworkHash))` — deadline is
-timestamp + 3600. `buildServeProofMessageHash` is the TS implementation;
-the Go side lives in `sealed/internal/proxy/proxy.go`.
+timestamp + 3600. `chainId` + `verifyingContract` (the AgenticID address the
+reputation registry is anchored to) give cross-chain / cross-deployment
+separation, and `submitter` binds the proof to the single address allowed to
+redeem it. `buildServeProofMessageHash` is the TS implementation; the Go side
+lives in `sealed/internal/proxy/proxy.go`.
+
+To verify with the exported primitive, pass the domain explicitly —
+`verifyServeProofSignature(proof, expectedSigner, { chainId, verifyingContract })`
+(`submitter` is read from the proof). `BuildServeProofHashParams` (used by
+`buildServeProofMessageHash` / `signServeProof`) requires `chainId`,
+`verifyingContract`, and `submitter` alongside the service fields.
 
 `signServeProof`'s callback receives the **already-EIP-191-wrapped** digest
 (the `buildServeProofSigningHash` output), so sign it raw — don't re-wrap:

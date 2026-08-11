@@ -154,7 +154,7 @@ const { agentId: id3 } = await ag.agent.deploy({ ...params, sandbox: undefined }
 
 // 或者先拿 sealId,稍后再等(或轮询)铸造:
 const dep = await ag.agent.deploy(params);            // → { sealId, agentSealAddr }
-const id = await ag.agent.waitForMint(dep.sealId);    // → 铸好后返回 34n(可调 { timeoutMs, pollIntervalMs })
+const id = await ag.agent.waitForMint(dep.sealId);    // → 铸好后返回 34n;phase=failed 会抛错(带 owner-scoped 原因),超时也抛(可调 { timeoutMs, pollIntervalMs })
 
 // clone——源 owner 为另一个 owner 铸一份副本(attestor 对密封数据重新加密)
 const newOwner = '0x1111111111111111111111111111111111111111';
@@ -236,7 +236,7 @@ await ag.agent.listDeployments();
 
 ## `ag.reputation` —— 服务证明 + 评价
 
-每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么,协议不做规定,agent 之间可以完全不同.不变量是挡在前面的 **sealed 代理**:它只在 agent 的**对外可归属面**——即 agent 注册的 `/api/*` service(agent 自己的代码在服务外部任务)——上盖 `X-Agent-Proof` 头.它**不签** owner↔agent 的操舵通道(框架的 chat/UI,用 `/_seal/auth` 拿的 owner token 访问):给一个 owner 鉴权的通道签名,等于让 owner 给"和自己 agent 对话"铸造 proof(自助刷声誉).所以 `capture` 要在对 agent 自己的 `/api/*` service 的调用上读那个头.SDK 不对调用本身建模——你按 agent 期望的方式调用它,`capture` 只负责读那个头.归属按提交时的 `msg.sender`;证明本身**不**绑定客户端.
+每个 agent 运行**自己的**服务端点——需要什么 HTTP API 就开什么,协议不做规定,agent 之间可以完全不同.不变量是挡在前面的 **sealed 代理**:它只在 agent 的**对外可归属面**——即 agent 注册的 `/api/*` service(agent 自己的代码在服务外部任务)——上盖 `X-Agent-Proof` 头.它**不签** owner↔agent 的操舵通道(框架的 chat/UI,用 `/_seal/auth` 拿的 owner token 访问):给一个 owner 鉴权的通道签名,等于让 owner 给"和自己 agent 对话"铸造 proof(自助刷声誉).所以 `capture` 要在对 agent 自己的 `/api/*` service 的调用上读那个头.SDK 不对调用本身建模——你按 agent 期望的方式调用它,`capture` 只负责读那个头.链上**归属**仍按提交时的 `msg.sender`,但每条 proof 现在绑定一个**赎回者**:proof 里的 `submitter`(由调用方的 `X-Client-Address` 请求头回填)是合约唯一允许赎回它的地址,所以抓到的 proof 不会被别的 submitter 抢跑.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -249,7 +249,7 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
 const data = await response.json();                   // 正常的业务响应体
-// proof → { agentId: 33n, timestamp: 1719_000_000n, deadline: 1719_003_600n,
+// proof → { agentId: 33n, submitter: "0x…", timestamp: 1719_000_000n, deadline: 1719_003_600n,
 //           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
 // 底层逃生舱(请求全由你自己组织):ag.reputation.capture(() => fetch(…))
 
@@ -487,11 +487,11 @@ const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
 
 **唯一事实来源:仓库 `contracts/DEPLOYMENT.md` §6.** 同一条链(0G Galileo 测试网,`chainId 16602`)上并行跑着多套 canonical-bound 部署——选与你 `attestorUrl` 指向的 attestor 相匹配的那套(例如 dev 部署配 dev 主机上的 attestor).把那五个地址抄进 `ContractAddresses`(形状见上文),或从你自己的配置/环境变量加载.
 
-稳定的协议级常量**有**导出:`ZERO_G_TESTNET`(viem chain),`RPC_URL`,`CHAIN_ID`,`RECEIPT_WAIT`.
+稳定的协议级常量**有**导出:`ZERO_G_TESTNET` / `ZERO_G_MAINNET`(viem chain),`RPC_URL`,`CHAIN_ID`,`RECEIPT_WAIT`.
 
 ## 注意事项
 
-- **服务证明不绑定客户端.** 评价按 `giveFeedback` 时的 `msg.sender` 归属;证明是持有者凭证(签名 nonce 保证单次使用).无论走什么传输都请把证明当敏感信息对待——服务面的协议取决于部署环境(dev 代理是明文 http,托管环境是 https).
+- **服务证明的绑定.** 链上归属仍按 `giveFeedback` 时的 `msg.sender`;每条证明另外带一个 `submitter`(赎回者,由 `X-Client-Address` 请求头回填)——合约只允许这个地址赎回它,所以证明不会被别的 submitter 抢跑.无论走什么传输都请把证明当敏感信息对待——服务面的协议取决于部署环境(dev 代理是明文 http,托管环境是 https).
 - **0G 回执时序.** `waitForTransaction` 针对 0G 调过参(120 秒超时 + 重试).如果仍超时,交易大概率已落地——读状态确认.
 - 链上类型:`value` / `summaryValue` 是 `int128`(bigint),`feedbackIndex` 是 `uint64`(bigint).
 
@@ -503,6 +503,9 @@ const ag = await AgenticID.fromAttestor(ATTESTOR_URL, {
 
 ```
 digest = keccak256(abi.encode(
+  block.chainid,            // uint256(链 ID,跨链域分隔)
+  identityRegistry,         // address(verifyingContract:声誉合约锚定的 AgenticID 地址)
+  submitter,                // address(唯一被允许赎回本 proof 的地址)
   agentId,                  // uint256
   timestamp,                // uint256(unix 秒)
   deadline,                 // uint256(= timestamp + 3600)
@@ -512,7 +515,7 @@ digest = keccak256(abi.encode(
 ))
 ```
 
-`buildServeProofMessageHash` 就是这个公式的 TS 实现;对照 `sealed/internal/proxy/proxy.go` 的 Go 侧实现.
+chainId + verifyingContract 提供跨链/跨部署分隔,submitter 把 proof 绑定到唯一可赎回它的地址.`buildServeProofMessageHash` 就是这个公式的 TS 实现;对照 `sealed/internal/proxy/proxy.go` 的 Go 侧实现.用导出原语验证时要显式传 domain:`verifyServeProofSignature(proof, expectedSigner, { chainId, verifyingContract })`(submitter 从 proof 里读);`BuildServeProofHashParams`(供 `buildServeProofMessageHash` / `signServeProof` 用)也新增了 `chainId` / `verifyingContract` / `submitter` 三个字段.
 
 `signServeProof` 传给回调的 digest **已经过 EIP-191 包装**(即 `buildServeProofSigningHash` 的输出),所以要裸签,别再包一层:
 
