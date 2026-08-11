@@ -28,14 +28,15 @@
 //   - skills.go       the skills/ manifest role
 //   - persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
 //   - platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
+//   - spawn.go        Start/Stop/probes + version pin + bridge supervision
+//   - bridge/bridge.mjs  the go:embed'ed HTTP bridge (see spawn.go)
 //
-// STATUS: the state/identity half is complete and conformance-tested. The
-// process-lifecycle half (Start/Stop/Liveness/Readiness/AuthResponse/
-// MonitorExit) is NOT implemented — it needs the HTTP bridge, because Prime
-// Agent's daemon speaks JSONL over a local socket and has no HTTP surface for
-// sealed's proxy to forward to. This adapter is therefore deliberately NOT
-// registered in main.go yet; wiring it up before Start works would let a
-// deploy select a framework that cannot boot.
+// Prime Agent has no HTTP surface of its own — its daemon speaks JSONL over a
+// local socket — so sealed ships its own bridge, which embeds the SDK and
+// exposes exactly one OpenAI-shaped chat endpoint. That inverts the usual
+// exposure problem: instead of auditing a framework's built-in dashboard for
+// shell/file/exec reach, the public surface here is a whitelist by
+// construction.
 package prime
 
 import (
@@ -44,7 +45,6 @@ import (
 	"fmt"
 	"os/exec"
 	"sync"
-	"time"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
@@ -54,10 +54,6 @@ import (
 // frameworkName is the adapter id and the `name` field of the framework
 // binding. Selection at boot matches on this exact string.
 const frameworkName = "prime-agent"
-
-// errNoLifecycle marks the not-yet-implemented process half. Returned rather
-// than panicking so a mis-wired build fails loud but survivably.
-var errNoLifecycle = fmt.Errorf("prime: process lifecycle not implemented yet (needs the HTTP bridge; see package doc)")
 
 // Adapter is the Prime Agent implementation of framework.Framework.
 type Adapter struct {
@@ -72,8 +68,17 @@ type Adapter struct {
 	personaProvider string
 	personaModel    string
 
-	// cmd is the running daemon process; nil before Start / after exit.
+	// cmd is the running bridge process; nil before Start / after Stop.
 	cmd *exec.Cmd
+
+	// bridgeToken gates the bridge's /v1/* surface and is what AuthResponse
+	// hands a verified owner. Minted once per container, memory-only.
+	bridgeToken string
+
+	// initialized flips after the first successful Start. Subsequent Starts
+	// (supervisor restarts, Reload) skip the install so agent
+	// self-modifications survive restart untouched.
+	initialized bool
 }
 
 // frameworkBinding is the protocol-reserved "framework" role's plaintext.
@@ -298,35 +303,16 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 // framework's own port: Prime Agent has none.
 const bridgePort = 8791
 
-// ── Process lifecycle: NOT IMPLEMENTED ──────────────────────────────────────
+// Compile-time interface assertions — silent non-implementation of an optional
+// capability is a feature quietly off (FRAMEWORK_ADAPTER.md §2.2).
 //
-// These need the HTTP bridge (package doc, STATUS). Each returns a loud error
-// instead of a silent no-op so a premature main.go registration fails at
-// Start rather than producing an agent that looks alive and serves nothing.
-
-func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
-	return framework.StartResult{}, errNoLifecycle
-}
-
-func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error {
-	return errNoLifecycle
-}
-
-func (a *Adapter) Liveness(ctx context.Context) error  { return errNoLifecycle }
-func (a *Adapter) Readiness(ctx context.Context) error { return errNoLifecycle }
-
-func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
-	return nil, errNoLifecycle
-}
-
-// MonitorExit satisfies manager.Adapter. main.go asserts this at startup.
-func (a *Adapter) MonitorExit(onExit func(err error)) {
-	go onExit(errNoLifecycle)
-}
-
-// Compile-time interface assertions. VersionReconciler, SubprocessLogProvider
-// and SettleDelayer land with the spawn implementation.
+// SettleDelayer is deliberately absent: Prime Agent writes its harness state
+// lazily (on the first refine), not as a first-boot config rewrite, so the
+// conservative 5s bootstrap default is right and a custom value would be
+// noise. framework.Reloadable is absent because nothing consumes it.
 var (
-	_ framework.Framework     = (*Adapter)(nil)
-	_ framework.RouteProvider = (*Adapter)(nil)
+	_ framework.Framework             = (*Adapter)(nil)
+	_ framework.RouteProvider         = (*Adapter)(nil)
+	_ framework.VersionReconciler     = (*Adapter)(nil)
+	_ framework.SubprocessLogProvider = (*Adapter)(nil)
 )

@@ -325,10 +325,12 @@ await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 
 The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
 `0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
-is the sealed runtime image bundling a framework adapter. Two adapters ship
-today — **openclaw** (`0g-sealed`) and **hermes** (`0g-sealed-hermes`, pass it
-as `sandbox.sealedImage` at deploy *and* reset); which are live in a given
-environment is whatever `/config.supported_frameworks` advertises.
+is the sealed runtime image carrying the runtime a framework adapter needs.
+Three adapters ship today — **openclaw** (`0g-sealed`), **hermes**
+(`0g-sealed-hermes`) and **prime-agent** (`0g-sealed-prime`); the latter two
+need their image passed as `sandbox.sealedImage` at deploy *and* reset. Which
+are live in a given environment is whatever `/config.supported_frameworks`
+advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
 `role` labels what the entry is for, `plaintext` is the content itself.
