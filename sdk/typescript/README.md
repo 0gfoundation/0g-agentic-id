@@ -244,7 +244,10 @@ await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
 
 // 3. submit feedback — recorded under buyer (msg.sender). Three fields
-// required; everything else defaults (decimals 0, empty tags/endpoint/URI):
+// required; everything else defaults (decimals 0, empty tags/endpoint/URI).
+// NOTE: an agent's OWNER cannot rate their own agent — the contract rejects it
+// (ReputationSelfFeedback). Feedback must come from a different wallet than the
+// one that owns `agentId`.
 const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // full control when you want it: add valueDecimals / tag1 / tag2 /
 // endpoint / feedbackURI / feedbackHash.
@@ -258,7 +261,7 @@ const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof
 const idx = await ag.reputation.getLastIndex(agentId, buyer);   // → 2n   latest index for this buyer
 await ag.reputation.readFeedback(agentId, buyer, idx);
 // → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "latency", isRevoked: false }
-await ag.reputation.getSummary({ agentId });   // filters all optional
+await ag.reputation.getSummary({ agentId });   // unscoped → summarizes across all clients (SDK fills them; empty → zero summary)
 // → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }
 await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
 await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
@@ -476,14 +479,17 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // the owner↔agent steering channel and is NOT signed (no `X-Agent-Proof`) —
   // reputation comes from the agent's own `/api/*` services, not from talking
   // to your own agent.
+  // `model` is the FRAMEWORK's own selector, not an LLM name (the LLM is fixed
+  // at deploy). openclaw requires "openclaw" (or "openclaw/<agentId>"); pass the
+  // framework you deployed. Omit it and the framework may reject the request.
   if (agent.chat) {
-    const { choices } = await agent.chat([{ role: 'user', content: 'What can you do?' }]);
+    const { choices } = await agent.chat([{ role: 'user', content: 'What can you do?' }], { model: 'openclaw' });
     // choices[0].message.content — a real inference reply
   }
 
   // Live-typing variant — same conditions as chat; yields each content delta:
   if (agent.chatStream) {
-    for await (const delta of agent.chatStream([{ role: 'user', content: 'Hi' }]))
+    for await (const delta of agent.chatStream([{ role: 'user', content: 'Hi' }], { model: 'openclaw' }))
       process.stdout.write(delta);
   }
 
