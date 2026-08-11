@@ -182,8 +182,10 @@ verified once; re-run after each upgrade (already-verified ones skip). Browser
 > is the truth for the most recent deploy. Addresses/wiring below were
 > **verified on chain 2026-07-03** (`VERSION` / `canonical()` /
 > `getIdentityRegistry()` / `beacon.implementation()` all matched as of that
-> check); the one change since is the test ReputationRegistry beacon upgrade
-> to 1.1.0 on **2026-07-22**, verified post-upgrade (see §7).
+> check). Test was subsequently beacon-upgraded twice: ReputationRegistry to
+> 1.1.0 on **2026-07-22**, then the full audit batch (AgenticID 1.1.0 /
+> ReputationRegistry 1.2.0 / TEEDataVerifier 1.1.0) on **2026-08-10** — both
+> verified post-upgrade (see §7).
 >
 > **Two canonical-bound environments run in parallel** — pick the set by env:
 > - **test** (§6.1) — AgenticID `0x3449…`, owner `0xea69…`. **This is what the
@@ -202,14 +204,14 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 
 | Contract | Address | VERSION |
 |---|---|---|
-| **AgenticID proxy** | `0x34493302287308f565CF3409DAAdEDF4C8895648` | 1.0.0 |
-| AgenticID impl | `0x852D34434AE4C3aD28e58272ab9fa871ebeE24c9` | |
+| **AgenticID proxy** | `0x34493302287308f565CF3409DAAdEDF4C8895648` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
+| AgenticID impl | `0x99484dd890Ce0A507949af703544098Aa9312F70` | |
 | AgenticID beacon | `0x201E35B8566EDC26057348D8419Bc8cBCa609c0E` | |
-| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.1.0 (clientless ServeProof — beacon-upgraded 2026-07-22, see §7) |
-| ReputationRegistry impl | `0xC93DAF00e08B4C086629aEd75387805A41f55321` | |
+| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.2.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
+| ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0x309AfEca706659e415FCb0CcF53B25F18859BB99` | |
-| **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.0.0 |
-| TEEDataVerifier impl | `0x306d12BA4b2A3862AdEe45a12C97376a889d937f` | |
+| **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
+| TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` | |
 | TimelockController | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` | |
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
@@ -274,15 +276,33 @@ beacon upgrade and was verified post-upgrade — see changelog):
 
 | Contract | dev VERSION | test VERSION |
 |---|---|---|
-| AgenticID | **1.1.0** | 1.0.0 |
-| TEEDataVerifier | **1.1.0** | 1.0.0 |
-| AgenticIDReputationRegistry | **1.2.0** | **1.1.0** |
+| AgenticID | **1.1.0** | **1.1.0** |
+| TEEDataVerifier | **1.1.0** | **1.1.0** |
+| AgenticIDReputationRegistry | **1.2.0** | **1.2.0** |
 
-> dev and test have drifted: dev upgraded to the audit batch on **2026-08-06**;
-> test is not yet upgraded (still 1.0.0 / 1.0.0 / 1.1.0). Upgrade test to match
-> before relying on cross-env parity.
+> dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
+> test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
 
 Changelog:
+
+- **Audit batch (PR #103), test beacon-upgraded 2026-08-10** — proposer/executor
+  `0xea69…`, timelock `0x111b6c…`, `minDelay=0`, open execution. Reused the
+  audit impls already on chain from the dev upgrade (same chain 16602, not
+  redeployed): AgenticID `1.0.0 → 1.1.0`
+  (impl `0x99484dd890Ce0A507949af703544098Aa9312F70`), AgenticIDReputationRegistry
+  `1.1.0 → 1.2.0` (impl `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3`),
+  TEEDataVerifier `1.0.0 → 1.1.0` (impl `0x2509aE421410f266189F1DB1D57361BE9651AF20`),
+  each via the standard two-phase `ScheduleUpgrade` / `ExecuteUpgrade`. Execute
+  txs: AgenticID `0xc7d22aa0e6eb541f00fb8f0409661611a46c6d27c367b8a9d3cb7254aedc1935`,
+  ReputationRegistry `0x82a1583aeac3e0f6ae5b994c59a7cd45e17c2e298931d55bee9cf63e49e6ca62`,
+  TEEDataVerifier `0x7d6201de6f8508840d7c04596860286ad8faa34a9209c09cfcb3c1513fa81077`.
+  Post-upgrade verified on chain: proxy `VERSION()` reads 1.1.0 / 1.2.0 / 1.1.0
+  and each `beacon.implementation()` matches the impl above; explorer verification
+  idempotent (all impl/beacon/proxy already verified). **Note:** test is the env
+  the production attestor (`agenticid.0g.ai`) uses; the serve-proof digest changed
+  (#86), so the production sealed image + SDK must move to the #103 build in the
+  same window, or running agents' ServeProofs fail `giveFeedback` verification
+  until updated.
 
 - **Audit batch (PR #103), dev beacon-upgraded 2026-08-06** — proposer/executor
   `0xB831…`, `minDelay=0`. AgenticID `1.0.0 → 1.1.0`
