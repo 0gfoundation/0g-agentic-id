@@ -277,8 +277,13 @@ export function makeAgentClient(params: {
   // stream:true so the reply flows as SSE — a reasoning turn can take minutes,
   // and a buffered reply sends no bytes until it finishes, so an idle-timeout
   // hop in front of the agent (e.g. a load balancer, ~60s) would cut it.
+  // The `model` field is the framework's own selector, NOT an LLM name — e.g.
+  // openclaw requires "openclaw" (or "openclaw/<agentId>"); the LLM is fixed at
+  // deploy. There's no framework-agnostic default (/hello doesn't declare it),
+  // so omit the field when the caller doesn't set one rather than sending a
+  // bogus value the framework rejects.
   const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
-    JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true });
+    JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {
