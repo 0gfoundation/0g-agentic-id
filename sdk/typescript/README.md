@@ -1,8 +1,6 @@
 # @0gfoundation/0g-agenticid-sdk
 
-English | [中文](README.zh.md)
-
-TypeScript SDK for the [0G AgenticID](https://github.com/0gfoundation/0g-agentic-id) protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
+TypeScript SDK for the 0G AgenticID protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
 
 One entry point, `AgenticID`, with two intent namespaces plus a few top-level ops:
 
@@ -273,7 +271,7 @@ await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackInde
 await ag.reputation.revokeFeedback(agentId, idx);              // → tx hash "0x…"  (only by the buyer who left it)
 ```
 
-> **Data-bound reputation** (weighting a score by whether it was earned under the agent's *current* data, rather than lumping all of history like `getSummary`) is designed but **not yet in the SDK** — it belongs to the event-indexer phase. See [`REPUTATION_MODEL.md`](../../REPUTATION_MODEL.md) for the model.
+> **Data-bound reputation** (weighting a score by whether it was earned under the agent's *current* data, rather than lumping all of history like `getSummary`) is designed but **not yet in the SDK** — it belongs to the event-indexer phase.
 
 ---
 
@@ -566,7 +564,7 @@ is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: [contracts/DEPLOYMENT.md §6](../../contracts/DEPLOYMENT.md).** Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`) — pick the set matching the attestor you point `attestorUrl` at (e.g. the dev deployment is what the dev-host attestor uses). Copy those five addresses into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills all five addresses for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the five into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
