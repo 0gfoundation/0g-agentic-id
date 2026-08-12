@@ -12,6 +12,7 @@ import {
 import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.sol";
 import {NonceExpired, NonceAlreadyUsed} from "../src/utils/NonceRegistryUpgradeable.sol";
 import {IERC7857, SealedKeyEntry} from "../src/interfaces/IERC7857.sol";
+import {IERC721Receiver} from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import {
     OracleType,
     AccessProof,
@@ -472,5 +473,195 @@ contract TransferFlowTest is AgenticIDTestBase {
             abi.encodeWithSelector(AgenticIDSealedAgentUseTransfer.selector, agentId)
         );
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+    }
+
+    // ── Dynamic-field boundary re-split (encode, not packed) ──────────────────
+
+    /// @dev A buyer signature over one (targetPubkey, nonce) split must NOT be
+    ///      valid for a different split. The exploit: the buyer signs an honest
+    ///      empty-target proof whose nonce embeds the attacker's pubkey; the
+    ///      seller re-splits the identical bytes so targetPubkey becomes the
+    ///      attacker's key and the data would seal to the attacker while the
+    ///      buyer takes the token. Under packed encoding both splits hashed
+    ///      identically and the re-split was honored; under abi.encode the
+    ///      length prefix makes the two splits distinct digests, so the buyer's
+    ///      signature no longer recovers to the buyer and the transfer reverts.
+    function test_iTransferFrom_revertsOnAccessProofBoundaryReSplit() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        Vm.Wallet memory attacker = vm.createWallet("attacker");
+        bytes memory kAtt = _pubkey(attacker); // 64-byte pubkey
+        bytes memory apTail = hex"42";
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // Buyer signs the HONEST split: targetPubkey = "", nonce = kAtt ‖ apTail.
+        // (In Ethereum mode the empty target means "seal to my own key".)
+        bytes32 innerHonest = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash,
+            bytes(""), abi.encodePacked(kAtt, apTail), deadline
+        ));
+        bytes memory buyerSig = _sign(buyerWallet.privateKey, _eip191HexHash(innerHonest));
+
+        // Seller re-splits the identical bytes and presents targetPubkey = kAtt.
+        AccessProof memory apReSplit = AccessProof({
+            dataHash: dataHash,
+            targetPubkey: kAtt,     // moved boundary (was "")
+            nonce: apTail,          // moved boundary (was kAtt ‖ apTail)
+            deadline: deadline,
+            proof: buyerSig         // unchanged buyer signature
+        });
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, kAtt, bytes("op-resplit"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: apReSplit, ownershipProof: op});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(); // buyer sig recovers to a non-buyer address → rejected
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+
+        assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "token stayed with seller");
+    }
+
+    /// @dev Same class on the oracle side: re-splitting the (sealedKey,
+    ///      targetPubkey, nonce) run of the ownership proof must invalidate the
+    ///      oracle signature rather than let the stored sealedKey differ from
+    ///      what was signed.
+    function test_iTransferFrom_revertsOnOwnershipProofBoundaryReSplit() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        bytes memory buyerPubkey = _pubkey(buyerWallet);
+        uint256 deadline = block.timestamp + 1 hours;
+
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, "", bytes("ap-osplit"), deadline, buyerWallet.privateKey
+        );
+
+        // Oracle signs sealedKey = A ‖ B (concatenated); attacker re-splits so
+        // the stored sealedKey is just A. abi.encode makes these distinct digests.
+        bytes memory keyHead = hex"aaaa";
+        bytes memory keyTail = hex"bbbb";
+        bytes memory opNonce = bytes("op-osplit");
+        bytes32 innerHonest = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash,
+            abi.encodePacked(keyHead, keyTail), buyerPubkey, opNonce, deadline
+        ));
+        bytes memory oracleSig = _sign(oraclePk, _eip191HexHash(innerHonest));
+
+        OwnershipProof memory opReSplit = OwnershipProof({
+            oracleType: OracleType.TEE,
+            dataHash: dataHash,
+            sealedKey: keyHead,   // moved boundary (was keyHead ‖ keyTail)
+            targetPubkey: buyerPubkey,
+            nonce: opNonce,
+            deadline: deadline,
+            proof: oracleSig
+        });
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: opReSplit});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofs);
+    }
+
+    /// @dev Known-answer vector for the AccessProof digest, computed with fixed
+    ///      inputs (chain/contract/fields as literals, independent of the test
+    ///      chain). This is the canonical reference any off-chain buyer signer —
+    ///      which lives outside this repo — must reproduce. If the on-chain
+    ///      encoding drifts, this constant changes and the assertion fails.
+    function test_accessProofDigest_knownAnswerVector() public pure {
+        bytes memory targetPubkey = new bytes(64);
+        for (uint256 i = 0; i < 64; i++) targetPubkey[i] = 0x22;
+        bytes memory nonce = hex"3333";
+
+        bytes32 digest = keccak256(abi.encode(
+            uint256(16602),                                   // chainId
+            address(0x00000000000000000000000000000000000000A9), // erc7857
+            bytes32(0x1111111111111111111111111111111111111111111111111111111111111111), // dataHash
+            targetPubkey,
+            nonce,
+            uint256(1700003600)                               // deadline
+        ));
+
+        assertEq(
+            digest,
+            0x23cf25e6103163928e91c5c7a4efe48f9a4405856f1b236f15beb4c5d754b0ff,
+            "AccessProof digest drifted from the cross-component known-answer vector"
+        );
+    }
+
+    // ── Receiver reentrancy ───────────────────────────────────────────────────
+
+    /// @dev A malicious receiver that re-enters iTransferFrom from its
+    ///      onERC721Received callback must not be able to desync ownership from
+    ///      the stored sealed keys. The re-entrant call trips nonReentrant and
+    ///      reverts, which bubbles up and rolls back the whole transfer, so
+    ///      ownerOf and sealedKeysOf can never disagree.
+    function test_iTransferFrom_reentrantReceiverIsBlocked() public {
+        (uint256 agentId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+
+        ReentrantReceiver mal = new ReentrantReceiver();
+        // A contract can't ECDSA-sign its own access proof, so it authorises a
+        // delegate EOA (custom-key mode: an arbitrary non-empty target key).
+        Vm.Wallet memory delegate = vm.createWallet("mal-delegate");
+        vm.prank(address(mal));
+        agenticId.setAccessDelegate(delegate.addr);
+
+        mal.arm(address(agenticId), address(0xC0FFEE));
+
+        bytes memory malKey = hex"c0ffee";
+        uint256 deadline = block.timestamp + 1 hours;
+        AccessProof memory ap = _mkAccessProof(
+            dataHash, malKey, bytes("re-ap"), deadline, delegate.privateKey
+        );
+        OwnershipProof memory op = _mkOwnershipProof(
+            dataHash, SEALED_KEY_NEW, malKey, bytes("re-op"), deadline
+        );
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(); // re-entry trips nonReentrant → whole transfer reverts
+        agenticId.iTransferFrom(sellerWallet.addr, address(mal), agentId, proofs);
+
+        assertEq(agenticId.ownerOf(agentId), sellerWallet.addr, "token stayed with seller; no desync");
+    }
+}
+
+interface IReentryTarget {
+    function iTransferFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        TransferValidityProof[] calldata proofs
+    ) external returns (SealedKeyEntry[] memory);
+}
+
+/// @dev On its first onERC721Received it re-enters iTransferFrom to forward the
+///      token onward — the receiver-reentrancy attack from the audit.
+contract ReentrantReceiver is IERC721Receiver {
+    IReentryTarget internal target;
+    address internal forwardTo;
+    bool internal armed;
+
+    function arm(address target_, address forwardTo_) external {
+        target = IReentryTarget(target_);
+        forwardTo = forwardTo_;
+        armed = true;
+    }
+
+    function onERC721Received(address, address, uint256 tokenId, bytes calldata)
+        external
+        returns (bytes4)
+    {
+        if (armed) {
+            armed = false;
+            // Empty proofs are fine: nonReentrant reverts on entry, before any
+            // proof is examined.
+            TransferValidityProof[] memory empty = new TransferValidityProof[](0);
+            target.iTransferFrom(address(this), forwardTo, tokenId, empty);
+        }
+        return IERC721Receiver.onERC721Received.selector;
     }
 }

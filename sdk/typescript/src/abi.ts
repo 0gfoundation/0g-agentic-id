@@ -55,18 +55,6 @@ export const agenticIDAbi = [
     outputs: [{ name: 'agentId', type: 'uint256' }],
   },
 
-  // ── Seal Management ──
-  {
-    type: 'function',
-    name: 'setAgentSeal',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'agentId', type: 'uint256' },
-      { name: 'agentSeal_', type: 'address' },
-      { name: 'sealId', type: 'bytes32' },
-    ],
-    outputs: [],
-  },
   {
     type: 'function',
     name: 'tokenURI',
@@ -522,6 +510,36 @@ export const agenticIDAbi = [
  * ABI for the ReputationRegistry contract.
  */
 export const reputationRegistryAbi = [
+  // Custom errors (from AgenticIDReputationRegistry.sol) — so viem can decode
+  // reverts like ReputationSelfFeedback / ReputationClientsRequired instead of
+  // showing a bare 4-byte selector.
+  {"type":"error","name":"AgenticIDProofRequired","inputs":[]},
+  {"type":"error","name":"ECDSAInvalidSignature","inputs":[]},
+  {"type":"error","name":"ECDSAInvalidSignatureLength","inputs":[{"name":"length","type":"uint256"}]},
+  {"type":"error","name":"ECDSAInvalidSignatureS","inputs":[{"name":"s","type":"bytes32"}]},
+  {"type":"error","name":"EnforcedPause","inputs":[]},
+  {"type":"error","name":"ExpectedPause","inputs":[]},
+  {"type":"error","name":"InvalidInitialization","inputs":[]},
+  {"type":"error","name":"NonceAlreadyUsed","inputs":[{"name":"key","type":"bytes32"}]},
+  {"type":"error","name":"NonceDeadlineTooFar","inputs":[{"name":"deadline","type":"uint256"},{"name":"maxDeadline","type":"uint256"}]},
+  {"type":"error","name":"NonceExpired","inputs":[{"name":"deadline","type":"uint256"},{"name":"nowTimestamp","type":"uint256"}]},
+  {"type":"error","name":"NotInitializing","inputs":[]},
+  {"type":"error","name":"OwnableInvalidOwner","inputs":[{"name":"owner","type":"address"}]},
+  {"type":"error","name":"OwnableUnauthorizedAccount","inputs":[{"name":"account","type":"address"}]},
+  {"type":"error","name":"ReputationAlreadyResponded","inputs":[]},
+  {"type":"error","name":"ReputationAlreadyRevoked","inputs":[]},
+  {"type":"error","name":"ReputationClientsRequired","inputs":[]},
+  {"type":"error","name":"ReputationInvalidIndex","inputs":[{"name":"index","type":"uint256"},{"name":"length","type":"uint256"}]},
+  {"type":"error","name":"ReputationInvalidProofSignature","inputs":[]},
+  {"type":"error","name":"ReputationNoAgentSeal","inputs":[]},
+  {"type":"error","name":"ReputationNotAgentOwner","inputs":[]},
+  {"type":"error","name":"ReputationNotPauser","inputs":[]},
+  {"type":"error","name":"ReputationProofAgentMismatch","inputs":[{"name":"agentId","type":"uint256"},{"name":"proofAgentId","type":"uint256"}]},
+  {"type":"error","name":"ReputationProofSubmitterMismatch","inputs":[{"name":"submitter","type":"address"},{"name":"sender","type":"address"}]},
+  {"type":"error","name":"ReputationSelfFeedback","inputs":[{"name":"agentId","type":"uint256"},{"name":"submitter","type":"address"}]},
+  {"type":"error","name":"ReputationSummaryOverflow","inputs":[]},
+  {"type":"error","name":"ReputationValueDecimalsTooLarge","inputs":[{"name":"valueDecimals","type":"uint8"}]},
+  {"type":"error","name":"ReputationValueOutOfRange","inputs":[{"name":"value","type":"int128"}]},
   // ── Give Feedback ──
   {
     type: 'function',
@@ -538,6 +556,7 @@ export const reputationRegistryAbi = [
       { name: 'feedbackHash', type: 'bytes32' },
       { name: 'ServeProof', type: 'tuple', components: [
         { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
         { name: 'timestamp', type: 'uint256' },
         { name: 'deadline', type: 'uint256' },
         { name: 'taskHash', type: 'bytes32' },

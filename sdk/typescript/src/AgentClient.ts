@@ -218,9 +218,13 @@ export function makeAgentClient(params: {
   token?: string;
   reauth?: () => Promise<string>;
   logAuth?: () => Promise<{ message: string; signature: string }>;
+  /** Address that will redeem serve-proofs from this handle's responses. Sent
+   *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
+   *  protection). Omit for anonymous calls (proofs come back unredeemable). */
+  clientAddress?: string;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
-  const { services, routes, reauth } = params;
+  const { services, routes, reauth, clientAddress } = params;
   const canAuth = !!(reauth || params.token);
 
   let cached: string | undefined = params.token;
@@ -240,6 +244,11 @@ export function makeAgentClient(params: {
     const send = (tok?: string) => {
       const headers = new Headers(init?.headers);
       if (tok) headers.set('Authorization', `Bearer ${tok}`);
+      // Bind serve-proofs from this response to the redeemer, unless the caller
+      // set the header explicitly.
+      if (clientAddress && !headers.has('X-Client-Address')) {
+        headers.set('X-Client-Address', clientAddress);
+      }
       return fetch(url, { ...init, headers });
     };
 
@@ -268,8 +277,13 @@ export function makeAgentClient(params: {
   // stream:true so the reply flows as SSE — a reasoning turn can take minutes,
   // and a buffered reply sends no bytes until it finishes, so an idle-timeout
   // hop in front of the agent (e.g. a load balancer, ~60s) would cut it.
+  // The `model` field is the framework's own selector, NOT an LLM name — e.g.
+  // openclaw requires "openclaw" (or "openclaw/<agentId>"); the LLM is fixed at
+  // deploy. There's no framework-agnostic default (/hello doesn't declare it),
+  // so omit the field when the caller doesn't set one rather than sending a
+  // bogus value the framework rejects.
   const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
-    JSON.stringify({ model: opts?.model ?? 'default', messages, stream: true });
+    JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
 
   const chat = routes.find((r) => r.kind === 'chat');
   if (chat && canAuth) {

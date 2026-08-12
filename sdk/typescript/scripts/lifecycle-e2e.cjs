@@ -56,8 +56,12 @@ async function patientWait(waitFn, hash, label) {
 
 // /hello via curl: node's undici can't reach the nip.io proxy from some
 // networks where curl can (same workaround as agent-e2e.cjs).
-function curlHelloHeader(base) {
-  const raw = execSync(`curl -sm20 -D - -o /dev/null '${base}/hello'`, { encoding: 'utf8' });
+// clientAddr, when given, is echoed as X-Client-Address so the TEE binds the
+// serve-proof's `submitter` to it — required for the proof to be redeemable via
+// giveFeedback (the contract enforces submitter == msg.sender).
+function curlHelloHeader(base, clientAddr) {
+  const hdr = clientAddr ? `-H 'X-Client-Address: ${clientAddr}'` : '';
+  const raw = execSync(`curl -sm20 -D - -o /dev/null ${hdr} '${base}/hello'`, { encoding: 'utf8' });
   return (raw.match(/^x-agent-proof:\s*(.+)$/mi) || [])[1]?.trim() || null;
 }
 
@@ -163,8 +167,10 @@ function mkClient(privKey, cfg) {
 
   // ── 2. feedback: B (non-owner) rates the running source agent ─────────
   console.log('· giveFeedback() — wallet B rates the agent with its live ServeProof…');
+  // Bind the proof to wallet B (the giveFeedback caller) via X-Client-Address,
+  // else submitter defaults to the zero address and the contract rejects it.
   let header = null;
-  for (let i = 0; i < 8 && !header; i++) { header = curlHelloHeader(AGENT_URL); if (!header) await sleep(8000); }
+  for (let i = 0; i < 8 && !header; i++) { header = curlHelloHeader(AGENT_URL, acctB.address); if (!header) await sleep(8000); }
   check('live ServeProof captured from /hello', !!header);
   const proof = A.reputation.parseServeProofHeader(header);
   check('proof names the source agent', proof.agentId === AGENT_ID, `proof.agentId=${proof.agentId}`);

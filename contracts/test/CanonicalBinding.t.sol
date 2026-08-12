@@ -106,13 +106,17 @@ contract CanonicalBindingTest is AgenticIDTestBase {
         assertEq(agenticId.getAgentIdBySealId(SEAL_ID), 0, "reverse map returns 0 (the real agent)");
         assertTrue(agenticId.isSealIdBound(SEAL_ID), "existence flag distinguishes from unbound");
 
-        // Binding the same sealId to another (seal-less) agent must still be
-        // rejected, even though sealIdToAgentId[SEAL_ID] == 0 would look "empty"
-        // without the explicit existence flag.
-        (uint256 agentId2, ) = _selfMint(alice);
+        // Minting another agent with the same sealId must still be rejected,
+        // even though sealIdToAgentId[SEAL_ID] == 0 would look "empty" without
+        // the explicit existence flag.
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: keccak256("cb-dup")});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = hex"cafe";
+        MetadataEntry[] memory meta = new MetadataEntry[](0);
         vm.prank(attestor);
         vm.expectRevert(abi.encodeWithSelector(AgenticIDSealIdTaken.selector, SEAL_ID, uint256(0)));
-        agenticId.setAgentSeal(agentId2, address(0xB1), SEAL_ID);
+        agenticId.registerWithSeal(alice, "", meta, datas, keys, address(0xB1), SEAL_ID);
     }
 
     // ── Clone also registers a fresh canonical identity ────────────────────────
@@ -139,6 +143,31 @@ contract CanonicalBindingTest is AgenticIDTestBase {
         assertEq(canonical.getAgentWallet(cloneId), address(0), "clone agentWallet cleared");
         // Source canonical identity untouched.
         assertEq(canonical.ownerOf(srcId), address(agenticId), "source still custodied");
+    }
+
+    // ── Stray canonical deposits are rejected (no permanent lock) ─────────────
+
+    function test_strayCanonicalDepositRejected() public {
+        address stranger = address(0x5747);
+        vm.prank(stranger);
+        uint256 strayId = canonical.register();
+
+        // Pushing an already-existing canonical token into custody must revert —
+        // there is no withdrawal path, so accepting it would lock it forever.
+        vm.prank(stranger);
+        vm.expectRevert();
+        canonical.safeTransferFrom(stranger, address(agenticId), strayId);
+
+        assertEq(canonical.ownerOf(strayId), stranger, "stray token stays with its owner");
+    }
+
+    // ── setAgentURI requires a local token even for an attestor ───────────────
+
+    function test_setAgentURI_revertsOnNonexistentTokenEvenForAttestor() public {
+        uint256 ghostId = 999_999;
+        vm.prank(attestor);
+        vm.expectRevert();
+        agenticId.setAgentURI(ghostId, "ipfs://attacker-controlled");
     }
 
     // ── helper ──────────────────────────────────────────────────────────────────

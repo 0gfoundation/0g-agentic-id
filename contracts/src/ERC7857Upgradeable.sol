@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {IERC721} from "@openzeppelin/contracts/interfaces/IERC721.sol";
 
@@ -15,9 +16,9 @@ import {
     TransferValidityProofOutput
 } from "./interfaces/IERC7857DataVerifier.sol";
 
-contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, PausableUpgradeable {
+contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, PausableUpgradeable, ReentrancyGuardUpgradeable {
 
-    /// @custom:storage-location erc7857:0g.storage.ERC7857
+    /// @custom:storage-location erc7201:0g.storage.ERC7857
     struct ERC7857Storage {
         mapping(address => address) accessDelegates;
         IERC7857DataVerifier verifier;
@@ -97,25 +98,32 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         address to,
         uint256 tokenId,
         TransferValidityProof[] calldata proofs
-    ) public virtual whenNotPaused returns (SealedKeyEntry[] memory entries) {
+    ) public virtual whenNotPaused nonReentrant returns (SealedKeyEntry[] memory entries) {
         // Authorization checked BEFORE proof verification so unauthorised
         // callers fail cheaply without spending gas on proof validation.
         _checkAuthorized(from, msg.sender, tokenId);
 
         entries = _proofCheck(from, to, tokenId, proofs);
 
-        // Use internal transfer to avoid a redundant _checkAuthorized call
-        // and to bypass our own transferFrom override.
-        _safeTransfer(from, to, tokenId, "");
-
-        // Persist the new sealedKeys (wrapped to `to`) alongside the
-        // dataHashes that already live in storage. dataHashes don't
-        // change on transfer; only the wrap target does.
+        // Checks-effects-interactions: persist the new sealedKeys (wrapped to
+        // `to`) BEFORE handing control to `to` via _safeTransfer's
+        // onERC721Received callback. Writing keys after the callback let a
+        // malicious receiver re-enter and forward the token onward, so the
+        // outer frame's key write clobbered the inner one — leaving ownership
+        // and the stored keys desynced. dataHashes don't change on transfer;
+        // only the wrap target does. The key write is keyed by tokenId (not by
+        // owner), so doing it while the token still belongs to `from` is fine,
+        // and if the receiver rejects, the whole tx (including this write)
+        // reverts — atomicity preserved. nonReentrant is belt-and-suspenders.
         bytes[] memory sealedKeys = new bytes[](entries.length);
         for (uint256 i; i < entries.length; ++i) {
             sealedKeys[i] = entries[i].sealedKey;
         }
         _updateSealedKeys(tokenId, sealedKeys);
+
+        // Use internal transfer to avoid a redundant _checkAuthorized call
+        // and to bypass our own transferFrom override.
+        _safeTransfer(from, to, tokenId, "");
 
         emit ITransferred(from, to, tokenId, entries);
     }

@@ -82,6 +82,7 @@ export class ReputationClient {
         params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
         {
           agentId: sp.agentId,
+          submitter: sp.submitter,
           timestamp: sp.timestamp,
           deadline: sp.deadline,
           taskHash: sp.taskHash,
@@ -204,11 +205,21 @@ export class ReputationClient {
    * @returns Feedback summary (count, summary value, decimals)
    */
   async getSummary(params: GetSummaryParams): Promise<FeedbackSummary> {
+    // getSummary reverts (ReputationClientsRequired) on an empty clientAddresses
+    // list — unlike readAllFeedback. When the caller doesn't scope to specific
+    // clients, default to "all clients that have left feedback" (getClients),
+    // matching the intuitive "summary of everything". No clients yet → return an
+    // empty summary rather than letting the contract revert.
+    let clients = params.clientAddresses ?? [];
+    if (clients.length === 0) {
+      clients = await this.getClients(params.agentId);
+      if (clients.length === 0) return { count: 0n, summaryValue: 0n, summaryValueDecimals: 0 };
+    }
     const result = await this.publicClient.readContract({
       address: this.address,
       abi: reputationRegistryAbi,
       functionName: 'getSummary',
-      args: [params.agentId, (params.clientAddresses ?? []), (params.tag1 ?? ''), (params.tag2 ?? '')],
+      args: [params.agentId, clients, (params.tag1 ?? ''), (params.tag2 ?? '')],
     });
     const [count, summaryValue, summaryValueDecimals] = result as [bigint, bigint, number];
     return { count, summaryValue, summaryValueDecimals };

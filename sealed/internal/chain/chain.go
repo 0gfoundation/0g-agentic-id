@@ -64,6 +64,7 @@ type Client struct {
 	eth      *ethclient.Client
 	abi      abi.ABI
 	contract common.Address
+	chainID  *big.Int
 }
 
 // Dial connects to rpcURL and binds the AgenticID ABI at contractHex.
@@ -72,6 +73,14 @@ func Dial(ctx context.Context, rpcURL, contractHex string) (*Client, error) {
 	eth, err := ethclient.DialContext(ctx, rpcURL)
 	if err != nil {
 		return nil, fmt.Errorf("dial rpc: %w", err)
+	}
+	// Fetch the chain id once at dial. It's part of the serve-proof digest
+	// (domain separation), so the runtime must know it without a per-request
+	// round-trip.
+	chainID, err := eth.ChainID(ctx)
+	if err != nil {
+		eth.Close()
+		return nil, fmt.Errorf("chain id: %w", err)
 	}
 	parsedABI, err := abi.JSON(strings.NewReader(AgenticIDABI))
 	if err != nil {
@@ -82,8 +91,15 @@ func Dial(ctx context.Context, rpcURL, contractHex string) (*Client, error) {
 		eth:      eth,
 		abi:      parsedABI,
 		contract: common.HexToAddress(contractHex),
+		chainID:  chainID,
 	}, nil
 }
+
+// ChainID returns the chain id fetched at dial (nil only if never dialed).
+func (c *Client) ChainID() *big.Int { return c.chainID }
+
+// ContractAddr returns the bound AgenticID (identity registry) address.
+func (c *Client) ContractAddr() common.Address { return c.contract }
 
 // Close releases the underlying RPC connection.
 func (c *Client) Close() {

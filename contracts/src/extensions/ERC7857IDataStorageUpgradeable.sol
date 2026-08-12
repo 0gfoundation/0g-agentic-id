@@ -8,7 +8,7 @@ import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 
 contract ERC7857IDataStorageUpgradeable is IERC7857Updatable, ERC7857Upgradeable {
 
-    /// @custom:storage-location erc7857:0g.storage.ERC7857IDataStorage
+    /// @custom:storage-location erc7201:0g.storage.ERC7857IDataStorage
     /// @dev `sealedKeys[tokenId][i]` is the wrap for `iDatas[tokenId][i]`.
     ///      Maintained 1:1 with iDatas by _updateData / _updateDataAt /
     ///      _updateSealedKeys. Appended to the struct in V2 — safe across

@@ -304,7 +304,8 @@ type RuntimeContext struct {
 	AgentID      string // on-chain AgenticID token ID (decimal string); empty if not minted
 	Owner        string // 0x-prefixed owner address from OwnerOf; empty if lookup failed
 	ChainRPC     string // RPC endpoint used for chain queries
-	ContractAddr string // AgenticID contract address
+	ContractAddr string // AgenticID (identity registry) address; signed into serve-proof domain
+	ChainID      string // chain id (decimal); signed into serve-proof domain separation
 	AttestorURL  string // attestor endpoint URL
 
 	// Inference routing (populated by spawn.go after resolving provider).

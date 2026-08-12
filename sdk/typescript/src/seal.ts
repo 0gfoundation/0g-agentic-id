@@ -9,8 +9,8 @@
  * transaction — see sealed/internal/proxy/sign.go). This module bridges
  * that signer into a viem `Account`, so the whole SDK works unchanged:
  *
- *   import { AgenticID } from '@0gfoundation/agentic-sdk';
- *   import { sealAccount } from '@0gfoundation/agentic-sdk/seal';
+ *   import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
+ *   import { sealAccount } from '@0gfoundation/0g-agenticid-sdk/seal';
  *   const ag = await AgenticID.fromAttestor(url, { account: await sealAccount() });
  *
  * Node-only (unix sockets); import from the `/seal` subpath so browser

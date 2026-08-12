@@ -62,6 +62,11 @@ pub struct Config {
     pub tapp_ip: String,
     /// Port for tapp-server gRPC. Default 50051.
     pub tapp_port: u16,
+    /// Optional unix socket path for tapp-server gRPC (e.g.
+    /// `/run/tapp/tapp.sock`). When set it takes precedence over
+    /// `tapp_ip`/`tapp_port`, which are then ignored. Mount the socket into
+    /// the container to use it, keeping the TEE-key/KMS RPCs off any TCP port.
+    pub tapp_socket: Option<String>,
     /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
     /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
     /// either `mock_tee=false` or `mock_kms=false`. Also surfaced to the
@@ -245,6 +250,7 @@ impl Config {
             tapp_port: env_opt("ATTESTOR_TAPP_PORT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(50051),
+            tapp_socket: env_opt("ATTESTOR_TAPP_SOCKET").filter(|s| !s.is_empty()),
             app_id: env_opt("ATTESTOR_APP_ID"),
             kms_app_id: env_opt("ATTESTOR_KMS_APP_ID"),
             sandbox_app_id: env_opt("ATTESTOR_SANDBOX_APP_ID"),
