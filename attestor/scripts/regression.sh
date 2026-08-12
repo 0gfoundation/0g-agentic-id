@@ -60,6 +60,9 @@ fi
 # ── negative path (free) ──────────────────────────────────────────────
 step "smoke (negative deploy → 400)" bash -c "cd '$SDK' && node scripts/smoke.cjs"
 
+# ── CLI smoke, public tier (free): read paths + the WALLET_REQUIRED gates ──
+step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
+
 # ── deploy a fresh source, capture its coordinates ────────────────────
 DEPLOY_LOG="$(mktemp)"
 printf '\n\033[1m══ deploy source ══\033[0m\n'
@@ -81,6 +84,10 @@ if [ -n "${SEAL_ID:-}" ]; then
   AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
   echo "source: agent_id=$AGENT_ID seal=$SEAL_ID sandbox=$SANDBOX url=$AGENT_URL"
 
+  # CLI owner tier against the fresh deployment: doctor all six green,
+  # list --mine non-empty, status pinned to this agent, and the owner-tier
+  # failure-reason folding when the env has a failed row (#116). Read-only.
+  step "cli-smoke (owner tier)" bash -c "cd '$SDK' && AGENTIC_ATTESTOR_URL='$API' AGENTIC_PRIVATE_KEY='$OWNER_PRIV' AGENT_ID='$AGENT_ID' node scripts/cli-smoke.cjs"
   # identity / decrypt / serve-proof
   step "verify-agent (identity+decrypt+proof)" env AGENT_ID="$AGENT_ID" bash "$HERE/verify-agent.sh"
   # sayHi real verify + reset determinism
