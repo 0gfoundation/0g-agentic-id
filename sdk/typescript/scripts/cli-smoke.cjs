@@ -18,6 +18,9 @@
 //                            both paths are real coverage.
 //   AGENT_ID=33              pin the status leg to a known agent; otherwise
 //                            it targets the first row of the public listing.
+//                            With a key, a failed row (when one exists) gets
+//                            a second status leg asserting the owner-tier
+//                            failure-reason folding.
 //   AGENTIC_RPC_URL=…        forwarded to the CLI (explicit-wins override).
 'use strict';
 const { spawn } = require('child_process');
@@ -164,6 +167,30 @@ const byName = (checks, name) => (checks ?? []).find((c) => c.name === name);
           `agentId=${d.agentId} sealId=${d.sealId}`);
         check('status phase is populated from the listing', typeof d.phase === 'string',
           `phase=${d.phase}`);
+      }
+    }
+  }
+
+  // ── status on a failed row: the owner-tier failure-reason folding ──
+  // The public listing withholds failure reasons (#64); with a key, status
+  // silently re-reads the owner-signed tier. Only reachable when the live
+  // environment actually has a failed deployment — skipped loudly otherwise.
+  {
+    const failed = rows.find((row) => row.phase === 'failed');
+    if (!PRIVATE_KEY) skip('status failed-row folding', 'needs AGENTIC_PRIVATE_KEY');
+    else if (!failed) skip('status failed-row folding', 'no failed deployment in the public listing');
+    else {
+      const ref = failed.agentId ?? failed.sealId;
+      const r = await cli(['status', String(ref), '--json'], LIVE);
+      const env = envelope('failed-row envelope', r);
+      check(`status ${ref} (failed row) exit 0`, r.code === 0);
+      if (env && env.ok) {
+        check('failed row: phase=failed + retry hint',
+          env.data.phase === 'failed' && typeof env.data.hint === 'string',
+          `phase=${env.data.phase}`);
+        console.log(`  note: failureReason=${env.data.failureReason === null
+          ? 'null (absent even on the owner tier)'
+          : JSON.stringify(env.data.failureReason).slice(0, 100)}`);
       }
     }
   }
