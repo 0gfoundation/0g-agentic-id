@@ -77,6 +77,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := materializeBridge(); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
+	if err := ensureDir(sessionStateDir()); err != nil {
+		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
+	}
 
 	sdkProvider, baseURLEnv, baseURL := resolveInference(ctx, provider, model)
 
@@ -237,6 +240,10 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		"HOME=" + os.Getenv("HOME"),
 		"NODE_PATH=" + nodePath,
 		"PRIME_AGENT_CODING_AGENT_DIR=" + primeHome,
+		// Read by harness.py inside the IPython kernel, which the SDK spawns as
+		// a child of this bridge and which therefore inherits this env. See
+		// sessionStateDir for why leaving it unset is not an option.
+		"RLM_SESSION_DIR=" + sessionStateDir(),
 		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
 		"SEAL_BRIDGE_TOKEN=" + be.token,
 		"SEAL_AGENT_DOC=" + agentDocPath(),

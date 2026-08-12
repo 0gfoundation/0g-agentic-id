@@ -55,6 +55,23 @@ func harnessStateDir() string  { return primeHome + "/harness" }
 func skillsDir() string        { return primeHome + "/skills" }
 func appendSystemPath() string { return primeHome + "/APPEND_SYSTEM.md" }
 
+// sessionStateDir is the explicit home for the framework's per-session
+// ("local") harness state, exported to the framework as RLM_SESSION_DIR.
+//
+// Not cosmetic. harness.py resolves the local state file from the environment
+// (RLM_HARNESS_STATE_DIR, else RLM_SESSION_DIR/harness) and RAISES when neither
+// is set — and local is the default scope for every create_*/update_* call, so
+// without this the agent's first memory write fails. Worse, harness.py's own
+// comment warns that a fall-through lands local writes in the GLOBAL agent-dir
+// file, which is the one this adapter tracks: mid-task drafts would go on chain.
+// Pinning local state under /tmp keeps them off chain BY CONSTRUCTION rather
+// than by the framework happening to resolve the way we want.
+//
+// Outside primeHome, so no tracked role can reach it. If the SDK sets its own
+// RLM_SESSION_DIR per session, ours is simply overridden — that is the
+// framework doing the same job, and this stays a floor for when it does not.
+func sessionStateDir() string { return "/tmp/prime-session" }
+
 // agentDocPath is where Start writes the assembled agent doc (platform
 // mechanics + this adapter's FrameworkFacts) for the HTTP bridge to inject
 // via the SDK's agentsFilesOverride. Deliberately OUTSIDE primeHome: it is
