@@ -38,8 +38,14 @@ const (
 	// and it can never drift out of sync with the adapter that spawns it.
 	bridgeScriptDir = "/usr/local/lib/seal-prime-bridge"
 
-	// npmPackage is the SDK the bridge imports; the version whitelist pins it.
-	npmPackage = "@earendil-works/pi-coding-agent"
+	// releasePackage is the global npm package name the release tarball installs
+	// under. The bridge imports it, and Start verifies the installed version
+	// against the binding rather than installing anything — the framework is
+	// provisioned at image build time (images/prime/Dockerfile), so its bytes
+	// are covered by the image hash that goes into on-chain
+	// validFrameworkHashes. A first-Start download would leave the running
+	// framework outside that measurement.
+	releasePackage = "prime-agent"
 
 	// agentLogPath receives the bridge's stdout/stderr, served on /log/agent.
 	agentLogPath = "/tmp/prime-agent.log"
@@ -58,7 +64,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	a.mu.RUnlock()
 
 	if !initialized {
-		if err := installPinned(ctx, version); err != nil {
+		if err := verifyInstalled(ctx, version); err != nil {
 			return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 		}
 		if token == "" {
@@ -68,10 +74,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			}
 		}
 	} else {
-		// Restart: never redo install or rewrite agent-owned state — the
-		// platform keeps the agent alive without interfering with what the
-		// agent did to itself.
-		logger.Logf("prime restart: skipping install (preserving agent self-modifications)")
+		// Restart: never rewrite agent-owned state — the platform keeps the
+		// agent alive without interfering with what the agent did to itself.
+		logger.Logf("prime restart: reusing the installed framework and bridge token")
 	}
 
 	if err := materializeBridge(); err != nil {
@@ -163,25 +168,29 @@ func resolveInference(ctx context.Context, provider, model string) (sdkProvider,
 	}
 }
 
-// installPinned installs the whitelisted SDK version globally. npm is the only
-// pinnable channel the project offers (the public `curl | sh` installer fetches
-// an unversioned-by-default release), and the bridge imports the package by
-// name, so a global install is exactly what it needs.
-func installPinned(ctx context.Context, version string) error {
-	spec := npmPackage + "@" + coerceWhitelisted(version)
-	logger.Logf("prime: installing %s", spec)
-	cmd := exec.CommandContext(ctx, "npm", "install", "-g", "--no-fund", "--no-audit", spec)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("npm install %s: %w: %s", spec, err, strings.TrimSpace(string(out)))
+// verifyInstalled checks that the framework baked into this image is the one
+// the agent's binding asks for, and fails Start loudly when it is not.
+//
+// This adapter deliberately does NOT install at runtime, so there is no
+// framework.VersionReconciler: a drifted `framework` role is committed on chain
+// as-is (the documented degradation, FRAMEWORK_ADAPTER.md §2.2) rather than
+// silently downloading a different framework into an attested container. The
+// consequence is a hard constraint on releases: the version whitelist and the
+// image must move together, and this check is what turns a mismatch into a
+// clear boot failure instead of an agent running something nobody validated.
+func verifyInstalled(ctx context.Context, version string) error {
+	want := coerceWhitelisted(version)
+	out, err := exec.CommandContext(ctx, "node", "-e",
+		"process.stdout.write(require('"+releasePackage+"/package.json').version)").Output()
+	if err != nil {
+		return fmt.Errorf("%s is not installed in this image (expected %s): %w — a prime-agent binding needs the prime-agent image; check sealedImage", releasePackage, want, err)
 	}
+	got := strings.TrimSpace(string(out))
+	if got != want {
+		return fmt.Errorf("image carries %s@%s but this agent's binding resolves to %s; the version whitelist and the image are out of sync", releasePackage, got, want)
+	}
+	logger.Logf("prime: %s@%s present (binding resolved to %s)", releasePackage, got, want)
 	return nil
-}
-
-// ReconcileFramework implements framework.VersionReconciler: on `framework`
-// role drift, force the install back to the whitelist ceiling before the
-// manager reloads the process.
-func (a *Adapter) ReconcileFramework(ctx context.Context) error {
-	return installPinned(ctx, whitelistMax())
 }
 
 // materializeBridge writes the embedded bridge script to disk. Rewritten on

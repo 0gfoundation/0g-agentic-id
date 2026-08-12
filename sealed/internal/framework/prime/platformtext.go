@@ -32,10 +32,13 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Ask: "Give yourself a new capability", Place: "a Python package under `skills/<name>/`, then register it as a harness skill entry (global scope)"},
 			{Ask: "Change how you always behave", Place: "`APPEND_SYSTEM.md`, or a `global`-scope prompt note"},
 		},
-		VersionScheme:        "@earendil-works/pi-coding-agent npm releases",
-		Versions:             supportedPrimeVersions,
-		VersionMax:           whitelistMax(),
-		ReconcileHow:         "`npm install -g @earendil-works/pi-coding-agent@<max>`",
+		VersionScheme: "Prime Agent release versions",
+		Versions:      supportedPrimeVersions,
+		VersionMax:    whitelistMax(),
+		// No runtime reconcile: the framework is installed at image build time,
+		// so changing version means a new image. Start verifies what is present
+		// rather than installing (spawn.go verifyInstalled).
+		ReconcileHow:         "not applicable — the framework is baked into the sealed image, so a version change means deploying a new image",
 		ConfigFile:           "harness_state.json",
 		ConfigKeys:           []string{"entries", "schema"},
 		ConfigIgnoredExample: []string{"refinements"},

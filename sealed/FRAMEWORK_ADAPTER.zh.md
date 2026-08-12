@@ -776,3 +776,25 @@ Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
     router,还是需要一条 `models.json` 记录。bridge 在启动时会打印解析出的
     provider/model,`/log/agent` 能看到走的是哪条路 —— 这条防的正是 §12
     第 19 条那种"部署绿了、首次推理 400"。
+
+**一个值得记下来的错误 —— 先确认哪个产物装着哪一半。**
+这次移植的第一版是从 npm 装框架的(`@earendil-works/pi-coding-agent`),理由是
+桥 import 的 SDK 就发布在那个包名下,而且 npm 有干净的 semver 定版。两条都对,
+两条都不相关:那个包只装了 TypeScript 那一半 —— **0 个 `.py` 文件、没有
+postinstall** —— 而这个 adapter 锚上链的 harness 状态是 IPython kernel 里的
+Python 写的。安装会成功,然后产出一个容器,里面 adapter 最核心的那个被追踪角色
+**根本不会存在**。Python 那半只随 release tarball 分发
+(`<base>/releases/v<v>/prime-agent-<v>.tgz`,包名 `prime-agent`),它的
+postinstall 才是装 uv、Python 和 kernel 的地方,而且它照样导出同一套 SDK。
+两条教训:跨两种语言的框架很可能有两个分发渠道,所以要**验证你钉的那个产物里
+到底装了什么**(`tar tzf … | grep '\.py$'` 一条命令就能发现);以及 release 的
+版本序列跟 npm 的不必一致 —— 这里 release 0.7.2 就是 npm 0.84.1。
+
+**安装该放在镜像里,而且这有安全收益。**框架在镜像构建期装好,它的字节就被镜像
+哈希覆盖了 —— 也就是进链上 `validFrameworkHashes` 的那个度量。openclaw 和
+hermes 在首次 Start 时重新钉版本,所以那些 agent 实际跑的框架是启动那一刻
+registry 给什么就是什么,**在度量之外**。因此这个 adapter 运行时不装任何东西:
+Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并且不实现
+`VersionReconciler`(漂移的 `framework` 角色原样上链,即 §2.2 记载的降级)。
+代价是一条硬性发布约束 —— 版本白名单和镜像必须一起动 —— 为了让被认证的度量
+诚实,这个交换是值得的。

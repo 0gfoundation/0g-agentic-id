@@ -5,7 +5,8 @@
 // Role set:
 //
 //	framework            Leaf — 3-field binding JSON (package_version = the
-//	                     @earendil-works/pi-coding-agent npm version)
+//	                     Prime Agent RELEASE version, e.g. 0.7.2 — not the npm
+//	                     version, which is a different series; see whitelist.go)
 //	harness_state.json   Leaf — the GLOBAL half of ~/.prime/agent/harness/
 //	                     harness_state.json, canonical JSON, `refinements`
 //	                     dropped (harness.go)
@@ -23,7 +24,7 @@
 // File map:
 //   - prime.go        Adapter struct + framework.Framework interface methods
 //   - paths.go        on-disk paths (+ the do-not-track list and why)
-//   - whitelist.go    validated npm version set
+//   - whitelist.go    validated release version set (and why not npm)
 //   - harness.go      harness_state.json canonicalization (the identity anchor)
 //   - skills.go       the skills/ manifest role
 //   - persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
@@ -306,13 +307,21 @@ const bridgePort = 8791
 // Compile-time interface assertions — silent non-implementation of an optional
 // capability is a feature quietly off (FRAMEWORK_ADAPTER.md §2.2).
 //
-// SettleDelayer is deliberately absent: Prime Agent writes its harness state
-// lazily (on the first refine), not as a first-boot config rewrite, so the
-// conservative 5s bootstrap default is right and a custom value would be
-// noise. framework.Reloadable is absent because nothing consumes it.
+// Two are deliberately absent:
+//
+//   - VersionReconciler. Reconciling means installing, and this framework is
+//     provisioned at image build time so its bytes ride the image hash that
+//     goes into on-chain validFrameworkHashes. Downloading a different version
+//     into an attested container at drift time would defeat that, so a drifted
+//     `framework` role is committed as-is and Start verifies instead (see
+//     verifyInstalled).
+//   - SettleDelayer. Prime Agent writes harness state lazily, on the first
+//     refine, not as a first-boot config rewrite, so the conservative 5s
+//     bootstrap default is right and a custom value would be noise.
+//
+// framework.Reloadable is absent because nothing consumes it.
 var (
 	_ framework.Framework             = (*Adapter)(nil)
 	_ framework.RouteProvider         = (*Adapter)(nil)
-	_ framework.VersionReconciler     = (*Adapter)(nil)
 	_ framework.SubprocessLogProvider = (*Adapter)(nil)
 )

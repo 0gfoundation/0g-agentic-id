@@ -36,13 +36,18 @@
 import { createServer } from "node:http";
 import { readFileSync } from "node:fs";
 
+// The official release package (`prime-agent`), installed globally in the
+// image. NOT the @earendil-works/pi-coding-agent npm package: that one ships
+// the TypeScript half only — zero .py files — while the harness state this
+// adapter anchors on chain is written by Python in the IPython kernel. The
+// release tarball carries both halves and exports the same SDK surface.
 import {
 	AuthStorage,
 	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
-} from "@earendil-works/pi-coding-agent";
+} from "prime-agent";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
 const TOKEN = process.env.SEAL_BRIDGE_TOKEN || "";

@@ -909,3 +909,32 @@ watcher, so the port is worth recording.
     entry instead. The bridge logs the resolved provider/model at startup so
     `/log/agent` shows which path was taken — the failure mode this guards
     against is §12 finding 19's "deploy green, first inference 400".
+
+**A mistake worth recording — check which artifact carries which half.**
+The first version of this port installed the framework from npm
+(`@earendil-works/pi-coding-agent`), because that is the package the SDK the
+bridge imports is published as, and because npm gives clean semver pinning.
+Both true, and both irrelevant: that package ships the TypeScript half only —
+**zero `.py` files, no postinstall** — while the harness state this adapter
+anchors on chain is written by Python in the IPython kernel. The install
+succeeded and would have produced a container where the adapter's central
+tracked role never came into existence. The Python half is distributed only in
+the release tarball (`<base>/releases/v<v>/prime-agent-<v>.tgz`, package name
+`prime-agent`), whose postinstall provisions uv, Python and the kernel, and
+which exports the same SDK surface anyway. Two lessons: a framework in two
+languages probably has two distribution channels, so verify what is actually
+inside the artifact you pin (`tar tzf … | grep '\.py$'` would have caught this
+in one command); and the release version series need not match the npm one —
+here release 0.7.2 *is* npm 0.84.1.
+
+**The install belongs in the image, and that has a security payoff.** Because
+the framework is provisioned at image build time, its bytes are covered by the
+image hash that goes into on-chain `validFrameworkHashes`. openclaw and hermes
+re-pin their version at first Start, so the framework those agents actually run
+is whatever the registry served at boot — outside the measurement. This adapter
+therefore installs nothing at runtime: Start verifies the installed version
+against the binding and fails loudly on a mismatch, and it implements no
+`VersionReconciler` (a drifted `framework` role is committed as-is, §2.2's
+documented degradation). The cost is a hard release constraint — the version
+whitelist and the image must move together — which is the right trade for
+keeping the attested measurement honest.

@@ -67,23 +67,40 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
  && rm /tmp/node.tar.xz \
  && node --version && npm --version
 
-# Python for the IPython kernel. Pinned here (not by a checkout's
-# .python-version like hermes) because Prime Agent ships its runtime inside the
-# npm package rather than as a git checkout with its own interpreter pin.
-ARG PYTHON_VERSION=3.12
-RUN uv python install ${PYTHON_VERSION} \
- && uv tool install --python ${PYTHON_VERSION} ipykernel \
- && uv --version
-
-# Warm-cache the SDK at the whitelisted version. Keep PRIME_BAKED_VERSION in
-# sync with whitelistMax in sealed/internal/framework/prime/whitelist.go: when
-# they match, the adapter's first-Start `npm install -g` is a cache hit; a
-# binding pinned to another whitelisted version pays the install at first boot
-# (same runtime-flexibility tradeoff as the openclaw and hermes images).
-ARG PRIME_BAKED_VERSION=0.84.1
-RUN npm install -g --no-fund --no-audit "@earendil-works/pi-coding-agent@${PRIME_BAKED_VERSION}" \
- && node -e "require.resolve('@earendil-works/pi-coding-agent')" \
- && echo "baked @earendil-works/pi-coding-agent@${PRIME_BAKED_VERSION}"
+# Install Prime Agent from its official RELEASE tarball, not from npm.
+#
+# This is load-bearing, not a preference. The framework ships two halves:
+#   - the TypeScript one, published to npm as @earendil-works/pi-coding-agent;
+#   - the Python one (the RLM runtime, whose rlm/harness.py writes the harness
+#     state this adapter anchors on chain).
+# The npm package contains ZERO .py files and has no postinstall, so an
+# npm-only install produces a container where the tracked harness-state file is
+# never created. The release tarball carries both halves, exports the same SDK
+# surface the bridge imports (as package `prime-agent`), and its postinstall is
+# what provisions uv, Python and the IPython kernel — driven by the two
+# BOOTSTRAP env vars below, exactly as the upstream `curl | sh` installer does.
+#
+# The install happens HERE rather than at first Start, so the framework's bytes
+# are covered by the image hash that goes into on-chain validFrameworkHashes. A
+# runtime download would leave the framework the agent actually runs outside
+# that measurement — the adapter therefore verifies the installed version at
+# Start instead of installing (spawn.go verifyInstalled) and implements no
+# VersionReconciler.
+#
+# Keep PRIME_VERSION in sync with whitelistMax in
+# sealed/internal/framework/prime/whitelist.go — a mismatch is a hard boot
+# failure by design. Release versions are their own series (release 0.7.2 ==
+# npm 0.84.1); resolve the current stable with:
+#   curl -fsSL https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev/stable
+ARG PRIME_VERSION=0.7.2
+ARG PRIME_DOWNLOAD_BASE_URL=https://pub-728493de92a943e2a9b2d17b4719f318.r2.dev
+RUN curl -fsSL "${PRIME_DOWNLOAD_BASE_URL}/releases/v${PRIME_VERSION}/prime-agent-${PRIME_VERSION}.tgz" \
+      -o /tmp/prime-agent.tgz \
+ && env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 \
+        PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 \
+        npm install -g --no-fund --no-audit --loglevel=error /tmp/prime-agent.tgz \
+ && rm -f /tmp/prime-agent.tgz \
+ && node -e "const v=require('prime-agent/package.json').version; if (v!=='${PRIME_VERSION}') { console.error('baked '+v+' != PRIME_VERSION ${PRIME_VERSION}'); process.exit(1) } console.log('baked prime-agent@'+v)"
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /usr/local/bin/bootstrap
