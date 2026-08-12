@@ -36,8 +36,11 @@ echo "seal_id = $SEAL_ID"
 # 2. Wait for mint to complete
 banner "2. Wait for mint (up to 30s)"
 for i in $(seq 1 30); do
-  AGENT_ID=$(curl -fsS "$API/deployment/$SEAL_ID" | jq -r '.agent_id // ""')
-  PHASE=$(curl -fsS "$API/deployment/$SEAL_ID" | jq -r .phase)
+  # One fetch per tick; `|| true` keeps a transient curl failure from killing
+  # the script via set -e — the post-loop check handles the empty case (#120)
+  STATE=$(curl -fsS -m 10 "$API/deployment/$SEAL_ID" || true)
+  AGENT_ID=$(echo "$STATE" | jq -r '.agent_id // ""' 2>/dev/null || true)
+  PHASE=$(echo "$STATE" | jq -r '.phase // ""' 2>/dev/null || true)
   if [[ -n "$AGENT_ID" && "$AGENT_ID" != "null" && "$AGENT_ID" != "" ]]; then
     echo "agent_id = $AGENT_ID (phase=$PHASE)"
     break
