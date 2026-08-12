@@ -160,7 +160,7 @@ pub struct Config {
     // reachable via the sandbox proxy:
     //   http://{port}-{sandbox_id}.{sandbox_proxy_addr}{path}
     // where `sandbox_proxy_addr` is a bare `host:port` string (e.g.
-    // `47.236.111.154.nip.io:4000`). Caller is responsible for any
+    // `sandbox.example:4000`). Caller is responsible for any
     // wildcard-DNS suffix (.nip.io / real domain); the attestor just
     // prepends `{port}-{sandbox_id}.` as the subdomain.
     //

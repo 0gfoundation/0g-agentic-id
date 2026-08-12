@@ -195,7 +195,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | env | 含义 |
 |---|---|
-| `ATTESTOR_SANDBOX_PROXY_ADDR` | sandbox proxy 的公共域名（nip.io 风格，如 `47.236.111.154.nip.io:4000`）|
+| `ATTESTOR_SANDBOX_PROXY_ADDR` | sandbox proxy 的公共域名（nip.io 风格，如 `sandbox.example:4000`）|
 | `ATTESTOR_AGENT_SERVE_PORT` + `ATTESTOR_AGENT_SERVE_PATH` | agent 对外服务入口（写进链上 tokenURI 作为 AgentCard `url`，**8004 里 "A2A" 指 AgentCard 本身、不是这个 path**，所以这里别用 "A2A" 名字）|
 | `ATTESTOR_AGENT_DASHBOARD_PORT` + `ATTESTOR_AGENT_DASHBOARD_PATH` | owner-only operator dashboard 入口（deploy console 用）|
 

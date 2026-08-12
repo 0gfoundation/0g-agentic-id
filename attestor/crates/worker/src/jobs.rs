@@ -3003,8 +3003,8 @@ mod tests {
 
     #[test]
     fn build_serve_url_with_explicit_port() {
-        let url = build_serve_url("47.236.111.154.nip.io:4000", "sbx-abc", 8080, "/result");
-        assert_eq!(url, "http://8080-sbx-abc.47.236.111.154.nip.io:4000/result");
+        let url = build_serve_url("sandbox.example:4000", "sbx-abc", 8080, "/result");
+        assert_eq!(url, "http://8080-sbx-abc.sandbox.example:4000/result");
     }
 
     #[test]

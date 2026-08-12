@@ -209,7 +209,7 @@ entries decide path and port:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_SANDBOX_PROXY_ADDR` | Sandbox proxy's public domain (nip.io style, e.g. `47.236.111.154.nip.io:4000`) |
+| `ATTESTOR_SANDBOX_PROXY_ADDR` | Sandbox proxy's public domain (nip.io style, e.g. `sandbox.example:4000`) |
 | `ATTESTOR_AGENT_SERVE_PORT` + `ATTESTOR_AGENT_SERVE_PATH` | Agent's public service entry, written on chain via tokenURI as the AgentCard `url`. **In 8004, "A2A" refers to the AgentCard itself, not this path**, so don't call this "A2A" |
 | `ATTESTOR_AGENT_DASHBOARD_PORT` + `ATTESTOR_AGENT_DASHBOARD_PATH` | Owner-only operator dashboard entry, used by the deploy console |
 
