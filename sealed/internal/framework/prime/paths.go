@@ -55,6 +55,17 @@ func harnessStateDir() string  { return primeHome + "/harness" }
 func skillsDir() string        { return primeHome + "/skills" }
 func appendSystemPath() string { return primeHome + "/APPEND_SYSTEM.md" }
 
+// kernelVenvPython is the interpreter the framework's IPython kernel runs, in
+// the venv its bootstrap provisions (uv-managed Python 3.11 + ipykernel +
+// prime-agent-runtime, ~330MB). Provisioned at image build time; Start asserts
+// it can import both halves, because THIS is what writes the harness state
+// this adapter anchors on chain.
+//
+// It sits inside primeHome but under none of the tracked paths — a venv is
+// reproducible from the pinned version, so tracking it would put 330MB of
+// derivable content on chain per agent.
+func kernelVenvPython() string { return primeHome + "/kernel-venv/bin/python" }
+
 // sessionStateDir is the explicit home for the framework's per-session
 // ("local") harness state, exported to the framework as RLM_SESSION_DIR.
 //

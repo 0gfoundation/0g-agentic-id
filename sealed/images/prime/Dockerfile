@@ -98,9 +98,31 @@ RUN curl -fsSL "${PRIME_DOWNLOAD_BASE_URL}/releases/v${PRIME_VERSION}/prime-agen
       -o /tmp/prime-agent.tgz \
  && env PRIME_AGENT_BOOTSTRAP_TOOLS_ON_INSTALL=1 \
         PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 \
-        npm install -g --no-fund --no-audit --loglevel=error /tmp/prime-agent.tgz \
+        npm install -g --no-fund --no-audit /tmp/prime-agent.tgz \
  && rm -f /tmp/prime-agent.tgz \
- && node -e "const v=require('prime-agent/package.json').version; if (v!=='${PRIME_VERSION}') { console.error('baked '+v+' != PRIME_VERSION ${PRIME_VERSION}'); process.exit(1) } console.log('baked prime-agent@'+v)"
+ && ROOT="$(npm root -g)" \
+ && PKG="$ROOT/prime-agent" \
+ # Absolute path on purpose: a bare `require('prime-agent/package.json')` fails
+ # twice over — global node_modules is not on Node's default resolution path,
+ # and the package's `exports` map does not expose ./package.json.
+ && V="$(node -p "require('$PKG/package.json').version")" \
+ && if [ "$V" != "${PRIME_VERSION}" ]; then echo "baked $V != PRIME_VERSION ${PRIME_VERSION}" >&2; exit 1; fi \
+ # Provision the Python kernel EXPLICITLY rather than relying on the package's
+ # npm postinstall hook. The hook exists and does exactly this, but it did not
+ # run during `npm install -g` in the build (and it is written to swallow every
+ # error and always exit 0, so a silent no-op is indistinguishable from success).
+ # Calling it directly makes the step deterministic and lets a failure fail the
+ # build. It installs uv-managed Python 3.11, ipykernel and prime-agent-runtime
+ # into <agent dir>/kernel-venv (~330MB).
+ && env PRIME_AGENT_BOOTSTRAP_KERNEL_ON_INSTALL=1 node "$PKG/dist/postinstall.js" \
+ # The assertion that actually matters. `find -name '*.py'` is NOT enough: the
+ # runtime sources ship inside the tarball, so that check passes even when the
+ # kernel was never provisioned — which is exactly how the previous build shipped
+ # an image whose agent could never have written the harness state this adapter
+ # tracks. Assert the venv's interpreter can import both halves.
+ && KPY=/root/.prime/agent/kernel-venv/bin/python \
+ && "$KPY" -c "import ipykernel, rlm.harness" \
+ && echo "baked prime-agent@$V + $("$KPY" -V) kernel (ipykernel $("$KPY" -c 'import ipykernel;print(ipykernel.__version__)'))"
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /usr/local/bin/bootstrap

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"embed"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -180,16 +181,43 @@ func resolveInference(ctx context.Context, provider, model string) (sdkProvider,
 // clear boot failure instead of an agent running something nobody validated.
 func verifyInstalled(ctx context.Context, version string) error {
 	want := coerceWhitelisted(version)
-	out, err := exec.CommandContext(ctx, "node", "-e",
-		"process.stdout.write(require('"+releasePackage+"/package.json').version)").Output()
+
+	root, err := npmGlobalRoot()
 	if err != nil {
-		return fmt.Errorf("%s is not installed in this image (expected %s): %w — a prime-agent binding needs the prime-agent image; check sealedImage", releasePackage, want, err)
+		return fmt.Errorf("locate the global install: %w", err)
 	}
-	got := strings.TrimSpace(string(out))
-	if got != want {
-		return fmt.Errorf("image carries %s@%s but this agent's binding resolves to %s; the version whitelist and the image are out of sync", releasePackage, got, want)
+	pkgDir := filepath.Join(root, releasePackage)
+
+	// Read package.json directly rather than asking node: a bare
+	// require("prime-agent/package.json") fails twice over — the global
+	// node_modules is not on node's default resolution path, and the package's
+	// `exports` map does not expose ./package.json.
+	raw, err := os.ReadFile(filepath.Join(pkgDir, "package.json"))
+	if err != nil {
+		return fmt.Errorf("%s is not installed in this image (expected %s): %w — a prime-agent binding needs the prime-agent image; check the deploy's sealedImage", releasePackage, want, err)
 	}
-	logger.Logf("prime: %s@%s present (binding resolved to %s)", releasePackage, got, want)
+	var meta struct{ Version string }
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return fmt.Errorf("parse %s/package.json: %w", pkgDir, err)
+	}
+	if meta.Version != want {
+		return fmt.Errorf("image carries %s@%s but this agent's binding resolves to %s; the version whitelist and the image are out of sync", releasePackage, meta.Version, want)
+	}
+
+	// The Python half is what makes this framework hostable at all — the harness
+	// state this adapter anchors on chain is written by it, in the kernel. Assert
+	// the provisioned interpreter can import BOTH halves.
+	//
+	// Checking for .py files in the install tree is not enough: the runtime
+	// sources ship inside the release tarball, so that check passes on an image
+	// where the kernel venv was never provisioned. An agent there looks perfectly
+	// healthy and never persists a thing.
+	if out, err := exec.CommandContext(ctx, kernelVenvPython(), "-c", "import ipykernel, rlm.harness").CombinedOutput(); err != nil {
+		return fmt.Errorf("kernel venv at %s cannot import ipykernel + rlm.harness: %w: %s — the image's kernel bootstrap did not complete, so the harness state would never be written",
+			kernelVenvPython(), err, strings.TrimSpace(string(out)))
+	}
+
+	logger.Logf("prime: %s@%s present with a working kernel venv (binding resolved to %s)", releasePackage, meta.Version, want)
 	return nil
 }
 
@@ -230,6 +258,12 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("open %s: %w", agentLogPath, err)
 	}
 
+	// The bridge imports `prime-agent` by bare specifier. That resolves because
+	// the bridge is materialized under /usr/local/lib/, whose sibling
+	// /usr/local/lib/node_modules IS npm's global root, so node's ordinary
+	// walk-up finds it — verified in the built image. NODE_PATH is set anyway
+	// for anything CommonJS in the dependency graph; it would NOT be enough on
+	// its own, since NODE_PATH is ignored by ESM resolution.
 	nodePath, err := npmGlobalRoot()
 	if err != nil {
 		logFile.Close()

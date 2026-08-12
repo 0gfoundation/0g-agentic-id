@@ -26,6 +26,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Note: "the per-session harness state (`$RLM_SESSION_DIR/harness/harness_state.json`) — everything you refine mid-task lands here first. Deliberate: half-finished harness edits must not become your on-chain identity"},
 			{Note: "the `refinements` log inside `harness_state.json` — a local audit trail of your self-modifications, not part of your identity"},
 			{Note: "`.env` and any credential file — secrets never reach chain"},
+			{Note: "`~/.prime/agent/kernel-venv/` and `~/.prime/agent/bin/` — your Python kernel and its tooling. Provisioned in the image and reproducible from the pinned version, so they are infrastructure rather than identity. Installing a package into the kernel venv does NOT survive a rebuild; if a capability needs a dependency, declare it in the skill package under `skills/<name>/`"},
 		},
 		DurableHints: []platform.DurableHint{
 			{Ask: "Remember this long-term", Place: "a harness memory entry promoted to `global` scope"},
