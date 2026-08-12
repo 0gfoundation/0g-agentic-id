@@ -853,6 +853,19 @@ watcher, so the port is worth recording.
    markers, no stripping, nothing platform-authored anywhere near a tracked
    role — and the doctrine sits in a channel the framework's own
    `delete_prompt_note` API cannot reach.
+
+   **But un-deletable is not the same as authoritative, and this port got it
+   wrong on the first pass.** The doc was injected only as a context file
+   (an `AGENTS.md`-class channel) because that channel was the one the agent
+   could not delete. That is §12 finding 24 all over again: Claude Code
+   disclaimed its own agentSeal identity because CLAUDE.md is *memory*, not
+   the system prompt. Fixed by injecting into **both** — the framework's
+   authoritative append-to-system-prompt hook *and* the context file — and
+   by spreading the SDK's own append list (`(base) => [...base, doc]`)
+   rather than replacing it, since the list already carries the
+   owner-persona file. Generalized rule, now twice-learned: **pick the
+   authoritative instruction channel first, add the un-deletable one as
+   belt, and verify the model actually adopts the identity.**
 3. **"No HTTP surface" is not a blocker; it can be an advantage.** Prime
    Agent's daemon speaks JSONL over a local socket, so sealed ships its own
    bridge (embedding the SDK, `go:embed`ed in the sealed binary). Writing the

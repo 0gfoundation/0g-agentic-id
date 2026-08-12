@@ -732,6 +732,15 @@ Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
    注入。净效果:没有 marker、不需要剥离、任何平台产出的文字都不靠近被追踪
    的角色 —— 而且 doctrine 待在框架自己的 `delete_prompt_note` API 碰不到
    的通道里。
+
+   **但"删不掉"不等于"有权威",而这次移植第一版就搞错了。**当时只把 doc 作为
+   上下文文件注入(`AGENTS.md` 那一类通道),理由是那个通道 agent 删不掉。这
+   正是 §12 第 24 条的复发:Claude Code 当场否认自己的 agentSeal 身份,就是
+   因为 CLAUDE.md 是*记忆*而不是系统提示。修法是**两条通道都走** —— 框架权威
+   的"追加到系统提示"钩子 **加上** 上下文文件 —— 并且用 `(base) => [...base,
+   doc]` 展开 SDK 自己的 append 列表而不是替换它,因为那个列表里已经装着
+   owner persona 文件。推广出来的规则(现在学了两遍):**先选权威指令通道,
+   再把删不掉的那个作为保底,并且要实测模型真的认下了这个身份。**
 3. **"没有 HTTP 面"不是障碍,反而可能是优势。**Prime Agent 的 daemon 说的
    是本地 socket 上的 JSONL,所以 sealed 自己带一个 bridge(内嵌 SDK,
    `go:embed` 在 sealed 二进制里)。自己写 bridge 意味着对外面是**按构造

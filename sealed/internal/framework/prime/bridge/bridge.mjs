@@ -13,15 +13,15 @@
  *
  * Deliberate properties, each load-bearing:
  *
- *   - The platform/doctrine text is injected here, in code, via the SDK's
- *     agentsFilesOverride. It is read from SEAL_AGENT_DOC (outside the
- *     framework home) and handed to the session as a virtual context file, so
- *     it never lands in a chain-tracked path and the agent's own
+ *   - The platform/doctrine text is injected here, in code, from SEAL_AGENT_DOC
+ *     (a path outside the framework home) into BOTH the system prompt (the
+ *     authoritative channel) and a virtual context file (belt). It therefore
+ *     never lands in a chain-tracked path, and the agent's own
  *     rlm.harness.delete_prompt_note — which operates on harness entries, a
- *     different mechanism — cannot remove it.
- *   - APPEND_SYSTEM.md is NOT overridden: the DefaultResourceLoader appends it
- *     natively, and that file is the owner-persona role. Leaving the default
- *     alone is what makes the mint-time persona take effect.
+ *     different store — cannot remove it. See buildSession for why both.
+ *   - The owner persona (APPEND_SYSTEM.md) is preserved by spreading the SDK's
+ *     own append list rather than replacing it; replacing would silently drop
+ *     the mint-time persona.
  *   - The inference API key arrives via authStorage.setRuntimeApiKey(), which
  *     the SDK documents as not persisted to disk. The key therefore never
  *     touches a tracked path, so unlike a config-file framework there is no
@@ -98,9 +98,23 @@ async function buildSession() {
 	const loader = new DefaultResourceLoader({
 		cwd: process.cwd(),
 		agentDir: getAgentDir(),
-		// Inject the sealed platform doc as a virtual context file. Note there
-		// is no appendSystemPromptOverride here on purpose: the default picks up
-		// APPEND_SYSTEM.md, which is the owner-persona role.
+		// The platform doc goes into BOTH channels, deliberately:
+		//
+		//   1. appendSystemPromptOverride — the AUTHORITATIVE channel. This is
+		//      the lesson of the retired claudecode port (FRAMEWORK_ADAPTER.md
+		//      §12 item 24): identity injected into a framework's *memory* or
+		//      *context* channel reads as advisory, and a safety-tuned model
+		//      disclaimed its own agentSeal identity live because of it. The
+		//      sign-refusal doctrine must not be advisory.
+		//   2. agentsFilesOverride — belt. A context file survives prompt
+		//      surgery the harness might perform on itself and costs nothing.
+		//
+		// `(base) => [...base, doc]` and not `() => [doc]`: base already carries
+		// APPEND_SYSTEM.md, which is the owner-persona role. Replacing the list
+		// would silently drop the owner's mint-time persona. The doc goes LAST
+		// so platform mechanics are the final word in the system prompt — owner
+		// persona is legitimate, but it does not get to override the doctrine.
+		appendSystemPromptOverride: (base) => (doc ? [...base, doc] : base),
 		agentsFilesOverride: (current) => ({
 			agentsFiles: doc
 				? [...current.agentsFiles, { path: "/virtual/0G-PLATFORM.md", content: doc }]
