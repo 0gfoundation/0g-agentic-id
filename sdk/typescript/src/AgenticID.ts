@@ -48,7 +48,7 @@ function assertSealBound(seal: Address, op: string): void {
 type WaitMintOpts = { timeoutMs?: number; pollIntervalMs?: number; preflight?: boolean };
 
 /** 0.1 OG — the sandbox-balance floor deploys are gated on (attestor + console use the same). */
-const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
+export const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 /**
  * How long `deploy()` / `clone()` blocks before returning, in phase order:
  *   - omit       → return on **acceptance** ({@link DeployAccepted});
