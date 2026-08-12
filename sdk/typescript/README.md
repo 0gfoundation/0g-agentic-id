@@ -111,8 +111,9 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  framework: 'openclaw',                           // 'openclaw' | 'hermes' — must be a name GET /config advertises.
-                                                   // hermes needs its own image: set sandbox.sealedImage:'0g-sealed-hermes' (see framework section).
+  framework: 'openclaw',                           // 'openclaw' | 'hermes' | 'prime-agent' — must be a name GET /config advertises.
+                                                   // only openclaw runs on the default image; hermes needs sandbox.sealedImage:'0g-sealed-hermes'
+                                                   // and prime-agent needs '0g-sealed-prime' (see framework section).
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b.
                                                    // provider is effectively '0g-compute' (the 0G router) today; run ag.agent.listModels()
                                                    // first to see the router's live catalog before picking `model`.
@@ -371,12 +372,25 @@ live agent's `intelligentDatasOf` will find nothing.
 **What the attestor does NOT check**: beyond the framework *name* (must be
 in `/config.supported_frameworks`), deploy iData content is unvalidated by
 design — minting is the owner's freedom; whether the content actually
-boots is the **sealed runtime's contract**. The sealed images bundle two
-framework adapters — **openclaw** (default image `0g-sealed`) and **hermes**
-(image `0g-sealed-hermes` — pass `sandbox.sealedImage: '0g-sealed-hermes'` at
-deploy *and* reset, or the agent boots the wrong image and 404s). Pick with
-`framework: 'openclaw' | 'hermes'`; the name must be in
-`/config.supported_frameworks`. openclaw's persona seed supports
+boots is the **sealed runtime's contract**. Three framework adapters ship —
+**openclaw** (default image `0g-sealed`), **hermes** (`0g-sealed-hermes`) and
+**prime-agent** (`0g-sealed-prime`). Only openclaw runs on the default image;
+for the other two pass `sandbox.sealedImage` at deploy *and* reset, or the
+agent boots an image without its runtime and never comes up. Pick with
+`framework: 'openclaw' | 'hermes' | 'prime-agent'`; the name must be in
+`/config.supported_frameworks`.
+
+One behavioural difference worth knowing before you build a chat UI on
+**prime-agent**: its `/v1/chat/completions` is OpenAI-*shaped* but not
+stateless. The framework has no HTTP surface of its own, so sealed bridges to
+its SDK, and the conversation lives in that server-side session — the bridge
+reads only the **last user message** of the `messages` array you send. So
+`chat()` and `chatStream()` work unchanged, but re-sending an edited history
+does not rewind or branch the conversation the way it does against openclaw or
+hermes (which are real OpenAI-compatible servers). Turns are also serialized
+per agent, since one SDK session is one conversation.
+
+openclaw's persona seed supports
 `inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
 router). For the router's live model catalog:
 
