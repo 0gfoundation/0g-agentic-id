@@ -13,16 +13,12 @@
 
 import { createPublicClient, http, formatEther, type PublicClient } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import type { AgenticID } from '../../AgenticID';
+import { MIN_SANDBOX_BALANCE_WEI, type AgenticID } from '../../AgenticID';
 import { RPC_URL } from '../../constants';
 import { buildClient } from '../sdk';
 import { CliError, type ErrorCode } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
-
-/** 0.1 OG — the deploy gate the attestor enforces (mirrors the SDK's
- *  internal MIN_SANDBOX_BALANCE_WEI, which is not exported). */
-const MIN_SANDBOX_BALANCE_WEI = 10n ** 17n;
 
 type Status = 'pass' | 'fail' | 'skip';
 

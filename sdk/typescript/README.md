@@ -618,7 +618,7 @@ The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`
 The package ships a read-only diagnostics CLI — no separate install, zero extra dependencies (arg parsing is `node:util`'s):
 
 ```bash
-npm install @0gfoundation/agentic-sdk
+npm install @0gfoundation/0g-agenticid-sdk
 npx 0g-agenticid --help
 ```
 

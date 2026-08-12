@@ -2,7 +2,7 @@
 /**
  * @file main.ts
  * @description Entry point of `0g-agenticid` — the diagnostics CLI that ships
- * inside @0gfoundation/agentic-sdk (`bin` in package.json; no extra install,
+ * inside @0gfoundation/0g-agenticid-sdk (`bin` in package.json; no extra install,
  * no extra deps — arg parsing is node:util's parseArgs).
  *
  * This file owns: argv parsing, command routing, `--help`/`--version`, and
@@ -28,7 +28,7 @@ const COMMANDS: Record<string, CommandRun> = { doctor, status, list };
 // env contract, exit-code semantics, runnable examples — it is the ground
 // truth an agent plans against (spec v0.03 §2.4).
 const HELP = `0g-agenticid — diagnostics CLI for the 0G AgenticID protocol
-(ships with @0gfoundation/agentic-sdk; no separate install)
+(ships with @0gfoundation/0g-agenticid-sdk; no separate install)
 
 USAGE
   0g-agenticid <command> [options]
