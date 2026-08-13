@@ -293,14 +293,34 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 // enforces that for every framework route regardless; false here keeps the
 // declaration honest.
 func (a *Adapter) FrameworkRoutes() []framework.Route {
+	backend := fmt.Sprintf("http://127.0.0.1:%d", bridgePort)
 	return []framework.Route{
 		{
-			Prefix:      "/v1/",
-			Kind:        "chat",
-			Auth:        "bearer",
-			Signed:      false,
-			Backend:     fmt.Sprintf("http://127.0.0.1:%d", bridgePort),
-			Description: "OpenAI-compatible chat/completions API (sealed bridge onto the Prime Agent daemon).",
+			Prefix:  "/v1/",
+			Kind:    "chat",
+			Auth:    "bearer",
+			Signed:  false,
+			Backend: backend,
+			// The stateful note is not decoration. Unlike openclaw and hermes —
+			// real OpenAI-compatible servers, stateless per request — the
+			// conversation here lives in a server-side SDK session and only the
+			// last user message of `messages` is read. A caller that re-sends an
+			// edited history to rewind gets no such thing, and `kind: "chat"`
+			// alone would not tell them.
+			Description: "OpenAI-compatible chat/completions API (sealed bridge). STATEFUL: the conversation lives in a server-side session and only the last user message is read, so re-sending an edited history does not rewind it. Turns are serialized.",
+		},
+		{
+			Prefix:  "/activity",
+			Kind:    "activity",
+			Auth:    "bearer",
+			Signed:  false,
+			Backend: backend,
+			// An agent turn is mostly not text generation, so the chat stream is
+			// legitimately silent for minutes. This is where the owner can see
+			// what a turn is doing — including the moments the agent rewrites its
+			// own harness, which is a meaningful event on this platform and not
+			// merely a progress bar.
+			Description: "SSE stream of turn activity: tool and bash calls, subagent updates, context compaction, retries, and harness self-modification (refine). Correlate with a chat response by its `turn` id. Owner-only, unsigned — this is observability of the steering channel, not an attributable service.",
 		},
 	}
 }

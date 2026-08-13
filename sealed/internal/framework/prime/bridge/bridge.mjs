@@ -170,6 +170,55 @@ function getSession() {
 	return sessionPromise;
 }
 
+// ── Activity stream ─────────────────────────────────────────────────────────
+//
+// The owner↔agent channel is a declared route, so what the owner can observe is
+// this adapter's business — and a turn that runs tools for 87 seconds while the
+// chat stream stays silent is indistinguishable from a dead one. `/activity`
+// carries what the turn is actually doing.
+//
+// Deliberately a SEPARATE route rather than extra fields in the chat payload: a
+// route declares its `kind`, so a client knows what it is getting, whereas a
+// private field inside a standard chunk is something other clients cannot read
+// (an earlier attempt did exactly that and was reverted).
+
+const activityClients = new Set();
+
+function broadcastActivity(event) {
+	const frame = `data: ${JSON.stringify({ ...event, ts: Date.now() })}\n\n`;
+	for (const res of activityClients) {
+		try {
+			res.write(frame);
+		} catch {
+			activityClients.delete(res); // client went away mid-write
+		}
+	}
+}
+
+function handleActivity(req, res) {
+	res.writeHead(200, {
+		"content-type": "text/event-stream",
+		"cache-control": "no-cache",
+		connection: "keep-alive",
+	});
+	if (typeof res.flushHeaders === "function") res.flushHeaders();
+	activityClients.add(res);
+	res.write(`data: ${JSON.stringify({ kind: "subscribed", text: "activity stream open", ts: Date.now() })}\n\n`);
+	// Same reason as the chat stream: a stretch with no events must still put
+	// bytes on the wire or an idle-timeout hop closes a healthy connection.
+	const beat = setInterval(() => {
+		try {
+			res.write(": keepalive\n\n");
+		} catch {
+			/* cleaned up by the close handler */
+		}
+	}, 10_000);
+	req.on("close", () => {
+		clearInterval(beat);
+		activityClients.delete(res);
+	});
+}
+
 // ── Turn serialization ──────────────────────────────────────────────────────
 
 let tail = Promise.resolve();
@@ -352,27 +401,57 @@ async function handleChat(req, res) {
 		const beat = setInterval(() => res.write(": keepalive\n\n"), 10_000);
 
 		const started = Date.now();
+		broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
+		let failure = null;
 		try {
 			await serialize(() =>
 				runTurn(
 					session,
 					text,
 					(delta) => res.write(chunkFrame(id, model, { content: delta })),
-					(line) => log(`  ${line}`),
+					(line, type) => {
+						log(`  ${line}`);
+						broadcastActivity({ turn: id, kind: type, text: line });
+					},
 				),
 			);
+		} catch (err) {
+			failure = String((err && err.message) || err);
 		} finally {
 			clearInterval(beat);
 		}
-		log(`turn done in ${Math.round((Date.now() - started) / 1000)}s (streamed)`);
-		res.write(chunkFrame(id, model, {}, "stop"));
+
+		const secs = Math.round((Date.now() - started) / 1000);
+		if (failure) {
+			// The status line went out with the first byte, so a mid-turn failure
+			// can only ever truncate the body. Say so explicitly instead: an error
+			// frame plus finish_reason="error", so a client that reads either can
+			// tell a failed turn from a short answer. (Surfacing this through
+			// AgentClient.chatStream, which yields text only, needs an SDK change.)
+			log(`turn FAILED after ${secs}s: ${failure}`);
+			broadcastActivity({ turn: id, kind: "turn_failed", text: failure });
+			res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: created(), model, error: { message: failure } })}\n\n`);
+			res.write(chunkFrame(id, model, {}, "error"));
+		} else {
+			log(`turn done in ${secs}s (streamed)`);
+			broadcastActivity({ turn: id, kind: "turn_end", text: `${secs}s` });
+			res.write(chunkFrame(id, model, {}, "stop"));
+		}
 		res.write("data: [DONE]\n\n");
 		return res.end();
 	}
 
 	const t0 = Date.now();
-	const full = await serialize(() => runTurn(session, text, null, (line) => log(`  ${line}`)));
-	log(`turn done in ${Math.round((Date.now() - t0) / 1000)}s (buffered)`);
+	broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
+	const full = await serialize(() =>
+		runTurn(session, text, null, (line, type) => {
+			log(`  ${line}`);
+			broadcastActivity({ turn: id, kind: type, text: line });
+		}),
+	);
+	const buffered = Math.round((Date.now() - t0) / 1000);
+	log(`turn done in ${buffered}s (buffered)`);
+	broadcastActivity({ turn: id, kind: "turn_end", text: `${buffered}s` });
 	return sendJSON(res, 200, completionBody(id, model, full));
 }
 
@@ -388,6 +467,10 @@ const server = createServer((req, res) => {
 
 	if (!authorized(req)) {
 		return sendJSON(res, 401, { error: { message: "bearer token required" } });
+	}
+
+	if (req.method === "GET" && path === "/activity") {
+		return handleActivity(req, res);
 	}
 
 	if (req.method === "POST" && path === "/v1/chat/completions") {
