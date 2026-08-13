@@ -12,7 +12,7 @@ npm install @0gfoundation/0g-agenticid-sdk viem
 
 - **Deploy & run your own agent** → [Quickstart](#quickstart)
 - **Call another agent, leave reputation** → [`ag.reputation`](#agreputation--serve-proof--feedback)
-- **Independently verify a serve-proof** → [Guide → Advanced](./GUIDE.md#advanced)
+- **Independently verify a serve-proof** → [serve-proof primitives](./GUIDE.md#advanced) (in the guide)
 
 > This README is the **interface reference** — signatures and shapes. The **[Guide](./GUIDE.md)** explains the reasoning behind each call; the [repo](https://github.com/0gfoundation/0g-agentic-id) has protocol docs + source.
 
@@ -39,7 +39,7 @@ const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
 });
 ```
 
-`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgenticID({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape → **[Guide → Setup](./GUIDE.md#setup)**.
+`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgenticID({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape are covered in the [setup guide](./GUIDE.md#setup).
 
 **What you pass grows with what you do:**
 
@@ -59,7 +59,7 @@ const buyer = '0xBbBb...';    // the address leaving feedback (attribution is ms
 
 ## `ag.agent` — lifecycle + reads
 
-> `iData` is the encrypted content minted for an agent (persona, framework binding). `deploy` assembles it from `name`/`description`/`inference` via `defaultIData()`; pass your own `iData` for full control. → [Guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes).
+> `iData` is the encrypted content minted for an agent (persona, framework binding). `deploy` assembles it from `name`/`description`/`inference` via `defaultIData()`; pass your own `iData` for full control ([details in the guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes)).
 
 ```ts
 import { parseEther } from 'viem';
@@ -116,7 +116,7 @@ await ag.agent.listMyDeployments();           // owner-signed; full detail
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
 ```
 
-Async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, failure reasons → **[Guide](./GUIDE.md#agagent--lifecycle--reads)**.
+The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
 
 **Three IDs, same agent:**
 
@@ -130,7 +130,7 @@ Convert freely: `getSealId` / `getAgentIdBySealId` / `getAgentSeal`.
 
 ## `ag.reputation` — serve-proof + feedback
 
-The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Why → [Guide](./GUIDE.md#agreputation--serve-proof--feedback).
+The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -167,7 +167,7 @@ await ag.reputation.revokeFeedback(agentId, idx);          // → "0x…"
 
 ## Top-level ops
 
-Two distinct balances: **`ag.deposit()`** funds the prepaid sandbox balance (compute runtime, pay-as-you-go), **`ag.agent.topUpAgentSeal()`** funds the agentSeal's own gas (the agent's on-chain activity). Full explanation → [Guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent).
+Two distinct balances: **`ag.deposit()`** funds the prepaid sandbox balance (compute runtime, pay-as-you-go), **`ag.agent.topUpAgentSeal()`** funds the agentSeal's own gas (the agent's on-chain activity). The [top-level-ops guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent) explains both in full.
 
 ```ts
 import { parseEther } from 'viem';
@@ -184,11 +184,11 @@ const depositTx = await ag.deposit({ amountWei: parseEther('0.5') });
 await ag.waitForTransaction(depositTx);
 ```
 
-`deploy()`/`clone()` **preflight** both prerequisites (all components acked + balance ≥ 0.1 OG). Bare writes (`ack`/`deposit`/`topUpAgentSeal`/`giveFeedback`) return before mining — `await ag.waitForTransaction(tx)` before reading state back. → [Guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent).
+`deploy()`/`clone()` **preflight** both prerequisites (all components acked + balance ≥ 0.1 OG). Bare writes (`ack`/`deposit`/`topUpAgentSeal`/`giveFeedback`) return before mining — `await ag.waitForTransaction(tx)` before reading state back (more in the [guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent)).
 
 ## iData & framework
 
-You don't pass a sealed image — the SDK resolves it from your `framework` via `GET /config`'s `frameworks[]` (each `{ name, image? }`). `iData` is an array of `{ role, plaintext, extra }`; `deploy` builds a `framework` + `persona` entry by default. Shapes + rules (WYSIWYS, persona is a one-shot seed, what the attestor validates) → **[Guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes)**.
+You don't pass a sealed image — the SDK resolves it from your `framework` via `GET /config`'s `frameworks[]` (each `{ name, image? }`). `iData` is an array of `{ role, plaintext, extra }`; `deploy` builds a `framework` + `persona` entry by default. The [iData guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) has the shapes and rules (WYSIWYS, persona is a one-shot seed, what the attestor validates).
 
 ```ts
 await ag.agent.listModels();   // → ['claude-opus-4-8', …]   the 0G router's live catalog
@@ -233,14 +233,14 @@ const auth = await ag.agent.authenticate(agentId);   // mints the owner token up
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)
 ```
 
-`model` is the framework's own selector, not an LLM name (the LLM is fixed at deploy) — openclaw wants `"openclaw"`. Capability signalling, openclaw token lifecycle, and the failure/`retry` flow → **[Guide](./GUIDE.md#interacting-with-a-running-agent-no-console-needed)**.
+`model` is the framework's own selector, not an LLM name (the LLM is fixed at deploy) — openclaw wants `"openclaw"`. The [interaction guide](./GUIDE.md#interacting-with-a-running-agent-no-console-needed) covers capability signalling, openclaw's token lifecycle, and the failure/`retry` flow.
 
 ## More
 
-- **Agents as owners (nested agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key. → [Guide](./GUIDE.md#agents-as-owners-nested-agents)
-- **Addresses** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`. → [Guide](./GUIDE.md#addresses)
-- **Advanced** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec. → [Guide](./GUIDE.md#advanced)
-- **CLI** `npx 0g-agenticid` — `doctor` / `status <agent>` / `list [--mine]`; `--json` for scripts. → [Guide](./GUIDE.md#cli-0g-agenticid-diagnostics)
+- **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
+- **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
+- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec.
+- **[CLI](./GUIDE.md#cli-0g-agenticid-diagnostics)** `npx 0g-agenticid` — `doctor` / `status <agent>` / `list [--mine]`; `--json` for scripts.
 
 ## Notes
 
