@@ -294,35 +294,12 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
-            frameworks: {
-                // `ATTESTOR_FRAMEWORKS=openclaw,hermes:0g-sealed-hermes` — each
-                // entry is `name[:image]`; no image → default sandbox_snapshot.
-                // Falls back to the legacy `ATTESTOR_SUPPORTED_FRAMEWORKS`
-                // (names only) so a not-yet-migrated deployment keeps working.
-                let parsed: Vec<Framework> = env_opt("ATTESTOR_FRAMEWORKS")
-                    .or_else(|| env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS"))
-                    .map(|s| {
-                        s.split(',')
-                            .map(str::trim)
-                            .filter(|f| !f.is_empty())
-                            .map(|f| {
-                                let (name, image) = f.split_once(':').unwrap_or((f, ""));
-                                let image = image.trim();
-                                Framework {
-                                    name: name.trim().to_string(),
-                                    image: (!image.is_empty()).then(|| image.to_string()),
-                                }
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // An empty list would silently reject every deploy → default openclaw.
-                if parsed.is_empty() {
-                    vec![Framework { name: "openclaw".to_string(), image: None }]
-                } else {
-                    parsed
-                }
-            },
+            // `ATTESTOR_FRAMEWORKS=openclaw,hermes:0g-sealed-hermes` — `name[:image]`
+            // per entry; legacy `ATTESTOR_SUPPORTED_FRAMEWORKS` (names only) is a
+            // fallback so a not-yet-migrated deployment keeps working.
+            frameworks: parse_frameworks(
+                env_opt("ATTESTOR_FRAMEWORKS").or_else(|| env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")),
+            ),
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),
@@ -382,4 +359,65 @@ fn env(key: &str) -> anyhow::Result<String> {
 
 fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok()
+}
+
+/// Parse the `ATTESTOR_FRAMEWORKS` value: a comma list of `name[:image]`
+/// entries. `image` omitted → `None` (caller falls back to sandbox_snapshot).
+/// Empty / `None` → `[openclaw]` (an empty list would reject every deploy).
+fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
+    let parsed: Vec<Framework> = raw
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|f| !f.is_empty())
+                .map(|f| {
+                    let (name, image) = f.split_once(':').unwrap_or((f, ""));
+                    let image = image.trim();
+                    Framework {
+                        name: name.trim().to_string(),
+                        image: (!image.is_empty()).then(|| image.to_string()),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if parsed.is_empty() {
+        vec![Framework { name: "openclaw".to_string(), image: None }]
+    } else {
+        parsed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_frameworks_name_and_image() {
+        let fws = parse_frameworks(Some("openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string()));
+        assert_eq!(fws.len(), 3);
+        assert_eq!(fws[0].name, "openclaw");
+        assert_eq!(fws[0].image, None); // no image → default snapshot
+        assert_eq!(fws[1].name, "hermes");
+        assert_eq!(fws[1].image.as_deref(), Some("0g-sealed-hermes"));
+        assert_eq!(fws[2].image.as_deref(), Some("0g-sealed-prime"));
+    }
+
+    #[test]
+    fn parse_frameworks_empty_or_none_defaults_openclaw() {
+        for raw in [None, Some(String::new()), Some("  ,  ".to_string())] {
+            let fws = parse_frameworks(raw);
+            assert_eq!(fws.len(), 1);
+            assert_eq!(fws[0].name, "openclaw");
+            assert_eq!(fws[0].image, None);
+        }
+    }
+
+    #[test]
+    fn parse_frameworks_legacy_names_only_still_works() {
+        // legacy ATTESTOR_SUPPORTED_FRAMEWORKS value shape (no images)
+        let fws = parse_frameworks(Some("openclaw,hermes".to_string()));
+        assert_eq!(fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["openclaw", "hermes"]);
+        assert!(fws.iter().all(|f| f.image.is_none()));
+    }
 }
