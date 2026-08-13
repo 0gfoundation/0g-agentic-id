@@ -207,6 +207,30 @@ function completionBody(id, model, content) {
 	};
 }
 
+/**
+ * Condense one session event into a short activity line.
+ *
+ * Deliberately defensive about payload shape: the event union is large
+ * (tool_execution_*, bash_*, compaction_*, auto_retry_*, refine_*,
+ * rlm_child_update, …) and its fields are not part of any contract we control,
+ * so this reads a few likely names and otherwise falls back to the type alone.
+ * A progress line is worth degrading; it is never worth crashing a turn over.
+ */
+function activityLine(event) {
+	const t = event?.type;
+	if (!t || t === "message_update") return null;
+	const pick = (...keys) => {
+		for (const k of keys) {
+			const v = event[k] ?? event?.detail?.[k] ?? event?.data?.[k];
+			if (typeof v === "string" && v.trim()) return v.trim().slice(0, 120);
+			if (typeof v === "number") return String(v);
+		}
+		return "";
+	};
+	const detail = pick("command", "name", "tool", "toolName", "title", "reason", "id");
+	return detail ? `${t} — ${detail}` : t;
+}
+
 /** The prompt text for this turn: the last user message's content. */
 function lastUserText(messages) {
 	if (!Array.isArray(messages)) return "";
@@ -255,14 +279,22 @@ function authorized(req) {
  * Run one turn, forwarding assistant text as it is generated. onDelta may be
  * called many times; the resolved value is the full concatenated text.
  */
-async function runTurn(session, text, onDelta) {
+async function runTurn(session, text, onDelta, onActivity) {
 	let full = "";
 	const unsubscribe = session.subscribe((event) => {
-		if (event.type !== "message_update") return;
-		const e = event.assistantMessageEvent;
-		if (!e || e.type !== "text_delta" || typeof e.delta !== "string") return;
-		full += e.delta;
-		if (onDelta) onDelta(e.delta);
+		if (event.type === "message_update") {
+			const e = event.assistantMessageEvent;
+			if (!e || e.type !== "text_delta" || typeof e.delta !== "string") return;
+			full += e.delta;
+			if (onDelta) onDelta(e.delta);
+			return;
+		}
+		// Everything else is turn progress. An agent turn spends most of its time
+		// NOT producing assistant text — it thinks, runs tools, spawns subagents —
+		// so without this the stream is silent for minutes and an idle-timeout hop
+		// in front of the agent drops a connection that was working fine.
+		const line = activityLine(event);
+		if (line && onActivity) onActivity(line, event.type);
 	});
 	try {
 		await session.prompt(text);
@@ -300,13 +332,47 @@ async function handleChat(req, res) {
 		});
 		res.write(chunkFrame(id, model, { role: "assistant" }));
 		if (typeof res.flushHeaders === "function") res.flushHeaders();
-		await serialize(() => runTurn(session, text, (delta) => res.write(chunkFrame(id, model, { content: delta }))));
+
+		// Keepalive as SSE COMMENTS, and nothing else on the wire.
+		//
+		// An agent turn spends most of its time not producing assistant text — it
+		// thinks, runs tools, spawns subagents — so this stream is legitimately
+		// silent for minutes, and silence is what makes an idle-timeout hop in
+		// front of the agent drop a connection that is working fine.
+		//
+		// Comments are part of the SSE format and every parser skips them
+		// (including this SDK's), so they keep the response standard: a client
+		// sees exactly the text frames it would see from any OpenAI-compatible
+		// server. Turn activity is NOT put on the wire — chat/completions has no
+		// standard slot for it, and inventing a private field would make our
+		// payload something other clients cannot read. It goes to the bridge log
+		// instead, where /log/agent surfaces it for debugging. Reporting progress
+		// to a client properly wants a Responses-shaped surface; that is its own
+		// piece of work.
+		const beat = setInterval(() => res.write(": keepalive\n\n"), 10_000);
+
+		const started = Date.now();
+		try {
+			await serialize(() =>
+				runTurn(
+					session,
+					text,
+					(delta) => res.write(chunkFrame(id, model, { content: delta })),
+					(line) => log(`  ${line}`),
+				),
+			);
+		} finally {
+			clearInterval(beat);
+		}
+		log(`turn done in ${Math.round((Date.now() - started) / 1000)}s (streamed)`);
 		res.write(chunkFrame(id, model, {}, "stop"));
 		res.write("data: [DONE]\n\n");
 		return res.end();
 	}
 
-	const full = await serialize(() => runTurn(session, text, null));
+	const t0 = Date.now();
+	const full = await serialize(() => runTurn(session, text, null, (line) => log(`  ${line}`)));
+	log(`turn done in ${Math.round((Date.now() - t0) / 1000)}s (buffered)`);
 	return sendJSON(res, 200, completionBody(id, model, full));
 }
 
