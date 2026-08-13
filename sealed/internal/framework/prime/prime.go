@@ -134,6 +134,7 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 		{Name: "framework", Shape: framework.Leaf},
 		{Name: "harness_state.json", Shape: framework.Leaf},
 		{Name: "APPEND_SYSTEM.md", Shape: framework.Leaf},
+		{Name: "models.json", Shape: framework.Leaf},
 		{Name: "skills/", Shape: framework.DirectoryManifest},
 	}
 }
@@ -157,7 +158,7 @@ func (a *Adapter) Defaults(role string) []byte {
 			return nil
 		}
 		return b
-	case "harness_state.json", "APPEND_SYSTEM.md":
+	case "harness_state.json", "APPEND_SYSTEM.md", "models.json":
 		return nil
 	case "skills/":
 		b, err := manifest.New().Marshal()
@@ -179,6 +180,8 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 		return a.restoreHarnessState(plaintext)
 	case "APPEND_SYSTEM.md":
 		return a.restoreAppendSystem(plaintext)
+	case "models.json":
+		return a.restoreModelsJSON(plaintext)
 	case "skills/":
 		return a.restoreManifestDir(plaintext)
 	}
@@ -251,6 +254,8 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 		return a.evoHarnessState()
 	case "APPEND_SYSTEM.md":
 		return a.evoAppendSystem()
+	case "models.json":
+		return a.evoModelsJSON()
 	case "skills/":
 		return a.evoSkills()
 	}

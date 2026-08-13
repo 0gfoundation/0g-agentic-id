@@ -87,6 +87,18 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
 
+	// The pin's durable home is the tracked models.json, NOT the in-memory
+	// persona: `persona` is a mint-time seed that leaves the chain at the first
+	// drift commit, so on every later boot HandleLegacy does not run and the
+	// in-memory fields are empty. Prefer the file; fall back to memory for the
+	// very first boot, where HandleLegacy has just run but a Restore has not.
+	if p, m := readPin(); p != "" && m != "" {
+		provider, model = p, m
+	}
+	if provider == "" || model == "" {
+		return framework.StartResult{}, fmt.Errorf(
+			"prime.Start: no inference pin — neither %s nor the persona seed named a provider/model", modelsJSONPath())
+	}
 	sdkProvider, modelAPI, baseURL := resolveInference(ctx, provider, model)
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the

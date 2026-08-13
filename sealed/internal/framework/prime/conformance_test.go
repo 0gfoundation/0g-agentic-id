@@ -33,6 +33,12 @@ func TestConformance(t *testing.T) {
 				Leaf: []byte(`{"entries":{"memory":{"m1":{"id":"m1","scope":"global","title":"owner prefers metric units","version":1}},"prompt":{"p1":{"id":"p1","scope":"global","title":"always cite sources","version":2}}},"schema":1}`),
 			},
 			{
+				// Canonical form: providers map sorted, struct fields in
+				// declaration order, apiKey an env-var NAME rather than a secret.
+				Role: "models.json",
+				Leaf: []byte(`{"providers":{"0g-compute":{"baseUrl":"https://router-api.0g.ai/v1","api":"openai-completions","apiKey":"SEAL_MODEL_API_KEY","authHeader":true,"compat":{"supportsDeveloperRole":false,"supportsReasoningEffort":false},"models":[{"id":"glm-5.2"}]}}}`),
+			},
+			{
 				Role: "APPEND_SYSTEM.md",
 				Leaf: []byte("# Persona\n\nOwner-authored persona.\n"),
 			},

@@ -55,6 +55,10 @@ func harnessStateDir() string  { return primeHome + "/harness" }
 func skillsDir() string        { return primeHome + "/skills" }
 func appendSystemPath() string { return primeHome + "/APPEND_SYSTEM.md" }
 
+// modelsJSONPath is the framework's native model registration, and this
+// adapter's durable home for the inference pin (see modelsjson.go).
+func modelsJSONPath() string { return primeHome + "/models.json" }
+
 // kernelVenvPython is the interpreter the framework's IPython kernel runs, in
 // the venv its bootstrap provisions (uv-managed Python 3.11 + ipykernel +
 // prime-agent-runtime, ~330MB). Provisioned at image build time; Start asserts

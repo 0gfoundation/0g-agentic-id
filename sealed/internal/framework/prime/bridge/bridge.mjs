@@ -34,8 +34,7 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 // The official release package (`prime-agent`), installed globally in the
 // image. NOT the @earendil-works/pi-coding-agent npm package: that one ships
@@ -58,7 +57,7 @@ const MODEL_ID = process.env.SEAL_MODEL_ID || "";
 const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
 // Set when the model is served by an OpenAI/Anthropic-compatible endpoint that
 // is NOT the provider's own (the 0G compute router). Then the model has to be
-// REGISTERED, not merely named — see writeModelsJson.
+// REGISTERED (models.json), which the adapter writes as a tracked role.
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || "";
 const MODEL_API = process.env.SEAL_MODEL_API || "openai-completions";
 
@@ -85,41 +84,9 @@ function readAgentDoc() {
 	}
 }
 
-/**
- * Register the pinned model as a CUSTOM provider in <agentDir>/models.json.
- *
- * Required, not cosmetic. A model served by the 0G router is not a built-in, so
- * `modelRegistry.find()` cannot see it, and there is no base-URL environment
- * variable that redirects a built-in provider: setting OPENAI_BASE_URL is
- * ignored, and the request goes to api.openai.com with the router's key — a 401
- * that reads as "wrong API key" and hides the real cause. Registration is the
- * documented mechanism (the package's docs/models.md).
- *
- * The key is written as the NAME of an environment variable, which the loader
- * resolves at use time. So the credential still never touches disk — the file
- * holds the string "SEAL_MODEL_API_KEY", not the key.
- */
-function writeModelsJson(agentDir) {
-	const cfg = {
-		providers: {
-			[PROVIDER]: {
-				baseUrl: MODEL_BASE_URL,
-				api: MODEL_API,
-				apiKey: "SEAL_MODEL_API_KEY",
-				authHeader: true,
-				// A third-party OpenAI-compatible endpoint generally understands
-				// neither the `developer` role nor `reasoning_effort`; the package's
-				// own docs recommend disabling both for this class of server.
-				compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
-				models: [{ id: MODEL_ID }],
-			},
-		},
-	};
-	const path = join(agentDir, "models.json");
-	writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`);
-	log(`registered ${PROVIDER}/${MODEL_ID} → ${MODEL_BASE_URL} (${MODEL_API}) in ${path}`);
-	return path;
-}
+// models.json (the model registration) is written by the ADAPTER, not here: it
+// is a chain-tracked role, so sealed owns it and Restore lands it before this
+// process starts. The registry picks it up from the agent dir automatically.
 
 /**
  * Resolve the pinned model, and FAIL if it cannot be resolved.
@@ -145,10 +112,6 @@ function resolveModel(modelRegistry) {
 
 async function buildSession() {
 	const agentDir = getAgentDir();
-	// A non-native endpoint (the 0G router) needs the model registered before the
-	// registry can see it.
-	if (MODEL_BASE_URL) writeModelsJson(agentDir);
-
 	const authStorage = AuthStorage.create();
 	// Also hand the key over at runtime (not persisted). Native providers need
 	// this; for a registered custom provider the models.json entry resolves the

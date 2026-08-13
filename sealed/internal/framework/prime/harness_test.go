@@ -238,3 +238,37 @@ func TestEvoSkills_SkipsDotDirs(t *testing.T) {
 }
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }
+
+// The bug this guards: `persona` is a mint-time seed that leaves the chain at
+// the first drift commit, so an inference pin kept only in memory is gone on
+// every later boot. HandleLegacy must land it in the tracked models.json, and it
+// must survive a fresh adapter that never sees persona again.
+func TestPersonaPinIsDurable(t *testing.T) {
+	primeHome = t.TempDir()
+	ctx := context.Background()
+
+	seed := []byte(`{"system_prompt":"You are Ada.\n","inference":{"provider":"0g-compute","model":"glm-5.2"}}`)
+	if err := New().HandleLegacy(ctx, "persona", seed); err != nil {
+		t.Fatalf("HandleLegacy(persona): %v", err)
+	}
+
+	// A NEW adapter — as after a container rebuild, where persona is no longer on
+	// chain and HandleLegacy never runs — must still find the pin.
+	provider, model := readPin()
+	if provider != "0g-compute" || model != "glm-5.2" {
+		t.Fatalf("pin not durable: got %q/%q, want 0g-compute/glm-5.2", provider, model)
+	}
+
+	// And it must be a tracked role, so it actually reaches chain.
+	out, err := New().EvolutionFor(ctx, "models.json")
+	if err != nil {
+		t.Fatalf("EvolutionFor(models.json): %v", err)
+	}
+	if !contains(string(out), `"glm-5.2"`) || !contains(string(out), "router-api.0g.ai") {
+		t.Errorf("models.json does not carry the pin: %s", out)
+	}
+	// The credential is referenced by env-var NAME, never embedded.
+	if !contains(string(out), apiKeyEnvRef) {
+		t.Errorf("apiKey should reference %s, got: %s", apiKeyEnvRef, out)
+	}
+}
