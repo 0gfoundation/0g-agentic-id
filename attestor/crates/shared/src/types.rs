@@ -121,7 +121,7 @@ pub struct DeployRequest {
     /// minted (WYSIWYS: what the owner signs is what gets sealed — the
     /// attestor synthesizes NOTHING). Must contain a `role="framework"`
     /// binding entry whose `name` is validated against
-    /// `Config.supported_frameworks` before the irreversible mint; every
+    /// `Config.frameworks` (by name) before the irreversible mint; every
     /// other role is opaque to the attestor. Clients that want the old
     /// "just name + description" ergonomics use the SDK's
     /// `defaultIData()` helper, which builds the same two entries the
