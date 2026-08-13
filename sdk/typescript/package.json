@@ -21,6 +21,7 @@
     "dist",
     "src",
     "README.md",
+    "GUIDE.md",
     "LICENSE"
   ],
   "scripts": {

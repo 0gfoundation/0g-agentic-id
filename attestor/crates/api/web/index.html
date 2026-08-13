@@ -1994,9 +1994,9 @@ window.addEventListener('DOMContentLoaded', async () => {
     // without a frontend change.
     const FW_LABELS = { 'openclaw': 'OpenClaw', 'claude-code': 'Claude Code' };
     const label = (f) => FW_LABELS[f] || f.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
-    const list = (State.config && Array.isArray(State.config.supported_frameworks) && State.config.supported_frameworks.length)
-      ? State.config.supported_frameworks
-      : ['openclaw']; // fallback when the attestor predates /config.supported_frameworks
+    const list = (State.config && Array.isArray(State.config.frameworks) && State.config.frameworks.length)
+      ? State.config.frameworks.map((f) => f.name)
+      : ['openclaw']; // fallback when the attestor predates /config.frameworks
     const sel = $('#framework');
     sel.innerHTML = list.map((f) => `<option value="${escapeHtml(f)}">${escapeHtml(label(f))}</option>`).join('');
     enhanceAllSelects();

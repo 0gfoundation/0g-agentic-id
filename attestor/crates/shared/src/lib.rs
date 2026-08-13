@@ -23,7 +23,7 @@ pub mod tee;
 pub mod traits;
 pub mod types;
 
-pub use config::Config;
+pub use config::{Config, Framework};
 pub use error::{AttestorError, Result};
 pub use events::WsEvent;
 pub use traits::{

@@ -21,7 +21,7 @@ const ATTESTOR_URL = need('ATTESTOR_URL');
 
 (async () => {
   const cfg = await (await fetch(ATTESTOR_URL.replace(/\/$/, '') + '/config')).json();
-  console.log('supported_frameworks:', cfg.supported_frameworks);
+  console.log('frameworks:', cfg.frameworks);
 
   const ai = new AgenticID({
     attestorUrl: ATTESTOR_URL,

@@ -100,7 +100,7 @@ API=http://<attestor>:8080
 # 1. preflight — health, config sanity, and the KMS self-check already
 #    passed if the binaries are up at all (they refuse to boot otherwise)
 curl -s $API/health                                    # "ok"
-curl -s $API/config | jq '{sandbox_snapshot, supported_frameworks}'
+curl -s $API/config | jq '{sandbox_snapshot, frameworks}'
 
 # 2. deploy (snapshot is read from /config — never hardcode it)
 OWNER_PRIV=0x<funded key> API=$API bash scripts/e2e.sh # → PASS — phase=running
