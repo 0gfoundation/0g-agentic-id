@@ -34,7 +34,8 @@
  */
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 // The official release package (`prime-agent`), installed globally in the
 // image. NOT the @earendil-works/pi-coding-agent npm package: that one ships
@@ -55,6 +56,11 @@ const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
 const MODEL_ID = process.env.SEAL_MODEL_ID || "";
 const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
+// Set when the model is served by an OpenAI/Anthropic-compatible endpoint that
+// is NOT the provider's own (the 0G compute router). Then the model has to be
+// REGISTERED, not merely named — see writeModelsJson.
+const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || "";
+const MODEL_API = process.env.SEAL_MODEL_API || "openai-completions";
 
 if (!TOKEN) {
 	console.error("bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)");
@@ -79,30 +85,81 @@ function readAgentDoc() {
 	}
 }
 
-async function resolveModel(modelRegistry) {
-	if (PROVIDER && MODEL_ID) {
-		const pinned = modelRegistry.find(PROVIDER, MODEL_ID);
-		if (pinned) return pinned;
-		log(`WARN pinned model ${PROVIDER}/${MODEL_ID} not in the registry; falling back to first available`);
+/**
+ * Register the pinned model as a CUSTOM provider in <agentDir>/models.json.
+ *
+ * Required, not cosmetic. A model served by the 0G router is not a built-in, so
+ * `modelRegistry.find()` cannot see it, and there is no base-URL environment
+ * variable that redirects a built-in provider: setting OPENAI_BASE_URL is
+ * ignored, and the request goes to api.openai.com with the router's key — a 401
+ * that reads as "wrong API key" and hides the real cause. Registration is the
+ * documented mechanism (the package's docs/models.md).
+ *
+ * The key is written as the NAME of an environment variable, which the loader
+ * resolves at use time. So the credential still never touches disk — the file
+ * holds the string "SEAL_MODEL_API_KEY", not the key.
+ */
+function writeModelsJson(agentDir) {
+	const cfg = {
+		providers: {
+			[PROVIDER]: {
+				baseUrl: MODEL_BASE_URL,
+				api: MODEL_API,
+				apiKey: "SEAL_MODEL_API_KEY",
+				authHeader: true,
+				// A third-party OpenAI-compatible endpoint generally understands
+				// neither the `developer` role nor `reasoning_effort`; the package's
+				// own docs recommend disabling both for this class of server.
+				compat: { supportsDeveloperRole: false, supportsReasoningEffort: false },
+				models: [{ id: MODEL_ID }],
+			},
+		},
+	};
+	const path = join(agentDir, "models.json");
+	writeFileSync(path, `${JSON.stringify(cfg, null, 2)}\n`);
+	log(`registered ${PROVIDER}/${MODEL_ID} → ${MODEL_BASE_URL} (${MODEL_API}) in ${path}`);
+	return path;
+}
+
+/**
+ * Resolve the pinned model, and FAIL if it cannot be resolved.
+ *
+ * Deliberately no fallback to "first available": that silently ran a model the
+ * owner never chose (it picked openai/gpt-4 for a 0g-compute/glm-5.2 pin), which
+ * is both wrong and hard to see — the inference pin is part of the agent's
+ * on-chain identity, so substituting it must be an error, not a warning.
+ */
+function resolveModel(modelRegistry) {
+	if (!PROVIDER || !MODEL_ID) {
+		throw new Error("no model pinned: SEAL_MODEL_PROVIDER and SEAL_MODEL_ID are required");
 	}
-	const available = await modelRegistry.getAvailable();
-	if (!available.length) {
-		throw new Error("no model available (no valid API key, or the pinned model is unknown)");
+	const pinned = modelRegistry.find(PROVIDER, MODEL_ID);
+	if (!pinned) {
+		throw new Error(
+			`pinned model ${PROVIDER}/${MODEL_ID} is not resolvable` +
+				(MODEL_BASE_URL ? ` even after registering ${MODEL_BASE_URL}` : " (no base URL given, so it must be a built-in)"),
+		);
 	}
-	return available[0];
+	return pinned;
 }
 
 async function buildSession() {
+	const agentDir = getAgentDir();
+	// A non-native endpoint (the 0G router) needs the model registered before the
+	// registry can see it.
+	if (MODEL_BASE_URL) writeModelsJson(agentDir);
+
 	const authStorage = AuthStorage.create();
-	// Runtime override: not persisted to disk (SDK example 09). The key comes
-	// from the owner's deploy envelope via sealed's RuntimeContext.
+	// Also hand the key over at runtime (not persisted). Native providers need
+	// this; for a registered custom provider the models.json entry resolves the
+	// key from the environment instead.
 	if (PROVIDER && API_KEY) authStorage.setRuntimeApiKey(PROVIDER, API_KEY);
 	const modelRegistry = ModelRegistry.create(authStorage);
 
 	const doc = readAgentDoc();
 	const loader = new DefaultResourceLoader({
 		cwd: process.cwd(),
-		agentDir: getAgentDir(),
+		agentDir,
 		// The platform doc goes into BOTH channels, deliberately:
 		//
 		//   1. appendSystemPromptOverride — the AUTHORITATIVE channel. This is
@@ -128,7 +185,7 @@ async function buildSession() {
 	});
 	await loader.reload();
 
-	const model = await resolveModel(modelRegistry);
+	const model = resolveModel(modelRegistry);
 	log(`model resolved: ${model.provider}/${model.id}`);
 	const { session } = await createAgentSession({
 		model,

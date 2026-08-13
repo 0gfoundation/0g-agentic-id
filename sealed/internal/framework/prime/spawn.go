@@ -87,7 +87,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
 
-	sdkProvider, baseURLEnv, baseURL := resolveInference(ctx, provider, model)
+	sdkProvider, modelAPI, baseURL := resolveInference(ctx, provider, model)
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the
 	// bridge injects it as a virtual context file at session creation. No
@@ -120,7 +120,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		apiKey:      rt.APIKey,
 		sdkProvider: sdkProvider,
 		model:       model,
-		baseURLEnv:  baseURLEnv,
+		modelAPI:    modelAPI,
 		baseURL:     baseURL,
 		rt:          rt,
 	})
@@ -145,28 +145,39 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 // the 0G compute router".
 const zgComputeProvider = "0g-compute"
 
-// resolveInference translates the persona seed's inference pin into the shape
-// the bridge needs: the SDK provider id, plus the base-URL env var to set when
-// the request has to go through the 0G router.
+// resolveInference translates the persona seed's inference pin into what the
+// bridge needs to REGISTER the model: the provider name to register it under,
+// the wire API, and the endpoint.
 //
-// Provider knowledge lives in internal/inference, never here — the openclaw
-// adapter learned that the hard way when the router added Anthropic-format
-// models and a hardcoded OpenAI assumption turned every first inference into a
-// 400 (FRAMEWORK_ADAPTER.md §12, item 19). This function only decides HOW the
+// A non-empty baseURL is the bridge's signal that the model is not a built-in
+// and must be written into models.json. That indirection is required: there is
+// no environment variable that redirects a built-in provider at another
+// endpoint. Setting OPENAI_BASE_URL is simply ignored — the request goes to
+// api.openai.com with the router's key and comes back 401 "incorrect API key",
+// which reads like a credential problem and hides the real cause. Verified live
+// on 0G Galileo, 2026-08-13.
+//
+// The provider is registered under its own name (`0g-compute`) rather than
+// masquerading as `openai`: it is a distinct endpoint with distinct credentials,
+// and overriding a built-in provider would make the agent's own /model listing
+// lie about where inference goes.
+//
+// Provider knowledge stays in internal/inference — the openclaw adapter learned
+// that the hard way when the router added Anthropic-format models and a
+// hardcoded OpenAI assumption turned every first inference into a 400
+// (FRAMEWORK_ADAPTER.md §12, item 19). This function only decides HOW the
 // framework is told about a resolved route.
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, baseURLEnv, baseURL string) {
+func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string) {
 	if provider != zgComputeProvider {
-		// A native provider ("anthropic", "openai", …) needs no rewriting: the
-		// SDK's own registry knows it and reads its standard base URL.
+		// A native provider ("anthropic", "openai", …) is a built-in: the SDK
+		// knows its endpoint, so nothing needs registering.
 		return provider, "", ""
 	}
 	route := inference.ResolveZG(ctx, model)
-	switch route.Format {
-	case inference.WireAnthropic:
-		return "anthropic", "ANTHROPIC_BASE_URL", route.BaseURL
-	default:
-		return "openai", "OPENAI_BASE_URL", route.BaseURL
+	if route.Format == inference.WireAnthropic {
+		return provider, "anthropic-messages", route.BaseURL
 	}
+	return provider, "openai-completions", route.BaseURL
 }
 
 // verifyInstalled checks that the framework baked into this image is the one
@@ -242,7 +253,7 @@ type bridgeEnv struct {
 	apiKey      string
 	sdkProvider string
 	model       string
-	baseURLEnv  string
+	modelAPI    string
 	baseURL     string
 	rt          framework.RuntimeContext
 }
@@ -302,8 +313,14 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		// so the inference key touches no tracked path.
 		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
 	}
-	if be.baseURLEnv != "" && be.baseURL != "" {
-		env = append(env, be.baseURLEnv+"="+be.baseURL)
+	// A non-empty base URL tells the bridge to register the model as a custom
+	// provider (models.json) rather than expecting a built-in. The API key is
+	// referenced there BY ENV VAR NAME, so it stays out of the file.
+	if be.baseURL != "" {
+		env = append(env, "SEAL_MODEL_BASE_URL="+be.baseURL)
+		if be.modelAPI != "" {
+			env = append(env, "SEAL_MODEL_API="+be.modelAPI)
+		}
 	}
 	// Public on-chain facts the agent benefits from knowing directly, mirroring
 	// the openclaw allowlist. The authoritative copy is the injected doc.
