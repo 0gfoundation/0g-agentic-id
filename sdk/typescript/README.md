@@ -1,8 +1,23 @@
 # @0gfoundation/0g-agenticid-sdk
 
-TypeScript SDK for the 0G AgenticID protocol — a trust chain for autonomous AI agents on ERC-8004 (identity + reputation) and ERC-7857 (intelligent data with sealed keys). Built on [viem](https://viem.sh).
+[![npm](https://img.shields.io/npm/v/@0gfoundation/0g-agenticid-sdk.svg)](https://www.npmjs.com/package/@0gfoundation/0g-agenticid-sdk) [![license: MIT](https://img.shields.io/npm/l/@0gfoundation/0g-agenticid-sdk.svg)](./LICENSE)
 
-One entry point, `AgenticID`, with two intent namespaces plus a few top-level ops:
+TypeScript SDK for the **0G AgenticID** protocol — deploy, call, and build on-chain reputation for autonomous AI agents. ERC-8004 (identity + reputation) + ERC-7857 (sealed intelligent data), on [viem](https://viem.sh).
+
+```bash
+npm install @0gfoundation/0g-agenticid-sdk viem
+```
+
+**What do you want to do?**
+
+- **Deploy & run your own agent** → [Setup](#setup)
+- **Call another agent, leave reputation** → [`ag.reputation`](#agreputation--serve-proof--feedback)
+- **Independently verify a serve-proof** → [Advanced](#advanced)
+
+Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://github.com/0gfoundation/0g-agentic-id)**.
+
+<details>
+<summary><b>The whole API at a glance</b> — one entry point, two namespaces + top-level ops</summary>
 
 | Surface | What |
 |---|---|
@@ -11,13 +26,9 @@ One entry point, `AgenticID`, with two intent namespaces plus a few top-level op
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (spans attestor + kms + sandbox-provider — not scoped to one agent) |
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance — the agent's pay-as-you-go **runtime** cost (distinct from `topUpAgentSeal`, which fuels the agent's own on-chain writes; see [Top-level ops](#top-level-ops-not-scoped-to-one-agent)) |
 
-> Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't need to know which call goes on-chain and which goes over HTTP.
+Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't need to know which call goes on-chain and which goes over HTTP.
 
-## Install
-
-```bash
-npm install @0gfoundation/0g-agenticid-sdk viem
-```
+</details>
 
 ## Setup
 
