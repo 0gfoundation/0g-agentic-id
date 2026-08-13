@@ -125,8 +125,17 @@ RUN curl -fsSL "${PRIME_DOWNLOAD_BASE_URL}/releases/v${PRIME_VERSION}/prime-agen
  && echo "baked prime-agent@$V + $("$KPY" -V) kernel (ipykernel $("$KPY" -c 'import ipykernel;print(ipykernel.__version__)'))"
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
-COPY --from=bootstrap-builder /app/bootstrap /usr/local/bin/bootstrap
+COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 
-# No CMD: this image is booted by the sealed bootstrap binary, which the
-# sandbox layer injects and runs as PID 1. Framework processes are children of
-# sealed, never a container entrypoint.
+# Bootstrap runs as PID 1 and spawns the framework itself (here: the sealed
+# bridge) once it has decrypted and restored the agent's iData.
+#
+# The ENTRYPOINT is REQUIRED and its absence is not a cosmetic omission: this
+# image is standalone (debian:13-slim), like images/hermes/, so nothing else
+# supplies one. images/openclaw/ can get away without it because it is layered
+# FROM the platform's own 0g-sandbox base, which provides the entrypoint —
+# copying that image's "no CMD" comment onto a standalone image produced a
+# container that booted debian's default shell, never ran sealed, and failed as
+# a provision timeout with a 502 on /log (the sandbox exists, nothing listens).
+ENTRYPOINT ["/bootstrap"]
+EXPOSE 8080
