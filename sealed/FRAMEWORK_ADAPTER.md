@@ -5,13 +5,16 @@
 This document is the integration contract for **agent framework authors**:
 what you must implement to run your framework (eliza, autogen, a custom
 orchestrator, ...) inside a Sealed Sandbox, what sealed provides around
-your process, and what still requires out-of-repo work. One adapter ships
-in-tree and doubles as the reference implementation: `openclaw`
-(server-shaped framework). A second, `claudecode` (CLI-shaped framework
-behind an HTTP bridge), was built as a seam probe and then **retired** — a
-per-request CLI can't host the owner-built public services this platform
-is for (see §12 for the full field report; the adapter code was removed,
-but the port's lessons are the reason much of this contract exists).
+your process, and what still requires out-of-repo work. Three adapters ship
+in-tree: `openclaw` (server-shaped framework; the reference
+implementation), `hermes` (python/uv, multi-channel gateway) and
+`prime-agent` (a self-modifying harness with no HTTP surface of its own —
+sealed ships the bridge; see §13). A fourth, `claudecode` (CLI-shaped
+framework behind an HTTP bridge), was built as a seam probe and then
+**retired** — a per-request CLI can't host the owner-built public services
+this platform is for (see §12 for the full field report; the adapter code
+was removed, but the port's lessons are the reason much of this contract
+exists).
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -82,20 +85,32 @@ components hold only the interface (or a narrow subset of it) and need
   agents register services via `POST $SEAL_SIGN_SOCK/services` and sealed
   routes + signs them through `/hello` and the proxy; adapters declare no
   manifest.)
-- **One universal image**: `images/sealed/` bakes node + the sealed
-  binary, with the bundled frameworks npm-installed as a warm cache
-  only — each adapter re-pins its binding version at first Start, and
-  a CLI-framework shim, when an adapter ships one, is `go:embed`ded in
-  the binary and materialized at Start (the retired claudecode bridge
-  worked this way). Supporting a new node-ecosystem
-  framework does not require a new image, just (optionally) one more
-  warm-cache line.
+- **One image per RUNTIME** (not per framework): `images/sealed/` carries
+  node, `images/hermes/` python/uv, `images/prime/` both (Prime Agent is a
+  TypeScript harness over a Python kernel). Frameworks sharing a runtime
+  share an image, where the framework install is a warm cache only — each
+  adapter re-pins its binding version at first Start, and a framework shim
+  or bridge, when an adapter ships one, is `go:embed`ded in the sealed
+  binary and materialized at Start (the retired claudecode bridge and the
+  prime-agent HTTP bridge both work this way), so its measurement rides the
+  sealed image hash. Supporting a new framework in an ecosystem we already
+  carry does not require a new image, just (optionally) one more warm-cache
+  line; a new ecosystem does.
+
+  **Which adapter runs is still never decided by the image** — that is the
+  on-chain binding's job (§2.1 above), and the sealed binary in every image
+  registers every adapter. But the image must actually *carry* the runtime
+  the selected adapter needs, and **nothing validates that pairing**: a
+  binding naming a framework whose runtime is absent yields a container that
+  boots and then fails at Start. Deploys of anything but the default image
+  must pass `sealedImage` explicitly.
 
 What remains genuinely out-of-repo:
 
-1. **Image allowlist governance**: the universal image's hash must be in
+1. **Image allowlist governance**: every image's hash must be in
    attestor's allowlist; rebuilds (new sealed binary, new warm-cache
-   entries, version-whitelist bumps) mean a new allowlist entry.
+   entries, version-whitelist bumps) mean a new allowlist entry — one per
+   runtime flavour you ship.
 2. **Attestor mint support**: the deploy API is WYSIWYS — clients ship
    the agent's COMPLETE iData (the owner signs the exact minted bytes;
    attestor synthesizes nothing) and a `role="framework"` binding entry
@@ -532,10 +547,12 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-The bundled adapter runs it (`openclaw/conformance_test.go`; the
-retired claudecode port ran it too); its first run against openclaw
-immediately caught two real bugs (§12), so treat a red conformance test
-as a production incident you got for free.
+Every bundled adapter runs it (`openclaw/`, `hermes/`, `prime/`
+`conformance_test.go`; the retired claudecode port ran it too); its first
+run against openclaw immediately caught two real bugs (§12), so treat a
+red conformance test as a production incident you got for free. It is
+also what lets an adapter's state half be finished and verified before
+its process half exists — the prime-agent port was built in that order.
 
 Two hard-won rules the suite enforces structurally:
 
@@ -691,13 +708,16 @@ already been moved and which remain.
    builder (`platform.Build`) was already shared → delivery primitives
    moved to `internal/platform/markers.go`.
 8. The §9 invariants existed only as prose → executable
-   `internal/framework/conformance` suite, now run by both adapters.
+   `internal/framework/conformance` suite, now run by every bundled adapter.
 
 **Known rough edges, deliberately left (open issues welcome):**
 
 9. `Start` helpers (`waitForListen`, `randomTokenHex`, npm install) are
    duplicated across adapters — a third port should extract a shared
-   spawn-util package.
+   spawn-util package. **The third port (prime-agent, 2026-08) happened and
+   duplicated them again**, deliberately: extracting would have touched two
+   shipping adapters in a change that had no other reason to. The refactor
+   is now overdue, and each copy carries a comment saying so.
 10. `RuntimeContext` mixes bootstrap inputs with fields the adapter
     itself resolves (`Provider`/`Model`/`ZGComputeRouted`); the contract
     would be cleaner as separate input/output types.
@@ -804,3 +824,117 @@ the deployed binaries surfaced these; all shipped:
     `stop`/`start`/`reset`) so interacting with a live agent
     (serve-proof verify, recovery/reload) is first-class and regression-
     tested (`sdk/typescript/scripts/agent-e2e.cjs`), not ad-hoc curl.
+
+---
+
+## 13. Port report: integrating prime-agent (2026-08) — the third port
+
+Prime Agent (Prime Intellect) is a self-improving RLM harness: it rewrites
+its own prompts, memories and skills **mid-task**, not between tasks. That
+is the first framework whose headline feature is in direct tension with the
+watcher, so the port is worth recording.
+
+**What made it easy, and generalizes:**
+
+1. **Look for the framework's own durability split before inventing drift
+   heuristics.** The obvious plan was to measure how fast a self-evolving
+   agent drifts and tune around it. Unnecessary: Prime Agent already keeps
+   harness state in a per-session file and a cross-session one, and only an
+   explicit promote crosses over. Tracking the global half alone yields
+   "durable identity" exactly, with no tuning and no risk of anchoring a
+   half-finished edit. Ask this question first for any self-modifying
+   framework.
+2. **Injection does not have to go through a tracked file.** openclaw and
+   hermes inject the agent doc into a chain-tracked identity file and strip
+   the marker before hashing — which works, but marker stripping is itself a
+   phantom-drift source (§12 finding 1 was exactly that bug). Because this
+   adapter owns the process bootstrap, the doc is written OUTSIDE the
+   framework home and injected in code at session creation. Net effect: no
+   markers, no stripping, nothing platform-authored anywhere near a tracked
+   role — and the doctrine sits in a channel the framework's own
+   `delete_prompt_note` API cannot reach.
+
+   **But un-deletable is not the same as authoritative, and this port got it
+   wrong on the first pass.** The doc was injected only as a context file
+   (an `AGENTS.md`-class channel) because that channel was the one the agent
+   could not delete. That is §12 finding 24 all over again: Claude Code
+   disclaimed its own agentSeal identity because CLAUDE.md is *memory*, not
+   the system prompt. Fixed by injecting into **both** — the framework's
+   authoritative append-to-system-prompt hook *and* the context file — and
+   by spreading the SDK's own append list (`(base) => [...base, doc]`)
+   rather than replacing it, since the list already carries the
+   owner-persona file. Generalized rule, now twice-learned: **pick the
+   authoritative instruction channel first, add the un-deletable one as
+   belt, and verify the model actually adopts the identity.**
+3. **"No HTTP surface" is not a blocker; it can be an advantage.** Prime
+   Agent's daemon speaks JSONL over a local socket, so sealed ships its own
+   bridge (embedding the SDK, `go:embed`ed in the sealed binary). Writing the
+   bridge means the public surface is a *whitelist by construction* — one
+   OpenAI-shaped chat endpoint — instead of a built-in dashboard whose every
+   endpoint has to be audited for shell/file/exec reach (§11 step 10). A
+   framework that hands you its own control UI is the harder case, not the
+   easier one.
+4. **Prefer a runtime-key API over config-file secrets.** The SDK accepts the
+   inference key via `authStorage.setRuntimeApiKey()`, documented as not
+   persisted. So unlike hermes (`api_key` lands in `config.yaml` and must be
+   stripped before iData) there is no secret to strip, because none is ever
+   written.
+5. **The state half can ship before the process half.** Roles, canonicalization,
+   Defaults and FrameworkFacts were finished and fully green under the
+   conformance suite with the framework not installed at all — the invariants
+   are pure functions of disk state. Landing them first, with the lifecycle
+   methods returning a loud error and the adapter unregistered, kept the risky
+   half reviewable on its own.
+
+**What it cost:**
+
+6. **A third image flavour.** Prime Agent is TypeScript over a Python kernel,
+   so neither the node image nor the python one can host it (`images/prime/`
+   carries both). This is what forced §2.1's "one universal image" claim to be
+   corrected to "one image per runtime" — the claim had already been false
+   since hermes.
+7. **The framework↔image pairing is still unvalidated** (§2.1). A
+   prime-agent binding deployed onto the default image boots and then fails at
+   Start. Deploys must pass `sealedImage` explicitly, and nothing enforces it.
+8. **The spawn-util duplication got worse** (§12 finding 9). See that entry.
+
+**Left to verify on the first live boot** (both marked in the code):
+
+9. Whether the framework seeds its stock skills into `~/.prime/agent/skills/`.
+   If it does, they need excluding the way hermes excludes
+   `skills/.bundled_manifest`, or every agent puts a copy of the stock library
+   on chain.
+10. Whether the SDK honours the conventional `OPENAI_BASE_URL` /
+    `ANTHROPIC_BASE_URL` for 0G-router routing, or needs a `models.json`
+    entry instead. The bridge logs the resolved provider/model at startup so
+    `/log/agent` shows which path was taken — the failure mode this guards
+    against is §12 finding 19's "deploy green, first inference 400".
+
+**A mistake worth recording — check which artifact carries which half.**
+The first version of this port installed the framework from npm
+(`@earendil-works/pi-coding-agent`), because that is the package the SDK the
+bridge imports is published as, and because npm gives clean semver pinning.
+Both true, and both irrelevant: that package ships the TypeScript half only —
+**zero `.py` files, no postinstall** — while the harness state this adapter
+anchors on chain is written by Python in the IPython kernel. The install
+succeeded and would have produced a container where the adapter's central
+tracked role never came into existence. The Python half is distributed only in
+the release tarball (`<base>/releases/v<v>/prime-agent-<v>.tgz`, package name
+`prime-agent`), whose postinstall provisions uv, Python and the kernel, and
+which exports the same SDK surface anyway. Two lessons: a framework in two
+languages probably has two distribution channels, so verify what is actually
+inside the artifact you pin (`tar tzf … | grep '\.py$'` would have caught this
+in one command); and the release version series need not match the npm one —
+here release 0.7.2 *is* npm 0.84.1.
+
+**The install belongs in the image, and that has a security payoff.** Because
+the framework is provisioned at image build time, its bytes are covered by the
+image hash that goes into on-chain `validFrameworkHashes`. openclaw and hermes
+re-pin their version at first Start, so the framework those agents actually run
+is whatever the registry served at boot — outside the measurement. This adapter
+therefore installs nothing at runtime: Start verifies the installed version
+against the binding and fails loudly on a mismatch, and it implements no
+`VersionReconciler` (a drifted `framework` role is committed as-is, §2.2's
+documented degradation). The cost is a hard release constraint — the version
+whitelist and the image must move together — which is the right trade for
+keeping the attested measurement honest.

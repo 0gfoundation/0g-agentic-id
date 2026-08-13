@@ -73,7 +73,9 @@ sealed/
 │   ├── report/                   /status reporting to attestor
 │   ├── logger/                   structured logging (the shared writer logger.Logf, exposed by proxy as /log.html)
 │   ├── framework/                framework adapter abstraction + optional capability interfaces
-│   │   ├── openclaw/             openclaw adapter implementation (the only shipping adapter)
+│   │   ├── openclaw/             openclaw adapter (node; the reference implementation)
+│   │   ├── hermes/               hermes adapter (python/uv)
+│   │   ├── prime/                prime-agent adapter (node + python; ships its own go:embed'ed HTTP bridge)
 │   │   └── conformance/          executable invariant suite every adapter runs in its tests
 │   ├── inference/                framework-agnostic provider knowledge (0g router endpoints,
 │   │                             wire format per model via the live catalog); adapters only
@@ -89,7 +91,9 @@ sealed/
 │   ├── watcher/                  30s tick running EvolutionFor, triggers uploader.Apply
 │   └── proxy/                    :8080 reverse proxy + signing + log pages
 ├── images/openclaw/              openclaw base-image build scripts (independent artifact, layered separately from the sealed bootstrap image)
-└── images/sealed/                universal sealed sandbox image (one image for every bundled framework; npm installs are warm cache only)
+├── images/sealed/                sealed sandbox image, node flavour (openclaw; npm installs are warm cache only)
+├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
+└── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
 ```
 
 ### One-line per-package summary

@@ -525,6 +525,16 @@ openclaw token lifecycle: generated at the container's first boot, stable
 across restarts (the chat session stays authenticated), no expiry, rotates
 only when the container is recreated — `reset()` is the revocation lever.
 
+One behavioural difference worth knowing before you build a chat UI on
+**prime-agent**: its `/v1/chat/completions` is OpenAI-*shaped* but not
+stateless. The framework has no HTTP surface of its own, so sealed bridges to
+its SDK, and the conversation lives in that server-side session — the bridge
+reads only the **last user message** of the `messages` array you send. So
+`chat()` and `chatStream()` work unchanged, but re-sending an edited history
+does not rewind or branch the conversation the way it does against openclaw or
+hermes (which are real OpenAI-compatible servers). Turns are also serialized
+per agent, since one SDK session is one conversation.
+
 ## Agents as owners (nested agents)
 
 An agent inside a sealed container can run this SDK **as itself** — deploy

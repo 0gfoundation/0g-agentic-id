@@ -68,7 +68,9 @@ sealed/
 │   ├── report/                   /status 上报到 attestor
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
 │   ├── framework/                framework 适配器抽象 + 可选能力接口
-│   │   ├── openclaw/             openclaw 适配器实现
+│   │   ├── openclaw/             openclaw 适配器（node；参考实现）
+│   │   ├── hermes/               hermes 适配器（python/uv）
+│   │   ├── prime/                prime-agent 适配器（node + python；自带 go:embed 的 HTTP bridge）
 │   │   └── conformance/          可执行不变量套件,每个 adapter 在测试里跑
 │   ├── inference/                框架无关的 provider 知识(0g router 端点、按模型的线格式,
 │   │                             读 router 实时目录);adapter 只做 Route → 自家配置方言的翻译
@@ -82,7 +84,9 @@ sealed/
 │   ├── watcher/                  30s tick 跑 EvolutionFor、触发 uploader.Apply
 │   └── proxy/                    :8080 反向代理 + 签名 + 日志页
 ├── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
-└── images/sealed/                通用 sealed sandbox 镜像（一个镜像装下所有内置框架；npm 安装只是热缓存）
+├── images/sealed/                sealed sandbox 镜像，node 版（openclaw；npm 安装只是热缓存）
+├── images/hermes/                sealed sandbox 镜像，python/uv 版（hermes）
+└── images/prime/                 sealed sandbox 镜像，node+python 版（prime-agent）
 ```
 
 ### 各包职责一句话

@@ -4,8 +4,10 @@
 
 这份文档是给 **agent 框架作者** 的接入契约:要把你的框架(eliza、
 autogen、自研编排器……)跑进 Sealed Sandbox,需要实现什么、sealed 会
-在你的进程周围提供什么,以及哪些工作仍在仓库之外。树内有一个 adapter
-作参照实现:`openclaw`(服务型框架)。第二个 `claudecode`(CLI 型框架,
+在你的进程周围提供什么,以及哪些工作仍在仓库之外。树内有三个 adapter:
+`openclaw`(服务型框架,参照实现)、`hermes`(python/uv,多渠道网关)、
+`prime-agent`(自我改写型 harness,自身没有 HTTP 面,由 sealed 提供
+bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 经 HTTP bridge 托管)是当初用来验证 seam 的探针,**已下线**——每次请求
 现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
 (openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
@@ -71,17 +73,26 @@ sealed 的四个组件各自通过一个窄切面消费它:
   注册。
 - **框架相关行为** 走可选能力接口(§2.2),core type-assert 后优雅
   降级:版本回正、子进程日志页、settle 延迟。
-- **一个通用镜像**:`images/sealed/` 只烧 node + sealed 二进制,打包
-  的框架以 npm 预装作为**热缓存**——每个 adapter 在首次 Start 时按
-  binding 重新钉版本;CLI 框架如带 shim,`go:embed` 在二进制里、
-  Start 时落盘(已下线的 claudecode bridge 就是这个模式)。接入新的
-  node 系框架不需要新镜像,顶多加一行热缓存。
+- **按运行时分镜像**(不是按框架):`images/sealed/` 带 node,
+  `images/hermes/` 带 python/uv,`images/prime/` 两者都带(Prime Agent 是
+  TypeScript harness 驱动 Python kernel)。共用同一运行时的框架共用镜像,
+  框架预装只是**热缓存**——每个 adapter 在首次 Start 时按 binding 重新钉
+  版本;框架 shim 或 bridge 如果有,`go:embed` 在 sealed 二进制里、Start
+  时落盘(已下线的 claudecode bridge 和 prime-agent 的 HTTP bridge 都是这
+  个模式),这样它的度量跟着 sealed 镜像哈希走。接入一个我们已有生态的新
+  框架不需要新镜像,顶多加一行热缓存;新生态则需要。
+
+  **跑哪个 adapter 仍然与镜像无关** —— 那是链上 binding 决定的(见上面
+  §2.1),每个镜像里的 sealed 二进制都注册了全部 adapter。但镜像必须真的
+  **带着**被选中 adapter 所需的运行时,而**这个配对没有任何校验**:binding
+  指向一个运行时缺失的框架,容器会正常起来然后在 Start 阶段失败。所以部署
+  非默认镜像时必须显式传 `sealedImage`。
 
 仍然真正在仓库之外的:
 
-1. **镜像 allowlist 治理**:通用镜像的 hash 要进 attestor 的
+1. **镜像 allowlist 治理**:每个镜像的 hash 都要进 attestor 的
    allowlist;重新构建(新 sealed 二进制、新热缓存条目、版本
-   allowlist 提升)= 新 allowlist 条目。
+   allowlist 提升)= 新 allowlist 条目 —— 你发布几种运行时口味就有几条。
 2. **attestor 的 mint 支持**:部署 API 是 WYSIWYS 的——客户端交付
    agent 的**完整 iData**(owner 签的就是上链的字节,attestor 不做
    任何合成),`role="framework"` binding 条目为必填,其 `name` 在
@@ -609,12 +620,15 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
    (`platform.Build`)早已共享 → delivery 原语移到
    `internal/platform/markers.go`。
 8. §9 不变量只存在于文字里 → 可执行的
-   `internal/framework/conformance` 套件,两个 adapter 都在跑。
+   `internal/framework/conformance` 套件,每个内置 adapter 都在跑。
 
 **已知的毛边,刻意留下(欢迎开 issue):**
 
 9. `Start` 的辅助函数(`waitForListen`、`randomTokenHex`、npm 安装)
    在两个 adapter 间重复——第三次移植时应该提取共享 spawn-util 包。
+   **第三次移植(prime-agent,2026-08)发生了,并且又复制了一遍**,这是刻意
+   的:提取会动到两个在跑的 adapter,而那次改动没有别的理由碰它们。这个重构
+   现在已经欠着了,每份拷贝里都有注释说明。
 10. `RuntimeContext` 把 bootstrap 输入和 adapter 自己解析的字段
     (`Provider`/`Model`/`ZGComputeRouted`)混在一个结构里;拆成
     输入/输出两个类型会更干净。
@@ -695,3 +709,92 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     `reset`),和运行中 agent 交互(serve-proof 验证、恢复/重载)成为
     一等公民并有回归(`sdk/typescript/scripts/agent-e2e.cjs`),不再是
     ad-hoc curl。
+
+---
+
+## 13. 移植实录:接入 prime-agent(2026-08)——第三次移植
+
+Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
+执行中途**就改写自己的 prompt、memory 和 skill,而不是任务结束后才沉淀。
+这是第一个"卖点直接和 watcher 冲突"的框架,所以这次移植值得记下来。
+
+**让它变简单的东西,而且可以推广:**
+
+1. **在自己发明漂移启发式之前,先找框架自带的持久性分层。**原本的计划是
+   测量自演化 agent 的漂移速度然后调参。完全没必要:Prime Agent 自己就把
+   harness 状态分成 per-session 和 cross-session 两个文件,只有显式 promote
+   才跨过去。只追踪 global 那一半,得到的正好是"值得沉淀的身份",不用调参,
+   也不会锚定半成品。任何自我改写的框架,先问这个问题。
+2. **注入不一定要经过被追踪的文件。**openclaw 和 hermes 把 agent doc 注入
+   到链上追踪的身份文件里,再在哈希前剥掉 marker —— 能用,但 marker 剥离
+   本身就是幻影漂移的来源(§12 第 1 条正是这个 bug)。这个 adapter 因为自己
+   拥有进程启动过程,把 doc 写到**框架 home 之外**,在建 session 时用代码
+   注入。净效果:没有 marker、不需要剥离、任何平台产出的文字都不靠近被追踪
+   的角色 —— 而且 doctrine 待在框架自己的 `delete_prompt_note` API 碰不到
+   的通道里。
+
+   **但"删不掉"不等于"有权威",而这次移植第一版就搞错了。**当时只把 doc 作为
+   上下文文件注入(`AGENTS.md` 那一类通道),理由是那个通道 agent 删不掉。这
+   正是 §12 第 24 条的复发:Claude Code 当场否认自己的 agentSeal 身份,就是
+   因为 CLAUDE.md 是*记忆*而不是系统提示。修法是**两条通道都走** —— 框架权威
+   的"追加到系统提示"钩子 **加上** 上下文文件 —— 并且用 `(base) => [...base,
+   doc]` 展开 SDK 自己的 append 列表而不是替换它,因为那个列表里已经装着
+   owner persona 文件。推广出来的规则(现在学了两遍):**先选权威指令通道,
+   再把删不掉的那个作为保底,并且要实测模型真的认下了这个身份。**
+3. **"没有 HTTP 面"不是障碍,反而可能是优势。**Prime Agent 的 daemon 说的
+   是本地 socket 上的 JSONL,所以 sealed 自己带一个 bridge(内嵌 SDK,
+   `go:embed` 在 sealed 二进制里)。自己写 bridge 意味着对外面是**按构造
+   白名单的** —— 一个 OpenAI 形状的 chat 端点,而不是一个自带 dashboard、
+   需要逐个 endpoint 审有没有 shell/文件/exec 可达(§11 step 10)。一个把
+   自己的控制台交给你的框架是更难的情况,不是更简单的。
+4. **优先选运行时注入密钥的 API,而不是写配置文件。**这个 SDK 通过
+   `authStorage.setRuntimeApiKey()` 接收推理 key,文档明确写了不落盘。所以
+   不像 hermes(`api_key` 会落进 `config.yaml`,必须在进 iData 前剥掉),
+   这里没有秘密需要剥,因为根本没写过。
+5. **状态那一半可以先于进程那一半上线。**角色、规范化、Defaults 和
+   FrameworkFacts 在框架完全没安装的情况下就写完并且 conformance 全绿 ——
+   因为这些不变量是磁盘状态的纯函数。先落这一半、生命周期方法返回明确错误、
+   adapter 不注册,让风险最高的那一半可以单独 review。
+
+**它的代价:**
+
+6. **第三种镜像口味。**Prime Agent 是 TypeScript 驱动 Python kernel,node
+   镜像和 python 镜像都托不住它(`images/prime/` 两者都带)。正是这条迫使
+   §2.1 那句"一个通用镜像"被改成"按运行时一个镜像"—— 而那句话从 hermes
+   开始就已经不成立了。
+7. **framework↔镜像的配对仍然没有校验**(§2.1)。prime-agent 的 binding
+   部署到默认镜像上,容器会起来然后在 Start 失败。部署必须显式传
+   `sealedImage`,而没有任何机制强制这一点。
+8. **spawn 辅助函数的重复变得更严重了**(§12 第 9 条),见那一条。
+
+**留待首次实机启动核实的**(代码里都标了):
+
+9. 框架会不会把自带 skill 播种到 `~/.prime/agent/skills/`。如果会,就得像
+   hermes 排除 `skills/.bundled_manifest` 那样排除掉,否则每个 agent 都会把
+   一份自带库放上链。
+10. SDK 是否认约定的 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 来走 0G
+    router,还是需要一条 `models.json` 记录。bridge 在启动时会打印解析出的
+    provider/model,`/log/agent` 能看到走的是哪条路 —— 这条防的正是 §12
+    第 19 条那种"部署绿了、首次推理 400"。
+
+**一个值得记下来的错误 —— 先确认哪个产物装着哪一半。**
+这次移植的第一版是从 npm 装框架的(`@earendil-works/pi-coding-agent`),理由是
+桥 import 的 SDK 就发布在那个包名下,而且 npm 有干净的 semver 定版。两条都对,
+两条都不相关:那个包只装了 TypeScript 那一半 —— **0 个 `.py` 文件、没有
+postinstall** —— 而这个 adapter 锚上链的 harness 状态是 IPython kernel 里的
+Python 写的。安装会成功,然后产出一个容器,里面 adapter 最核心的那个被追踪角色
+**根本不会存在**。Python 那半只随 release tarball 分发
+(`<base>/releases/v<v>/prime-agent-<v>.tgz`,包名 `prime-agent`),它的
+postinstall 才是装 uv、Python 和 kernel 的地方,而且它照样导出同一套 SDK。
+两条教训:跨两种语言的框架很可能有两个分发渠道,所以要**验证你钉的那个产物里
+到底装了什么**(`tar tzf … | grep '\.py$'` 一条命令就能发现);以及 release 的
+版本序列跟 npm 的不必一致 —— 这里 release 0.7.2 就是 npm 0.84.1。
+
+**安装该放在镜像里,而且这有安全收益。**框架在镜像构建期装好,它的字节就被镜像
+哈希覆盖了 —— 也就是进链上 `validFrameworkHashes` 的那个度量。openclaw 和
+hermes 在首次 Start 时重新钉版本,所以那些 agent 实际跑的框架是启动那一刻
+registry 给什么就是什么,**在度量之外**。因此这个 adapter 运行时不装任何东西:
+Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并且不实现
+`VersionReconciler`(漂移的 `framework` 角色原样上链,即 §2.2 记载的降级)。
+代价是一条硬性发布约束 —— 版本白名单和镜像必须一起动 —— 为了让被认证的度量
+诚实,这个交换是值得的。

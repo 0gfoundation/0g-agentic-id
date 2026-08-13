@@ -1,10 +1,14 @@
 // Sealed container bootstrap (orchestrator).
 //
 // Phase 0  attest         - parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pubkey,
-//                           recover TEE signer (and match TEE_SIGNER_ADDRESS if set)
+//
+//	recover TEE signer (and match TEE_SIGNER_ADDRESS if set)
+//
 // Phase 1  provision      - POST /provision -> ECIES-decrypt agent_seal_priv
 // Phase 2  chain bootstrap - getAgentIdBySealId + intelligentDatasOf +
-//                           loadSealedKeys + per-entry download + AES-GCM decrypt
+//
+//	loadSealedKeys + per-entry download + AES-GCM decrypt
+//
 // Phase 3  framework      - adapter.Restore each decrypted entry; adapter.Start
 // Phase 4  status report  - notify attestor only on full pipeline success
 //
@@ -33,6 +37,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/framework/hermes"
 	"seal-verify/internal/framework/openclaw"
+	"seal-verify/internal/framework/prime"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
 	"seal-verify/internal/manifest"
@@ -92,14 +97,20 @@ func main() {
 	// the on-chain framework binding (see resolveAdapter); registration is
 	// cheap and touches no disk.
 	//
-	// openclaw and hermes ship today. The adapter interface + platform seam
-	// are framework-agnostic (see FRAMEWORK_ADAPTER.md); a claude-code
-	// adapter was prototyped to validate the seam and retired — a
+	// openclaw, hermes and prime-agent ship today. The adapter interface +
+	// platform seam are framework-agnostic (see FRAMEWORK_ADAPTER.md); a
+	// claude-code adapter was prototyped to validate the seam and retired — a
 	// per-request CLI couldn't host owner-built public services, the shape
 	// this platform is for. That port's lessons live on as a case study in
 	// the doc.
+	//
+	// prime-agent needs a node+python image (its runtime is TypeScript over a
+	// Python IPython kernel); registration is harmless on an image without
+	// them, since selection is per-agent and an unusable adapter simply never
+	// gets picked.
 	openclaw.New()
 	hermes.New()
+	prime.New()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()
@@ -575,10 +586,10 @@ func startAgent(
 	})
 	if err := mgr.Start(context.Background(), manager.StartParams{
 		Runtime: framework.RuntimeContext{
-			APIKey:        apiKey,
-			PublicURL:     publicURL,
-			SealSignSock:  sealSignSockPath,
-			AgentSeal:     agentSealAddr,
+			APIKey:       apiKey,
+			PublicURL:    publicURL,
+			SealSignSock: sealSignSockPath,
+			AgentSeal:    agentSealAddr,
 
 			// Chain bootstrap context (public on-chain data, not secrets).
 			AgentID:      res.agentID.String(),
@@ -848,7 +859,7 @@ func sha256Hex(data []byte) string {
 }
 
 func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
-func removeFile(path string)                { _ = os.Remove(path) }
+func removeFile(path string)               { _ = os.Remove(path) }
 
 // findEntry returns the entry with the matching role, or nil if absent.
 // Caller is expected to have validated presence beforehand.
