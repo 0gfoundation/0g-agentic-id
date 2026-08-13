@@ -240,8 +240,13 @@ export class AttestorClient {
     params: {
       sealId: `0x${string}`;
       sandboxId?: string;
+      /** Framework name for `reset`/first `start` — the SDK resolves its
+       *  sealed image from GET /config's frameworks[] (same as deploy), so a
+       *  non-default framework doesn't need `sealedImage` passed. */
+      framework?: string;
       /** The sealed runtime image name (0g-sandbox's own field is called
-       *  `snapshot`; only relevant for `reset`). */
+       *  `snapshot`; only relevant for `reset`). Explicit wins over the
+       *  framework-resolved image. */
       sealedImage?: string;
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
@@ -257,7 +262,7 @@ export class AttestorClient {
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
     if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage);
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework);
       envelope = await this.signEnvelope(
         'create',
         '',
@@ -301,6 +306,9 @@ export class AttestorClient {
    */
   async retry(params: {
     sealId: `0x${string}`;
+    /** Framework name — resolves the sealed image from /config's frameworks[]
+     *  (same as deploy) when `sealedImage` isn't given. */
+    framework?: string;
     sealedImage?: string;
     apiKey?: string;
     envelopeTtlSec?: number;
@@ -308,7 +316,7 @@ export class AttestorClient {
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
     if (params.apiKey) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage);
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework);
       body.sandbox_envelope = await this.signEnvelope(
         'create',
         '',

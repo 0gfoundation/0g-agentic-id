@@ -586,8 +586,8 @@ export class AgentApi {
    * attestor never stores it, which is also WHY it must be passed
    * again on every recreate.
    */
-  reset(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**
@@ -602,8 +602,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied because
    * the attestor never stores it.
    */
-  retry(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.retry({ sealId, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**
