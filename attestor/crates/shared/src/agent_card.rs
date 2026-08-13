@@ -114,7 +114,7 @@ fn default_capabilities() -> Value {
 /// base host via `sandbox_proxy_addr`. The scheme is inferred from whether a
 /// port is present:
 ///   - `host:port` → `http://{port}-{sid}.{host}:{port}{path}`
-///     (dev / IP behind a plain-HTTP proxy, e.g. `47.236.111.154.nip.io:4000`)
+///     (dev / IP behind a plain-HTTP proxy, e.g. `sandbox.example:4000`)
 ///   - bare `host` → `https://{port}-{sid}.{host}{path}`
 ///     (a real domain fronted by TLS on 443, e.g. `art.0g.ai`)
 ///
@@ -173,14 +173,14 @@ mod tests {
         // Caller supplies the full base host (including wildcard-DNS
         // suffix if any). Here: nip.io form of an IP + port 4000.
         let url = build_agent_url(
-            "47.236.111.154.nip.io:4000",
+            "sandbox.example:4000",
             "8aba43ad-d34f-4a5f-8937-316c2a2bdc23",
             8080,
             "/hello",
         );
         assert_eq!(
             url,
-            "http://8080-8aba43ad-d34f-4a5f-8937-316c2a2bdc23.47.236.111.154.nip.io:4000/hello"
+            "http://8080-8aba43ad-d34f-4a5f-8937-316c2a2bdc23.sandbox.example:4000/hello"
         );
     }
 
@@ -216,7 +216,7 @@ mod tests {
             chain_id: 16602,
             seal_id: &seed,
             sandbox_id: "", // no running sandbox
-            sandbox_proxy_addr: "47.236.111.154.nip.io:4000",
+            sandbox_proxy_addr: "sandbox.example:4000",
             agent_serve_port: 8080,
             agent_serve_path: "/hello",
         });
@@ -243,7 +243,7 @@ mod tests {
             chain_id: 16602,
             seal_id: &seed,
             sandbox_id: "sb-123",
-            sandbox_proxy_addr: "47.236.111.154.nip.io:4000",
+            sandbox_proxy_addr: "sandbox.example:4000",
             agent_serve_port: 8080,
             agent_serve_path: "/hello",
         };
@@ -263,7 +263,7 @@ mod tests {
         // ERC-8004 fields
         assert_eq!(
             card["url"],
-            "http://8080-sb-123.47.236.111.154.nip.io:4000/hello"
+            "http://8080-sb-123.sandbox.example:4000/hello"
         );
         assert_eq!(card["version"], AGENT_CARD_SCHEMA_VERSION);
         assert_eq!(card["capabilities"]["streaming"], true);

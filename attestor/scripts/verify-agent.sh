@@ -13,7 +13,7 @@
 #      verifier / SDK sayHi; this is the transport-level check)
 #
 # Usage:
-#   API=http://47.236.111.154:8080 AGENT_ID=61 scripts/verify-agent.sh
+#   API=http://sandbox.example:8080 AGENT_ID=61 scripts/verify-agent.sh
 #
 # Env:
 #   API       attestor base URL            (default http://localhost:8080)

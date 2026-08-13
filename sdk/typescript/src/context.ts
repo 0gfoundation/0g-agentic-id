@@ -51,6 +51,11 @@ export interface AttestorPublicConfig {
   sandbox_app_id?: string;
   sandbox_provider_addr?: `0x${string}`;
   sandbox_serving_addr?: `0x${string}`;
+  /** Default sealed image when a framework declares none. */
+  sandbox_snapshot?: string;
+  /** Selectable frameworks + the sealed image each needs (`image` omitted →
+   *  `sandbox_snapshot`). The SDK resolves a deploy's image from here. */
+  frameworks?: Array<{ name: string; image?: string }>;
 }
 
 /** Resolved context shared by the internal clients. */

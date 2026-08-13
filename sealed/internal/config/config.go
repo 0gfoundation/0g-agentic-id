@@ -125,7 +125,7 @@ func Load() (*Bootstrap, error) {
 //
 // Scheme inference mirrors attestor/shared/agent_card::build_agent_url:
 // a bare host (e.g. "art.0g.ai") yields https://…, while a host:port
-// form (e.g. "47.236.111.154.nip.io:4000", dev/IP) stays http://…. The
+// form (e.g. "sandbox.example:4000", dev/IP) stays http://…. The
 // rule keeps AGENT_PUBLIC_URL canonical for TLS-fronted production
 // domains so the agent doesn't hand users URLs that only "work" via an
 // HTTP→HTTPS redirect.

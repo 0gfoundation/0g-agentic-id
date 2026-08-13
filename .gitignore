@@ -7,3 +7,14 @@ broadcast/
 .DS_Store
 *.swp
 
+# Local-only design/thinking specs — never committed or pushed
+/spec/
+
+# Secrets / local env — never commit real values (keep the .example template)
+.env
+.env.*
+!.env.example
+
+# Local-only SDK interface showcase / scratch scripts (may hold dev keys)
+showcase/
+

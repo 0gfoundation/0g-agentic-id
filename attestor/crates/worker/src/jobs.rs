@@ -1495,7 +1495,8 @@ mod tests {
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            supported_frameworks: vec!["openclaw".into()],
+            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,
@@ -3003,8 +3004,8 @@ mod tests {
 
     #[test]
     fn build_serve_url_with_explicit_port() {
-        let url = build_serve_url("47.236.111.154.nip.io:4000", "sbx-abc", 8080, "/result");
-        assert_eq!(url, "http://8080-sbx-abc.47.236.111.154.nip.io:4000/result");
+        let url = build_serve_url("sandbox.example:4000", "sbx-abc", 8080, "/result");
+        assert_eq!(url, "http://8080-sbx-abc.sandbox.example:4000/result");
     }
 
     #[test]
