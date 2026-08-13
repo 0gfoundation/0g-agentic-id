@@ -95,12 +95,13 @@ export interface DeployParams {
   /**
    * Agent-framework name for the SDK-built default iData ("openclaw"
    * default). Must be one of the names your attestor's `GET /config`
-   * advertises in `supported_frameworks` (openclaw by default) — the
-   * attestor rejects unsupported names pre-mint. CLIENT-SIDE ONLY: it feeds
-   * `defaultIData()` when `iData` is omitted — the API has no framework
-   * field; the on-chain binding inside i_data is the single source of
-   * truth (validated against `GET /config`'s `supported_frameworks`
-   * before mint). Ignored when you pass your own `iData`.
+   * advertises in `frameworks[]` — the attestor rejects unsupported names
+   * pre-mint. The SDK also resolves this framework's sealed image from
+   * `frameworks[]` when you don't pass `sandbox.sealedImage`, so you never
+   * need to know a framework's image. CLIENT-SIDE for the binding: it feeds
+   * `defaultIData()` when `iData` is omitted — the on-chain binding inside
+   * i_data is the single source of truth (validated against `GET /config`'s
+   * `frameworks[]` before mint). Ignored when you pass your own `iData`.
    */
   framework?: string;
   /** Inference pin for the SDK-built default persona (defaults to
@@ -195,23 +196,28 @@ export class AttestorClient {
 
   /**
    * Resolve the sealed image name: an explicit value wins; otherwise the
-   * attestor /config's current image. An empty snapshot in the create
-   * envelope makes the sandbox provider fail the request ("sealed
-   * containers require an image or snapshot") — and operators bump the
-   * current name via ATTESTOR_SANDBOX_SNAPSHOT, so /config is the source
-   * of truth (same default the deploy console uses).
+   * image `GET /config` declares for `framework` (frameworks whose runtime
+   * isn't in the default snapshot — hermes etc. — carry their own image);
+   * failing that, the default `sandbox_snapshot`. So a caller who passes a
+   * `framework` never needs to know its image. An empty snapshot in the
+   * create envelope makes the provider fail ("sealed containers require an
+   * image or snapshot"), so /config is the source of truth.
    */
-  private async resolveSealedImage(explicit?: string): Promise<string> {
+  private async resolveSealedImage(explicit?: string, framework?: string): Promise<string> {
     if (explicit) return explicit;
     const cfg: any = await fetch(`${this.baseUrl()}/config`)
       .then((r) => (r.ok ? r.json() : null))
       .catch(() => null);
+    if (framework && Array.isArray(cfg?.frameworks)) {
+      const fw = cfg.frameworks.find((f: any) => f?.name === framework);
+      if (fw?.image) return fw.image;
+    }
     return (cfg && cfg.sandbox_snapshot) || '';
   }
 
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
-  private async sandboxEnvelope(sandbox: NonNullable<DeployParams['sandbox']>, ttlSec: number) {
-    const snapshot = await this.resolveSealedImage(sandbox.sealedImage);
+  private async sandboxEnvelope(sandbox: NonNullable<DeployParams['sandbox']>, ttlSec: number, framework?: string) {
+    const snapshot = await this.resolveSealedImage(sandbox.sealedImage, framework);
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
@@ -355,7 +361,7 @@ export class AttestorClient {
     // Provision only when a sandbox is given; omit it → mint-only deploy
     // (attestor mints, no container — the agent lands Offline).
     const sandbox_envelope = params.sandbox
-      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180)
+      ? await this.sandboxEnvelope(params.sandbox, params.envelopeTtlSec ?? 180, params.framework)
       : undefined;
 
     return this.post('/deploy', {

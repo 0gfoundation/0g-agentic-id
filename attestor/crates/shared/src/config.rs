@@ -2,6 +2,18 @@
 
 use alloy::primitives::Address;
 
+/// A deployable framework + the sealed image that carries its runtime.
+/// `image` omitted → the framework runs on the default `sandbox_snapshot`
+/// (openclaw); non-default runtimes (hermes = Python/uv, prime-agent) ship
+/// as SEPARATE images (see sealed/images/). Served by GET /config so the SDK
+/// resolves the right image per framework at deploy time.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Framework {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub chain_rpc: String,
@@ -127,14 +139,16 @@ pub struct Config {
     /// provider runs the 0g-daytona fork images.
     pub sandbox_public_ports: Vec<u16>,
 
-    /// Framework names deploys may select — the attestor's ONLY
-    /// framework knowledge, and it is a list of opaque strings: validated
-    /// pre-mint at the deploy edge, written verbatim into the synthesized
-    /// binding, listed by GET /config for the UI picker. Must be a subset
-    /// of the adapters the sealed binary in `sandbox_snapshot` registers;
-    /// keep the two in sync at image-release time (a name sealed doesn't
-    /// know mints a bricked agent).
-    pub supported_frameworks: Vec<String>,
+    /// Frameworks deploys may select, each with the sealed image that
+    /// carries its runtime. Frameworks whose runtime isn't in the default
+    /// `sandbox_snapshot` ship as separate images (hermes = Python/uv,
+    /// prime-agent — see sealed/images/); `image` omitted → default snapshot
+    /// (openclaw). The attestor's ONLY framework knowledge: names validated
+    /// pre-mint at the deploy edge, the whole list served by GET /config so
+    /// the SDK resolves the right image per framework at deploy time. Keep
+    /// names + images in sync with what sealed actually ships (a name/image
+    /// sealed doesn't know mints a bricked agent).
+    pub frameworks: Vec<Framework>,
 
     /// EIP-1559 priority fee (tip, gwei) set on every attestor-sent tx.
     /// Must be ≥ the chain's minimum (0G testnet enforces 2 gwei).
@@ -199,6 +213,12 @@ impl Config {
             }
             _ => None,
         }
+    }
+
+    /// Supported framework names only — the deploy edge validates the
+    /// binding's name against this (images are the SDK's concern at signing).
+    pub fn framework_names(&self) -> Vec<String> {
+        self.frameworks.iter().map(|f| f.name.clone()).collect()
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
@@ -274,18 +294,35 @@ impl Config {
                         .collect()
                 })
                 .unwrap_or_default(),
-            supported_frameworks: env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS")
-                .map(|s| {
-                    s.split(',')
-                        .map(|f| f.trim().to_string())
-                        .filter(|f| !f.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                // An empty PARSE RESULT (var set to "" or only commas) falls
-                // back to the default too — an empty list would silently
-                // reject every deploy while the UI still offers openclaw.
-                .filter(|v: &Vec<String>| !v.is_empty())
-                .unwrap_or_else(|| vec!["openclaw".to_string()]),
+            frameworks: {
+                // `ATTESTOR_FRAMEWORKS=openclaw,hermes:0g-sealed-hermes` — each
+                // entry is `name[:image]`; no image → default sandbox_snapshot.
+                // Falls back to the legacy `ATTESTOR_SUPPORTED_FRAMEWORKS`
+                // (names only) so a not-yet-migrated deployment keeps working.
+                let parsed: Vec<Framework> = env_opt("ATTESTOR_FRAMEWORKS")
+                    .or_else(|| env_opt("ATTESTOR_SUPPORTED_FRAMEWORKS"))
+                    .map(|s| {
+                        s.split(',')
+                            .map(str::trim)
+                            .filter(|f| !f.is_empty())
+                            .map(|f| {
+                                let (name, image) = f.split_once(':').unwrap_or((f, ""));
+                                let image = image.trim();
+                                Framework {
+                                    name: name.trim().to_string(),
+                                    image: (!image.is_empty()).then(|| image.to_string()),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                // An empty list would silently reject every deploy → default openclaw.
+                if parsed.is_empty() {
+                    vec![Framework { name: "openclaw".to_string(), image: None }]
+                } else {
+                    parsed
+                }
+            },
             chain_priority_fee_gwei: env_opt("ATTESTOR_PRIORITY_FEE_GWEI")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(2),

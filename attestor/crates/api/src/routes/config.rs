@@ -42,11 +42,12 @@ pub struct ConfigResponse {
     pub reputation_registry_addr: Option<String>,
     pub tee_data_verifier_addr: Option<String>,
 
-    /// Framework names deploys may select. Frontend renders the deploy
-    /// picker from this so invalid choices can't be expressed; the deploy
-    /// route enforces the same list pre-mint (this copy is UX, that copy
-    /// is the boundary).
-    pub supported_frameworks: Vec<String>,
+    /// Frameworks deploys may select, each with the sealed image for its
+    /// runtime (`image` omitted → default `sandbox_snapshot`). The SDK
+    /// resolves the right image per framework from this at deploy time; the
+    /// deploy route enforces the name list pre-mint (this copy is UX, that
+    /// copy is the boundary).
+    pub frameworks: Vec<attestor_shared::Framework>,
 }
 
 pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -81,6 +82,6 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .cfg
             .tee_data_verifier_addr
             .map(|a| format!("{:#x}", a)),
-        supported_frameworks: state.cfg.supported_frameworks.clone(),
+        frameworks: state.cfg.frameworks.clone(),
     })
 }

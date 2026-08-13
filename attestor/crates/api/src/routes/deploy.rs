@@ -34,7 +34,7 @@ pub async fn handle(
     let framework =
         attestor_shared::i_data_validate::validate_framework_binding(
             &req.i_data,
-            &state.cfg.supported_frameworks,
+            &state.cfg.framework_names(),
         )
         .map_err(ApiError::bad_request)?;
 

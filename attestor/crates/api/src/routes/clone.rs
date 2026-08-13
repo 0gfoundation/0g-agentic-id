@@ -232,7 +232,7 @@ mod tests {
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            supported_frameworks: vec!["openclaw".into()],
+            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
             indexer_start_block: None,

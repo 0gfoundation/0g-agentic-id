@@ -122,8 +122,8 @@ import { parseEther } from 'viem';
 const params = {
   name: 'Sage',
   description: 'a helpful agent',
-  framework: 'openclaw',                           // 'openclaw' | 'hermes' — must be a name GET /config advertises.
-                                                   // hermes needs its own image: set sandbox.sealedImage:'0g-sealed-hermes' (see framework section).
+  framework: 'openclaw',                           // must be a name GET /config's frameworks[] advertises.
+                                                   // the SDK resolves this framework's sealed image from /config — you don't pass one.
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b.
                                                    // provider is effectively '0g-compute' (the 0G router) today; run ag.agent.listModels()
                                                    // first to see the router's live catalog before picking `model`.
@@ -334,12 +334,16 @@ await ag.waitForTransaction(tx);   // now getBalance() sees the new value
 
 ## The runtime image, framework, and iData shapes
 
-The `sealedImage` (from `GET /config`'s `sandbox_snapshot`, currently
-`0g-sealed`; 0g-sandbox's own wire field for it is still called `snapshot`)
-is the sealed runtime image bundling a framework adapter. Two adapters ship
-today — **openclaw** (`0g-sealed`) and **hermes** (`0g-sealed-hermes`, pass it
-as `sandbox.sealedImage` at deploy *and* reset); which are live in a given
-environment is whatever `/config.supported_frameworks` advertises.
+The `sealedImage` is the sealed runtime image bundling a framework's adapter
+(0g-sandbox's own wire field for it is still called `snapshot`). Frameworks
+whose runtime isn't in the default image ship their own — openclaw runs on the
+default `sandbox_snapshot`, hermes on a Python/uv image. **You don't pass it at
+deploy**: the SDK resolves the right image for your `framework` from `GET
+/config`'s `frameworks[]` (each entry `{ name, image? }`; no image → the default
+snapshot). Pass `sandbox.sealedImage` only to pin a specific image — notably at
+`reset`, which doesn't know the framework, so a non-default framework still
+needs it there. Which frameworks are live is whatever `/config.frameworks[]`
+advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
 `role` labels what the entry is for, `plaintext` is the content itself.
@@ -378,14 +382,15 @@ Update replaces the whole array). Matching `role === 'persona'` against a
 live agent's `intelligentDatasOf` will find nothing.
 
 **What the attestor does NOT check**: beyond the framework *name* (must be
-in `/config.supported_frameworks`), deploy iData content is unvalidated by
-design — minting is the owner's freedom; whether the content actually
-boots is the **sealed runtime's contract**. The sealed images bundle two
-framework adapters — **openclaw** (default image `0g-sealed`) and **hermes**
-(image `0g-sealed-hermes` — pass `sandbox.sealedImage: '0g-sealed-hermes'` at
-deploy *and* reset, or the agent boots the wrong image and 404s). Pick with
-`framework: 'openclaw' | 'hermes'`; the name must be in
-`/config.supported_frameworks`. openclaw's persona seed supports
+in `/config.frameworks[]`), deploy iData content is unvalidated by design —
+minting is the owner's freedom; whether the content actually boots is the
+**sealed runtime's contract**. Each framework runs on the sealed image
+`/config.frameworks[]` declares for it (openclaw = the default snapshot,
+hermes = its own Python/uv image); at **deploy** the SDK resolves that image
+from `framework`, so you don't pass one. (**reset** doesn't know the
+framework, so a non-default framework still needs `sandbox.sealedImage`
+passed there, or it boots the wrong image and 404s.) Pick with `framework`;
+the name must be in `/config.frameworks[]`. openclaw's persona seed supports
 `inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
 router). For the router's live model catalog:
 
