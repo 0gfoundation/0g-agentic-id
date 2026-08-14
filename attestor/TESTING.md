@@ -115,6 +115,13 @@ AGENT_ID=<decimal id printed by e2e> API=$API bash scripts/verify-agent.sh
 # free negative path: canonical building, signing, deploy gate
 OWNER_PRIV=0x… ATTESTOR_URL=$API node scripts/smoke.cjs
 
+# CLI stage-0 smoke (doctor/status/list), read-only both ways:
+# keyless run asserts the WALLET_REQUIRED gates; with a key it asserts the
+# owner tier instead (doctor all green, list --mine, owner-only failure
+# reasons via the status folding leg).
+AGENTIC_ATTESTOR_URL=$API node scripts/cli-smoke.cjs
+AGENTIC_ATTESTOR_URL=$API AGENTIC_PRIVATE_KEY=0x… [AGENT_ID=<id>] node scripts/cli-smoke.cjs
+
 # full runtime surface against the live agent: sayHi with REAL signature
 # recovery, on-chain iData tracking, reset -> recreate -> same identity
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \

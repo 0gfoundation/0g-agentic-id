@@ -159,8 +159,22 @@ banner "2. Poll /deployment/:id until phase ∈ {running, failed}"
 # First boot pulls image layers + npm-installs the framework — regularly
 # >2 min on a cold provider. 300s keeps the deploy-side poll from declaring
 # failure on a container that is merely still booting.
+# A transient poll failure (timeout, connection reset) must cost one tick,
+# not the whole deploy — a real round died on a single `curl: (28)` while
+# the deploy itself succeeded (#120). Only PERSISTENT unreachability
+# (5 consecutive failures) is fatal; every failed tick stays visible.
+phase=""
+consec_fails=0
 for i in $(seq 1 300); do
-  state=$(curl -fsS "$API/deployment/$SEAL_ID")
+  if ! state=$(curl -fsS -m 10 "$API/deployment/$SEAL_ID"); then
+    consec_fails=$((consec_fails + 1))
+    printf "  [%03d] poll failed (%d consecutive; fatal at 5)\n" "$i" "$consec_fails"
+    if [ "$consec_fails" -ge 5 ]; then
+      echo "❌ poll: attestor unreachable ($consec_fails consecutive failures)"; exit 1
+    fi
+    sleep 1; continue
+  fi
+  consec_fails=0
   phase=$(echo "$state" | jq -r .phase)
   storage=$(echo "$state" | jq -r .storage_stage.state)
   mint=$(echo "$state" | jq -r .mint_stage.state)

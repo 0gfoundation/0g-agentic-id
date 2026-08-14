@@ -40,7 +40,9 @@ echo "seal_id = $SEAL_ID"
 banner "2. Wait for mint"
 AGENT_ID=""
 for i in $(seq 1 30); do
-  AGENT_ID=$(curl -fsS "$API/deployment/$SEAL_ID" | jq -r '.agent_id // ""')
+  # `|| true`: a transient curl failure is one empty tick, not (via set -e)
+  # the whole script — the post-loop check still catches a never-minted id (#120)
+  AGENT_ID=$(curl -fsS -m 10 "$API/deployment/$SEAL_ID" | jq -r '.agent_id // ""' || true)
   [[ -n "$AGENT_ID" && "$AGENT_ID" != "null" ]] && break
   sleep 1
 done
