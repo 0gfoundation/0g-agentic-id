@@ -38,6 +38,20 @@ owner_deployments() {
   curl -fsS -H "X-Auth-Message: $msg" -H "X-Auth-Signature: $sig" "$API/deployments?owner=$OWNER_ADDR"
 }
 
+# Agent base URL for a seal_id. Prefer the row's own agent_card.url origin —
+# it carries the CORRECT scheme (production art.0g.ai is 443-only; a
+# hand-built http:// URL times out there, #128) and is provision-updated, so
+# it survives resets. Fall back to constructing from the proxy config for
+# rows without a card url (e.g. -dev environments).
+agent_url_of() { # agent_url_of <seal_id>
+  local row url
+  row=$(owner_deployments | jq -c --arg s "$1" '.[] | select(.seal_id==$s)')
+  url=$(echo "$row" | jq -r '.agent_card.url // ""' | sed -E 's#^(https?://[^/]+).*#\1#')
+  if [ -n "$url" ]; then echo "$url"; else
+    echo "http://${PORT}-$(echo "$row" | jq -r .sandbox_id).${PROXY}"
+  fi
+}
+
 declare -a NAMES RESULTS
 step() { # step "name" cmd...
   local name="$1"; shift
@@ -61,7 +75,9 @@ fi
 step "smoke (negative deploy → 400)" bash -c "cd '$SDK' && node scripts/smoke.cjs"
 
 # ── CLI smoke, public tier (free): read paths + the WALLET_REQUIRED gates ──
-step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
+# OWNER_PRIV= (empty): this leg must run KEYLESS, but the script honors
+# OWNER_PRIV as a fallback alias and regression exports it globally (#128).
+step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && OWNER_PRIV= AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
 
 # ── deploy a fresh source, capture its coordinates ────────────────────
 DEPLOY_LOG="$(mktemp)"
@@ -81,7 +97,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   SEAL_ADDR=$(echo "$ROW" | jq -r .agent_seal_addr)
   PROXY=$(curl -fsS "$API/config" | jq -r .sandbox_proxy_addr)
   PORT=$(curl -fsS "$API/config" | jq -r .agent_serve_port)
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  AGENT_URL=$(agent_url_of "$SEAL_ID")
   echo "source: agent_id=$AGENT_ID seal=$SEAL_ID sandbox=$SANDBOX url=$AGENT_URL"
 
   # CLI owner tier against the fresh deployment: doctor all six green,
@@ -97,8 +113,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   # clone + feedback + transfer + owner gate (consumes the source via transfer, so LAST among source-bound legs).
   # Re-derive the URL first: agent-e2e's reset above recreated the container
   # with a NEW sandbox_id, so the deploy-time AGENT_URL is now stale.
-  SANDBOX=$(owner_deployments | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  AGENT_URL=$(agent_url_of "$SEAL_ID")
   echo "source url refreshed post-reset: $AGENT_URL"
   if [ -n "${REPUTATION_ADDR:-}" ]; then
     step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' REPUTATION_ADDR='$REPUTATION_ADDR' node scripts/lifecycle-e2e.cjs"
