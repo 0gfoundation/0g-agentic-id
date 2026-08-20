@@ -157,7 +157,8 @@ function mkClient(privKey, cfg) {
   for (let i = 0; i < 40; i++) { crow = await rowOf(B, cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
   check('clone reaches RUNNING under new owner', crow && crow.phase === 'running', `phase=${crow && crow.phase}`);
   if (crow && crow.sandboxId) {
-    const cbase = `http://${port}-${crow.sandboxId}.${proxy}`;
+    // Row url first — correct scheme on 443-only production proxies (#128).
+    const cbase = crow.url ?? `http://${port}-${crow.sandboxId}.${proxy}`;
     let ch = null;
     for (let i = 0; i < 8 && !ch; i++) { ch = curlHelloHeader(cbase); if (!ch) await sleep(8000); }
     check('clone /hello serves a proof for the clone identity', !!ch && A.reputation.parseServeProofHeader(ch).agentId === cloneId,
