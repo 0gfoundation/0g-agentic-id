@@ -14,7 +14,9 @@ framework behind an HTTP bridge), was built as a seam probe and then
 **retired** — a per-request CLI can't host the owner-built public services
 this platform is for (see §12 for the full field report; the adapter code
 was removed, but the port's lessons are the reason much of this contract
-exists).
+exists). A fifth, `dsh` (DeepSeek Harness), has its state half built and
+conformance-tested in `internal/framework/dsh/` but is **not registered** —
+its process half needs a live sandbox to finish; see §14.
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -938,3 +940,133 @@ against the binding and fails loudly on a mismatch, and it implements no
 documented degradation). The cost is a hard release constraint — the version
 whitelist and the image must move together — which is the right trade for
 keeping the attested measurement honest.
+
+## 14. Port in progress: DeepSeek Harness (DSH) (2026-08) — state half only
+
+> **Status: not shipped.** `internal/framework/dsh/` compiles and passes the
+> conformance suite, but `New()` does not call `framework.Register` and
+> `main.go` has no registration line, so no on-chain binding can select it.
+> `Start`/`Stop`/`Liveness`/`Readiness`/`AuthResponse` are stubs returning a
+> clear error. This section documents what is real, what is deliberately
+> deferred, and why — the fourth data point on porting a framework into this
+> contract, and the first one written without a live sandbox loop to verify
+> against.
+
+DSH (`@deepseek-ai/dsh`) is a Cordis-plugin-composed harness: every
+capability — model, tools, skills, sessions, storage, the system prompt
+itself — is an independently versioned, independently swappable plugin
+package (~50 of them). Unlike openclaw, hermes and prime-agent, there is no
+single "the framework's config file"; the composition itself (which plugins,
+in what order, with what config) is platform structure this adapter would
+author and materialize at Start, the same way it already ships the HTTP
+bridges for prime-agent and (formerly) claudecode.
+
+**Why the state half is real and the process half is not.** Every prior port
+in this document needed a live sandbox to actually finish: the prime-agent
+report above documents a real bug (installing the npm-only half of a
+two-channel distribution) that only a built container caught, plus two items
+explicitly left as "verify on first live boot". This port has not had that
+loop. Rather than ship an unexecuted composition + bridge as though it were
+working, `Start` fails loud with "not implemented" and the adapter stays
+unregistered. The roles/canonicalization half needed no such loop — it is a
+pure function of disk state, and §13 point 5 already established that this
+half can be finished and reviewed on its own. That is exactly what shipped
+here: `Roles`, `Defaults`, `Restore`/`EvolutionFor`, `HandleLegacy["persona"]`,
+and `FrameworkFacts`, green under `conformance.Run` plus adapter-specific
+tests for secret-stripping and persona ingestion (mirroring the prime-agent
+bug where an in-memory-only inference pin vanished at the first drift
+commit — this adapter has the same test, guarding the same mistake in
+`settings.yaml` instead of `models.json`).
+
+**Role set, and the reasoning distinct from the other three adapters:**
+
+1. **`framework`** — the protocol-reserved binding leaf, same shape as every
+   adapter. DSH's release series and its npm version are the *same* series
+   (unlike prime-agent's tarball/npm split), so the whitelist speaks npm
+   versions directly.
+2. **`APPEND_SYSTEM.md`** — owner persona, verbatim bytes. DSH has no
+   file-based "append to my system prompt" convention the way prime-agent's
+   `DefaultResourceLoader` does; its own `persona` concept is a *config value*
+   inside the plugin composition, which is per-boot platform structure this
+   adapter authors, not agent state. So this role's bytes are meant to reach
+   the model through the bridge's own code — a `ctx.systemPrompt.section()`
+   call after boot settles — never through a file DSH itself reads. That
+   also means, like prime-agent, no marker stripping is needed: nothing
+   platform-authored ever shares this role's bytes.
+3. **`settings.yaml`** — the inference route pin, in DSH's own hot-reloaded
+   settings-file format (`$DSH_HOME/settings.yaml`, live-reloaded by
+   `@deepseek-ai/dsh-settings-file`). This is the `models.json`/`config.yaml`
+   role again, for the same reason: the mint-time `persona` seed disappears
+   from chain at the first drift commit, so the pin needs a path-driven,
+   durable home. Wire form is canonical JSON; on-disk form is YAML — the
+   same split hermes's `config.yaml` uses (`yamlio.go`), reused here rather
+   than invented fresh. `apiKeyEnv` names an environment variable, never a
+   literal key, and `stripSecrets` deletes any `apiKey`/`api_key` that
+   reaches the file anyway, defense in depth against a future
+   settings-writing tool (this adapter's own writer never produces one).
+4. **`skills/`** — `DirectoryManifest` over `$DSH_HOME/skills/`, DSH's own
+   rank-400 ("user-dsh") skill discovery root (`docs/subsystems/skills.md`).
+   Unlike prime-agent's Python-package skills (directories only), DSH skills
+   are either a directory bundle (`<name>/SKILL.md`) or a flat file
+   (`<name>.md`) — this role tracks both entry shapes. The provider's own
+   reserved child (`.system`) is excluded, the same pattern hermes uses for
+   `skills/.bundled_manifest`.
+
+**What a fifth data point taught about scope, before any code was written.**
+DSH is the first framework here whose own designers explicitly *invite*
+agent self-modification of the harness's own source — a system-prompt
+section names the harness checkout's path specifically so its
+self-referential `dsh-tool-cordis` toolset can read and edit it. This port
+does **not** track that. The reason is not that iData cannot hold code —
+it can; a role is just bytes, and a git-committed skill file with an
+embedded shell command is no different in kind. The reason is this
+codebase's actual gap: promoting an agent's in-memory or on-disk edit into a
+*durable, chain-anchored* framework-source role needs a way to roll back to
+the image baseline if the agent bricks itself, because `/reset` re-provisions
+from chain and would faithfully restore a bricked agent's own bad edit. That
+primitive — drop one role, fall back to the image's baseline bytes — does not
+exist yet. Until it does, this port tracks only the framework's *data*
+surface (persona, skills, the inference pin), the same surface openclaw and
+hermes track; DSH's own harness code stays untracked and confined to one
+container's lifetime, which costs nothing beyond that one capability DSH
+happens to expose that the others don't.
+
+**What a per-endpoint audit found on DSH's own web app (§11 step 10).** DSH
+ships a full dashboard (`apps/web`) with a file browser and a settings page
+that can disable any composition plugin — including one this adapter would
+register for doctrine injection — from the UI, bypassing the agent entirely.
+Per this document's standing rule, no route is declared for it. The two
+capabilities that *do* need a human answerer when the UI is absent —
+`ctx.approval` (fails closed without an answerer) and `ctx.userQuestions`
+(throws `NO_PROVIDER` if a tool that needs it is even loaded) — do not need
+replacing with equivalent machinery: the intended shape is an always-allow
+approval policy (doctrine constrains the agent, not a permission dialog) and
+simply not loading a structured ask-user tool, so a question surfaces as
+plain assistant text the way it already does on openclaw and prime-agent —
+free, because the underlying `Agent` object is long-lived in the bridge
+process and a plain follow-up message already continues the same turn
+context, no separate answer channel required.
+
+**Left for the process-half port**, when a live sandbox is available to
+iterate against (the same iteration prime-agent's own port needed):
+
+- Author the actual plugin composition (llm-pi-ai routed at 0G, no
+  session-persistence plugin — an append-only session log must never be
+  chain-tracked, and the live `Agent` object already gives turn continuity
+  without one — an always-allow approval policy, `danger-full-access`
+  sandbox mode) and confirm it boots via `@deepseek-ai/dsh-app-boot`'s
+  `boot()`.
+- Write the sealed-owned HTTP bridge: one OpenAI-shaped `/v1/chat/completions`
+  endpoint over `Agent.followup()`, injecting the platform doc into
+  `ctx.systemPrompt` after boot settles — the authoritative channel, per
+  §13 point 2's twice-learned rule, verified by confirming the model actually
+  adopts the identity rather than assuming the injection binds.
+- Confirm the actual shape of session/turn-completion events (DSH's
+  `agent/*` and `session/event` streams) closely enough to stream assistant
+  deltas the way prime-agent's bridge does off `message_update`/`text_delta`.
+- Decide the image: DSH needs Node ≥22.19 and either a full pnpm-workspace
+  build or a global npm install of `@deepseek-ai/dsh` at build time (the
+  latter is simpler and is what this port's whitelist assumes — see
+  `whitelist.go`); either way the install belongs in the image for the same
+  measurement reason §13 gives prime-agent's install, not a warm-cache
+  re-pin at Start.
