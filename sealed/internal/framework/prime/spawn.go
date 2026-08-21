@@ -121,6 +121,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Model:            model,
 		ZGComputeRouted:  provider == zgComputeProvider,
 		BootTime:         time.Now(),
+		Deprivileged:     privsep.Active(),
 	})
 	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its

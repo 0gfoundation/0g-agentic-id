@@ -72,6 +72,14 @@ func credential() *syscall.Credential {
 	return cred
 }
 
+// Active reports whether the uid split is available in this container —
+// i.e. whether the framework subprocess will run de-privileged. Adapters
+// feed it into platform.RuntimeSnapshot so the injected doctrine can state
+// the container's real boundary (shell ban vs kernel-enforced isolation).
+func Active() bool {
+	return credential() != nil
+}
+
 // Drop configures cmd to spawn as the agent user. Returns false — leaving
 // cmd untouched — when the split is unavailable.
 func Drop(cmd *exec.Cmd) bool {
