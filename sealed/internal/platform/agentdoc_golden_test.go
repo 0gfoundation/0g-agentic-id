@@ -34,7 +34,11 @@ func bibleTemplate() string {
 		Provider:         "(provider)",
 		Model:            "(model)",
 		ZGComputeRouted:  false,
-		BootTime:         time.Unix(0, 0).UTC(),
+		// The reference doc renders the uid-split variant of refusal 2 —
+		// every current image ships the agent user; the legacy full-ban
+		// text remains in code for degraded boots only.
+		Deprivileged: true,
+		BootTime:     time.Unix(0, 0).UTC(),
 	}
 	facts := FrameworkFacts{
 		Home: "(framework home dir, e.g. ~/.acme/)",

@@ -19,6 +19,7 @@ import (
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
+	"seal-verify/internal/privsep"
 )
 
 // Start: version pin → materialize the bridge → write the agent doc → spawn.
@@ -120,6 +121,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Model:            model,
 		ZGComputeRouted:  provider == zgComputeProvider,
 		BootTime:         time.Now(),
+		Deprivileged:     privsep.Active(),
 	})
 	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its
@@ -346,6 +348,16 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
 	}
 	cmd.Env = env
+
+	// Run the bridge (and the IPython kernel it spawns) as the low-privilege
+	// agent user when the image provides one (no-op otherwise — see
+	// internal/privsep). Restore wrote the home as root, so hand it over
+	// now; $HOME itself must also accept new dotfiles. sessionStateDir is
+	// under /tmp (world-writable), no handover needed.
+	if privsep.Drop(cmd) {
+		privsep.OwnPath(os.Getenv("HOME"))
+		privsep.OwnTree(primeHome)
+	}
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()

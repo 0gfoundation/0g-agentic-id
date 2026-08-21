@@ -15,6 +15,7 @@ import (
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
+	"seal-verify/internal/privsep"
 )
 
 // Start does the heavy lifting of bringing openclaw up, in two flavours:
@@ -135,6 +136,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Model:            model,
 		ZGComputeRouted:  isZGComputeRouted(provider),
 		BootTime:         time.Now(),
+		Deprivileged:     privsep.Active(),
 	}
 	rs.WhitelistMax = whitelistMax()
 
@@ -318,6 +320,16 @@ func spawnGateway(apiKeyEnv string, rt framework.RuntimeContext) (*exec.Cmd, err
 		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
 	}
 	cmd.Env = envWhitelist
+
+	// Run the framework as the low-privilege agent user when the image
+	// provides one (no-op otherwise — see internal/privsep). Restore wrote
+	// the home as root, so hand it over now; $HOME itself must also accept
+	// new dotfiles (npm/openclaw caches).
+	if privsep.Drop(cmd) {
+		privsep.OwnPath(os.Getenv("HOME"))
+		privsep.OwnTree(openclawHome)
+	}
+
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return nil, fmt.Errorf("start openclaw gateway: %w", err)
