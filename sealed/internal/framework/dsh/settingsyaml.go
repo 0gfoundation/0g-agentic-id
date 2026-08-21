@@ -4,22 +4,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 )
 
-// role="settings.yaml" — the inference route pin, in DSH's own hot-reloaded
-// settings-file format ($DSH_HOME/settings.yaml, `@deepseek-ai/dsh-settings-file`
-// — a top-level `<plugin-id>:` section overrides that composition entry's
-// config live, with no restart).
+// role="settings.yaml" — the inference route pin, in DSH's settings-file YAML
+// shape ($DSH_HOME/settings.yaml).
 //
-// This role exists for the same reason prime-agent's models.json does
+// NOTE the bridge deliberately does NOT mount `@deepseek-ai/dsh-settings-file`
+// (see bridge/bridge.mjs): its hot-reload would layer this file OVER the
+// composition, letting an agent edit inject an arbitrary baseURL/apiKeyEnv
+// route live. So DSH itself never reads this file. It is purely THIS adapter's
+// durable store for the pin: Start reads it (readPin) and passes provider +
+// model to the bridge as env; the bridge builds the llm-pi-ai route from that.
+//
+// The role exists for the same reason prime-agent's models.json does
 // (FRAMEWORK_ADAPTER.md §13): the mint-time `persona` seed is consumed once
 // and gone from chain at the first drift commit, so the inference pin needs a
 // durable, path-driven home or every boot after that first commit comes up
-// with no model. DSH's settings-file mechanism is that home — the framework
-// already looks there, so tracking it puts the pin exactly where a fresh
-// container's own composition would read it.
+// with no model. The file keeps DSH's own settings shape (so the format stays
+// recognizable) even though nothing in the composition reads it.
 //
 // The wire encoding is canonical JSON (compact, sorted keys), NOT YAML — YAML
 // serialization is not deterministic enough to hash. The adapter converts at
@@ -158,8 +163,16 @@ func readPin() (provider, model string) {
 	}
 	section, _ := cfg[llmPluginID].(map[string]any)
 	providers, _ := section["providers"].(map[string]any)
-	for name, raw := range providers {
-		route, _ := raw.(map[string]any)
+	// Deterministic pick: sort provider names so a multi-provider file (which
+	// this adapter never writes, but a future edit might) yields a stable pin
+	// rather than a random map-iteration order.
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		route, _ := providers[name].(map[string]any)
 		models, _ := route["models"].([]any)
 		if len(models) > 0 {
 			if m, ok := models[0].(map[string]any); ok {

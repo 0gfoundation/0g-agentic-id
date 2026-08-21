@@ -35,6 +35,7 @@ import (
 	"seal-verify/internal/config"
 	"seal-verify/internal/dataplane"
 	"seal-verify/internal/framework"
+	"seal-verify/internal/framework/dsh"
 	"seal-verify/internal/framework/hermes"
 	"seal-verify/internal/framework/openclaw"
 	"seal-verify/internal/framework/prime"
@@ -112,6 +113,7 @@ func main() {
 	openclaw.New()
 	hermes.New()
 	prime.New()
+	dsh.New()
 
 	// agent_seal_priv lives only in this process's memory: make it
 	// non-dumpable before anything else runs, so no sibling process can

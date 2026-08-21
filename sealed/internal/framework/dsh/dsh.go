@@ -3,19 +3,17 @@
 // (model, tools, skills, sessions, storage, system prompt) is an independently
 // swappable plugin.
 //
-// STATUS: state half only. Roles(), Defaults(), Restore/EvolutionFor and
-// FrameworkFacts are real and conformance-tested. Start/Stop/Liveness/
-// Readiness/AuthResponse are stubs that return a clear "not implemented"
-// error, and New() does not self-register (see spawn.go) — so this package
-// compiles and its invariants are checked, but no on-chain binding can select
-// it yet. This mirrors the prime-agent port's own documented strategy
-// (FRAMEWORK_ADAPTER.md §13 point 5): the roles/canonicalization half is a
-// pure function of disk state and can be finished and reviewed before the
-// process half exists. The process half needs a live sandbox loop to get
-// right — composing a working DSH plugin tree, wiring an HTTP bridge into it,
-// and confirming the model actually streams — the same kind of iteration the
-// prime-agent port needed (see its port report's "left to verify on first
-// live boot" and the npm-vs-tarball mistake it documents).
+// STATUS: complete adapter. The state half — Roles(), Defaults(),
+// Restore/EvolutionFor, FrameworkFacts — is conformance-tested. The process
+// half (spawn.go) composes the DSH plugin tree inside a sealed-owned Node
+// bridge (bridge/bridge.mjs), embedded via go:embed and materialized at
+// Start, and New() self-registers so an on-chain "dsh" binding selects it.
+// The composition is authored IN the bridge (not a loader/profile/cordis.yml
+// and not any $DSH_HOME patch layer), so it rides the image hash and an agent
+// editing its home cannot alter what mounts next boot. Like prime-agent, the
+// process half wants a live-boot pass to confirm on first deploy (model
+// streams end-to-end, bash/skills work de-privileged); the state half needed
+// no such loop (FRAMEWORK_ADAPTER.md §13 point 5).
 //
 // Role set:
 //
@@ -50,13 +48,17 @@
 //	settingsyaml.go the settings.yaml role (inference pin, YAML on disk / canonical JSON on chain)
 //	skills.go       the skills/ manifest role
 //	platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
-//	spawn.go        Start/Stop/probes — STUBBED, see the package doc above
+//	spawn.go        Start/Stop/probes + the bridge lifecycle
+//	bridge/         the go:embed'd Node bridge (bridge.mjs) + platform plugins
+//	                (seal-tools.mjs, seal-guard.mjs)
 package dsh
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os/exec"
+	"sync"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
@@ -69,8 +71,22 @@ const frameworkName = "dsh"
 
 // Adapter is the DSH implementation of framework.Framework.
 type Adapter struct {
+	mu sync.RWMutex
+
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
+
+	// cmd is the running bridge process (nil before first Start / after Stop).
+	cmd *exec.Cmd
+
+	// bridgeToken gates the bridge's /v1/* surface; AuthResponse hands it to a
+	// verified owner. Minted once per container (memory-only), so a reset
+	// rotates it.
+	bridgeToken string
+
+	// initialized flips after the first successful Start. A supervisor restart
+	// reuses the installed framework + token and never rewrites agent state.
+	initialized bool
 }
 
 // frameworkBinding is the protocol-reserved "framework" role's plaintext.
@@ -81,20 +97,19 @@ type frameworkBinding struct {
 	SchemaVersion  int    `json:"schema_version"`
 }
 
-// New builds the adapter. It does NOT self-register (unlike every other
-// bundled adapter's New()) — see the package doc for why: the process half
-// is not implemented yet, and an on-chain binding must never be able to
-// select a framework whose Start always fails. Wiring it up is one call to
-// framework.Register(frameworkName, New()) here, plus the registration line
-// in main.go, once spawn.go is real.
+// New builds the adapter and self-registers it (side-effect, like every other
+// bundled adapter's New()). The process half (spawn.go) is real now, so an
+// on-chain "dsh" binding can select it.
 func New() *Adapter {
-	return &Adapter{
+	a := &Adapter{
 		binding: frameworkBinding{
 			Name:           frameworkName,
 			PackageVersion: whitelistMax(),
 			SchemaVersion:  1,
 		},
 	}
+	framework.Register(frameworkName, a)
+	return a
 }
 
 func (a *Adapter) Name() string { return frameworkName }
@@ -246,7 +261,7 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 // prime-agent: DSH is provisioned at image build time so its bytes ride the
 // image hash in on-chain validFrameworkHashes; a drifted `framework` role is
 // committed as-is rather than downloading a different version into an
-// attested container (see spawn.go once it is real).
+// attested container (see spawn.go verifyInstalled).
 var (
 	_ framework.Framework = (*Adapter)(nil)
 )
