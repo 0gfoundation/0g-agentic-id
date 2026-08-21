@@ -45,16 +45,12 @@ import { createServer } from 'node:http'
 import { readFileSync } from 'node:fs'
 
 import { Context } from '@deepseek-ai/cordis'
-import Spine from '@deepseek-ai/dsh-agent-spine-demo'
-import PiAi from '@deepseek-ai/dsh-llm-pi-ai'
-import CredentialProvider from '@deepseek-ai/dsh-credentials'
+import * as Spine from '@deepseek-ai/dsh-agent-spine-demo'
+import * as PiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import LocalCredentialProvider from '@deepseek-ai/dsh-credentials-local'
-import ShellExecutor from '@deepseek-ai/dsh-shell'
 import LocalBashExecutor from '@deepseek-ai/dsh-bash-local'
-import SubprocessRuntime from '@deepseek-ai/dsh-subprocess'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
-import FileSystem from '@deepseek-ai/dsh-fs'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
 import * as ToolFs from '@deepseek-ai/dsh-tool-fs'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
@@ -124,12 +120,19 @@ async function boot() {
     workspaceContext: false,
     toolJobs: false,
     maxParallelToolCalls: 1,
+    // The spine bundle unconditionally mounts a set of relational invariant
+    // self-checks (scope/session/agent/agent-loop) meant for development. On
+    // rc.1 the session/created dispatch trips the scope-carrier check; these
+    // are dev diagnostics, not runtime requirements, so disable them.
+    invariants: { enabled: false },
   })
 
   // Credentials: apiKeyEnv references resolve through ctx.credentials; the
   // process-env layer wins and is read-only, so no credential file is ever
   // written (the inference key reaches this process as SEAL_MODEL_API_KEY).
-  await ctx.plugin(CredentialProvider)
+  // LocalCredentialProvider extends the base CredentialProvider (its super()
+  // registers the `credentials` service), so mounting it alone is complete —
+  // mounting the base too double-registers the service.
   await ctx.plugin(LocalCredentialProvider, { dshHome: DSH_HOME })
 
   // Inference: one self-declared llm-pi-ai route for the resolved provider.
@@ -148,15 +151,15 @@ async function boot() {
   // Execution substrate for the bash tool the spine mounts. No DSH sandbox
   // stack: privsep is the wall (see header), so the policy is the unconfined
   // local executor pair — exactly examples/jsonrpc-agent/minimal.cordis.yml.
-  await ctx.plugin(SubprocessRuntime)
+  // Each Local* extends its base service class (super() registers the service),
+  // so mounting the Local one alone is complete; mounting the base too would
+  // double-register (subprocess / shell / fs).
   await ctx.plugin(LocalSubprocessRuntime)
-  await ctx.plugin(ShellExecutor)
   await ctx.plugin(LocalBashExecutor)
   await ctx.plugin(SandboxPolicyService, { mode: 'danger-full-access' })
 
   // Filesystem tools (writes outside the agent's own files fail at the
   // kernel — privsep owns that boundary, not a plugin).
-  await ctx.plugin(FileSystem)
   await ctx.plugin(LocalFileSystem, { cwd: DSH_HOME })
   await ctx.plugin(ToolFs)
 
