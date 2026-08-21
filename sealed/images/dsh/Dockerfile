@@ -45,7 +45,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 FROM debian:13-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git curl procps \
+ && apt-get install -y --no-install-recommends ca-certificates git curl procps xz-utils \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
