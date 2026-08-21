@@ -6,15 +6,16 @@ package dsh
 // a version listed here that the image does not carry cannot be honoured.
 //
 // Unlike prime-agent, DSH's release series and its npm package version are
-// the SAME series (npm dist-tag `latest` at the time this adapter was written
-// was 0.1.0-rc.6, matching the checked-out repo's own package.json), so this
-// list speaks npm versions directly — no tarball/release-channel split.
+// the SAME series, so this list speaks npm versions directly — no
+// tarball/release-channel split. Keep it in lockstep with DSH_VERSION in
+// sealed/images/dsh/Dockerfile: the image bakes exactly this version, and
+// spawn.go verifyInstalled hard-fails a mismatch.
 //
 // Stored as a slice (not a map) so the order encodes "preferred order": the
 // LAST entry is whitelistMax, the version a `framework` role drift
 // reconciles against.
 var supportedDSHVersions = []string{
-	"0.1.0-rc.6", // pre-1.0: expect this list to move often (see package doc)
+	"0.1.1-rc.1", // pre-1.0: expect this list to move often (see package doc)
 }
 
 // whitelistMax returns the version sealed targets: always the last element.

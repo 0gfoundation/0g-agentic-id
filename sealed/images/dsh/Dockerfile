@@ -81,7 +81,7 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 #
 # node-pty (pulled in by bash-local → subprocess-local) is a native module, so
 # a build toolchain is needed during install, then purged to keep the image slim.
-ARG DSH_VERSION=0.1.0-rc.6
+ARG DSH_VERSION=0.1.1-rc.1
 ARG CORDIS_VERSION=4.0.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
