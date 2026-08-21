@@ -18,12 +18,6 @@
 # Requires base image from: eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22
 FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubuntu22
 
-# Low-privilege user the framework subprocess runs as (internal/privsep):
-# sealed (root, PID 1) drops the agent process to it so the agent cannot
-# read sealed's memory or bootstrap env. Home stays /root — ownership of
-# the framework subtrees is handed over at spawn; the paths don't move.
-RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
-
 # openclaw 2026.7.1 (whitelist.go's whitelistMax) requires
 # node >=22.22.3 <23 || >=24.15.0 <25 || >=25.9.0 — the 0g-sandbox base
 # ships an older node in its nvm, so install the pinned version here

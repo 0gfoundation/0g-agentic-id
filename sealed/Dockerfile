@@ -36,6 +36,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 # Stage 3 — runtime: openclaw base already has node + openclaw + nvm PATH set.
 FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:openclaw-1.1.0
 
+# Low-privilege user the framework subprocess runs as (internal/privsep):
+# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Home stays /root — ownership of
+# the framework subtrees is handed over at spawn; the paths don't move.
+RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
+
 # Pre-install a pinned openclaw version and warm up its "bundled runtime
 # deps" (the npm packages openclaw fetches the first time `gateway run`
 # starts). Without this, every fresh container spends ~30-60s of first-boot
