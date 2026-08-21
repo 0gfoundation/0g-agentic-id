@@ -41,6 +41,7 @@ import (
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
@@ -111,6 +112,11 @@ func main() {
 	openclaw.New()
 	hermes.New()
 	prime.New()
+
+	// agent_seal_priv lives only in this process's memory: make it
+	// non-dumpable before anything else runs, so no sibling process can
+	// ptrace it or read /proc/<pid>/mem even if it shares our uid.
+	privsep.HardenSelf()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()

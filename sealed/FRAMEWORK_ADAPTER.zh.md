@@ -11,7 +11,9 @@ bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 经 HTTP bridge 托管)是当初用来验证 seam 的探针,**已下线**——每次请求
 现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
 (openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
-这份契约里很多条款的由来,见 §12 实录。
+这份契约里很多条款的由来,见 §12 实录。第五个 `dsh`(DeepSeek Harness)
+的状态那一半已经写好、跑过 conformance,在 `internal/framework/dsh/`
+里,但**未注册**——进程那一半需要真实沙盒才能收尾,见 §14。
 
 权威来源是代码:接口定义在
 [`internal/framework/framework.go`](internal/framework/framework.go);
@@ -798,3 +800,105 @@ Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并
 `VersionReconciler`(漂移的 `framework` 角色原样上链,即 §2.2 记载的降级)。
 代价是一条硬性发布约束 —— 版本白名单和镜像必须一起动 —— 为了让被认证的度量
 诚实,这个交换是值得的。
+
+## 14. 移植中:接入 DeepSeek Harness(DSH)(2026-08)——只有状态那一半
+
+> **状态:未上线。**`internal/framework/dsh/` 能编译、conformance 套件全绿,
+> 但 `New()` 没有调用 `framework.Register`,`main.go` 也没有注册这一行,所以
+> 没有任何链上 binding 能选中它。`Start`/`Stop`/`Liveness`/`Readiness`/
+> `AuthResponse` 都是返回明确错误的桩函数。这一节记的是:哪些是真的、哪些故意
+> 延后、为什么延后 —— 这是第四次移植的记录,也是第一次没有真实沙盒可以跑通再
+> 写下来的记录。
+
+DSH(`@deepseek-ai/dsh`)是一个由 Cordis 插件组合出来的 harness:模型、工具、
+skill、会话、存储、乃至系统提示本身,每一样都是独立版本化、独立可替换的插件包
+(约 50 个)。跟 openclaw、hermes、prime-agent 不同,它没有"框架自己的那个配置
+文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是这个 adapter要
+自己撰写、在 Start 时落地的平台结构,跟它已经为 prime-agent(以及已退役的
+claudecode)自建 HTTP bridge 是同一件事。
+
+**为什么状态那一半是真的,进程那一半不是。**本文档里每一次此前的移植,最终
+都靠一个真实沙盒才收尾:上面 prime-agent 那篇实录记的就是一个真 bug(装错了
+两个分发渠道里只含 TypeScript 那一半的 npm 包),只有真的建出容器才抓得到,
+外加两条明确留到"第一次真实开机再验证"的条目。这次移植还没有过这一轮。与其把
+一份从没跑过的组合 + bridge 当成能用的东西交出去,不如让 `Start` 直接报
+"未实现",adapter 也保持未注册。角色/规范化这一半不需要这一轮——它是磁盘状态
+的纯函数,§13 第 5 条已经确立过这一半可以独立完工、独立评审。这次真正上线的
+就是这些:`Roles`、`Defaults`、`Restore`/`EvolutionFor`、
+`HandleLegacy["persona"]`、`FrameworkFacts`,在 `conformance.Run` 之外还配了
+密钥剥离和 persona 注入的专项测试(照着 prime-agent 那个"推理 pin 只存内存、
+第一次漂移提交后就消失"的 bug 写的同款测试,只是这里追的是 `settings.yaml`
+而不是 `models.json`)。
+
+**角色集,以及跟另外三个 adapter 不一样的地方:**
+
+1. **`framework`** —— 协议保留的 binding leaf,跟每个 adapter 一样。DSH 的
+   release 序列和 npm 版本号是**同一个**序列(不像 prime-agent 的 tarball/npm
+   分裂),所以白名单直接说 npm 版本号。
+2. **`APPEND_SYSTEM.md`** —— owner persona,原样字节。DSH 没有 prime-agent
+   `DefaultResourceLoader` 那种"从文件追加到系统提示"的原生约定;它自己的
+   `persona` 概念是插件组合里的一个**配置值**,那是这个 adapter 自己撰写的
+   平台结构,不是 agent 状态。所以这个角色的字节设计上要靠 bridge 自己的代码
+   送到模型面前——boot 稳定之后调一次 `ctx.systemPrompt.section()`——而不是
+   经过 DSH 自己会读的某个文件。这也意味着跟 prime-agent 一样不需要剥
+   marker:没有任何平台产出的文字会跟这个角色的字节共用一处。
+3. **`settings.yaml`** —— 推理路由 pin,用 DSH 自己热重载的 settings 文件格式
+   (`$DSH_HOME/settings.yaml`,`@deepseek-ai/dsh-settings-file` 实时重载)。
+   这又是一次 `models.json`/`config.yaml` 角色,原因相同:mint 时的 `persona`
+   种子在第一次漂移提交后就从链上消失,所以这个 pin 需要一个路径驱动的持久
+   归宿。链上编码是规范 JSON;盘上是 YAML——跟 hermes `config.yaml` 用的是
+   同一套拆分(`yamlio.go`),这里是复用不是重新发明。`apiKeyEnv` 存的是
+   环境变量的名字,从来不是字面 key,`stripSecrets` 会把落进文件里的任何
+   `apiKey`/`api_key` 删掉——这是防将来某个会写 settings 的工具用的纵深防御
+   (这个 adapter 自己的写入路径从来不会产出这种东西)。
+4. **`skills/`** —— `DirectoryManifest`,指向 `$DSH_HOME/skills/`,DSH 自己
+   skill 发现表里 rank 400("user-dsh")的那个根(`docs/subsystems/skills.md`)。
+   跟 prime-agent 只有 Python 包(纯目录)形状的 skill 不同,DSH 的 skill 要么
+   是目录包(`<name>/SKILL.md`),要么是扁平文件(`<name>.md`)——这个角色两种
+   entry 形状都追踪。provider 自己保留的子目录(`.system`)被排除,跟 hermes
+   排除 `skills/.bundled_manifest` 是同一个套路。
+
+**动手写代码之前,第五个样本教会的一件关于范围的事。**DSH 是这里第一个
+**设计者主动邀请** agent 自己改写 harness 源码的框架——它有一段系统提示专门
+点出 harness checkout 的路径,就是为了让它的自省工具集 `dsh-tool-cordis` 能
+读能改。这次移植**没有**追踪这件事。原因不是 iData 装不下代码——它能装,一个
+role 就是一堆字节,一个提交进 git 的、内嵌 shell 命令的 skill 文件跟代码没有
+本质区别。真正的原因是这个代码库自己现有的缺口:把 agent 对 harness 源码的
+一次改动,提升成一个**持久的、链上锚定的**角色,需要有办法在 agent 把自己改坏
+时回退到镜像基线——因为 `/reset` 是从链上重新 provision,会老老实实把一个已经
+改坏的 agent 自己的坏改动恢复回来。这个原语——丢掉某个角色、退回镜像自带的
+基线字节——现在还没有。在它出现之前,这次移植只追踪框架的**数据**面(persona、
+skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的 harness
+代码不追踪,只活在单个容器的生命周期里——除了 DSH 恰好比另外两个多暴露的这一
+项能力,不损失别的东西。
+
+**对 DSH 自己 web app 的逐端点审计(§11 step 10)发现了什么。**DSH 自带一个
+完整的 dashboard(`apps/web`),带文件浏览器,还有一个能从界面上直接关掉任意
+组合插件的设置页——包括这个 adapter 将来会注册来注入 doctrine 的那一个,完全
+绕开 agent。按本文档的既定规则,不为它声明 route。界面缺席时真正需要一个人类
+应答者的两样东西——`ctx.approval`(没有应答者就 fail closed)和
+`ctx.userQuestions`(工具一旦装了结构化提问、没有 provider 就直接抛
+`NO_PROVIDER`)——不需要另造一套等价机制:该有的形状是一个全放行的批准策略
+(约束 agent 的是 doctrine,不是一个权限弹窗),以及干脆不装那个结构化提问
+工具,让问题像在 openclaw、prime-agent 上一样以普通文字冒出来——这是免费的,
+因为 bridge 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
+能接上同一个 turn 的上下文,不需要另开一条应答通道。
+
+**留给进程那一半的活**,等有真实沙盒可以对着迭代的时候(跟 prime-agent 当年
+需要的是同一种迭代):
+
+- 撰写真正的插件组合(llm-pi-ai 指向 0G、不挂任何 session-persistence 插件——
+  一份只增不减的会话日志绝不能上链追踪,而活着的 `Agent` 对象本来就给了 turn
+  连续性、不需要它、一个全放行的批准策略、`danger-full-access` 沙盒模式),
+  并确认它能通过 `@deepseek-ai/dsh-app-boot` 的 `boot()` 启动起来。
+- 写 sealed 自己的 HTTP bridge:一个 OpenAI 形状的 `/v1/chat/completions`
+  端点,内部调 `Agent.followup()`;boot 稳定之后把平台文档注入
+  `ctx.systemPrompt`——按 §13 第 2 条学了两遍的规则,这是权威通道,并且要
+  实测模型真的认下了这个身份,不能假设注入就一定生效。
+- 确认 session/turn 完成事件(DSH 的 `agent/*` 和 `session/event` 流)的
+  真实形状,精确到能像 prime-agent 的 bridge 依赖
+  `message_update`/`text_delta` 那样去流式吐出回复增量。
+- 定下镜像方案:DSH 需要 Node ≥22.19,以及要么整个 pnpm workspace 构建,
+  要么在镜像构建期全局 `npm install @deepseek-ai/dsh`(后者更简单,也是这次
+  移植白名单假设的路径——见 `whitelist.go`);不管哪种,安装都该放在镜像里,
+  理由跟 §13 讲 prime-agent 的安装一样,而不是在 Start 时热缓存重新定版。

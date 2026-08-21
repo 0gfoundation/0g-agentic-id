@@ -44,6 +44,7 @@ import (
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 // ListenInternal binds a Unix domain socket and serves the agent-only sign
@@ -68,11 +69,15 @@ func (s *Server) ListenInternal(sockPath string) {
 		logger.Logf("FAIL sign socket: listen %s: %v", sockPath, err)
 		return
 	}
-	// Same uid as openclaw (single-container, same user); 0600 is enough.
-	// If we ever split processes by uid, widen to 0660 and set group.
+	// The framework subprocess runs as the low-privilege agent user
+	// (internal/privsep), and this socket is its one legitimate channel to
+	// its key — hand the file to that user, 0600 keeps everyone else out
+	// (sealed is root and unaffected). Without the split (dev, legacy
+	// image) OwnPath is a no-op and 0600 matches the single-uid reality.
 	if err := os.Chmod(sockPath, 0o600); err != nil {
 		logger.Logf("warn sign socket: chmod %s: %v", sockPath, err)
 	}
+	privsep.OwnPath(sockPath)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sign/personal_sign", s.handleSignPersonalSign)
