@@ -111,7 +111,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Provider:         provider,
 		Model:            model,
 		ZGComputeRouted:  provider == zgComputeProvider,
-		Deprivileged:     privsep.Active(),
 		BootTime:         time.Now(),
 	})
 	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {

@@ -515,8 +515,7 @@ unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent`
 owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
-（sealed 另外自设 `PR_SET_DUMPABLE=0`，兜底没有 `agent` 用户的旧镜像）。
-这跟任何钱包里
+（sealed 另外自设 `PR_SET_DUMPABLE=0`）。这跟任何钱包里
 `eth_signTransaction` / `personal_sign` 的工作方式同构：钱包担保
 **谁签的**，不担保**内容正确**。agentSeal 没什么不同，它只是恰好是
 一个运行时被硬件认证过的钱包。

@@ -136,7 +136,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Model:            model,
 		ZGComputeRouted:  isZGComputeRouted(provider),
 		BootTime:         time.Now(),
-		Deprivileged:     privsep.Active(),
 	}
 	rs.WhitelistMax = whitelistMax()
 

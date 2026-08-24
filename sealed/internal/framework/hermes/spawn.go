@@ -113,7 +113,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		Model:            model,
 		ZGComputeRouted:  provider == "0g-compute",
 		BootTime:         time.Now(),
-		Deprivileged:     privsep.Active(),
 	})
 	if err := upsertSoulMD(pc, a.FrameworkFacts()); err != nil {
 		logger.Logf("warn: inject platform context into SOUL.md: %v", err)
