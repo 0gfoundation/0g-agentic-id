@@ -14,7 +14,10 @@ framework behind an HTTP bridge), was built as a seam probe and then
 **retired** — a per-request CLI can't host the owner-built public services
 this platform is for (see §12 for the full field report; the adapter code
 was removed, but the port's lessons are the reason much of this contract
-exists).
+exists). A fifth, `dsh` (DeepSeek Harness), is a Cordis-plugin-composed
+harness driven through a sealed-owned bridge; its composition and
+capability tiers are documented in `internal/framework/dsh/README.md`,
+the port report in §14.
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -938,3 +941,119 @@ against the binding and fails loudly on a mismatch, and it implements no
 documented degradation). The cost is a hard release constraint — the version
 whitelist and the image must move together — which is the right trade for
 keeping the attested measurement honest.
+
+## 14. Port report: DeepSeek Harness (DSH) (2026-08) — the fourth port
+
+This section records the port's design decisions; the composition and
+capability tiers are documented in
+[`internal/framework/dsh/README.md`](internal/framework/dsh/README.md).
+
+DSH (`@deepseek-ai/dsh`) is a Cordis-plugin-composed harness: every
+capability — model, tools, skills, sessions, storage, the system prompt
+itself — is an independently versioned, independently swappable plugin
+package (~50 of them). Unlike openclaw, hermes and prime-agent, there is no
+single "the framework's config file"; the composition itself (which plugins,
+in what order, with what config) is platform structure this adapter authors:
+it lives in the sealed-owned bridge (`bridge/bridge.mjs`, go:embed'd,
+materialized at Start), the same way this repo already ships the prime-agent
+bridge. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
+`HandleLegacy["persona"]`, `FrameworkFacts` — is green under
+`conformance.Run` plus adapter-specific tests for secret-stripping and
+persona ingestion (the same in-memory-pin regression test §13 describes for
+prime-agent, guarding `settings.yaml` instead of `models.json`).
+
+**Role set, and the reasoning distinct from the other three adapters:**
+
+1. **`framework`** — the protocol-reserved binding leaf, same shape as every
+   adapter. DSH's release series and its npm version are the *same* series
+   (unlike prime-agent's tarball/npm split), so the whitelist speaks npm
+   versions directly.
+2. **`APPEND_SYSTEM.md`** — owner persona, verbatim bytes. DSH has no
+   file-based "append to my system prompt" convention the way prime-agent's
+   `DefaultResourceLoader` does; its own `persona` concept is a *config value*
+   inside the plugin composition, which is per-boot platform structure this
+   adapter authors, not agent state. So this role's bytes reach the model
+   through the bridge's own code — a `ctx.systemPrompt.section()` call after
+   boot settles — never through a file DSH itself reads. That
+   also means, like prime-agent, no marker stripping is needed: nothing
+   platform-authored ever shares this role's bytes.
+3. **`settings.yaml`** — the inference route pin, kept in DSH's settings-file
+   YAML shape (`$DSH_HOME/settings.yaml`). Note the bridge deliberately does
+   NOT mount `@deepseek-ai/dsh-settings-file` (its hot-reload would layer
+   this file over the composition, letting an agent edit inject an arbitrary
+   inference route) — the adapter reads the pin itself and passes it to the
+   bridge as env; DSH never reads the file. This is the
+   `models.json`/`config.yaml` role again, for the same reason: the mint-time
+   `persona` seed disappears from chain at the first drift commit, so the pin
+   needs a path-driven, durable home. Wire form is canonical JSON; on-disk
+   form is YAML — the
+   same split hermes's `config.yaml` uses (`yamlio.go`), reused here rather
+   than invented fresh. `apiKeyEnv` names an environment variable, never a
+   literal key, and `stripSecrets` deletes any `apiKey`/`api_key` that
+   reaches the file anyway, defense in depth against a future
+   settings-writing tool (this adapter's own writer never produces one).
+4. **`skills/`** — `DirectoryManifest` over `$DSH_HOME/skills/`, DSH's own
+   rank-400 ("user-dsh") skill discovery root (`docs/subsystems/skills.md`).
+   Unlike prime-agent's Python-package skills (directories only), DSH skills
+   are either a directory bundle (`<name>/SKILL.md`) or a flat file
+   (`<name>.md`) — this role tracks both entry shapes. The provider's own
+   reserved child (`.system`) is excluded, the same pattern hermes uses for
+   `skills/.bundled_manifest`.
+
+**What a fifth data point taught about scope, before any code was written.**
+DSH is the first framework here whose own designers explicitly *invite*
+agent self-modification of the harness's own source — a system-prompt
+section names the harness checkout's path specifically so its
+self-referential `dsh-tool-cordis` toolset can read and edit it. This port
+does **not** track that. The reason is not that iData cannot hold code —
+it can; a role is just bytes, and a git-committed skill file with an
+embedded shell command is no different in kind. The reason is this
+codebase's actual gap: promoting an agent's in-memory or on-disk edit into a
+*durable, chain-anchored* framework-source role needs a way to roll back to
+the image baseline if the agent bricks itself, because `/reset` re-provisions
+from chain and would faithfully restore a bricked agent's own bad edit. That
+primitive — drop one role, fall back to the image's baseline bytes — does not
+exist yet. Until it does, this port tracks only the framework's *data*
+surface (persona, skills, the inference pin), the same surface openclaw and
+hermes track; DSH's own harness code stays untracked and confined to one
+container's lifetime, which costs nothing beyond that one capability DSH
+happens to expose that the others don't.
+
+**What a per-endpoint audit found on DSH's own web app (§11 step 10).** DSH
+ships a full dashboard (`apps/web`) with a file browser and a settings page
+that can disable any composition plugin — including the one this
+adapter registers for doctrine injection — from the UI, bypassing the agent entirely.
+Per this document's standing rule, no route is declared for it. The two
+capabilities that *do* need a human answerer when the UI is absent —
+`ctx.approval` (fails closed without an answerer) and `ctx.userQuestions`
+(throws `NO_PROVIDER` if a tool that needs it is even loaded) — do not need
+replacing with equivalent machinery: the intended shape is an always-allow
+approval policy (doctrine constrains the agent, not a permission dialog) and
+simply not loading a structured ask-user tool, so a question surfaces as
+plain assistant text the way it already does on openclaw and prime-agent —
+free, because the underlying `Agent` object is long-lived in the bridge
+process and a plain follow-up message already continues the same turn
+context, no separate answer channel required.
+
+**The process half.** The bridge (`bridge/bridge.mjs` + the platform
+plugins `seal-tools.mjs` / `seal-guard.mjs`, all go:embed'd) composes the
+plugin tree in-process — no loader, no profile, no `$DSH_HOME` patch layer,
+so the composition rides the sealed image hash and an agent editing its home
+cannot change what mounts next boot. It keeps one long-lived `Agent`,
+serializes turns, and exposes one OpenAI-shaped `/v1/chat/completions`
+(streaming off `session/event`'s `text-delta` chunks). Doctrine constrains
+the agent rather than a permission dialog: no approval UI, `danger-full-access`
+sandbox mode — privsep's kernel uid split is the isolation wall, not DSH's
+own sandbox stack. The `@deepseek-ai/dsh-*` family is npm-installed at image
+build time, pinned exact per `whitelist.go` (the family's `latest` dist-tags
+are mutually inconsistent, so exact pins only), and `verifyInstalled` makes a
+whitelist/image mismatch a loud boot failure — same measurement reasoning as
+prime-agent's install (§13). What each capability plugin is and why the rest
+are deliberately unmounted is the composition doc:
+[`internal/framework/dsh/README.md`](internal/framework/dsh/README.md).
+
+One rule this port added to the checklist: **run an embedded bridge against
+the built image before shipping it** — `go build` embeds the JS without
+validating it, so module-shape mistakes (default-importing a named-only
+plugin module, mounting both a `Local*` provider and the base class it
+already registers) surface only at boot, as a container that never listens.

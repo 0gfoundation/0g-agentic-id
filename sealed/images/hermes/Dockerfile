@@ -57,6 +57,12 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git curl procps \
  && rm -rf /var/lib/apt/lists/*
 
+# Low-privilege user the framework subprocess runs as (internal/privsep):
+# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Home stays /root — ownership of
+# the framework subtrees is handed over at spawn; the paths don't move.
+RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
+
 ENV HOME=/root
 
 # Warm-cache the framework at the whitelisted tag. Keep HERMES_BAKED_VERSION

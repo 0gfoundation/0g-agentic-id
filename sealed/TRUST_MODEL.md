@@ -595,9 +595,15 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
 - Send chain transactions as agentSeal
 
-The unix socket is bound 0600 inside the container and **never exposed
-over the network** — sandbox owners cannot post to it directly from
-outside. This is analogous to how `eth_signTransaction` and
+The unix socket is bound 0600 and owned by the low-privilege `agent`
+user the framework subprocess runs as (`internal/privsep`), and **never
+exposed over the network** — sandbox owners cannot post to it directly
+from outside. The uid split also makes the key-exfiltration half of
+doctrine refusals 2/4 kernel-enforced: a de-privileged agent process
+cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read PID 1's
+bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`). This is
+analogous to how
+`eth_signTransaction` and
 `personal_sign` work in any wallet: the wallet attests *who signed*,
 not *that the content is correct*. agentSeal is no different; it just
 happens to be a wallet whose runtime is hardware-attested.

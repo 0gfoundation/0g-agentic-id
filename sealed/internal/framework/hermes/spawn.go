@@ -15,6 +15,7 @@ import (
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
+	"seal-verify/internal/privsep"
 )
 
 // Start brings hermes up, in two flavours (mirrors the openclaw twin):
@@ -340,6 +341,17 @@ func spawnGateway(apiKeyEnv, apiServerKey string, rt framework.RuntimeContext) (
 		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
 	}
 	cmd.Env = envWhitelist
+
+	// Run the framework as the low-privilege agent user when the image
+	// provides one (no-op otherwise — see internal/privsep). Restore wrote
+	// the home as root, so hand it over now; $HOME itself must also accept
+	// new dotfiles. The checkout under hermesInstallDir stays root-owned
+	// read-only, which is fine (python skips __pycache__ writes silently).
+	if privsep.Drop(cmd) {
+		privsep.OwnPath(os.Getenv("HOME"))
+		privsep.OwnTree(hermesHome)
+	}
+
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return nil, fmt.Errorf("start hermes gateway: %w", err)
