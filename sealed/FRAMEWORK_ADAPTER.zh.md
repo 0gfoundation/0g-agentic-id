@@ -12,8 +12,9 @@ bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
 (openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
 这份契约里很多条款的由来,见 §12 实录。第五个 `dsh`(DeepSeek Harness)
-的状态那一半已经写好、跑过 conformance,在 `internal/framework/dsh/`
-里,但**未注册**——进程那一半需要真实沙盒才能收尾,见 §14。
+已完整、已注册——一个由 Cordis 插件组合出来的 harness,由 sealed 通过自建的
+桥来驱动,已在 dev 上端到端验证(deploy → running → chat + serve-proof)。
+组合和能力档位见 `internal/framework/dsh/README.zh.md`,移植实录见 §14。
 
 权威来源是代码:接口定义在
 [`internal/framework/framework.go`](internal/framework/framework.go);
@@ -801,34 +802,24 @@ Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并
 代价是一条硬性发布约束 —— 版本白名单和镜像必须一起动 —— 为了让被认证的度量
 诚实,这个交换是值得的。
 
-## 14. 移植中:接入 DeepSeek Harness(DSH)(2026-08)——只有状态那一半
+## 14. 移植实录:接入 DeepSeek Harness(DSH)(2026-08)——第四个框架
 
-> **状态:未上线。**`internal/framework/dsh/` 能编译、conformance 套件全绿,
-> 但 `New()` 没有调用 `framework.Register`,`main.go` 也没有注册这一行,所以
-> 没有任何链上 binding 能选中它。`Start`/`Stop`/`Liveness`/`Readiness`/
-> `AuthResponse` 都是返回明确错误的桩函数。这一节记的是:哪些是真的、哪些故意
-> 延后、为什么延后 —— 这是第四次移植的记录,也是第一次没有真实沙盒可以跑通再
-> 写下来的记录。
+> **状态:已上线。**`internal/framework/dsh/` 是一个完整的 adapter——已注册、
+> 所有生命周期方法都是真的,并且在 dev 上端到端验证过(deploy → mint →
+> running → chat + 合法 serve-proof,外加一次 agent-bible 实测)。组合与能力
+> 档位见 [`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md);
+> 本节记这次移植的设计决策。
 
 DSH(`@deepseek-ai/dsh`)是一个由 Cordis 插件组合出来的 harness:模型、工具、
 skill、会话、存储、乃至系统提示本身,每一样都是独立版本化、独立可替换的插件包
 (约 50 个)。跟 openclaw、hermes、prime-agent 不同,它没有"框架自己的那个配置
-文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是这个 adapter要
-自己撰写、在 Start 时落地的平台结构,跟它已经为 prime-agent(以及已退役的
-claudecode)自建 HTTP bridge 是同一件事。
-
-**为什么状态那一半是真的,进程那一半不是。**本文档里每一次此前的移植,最终
-都靠一个真实沙盒才收尾:上面 prime-agent 那篇实录记的就是一个真 bug(装错了
-两个分发渠道里只含 TypeScript 那一半的 npm 包),只有真的建出容器才抓得到,
-外加两条明确留到"第一次真实开机再验证"的条目。这次移植还没有过这一轮。与其把
-一份从没跑过的组合 + bridge 当成能用的东西交出去,不如让 `Start` 直接报
-"未实现",adapter 也保持未注册。角色/规范化这一半不需要这一轮——它是磁盘状态
-的纯函数,§13 第 5 条已经确立过这一半可以独立完工、独立评审。这次真正上线的
-就是这些:`Roles`、`Defaults`、`Restore`/`EvolutionFor`、
-`HandleLegacy["persona"]`、`FrameworkFacts`,在 `conformance.Run` 之外还配了
-密钥剥离和 persona 注入的专项测试(照着 prime-agent 那个"推理 pin 只存内存、
-第一次漂移提交后就消失"的 bug 写的同款测试,只是这里追的是 `settings.yaml`
-而不是 `models.json`)。
+文件"这种东西——组合本身(装哪些插件、什么顺序、什么配置)就是本 adapter 写的
+平台结构:它放在 sealed 自己的桥里(`bridge/bridge.mjs`,go:embed 进二进制,
+Start 时落盘),跟本仓库为 prime-agent 自建 HTTP bridge 是同一件事。状态那一半
+——`Roles`、`Defaults`、`Restore`/`EvolutionFor`、`HandleLegacy["persona"]`、
+`FrameworkFacts`——在 `conformance.Run` 之外还配了密钥剥离和 persona 注入的
+专项测试(就是 §13 讲的 prime-agent"推理 pin 只存内存、第一次漂移提交后消失"
+那个回归测试的同款,只是这里守的是 `settings.yaml` 而不是 `models.json`)。
 
 **角色集,以及跟另外三个 adapter 不一样的地方:**
 
@@ -838,15 +829,17 @@ claudecode)自建 HTTP bridge 是同一件事。
 2. **`APPEND_SYSTEM.md`** —— owner persona,原样字节。DSH 没有 prime-agent
    `DefaultResourceLoader` 那种"从文件追加到系统提示"的原生约定;它自己的
    `persona` 概念是插件组合里的一个**配置值**,那是这个 adapter 自己撰写的
-   平台结构,不是 agent 状态。所以这个角色的字节设计上要靠 bridge 自己的代码
+   平台结构,不是 agent 状态。所以这个角色的字节靠 bridge 自己的代码
    送到模型面前——boot 稳定之后调一次 `ctx.systemPrompt.section()`——而不是
    经过 DSH 自己会读的某个文件。这也意味着跟 prime-agent 一样不需要剥
    marker:没有任何平台产出的文字会跟这个角色的字节共用一处。
-3. **`settings.yaml`** —— 推理路由 pin,用 DSH 自己热重载的 settings 文件格式
-   (`$DSH_HOME/settings.yaml`,`@deepseek-ai/dsh-settings-file` 实时重载)。
-   这又是一次 `models.json`/`config.yaml` 角色,原因相同:mint 时的 `persona`
-   种子在第一次漂移提交后就从链上消失,所以这个 pin 需要一个路径驱动的持久
-   归宿。链上编码是规范 JSON;盘上是 YAML——跟 hermes `config.yaml` 用的是
+3. **`settings.yaml`** —— 推理路由 pin,沿用 DSH settings 文件的 YAML 形状
+   (`$DSH_HOME/settings.yaml`)。注意:桥**故意不挂** `@deepseek-ai/dsh-settings-file`
+   ——它的热重载会把这个文件叠在组合之上,agent 改一下就能给自己注入任意推理
+   路由。所以这个 pin 由 adapter 自己读、用环境变量传给桥,DSH 本身根本不读
+   这个文件。这又是一次 `models.json`/`config.yaml` 角色,原因相同:mint 时的
+   `persona` 种子在第一次漂移提交后就从链上消失,所以这个 pin 需要一个路径
+   驱动的持久归宿。链上编码是规范 JSON;盘上是 YAML——跟 hermes `config.yaml` 用的是
    同一套拆分(`yamlio.go`),这里是复用不是重新发明。`apiKeyEnv` 存的是
    环境变量的名字,从来不是字面 key,`stripSecrets` 会把落进文件里的任何
    `apiKey`/`api_key` 删掉——这是防将来某个会写 settings 的工具用的纵深防御
@@ -874,7 +867,7 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 
 **对 DSH 自己 web app 的逐端点审计(§11 step 10)发现了什么。**DSH 自带一个
 完整的 dashboard(`apps/web`),带文件浏览器,还有一个能从界面上直接关掉任意
-组合插件的设置页——包括这个 adapter 将来会注册来注入 doctrine 的那一个,完全
+组合插件的设置页——包括本 adapter 注入 doctrine 用的那一个,完全
 绕开 agent。按本文档的既定规则,不为它声明 route。界面缺席时真正需要一个人类
 应答者的两样东西——`ctx.approval`(没有应答者就 fail closed)和
 `ctx.userQuestions`(工具一旦装了结构化提问、没有 provider 就直接抛
@@ -884,21 +877,20 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 因为 bridge 进程里那个 `Agent` 对象本来就长期存活,一句普通的后续消息就已经
 能接上同一个 turn 的上下文,不需要另开一条应答通道。
 
-**留给进程那一半的活**,等有真实沙盒可以对着迭代的时候(跟 prime-agent 当年
-需要的是同一种迭代):
+**进程那一半。**桥(`bridge/bridge.mjs` + 两个平台插件 `seal-tools.mjs` /
+`seal-guard.mjs`,全部 go:embed)在进程内组出整棵插件树——不走 loader、不走
+profile、不吃 `$DSH_HOME` 的任何 patch 层,所以组合跟着 sealed 镜像哈希走,
+agent 改自己家目录也改不动下次启动挂什么。桥常驻一个 `Agent` 对象、turn 串行,
+对外一个 OpenAI 形状的 `/v1/chat/completions`(靠 `session/event` 的
+`text-delta` 块做流式)。约束 agent 的是 doctrine 而不是权限弹窗:不装审批 UI,
+沙盒模式 `danger-full-access`——隔离墙是 privsep 的内核 uid 拆分,不是 DSH 自带
+的 sandbox 栈。`@deepseek-ai/dsh-*` 全家族在镜像构建期 npm 安装、按
+`whitelist.go` 逐包精确钉版本(这个家族的 `latest` dist-tag 互不一致,只能钉
+精确版本),`verifyInstalled` 把白名单和镜像不一致变成响亮的启动失败——和 §13
+讲 prime-agent 安装的度量理由相同。每个能力插件是什么、其余为什么故意不挂,
+见组合文档 [`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md)。
 
-- 撰写真正的插件组合(llm-pi-ai 指向 0G、不挂任何 session-persistence 插件——
-  一份只增不减的会话日志绝不能上链追踪,而活着的 `Agent` 对象本来就给了 turn
-  连续性、不需要它、一个全放行的批准策略、`danger-full-access` 沙盒模式),
-  并确认它能通过 `@deepseek-ai/dsh-app-boot` 的 `boot()` 启动起来。
-- 写 sealed 自己的 HTTP bridge:一个 OpenAI 形状的 `/v1/chat/completions`
-  端点,内部调 `Agent.followup()`;boot 稳定之后把平台文档注入
-  `ctx.systemPrompt`——按 §13 第 2 条学了两遍的规则,这是权威通道,并且要
-  实测模型真的认下了这个身份,不能假设注入就一定生效。
-- 确认 session/turn 完成事件(DSH 的 `agent/*` 和 `session/event` 流)的
-  真实形状,精确到能像 prime-agent 的 bridge 依赖
-  `message_update`/`text_delta` 那样去流式吐出回复增量。
-- 定下镜像方案:DSH 需要 Node ≥22.19,以及要么整个 pnpm workspace 构建,
-  要么在镜像构建期全局 `npm install @deepseek-ai/dsh`(后者更简单,也是这次
-  移植白名单假设的路径——见 `whitelist.go`);不管哪种,安装都该放在镜像里,
-  理由跟 §13 讲 prime-agent 的安装一样,而不是在 Start 时热缓存重新定版。
+这次移植给清单加了一条规则:**内嵌的桥要先对着构建好的镜像跑一遍再发**——
+`go build` 只把 JS 原样嵌进去、不校验它,所以模块形状类的错误(对只有具名导出
+的插件模块用 default import、把 `Local*` provider 和它已经注册过服务的基类
+同时挂上)只会在启动时暴露成一个永远不 listen 的容器。
