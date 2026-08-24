@@ -15,9 +15,9 @@ framework behind an HTTP bridge), was built as a seam probe and then
 this platform is for (see §12 for the full field report; the adapter code
 was removed, but the port's lessons are the reason much of this contract
 exists). A fifth, `dsh` (DeepSeek Harness), is a Cordis-plugin-composed
-harness driven through a sealed-owned bridge — complete, registered, and
-live-verified; composition and capability tiers are documented in
-`internal/framework/dsh/README.md`, the port report in §14.
+harness driven through a sealed-owned bridge; its composition and
+capability tiers are documented in `internal/framework/dsh/README.md`,
+the port report in §14.
 
 The authoritative source is the code:
 [`internal/framework/framework.go`](internal/framework/framework.go)
@@ -944,12 +944,9 @@ keeping the attested measurement honest.
 
 ## 14. Port report: DeepSeek Harness (DSH) (2026-08) — the fourth port
 
-> **Status: shipped.** `internal/framework/dsh/` is a complete adapter —
-> registered, all lifecycle methods real, verified end-to-end on dev
-> (deploy → mint → running → chat with a valid serve-proof, plus an
-> agent-bible live check). The composition and capability tiers are
-> documented in [`internal/framework/dsh/README.md`](internal/framework/dsh/README.md);
-> this section records the port's design decisions.
+This section records the port's design decisions; the composition and
+capability tiers are documented in
+[`internal/framework/dsh/README.md`](internal/framework/dsh/README.md).
 
 DSH (`@deepseek-ai/dsh`) is a Cordis-plugin-composed harness: every
 capability — model, tools, skills, sessions, storage, the system prompt

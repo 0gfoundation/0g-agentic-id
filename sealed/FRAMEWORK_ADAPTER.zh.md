@@ -12,9 +12,8 @@ bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 现拉起的 CLI 托不住这个平台真正要的"owner 委托、可对外调用的服务"
 (openclaw 的常驻 server 才行)。适配器代码已移除,但移植过程的经验正是
 这份契约里很多条款的由来,见 §12 实录。第五个 `dsh`(DeepSeek Harness)
-已完整、已注册——一个由 Cordis 插件组合出来的 harness,由 sealed 通过自建的
-桥来驱动,已在 dev 上端到端验证(deploy → running → chat + serve-proof)。
-组合和能力档位见 `internal/framework/dsh/README.zh.md`,移植实录见 §14。
+是一个由 Cordis 插件组合出来的 harness,由 sealed 自建的桥来驱动;组合和
+能力档位见 `internal/framework/dsh/README.zh.md`,移植实录见 §14。
 
 权威来源是代码:接口定义在
 [`internal/framework/framework.go`](internal/framework/framework.go);
@@ -804,11 +803,8 @@ Start 校验已安装版本与 binding 是否一致,不一致就明确失败;并
 
 ## 14. 移植实录:接入 DeepSeek Harness(DSH)(2026-08)——第四个框架
 
-> **状态:已上线。**`internal/framework/dsh/` 是一个完整的 adapter——已注册、
-> 所有生命周期方法都是真的,并且在 dev 上端到端验证过(deploy → mint →
-> running → chat + 合法 serve-proof,外加一次 agent-bible 实测)。组合与能力
-> 档位见 [`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md);
-> 本节记这次移植的设计决策。
+本节记这次移植的设计决策;组合与能力档位见
+[`internal/framework/dsh/README.zh.md`](internal/framework/dsh/README.zh.md)。
 
 DSH(`@deepseek-ai/dsh`)是一个由 Cordis 插件组合出来的 harness:模型、工具、
 skill、会话、存储、乃至系统提示本身,每一样都是独立版本化、独立可替换的插件包
