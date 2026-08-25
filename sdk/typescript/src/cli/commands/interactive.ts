@@ -172,10 +172,25 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
 }
 
+/** Resolve an agent ref to this wallet's deployment row (owner listing —
+ *  lifecycle verbs need sandboxId, which the public listing withholds). */
+async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string }> {
+  const ref = parseAgentRef(refInput);
+  const rows = await ag.agent.listMyDeployments();
+  const row = rows.find((r) =>
+    ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+  if (!row) {
+    throw new CliError('AGENT_NOT_FOUND', `no deployment of yours matches ${refInput}`, {
+      remedy: 'check `list` (* marks your agents)',
+    });
+  }
+  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined };
+}
+
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <agentId|sealId> · deploy · balance · deposit · login · whoami · help · quit';
+  'commands: list · use <id> · deploy · start <id> · stop <id> · reset <id> · balance · deposit · login · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
@@ -272,6 +287,38 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${r.name ?? ''}\n`);
         }
         if (mySeals) out('(* = owned by your wallet)\n');
+        continue;
+      }
+
+      if (cmd === 'stop' || cmd === 'start' || cmd === 'reset') {
+        // Manager-level lifecycle: act and stay at L1 (enter with `use` to chat).
+        if (!args[0]) { out(`usage: ${cmd} <agentId|sealId>\n`); continue; }
+        const ag = await withWallet(ctx);
+        const attestorUrl = requireAttestorUrl(ctx.env);
+        const row = await myRow(ag, args[0]);
+        if (cmd === 'stop') {
+          if (row.phase !== 'running' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — nothing to stop\n`); continue; }
+          await ag.agent.stop(row.sealId, row.sandboxId);
+          out(`agent ${row.agentId} stopped\n`);
+          continue;
+        }
+        if (cmd === 'start') {
+          if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
+          if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
+          out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          await ag.agent.start(row.sealId, row.sandboxId);
+          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+          if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+          continue;
+        }
+        // reset
+        const framework = await pickFramework(attestorUrl, ask);
+        const apiKey = await inferenceKey(ctx, ask);
+        if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        await ag.agent.reset(row.sealId, { framework, apiKey });
+        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+        if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
         continue;
       }
 

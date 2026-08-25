@@ -43,6 +43,9 @@ INTERACTIVE (default — no command)
                             use <agentId|seal>   enter that agent's session, in
                                                  ANY phase (lifecycle is inside)
                             deploy               new-agent wizard, then chat
+                            start/stop/reset <id> lifecycle without entering
+                                                 the session (reset asks the
+                                                 framework + key)
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
                             login                guided setup: attestor URL,
