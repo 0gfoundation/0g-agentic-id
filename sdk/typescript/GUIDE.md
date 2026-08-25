@@ -615,14 +615,26 @@ const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
 
 The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
 
-## CLI: `0g-agenticid` (diagnostics)
+## CLI: `0g-agenticid`
 
-The package ships a read-only diagnostics CLI — no separate install, zero extra dependencies (arg parsing is `node:util`'s):
+The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agenticid` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list` remain scriptable diagnostics subcommands.
 
 ```bash
 npm install @0gfoundation/0g-agenticid-sdk
+npx 0g-agenticid          # interactive shell
+npx 0g-agenticid 286      # jump straight into agent 286's session
 npx 0g-agenticid --help
 ```
+
+### Interactive shell
+
+Two levels. The **manager** (`0g-agenticid>`): `list` (public listing, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `deploy` (framework + model wizard), `balance` / `deposit [og]` (prepaid sandbox account), `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami`, `quit`.
+
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
+
+Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL) and `credentials` (owner key + inference key, JSON, chmod 600). The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+
+### Diagnostics subcommands
 
 | Command | What |
 |---|---|
@@ -630,7 +642,7 @@ npx 0g-agenticid --help
 | `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
 
-Configuration is env-only:
+Environment variables (override the config files):
 
 ```bash
 export AGENTIC_ATTESTOR_URL=https://agenticid.0g.ai   # required — one URL selects the environment

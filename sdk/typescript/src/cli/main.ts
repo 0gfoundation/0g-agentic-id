@@ -40,24 +40,27 @@ USAGE
 INTERACTIVE (default — no command)
   0g-agenticid            Open the manager REPL. Its commands:
                             list                 agents on this attestor (* = yours)
-                            use <agentId|seal>   enter that agent's session (any
-                                                 phase; /start /reset inside)
+                            use <agentId|seal>   enter that agent's session, in
+                                                 ANY phase (lifecycle is inside)
                             deploy               new-agent wizard, then chat
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
-                            env [url]            show/set the attestor (saved)
-                            login                store the owner key (chmod 600)
-                            apikey               store the inference key (chmod 600)
+                            login                guided setup: attestor URL,
+                                                 owner key, inference key (Enter
+                                                 keeps current; keys echo *)
                             whoami · help · quit
-  0g-agenticid <agent>    Shortcut: link straight into that agent's chat,
-                          then drop to the manager REPL on /back.
+  0g-agenticid <agent>    Shortcut: use that agent directly, then drop to
+                          the manager REPL on /back.
 
-                          In a chat: type to talk; Esc / Ctrl-C interrupts the
-                          turn in flight; /back returns to the manager, /quit
-                          exits. Slash: /hello /balance /stop /start /reset
-                          /agentlog /startuplog. Config persists to
-                          ~/.config/0g-agenticid (env vars still override);
-                          the inference key comes from AGENTIC_API_KEY.
+                          In a session: type to talk; Esc / Ctrl-C interrupts
+                          the turn in flight (and cancels a /start or /reset
+                          wait). Slash: /hello /balance /topup [og] /stop
+                          /start /reset /agentlog [n] /startuplog [n]
+                          /back (or /unuse) /quit. The framework (for /reset
+                          and the chat model selector) is picked by you, never
+                          guessed. Config persists to ~/.config/0g-agenticid
+                          (config.json + credentials at 0600); AGENTIC_* env
+                          vars always override the files.
 
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
@@ -91,6 +94,8 @@ ENVIRONMENT
   AGENTIC_PRIVATE_KEY    optional. Owner key (0x… hex). Env only — there is
                          deliberately no flag for it.
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
+  AGENTIC_API_KEY        optional. Inference key for deploy/reset; overrides
+                         the one stored by login.
 
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
