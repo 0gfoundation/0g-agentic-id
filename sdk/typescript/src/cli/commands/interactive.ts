@@ -115,6 +115,10 @@ export async function run(ctx: CommandContext): Promise<void> {
       await sessionRepl(s, ask, irq, ctx);
     }
     await managerRepl(ctx, ask, irq);
+  } catch (e) {
+    // stdin EOF (piped input, Ctrl-D) closes readline while a question is
+    // pending — that's a normal way to leave, not an error.
+    if ((e as { code?: string }).code !== 'ERR_USE_AFTER_CLOSE') throw e;
   } finally {
     rl.close();
   }
@@ -199,18 +203,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'list') {
-        // Public listing — no wallet needed. If a key is configured, mark the
-        // rows this wallet owns with `*`.
+        // Public listing — no wallet needed. The public rows carry no owner
+        // field (owner-only since #64), so "mine" cannot be derived from
+        // them: with a key configured, ALSO fetch the owner-signed listing
+        // and mark rows by sealId membership.
         const ag = await buildClient(ctx.env);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        const mine = key ? (await addressOf(key)).toLowerCase() : null;
+        let mySeals: Set<string> | null = null;
+        if (key) {
+          try { mySeals = new Set((await ag.agent.listMyDeployments()).map((r) => r.sealId)); }
+          catch { mySeals = null; /* public view still works */ }
+        }
         const rows = await ag.agent.listDeployments();
         if (!rows.length) { out('no agents on this attestor\n'); continue; }
         for (const r of rows) {
-          const owned = mine && r.owner?.toLowerCase() === mine ? '*' : ' ';
+          const owned = mySeals?.has(r.sealId) ? '*' : ' ';
           out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${r.name ?? ''}\n`);
         }
-        if (mine) out('(* = owned by your wallet)\n');
+        if (mySeals) out('(* = owned by your wallet)\n');
         continue;
       }
 
