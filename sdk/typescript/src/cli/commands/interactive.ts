@@ -190,17 +190,38 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · deploy · start <id> · stop <id> · reset <id> · balance · deposit · login · whoami · help · quit';
+  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · login · whoami · help · quit';
+
+const L1_HELP_FULL = `manager commands
+  list                    agents on this attestor (* = owned by your wallet)
+  use <agentId|sealId>    enter an agent's session — works in ANY phase
+  deploy                  new-agent wizard (framework + model), then chat
+  start <id>              start a stopped agent
+  stop <id>               stop a running agent
+  reset <id>              recreate an agent's container (asks framework + key)
+  balance                 prepaid sandbox balance, burn rate, runway
+  deposit [og]            fund the prepaid balance (default 0.2 OG)
+  login                   guided setup: attestor URL, owner key, inference key
+                          (Enter keeps the current value; secrets echo *)
+  whoami                  show attestor / wallet / api-key status
+  help                    this text
+  quit                    exit (Ctrl-C twice also works)`;
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
-  out('\n0G AgenticID — interactive shell\n');
-  out(`  attestor : ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet   : ${key ? await addressOf(key) : '(none)'}\n`);
-  out(`  api key  : ${hasApiKey ? 'set' : '(none)'}\n`);
-  if (!ctx.env.attestorUrl || !key || !hasApiKey) out('  → run `login` to set the attestor + keys\n');
-  out(`\n${L1_HELP}\n`);
+  const wallet = key ? await addressOf(key) : null;
+  const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+  out('\n╭──────────────────────────────────────────────╮\n');
+  out('│  0G AgenticID — interactive shell            │\n');
+  out('╰──────────────────────────────────────────────╯\n');
+  out(`  attestor  ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  out(`  wallet    ${wallet ? short(wallet) : '(none)'}      api key  ${hasApiKey ? 'set' : '(none)'}\n\n`);
+  if (!ctx.env.attestorUrl || !key || !hasApiKey) {
+    out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
+  } else {
+    out('  `list` to see your agents · `use <id>` to chat (Esc interrupts a turn) · `help` for everything\n\n');
+  }
   for (;;) {
     const line = (await ask('\n0g-agenticid> ')).trim();
     if (!line) continue;
@@ -208,7 +229,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
-      if (cmd === 'help') { out(`${L1_HELP}\n`); continue; }
+      if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
         // One guided setup — attestor URL, owner key, inference key. Enter
@@ -541,7 +562,22 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup [og] /stop /start /reset /agentlog /startuplog /back /quit — Esc or Ctrl-C interrupts a turn';
+  'chat, or: /hello /balance /topup /stop /start /reset /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+
+const L2_HELP_FULL = `session commands
+  <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
+                          turn in flight (the runtime cancels server-side)
+  /hello                  identity, routes/services, serve-proof verification
+  /balance                this agent's agentSeal gas + the account prepaid
+  /topup [og]             fund this agent's agentSeal gas (default 0.02 OG)
+  /start                  start (only from stopped)
+  /stop                   stop the running container
+  /reset                  recreate the container (asks framework + key; also
+                          clears the local chat history)
+  /agentlog [n]           agent process log, last n lines (owner-only)
+  /startuplog [n]         sealed runtime startup log, last n lines
+  /back  (or /unuse)      return to the manager
+  /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
   out(`\nagent ${s.agentId} session (${s.phase}). ${L2_HELP}\n`);
@@ -558,7 +594,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!line) continue;
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
-    if (line === '/help') { out(`${L2_HELP}\n`); continue; }
+    if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
 
     try {
       if (line === '/hello') {
