@@ -30,6 +30,7 @@ const out = (s: string): void => void process.stdout.write(s);
 
 interface Session {
   ag: AgenticID;
+  attestorUrl: string;
   sealId: `0x${string}`;
   agentId: string;
   agentSeal?: `0x${string}`; // for /topup; resolved from /hello
@@ -37,6 +38,43 @@ interface Session {
   url: string;
   sandboxId?: string;
   client: AgentClient;
+}
+
+/**
+ * Wait for a deployment to reach `running` by polling the attestor's public
+ * /deployment/:sealId — and FAIL LOUD instead of hanging: a `failed`/`offline`
+ * phase (or a failed container_stage) surfaces its recorded reason
+ * immediately, and the timeout produces an error naming the last phase seen.
+ */
+async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000): Promise<{ url: string }> {
+  const deadline = Date.now() + timeoutMs;
+  let lastPhase = 'unknown';
+  for (;;) {
+    try {
+      const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
+        phase?: string; url?: string;
+        container_stage?: { state?: string; reason?: string };
+      };
+      lastPhase = d.phase ?? lastPhase;
+      const url = d.url ?? undefined;
+      if (d.phase === 'running' && url) return { url };
+      const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
+      if (d.phase === 'failed' || reason) {
+        throw new CliError('UNKNOWN', `agent ${agentId} did not start: ${reason ?? `phase=${d.phase}`}`, {
+          remedy: 'inspect with `status`, then /reset (or retry) once the cause is fixed',
+        });
+      }
+    } catch (e) {
+      if (e instanceof CliError) throw e;
+      // transient fetch error — keep polling until the deadline
+    }
+    if (Date.now() > deadline) {
+      throw new CliError('UNKNOWN', `timed out after ${Math.round(timeoutMs / 1000)}s waiting for agent ${agentId} (last phase: ${lastPhase})`, {
+        remedy: 'check `status` — provisioning can lag; retry the command when the phase moves',
+      });
+    }
+    await new Promise((r) => setTimeout(r, 4000));
+  }
 }
 
 /** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it. */
@@ -85,10 +123,15 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · balance · deposit · env [url] · login · apikey · whoami · help · quit';
+  'commands: list · link <agentId|sealId> · deploy · balance · deposit · login · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
-  out(`\n0G AgenticID — interactive. ${L1_HELP}\n`);
+  const key = ctx.env.privateKey ?? loadKey() ?? undefined;
+  out('\n0G AgenticID — interactive shell\n');
+  out(`  attestor : ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  out(`  wallet   : ${key ? await addressOf(key) : '(none)'}\n`);
+  if (!ctx.env.attestorUrl || !key) out('  → run `login` to set the attestor + keys\n');
+  out(`\n${L1_HELP}\n`);
   for (;;) {
     const line = (await ask('\n0g-agenticid> ')).trim();
     if (!line) continue;
@@ -98,26 +141,26 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { out(`${L1_HELP}\n`); continue; }
 
-      if (cmd === 'env') {
-        if (args[0]) {
-          saveConfig({ attestorUrl: args[0].replace(/\/$/, '') });
-          ctx.env.attestorUrl = args[0].replace(/\/$/, '');
-          out(`attestor set to ${ctx.env.attestorUrl} (saved to ${configPaths().config})\n`);
-        } else {
-          out(`attestor: ${ctx.env.attestorUrl ?? '(unset — `env <url>` to set)'}\n`);
-        }
-        continue;
-      }
+      if (cmd === 'login' || cmd === 'config') {
+        // One guided setup — attestor URL, owner key, inference key. Enter
+        // keeps the current value; a typed value replaces it. Secrets masked.
+        const url = (await ask(`attestor URL [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
+        if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); }
 
-      if (cmd === 'login') {
-        const key = (await askSecret(ask, 'owner private key (0x…, hidden): ')).trim();
-        try {
-          saveKey(key);
-          ctx.env.privateKey = key as `0x${string}`;
-          out(`saved to ${configPaths().credentials} (chmod 600)\n`);
-        } catch (e) {
-          out(`not saved: ${(e as Error).message}\n`);
+        const hasKey = !!(ctx.env.privateKey ?? loadKey());
+        const key = (await askSecret(ask, `owner private key [${hasKey ? 'set — Enter to keep' : 'unset'}]: `)).trim();
+        if (key) {
+          try { saveKey(key); ctx.env.privateKey = key as `0x${string}`; }
+          catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
         }
+
+        const hasApi = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
+        const api = (await askSecret(ask, `inference API key [${hasApi ? 'set — Enter to keep' : 'unset'}]: `)).trim();
+        if (api) {
+          try { saveApiKey(api); }
+          catch (e) { out(`api key not saved: ${(e as Error).message}\n`); }
+        }
+        out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
         continue;
       }
 
@@ -146,12 +189,6 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
-      if (cmd === 'apikey') {
-        const k = (await askSecret(ask, 'inference API key (hidden): ')).trim();
-        try { saveApiKey(k); out(`saved to ${configPaths().credentials} (chmod 600)\n`); }
-        catch (e) { out(`not saved: ${(e as Error).message}\n`); }
-        continue;
-      }
 
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
@@ -221,7 +258,13 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
   return new Promise((res) => {
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
     const orig = stdout.write.bind(stdout);
-    stdout.write = (s: string): boolean => (s && !s.includes(prompt) ? true : orig(s)); // swallow echoed keys
+    // Echo the typed/pasted characters as `*` so there IS visible feedback
+    // (an all-silent prompt reads as a hang). The prompt line and control
+    // sequences pass through unchanged.
+    stdout.write = (s: string): boolean => {
+      if (!s || s.includes(prompt) || s.startsWith('\x1b') || s === '\r\n' || s === '\n') return orig(s);
+      return orig('*'.repeat(s.length));
+    };
     void ask(prompt).then((ans) => {
       stdout.write = orig;
       process.stdout.write('\n');
@@ -248,14 +291,22 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
   return 'sk-smoke-dummy';
 }
 
-async function ensureOwnerReady(ag: AgenticID): Promise<void> {
+/** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
+ *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
+ *  Returns false when the user declines (caller should abort link/deploy). */
+async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
-  if ((await ag.getBalance()) < parseEther('0.1')) {
-    out('prepaid balance < 0.1 OG — depositing 0.2 OG…\n');
-    const tx = await ag.deposit({ amountWei: parseEther('0.2') });
+  const bal = await ag.getBalance();
+  if (bal < parseEther('0.1')) {
+    out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
+    const amt = (await ask('deposit how much OG now? [0.2, empty to cancel]: ')).trim();
+    if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
+    const tx = await ag.deposit({ amountWei: parseEther(amt || '0.2') });
+    out(`deposit ${amt} OG → ${tx} (waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
+  return true;
 }
 
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext): Promise<Session> {
@@ -278,7 +329,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
 
   const apiKey = await inferenceKey(ctx, ask);
-  await ensureOwnerReady(ag);
+  if (!(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
   out(`\ndeploying ${framework} (${model})…\n`);
   const dep = await ag.agent.deploy({
     name: `chat-${framework}`,
@@ -290,9 +341,9 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const mint = await ag.agent.waitForMint(dep.sealId, { timeoutMs: 180000 });
   const agentId = String((mint as { agentId?: unknown }).agentId ?? mint);
   out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
-  const r = await ag.agent.waitForRunning(dep.sealId, { timeoutMs: 360000 });
+  const r = await pollRunning(attestorUrl, dep.sealId, agentId);
   out(`running at ${r.url}\n`);
-  return { ag, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, url: r.url, sandboxId: sbid(r.url), client: await ag.agent.client(r.url) };
+  return { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, url: r.url, sandboxId: sbid(r.url), client: await ag.agent.client(r.url) };
 }
 
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Promise<Session> {
@@ -312,7 +363,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Pro
   if (row.phase !== 'running' || !url) {
     out(`agent ${agentId} is ${row.phase ?? 'unknown'} — starting…\n`);
     if (row.phase === 'stopped' && url && sbid(url)) await ag.agent.start(row.sealId, sbid(url)!);
-    url = (await ag.agent.waitForRunning(row.sealId, { timeoutMs: 360000 })).url;
+    url = (await pollRunning(attestorUrl, row.sealId, agentId)).url;
   }
   out(`linked agent ${agentId} (${framework}) at ${url}\n`);
   // agentSeal (for /topup) is the `agent` field /hello reports.
@@ -321,7 +372,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Pro
     const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
     if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) agentSeal = hello.agent as `0x${string}`;
   } catch { /* topup will report it's unavailable */ }
-  return { ag, sealId: row.sealId, agentId, agentSeal, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
+  return { ag, attestorUrl, sealId: row.sealId, agentId, agentSeal, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
 }
 
 async function frameworkOf(attestorUrl: string, sealId: `0x${string}`): Promise<string> {
@@ -342,6 +393,14 @@ const L2_HELP =
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
   out(`\nnow chatting with agent ${s.agentId}. ${L2_HELP}\n`);
+  // Low-gas heads-up on entry: an agent with an empty agentSeal can serve
+  // chat but cannot commit its evolution on chain.
+  try {
+    const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
+    if (rc.sealGasWei < parseEther('0.005')) {
+      out(`⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
+    }
+  } catch { /* advisory only */ }
   const messages: ChatMessage[] = [];
   for (;;) {
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
@@ -383,16 +442,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/start') {
         if (!s.sandboxId) { out('no sandboxId to start from\n'); continue; }
         out('starting…\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
-        const r = await s.ag.agent.waitForRunning(s.sealId, { timeoutMs: 360000 });
+        const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
         s.url = r.url; s.sandboxId = sbid(r.url); s.client = await s.ag.agent.client(r.url);
         out(`running again at ${s.url}\n`); continue;
       }
       if (line === '/reset') {
         const apiKey = await inferenceKey(ctx, ask);
-        await ensureOwnerReady(s.ag);
+        if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting ${s.framework}…\n`);
         await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
-        const r = await s.ag.agent.waitForRunning(s.sealId, { timeoutMs: 360000 });
+        const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
         s.url = r.url; s.sandboxId = sbid(r.url); s.client = await s.ag.agent.client(r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
