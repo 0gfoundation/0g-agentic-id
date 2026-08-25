@@ -183,6 +183,13 @@ async function boot() {
     log('WARN platform doc ABSENT — agent will not know its identity or doctrine')
   }
 
+  // Observability: a turn that dies inside the agent loop is otherwise
+  // invisible (it just ends in 0s with no text). Log the error events and
+  // each turn's end reason.
+  ctx.on('agent/error', (...args) => {
+    try { log(`agent/error: ${JSON.stringify(args).slice(0, 500)}`) } catch { log('agent/error (unserializable)') }
+  })
+
   const handle = await ctx.agents.create({
     sessionId: SessionId('owner-chat'),
     meta: { cwd: DSH_HOME },
@@ -235,6 +242,9 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
       return
     }
     // Progress lines for the log: tool calls, turn boundaries.
+    if (event.type === 'turn/end') {
+      try { log(`turn/end reason: ${JSON.stringify(event.data?.reason ?? event.reason)}`) } catch { /* log only */ }
+    }
     if (onActivity && (event.type === 'tool/call' || event.type === 'tool/result' || event.type === 'turn/end')) {
       onActivity(event.type)
     }
