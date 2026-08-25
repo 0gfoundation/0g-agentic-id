@@ -131,10 +131,12 @@ const L1_HELP =
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
+  const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   out('\n0G AgenticID — interactive shell\n');
   out(`  attestor : ${ctx.env.attestorUrl ?? '(unset)'}\n`);
   out(`  wallet   : ${key ? await addressOf(key) : '(none)'}\n`);
-  if (!ctx.env.attestorUrl || !key) out('  → run `login` to set the attestor + keys\n');
+  out(`  api key  : ${hasApiKey ? 'set' : '(none)'}\n`);
+  if (!ctx.env.attestorUrl || !key || !hasApiKey) out('  → run `login` to set the attestor + keys\n');
   out(`\n${L1_HELP}\n`);
   for (;;) {
     const line = (await ask('\n0g-agenticid> ')).trim();
@@ -198,7 +200,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
-        out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `apikey`)'}\n`);
+        out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
         continue;
       }
 
