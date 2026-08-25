@@ -66,7 +66,9 @@ async function connectSession(s: Session, url: string): Promise<void> {
  * phase (or a failed container_stage) surfaces its recorded reason
  * immediately, and the timeout produces an error naming the last phase seen.
  */
-async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000): Promise<{ url: string }> {
+class WaitCancelled extends Error { constructor() { super('wait cancelled'); } }
+
+async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000, signal?: AbortSignal): Promise<{ url: string }> {
   const deadline = Date.now() + timeoutMs;
   let lastPhase = 'unknown';
   let lastShown = '';
@@ -99,7 +101,27 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
         remedy: 'check `status` — provisioning can lag; retry the command when the phase moves',
       });
     }
+    if (signal?.aborted) throw new WaitCancelled();
     await new Promise((r) => setTimeout(r, 4000));
+    if (signal?.aborted) throw new WaitCancelled();
+  }
+}
+
+/** pollRunning wired to the Esc/Ctrl-C interrupt: cancelling abandons the
+ *  WAIT only — the lifecycle operation keeps going server-side. */
+async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string): Promise<{ url: string } | null> {
+  const ac = new AbortController();
+  irq.streaming = ac;
+  try {
+    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal);
+  } catch (e) {
+    if (e instanceof WaitCancelled || ac.signal.aborted) {
+      out('\n(wait cancelled — the operation continues server-side; check with `list` or re-enter with `use`)\n');
+      return null;
+    }
+    throw e;
+  } finally {
+    irq.streaming = null;
   }
 }
 
@@ -502,8 +524,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/start') {
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
-        out('starting…\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
-        const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
+        out('starting… (Esc cancels the wait)\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        if (!r) continue;
         await connectSession(s, r.url);
         out(`running at ${s.url}\n`); continue;
       }
@@ -511,9 +534,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
-        out(`resetting as ${s.framework}…\n`);
+        out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
         await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
-        const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        if (!r) continue;
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
