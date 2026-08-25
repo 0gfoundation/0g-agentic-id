@@ -58,26 +58,61 @@ export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.e
   writeFileSync(config, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o644 });
 }
 
-/** Read the owner key from the credentials file. null when absent. */
-export function loadKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` | null {
+/** Both secrets live in the one 0600 credentials file, as JSON. */
+export interface Credentials {
+  privateKey?: `0x${string}`;
+  apiKey?: string;
+}
+
+/** Read the credentials file. Missing/corrupt → {}. Tolerates a legacy
+ *  plain-`0x…`-key file (the earlier format) by reading it as privateKey. */
+export function loadCredentials(env: NodeJS.ProcessEnv = process.env): Credentials {
   const { credentials } = configPaths(env);
-  if (!existsSync(credentials)) return null;
+  if (!existsSync(credentials)) return {};
   try {
-    const k = readFileSync(credentials, 'utf8').trim();
-    return /^0x[0-9a-fA-F]{64}$/.test(k) ? (k as `0x${string}`) : null;
+    const t = readFileSync(credentials, 'utf8').trim();
+    if (!t) return {};
+    if (t.startsWith('{')) {
+      const c = JSON.parse(t) as Credentials;
+      const pk = c.privateKey && /^0x[0-9a-fA-F]{64}$/.test(c.privateKey) ? c.privateKey : undefined;
+      return { ...(pk ? { privateKey: pk } : {}), ...(c.apiKey ? { apiKey: c.apiKey } : {}) };
+    }
+    return /^0x[0-9a-fA-F]{64}$/.test(t) ? { privateKey: t as `0x${string}` } : {};
   } catch {
-    return null;
+    return {};
   }
 }
 
-/** Write the owner key to the credentials file at 0600. Validates format. */
+/** Merge a patch into the credentials file, writing JSON at 0600. */
+export function saveCredentials(patch: Credentials, env: NodeJS.ProcessEnv = process.env): void {
+  const { dir, credentials } = configPaths(env);
+  const next = { ...loadCredentials(env), ...patch };
+  for (const k of Object.keys(next) as (keyof Credentials)[]) if (!next[k]) delete next[k];
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(credentials, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(credentials, 0o600); // enforce even if the file pre-existed with looser bits
+}
+
+/** The owner key, or null. */
+export function loadKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` | null {
+  return loadCredentials(env).privateKey ?? null;
+}
+
+/** Persist the owner key (validates 0x + 64 hex). */
 export function saveKey(key: string, env: NodeJS.ProcessEnv = process.env): void {
   const k = key.trim();
-  if (!/^0x[0-9a-fA-F]{64}$/.test(k)) {
-    throw new Error('private key must be 0x followed by 64 hex chars');
-  }
-  const { dir, credentials } = configPaths(env);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(credentials, `${k}\n`, { mode: 0o600 });
-  chmodSync(credentials, 0o600); // enforce even if the file pre-existed with looser bits
+  if (!/^0x[0-9a-fA-F]{64}$/.test(k)) throw new Error('private key must be 0x followed by 64 hex chars');
+  saveCredentials({ privateKey: k as `0x${string}` }, env);
+}
+
+/** The inference API key, or null. */
+export function loadApiKey(env: NodeJS.ProcessEnv = process.env): string | null {
+  return loadCredentials(env).apiKey ?? null;
+}
+
+/** Persist the inference API key. */
+export function saveApiKey(apiKey: string, env: NodeJS.ProcessEnv = process.env): void {
+  const k = apiKey.trim();
+  if (!k) throw new Error('api key is empty');
+  saveCredentials({ apiKey: k }, env);
 }

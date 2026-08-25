@@ -44,6 +44,7 @@ INTERACTIVE (default — no command)
                             deploy               new-agent wizard, then chat
                             env [url]            show/set the attestor (saved)
                             login                store the owner key (chmod 600)
+                            apikey               store the inference key (chmod 600)
                             whoami · help · quit
   0g-agenticid <agent>    Shortcut: link straight into that agent's chat,
                           then drop to the manager REPL on /back.

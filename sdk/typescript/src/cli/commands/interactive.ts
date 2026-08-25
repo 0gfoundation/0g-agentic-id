@@ -20,7 +20,7 @@ import type { AgentClient, ChatMessage } from '../../AgentClient';
 import { buildClient } from '../sdk';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
-import { loadKey, saveKey, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
 import type { CommandContext } from '../types';
 
@@ -84,7 +84,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · env [url] · login · whoami · help · quit';
+  'commands: list · link <agentId|sealId> · deploy · env [url] · login · apikey · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   out(`\n0G AgenticID — interactive. ${L1_HELP}\n`);
@@ -120,10 +120,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'apikey') {
+        const k = (await askSecret(ask, 'inference API key (hidden): ')).trim();
+        try { saveApiKey(k); out(`saved to ${configPaths().credentials} (chmod 600)\n`); }
+        catch (e) { out(`not saved: ${(e as Error).message}\n`); }
+        continue;
+      }
+
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
+        out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `apikey`)'}\n`);
         continue;
       }
 
@@ -198,9 +206,14 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
 async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<string>): Promise<string> {
+  // env wins, then the persisted credentials file, then a one-off prompt.
   const fromEnv = process.env.AGENTIC_API_KEY?.trim() || process.env.API_KEY?.trim();
   if (fromEnv) return fromEnv;
-  return (await askSecret(ask, 'inference API key (or set AGENTIC_API_KEY): ')).trim() || 'sk-smoke-dummy';
+  const stored = loadApiKey();
+  if (stored) return stored;
+  const typed = (await askSecret(ask, 'inference API key (saved to credentials): ')).trim();
+  if (typed) { try { saveApiKey(typed); } catch { /* keep going with the typed value */ } return typed; }
+  return 'sk-smoke-dummy';
 }
 
 async function ensureOwnerReady(ag: AgenticID): Promise<void> {
