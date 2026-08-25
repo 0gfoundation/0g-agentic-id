@@ -15,7 +15,7 @@ package dsh
 // LAST entry is whitelistMax, the version a `framework` role drift
 // reconciles against.
 var supportedDSHVersions = []string{
-	"0.1.1-rc.1", // pre-1.0: expect this list to move often (see package doc)
+	"0.1.1-rc.2", // pre-1.0: expect this list to move often (see package doc)
 }
 
 // whitelistMax returns the version sealed targets: always the last element.

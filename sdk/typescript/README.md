@@ -240,7 +240,7 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
 - **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec.
-- **[CLI](./GUIDE.md#cli-0g-agenticid-diagnostics)** `npx 0g-agenticid` — `doctor` / `status <agent>` / `list [--mine]`; `--json` for scripts.
+- **[CLI](./GUIDE.md#cli-0g-agenticid)** `npx 0g-agenticid` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
 

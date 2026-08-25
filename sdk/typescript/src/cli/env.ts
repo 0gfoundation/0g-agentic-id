@@ -7,6 +7,7 @@
  */
 
 import { CliError } from './errors';
+import { loadConfig, loadKey } from './config';
 
 /** Resolved CLI environment. All values come from `process.env`. */
 export interface CliEnv {
@@ -21,16 +22,23 @@ export interface CliEnv {
   rpcUrl?: string;
 }
 
-/** Read the three stage-0 env vars. Empty strings count as unset. */
+/**
+ * Resolve the CLI environment. Environment variables WIN; the persisted
+ * config files (config.ts) are the fallback layer, so `0g-agenticid` works
+ * across sessions without re-exporting, while a one-off `AGENTIC_*=… ` or CI
+ * still overrides without touching disk.
+ */
 export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
   const pick = (name: string): string | undefined => {
     const v = env[name]?.trim();
     return v ? v : undefined;
   };
+  const file = loadConfig(env);
+  const fileKey = loadKey(env);
   return {
-    attestorUrl: pick('AGENTIC_ATTESTOR_URL')?.replace(/\/$/, ''),
-    privateKey: pick('AGENTIC_PRIVATE_KEY') as `0x${string}` | undefined,
-    rpcUrl: pick('AGENTIC_RPC_URL'),
+    attestorUrl: (pick('AGENTIC_ATTESTOR_URL') ?? file.attestorUrl)?.replace(/\/$/, ''),
+    privateKey: (pick('AGENTIC_PRIVATE_KEY') ?? fileKey ?? undefined) as `0x${string}` | undefined,
+    rpcUrl: pick('AGENTIC_RPC_URL') ?? file.rpcUrl,
   };
 }
 

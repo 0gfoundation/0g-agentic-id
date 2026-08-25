@@ -97,14 +97,19 @@ export interface AgentClient {
    * the agent; the completion is reassembled before returning, so the shape is
    * a plain {@link ChatCompletion}.
    */
-  chat?(messages: ChatMessage[], opts?: { model?: string }): Promise<ChatCompletion>;
+  chat?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): Promise<ChatCompletion>;
   /**
    * Like {@link chat}, but yields each content delta as it is generated — for
    * a live-typing UI. Present under the same conditions as `chat`.
    *
    *   for await (const delta of client.chatStream(msgs)) process.stdout.write(delta);
+   *
+   * Pass `signal` to interrupt a turn in flight: aborting tears down the HTTP
+   * connection, which is the OpenAI-conventional cancel signal — the runtime
+   * side stops the turn where the framework supports cancellation (dsh does).
+   * The generator then throws the abort error (`err.name === "AbortError"`).
    */
-  chatStream?(messages: ChatMessage[], opts?: { model?: string }): AsyncGenerator<string>;
+  chatStream?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): AsyncGenerator<string>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -282,7 +287,7 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
+  const chatBody = (messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }) =>
     JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
 
   const chat = routes.find((r) => r.kind === 'chat');
@@ -295,6 +300,7 @@ export function makeAgentClient(params: {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: chatBody(messages, opts),
+        signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
@@ -309,6 +315,7 @@ export function makeAgentClient(params: {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: chatBody(messages, opts),
+        signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
