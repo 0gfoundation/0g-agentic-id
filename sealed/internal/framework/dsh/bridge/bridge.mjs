@@ -333,32 +333,67 @@ async function handleChat(req, res) {
   const id = `chatcmpl-${created()}`
   const model = body.model || `${PROVIDER}/${MODEL_ID}`
 
+  // Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
+  // signal (chat/completions has no cancel endpoint). When the client goes
+  // away mid-turn, stop the turn via DSH's native agent.cancel() — the abort
+  // propagates into every running tool and the in-flight LLM request, and the
+  // turn settles cleanly in the session. Two details matter:
+  //   - Guard on "MY turn is the active one": turns are serialized, so a
+  //     queued request's disconnect must not cancel someone else's turn.
+  //   - This also un-blocks the queue: without it, an abandoned long turn
+  //     stalls every request behind it.
+  let myTurnActive = false
+  let disconnected = false
+  const onGone = () => {
+    if (disconnected) return
+    disconnected = true
+    if (myTurnActive) {
+      log('client disconnected mid-turn — cancelling')
+      try { agent.cancel('client disconnected') } catch (err) {
+        log(`WARN agent.cancel: ${(err && err.message) || err}`)
+      }
+    }
+  }
+  res.on('close', () => { if (!res.writableEnded) onGone() })
+
+  // Writes after a disconnect throw / emit errors (incl. from the keepalive
+  // interval, where an exception would take the whole bridge down): route
+  // every write through this guard.
+  const safeWrite = (s) => {
+    if (disconnected || res.writableEnded || res.destroyed) return
+    try { res.write(s) } catch { /* client raced us to the close */ }
+  }
+
+  const runMine = (onDelta, onActivity) =>
+    serialize(() => {
+      if (disconnected) return '' // client left while queued — skip, don't run
+      myTurnActive = true
+      return runTurn(ctx, agent, text, onDelta, onActivity).finally(() => {
+        myTurnActive = false
+      })
+    })
+
   if (body.stream) {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     })
-    res.write(chunkFrame(id, model, { role: 'assistant' }))
+    safeWrite(chunkFrame(id, model, { role: 'assistant' }))
     if (typeof res.flushHeaders === 'function') res.flushHeaders()
 
     // SSE keepalive COMMENTS: an agent turn spends most of its time running
     // tools, not producing text; a silent stream gets dropped by idle-timeout
     // hops. Comments are skipped by every SSE parser, so the payload stays a
     // standard OpenAI stream. (Lesson inherited from the prime bridge.)
-    const beat = setInterval(() => res.write(': keepalive\n\n'), 10_000)
+    const beat = setInterval(() => safeWrite(': keepalive\n\n'), 10_000)
 
     const started = Date.now()
     let failure = null
     try {
-      await serialize(() =>
-        runTurn(
-          ctx,
-          agent,
-          text,
-          (delta) => res.write(chunkFrame(id, model, { content: delta })),
-          (kind) => log(`  ${kind}`),
-        ),
+      await runMine(
+        (delta) => safeWrite(chunkFrame(id, model, { content: delta })),
+        (kind) => log(`  ${kind}`),
       )
     } catch (err) {
       failure = String((err && err.message) || err)
@@ -367,20 +402,28 @@ async function handleChat(req, res) {
     }
 
     const secs = Math.round((Date.now() - started) / 1000)
+    if (disconnected) {
+      log(`turn ended after ${secs}s (client disconnected)`)
+      return res.destroyed ? undefined : res.end()
+    }
     if (failure) {
       log(`turn FAILED after ${secs}s: ${failure}`)
-      res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: created(), model, error: { message: failure } })}\n\n`)
-      res.write(chunkFrame(id, model, {}, 'error'))
+      safeWrite(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created: created(), model, error: { message: failure } })}\n\n`)
+      safeWrite(chunkFrame(id, model, {}, 'error'))
     } else {
       log(`turn done in ${secs}s (streamed)`)
-      res.write(chunkFrame(id, model, {}, 'stop'))
+      safeWrite(chunkFrame(id, model, {}, 'stop'))
     }
-    res.write('data: [DONE]\n\n')
+    safeWrite('data: [DONE]\n\n')
     return res.end()
   }
 
   const t0 = Date.now()
-  const full = await serialize(() => runTurn(ctx, agent, text, null, (kind) => log(`  ${kind}`)))
+  const full = await runMine(null, (kind) => log(`  ${kind}`))
+  if (disconnected) {
+    log(`turn ended after ${Math.round((Date.now() - t0) / 1000)}s (client disconnected, buffered)`)
+    return
+  }
   log(`turn done in ${Math.round((Date.now() - t0) / 1000)}s (buffered)`)
   return sendJSON(res, 200, completionBody(id, model, full))
 }
