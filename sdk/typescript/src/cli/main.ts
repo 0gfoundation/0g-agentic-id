@@ -43,6 +43,7 @@ INTERACTIVE (default — no command)
                             link <agentId|seal>  attach + chat (starts if stopped)
                             deploy               new-agent wizard, then chat
                             balance              prepaid balance + burn rate
+                            deposit [og]         fund the prepaid balance
                             env [url]            show/set the attestor (saved)
                             login                store the owner key (chmod 600)
                             apikey               store the inference key (chmod 600)

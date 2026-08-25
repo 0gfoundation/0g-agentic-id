@@ -85,7 +85,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · balance · env [url] · login · apikey · whoami · help · quit';
+  'commands: list · link <agentId|sealId> · deploy · balance · deposit · env [url] · login · apikey · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   out(`\n0G AgenticID — interactive. ${L1_HELP}\n`);
@@ -133,6 +133,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
         out(`burn rate       : ${og(burnPerMin)}/min\n`);
         out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
+        out('add funds with `deposit [amount OG]`\n');
+        continue;
+      }
+
+      if (cmd === 'deposit') {
+        const ag = await withWallet(ctx);
+        const amt = args[0] || (await ask('amount OG [0.2]: ')).trim() || '0.2';
+        const tx = await ag.deposit({ amountWei: parseEther(amt) });
+        await ag.waitForTransaction(tx);
+        out(`deposited ${amt} OG to the prepaid sandbox balance → ${tx}\n`);
         continue;
       }
 
