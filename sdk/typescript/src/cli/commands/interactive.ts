@@ -34,7 +34,10 @@ interface Session {
   sealId: `0x${string}`;
   agentId: string;
   agentSeal?: `0x${string}`; // for /topup; resolved from /hello
-  framework: string;
+  /** Needed by /reset (which image) and the chat model selector. Not exposed
+   *  by the attestor post-mint, so it is PICKED by the user when first
+   *  needed (deploy knows it; use/attach does not). */
+  framework?: string;
   phase: string;
   // Connection half — absent until the agent is running (`use` enters the
   // session in ANY phase; /start and /reset fill these in on success).
@@ -389,21 +392,20 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     });
   }
   const agentId = String(row.agentId ?? '?');
-  const framework = await resolveFramework(attestorUrl, row.name ?? undefined, ask);
 
   // `use` selects the agent in ANY phase — lifecycle stays explicit inside
   // the session (/start, /reset). Only a running agent gets a connection.
   const s: Session = {
-    ag, attestorUrl, sealId: row.sealId, agentId, framework,
+    ag, attestorUrl, sealId: row.sealId, agentId,
     phase: row.phase ?? 'unknown',
     sandboxId: row.url ? sbid(row.url) : undefined,
   };
   if (row.phase === 'running' && row.url) {
     await connectSession(s, row.url);
-    out(`using agent ${agentId} (${framework}) at ${row.url}\n`);
+    out(`using agent ${agentId} at ${row.url}\n`);
   } else {
     const reason = await failureReasonOf(attestorUrl, row.sealId);
-    out(`using agent ${agentId} (${framework}) — ${s.phase}${reason ? ` (last error: ${reason})` : ''}\n`);
+    out(`using agent ${agentId} — ${s.phase}${reason ? ` (last error: ${reason})` : ''}\n`);
     out(s.phase === 'stopped' ? '→ /start to bring it back\n' : '→ /reset to recreate its container\n');
   }
   return s;
@@ -421,25 +423,18 @@ async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Prom
   }
 }
 
-/**
- * The framework name drives /reset (which image gets recreated) and the chat
- * `model` selector — guessing wrong is destructive, so NEVER guess silently.
- * The attestor exposes no framework field post-mint (the binding lives in
- * encrypted iData), so: heuristic from the agent-card name suffix against
- * /config's frameworks[] (wizard-deployed agents are `chat-<fw>`), and when
- * that fails, ask the user with a numbered picker.
- */
-async function resolveFramework(attestorUrl: string, cardName: string | undefined, ask: (q: string) => Promise<string>): Promise<string> {
+/** Numbered framework picker from /config — the user chooses; never guess.
+ *  (The attestor exposes no framework name post-mint.) */
+async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<string>, current?: string): Promise<string> {
   const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
-  if (!fws.length) return 'openclaw';
-  const guessed = cardName ? fws.find((f) => cardName === f || cardName.endsWith(`-${f}`)) : undefined;
-  if (guessed) return guessed;
-  out('this agent\'s framework is not recorded publicly — pick it (wrong choice breaks /reset):\n');
-  fws.forEach((n, i) => out(`  ${i}. ${n}\n`));
-  const raw = (await ask('framework [0]: ')).trim();
+  if (!fws.length) return current ?? 'openclaw';
+  const di = Math.max(0, current ? fws.indexOf(current) : 0);
+  out('frameworks:\n');
+  fws.forEach((n, i) => out(`  ${i}. ${n}${i === di ? '  (default)' : ''}\n`));
+  const raw = (await ask(`framework [${di}]: `)).trim();
   const i = Number(raw);
-  return !raw ? fws[0] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[0];
+  return !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
 }
 
 // ── L2: session REPL ─────────────────────────────────────────────────────────
@@ -507,9 +502,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`running at ${s.url}\n`); continue;
       }
       if (line === '/reset') {
+        s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
-        out(`resetting ${s.framework}…\n`);
+        out(`resetting as ${s.framework}…\n`);
         await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
         const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
         await connectSession(s, r.url);
@@ -535,6 +531,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
+    if (!s.framework) {
+      out('which framework is this agent? (sets the chat model selector)\n');
+      s.framework = await pickFramework(s.attestorUrl, ask);
+    }
     messages.push({ role: 'user', content: line });
     const ac = new AbortController();
     irq.streaming = ac;
