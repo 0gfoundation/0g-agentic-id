@@ -35,9 +35,26 @@ interface Session {
   agentId: string;
   agentSeal?: `0x${string}`; // for /topup; resolved from /hello
   framework: string;
-  url: string;
+  phase: string;
+  // Connection half — absent until the agent is running (`use` enters the
+  // session in ANY phase; /start and /reset fill these in on success).
+  url?: string;
   sandboxId?: string;
-  client: AgentClient;
+  client?: AgentClient;
+}
+
+/** (Re)establish the connection half of a session from a running URL. */
+async function connectSession(s: Session, url: string): Promise<void> {
+  s.url = url;
+  s.sandboxId = sbid(url);
+  s.client = await s.ag.agent.client(url);
+  s.phase = 'running';
+  if (!s.agentSeal) {
+    try {
+      const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
+      if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) s.agentSeal = hello.agent as `0x${string}`;
+    } catch { /* /topup will say it's unavailable */ }
+  }
 }
 
 /**
@@ -111,7 +128,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Shortcut: `0g-agenticid <agent>` links straight into L2, then drops to L1.
     if (ctx.positionals[0]) {
       const ag = await withWallet(ctx);
-      const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0]);
+      const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
       await sessionRepl(s, ask, irq, ctx);
     }
     await managerRepl(ctx, ask, irq);
@@ -127,7 +144,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · reset <agentId|sealId> · balance · deposit · login · whoami · help · quit';
+  'commands: list · use <agentId|sealId> · deploy · balance · deposit · login · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
@@ -226,33 +243,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
-      if (cmd === 'link') {
-        if (!args[0]) { out('usage: link <agentId|sealId>\n'); continue; }
+      if (cmd === 'use' || cmd === 'link') {
+        if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
-        const s = await attach(ag, requireAttestorUrl(ctx.env), args[0]);
-        await sessionRepl(s, ask, irq, ctx);
-        continue;
-      }
-
-      if (cmd === 'reset') {
-        // Recreate an agent's container (the recovery for offline/failed).
-        if (!args[0]) { out('usage: reset <agentId|sealId>\n'); continue; }
-        const ag = await withWallet(ctx);
-        const attestorUrl = requireAttestorUrl(ctx.env);
-        const ref = parseAgentRef(args[0]);
-        const rows = await ag.agent.listDeployments();
-        const row = rows.find((r) =>
-          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
-        if (!row) { out(`no deployment matches ${args[0]} here\n`); continue; }
-        const agentId = String(row.agentId ?? '?');
-        const framework = await frameworkOf(attestorUrl, row.sealId);
-        const apiKey = await inferenceKey(ctx, ask);
-        if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
-        out(`resetting agent ${agentId} (${framework})…\n`);
-        await ag.agent.reset(row.sealId, { framework, apiKey });
-        const r = await pollRunning(attestorUrl, row.sealId, agentId);
-        out(`running at ${r.url} — linking…\n`);
-        const s = await attach(ag, attestorUrl, agentId);
+        const s = await attach(ag, requireAttestorUrl(ctx.env), args[0], ask);
         await sessionRepl(s, ask, irq, ctx);
         continue;
       }
@@ -378,45 +372,41 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
   const r = await pollRunning(attestorUrl, dep.sealId, agentId);
   out(`running at ${r.url}\n`);
-  return { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, url: r.url, sandboxId: sbid(r.url), client: await ag.agent.client(r.url) };
+  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running' };
+  await connectSession(s, r.url);
+  return s;
 }
 
-async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Promise<Session> {
+async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
   const row = rows.find((r: { agentId?: unknown; sealId?: string }) =>
     ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId,
-  ) as { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string } | undefined;
+  ) as { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null } | undefined;
   if (!row) {
     throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
       remedy: 'use `list` to see the agents this wallet owns here',
     });
   }
   const agentId = String(row.agentId ?? '?');
-  const framework = await frameworkOf(attestorUrl, row.sealId);
-  let url = row.url;
-  if (row.phase !== 'running' || !url) {
-    // /start only revives a STOPPED container. offline/failed means the
-    // container is gone (or provisioning already failed) — polling would just
-    // resurface the stale recorded reason; the recovery path is `reset`.
-    if (row.phase !== 'stopped' || !url || !sbid(url)) {
-      const reason = await failureReasonOf(attestorUrl, row.sealId);
-      throw new CliError('UNKNOWN', `agent ${agentId} is ${row.phase ?? 'unknown'}${reason ? ` (last error: ${reason})` : ''} — a plain start cannot revive it`, {
-        remedy: `run \`reset ${agentId}\` to recreate its container`,
-      });
-    }
-    out(`agent ${agentId} is stopped — starting…\n`);
-    await ag.agent.start(row.sealId, sbid(url)!);
-    url = (await pollRunning(attestorUrl, row.sealId, agentId)).url;
+  const framework = await resolveFramework(attestorUrl, row.name ?? undefined, ask);
+
+  // `use` selects the agent in ANY phase — lifecycle stays explicit inside
+  // the session (/start, /reset). Only a running agent gets a connection.
+  const s: Session = {
+    ag, attestorUrl, sealId: row.sealId, agentId, framework,
+    phase: row.phase ?? 'unknown',
+    sandboxId: row.url ? sbid(row.url) : undefined,
+  };
+  if (row.phase === 'running' && row.url) {
+    await connectSession(s, row.url);
+    out(`using agent ${agentId} (${framework}) at ${row.url}\n`);
+  } else {
+    const reason = await failureReasonOf(attestorUrl, row.sealId);
+    out(`using agent ${agentId} (${framework}) — ${s.phase}${reason ? ` (last error: ${reason})` : ''}\n`);
+    out(s.phase === 'stopped' ? '→ /start to bring it back\n' : '→ /reset to recreate its container\n');
   }
-  out(`linked agent ${agentId} (${framework}) at ${url}\n`);
-  // agentSeal (for /topup) is the `agent` field /hello reports.
-  let agentSeal: `0x${string}` | undefined;
-  try {
-    const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
-    if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) agentSeal = hello.agent as `0x${string}`;
-  } catch { /* topup will report it's unavailable */ }
-  return { ag, attestorUrl, sealId: row.sealId, agentId, agentSeal, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
+  return s;
 }
 
 /** The last recorded container failure reason, if any (public detail). */
@@ -431,15 +421,25 @@ async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Prom
   }
 }
 
-async function frameworkOf(attestorUrl: string, sealId: `0x${string}`): Promise<string> {
-  try {
-    const dep = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
-      i_data?: { role: string; plaintext?: { name?: string } }[];
-    };
-    return dep.i_data?.find((e) => e.role === 'framework')?.plaintext?.name ?? 'openclaw';
-  } catch {
-    return 'openclaw';
-  }
+/**
+ * The framework name drives /reset (which image gets recreated) and the chat
+ * `model` selector — guessing wrong is destructive, so NEVER guess silently.
+ * The attestor exposes no framework field post-mint (the binding lives in
+ * encrypted iData), so: heuristic from the agent-card name suffix against
+ * /config's frameworks[] (wizard-deployed agents are `chat-<fw>`), and when
+ * that fails, ask the user with a numbered picker.
+ */
+async function resolveFramework(attestorUrl: string, cardName: string | undefined, ask: (q: string) => Promise<string>): Promise<string> {
+  const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
+  const fws = (cfg.frameworks ?? []).map((f) => f.name);
+  if (!fws.length) return 'openclaw';
+  const guessed = cardName ? fws.find((f) => cardName === f || cardName.endsWith(`-${f}`)) : undefined;
+  if (guessed) return guessed;
+  out('this agent\'s framework is not recorded publicly — pick it (wrong choice breaks /reset):\n');
+  fws.forEach((n, i) => out(`  ${i}. ${n}\n`));
+  const raw = (await ask('framework [0]: ')).trim();
+  const i = Number(raw);
+  return !raw ? fws[0] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[0];
 }
 
 // ── L2: session REPL ─────────────────────────────────────────────────────────
@@ -448,7 +448,7 @@ const L2_HELP =
   'chat, or: /hello /balance /topup [og] /stop /start /reset /agentlog /startuplog /back /quit — Esc or Ctrl-C interrupts a turn';
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nnow chatting with agent ${s.agentId}. ${L2_HELP}\n`);
+  out(`\nagent ${s.agentId} session (${s.phase}). ${L2_HELP}\n`);
   // Low-gas heads-up on entry: an agent with an empty agentSeal can serve
   // chat but cannot commit its evolution on chain.
   try {
@@ -467,6 +467,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
 
     try {
       if (line === '/hello') {
+        if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
         const res = await fetch(`${s.url}/hello`);
         const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
         const proof = s.ag.reputation.proofFromResponse(res);
@@ -491,16 +492,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/stop') {
-        if (!s.sandboxId) { out('no sandboxId (not running?)\n'); continue; }
-        out('stopping…\n'); await s.ag.agent.stop(s.sealId, s.sandboxId); out('stopped.\n');
+        if (s.phase !== 'running' || !s.sandboxId) { out(`agent is ${s.phase} — nothing to stop\n`); continue; }
+        out('stopping…\n'); await s.ag.agent.stop(s.sealId, s.sandboxId);
+        s.phase = 'stopped'; s.url = undefined; s.client = undefined;
+        out('stopped. /start brings it back.\n');
         continue;
       }
       if (line === '/start') {
-        if (!s.sandboxId) { out('no sandboxId to start from\n'); continue; }
+        if (s.phase === 'running') { out('already running\n'); continue; }
+        if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         out('starting…\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
-        s.url = r.url; s.sandboxId = sbid(r.url); s.client = await s.ag.agent.client(r.url);
-        out(`running again at ${s.url}\n`); continue;
+        await connectSession(s, r.url);
+        out(`running at ${s.url}\n`); continue;
       }
       if (line === '/reset') {
         const apiKey = await inferenceKey(ctx, ask);
@@ -508,15 +512,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`resetting ${s.framework}…\n`);
         await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
         const r = await pollRunning(s.attestorUrl, s.sealId, s.agentId);
-        s.url = r.url; s.sandboxId = sbid(r.url); s.client = await s.ag.agent.client(r.url);
+        await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
-        if (!s.client.logs) { out('(logs unavailable — owner key needed)\n'); continue; }
+        if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         out(`${await s.client.logs({ tail: n })}\n`); continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
+        if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         const res = await fetch(`${s.url}/log`);
         out(res.ok ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n` : `/log → HTTP ${res.status}\n`);
@@ -528,6 +533,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     }
 
     // a chat turn (interruptible)
+    if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
     messages.push({ role: 'user', content: line });
     const ac = new AbortController();

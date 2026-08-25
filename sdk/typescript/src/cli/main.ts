@@ -39,10 +39,10 @@ USAGE
 
 INTERACTIVE (default — no command)
   0g-agenticid            Open the manager REPL. Its commands:
-                            list                 your agents on this attestor
-                            link <agentId|seal>  attach + chat (starts if stopped)
+                            list                 agents on this attestor (* = yours)
+                            use <agentId|seal>   enter that agent's session (any
+                                                 phase; /start /reset inside)
                             deploy               new-agent wizard, then chat
-                            reset <agent>        recreate an offline/failed agent
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
                             env [url]            show/set the attestor (saved)
