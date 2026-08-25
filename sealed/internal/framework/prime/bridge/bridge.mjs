@@ -373,13 +373,40 @@ async function handleChat(req, res) {
 	const id = `chatcmpl-${created()}`;
 	const model = body.model || `${PROVIDER || "prime"}/${MODEL_ID || "default"}`;
 
+	// Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
+	// signal. The SDK session exposes abort() — stop the turn when the client
+	// goes away, guarded so a QUEUED request's disconnect never aborts someone
+	// else's active turn (turns are serialized), which also un-blocks the queue.
+	let myTurnActive = false;
+	let disconnected = false;
+	const onGone = () => {
+		if (disconnected) return;
+		disconnected = true;
+		if (myTurnActive) {
+			log("client disconnected mid-turn — aborting");
+			Promise.resolve(session.abort()).catch((err) => log(`WARN session.abort: ${(err && err.message) || err}`));
+		}
+	};
+	res.on("close", () => { if (!res.writableEnded) onGone(); });
+	// Writes after a disconnect throw (incl. from the keepalive interval, where
+	// an exception would take the bridge down) — guard every write.
+	const safeWrite = (s) => {
+		if (disconnected || res.writableEnded || res.destroyed) return;
+		try { res.write(s); } catch { /* client raced us to the close */ }
+	};
+	const runMine = (fn) => serialize(() => {
+		if (disconnected) return "";
+		myTurnActive = true;
+		return Promise.resolve(fn()).finally(() => { myTurnActive = false; });
+	});
+
 	if (body.stream) {
 		res.writeHead(200, {
 			"content-type": "text/event-stream",
 			"cache-control": "no-cache",
 			connection: "keep-alive",
 		});
-		res.write(chunkFrame(id, model, { role: "assistant" }));
+		safeWrite(chunkFrame(id, model, { role: "assistant" }));
 		if (typeof res.flushHeaders === "function") res.flushHeaders();
 
 		// Keepalive as SSE COMMENTS, and nothing else on the wire.
@@ -398,17 +425,17 @@ async function handleChat(req, res) {
 		// instead, where /log/agent surfaces it for debugging. Reporting progress
 		// to a client properly wants a Responses-shaped surface; that is its own
 		// piece of work.
-		const beat = setInterval(() => res.write(": keepalive\n\n"), 10_000);
+		const beat = setInterval(() => safeWrite(": keepalive\n\n"), 10_000);
 
 		const started = Date.now();
 		broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
 		let failure = null;
 		try {
-			await serialize(() =>
+			await runMine(() =>
 				runTurn(
 					session,
 					text,
-					(delta) => res.write(chunkFrame(id, model, { content: delta })),
+					(delta) => safeWrite(chunkFrame(id, model, { content: delta })),
 					(line, type) => {
 						log(`  ${line}`);
 						broadcastActivity({ turn: id, kind: type, text: line });
@@ -422,6 +449,11 @@ async function handleChat(req, res) {
 		}
 
 		const secs = Math.round((Date.now() - started) / 1000);
+		if (disconnected) {
+			log(`turn ended after ${secs}s (client disconnected)`);
+			broadcastActivity({ turn: id, kind: "turn_aborted", text: `${secs}s` });
+			return res.destroyed ? undefined : res.end();
+		}
 		if (failure) {
 			// The status line went out with the first byte, so a mid-turn failure
 			// can only ever truncate the body. Say so explicitly instead: an error
@@ -430,25 +462,29 @@ async function handleChat(req, res) {
 			// AgentClient.chatStream, which yields text only, needs an SDK change.)
 			log(`turn FAILED after ${secs}s: ${failure}`);
 			broadcastActivity({ turn: id, kind: "turn_failed", text: failure });
-			res.write(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: created(), model, error: { message: failure } })}\n\n`);
-			res.write(chunkFrame(id, model, {}, "error"));
+			safeWrite(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: created(), model, error: { message: failure } })}\n\n`);
+			safeWrite(chunkFrame(id, model, {}, "error"));
 		} else {
 			log(`turn done in ${secs}s (streamed)`);
 			broadcastActivity({ turn: id, kind: "turn_end", text: `${secs}s` });
-			res.write(chunkFrame(id, model, {}, "stop"));
+			safeWrite(chunkFrame(id, model, {}, "stop"));
 		}
-		res.write("data: [DONE]\n\n");
+		safeWrite("data: [DONE]\n\n");
 		return res.end();
 	}
 
 	const t0 = Date.now();
 	broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
-	const full = await serialize(() =>
+	const full = await runMine(() =>
 		runTurn(session, text, null, (line, type) => {
 			log(`  ${line}`);
 			broadcastActivity({ turn: id, kind: type, text: line });
 		}),
 	);
+	if (disconnected) {
+		log("turn ended (client disconnected, buffered)");
+		return;
+	}
 	const buffered = Math.round((Date.now() - t0) / 1000);
 	log(`turn done in ${buffered}s (buffered)`);
 	broadcastActivity({ turn: id, kind: "turn_end", text: `${buffered}s` });
