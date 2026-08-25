@@ -28,11 +28,23 @@ const COMMANDS: Record<string, CommandRun> = { doctor, status, list, chat };
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
 // truth an agent plans against (spec v0.03 §2.4).
-const HELP = `0g-agenticid — diagnostics CLI for the 0G AgenticID protocol
+const HELP = `0g-agenticid — CLI for the 0G AgenticID protocol
 (ships with @0gfoundation/0g-agenticid-sdk; no separate install)
 
 USAGE
-  0g-agenticid <command> [options]
+  0g-agenticid [agent] [options]     interactive chat (default)
+  0g-agenticid <command> [options]   diagnostics
+
+INTERACTIVE (default — no command)
+  0g-agenticid            Deploy a new agent (framework + model wizard),
+                          then chat with it.
+  0g-agenticid <agent>    Attach to an existing agent (decimal agentId or
+                          0x… sealId; starts it if stopped) and chat.
+                          Esc / Ctrl-C interrupts the turn in flight;
+                          Ctrl-C twice at the prompt exits. Slash commands:
+                          /hello /balance /stop /start /reset /agentlog
+                          /startuplog /quit. Needs AGENTIC_PRIVATE_KEY;
+                          inference key from AGENTIC_API_KEY (env only).
 
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
@@ -47,13 +59,6 @@ COMMANDS
   list             List deployments. --mine (owner-signed, needs
                    AGENTIC_PRIVATE_KEY) adds owner-only fields such as the
                    failure reason and sandboxId.
-  chat [agent]     Interactive REPL (owner wallet required). No argument →
-                   deploy wizard (pick framework + model, deploy, chat);
-                   with an agentId/sealId → attach to that agent (starting
-                   it if stopped). Esc or Ctrl-C interrupts the turn in
-                   flight; slash commands: /hello /balance /stop /start
-                   /reset /agentlog /startuplog /quit. Inference key comes
-                   from AGENTIC_API_KEY (env only, never argv).
 
 OPTIONS
   --json           Machine output: stdout carries exactly one
@@ -80,9 +85,10 @@ EXIT CODES
   remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
 
 EXAMPLES
+  0g-agenticid                       # deploy a new agent and chat
+  0g-agenticid 286                   # attach to agent 286 and chat
   0g-agenticid doctor
   0g-agenticid status 33
-  0g-agenticid status 0x8f2a…c4 --json
   0g-agenticid list --mine --phase failed --json | jq -r '.data[].sealId'`;
 
 /** Package version, read at runtime from the SDK's own package.json
@@ -111,23 +117,25 @@ async function main(): Promise<number> {
     print(packageVersion());
     return EXIT.OK;
   }
-  if (values.help || positionals.length === 0) {
+  if (values.help) {
     print(HELP);
     return EXIT.OK;
   }
 
-  const [command, ...rest] = positionals;
+  // Claude-Code-style default: bare `0g-agenticid` (or with just an agent
+  // ref, e.g. `0g-agenticid 286`) enters the interactive chat. The
+  // diagnostics commands (doctor/status/list) are the only reserved words;
+  // an agentId is decimal and a sealId is 0x…, so neither collides with a
+  // command name — anything that isn't a known command routes to chat.
+  const [first, ...rest] = positionals;
+  const command = first && first in COMMANDS ? first : 'chat';
+  const commandArgs = first && first in COMMANDS ? rest : positionals;
   const run = COMMANDS[command];
-  if (!run) {
-    throw new CliError('UNKNOWN_COMMAND', `unknown command: ${command}`, {
-      remedy: '0g-agenticid --help',
-    });
-  }
 
   const ctx: CommandContext = {
     env: readEnv(),
     json: values.json,
-    positionals: rest,
+    positionals: commandArgs,
     flags: { mine: values.mine, phase: values.phase },
   };
   await run(ctx);
