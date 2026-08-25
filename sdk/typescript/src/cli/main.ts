@@ -21,8 +21,9 @@ import type { CommandContext, CommandRun } from './types';
 import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
 import { run as list } from './commands/list';
+import { run as chat } from './commands/chat';
 
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, chat };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -46,6 +47,13 @@ COMMANDS
   list             List deployments. --mine (owner-signed, needs
                    AGENTIC_PRIVATE_KEY) adds owner-only fields such as the
                    failure reason and sandboxId.
+  chat [agent]     Interactive REPL (owner wallet required). No argument →
+                   deploy wizard (pick framework + model, deploy, chat);
+                   with an agentId/sealId → attach to that agent (starting
+                   it if stopped). Esc or Ctrl-C interrupts the turn in
+                   flight; slash commands: /hello /balance /stop /start
+                   /reset /agentlog /startuplog /quit. Inference key comes
+                   from AGENTIC_API_KEY (env only, never argv).
 
 OPTIONS
   --json           Machine output: stdout carries exactly one
