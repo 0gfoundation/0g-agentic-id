@@ -69,14 +69,20 @@ async function connectSession(s: Session, url: string): Promise<void> {
 async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000): Promise<{ url: string }> {
   const deadline = Date.now() + timeoutMs;
   let lastPhase = 'unknown';
+  let lastShown = '';
+  // The DETAIL endpoint carries no `url` field (only the listing does), so a
+  // running agent's URL is constructed from its sandbox_id + the sandbox
+  // proxy address the attestor /config advertises.
+  const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { sandbox_proxy_addr?: string };
   for (;;) {
     try {
       const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
-        phase?: string; url?: string;
+        phase?: string; url?: string; sandbox_id?: string;
         container_stage?: { state?: string; reason?: string };
       };
       lastPhase = d.phase ?? lastPhase;
-      const url = d.url ?? undefined;
+      if (lastPhase !== lastShown) { out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
+      const url = d.url ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? `http://8080-${d.sandbox_id}.${cfg.sandbox_proxy_addr}` : undefined);
       if (d.phase === 'running' && url) return { url };
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
       if (d.phase === 'failed' || reason) {
