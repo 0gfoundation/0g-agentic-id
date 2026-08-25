@@ -61,7 +61,7 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
       if (d.phase === 'failed' || reason) {
         throw new CliError('UNKNOWN', `agent ${agentId} did not start: ${reason ?? `phase=${d.phase}`}`, {
-          remedy: 'inspect with `status`, then /reset (or retry) once the cause is fixed',
+          remedy: `run \`reset ${agentId}\` to recreate the container once the cause is fixed`,
         });
       }
     } catch (e) {
@@ -127,7 +127,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · balance · deposit · login · whoami · help · quit';
+  'commands: list · link <agentId|sealId> · deploy · reset <agentId|sealId> · balance · deposit · login · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
@@ -230,6 +230,29 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[0]) { out('usage: link <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
         const s = await attach(ag, requireAttestorUrl(ctx.env), args[0]);
+        await sessionRepl(s, ask, irq, ctx);
+        continue;
+      }
+
+      if (cmd === 'reset') {
+        // Recreate an agent's container (the recovery for offline/failed).
+        if (!args[0]) { out('usage: reset <agentId|sealId>\n'); continue; }
+        const ag = await withWallet(ctx);
+        const attestorUrl = requireAttestorUrl(ctx.env);
+        const ref = parseAgentRef(args[0]);
+        const rows = await ag.agent.listDeployments();
+        const row = rows.find((r) =>
+          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+        if (!row) { out(`no deployment matches ${args[0]} here\n`); continue; }
+        const agentId = String(row.agentId ?? '?');
+        const framework = await frameworkOf(attestorUrl, row.sealId);
+        const apiKey = await inferenceKey(ctx, ask);
+        if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        out(`resetting agent ${agentId} (${framework})…\n`);
+        await ag.agent.reset(row.sealId, { framework, apiKey });
+        const r = await pollRunning(attestorUrl, row.sealId, agentId);
+        out(`running at ${r.url} — linking…\n`);
+        const s = await attach(ag, attestorUrl, agentId);
         await sessionRepl(s, ask, irq, ctx);
         continue;
       }
@@ -373,8 +396,17 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Pro
   const framework = await frameworkOf(attestorUrl, row.sealId);
   let url = row.url;
   if (row.phase !== 'running' || !url) {
-    out(`agent ${agentId} is ${row.phase ?? 'unknown'} — starting…\n`);
-    if (row.phase === 'stopped' && url && sbid(url)) await ag.agent.start(row.sealId, sbid(url)!);
+    // /start only revives a STOPPED container. offline/failed means the
+    // container is gone (or provisioning already failed) — polling would just
+    // resurface the stale recorded reason; the recovery path is `reset`.
+    if (row.phase !== 'stopped' || !url || !sbid(url)) {
+      const reason = await failureReasonOf(attestorUrl, row.sealId);
+      throw new CliError('UNKNOWN', `agent ${agentId} is ${row.phase ?? 'unknown'}${reason ? ` (last error: ${reason})` : ''} — a plain start cannot revive it`, {
+        remedy: `run \`reset ${agentId}\` to recreate its container`,
+      });
+    }
+    out(`agent ${agentId} is stopped — starting…\n`);
+    await ag.agent.start(row.sealId, sbid(url)!);
     url = (await pollRunning(attestorUrl, row.sealId, agentId)).url;
   }
   out(`linked agent ${agentId} (${framework}) at ${url}\n`);
@@ -385,6 +417,18 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Pro
     if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) agentSeal = hello.agent as `0x${string}`;
   } catch { /* topup will report it's unavailable */ }
   return { ag, attestorUrl, sealId: row.sealId, agentId, agentSeal, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
+}
+
+/** The last recorded container failure reason, if any (public detail). */
+async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Promise<string | undefined> {
+  try {
+    const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
+      container_stage?: { state?: string; reason?: string };
+    };
+    return d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function frameworkOf(attestorUrl: string, sealId: `0x${string}`): Promise<string> {

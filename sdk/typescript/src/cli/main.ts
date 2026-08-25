@@ -42,6 +42,7 @@ INTERACTIVE (default — no command)
                             list                 your agents on this attestor
                             link <agentId|seal>  attach + chat (starts if stopped)
                             deploy               new-agent wizard, then chat
+                            reset <agent>        recreate an offline/failed agent
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
                             env [url]            show/set the attestor (saved)
