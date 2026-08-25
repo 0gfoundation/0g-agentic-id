@@ -107,7 +107,12 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
     await new Promise((r) => setTimeout(r, 6000));
   }
   check('agent back to running after reset', phase === 'running', `phase=${phase}`);
-  const resetUrl = `http://${cfg.agent_serve_port}-${newSandbox}.${cfg.sandbox_proxy_addr}`;
+  // Prefer the row's provision-updated url — it carries the correct scheme
+  // (production art.0g.ai is 443-only; hand-built http:// times out, #128).
+  const resetRow = (await ai.agent.listMyDeployments())
+    .find((r) => r.sealId.toLowerCase() === SEAL_ID.toLowerCase());
+  const resetUrl = resetRow?.url
+    ?? `${new URL(AGENT_URL).protocol}//${cfg.agent_serve_port}-${newSandbox}.${cfg.sandbox_proxy_addr}`;
 
   const after = await ai.agent.intelligentDatasOf(AGENT_ID);
   const rolesAfter = roles(after);
