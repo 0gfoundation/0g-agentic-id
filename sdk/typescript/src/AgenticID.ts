@@ -482,7 +482,9 @@ export class AgentApi {
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
-    const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
+    // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
+    // predating the param ignore it.
+    const rows = (await (await fetch(`${this.attestorBase()}/deployments?slim=1`)).json()) as Array<Record<string, unknown>>;
     return rows.map((r) => this.normalizeDeploymentRow(r));
   }
 
@@ -500,7 +502,7 @@ export class AgentApi {
     const owner = account.address;
     const message = `0GDeployments:${owner}:${Math.floor(Date.now() / 1000)}`;
     const signature = await walletClient.signMessage({ account, message });
-    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}`, {
+    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}&slim=1`, {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!res.ok) throw new Error(`listMyDeployments: HTTP ${res.status}: ${await res.text()}`);

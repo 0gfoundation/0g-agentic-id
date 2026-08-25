@@ -184,6 +184,26 @@ func resolveInferenceFromConfigYAML() (provider, model string, err error) {
 // Anthropic-format-only models (route.Format != openai) cannot ride the
 // custom endpoint; fail loud at deploy time rather than 400 at first chat.
 func applyZGComputeAugmentation(provider, model, apiKey string, route *inference.Route) error {
+	// Already-augmented config (chain-restored): a previous life's first boot
+	// rewrote the provider to hermes's `custom` form, and the drift commit
+	// uploaded it WITHOUT the key (stripSecrets — secrets never ride the
+	// chain). So every container after that first commit restores a keyless
+	// `custom` config, and skipping here left hermes dialing the router
+	// unauthenticated (live 401s on every reset/restart of an evolved agent).
+	// Re-inject this container's key into the resolved form.
+	if provider == "custom" {
+		if apiKey == "" {
+			return fmt.Errorf("config.yaml is the resolved custom form but no API key was provided — hermes would dial its endpoint unauthenticated")
+		}
+		return updateConfigYAML(func(cfg map[string]any) {
+			m, _ := cfg["model"].(map[string]any)
+			if m == nil {
+				m = map[string]any{}
+			}
+			m["api_key"] = apiKey
+			cfg["model"] = m
+		})
+	}
 	if provider != "0g-compute" {
 		return nil
 	}

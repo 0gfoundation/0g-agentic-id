@@ -81,11 +81,17 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 #
 # node-pty (pulled in by bash-local → subprocess-local) is a native module, so
 # a build toolchain is needed during install, then purged to keep the image slim.
-ARG DSH_VERSION=0.1.1-rc.1
+# DSH_NPM_BEFORE freezes TRANSITIVE resolution: the family's packages depend
+# on each other via ranges (^rc.N), so without a cutoff every rebuild re-rolls
+# nested versions against whatever upstream published since — which is exactly
+# how a top-pinned rc.1 tree got rc.2 internals and broke the llm adapter
+# interface. --before makes the tree a pure function of (pins, cutoff).
+ARG DSH_VERSION=0.1.1-rc.2
+ARG DSH_NPM_BEFORE=2026-08-21T13:00:00Z
 ARG CORDIS_VERSION=4.0.1
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
- && npm install -g --no-fund --no-audit \
+ && npm install -g --no-fund --no-audit --before "${DSH_NPM_BEFORE}" \
       "@deepseek-ai/cordis@${CORDIS_VERSION}" \
       "@deepseek-ai/dsh-agent-spine-demo@${DSH_VERSION}" \
       "@deepseek-ai/dsh-llm@${DSH_VERSION}" \

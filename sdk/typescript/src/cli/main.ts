@@ -21,17 +21,49 @@ import type { CommandContext, CommandRun } from './types';
 import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
 import { run as list } from './commands/list';
+import { run as interactive } from './commands/interactive';
 
+/** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
+ *  routes to the default interactive shell. */
 const COMMANDS: Record<string, CommandRun> = { doctor, status, list };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
 // truth an agent plans against (spec v0.03 §2.4).
-const HELP = `0g-agenticid — diagnostics CLI for the 0G AgenticID protocol
+const HELP = `0g-agenticid — CLI for the 0G AgenticID protocol
 (ships with @0gfoundation/0g-agenticid-sdk; no separate install)
 
 USAGE
-  0g-agenticid <command> [options]
+  0g-agenticid [agent] [options]     interactive chat (default)
+  0g-agenticid <command> [options]   diagnostics
+
+INTERACTIVE (default — no command)
+  0g-agenticid            Open the manager REPL. Its commands:
+                            list                 agents on this attestor (* = yours)
+                            use <agentId|seal>   enter that agent's session, in
+                                                 ANY phase (lifecycle is inside)
+                            deploy               new-agent wizard, then chat
+                            start/stop/reset <id> lifecycle without entering
+                                                 the session (reset asks the
+                                                 framework + key)
+                            balance              prepaid balance + burn rate
+                            deposit [og]         fund the prepaid balance
+                            login                guided setup: attestor URL,
+                                                 owner key, inference key (Enter
+                                                 keeps current; keys echo *)
+                            whoami · help · quit
+  0g-agenticid <agent>    Shortcut: use that agent directly, then drop to
+                          the manager REPL on /back.
+
+                          In a session: type to talk; Esc / Ctrl-C interrupts
+                          the turn in flight (and cancels a /start or /reset
+                          wait). Slash: /hello /balance /topup [og] /stop
+                          /start /reset /agentlog [n] /startuplog [n]
+                          /back (or /unuse) /quit. The framework (for /reset
+                          and the chat model selector) is picked by you, never
+                          guessed. Config persists to ~/.config/0g-agenticid
+                          (config.json + credentials at 0600); AGENTIC_* env
+                          vars always override the files.
 
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
@@ -65,6 +97,8 @@ ENVIRONMENT
   AGENTIC_PRIVATE_KEY    optional. Owner key (0x… hex). Env only — there is
                          deliberately no flag for it.
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
+  AGENTIC_API_KEY        optional. Inference key for deploy/reset; overrides
+                         the one stored by login.
 
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
@@ -72,9 +106,10 @@ EXIT CODES
   remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
 
 EXAMPLES
+  0g-agenticid                       # deploy a new agent and chat
+  0g-agenticid 286                   # attach to agent 286 and chat
   0g-agenticid doctor
   0g-agenticid status 33
-  0g-agenticid status 0x8f2a…c4 --json
   0g-agenticid list --mine --phase failed --json | jq -r '.data[].sealId'`;
 
 /** Package version, read at runtime from the SDK's own package.json
@@ -103,23 +138,24 @@ async function main(): Promise<number> {
     print(packageVersion());
     return EXIT.OK;
   }
-  if (values.help || positionals.length === 0) {
+  if (values.help) {
     print(HELP);
     return EXIT.OK;
   }
 
-  const [command, ...rest] = positionals;
-  const run = COMMANDS[command];
-  if (!run) {
-    throw new CliError('UNKNOWN_COMMAND', `unknown command: ${command}`, {
-      remedy: '0g-agenticid --help',
-    });
-  }
+  // Claude-Code-style default: bare `0g-agenticid` (or with just an agent
+  // ref, e.g. `0g-agenticid 286`) enters the interactive chat. The
+  // diagnostics commands (doctor/status/list) are the only reserved words;
+  // an agentId is decimal and a sealId is 0x…, so neither collides with a
+  // command name — anything that isn't a known command routes to chat.
+  const [first, ...rest] = positionals;
+  const isCommand = !!first && first in COMMANDS;
+  const run = isCommand ? COMMANDS[first] : interactive;
 
   const ctx: CommandContext = {
     env: readEnv(),
     json: values.json,
-    positionals: rest,
+    positionals: isCommand ? rest : positionals,
     flags: { mine: values.mine, phase: values.phase },
   };
   await run(ctx);

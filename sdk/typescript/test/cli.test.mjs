@@ -14,6 +14,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -27,7 +29,10 @@ const MAIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli', 
 function run(args, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [MAIN, ...args], {
-      env: { PATH: process.env.PATH, ...env }, // deliberately NOT inheriting AGENTIC_*
+      // Deliberately NOT inheriting AGENTIC_*; XDG_CONFIG_HOME points at an
+      // empty dir so the persisted ~/.config/0g-agenticid files (readEnv's
+      // fallback layer) can never leak the developer's real key/attestor in.
+      env: { PATH: process.env.PATH, XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'agcli-')), ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -88,12 +93,14 @@ test('--version: exit 0, semver on stdout', async () => {
   assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/);
 });
 
-test('unknown command --json: exit 2, valid envelope, stderr silent', async () => {
+test('non-command token routes to interactive, which rejects --json (exit 2, envelope)', async () => {
+  // There is no UNKNOWN_COMMAND anymore by design: any non-command token is
+  // an agent ref for the interactive default, and interactive has no --json.
   const r = await run(['nope', '--json']);
   assert.equal(r.code, 2);
   const env = JSON.parse(r.stdout);
   assert.equal(env.ok, false);
-  assert.equal(env.error.code, 'UNKNOWN_COMMAND');
+  assert.equal(env.error.code, 'BAD_FLAG');
   assert.ok(env.error.remedy.length > 0);
   assert.equal(r.stderr, '');
 });
