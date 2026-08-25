@@ -134,7 +134,7 @@ pub async fn handle(
                 .map_err(|_| ApiError::bad_request("owner must be 0x-prefixed 20-byte hex"))?;
             verify_owner_auth(&state, &headers, owner)?;
             let rows = state.deployments.list_by_owner(owner).await?;
-            let slim = p.slim.as_deref() == Some("1");
+            let slim = matches!(p.slim.as_deref(), Some("1" | "true"));
             let dtos: Vec<OwnerDeployment> = rows
                 .into_iter()
                 .map(OwnerDeployment::from)
@@ -147,7 +147,7 @@ pub async fn handle(
         }
         None => {
             let rows = state.deployments.list_all().await?;
-            let slim = p.slim.as_deref() == Some("1");
+            let slim = matches!(p.slim.as_deref(), Some("1" | "true"));
             let dtos: Vec<PublicDeployment> = rows
                 .into_iter()
                 .map(PublicDeployment::from)

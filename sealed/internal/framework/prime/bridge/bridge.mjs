@@ -383,8 +383,16 @@ async function handleChat(req, res) {
 		if (disconnected) return;
 		disconnected = true;
 		if (myTurnActive) {
-			log("client disconnected mid-turn — aborting");
-			Promise.resolve(session.abort()).catch((err) => log(`WARN session.abort: ${(err && err.message) || err}`));
+			// session.abort(): Promise<void> — verified against the installed SDK
+			// (dist/core/agent-session.d.ts). Guarded anyway: on an SDK where it
+			// is absent the turn must keep its old run-to-completion behaviour
+			// with a loud log, not a TypeError.
+			if (typeof session.abort === "function") {
+				log("client disconnected mid-turn — aborting");
+				Promise.resolve(session.abort()).catch((err) => log(`WARN session.abort: ${(err && err.message) || err}`));
+			} else {
+				log("WARN client disconnected mid-turn but this SDK exposes no session.abort() — turn continues server-side");
+			}
 		}
 	};
 	res.on("close", () => { if (!res.writableEnded) onGone(); });

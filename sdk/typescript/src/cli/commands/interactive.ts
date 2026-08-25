@@ -329,7 +329,7 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
-  return new Promise((res) => {
+  return new Promise((res, rej) => {
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
     const orig = stdout.write.bind(stdout);
     // Echo the typed/pasted characters as `*` so there IS visible feedback
@@ -339,11 +339,19 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
       if (!s || s.includes(prompt) || s.startsWith('\x1b') || s === '\r\n' || s === '\n') return orig(s);
       return orig('*'.repeat(s.length));
     };
-    void ask(prompt).then((ans) => {
-      stdout.write = orig;
-      process.stdout.write('\n');
-      res(ans);
-    });
+    void ask(prompt).then(
+      (ans) => {
+        stdout.write = orig;
+        process.stdout.write('\n');
+        res(ans);
+      },
+      // stdin EOF mid-prompt: restore the write hook BEFORE surfacing, or
+      // every later line stays masked.
+      (err) => {
+        stdout.write = orig;
+        rej(err);
+      },
+    );
   });
 }
 
@@ -362,7 +370,11 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
   if (stored) return stored;
   const typed = (await askSecret(ask, 'inference API key (saved to credentials): ')).trim();
   if (typed) { try { saveApiKey(typed); } catch { /* keep going with the typed value */ } return typed; }
-  return 'sk-smoke-dummy';
+  // No key anywhere: deploying anyway would provision a container that 401s
+  // on every turn minutes later — fail HERE with the fix instead.
+  throw new CliError('WALLET_REQUIRED', 'no inference API key configured — the agent could not reach its model', {
+    remedy: 'run `login` (stores it, chmod 600) or set AGENTIC_API_KEY',
+  });
 }
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
