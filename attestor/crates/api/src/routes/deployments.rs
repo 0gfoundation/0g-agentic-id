@@ -37,6 +37,22 @@ const AUTH_WINDOW_SECS: i64 = 300;
 pub struct Params {
     #[serde(default)]
     owner: Option<String>,
+    /// `slim=1` drops `agent_card.image` from every row: the embedded avatar
+    /// data-URI is ~95% of the listing payload and terminal/CLI consumers
+    /// never render it (the avatar stays available at /avatar/:seed and in
+    /// the single-deployment detail).
+    #[serde(default)]
+    slim: Option<String>,
+}
+
+/// Strip the heavyweight avatar from a card when `slim` was requested.
+fn slim_card(mut card: serde_json::Value, slim: bool) -> serde_json::Value {
+    if slim {
+        if let Some(obj) = card.as_object_mut() {
+            obj.remove("image");
+        }
+    }
+    card
 }
 
 /// Public tier — safe to hand anyone. No owner, no sandbox_id, no internals.
@@ -118,7 +134,12 @@ pub async fn handle(
                 .map_err(|_| ApiError::bad_request("owner must be 0x-prefixed 20-byte hex"))?;
             verify_owner_auth(&state, &headers, owner)?;
             let rows = state.deployments.list_by_owner(owner).await?;
-            let dtos: Vec<OwnerDeployment> = rows.into_iter().map(OwnerDeployment::from).collect();
+            let slim = p.slim.as_deref() == Some("1");
+            let dtos: Vec<OwnerDeployment> = rows
+                .into_iter()
+                .map(OwnerDeployment::from)
+                .map(|mut d| { d.agent_card = slim_card(d.agent_card, slim); d })
+                .collect();
             Ok(Json(
                 serde_json::to_value(dtos)
                     .map_err(|e| anyhow::anyhow!("serialize owner deployments: {e}"))?,
@@ -126,7 +147,12 @@ pub async fn handle(
         }
         None => {
             let rows = state.deployments.list_all().await?;
-            let dtos: Vec<PublicDeployment> = rows.into_iter().map(PublicDeployment::from).collect();
+            let slim = p.slim.as_deref() == Some("1");
+            let dtos: Vec<PublicDeployment> = rows
+                .into_iter()
+                .map(PublicDeployment::from)
+                .map(|mut d| { d.agent_card = slim_card(d.agent_card, slim); d })
+                .collect();
             Ok(Json(
                 serde_json::to_value(dtos)
                     .map_err(|e| anyhow::anyhow!("serialize public deployments: {e}"))?,

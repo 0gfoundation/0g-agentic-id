@@ -259,12 +259,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // and mark rows by sealId membership.
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         const ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
-        let mySeals: Set<string> | null = null;
-        if (key) {
-          try { mySeals = new Set((await ag.agent.listMyDeployments()).map((r) => r.sealId)); }
-          catch { mySeals = null; /* public view still works */ }
-        }
-        const rows = await ag.agent.listDeployments();
+        // The two listings are independent — fetch them in parallel.
+        const [rows, mySeals] = await Promise.all([
+          ag.agent.listDeployments(),
+          key
+            ? ag.agent.listMyDeployments().then((rs) => new Set(rs.map((r) => r.sealId))).catch(() => null)
+            : Promise.resolve(null),
+        ]);
         if (!rows.length) { out('no agents on this attestor\n'); continue; }
         for (const r of rows) {
           const owned = mySeals?.has(r.sealId) ? '*' : ' ';
