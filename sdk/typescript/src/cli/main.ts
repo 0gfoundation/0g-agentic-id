@@ -42,6 +42,7 @@ INTERACTIVE (default — no command)
                             list                 your agents on this attestor
                             link <agentId|seal>  attach + chat (starts if stopped)
                             deploy               new-agent wizard, then chat
+                            balance              prepaid balance + burn rate
                             env [url]            show/set the attestor (saved)
                             login                store the owner key (chmod 600)
                             apikey               store the inference key (chmod 600)

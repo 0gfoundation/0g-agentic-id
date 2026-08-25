@@ -32,6 +32,7 @@ interface Session {
   ag: AgenticID;
   sealId: `0x${string}`;
   agentId: string;
+  agentSeal?: `0x${string}`; // for /topup; resolved from /hello
   framework: string;
   url: string;
   sandboxId?: string;
@@ -84,7 +85,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · link <agentId|sealId> · deploy · env [url] · login · apikey · whoami · help · quit';
+  'commands: list · link <agentId|sealId> · deploy · balance · env [url] · login · apikey · whoami · help · quit';
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   out(`\n0G AgenticID — interactive. ${L1_HELP}\n`);
@@ -120,6 +121,21 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'balance') {
+        // Account-level view: prepaid sandbox balance, the burn rate implied
+        // by how many of this wallet's agents are running, and the runway.
+        const ag = await withWallet(ctx);
+        const [est, rows] = await Promise.all([ag.agent.estimateCosts(), ag.agent.listMyDeployments()]);
+        const running = rows.filter((r) => r.phase === 'running').length;
+        const burnPerMin = est.costPerMinWei * BigInt(running);
+        const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
+        out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
+        out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
+        out(`burn rate       : ${og(burnPerMin)}/min\n`);
+        out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
+        continue;
+      }
+
       if (cmd === 'apikey') {
         const k = (await askSecret(ask, 'inference API key (hidden): ')).trim();
         try { saveApiKey(k); out(`saved to ${configPaths().credentials} (chmod 600)\n`); }
@@ -136,12 +152,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'list') {
-        const ag = await withWallet(ctx);
-        const rows = await ag.agent.listMyDeployments();
-        if (!rows.length) { out('no agents for this wallet on this attestor\n'); continue; }
-        for (const r of rows as Array<Record<string, unknown>>) {
-          out(`  ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${(r.agentCard as { name?: string })?.name ?? ''}\n`);
+        // Public listing — no wallet needed. If a key is configured, mark the
+        // rows this wallet owns with `*`.
+        const ag = await buildClient(ctx.env);
+        const key = ctx.env.privateKey ?? loadKey() ?? undefined;
+        const mine = key ? (await addressOf(key)).toLowerCase() : null;
+        const rows = await ag.agent.listDeployments();
+        if (!rows.length) { out('no agents on this attestor\n'); continue; }
+        for (const r of rows) {
+          const owned = mine && r.owner?.toLowerCase() === mine ? '*' : ' ';
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${r.name ?? ''}\n`);
         }
+        if (mine) out('(* = owned by your wallet)\n');
         continue;
       }
 
@@ -260,7 +282,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
   const r = await ag.agent.waitForRunning(dep.sealId, { timeoutMs: 360000 });
   out(`running at ${r.url}\n`);
-  return { ag, sealId: dep.sealId, agentId, framework, url: r.url, sandboxId: sbid(r.url), client: await ag.agent.client(r.url) };
+  return { ag, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, url: r.url, sandboxId: sbid(r.url), client: await ag.agent.client(r.url) };
 }
 
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Promise<Session> {
@@ -283,7 +305,13 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string): Pro
     url = (await ag.agent.waitForRunning(row.sealId, { timeoutMs: 360000 })).url;
   }
   out(`linked agent ${agentId} (${framework}) at ${url}\n`);
-  return { ag, sealId: row.sealId, agentId, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
+  // agentSeal (for /topup) is the `agent` field /hello reports.
+  let agentSeal: `0x${string}` | undefined;
+  try {
+    const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
+    if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) agentSeal = hello.agent as `0x${string}`;
+  } catch { /* topup will report it's unavailable */ }
+  return { ag, sealId: row.sealId, agentId, agentSeal, framework, url, sandboxId: sbid(url), client: await ag.agent.client(url) };
 }
 
 async function frameworkOf(attestorUrl: string, sealId: `0x${string}`): Promise<string> {
@@ -300,7 +328,7 @@ async function frameworkOf(attestorUrl: string, sealId: `0x${string}`): Promise<
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /stop /start /reset /agentlog /startuplog /back /quit — Esc or Ctrl-C interrupts a turn';
+  'chat, or: /hello /balance /topup [og] /stop /start /reset /agentlog /startuplog /back /quit — Esc or Ctrl-C interrupts a turn';
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
   out(`\nnow chatting with agent ${s.agentId}. ${L2_HELP}\n`);
@@ -322,8 +350,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/balance') {
+        // Agent-focused: this agent's own evolution-gas (agentSeal) balance,
+        // with the account-level prepaid alongside for context.
         const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
-        out(`agentSeal gas  : ${og(rc.sealGasWei)}\nsandbox balance: ${og(rc.prepaidBalanceWei)}\ncost/min       : ${og(rc.costPerMinWei)} → runway ~${rc.estimatedRunwayMinutes} min\n`);
+        out(`agentSeal gas   : ${og(rc.sealGasWei)}  (${s.agentSeal ?? '?'})\n`);
+        out(`sandbox prepaid : ${og(rc.prepaidBalanceWei)}  (account-level; see \`balance\` in the manager)\n`);
+        out('top up this agent with /topup [amount OG]\n');
+        continue;
+      }
+      if (line === '/topup' || line.startsWith('/topup ')) {
+        if (!s.agentSeal) { out('agentSeal unknown — cannot top up (try /hello first)\n'); continue; }
+        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.02]: ')).trim() || '0.02';
+        const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
+        out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
         continue;
       }
       if (line === '/stop') {
