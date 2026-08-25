@@ -257,8 +257,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // field (owner-only since #64), so "mine" cannot be derived from
         // them: with a key configured, ALSO fetch the owner-signed listing
         // and mark rows by sealId membership.
-        const ag = await buildClient(ctx.env);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
+        const ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
         let mySeals: Set<string> | null = null;
         if (key) {
           try { mySeals = new Set((await ag.agent.listMyDeployments()).map((r) => r.sealId)); }
@@ -298,6 +298,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   }
 }
 
+/** One client per (attestor,key) pair, cached across REPL commands —
+ *  rebuilding the SDK (a /config fetch + viem clients) on EVERY command is
+ *  what made the REPL feel slow. login/env changes invalidate naturally
+ *  because the cache key changes. */
+let cachedClient: { key: string; ag: AgenticID } | null = null;
+async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<AgenticID> {
+  const cacheKey = `${ctx.env.attestorUrl}|${withWalletOpt ? ctx.env.privateKey ?? '' : ''}`;
+  if (cachedClient?.key === cacheKey) return cachedClient.ag;
+  const ag = await buildClient(ctx.env, withWalletOpt ? { withWallet: true } : {});
+  cachedClient = { key: cacheKey, ag };
+  return ag;
+}
+
 /** Build a wallet-backed client, turning a missing key into a `login` nudge. */
 async function withWallet(ctx: CommandContext): Promise<AgenticID> {
   if (!ctx.env.privateKey) {
@@ -309,7 +322,7 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
       remedy: 'run `login` here (stored 0600), or set AGENTIC_PRIVATE_KEY',
     });
   }
-  return buildClient(ctx.env, { withWallet: true });
+  return clientFor(ctx, true);
 }
 
 /** Prompt for a secret with the typed characters not echoed. readline has no
@@ -472,14 +485,13 @@ const L2_HELP =
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
   out(`\nagent ${s.agentId} session (${s.phase}). ${L2_HELP}\n`);
-  // Low-gas heads-up on entry: an agent with an empty agentSeal can serve
-  // chat but cannot commit its evolution on chain.
-  try {
-    const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
+  // Low-gas heads-up on entry: advisory, so it must not block the prompt
+  // (3-4 chain reads). Runs in the background and only speaks up when low.
+  void s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
     if (rc.sealGasWei < parseEther('0.005')) {
-      out(`⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
+      out(`\n⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
     }
-  } catch { /* advisory only */ }
+  }).catch(() => { /* advisory only */ });
   const messages: ChatMessage[] = [];
   for (;;) {
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
