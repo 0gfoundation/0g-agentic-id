@@ -21,9 +21,11 @@ import type { CommandContext, CommandRun } from './types';
 import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
 import { run as list } from './commands/list';
-import { run as chat } from './commands/chat';
+import { run as interactive } from './commands/interactive';
 
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list, chat };
+/** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
+ *  routes to the default interactive shell. */
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -36,15 +38,22 @@ USAGE
   0g-agenticid <command> [options]   diagnostics
 
 INTERACTIVE (default — no command)
-  0g-agenticid            Deploy a new agent (framework + model wizard),
-                          then chat with it.
-  0g-agenticid <agent>    Attach to an existing agent (decimal agentId or
-                          0x… sealId; starts it if stopped) and chat.
-                          Esc / Ctrl-C interrupts the turn in flight;
-                          Ctrl-C twice at the prompt exits. Slash commands:
-                          /hello /balance /stop /start /reset /agentlog
-                          /startuplog /quit. Needs AGENTIC_PRIVATE_KEY;
-                          inference key from AGENTIC_API_KEY (env only).
+  0g-agenticid            Open the manager REPL. Its commands:
+                            list                 your agents on this attestor
+                            link <agentId|seal>  attach + chat (starts if stopped)
+                            deploy               new-agent wizard, then chat
+                            env [url]            show/set the attestor (saved)
+                            login                store the owner key (chmod 600)
+                            whoami · help · quit
+  0g-agenticid <agent>    Shortcut: link straight into that agent's chat,
+                          then drop to the manager REPL on /back.
+
+                          In a chat: type to talk; Esc / Ctrl-C interrupts the
+                          turn in flight; /back returns to the manager, /quit
+                          exits. Slash: /hello /balance /stop /start /reset
+                          /agentlog /startuplog. Config persists to
+                          ~/.config/0g-agenticid (env vars still override);
+                          the inference key comes from AGENTIC_API_KEY.
 
 COMMANDS
   doctor           Check every deploy prerequisite (attestor reachable, RPC,
@@ -128,14 +137,13 @@ async function main(): Promise<number> {
   // an agentId is decimal and a sealId is 0x…, so neither collides with a
   // command name — anything that isn't a known command routes to chat.
   const [first, ...rest] = positionals;
-  const command = first && first in COMMANDS ? first : 'chat';
-  const commandArgs = first && first in COMMANDS ? rest : positionals;
-  const run = COMMANDS[command];
+  const isCommand = !!first && first in COMMANDS;
+  const run = isCommand ? COMMANDS[first] : interactive;
 
   const ctx: CommandContext = {
     env: readEnv(),
     json: values.json,
-    positionals: commandArgs,
+    positionals: isCommand ? rest : positionals,
     flags: { mine: values.mine, phase: values.phase },
   };
   await run(ctx);
