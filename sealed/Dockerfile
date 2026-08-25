@@ -16,6 +16,12 @@
 # tag is applied when pushing that image to the registry. You
 # only need to rebuild the base when bumping node / openclaw versions.
 
+# Global build arg (declared before the first FROM so the stage-3 FROM can
+# reference it): the openclaw base registry. GCP by default — reachable from
+# GCP build environments and replacing the aliyun VPC registry. Override with
+# --build-arg OPENCLAW_BASE=<aliyun tag> to build against the aliyun mirror.
+ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.0
+
 # Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).
 FROM golang:1.24-alpine AS storage-builder
 RUN apk add --no-cache git
@@ -34,7 +40,14 @@ COPY internal/ ./internal/
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 
 # Stage 3 — runtime: openclaw base already has node + openclaw + nvm PATH set.
-FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:openclaw-1.1.0
+# OPENCLAW_BASE is the global arg declared at the top of this file.
+FROM ${OPENCLAW_BASE}
+
+# Low-privilege user the framework subprocess runs as (internal/privsep):
+# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Home stays /root — ownership of
+# the framework subtrees is handed over at spawn; the paths don't move.
+RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
 
 # Pre-install a pinned openclaw version and warm up its "bundled runtime
 # deps" (the npm packages openclaw fetches the first time `gateway run`

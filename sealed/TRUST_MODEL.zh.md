@@ -66,6 +66,39 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 
 ---
 
+## Habitat 与 tool sandbox
+
+本文档（以及整个项目）用两个词区分两种沙盒：
+
+- **habitat（栖居沙盒）**：agent 所栖居的那个被远程认证的 TEE 容器
+  —— 唯一被度量的边界，持有 `agent_seal_priv`、运行 sealed 和框架
+  进程，也是每条 attestation 和 `serve-proof` 断言所**指涉**的对象。
+  一个 agent 有且只有一个 habitat。它是 agent 的身体，不是 agent
+  使用的东西。
+- **tool sandbox（工具沙盒）**：边界**之外**的一次性算力（e2b 式的
+  执行沙盒、租来的 VM、任何外部运行时），agent 把它当工具消费：
+  不可信代码在那里跑、在那里炸、用完即弃。一个 agent 可以用任意
+  多个。
+
+两者的分界线就是"什么可被证明"：
+
+> **只有在 habitat 内执行的 work 才是可证明的。** attestation 和
+> `serve-proof` 只覆盖被度量的边界，边界之外一概不覆盖。从 tool
+> sandbox 拿回来的任何东西都是不可信输入 —— 只有当 agent 在自己的
+> habitat 内对它审议过、并（签名）发出自己的陈述时，它才获得归因。
+> 工具沙盒的结果是 agent 引用的证据，永远不是平台出具的证明。
+
+推论，双向都成立：任何秘密不得离开 habitat 进入 tool sandbox
+（`agent_seal_priv` 的任何派生物、iData 明文、推理 key 都不行）；
+从工具沙盒返回的东西也不因"在哪跑的"而获得任何信任。
+
+这也是与工具型沙盒产品的设计差异：那边的沙盒是（跑在别处的）agent
+用完即弃的东西；这边的沙盒**就是** agent 本人 —— 它的记忆、身份、
+签名能力全部锚定在这一个被度量的边界上。habitat 的对外产品名是
+**0G Sealed Sandbox**。
+
+---
+
 ## 信任链：`agent_seal_priv` 如何到达 TEE
 
 在 `serve-proof` 能有任何含义之前，私钥必须落到一个**可以推理其
@@ -510,8 +543,12 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-unix socket 在容器内 0600 绑定、**永不暴露到网络上** —— sandbox
-owner 没法从外面直接 post。这跟任何钱包里
+unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
+（`internal/privsep`），并且**永不暴露到网络上** —— sandbox
+owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
+"偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
+sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
+（sealed 另外自设 `PR_SET_DUMPABLE=0`）。这跟任何钱包里
 `eth_signTransaction` / `personal_sign` 的工作方式同构：钱包担保
 **谁签的**，不担保**内容正确**。agentSeal 没什么不同，它只是恰好是
 一个运行时被硬件认证过的钱包。

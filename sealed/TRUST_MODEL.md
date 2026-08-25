@@ -73,6 +73,44 @@ security regression**. It is the one rule that cannot bend.
 
 ---
 
+## Habitat vs tool sandbox
+
+Two words this document (and the project) uses for two different kinds
+of sandbox:
+
+- The **habitat** is the attested TEE container the agent lives in —
+  the one measured boundary that holds `agent_seal_priv`, runs sealed
+  and the framework process, and is what every attestation and
+  `serve-proof` claim is *about*. An agent has exactly one habitat.
+  It is the agent's body, not something the agent uses.
+- A **tool sandbox** is disposable compute *outside* that boundary
+  (an e2b-style execution sandbox, a rented VM, any external runtime)
+  that the agent may consume as a tool: run untrusted code there, let
+  it crash there, throw it away. An agent may use any number of them.
+
+The line between the two is what is provable:
+
+> **Only work executed inside the habitat is provable.** Attestation
+> and `serve-proof` cover the measured boundary and nothing beyond it.
+> Whatever comes back from a tool sandbox is untrusted input — it
+> gains attribution only when the agent, inside its habitat,
+> deliberates over it and emits (and signs) its own statement about
+> it. A tool-sandbox result is evidence the agent cites, never a
+> proof the platform makes.
+
+Corollary, in both directions: nothing secret may leave the habitat
+for a tool sandbox (no `agent_seal_priv` derivatives, no iData
+plaintext, no inference keys), and nothing returning from one is
+trusted by virtue of where it ran.
+
+This is also the design difference from tool-first sandbox products:
+there, the sandbox is something an agent (running elsewhere) uses and
+discards; here, the sandbox *is* the agent — its memory, identity, and
+signing capability are anchored to this one measured boundary. The
+marketing name for the habitat is **0G Sealed Sandbox**.
+
+---
+
 ## Trust chain: how `agent_seal_priv` reaches the TEE
 
 Before `serve-proof` can mean anything, the private key has to land in a
@@ -595,9 +633,15 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
 - Send chain transactions as agentSeal
 
-The unix socket is bound 0600 inside the container and **never exposed
-over the network** — sandbox owners cannot post to it directly from
-outside. This is analogous to how `eth_signTransaction` and
+The unix socket is bound 0600 and owned by the low-privilege `agent`
+user the framework subprocess runs as (`internal/privsep`), and **never
+exposed over the network** — sandbox owners cannot post to it directly
+from outside. The uid split also makes the key-exfiltration half of
+doctrine refusals 2/4 kernel-enforced: a de-privileged agent process
+cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read PID 1's
+bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`). This is
+analogous to how
+`eth_signTransaction` and
 `personal_sign` work in any wallet: the wallet attests *who signed*,
 not *that the content is correct*. agentSeal is no different; it just
 happens to be a wallet whose runtime is hardware-attested.
