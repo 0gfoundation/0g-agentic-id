@@ -484,7 +484,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   for (;;) {
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
     if (!line) continue;
-    if (line === '/back') { out('← back to manager\n'); return; }
+    if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP}\n`); continue; }
 
@@ -561,31 +561,43 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     // a chat turn (interruptible)
     if (!s.client) { out(`agent is ${s.phase} — /start or /reset before chatting\n`); continue; }
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
-    if (!s.framework) {
-      out('which framework is this agent? (sets the chat model selector)\n');
-      s.framework = await pickFramework(s.attestorUrl, ask);
-    }
     messages.push({ role: 'user', content: line });
-    const ac = new AbortController();
-    irq.streaming = ac;
-    out('agent> ');
-    let reply = '';
-    let interrupted = false;
-    try {
-      for await (const delta of s.client.chatStream(messages, { model: s.framework, signal: ac.signal })) {
-        out(delta); reply += delta;
+    // `model` is a per-framework selector some gateways require (openclaw
+    // does; the dsh/prime bridges ignore it). Send it when known, omit it
+    // otherwise — and only if the framework rejects that, ask once and retry.
+    let retriedWithPick = false;
+    for (;;) {
+      const ac = new AbortController();
+      irq.streaming = ac;
+      out('agent> ');
+      let reply = '';
+      let interrupted = false;
+      let failure: string | null = null;
+      try {
+        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal };
+        for await (const delta of s.client.chatStream(messages, opts)) {
+          out(delta); reply += delta;
+        }
+      } catch (e) {
+        if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
+          interrupted = true;
+          out('\n(interrupted)');
+        } else {
+          failure = (e as Error).message;
+        }
+      } finally {
+        irq.streaming = null;
       }
-    } catch (e) {
-      if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
-        interrupted = true;
-        out('\n(interrupted)');
-      } else {
-        out(`\n(chat failed: ${(e as Error).message})`);
+      if (failure && !s.framework && !retriedWithPick) {
+        out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);
+        s.framework = await pickFramework(s.attestorUrl, ask);
+        retriedWithPick = true;
+        continue; // retry the same user message once with the selector
       }
-    } finally {
-      irq.streaming = null;
+      if (failure) out(`\n(chat failed: ${failure})`);
+      out('\n');
+      messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
+      break;
     }
-    out('\n');
-    messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
   }
 }
