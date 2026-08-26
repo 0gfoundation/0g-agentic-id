@@ -175,7 +175,19 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 	if len(sigBytes) != 65 {
 		return fmt.Errorf("signature must be 65 bytes, got %d", len(sigBytes))
 	}
-	sigBytes[64] -= 27
+	// The sandbox TEE signer is external code we don't control; its library
+	// may emit the recovery id as raw 0/1 or as Ethereum's 27/28 convention.
+	// crypto.SigToPub only accepts 0/1, so normalize both forms explicitly
+	// instead of blindly subtracting 27 (which corrupts an already-raw 0/1
+	// byte into garbage and rejects an otherwise-valid signature).
+	switch sigBytes[64] {
+	case 27, 28:
+		sigBytes[64] -= 27
+	case 0, 1:
+		// already normalized
+	default:
+		return fmt.Errorf("invalid signature recovery id %d", sigBytes[64])
+	}
 	pub, err := crypto.SigToPub(hash[:], sigBytes)
 	if err != nil {
 		return fmt.Errorf("recover TEE signer: %w", err)

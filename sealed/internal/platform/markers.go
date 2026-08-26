@@ -71,11 +71,36 @@ func UpsertMarkedSection(path, body string) error {
 		}
 		out = append(out, []byte(section)...)
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	if err := os.WriteFile(path, out, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", path, err)
+	// Write via a same-directory temp file + rename so a failure mid-write
+	// (disk full, killed process) cannot truncate or corrupt the existing
+	// file — the rename is the only step that can observably change it, and
+	// it either fully succeeds or leaves the original untouched.
+	tmp, err := os.CreateTemp(dir, ".markers-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp for %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write temp for %s: %w", path, err)
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp for %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp for %s: %w", path, err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename temp to %s: %w", path, err)
 	}
 	return nil
 }
