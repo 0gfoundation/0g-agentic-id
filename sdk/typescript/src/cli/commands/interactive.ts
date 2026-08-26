@@ -808,10 +808,29 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/hello') {
         if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
         const res = await fetch(`${s.url}/hello`);
-        const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+        const body = (await res.json().catch(() => ({}))) as {
+          agent?: string; owner?: string; message?: string;
+          services?: { path: string; method: string; description?: string; skill?: string }[];
+          routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
+        };
         const proof = s.ag.reputation.proofFromResponse(res);
         const valid = proof ? await s.ag.reputation.verifyProof(proof) : null;
         out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+        // services = agent-registered endpoints (entry #0 is /hello itself);
+        // routes = framework-declared prefixes (dashboard, chat, …).
+        if (body.services?.length) {
+          out('services:\n');
+          for (const sv of body.services) {
+            out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+          }
+        }
+        if (body.routes?.length) {
+          out('routes:\n');
+          for (const rt of body.routes) {
+            const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
+            out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
+          }
+        }
         continue;
       }
       if (line === '/balance') {
