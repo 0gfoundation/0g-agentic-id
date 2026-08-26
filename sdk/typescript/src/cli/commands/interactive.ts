@@ -22,6 +22,7 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
+import { pandaLines } from '../logo';
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -258,9 +259,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   const wallet = key ? await addressOf(key) : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  out('\n╭──────────────────────────────────────╮\n');
-  out('│   0G AgenticID — interactive shell   │\n');
-  out('╰──────────────────────────────────────╯\n\n');
+  // Pixel splash (the avatar generator's panda) when the terminal can show
+  // it; the plain box otherwise (pipes, NO_COLOR, dumb terminals).
+  if (process.stdout.isTTY && !process.env.NO_COLOR) {
+    const art = pandaLines();
+    const caption = ['', '', '', '   \x1b[1m0G AgenticID\x1b[0m', '   interactive shell', '', '', ''];
+    out('\n');
+    art.forEach((l, i) => out(`  ${l}${caption[i] ?? ''}\n`));
+    out('\n');
+  } else {
+    out('\n╭──────────────────────────────────────╮\n');
+    out('│   0G AgenticID — interactive shell   │\n');
+    out('╰──────────────────────────────────────╯\n\n');
+  }
   // Ack read = /config fetch + chain reads; tolerate a down attestor/RPC so
   // a dead environment never blocks entering the shell.
   let ack = '';
