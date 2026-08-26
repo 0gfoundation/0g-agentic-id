@@ -21,11 +21,12 @@ import type { CommandContext, CommandRun } from './types';
 import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
 import { run as list } from './commands/list';
+import { run as update } from './commands/update';
 import { run as interactive } from './commands/interactive';
 
 /** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
  *  routes to the default interactive shell. */
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -40,8 +41,10 @@ USAGE
 INTERACTIVE (default — no command)
   0g-agenticid            Open the manager REPL. Its commands:
                             list                 agents on this attestor (* = yours)
-                            use <agentId|seal>   enter that agent's session, in
+                            use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
+                            hello <agentId|seal> any agent's public /hello
+                                                 (identity + services + proof)
                             deploy               new-agent wizard, then chat
                             start/stop/reset <id> lifecycle without entering
                                                  the session (reset asks the
@@ -83,6 +86,9 @@ COMMANDS
   list             List deployments. --mine (owner-signed, needs
                    AGENTIC_PRIVATE_KEY) adds owner-only fields such as the
                    failure reason and sandboxId.
+  update           Self-update: compare against the npm registry and
+                   npm install -g the latest (a git-checkout/npm-link copy
+                   is reported, not overwritten). --json only reports.
 
 OPTIONS
   --json           Machine output: stdout carries exactly one

@@ -22,7 +22,13 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
-import { pandaLines } from '../logo';
+import { pandaLines, svgPixelLines } from '../logo';
+
+// Tab-completion candidates for the active REPL level (canonical names only —
+// aliases like link//unuse still work typed out but don't clutter the list).
+const L1_WORDS = ['list', 'use ', 'hello ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -180,7 +186,19 @@ export async function run(ctx: CommandContext): Promise<void> {
     });
   }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    // Tab completion on the command word. One readline serves both levels,
+    // so the candidate set is swapped by whichever REPL loop is active
+    // (activeCompletions); empty line + Tab lists everything.
+    completer: (line: string): [string[], string] => {
+      if (line.includes(' ')) return [[], line];
+      const hits = activeCompletions.filter((c) => c.startsWith(line));
+      return [hits.length ? hits : activeCompletions, line];
+    },
+  });
   const ask = (q: string): Promise<string> => new Promise((res) => rl.question(q, res));
   const irq: Interrupt = { streaming: null };
 
@@ -223,9 +241,18 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
   const row = rows.find((r) =>
     ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
   if (!row) {
-    throw new CliError('AGENT_NOT_FOUND', `no deployment of yours matches ${refInput}`, {
-      remedy: 'check `list` (* marks your agents)',
-    });
+    // Say WHICH of the two things went wrong: the agent doesn't exist here,
+    // or it exists but belongs to another wallet (owner-only action).
+    const pub = await ag.agent.listDeployments().catch(() => []);
+    const exists = pub.some((r) =>
+      ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+    throw new CliError(
+      'AGENT_NOT_FOUND',
+      exists
+        ? `agent ${refInput} is not yours`
+        : `agent ${refInput} does not exist`,
+      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
+    );
   }
   return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined };
 }
@@ -233,17 +260,19 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
-  use <agentId|sealId>    enter an agent's session — works in ANY phase
+  use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
+  hello <agentId|sealId>  any agent's public /hello: identity, services,
+                          routes, serve-proof verification
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (asks framework + key)
   balance                 prepaid sandbox balance, burn rate, runway
-  deposit [og]            fund the prepaid balance (default 0.2 OG)
+  deposit [og]            fund the prepaid balance (default 1 OG)
   withdraw [og]           get prepaid funds back: shows balance + pending,
                           offers to claim matured refunds, then asks how
                           much (more) to withdraw (time-locked)
@@ -295,6 +324,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
   for (;;) {
+    activeCompletions = L1_WORDS;
     const line = (await ask('\n0g-agenticid> ')).trim();
     if (!line) continue;
     const [cmd, ...args] = line.split(/\s+/);
@@ -351,7 +381,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'deposit') {
         const ag = await withWallet(ctx);
-        const amt = args[0] || (await ask('amount OG [0.2]: ')).trim() || '0.2';
+        const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
         const tx = await ag.deposit({ amountWei: parseEther(amt) });
         await ag.waitForTransaction(tx);
         out(`deposited ${amt} OG to the prepaid sandbox balance → ${tx}\n`);
@@ -488,6 +518,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'hello') {
+        // Public inspection of ANY agent (yours or not) — no wallet needed.
+        if (!args[0]) { out('usage: hello <agentId|sealId>\n'); continue; }
+        const ag = await clientFor(ctx, false);
+        const ref = parseAgentRef(args[0]);
+        const rows = await ag.agent.listDeployments();
+        const row = rows.find((r) =>
+          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        await showHello(ag, row.url);
+        continue;
+      }
+
       if (cmd === 'use' || cmd === 'link') {
         if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
@@ -498,7 +542,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'deploy') {
         const ag = await withWallet(ctx);
-        const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx);
+        const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
+        if (!s) { out('wait cancelled — the deploy continues in the background; watch it with `list`, enter later with `use <id>`\n'); continue; }
         await sessionRepl(s, ask, irq, ctx);
         continue;
       }
@@ -523,6 +568,58 @@ async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<A
   const ag = await buildClient(ctx.env, withWalletOpt ? { withWallet: true } : {});
   cachedClient = { key: cacheKey, ag };
   return ag;
+}
+
+/** The agent's avatar as terminal art. Source of truth is the CARD's stored
+ *  image (agent_card.image, frozen at mint — the exact image the dashboard
+ *  shows), so the CLI can never drift from other surfaces; the attestor's
+ *  live /avatar/:sealId derivation is only the fallback for cards without
+ *  one. */
+async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<string[] | null> {
+  const B64 = 'data:image/svg+xml;base64,';
+  try {
+    const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`, { signal: AbortSignal.timeout(3000) })).json()) as { agent_card?: { image?: string } };
+    const img = d.agent_card?.image;
+    if (img?.startsWith(B64)) {
+      const lines = svgPixelLines(Buffer.from(img.slice(B64.length), 'base64').toString('utf8'));
+      if (lines) return lines;
+    }
+  } catch { /* fall through to the live derivation */ }
+  try {
+    const r = await fetch(`${attestorUrl}/avatar/${sealId}.svg`, { signal: AbortSignal.timeout(3000) });
+    return r.ok ? svgPixelLines(await r.text()) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch and print an agent's signed /hello: identity, proof verification,
+ *  and its two capability tables — services (agent-registered endpoints,
+ *  entry #0 is /hello itself) and routes (framework-declared prefixes).
+ *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello). */
+async function showHello(ag: AgenticID, url: string): Promise<void> {
+  const res = await fetch(`${url}/hello`);
+  const body = (await res.json().catch(() => ({}))) as {
+    agent?: string; owner?: string; message?: string;
+    services?: { path: string; method: string; description?: string; skill?: string }[];
+    routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
+  };
+  const proof = ag.reputation.proofFromResponse(res);
+  const valid = proof ? await ag.reputation.verifyProof(proof) : null;
+  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  if (body.services?.length) {
+    out('services:\n');
+    for (const sv of body.services) {
+      out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+    }
+  }
+  if (body.routes?.length) {
+    out('routes:\n');
+    for (const rt of body.routes) {
+      const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
+      out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
+    }
+  }
 }
 
 /** Build a wallet-backed client, turning a missing key into a `login` nudge. */
@@ -600,16 +697,16 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   const bal = await ag.getBalance();
   if (bal < parseEther('0.1')) {
     out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
-    const amt = (await ask('deposit how much OG now? [0.2, empty to cancel]: ')).trim();
+    const amt = (await ask('deposit how much OG now? [1, empty to cancel]: ')).trim();
     if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
-    const tx = await ag.deposit({ amountWei: parseEther(amt || '0.2') });
+    const tx = await ag.deposit({ amountWei: parseEther(amt || '1') });
     out(`deposit ${amt} OG → ${tx} (waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;
 }
 
-async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext): Promise<Session> {
+async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
@@ -640,11 +737,14 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   });
   const mint = await ag.agent.waitForMint(dep.sealId, { timeoutMs: 180000 });
   const agentId = String((mint as { agentId?: unknown }).agentId ?? mint);
-  out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
-  const r = await pollRunning(attestorUrl, dep.sealId, agentId);
-  out(`running at ${r.url}\n`);
-  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running' };
-  await connectSession(s, r.url);
+  out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
+  const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
+  if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  // Enter through attach so a fresh deploy gets the same entry card
+  // (avatar / gas / status) as `use`; only the wizard knows the framework.
+  const s = await attach(ag, attestorUrl, agentId, ask);
+  s.framework = framework;
+  if (!s.agentSeal) s.agentSeal = dep.agentSealAddr;
   return s;
 }
 
@@ -669,19 +769,50 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     sandboxId: row.url ? sbid(row.url) : undefined,
   };
   if (row.phase === 'running' && row.url) await connectSession(s, row.url);
-  // Entry status card — everything comes from the listing row already
-  // fetched (plus the failure reason for broken phases), no extra reads.
-  out(`\nagent ${agentId}${row.name ? ` · ${row.name}` : ''}\n`);
-  out(`  phase   ${s.phase}\n`);
-  if (s.url) out(`  url     ${s.url}\n`);
-  out(`  sealId  ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}\n`);
+  // Entry status card: the agent's own pixel avatar (the attestor renders
+  // it from the sealId — the exact image its AgentCard carries) beside
+  // phase / url / sealId / agentSeal gas. Avatar + gas fetch in parallel
+  // and each degrades to absence on failure.
+  const wantArt = !!process.stdout.isTTY && !process.env.NO_COLOR;
+  const [art, gasWei, mine] = await Promise.all([
+    wantArt ? fetchAvatarLines(attestorUrl, row.sealId) : Promise.resolve(null),
+    /^\d+$/.test(agentId)
+      ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
+      : Promise.resolve(null),
+    // Ownership up front, so owner-only commands can refuse plainly instead
+    // of failing phase checks or bouncing off the attestor's auth later.
+    ag.agent.listMyDeployments().then((rs) => rs.some((r) => r.sealId === row.sealId)).catch(() => undefined),
+  ]);
+  // The session is the owner's cockpit — a foreign agent's public surface is
+  // L1 `hello <id>`. Undetermined ownership (listing fetch failed) enters
+  // anyway; the attestor's auth still guards every owner action.
+  if (mine === false) {
+    throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} is not yours`, {
+      remedy: `talk to its public surface with: hello ${agentId}`,
+    });
+  }
+  const fields: string[] = [];
+  fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
+  fields.push(`phase    ${s.phase}`);
+  if (s.url) fields.push(`url      ${s.url}`);
+  fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
+  if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
   if (s.phase === 'running' && s.url) {
-    out('  type to chat · /help for commands · Esc interrupts a turn\n\n');
+    fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
     const reason = await failureReasonOf(attestorUrl, row.sealId);
-    if (reason) out(`  last error: ${reason}\n`);
-    out(s.phase === 'stopped' ? '  → /start to bring it back\n\n' : '  → /reset to recreate its container\n\n');
+    if (reason) fields.push(`last error: ${reason}`);
+    fields.push(s.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
   }
+  out('\n');
+  if (art) {
+    for (let i = 0; i < Math.max(art.length, fields.length); i++) {
+      out(`  ${art[i] ?? ' '.repeat(16)}   ${fields[i] ?? ''}\n`);
+    }
+  } else {
+    for (const f of fields) out(`  ${f}\n`);
+  }
+  out('\n');
   return s;
 }
 
@@ -722,7 +853,7 @@ const L2_HELP_FULL = `session commands
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
-  /topup [og]             fund this agent's agentSeal gas (default 0.02 OG)
+  /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
   /start                  start (only from stopped)
   /stop                   stop the running container
   /reset                  recreate the container (asks framework + key; also
@@ -733,7 +864,7 @@ const L2_HELP_FULL = `session commands
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session (${s.phase}). ${L2_HELP}\n`);
+  out(`\nagent ${s.agentId} session — ${s.phase} · type to chat · Tab completes /commands · /help for details\n`);
   // Low-gas heads-up on entry: advisory, so it must not block the prompt
   // (3-4 chain reads). Runs in the background and only speaks up when low.
   void s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
@@ -743,6 +874,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }).catch(() => { /* advisory only */ });
   const messages: ChatMessage[] = [];
   for (;;) {
+    activeCompletions = L2_WORDS;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
@@ -762,11 +894,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     try {
       if (line === '/hello') {
         if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
-        const res = await fetch(`${s.url}/hello`);
-        const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-        const proof = s.ag.reputation.proofFromResponse(res);
-        const valid = proof ? await s.ag.reputation.verifyProof(proof) : null;
-        out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+        await showHello(s.ag, s.url);
         continue;
       }
       if (line === '/balance') {
@@ -791,7 +919,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
         }
-        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.02]: ')).trim() || '0.02';
+        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
         const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
         out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
         continue;
