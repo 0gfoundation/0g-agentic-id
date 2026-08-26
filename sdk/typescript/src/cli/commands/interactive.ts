@@ -725,11 +725,13 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   models.forEach((m, i) => out(`  ${i}. ${m}\n`));
   const model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
 
+  const name = (await ask(`name [chat-${framework}]: `)).trim() || `chat-${framework}`;
+
   const apiKey = await inferenceKey(ctx, ask);
   if (!(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${framework} (${model})…\n`);
+  out(`\ndeploying ${name} (${framework} · ${model})…\n`);
   const dep = await ag.agent.deploy({
-    name: `chat-${framework}`,
+    name,
     description: 'deployed from 0g-agenticid',
     framework,
     inference: { provider: '0g-compute', model },
