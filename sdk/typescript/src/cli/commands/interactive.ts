@@ -216,24 +216,29 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   const wallet = key ? await addressOf(key) : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  out('\n╭──────────────────────────────────────────────╮\n');
-  out('│  0G AgenticID — interactive shell            │\n');
-  out('╰──────────────────────────────────────────────╯\n');
+  out('\n╭──────────────────────────────────────╮\n');
+  out('│   0G AgenticID — interactive shell   │\n');
+  out('╰──────────────────────────────────────╯\n\n');
   // Ack read = /config fetch + chain reads; tolerate a down attestor/RPC so
   // a dead environment never blocks entering the shell.
   let ack = '';
   if (key && ctx.env.attestorUrl) {
-    ack = await withWallet(ctx)
+    const read = withWallet(ctx)
       .then((ag) => ag.ackStatus())
       .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
       .catch(() => '(unreachable)');
+    // A hanging (vs refusing) attestor must not stall the banner.
+    ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
   }
-  out(`  attestor  ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet    ${wallet ? short(wallet) : '(none)'}      api key  ${hasApiKey ? 'set' : '(none)'}${ack ? `      ack  ${ack}` : ''}\n\n`);
+  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  out(`  wallet     ${wallet ? short(wallet) : '(none)'}\n`);
+  out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
+  if (ack) out(`  ack        ${ack}\n`);
+  out('\n');
   if (!ctx.env.attestorUrl || !key || !hasApiKey) {
     out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
   } else {
-    out('  `list` to see your agents · `use <id>` to chat (Esc interrupts a turn) · `help` for everything\n\n');
+    out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
   for (;;) {
     const line = (await ask('\n0g-agenticid> ')).trim();
@@ -598,13 +603,19 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     phase: row.phase ?? 'unknown',
     sandboxId: row.url ? sbid(row.url) : undefined,
   };
-  if (row.phase === 'running' && row.url) {
-    await connectSession(s, row.url);
-    out(`using agent ${agentId} at ${row.url}\n`);
+  if (row.phase === 'running' && row.url) await connectSession(s, row.url);
+  // Entry status card — everything comes from the listing row already
+  // fetched (plus the failure reason for broken phases), no extra reads.
+  out(`\nagent ${agentId}${row.name ? ` · ${row.name}` : ''}\n`);
+  out(`  phase   ${s.phase}\n`);
+  if (s.url) out(`  url     ${s.url}\n`);
+  out(`  sealId  ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}\n`);
+  if (s.phase === 'running' && s.url) {
+    out('  type to chat · /help for commands · Esc interrupts a turn\n\n');
   } else {
     const reason = await failureReasonOf(attestorUrl, row.sealId);
-    out(`using agent ${agentId} — ${s.phase}${reason ? ` (last error: ${reason})` : ''}\n`);
-    out(s.phase === 'stopped' ? '→ /start to bring it back\n' : '→ /reset to recreate its container\n');
+    if (reason) out(`  last error: ${reason}\n`);
+    out(s.phase === 'stopped' ? '  → /start to bring it back\n\n' : '  → /reset to recreate its container\n\n');
   }
   return s;
 }
