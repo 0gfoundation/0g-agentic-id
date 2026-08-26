@@ -22,7 +22,7 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
-import { pandaLines } from '../logo';
+import { pandaLines, svgPixelLines } from '../logo';
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -669,19 +669,44 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     sandboxId: row.url ? sbid(row.url) : undefined,
   };
   if (row.phase === 'running' && row.url) await connectSession(s, row.url);
-  // Entry status card — everything comes from the listing row already
-  // fetched (plus the failure reason for broken phases), no extra reads.
-  out(`\nagent ${agentId}${row.name ? ` · ${row.name}` : ''}\n`);
-  out(`  phase   ${s.phase}\n`);
-  if (s.url) out(`  url     ${s.url}\n`);
-  out(`  sealId  ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}\n`);
+  // Entry status card: the agent's own pixel avatar (the attestor renders
+  // it from the sealId — the exact image its AgentCard carries) beside
+  // phase / url / sealId / agentSeal gas. Avatar + gas fetch in parallel
+  // and each degrades to absence on failure.
+  const wantArt = !!process.stdout.isTTY && !process.env.NO_COLOR;
+  const [art, gasWei] = await Promise.all([
+    wantArt
+      ? fetch(`${attestorUrl}/avatar/${row.sealId}.svg`, { signal: AbortSignal.timeout(3000) })
+          .then((r) => (r.ok ? r.text() : null))
+          .then((t) => (t ? svgPixelLines(t) : null))
+          .catch(() => null)
+      : Promise.resolve(null),
+    /^\d+$/.test(agentId)
+      ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
+      : Promise.resolve(null),
+  ]);
+  const fields: string[] = [];
+  fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
+  fields.push(`phase    ${s.phase}`);
+  if (s.url) fields.push(`url      ${s.url}`);
+  fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
+  if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
   if (s.phase === 'running' && s.url) {
-    out('  type to chat · /help for commands · Esc interrupts a turn\n\n');
+    fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
     const reason = await failureReasonOf(attestorUrl, row.sealId);
-    if (reason) out(`  last error: ${reason}\n`);
-    out(s.phase === 'stopped' ? '  → /start to bring it back\n\n' : '  → /reset to recreate its container\n\n');
+    if (reason) fields.push(`last error: ${reason}`);
+    fields.push(s.phase === 'stopped' ? '→ /start to bring it back' : '→ /reset to recreate its container');
   }
+  out('\n');
+  if (art) {
+    for (let i = 0; i < Math.max(art.length, fields.length); i++) {
+      out(`  ${art[i] ?? ' '.repeat(16)}   ${fields[i] ?? ''}\n`);
+    }
+  } else {
+    for (const f of fields) out(`  ${f}\n`);
+  }
+  out('\n');
   return s;
 }
 
