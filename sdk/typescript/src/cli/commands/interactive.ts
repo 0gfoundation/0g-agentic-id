@@ -542,7 +542,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'deploy') {
         const ag = await withWallet(ctx);
-        const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx);
+        const s = await deployWizard(ag, requireAttestorUrl(ctx.env), ask, ctx, irq);
+        if (!s) { out('wait cancelled — the deploy continues in the background; watch it with `list`, enter later with `use <id>`\n'); continue; }
         await sessionRepl(s, ask, irq, ctx);
         continue;
       }
@@ -567,6 +568,29 @@ async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<A
   const ag = await buildClient(ctx.env, withWalletOpt ? { withWallet: true } : {});
   cachedClient = { key: cacheKey, ag };
   return ag;
+}
+
+/** The agent's avatar as terminal art. Source of truth is the CARD's stored
+ *  image (agent_card.image, frozen at mint — the exact image the dashboard
+ *  shows), so the CLI can never drift from other surfaces; the attestor's
+ *  live /avatar/:sealId derivation is only the fallback for cards without
+ *  one. */
+async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<string[] | null> {
+  const B64 = 'data:image/svg+xml;base64,';
+  try {
+    const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`, { signal: AbortSignal.timeout(3000) })).json()) as { agent_card?: { image?: string } };
+    const img = d.agent_card?.image;
+    if (img?.startsWith(B64)) {
+      const lines = svgPixelLines(Buffer.from(img.slice(B64.length), 'base64').toString('utf8'));
+      if (lines) return lines;
+    }
+  } catch { /* fall through to the live derivation */ }
+  try {
+    const r = await fetch(`${attestorUrl}/avatar/${sealId}.svg`, { signal: AbortSignal.timeout(3000) });
+    return r.ok ? svgPixelLines(await r.text()) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Fetch and print an agent's signed /hello: identity, proof verification,
@@ -682,7 +706,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   return true;
 }
 
-async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext): Promise<Session> {
+async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
   const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
@@ -713,11 +737,14 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   });
   const mint = await ag.agent.waitForMint(dep.sealId, { timeoutMs: 180000 });
   const agentId = String((mint as { agentId?: unknown }).agentId ?? mint);
-  out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
-  const r = await pollRunning(attestorUrl, dep.sealId, agentId);
-  out(`running at ${r.url}\n`);
-  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running' };
-  await connectSession(s, r.url);
+  out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
+  const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
+  if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
+  // Enter through attach so a fresh deploy gets the same entry card
+  // (avatar / gas / status) as `use`; only the wizard knows the framework.
+  const s = await attach(ag, attestorUrl, agentId, ask);
+  s.framework = framework;
+  if (!s.agentSeal) s.agentSeal = dep.agentSealAddr;
   return s;
 }
 
@@ -748,12 +775,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   // and each degrades to absence on failure.
   const wantArt = !!process.stdout.isTTY && !process.env.NO_COLOR;
   const [art, gasWei, mine] = await Promise.all([
-    wantArt
-      ? fetch(`${attestorUrl}/avatar/${row.sealId}.svg`, { signal: AbortSignal.timeout(3000) })
-          .then((r) => (r.ok ? r.text() : null))
-          .then((t) => (t ? svgPixelLines(t) : null))
-          .catch(() => null)
-      : Promise.resolve(null),
+    wantArt ? fetchAvatarLines(attestorUrl, row.sealId) : Promise.resolve(null),
     /^\d+$/.test(agentId)
       ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
       : Promise.resolve(null),
