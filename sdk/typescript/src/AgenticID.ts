@@ -849,4 +849,8 @@ export class AgenticID {
   getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     return this.infra.getBalanceDetail(opts?.user, opts?.provider);
   }
+  /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). Claim with {@link withdrawRefund}. */
+  requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }
+  /** Claim the pending refund once `refundUnlockAt` has passed (reverts earlier); pays out to the caller's wallet. */
+  withdrawRefund(opts?: { provider?: Address }): Promise<WriteContractReturnType> { return this.infra.withdrawRefund(opts?.provider); }
 }

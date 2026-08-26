@@ -26,6 +26,7 @@ One entry point, two namespaces + top-level ops.
 | `ag.reputation` | capture a TEE-signed serve-proof, verify it, submit/read on-chain feedback |
 | `ag.ack()` / `ag.ackStatus()` | acknowledge the TEE trust-root component set (attestor + kms + sandbox-provider) |
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance (pay-as-you-go runtime) |
+| `ag.getBalanceDetail()` / `ag.requestRefund()` / `ag.withdrawRefund()` | full 3-value account view; withdraw prepaid funds (time-locked two-step) |
 
 Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't decide which call is on-chain and which is HTTP.
 
