@@ -23,6 +23,12 @@ import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
 import { pandaLines, svgPixelLines } from '../logo';
+
+// Tab-completion candidates for the active REPL level (canonical names only —
+// aliases like link//unuse still work typed out but don't clutter the list).
+const L1_WORDS = ['list', 'use ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -180,7 +186,19 @@ export async function run(ctx: CommandContext): Promise<void> {
     });
   }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+    // Tab completion on the command word. One readline serves both levels,
+    // so the candidate set is swapped by whichever REPL loop is active
+    // (activeCompletions); empty line + Tab lists everything.
+    completer: (line: string): [string[], string] => {
+      if (line.includes(' ')) return [[], line];
+      const hits = activeCompletions.filter((c) => c.startsWith(line));
+      return [hits.length ? hits : activeCompletions, line];
+    },
+  });
   const ask = (q: string): Promise<string> => new Promise((res) => rl.question(q, res));
   const irq: Interrupt = { streaming: null };
 
@@ -295,6 +313,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
   for (;;) {
+    activeCompletions = L1_WORDS;
     const line = (await ask('\n0g-agenticid> ')).trim();
     if (!line) continue;
     const [cmd, ...args] = line.split(/\s+/);
@@ -758,7 +777,7 @@ const L2_HELP_FULL = `session commands
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session (${s.phase}). ${L2_HELP}\n`);
+  out(`\nagent ${s.agentId} session — ${s.phase} · type to chat · Tab completes /commands · /help for details\n`);
   // Low-gas heads-up on entry: advisory, so it must not block the prompt
   // (3-4 chain reads). Runs in the background and only speaks up when low.
   void s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
@@ -768,6 +787,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }).catch(() => { /* advisory only */ });
   const messages: ChatMessage[] = [];
   for (;;) {
+    activeCompletions = L2_WORDS;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
