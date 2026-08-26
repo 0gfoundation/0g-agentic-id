@@ -36,10 +36,19 @@ export async function run(ctx: CommandContext): Promise<void> {
   const latest = ((await res.json()) as { version?: string }).version;
   if (!latest) throw new CliError('UNKNOWN', 'npm registry response had no version field');
 
+  // numeric x.y.z compare: <0 behind, 0 equal, >0 ahead of the registry
+  const cmp = ((a: string, b: string): number => {
+    const pa = a.split('.').map(Number);
+    const pb = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
+    return 0;
+  })(self.version, latest);
+
   const dev = !self.dir.includes('node_modules');
-  if (latest === self.version) {
+  if (cmp >= 0) {
     if (ctx.json) { emitOk({ name: self.name, current: self.version, latest, updated: false, dev }); return; }
-    print(`up to date — ${self.name} ${self.version}`);
+    if (cmp === 0) print(`up to date — ${self.name} ${self.version}`);
+    else print(`ahead of the registry — running ${self.version}, npm latest is ${latest} (not yet published)`);
     return;
   }
   if (dev) {
