@@ -811,7 +811,11 @@ export const sandboxServingAbi = [
       { name: 'user', type: 'address' },
       { name: 'provider', type: 'address' },
     ],
-    outputs: [{ name: '', type: 'uint256' }],
+    outputs: [
+      { name: 'balance', type: 'uint256' },
+      { name: 'pendingRefund', type: 'uint256' },
+      { name: 'refundUnlockAt', type: 'uint256' },
+    ],
   },
   {
     type: 'function',
