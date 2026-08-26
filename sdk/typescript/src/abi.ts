@@ -805,6 +805,23 @@ export const sandboxServingAbi = [
   },
   {
     type: 'function',
+    name: 'requestRefund',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'provider', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'withdrawRefund',
+    stateMutability: 'nonpayable',
+    inputs: [{ name: 'provider', type: 'address' }],
+    outputs: [],
+  },
+  {
+    type: 'function',
     name: 'getBalance',
     stateMutability: 'view',
     inputs: [

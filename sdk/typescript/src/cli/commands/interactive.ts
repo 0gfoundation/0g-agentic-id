@@ -22,6 +22,7 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
+import { pandaLines } from '../logo';
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -33,7 +34,7 @@ interface Session {
   attestorUrl: string;
   sealId: `0x${string}`;
   agentId: string;
-  agentSeal?: `0x${string}`; // for /topup; resolved from /hello
+  agentSeal?: `0x${string}`; // for /topup; from deploy//hello, else read from chain on demand
   /** Needed by /reset (which image) and the chat model selector. Not exposed
    *  by the attestor post-mint, so it is PICKED by the user when first
    *  needed (deploy knows it; use/attach does not). */
@@ -58,6 +59,48 @@ async function connectSession(s: Session, url: string): Promise<void> {
       if (hello.agent && /^0x[0-9a-fA-F]{40}$/.test(hello.agent)) s.agentSeal = hello.agent as `0x${string}`;
     } catch { /* /topup will say it's unavailable */ }
   }
+}
+
+/** /config's sandbox_proxy_addr, fetched once per attestor (used to construct
+ *  container URLs — the detail endpoint has no url field). */
+const proxyAddrCache = new Map<string, Promise<string | undefined>>();
+function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
+  let p = proxyAddrCache.get(attestorUrl);
+  if (!p) {
+    p = fetch(`${attestorUrl}/config`)
+      .then((r) => r.json())
+      .then((c) => (c as { sandbox_proxy_addr?: string }).sandbox_proxy_addr)
+      .catch(() => undefined);
+    proxyAddrCache.set(attestorUrl, p);
+  }
+  return p;
+}
+
+/** Re-read the deployment row and resync the session, printing the result:
+ *  phase always; the container URL as soon as a sandbox exists (the sealed
+ *  runtime serves /log while still `deploying`); the chat client only when
+ *  running (and dropped again when not, so a stale connection can't linger). */
+async function refreshSession(s: Session, quiet = false): Promise<void> {
+  const before = s.phase;
+  const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
+    phase?: string; url?: string; sandbox_id?: string;
+    container_stage?: { state?: string; reason?: string };
+  };
+  s.phase = d.phase ?? s.phase;
+  const proxy = await proxyAddrOf(s.attestorUrl);
+  const url = d.url ?? (d.sandbox_id && proxy ? `http://8080-${d.sandbox_id}.${proxy}` : undefined);
+  if (s.phase === 'running' && url) {
+    if (!s.client || s.url !== url) await connectSession(s, url);
+  } else {
+    s.url = url;
+    s.sandboxId = d.sandbox_id ?? s.sandboxId;
+    s.client = undefined;
+  }
+  if (quiet && s.phase === before) return; // background refresh: report only movement
+  out(`  phase   ${s.phase}\n`);
+  if (s.url) out(`  url     ${s.url}\n`);
+  const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
+  if (reason) out(`  last error: ${reason}\n`);
 }
 
 /**
@@ -190,7 +233,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · login · whoami · help · quit';
+  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -201,9 +244,14 @@ const L1_HELP_FULL = `manager commands
   reset <id>              recreate an agent's container (asks framework + key)
   balance                 prepaid sandbox balance, burn rate, runway
   deposit [og]            fund the prepaid balance (default 0.2 OG)
+  withdraw [og]           get prepaid funds back: shows balance + pending,
+                          offers to claim matured refunds, then asks how
+                          much (more) to withdraw (time-locked)
+  ack                     acknowledge the TEE trust root (deploy/start/reset
+                          do this implicitly; re-run after an attestor upgrade)
   login                   guided setup: attestor URL, owner key, inference key
                           (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / api-key status
+  whoami                  show attestor / wallet / api-key / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)`;
 
@@ -212,15 +260,39 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   const wallet = key ? await addressOf(key) : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
-  out('\n╭──────────────────────────────────────────────╮\n');
-  out('│  0G AgenticID — interactive shell            │\n');
-  out('╰──────────────────────────────────────────────╯\n');
-  out(`  attestor  ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet    ${wallet ? short(wallet) : '(none)'}      api key  ${hasApiKey ? 'set' : '(none)'}\n\n`);
+  // Pixel splash (the avatar generator's panda) when the terminal can show
+  // it; the plain box otherwise (pipes, NO_COLOR, dumb terminals).
+  if (process.stdout.isTTY && !process.env.NO_COLOR) {
+    const art = pandaLines();
+    const caption = ['', '', '', '   \x1b[1m0G AgenticID\x1b[0m', '   interactive shell', '', '', ''];
+    out('\n');
+    art.forEach((l, i) => out(`  ${l}${caption[i] ?? ''}\n`));
+    out('\n');
+  } else {
+    out('\n╭──────────────────────────────────────╮\n');
+    out('│   0G AgenticID — interactive shell   │\n');
+    out('╰──────────────────────────────────────╯\n\n');
+  }
+  // Ack read = /config fetch + chain reads; tolerate a down attestor/RPC so
+  // a dead environment never blocks entering the shell.
+  let ack = '';
+  if (key && ctx.env.attestorUrl) {
+    const read = withWallet(ctx)
+      .then((ag) => ag.ackStatus())
+      .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
+      .catch(() => '(unreachable)');
+    // A hanging (vs refusing) attestor must not stall the banner.
+    ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
+  }
+  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  out(`  wallet     ${wallet ? short(wallet) : '(none)'}\n`);
+  out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
+  if (ack) out(`  ack        ${ack}\n`);
+  out('\n');
   if (!ctx.env.attestorUrl || !key || !hasApiKey) {
     out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
   } else {
-    out('  `list` to see your agents · `use <id>` to chat (Esc interrupts a turn) · `help` for everything\n\n');
+    out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
   for (;;) {
     const line = (await ask('\n0g-agenticid> ')).trim();
@@ -258,15 +330,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        const [est, rows] = await Promise.all([ag.agent.estimateCosts(), ag.agent.listMyDeployments()]);
+        const [est, rows, detail] = await Promise.all([
+          ag.agent.estimateCosts(),
+          ag.agent.listMyDeployments(),
+          ag.getBalanceDetail().catch(() => null),
+        ]);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
+        if (detail && detail.pendingRefund > 0n) {
+          out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
+        }
         out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
         out(`burn rate       : ${og(burnPerMin)}/min\n`);
         out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
-        out('add funds with `deposit [amount OG]`\n');
+        out('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
         continue;
       }
 
@@ -279,12 +358,77 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'withdraw') {
+        // Two-step by contract design: requestRefund moves funds into a
+        // time-locked pending pot; withdrawRefund claims it after the lock.
+        // `withdraw <og>` starts one, bare `withdraw` claims (or reports the
+        // lock) — the pending state decides which step the user is on.
+        const ag = await withWallet(ctx);
+        const d = await ag.getBalanceDetail();
+        const unlockMs = Number(d.refundUnlockAt) * 1000;
+        let pending = d.pendingRefund;
+        // Status first: spendable, the pending pot (one per provider — the
+        // contract holds a single pot, not a list) and its lock state.
+        out(`spendable : ${og(d.balance)}\n`);
+        out(`pending   : ${pending > 0n ? `${og(pending)} ${Date.now() >= unlockMs ? '(unlocked — claimable now)' : `(locked until ${new Date(unlockMs).toLocaleString()})`}` : '(none)'}\n`);
+        // Matured funds are offered FIRST: requestRefund re-absorbs the pot
+        // and re-locks it, so requesting before claiming would freeze money
+        // that was already free.
+        if (pending > 0n && Date.now() >= unlockMs) {
+          const yn = (await ask(`claim ${og(pending)} to your wallet now? [Y/n]: `)).trim().toLowerCase();
+          if (!yn || yn === 'y' || yn === 'yes') {
+            const tx = await ag.withdrawRefund();
+            await ag.waitForTransaction(tx);
+            out(`withdrew ${og(pending)} to your wallet → ${tx}\n`);
+            pending = 0n;
+          }
+        }
+        // Then the request. The amount asked is the INCREMENT, drawn from the
+        // spendable balance — the contract itself only takes a new total
+        // (re-absorbing the pot, restarting the lock), so we submit
+        // pending + amount on the user's behalf.
+        const more = pending > 0n ? ` more (joins the pending ${og(pending)}; lock restarts)` : '';
+        const amt = args[0] || (await ask(`withdraw how much${more}? [max ${og(d.balance)}, empty to skip]: `)).trim();
+        if (!amt) continue;
+        const amountWei = parseEther(amt);
+        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
+        const tx = await ag.requestRefund({ amountWei: amountWei + pending });
+        await ag.waitForTransaction(tx);
+        const after = await ag.getBalanceDetail();
+        if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
+        else out(`${amt} OG moved to pending refund → ${tx}\n`);
+        out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
+        continue;
+      }
+
 
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
+        if (key && ctx.env.attestorUrl) {
+          try {
+            const { allAcked, missing } = await (await withWallet(ctx)).ackStatus();
+            out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
+          } catch (e) {
+            out(`ack     : (unreadable: ${(e as Error).message})\n`);
+          }
+        }
+        continue;
+      }
+
+      if (cmd === 'ack') {
+        // Manual trust-root acknowledgment. deploy/start/reset all run this
+        // implicitly, but the attestor's ackVersion can bump under you (e.g.
+        // a redeploy) — this is the explicit re-ack.
+        const ag = await withWallet(ctx);
+        const { allAcked, missing } = await ag.ackStatus();
+        if (allAcked) { out('trust root already acknowledged — nothing to do\n'); continue; }
+        out(`acknowledging: ${missing.join(', ')}\n`);
+        const tx = await ag.ack();
+        if (tx) { out(`ack() → ${tx} (waiting…)\n`); await ag.waitForTransaction(tx); }
+        out('acknowledged\n');
         continue;
       }
 
@@ -326,6 +470,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (cmd === 'start') {
           if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
           if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
+          if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
           out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
@@ -447,7 +592,8 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
  *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
- *  Returns false when the user declines (caller should abort link/deploy). */
+ *  Gates every balance-spending action (deploy/start/reset). Returns false
+ *  when the user declines (caller should abort the action). */
 async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
@@ -522,13 +668,19 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     phase: row.phase ?? 'unknown',
     sandboxId: row.url ? sbid(row.url) : undefined,
   };
-  if (row.phase === 'running' && row.url) {
-    await connectSession(s, row.url);
-    out(`using agent ${agentId} at ${row.url}\n`);
+  if (row.phase === 'running' && row.url) await connectSession(s, row.url);
+  // Entry status card — everything comes from the listing row already
+  // fetched (plus the failure reason for broken phases), no extra reads.
+  out(`\nagent ${agentId}${row.name ? ` · ${row.name}` : ''}\n`);
+  out(`  phase   ${s.phase}\n`);
+  if (s.url) out(`  url     ${s.url}\n`);
+  out(`  sealId  ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}\n`);
+  if (s.phase === 'running' && s.url) {
+    out('  type to chat · /help for commands · Esc interrupts a turn\n\n');
   } else {
     const reason = await failureReasonOf(attestorUrl, row.sealId);
-    out(`using agent ${agentId} — ${s.phase}${reason ? ` (last error: ${reason})` : ''}\n`);
-    out(s.phase === 'stopped' ? '→ /start to bring it back\n' : '→ /reset to recreate its container\n');
+    if (reason) out(`  last error: ${reason}\n`);
+    out(s.phase === 'stopped' ? '  → /start to bring it back\n\n' : '  → /reset to recreate its container\n\n');
   }
   return s;
 }
@@ -567,6 +719,7 @@ const L2_HELP =
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side)
+  (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
   /topup [og]             fund this agent's agentSeal gas (default 0.02 OG)
@@ -590,8 +743,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }).catch(() => { /* advisory only */ });
   const messages: ChatMessage[] = [];
   for (;;) {
+    // While not connected (deploying/stopped/offline) the phase is in flux —
+    // auto-refresh before every prompt, printing only when it moves (and
+    // connecting the moment it reaches running). Once connected, skip: no
+    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
+    if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
-    if (!line) continue;
+    if (!line) {
+      // Bare Enter = live status refresh (phase moves on its own during
+      // deploying/provisioning; the entry card only showed the initial one).
+      try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
+      continue;
+    }
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
@@ -616,7 +779,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/topup' || line.startsWith('/topup ')) {
-        if (!s.agentSeal) { out('agentSeal unknown — cannot top up (try /hello first)\n'); continue; }
+        if (!s.agentSeal) {
+          // Not learned from deploy//hello yet — the chain has it regardless
+          // of phase (set-once at mint), so a stopped agent tops up fine.
+          try {
+            const sealAddr = await s.ag.agent.getAgentSeal(BigInt(s.agentId));
+            if (!sealAddr || /^0x0{40}$/.test(sealAddr)) throw new Error('zero');
+            s.agentSeal = sealAddr;
+          } catch {
+            out(`cannot resolve agent ${s.agentId}'s agentSeal from chain — is the mint complete?\n`);
+            continue;
+          }
+        }
         const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.02]: ')).trim() || '0.02';
         const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
         out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
@@ -632,6 +806,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/start') {
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
+        if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
         out('starting… (Esc cancels the wait)\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
@@ -655,7 +830,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`${await s.client.logs({ tail: n })}\n`); continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
-        if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        // The sealed runtime serves /log from early boot — mid-`deploying` is
+        // exactly when this log matters, so resolve the container URL now.
+        if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
+        if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         const res = await fetch(`${s.url}/log`);
         out(res.ok ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n` : `/log → HTTP ${res.status}\n`);
