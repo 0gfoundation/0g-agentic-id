@@ -48,6 +48,11 @@ INTERACTIVE (default — no command)
                                                  framework + key)
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
+                            withdraw [og]        refund prepaid funds (time-
+                                                 locked; bare claims)
+                            ack                  acknowledge the TEE trust
+                                                 root (implicit in deploy/
+                                                 start/reset)
                             login                guided setup: attestor URL,
                                                  owner key, inference key (Enter
                                                  keeps current; keys echo *)
