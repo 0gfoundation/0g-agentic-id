@@ -249,7 +249,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
     throw new CliError(
       'AGENT_NOT_FOUND',
       exists
-        ? `agent ${refInput} exists on this attestor but is NOT owned by your wallet — lifecycle commands are owner-only`
+        ? `agent ${refInput} is not yours`
         : `agent ${refInput} does not exist on this attestor`,
       { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
     );
