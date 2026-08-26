@@ -75,7 +75,10 @@ func (s *Server) ListenInternal(sockPath string) {
 	// (sealed is root and unaffected). Without the split (dev, legacy
 	// image) OwnPath is a no-op and 0600 matches the single-uid reality.
 	if err := os.Chmod(sockPath, 0o600); err != nil {
-		logger.Logf("warn sign socket: chmod %s: %v", sockPath, err)
+		logger.Logf("FAIL sign socket: chmod %s: %v", sockPath, err)
+		l.Close()
+		os.Remove(sockPath)
+		return
 	}
 	privsep.OwnPath(sockPath)
 
