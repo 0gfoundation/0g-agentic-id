@@ -326,6 +326,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (cmd === 'start') {
           if (row.phase === 'running') { out(`agent ${row.agentId} is already running\n`); continue; }
           if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
+          if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
           out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
           await ag.agent.start(row.sealId, row.sandboxId);
           const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
@@ -447,7 +448,8 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
 
 /** Trust-root ack (once per owner) + a prepaid-balance gate that ASKS before
  *  spending: under 0.1 OG, report the shortfall and offer to deposit now.
- *  Returns false when the user declines (caller should abort link/deploy). */
+ *  Gates every balance-spending action (deploy/start/reset). Returns false
+ *  when the user declines (caller should abort the action). */
 async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
@@ -632,6 +634,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/start') {
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
+        if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
         out('starting… (Esc cancels the wait)\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
