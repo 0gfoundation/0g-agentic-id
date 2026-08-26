@@ -41,8 +41,10 @@ USAGE
 INTERACTIVE (default — no command)
   0g-agenticid            Open the manager REPL. Its commands:
                             list                 agents on this attestor (* = yours)
-                            use <agentId|seal>   enter that agent's session, in
+                            use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
+                            hello <agentId|seal> any agent's public /hello
+                                                 (identity + services + proof)
                             deploy               new-agent wizard, then chat
                             start/stop/reset <id> lifecycle without entering
                                                  the session (reset asks the

@@ -26,7 +26,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
@@ -46,10 +46,6 @@ interface Session {
    *  needed (deploy knows it; use/attach does not). */
   framework?: string;
   phase: string;
-  /** Whether the connected wallet owns this agent. false gates the
-   *  owner-only commands up front; undefined (couldn't determine) lets the
-   *  attestor's own auth be the judge. */
-  mine?: boolean;
   // Connection half — absent until the agent is running (`use` enters the
   // session in ANY phase; /start and /reset fill these in on success).
   url?: string;
@@ -264,11 +260,13 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
-  use <agentId|sealId>    enter an agent's session — works in ANY phase
+  use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
+  hello <agentId|sealId>  any agent's public /hello: identity, services,
+                          routes, serve-proof verification
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
@@ -520,6 +518,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'hello') {
+        // Public inspection of ANY agent (yours or not) — no wallet needed.
+        if (!args[0]) { out('usage: hello <agentId|sealId>\n'); continue; }
+        const ag = await clientFor(ctx, false);
+        const ref = parseAgentRef(args[0]);
+        const rows = await ag.agent.listDeployments();
+        const row = rows.find((r) =>
+          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        await showHello(ag, row.url);
+        continue;
+      }
+
       if (cmd === 'use' || cmd === 'link') {
         if (!args[0]) { out('usage: use <agentId|sealId>\n'); continue; }
         const ag = await withWallet(ctx);
@@ -555,6 +567,35 @@ async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<A
   const ag = await buildClient(ctx.env, withWalletOpt ? { withWallet: true } : {});
   cachedClient = { key: cacheKey, ag };
   return ag;
+}
+
+/** Fetch and print an agent's signed /hello: identity, proof verification,
+ *  and its two capability tables — services (agent-registered endpoints,
+ *  entry #0 is /hello itself) and routes (framework-declared prefixes).
+ *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello). */
+async function showHello(ag: AgenticID, url: string): Promise<void> {
+  const res = await fetch(`${url}/hello`);
+  const body = (await res.json().catch(() => ({}))) as {
+    agent?: string; owner?: string; message?: string;
+    services?: { path: string; method: string; description?: string; skill?: string }[];
+    routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
+  };
+  const proof = ag.reputation.proofFromResponse(res);
+  const valid = proof ? await ag.reputation.verifyProof(proof) : null;
+  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  if (body.services?.length) {
+    out('services:\n');
+    for (const sv of body.services) {
+      out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+    }
+  }
+  if (body.routes?.length) {
+    out('routes:\n');
+    for (const rt of body.routes) {
+      const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
+      out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
+    }
+  }
 }
 
 /** Build a wallet-backed client, turning a missing key into a `login` nudge. */
@@ -675,7 +716,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
   const r = await pollRunning(attestorUrl, dep.sealId, agentId);
   out(`running at ${r.url}\n`);
-  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running', mine: true };
+  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running' };
   await connectSession(s, r.url);
   return s;
 }
@@ -720,14 +761,20 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     // of failing phase checks or bouncing off the attestor's auth later.
     ag.agent.listMyDeployments().then((rs) => rs.some((r) => r.sealId === row.sealId)).catch(() => undefined),
   ]);
-  s.mine = mine;
+  // The session is the owner's cockpit — a foreign agent's public surface is
+  // L1 `hello <id>`. Undetermined ownership (listing fetch failed) enters
+  // anyway; the attestor's auth still guards every owner action.
+  if (mine === false) {
+    throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} is not yours`, {
+      remedy: `talk to its public surface with: hello ${agentId}`,
+    });
+  }
   const fields: string[] = [];
   fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
   fields.push(`phase    ${s.phase}`);
   if (s.url) fields.push(`url      ${s.url}`);
   fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
   if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
-  if (s.mine === false) fields.push('owner    not you — /start /stop /reset /agentlog disabled');
   if (s.phase === 'running' && s.url) {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
@@ -825,30 +872,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     try {
       if (line === '/hello') {
         if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
-        const res = await fetch(`${s.url}/hello`);
-        const body = (await res.json().catch(() => ({}))) as {
-          agent?: string; owner?: string; message?: string;
-          services?: { path: string; method: string; description?: string; skill?: string }[];
-          routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
-        };
-        const proof = s.ag.reputation.proofFromResponse(res);
-        const valid = proof ? await s.ag.reputation.verifyProof(proof) : null;
-        out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
-        // services = agent-registered endpoints (entry #0 is /hello itself);
-        // routes = framework-declared prefixes (dashboard, chat, …).
-        if (body.services?.length) {
-          out('services:\n');
-          for (const sv of body.services) {
-            out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-          }
-        }
-        if (body.routes?.length) {
-          out('routes:\n');
-          for (const rt of body.routes) {
-            const tags = [rt.kind, rt.auth ? `auth=${rt.auth}` : '', rt.signed ? 'signed' : ''].filter(Boolean).join(' · ');
-            out(`  ${rt.prefix.padEnd(29)} ${tags}${rt.description ? `  — ${rt.description}` : ''}\n`);
-          }
-        }
+        await showHello(s.ag, s.url);
         continue;
       }
       if (line === '/balance') {
@@ -879,7 +903,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/stop') {
-        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         if (s.phase !== 'running' || !s.sandboxId) { out(`agent is ${s.phase} — nothing to stop\n`); continue; }
         out('stopping…\n'); await s.ag.agent.stop(s.sealId, s.sandboxId);
         s.phase = 'stopped'; s.url = undefined; s.client = undefined;
@@ -887,7 +910,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/start') {
-        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
@@ -898,7 +920,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`running at ${s.url}\n`); continue;
       }
       if (line === '/reset') {
-        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
@@ -910,7 +931,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
-        if (s.mine === false) { out(`agent ${s.agentId} is not yours — its log is owner-only\n`); continue; }
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         out(`${await s.client.logs({ tail: n })}\n`); continue;
