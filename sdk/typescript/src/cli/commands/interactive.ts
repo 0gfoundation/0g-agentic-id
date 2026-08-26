@@ -219,8 +219,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   out('\n╭──────────────────────────────────────────────╮\n');
   out('│  0G AgenticID — interactive shell            │\n');
   out('╰──────────────────────────────────────────────╯\n');
+  // Ack read = /config fetch + chain reads; tolerate a down attestor/RPC so
+  // a dead environment never blocks entering the shell.
+  let ack = '';
+  if (key && ctx.env.attestorUrl) {
+    ack = await withWallet(ctx)
+      .then((ag) => ag.ackStatus())
+      .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
+      .catch(() => '(unreachable)');
+  }
   out(`  attestor  ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet    ${wallet ? short(wallet) : '(none)'}      api key  ${hasApiKey ? 'set' : '(none)'}\n\n`);
+  out(`  wallet    ${wallet ? short(wallet) : '(none)'}      api key  ${hasApiKey ? 'set' : '(none)'}${ack ? `      ack  ${ack}` : ''}\n\n`);
   if (!ctx.env.attestorUrl || !key || !hasApiKey) {
     out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
   } else {
