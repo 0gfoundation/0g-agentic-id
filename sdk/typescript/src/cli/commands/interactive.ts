@@ -190,7 +190,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · login · whoami · help · quit';
+  'commands: list · use <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -201,9 +201,13 @@ const L1_HELP_FULL = `manager commands
   reset <id>              recreate an agent's container (asks framework + key)
   balance                 prepaid sandbox balance, burn rate, runway
   deposit [og]            fund the prepaid balance (default 0.2 OG)
+  withdraw [og]           get prepaid funds back — with an amount, starts a
+                          time-locked refund; bare, claims it once unlocked
+  ack                     acknowledge the TEE trust root (deploy/start/reset
+                          do this implicitly; re-run after an attestor upgrade)
   login                   guided setup: attestor URL, owner key, inference key
                           (Enter keeps the current value; secrets echo *)
-  whoami                  show attestor / wallet / api-key status
+  whoami                  show attestor / wallet / api-key / ack status
   help                    this text
   quit                    exit (Ctrl-C twice also works)`;
 
@@ -258,15 +262,22 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        const [est, rows] = await Promise.all([ag.agent.estimateCosts(), ag.agent.listMyDeployments()]);
+        const [est, rows, detail] = await Promise.all([
+          ag.agent.estimateCosts(),
+          ag.agent.listMyDeployments(),
+          ag.getBalanceDetail().catch(() => null),
+        ]);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
+        if (detail && detail.pendingRefund > 0n) {
+          out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
+        }
         out(`running agents  : ${running}  (× ${og(est.costPerMinWei)}/min each)\n`);
         out(`burn rate       : ${og(burnPerMin)}/min\n`);
         out(`runway          : ${runway == null ? (running === 0 ? '∞ (nothing running)' : 'n/a') : `~${runway} min`}\n`);
-        out('add funds with `deposit [amount OG]`\n');
+        out('add funds with `deposit [amount OG]` · withdraw with `withdraw [amount OG]`\n');
         continue;
       }
 
@@ -279,12 +290,66 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'withdraw') {
+        // Two-step by contract design: requestRefund moves funds into a
+        // time-locked pending pot; withdrawRefund claims it after the lock.
+        // `withdraw <og>` starts one, bare `withdraw` claims (or reports the
+        // lock) — the pending state decides which step the user is on.
+        const ag = await withWallet(ctx);
+        const d = await ag.getBalanceDetail();
+        if (!args[0]) {
+          if (d.pendingRefund === 0n) {
+            out(`nothing pending — spendable balance is ${og(d.balance)}; start with: withdraw <amount OG>\n`);
+            continue;
+          }
+          const unlockMs = Number(d.refundUnlockAt) * 1000;
+          if (Date.now() < unlockMs) {
+            out(`${og(d.pendingRefund)} pending, locked until ${new Date(unlockMs).toLocaleString()} — run \`withdraw\` again after that\n`);
+            continue;
+          }
+          const tx = await ag.withdrawRefund();
+          await ag.waitForTransaction(tx);
+          out(`withdrew ${og(d.pendingRefund)} to your wallet → ${tx}\n`);
+          continue;
+        }
+        const amountWei = parseEther(args[0]);
+        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${args[0]} OG\n`); continue; }
+        const tx = await ag.requestRefund({ amountWei });
+        await ag.waitForTransaction(tx);
+        const after = await ag.getBalanceDetail();
+        out(`${args[0]} OG moved to pending refund → ${tx}\n`);
+        out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
+        continue;
+      }
+
 
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
+        if (key && ctx.env.attestorUrl) {
+          try {
+            const { allAcked, missing } = await (await withWallet(ctx)).ackStatus();
+            out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
+          } catch (e) {
+            out(`ack     : (unreadable: ${(e as Error).message})\n`);
+          }
+        }
+        continue;
+      }
+
+      if (cmd === 'ack') {
+        // Manual trust-root acknowledgment. deploy/start/reset all run this
+        // implicitly, but the attestor's ackVersion can bump under you (e.g.
+        // a redeploy) — this is the explicit re-ack.
+        const ag = await withWallet(ctx);
+        const { allAcked, missing } = await ag.ackStatus();
+        if (allAcked) { out('trust root already acknowledged — nothing to do\n'); continue; }
+        out(`acknowledging: ${missing.join(', ')}\n`);
+        const tx = await ag.ack();
+        if (tx) { out(`ack() → ${tx} (waiting…)\n`); await ag.waitForTransaction(tx); }
+        out('acknowledged\n');
         continue;
       }
 
