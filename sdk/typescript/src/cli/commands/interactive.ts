@@ -364,10 +364,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // lock) — the pending state decides which step the user is on.
         const ag = await withWallet(ctx);
         const d = await ag.getBalanceDetail();
+        // requestRefund REPLACES the pending pot (the contract re-absorbs it
+        // into balance first) and restarts the lock — so the request cap is
+        // balance + pending, and "add more" really means "request the new
+        // total".
+        const available = d.balance + d.pendingRefund;
         if (!args[0] && d.pendingRefund > 0n) {
           const unlockMs = Number(d.refundUnlockAt) * 1000;
           if (Date.now() < unlockMs) {
-            out(`${og(d.pendingRefund)} pending, locked until ${new Date(unlockMs).toLocaleString()} — run \`withdraw\` again after that\n`);
+            out(`${og(d.pendingRefund)} pending, locked until ${new Date(unlockMs).toLocaleString()}\n`);
+            out(`  → claim  : run \`withdraw\` again after it unlocks\n`);
+            out(`  → change : \`withdraw <og>\` REPLACES the pending amount (new total, max ${og(available)}) and restarts the lock\n`);
             continue;
           }
           const tx = await ag.withdrawRefund();
@@ -377,14 +384,15 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
         // Deposit-symmetric: no amount → ask. (No safe default exists here —
         // "all of it" halts every running agent's billing — so empty cancels.)
-        const amt = args[0] || (await ask(`amount OG to withdraw [max ${og(d.balance)}, empty to cancel]: `)).trim();
+        const amt = args[0] || (await ask(`amount OG to withdraw [max ${og(available)}, empty to cancel]: `)).trim();
         if (!amt) { out('cancelled\n'); continue; }
         const amountWei = parseEther(amt);
-        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
+        if (amountWei > available) { out(`only ${og(available)} available — cannot withdraw ${amt} OG\n`); continue; }
         const tx = await ag.requestRefund({ amountWei });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
-        out(`${amt} OG moved to pending refund → ${tx}\n`);
+        if (d.pendingRefund > 0n) out(`pending refund replaced: ${og(d.pendingRefund)} → ${og(after.pendingRefund)} (lock restarted)\n`);
+        else out(`${amt} OG moved to pending refund → ${tx}\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }

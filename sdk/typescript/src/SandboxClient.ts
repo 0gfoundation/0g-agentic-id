@@ -192,10 +192,13 @@ export class SandboxClient {
   }
 
   /**
-   * Start withdrawing prepaid funds: moves `amountWei` from the spendable
-   * balance into `pendingRefund`, locked until `refundUnlockAt` (contract-set
-   * delay). Claim with {@link withdrawRefund} once unlocked; track via
-   * {@link getBalanceDetail}. Provider defaults to the attestor /config's.
+   * Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund`,
+   * locked until `refundUnlockAt` (contract-set delay). NB the contract
+   * REPLACES any existing pending refund (re-absorbing it into the spendable
+   * balance first) and restarts the lock — `amountWei` is the new total, and
+   * may go up to `balance + pendingRefund`. Claim with {@link withdrawRefund}
+   * once unlocked; track via {@link getBalanceDetail}. Provider defaults to
+   * the attestor /config's.
    */
   async requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> {
     const { walletClient, account } = requireWallet(this.ctx);
