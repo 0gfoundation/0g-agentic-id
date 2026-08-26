@@ -79,7 +79,8 @@ function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
  *  phase always; the container URL as soon as a sandbox exists (the sealed
  *  runtime serves /log while still `deploying`); the chat client only when
  *  running (and dropped again when not, so a stale connection can't linger). */
-async function refreshSession(s: Session): Promise<void> {
+async function refreshSession(s: Session, quiet = false): Promise<void> {
+  const before = s.phase;
   const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
     phase?: string; url?: string; sandbox_id?: string;
     container_stage?: { state?: string; reason?: string };
@@ -94,6 +95,7 @@ async function refreshSession(s: Session): Promise<void> {
     s.sandboxId = d.sandbox_id ?? s.sandboxId;
     s.client = undefined;
   }
+  if (quiet && s.phase === before) return; // background refresh: report only movement
   out(`  phase   ${s.phase}\n`);
   if (s.url) out(`  url     ${s.url}\n`);
   const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
@@ -718,6 +720,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   }).catch(() => { /* advisory only */ });
   const messages: ChatMessage[] = [];
   for (;;) {
+    // While not connected (deploying/stopped/offline) the phase is in flux —
+    // auto-refresh before every prompt, printing only when it moves (and
+    // connecting the moment it reaches running). Once connected, skip: no
+    // per-chat-line attestor round-trip; bare Enter stays the manual refresh.
+    if (!s.client) { try { await refreshSession(s, true); } catch { /* prompt anyway */ } }
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
     if (!line) {
       // Bare Enter = live status refresh (phase moves on its own during
