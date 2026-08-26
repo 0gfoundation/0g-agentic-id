@@ -60,6 +60,46 @@ async function connectSession(s: Session, url: string): Promise<void> {
   }
 }
 
+/** /config's sandbox_proxy_addr, fetched once per attestor (used to construct
+ *  container URLs — the detail endpoint has no url field). */
+const proxyAddrCache = new Map<string, Promise<string | undefined>>();
+function proxyAddrOf(attestorUrl: string): Promise<string | undefined> {
+  let p = proxyAddrCache.get(attestorUrl);
+  if (!p) {
+    p = fetch(`${attestorUrl}/config`)
+      .then((r) => r.json())
+      .then((c) => (c as { sandbox_proxy_addr?: string }).sandbox_proxy_addr)
+      .catch(() => undefined);
+    proxyAddrCache.set(attestorUrl, p);
+  }
+  return p;
+}
+
+/** Re-read the deployment row and resync the session, printing the result:
+ *  phase always; the container URL as soon as a sandbox exists (the sealed
+ *  runtime serves /log while still `deploying`); the chat client only when
+ *  running (and dropped again when not, so a stale connection can't linger). */
+async function refreshSession(s: Session): Promise<void> {
+  const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
+    phase?: string; url?: string; sandbox_id?: string;
+    container_stage?: { state?: string; reason?: string };
+  };
+  s.phase = d.phase ?? s.phase;
+  const proxy = await proxyAddrOf(s.attestorUrl);
+  const url = d.url ?? (d.sandbox_id && proxy ? `http://8080-${d.sandbox_id}.${proxy}` : undefined);
+  if (s.phase === 'running' && url) {
+    if (!s.client || s.url !== url) await connectSession(s, url);
+  } else {
+    s.url = url;
+    s.sandboxId = d.sandbox_id ?? s.sandboxId;
+    s.client = undefined;
+  }
+  out(`  phase   ${s.phase}\n`);
+  if (s.url) out(`  url     ${s.url}\n`);
+  const reason = d.container_stage?.state === 'failed' ? d.container_stage.reason : undefined;
+  if (reason) out(`  last error: ${reason}\n`);
+}
+
 /**
  * Wait for a deployment to reach `running` by polling the attestor's public
  * /deployment/:sealId — and FAIL LOUD instead of hanging: a `failed`/`offline`
@@ -654,6 +694,7 @@ const L2_HELP =
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
                           turn in flight (the runtime cancels server-side)
+  (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
   /topup [og]             fund this agent's agentSeal gas (default 0.02 OG)
@@ -678,7 +719,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   const messages: ChatMessage[] = [];
   for (;;) {
     const line = (await ask(`\nagent ${s.agentId} › `)).trim();
-    if (!line) continue;
+    if (!line) {
+      // Bare Enter = live status refresh (phase moves on its own during
+      // deploying/provisioning; the entry card only showed the initial one).
+      try { await refreshSession(s); } catch { out(`  phase   ${s.phase} (refresh failed — attestor unreachable)\n`); }
+      continue;
+    }
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
@@ -754,7 +800,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`${await s.client.logs({ tail: n })}\n`); continue;
       }
       if (line === '/startuplog' || line.startsWith('/startuplog ')) {
-        if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        // The sealed runtime serves /log from early boot — mid-`deploying` is
+        // exactly when this log matters, so resolve the container URL now.
+        if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
+        if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         const res = await fetch(`${s.url}/log`);
         out(res.ok ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n` : `/log → HTTP ${res.status}\n`);
