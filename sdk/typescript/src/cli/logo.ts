@@ -103,24 +103,23 @@ export function svgPixelLines(svg: string): string[] | null {
   return lines;
 }
 
+/** Splash background tile — the light tint a real Pretty-SHA avatar gets
+ *  (make_bg lands around L=0.92), so the panda renders as the same solid
+ *  16×8 tile the agent avatars do. */
+const SPLASH_BG = 254;
+
 /** The panda as 8 ANSI lines (each ends reset, no trailing newline). */
 export function pandaLines(): string[] {
   const g = pandaGrid();
-  const fg = (n: number) => `\x1b[38;5;${n}m`;
-  const bg = (n: number) => `\x1b[48;5;${n}m`;
-  const RESET = '\x1b[0m';
   const lines: string[] = [];
   for (let r = 0; r < GS; r += 2) {
     let line = '';
     for (let c = 0; c < GS; c++) {
-      const top = g[r][c] != null ? ANSI256[g[r][c] as number] : null;
-      const bot = g[r + 1][c] != null ? ANSI256[g[r + 1][c] as number] : null;
-      if (top != null && bot != null) line += `${fg(top)}${bg(bot)}▀${RESET}`;
-      else if (top != null) line += `${fg(top)}▀${RESET}`;
-      else if (bot != null) line += `${fg(bot)}▄${RESET}`;
-      else line += ' ';
+      const top = g[r][c] != null ? ANSI256[g[r][c] as number] : SPLASH_BG;
+      const bot = g[r + 1][c] != null ? ANSI256[g[r + 1][c] as number] : SPLASH_BG;
+      line += `\x1b[38;5;${top}m\x1b[48;5;${bot}m▀`;
     }
-    lines.push(line);
+    lines.push(`${line}\x1b[0m`);
   }
   return lines;
 }
