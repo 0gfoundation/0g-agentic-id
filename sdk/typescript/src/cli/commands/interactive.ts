@@ -383,18 +383,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             pending = 0n;
           }
         }
-        // Then the request: requestRefund REPLACES the pending pot (new
-        // total) and restarts the lock, so the cap is balance + pending.
-        const available = d.balance + pending;
-        const repl = pending > 0n ? ' (REPLACES the locked pending — new total, lock restarts)' : '';
-        const amt = args[0] || (await ask(`withdraw how much${repl}? [max ${og(available)}, empty to skip]: `)).trim();
+        // Then the request. The amount asked is the INCREMENT, drawn from the
+        // spendable balance — the contract itself only takes a new total
+        // (re-absorbing the pot, restarting the lock), so we submit
+        // pending + amount on the user's behalf.
+        const more = pending > 0n ? ` more (joins the pending ${og(pending)}; lock restarts)` : '';
+        const amt = args[0] || (await ask(`withdraw how much${more}? [max ${og(d.balance)}, empty to skip]: `)).trim();
         if (!amt) continue;
         const amountWei = parseEther(amt);
-        if (amountWei > available) { out(`only ${og(available)} available — cannot withdraw ${amt} OG\n`); continue; }
-        const tx = await ag.requestRefund({ amountWei });
+        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
+        const tx = await ag.requestRefund({ amountWei: amountWei + pending });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
-        if (pending > 0n) out(`pending refund replaced: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
+        if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
         else out(`${amt} OG moved to pending refund → ${tx}\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
