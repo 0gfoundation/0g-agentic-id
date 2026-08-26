@@ -66,24 +66,60 @@ function pandaGrid(): Grid {
   return g;
 }
 
+/** Nearest xterm-256 color-cube index for a #rrggbb hex — the same plain
+ *  256-color escapes the panda uses, so no truecolor dependency anywhere. */
+function hexTo256(h: string): number {
+  const lvl = (v: number) => (v < 48 ? 0 : v < 115 ? 1 : Math.min(5, Math.round((v - 35) / 40)));
+  const r = lvl(parseInt(h.slice(1, 3), 16));
+  const g = lvl(parseInt(h.slice(3, 5), 16));
+  const b = lvl(parseInt(h.slice(5, 7), 16));
+  return 16 + 36 * r + 6 * g + b;
+}
+
+/**
+ * Render a Pretty-SHA avatar SVG (the attestor's /avatar/:seed.svg — a
+ * 16×16 background rect plus 1×1 pixel rects) as 8 ANSI-256 half-block
+ * lines. Returns null when the SVG doesn't look like one.
+ */
+export function svgPixelLines(svg: string): string[] | null {
+  const bg = svg.match(/<rect width="16" height="16" fill="(#[0-9a-fA-F]{6})"\/>/);
+  if (!bg) return null;
+  const grid: string[][] = Array.from({ length: GS }, () => Array<string>(GS).fill(bg[1]));
+  const re = /<rect x="(\d+)" y="(\d+)" width="1" height="1" fill="(#[0-9a-fA-F]{6})"\/>/g;
+  let m: RegExpExecArray | null;
+  let n = 0;
+  while ((m = re.exec(svg))) {
+    const x = Number(m[1]);
+    const y = Number(m[2]);
+    if (x < GS && y < GS) { grid[y][x] = m[3]; n++; }
+  }
+  if (!n) return null;
+  const lines: string[] = [];
+  for (let r = 0; r < GS; r += 2) {
+    let line = '';
+    for (let c = 0; c < GS; c++) line += `\x1b[38;5;${hexTo256(grid[r][c])}m\x1b[48;5;${hexTo256(grid[r + 1][c])}m▀`;
+    lines.push(`${line}\x1b[0m`);
+  }
+  return lines;
+}
+
+/** Splash background tile — the light tint a real Pretty-SHA avatar gets
+ *  (make_bg lands around L=0.92), so the panda renders as the same solid
+ *  16×8 tile the agent avatars do. */
+const SPLASH_BG = 254;
+
 /** The panda as 8 ANSI lines (each ends reset, no trailing newline). */
 export function pandaLines(): string[] {
   const g = pandaGrid();
-  const fg = (n: number) => `\x1b[38;5;${n}m`;
-  const bg = (n: number) => `\x1b[48;5;${n}m`;
-  const RESET = '\x1b[0m';
   const lines: string[] = [];
   for (let r = 0; r < GS; r += 2) {
     let line = '';
     for (let c = 0; c < GS; c++) {
-      const top = g[r][c] != null ? ANSI256[g[r][c] as number] : null;
-      const bot = g[r + 1][c] != null ? ANSI256[g[r + 1][c] as number] : null;
-      if (top != null && bot != null) line += `${fg(top)}${bg(bot)}▀${RESET}`;
-      else if (top != null) line += `${fg(top)}▀${RESET}`;
-      else if (bot != null) line += `${fg(bot)}▄${RESET}`;
-      else line += ' ';
+      const top = g[r][c] != null ? ANSI256[g[r][c] as number] : SPLASH_BG;
+      const bot = g[r + 1][c] != null ? ANSI256[g[r + 1][c] as number] : SPLASH_BG;
+      line += `\x1b[38;5;${top}m\x1b[48;5;${bot}m▀`;
     }
-    lines.push(line);
+    lines.push(`${line}\x1b[0m`);
   }
   return lines;
 }
