@@ -250,7 +250,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
       'AGENT_NOT_FOUND',
       exists
         ? `agent ${refInput} is not yours`
-        : `agent ${refInput} does not exist on this attestor`,
+        : `agent ${refInput} does not exist`,
       { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
     );
   }
