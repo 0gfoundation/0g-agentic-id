@@ -66,10 +66,20 @@ function pandaGrid(): Grid {
   return g;
 }
 
+/** Nearest xterm-256 color-cube index for a #rrggbb hex — the same plain
+ *  256-color escapes the panda uses, so no truecolor dependency anywhere. */
+function hexTo256(h: string): number {
+  const lvl = (v: number) => (v < 48 ? 0 : v < 115 ? 1 : Math.min(5, Math.round((v - 35) / 40)));
+  const r = lvl(parseInt(h.slice(1, 3), 16));
+  const g = lvl(parseInt(h.slice(3, 5), 16));
+  const b = lvl(parseInt(h.slice(5, 7), 16));
+  return 16 + 36 * r + 6 * g + b;
+}
+
 /**
  * Render a Pretty-SHA avatar SVG (the attestor's /avatar/:seed.svg — a
- * 16×16 background rect plus 1×1 pixel rects) as 8 truecolor ANSI
- * half-block lines. Returns null when the SVG doesn't look like one.
+ * 16×16 background rect plus 1×1 pixel rects) as 8 ANSI-256 half-block
+ * lines. Returns null when the SVG doesn't look like one.
  */
 export function svgPixelLines(svg: string): string[] | null {
   const bg = svg.match(/<rect width="16" height="16" fill="(#[0-9a-fA-F]{6})"\/>/);
@@ -84,11 +94,10 @@ export function svgPixelLines(svg: string): string[] | null {
     if (x < GS && y < GS) { grid[y][x] = m[3]; n++; }
   }
   if (!n) return null;
-  const rgb = (h: string) => `${parseInt(h.slice(1, 3), 16)};${parseInt(h.slice(3, 5), 16)};${parseInt(h.slice(5, 7), 16)}`;
   const lines: string[] = [];
   for (let r = 0; r < GS; r += 2) {
     let line = '';
-    for (let c = 0; c < GS; c++) line += `\x1b[38;2;${rgb(grid[r][c])}m\x1b[48;2;${rgb(grid[r + 1][c])}m▀`;
+    for (let c = 0; c < GS; c++) line += `\x1b[38;5;${hexTo256(grid[r][c])}m\x1b[48;5;${hexTo256(grid[r + 1][c])}m▀`;
     lines.push(`${line}\x1b[0m`);
   }
   return lines;
