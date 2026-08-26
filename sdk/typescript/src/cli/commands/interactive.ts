@@ -241,9 +241,18 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
   const row = rows.find((r) =>
     ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
   if (!row) {
-    throw new CliError('AGENT_NOT_FOUND', `no deployment of yours matches ${refInput}`, {
-      remedy: 'check `list` (* marks your agents)',
-    });
+    // Say WHICH of the two things went wrong: the agent doesn't exist here,
+    // or it exists but belongs to another wallet (owner-only action).
+    const pub = await ag.agent.listDeployments().catch(() => []);
+    const exists = pub.some((r) =>
+      ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+    throw new CliError(
+      'AGENT_NOT_FOUND',
+      exists
+        ? `agent ${refInput} exists on this attestor but is NOT owned by your wallet — lifecycle commands are owner-only`
+        : `agent ${refInput} does not exist on this attestor`,
+      { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
+    );
   }
   return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined };
 }
