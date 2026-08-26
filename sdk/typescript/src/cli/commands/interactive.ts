@@ -272,7 +272,7 @@ const L1_HELP_FULL = `manager commands
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (asks framework + key)
   balance                 prepaid sandbox balance, burn rate, runway
-  deposit [og]            fund the prepaid balance (default 0.2 OG)
+  deposit [og]            fund the prepaid balance (default 1 OG)
   withdraw [og]           get prepaid funds back: shows balance + pending,
                           offers to claim matured refunds, then asks how
                           much (more) to withdraw (time-locked)
@@ -381,7 +381,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
 
       if (cmd === 'deposit') {
         const ag = await withWallet(ctx);
-        const amt = args[0] || (await ask('amount OG [0.2]: ')).trim() || '0.2';
+        const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
         const tx = await ag.deposit({ amountWei: parseEther(amt) });
         await ag.waitForTransaction(tx);
         out(`deposited ${amt} OG to the prepaid sandbox balance → ${tx}\n`);
@@ -697,9 +697,9 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   const bal = await ag.getBalance();
   if (bal < parseEther('0.1')) {
     out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
-    const amt = (await ask('deposit how much OG now? [0.2, empty to cancel]: ')).trim();
+    const amt = (await ask('deposit how much OG now? [1, empty to cancel]: ')).trim();
     if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
-    const tx = await ag.deposit({ amountWei: parseEther(amt || '0.2') });
+    const tx = await ag.deposit({ amountWei: parseEther(amt || '1') });
     out(`deposit ${amt} OG → ${tx} (waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
@@ -853,7 +853,7 @@ const L2_HELP_FULL = `session commands
   (bare Enter)            refresh this agent's phase/url from the attestor
   /hello                  identity, routes/services, serve-proof verification
   /balance                this agent's agentSeal gas + the account prepaid
-  /topup [og]             fund this agent's agentSeal gas (default 0.02 OG)
+  /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
   /start                  start (only from stopped)
   /stop                   stop the running container
   /reset                  recreate the container (asks framework + key; also
@@ -919,7 +919,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
         }
-        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.02]: ')).trim() || '0.02';
+        const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
         const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
         out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
         continue;
