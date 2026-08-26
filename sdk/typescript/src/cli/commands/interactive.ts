@@ -33,7 +33,7 @@ interface Session {
   attestorUrl: string;
   sealId: `0x${string}`;
   agentId: string;
-  agentSeal?: `0x${string}`; // for /topup; resolved from /hello
+  agentSeal?: `0x${string}`; // for /topup; from deploy//hello, else read from chain on demand
   /** Needed by /reset (which image) and the chat model selector. Not exposed
    *  by the attestor post-mint, so it is PICKED by the user when first
    *  needed (deploy knows it; use/attach does not). */
@@ -703,7 +703,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/topup' || line.startsWith('/topup ')) {
-        if (!s.agentSeal) { out('agentSeal unknown — cannot top up (try /hello first)\n'); continue; }
+        if (!s.agentSeal) {
+          // Not learned from deploy//hello yet — the chain has it regardless
+          // of phase (set-once at mint), so a stopped agent tops up fine.
+          try {
+            const sealAddr = await s.ag.agent.getAgentSeal(BigInt(s.agentId));
+            if (!sealAddr || /^0x0{40}$/.test(sealAddr)) throw new Error('zero');
+            s.agentSeal = sealAddr;
+          } catch {
+            out(`cannot resolve agent ${s.agentId}'s agentSeal from chain — is the mint complete?\n`);
+            continue;
+          }
+        }
         const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.02]: ')).trim() || '0.02';
         const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
         out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
