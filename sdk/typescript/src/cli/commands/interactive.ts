@@ -46,6 +46,10 @@ interface Session {
    *  needed (deploy knows it; use/attach does not). */
   framework?: string;
   phase: string;
+  /** Whether the connected wallet owns this agent. false gates the
+   *  owner-only commands up front; undefined (couldn't determine) lets the
+   *  attestor's own auth be the judge. */
+  mine?: boolean;
   // Connection half — absent until the agent is running (`use` enters the
   // session in ANY phase; /start and /reset fill these in on success).
   url?: string;
@@ -671,7 +675,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   out(`minted agentId ${agentId} — waiting for the container (can take minutes)…\n`);
   const r = await pollRunning(attestorUrl, dep.sealId, agentId);
   out(`running at ${r.url}\n`);
-  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running' };
+  const s: Session = { ag, attestorUrl, sealId: dep.sealId, agentId, agentSeal: dep.agentSealAddr, framework, phase: 'running', mine: true };
   await connectSession(s, r.url);
   return s;
 }
@@ -702,7 +706,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   // phase / url / sealId / agentSeal gas. Avatar + gas fetch in parallel
   // and each degrades to absence on failure.
   const wantArt = !!process.stdout.isTTY && !process.env.NO_COLOR;
-  const [art, gasWei] = await Promise.all([
+  const [art, gasWei, mine] = await Promise.all([
     wantArt
       ? fetch(`${attestorUrl}/avatar/${row.sealId}.svg`, { signal: AbortSignal.timeout(3000) })
           .then((r) => (r.ok ? r.text() : null))
@@ -712,13 +716,18 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     /^\d+$/.test(agentId)
       ? ag.agent.runtimeCosts(BigInt(agentId)).then((rc) => rc.sealGasWei).catch(() => null)
       : Promise.resolve(null),
+    // Ownership up front, so owner-only commands can refuse plainly instead
+    // of failing phase checks or bouncing off the attestor's auth later.
+    ag.agent.listMyDeployments().then((rs) => rs.some((r) => r.sealId === row.sealId)).catch(() => undefined),
   ]);
+  s.mine = mine;
   const fields: string[] = [];
   fields.push(`agent ${agentId}${row.name ? ` · ${row.name}` : ''}`);
   fields.push(`phase    ${s.phase}`);
   if (s.url) fields.push(`url      ${s.url}`);
   fields.push(`sealId   ${row.sealId.slice(0, 10)}…${row.sealId.slice(-6)}`);
   if (gasWei != null) fields.push(`gas      ${og(gasWei)} (agentSeal — fund with /topup)`);
+  if (s.mine === false) fields.push('owner    not you — /start /stop /reset /agentlog disabled');
   if (s.phase === 'running' && s.url) {
     fields.push('type to chat · /help for commands · Esc interrupts a turn');
   } else {
@@ -870,6 +879,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/stop') {
+        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         if (s.phase !== 'running' || !s.sandboxId) { out(`agent is ${s.phase} — nothing to stop\n`); continue; }
         out('stopping…\n'); await s.ag.agent.stop(s.sealId, s.sandboxId);
         s.phase = 'stopped'; s.url = undefined; s.client = undefined;
@@ -877,6 +887,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/start') {
+        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
@@ -887,6 +898,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(`running at ${s.url}\n`); continue;
       }
       if (line === '/reset') {
+        if (s.mine === false) { out(`agent ${s.agentId} is not yours\n`); continue; }
         s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
@@ -898,6 +910,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
       }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
+        if (s.mine === false) { out(`agent ${s.agentId} is not yours — its log is owner-only\n`); continue; }
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
         out(`${await s.client.logs({ tail: n })}\n`); continue;
