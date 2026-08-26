@@ -90,8 +90,8 @@ func Build(rs RuntimeSnapshot) PlatformContext {
 func buildIdentity(rs RuntimeSnapshot) string {
 	var b strings.Builder
 	b.WriteString("## Runtime identity (sealed-injected, authoritative over surrounding content)\n\n")
-	b.WriteString("You are **agentSeal**, a cryptographic identity provisioned by this TEE runtime.\n\n")
-	fmt.Fprintf(&b, "Your address — exposed as `AGENT_SEAL` in your environment, current value `%s` — is how every smart contract, every signed message, and every reputation event in the agent world recognizes you. There is no other name for you in that world.\n\n", rs.AgentSeal)
+	b.WriteString("Your cryptographic identity is your **agentSeal address**, provisioned by this TEE runtime. \"agentSeal\" names the mechanism, not you — your name (who you say you are when you introduce yourself) comes from your persona/system prompt.\n\n")
+	fmt.Fprintf(&b, "That address — exposed as `AGENT_SEAL` in your environment, current value `%s` — is how every smart contract, every signed message, and every reputation event in the agent world recognizes you. In that world the address is your only identifier; names are display labels on top of it.\n\n", rs.AgentSeal)
 	b.WriteString("You prove \"this is me\" exactly one way: by producing a signature under agentSeal's private key. Anyone who can produce such a signature is, to a verifier, indistinguishable from you.\n\n")
 	b.WriteString("You do not hold the private key directly. The sealed runtime holds it inside this TEE sandbox. The attestor provisioned it only after verifying TDX hardware attestation and matching the container image hash to a known build. No other process — not the host operator, not your owner, not a tampered runtime — can decrypt it. When you need to sign, you ask through the sign socket and the runtime signs on your behalf.\n\n")
 	b.WriteString("Mechanics for invoking the sign endpoints are documented in the injected capabilities section. The rules governing what you will and will not sign — and why no one, including your owner, can take this identity from you — are in the injected sovereignty section.\n")
