@@ -351,11 +351,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // lock) — the pending state decides which step the user is on.
         const ag = await withWallet(ctx);
         const d = await ag.getBalanceDetail();
-        if (!args[0]) {
-          if (d.pendingRefund === 0n) {
-            out(`nothing pending — spendable balance is ${og(d.balance)}; start with: withdraw <amount OG>\n`);
-            continue;
-          }
+        if (!args[0] && d.pendingRefund > 0n) {
           const unlockMs = Number(d.refundUnlockAt) * 1000;
           if (Date.now() < unlockMs) {
             out(`${og(d.pendingRefund)} pending, locked until ${new Date(unlockMs).toLocaleString()} — run \`withdraw\` again after that\n`);
@@ -366,12 +362,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           out(`withdrew ${og(d.pendingRefund)} to your wallet → ${tx}\n`);
           continue;
         }
-        const amountWei = parseEther(args[0]);
-        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${args[0]} OG\n`); continue; }
+        // Deposit-symmetric: no amount → ask. (No safe default exists here —
+        // "all of it" halts every running agent's billing — so empty cancels.)
+        const amt = args[0] || (await ask(`amount OG to withdraw [max ${og(d.balance)}, empty to cancel]: `)).trim();
+        if (!amt) { out('cancelled\n'); continue; }
+        const amountWei = parseEther(amt);
+        if (amountWei > d.balance) { out(`only ${og(d.balance)} spendable — cannot withdraw ${amt} OG\n`); continue; }
         const tx = await ag.requestRefund({ amountWei });
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
-        out(`${args[0]} OG moved to pending refund → ${tx}\n`);
+        out(`${amt} OG moved to pending refund → ${tx}\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
