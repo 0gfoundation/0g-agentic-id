@@ -289,6 +289,7 @@ if (ackTx) await ag.waitForTransaction(ackTx);   // see the read-after-write not
 // prepaid sandbox balance (SandboxServing)
 await ag.getBalance();                              // → 500000000000000000n   (wei; user defaults to the account, provider to the attestor /config's)
 await ag.getBalance({ user: owner });               // also takes a deposit-style options object (positional still works)
+await ag.getBalanceDetail();                        // → { balance, pendingRefund, refundUnlockAt } — getBalance() is the spendable part; funds mid-refund show only here
 const depositTx = await ag.deposit({ amountWei: parseEther('0.5') }); // → tx hash "0x…"
 await ag.waitForTransaction(depositTx);
 ```

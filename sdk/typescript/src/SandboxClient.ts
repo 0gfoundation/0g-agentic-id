@@ -134,19 +134,30 @@ export class SandboxClient {
   // ── deposit ──────────────────────────────────────────────────────────────
 
   /**
-   * Read a user's prepaid sandbox balance against a provider (wei).
+   * Read a user's *spendable* prepaid sandbox balance against a provider (wei).
    * Both args optional: `user` defaults to the configured account,
    * `provider` to the attestor /config's provider.
+   * Funds mid-refund are excluded — see {@link getBalanceDetail}.
    */
   async getBalance(user?: Address, provider?: Address): Promise<bigint> {
+    return (await this.getBalanceDetail(user, provider)).balance;
+  }
+
+  /**
+   * Full prepaid-account view: spendable `balance`, `pendingRefund` (moved out
+   * by requestRefund, locked), and `refundUnlockAt` (unix seconds when the
+   * pending refund becomes withdrawable; 0 if none). All wei/bigint.
+   */
+  async getBalanceDetail(user?: Address, provider?: Address): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     const addr = user ?? this.ctx.account?.address;
     if (!addr) throw new Error('no user address (pass one or set account)');
-    return this.ctx.publicClient.readContract({
+    const [balance, pendingRefund, refundUnlockAt] = (await this.ctx.publicClient.readContract({
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'getBalance',
       args: [addr, await this.resolveProvider(provider)],
-    }) as Promise<bigint>;
+    })) as [bigint, bigint, bigint];
+    return { balance, pendingRefund, refundUnlockAt };
   }
 
   /** Provider's registered service entry (endpoint + price schedule). Provider defaults from /config. */

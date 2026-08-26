@@ -53,7 +53,7 @@ sol!(
 sol!(
     #[sol(rpc)]
     interface SandboxServing {
-        function getBalance(address user, address provider) external view returns (uint256);
+        function getBalance(address user, address provider) external view returns (uint256 balance, uint256 pendingRefund, uint256 refundUnlockAt);
     }
 );
 
@@ -369,7 +369,9 @@ where
         provider: Address,
     ) -> anyhow::Result<alloy::primitives::U256> {
         let s = SandboxServing::new(serving, self.provider.clone());
-        Ok(s.getBalance(user, provider).call().await?._0)
+        // Only the spendable balance is consumed here; the contract also
+        // returns (pendingRefund, refundUnlockAt) — see issue #136.
+        Ok(s.getBalance(user, provider).call().await?.balance)
     }
 
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String> {

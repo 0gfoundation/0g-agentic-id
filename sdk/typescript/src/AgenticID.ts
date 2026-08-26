@@ -841,4 +841,12 @@ export class AgenticID {
     }
     return this.infra.getBalance(userOrOpts, provider);
   }
+  /**
+   * Full prepaid-account view: spendable `balance`, plus `pendingRefund` and
+   * `refundUnlockAt` (funds mid-refund and when they unlock — invisible to
+   * {@link getBalance}, which returns only the spendable part).
+   */
+  getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
+    return this.infra.getBalanceDetail(opts?.user, opts?.provider);
+  }
 }
