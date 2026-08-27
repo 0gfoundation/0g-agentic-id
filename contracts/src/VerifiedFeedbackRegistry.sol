@@ -53,8 +53,11 @@ error VerifiedFeedbackSummaryOverflow();
 ///      identityRegistry, submitter), NOT to this contract's address — so the
 ///      sealed runtime and SDK signing paths are unchanged. Consequence: while
 ///      both contracts are live on one deployment, a single proof can be
-///      redeemed once on EACH (their nonce stores are separate). Acceptable —
-///      the fork registry is deprecated and new stacks deploy only this one.
+///      redeemed once on EACH (their nonce stores are separate) — and the same
+///      generalizes to any extra VerifiedFeedbackRegistry instance anchored to
+///      the same pair, so readers should pin ONE registry address per
+///      deployment (DEPLOYMENT.md §6). Acceptable — the fork registry is
+///      deprecated and new stacks deploy only this one.
 contract VerifiedFeedbackRegistry is
     IVerifiedFeedbackRegistry,
     OwnableUpgradeable,

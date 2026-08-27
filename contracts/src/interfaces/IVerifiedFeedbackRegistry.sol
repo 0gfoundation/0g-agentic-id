@@ -40,13 +40,14 @@ interface IVerifiedFeedbackRegistry {
 
     /// @notice Mark the caller's canonical feedback entry `feedbackIndex` for
     ///         `agentId` as backed by a TEE-signed ServeProof.
-    /// @dev Verifies (in order): agentId matches proof.agentId; the ServeProof
-    ///      signature against the agentSeal registered in the identity registry
-    ///      (digest bound to this chain + identity registry + submitter);
-    ///      proof.submitter == msg.sender; the caller is not the agent owner or
-    ///      an approved operator; the canonical entry exists for msg.sender;
-    ///      the entry is not already verified. Consumes the proof's nonce —
-    ///      one proof attests at most one entry.
+    /// @dev Verifies (in order): agentId matches proof.agentId;
+    ///      proof.submitter == msg.sender (before signature recovery, so a
+    ///      mismatched caller reverts cheaply); the ServeProof signature
+    ///      against the agentSeal registered in the identity registry (digest
+    ///      bound to this chain + identity registry + submitter); the proof's
+    ///      nonce (consumed — one proof attests at most one entry); the caller
+    ///      is not the agent owner or an approved operator; the canonical
+    ///      entry exists for msg.sender; the entry is not already verified.
     function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof) external;
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -77,6 +78,8 @@ interface IVerifiedFeedbackRegistry {
     ///         getSummary (verification proves a service call happened, not
     ///         that the client is unrelated to the owner).
     /// @dev O(verified entries × canonical reads) — off-chain eth_call only.
+    ///      A client listed twice in `clientAddresses` is aggregated twice —
+    ///      dedup is the caller's responsibility (matches the fork registry).
     function getVerifiedSummary(
         uint256 agentId,
         address[] calldata clientAddresses,

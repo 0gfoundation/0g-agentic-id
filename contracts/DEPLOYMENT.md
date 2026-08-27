@@ -63,6 +63,12 @@ views are unaffected. `owner` can `setPauser` at any time.
   `VerifiedFeedbackRegistry` anchors to it and stores only ServeProof
   verification marks. The `AgenticIDReputationRegistry` fork is deprecated
   (live on existing environments, absent from fresh deploys).
+  Deploy `VerifiedFeedbackRegistry` through `Deploy.s.sol` only — the script's
+  fail-fast checks (`getVersion`, `getIdentityRegistry() == canonical`) are
+  what validate the anchoring; `initialize` itself only zero-checks the
+  addresses. And treat the §6 proxy address as **the** registry: any second
+  instance anchored to the same pair could redeem the same proofs
+  independently, so readers must pin one aggregator address per deployment.
 - **setAgentWallet is the official 4-arg form** (no nonce): signed by `newWallet`
   over `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`
   under domain `"ERC8004IdentityRegistry"/"1"`, `owner` = the AgenticID contract,
