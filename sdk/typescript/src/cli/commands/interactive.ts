@@ -384,7 +384,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
         const tx = await ag.deposit({ amountWei: parseEther(amt) });
         await ag.waitForTransaction(tx);
-        out(`deposited ${amt} OG to the prepaid sandbox balance → ${tx}\n`);
+        out(`deposited ${amt} OG to the prepaid sandbox balance (tx ${tx})\n`);
         continue;
       }
 
@@ -409,7 +409,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (!yn || yn === 'y' || yn === 'yes') {
             const tx = await ag.withdrawRefund();
             await ag.waitForTransaction(tx);
-            out(`withdrew ${og(pending)} to your wallet → ${tx}\n`);
+            out(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
             pending = 0n;
           }
         }
@@ -426,7 +426,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
         if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
-        else out(`${amt} OG moved to pending refund → ${tx}\n`);
+        else out(`${amt} OG moved to pending refund (tx ${tx})\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
@@ -700,7 +700,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     const amt = (await ask('deposit how much OG now? [1, empty to cancel]: ')).trim();
     if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
     const tx = await ag.deposit({ amountWei: parseEther(amt || '1') });
-    out(`deposit ${amt} OG → ${tx} (waiting…)\n`);
+    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;
