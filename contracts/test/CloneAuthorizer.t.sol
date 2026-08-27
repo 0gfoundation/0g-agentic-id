@@ -2,56 +2,57 @@
 pragma solidity ^0.8.24;
 
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import {IERC721Errors} from "@openzeppelin/contracts/interfaces/IERC721Errors.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticID} from "../src/AgenticID.sol";
+import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDSealIdTaken, AgenticIDCloneDenied, AgenticIDCloneDataHashMismatch} from "../src/AgenticID.sol";
+import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
 import {ICloneAuthorizer} from "../src/interfaces/ICloneAuthorizer.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+
+/// @dev Configurable verdict — for deny / allow toggling.
+contract ToggleAuthorizer {
+    bool public allow = true;
+
+    function setAllow(bool a) external {
+        allow = a;
+    }
+
+    function canClone(uint256, address, address, bytes calldata) external view returns (bool) {
+        return allow;
+    }
+}
+
+/// @dev Args-binding authorizer: returns true only when called with the EXACT
+///      (source, target, caller, data) it was constructed with. Asserts the
+///      policy receives correctly-bound arguments (canClone is view — no
+///      mock-side recording possible).
+contract BoundAuthorizer {
+    uint256 internal immutable _source;
+    address internal immutable _target;
+    address internal immutable _caller;
+    bytes internal _data;
+
+    constructor(uint256 s, address t, address c, bytes memory d) {
+        _source = s;
+        _target = t;
+        _caller = c;
+        _data = d;
+    }
+
+    function canClone(uint256 s, address t, address c, bytes calldata d)
+        external view returns (bool)
+    {
+        return s == _source && t == _target && c == _caller && keccak256(d) == keccak256(_data);
+    }
+}
 
 /// @notice Policy-mode cloning (issue #133): setCloneAuthorizer / cloneFrom /
 ///         transfer-clearing semantics, against controllable authorizer mocks.
 contract CloneAuthorizerTest is AgenticIDTestBase {
-    /// @dev Configurable verdict — for deny / allow toggling.
-    contract ToggleAuthorizer {
-        bool public allow = true;
-
-        function setAllow(bool a) external {
-            allow = a;
-        }
-
-        function canClone(uint256, address, address, bytes calldata) external view returns (bool) {
-            return allow;
-        }
-    }
-
-    /// @dev Args-binding authorizer: returns true only when called with the
-    ///      EXACT (source, target, caller, data) it was constructed with.
-    ///      Asserts the policy receives correctly-bound arguments without
-    ///      vm.expectCall (canClone is view — no mock-side recording possible).
-    contract BoundAuthorizer {
-        uint256 internal immutable _source;
-        address internal immutable _target;
-        address internal immutable _caller;
-        bytes internal immutable _data;
-
-        constructor(uint256 s, address t, address c, bytes memory d) {
-            _source = s;
-            _target = t;
-            _caller = c;
-            _data = d;
-        }
-
-        function canClone(uint256 s, address t, address c, bytes calldata d)
-            external view returns (bool)
-        {
-            return s == _source && t == _target && c == _caller && keccak256(d) == keccak256(_data);
-        }
-    }
-
     ToggleAuthorizer internal toggle;
     address internal buyer = address(0xB0B);
-    address internal attacker = address(0xEV1L);
+    address internal attacker = address(0xEA11);
 
     // Fresh seal material for clones — must not collide with the base's
     // SEAL_ID / SEAL_ADDR (base mints with those).
@@ -194,7 +195,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
 
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
         vm.prank(attacker);
-        vm.expectRevert(AgenticID.AgenticIDNotTrustedAttestor.selector);
+        vm.expectRevert(AgenticIDNotTrustedAttestor.selector);
         agenticId.cloneFrom(
             sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, attacker, AUTH_DATA
         );
@@ -206,7 +207,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         _cloneFromExpectRevert(
             sourceId,
             dataHash,
-            abi.encodeWithSelector(AgenticID.AgenticIDCloneDenied.selector, sourceId, address(0))
+            abi.encodeWithSelector(AgenticIDCloneDenied.selector, sourceId, address(0))
         );
     }
 
@@ -219,7 +220,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         _cloneFromExpectRevert(
             sourceId,
             dataHash,
-            abi.encodeWithSelector(AgenticID.AgenticIDCloneDenied.selector, sourceId, address(toggle))
+            abi.encodeWithSelector(AgenticIDCloneDenied.selector, sourceId, address(toggle))
         );
     }
 
@@ -234,7 +235,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
             sourceId,
             staleHash,
             abi.encodeWithSelector(
-                AgenticID.AgenticIDCloneDataHashMismatch.selector, 0, liveHash, staleHash
+                AgenticIDCloneDataHashMismatch.selector, 0, liveHash, staleHash
             )
         );
     }
@@ -256,7 +257,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         bytes[] memory keys = new bytes[](0); // source carries 1 entry
         vm.prank(attestor);
         vm.expectRevert(
-            abi.encodeWithSelector(AgenticID.ERC7857SealedKeyArityMismatch.selector, 1, 0)
+            abi.encodeWithSelector(IERC7857Updatable.ERC7857SealedKeyArityMismatch.selector, 1, 0)
         );
         agenticId.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
     }
@@ -270,7 +271,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
         vm.prank(attestor);
         vm.expectRevert(
-            abi.encodeWithSelector(AgenticID.AgenticIDSealIdTaken.selector, SEAL_ID, sourceId)
+            abi.encodeWithSelector(AgenticIDSealIdTaken.selector, SEAL_ID, sourceId)
         );
         agenticId.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, SEAL_ID, buyer, AUTH_DATA);
     }

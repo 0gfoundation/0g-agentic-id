@@ -643,7 +643,11 @@ contract AgenticID is
         AgenticIDStorage storage $ = _getAgenticIDStorage();
         if (!$.trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
 
-        // Policy first: an unconfigured (0) or declining authorizer denies
+        // Source must exist — checked before the policy lookup for a precise
+        // error (consistent with setCloneAuthorizer's ordering).
+        if (_ownerOf(sourceAgentId) == address(0)) revert ERC721NonexistentToken(sourceAgentId);
+
+        // Policy next: an unconfigured (0) or declining authorizer denies
         // before any gas is spent on data reads. The call is a STATICCALL
         // (view interface) — the policy cannot mutate or reenter.
         address authorizer = $.cloneAuthorizers[sourceAgentId];
@@ -652,8 +656,7 @@ contract AgenticID is
             revert AgenticIDCloneDenied(sourceAgentId, authorizer);
         }
 
-        // Source must exist and carry iData.
-        if (_ownerOf(sourceAgentId) == address(0)) revert ERC721NonexistentToken(sourceAgentId);
+        // Source must carry iData.
         IntelligentData[] memory datas = _intelligentDatasOf(sourceAgentId);
         if (datas.length == 0) revert ERC7857EmptyData();
         if (sealedKeys.length != datas.length || dataHashes.length != datas.length) {
