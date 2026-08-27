@@ -32,8 +32,8 @@ import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } 
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
-  ServeProof, GiveFeedbackParams, AppendResponseParams, ReadAllFeedbackParams,
-  GetSummaryParams, Feedback, FeedbackSummary, ServeData,
+  ServeProof, GiveFeedbackParams, GiveFeedbackResult, AppendResponseParams,
+  ReadAllFeedbackParams, GetSummaryParams, Feedback, FeedbackSummary, ServeData,
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -740,17 +740,24 @@ export class ReputationApi {
   parseServeProofHeader(value: string): ServeProof { return parseServeProofHeader(value); }
   verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
 
-  // — feedback —
-  giveFeedback(params: GiveFeedbackParams): Promise<WriteContractReturnType> { return this.rep.giveFeedback(params); }
+  // — feedback (canonical write + TEE verification mark, bundled) —
+  giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> { return this.rep.giveFeedback(params); }
+  attestFeedback(agentId: bigint, feedbackIndex: bigint, proof: ServeProof): Promise<WriteContractReturnType> { return this.rep.attestFeedback(agentId, feedbackIndex, proof); }
   revokeFeedback(agentId: bigint, feedbackIndex: bigint): Promise<WriteContractReturnType> { return this.rep.revokeFeedback(agentId, feedbackIndex); }
   appendResponse(params: AppendResponseParams): Promise<WriteContractReturnType> { return this.rep.appendResponse(params); }
+  // — canonical reads (raw feedback, verified or not) —
   readFeedback(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<Feedback> { return this.rep.readFeedback(agentId, client, feedbackIndex); }
   readAllFeedback(params: ReadAllFeedbackParams): Promise<Feedback[]> { return this.rep.readAllFeedback(params); }
   getSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getSummary(params); }
-  getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   getClients(agentId: bigint): Promise<Address[]> { return this.rep.getClients(agentId); }
   getLastIndex(agentId: bigint, client: Address): Promise<bigint> { return this.rep.getLastIndex(agentId, client); }
   getResponseCount(agentId: bigint, client: Address, feedbackIndex: bigint, responders: Address[]): Promise<bigint> { return this.rep.getResponseCount(agentId, client, feedbackIndex, responders); }
+  // — verified reads (TEE marks) —
+  isVerified(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<boolean> { return this.rep.isVerified(agentId, client, feedbackIndex); }
+  getVerifiedIndexes(agentId: bigint, client: Address): Promise<bigint[]> { return this.rep.getVerifiedIndexes(agentId, client); }
+  getVerifiedClients(agentId: bigint): Promise<Address[]> { return this.rep.getVerifiedClients(agentId); }
+  getVerifiedSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getVerifiedSummary(params); }
+  getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   waitForTransaction(txHash: Hash): Promise<TransactionReceipt> { return this.rep.waitForTransaction(txHash); }
 }
 
@@ -807,7 +814,7 @@ export class AgenticID {
       rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
       addresses: {
         agenticID: addr(cfg.agentic_id_addr),
-        reputationRegistry: addr(cfg.reputation_registry_addr),
+        verifiedFeedback: addr(cfg.verified_feedback_addr),
         teeDataVerifier: addr(cfg.tee_data_verifier_addr),
         tappRegistry: addr(cfg.tapp_registry_addr),
         sandboxServing: addr(cfg.sandbox_serving_addr),

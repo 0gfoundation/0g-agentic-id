@@ -507,40 +507,15 @@ export const agenticIDAbi = [
 ] as const;
 
 /**
- * ABI for the ReputationRegistry contract.
+ * Official canonical ERC-8004 ReputationRegistry (the fixed 0x8004B… singleton;
+ * v2.0.0). Feedback STORAGE lives here — clients call `giveFeedback` directly,
+ * so attribution is native msg.sender and every 8004 reader sees it. It has no
+ * ServeProof parameter and no custom errors (plain require strings).
+ * TEE verification marks live in the separate VerifiedFeedbackRegistry
+ * (`verifiedFeedbackAbi` below).
  */
-export const reputationRegistryAbi = [
-  // Custom errors (from AgenticIDReputationRegistry.sol) — so viem can decode
-  // reverts like ReputationSelfFeedback / ReputationClientsRequired instead of
-  // showing a bare 4-byte selector.
-  {"type":"error","name":"AgenticIDProofRequired","inputs":[]},
-  {"type":"error","name":"ECDSAInvalidSignature","inputs":[]},
-  {"type":"error","name":"ECDSAInvalidSignatureLength","inputs":[{"name":"length","type":"uint256"}]},
-  {"type":"error","name":"ECDSAInvalidSignatureS","inputs":[{"name":"s","type":"bytes32"}]},
-  {"type":"error","name":"EnforcedPause","inputs":[]},
-  {"type":"error","name":"ExpectedPause","inputs":[]},
-  {"type":"error","name":"InvalidInitialization","inputs":[]},
-  {"type":"error","name":"NonceAlreadyUsed","inputs":[{"name":"key","type":"bytes32"}]},
-  {"type":"error","name":"NonceDeadlineTooFar","inputs":[{"name":"deadline","type":"uint256"},{"name":"maxDeadline","type":"uint256"}]},
-  {"type":"error","name":"NonceExpired","inputs":[{"name":"deadline","type":"uint256"},{"name":"nowTimestamp","type":"uint256"}]},
-  {"type":"error","name":"NotInitializing","inputs":[]},
-  {"type":"error","name":"OwnableInvalidOwner","inputs":[{"name":"owner","type":"address"}]},
-  {"type":"error","name":"OwnableUnauthorizedAccount","inputs":[{"name":"account","type":"address"}]},
-  {"type":"error","name":"ReputationAlreadyResponded","inputs":[]},
-  {"type":"error","name":"ReputationAlreadyRevoked","inputs":[]},
-  {"type":"error","name":"ReputationClientsRequired","inputs":[]},
-  {"type":"error","name":"ReputationInvalidIndex","inputs":[{"name":"index","type":"uint256"},{"name":"length","type":"uint256"}]},
-  {"type":"error","name":"ReputationInvalidProofSignature","inputs":[]},
-  {"type":"error","name":"ReputationNoAgentSeal","inputs":[]},
-  {"type":"error","name":"ReputationNotAgentOwner","inputs":[]},
-  {"type":"error","name":"ReputationNotPauser","inputs":[]},
-  {"type":"error","name":"ReputationProofAgentMismatch","inputs":[{"name":"agentId","type":"uint256"},{"name":"proofAgentId","type":"uint256"}]},
-  {"type":"error","name":"ReputationProofSubmitterMismatch","inputs":[{"name":"submitter","type":"address"},{"name":"sender","type":"address"}]},
-  {"type":"error","name":"ReputationSelfFeedback","inputs":[{"name":"agentId","type":"uint256"},{"name":"submitter","type":"address"}]},
-  {"type":"error","name":"ReputationSummaryOverflow","inputs":[]},
-  {"type":"error","name":"ReputationValueDecimalsTooLarge","inputs":[{"name":"valueDecimals","type":"uint8"}]},
-  {"type":"error","name":"ReputationValueOutOfRange","inputs":[{"name":"value","type":"int128"}]},
-  // ── Give Feedback ──
+export const canonicalReputationAbi = [
+  // ── Give Feedback (canonical 8-arg form, attribution = msg.sender) ──
   {
     type: 'function',
     name: 'giveFeedback',
@@ -554,16 +529,6 @@ export const reputationRegistryAbi = [
       { name: 'endpoint', type: 'string' },
       { name: 'feedbackURI', type: 'string' },
       { name: 'feedbackHash', type: 'bytes32' },
-      { name: 'ServeProof', type: 'tuple', components: [
-        { name: 'agentId', type: 'uint256' },
-        { name: 'submitter', type: 'address' },
-        { name: 'timestamp', type: 'uint256' },
-        { name: 'deadline', type: 'uint256' },
-        { name: 'taskHash', type: 'bytes32' },
-        { name: 'dataHashes', type: 'bytes32[]' },
-        { name: 'frameworkHash', type: 'bytes32' },
-        { name: 'signature', type: 'bytes' },
-      ] },
     ],
     outputs: [],
   },
@@ -690,7 +655,129 @@ export const reputationRegistryAbi = [
     outputs: [{ name: '', type: 'uint64' }],
   },
 
-  // ── Get Serve Data ──
+  // ── Environment sanity reads ──
+  {
+    type: 'function',
+    name: 'getIdentityRegistry',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'getVersion',
+    stateMutability: 'pure',
+    inputs: [],
+    outputs: [{ name: '', type: 'string' }],
+  },
+
+  // ── Events (canonical v2.0.0 shapes) ──
+  {
+    type: 'event',
+    name: 'NewFeedback',
+    inputs: [
+      { name: 'agentId', type: 'uint256', indexed: true },
+      { name: 'clientAddress', type: 'address', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: false },
+      { name: 'value', type: 'int128', indexed: false },
+      { name: 'valueDecimals', type: 'uint8', indexed: false },
+      { name: 'indexedTag1', type: 'string', indexed: true },
+      { name: 'tag1', type: 'string', indexed: false },
+      { name: 'tag2', type: 'string', indexed: false },
+      { name: 'endpoint', type: 'string', indexed: false },
+      { name: 'feedbackURI', type: 'string', indexed: false },
+      { name: 'feedbackHash', type: 'bytes32', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'FeedbackRevoked',
+    inputs: [
+      { name: 'agentId', type: 'uint256', indexed: true },
+      { name: 'clientAddress', type: 'address', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: true },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ResponseAppended',
+    inputs: [
+      { name: 'agentId', type: 'uint256', indexed: true },
+      { name: 'clientAddress', type: 'address', indexed: true },
+      { name: 'feedbackIndex', type: 'uint64', indexed: false },
+      { name: 'responder', type: 'address', indexed: true },
+      { name: 'responseURI', type: 'string', indexed: false },
+      { name: 'responseHash', type: 'bytes32', indexed: false },
+    ],
+  },
+] as const;
+
+/**
+ * VerifiedFeedbackRegistry — the local TEE-verification layer over the
+ * canonical ERC-8004 ReputationRegistry. `attestFeedback` marks a canonical
+ * entry as backed by a ServeProof; the `getVerified*` reads expose the marks
+ * so readers can intersect them with canonical entries.
+ */
+export const verifiedFeedbackAbi = [
+  // Custom errors — so viem decodes reverts instead of showing a 4-byte selector.
+  {"type":"error","name":"ECDSAInvalidSignature","inputs":[]},
+  {"type":"error","name":"ECDSAInvalidSignatureLength","inputs":[{"name":"length","type":"uint256"}]},
+  {"type":"error","name":"ECDSAInvalidSignatureS","inputs":[{"name":"s","type":"bytes32"}]},
+  {"type":"error","name":"EnforcedPause","inputs":[]},
+  {"type":"error","name":"ExpectedPause","inputs":[]},
+  {"type":"error","name":"InvalidInitialization","inputs":[]},
+  {"type":"error","name":"NonceAlreadyUsed","inputs":[{"name":"key","type":"bytes32"}]},
+  {"type":"error","name":"NonceDeadlineTooFar","inputs":[{"name":"deadline","type":"uint256"},{"name":"maxDeadline","type":"uint256"}]},
+  {"type":"error","name":"NonceExpired","inputs":[{"name":"deadline","type":"uint256"},{"name":"nowTimestamp","type":"uint256"}]},
+  {"type":"error","name":"NotInitializing","inputs":[]},
+  {"type":"error","name":"OwnableInvalidOwner","inputs":[{"name":"owner","type":"address"}]},
+  {"type":"error","name":"OwnableUnauthorizedAccount","inputs":[{"name":"account","type":"address"}]},
+  {"type":"error","name":"VerifiedFeedbackAlreadyVerified","inputs":[{"name":"agentId","type":"uint256"},{"name":"clientAddress","type":"address"},{"name":"feedbackIndex","type":"uint64"}]},
+  {"type":"error","name":"VerifiedFeedbackClientsRequired","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackInvalidProofSignature","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackNoAgentSeal","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackNoSuchEntry","inputs":[{"name":"agentId","type":"uint256"},{"name":"clientAddress","type":"address"},{"name":"feedbackIndex","type":"uint64"},{"name":"lastIndex","type":"uint64"}]},
+  {"type":"error","name":"VerifiedFeedbackNotPauser","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackNotVerified","inputs":[{"name":"agentId","type":"uint256"},{"name":"clientAddress","type":"address"},{"name":"feedbackIndex","type":"uint64"}]},
+  {"type":"error","name":"VerifiedFeedbackProofAgentMismatch","inputs":[{"name":"agentId","type":"uint256"},{"name":"proofAgentId","type":"uint256"}]},
+  {"type":"error","name":"VerifiedFeedbackProofSubmitterMismatch","inputs":[{"name":"submitter","type":"address"},{"name":"sender","type":"address"}]},
+  {"type":"error","name":"VerifiedFeedbackSelfFeedback","inputs":[{"name":"agentId","type":"uint256"},{"name":"submitter","type":"address"}]},
+  {"type":"error","name":"VerifiedFeedbackSummaryOverflow","inputs":[]},
+
+  // ── Attest ──
+  {
+    type: 'function',
+    name: 'attestFeedback',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
+      { name: 'proof', type: 'tuple', components: [
+        { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
+        { name: 'timestamp', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+        { name: 'taskHash', type: 'bytes32' },
+        { name: 'dataHashes', type: 'bytes32[]' },
+        { name: 'frameworkHash', type: 'bytes32' },
+        { name: 'signature', type: 'bytes' },
+      ] },
+    ],
+    outputs: [],
+  },
+
+  // ── Reads ──
+  {
+    type: 'function',
+    name: 'isVerified',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddress', type: 'address' },
+      { name: 'feedbackIndex', type: 'uint64' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
   {
     type: 'function',
     name: 'getServeData',
@@ -705,32 +792,64 @@ export const reputationRegistryAbi = [
       { name: 'frameworkHash', type: 'bytes32' },
     ],
   },
+  {
+    type: 'function',
+    name: 'getVerifiedIndexes',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddress', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'uint64[]' }],
+  },
+  {
+    type: 'function',
+    name: 'getVerifiedClients',
+    stateMutability: 'view',
+    inputs: [{ name: 'agentId', type: 'uint256' }],
+    outputs: [{ name: '', type: 'address[]' }],
+  },
+  {
+    type: 'function',
+    name: 'getVerifiedSummary',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddresses', type: 'address[]' },
+      { name: 'tag1', type: 'string' },
+      { name: 'tag2', type: 'string' },
+    ],
+    outputs: [
+      { name: 'count', type: 'uint64' },
+      { name: 'summaryValue', type: 'int128' },
+      { name: 'summaryValueDecimals', type: 'uint8' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'getIdentityRegistry',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'getCanonicalReputation',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
 
   // ── Events ──
   {
     type: 'event',
-    name: 'FeedbackGiven',
-    inputs: [
-      { name: 'agentId', type: 'uint256', indexed: true },
-      { name: 'client', type: 'address', indexed: true },
-      { name: 'feedbackIndex', type: 'uint64', indexed: true },
-    ],
-  },
-  {
-    type: 'event',
-    name: 'FeedbackRevoked',
-    inputs: [
-      { name: 'agentId', type: 'uint256', indexed: true },
-      { name: 'feedbackIndex', type: 'uint64', indexed: true },
-    ],
-  },
-  {
-    type: 'event',
-    name: 'ResponseAppended',
+    name: 'FeedbackVerified',
     inputs: [
       { name: 'agentId', type: 'uint256', indexed: true },
       { name: 'clientAddress', type: 'address', indexed: true },
       { name: 'feedbackIndex', type: 'uint64', indexed: true },
+      { name: 'dataHashes', type: 'bytes32[]', indexed: false },
+      { name: 'frameworkHash', type: 'bytes32', indexed: false },
     ],
   },
 ] as const;

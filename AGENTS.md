@@ -40,7 +40,7 @@ go test ./internal/proxy -run TestServeProof       # one test
 cd sdk/typescript && npm install && npm run typecheck && npm run build
 
 # live regression (costs gas + sandbox billing; drives every e2e leg against a deployed env)
-OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 REPUTATION_ADDR=0x<registry> \
+OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 VERIFIED_FEEDBACK_ADDR=0x<registry> \
   bash attestor/scripts/regression.sh
 ```
 
@@ -57,7 +57,7 @@ There is no CI — run the relevant suite(s) locally before pushing. `attestor/T
 - The agent's own on-chain writes (`update`/`updateAt`) are gated purely on `msg.sender == agentSeal` — no signature scheme involved.
 - Transfer/clone proofs (AccessProof/OwnershipProof) preimages **must** be prefixed with `chainId ‖ erc7857-contract-address` (domain separation; see `BaseDataVerifier.sol`). Off-chain signers that omit the prefix produce proofs that never verify.
 
-**Consensus-critical duplication**: the ServeProof digest (`keccak256(abi.encode(agentId, timestamp, deadline, taskHash, keccak256(dataHashes), frameworkHash))`, then EIP-191) is independently implemented in the contracts, `sealed/internal/proxy/`, and `sdk/typescript/src/ServeProof.ts`. Any change must land in all three. When signing it in the SDK, sign the digest **raw** (`account.sign({ hash })`) — `signMessage({ message: { raw } })` double-wraps EIP-191 and fails verification.
+**Consensus-critical duplication**: the ServeProof digest (`keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp, deadline, taskHash, keccak256(dataHashes), frameworkHash))`, then EIP-191) is independently implemented in the contracts, `sealed/internal/proxy/`, and `sdk/typescript/src/ServeProof.ts`. Any change must land in all three. When signing it in the SDK, sign the digest **raw** (`account.sign({ hash })`) — `signMessage({ message: { raw } })` double-wraps EIP-191 and fails verification.
 
 **Address/config discovery**: contract addresses are deployment artifacts, deliberately NOT baked into the SDK. Source of truth: `contracts/DEPLOYMENT.md` §6 and the attestor's `GET /config` (which also serves the current `sandbox_snapshot` image name — environment-specific: production `0g-sealed`, dev default `0g-test-sealed`). Production (`agenticid.0g.ai`) runs the §6.1 "test" address set on 0G Galileo (chain id 16602, `https://evmrpc-testnet.0g.ai`).
 

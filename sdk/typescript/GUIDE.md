@@ -28,8 +28,8 @@ Not every environment deploys every contract. An address absent from
 /config maps to the zero address: `fromAttestor` still constructs (chain
 reads, deploy, etc. all work), and the affected namespace fails fast with
 a named error only when actually invoked — e.g. an environment without a
-ReputationRegistry throws `reputation: this environment has no
-ReputationRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
+VerifiedFeedbackRegistry throws `reputation: this environment has no
+VerifiedFeedbackRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
 still exists for hand-picked addresses — audit tooling, or reading a
 chain with no attestor running — and `overrides` lets you pin any single
 address without giving up the bootstrap.)
@@ -230,31 +230,45 @@ const data = await response.json();                   // your normal response bo
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
 
-// 3. submit feedback — recorded under buyer (msg.sender). Three fields
-// required; everything else defaults (decimals 0, empty tags/endpoint/URI).
-// NOTE: an agent's OWNER cannot rate their own agent — the contract rejects it
-// (ReputationSelfFeedback). Feedback must come from a different wallet than the
-// one that owns `agentId`.
-const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// 3. submit feedback. Storage and trust are split across two contracts:
+// the entry itself goes to the OFFICIAL canonical ERC-8004 Reputation
+// Registry (attribution = msg.sender natively, so every 8004 reader sees
+// it), and the ServeProof mark goes to the local VerifiedFeedbackRegistry.
+// giveFeedback bundles both: canonical write (mined inside the call, so the
+// assigned index can be read back) + attestFeedback (returned pending).
+// NOTE: an agent's OWNER cannot attest feedback on their own agent — the
+// verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
+// come from a different wallet than the one that owns `agentId`.
+const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// → { feedbackTx: "0x…" (mined), attestTx: "0x…" (pending), feedbackIndex: 2n }
+await ag.reputation.waitForTransaction(fb.attestTx);
 // full control when you want it: add valueDecimals / tag1 / tag2 /
-// endpoint / feedbackURI / feedbackHash.
+// endpoint / feedbackURI / feedbackHash. Escape hatch: if you submitted the
+// canonical entry yourself, mark it with attestFeedback(agentId, idx, proof).
 // The proof should come from the interaction you are actually rating —
 // capture() it during your real call, then submit. The proof's `deadline`
 // is serve-time +3600s (one hour) — ample for verify + a 120s+ 0G receipt,
 // but don't submit it the next day: the contract rejects expired proofs.
-// txHash → "0x…"
 
-// read back
+// read back — canonical reads return RAW 8004 feedback (the canonical
+// registry is permissionless, anyone can write unverified entries there);
+// the verified reads expose the TEE marks to intersect with.
 const idx = await ag.reputation.getLastIndex(agentId, buyer);   // → 2n   latest index for this buyer
 await ag.reputation.readFeedback(agentId, buyer, idx);
 // → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "latency", isRevoked: false }
-await ag.reputation.getSummary({ agentId });   // unscoped → summarizes across all clients (SDK fills them; empty → zero summary)
+await ag.reputation.getSummary({ agentId });   // RAW summary, unscoped → all clients (SDK fills them; empty → zero summary)
 // → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }
-await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
 await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
 // → [ { value, valueDecimals, tag1, tag2, isRevoked }, … ]
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  addresses that left feedback
 await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n   how many of the listed responders replied to buyer's feedback #idx
+
+// verified reads — only proof-backed entries count here
+await ag.reputation.isVerified(agentId, buyer, idx);            // → true
+await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → all VERIFIED clients (empty → zero summary)
+await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
+await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
+await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }  (verified entries only)
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -300,7 +314,7 @@ The trust-root component set auto-resolves from the attestor's `GET /config` whe
 
 `agent.deploy()` / `agent.clone()` **preflight** both prerequisites (all components acked + prepaid balance ≥ 0.1 OG) and throw a synchronous, actionable error naming the missing step — pass `{ preflight: false }` to skip. The attestor enforces the same two checks at accept (HTTP 402, codes `trust_roots_not_acked` / `insufficient_sandbox_balance`).
 
-**Read-after-write races the pending tx**: `ack()` / `deposit()` / `topUpAgentSeal()` / `giveFeedback()` are bare `writeContract` calls — they return the hash immediately, not after mining. Reading state right after (`ackStatus()` / `getBalance()` / `readFeedback()`) can see the pre-tx value. Each namespace has its own `waitForTransaction(txHash)` (top-level `ag`, `ag.agent`, `ag.reputation`) — await it before reading:
+**Read-after-write races the pending tx**: `ack()` / `deposit()` / `topUpAgentSeal()` / `attestFeedback()` are bare `writeContract` calls — they return the hash immediately, not after mining (`giveFeedback()` mines its canonical write internally but returns `attestTx` pending). Reading state right after (`ackStatus()` / `getBalance()` / `readFeedback()`) can see the pre-tx value. Each namespace has its own `waitForTransaction(txHash)` (top-level `ag`, `ag.agent`, `ag.reputation`) — await it before reading:
 
 ```ts
 const tx = await ag.deposit({ amountWei: parseEther('1') });
@@ -581,7 +595,7 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G
 
 ## Notes
 
-- **Serve-proof binding.** On-chain attribution is `msg.sender` at `giveFeedback`; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
+- **Serve-proof binding.** On-chain attribution is `msg.sender` at the canonical `giveFeedback`, and `attestFeedback` requires the same wallet; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
 - **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries). If it still times out, the tx likely landed — confirm by reading state.
 - On-chain types: `value`/`summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint).
 

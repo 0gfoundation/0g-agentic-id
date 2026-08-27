@@ -108,10 +108,15 @@ pub struct Config {
     /// SandboxServing contract address. Separate from TappRegistry; holds
     /// the per-provider business state (price schedule, service URL).
     pub sandbox_serving_addr: Option<Address>,
-    /// ReputationRegistry (client-less) bound to this AgenticID. Served on
+    /// DEPRECATED ReputationRegistry fork bound to this AgenticID. Served on
     /// GET /config purely so clients (SDK env bootstrap) can discover the
     /// full environment from one URL — the attestor itself never calls it.
+    /// New SDKs use `verified_feedback_addr` instead.
     pub reputation_registry_addr: Option<Address>,
+    /// VerifiedFeedbackRegistry bound to this AgenticID (TEE marks over the
+    /// canonical ERC-8004 reputation registry, which SDKs discover FROM it
+    /// via getCanonicalReputation). Same /config-discovery-only purpose.
+    pub verified_feedback_addr: Option<Address>,
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
@@ -279,6 +284,8 @@ impl Config {
             sandbox_serving_addr: env_opt("ATTESTOR_SANDBOX_SERVING_ADDR")
                 .and_then(|s| s.parse().ok()),
             reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
+                .and_then(|s| s.parse().ok()),
+            verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),

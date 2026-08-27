@@ -40,6 +40,7 @@ pub struct ConfigResponse {
     // describes the whole environment (SDK bootstrap) — the attestor
     // itself never calls either contract.
     pub reputation_registry_addr: Option<String>,
+    pub verified_feedback_addr: Option<String>,
     pub tee_data_verifier_addr: Option<String>,
 
     /// Frameworks deploys may select, each with the sealed image for its
@@ -77,6 +78,10 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         reputation_registry_addr: state
             .cfg
             .reputation_registry_addr
+            .map(|a| format!("{:#x}", a)),
+        verified_feedback_addr: state
+            .cfg
+            .verified_feedback_addr
             .map(|a| format!("{:#x}", a)),
         tee_data_verifier_addr: state
             .cfg

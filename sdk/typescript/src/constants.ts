@@ -50,8 +50,8 @@ export interface ContractAddresses {
   agenticID: `0x${string}`;
   /** TEEDataVerifier proxy contract address */
   teeDataVerifier: `0x${string}`;
-  /** ReputationRegistry proxy contract address */
-  reputationRegistry: `0x${string}`;
+  /** VerifiedFeedbackRegistry proxy — TEE marks over the canonical 8004 reputation registry (which is discovered FROM this contract via getCanonicalReputation) */
+  verifiedFeedback: `0x${string}`;
   /** TappRegistry — trust-root acknowledgement (ack) */
   tappRegistry: `0x${string}`;
   /** SandboxServing — prepaid sandbox balance (deposit) */

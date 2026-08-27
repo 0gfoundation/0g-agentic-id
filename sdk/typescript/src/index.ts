@@ -70,6 +70,7 @@ export type {
   FeedbackSummary,
   ServeData,
   GiveFeedbackParams,
+  GiveFeedbackResult,
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,
@@ -90,7 +91,8 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
-  reputationRegistryAbi,
+  canonicalReputationAbi,
+  verifiedFeedbackAbi,
   tappRegistryAbi,
   sandboxServingAbi,
 } from './abi';

@@ -55,7 +55,7 @@ function mk(priv, cfg) {
     // (or any non-default) environment must supply the ids /config reports,
     // or acknowledgeApps reverts "app not found".
     componentAppIds: [cfg.attestor_app_id, cfg.kms_app_id, cfg.sandbox_app_id].filter(Boolean),
-    addresses: { agenticID: cfg.agentic_id_addr, teeDataVerifier: Z, reputationRegistry: Z,
+    addresses: { agenticID: cfg.agentic_id_addr, teeDataVerifier: Z, verifiedFeedback: Z,
                  tappRegistry: cfg.tapp_registry_addr, sandboxServing: cfg.sandbox_serving_addr } });
 }
 

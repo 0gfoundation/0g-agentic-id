@@ -254,6 +254,22 @@ export interface GiveFeedbackParams {
 }
 
 /**
+ * Result of the bundled feedback flow: the canonical `giveFeedback` tx (already
+ * mined — the flow must read the assigned index before attesting), the
+ * `attestFeedback` tx on the VerifiedFeedbackRegistry (returned unmined; wait
+ * with `waitForTransaction`), and the canonical 1-based index the entry landed
+ * at.
+ */
+export interface GiveFeedbackResult {
+  /** Canonical registry giveFeedback tx hash (mined). */
+  feedbackTx: `0x${string}`;
+  /** VerifiedFeedbackRegistry attestFeedback tx hash (pending). */
+  attestTx: `0x${string}`;
+  /** 1-based canonical feedback index of the new entry. */
+  feedbackIndex: bigint;
+}
+
+/**
  * Parameters for appending a response to feedback.
  */
 export interface AppendResponseParams {
