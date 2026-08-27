@@ -16,6 +16,7 @@ import {ERC8004CanonicalBoundUpgradeable} from "./ERC8004CanonicalBoundUpgradeab
 import {ERC7857IDataStorageUpgradeable} from "./extensions/ERC7857IDataStorageUpgradeable.sol";
 import {ERC7857AuthorizeUpgradeable} from "./extensions/ERC7857AuthorizeUpgradeable.sol";
 import {ERC7857CloneableUpgradeable} from "./extensions/ERC7857CloneableUpgradeable.sol";
+import {ICloneAuthorizer} from "./interfaces/ICloneAuthorizer.sol";
 
 /// @notice Caller is not a trusted attestor.
 error AgenticIDNotTrustedAttestor();
@@ -58,6 +59,17 @@ error AgenticIDSealedAgentUseTransfer(uint256 agentId);
 ///         data outside the TEE) and the clone could not operate under its own
 ///         seal anyway. Fork a seal-bound agent through the attestor instead.
 error AgenticIDCannotCloneSealedAgent(uint256 agentId);
+
+/// @notice cloneFrom was called but no clone authorizer is configured for the
+///         source token, or the configured authorizer declined the clone.
+///         Fail-closed: zero authorizer == deny.
+error AgenticIDCloneDenied(uint256 sourceAgentId, address authorizer);
+
+/// @notice cloneFrom's submitted dataHashes don't match the source's LIVE
+///         on-chain iData hashes — the attestor re-sealed against a stale
+///         snapshot (the source evolved between the TEE re-seal and this tx).
+///         The attestor should re-seal from current data and retry.
+error AgenticIDCloneDataHashMismatch(uint256 index, bytes32 onChain, bytes32 submitted);
 
 /// @title AgenticID
 /// @notice Main contract of the AgenticID protocol.
@@ -116,9 +128,28 @@ contract AgenticID is
         // is ambiguous between "unbound" and "bound to agent 0", so uniqueness
         // and existence checks key off this flag instead of the zero sentinel.
         mapping(bytes32 => bool)    sealIdBound;
+
+        // ── Policy-mode cloning (issue #133, ICloneAuthorizer) ─────────────
+        // token → owner-configured clone policy contract (0 = none, fail-closed).
+        // Cleared on transfer in _update — authorization is owner intent and
+        // must not survive an ownership change (same discipline as
+        // authorizedUsers / canonical agentWallet).
+        mapping(uint256 => address) cloneAuthorizers;
+        // Lineage: newAgentId → sourceAgentId (0 = not a clone). Deliberately
+        // NOT cleared on transfer — lineage is a historical fact, not intent.
+        mapping(uint256 => uint256) cloneSource;
     }
 
     /// @notice Current implementation version. Bump on every upgrade.
+    /// @dev 1.2.0 — policy-mode cloning (beacon upgrade, issue #133): per-token
+    ///      `cloneAuthorizers` + `cloneSource` lineage storage appended to the
+    ///      ERC-7201 namespace (layout-compatible), `setCloneAuthorizer` /
+    ///      `cloneAuthorizerOf` / `cloneSourceOf` / `cloneFrom` — a
+    ///      trusted-attestor-only mint that consults the owner-configured
+    ///      ICloneAuthorizer atomically with the mint, for marketplace fork
+    ///      flows. cloneAuthorizers is cleared on transfer in _update (owner
+    ///      intent); cloneSource survives (lineage is historical fact). New
+    ///      events: CloneAuthorizerSet, ClonedFrom.
     /// @dev 1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
     ///      sealed keys before the receiver callback and iTransferFrom/iCloneFrom
     ///      are nonReentrant, so a re-entrant receiver can't desync ownership from
@@ -130,6 +161,13 @@ contract AgenticID is
     string public constant VERSION = "1.1.0";
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
+
+    /// @notice A token's clone authorizer was set or cleared (0 = cleared).
+    event CloneAuthorizerSet(uint256 indexed tokenId, address indexed authorizer);
+
+    /// @notice A policy-mode clone was minted via cloneFrom. Pairs with the
+    ///          ITransferred mint event (indexer symmetry with registerWithSeal).
+    event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.AgenticID")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant AgenticIDStorageLocation =
@@ -526,6 +564,125 @@ contract AgenticID is
         return _getAgenticIDStorage().sealIdBound[sealId];
     }
 
+    // ── Policy-mode cloning (issue #133) ──────────────────────────────────────
+    //
+    // Sealed agents cannot use the on-chain iCloneFrom (data must not leave the
+    // TEE): their only clone path is the attestor's POST /clone, which today
+    // requires a fresh owner signature per request. That model cannot express
+    // "publisher opts in once, marketplace buyers fork" — an ERC-721 operator
+    // grant would work only for ON-CHAIN callers (msg.sender checks) and is
+    // far broader than needed (transfer authority). The authorizer below is
+    // the clone-only, chain-readable counterpart: the owner registers a policy
+    // contract once; the attestor's mint consults it atomically. Identity
+    // authorization answers "who may act"; this answers "under what conditions".
+
+    /// @notice Set or clear (0) this token's clone authorizer. Owner-only.
+    ///         No opinion on what the authorizer checks — listing state,
+    ///         payment, supply, expiry are all the policy contract's business.
+    function setCloneAuthorizer(uint256 tokenId, address authorizer) external whenNotPaused {
+        address tokenOwner = _ownerOf(tokenId);
+        if (tokenOwner == address(0)) revert ERC721NonexistentToken(tokenId);
+        if (msg.sender != tokenOwner) {
+            revert ERC721IncorrectOwner(msg.sender, tokenId, tokenOwner);
+        }
+        _getAgenticIDStorage().cloneAuthorizers[tokenId] = authorizer;
+        emit CloneAuthorizerSet(tokenId, authorizer);
+    }
+
+    /// @notice The configured clone authorizer for a token (0 = none → cloneFrom
+    ///         fails closed).
+    function cloneAuthorizerOf(uint256 tokenId) external view returns (address) {
+        return _getAgenticIDStorage().cloneAuthorizers[tokenId];
+    }
+
+    /// @notice For a clone, the agentId it was forked from (0 = not a clone).
+    ///         Survives transfers — lineage is a historical fact.
+    function cloneSourceOf(uint256 agentId) external view returns (uint256) {
+        return _getAgenticIDStorage().cloneSource[agentId];
+    }
+
+    /// @notice Policy-mode clone mint. Trusted attestors only — the attestor
+    ///         performs the TEE re-seal off-chain (derive the clone's fresh
+    ///         agentSeal, decrypt the source's data, re-encrypt under the new
+    ///         seal's public key) and submits the result here, where the owner's
+    ///         policy is consulted ATOMICALLY with the mint: a deny or a
+    ///         stale-data revert rolls the whole transaction back, so there is
+    ///         no verify-mint race window by construction.
+    ///
+    ///         The source may be sealed or not (parity with POST /clone, which
+    ///         clones either); the clone is always minted WITH a fresh seal.
+    ///         URI and metadata are not copied (parity with the current
+    ///         attestor flow, whose CloneRequest carries neither) — the new
+    ///         owner sets their own.
+    ///
+    /// @param sourceAgentId source token to fork; its iData hashes are copied
+    ///                      from LIVE on-chain storage
+    /// @param to            owner of the clone
+    /// @param dataHashes    the hashes the attestor re-sealed against — must
+    ///                      match the source's current dataHashes exactly, else
+    ///                      AgenticIDCloneDataHashMismatch (source evolved
+    ///                      between re-seal and mint; re-seal and retry)
+    /// @param sealedKeys    the re-sealed ciphertexts (one per data entry,
+    ///                      encrypted under newAgentSeal's public key)
+    /// @param newAgentSeal  the clone's fresh agentSeal address
+    /// @param newSealId     fresh random sealId for the clone
+    /// @param caller        the wallet that initiated the off-chain /clone —
+    ///                      passed to the authorizer so purchases can bind to
+    ///                      buyers even when the attestor submits the tx
+    /// @param authData      opaque bytes forwarded to the authorizer
+    function cloneFrom(
+        uint256 sourceAgentId,
+        address to,
+        bytes32[] calldata dataHashes,
+        bytes[] calldata sealedKeys,
+        address newAgentSeal,
+        bytes32 newSealId,
+        address caller,
+        bytes calldata authData
+    ) external whenNotPaused returns (uint256 agentId) {
+        AgenticIDStorage storage $ = _getAgenticIDStorage();
+        if (!$.trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
+
+        // Policy first: an unconfigured (0) or declining authorizer denies
+        // before any gas is spent on data reads. The call is a STATICCALL
+        // (view interface) — the policy cannot mutate or reenter.
+        address authorizer = $.cloneAuthorizers[sourceAgentId];
+        if (authorizer == address(0) ||
+            !ICloneAuthorizer(authorizer).canClone(sourceAgentId, to, caller, authData)) {
+            revert AgenticIDCloneDenied(sourceAgentId, authorizer);
+        }
+
+        // Source must exist and carry iData.
+        if (_ownerOf(sourceAgentId) == address(0)) revert ERC721NonexistentToken(sourceAgentId);
+        IntelligentData[] memory datas = _intelligentDatasOf(sourceAgentId);
+        if (datas.length == 0) revert ERC7857EmptyData();
+        if (sealedKeys.length != datas.length || dataHashes.length != datas.length) {
+            revert ERC7857SealedKeyArityMismatch(datas.length, sealedKeys.length);
+        }
+        // The re-sealed ciphertexts must correspond to the CURRENT data hashes:
+        // a stale attestor snapshot (source evolved post-re-seal) mints keys
+        // that decrypt nothing — reject, re-seal, retry.
+        for (uint256 i = 0; i < datas.length; i++) {
+            if (datas[i].dataHash != dataHashes[i]) {
+                revert AgenticIDCloneDataHashMismatch(i, datas[i].dataHash, dataHashes[i]);
+            }
+        }
+
+        // Mint — same internal path as registerWithSeal.
+        agentId = _mintAgent(to, "");
+        _updateData(agentId, datas, sealedKeys);
+        _setAgentSeal(agentId, newAgentSeal, newSealId);
+        $.cloneSource[agentId] = sourceAgentId;
+
+        // Mint symmetry for indexers (register / registerWithSeal do the same).
+        SealedKeyEntry[] memory entries = new SealedKeyEntry[](datas.length);
+        for (uint256 j = 0; j < datas.length; j++) {
+            entries[j] = SealedKeyEntry({dataHash: datas[j].dataHash, sealedKey: sealedKeys[j]});
+        }
+        emit ITransferred(address(0), to, agentId, entries);
+        emit ClonedFrom(sourceAgentId, agentId, to, caller);
+    }
+
     // ── Trusted attestors ─────────────────────────────────────────────────────
 
     function addTrustedAttestor(address attestor) external onlyOwner {
@@ -594,12 +751,20 @@ contract AgenticID is
     // ── _update — diamond disambiguation ──────────────────────────────────────
     // agentSeal / sealId are NOT cleared on transfer: seals are one-time bindings
     // for the token's lifetime, so clearing would leave the token permanently unsealable.
+    // The clone AUTHORIZER, by contrast, IS cleared: it is owner intent (not a
+    // lifetime fact), so it must not survive an ownership change — same
+    // discipline as the authorized users and canonical agentWallet clearing in
+    // this chain. cloneSource (lineage) is a historical fact and survives too.
 
     function _update(address to, uint256 tokenId, address auth)
         internal virtual
         override(ERC721Upgradeable, ERC8004CanonicalBoundUpgradeable, ERC7857AuthorizeUpgradeable)
         returns (address)
     {
-        return super._update(to, tokenId, auth);
+        address from = super._update(to, tokenId, auth);
+        if (from != address(0)) {
+            _getAgenticIDStorage().cloneAuthorizers[tokenId] = address(0);
+        }
+        return from;
     }
 }
