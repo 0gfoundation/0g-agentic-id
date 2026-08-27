@@ -57,6 +57,12 @@ views are unaffected. `owner` can `setPauser` at any time.
   `isSealIdBound(bytes32)` disambiguates `getAgentIdBySealId`'s 0 return.
 - **`initialize` gained a `canonical_` param** (last arg), defaulting by chainId;
   override with `CANONICAL_8004`.
+- **Reputation is canonical too**: feedback lives in the official ERC-8004
+  Reputation Registry (Galileo `0x8004B663…8713`, mainnet `0x8004BAa1…9b63`,
+  chosen by chainId, override with `CANONICAL_8004_REPUTATION`); the local
+  `VerifiedFeedbackRegistry` anchors to it and stores only ServeProof
+  verification marks. The `AgenticIDReputationRegistry` fork is deprecated
+  (live on existing environments, absent from fresh deploys).
 - **setAgentWallet is the official 4-arg form** (no nonce): signed by `newWallet`
   over `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`
   under domain `"ERC8004IdentityRegistry"/"1"`, `owner` = the AgenticID contract,
@@ -76,14 +82,16 @@ signers must mirror these exactly:
 
 `erc7857` = the AgenticID contract address (the token contract calling the verifier).
 
-**ServeProof is deliberately NOT envelope-domain-separated**, and carries **no
-`client`** (attribution is `msg.sender` at giveFeedback; signed digest =
-`keccak256(abi.encode(agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`).
-Cross-chain / cross-contract replay is prevented at the **key layer**: agentSeal is
-derived per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS
-derivation, agentic-id#38), so the same agentId on another deployment resolves to a
-different agentSeal and the recovered signer won't match — keeping the off-chain
-`sealed` signer's envelope free of chainId/contract fields.
+**ServeProof is envelope-domain-separated and submitter-bound** (since
+reputation registry 1.2.0): signed digest =
+`keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`,
+where `identityRegistry` = the AgenticID proxy and `submitter` = the only wallet
+allowed to redeem the proof (`== msg.sender` at redemption). Consumed by
+`VerifiedFeedbackRegistry.attestFeedback` (and the deprecated fork registry's
+`giveFeedback`). The **key layer** adds defense in depth: agentSeal is derived
+per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS derivation,
+agentic-id#38), so the same agentId on another deployment resolves to a
+different agentSeal regardless.
 
 Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
 `chainId ‖ erc7857`; the `sealed` runtime is unchanged.
@@ -121,15 +129,16 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 ## 3. Deploy
 
 `script/Deploy.s.sol` deploys all 10 contracts in one run (Timelock + 3 × (impl +
-beacon + proxy)); reputation/verifier bind to the freshly-minted AgenticID, and
-AgenticID binds to `CANONICAL_8004` (chainId default):
+beacon + proxy)); verified-feedback/verifier bind to the freshly-minted AgenticID,
+AgenticID binds to `CANONICAL_8004`, and the verified-feedback registry anchors to
+`CANONICAL_8004_REPUTATION` (both chainId defaults):
 
 ```bash
 export OWNER=0x...
 export PAUSER=0x...
 export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
 export TIMELOCK_DELAY=172800      # prod ≥ 2 days; dev may be 0
-# optional: CANONICAL_8004, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
+# optional: CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
   --priority-gas-price 2000000000 --gas-price 5000000000

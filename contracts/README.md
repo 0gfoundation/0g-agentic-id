@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 138 tests / 18 suites; 1 fork test skips without FORK_RPC)
+forge test                      # full test suite (currently 178 tests / 20 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -88,7 +88,10 @@ stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 ```
 contracts/src/
 ├── AgenticID.sol                               main contract (identity + 7857 token + seal)
-├── AgenticIDReputationRegistry.sol             reputation registry (ServeProof)
+├── VerifiedFeedbackRegistry.sol                TEE-verification layer over the canonical ERC-8004
+│                                               Reputation Registry (attestFeedback + ServeProof)
+├── AgenticIDReputationRegistry.sol             DEPRECATED private reputation fork — replaced by
+│                                               VerifiedFeedbackRegistry; kept for live deployments
 ├── ERC7857Upgradeable.sol                      7857 core (iTransferFrom + proof check)
 ├── ERC8004CanonicalBoundUpgradeable.sol        ERC-8004 identity, custody-bound to the
 │                                               canonical registry (read-through / write-forward)
@@ -101,12 +104,14 @@ contracts/src/
 │   └── TEEDataVerifier.sol                     TEE-signed ownership proof implementation
 ├── utils/
 │   └── NonceRegistryUpgradeable.sol            replay protection (used by the verifier and
-│                                               the reputation registry)
+│                                               the reputation registries)
 ├── proxy/
 │   ├── BeaconProxy.sol                         OZ re-export (so the compiler pulls it into artifacts)
 │   └── UpgradeableBeacon.sol                   OZ re-export
 └── interfaces/
     ├── ICanonicalIdentityRegistry.sol          the fixed canonical ERC-8004 registry AgenticID binds to
+    ├── ICanonicalReputationRegistry.sol        the fixed canonical ERC-8004 Reputation Registry the
+    │                                           verified-feedback layer anchors to
     └── I*.sol                                  all other interface definitions
 ```
 
@@ -208,7 +213,7 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 `msg.sender == to`. The user decides which pubkey each `sealedKeys[i]` is sealed to (their own EOA key, some TEE, or any other choice). The contract **does not validate** the encryption target. If the caller loses the matching decryption key, future transfers cannot produce an OwnershipProof and the agent gets stuck.
 
-In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate reputation. This is permanent: a seal is bound only at mint via `registerWithSeal` (Path A). There is no retroactive "seal an existing agent" call — `sealId` asserts the data has been TEE-confined since creation, which cannot be granted after the fact to a self-minted agent whose data was uploaded in the clear. A seal-bound agent requires the attestor-mint path.
+In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot accumulate verified reputation. This is permanent: a seal is bound only at mint via `registerWithSeal` (Path A). There is no retroactive "seal an existing agent" call — `sealId` asserts the data has been TEE-confined since creation, which cannot be granted after the fact to a self-minted agent whose data was uploaded in the clear. A seal-bound agent requires the attestor-mint path.
 
 ### Key invariants
 
@@ -225,6 +230,15 @@ In this case the agent has no `agentSeal`, cannot sign ServeProof, and cannot ac
 
 ## 5. Flow 2: reputation accumulation
 
+Feedback itself lives in the **official canonical ERC-8004 Reputation Registry**
+(on 0G: mainnet `0x8004BAa1…`, testnet `0x8004B663…`; bound to the same canonical
+Identity Registry AgenticID custody-binds, so the agentId space is shared).
+Clients submit feedback there directly — per-client attribution is native and
+every 8004 reader sees it without adaptation. The local
+`VerifiedFeedbackRegistry` stores only the **TEE-verification marks**: which
+canonical entries were backed by a real service interaction, proven by a
+ServeProof. Storage is canonical, trust is local.
+
 ### ServeProof (off-chain, signed by Agent TEE)
 
 A client makes a real business call to the Agent TEE. After completing it,
@@ -233,6 +247,7 @@ the Agent TEE constructs the following inside the TEE:
 ```solidity
 struct ServeProof {
     uint256   agentId;
+    address   submitter;             // the only address permitted to redeem this proof
     uint256   timestamp;
     uint256   deadline;              // revert past expiry
     bytes32   taskHash;              // task hash (input/output/contract), chosen by the client; the verifier only ecrecovers, doesn't enforce semantics
@@ -242,59 +257,56 @@ struct ServeProof {
 }
 ```
 
-There is **no `client` field**: attribution is `msg.sender` at submission time, and
-the proof is a bearer attestation the buyer submits from its own wallet (single-use
-via the signature nonce). Signed payload:
+Signed payload (domain- and submitter-bound: non-portable across chains and
+protocol deployments, non-transferable across wallets):
 ```
-inner = keccak256(abi.encode(agentId, timestamp, deadline,
-                             taskHash,
+inner = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
+                             agentId, timestamp, deadline, taskHash,
                              keccak256(abi.encodePacked(dataHashes)),
                              frameworkHash))
 signature = personal_sign(inner, agentSeal_priv)
 ```
 
-### On-chain call `giveFeedback`
+### On-chain submission — two calls by the client (SDK bundles them)
 
 ```solidity
-AgenticIDReputationRegistry.giveFeedback(
-    agentId, value, valueDecimals,
-    tag1, tag2,
-    endpoint, feedbackURI, feedbackHash,
-    serveProof
-)
+// 1. feedback → the canonical registry (attribution = msg.sender, natively)
+canonicalReputation.giveFeedback(agentId, value, valueDecimals,
+                                 tag1, tag2, endpoint, feedbackURI, feedbackHash);
+
+// 2. verification mark → the local registry
+VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, serveProof);
 ```
 
-What the contract does:
-1. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)` to verify the signature.
-2. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline` (each proof redeemable once).
-3. Pushes a `FeedbackEntry` under `msg.sender` and records `clients` / `isClient`.
-4. Emits `NewFeedback` and `FeedbackWithProof`.
+What `attestFeedback` verifies:
+1. `agentId == proof.agentId`, and `proof.submitter == msg.sender` (only the declared client may redeem — closes front-running/theft).
+2. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)`.
+3. The caller is not the agent owner or an approved operator (checked against the **local** AgenticID owner — the canonical registry can't enforce this itself, it sees the AgenticID contract as every custody-bound token's owner).
+4. The canonical entry `(agentId, msg.sender, feedbackIndex)` exists and carries no mark yet.
+5. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline` (each proof redeemable once).
+6. Stores the proof's `dataHashes` / `frameworkHash` and emits `FeedbackVerified`.
 
-**The sybil-resistance core**: no agentSeal means no valid ServeProof, and only the Agent TEE holds `agentSeal_priv`. Clients cannot forge a ServeProof, nor self-rate without calling the agent.
+**The sybil-resistance core**: no agentSeal means no valid ServeProof, and only
+the Agent TEE holds `agentSeal_priv`. The canonical registry is permissionless —
+anyone can write unverified feedback there — but nobody can obtain a
+verification mark without a real service call. Readers that care about
+authenticity intersect canonical entries with the marks.
 
 ### Other operations
 
-- `appendResponse(agentId, client, feedbackIndex, responseURI, responseHash)`: the agent owner responds to a specific feedback. Limited to one response per `(agentId, client, feedbackIndex, responder)`.
-- `revokeFeedback(agentId, feedbackIndex)`: the client revokes their own feedback.
+- `revokeFeedback` / `appendResponse`: on the canonical registry directly (the client revokes their own entry; the mark stays but `getVerifiedSummary` follows the canonical revoked flag).
 
-### Read interfaces (ERC-8004 shaped, with named divergences)
+### Read interfaces
 
-The function **shapes** follow ERC-8004, but this is a private fork, not the
-canonical Reputation Registry, and the numbers it returns differ from the 8004
-reference implementation — a tool reading it transparently gets *different
-values*, not an error. Divergences, stated so integrators don't assume parity:
-- `getSummary` returns a **sum** (with count), where the reference returns an
-  **average**. ERC-8004 itself is agnostic on the aggregation (it happens
-  off-chain), but the reference registry averages — so don't treat our number
-  as the reference's.
-- summary values are normalized to a **fixed 18 decimals**.
-- `feedbackIndex` is **1-based** (matching the current ERC-8004 revision).
+- `isVerified(agentId, client, idx)` — does this canonical entry carry a mark?
+- `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` — enumerate the verified set.
+- `getVerifiedSummary(agentId, clients[], tag1, tag2)` — aggregate the given clients' **verified** canonical entries (values read live from the canonical registry; revoked skipped; sum + count, normalized to fixed 18 decimals; `clients` must be non-empty — the caller picks whom to trust). Off-chain `eth_call` only.
+- `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
 
-- `readFeedback(agentId, client, idx)` — single entry (idx is 1-based).
-- `readAllFeedback(agentId, clients[], tag1, tag2, includeRevoked)` — filtered read.
-- `getSummary(agentId, clients[], tag1, tag2)` — normalized to 18 decimals, returns sum and count.
-- `getClients(agentId)` — all clients who have ever submitted feedback.
-- `getServeData(agentId, client, idx)` — returns the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint.**
+> **Deprecated:** the previous private fork (`AgenticIDReputationRegistry`,
+> proof-gated `giveFeedback` with its own feedback store) is replaced by this
+> split. It remains deployed on existing environments and its source stays in
+> the repo, but fresh deploys ship `VerifiedFeedbackRegistry` only.
 
 ---
 
@@ -380,7 +392,7 @@ Contract logic (`ERC7857Upgradeable._proofCheck` and `BaseDataVerifier.verifyTra
 ## 7. Replay protection: NonceRegistry
 
 `contracts/src/utils/NonceRegistryUpgradeable.sol` is inherited by the **transfer
-verifier** and the **reputation registry** (each keeps its own store). AgenticID
+verifier** and the **reputation registries** (each keeps its own store). AgenticID
 itself does not consume nonces — `setAgentWallet` is forwarded to the canonical
 registry, which uses a ≤ 5-minute deadline (no nonce).
 
@@ -388,7 +400,7 @@ registry, which uses a ≤ 5-minute deadline (no nonce).
 |---|---|---|
 | transfer access proof | verifier | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
 | transfer ownership proof | verifier | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
-| ServeProof | reputation registry | `keccak256("SERVEPROOF", agentId, signature)` |
+| ServeProof | verified-feedback registry (and the deprecated fork) | `keccak256("SERVEPROOF", agentId, signature)` |
 
 Each nonce consumption also checks `block.timestamp <= deadline`. Records can be
 reclaimed via `cleanExpiredNonces(keys)`, as long as `maxProofAge` exceeds the
@@ -416,24 +428,25 @@ longest business deadline window.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
 - **dataKey flows only between TEEs**: the attestor generates and discards it; the Agent TEE holds it; the Oracle TEE holds it briefly during transfer and discards it. Only the ciphertext (sealedKey) appears on chain.
 - **Oracle encryption pubkey lives in TappRegistry**: it is published via 0g-Tapp's `TappRegistry` contract (an external dependency, already deployed) through its `getNode` / `getNodeList` views. It does not live in `TEEDataVerifier` storage, which keeps the verifier clean. The Agent TEE queries the registry directly during a transfer.
-- **8004 compatibility is identity-canonical, reputation-forked.** Identity is bound to the canonical ERC-8004 registry (the 0x8004… singleton), so 8004 identity tooling and scanners see AgenticID agents natively. Reputation is a **private fork**, not bound to the canonical Reputation Registry — its read shapes are 8004-style but its aggregation diverges from the reference (see "Read interfaces" above), so it is **not** transparently interchangeable with the reference registry. The write interfaces (the parameterless `register()` and the proof-less `giveFeedback`) are **deliberately disabled**, forcing callers to use the extended forms that carry IntelligentData or ServeProof. Because those standard overloads revert, this contract does **not** advertise blanket ERC-8004 read compatibility via ERC-165 as a promise of interchangeability. Targeted ERC-8004 revision: **2026-01-25**.
+- **8004 compatibility is canonical on both axes.** Identity is bound by custody to the canonical ERC-8004 Identity Registry (the 0x8004… singleton), so 8004 identity tooling and scanners see AgenticID agents natively. Feedback is submitted by clients **directly to the canonical Reputation Registry** (native per-client attribution, readable by every 8004 tool), and the local `VerifiedFeedbackRegistry` adds the TEE layer: a mark per canonical entry that was backed by a ServeProof, plus the proof's audit data. Readers that care about authenticity intersect the two; readers that don't still get standard 8004 reputation. The parameterless identity `register()` overloads remain **deliberately disabled** (registration must carry IntelligentData). The previous private reputation fork (`AgenticIDReputationRegistry`) is **deprecated** — live on existing environments, absent from fresh deploys. Targeted ERC-8004 revision: **2026-01-25**.
 
 ---
 
 ## 9. Tests
 
-138 Foundry tests across 18 suites (137 pass, 1 fork test skips unless
+178 Foundry tests across 20 suites (176 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
 | Suite | Cases | Coverage |
 |---|---|---|
 | `AgenticID.t.sol` | 10 | register / registerWithSeal / disabled overloads / attestor allowlist |
-| `AgentSeal.t.sol` | 6 | set-once / sealId collision / zero values / late-binding seal / non-attestor |
-| `TransferFlow.t.sol` | 19 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
+| `AgentSeal.t.sol` | 5 | set-once / sealId collision / zero values / late-binding seal / non-attestor |
+| `TransferFlow.t.sol` | 23 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
 | `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
-| `Reputation.t.sol` | 13 | giveFeedback ServeProof verification + revoke / appendResponse, all paths |
+| `VerifiedFeedback.t.sol` | 21 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback / verified summary against the canonical registry mock |
+| `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification + revoke / appendResponse, all paths (incl. the cross-impl digest known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
@@ -441,11 +454,12 @@ longest business deadline window.
 | `VerifierAdmin.t.sol` | 7 | oracle rotation / pause (pauser role) / maxProofAge / onlyOwner |
 | `AgenticIDAdmin.t.sol` | 7 | attestor add/remove / frameworkHash / setVerifier / onlyOwner |
 | `Upgradeable.t.sol` | 9 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
-| `CanonicalBinding.t.sol` | 7 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id |
+| `CanonicalBinding.t.sol` | 9 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id |
 | `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
+| `StorageLayout.t.sol` | 2 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal) |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
-| `CanonicalForkIntegration.t.sol` | 1 | self-mint against the live canonical registry (runs only with `FORK_RPC` set; skips otherwise) |
+| `CanonicalForkIntegration.t.sol` | 2 | self-mint + verified-feedback attest against the live canonical registries (runs only with `FORK_RPC` set; skips otherwise) |
 
 Shared scaffolding lives in `test/AgenticIDTestBase.sol`: two EIP-191 variants
 (hex-encoded for transfer proof, raw 32-byte for ServeProof and wallet sig),

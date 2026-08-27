@@ -9,7 +9,7 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 import {AgenticID} from "../src/AgenticID.sol";
-import {AgenticIDReputationRegistry} from "../src/AgenticIDReputationRegistry.sol";
+import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 
 /// @notice Deploy AgenticID stack behind BeaconProxy + TimelockController.
@@ -38,6 +38,9 @@ contract Deploy is Script {
         // Fixed canonical ERC-8004 registry to custody-bind to.
         // 0G Galileo testnet: 0x8004a818bfb912233c491871b3d84c89a494bd9e
         address   canonical;
+        // Fixed canonical ERC-8004 Reputation Registry the verified-feedback
+        // layer anchors to. 0G Galileo testnet: 0x8004b663…8713
+        address   canonicalReputation;
     }
 
     struct Deployed {
@@ -48,9 +51,9 @@ contract Deploy is Script {
         address agenticIdImpl;
         address agenticIdBeacon;
         address agenticId;
-        address reputationImpl;
-        address reputationBeacon;
-        address reputation;
+        address verifiedFeedbackImpl;
+        address verifiedFeedbackBeacon;
+        address verifiedFeedback;
     }
 
     function run() external returns (Deployed memory d) {
@@ -62,6 +65,14 @@ contract Deploy is Script {
         require(
             keccak256(bytes(ICanonical8004(c.canonical).getVersion())) == keccak256(bytes("2.0.0")),
             "canonical is not ERC-8004 IdentityRegistry v2.0.0 on this chain"
+        );
+        require(
+            keccak256(bytes(ICanonical8004(c.canonicalReputation).getVersion())) == keccak256(bytes("2.0.0")),
+            "canonicalReputation is not ERC-8004 ReputationRegistry v2.0.0 on this chain"
+        );
+        require(
+            ICanonical8004Reputation(c.canonicalReputation).getIdentityRegistry() == c.canonical,
+            "canonicalReputation is not bound to the canonical IdentityRegistry"
         );
 
         vm.startBroadcast();
@@ -97,19 +108,20 @@ contract Deploy is Script {
         d.agenticIdBeacon = address(agenticIdBeacon);
         d.agenticId = address(agenticIdProxy);
 
-        // 4. Reputation registry.
-        AgenticIDReputationRegistry repImpl = new AgenticIDReputationRegistry();
-        UpgradeableBeacon repBeacon = new UpgradeableBeacon(address(repImpl), address(timelock));
-        BeaconProxy repProxy = new BeaconProxy(
-            address(repBeacon),
+        // 4. Verified-feedback registry (companion to the canonical ERC-8004
+        //    Reputation Registry — feedback lives there, verification marks here).
+        VerifiedFeedbackRegistry vfImpl = new VerifiedFeedbackRegistry();
+        UpgradeableBeacon vfBeacon = new UpgradeableBeacon(address(vfImpl), address(timelock));
+        BeaconProxy vfProxy = new BeaconProxy(
+            address(vfBeacon),
             abi.encodeCall(
-                AgenticIDReputationRegistry.initialize,
-                (address(agenticIdProxy), c.owner, c.pauser, c.maxProofAge)
+                VerifiedFeedbackRegistry.initialize,
+                (address(agenticIdProxy), c.canonicalReputation, c.owner, c.pauser, c.maxProofAge)
             )
         );
-        d.reputationImpl = address(repImpl);
-        d.reputationBeacon = address(repBeacon);
-        d.reputation = address(repProxy);
+        d.verifiedFeedbackImpl = address(vfImpl);
+        d.verifiedFeedbackBeacon = address(vfBeacon);
+        d.verifiedFeedback = address(vfProxy);
 
         vm.stopBroadcast();
 
@@ -124,8 +136,10 @@ contract Deploy is Script {
         c.nftName       = vm.envOr("NFT_NAME", string("AgenticID"));
         c.nftSymbol     = vm.envOr("NFT_SYMBOL", string("AID"));
         c.maxProofAge   = vm.envOr("MAX_PROOF_AGE", uint256(86400));
-        // Canonical ERC-8004 registry, chosen by chainId (override via CANONICAL_8004).
-        c.canonical     = vm.envOr("CANONICAL_8004", _defaultCanonical(block.chainid));
+        // Canonical ERC-8004 registries, chosen by chainId (override via
+        // CANONICAL_8004 / CANONICAL_8004_REPUTATION).
+        c.canonical           = vm.envOr("CANONICAL_8004", _defaultCanonical(block.chainid));
+        c.canonicalReputation = vm.envOr("CANONICAL_8004_REPUTATION", _defaultCanonicalReputation(block.chainid));
 
         address[] memory defaultProposers = new address[](1);
         defaultProposers[0] = c.owner;
@@ -144,6 +158,7 @@ contract Deploy is Script {
         console2.log("timelockDelay: ", c.timelockDelay);
         console2.log("maxProofAge:   ", c.maxProofAge);
         console2.log("canonical8004: ", c.canonical);
+        console2.log("canonical8004Reputation: ", c.canonicalReputation);
     }
 
     function _printDeployed(Deployed memory d) internal pure {
@@ -155,9 +170,9 @@ contract Deploy is Script {
         console2.log("AgenticID impl:             ", d.agenticIdImpl);
         console2.log("AgenticID beacon:           ", d.agenticIdBeacon);
         console2.log("AgenticID proxy:            ", d.agenticId);
-        console2.log("ReputationRegistry impl:    ", d.reputationImpl);
-        console2.log("ReputationRegistry beacon:  ", d.reputationBeacon);
-        console2.log("ReputationRegistry proxy:   ", d.reputation);
+        console2.log("VerifiedFeedback impl:      ", d.verifiedFeedbackImpl);
+        console2.log("VerifiedFeedback beacon:    ", d.verifiedFeedbackBeacon);
+        console2.log("VerifiedFeedback proxy:     ", d.verifiedFeedback);
     }
 
     /// @dev Canonical ERC-8004 IdentityRegistry by chainId. ERC-8004 is deployed
@@ -171,8 +186,24 @@ contract Deploy is Script {
         }
         revert("no known canonical ERC-8004 for this chainId; set CANONICAL_8004");
     }
+
+    /// @dev Canonical ERC-8004 ReputationRegistry by chainId — same CREATE2
+    ///      vanity-address pattern as the identity registry.
+    function _defaultCanonicalReputation(uint256 chainId) internal pure returns (address) {
+        if (chainId == 16661 || chainId == 1) {
+            return 0x8004BAa17C55a88189AE136b182e5fdA19dE9b63; // 0G / Ethereum mainnet
+        }
+        if (chainId == 16602 || chainId == 11155111) {
+            return 0x8004B663056A597Dffe9eCcC1965A193B7388713; // 0G Galileo / Ethereum Sepolia
+        }
+        revert("no known canonical ERC-8004 ReputationRegistry for this chainId; set CANONICAL_8004_REPUTATION");
+    }
 }
 
 interface ICanonical8004 {
     function getVersion() external view returns (string memory);
+}
+
+interface ICanonical8004Reputation {
+    function getIdentityRegistry() external view returns (address);
 }
