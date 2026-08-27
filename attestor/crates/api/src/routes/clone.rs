@@ -1,18 +1,32 @@
-//! POST /clone — the SOURCE agent's owner mints a brand-new agent for
-//! `target_owner`, reusing the source's iData.
+//! POST /clone — mint a brand-new agent reusing a source agent's iData.
+//! Two authorization modes (issue #133):
 //!
-//! Auth: the owner signs a `CanonicalClone` payload; we verify it against the
-//! LIVE on-chain `ownerOf(source_agent_id)` (read fresh, fail-closed) so only
-//! the current owner of the source token can clone it. The worker then
-//! re-seals each iData `data_key` to the clone's new agentSeal and mints via
-//! `registerWithSeal` — the clone lands Offline for `target_owner` to bring
-//! online later (their sandbox, their billing).
+//! - **owner mode** (original, wire shape unchanged): the SOURCE agent's
+//!   owner signs a `CanonicalClone` payload; we verify it against the LIVE
+//!   on-chain `ownerOf(source_agent_id)` (read fresh, fail-closed).
+//! - **contract mode** (marketplace forks): the BUYER signs a
+//!   `CanonicalCloneContract` intent (`AgenticID.CloneContract.v1` — a
+//!   distinct domain, so signatures can't cross modes), and the source
+//!   owner's on-chain `ICloneAuthorizer` decides: we read the LIVE
+//!   `cloneAuthorizerOf(source)` (never a client-supplied address) and
+//!   pre-check `canClone` via eth_call (fail-closed on deny/revert/timeout,
+//!   idempotency key not burned). The pre-check is UX only — the
+//!   AUTHORITATIVE gate is the atomic policy consult inside the `cloneFrom`
+//!   mint tx the worker submits, so a late policy change or a transfer that
+//!   clears the authorizer cannot mint past the owner's intent.
+//!
+//! Both modes then take the same path: the worker re-seals each iData
+//! `data_key` to the clone's new agentSeal and mints (`registerWithSeal`
+//! for owner mode, policy-gated `cloneFrom` for contract mode) — the clone
+//! lands Offline for `target_owner` to bring online later (their sandbox,
+//! their billing).
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
-    auth::clone::verify_clone_signature, derive_phase, CloneRequest, CloneResponse, Deployment,
-    DeploymentPhase, JobPayload, SealId, StageStatus, WsEvent,
+    auth::clone::{verify_clone_contract_intent, verify_clone_signature},
+    derive_phase, CloneRequest, CloneResponse, Deployment, DeploymentPhase, JobCloneAuth,
+    JobPayload, SealId, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -27,6 +41,14 @@ pub async fn handle(
     }
     if req.target_owner.is_zero() {
         return Err(ApiError::bad_request("target_owner is required"));
+    }
+    let has_owner_creds = req.owner_signature.is_some() || req.owner_signed_message_b64.is_some();
+    if has_owner_creds == req.authorization.is_some() {
+        return Err(ApiError::bad_request(
+            "exactly one authorization mode required: owner-mode credentials \
+             (owner_signature + owner_signed_message_b64) XOR contract-mode \
+             (authorization)",
+        ));
     }
 
     // Source must be a known, minted agent.
@@ -52,20 +74,83 @@ pub async fn handle(
         ));
     }
 
-    // Authorize: the signer must be the CURRENT on-chain owner of the source
-    // token (read live, fail-closed) — not a self-declared field.
-    let owner = state
-        .chain
-        .owner_of(req.source_agent_id)
-        .await
-        .map_err(|e| ApiError::internal(format!("owner_of: {e}")))?;
-    verify_clone_signature(&req, owner, state.crypto.as_ref())
-        .map_err(|e| ApiError::unauthorized(format!("owner_signature: {e}")))?;
+    // Which sandbox-billing party the deploy-edge preflight checks: the party
+    // that signed — the source owner (owner mode) or the buyer acquiring the
+    // clone (contract mode).
+    let billing_party;
+    // Contract-mode policy context recorded onto the job (see header).
+    let job_authorization;
 
-    // Same deploy-edge preflight as /deploy: the clone's sandbox is billed
-    // to the signing owner, so their ack + balance must hold NOW — not
-    // minutes later in a worker 402.
-    super::preflight::check_owner_ready(&state, owner).await?;
+    match req.authorization.as_ref() {
+        None => {
+            // ── owner mode (original path, byte-identical) ────────────────
+            // The signer must be the CURRENT on-chain owner of the source
+            // token (read live, fail-closed) — not a self-declared field.
+            let owner = state
+                .chain
+                .owner_of(req.source_agent_id)
+                .await
+                .map_err(|e| ApiError::internal(format!("owner_of: {e}")))?;
+            verify_clone_signature(&req, owner, state.crypto.as_ref())
+                .map_err(|e| ApiError::unauthorized(format!("owner_signature: {e}")))?;
+            billing_party = owner;
+            job_authorization = JobCloneAuth::Owner;
+        }
+        Some(attestor_shared::CloneAuthorization::Contract { auth_data, .. }) => {
+            // ── contract mode (marketplace fork, issue #133) ──────────────
+            // 1. The buyer must have signed THIS operation — the expected
+            //    signer is the request's own target_owner, so a relayer can
+            //    transport but not retarget or re-source the clone.
+            verify_clone_contract_intent(&req, req.target_owner, state.crypto.as_ref())
+                .map_err(|e| ApiError::unauthorized(format!("clone intent: {e}")))?;
+
+            // 2. The authorizer is read LIVE from the source token's config —
+            //    never client-supplied. None configured → fail closed.
+            let authorizer = state
+                .chain
+                .clone_authorizer_of(req.source_agent_id)
+                .await
+                .map_err(|e| ApiError::internal(format!("clone_authorizer_of: {e}")))?;
+            if authorizer.is_zero() {
+                return Err(ApiError::bad_request(
+                    "source agent has no clone authorizer configured \
+                     (owner must call setCloneAuthorizer)",
+                ));
+            }
+
+            // 3. Policy pre-check (UX only; the mint's atomic consult is
+            //    authoritative). Fail-closed on deny / revert / timeout, and
+            //    the idempotency key is NOT burned — the buyer may retry once
+            //    the market's conditions actually hold.
+            let allowed = state
+                .chain
+                .can_clone(
+                    authorizer,
+                    req.source_agent_id,
+                    req.target_owner,
+                    req.target_owner, // caller: the buyer (intent-proven above)
+                    auth_data.clone(),
+                )
+                .await
+                .map_err(|e| ApiError::forbidden(format!("clone policy: {e}")))?;
+            if !allowed {
+                return Err(ApiError::forbidden(
+                    "clone policy denied this request (canClone returned false)",
+                ));
+            }
+
+            billing_party = req.target_owner;
+            job_authorization = JobCloneAuth::Contract {
+                authorizer,
+                auth_data: auth_data.clone(),
+                caller: req.target_owner,
+            };
+        }
+    }
+
+    // Same deploy-edge preflight as /deploy, against the signing party: their
+    // ack + balance must hold NOW — not minutes later in a worker 402.
+    super::preflight::check_owner_ready(&state, billing_party).await?;
 
     // The clone copies the source card verbatim — no caller overrides. A name
     // is required, so reject if the source card has none.
@@ -80,6 +165,7 @@ pub async fn handle(
     tracing::info!(
         source_agent_id = %req.source_agent_id,
         target_owner = %req.target_owner,
+        mode = if matches!(job_authorization, JobCloneAuth::Owner) { "owner" } else { "contract" },
         key = %req.idempotency_key,
         "clone request"
     );
@@ -88,10 +174,28 @@ pub async fn handle(
     let new_seal_id = state.crypto.generate_seal_id();
     let seal_kp = state.crypto.derive_agent_seal(new_seal_id).await?;
 
-    // Idempotency: a replay returns the prior clone's identity.
+    // Idempotency: a replay returns the prior clone's identity. Contract mode
+    // derives the store key from (idempotency_key ‖ authorizer ‖ auth_data):
+    // the same key under a DIFFERENT policy context is a different logical
+    // operation and must not silently return the earlier clone — while the
+    // exact same request (replay, incl. by a relayer) still hits the same
+    // entry.
+    let idem_store_key = match &job_authorization {
+        JobCloneAuth::Owner => req.idempotency_key.clone(),
+        JobCloneAuth::Contract { authorizer, auth_data, .. } => {
+            let mut buf = Vec::with_capacity(
+                req.idempotency_key.len() + 20 + auth_data.len(),
+            );
+            buf.extend_from_slice(req.idempotency_key.as_bytes());
+            buf.extend_from_slice(authorizer.as_slice());
+            buf.extend_from_slice(auth_data);
+            let digest = state.crypto.keccak256(&buf);
+            format!("clone-contract:{}", hex::encode(digest))
+        }
+    };
     if let Some(existing) = state
         .idempotency
-        .try_reserve(&req.idempotency_key, new_seal_id)
+        .try_reserve(&idem_store_key, new_seal_id)
         .await?
     {
         let d = state
@@ -146,6 +250,7 @@ pub async fn handle(
             name,
             description,
             image,
+            authorization: job_authorization,
         })
         .await?;
     tracing::info!(?new_seal_id, "CloneJob enqueued");
@@ -185,13 +290,14 @@ mod tests {
     use alloy::primitives::{Address, Bytes, B256, U256};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::signers::SignerSync;
-    use attestor_shared::auth::clone::CanonicalClone;
+    use attestor_shared::auth::clone::{CanonicalClone, CanonicalCloneContract};
     use attestor_shared::auth::Canonical;
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain, MockSandbox,
     };
+    use attestor_shared::CloneAuthorization;
     use attestor_shared::sandbox::eip191_digest;
     use attestor_shared::{
         AgentId, Config, IDataArtifact, IntelligentData, StageStatus, StorageRoot,
@@ -343,9 +449,45 @@ mod tests {
             idempotency_key: idem.to_string(),
             source_agent_id,
             target_owner: target,
-            owner_signature: Bytes::from(<Vec<u8>>::from(sig)),
-            owner_signed_message_b64: B64.encode(&bytes),
+            owner_signature: Some(Bytes::from(<Vec<u8>>::from(sig))),
+            owner_signed_message_b64: Some(B64.encode(&bytes)),
+            authorization: None,
         }
+    }
+
+    fn contract_clone_req(
+        buyer: &PrivateKeySigner,
+        idem: &str,
+        source_agent_id: AgentId,
+        auth_data: &[u8],
+    ) -> CloneRequest {
+        let canonical = serde_json::json!({
+            "domain": CanonicalCloneContract::DOMAIN,
+            "idempotency_key": idem,
+            "source_agent_id": source_agent_id,
+            "target_owner": buyer.address(),
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        let sig = signer_sign(buyer, &bytes);
+        CloneRequest {
+            idempotency_key: idem.to_string(),
+            source_agent_id,
+            target_owner: buyer.address(),
+            owner_signature: None,
+            owner_signed_message_b64: None,
+            authorization: Some(CloneAuthorization::Contract {
+                intent_signature: Bytes::from(sig),
+                intent_signed_message_b64: B64.encode(&bytes),
+                auth_data: Bytes::copy_from_slice(auth_data),
+            }),
+        }
+    }
+
+    fn signer_sign(signer: &PrivateKeySigner, bytes: &[u8]) -> Vec<u8> {
+        let sig = signer
+            .sign_hash_sync(&B256::from(eip191_digest(bytes)))
+            .unwrap();
+        <Vec<u8>>::from(sig)
     }
 
     #[tokio::test]
@@ -402,6 +544,149 @@ mod tests {
             .await
             .expect_err("unknown source must be rejected");
         let _ = err;
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    // ── contract mode (issue #133) ──────────────────────────────────────
+
+    const AUTHORIZER: Address = Address::new([0xa7; 20]);
+
+    #[tokio::test]
+    async fn contract_clone_enqueues_policy_job() {
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(Some(true));
+        let req = contract_clone_req(&buyer, "idem-c1", s.source_agent_id, b"purchase-1");
+
+        let resp = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect("policy clone should be accepted");
+        assert_ne!(resp.0.seal_id, s.source_seal);
+
+        let submitted = s.jobs.submitted.lock().unwrap();
+        assert_eq!(submitted.len(), 1);
+        match &submitted[0] {
+            JobPayload::Clone { authorization, target_owner, .. } => {
+                assert_eq!(*target_owner, buyer.address());
+                match authorization {
+                    JobCloneAuth::Contract { authorizer, auth_data, caller } => {
+                        assert_eq!(*authorizer, AUTHORIZER, "live authorizer recorded");
+                        assert_eq!(auth_data.as_ref(), b"purchase-1", "auth_data forwarded");
+                        assert_eq!(*caller, buyer.address(), "caller = buyer");
+                    }
+                    other => panic!("expected Contract auth, got {other:?}"),
+                }
+            }
+            other => panic!("expected Clone job, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_clone_without_authorizer_fails_closed() {
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        // No set_clone_authorizer → clone_authorizer_of returns 0.
+        let req = contract_clone_req(&buyer, "idem-c2", s.source_agent_id, b"p");
+
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("unconfigured authorizer must fail closed");
+        assert!(format!("{err:?}").contains("authorizer"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty(), "no job");
+    }
+
+    #[tokio::test]
+    async fn contract_clone_policy_deny_rejects_without_burning_key() {
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(Some(false));
+        let req = contract_clone_req(&buyer, "idem-c3", s.source_agent_id, b"p");
+
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("policy deny must reject");
+        assert!(format!("{err:?}").contains("denied"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty(), "no job");
+
+        // Fail-closed WITHOUT burning the idempotency key: flip the policy to
+        // allow and re-POST the SAME request — it must go through now.
+        s.chain.set_can_clone_verdict(Some(true));
+        let req2 = contract_clone_req(&buyer, "idem-c3", s.source_agent_id, b"p");
+        handle(axum::extract::State(s.state.clone()), axum::Json(req2))
+            .await
+            .expect("retry after policy flip must succeed");
+        assert_eq!(s.jobs.submitted.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn contract_clone_authorizer_revert_rejects_fail_closed() {
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(None); // mock reverts
+        let req = contract_clone_req(&buyer, "idem-c4", s.source_agent_id, b"p");
+
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("authorizer revert must reject (fail-closed)");
+        assert!(format!("{err:?}").contains("policy"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn contract_clone_rejects_non_buyer_signature() {
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(Some(true));
+        // A marketplace key signs the intent, not the buyer.
+        let mut req = contract_clone_req(&PrivateKeySigner::random(), "idem-c5", s.source_agent_id, b"p");
+        // Bind the envelope to the real buyer so only the signer is wrong.
+        let canonical = serde_json::json!({
+            "domain": CanonicalCloneContract::DOMAIN,
+            "idempotency_key": "idem-c5",
+            "source_agent_id": s.source_agent_id,
+            "target_owner": buyer.address(),
+        });
+        let bytes = serde_json::to_vec(&canonical).unwrap();
+        let rogue = PrivateKeySigner::random();
+        let sig = rogue.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap();
+        if let Some(CloneAuthorization::Contract {
+            ref mut intent_signature,
+            ref mut intent_signed_message_b64,
+            ..
+        }) = req.authorization
+        {
+            *intent_signature = Bytes::from(<Vec<u8>>::from(sig));
+            *intent_signed_message_b64 = B64.encode(&bytes);
+        }
+
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("non-buyer intent signature must be rejected");
+        assert!(format!("{err:?}").contains("signer"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clone_rejects_both_modes_present() {
+        let s = make_setup();
+        let owner = PrivateKeySigner::random();
+        s.chain.set_owner_of(owner.address());
+        let target = Address::from([0xbb; 20]);
+        let mut req = signed_clone_req(&owner, "idem-x", s.source_agent_id, target);
+        req.authorization = Some(CloneAuthorization::Contract {
+            intent_signature: Bytes::new(),
+            intent_signed_message_b64: String::new(),
+            auth_data: Bytes::new(),
+        });
+
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("both modes present must be rejected");
+        assert!(format!("{err:?}").contains("exactly one"), "got: {err:?}");
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 }

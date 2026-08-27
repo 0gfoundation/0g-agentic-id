@@ -145,11 +145,18 @@ pub struct DeployResponse {
     pub subscribe_url: String,
 }
 
-/// `POST /clone` — the SOURCE agent's owner asks the attestor to mint a
-/// brand-new agent (new seal/agentSeal/tokenId) for `target_owner`, reusing
-/// the source's iData. Authorized by an owner signature over
-/// `auth::clone::CanonicalClone`; the attestor additionally checks the signer
-/// equals the live on-chain `ownerOf(source_agent_id)`.
+/// `POST /clone` — dual-mode (issue #133):
+///
+/// - **owner mode** (original): the SOURCE agent's owner signs a
+///   `auth::clone::CanonicalClone` payload; the attestor verifies the signer
+///   equals the live on-chain `ownerOf(source_agent_id)`. Wire shape
+///   unchanged.
+/// - **contract mode**: the BUYER (`target_owner`) signs a
+///   `auth::clone::CanonicalCloneContract` intent and the on-chain
+///   `ICloneAuthorizer` configured by the source owner decides. Marketplace
+///   fork flow: publisher opts in once via `setCloneAuthorizer`, buyers fork.
+///
+/// Exactly one mode's credentials may be present; the route enforces it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloneRequest {
     pub idempotency_key: String,
@@ -157,9 +164,38 @@ pub struct CloneRequest {
     pub source_agent_id: AgentId,
     /// Who the clone is minted to.
     pub target_owner: Address,
-    /// EIP-191 signature by the source owner over the canonical clone payload.
-    pub owner_signature: Bytes,
-    pub owner_signed_message_b64: String,
+    /// Owner mode: EIP-191 signature by the source owner over
+    /// `CanonicalClone`. Required iff `authorization` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_signature: Option<Bytes>,
+    /// Owner mode: base64 of the exact canonical bytes signed above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_signed_message_b64: Option<String>,
+    /// Contract mode credentials. Required for policy-mode cloning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<CloneAuthorization>,
+}
+
+/// Contract-mode (`authorization`) credentials for `POST /clone` (issue #133).
+///
+/// The buyer signs intent over the SAME binding fields as owner mode but
+/// under a DISTINCT domain (`AgenticID.CloneContract.v1`), so a signature
+/// minted for one mode can never be replayed as the other. The authorizer
+/// address is deliberately NOT client-supplied: the attestor reads the live
+/// on-chain `cloneAuthorizerOf(source)` and pre-checks `canClone` — the
+/// authoritative gate is the atomic consult inside the `cloneFrom` mint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum CloneAuthorization {
+    Contract {
+        /// EIP-191 signature by `target_owner` over `CanonicalCloneContract`.
+        intent_signature: Bytes,
+        /// base64 of the exact canonical bytes signed above.
+        intent_signed_message_b64: String,
+        /// Opaque bytes forwarded to the source's `ICloneAuthorizer.canClone`
+        /// (e.g. abi-encoded purchase id / listing terms — the market's shape).
+        auth_data: Bytes,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -410,6 +446,7 @@ mod tests {
             name: "Sage".into(),
             description: "d".into(),
             image: None,
+            authorization: JobCloneAuth::Owner,
         };
         let json = serde_json::to_string(&p).unwrap();
         let back: JobPayload = serde_json::from_str(&json).unwrap();
@@ -419,12 +456,32 @@ mod tests {
                 source_seal_id,
                 target_owner,
                 name,
+                authorization,
                 ..
             } => {
                 assert_eq!(new_seal_id, B256::repeat_byte(1));
                 assert_eq!(source_seal_id, B256::repeat_byte(2));
                 assert_eq!(target_owner, Address::from([3u8; 20]));
                 assert_eq!(name, "Sage");
+                assert_eq!(authorization, JobCloneAuth::Owner);
+            }
+            other => panic!("expected Clone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn job_payload_clone_serde_legacy_without_authorization_defaults_to_owner() {
+        // Jobs serialized by a pre-#133 attestor (no `authorization` field)
+        // must keep deserializing as owner-mode clones.
+        let new_seal = format!("0x{}", "01".repeat(32));
+        let source_seal = format!("0x{}", "02".repeat(32));
+        let legacy = format!(
+            r#"{{"kind":"clone","new_seal_id":"{new_seal}","source_seal_id":"{source_seal}","target_owner":"0x0303030303030303030303030303030303030303","name":"Sage","description":"d"}}"#
+        );
+        let back: JobPayload = serde_json::from_str(&legacy).unwrap();
+        match back {
+            JobPayload::Clone { authorization, .. } => {
+                assert_eq!(authorization, JobCloneAuth::Owner);
             }
             other => panic!("expected Clone, got {other:?}"),
         }
@@ -831,6 +888,39 @@ pub struct MintParams {
     pub seal_id: SealId,
 }
 
+/// Policy-mode clone mint parameters (issue #133) — mirrors AgenticID
+/// `cloneFrom`'s calldata. The attestor performs the TEE re-seal off-chain
+/// (fresh agentSeal derivation, decrypt + re-encrypt under the clone's new
+/// seal) and submits the result; on chain the owner-configured
+/// `ICloneAuthorizer` is consulted ATOMICALLY with the mint, so a deny or a
+/// stale-data revert rolls the whole tx back (no verify-mint race).
+#[derive(Debug, Clone)]
+pub struct CloneFromParams {
+    /// Source token being forked.
+    pub source_agent_id: AgentId,
+    /// Owner of the clone.
+    pub to: Address,
+    /// The live source dataHashes the re-sealed keys correspond to — must
+    /// match on-chain storage at mint time, else the tx reverts
+    /// (`AgenticIDCloneDataHashMismatch`) and the worker retries the re-seal.
+    pub data_hashes: Vec<B256>,
+    /// Re-sealed ciphertexts (one per source iData, sealed to the clone's
+    /// new agentSeal).
+    pub sealed_keys: Vec<Bytes>,
+    /// The clone's fresh agentSeal address.
+    pub agent_seal: Address,
+    /// Fresh sealId for the clone.
+    pub seal_id: SealId,
+    /// Buyer wallet (passed through to the authorizer so purchases can bind
+    /// to buyers even though the attestor EOA submits the tx).
+    pub caller: Address,
+    /// The live authorizer address (audit + forwarded by the tx itself via
+    /// the on-chain storage lookup; recorded here for tracing).
+    pub authorizer: Address,
+    /// Opaque buyer-supplied bytes forwarded to `canClone`.
+    pub auth_data: Bytes,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReceiptSummary {
     pub tx_hash: TxHash,
@@ -930,10 +1020,11 @@ pub enum JobPayload {
     /// Clone an existing agent's iData into a brand-new agent owned by
     /// `target_owner`. The worker re-seals each iData `data_key` from the
     /// source agentSeal to the clone's new agentSeal (source storage roots
-    /// are reused, not re-uploaded), mints via `registerWithSeal`, and
-    /// finalizes identity — the clone lands Offline (its owner brings it
-    /// online later). `name`/`description`/`image` are resolved at the
-    /// route (override or copied from the source card).
+    /// are reused, not re-uploaded), mints via `registerWithSeal` (owner
+    /// mode) or the policy-gated `cloneFrom` (contract mode), and finalizes
+    /// identity — the clone lands Offline (its owner brings it online
+    /// later). `name`/`description`/`image` are resolved at the route
+    /// (override or copied from the source card).
     Clone {
         new_seal_id: SealId,
         source_seal_id: SealId,
@@ -942,6 +1033,40 @@ pub enum JobPayload {
         description: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         image: Option<String>,
+        /// Which mint path + policy context the worker must use (issue #133).
+        /// Defaults to owner mode for pre-existing serialized jobs.
+        #[serde(default)]
+        authorization: JobCloneAuth,
     },
+}
+
+/// Mint-path selector carried on `JobPayload::Clone` (issue #133).
+///
+/// - `Owner` — the original path: `registerWithSeal` with re-sealed keys.
+///   Authorization was the source owner's EIP-191 signature, verified at the
+///   route; nothing further to check at mint time.
+/// - `Contract` — the marketplace path: mint via AgenticID `cloneFrom`, whose
+///   on-chain policy consult is ATOMIC with the mint (the authoritative
+///   gate; the route's eth_call pre-check was UX only). Carries the policy
+///   context so the mint tx can bind `caller` + `auth_data`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum JobCloneAuth {
+    Owner,
+    Contract {
+        /// The authorizer read live from `cloneAuthorizerOf(source)` at the
+        /// route (recorded for the mint + audit trail).
+        authorizer: Address,
+        /// Opaque bytes the buyer supplied; forwarded to `canClone` on chain.
+        auth_data: Bytes,
+        /// The wallet that initiated the /clone request (the buyer —
+        /// proven by the intent signature at the route).
+        caller: Address,
+    },
+}
+
+impl Default for JobCloneAuth {
+    fn default() -> Self {
+        Self::Owner
+    }
 }
 

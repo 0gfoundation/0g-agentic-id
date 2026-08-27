@@ -57,6 +57,25 @@ sol!(
     }
 );
 
+// ICloneAuthorizer (contracts/src/interfaces/ICloneAuthorizer.sol) — the
+// per-token policy contract source owners configure for marketplace fork
+// flows (issue #133). Inline interface (like TappRegistry above): the
+// authorizer is an arbitrary third-party address, so its ABI must not ride
+// the AgenticID JSON binding. Only the pre-check rides here; the
+// authoritative consult happens inside the AgenticID `cloneFrom` tx.
+sol!(
+    #[sol(rpc)]
+    interface ICloneAuthorizer {
+        function canClone(uint256 sourceAgentId, address targetOwner, address caller, bytes calldata data) external view returns (bool allowed);
+    }
+);
+
+/// Wall-time bound for the authorizer pre-check eth_call. A hostile or
+/// looping authorizer must not pin an attestor worker thread indefinitely;
+/// expiry maps to `Err` (fail-closed reject — the idempotency key is not
+/// burned and the client may retry).
+const CAN_CLONE_TIMEOUT_SECS: u64 = 5;
+
 /// Try to decode a revert reason embedded in an alloy RPC error string.
 /// Looks for `data: "0x<hex>"` and decodes against AgenticID's full set
 /// of custom errors (AgenticID + inherited ERC-7857/8004/NonceRegistry).
@@ -296,10 +315,17 @@ where
                 let success = receipt.status();
                 let block_number = receipt.block_number.unwrap_or(0);
 
+                // Mint-transaction agent ids: `Registered` (deploy /
+                // registerWithSeal) or `ClonedFrom.newAgentId` (policy-mode
+                // cloneFrom — cloneFrom emits no Registered, by design the
+                // mint symmetry event is ITransferred + ClonedFrom).
                 let agent_id = receipt.inner.logs().iter().find_map(|log| {
-                    AgenticID::Registered::decode_log(&log.inner, true)
+                    if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
+                        return Some(ev.data.agentId);
+                    }
+                    AgenticID::ClonedFrom::decode_log(&log.inner, true)
                         .ok()
-                        .map(|ev| ev.data.agentId)
+                        .map(|ev| ev.data.newAgentId)
                 });
 
                 tracing::info!(
@@ -330,6 +356,87 @@ where
     async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.ownerOf(agent_id).call().await?._0)
+    }
+
+    async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
+        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        Ok(c.cloneAuthorizerOf(agent_id).call().await?._0)
+    }
+
+    async fn can_clone(
+        &self,
+        authorizer: Address,
+        source: AgentId,
+        target: Address,
+        caller: Address,
+        data: Bytes,
+    ) -> anyhow::Result<bool> {
+        let c = ICloneAuthorizer::new(authorizer, self.provider.clone());
+        // Fail-closed: revert, RPC error or timeout all surface as Err — the
+        // route rejects and the idempotency key is not burned. (Deliberately
+        // a wall-time bound rather than a call-gas cap: an eth_call charges
+        // nobody, the protected resource is OUR wall clock + RPC worker.)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CAN_CLONE_TIMEOUT_SECS),
+            c.canClone(source, target, caller, data).call(),
+        )
+        .await
+        {
+            Ok(res) => Ok(res?.allowed),
+            Err(_) => anyhow::bail!(
+                "canClone pre-check timed out after {CAN_CLONE_TIMEOUT_SECS}s (fail-closed)"
+            ),
+        }
+    }
+
+    async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash> {
+        // Encode the call and construct the tx request from scratch — same
+        // explicit-gas pattern as register_with_seal (mempool tip-cap quirk,
+        // 20% gas buffer, submit_lock-serialized broadcast).
+        let call_data = AgenticID::cloneFromCall {
+            sourceAgentId: params.source_agent_id,
+            to: params.to,
+            dataHashes: params.data_hashes,
+            sealedKeys: params.sealed_keys,
+            newAgentSeal: params.agent_seal,
+            newSealId: params.seal_id,
+            caller: params.caller,
+            authData: params.auth_data,
+        }
+        .abi_encode();
+
+        let mut tx = TransactionRequest::default()
+            .with_from(self.sender)
+            .with_to(self.contract_addr)
+            .with_input(call_data);
+
+        let gas = self
+            .provider
+            .estimate_gas(&tx)
+            .await
+            .map_err(decode_err)? as u128;
+        let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
+        tx.set_gas_limit(gas_limit);
+        tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
+        tx.set_max_fee_per_gas(self.max_fee_wei);
+
+        tracing::info!(
+            gas_limit,
+            authorizer = %params.authorizer,
+            source = %params.source_agent_id,
+            "alloy: sending cloneFrom (policy-gated mint)"
+        );
+
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
+        let tx_hash = *pending.tx_hash();
+        tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
+        Ok(tx_hash)
     }
 
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool> {
