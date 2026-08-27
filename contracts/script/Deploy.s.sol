@@ -10,6 +10,7 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 
 import {AgenticID} from "../src/AgenticID.sol";
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
+import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 
 /// @notice Deploy AgenticID stack behind BeaconProxy + TimelockController.
@@ -54,6 +55,7 @@ contract Deploy is Script {
         address verifiedFeedbackImpl;
         address verifiedFeedbackBeacon;
         address verifiedFeedback;
+        address feedbackBatcher;
     }
 
     function run() external returns (Deployed memory d) {
@@ -123,6 +125,10 @@ contract Deploy is Script {
         d.verifiedFeedbackBeacon = address(vfBeacon);
         d.verifiedFeedback = address(vfProxy);
 
+        // 5. Feedback batcher (EIP-7702 delegate; stateless, no beacon —
+        //    replace by deploying a new one and re-delegating).
+        d.feedbackBatcher = address(new FeedbackBatcher(c.canonicalReputation, address(vfProxy)));
+
         vm.stopBroadcast();
 
         _printDeployed(d);
@@ -173,6 +179,7 @@ contract Deploy is Script {
         console2.log("VerifiedFeedback impl:      ", d.verifiedFeedbackImpl);
         console2.log("VerifiedFeedback beacon:    ", d.verifiedFeedbackBeacon);
         console2.log("VerifiedFeedback proxy:     ", d.verifiedFeedback);
+        console2.log("FeedbackBatcher:            ", d.feedbackBatcher);
     }
 
     /// @dev Canonical ERC-8004 IdentityRegistry by chainId. ERC-8004 is deployed

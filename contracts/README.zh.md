@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 178 tests / 20 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 183 tests / 21 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -89,6 +89,8 @@ contracts/src/
 ├── AgenticID.sol                               主合约（身份 + 7857 token + seal）
 ├── VerifiedFeedbackRegistry.sol                canonical ERC-8004 声誉注册表之上的
 │                                               TEE 验证层（attestFeedback + ServeProof）
+├── FeedbackBatcher.sol                         EIP-7702 委托目标：canonical feedback + 盖章
+│                                               一笔自调用原子完成（无状态、无 beacon）
 ├── AgenticIDReputationRegistry.sol             已废弃的私有声誉分叉——被
 │                                               VerifiedFeedbackRegistry 取代；为存量部署保留
 ├── ERC7857Upgradeable.sol                      7857 核心（iTransferFrom + proof 校验）
@@ -261,6 +263,12 @@ signature = personal_sign(inner, agentSeal_priv)
 
 ### 链上提交——client 两笔调用（SDK 打包成一步）
 
+在启用 EIP-7702 的链上（0G Galileo 已实测支持），SDK 会把两笔合成**一笔原子的
+type-4 交易**：client 的 EOA 委托给 `FeedbackBatcher` 后自调用
+`giveFeedbackAndAttest`——代码跑在 EOA 自己的账户上下文里（两个内部调用的
+msg.sender 都是 client 本人），index 在同一笔交易内读取；盖章失败会连
+canonical 写入一起回滚。链不支持 7702 时 SDK 退回下面的两笔顺序流程。
+
 ```solidity
 // 1. feedback → canonical 注册表（归因 = msg.sender，原生）
 canonicalReputation.giveFeedback(agentId, value, valueDecimals,
@@ -411,7 +419,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-178 个 Foundry tests / 20 suites（176 通过，2 个 fork 测试未设 `FORK_RPC`
+183 个 Foundry tests / 21 suites（181 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -423,6 +431,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
 | `VerifiedFeedback.t.sol` | 21 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评 / 对着 canonical mock 的 verified summary |
+| `FeedbackBatcher.t.sol` | 5 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用 |
 | `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签 + revoke / appendResponse 全路径（含跨实现 digest 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |

@@ -117,6 +117,10 @@ pub struct Config {
     /// canonical ERC-8004 reputation registry, which SDKs discover FROM it
     /// via getCanonicalReputation). Same /config-discovery-only purpose.
     pub verified_feedback_addr: Option<Address>,
+    /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
+    /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
+    /// presence as "the atomic path works here". Discovery-only.
+    pub feedback_batcher_addr: Option<Address>,
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
@@ -286,6 +290,8 @@ impl Config {
             reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
                 .and_then(|s| s.parse().ok()),
             verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
+                .and_then(|s| s.parse().ok()),
+            feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),

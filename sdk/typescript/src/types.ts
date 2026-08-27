@@ -254,16 +254,18 @@ export interface GiveFeedbackParams {
 }
 
 /**
- * Result of the bundled feedback flow: the canonical `giveFeedback` tx (already
- * mined — the flow must read the assigned index before attesting), the
- * `attestFeedback` tx on the VerifiedFeedbackRegistry (returned unmined; wait
- * with `waitForTransaction`), and the canonical 1-based index the entry landed
- * at.
+ * Result of the bundled feedback flow. On the atomic EIP-7702 path (the
+ * environment advertises a feedbackBatcher) both fields carry the SAME
+ * type-4 transaction hash, already mined. On the sequential fallback,
+ * `feedbackTx` is the canonical write (mined — the flow must read the
+ * assigned index before attesting) and `attestTx` the attest (returned
+ * unmined; wait with `waitForTransaction`). Waiting `attestTx` is correct on
+ * both paths.
  */
 export interface GiveFeedbackResult {
-  /** Canonical registry giveFeedback tx hash (mined). */
+  /** Canonical registry write tx hash (atomic path: the batch tx). */
   feedbackTx: `0x${string}`;
-  /** VerifiedFeedbackRegistry attestFeedback tx hash (pending). */
+  /** VerifiedFeedbackRegistry attest tx hash (atomic path: same as feedbackTx). */
   attestTx: `0x${string}`;
   /** 1-based canonical feedback index of the new entry. */
   feedbackIndex: bigint;

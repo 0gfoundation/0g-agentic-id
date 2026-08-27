@@ -149,8 +149,10 @@ await ag.reputation.verifyProof(proof);
 // → { ok, signerMatches, notExpired, dataOnChain, reasons }
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
-//    verification mark, bundled. An owner CANNOT attest feedback on their own
-//    agent (the verified registry rejects it).
+//    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
+//    is advertised) both land in ONE atomic type-4 tx; otherwise two sequential
+//    txs. An owner CANNOT attest feedback on their own agent (the verified
+//    registry rejects it).
 const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
 await ag.reputation.waitForTransaction(fb.attestTx);

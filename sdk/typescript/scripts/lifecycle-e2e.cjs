@@ -76,6 +76,8 @@ function mkClient(privKey, cfg) {
       agenticID: cfg.agentic_id_addr,
       teeDataVerifier: Z,
       verifiedFeedback: VERIFIED_FEEDBACK_ADDR,
+      // optional: exercises the atomic EIP-7702 path when set (or served by /config)
+      feedbackBatcher: process.env.FEEDBACK_BATCHER_ADDR || cfg.feedback_batcher_addr || undefined,
       tappRegistry: cfg.tapp_registry_addr,
       sandboxServing: cfg.sandbox_serving_addr ?? Z,
     },

@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 178 tests / 20 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 183 tests / 21 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -90,6 +90,8 @@ contracts/src/
 ├── AgenticID.sol                               main contract (identity + 7857 token + seal)
 ├── VerifiedFeedbackRegistry.sol                TEE-verification layer over the canonical ERC-8004
 │                                               Reputation Registry (attestFeedback + ServeProof)
+├── FeedbackBatcher.sol                         EIP-7702 delegate: canonical feedback + attest in
+│                                               one atomic self-call (stateless, no beacon)
 ├── AgenticIDReputationRegistry.sol             DEPRECATED private reputation fork — replaced by
 │                                               VerifiedFeedbackRegistry; kept for live deployments
 ├── ERC7857Upgradeable.sol                      7857 core (iTransferFrom + proof check)
@@ -269,6 +271,14 @@ signature = personal_sign(inner, agentSeal_priv)
 
 ### On-chain submission — two calls by the client (SDK bundles them)
 
+On EIP-7702-enabled chains (0G Galileo is — verified live) the SDK executes
+both calls in ONE atomic type-4 transaction: the client EOA delegates to
+`FeedbackBatcher` and self-calls `giveFeedbackAndAttest`, which runs in the
+EOA's account context (msg.sender = the client for both inner calls) and reads
+the assigned index inside the same transaction. A failed attest rolls back the
+canonical write. Without 7702 the SDK falls back to the sequential two-tx flow
+below.
+
 ```solidity
 // 1. feedback → the canonical registry (attribution = msg.sender, natively)
 canonicalReputation.giveFeedback(agentId, value, valueDecimals,
@@ -434,7 +444,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-178 Foundry tests across 20 suites (176 pass, 2 fork tests skip unless
+183 Foundry tests across 21 suites (181 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -446,6 +456,7 @@ longest business deadline window.
 | `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
 | `VerifiedFeedback.t.sol` | 21 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback / verified summary against the canonical registry mock |
+| `FeedbackBatcher.t.sol` | 5 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls |
 | `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification + revoke / appendResponse, all paths (incl. the cross-impl digest known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |

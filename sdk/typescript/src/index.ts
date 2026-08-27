@@ -93,6 +93,7 @@ export {
   agenticIDAbi,
   canonicalReputationAbi,
   verifiedFeedbackAbi,
+  feedbackBatcherAbi,
   tappRegistryAbi,
   sandboxServingAbi,
 } from './abi';

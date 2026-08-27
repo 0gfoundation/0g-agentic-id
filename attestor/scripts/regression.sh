@@ -102,7 +102,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
   echo "source url refreshed post-reset: $AGENT_URL"
   if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
-    step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' VERIFIED_FEEDBACK_ADDR='$VERIFIED_FEEDBACK_ADDR' node scripts/lifecycle-e2e.cjs"
+    step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' VERIFIED_FEEDBACK_ADDR='$VERIFIED_FEEDBACK_ADDR' FEEDBACK_BATCHER_ADDR='${FEEDBACK_BATCHER_ADDR:-}' node scripts/lifecycle-e2e.cjs"
   else
     skip "lifecycle-e2e (clone+feedback+transfer+gate)" "VERIFIED_FEEDBACK_ADDR unset"
   fi

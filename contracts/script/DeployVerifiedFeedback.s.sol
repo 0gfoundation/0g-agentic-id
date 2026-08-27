@@ -8,6 +8,7 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
+import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 
 /// @notice Incremental deploy: add a VerifiedFeedbackRegistry (impl + beacon +
 ///         proxy) to an EXISTING AgenticID environment (DEPLOYMENT.md §6),
@@ -23,7 +24,7 @@ import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 ///           MAX_PROOF_AGE             — nonce GC horizon in seconds (default 86400)
 ///           CANONICAL_8004_REPUTATION — override the chainId default
 contract DeployVerifiedFeedback is Script {
-    function run() external returns (address impl, address beacon, address proxy) {
+    function run() external returns (address impl, address beacon, address proxy, address batcher) {
         address agenticId   = vm.envAddress("AGENTIC_ID");
         address timelock    = vm.envAddress("TIMELOCK");
         address owner       = vm.envAddress("OWNER");
@@ -62,16 +63,21 @@ contract DeployVerifiedFeedback is Script {
                 (agenticId, canonicalReputation, owner, pauser, maxProofAge)
             )
         );
+        // EIP-7702 delegate for the atomic feedback+attest flow (stateless,
+        // no beacon — replace by deploying a new one and re-delegating).
+        FeedbackBatcher fb = new FeedbackBatcher(canonicalReputation, address(vfProxy));
         vm.stopBroadcast();
 
         impl = address(vfImpl);
         beacon = address(vfBeacon);
         proxy = address(vfProxy);
+        batcher = address(fb);
 
         console2.log("=== Deployed -- record in DEPLOYMENT.md section 6 ===");
         console2.log("VerifiedFeedback impl:  ", impl);
         console2.log("VerifiedFeedback beacon:", beacon);
         console2.log("VerifiedFeedback proxy: ", proxy);
+        console2.log("FeedbackBatcher:        ", batcher);
     }
 
     /// @dev Same defaults as Deploy.s.sol — keep the two in sync.

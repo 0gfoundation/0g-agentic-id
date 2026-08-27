@@ -855,6 +855,56 @@ export const verifiedFeedbackAbi = [
 ] as const;
 
 /**
+ * FeedbackBatcher — EIP-7702 delegate target. A client EOA attaches this code
+ * to itself (type-4 authorization) and self-calls to execute the canonical
+ * giveFeedback + attestFeedback pair atomically, with msg.sender = the EOA
+ * for both inner calls.
+ */
+export const feedbackBatcherAbi = [
+  {"type":"error","name":"BatcherNotSelf","inputs":[]},
+  {
+    type: 'function',
+    name: 'giveFeedbackAndAttest',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'value', type: 'int128' },
+      { name: 'valueDecimals', type: 'uint8' },
+      { name: 'tag1', type: 'string' },
+      { name: 'tag2', type: 'string' },
+      { name: 'endpoint', type: 'string' },
+      { name: 'feedbackURI', type: 'string' },
+      { name: 'feedbackHash', type: 'bytes32' },
+      { name: 'proof', type: 'tuple', components: [
+        { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
+        { name: 'timestamp', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+        { name: 'taskHash', type: 'bytes32' },
+        { name: 'dataHashes', type: 'bytes32[]' },
+        { name: 'frameworkHash', type: 'bytes32' },
+        { name: 'signature', type: 'bytes' },
+      ] },
+    ],
+    outputs: [{ name: 'feedbackIndex', type: 'uint64' }],
+  },
+  {
+    type: 'function',
+    name: 'canonicalReputation',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'verifiedFeedback',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+] as const;
+
+/**
  * TappRegistry — trust-root acknowledgement. `ack` acknowledges the set of
  * TEE components (attestor, kms, sandbox) the deploy/sandbox flow depends on.
  */

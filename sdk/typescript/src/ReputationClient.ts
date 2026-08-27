@@ -22,8 +22,10 @@ import {
   type Account,
   type WriteContractReturnType,
   type TransactionReceipt,
+  encodeFunctionData,
+  parseEventLogs,
 } from 'viem';
-import { canonicalReputationAbi, verifiedFeedbackAbi } from './abi';
+import { canonicalReputationAbi, verifiedFeedbackAbi, feedbackBatcherAbi } from './abi';
 import { RECEIPT_WAIT } from './constants';
 import { type Ctx } from './context';
 import type {
@@ -84,14 +86,32 @@ export class ReputationClient {
   // ── Give Feedback (canonical write + verification mark, bundled) ──
 
   /**
-   * Give feedback for an agent: writes the entry to the canonical ERC-8004
-   * registry (attribution = the connected wallet), waits for it to mine,
-   * reads the assigned 1-based index, then attests it on the
-   * VerifiedFeedbackRegistry with the ServeProof. The attest tx is returned
-   * unmined — wait for `result.attestTx` before reading `isVerified`.
+   * Give feedback for an agent — canonical ERC-8004 write (attribution = the
+   * connected wallet) + ServeProof mark on the VerifiedFeedbackRegistry.
+   *
+   * Two execution paths:
+   * - **Atomic (EIP-7702)** — when the environment advertises a
+   *   `feedbackBatcher` (only done on 7702-enabled chains): ONE type-4
+   *   transaction executes both calls in the EOA's own context; either
+   *   everything lands or nothing does. `feedbackTx === attestTx`, already
+   *   mined on return.
+   * - **Sequential (fallback)** — canonical write (mined in-call so the
+   *   assigned index can be read), then attest. `attestTx` is returned
+   *   unmined — wait for it before reading `isVerified`. If the attest leg
+   *   fails, retry it later with `attestFeedback` (the proof is not consumed
+   *   by a reverted attempt).
    */
   async giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> {
     this.requireWallet();
+
+    const batcher = this.ctx.addresses.feedbackBatcher;
+    if (batcher && batcher !== '0x0000000000000000000000000000000000000000') {
+      const atomic = await this.giveFeedbackAtomic(batcher, params);
+      if (atomic) return atomic;
+      // fall through: the wallet couldn't sign a 7702 authorization — nothing
+      // was broadcast, so the sequential path is safe to take.
+    }
+
     const canonical = await this.canonical();
     const feedbackTx = await this.walletClient!.writeContract({
       address: canonical,
@@ -116,6 +136,90 @@ export class ReputationClient {
     const feedbackIndex = await this.getLastIndex(params.agentId, this.account!.address);
     const attestTx = await this.attestFeedback(params.agentId, feedbackIndex, params.serveProof);
     return { feedbackTx, attestTx, feedbackIndex };
+  }
+
+  /**
+   * Atomic (EIP-7702) leg of giveFeedback. Returns null ONLY when no
+   * transaction was broadcast (the wallet can't sign a 7702 authorization) —
+   * the caller then safely falls back to the sequential flow. Failures after
+   * broadcast propagate: the batch reverts as a whole, nothing is written,
+   * and silently retrying sequentially could orphan a canonical entry the
+   * user didn't ask for twice.
+   */
+  private async giveFeedbackAtomic(
+    batcher: Address,
+    params: GiveFeedbackParams,
+  ): Promise<GiveFeedbackResult | null> {
+    const me = this.account!.address;
+
+    // Delegation designator this EOA needs: 0xef0100 ‖ batcher.
+    const designator = ('0xef0100' + batcher.slice(2)).toLowerCase();
+    const code = (await this.publicClient.getCode({ address: me })) ?? '0x';
+    let authorizationList;
+    if (code.toLowerCase() !== designator) {
+      try {
+        authorizationList = [
+          await this.walletClient!.signAuthorization({
+            account: this.account!,
+            contractAddress: batcher,
+            // The EOA itself sends the type-4 tx (auth nonce = account nonce + 1).
+            executor: 'self',
+          }),
+        ];
+      } catch {
+        return null; // wallet can't do 7702 (e.g. JSON-RPC account) — no side effects yet
+      }
+    }
+
+    const sp = params.serveProof;
+    const txHash = await this.walletClient!.sendTransaction({
+      account: this.account!,
+      chain: this.chain,
+      to: me, // self-call executes the delegated batcher code as the EOA
+      data: encodeFunctionData({
+        abi: feedbackBatcherAbi,
+        functionName: 'giveFeedbackAndAttest',
+        args: [
+          params.agentId,
+          params.value,
+          params.valueDecimals ?? 0,
+          params.tag1 ?? '',
+          params.tag2 ?? '',
+          params.endpoint ?? '',
+          params.feedbackURI ?? '',
+          params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
+          {
+            agentId: sp.agentId,
+            submitter: sp.submitter,
+            timestamp: sp.timestamp,
+            deadline: sp.deadline,
+            taskHash: sp.taskHash,
+            dataHashes: sp.dataHashes,
+            frameworkHash: sp.frameworkHash,
+            signature: sp.signature,
+          },
+        ],
+      }),
+      authorizationList,
+    });
+
+    const receipt = await this.waitForTransaction(txHash);
+    if (receipt.status !== 'success') {
+      throw new Error(
+        `atomic feedback batch reverted (tx ${txHash}) — nothing was written; ` +
+        'check the proof (expired deadline / wrong submitter / owner self-feedback)',
+      );
+    }
+    const events = parseEventLogs({
+      abi: verifiedFeedbackAbi,
+      logs: receipt.logs,
+      eventName: 'FeedbackVerified',
+    });
+    if (events.length === 0) {
+      throw new Error(`atomic feedback batch mined without a FeedbackVerified event (tx ${txHash})`);
+    }
+    const feedbackIndex = BigInt((events[0].args as { feedbackIndex: bigint }).feedbackIndex);
+    return { feedbackTx: txHash, attestTx: txHash, feedbackIndex };
   }
 
   /**

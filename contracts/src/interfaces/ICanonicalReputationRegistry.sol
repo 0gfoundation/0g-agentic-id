@@ -21,6 +21,20 @@ pragma solidity ^0.8.20;
 ///      (plus the deploy-time sanity checks). Signatures match the live
 ///      contract exactly — 1-based feedbackIndex, uint64 indexes.
 interface ICanonicalReputationRegistry {
+    /// @notice Submit feedback, attributed to msg.sender (the client).
+    /// @dev Called by {FeedbackBatcher} while executing AS the client's EOA
+    ///      (EIP-7702 delegation) — never by protocol contracts directly.
+    function giveFeedback(
+        uint256 agentId,
+        int128  value,
+        uint8   valueDecimals,
+        string calldata tag1,
+        string calldata tag2,
+        string calldata endpoint,
+        string calldata feedbackURI,
+        bytes32 feedbackHash
+    ) external;
+
     /// @notice 1-based index of the most recent feedback from `clientAddress`
     ///         for `agentId`; 0 when there is none. Equals the entry count.
     function getLastIndex(uint256 agentId, address clientAddress) external view returns (uint64);

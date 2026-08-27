@@ -43,11 +43,12 @@ import { AgenticID, type ContractAddresses } from '@0gfoundation/0g-agenticid-sd
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
 // addresses fully determine the target contracts.
 const addresses: ContractAddresses = {
-  agenticID:          '0x…',
-  reputationRegistry: '0x…',
-  teeDataVerifier:    '0x…',
-  tappRegistry:       '0x…',
-  sandboxServing:     '0x…',
+  agenticID:        '0x…',
+  verifiedFeedback: '0x…',   // canonical 8004 reputation registry is discovered FROM it
+  teeDataVerifier:  '0x…',
+  tappRegistry:     '0x…',
+  sandboxServing:   '0x…',
+  feedbackBatcher:  '0x…',   // optional — only on EIP-7702-enabled chains (atomic feedback)
 };
 
 // read-only:
@@ -234,7 +235,11 @@ await ag.reputation.verifyProof(proof);
 // the entry itself goes to the OFFICIAL canonical ERC-8004 Reputation
 // Registry (attribution = msg.sender natively, so every 8004 reader sees
 // it), and the ServeProof mark goes to the local VerifiedFeedbackRegistry.
-// giveFeedback bundles both: canonical write (mined inside the call, so the
+// giveFeedback bundles both. On EIP-7702-enabled environments (the attestor
+// advertises a feedbackBatcher) the two calls execute in ONE atomic type-4
+// transaction — the EOA delegates to the batcher and self-calls, so a failed
+// attest rolls back the canonical write too, and feedbackTx === attestTx
+// (already mined). Otherwise: canonical write (mined inside the call, so the
 // assigned index can be read back) + attestFeedback (returned pending).
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
@@ -589,7 +594,7 @@ is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills all five addresses for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the five into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 

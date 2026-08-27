@@ -120,6 +120,7 @@ mod tests {
             sandbox_serving_addr: None,
             reputation_registry_addr: None,
             verified_feedback_addr: None,
+            feedback_batcher_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
