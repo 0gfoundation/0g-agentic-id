@@ -20,6 +20,14 @@ to compile ("stack too deep"). It's already enabled by default in
 known codegen bug when combined with Solidity 0.8.24 + `via_ir`. Precondition
 for unpinning: bump solc to ≥ 0.8.27 (several via_ir bugs are fixed there).
 
+### `via_ir` peak memory exceeds 4 GB on solc 0.8.24
+
+The full test tree (120 files as of the VerifiedFeedback/FeedbackBatcher
+suites) gets the compiler SIGKILLed in a 4 GB container, even at `-j 1`.
+Same tree compiles fine with `--use 0.8.28` — but solc stays pinned (see the
+forge-std pin above), so the fix is RAM: build contracts on a machine with
+more than 4 GB. Reported by the PR #144 round-2 review, reproduced there.
+
 ### The `via_ir + vm.warp` trap in tests
 
 Same root cause as the codegen bug above: after advancing time with

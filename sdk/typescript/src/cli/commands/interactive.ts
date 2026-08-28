@@ -14,10 +14,12 @@
  */
 
 import * as readline from 'node:readline';
-import { parseEther } from 'viem';
+import { parseEther, keccak256, toBytes, hexToBytes, concat } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
+import type { ServeProof, TaskReveal } from '../../types';
 import { buildClient } from '../sdk';
+import { saveProof, listProofs, removeProof, toServeProof, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
@@ -26,7 +28,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
@@ -260,13 +262,21 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
   use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
   hello <agentId|sealId>  any agent's public /hello: identity, services,
-                          routes, serve-proof verification
+                          routes, serve-proof verification (with a wallet
+                          configured it also banks a rating ticket, see rate)
+  call <id> [path [body]] use an agent's public service as a client; the
+                          response banks a rating ticket (bare call = list
+                          its services)
+  rate <id> [score] [/ep] rate an agent on-chain (canonical 8004 + TEE mark).
+                          Spends a ticket banked by call/hello (<1h) — no
+                          interaction, no rating; picks among multiple
+                          tickets; owners cannot rate their own agents
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
@@ -287,7 +297,7 @@ const L1_HELP_FULL = `manager commands
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
-  const wallet = key ? await addressOf(key) : null;
+  const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   // Pixel splash (the avatar generator's panda) when the terminal can show
   // it; the plain box otherwise (pipes, NO_COLOR, dumb terminals).
@@ -314,7 +324,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
   }
   out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet     ${wallet ? short(wallet) : '(none)'}\n`);
+  out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
   out('\n');
@@ -326,9 +336,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     const line = (await ask('\n0g-agenticid> ')).trim();
-    if (!line) continue;
-    const [cmd, ...args] = line.split(/\s+/);
-
+    // Bare Enter refreshes the account status — the L1 analog of L2's
+    // bare-Enter agent refresh.
+    const [cmd, ...args] = line ? line.split(/\s+/) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
@@ -384,7 +394,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const amt = args[0] || (await ask('amount OG [1]: ')).trim() || '1';
         const tx = await ag.deposit({ amountWei: parseEther(amt) });
         await ag.waitForTransaction(tx);
-        out(`deposited ${amt} OG to the prepaid sandbox balance → ${tx}\n`);
+        out(`deposited ${amt} OG to the prepaid sandbox balance (tx ${tx})\n`);
         continue;
       }
 
@@ -409,7 +419,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (!yn || yn === 'y' || yn === 'yes') {
             const tx = await ag.withdrawRefund();
             await ag.waitForTransaction(tx);
-            out(`withdrew ${og(pending)} to your wallet → ${tx}\n`);
+            out(`withdrew ${og(pending)} to your wallet (tx ${tx})\n`);
             pending = 0n;
           }
         }
@@ -426,7 +436,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.waitForTransaction(tx);
         const after = await ag.getBalanceDetail();
         if (pending > 0n) out(`pending refund: ${og(pending)} → ${og(after.pendingRefund)} (lock restarted)\n`);
-        else out(`${amt} OG moved to pending refund → ${tx}\n`);
+        else out(`${amt} OG moved to pending refund (tx ${tx})\n`);
         out(`unlocks ${new Date(Number(after.refundUnlockAt) * 1000).toLocaleString()} — claim then with a bare \`withdraw\`\n`);
         continue;
       }
@@ -435,7 +445,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
+        out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
         if (key && ctx.env.attestorUrl) {
           try {
@@ -444,6 +454,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           } catch (e) {
             out(`ack     : (unreadable: ${(e as Error).message})\n`);
           }
+          try {
+            const d = await (await withWallet(ctx)).getBalanceDetail();
+            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}\n`);
+          } catch { /* serving not configured — skip the line */ }
         }
         continue;
       }
@@ -467,8 +481,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // field (owner-only since #64), so "mine" cannot be derived from
         // them: with a key configured, ALSO fetch the owner-signed listing
         // and mark rows by sealId membership.
-        const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        const ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
+        let key = ctx.env.privateKey ?? loadKey() ?? undefined;
+        let ag: AgenticID;
+        try {
+          ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
+        } catch (e) {
+          // Malformed key must not block a PUBLIC listing — warn, go walletless.
+          out(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
+          key = undefined;
+          ag = await clientFor(ctx, false);
+        }
         // The two listings are independent — fetch them in parallel.
         const [rows, mySeals] = await Promise.all([
           ag.agent.listDeployments(),
@@ -479,7 +501,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!rows.length) { out('no agents on this attestor\n'); continue; }
         for (const r of rows) {
           const owned = mySeals?.has(r.sealId) ? '*' : ' ';
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${r.name ?? ''}\n`);
+          // Minted rows: short sealId (agentId is the working handle). Unminted
+          // rows ('?'): FULL sealId — it is the only handle commands accept.
+          const seal = r.agentId != null ? `${r.sealId.slice(0, 8)}…${r.sealId.slice(-6)}` : r.sealId;
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(17)} ${r.name ?? ''}\n`);
         }
         if (mySeals) out('(* = owned by your wallet)\n');
         continue;
@@ -528,7 +553,123 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
         if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
-        await showHello(ag, row.url);
+        // With a wallet configured, declare it as the proof's redeemer so this
+        // visit banks a rating ticket (see `rate`). Still no signing involved.
+        const helloKey = ctx.env.privateKey ?? loadKey() ?? undefined;
+        const helloAddr = helloKey ? ((await addressOf(helloKey)) as `0x${string}`) : undefined;
+        await showHello(ag, row.url, helloAddr);
+        continue;
+      }
+
+      if (cmd === 'call') {
+        // Use an agent's public service as a client — the experience that
+        // earns the right to rate. The response banks a rating ticket bound
+        // to your wallet; `call <id>` alone lists the services.
+        if (!args[0]) { out('usage: call <agentId|sealId> [</path> [json-body]]\n'); continue; }
+        const ag = await withWallet(ctx);
+        const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
+        // Service table for method resolution (no client address — this lookup
+        // is not the interaction being rated, so it must not bank a ticket).
+        const services = await servicesOf(row.url);
+        if (!args[1]) {
+          if (!services.length) { out('this agent registers no public services (only /hello)\n'); continue; }
+          out('services:\n');
+          for (const sv of services) out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+          out(`call one with: call ${args[0]} <path> [json-body]\n`);
+          continue;
+        }
+        const path = args[1];
+        if (!path.startsWith('/')) { out('path must start with /\n'); continue; }
+        const body = args.slice(2).join(' ') || undefined;
+        const registered = services.find((sv) => sv.path === path);
+        const method = registered?.method ?? (body ? 'POST' : 'GET');
+        if (!registered && path !== '/hello') out(`note: ${path} is not in the agent's service table — calling anyway\n`);
+
+        const started = Date.now();
+        const t = await callAgentWithTicket(ag, row.url, path, method, body, my);
+        out(`${method} ${path} → ${t.res.status} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
+        // Display only — hashing above used the full raw bytes.
+        let pretty = t.bodyText;
+        try { pretty = JSON.stringify(JSON.parse(t.bodyText), null, 2); } catch { /* not JSON */ }
+        out(pretty.length > 4096 ? `${pretty.slice(0, 4096)}\n… (${pretty.length} chars total)\n` : `${pretty}\n`);
+        if (t.banked) out(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
+        else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript seen here\n');
+        else out('ticket  : NOT banked — no serve-proof on the response\n');
+        continue;
+      }
+
+      if (cmd === 'rate') {
+        // Rate an agent you have INTERACTED with: spends a banked serve-proof
+        // ticket (from `call`/`hello` within the last hour), then submits
+        // canonical 8004 feedback + the TEE verification mark — atomically
+        // (EIP-7702) when the environment has a feedbackBatcher. No ticket,
+        // no rating: experiencing the agent is what earns the right to rate.
+        if (!args[0]) { out('usage: rate <agentId|sealId> [score] [</endpoint>]\n'); continue; }
+        const ag = await withWallet(ctx);
+        const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (row.agentId == null) { out(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
+        const agentId = BigInt(row.agentId);
+        // The chain would reject this at the attest step (self-feedback); say it upfront.
+        const agentOwner = await ag.agent.ownerOf(agentId);
+        if (agentOwner.toLowerCase() === my.toLowerCase()) { out(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
+
+        // `rate <id> [score] [endpoint]` — either trailing arg order works.
+        let rawScore = '';
+        let endpointFilter = '';
+        for (const a of args.slice(1)) {
+          if (a.startsWith('/')) endpointFilter = a;
+          else rawScore = a;
+        }
+
+        // Tickets come ONLY from real interactions (call/hello). Newest first.
+        let tickets = listProofs(agentId, my);
+        if (endpointFilter) tickets = tickets.filter((e) => e.task.uri === endpointFilter);
+        if (tickets.length === 0) {
+          out(`you hold no unexpired ticket for agent ${row.agentId}${endpointFilter ? ` on ${endpointFilter}` : ''} (tickets live ~1h)\n` +
+              `  → experience it first: \`call ${row.agentId}\` lists its services, \`call ${row.agentId} <path>\` uses one, then rate promptly\n`);
+          continue;
+        }
+        let ticket: SavedProof;
+        if (tickets.length === 1) {
+          ticket = tickets[0];
+        } else {
+          out(`you hold ${tickets.length} tickets for agent ${row.agentId}:\n`);
+          tickets.forEach((e, i) => {
+            const at = new Date(e.capturedAt * 1000).toLocaleTimeString();
+            const exp = new Date(e.deadline * 1000).toLocaleTimeString();
+            out(`  ${i + 1}. ${e.task.method.padEnd(4)} ${e.task.uri.padEnd(24)} ${at}  (expires ${exp})\n`);
+          });
+          const pick = (await ask('which interaction are you rating? [1]: ')).trim() || '1';
+          const n = Number(pick);
+          if (!Number.isInteger(n) || n < 1 || n > tickets.length) { out('invalid choice\n'); continue; }
+          ticket = tickets[n - 1];
+        }
+        out(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
+        const proof = toServeProof(ticket);
+
+        // Free pre-check before spending gas.
+        const v = await ag.reputation.verifyProof(proof);
+        if (!v.ok) {
+          removeProof(ticket.proof.signature);
+          out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+          continue;
+        }
+
+        if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
+        if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
+        out('submitting: canonical 8004 feedback + TEE attestation…\n');
+        const fb = await ag.reputation.giveFeedback({
+          agentId, value: BigInt(rawScore), serveProof: proof, endpoint: ticket.endpoint, task: ticket.task,
+        });
+        await ag.reputation.waitForTransaction(fb.attestTx);
+        removeProof(ticket.proof.signature);
+        const atomic = fb.feedbackTx === fb.attestTx;
+        out(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified (endpoint ${ticket.task.uri})${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
         continue;
       }
 
@@ -593,20 +734,110 @@ async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<st
   }
 }
 
+/** The sealed proxy's taskHash composition, recomputed client-side:
+ *  keccak256(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status). */
+function taskHashOf(task: TaskReveal): `0x${string}` {
+  return keccak256(concat([
+    toBytes(task.method), toBytes(task.uri),
+    hexToBytes(task.reqBodyHash), hexToBytes(task.respBodyHash),
+    toBytes(String(task.statusCode)),
+  ]));
+}
+
+/** Call one of an agent's endpoints, capturing the serve-proof AND its
+ *  task-receipt materials. With `clientAddr` the request declares
+ *  X-Client-Address, so the proof is redeemable by that wallet — and gets
+ *  banked in the proof jar as a rating ticket (only when the locally
+ *  recomputed taskHash matches the signed one, so a mangled transcript never
+ *  banks an unusable reveal). Non-2xx responses bank too: a failed
+ *  interaction is still an interaction — arguably the one you most want to
+ *  rate. */
+async function callAgentWithTicket(
+  ag: AgenticID,
+  url: string,
+  path: string,
+  method: string,
+  body: string | undefined,
+  clientAddr?: `0x${string}`,
+): Promise<{ res: Response; bodyText: string; proof: ServeProof | null; task: TaskReveal | null; banked: boolean }> {
+  const target = `${url}${path}`;
+  const bodyBytes = body ? new TextEncoder().encode(body) : new Uint8Array(0);
+  const res = await fetch(target, {
+    method,
+    headers: {
+      ...(clientAddr ? { 'X-Client-Address': clientAddr } : {}),
+      ...(body ? { 'content-type': 'application/json' } : {}),
+    },
+    ...(body ? { body } : {}),
+  });
+  const raw = new Uint8Array(await res.arrayBuffer());
+  const bodyText = new TextDecoder().decode(raw);
+  const proof = ag.reputation.proofFromResponse(res);
+  let task: TaskReveal | null = null;
+  let banked = false;
+  if (proof) {
+    const u = new URL(target);
+    const candidate: TaskReveal = {
+      method,
+      uri: u.pathname + u.search,
+      reqBodyHash: keccak256(bodyBytes),
+      respBodyHash: keccak256(raw),
+      statusCode: res.status,
+    };
+    if (taskHashOf(candidate) === proof.taskHash) task = candidate;
+    if (clientAddr && proof.submitter.toLowerCase() === clientAddr.toLowerCase() && task) {
+      saveProof(proof, task, target);
+      banked = true;
+    }
+  }
+  return { res, bodyText, proof, task, banked };
+}
+
+async function helloWithTicket(
+  ag: AgenticID,
+  url: string,
+  clientAddr?: `0x${string}`,
+): Promise<{ res: Response; bodyText: string; proof: ServeProof | null; task: TaskReveal | null; banked: boolean }> {
+  return callAgentWithTicket(ag, url, '/hello', 'GET', undefined, clientAddr);
+}
+
+/** Public-listing row for an agentId/sealId reference, or undefined. */
+async function findAgentRow(ag: AgenticID, refInput: string): Promise<Awaited<ReturnType<AgenticID['agent']['listDeployments']>>[number] | undefined> {
+  const ref = parseAgentRef(refInput);
+  const rows = await ag.agent.listDeployments();
+  return rows.find((r) =>
+    ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+}
+
+/** The agent's registered service table (from its /hello; empty on failure). */
+async function servicesOf(url: string): Promise<{ path: string; method: string; description?: string; skill?: string }[]> {
+  try {
+    const b = (await (await fetch(`${url}/hello`)).json()) as {
+      services?: { path: string; method: string; description?: string; skill?: string }[];
+    };
+    // entry #0 is /hello itself — callable but not a business service; keep it out of the picker
+    return (b.services ?? []).filter((sv) => sv.path !== '/hello');
+  } catch {
+    return [];
+  }
+}
+
 /** Fetch and print an agent's signed /hello: identity, proof verification,
  *  and its two capability tables — services (agent-registered endpoints,
  *  entry #0 is /hello itself) and routes (framework-declared prefixes).
- *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello). */
-async function showHello(ag: AgenticID, url: string): Promise<void> {
-  const res = await fetch(`${url}/hello`);
-  const body = (await res.json().catch(() => ({}))) as {
+ *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello).
+ *  With `clientAddr`, the serve-proof is banked as a rating ticket. */
+async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`): Promise<void> {
+  const { proof, bodyText, banked } = await helloWithTicket(ag, url, clientAddr);
+  let body: {
     agent?: string; owner?: string; message?: string;
     services?: { path: string; method: string; description?: string; skill?: string }[];
     routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
-  };
-  const proof = ag.reputation.proofFromResponse(res);
+  } = {};
+  try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
   out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
   if (body.services?.length) {
     out('services:\n');
     for (const sv of body.services) {
@@ -700,7 +931,7 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     const amt = (await ask('deposit how much OG now? [1, empty to cancel]: ')).trim();
     if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
     const tx = await ag.deposit({ amountWei: parseEther(amt || '1') });
-    out(`deposit ${amt} OG → ${tx} (waiting…)\n`);
+    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
     await ag.waitForTransaction(tx);
   }
   return true;

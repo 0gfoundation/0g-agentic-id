@@ -251,6 +251,51 @@ export interface GiveFeedbackParams {
   feedbackURI?: string;
   /** Hash of that document. Default zero hash. */
   feedbackHash?: `0x${string}`;
+  /** Optional task-receipt opening: when given, the attest step uses
+   *  attestFeedbackWithTask — the contract recomputes the proof's taskHash
+   *  from these materials and records `task.uri` as the entry's TEE-verified
+   *  endpoint (enabling trustless per-endpoint aggregation). */
+  task?: TaskReveal;
+}
+
+/**
+ * Opening of a ServeProof's `taskHash` commitment — the receipt materials of
+ * the exact interaction that earned the proof. The sealed proxy computes
+ * taskHash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody)
+ * ‖ decimal status), so revealing these five values (bodies stay private —
+ * only hashes go on-chain) lets the VerifiedFeedbackRegistry verify WHICH
+ * endpoint the interaction hit and record it as the entry's TEE-verified
+ * endpoint.
+ */
+export interface TaskReveal {
+  /** HTTP method — one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS. */
+  method: string;
+  /** Request URI (path + query), must start with '/'. */
+  uri: string;
+  /** keccak256 of the raw request body ('0x…' — keccak256 of empty for GET). */
+  reqBodyHash: `0x${string}`;
+  /** keccak256 of the raw response body bytes as received. */
+  respBodyHash: `0x${string}`;
+  /** HTTP status code of the response. */
+  statusCode: number;
+}
+
+/**
+ * Result of the bundled feedback flow. On the atomic EIP-7702 path (the
+ * environment advertises a feedbackBatcher) both fields carry the SAME
+ * type-4 transaction hash, already mined. On the sequential fallback,
+ * `feedbackTx` is the canonical write (mined — the flow must read the
+ * assigned index before attesting) and `attestTx` the attest (returned
+ * unmined; wait with `waitForTransaction`). Waiting `attestTx` is correct on
+ * both paths.
+ */
+export interface GiveFeedbackResult {
+  /** Canonical registry write tx hash (atomic path: the batch tx). */
+  feedbackTx: `0x${string}`;
+  /** VerifiedFeedbackRegistry attest tx hash (atomic path: same as feedbackTx). */
+  attestTx: `0x${string}`;
+  /** 1-based canonical feedback index of the new entry. */
+  feedbackIndex: bigint;
 }
 
 /**
