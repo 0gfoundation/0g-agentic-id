@@ -116,6 +116,47 @@ export class AgenticIDClient {
     }) as Promise<Address>;
   }
 
+  // ── Policy-mode cloning (issue #133) ──────────────────────────────────────
+
+  /**
+   * Configure (or clear, with `0x0`) this token's clone authorizer — the
+   * `ICloneAuthorizer` policy contract that decides which contract-mode
+   * clones may mint. Owner-only on chain. Setting an authorizer is the
+   * publisher's one-time opt-in to marketplace fork flows; clearing it (or
+   * transferring the token — the contract clears it automatically) revokes.
+   */
+  async setCloneAuthorizer(tokenId: bigint, authorizer: Address): Promise<WriteContractReturnType> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
+      address: this.address,
+      abi: agenticIDAbi,
+      functionName: 'setCloneAuthorizer',
+      args: [tokenId, authorizer],
+      account,
+      chain: this.ctx.chain,
+    });
+  }
+
+  /**
+   * The token's configured clone authorizer (`0x0` = none configured →
+   * contract-mode clones fail closed).
+   */
+  async cloneAuthorizerOf(tokenId: bigint): Promise<Address> {
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'cloneAuthorizerOf', args: [tokenId],
+    }) as Promise<Address>;
+  }
+
+  /**
+   * For a clone, the agentId it was forked from (0n = not a clone). Survives
+   * transfers — lineage is a historical fact.
+   */
+  async cloneSourceOf(agentId: bigint): Promise<bigint> {
+    return this.ctx.publicClient.readContract({
+      address: this.address, abi: agenticIDAbi, functionName: 'cloneSourceOf', args: [agentId],
+    }) as Promise<bigint>;
+  }
+
   async balanceOf(owner: Address): Promise<bigint> {
     return this.ctx.publicClient.readContract({
       address: this.address, abi: agenticIDAbi, functionName: 'balanceOf', args: [owner],

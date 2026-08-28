@@ -88,6 +88,16 @@ const id  = await ag.agent.waitForMint(dep.sealId);     // → 34n; throws on ph
 const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: 'minted' });
 // → { sealId, agentSealAddr, agentId }
 
+// clone, contract mode (issue #133 marketplace fork) — the BUYER (connected
+// wallet == targetOwner) signs an intent binding the policy context, and the
+// source owner's on-chain ICloneAuthorizer decides:
+const fork = await ag.agent.clone(
+  { sourceAgentId, targetOwner: buyer, authorization: { authData: purchaseReceipt } },
+  { wait: 'minted' },
+);
+// authorization.authorizer is optional — read live via cloneAuthorizerOf when
+// omitted. See the GUIDE's marketplace-fork walkthrough.
+
 // transfer — ERC-7857 (old container reaped async by the indexer; don't gate on phase right after)
 await ag.agent.transferFrom(owner, newOwner, agentId);       // → "0x…"
 await ag.agent.safeTransferFrom(owner, newOwner, agentId);   // → "0x…"

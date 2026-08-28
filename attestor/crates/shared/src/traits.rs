@@ -69,6 +69,36 @@ pub trait ChainClient: Send + Sync {
     /// reads sealed keys from here rather than the deploy-time DB snapshot.
     async fn sealed_keys_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<Bytes>>;
 
+    /// AgenticID `cloneAuthorizerOf(agentId)` view — the source owner's
+    /// configured `ICloneAuthorizer` (0 = none → contract-mode clones fail
+    /// closed). Read LIVE, never taken from the request (issue #133).
+    async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address>;
+
+    /// Policy PRE-CHECK for contract-mode clones: STATICCALL
+    /// `canClone(source, target, caller, data)` on `authorizer`, bounded in
+    /// wall time by the implementation. UX only — it turns a would-be mint
+    /// revert into a friendly early 4xx and avoids burning the idempotency
+    /// key on a certain deny. The AUTHORITATIVE gate is the atomic policy
+    /// consult inside the on-chain `cloneFrom` mint. Fail-closed: any RPC
+    /// error, authorizer revert or timeout surfaces as `Err` (→ reject,
+    /// key not burned), never as "allow".
+    async fn can_clone(
+        &self,
+        authorizer: Address,
+        source: AgentId,
+        target: Address,
+        caller: Address,
+        data: Bytes,
+    ) -> anyhow::Result<bool>;
+
+    /// AgenticID `cloneFrom(...)` — the policy-mode clone mint (issue #133).
+    /// The attestor EOA submits (trusted-attestor-gated on chain); the
+    /// owner's authorizer is consulted ATOMICALLY inside the tx, and the
+    /// submitted `data_hashes` must match the source's live on-chain iData
+    /// (a stale re-seal reverts `AgenticIDCloneDataHashMismatch` — re-seal
+    /// from current data and resubmit).
+    async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash>;
+
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
     /// AgentCard URL after OSS upload without going through the owner.

@@ -1,13 +1,13 @@
 //! Job handlers. Worker core logic.
 
-use alloy::primitives::{Address, Bytes};
+use alloy::primitives::{Address, B256, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     oss::OssClient,
     sandbox::SandboxError,
-    AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
-    IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
-    SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
+    AgentId, ChainClient, CloneFromParams, Config, CryptoModule, DeploymentRepo, EventBus,
+    IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobPayload, MintParams,
+    SandboxClient, SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -285,6 +285,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             name,
             description,
             image,
+            authorization,
         } => {
             handle_clone(
                 ctx,
@@ -294,6 +295,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 name,
                 description,
                 image,
+                authorization,
             )
             .await
         }
@@ -954,12 +956,22 @@ async fn handle_deploy(
 /// derivation lets us re-derive the source priv to unseal, then seal to the
 /// new pub); `storage_root`/`data_hash`/`description` are reused verbatim — the
 /// source ciphertext on 0g-storage is shared, nothing is re-uploaded. Then
-/// mint via `run_mint_track` and finalize identity via `run_phase2`; the clone
-/// lands Offline for `target_owner` to bring online later.
+/// mint and finalize identity via `run_phase2`; the clone lands Offline for
+/// `target_owner` to bring online later.
+///
+/// Mint path is selected by `authorization` (issue #133):
+/// - `Owner` — `run_mint_track` (`registerWithSeal`), as before.
+/// - `Contract` — `run_clone_from_track` (AgenticID `cloneFrom`): the owner's
+///   on-chain `ICloneAuthorizer` is consulted ATOMICALLY inside the mint tx,
+///   and the submitted dataHashes must match the source's live iData. A
+///   policy deny / authorizer cleared by a transfer / stale re-seal reverts
+///   the whole tx — the clone is simply not minted (fail-closed by
+///   construction; the route's pre-check was UX only).
 ///
 /// A pre-mint re-seal failure flips `mint_stage = Failed` (phase → Failed, so
 /// the dead clone is visible, not stuck Deploying) and bails. Clone failures
 /// aren't retryable via `/retry` in v0 — re-POST `/clone` with a new key.
+#[allow(clippy::too_many_arguments)]
 async fn handle_clone(
     ctx: &Ctx,
     new_seal_id: SealId,
@@ -968,6 +980,7 @@ async fn handle_clone(
     name: String,
     description: String,
     image: Option<String>,
+    authorization: JobCloneAuth,
 ) -> anyhow::Result<()> {
     let source = ctx
         .deployments
@@ -1056,23 +1069,132 @@ async fn handle_clone(
         })
         .await?;
 
-    // Mint the clone to the target owner: the source's CURRENT on-chain iData
-    // (descriptions + dataHashes) with keys re-sealed to the clone's agentSeal.
-    let mint_params = MintParams {
-        to: target_owner,
-        agent_uri: String::new(),
-        metadata: Vec::new(),
-        intelligent_datas: idatas,
-        sealed_keys,
-        agent_seal: new_kp.address,
-        seal_id: new_seal_id,
-    };
-    run_mint_track(ctx, new_seal_id, mint_params).await?;
+    // Mint the clone to the target owner. Owner mode: the source's CURRENT
+    // on-chain iData (descriptions + dataHashes) with keys re-sealed to the
+    // clone's agentSeal, via registerWithSeal. Contract mode: the same
+    // artifacts via the policy-gated cloneFrom — the on-chain authorizer
+    // consult is atomic with the mint, and the dataHashes we submit (read
+    // live above, re-sealed just now) must match on-chain storage at mint
+    // time or the tx reverts (stale re-seal → clean failure).
+    let data_hashes: Vec<B256> = idatas.iter().map(|d| d.data_hash).collect();
+    match authorization {
+        JobCloneAuth::Owner => {
+            let mint_params = MintParams {
+                to: target_owner,
+                agent_uri: String::new(),
+                metadata: Vec::new(),
+                intelligent_datas: idatas,
+                sealed_keys,
+                agent_seal: new_kp.address,
+                seal_id: new_seal_id,
+            };
+            run_mint_track(ctx, new_seal_id, mint_params).await?;
+        }
+        JobCloneAuth::Contract { authorizer, auth_data, caller } => {
+            let clone_params = CloneFromParams {
+                source_agent_id,
+                to: target_owner,
+                data_hashes: data_hashes,
+                sealed_keys,
+                agent_seal: new_kp.address,
+                seal_id: new_seal_id,
+                caller,
+                authorizer,
+                auth_data,
+            };
+            run_clone_from_track(ctx, new_seal_id, clone_params).await?;
+        }
+    }
 
     // Identity finalize (card + setAgentURI, empty url). Container never
     // runs → clone lands Offline; target owner brings it online later.
     run_phase2(ctx, new_seal_id, &name, &description, image.as_deref()).await?;
 
+    Ok(())
+}
+
+/// Contract-mode clone mint: submit AgenticID `cloneFrom` and drive the mint
+/// stage machine, mirroring `run_mint_track`'s transitions. The tx reverts
+/// (policy deny / authorizer cleared / dataHash mismatch) surface as
+/// `mint_stage = Failed` with the decoded revert reason — the clone is not
+/// minted, fail-closed by construction.
+async fn run_clone_from_track(
+    ctx: &Ctx,
+    seal_id: SealId,
+    params: CloneFromParams,
+) -> anyhow::Result<()> {
+    // NB: explicit trait call — a bare `ctx.chain.clone_from(...)` would
+    // resolve to `Clone::clone_from` on the Arc wrapper, not the chain method.
+    let submit = match ChainClient::clone_from(ctx.chain.as_ref(), params).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let now = Utc::now();
+            let reason = format!("cloneFrom submit: {e}");
+            ctx.deployments
+                .set_mint_stage(
+                    seal_id,
+                    StageStatus::Failed {
+                        at: now,
+                        reason: reason.clone(),
+                    },
+                )
+                .await?;
+            ctx.events
+                .publish(WsEvent::MintFailed {
+                    seal_id,
+                    reason: reason.clone(),
+                })
+                .await?;
+            anyhow::bail!(reason);
+        }
+    };
+
+    let now = Utc::now();
+    ctx.deployments
+        .set_mint_stage(
+            seal_id,
+            StageStatus::Submitted { at: now, tx_hash: Some(submit) },
+        )
+        .await?;
+    ctx.events
+        .publish(WsEvent::MintSubmitted {
+            seal_id,
+            tx_hash: submit,
+        })
+        .await?;
+
+    let receipt = ctx.chain.wait_receipt(submit).await?;
+    if !receipt.success {
+        let now = Utc::now();
+        let reason = "cloneFrom reverted on chain".to_string();
+        ctx.deployments
+            .set_mint_stage(
+                seal_id,
+                StageStatus::Failed {
+                    at: now,
+                    reason: reason.clone(),
+                },
+            )
+            .await?;
+        ctx.events
+            .publish(WsEvent::MintFailed {
+                seal_id,
+                reason: reason.clone(),
+            })
+            .await?;
+        anyhow::bail!(reason);
+    }
+    let agent_id = receipt
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("cloneFrom receipt missing ClonedFrom event"))?;
+    let now = Utc::now();
+    ctx.deployments
+        .set_mint_stage(seal_id, StageStatus::Confirmed { at: now })
+        .await?;
+    ctx.deployments.set_agent_id(seal_id, agent_id).await?;
+    ctx.events
+        .publish(WsEvent::MintConfirmed { seal_id, agent_id })
+        .await?;
     Ok(())
 }
 
@@ -1823,9 +1945,18 @@ mod tests {
         );
         seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
 
-        handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None)
-            .await
-            .expect("clone must succeed");
+        handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            target,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Owner,
+        )
+        .await
+        .expect("clone must succeed");
 
         // Minted to the target owner with the clone's new agentSeal, and the
         // minted sealed_key re-seals correctly: decrypting it with the NEW
@@ -1847,6 +1978,76 @@ mod tests {
         assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
         assert!(clone.agent_id.is_some(), "clone must be minted");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_clone_contract_mode_mints_via_clone_from() {
+        // Issue #133: a contract-mode clone must mint through the policy-
+        // gated `cloneFrom` (NOT registerWithSeal), carrying the live
+        // authorizer, the buyer's auth_data and the re-sealed keys.
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let buyer = Address::from([0xbb; 20]);
+        let authorizer = Address::from([0xa7; 20]);
+        let auth_data = Bytes::from_static(b"purchase-1");
+
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
+        let known_key = vec![0x9u8; 32];
+        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(sealed)],
+        );
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, buyer);
+
+        handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            buyer,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Contract { authorizer, auth_data: auth_data.clone(), caller: buyer },
+        )
+        .await
+        .expect("contract-mode clone must succeed");
+
+        // Minted via cloneFrom with the full policy context…
+        let p = t.chain.last_clone_from.lock().unwrap().clone().unwrap();
+        assert_eq!(p.to, buyer, "cloneFrom mints to the buyer");
+        assert_eq!(p.agent_seal, new_kp.address);
+        assert_eq!(p.seal_id, new_seal);
+        assert_eq!(p.caller, buyer, "caller = the buyer (route-proven)");
+        assert_eq!(p.authorizer, authorizer, "live authorizer forwarded");
+        assert_eq!(p.auth_data, auth_data, "buyer auth_data forwarded");
+        assert_eq!(p.data_hashes, vec![B256::repeat_byte(0x33)], "live dataHashes submitted");
+        // …and NOT via registerWithSeal.
+        assert!(
+            t.chain.last_register.lock().unwrap().is_none(),
+            "contract mode must not touch registerWithSeal"
+        );
+        // The re-sealed key decrypts under the clone's agentSeal.
+        let got = t.ctx.crypto.ecies_decrypt(&p.sealed_keys[0], &new_kp.priv_key).unwrap();
+        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey");
+        // Identity finalized as usual.
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
+        assert!(clone.agent_id.is_some(), "clone must be minted");
     }
 
     #[tokio::test]
@@ -1875,7 +2076,17 @@ mod tests {
         );
         seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
 
-        let res = handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None).await;
+        let res = handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            target,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Owner,
+        )
+        .await;
         assert!(res.is_err(), "re-seal failure must bail");
         let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
         assert!(

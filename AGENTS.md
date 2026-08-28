@@ -18,7 +18,7 @@ Guidance for AI coding agents working in this repository. (Claude Code loads thi
 ```bash
 # contracts — submodules first, once:
 git submodule update --init --recursive
-cd contracts && forge build && forge test          # 190 tests / 21 suites; 2 fork tests skip unless FORK_RPC is set
+cd contracts && forge build && forge test          # 209 tests / 22 suites; 2 fork tests skip unless FORK_RPC is set
 forge test --match-contract TransferFlow           # one suite
 forge test --match-test test_iCloneFrom_succeeds   # one test
 

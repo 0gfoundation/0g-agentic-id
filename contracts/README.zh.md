@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 190 tests / 21 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 209 tests / 22 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -323,8 +323,33 @@ canonical 条目做交集。
   之下，无需重加密；运营权链下随 ownership 走（attestor 给新 owner 重新
   provision）。seal 绑定的 token 调 `iTransferFrom` 和 `iCloneFrom` 都会
   **revert**（`AgenticIDSealedAgentUseTransfer` / `AgenticIDCannotCloneSealedAgent`）。
+  fork 一个 seal 绑定的 agent 走 attestor 的 `/clone` 端点，两种授权模式
+  （issue #133）：**owner 模式**——源 agent 现任 owner 签
+  `AgenticID.Clone.v1` 意图；**contract 模式**（市场分叉）——**买家**签
+  `AgenticID.CloneContract.v1` 意图（canonical 绑定 `keccak256(auth_data)` 与
+  authorizer 地址），由 owner 配置的 `ICloneAuthorizer` 在 `cloneFrom` 里
+  原子决策。
 - **无 seal agent**（数据 blob）：普通 transfer 保持禁用；ownership 只能走下面
   proof 门禁的 `iTransferFrom`，原子地把 dataKey 重加密给买家。`iCloneFrom` 可用。
+
+### 政策模式克隆（issue #133）：`setCloneAuthorizer` + `cloneFrom`
+
+seal 绑定 agent 的 owner 可以把 fork 授权委托给一个政策合约——市场分叉流程：
+
+1. **发布者一次性 opt-in：** `setCloneAuthorizer(tokenId, authorizer)`——
+   `ICloneAuthorizer` 的纯 view `canClone(source, to, caller, authData)` 决定
+   contract 模式克隆是否放行。token 换 owner 时自动清空（owner 意图）；
+   `cloneSourceOf` 血统跨转让保留（历史事实）。authorizer 为零 → contract
+   模式 fail-closed。
+2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
+   目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer
+   只能转运意图，不能换 auth_data 重放，也不能跨政策轮换搬运），经 attestor
+   `/clone`（或 SDK 的 `ag.agent.clone({ authorization: { authData } })`）提交。
+3. **原子门禁：** attestor worker 走 `cloneFrom` 铸造，`canClone` 与铸造同交易
+   执行——迟到的 deny、被清空的 authorizer、过期的 re-seal 都会让整笔交易
+   revert。`nonReentrant`，与 iTransferFrom/iCloneFrom 同款。revert 的
+   authorizer 冒泡自己的 revert 数据（fail-closed、保留诊断信息）；
+   `AgenticIDCloneDenied` 只用于未配置/明确拒绝。
 
 ### `iTransferFrom`（无 seal）—— 更换 ownership + 原子交付 dataKey
 
@@ -425,7 +450,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-190 个 Foundry tests / 21 suites（188 通过，2 个 fork 测试未设 `FORK_RPC`
+209 个 Foundry tests / 22 suites（207 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
