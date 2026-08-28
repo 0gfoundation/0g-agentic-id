@@ -9,6 +9,7 @@ juggling):
 ```bash
 OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 \
   VERIFIED_FEEDBACK_ADDR=0x<verified-feedback registry> \
+  FEEDBACK_BATCHER_ADDR=0x<7702 batcher, optional> \
   [RUN_UNIT=1] [SKIP_TRANSFER=1] bash attestor/scripts/regression.sh
 ```
 
@@ -132,7 +133,10 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
 # indexer owner sync, and the post-transfer owner gate (old owner
 # rejected, new owner can recreate). Needs VERIFIED_FEEDBACK_ADDR = the
 # VerifiedFeedbackRegistry bound to this AgenticID (the canonical 8004
-# reputation registry is discovered from it).
+# reputation registry is discovered from it). FEEDBACK_BATCHER_ADDR is
+# optional: set → the feedback leg goes through the atomic EIP-7702 path;
+# unset → the script falls back to the attestor /config's advertised value,
+# and to the sequential two-tx flow when that is absent too.
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
   SEAL_ID=0x… AGENT_ID=<id> VERIFIED_FEEDBACK_ADDR=0x… node scripts/lifecycle-e2e.cjs
 

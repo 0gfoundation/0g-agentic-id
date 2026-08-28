@@ -271,11 +271,17 @@ await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n  
 // verified reads — only proof-backed entries count here
 await ag.reputation.isVerified(agentId, buyer, idx);            // → true
 // 7702 notes: the delegation PERSISTS on your EOA between calls (that is what
-// lets later feedback skip re-signing). To remove it, sign a delegation to the
-// zero address — the standard 7702 escape hatch. And on a wallet with pending
-// transactions, the authorization's nonce (account nonce + 1 at signing time)
-// can be raced by a concurrent tx — the type-4 send then errors at the node;
-// it is safe to simply retry giveFeedback.
+// lets later feedback skip re-signing). Check it with getCode(yourAddress):
+// delegated reads 0xef0100‖batcher, undelegated reads 0x. To remove it, sign a
+// delegation to the zero address — the standard 7702 escape hatch. If the
+// environment later advertises a NEW batcher address, your EOA keeps running
+// the OLD code until the next giveFeedback re-delegates (the SDK does this
+// automatically on designator mismatch). Wallets that cannot sign a 7702
+// authorization at all — JSON-RPC accounts, i.e. browser/external signers
+// without type-4 support — silently take the sequential two-tx path instead.
+// And on a wallet with pending transactions, the authorization's nonce
+// (account nonce + 1 at signing time) can be raced by a concurrent tx — the
+// type-4 send then errors at the node; it is safe to simply retry giveFeedback.
 // pass `task: { method, uri, reqBodyHash, respBodyHash, statusCode }` to
 // giveFeedback (the receipt materials of the rated interaction — bodies stay
 // private, only their hashes go on-chain) and the contract opens the proof's
@@ -662,11 +668,11 @@ npx 0g-agenticid --help
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agenticid>`): `list` (public listing, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `deploy` (framework + model wizard), `balance` / `deposit [og]` (prepaid sandbox account), `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami`, `quit`.
+Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
 The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
-Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL) and `credentials` (owner key + inference key, JSON, chmod 600). The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
 ### Diagnostics subcommands
 

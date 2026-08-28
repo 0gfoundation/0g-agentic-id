@@ -279,6 +279,12 @@ the assigned index inside the same transaction. A failed attest rolls back the
 canonical write. Without 7702 the SDK falls back to the sequential two-tx flow
 below.
 
+The delegation **persists** on the EOA (`getCode(you)` reads `0xef0100‖batcher`
+while delegated); undelegate by signing a delegation to the zero address. When
+an environment advertises a NEW batcher address, already-delegated EOAs keep
+executing the old code until their next giveFeedback re-delegates (the SDK
+does this automatically).
+
 ```solidity
 // 1. feedback → the canonical registry (attribution = msg.sender, natively)
 canonicalReputation.giveFeedback(agentId, value, valueDecimals,

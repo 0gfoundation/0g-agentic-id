@@ -12,6 +12,8 @@
 #   VERIFIED_FEEDBACK_ADDR  VerifiedFeedbackRegistry bound to this AgenticID
 #                    (canonical 8004 reputation registry is discovered from
 #                    it); if unset, the feedback/lifecycle leg is skipped
+#   FEEDBACK_BATCHER_ADDR  optional EIP-7702 batcher for the atomic feedback
+#                    path; unset falls back to /config, then to two txs
 #   RUN_UNIT=1       also run the free T0 suites (cargo/go) first
 #   SKIP_TRANSFER=1  skip the (slow, ~10 min) self-contained transfer-live leg
 #

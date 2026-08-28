@@ -269,6 +269,11 @@ type-4 交易**：client 的 EOA 委托给 `FeedbackBatcher` 后自调用
 msg.sender 都是 client 本人），index 在同一笔交易内读取；盖章失败会连
 canonical 写入一起回滚。链不支持 7702 时 SDK 退回下面的两笔顺序流程。
 
+**委托是持久的**：type-4 落链后委托一直挂在 EOA 上（`getCode(你的地址)` 读到
+`0xef0100‖batcher` 即已委托），后续打分因此免重签；注销 = 再签一次指向零地址
+的委托（7702 标准出口）。环境更换 batcher 地址后，已委托的 EOA 在下次
+giveFeedback 时由 SDK 自动迁移。
+
 ```solidity
 // 1. feedback → canonical 注册表（归因 = msg.sender，原生）
 canonicalReputation.giveFeedback(agentId, value, valueDecimals,
