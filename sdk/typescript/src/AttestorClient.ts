@@ -12,6 +12,7 @@ import type { Address } from 'viem';
 import { requireWallet, type Ctx } from './context';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
+export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
 export const DEPLOY_DOMAIN = 'AgenticID.Deploy.v1';
 
 export interface CloneParams {
@@ -23,6 +24,21 @@ export interface CloneParams {
    * the existing clone instead of minting a duplicate).
    */
   idempotencyKey?: string;
+  /**
+   * Contract-mode credentials (issue #133 marketplace fork flow). Omit for the
+   * original owner mode — the connected wallet must then be the source's
+   * current on-chain owner.
+   *
+   * In contract mode the connected wallet is the BUYER (`targetOwner`): it
+   * signs a clone-intent (domain `AgenticID.CloneContract.v1`), and the
+   * source owner's on-chain `ICloneAuthorizer` decides whether the clone may
+   * mint. `authData` is opaque bytes forwarded to the authorizer — the
+   * marketplace defines its shape (e.g. abi-encoded purchase id).
+   */
+  authorization?: {
+    /** Opaque bytes forwarded to the source's `ICloneAuthorizer.canClone`. */
+    authData: `0x${string}`;
+  };
 }
 
 /** One intelligent-data input (role + opaque JSON plaintext + extra description fields). */
@@ -386,26 +402,53 @@ export class AttestorClient {
   }
 
   /**
-   * Clone `sourceAgentId` to `targetOwner`. The connected wallet must be the
-   * current on-chain owner of the source. Lands Offline for the target owner.
+   * Clone `sourceAgentId` to `targetOwner`. Lands Offline for the target owner.
+   *
+   * Owner mode (default): the connected wallet must be the current on-chain
+   * owner of the source. Contract mode (`authorization`): the connected
+   * wallet is the BUYER — it signs a `AgenticID.CloneContract.v1` intent, and
+   * the source owner's on-chain authorizer decides. The intent signature is
+   * transported by the marketplace backend verbatim (relayer can submit, not
+   * alter).
    */
   async clone(params: CloneParams): Promise<DeployCloneResponse> {
     const { walletClient, account } = requireWallet(this.ctx);
     if (params.sourceAgentId > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error('sourceAgentId too large for JSON number encoding');
     }
+    if (params.authorization && params.targetOwner.toLowerCase() !== account.address.toLowerCase()) {
+      throw new Error(
+        'contract mode requires the connected wallet to be targetOwner ' +
+          '(the buyer signs the intent)',
+      );
+    }
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
+    const domain = params.authorization ? CLONE_CONTRACT_DOMAIN : CLONE_DOMAIN;
     const canonical = JSON.stringify({
-      domain: CLONE_DOMAIN,
+      domain,
       idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
-    return this.post('/clone', {
+    const common = {
       idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
+    };
+    if (params.authorization) {
+      return this.post('/clone', {
+        ...common,
+        authorization: {
+          mode: 'contract',
+          intent_signature: signature,
+          intent_signed_message_b64: b64encode(canonical),
+          auth_data: params.authorization.authData,
+        },
+      });
+    }
+    return this.post('/clone', {
+      ...common,
       owner_signature: signature,
       owner_signed_message_b64: b64encode(canonical),
     });

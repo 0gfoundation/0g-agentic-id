@@ -139,6 +139,23 @@ const newOwner = '0x1111111111111111111111111111111111111111';
 const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner }, { wait: 'minted' });
 // cl → { sealId, agentSealAddr, agentId }  — the new agent's tokenId; lands Offline for the new owner
 
+// marketplace fork (issue #133) — contract-mode clone. The publisher opts in
+// ONCE on chain; after that, buyers clone themselves (the connected wallet IS
+// the buyer; the source owner is not involved per request):
+//   1. publisher: await ag.agent.setCloneAuthorizer(agentId, marketPolicyAddr)
+//      (a marketplace's ICloneAuthorizer contract; revoke with the zero address,
+//       or just transfer the token — the contract clears it automatically)
+//   2. buyer:     await ag.agent.clone({
+//                    sourceAgentId: agentId,
+//                    targetOwner: buyerAddress,          // must equal the connected wallet
+//                    authorization: { authData: '0x...' } // opaque bytes → the authorizer
+//                 }, { wait: 'minted' })
+// The buyer signs an intent under a DISTINCT domain (AgenticID.CloneContract.v1),
+// so a marketplace backend can relay the request verbatim but cannot retarget
+// or re-source it. The on-chain authorizer decides (pre-checked for a friendly
+// 403, enforced atomically inside the cloneFrom mint — no verify-mint race).
+// Lineage: await ag.agent.cloneSourceOf(cloneAgentId) → sourceAgentId
+
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass
 // your own STABLE key to make a retry dedupe server-side (same key → the attestor
 // returns the existing deploy/clone instead of minting a duplicate):

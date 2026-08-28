@@ -159,6 +159,12 @@ export class AgentApi {
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
    * `{ sealId, agentSealAddr }` on acceptance; `wait: 'minted'` also blocks on
    * the mint (adds `agentId`), `wait: 'running'` also blocks on provision.
+   *
+   * Two modes (issue #133): omit `authorization` for owner mode (the
+   * connected wallet must be the source's current owner); pass
+   * `authorization: { authData }` for contract mode — the marketplace fork
+   * flow, where the connected wallet IS the buyer and the source owner's
+   * on-chain `ICloneAuthorizer` (see {@link setCloneAuthorizer}) decides.
    */
   clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
   clone(params: CloneParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
@@ -172,6 +178,28 @@ export class AgentApi {
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
+  // ── Policy-mode cloning (issue #133) ──────────────────────────────────────
+
+  /**
+   * Configure (or clear, with the zero address) a token's clone authorizer —
+   * the `ICloneAuthorizer` contract deciding which contract-mode clones may
+   * mint. The publisher's one-time opt-in to marketplace forks; owner-only.
+   * Cleared automatically when the token changes owner.
+   */
+  async setCloneAuthorizer(tokenId: bigint, authorizer: Address): Promise<WriteContractReturnType> {
+    return this.id.setCloneAuthorizer(tokenId, authorizer);
+  }
+
+  /** The configured clone authorizer (`0x0` = none → contract-mode clones fail closed). */
+  async cloneAuthorizerOf(tokenId: bigint): Promise<Address> {
+    return this.id.cloneAuthorizerOf(tokenId);
+  }
+
+  /** For a clone, the agentId it was forked from (0n = not a clone; survives transfers). */
+  async cloneSourceOf(agentId: bigint): Promise<bigint> {
+    return this.id.cloneSourceOf(agentId);
+  }
+
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
     return this.id.transferFrom(from, to, tokenId);
