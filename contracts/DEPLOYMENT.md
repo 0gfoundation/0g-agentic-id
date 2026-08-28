@@ -125,8 +125,17 @@ defense-in-depth).
   `transferFrom` / `safeTransferFrom` is **re-enabled**, `iTransferFrom` **reverts**
   (`AgenticIDSealedAgentUseTransfer`), `iCloneFrom` **reverts**
   (`AgenticIDCannotCloneSealedAgent`). Operation rights follow ownership off-chain
-  (attestor owner-gating). Forking goes through an attestor-mediated re-key (the
-  `/clone` endpoint).
+  (attestor owner-gating). Forking goes through the attestor's `/clone` endpoint,
+  in one of two authorization modes (issue #133):
+  - **Owner mode** — the source's current owner signs a
+    `AgenticID.Clone.v1` intent (EIP-191), verified against live `ownerOf`.
+  - **Contract mode** (marketplace fork) — the BUYER signs a
+    `AgenticID.CloneContract.v1` intent whose canonical binds
+    `keccak256(auth_data)` and the authorizer address; the attestor reads the
+    authorizer live (`cloneAuthorizerOf`), pre-checks `canClone` (fail-closed),
+    and the worker mints via `cloneFrom` — the on-chain policy consult is
+    atomic with the mint. The source owner opts in per token via
+    `setCloneAuthorizer` (cleared on transfer; `cloneSourceOf` lineage survives).
 - **Non-seal agent** = a data blob. Plain transfers stay disabled; ownership moves
   only via proof-gated `iTransferFrom` (re-encrypts `dataKey` to the buyer);
   `iCloneFrom` works as before.
@@ -299,15 +308,29 @@ beacon upgrade and was verified post-upgrade — see changelog):
 
 | Contract | dev VERSION | test VERSION |
 |---|---|---|
-| AgenticID | **1.1.0** | **1.1.0** |
+| AgenticID | **1.1.0** (1.2.0 impl in PR #145, pending beacon upgrade) | **1.1.0** (same) |
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
 | VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
+> AgenticID **1.2.0** (policy-mode cloning, issue #133 / PR #145) is implemented
+> and tested but NOT yet live on either environment — upgrade via the dev/test
+> Timelock after merge.
 
 Changelog:
+
+- **AgenticID 1.2.0 (PR #145, pending beacon upgrade)** — policy-mode cloning
+  (issue #133): ERC-7201-appended `cloneAuthorizers` + `cloneSource` storage
+  (layout-compatible), `setCloneAuthorizer` (owner-only; cleared on transfer in
+  `_update`), `cloneAuthorizerOf` / `cloneSourceOf` reads, `cloneFrom` — a
+  trusted-attestor-only mint consulting the owner-configured
+  `ICloneAuthorizer` atomically with the mint (`nonReentrant`, parity with
+  iTransferFrom/iCloneFrom). New events `CloneAuthorizerSet`, `ClonedFrom`.
+  Wire counterpart: attestor dual-mode `POST /clone` (contract-mode buyer
+  intents bind `keccak256(auth_data)` + the authorizer) and SDK
+  `ag.agent.clone({ authorization: { authData } })`.
 
 - **VerifiedFeedbackRegistry 1.1.0, dev beacon-upgraded 2026-08-28** —
   task-receipt opening (`attestFeedbackWithTask`, `getVerifiedEndpoint`,
