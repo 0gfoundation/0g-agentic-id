@@ -53,6 +53,7 @@ ERC1967_BEACON_SLOT=0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35
 IMPL_CANDIDATES=(
     "src/AgenticID.sol:AgenticID"
     "src/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry"
+    "src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry"
     "src/verifiers/TEEDataVerifier.sol:TEEDataVerifier"
 )
 

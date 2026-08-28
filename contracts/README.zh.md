@@ -456,5 +456,5 @@ proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写�
 ## 10. 进一步阅读
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** —— 部署 / 升级 / Etherscan verify 全套
-  runbook（10 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
+  runbook（11 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
   Galileo testnet 参考地址）。

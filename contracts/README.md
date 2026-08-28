@@ -482,5 +482,5 @@ inherits this base and adds the business assertions.
 ## 10. Further reading
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
-  runbook (10 contracts in a single deploy, Timelock two-stage upgrade, how
+  runbook (11 contracts in a single deploy, Timelock two-stage upgrade, how
   `verify.sh` works, 0g Galileo testnet reference addresses).

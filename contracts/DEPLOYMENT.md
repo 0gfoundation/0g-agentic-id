@@ -8,14 +8,18 @@
 ## 1. Architecture
 
 Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
-`AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
-Implementation**. All three beacons are owned by one **TimelockController**;
-upgrades are two-phase `schedule → wait → execute`.
+`VerifiedFeedbackRegistry` / the deprecated `AgenticIDReputationRegistry`)
+uses **BeaconProxy + UpgradeableBeacon + Implementation**. All beacons are
+owned by one **TimelockController**; upgrades are two-phase
+`schedule → wait → execute`. `FeedbackBatcher` is the one non-upgradeable
+piece: stateless and privilege-free (an EIP-7702 delegate target), it is
+replaced by deploying a new one and re-delegating.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
 ERC-8004 Identity Registry** (binding semantics in §2).
-`AgenticIDReputationRegistry` extends ERC-8004 reputation; `giveFeedback` requires
-a TEE-signed ServeProof (§2.2).
+Reputation is split (§2.1): feedback lives in the canonical ERC-8004
+Reputation Registry; `VerifiedFeedbackRegistry` stamps TEE verification marks
+(ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated.
 
 Each contract has a `string public constant VERSION`, bumped whenever the impl
 changes — **the version scheme + upgrade procedure are in
@@ -134,8 +138,8 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 
 ## 3. Deploy
 
-`script/Deploy.s.sol` deploys all 10 contracts in one run (Timelock + 3 × (impl +
-beacon + proxy)); verified-feedback/verifier bind to the freshly-minted AgenticID,
+`script/Deploy.s.sol` deploys all 11 contracts in one run (Timelock + 3 × (impl +
+beacon + proxy) + FeedbackBatcher); verified-feedback/verifier bind to the freshly-minted AgenticID,
 AgenticID binds to `CANONICAL_8004`, and the verified-feedback registry anchors to
 `CANONICAL_8004_REPUTATION` (both chainId defaults):
 
@@ -151,7 +155,7 @@ forge script script/Deploy.s.sol \
 ```
 
 `PROPOSERS`/`EXECUTORS` default to proposers=[OWNER], executors=[0x0] (open
-execution). The run prints all 10 addresses — record them in §6.
+execution). The run prints all 11 addresses — record them in §6.
 
 **Required post-deploy (fresh contract = empty allowlists):** the owner must
 `addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`)
@@ -297,12 +301,24 @@ beacon upgrade and was verified post-upgrade — see changelog):
 |---|---|---|
 | AgenticID | **1.1.0** | **1.1.0** |
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
-| AgenticIDReputationRegistry | **1.2.0** | **1.2.0** |
+| AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
+| VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
 
 Changelog:
+
+- **VerifiedFeedbackRegistry 1.1.0, dev beacon-upgraded 2026-08-28** —
+  task-receipt opening (`attestFeedbackWithTask`, `getVerifiedEndpoint`,
+  `getVerifiedSummaryForEndpoint`; `FeedbackVerified` gains taskHash + uri).
+  Impl `0x6d785265d1C6c97C245988e50478605760D9b021`, two-phase via the dev
+  Timelock (`minDelay=0`); post-upgrade `VERSION()` verified 1.1.0 on chain.
+  `FeedbackBatcher` redeployed for the TaskReveal pass-through:
+  `0x59921B5C874b4ed311aecB43cBfB97d43dc748BF` (supersedes `0x8E8997…524f`).
+- **VerifiedFeedbackRegistry 1.0.0, dev deployed 2026-08-27** — initial
+  (canonical-reputation split, PR #144), via `DeployVerifiedFeedback.s.sol`;
+  atomicity of the 7702 batch verified live (bad-proof rollback).
 
 - **Audit batch (PR #103), test beacon-upgraded 2026-08-10** — proposer/executor
   `0xea69…`, timelock `0x111b6c…`, `minDelay=0`, open execution. Reused the
