@@ -46,8 +46,10 @@ INTERACTIVE (default — no command)
                             hello <agentId|seal> any agent's public /hello
                                                  (banks a rating ticket if a
                                                  wallet is configured)
-                            rate <id> [score]    rate an agent on-chain
-                                                 (serve-proof-backed feedback)
+                            call <id> [path]     use an agent's service (banks
+                                                 a rating ticket)
+                            rate <id> [score]    rate an agent on-chain, spending
+                                                 a ticket from call/hello (<1h)
                                                  (identity + services + proof)
                             deploy               new-agent wizard, then chat
                             start/stop/reset <id> lifecycle without entering

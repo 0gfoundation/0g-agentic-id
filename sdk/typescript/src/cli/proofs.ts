@@ -55,7 +55,12 @@ function writeJar(entries: SavedProof[]): void {
   writeFileSync(jarPath(), `${JSON.stringify(entries, null, 2)}\n`, { mode: 0o600 });
 }
 
-/** Save (or replace) the ticket for (agentId, submitter) — latest wins. */
+/** Tickets kept per (agentId, submitter). Proofs expire in ~1h anyway, so
+ *  the cap only bounds the file against pathological call loops. */
+const MAX_TICKETS_PER_PAIR = 5;
+
+/** Bank a ticket (append — one proof backs one rating, several interactions
+ *  with one agent yield several independently spendable tickets). */
 export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string): void {
   const entry: SavedProof = {
     agentId: proof.agentId.toString(),
@@ -75,33 +80,35 @@ export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string)
     },
     task,
   };
-  const rest = loadJar().filter(
-    (e) => !(e.agentId === entry.agentId && e.submitter.toLowerCase() === entry.submitter.toLowerCase()),
+  const all = loadJar();
+  const mine = all.filter(
+    (e) => e.agentId === entry.agentId && e.submitter.toLowerCase() === entry.submitter.toLowerCase(),
   );
-  writeJar([...rest, entry]);
+  const others = all.filter((e) => !mine.includes(e));
+  // newest kept; oldest dropped past the cap
+  const kept = [...mine, entry]
+    .sort((a, b) => b.capturedAt - a.capturedAt)
+    .slice(0, MAX_TICKETS_PER_PAIR);
+  writeJar([...others, ...kept]);
 }
 
-/** An unexpired ticket for (agentId, wallet), if any — with a mining-time
- *  margin so a ticket seconds from expiry isn't offered. */
-export function findProof(agentId: bigint, wallet: `0x${string}`, marginSeconds = 120): SavedProof | null {
+/** All unexpired tickets for (agentId, wallet), newest first — with a
+ *  mining-time margin so a ticket seconds from expiry isn't offered. */
+export function listProofs(agentId: bigint, wallet: `0x${string}`, marginSeconds = 120): SavedProof[] {
   const now = Math.floor(Date.now() / 1000);
-  return (
-    loadJar().find(
+  return loadJar()
+    .filter(
       (e) =>
         e.agentId === agentId.toString() &&
         e.submitter.toLowerCase() === wallet.toLowerCase() &&
         e.deadline > now + marginSeconds,
-    ) ?? null
-  );
+    )
+    .sort((a, b) => b.capturedAt - a.capturedAt);
 }
 
-/** Remove a spent (or refused) ticket. */
-export function removeProof(agentId: bigint, wallet: `0x${string}`): void {
-  writeJar(
-    loadJar().filter(
-      (e) => !(e.agentId === agentId.toString() && e.submitter.toLowerCase() === wallet.toLowerCase()),
-    ),
-  );
+/** Burn ONE spent (or refused) ticket, identified by its unique signature. */
+export function removeProof(signature: `0x${string}`): void {
+  writeJar(loadJar().filter((e) => e.proof.signature !== signature));
 }
 
 /** Rehydrate the bigint fields for SDK submission. */
