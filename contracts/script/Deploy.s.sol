@@ -10,6 +10,7 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 
 import {AgenticID} from "../src/AgenticID.sol";
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
+import {CloneGate} from "../src/CloneGate.sol";
 import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 
@@ -56,6 +57,9 @@ contract Deploy is Script {
         address verifiedFeedbackBeacon;
         address verifiedFeedback;
         address feedbackBatcher;
+        address cloneGateImpl;
+        address cloneGateBeacon;
+        address cloneGate;
     }
 
     function run() external returns (Deployed memory d) {
@@ -129,6 +133,19 @@ contract Deploy is Script {
         //    replace by deploying a new one and re-delegating).
         d.feedbackBatcher = address(new FeedbackBatcher(c.canonicalReputation, address(vfProxy)));
 
+        // 6. Clone gate (policy-mode cloning satellite). NOTE: post-deploy, the
+        //    AgenticID owner must `addTrustedAttestor(cloneGate)` — the gate
+        //    mints through registerWithSeal (same manual step as trusting the
+        //    real attestor).
+        CloneGate cgImpl = new CloneGate();
+        UpgradeableBeacon cgBeacon = new UpgradeableBeacon(address(cgImpl), address(timelock));
+        BeaconProxy cgProxy = new BeaconProxy(
+            address(cgBeacon), abi.encodeCall(CloneGate.initialize, (address(agenticIdProxy)))
+        );
+        d.cloneGateImpl = address(cgImpl);
+        d.cloneGateBeacon = address(cgBeacon);
+        d.cloneGate = address(cgProxy);
+
         vm.stopBroadcast();
 
         _printDeployed(d);
@@ -180,6 +197,9 @@ contract Deploy is Script {
         console2.log("VerifiedFeedback beacon:    ", d.verifiedFeedbackBeacon);
         console2.log("VerifiedFeedback proxy:     ", d.verifiedFeedback);
         console2.log("FeedbackBatcher:            ", d.feedbackBatcher);
+        console2.log("CloneGate impl:             ", d.cloneGateImpl);
+        console2.log("CloneGate beacon:           ", d.cloneGateBeacon);
+        console2.log("CloneGate proxy:            ", d.cloneGate);
     }
 
     /// @dev Canonical ERC-8004 IdentityRegistry by chainId. ERC-8004 is deployed

@@ -92,6 +92,7 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
+  cloneGateAbi,
   canonicalReputationAbi,
   verifiedFeedbackAbi,
   feedbackBatcherAbi,

@@ -5,7 +5,16 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDSealIdTaken, AgenticIDCloneDenied, AgenticIDCloneDataHashMismatch} from "../src/AgenticID.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDSealIdTaken} from "../src/AgenticID.sol";
+import {
+    CloneGate,
+    CloneGateNotTrustedAttestor,
+    CloneGateNotTokenOwner,
+    CloneGateDenied,
+    CloneGateDataHashMismatch,
+    CloneGateArityMismatch
+} from "../src/CloneGate.sol";
 import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
 import {ICloneAuthorizer} from "../src/interfaces/ICloneAuthorizer.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
@@ -26,7 +35,7 @@ contract ToggleAuthorizer {
 /// @dev An authorizer that REVERTS (a failed require) rather than returning
 ///      false — pins the documented bubbling semantics: the authorizer's own
 ///      revert data surfaces from cloneFrom unchanged, NOT
-///      AgenticIDCloneDenied (which is reserved for unconfigured/declined).
+///      CloneGateDenied (which is reserved for unconfigured/declined).
 contract RevertingAuthorizer {
     error PurchaseExpired(uint256 purchaseId);
 
@@ -61,7 +70,9 @@ contract BoundAuthorizer {
 
 /// @notice Policy-mode cloning (issue #133): setCloneAuthorizer / cloneFrom /
 ///         transfer-clearing semantics, against controllable authorizer mocks.
-contract CloneAuthorizerTest is AgenticIDTestBase {
+contract CloneGateTest is AgenticIDTestBase {
+    CloneGate internal gate;
+
     ToggleAuthorizer internal toggle;
     address internal buyer = address(0xB0B);
     address internal attacker = address(0xEA11);
@@ -77,6 +88,15 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         super.setUp();
         _whitelistAttestor();
         toggle = new ToggleAuthorizer();
+
+        CloneGate impl = new CloneGate();
+        ERC1967Proxy proxy = new ERC1967Proxy(
+            address(impl), abi.encodeCall(CloneGate.initialize, (address(agenticId)))
+        );
+        gate = CloneGate(address(proxy));
+        // The gate mints through registerWithSeal, so it must be allowlisted.
+        vm.prank(owner);
+        agenticId.addTrustedAttestor(address(gate));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -97,7 +117,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function _cloneFrom(uint256 sourceId, bytes32 dataHash) internal returns (uint256 cloneId) {
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
         vm.prank(attestor);
-        cloneId = agenticId.cloneFrom(
+        cloneId = gate.cloneFrom(
             sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA
         );
     }
@@ -108,7 +128,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
         vm.prank(attestor);
         vm.expectRevert(revertData);
-        agenticId.cloneFrom(
+        gate.cloneFrom(
             sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA
         );
     }
@@ -117,34 +137,34 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
 
     function test_setCloneAuthorizer_ownerSets() public {
         (uint256 sourceId,) = _mintSealedSource();
-        vm.expectEmit(true, true, true, true, address(agenticId));
-        emit AgenticID.CloneAuthorizerSet(sourceId, address(toggle));
+        vm.expectEmit(true, true, true, true, address(gate));
+        emit CloneGate.CloneAuthorizerSet(sourceId, address(toggle), owner);
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
-        assertEq(agenticId.cloneAuthorizerOf(sourceId), address(toggle), "authorizer set");
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(toggle), "authorizer set");
     }
 
     function test_setCloneAuthorizer_revertsForNonOwner() public {
         (uint256 sourceId,) = _mintSealedSource();
         vm.prank(attacker);
         vm.expectRevert(
-            abi.encodeWithSelector(IERC721Errors.ERC721IncorrectOwner.selector, attacker, sourceId, owner)
+            abi.encodeWithSelector(CloneGateNotTokenOwner.selector, attacker, sourceId, owner)
         );
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
     }
 
     function test_setCloneAuthorizer_revertsForNonexistentToken() public {
         vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(999)));
-        agenticId.setCloneAuthorizer(999, address(toggle));
+        gate.setCloneAuthorizer(999, address(toggle));
     }
 
     function test_setCloneAuthorizer_clearWithZero() public {
         (uint256 sourceId,) = _mintSealedSource();
         vm.startPrank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
-        agenticId.setCloneAuthorizer(sourceId, address(0));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(0));
         vm.stopPrank();
-        assertEq(agenticId.cloneAuthorizerOf(sourceId), address(0), "authorizer cleared");
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(0), "authorizer cleared");
     }
 
     // ── cloneFrom — happy paths ───────────────────────────────────────────────
@@ -152,12 +172,12 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function test_cloneFrom_happyPath() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         uint256 cloneId = _cloneFrom(sourceId, dataHash);
 
         assertEq(agenticId.ownerOf(cloneId), buyer, "clone minted to buyer");
-        assertEq(agenticId.cloneSourceOf(cloneId), sourceId, "lineage recorded");
+        assertEq(gate.cloneSourceOf(cloneId), sourceId, "lineage recorded");
         assertEq(agenticId.getAgentSeal(cloneId), CLONE_SEAL, "clone seal bound");
         assertEq(agenticId.getSealId(cloneId), CLONE_SEAL_ID, "clone sealId bound");
 
@@ -177,10 +197,10 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         BoundAuthorizer bound = new BoundAuthorizer(sourceId, buyer, buyer, AUTH_DATA);
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(bound));
+        gate.setCloneAuthorizer(sourceId, address(bound));
 
         uint256 cloneId = _cloneFrom(sourceId, dataHash);
-        assertEq(agenticId.cloneSourceOf(cloneId), sourceId, "bound policy allowed the clone");
+        assertEq(gate.cloneSourceOf(cloneId), sourceId, "bound policy allowed the clone");
     }
 
     /// @dev Sequential ids: no other mints between source and clone, so the
@@ -188,11 +208,11 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function test_cloneFrom_emitsClonedFrom() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         uint256 expectedCloneId = sourceId + 1;
-        vm.expectEmit(true, true, true, true, address(agenticId));
-        emit AgenticID.ClonedFrom(sourceId, expectedCloneId, buyer, buyer);
+        vm.expectEmit(true, true, true, true, address(gate));
+        emit CloneGate.ClonedFrom(sourceId, expectedCloneId, buyer, buyer);
 
         uint256 cloneId = _cloneFrom(sourceId, dataHash);
         assertEq(cloneId, expectedCloneId, "clone took the next canonical id");
@@ -203,12 +223,12 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function test_cloneFrom_revertsForNonAttestor() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
         vm.prank(attacker);
-        vm.expectRevert(AgenticIDNotTrustedAttestor.selector);
-        agenticId.cloneFrom(
+        vm.expectRevert(CloneGateNotTrustedAttestor.selector);
+        gate.cloneFrom(
             sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, attacker, AUTH_DATA
         );
     }
@@ -219,33 +239,33 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         _cloneFromExpectRevert(
             sourceId,
             dataHash,
-            abi.encodeWithSelector(AgenticIDCloneDenied.selector, sourceId, address(0))
+            abi.encodeWithSelector(CloneGateDenied.selector, sourceId, address(0))
         );
     }
 
     function test_cloneFrom_revertsWhenPolicyDenies() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
         toggle.setAllow(false);
 
         _cloneFromExpectRevert(
             sourceId,
             dataHash,
-            abi.encodeWithSelector(AgenticIDCloneDenied.selector, sourceId, address(toggle))
+            abi.encodeWithSelector(CloneGateDenied.selector, sourceId, address(toggle))
         );
     }
 
     /// @dev A REVERTING authorizer bubbles its own revert data (documented in
     ///      ICloneAuthorizer): the clone still fails closed, but the error is
-    ///      the authorizer's — AgenticIDCloneDenied is reserved for
+    ///      the authorizer's — CloneGateDenied is reserved for
     ///      unconfigured/declined, and the bubbled reason is the diagnostic
     ///      the tx submitter (the attestor worker) reports.
     function test_cloneFrom_revertingAuthorizerBubblesOwnData() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         RevertingAuthorizer reverting = new RevertingAuthorizer();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(reverting));
+        gate.setCloneAuthorizer(sourceId, address(reverting));
 
         _cloneFromExpectRevert(
             sourceId, dataHash, abi.encodeWithSelector(RevertingAuthorizer.PurchaseExpired.selector, 42)
@@ -255,7 +275,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function test_cloneFrom_revertsOnDataHashMismatch() public {
         (uint256 sourceId, bytes32 liveHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         // The attestor re-sealed against a stale snapshot (source evolved).
         bytes32 staleHash = keccak256("stale");
@@ -263,7 +283,7 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
             sourceId,
             staleHash,
             abi.encodeWithSelector(
-                AgenticIDCloneDataHashMismatch.selector, 0, liveHash, staleHash
+                CloneGateDataHashMismatch.selector, 0, liveHash, staleHash
             )
         );
     }
@@ -272,28 +292,28 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         vm.prank(attestor);
         vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, uint256(999)));
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(keccak256("x"));
-        agenticId.cloneFrom(999, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
+        gate.cloneFrom(999, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
     }
 
     function test_cloneFrom_revertsOnArityMismatch() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
-        bytes32[] memory hashes = new bytes32[](1);
+        bytes32[] memory hashes = new bytes32[](2);
         hashes[0] = dataHash;
-        bytes[] memory keys = new bytes[](0); // source carries 1 entry
+        hashes[1] = dataHash;
+        bytes[] memory keys = new bytes[](2); // source carries 1 entry
+        keys[0] = hex"aa"; keys[1] = hex"bb";
         vm.prank(attestor);
-        vm.expectRevert(
-            abi.encodeWithSelector(IERC7857Updatable.ERC7857SealedKeyArityMismatch.selector, 1, 0)
-        );
-        agenticId.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
+        vm.expectRevert(abi.encodeWithSelector(CloneGateArityMismatch.selector, 1, 2));
+        gate.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
     }
 
     function test_cloneFrom_revertsOnSealIdCollision() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         // Reuse the SOURCE's sealId (base mints with SEAL_ID) — already taken.
         (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
@@ -301,13 +321,13 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
         vm.expectRevert(
             abi.encodeWithSelector(AgenticIDSealIdTaken.selector, SEAL_ID, sourceId)
         );
-        agenticId.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, SEAL_ID, buyer, AUTH_DATA);
+        gate.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, SEAL_ID, buyer, AUTH_DATA);
     }
 
     function test_cloneFrom_revertsWhenPaused() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
 
         vm.prank(pauser);
         agenticId.pause();
@@ -320,25 +340,25 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
     function test_authorizerClearedOnTransfer() public {
         (uint256 sourceId,) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
-        assertTrue(agenticId.cloneAuthorizerOf(sourceId) != address(0), "precondition: set");
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+        assertTrue(gate.cloneAuthorizerOf(sourceId) != address(0), "precondition: set");
 
         // Sealed agents transfer via plain transferFrom (ownership-only path).
         vm.prank(owner);
         agenticId.transferFrom(owner, buyer, sourceId);
 
-        assertEq(agenticId.cloneAuthorizerOf(sourceId), address(0), "authorizer cleared on transfer");
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(0), "authorizer cleared on transfer");
     }
 
     function test_lineageSurvivesTransfer() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
-        agenticId.setCloneAuthorizer(sourceId, address(toggle));
+        gate.setCloneAuthorizer(sourceId, address(toggle));
         uint256 cloneId = _cloneFrom(sourceId, dataHash);
 
         vm.prank(buyer);
         agenticId.transferFrom(buyer, attacker, cloneId);
 
-        assertEq(agenticId.cloneSourceOf(cloneId), sourceId, "lineage survives transfer");
+        assertEq(gate.cloneSourceOf(cloneId), sourceId, "lineage survives transfer");
     }
 }

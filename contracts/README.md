@@ -342,33 +342,42 @@ Transfer behaviour splits on whether the agent has a seal (`getAgentSeal(tokenId
   current owner signs an `AgenticID.Clone.v1` intent; **contract mode**
   (marketplace fork) — the BUYER signs an `AgenticID.CloneContract.v1` intent
   binding `keccak256(auth_data)` and the authorizer, and the owner-configured
-  `ICloneAuthorizer` decides via `cloneFrom` (atomic policy consult).
+  `ICloneAuthorizer` decides via `CloneGate.cloneFrom` (atomic policy consult;
+  the gate is a SATELLITE contract — AgenticID itself sits at the EIP-170
+  bytecode ceiling and is unchanged).
 - **Non-seal agent** (data blob): plain transfers stay disabled; ownership moves
   only through the proof-gated `iTransferFrom` below, which atomically re-encrypts
   the dataKey to the buyer. `iCloneFrom` works.
 
-### Policy-mode cloning (issue #133): `setCloneAuthorizer` + `cloneFrom`
+### Policy-mode cloning (issue #133): the `CloneGate` satellite
 
 A seal-bound agent's owner can delegate fork authorization to a policy
-contract — the marketplace-fork flow:
+contract. Everything lives in `CloneGate` — AgenticID is untouched (it sits at
+the EIP-170 ceiling; new capabilities ship as companion contracts, like
+`VerifiedFeedbackRegistry`). The gate must be on AgenticID's trusted-attestor
+allowlist (it mints through `registerWithSeal`); pausing AgenticID pauses
+cloning; the marketplace-fork flow:
 
-1. **Publisher opts in once:** `setCloneAuthorizer(tokenId, authorizer)` —
-   an `ICloneAuthorizer` whose `canClone(source, to, caller, authData)`
-   pure-view verdict decides contract-mode clones. Cleared automatically when
-   the token changes owner (owner intent); `cloneSourceOf` lineage survives
-   transfers (historical fact). Zero authorizer → contract mode fails closed.
+1. **Publisher opts in once:** `CloneGate.setCloneAuthorizer(tokenId, authorizer)`
+   — an `ICloneAuthorizer` whose `canClone(source, to, caller, authData)`
+   pure-view verdict decides contract-mode clones. The config binds the owner
+   who set it: an ownership transfer auto-invalidates it (no transfer hook
+   needed — `cloneAuthorizerOf` returns the EFFECTIVE authorizer, 0 when the
+   owner changed). `cloneSourceOf` lineage survives transfers (historical
+   fact). Zero authorizer → contract mode fails closed.
 2. **Buyer forks:** signs a clone-intent whose canonical binds the operation
    (idempotency key, source, target) **and its policy context**
    (`keccak256(auth_data)` + the authorizer address — so a relayer can
    transport the intent but cannot replay it under different auth data or
    across a policy rotation), then submits via the attestor `/clone` (or
    `ag.agent.clone({ authorization: { authData } })` in the SDK).
-3. **Atomic gate:** the attestor worker mints through `cloneFrom`, which
-   consults `canClone` in the same transaction as the mint — a late deny, a
-   cleared authorizer, or a stale re-seal reverts everything.
-   `nonReentrant`, matching the iTransferFrom/iCloneFrom pattern. A
-   reverting authorizer bubbles its own revert data (fail-closed, diagnostics
-   preserved); `AgenticIDCloneDenied` is reserved for unconfigured/declined.
+3. **Atomic gate:** the attestor worker mints through `CloneGate.cloneFrom`,
+   which consults `canClone` and calls AgenticID's `registerWithSeal` in the
+   same transaction — a late deny, an invalidated authorizer, or a stale
+   re-seal reverts everything. `nonReentrant`, matching the
+   iTransferFrom/iCloneFrom pattern. A reverting authorizer bubbles its own
+   revert data (fail-closed, diagnostics preserved); `CloneGateDenied` is
+   reserved for unconfigured/invalidated/declined.
 
 ### `iTransferFrom` (non-seal): change ownership and atomically deliver dataKey
 

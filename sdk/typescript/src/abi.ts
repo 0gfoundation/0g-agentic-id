@@ -91,66 +91,6 @@ export const agenticIDAbi = [
     outputs: [{ name: '', type: 'bool' }],
   },
 
-  // ── Policy-mode cloning (issue #133) ──
-  {
-    type: 'function',
-    name: 'setCloneAuthorizer',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'tokenId', type: 'uint256' },
-      { name: 'authorizer', type: 'address' },
-    ],
-    outputs: [],
-  },
-  {
-    type: 'function',
-    name: 'cloneAuthorizerOf',
-    stateMutability: 'view',
-    inputs: [{ name: 'tokenId', type: 'uint256' }],
-    outputs: [{ name: '', type: 'address' }],
-  },
-  {
-    type: 'function',
-    name: 'cloneSourceOf',
-    stateMutability: 'view',
-    inputs: [{ name: 'agentId', type: 'uint256' }],
-    outputs: [{ name: '', type: 'uint256' }],
-  },
-  {
-    type: 'function',
-    name: 'cloneFrom',
-    stateMutability: 'nonpayable',
-    inputs: [
-      { name: 'sourceAgentId', type: 'uint256' },
-      { name: 'to', type: 'address' },
-      { name: 'dataHashes', type: 'bytes32[]' },
-      { name: 'sealedKeys', type: 'bytes[]' },
-      { name: 'newAgentSeal', type: 'address' },
-      { name: 'newSealId', type: 'bytes32' },
-      { name: 'caller', type: 'address' },
-      { name: 'authData', type: 'bytes' },
-    ],
-    outputs: [{ name: 'agentId', type: 'uint256' }],
-  },
-  {
-    type: 'event',
-    name: 'CloneAuthorizerSet',
-    inputs: [
-      { name: 'tokenId', type: 'uint256', indexed: true },
-      { name: 'authorizer', type: 'address', indexed: true },
-    ],
-  },
-  {
-    type: 'event',
-    name: 'ClonedFrom',
-    inputs: [
-      { name: 'sourceAgentId', type: 'uint256', indexed: true },
-      { name: 'newAgentId', type: 'uint256', indexed: true },
-      { name: 'to', type: 'address', indexed: true },
-      { name: 'caller', type: 'address', indexed: false },
-    ],
-  },
-
   // ── Trusted Attestors ──
   {
     type: 'function',
@@ -1022,6 +962,90 @@ export const feedbackBatcherAbi = [
   {
     type: 'function',
     name: 'verifiedFeedback',
+    stateMutability: 'view',
+    inputs: [],
+    outputs: [{ name: '', type: 'address' }],
+  },
+] as const;
+
+
+/**
+ * CloneGate — policy-mode cloning SATELLITE of AgenticID (the core contract
+ * sits at the EIP-170 bytecode ceiling; clone policy + lineage live here).
+ * The owner opts in with setCloneAuthorizer; the attestor mints through
+ * cloneFrom, which consults the policy atomically. cloneAuthorizerOf returns
+ * the EFFECTIVE authorizer: 0 when unset, cleared, or auto-invalidated by an
+ * ownership transfer since it was set.
+ */
+export const cloneGateAbi = [
+  {"type":"error","name":"CloneGateNotTrustedAttestor","inputs":[]},
+  {"type":"error","name":"CloneGateNotTokenOwner","inputs":[{"name":"caller","type":"address"},{"name":"tokenId","type":"uint256"},{"name":"owner","type":"address"}]},
+  {"type":"error","name":"CloneGateDenied","inputs":[{"name":"sourceAgentId","type":"uint256"},{"name":"authorizer","type":"address"}]},
+  {"type":"error","name":"CloneGateDataHashMismatch","inputs":[{"name":"index","type":"uint256"},{"name":"onChain","type":"bytes32"},{"name":"submitted","type":"bytes32"}]},
+  {"type":"error","name":"CloneGateArityMismatch","inputs":[{"name":"expected","type":"uint256"},{"name":"got","type":"uint256"}]},
+  {
+    type: 'function',
+    name: 'setCloneAuthorizer',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'tokenId', type: 'uint256' },
+      { name: 'authorizer', type: 'address' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'cloneAuthorizerOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'cloneSourceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'agentId', type: 'uint256' }],
+    outputs: [{ name: '', type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'cloneFrom',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'to', type: 'address' },
+      { name: 'dataHashes', type: 'bytes32[]' },
+      { name: 'sealedKeys', type: 'bytes[]' },
+      { name: 'newAgentSeal', type: 'address' },
+      { name: 'newSealId', type: 'bytes32' },
+      { name: 'caller', type: 'address' },
+      { name: 'authData', type: 'bytes' },
+    ],
+    outputs: [{ name: 'agentId', type: 'uint256' }],
+  },
+  {
+    type: 'event',
+    name: 'CloneAuthorizerSet',
+    inputs: [
+      { name: 'tokenId', type: 'uint256', indexed: true },
+      { name: 'authorizer', type: 'address', indexed: true },
+      { name: 'owner', type: 'address', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'ClonedFrom',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256', indexed: true },
+      { name: 'newAgentId', type: 'uint256', indexed: true },
+      { name: 'to', type: 'address', indexed: true },
+      { name: 'caller', type: 'address', indexed: false },
+    ],
+  },
+
+  {
+    type: 'function',
+    name: 'agenticId',
     stateMutability: 'view',
     inputs: [],
     outputs: [{ name: '', type: 'address' }],

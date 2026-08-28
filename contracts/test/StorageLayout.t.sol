@@ -35,6 +35,8 @@ contract StorageLayoutTest is Test {
             0xa2b40c657abdbf180a6038c081d3a0af6206dcea36f4558f991bf8c787ef3c00);
         assertEq(_erc7201("0g.storage.VerifiedFeedbackRegistry"),
             0xa91e4c2ef61514299267811101bdc16c30719384e3b85c6fa8328f091e37e100);
+        assertEq(_erc7201("0g.storage.CloneGate"),
+            0x70c420e34ba808fea9cb59170b4cd5f9b7bcf6408241b0008bcba5d7b854d100);
     }
 
     /// @dev BaseDataVerifier's slot is a fixed literal, not the ERC-7201

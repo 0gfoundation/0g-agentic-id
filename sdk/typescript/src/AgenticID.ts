@@ -848,6 +848,7 @@ export class AgenticID {
         agenticID: addr(cfg.agentic_id_addr),
         verifiedFeedback: addr(cfg.verified_feedback_addr),
         feedbackBatcher: addr(cfg.feedback_batcher_addr),
+        cloneGate: addr(cfg.clone_gate_addr),
         teeDataVerifier: addr(cfg.tee_data_verifier_addr),
         tappRegistry: addr(cfg.tapp_registry_addr),
         sandboxServing: addr(cfg.sandbox_serving_addr),
