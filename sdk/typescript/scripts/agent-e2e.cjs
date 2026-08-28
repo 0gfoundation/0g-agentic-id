@@ -68,7 +68,7 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
     addresses: {
       agenticID: cfg.agentic_id_addr,
       teeDataVerifier: ZERO,
-      reputationRegistry: ZERO,
+      verifiedFeedback: ZERO,
       tappRegistry: cfg.tapp_registry_addr,
       sandboxServing: cfg.sandbox_serving_addr ?? ZERO,
     },

@@ -28,8 +28,8 @@ Not every environment deploys every contract. An address absent from
 /config maps to the zero address: `fromAttestor` still constructs (chain
 reads, deploy, etc. all work), and the affected namespace fails fast with
 a named error only when actually invoked — e.g. an environment without a
-ReputationRegistry throws `reputation: this environment has no
-ReputationRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
+VerifiedFeedbackRegistry throws `reputation: this environment has no
+VerifiedFeedbackRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
 still exists for hand-picked addresses — audit tooling, or reading a
 chain with no attestor running — and `overrides` lets you pin any single
 address without giving up the bootstrap.)
@@ -43,11 +43,12 @@ import { AgenticID, type ContractAddresses } from '@0gfoundation/0g-agenticid-sd
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
 // addresses fully determine the target contracts.
 const addresses: ContractAddresses = {
-  agenticID:          '0x…',
-  reputationRegistry: '0x…',
-  teeDataVerifier:    '0x…',
-  tappRegistry:       '0x…',
-  sandboxServing:     '0x…',
+  agenticID:        '0x…',
+  verifiedFeedback: '0x…',   // canonical 8004 reputation registry is discovered FROM it
+  teeDataVerifier:  '0x…',
+  tappRegistry:     '0x…',
+  sandboxServing:   '0x…',
+  feedbackBatcher:  '0x…',   // optional — only on EIP-7702-enabled chains (atomic feedback)
 };
 
 // read-only:
@@ -230,31 +231,67 @@ const data = await response.json();                   // your normal response bo
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
 
-// 3. submit feedback — recorded under buyer (msg.sender). Three fields
-// required; everything else defaults (decimals 0, empty tags/endpoint/URI).
-// NOTE: an agent's OWNER cannot rate their own agent — the contract rejects it
-// (ReputationSelfFeedback). Feedback must come from a different wallet than the
-// one that owns `agentId`.
-const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// 3. submit feedback. Storage and trust are split across two contracts:
+// the entry itself goes to the OFFICIAL canonical ERC-8004 Reputation
+// Registry (attribution = msg.sender natively, so every 8004 reader sees
+// it), and the ServeProof mark goes to the local VerifiedFeedbackRegistry.
+// giveFeedback bundles both. On EIP-7702-enabled environments (the attestor
+// advertises a feedbackBatcher) the two calls execute in ONE atomic type-4
+// transaction — the EOA delegates to the batcher and self-calls, so a failed
+// attest rolls back the canonical write too, and feedbackTx === attestTx
+// (already mined). Otherwise: canonical write (mined inside the call, so the
+// assigned index can be read back) + attestFeedback (returned pending).
+// NOTE: an agent's OWNER cannot attest feedback on their own agent — the
+// verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
+// come from a different wallet than the one that owns `agentId`.
+const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// → { feedbackTx: "0x…" (mined), attestTx: "0x…" (pending), feedbackIndex: 2n }
+await ag.reputation.waitForTransaction(fb.attestTx);
 // full control when you want it: add valueDecimals / tag1 / tag2 /
-// endpoint / feedbackURI / feedbackHash.
+// endpoint / feedbackURI / feedbackHash. Escape hatch: if you submitted the
+// canonical entry yourself, mark it with attestFeedback(agentId, idx, proof).
 // The proof should come from the interaction you are actually rating —
 // capture() it during your real call, then submit. The proof's `deadline`
 // is serve-time +3600s (one hour) — ample for verify + a 120s+ 0G receipt,
 // but don't submit it the next day: the contract rejects expired proofs.
-// txHash → "0x…"
 
-// read back
+// read back — canonical reads return RAW 8004 feedback (the canonical
+// registry is permissionless, anyone can write unverified entries there);
+// the verified reads expose the TEE marks to intersect with.
 const idx = await ag.reputation.getLastIndex(agentId, buyer);   // → 2n   latest index for this buyer
 await ag.reputation.readFeedback(agentId, buyer, idx);
 // → { value: 5n, valueDecimals: 0, tag1: "quality", tag2: "latency", isRevoked: false }
-await ag.reputation.getSummary({ agentId });   // unscoped → summarizes across all clients (SDK fills them; empty → zero summary)
+await ag.reputation.getSummary({ agentId });   // RAW summary, unscoped → all clients (SDK fills them; empty → zero summary)
 // → { count: 2n, summaryValue: 10n * 10n**18n, summaryValueDecimals: 18 }
-await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }
 await ag.reputation.readAllFeedback({ agentId });   // filters optional; narrow with clientAddresses / tags / includeRevoked
 // → [ { value, valueDecimals, tag1, tag2, isRevoked }, … ]
 await ag.reputation.getClients(agentId);                        // → [ "0x…", … ]  addresses that left feedback
 await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n   how many of the listed responders replied to buyer's feedback #idx
+
+// verified reads — only proof-backed entries count here
+await ag.reputation.isVerified(agentId, buyer, idx);            // → true
+// 7702 notes: the delegation PERSISTS on your EOA between calls (that is what
+// lets later feedback skip re-signing). Check it with getCode(yourAddress):
+// delegated reads 0xef0100‖batcher, undelegated reads 0x. To remove it, sign a
+// delegation to the zero address — the standard 7702 escape hatch. If the
+// environment later advertises a NEW batcher address, your EOA keeps running
+// the OLD code until the next giveFeedback re-delegates (the SDK does this
+// automatically on designator mismatch). Wallets that cannot sign a 7702
+// authorization at all — JSON-RPC accounts, i.e. browser/external signers
+// without type-4 support — silently take the sequential two-tx path instead.
+// And on a wallet with pending transactions, the authorization's nonce
+// (account nonce + 1 at signing time) can be raced by a concurrent tx — the
+// type-4 send then errors at the node; it is safe to simply retry giveFeedback.
+// pass `task: { method, uri, reqBodyHash, respBodyHash, statusCode }` to
+// giveFeedback (the receipt materials of the rated interaction — bodies stay
+// private, only their hashes go on-chain) and the contract opens the proof's
+// taskHash commitment, recording the URI as a TEE-VERIFIED endpoint:
+await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);   // → "/hello" ("" if unrevealed)
+await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');  // trustless per-interface aggregate
+await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → all VERIFIED clients (empty → zero summary)
+await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
+await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
+await ag.reputation.getServeData(agentId, buyer, idx);          // → { dataHashes: ["0x…"], frameworkHash: "0x…" }  (verified entries only)
 
 // owner responds to a feedback entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://Qm…', responseHash: keccak256(toBytes('thanks')) });
@@ -300,7 +337,7 @@ The trust-root component set auto-resolves from the attestor's `GET /config` whe
 
 `agent.deploy()` / `agent.clone()` **preflight** both prerequisites (all components acked + prepaid balance ≥ 0.1 OG) and throw a synchronous, actionable error naming the missing step — pass `{ preflight: false }` to skip. The attestor enforces the same two checks at accept (HTTP 402, codes `trust_roots_not_acked` / `insufficient_sandbox_balance`).
 
-**Read-after-write races the pending tx**: `ack()` / `deposit()` / `topUpAgentSeal()` / `giveFeedback()` are bare `writeContract` calls — they return the hash immediately, not after mining. Reading state right after (`ackStatus()` / `getBalance()` / `readFeedback()`) can see the pre-tx value. Each namespace has its own `waitForTransaction(txHash)` (top-level `ag`, `ag.agent`, `ag.reputation`) — await it before reading:
+**Read-after-write races the pending tx**: `ack()` / `deposit()` / `topUpAgentSeal()` / `attestFeedback()` are bare `writeContract` calls — they return the hash immediately, not after mining (`giveFeedback()` mines its canonical write internally but returns `attestTx` pending). Reading state right after (`ackStatus()` / `getBalance()` / `readFeedback()`) can see the pre-tx value. Each namespace has its own `waitForTransaction(txHash)` (top-level `ag`, `ag.agent`, `ag.reputation`) — await it before reading:
 
 ```ts
 const tx = await ag.deposit({ amountWei: parseEther('1') });
@@ -575,13 +612,13 @@ is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills all five addresses for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the five into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
 ## Notes
 
-- **Serve-proof binding.** On-chain attribution is `msg.sender` at `giveFeedback`; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
+- **Serve-proof binding.** On-chain attribution is `msg.sender` at the canonical `giveFeedback`, and `attestFeedback` requires the same wallet; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
 - **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries). If it still times out, the tx likely landed — confirm by reading state.
 - On-chain types: `value`/`summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint).
 
@@ -631,11 +668,11 @@ npx 0g-agenticid --help
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agenticid>`): `list` (public listing, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `deploy` (framework + model wizard), `balance` / `deposit [og]` (prepaid sandbox account), `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami`, `quit`.
+Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
 The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
-Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL) and `credentials` (owner key + inference key, JSON, chmod 600). The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
 ### Diagnostics subcommands
 
