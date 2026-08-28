@@ -264,7 +264,7 @@ owner `0xB831…`.
 | VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
-| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x59921B5C874b4ed311aecB43cBfB97d43dc748BF` | deployed 2026-08-28 (adds the TaskReveal pass-through; supersedes `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback) |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577` | v3, deployed 2026-08-28 (adds `receive()` so a delegated EOA still accepts plain ETH; supersedes `0x59921B…48BF` and `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback) |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
@@ -314,8 +314,11 @@ Changelog:
   `getVerifiedSummaryForEndpoint`; `FeedbackVerified` gains taskHash + uri).
   Impl `0x6d785265d1C6c97C245988e50478605760D9b021`, two-phase via the dev
   Timelock (`minDelay=0`); post-upgrade `VERSION()` verified 1.1.0 on chain.
-  `FeedbackBatcher` redeployed for the TaskReveal pass-through:
-  `0x59921B5C874b4ed311aecB43cBfB97d43dc748BF` (supersedes `0x8E8997…524f`).
+  `FeedbackBatcher` redeployed for the TaskReveal pass-through
+  (`0x59921B…48BF`), then again as v3 `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577`
+  adding `receive()` — a delegated EOA executes the delegate code on plain
+  value transfers too, so without it faucet/exchange sends to delegated
+  users reverted (review round-2 finding).
 - **VerifiedFeedbackRegistry 1.0.0, dev deployed 2026-08-27** — initial
   (canonical-reputation split, PR #144), via `DeployVerifiedFeedback.s.sol`;
   atomicity of the 7702 batch verified live (bad-proof rollback).

@@ -97,7 +97,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
     function _delegatedCall(uint256 agentId, ServeProof memory proof) internal returns (uint64) {
         vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
         vm.prank(clientWallet.addr);
-        return FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
+        return FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
             "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
@@ -146,7 +146,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
 
         vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
         vm.prank(clientWallet.addr);
-        uint64 idx = FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
+        uint64 idx = FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
             "https://api.example.com", "", bytes32(0), proof, task
         );
@@ -165,7 +165,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
         vm.prank(clientWallet.addr);
         vm.expectRevert(); // VerifiedFeedbackInvalidProofSignature, bubbled through the batch
-        FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
+        FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
             "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
@@ -201,10 +201,25 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         address attacker = makeAddr("attacker");
         vm.prank(attacker);
         vm.expectRevert(BatcherNotSelf.selector);
-        FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
+        FeedbackBatcher(payable(clientWallet.addr)).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
             "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
+    }
+
+    /// @dev Delegation persists between feedback calls — a plain ETH transfer
+    ///      to the delegated EOA must still land (empty calldata resolves to
+    ///      the delegate code's receive()).
+    function test_delegatedEOA_stillReceivesPlainETH() public {
+        vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
+        address sender = makeAddr("faucet");
+        vm.deal(sender, 1 ether);
+        uint256 before = clientWallet.addr.balance;
+        vm.prank(sender);
+        (bool ok, ) = clientWallet.addr.call{value: 0.5 ether}("");
+        assertTrue(ok, "plain transfer to a delegated EOA must not revert");
+        assertEq(clientWallet.addr.balance, before + 0.5 ether, "value lands in the EOA's own balance");
+        assertEq(address(batcher).balance, 0, "the batcher contract itself holds nothing");
     }
 
     // ── Constructor guards ────────────────────────────────────────────────────

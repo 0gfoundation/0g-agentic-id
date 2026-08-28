@@ -270,6 +270,12 @@ await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n  
 
 // verified reads — only proof-backed entries count here
 await ag.reputation.isVerified(agentId, buyer, idx);            // → true
+// 7702 notes: the delegation PERSISTS on your EOA between calls (that is what
+// lets later feedback skip re-signing). To remove it, sign a delegation to the
+// zero address — the standard 7702 escape hatch. And on a wallet with pending
+// transactions, the authorization's nonce (account nonce + 1 at signing time)
+// can be raced by a concurrent tx — the type-4 send then errors at the node;
+// it is safe to simply retry giveFeedback.
 // pass `task: { method, uri, reqBodyHash, respBodyHash, statusCode }` to
 // giveFeedback (the receipt materials of the rated interaction — bodies stay
 // private, only their hashes go on-chain) and the contract opens the proof's

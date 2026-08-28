@@ -47,6 +47,13 @@ contract FeedbackBatcher {
         verifiedFeedback = IVerifiedFeedbackRegistry(verifiedFeedback_);
     }
 
+    /// @dev A delegated EOA executes THIS code on every incoming call — a
+    ///      plain value transfer included (empty calldata resolves to
+    ///      receive()). Without it, faucets/exchanges/friends sending ETH to a
+    ///      delegated user would revert. The value lands in the EOA's own
+    ///      balance; the batcher itself holds nothing by design.
+    receive() external payable {}
+
     /// @notice Submit canonical feedback and attest it with a ServeProof, in
     ///         one atomic transaction. See the contract natspec for the
     ///         execution model; parameters mirror the two underlying calls.
