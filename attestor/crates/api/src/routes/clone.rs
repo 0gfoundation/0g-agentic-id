@@ -98,13 +98,7 @@ pub async fn handle(
         }
         Some(attestor_shared::CloneAuthorization::Contract { auth_data, .. }) => {
             // ── contract mode (marketplace fork, issue #133) ──────────────
-            // 1. The buyer must have signed THIS operation — the expected
-            //    signer is the request's own target_owner, so a relayer can
-            //    transport but not retarget or re-source the clone.
-            verify_clone_contract_intent(&req, req.target_owner, state.crypto.as_ref())
-                .map_err(|e| ApiError::unauthorized(format!("clone intent: {e}")))?;
-
-            // 2. The authorizer is read LIVE from the source token's config —
+            // 1. The authorizer is read LIVE from the source token's config —
             //    never client-supplied. None configured → fail closed.
             let authorizer = state
                 .chain
@@ -117,6 +111,16 @@ pub async fn handle(
                      (owner must call setCloneAuthorizer)",
                 ));
             }
+
+            // 2. The buyer must have signed THIS operation, including its
+            //    policy context — the expected signer is the request's own
+            //    target_owner, the signed auth_data_keccak must match the
+            //    submitted bytes, and the signed authorizer must equal the
+            //    live one. A relayer can transport the request but not
+            //    retarget, re-source, re-armor (different auth data), or
+            //    carry it across a policy rotation.
+            verify_clone_contract_intent(&req, req.target_owner, authorizer, state.crypto.as_ref())
+                .map_err(|e| ApiError::unauthorized(format!("clone intent: {e}")))?;
 
             // 3. Policy pre-check (UX only; the mint's atomic consult is
             //    authoritative). Fail-closed on deny / revert / timeout, and
@@ -463,11 +467,27 @@ mod tests {
         source_agent_id: AgentId,
         auth_data: &[u8],
     ) -> CloneRequest {
+        contract_clone_req_auth(buyer, idem, source_agent_id, auth_data, AUTHORIZER)
+    }
+
+    /// Like {@link contract_clone_req} but with an explicit canonical
+    /// authorizer — for signing the intent under a DIFFERENT (e.g. rotated)
+    /// policy than the live one.
+    #[allow(clippy::too_many_arguments)]
+    fn contract_clone_req_auth(
+        buyer: &PrivateKeySigner,
+        idem: &str,
+        source_agent_id: AgentId,
+        auth_data: &[u8],
+        canonical_authorizer: Address,
+    ) -> CloneRequest {
         let canonical = serde_json::json!({
             "domain": CanonicalCloneContract::DOMAIN,
             "idempotency_key": idem,
             "source_agent_id": source_agent_id,
             "target_owner": buyer.address(),
+            "auth_data_keccak": alloy::primitives::keccak256(auth_data),
+            "authorizer": canonical_authorizer,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let sig = signer_sign(buyer, &bytes);
@@ -651,6 +671,8 @@ mod tests {
             "idempotency_key": "idem-c5",
             "source_agent_id": s.source_agent_id,
             "target_owner": buyer.address(),
+            "auth_data_keccak": alloy::primitives::keccak256(b"p"),
+            "authorizer": AUTHORIZER,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let rogue = PrivateKeySigner::random();
@@ -689,6 +711,45 @@ mod tests {
             .await
             .expect_err("both modes present must be rejected");
         assert!(format!("{err:?}").contains("exactly one"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn contract_clone_rejects_swapped_auth_data() {
+        // The relayer's attack: one signed buyer intent, resubmitted with
+        // different auth data (each variant = a distinct idem-key derivation
+        // = a fresh buyer-billed clone). The signed auth_data_keccak must
+        // pin the exact bytes.
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(Some(true));
+        let mut req = contract_clone_req(&buyer, "idem-c6", s.source_agent_id, b"purchase-1");
+        if let Some(CloneAuthorization::Contract { auth_data, .. }) = req.authorization.as_mut() {
+            *auth_data = Bytes::copy_from_slice(b"purchase-2");
+        }
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("swapped auth_data must be rejected");
+        assert!(format!("{err:?}").contains("auth_data"), "got: {err:?}");
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn contract_clone_rejects_rotated_authorizer() {
+        // The intent was signed under the OLD authorizer; the live one has
+        // rotated. Reject — a rotation must not re-open the idempotency slot
+        // for an already-consumed (key, auth_data) pair.
+        let s = make_setup();
+        let buyer = PrivateKeySigner::random();
+        s.chain.set_clone_authorizer(AUTHORIZER);
+        s.chain.set_can_clone_verdict(Some(true));
+        let old = Address::new([0x11; 20]);
+        let req = contract_clone_req_auth(&buyer, "idem-c7", s.source_agent_id, b"purchase-1", old);
+        let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
+            .await
+            .expect_err("intent signed under a rotated authorizer must be rejected");
+        assert!(format!("{err:?}").contains("authorizer"), "got: {err:?}");
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 }

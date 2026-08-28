@@ -158,7 +158,7 @@ contract AgenticID is
     ///      function) + new reentrancy-guard storage (ERC-7201 namespaced, no
     ///      collision); no existing storage layout change.
     ///      1.0.0 — initial.
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
@@ -607,7 +607,12 @@ contract AgenticID is
     ///         seal's public key) and submits the result here, where the owner's
     ///         policy is consulted ATOMICALLY with the mint: a deny or a
     ///         stale-data revert rolls the whole transaction back, so there is
-    ///         no verify-mint race window by construction.
+    ///         no verify-mint race window by construction. nonReentrant for
+    ///         parity with iTransferFrom/iCloneFrom: `_mintAgent`'s
+    ///         `_safeMint` fires the receiver callback while the clone is
+    ///         half-initialized (minted, no iData/seal/lineage yet) — no
+    ///         exploit is reachable through the attestor gate, but the guard
+    ///         is belt-and-suspenders against exactly that pattern.
     ///
     ///         The source may be sealed or not (parity with POST /clone, which
     ///         clones either); the clone is always minted WITH a fresh seal.
@@ -639,7 +644,7 @@ contract AgenticID is
         bytes32 newSealId,
         address caller,
         bytes calldata authData
-    ) external whenNotPaused returns (uint256 agentId) {
+    ) external whenNotPaused nonReentrant returns (uint256 agentId) {
         AgenticIDStorage storage $ = _getAgenticIDStorage();
         if (!$.trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
 

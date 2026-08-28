@@ -28,15 +28,26 @@ pragma solidity ^0.8.20;
 ///         separate, clone-only primitive.
 ///
 /// @dev Implementations MUST be pure `view` and MUST NOT revert to signal
-///      "deny" — return `false` instead. A reverting authorizer fails the
-///      clone closed (`AgenticIDCloneDenied`) but SHOULD be avoided: revert
-///      data is harder for clients to interpret than a clean deny.
+///      "deny" — return `false` instead. A reverting authorizer still fails
+///      the clone closed, but its revert data BUBBLES from `cloneFrom`
+///      unchanged (there is no try/catch around the consult) — clients see
+///      the authorizer's own error, not `AgenticIDCloneDenied` (which is
+///      reserved for an unconfigured/zero authorizer and a clean `false`).
+///      Bubbling is deliberate: it preserves the authorizer's diagnostic
+///      reason for the tx submitter. Returning `false` remains the
+///      recommended deny path.
 ///
 ///      One-time semantics are NOT the authorizer's job: replay protection
 ///      lives in the attestor's idempotency key plus the marketplace's own
 ///      purchase records (a purchase = an entitlement = a clone). A market
 ///      that wants explicit on-chain consumption may watch `ClonedFrom`
-///      events from its indexer.
+///      events from its indexer. This split is sound under today's trust
+///      model — the attestor is trusted to mint via `registerWithSeal`
+///      anyway, so a `view` (non-consuming) policy adds no marginal trust;
+///      if the attestor ever becomes less trusted (e.g. a multi-node
+///      roadmap), a consuming (state-writing) authorizer variant becomes
+///      the on-chain enforcement point and this interface should be
+///      revisited.
 ///
 ///      Cross-chain and cross-deployment separation come from the call
 ///      environment: the authorizer is read from THIS AgenticID deployment's

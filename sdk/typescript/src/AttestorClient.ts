@@ -9,7 +9,9 @@
  */
 
 import type { Address } from 'viem';
+import { keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
+import { agenticIDAbi } from './abi';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
 export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
@@ -34,10 +36,24 @@ export interface CloneParams {
    * source owner's on-chain `ICloneAuthorizer` decides whether the clone may
    * mint. `authData` is opaque bytes forwarded to the authorizer — the
    * marketplace defines its shape (e.g. abi-encoded purchase id).
+   *
+   * The intent binds the FULL policy context: `keccak256(authData)` and the
+   * authorizer address are signed alongside the operation fields, so a
+   * relayer can transport the request but cannot resubmit it under
+   * different auth data (each variant would be a fresh, buyer-billed clone)
+   * or carry it across a policy rotation. `authorizer` is optional here —
+   * omitted, the SDK reads it live via `cloneAuthorizerOf`; pass it
+   * explicitly to stay offline or pin the read.
    */
   authorization?: {
     /** Opaque bytes forwarded to the source's `ICloneAuthorizer.canClone`. */
     authData: `0x${string}`;
+    /**
+     * The authorizer the intent will be signed under. Optional — read live
+     * from `cloneAuthorizerOf(sourceAgentId)` when omitted. Must be
+     * non-zero; the attestor cross-checks it against its own live read.
+     */
+    authorizer?: Address;
   };
 }
 
@@ -423,12 +439,37 @@ export class AttestorClient {
       );
     }
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
+    // Contract mode: the intent signs the full policy context — the auth
+    // data hash and the authorizer it will be evaluated under (review #145:
+    // otherwise one signed intent replayable under N auth-data variants, or
+    // across a policy rotation, each a fresh buyer-billed clone).
+    let authDataKeccak: `0x${string}` | undefined;
+    let authorizer: Address | undefined;
+    if (params.authorization) {
+      authDataKeccak = keccak256(params.authorization.authData);
+      authorizer = params.authorization.authorizer
+        ?? (await this.ctx.publicClient.readContract({
+          address: this.ctx.addresses.agenticID,
+          abi: agenticIDAbi,
+          functionName: 'cloneAuthorizerOf',
+          args: [params.sourceAgentId],
+        }) as Address);
+      if (authorizer === '0x0000000000000000000000000000000000000000') {
+        throw new Error(
+          'contract mode requires the source to have a clone authorizer configured ' +
+            '(owner must call setCloneAuthorizer)',
+        );
+      }
+    }
     const domain = params.authorization ? CLONE_CONTRACT_DOMAIN : CLONE_DOMAIN;
     const canonical = JSON.stringify({
       domain,
       idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
+      ...(params.authorization
+        ? { auth_data_keccak: authDataKeccak, authorizer }
+        : {}),
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
     const common = {

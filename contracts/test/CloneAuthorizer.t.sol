@@ -23,6 +23,18 @@ contract ToggleAuthorizer {
     }
 }
 
+/// @dev An authorizer that REVERTS (a failed require) rather than returning
+///      false — pins the documented bubbling semantics: the authorizer's own
+///      revert data surfaces from cloneFrom unchanged, NOT
+///      AgenticIDCloneDenied (which is reserved for unconfigured/declined).
+contract RevertingAuthorizer {
+    error PurchaseExpired(uint256 purchaseId);
+
+    function canClone(uint256, address, address, bytes calldata) external pure returns (bool) {
+        revert PurchaseExpired(42);
+    }
+}
+
 /// @dev Args-binding authorizer: returns true only when called with the EXACT
 ///      (source, target, caller, data) it was constructed with. Asserts the
 ///      policy receives correctly-bound arguments (canClone is view — no
@@ -221,6 +233,22 @@ contract CloneAuthorizerTest is AgenticIDTestBase {
             sourceId,
             dataHash,
             abi.encodeWithSelector(AgenticIDCloneDenied.selector, sourceId, address(toggle))
+        );
+    }
+
+    /// @dev A REVERTING authorizer bubbles its own revert data (documented in
+    ///      ICloneAuthorizer): the clone still fails closed, but the error is
+    ///      the authorizer's — AgenticIDCloneDenied is reserved for
+    ///      unconfigured/declined, and the bubbled reason is the diagnostic
+    ///      the tx submitter (the attestor worker) reports.
+    function test_cloneFrom_revertingAuthorizerBubblesOwnData() public {
+        (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
+        RevertingAuthorizer reverting = new RevertingAuthorizer();
+        vm.prank(owner);
+        agenticId.setCloneAuthorizer(sourceId, address(reverting));
+
+        _cloneFromExpectRevert(
+            sourceId, dataHash, abi.encodeWithSelector(RevertingAuthorizer.PurchaseExpired.selector, 42)
         );
     }
 

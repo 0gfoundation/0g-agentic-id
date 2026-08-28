@@ -151,10 +151,14 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 //                    targetOwner: buyerAddress,          // must equal the connected wallet
 //                    authorization: { authData: '0x...' } // opaque bytes → the authorizer
 //                 }, { wait: 'minted' })
-// The buyer signs an intent under a DISTINCT domain (AgenticID.CloneContract.v1),
-// so a marketplace backend can relay the request verbatim but cannot retarget
-// or re-source it. The on-chain authorizer decides (pre-checked for a friendly
-// 403, enforced atomically inside the cloneFrom mint — no verify-mint race).
+// The buyer signs an intent under a DISTINCT domain (AgenticID.CloneContract.v1)
+// whose canonical binds the FULL policy context — keccak256(authData) and the
+// authorizer address alongside the operation fields — so a marketplace backend
+// can relay the request verbatim but cannot retarget or re-source it, resubmit
+// it under different auth data (each variant would be a fresh, buyer-billed
+// clone), or carry it across a policy rotation. The on-chain authorizer
+// decides (pre-checked for a friendly 403, enforced atomically inside the
+// cloneFrom mint — no verify-mint race).
 // Lineage: await ag.agent.cloneSourceOf(cloneAgentId) → sourceAgentId
 
 // idempotencyKey is optional on deploy/clone — the SDK generates one per call. Pass

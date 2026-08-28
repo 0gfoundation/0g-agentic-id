@@ -145,6 +145,20 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
 # agentSeal) and serves — the crypto lifecycle-e2e checks only on-chain.
 #   ai.agent.clone({sourceAgentId, targetOwner: self}) → reset(cloneSeal,
 #   {apiKey}) → verify-agent.sh AGENT_ID=<clone> (decrypt: 0 FAIL)
+#
+# clone CONTRACT-MODE wire (issue #133; exercised by unit tests, hand-test
+# against a dev authorizer): POST /clone with
+#   { idempotency_key, source_agent_id, target_owner,
+#     authorization: { mode: "contract", intent_signature,
+#                      intent_signed_message_b64, auth_data } }
+# where the b64 decodes to the buyer-signed canonical
+#   { domain: "AgenticID.CloneContract.v1", idempotency_key,
+#     source_agent_id, target_owner,
+#     auth_data_keccak: keccak256(auth_data), authorizer }
+# — the attestor cross-checks BOTH bound fields against its own live read
+# (auth_data bytes + cloneAuthorizerOf). Owner mode (default): owner_signature /
+# owner_signed_message_b64, canonical domain "AgenticID.Clone.v1", no
+# authorization field.
 
 # transfer LIVE: self-contained — generates a second wallet, funds it,
 # acks + deposits AS that wallet, deploys a source, transfers it, and the
