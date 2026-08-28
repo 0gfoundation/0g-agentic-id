@@ -14,10 +14,12 @@
  */
 
 import * as readline from 'node:readline';
-import { parseEther } from 'viem';
+import { parseEther, keccak256, toBytes, hexToBytes, concat } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
+import type { ServeProof, TaskReveal } from '../../types';
 import { buildClient } from '../sdk';
+import { saveProof, findProof, removeProof, toServeProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
@@ -26,7 +28,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
@@ -260,13 +262,18 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · rate <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
   use <agentId|sealId>    enter YOUR agent's session — works in ANY phase
   hello <agentId|sealId>  any agent's public /hello: identity, services,
-                          routes, serve-proof verification
+                          routes, serve-proof verification (with a wallet
+                          configured it also banks a rating ticket, see rate)
+  rate <id> [score]       rate an agent on-chain (canonical 8004 + TEE mark).
+                          Spends a banked serve-proof from your last hello/
+                          interaction if fresh (<1h), else fetches one live;
+                          owners cannot rate their own agents
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
@@ -528,7 +535,68 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
         if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
-        await showHello(ag, row.url);
+        // With a wallet configured, declare it as the proof's redeemer so this
+        // visit banks a rating ticket (see `rate`). Still no signing involved.
+        const helloKey = ctx.env.privateKey ?? loadKey() ?? undefined;
+        const helloAddr = helloKey ? ((await addressOf(helloKey)) as `0x${string}`) : undefined;
+        await showHello(ag, row.url, helloAddr);
+        continue;
+      }
+
+      if (cmd === 'rate') {
+        // Rate ANY agent you have interacted with: spends a banked serve-proof
+        // ticket (from `hello <id>` within the last hour) or fetches one live,
+        // then submits canonical 8004 feedback + the TEE verification mark —
+        // atomically (EIP-7702) when the environment has a feedbackBatcher.
+        if (!args[0]) { out('usage: rate <agentId|sealId> [score]\n'); continue; }
+        const ag = await withWallet(ctx);
+        const my = (await addressOf(ctx.env.privateKey!)) as `0x${string}`;
+        const ref = parseAgentRef(args[0]);
+        const rows = await ag.agent.listDeployments();
+        const row = rows.find((r) =>
+          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+        if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
+        if (row.agentId == null) { out(`agent ${args[0]} is not minted yet — nothing to rate\n`); continue; }
+        const agentId = BigInt(row.agentId);
+        // The chain would reject this at the attest step (self-feedback); say it upfront.
+        const agentOwner = await ag.agent.ownerOf(agentId);
+        if (agentOwner.toLowerCase() === my.toLowerCase()) { out(`agent ${row.agentId} is yours — owners cannot rate their own agent\n`); continue; }
+
+        // Ticket: banked (from a real interaction <1h ago) or fetched live.
+        let proof: ServeProof; let task: TaskReveal | null; let endpoint: string;
+        const banked = findProof(agentId, my);
+        if (banked) {
+          proof = toServeProof(banked); task = banked.task; endpoint = banked.endpoint;
+          out(`spending the banked ticket from ${new Date(banked.capturedAt * 1000).toLocaleTimeString()}\n`);
+        } else if (row.phase === 'running' && row.url) {
+          out(`fetching a serve-proof from agent ${row.agentId}…\n`);
+          const t = await helloWithTicket(ag, row.url, my);
+          if (!t.proof) { out('the agent did not stamp a serve-proof — cannot rate\n'); continue; }
+          proof = t.proof; task = t.task; endpoint = `${row.url}/hello`;
+        } else {
+          out(`agent ${row.agentId} is ${row.phase ?? 'unknown'} and you hold no fresh ticket\n  → visit it with \`hello ${row.agentId}\` while it runs, then rate within the hour\n`);
+          continue;
+        }
+
+        // Free pre-check before spending gas.
+        const v = await ag.reputation.verifyProof(proof);
+        if (!v.ok) {
+          removeProof(agentId, my);
+          out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded, try again\n`);
+          continue;
+        }
+
+        const rawScore = (args[1] ?? (await ask('score [1-5]: '))).trim();
+        if (!/^-?\d+$/.test(rawScore)) { out('score must be an integer\n'); continue; }
+        out('submitting: canonical 8004 feedback + TEE attestation…\n');
+        const fb = await ag.reputation.giveFeedback({
+          agentId, value: BigInt(rawScore), serveProof: proof, endpoint,
+          ...(task ? { task } : {}),
+        });
+        await ag.reputation.waitForTransaction(fb.attestTx);
+        removeProof(agentId, my);
+        const atomic = fb.feedbackTx === fb.attestTx;
+        out(`rated agent ${row.agentId}: ${rawScore} — canonical index ${fb.feedbackIndex}, TEE-verified${task ? ` (endpoint ${task.uri})` : ''}${atomic ? ', atomic' : ''} (tx ${fb.attestTx})\n`);
         continue;
       }
 
@@ -593,20 +661,67 @@ async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<st
   }
 }
 
+/** The sealed proxy's taskHash composition, recomputed client-side:
+ *  keccak256(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status). */
+function taskHashOf(task: TaskReveal): `0x${string}` {
+  return keccak256(concat([
+    toBytes(task.method), toBytes(task.uri),
+    hexToBytes(task.reqBodyHash), hexToBytes(task.respBodyHash),
+    toBytes(String(task.statusCode)),
+  ]));
+}
+
+/** GET an agent's /hello, capturing the serve-proof AND its task-receipt
+ *  materials. With `clientAddr` the request declares X-Client-Address, so the
+ *  proof is redeemable by that wallet — and gets banked in the proof jar as a
+ *  rating ticket (only when the locally recomputed taskHash matches the
+ *  signed one, so a mangled transcript never banks an unusable reveal). */
+async function helloWithTicket(
+  ag: AgenticID,
+  url: string,
+  clientAddr?: `0x${string}`,
+): Promise<{ res: Response; bodyText: string; proof: ServeProof | null; task: TaskReveal | null; banked: boolean }> {
+  const target = `${url}/hello`;
+  const res = await fetch(target, clientAddr ? { headers: { 'X-Client-Address': clientAddr } } : undefined);
+  const raw = new Uint8Array(await res.arrayBuffer());
+  const bodyText = new TextDecoder().decode(raw);
+  const proof = ag.reputation.proofFromResponse(res);
+  let task: TaskReveal | null = null;
+  let banked = false;
+  if (proof) {
+    const u = new URL(target);
+    const candidate: TaskReveal = {
+      method: 'GET',
+      uri: u.pathname + u.search,
+      reqBodyHash: keccak256(new Uint8Array(0)),
+      respBodyHash: keccak256(raw),
+      statusCode: res.status,
+    };
+    if (taskHashOf(candidate) === proof.taskHash) task = candidate;
+    if (clientAddr && proof.submitter.toLowerCase() === clientAddr.toLowerCase() && task) {
+      saveProof(proof, task, target);
+      banked = true;
+    }
+  }
+  return { res, bodyText, proof, task, banked };
+}
+
 /** Fetch and print an agent's signed /hello: identity, proof verification,
  *  and its two capability tables — services (agent-registered endpoints,
  *  entry #0 is /hello itself) and routes (framework-declared prefixes).
- *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello). */
-async function showHello(ag: AgenticID, url: string): Promise<void> {
-  const res = await fetch(`${url}/hello`);
-  const body = (await res.json().catch(() => ({}))) as {
+ *  The public way to inspect ANY agent (L1 `hello <id>` and L2 /hello).
+ *  With `clientAddr`, the serve-proof is banked as a rating ticket. */
+async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`): Promise<void> {
+  const { proof, bodyText, banked } = await helloWithTicket(ag, url, clientAddr);
+  let body: {
     agent?: string; owner?: string; message?: string;
     services?: { path: string; method: string; description?: string; skill?: string }[];
     routes?: { prefix: string; kind?: string; auth?: string; signed: boolean; description?: string }[];
-  };
-  const proof = ag.reputation.proofFromResponse(res);
+  } = {};
+  try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
   out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  if (banked) out(`ticket  : banked for \`rate\` (valid ~60 min)\n`);
   if (body.services?.length) {
     out('services:\n');
     for (const sv of body.services) {

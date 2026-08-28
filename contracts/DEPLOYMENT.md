@@ -257,10 +257,10 @@ owner `0xB831…`.
 | ReputationRegistry proxy (DEPRECATED — see VerifiedFeedback) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
-| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.0.0** (deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
-| VerifiedFeedback impl | `0x471C5a097bB557779564b8C0B9677a370513cfbd` | |
+| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
+| VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
-| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x8E8997b070195941Ef37249E66e465a68cf8524f` | deployed 2026-08-27; atomicity verified live (type-4 batch, bad-proof rollback) |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x59921B5C874b4ed311aecB43cBfB97d43dc748BF` | deployed 2026-08-28 (adds the TaskReveal pass-through; supersedes `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback) |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |

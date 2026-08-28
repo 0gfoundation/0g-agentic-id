@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 183 tests / 21 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 190 tests / 21 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -311,6 +311,7 @@ authenticity intersect canonical entries with the marks.
 - `isVerified(agentId, client, idx)` — does this canonical entry carry a mark?
 - `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` — enumerate the verified set.
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` — aggregate the given clients' **verified** canonical entries (values read live from the canonical registry; revoked skipped; sum + count, normalized to fixed 18 decimals; `clients` must be non-empty — the caller picks whom to trust). Off-chain `eth_call` only.
+- `attestFeedbackWithTask(…, TaskReveal)` — additionally opens the proof's taskHash commitment (method / uri / body **hashes** / status — bodies stay private): the contract recomputes the hash and records the URI as the entry's **TEE-verified endpoint**. `getVerifiedEndpoint` reads it back; `getVerifiedSummaryForEndpoint(agentId, clients[], uri)` aggregates per interface without trusting client-declared tags.
 - `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
 
 > **Deprecated:** the previous private fork (`AgenticIDReputationRegistry`,
@@ -444,7 +445,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-183 Foundry tests across 21 suites (181 pass, 2 fork tests skip unless
+190 Foundry tests across 21 suites (188 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -455,8 +456,8 @@ longest business deadline window.
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
 | `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
-| `VerifiedFeedback.t.sol` | 21 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback / verified summary against the canonical registry mock |
-| `FeedbackBatcher.t.sol` | 5 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls |
+| `VerifiedFeedback.t.sol` | 27 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback / verified summary against the canonical registry mock |
+| `FeedbackBatcher.t.sol` | 6 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls |
 | `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification + revoke / appendResponse, all paths (incl. the cross-impl digest known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |

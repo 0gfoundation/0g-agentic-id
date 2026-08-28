@@ -11,6 +11,7 @@ import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
+import {TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 
 /// @notice The batcher runs AS the client's EOA via an EIP-7702 delegation.
 ///         These tests exercise it with forge's 7702 cheatcodes
@@ -87,6 +88,10 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         });
     }
 
+    function _emptyTask() internal pure returns (TaskReveal memory) {
+        return TaskReveal({method: "", uri: "", reqBodyHash: 0, respBodyHash: 0, statusCode: 0});
+    }
+
     /// @dev Attach the batcher's code to the client EOA (7702) and self-call
     ///      giveFeedbackAndAttest with the given proof.
     function _delegatedCall(uint256 agentId, ServeProof memory proof) internal returns (uint64) {
@@ -94,7 +99,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         vm.prank(clientWallet.addr);
         return FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
-            "https://api.example.com", "", bytes32(0), proof
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
     }
 
@@ -114,6 +119,41 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         assertTrue(registry.isVerified(agentId, clientWallet.addr, 1), "verified mark set");
     }
 
+    /// @dev With a task reveal, the batch also records the TEE-verified endpoint.
+    function test_delegatedBatch_withTaskRecordsEndpoint() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        TaskReveal memory task = TaskReveal({
+            method: "GET", uri: "/hello",
+            reqBodyHash: keccak256(""), respBodyHash: keccak256("resp"), statusCode: 200
+        });
+        bytes32 taskHash = keccak256(abi.encodePacked(
+            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash, bytes("200")
+        ));
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes32 inner = keccak256(abi.encode(
+            block.chainid, address(agenticId), clientWallet.addr, agentId,
+            block.timestamp, deadline, taskHash,
+            keccak256(abi.encodePacked(dataHashes)), FRAMEWORK_HASH
+        ));
+        ServeProof memory proof = ServeProof({
+            agentId: agentId, submitter: clientWallet.addr,
+            timestamp: block.timestamp, deadline: deadline,
+            taskHash: taskHash, dataHashes: dataHashes, frameworkHash: FRAMEWORK_HASH,
+            signature: _sign(sealWallet.privateKey, _eip191RawHash(inner))
+        });
+
+        vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
+        vm.prank(clientWallet.addr);
+        uint64 idx = FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
+            agentId, 90, 0, "quality", "latency",
+            "https://api.example.com", "", bytes32(0), proof, task
+        );
+
+        assertEq(registry.getVerifiedEndpoint(agentId, clientWallet.addr, idx), "/hello", "endpoint recorded through the batch");
+    }
+
     // ── Atomicity: failed attest rolls back the canonical write ──────────────
 
     function test_delegatedBatch_badProofRollsBackCanonicalWrite() public {
@@ -127,7 +167,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         vm.expectRevert(); // VerifiedFeedbackInvalidProofSignature, bubbled through the batch
         FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
-            "https://api.example.com", "", bytes32(0), proof
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
 
         // The whole batch reverted: no orphan canonical entry, no mark.
@@ -147,7 +187,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         vm.expectRevert(BatcherNotSelf.selector);
         batcher.giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
-            "https://api.example.com", "", bytes32(0), proof
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
     }
 
@@ -163,7 +203,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         vm.expectRevert(BatcherNotSelf.selector);
         FeedbackBatcher(clientWallet.addr).giveFeedbackAndAttest(
             agentId, 90, 0, "quality", "latency",
-            "https://api.example.com", "", bytes32(0), proof
+            "https://api.example.com", "", bytes32(0), proof, _emptyTask()
         );
     }
 

@@ -34,6 +34,7 @@ import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRo
 import type {
   ServeProof, GiveFeedbackParams, GiveFeedbackResult, AppendResponseParams,
   ReadAllFeedbackParams, GetSummaryParams, Feedback, FeedbackSummary, ServeData,
+  TaskReveal,
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -743,6 +744,7 @@ export class ReputationApi {
   // — feedback (canonical write + TEE verification mark, bundled) —
   giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> { return this.rep.giveFeedback(params); }
   attestFeedback(agentId: bigint, feedbackIndex: bigint, proof: ServeProof): Promise<WriteContractReturnType> { return this.rep.attestFeedback(agentId, feedbackIndex, proof); }
+  attestFeedbackWithTask(agentId: bigint, feedbackIndex: bigint, proof: ServeProof, task: TaskReveal): Promise<WriteContractReturnType> { return this.rep.attestFeedbackWithTask(agentId, feedbackIndex, proof, task); }
   revokeFeedback(agentId: bigint, feedbackIndex: bigint): Promise<WriteContractReturnType> { return this.rep.revokeFeedback(agentId, feedbackIndex); }
   appendResponse(params: AppendResponseParams): Promise<WriteContractReturnType> { return this.rep.appendResponse(params); }
   // — canonical reads (raw feedback, verified or not) —
@@ -757,6 +759,8 @@ export class ReputationApi {
   getVerifiedIndexes(agentId: bigint, client: Address): Promise<bigint[]> { return this.rep.getVerifiedIndexes(agentId, client); }
   getVerifiedClients(agentId: bigint): Promise<Address[]> { return this.rep.getVerifiedClients(agentId); }
   getVerifiedSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getVerifiedSummary(params); }
+  getVerifiedEndpoint(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<string> { return this.rep.getVerifiedEndpoint(agentId, client, feedbackIndex); }
+  getVerifiedSummaryForEndpoint(agentId: bigint, uri: string, clients?: Address[]): Promise<FeedbackSummary> { return this.rep.getVerifiedSummaryForEndpoint(agentId, uri, clients); }
   getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   waitForTransaction(txHash: Hash): Promise<TransactionReceipt> { return this.rep.waitForTransaction(txHash); }
 }

@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 183 tests / 21 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 190 tests / 21 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -300,6 +300,7 @@ canonical 条目做交集。
 - `isVerified(agentId, client, idx)` —— 这条 canonical 条目有没有章？
 - `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` —— 枚举已验证集合
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` —— 聚合指定 client 的**已验证** canonical 条目（值实时从 canonical 读取；跳过 revoked；求和 + 计数，归一到固定 18 decimals；`clients` 必须非空——由调用方决定信谁）。仅限链下 `eth_call`。
+- `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag。
 - `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
 
 > **已废弃**：先前的私有分叉（`AgenticIDReputationRegistry`，proof 门禁的
@@ -419,7 +420,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-183 个 Foundry tests / 21 suites（181 通过，2 个 fork 测试未设 `FORK_RPC`
+190 个 Foundry tests / 21 suites（188 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -430,8 +431,8 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
-| `VerifiedFeedback.t.sol` | 21 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评 / 对着 canonical mock 的 verified summary |
-| `FeedbackBatcher.t.sol` | 5 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用 |
+| `VerifiedFeedback.t.sol` | 27 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评 / 对着 canonical mock 的 verified summary |
+| `FeedbackBatcher.t.sol` | 6 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用 |
 | `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签 + revoke / appendResponse 全路径（含跨实现 digest 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |

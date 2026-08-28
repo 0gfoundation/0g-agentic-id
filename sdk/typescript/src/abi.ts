@@ -743,6 +743,8 @@ export const verifiedFeedbackAbi = [
   {"type":"error","name":"VerifiedFeedbackProofSubmitterMismatch","inputs":[{"name":"submitter","type":"address"},{"name":"sender","type":"address"}]},
   {"type":"error","name":"VerifiedFeedbackSelfFeedback","inputs":[{"name":"agentId","type":"uint256"},{"name":"submitter","type":"address"}]},
   {"type":"error","name":"VerifiedFeedbackSummaryOverflow","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackTaskMismatch","inputs":[{"name":"expected","type":"bytes32"},{"name":"actual","type":"bytes32"}]},
+  {"type":"error","name":"VerifiedFeedbackInvalidTaskReveal","inputs":[]},
 
   // ── Attest ──
   {
@@ -761,6 +763,33 @@ export const verifiedFeedbackAbi = [
         { name: 'dataHashes', type: 'bytes32[]' },
         { name: 'frameworkHash', type: 'bytes32' },
         { name: 'signature', type: 'bytes' },
+      ] },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'attestFeedbackWithTask',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'feedbackIndex', type: 'uint64' },
+      { name: 'proof', type: 'tuple', components: [
+        { name: 'agentId', type: 'uint256' },
+        { name: 'submitter', type: 'address' },
+        { name: 'timestamp', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+        { name: 'taskHash', type: 'bytes32' },
+        { name: 'dataHashes', type: 'bytes32[]' },
+        { name: 'frameworkHash', type: 'bytes32' },
+        { name: 'signature', type: 'bytes' },
+      ] },
+      { name: 'task', type: 'tuple', components: [
+        { name: 'method', type: 'string' },
+        { name: 'uri', type: 'string' },
+        { name: 'reqBodyHash', type: 'bytes32' },
+        { name: 'respBodyHash', type: 'bytes32' },
+        { name: 'statusCode', type: 'uint16' },
       ] },
     ],
     outputs: [],
@@ -811,6 +840,32 @@ export const verifiedFeedbackAbi = [
   },
   {
     type: 'function',
+    name: 'getVerifiedEndpoint',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddress', type: 'address' },
+      { name: 'feedbackIndex', type: 'uint64' },
+    ],
+    outputs: [{ name: '', type: 'string' }],
+  },
+  {
+    type: 'function',
+    name: 'getVerifiedSummaryForEndpoint',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'agentId', type: 'uint256' },
+      { name: 'clientAddresses', type: 'address[]' },
+      { name: 'uri', type: 'string' },
+    ],
+    outputs: [
+      { name: 'count', type: 'uint64' },
+      { name: 'summaryValue', type: 'int128' },
+      { name: 'summaryValueDecimals', type: 'uint8' },
+    ],
+  },
+  {
+    type: 'function',
     name: 'getVerifiedSummary',
     stateMutability: 'view',
     inputs: [
@@ -850,6 +905,8 @@ export const verifiedFeedbackAbi = [
       { name: 'feedbackIndex', type: 'uint64', indexed: true },
       { name: 'dataHashes', type: 'bytes32[]', indexed: false },
       { name: 'frameworkHash', type: 'bytes32', indexed: false },
+      { name: 'taskHash', type: 'bytes32', indexed: false },
+      { name: 'uri', type: 'string', indexed: false },
     ],
   },
 ] as const;
@@ -884,6 +941,13 @@ export const feedbackBatcherAbi = [
         { name: 'dataHashes', type: 'bytes32[]' },
         { name: 'frameworkHash', type: 'bytes32' },
         { name: 'signature', type: 'bytes' },
+      ] },
+      { name: 'task', type: 'tuple', components: [
+        { name: 'method', type: 'string' },
+        { name: 'uri', type: 'string' },
+        { name: 'reqBodyHash', type: 'bytes32' },
+        { name: 'respBodyHash', type: 'bytes32' },
+        { name: 'statusCode', type: 'uint16' },
       ] },
     ],
     outputs: [{ name: 'feedbackIndex', type: 'uint64' }],

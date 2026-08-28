@@ -6,7 +6,9 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
-import {IVerifiedFeedbackRegistry} from "./interfaces/IVerifiedFeedbackRegistry.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
+
+import {IVerifiedFeedbackRegistry, TaskReveal} from "./interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "./interfaces/IAgenticIDReputationRegistry.sol";
 import {ICanonicalReputationRegistry} from "./interfaces/ICanonicalReputationRegistry.sol";
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
@@ -34,6 +36,12 @@ error VerifiedFeedbackAlreadyVerified(uint256 agentId, address clientAddress, ui
 error VerifiedFeedbackNotVerified(uint256 agentId, address clientAddress, uint64 feedbackIndex);
 /// @dev getVerifiedSummary requires an explicit, non-empty clientAddresses set.
 error VerifiedFeedbackClientsRequired();
+/// @dev The revealed receipt materials don't hash to the proof's taskHash.
+error VerifiedFeedbackTaskMismatch(bytes32 expected, bytes32 actual);
+/// @dev Malformed task reveal: method outside the known HTTP set, or a URI
+/// not starting with '/'. Both checks close the concatenation ambiguity at
+/// the method‖uri boundary of the taskHash preimage.
+error VerifiedFeedbackInvalidTaskReveal();
 /// @dev A summary summation exceeded int128 — unreachable given canonical's
 /// bounded writes (|value| ≤ 1e38 is still bounded after 18-decimal
 /// normalization only for ≤ 18-decimal values; the guard keeps a would-be
@@ -68,9 +76,15 @@ contract VerifiedFeedbackRegistry is
 
     /// @notice Current implementation version. See contracts/UPGRADING.md for
     ///         the bump rules.
-    /// @dev 1.0.0 — initial: attest-only companion to the canonical ERC-8004
+    /// @dev 1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
+    ///      recomputes the proof's taskHash from revealed receipt materials and
+    ///      records the URI as the entry's TEE-verified endpoint; new views
+    ///      getVerifiedEndpoint / getVerifiedSummaryForEndpoint; FeedbackVerified
+    ///      gains taskHash + uri fields (ABI change); ServeData gains a trailing
+    ///      `uri` field (mapping-stored struct — append-safe, old entries read "").
+    ///      1.0.0 — initial: attest-only companion to the canonical ERC-8004
     ///      Reputation Registry, replacing the AgenticIDReputationRegistry fork.
-    string public constant VERSION = "1.0.0";
+    string public constant VERSION = "1.1.0";
 
     /// @dev Same tag as the fork registry — the digest and nonce-key derivation
     ///      are consensus-critical, shared with sealed/ and the SDK.
@@ -84,6 +98,10 @@ contract VerifiedFeedbackRegistry is
         bool      exists;
         bytes32   frameworkHash;
         bytes32[] dataHashes;
+        /// @dev TEE-verified endpoint (task receipt opened on-chain); "" when
+        ///      the entry was attested without a reveal. Appended in 1.1.0 —
+        ///      mapping-stored struct, so old entries read the zero value.
+        string    uri;
     }
 
     /// @custom:storage-location erc7201:0g.storage.VerifiedFeedbackRegistry
@@ -175,6 +193,44 @@ contract VerifiedFeedbackRegistry is
     function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof)
         external whenNotPaused
     {
+        _attest(agentId, feedbackIndex, proof, "");
+    }
+
+    function attestFeedbackWithTask(
+        uint256 agentId,
+        uint64 feedbackIndex,
+        ServeProof calldata proof,
+        TaskReveal calldata task
+    ) external whenNotPaused {
+        // Open the taskHash commitment: recompute it from the revealed receipt
+        // materials exactly as the sealed proxy built it — keccak256(method ‖
+        // uri ‖ reqBodyHash ‖ respBodyHash ‖ decimal statusCode). The hash is
+        // inside the seal-signed digest, so a match proves the interaction hit
+        // `task.uri`. Method whitelist + leading '/' close the concatenation
+        // ambiguity at the method‖uri boundary.
+        if (!_isKnownMethod(task.method)) revert VerifiedFeedbackInvalidTaskReveal();
+        bytes memory uriBytes = bytes(task.uri);
+        if (uriBytes.length == 0 || uriBytes[0] != "/") revert VerifiedFeedbackInvalidTaskReveal();
+        bytes32 recomputed = keccak256(abi.encodePacked(
+            bytes(task.method),
+            uriBytes,
+            task.reqBodyHash,
+            task.respBodyHash,
+            bytes(Strings.toString(uint256(task.statusCode)))
+        ));
+        if (recomputed != proof.taskHash) revert VerifiedFeedbackTaskMismatch(proof.taskHash, recomputed);
+
+        _attest(agentId, feedbackIndex, proof, task.uri);
+    }
+
+    /// @dev Shared attest routine. `verifiedUri` is "" for the plain path and
+    ///      the receipt-opened endpoint for attestFeedbackWithTask.
+    function _attest(
+        uint256 agentId,
+        uint64 feedbackIndex,
+        ServeProof calldata proof,
+        string memory verifiedUri
+    ) internal {
         // The verification mark is stored under the outer `agentId`, but the
         // proof is verified against `proof.agentId` (the agent whose seal signs
         // it). Require them to match — otherwise a valid proof for agent A
@@ -208,6 +264,7 @@ contract VerifiedFeedbackRegistry is
         slot_.exists = true;
         slot_.frameworkHash = proof.frameworkHash;
         slot_.dataHashes = proof.dataHashes;
+        slot_.uri = verifiedUri;
         $.verifiedIndexes[agentId][msg.sender].push(feedbackIndex);
 
         if (!$.isVerifiedClient[agentId][msg.sender]) {
@@ -215,7 +272,20 @@ contract VerifiedFeedbackRegistry is
             $.verifiedClients[agentId].push(msg.sender);
         }
 
-        emit FeedbackVerified(agentId, msg.sender, feedbackIndex, proof.dataHashes, proof.frameworkHash);
+        emit FeedbackVerified(
+            agentId, msg.sender, feedbackIndex,
+            proof.dataHashes, proof.frameworkHash, proof.taskHash, verifiedUri
+        );
+    }
+
+    /// @dev The known HTTP methods a task reveal may claim — closes the
+    ///      method‖uri concatenation ambiguity (a shifted split would need a
+    ///      "method" outside this set or a URI without a leading '/').
+    function _isKnownMethod(string calldata method) private pure returns (bool) {
+        bytes32 h = keccak256(bytes(method));
+        return h == keccak256("GET") || h == keccak256("POST") || h == keccak256("PUT")
+            || h == keccak256("PATCH") || h == keccak256("DELETE") || h == keccak256("HEAD")
+            || h == keccak256("OPTIONS");
     }
 
     // ── IVerifiedFeedbackRegistry — read ──────────────────────────────────────
@@ -242,6 +312,46 @@ contract VerifiedFeedbackRegistry is
 
     function getVerifiedClients(uint256 agentId) external view returns (address[] memory) {
         return _getVerifiedFeedbackStorage().verifiedClients[agentId];
+    }
+
+    function getVerifiedEndpoint(uint256 agentId, address clientAddress, uint64 feedbackIndex)
+        external view returns (string memory)
+    {
+        ServeData storage d = _getVerifiedFeedbackStorage().verified[agentId][clientAddress][feedbackIndex];
+        if (!d.exists) revert VerifiedFeedbackNotVerified(agentId, clientAddress, feedbackIndex);
+        return d.uri;
+    }
+
+    /// @dev Same shape and caveats as getVerifiedSummary, additionally
+    ///      filtering to entries whose TEE-verified endpoint equals `uri`
+    ///      (entries attested without a task reveal never match — their
+    ///      endpoint is unproven). Off-chain eth_call only.
+    function getVerifiedSummaryForEndpoint(
+        uint256 agentId,
+        address[] calldata clientAddresses,
+        string calldata uri
+    ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals) {
+        if (clientAddresses.length == 0) revert VerifiedFeedbackClientsRequired();
+        VerifiedFeedbackStorage storage $ = _getVerifiedFeedbackStorage();
+        ICanonicalReputationRegistry canonical_ = ICanonicalReputationRegistry($.canonicalReputation);
+        bytes32 uriHash = keccak256(bytes(uri));
+
+        summaryValueDecimals = 18;
+        int256 acc;
+        for (uint256 i = 0; i < clientAddresses.length; i++) {
+            address client = clientAddresses[i];
+            uint64[] storage indexes = $.verifiedIndexes[agentId][client];
+            for (uint256 j = 0; j < indexes.length; j++) {
+                if (keccak256(bytes($.verified[agentId][client][indexes[j]].uri)) != uriHash) continue;
+                (int128 value, uint8 valueDecimals, , , bool revoked) =
+                    canonical_.readFeedback(agentId, client, indexes[j]);
+                if (revoked) continue;
+                count++;
+                acc += _normalizeTo18(value, valueDecimals);
+            }
+        }
+        if (acc < type(int128).min || acc > type(int128).max) revert VerifiedFeedbackSummaryOverflow();
+        summaryValue = int128(acc);
     }
 
     /// @dev O(verified entries × external canonical reads), unbounded and

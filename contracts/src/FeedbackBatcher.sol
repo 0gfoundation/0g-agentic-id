@@ -2,7 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {ICanonicalReputationRegistry} from "./interfaces/ICanonicalReputationRegistry.sol";
-import {IVerifiedFeedbackRegistry} from "./interfaces/IVerifiedFeedbackRegistry.sol";
+import {IVerifiedFeedbackRegistry, TaskReveal} from "./interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "./interfaces/IAgenticIDReputationRegistry.sol";
 
 /// @dev The routine may only be self-called: it is designed to run AS the
@@ -50,6 +50,9 @@ contract FeedbackBatcher {
     /// @notice Submit canonical feedback and attest it with a ServeProof, in
     ///         one atomic transaction. See the contract natspec for the
     ///         execution model; parameters mirror the two underlying calls.
+    ///         An empty `task.method` skips the receipt opening (plain
+    ///         attest); a non-empty one routes to attestFeedbackWithTask,
+    ///         recording `task.uri` as the entry's TEE-verified endpoint.
     /// @return feedbackIndex The 1-based canonical index the entry landed at.
     function giveFeedbackAndAttest(
         uint256 agentId,
@@ -60,7 +63,8 @@ contract FeedbackBatcher {
         string calldata endpoint,
         string calldata feedbackURI,
         bytes32 feedbackHash,
-        ServeProof calldata proof
+        ServeProof calldata proof,
+        TaskReveal calldata task
     ) external returns (uint64 feedbackIndex) {
         if (msg.sender != address(this)) revert BatcherNotSelf();
 
@@ -70,6 +74,10 @@ contract FeedbackBatcher {
         // address(this) IS the client EOA under delegation, so this reads the
         // index canonical just assigned to the entry above.
         feedbackIndex = canonicalReputation.getLastIndex(agentId, address(this));
-        verifiedFeedback.attestFeedback(agentId, feedbackIndex, proof);
+        if (bytes(task.method).length == 0) {
+            verifiedFeedback.attestFeedback(agentId, feedbackIndex, proof);
+        } else {
+            verifiedFeedback.attestFeedbackWithTask(agentId, feedbackIndex, proof, task);
+        }
     }
 }

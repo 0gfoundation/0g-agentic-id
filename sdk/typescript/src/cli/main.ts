@@ -44,6 +44,10 @@ INTERACTIVE (default — no command)
                             use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
                             hello <agentId|seal> any agent's public /hello
+                                                 (banks a rating ticket if a
+                                                 wallet is configured)
+                            rate <id> [score]    rate an agent on-chain
+                                                 (serve-proof-backed feedback)
                                                  (identity + services + proof)
                             deploy               new-agent wizard, then chat
                             start/stop/reset <id> lifecycle without entering
@@ -110,6 +114,9 @@ ENVIRONMENT
   AGENTIC_RPC_URL        optional. Overrides the RPC the attestor advertises.
   AGENTIC_API_KEY        optional. Inference key for deploy/reset; overrides
                          the one stored by login.
+  AGENTIC_VERIFIED_FEEDBACK_ADDR / AGENTIC_FEEDBACK_BATCHER_ADDR
+                         optional. Reputation-pair address overrides for
+                         attestors whose /config doesn't advertise them yet.
 
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch

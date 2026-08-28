@@ -38,7 +38,10 @@ import type {
   Feedback,
   FeedbackSummary,
   ServeData,
+  TaskReveal,
 } from './types';
+
+const ZERO32 = ('0x' + '0'.repeat(64)) as `0x${string}`;
 
 /**
  * Internal client for the reputation pair (canonical ERC-8004 registry +
@@ -134,7 +137,9 @@ export class ReputationClient {
     // once the write mines — this wait is inherent to the flow, not politeness.
     await this.waitForTransaction(feedbackTx);
     const feedbackIndex = await this.getLastIndex(params.agentId, this.account!.address);
-    const attestTx = await this.attestFeedback(params.agentId, feedbackIndex, params.serveProof);
+    const attestTx = params.task
+      ? await this.attestFeedbackWithTask(params.agentId, feedbackIndex, params.serveProof, params.task)
+      : await this.attestFeedback(params.agentId, feedbackIndex, params.serveProof);
     return { feedbackTx, attestTx, feedbackIndex };
   }
 
@@ -198,6 +203,7 @@ export class ReputationClient {
             frameworkHash: sp.frameworkHash,
             signature: sp.signature,
           },
+          params.task ?? { method: '', uri: '', reqBodyHash: ZERO32, respBodyHash: ZERO32, statusCode: 0 },
         ],
       }),
       authorizationList,
@@ -250,6 +256,42 @@ export class ReputationClient {
           frameworkHash: proof.frameworkHash,
           signature: proof.signature,
         },
+      ],
+      account: this.account!,
+      chain: this.chain,
+    });
+  }
+
+  /**
+   * Like {@link attestFeedback}, additionally opening the proof's taskHash
+   * commitment: the contract recomputes the hash from the revealed receipt
+   * materials and records `task.uri` as the entry's TEE-verified endpoint.
+   */
+  async attestFeedbackWithTask(
+    agentId: bigint,
+    feedbackIndex: bigint,
+    proof: ServeProof,
+    task: TaskReveal,
+  ): Promise<WriteContractReturnType> {
+    this.requireWallet();
+    return this.walletClient!.writeContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'attestFeedbackWithTask',
+      args: [
+        agentId,
+        feedbackIndex,
+        {
+          agentId: proof.agentId,
+          submitter: proof.submitter,
+          timestamp: proof.timestamp,
+          deadline: proof.deadline,
+          taskHash: proof.taskHash,
+          dataHashes: proof.dataHashes,
+          frameworkHash: proof.frameworkHash,
+          signature: proof.signature,
+        },
+        task,
       ],
       account: this.account!,
       chain: this.chain,
@@ -470,6 +512,44 @@ export class ReputationClient {
       abi: verifiedFeedbackAbi,
       functionName: 'getVerifiedSummary',
       args: [params.agentId, clients, (params.tag1 ?? ''), (params.tag2 ?? '')],
+    });
+    const [count, summaryValue, summaryValueDecimals] = result as [bigint, bigint, number];
+    return { count, summaryValue, summaryValueDecimals };
+  }
+
+  /**
+   * The TEE-verified endpoint of a verified entry — empty string when it was
+   * attested without opening its task receipt.
+   */
+  async getVerifiedEndpoint(agentId: bigint, clientAddress: Address, feedbackIndex: bigint): Promise<string> {
+    return this.publicClient.readContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'getVerifiedEndpoint',
+      args: [agentId, clientAddress, feedbackIndex],
+    }) as Promise<string>;
+  }
+
+  /**
+   * Summary over verified entries whose TEE-verified endpoint equals `uri`.
+   * Empty `clientAddresses` defaults to all verified clients; none yet →
+   * empty summary.
+   */
+  async getVerifiedSummaryForEndpoint(
+    agentId: bigint,
+    uri: string,
+    clientAddresses?: Address[],
+  ): Promise<FeedbackSummary> {
+    let clients = clientAddresses ?? [];
+    if (clients.length === 0) {
+      clients = await this.getVerifiedClients(agentId);
+      if (clients.length === 0) return { count: 0n, summaryValue: 0n, summaryValueDecimals: 0 };
+    }
+    const result = await this.publicClient.readContract({
+      address: this.verifiedFeedbackAddr,
+      abi: verifiedFeedbackAbi,
+      functionName: 'getVerifiedSummaryForEndpoint',
+      args: [agentId, clients, uri],
     });
     const [count, summaryValue, summaryValueDecimals] = result as [bigint, bigint, number];
     return { count, summaryValue, summaryValueDecimals };

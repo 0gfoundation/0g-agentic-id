@@ -24,9 +24,18 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
   const attestorUrl = requireAttestorUrl(env);
   const account = env.privateKey || opts.withWallet ? requirePrivateKey(env) : undefined;
   try {
+    // Address overrides for environments whose attestor /config doesn't (yet)
+    // advertise the reputation pair — explicit env wins over discovery.
+    const vf = process.env.AGENTIC_VERIFIED_FEEDBACK_ADDR?.trim();
+    const fbb = process.env.AGENTIC_FEEDBACK_BATCHER_ADDR?.trim();
+    const overrides = {
+      ...(vf ? { verifiedFeedback: vf as `0x${string}` } : {}),
+      ...(fbb ? { feedbackBatcher: fbb as `0x${string}` } : {}),
+    };
     return await AgenticID.fromAttestor(attestorUrl, {
       ...(account ? { account } : {}),
       ...(env.rpcUrl ? { rpcUrl: env.rpcUrl } : {}),
+      ...(Object.keys(overrides).length ? { overrides } : {}),
     });
   } catch (e) {
     if (e instanceof CliError) throw e;

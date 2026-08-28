@@ -71,6 +71,7 @@ export type {
   ServeData,
   GiveFeedbackParams,
   GiveFeedbackResult,
+  TaskReveal,
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,

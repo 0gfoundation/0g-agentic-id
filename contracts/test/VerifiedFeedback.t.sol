@@ -18,9 +18,11 @@ import {
     VerifiedFeedbackNoSuchEntry,
     VerifiedFeedbackAlreadyVerified,
     VerifiedFeedbackNotVerified,
-    VerifiedFeedbackClientsRequired
+    VerifiedFeedbackClientsRequired,
+    VerifiedFeedbackTaskMismatch,
+    VerifiedFeedbackInvalidTaskReveal
 } from "../src/VerifiedFeedbackRegistry.sol";
-import {IVerifiedFeedbackRegistry} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
+import {IVerifiedFeedbackRegistry, TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
@@ -148,7 +150,9 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         bytes32[] memory wantHashes = new bytes32[](1);
         wantHashes[0] = dataHash;
         vm.expectEmit(true, true, true, true, address(registry));
-        emit IVerifiedFeedbackRegistry.FeedbackVerified(agentId, client, idx, wantHashes, FRAMEWORK_HASH);
+        emit IVerifiedFeedbackRegistry.FeedbackVerified(
+            agentId, client, idx, wantHashes, FRAMEWORK_HASH, proof.taskHash, ""
+        );
 
         _attest(agentId, client, idx, proof);
 
@@ -425,6 +429,119 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         address[] memory empty = new address[](0);
         vm.expectRevert(VerifiedFeedbackClientsRequired.selector);
         registry.getVerifiedSummary(agentId, empty, "", "");
+    }
+
+    // ── Task-receipt opening (attestFeedbackWithTask) ─────────────────────────
+
+    /// @dev Cross-implementation known-answer vector for the taskHash
+    ///      reconstruction. Generated from the sealed proxy's Go code
+    ///      (crypto.Keccak256(method, uri, keccak(reqBody), respBodyHash,
+    ///      itoa(status))) — if the Solidity reconstruction or the Go
+    ///      composition drifts, this fails.
+    function test_taskHash_crossImplVector() public pure {
+        bytes32 recomputed = keccak256(abi.encodePacked(
+            bytes("GET"), bytes("/hello"),
+            keccak256(""), // empty request body
+            bytes32(0x1111111111111111111111111111111111111111111111111111111111111111),
+            bytes("200")
+        ));
+        assertEq(
+            recomputed,
+            0x2f9ed03f9562ed3d04171edfc8690f42c817e3ae99745799da3c108ab32122c3,
+            "taskHash reconstruction drifted from the sealed proxy's composition"
+        );
+    }
+
+    function _taskAndProof(uint256 agentId, address submitter, bytes32 dataHash, string memory uri)
+        internal view returns (TaskReveal memory task, ServeProof memory proof)
+    {
+        task = TaskReveal({
+            method: "GET",
+            uri: uri,
+            reqBodyHash: keccak256(""),
+            respBodyHash: keccak256("resp-body"),
+            statusCode: 200
+        });
+        bytes32 taskHash = keccak256(abi.encodePacked(
+            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash, bytes("200")
+        ));
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        proof = _mkServeProof(
+            agentId, submitter, taskHash, dataHashes, FRAMEWORK_HASH,
+            block.timestamp + 1 hours, sealWallet.privateKey
+        );
+    }
+
+    function test_attestWithTask_recordsVerifiedEndpoint() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        (TaskReveal memory task, ServeProof memory proof) = _taskAndProof(agentId, client, dataHash, "/hello");
+
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, idx, proof, task);
+
+        assertTrue(registry.isVerified(agentId, client, idx), "verified");
+        assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "/hello", "TEE-verified endpoint recorded");
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        (uint64 count, int128 sum, uint8 dec) = registry.getVerifiedSummaryForEndpoint(agentId, cs, "/hello");
+        assertEq(count, 1, "endpoint summary counts the entry");
+        assertEq(sum, int128(90) * int128(1e18), "value aggregated");
+        assertEq(dec, 18, "18 decimals");
+        (count, , ) = registry.getVerifiedSummaryForEndpoint(agentId, cs, "/other");
+        assertEq(count, 0, "other endpoint counts nothing");
+    }
+
+    /// @dev A plain attest leaves the endpoint unproven — it never matches an
+    ///      endpoint-scoped summary and reads back as "".
+    function test_plainAttest_hasNoVerifiedEndpoint() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        _attest(agentId, client, idx, _proofFor(agentId, client, dataHash, TASK_HASH));
+
+        assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "", "no endpoint without a reveal");
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        (uint64 count, , ) = registry.getVerifiedSummaryForEndpoint(agentId, cs, "");
+        // "" is the sentinel for "unproven", not a queryable endpoint — but even
+        // querying it aggregates only entries that genuinely stored "".
+        assertEq(count, 1, "unrevealed entries group under the empty sentinel");
+    }
+
+    function test_attestWithTask_revertsOnTaskMismatch() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _canonicalFeedback(agentId, client, 90, 0);
+        // Proof commits to /hello; the reveal claims /evil.
+        (, ServeProof memory proof) = _taskAndProof(agentId, client, dataHash, "/hello");
+        (TaskReveal memory lie, ) = _taskAndProof(agentId, client, dataHash, "/evil");
+
+        vm.prank(client);
+        vm.expectPartialRevert(VerifiedFeedbackTaskMismatch.selector);
+        registry.attestFeedbackWithTask(agentId, 1, proof, lie);
+    }
+
+    function test_attestWithTask_revertsOnUnknownMethod() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _canonicalFeedback(agentId, client, 90, 0);
+        (TaskReveal memory task, ServeProof memory proof) = _taskAndProof(agentId, client, dataHash, "/hello");
+        task.method = "FETCH";
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidTaskReveal.selector);
+        registry.attestFeedbackWithTask(agentId, 1, proof, task);
+    }
+
+    function test_attestWithTask_revertsOnUriWithoutSlash() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _canonicalFeedback(agentId, client, 90, 0);
+        (TaskReveal memory task, ServeProof memory proof) = _taskAndProof(agentId, client, dataHash, "/hello");
+        task.uri = "hello"; // no leading slash
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidTaskReveal.selector);
+        registry.attestFeedbackWithTask(agentId, 1, proof, task);
     }
 
     // ── Pause / initializer guards ────────────────────────────────────────────

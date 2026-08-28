@@ -173,6 +173,11 @@ await ag.reputation.getVerifiedSummary({ agentId });       // proof-backed entri
 await ag.reputation.getVerifiedClients(agentId);           // clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);    // → [1n, …]
 await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
+// task-receipt opening: pass `task` (method/uri/body hashes/status of the rated
+// interaction) to giveFeedback and the contract verifies it against the proof's
+// taskHash, recording the URI as the entry's TEE-verified endpoint:
+await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);            // → "/hello" ("" if unrevealed)
+await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');    // per-interface verified aggregate
 
 // owner responds to an entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://…', responseHash: keccak256(toBytes('thanks')) });

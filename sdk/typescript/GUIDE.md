@@ -270,6 +270,12 @@ await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);  // → 1n  
 
 // verified reads — only proof-backed entries count here
 await ag.reputation.isVerified(agentId, buyer, idx);            // → true
+// pass `task: { method, uri, reqBodyHash, respBodyHash, statusCode }` to
+// giveFeedback (the receipt materials of the rated interaction — bodies stay
+// private, only their hashes go on-chain) and the contract opens the proof's
+// taskHash commitment, recording the URI as a TEE-VERIFIED endpoint:
+await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);   // → "/hello" ("" if unrevealed)
+await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');  // trustless per-interface aggregate
 await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → all VERIFIED clients (empty → zero summary)
 await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
