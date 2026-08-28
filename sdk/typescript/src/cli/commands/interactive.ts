@@ -489,7 +489,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!rows.length) { out('no agents on this attestor\n'); continue; }
         for (const r of rows) {
           const owned = mySeals?.has(r.sealId) ? '*' : ' ';
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${r.name ?? ''}\n`);
+          // Minted rows: short sealId (agentId is the working handle). Unminted
+          // rows ('?'): FULL sealId — it is the only handle commands accept.
+          const seal = r.agentId != null ? `${r.sealId.slice(0, 8)}…${r.sealId.slice(-6)}` : r.sealId;
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(17)} ${r.name ?? ''}\n`);
         }
         if (mySeals) out('(* = owned by your wallet)\n');
         continue;
