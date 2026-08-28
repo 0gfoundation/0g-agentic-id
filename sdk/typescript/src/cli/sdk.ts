@@ -15,14 +15,22 @@ import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
  * Build an SDK facade from the CLI environment.
  *
  * - Attestor URL is always required (one URL selects the environment).
- * - The private key is validated whenever it is PRESENT (a malformed key must
- *   fail loudly with exit 3, not silently downgrade to read-only), but only
- *   REQUIRED when the caller asks (`withWallet` — owner-signed surfaces).
+ * - The private key is strictly validated when the caller REQUIRES a wallet
+ *   (`withWallet` — owner-signed surfaces fail loudly with exit 3 + remedy).
+ *   Read-only callers proceed walletless on a malformed key (the caller is
+ *   expected to warn) — public surfaces must not be hostage to a bad env var.
  * - `AGENTIC_RPC_URL` overrides the attestor-advertised RPC (explicit-wins).
  */
 export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = {}): Promise<AgenticID> {
   const attestorUrl = requireAttestorUrl(env);
-  const account = env.privateKey || opts.withWallet ? requirePrivateKey(env) : undefined;
+  // Wallet-requiring callers get the strict check (named error + remedy).
+  // Read-only callers proceed WALLETLESS on a malformed key instead of dying —
+  // public surfaces like `list`/`hello` must not be hostage to a bad env var.
+  const account = opts.withWallet
+    ? requirePrivateKey(env)
+    : env.privateKey && /^0x[0-9a-fA-F]{64}$/.test(env.privateKey)
+      ? env.privateKey
+      : undefined;
   try {
     // Address overrides for environments whose attestor /config doesn't (yet)
     // advertise the reputation pair — explicit env wins over discovery.

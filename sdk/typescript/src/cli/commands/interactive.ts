@@ -297,7 +297,7 @@ const L1_HELP_FULL = `manager commands
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
-  const wallet = key ? await addressOf(key) : null;
+  const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   // Pixel splash (the avatar generator's panda) when the terminal can show
   // it; the plain box otherwise (pipes, NO_COLOR, dumb terminals).
@@ -324,7 +324,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
   }
   out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  out(`  wallet     ${wallet ? short(wallet) : '(none)'}\n`);
+  out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
   out('\n');
@@ -336,9 +336,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     const line = (await ask('\n0g-agenticid> ')).trim();
-    if (!line) continue;
-    const [cmd, ...args] = line.split(/\s+/);
-
+    // Bare Enter refreshes the account status — the L1 analog of L2's
+    // bare-Enter agent refresh.
+    const [cmd, ...args] = line ? line.split(/\s+/) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
@@ -445,7 +445,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'whoami') {
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        out(`wallet  : ${key ? await addressOf(key) : '(no key — run `login`)'}\n`);
+        out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
         if (key && ctx.env.attestorUrl) {
           try {
@@ -454,6 +454,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           } catch (e) {
             out(`ack     : (unreadable: ${(e as Error).message})\n`);
           }
+          try {
+            const d = await (await withWallet(ctx)).getBalanceDetail();
+            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}\n`);
+          } catch { /* serving not configured — skip the line */ }
         }
         continue;
       }
@@ -477,8 +481,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // field (owner-only since #64), so "mine" cannot be derived from
         // them: with a key configured, ALSO fetch the owner-signed listing
         // and mark rows by sealId membership.
-        const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-        const ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
+        let key = ctx.env.privateKey ?? loadKey() ?? undefined;
+        let ag: AgenticID;
+        try {
+          ag = key ? await withWallet(ctx) : await clientFor(ctx, false);
+        } catch (e) {
+          // Malformed key must not block a PUBLIC listing — warn, go walletless.
+          out(`warning: ${(e as CliError).message} — listing without ownership marks\n`);
+          key = undefined;
+          ag = await clientFor(ctx, false);
+        }
         // The two listings are independent — fetch them in parallel.
         const [rows, mySeals] = await Promise.all([
           ag.agent.listDeployments(),
