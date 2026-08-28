@@ -6,9 +6,9 @@ import {Test} from "forge-std/Test.sol";
 /// @notice Pins each namespaced-storage slot to the ERC-7201 derivation of its
 ///         namespace string. If a namespace string ever drifts, or a hand-written
 ///         slot constant is edited, the corresponding assertion fails loudly.
-///         Nine of ten are the canonical derivation; BaseDataVerifier is a fixed
-///         literal that intentionally differs (see its source comment), pinned
-///         here so the discrepancy stays visible.
+///         All but BaseDataVerifier are the canonical derivation; BaseDataVerifier
+///         is a fixed literal that intentionally differs (see its source comment),
+///         pinned here so the discrepancy stays visible.
 contract StorageLayoutTest is Test {
     function _erc7201(string memory ns) internal pure returns (bytes32) {
         return keccak256(abi.encode(uint256(keccak256(bytes(ns))) - 1)) & ~bytes32(uint256(0xff));
@@ -33,6 +33,8 @@ contract StorageLayoutTest is Test {
             0x006e35ac9067c2fcc8a4631e7a010043a67a2342b0b0036bfa95c5fb0d9ec700);
         assertEq(_erc7201("0g.storage.ERC7857"),
             0xa2b40c657abdbf180a6038c081d3a0af6206dcea36f4558f991bf8c787ef3c00);
+        assertEq(_erc7201("0g.storage.VerifiedFeedbackRegistry"),
+            0xa91e4c2ef61514299267811101bdc16c30719384e3b85c6fa8328f091e37e100);
     }
 
     /// @dev BaseDataVerifier's slot is a fixed literal, not the ERC-7201

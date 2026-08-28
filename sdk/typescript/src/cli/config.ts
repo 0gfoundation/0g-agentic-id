@@ -98,11 +98,21 @@ export function loadKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` | n
   return loadCredentials(env).privateKey ?? null;
 }
 
-/** Persist the owner key (validates 0x + 64 hex). */
-export function saveKey(key: string, env: NodeJS.ProcessEnv = process.env): void {
+/** Normalize a pasted private key: trims, and prepends the 0x that wallet
+ *  exports (MetaMask among them) commonly omit. Returns null if it isn't a
+ *  64-hex key either way. */
+export function normalizeKey(key: string): `0x${string}` | null {
   const k = key.trim();
-  if (!/^0x[0-9a-fA-F]{64}$/.test(k)) throw new Error('private key must be 0x followed by 64 hex chars');
-  saveCredentials({ privateKey: k as `0x${string}` }, env);
+  if (/^0x[0-9a-fA-F]{64}$/.test(k)) return k as `0x${string}`;
+  if (/^[0-9a-fA-F]{64}$/.test(k)) return `0x${k}` as `0x${string}`;
+  return null;
+}
+
+/** Persist the owner key (accepts 64 hex with or without the 0x prefix). */
+export function saveKey(key: string, env: NodeJS.ProcessEnv = process.env): void {
+  const k = normalizeKey(key);
+  if (!k) throw new Error('private key must be 64 hex chars (0x prefix optional)');
+  saveCredentials({ privateKey: k }, env);
 }
 
 /** The inference API key, or null. */

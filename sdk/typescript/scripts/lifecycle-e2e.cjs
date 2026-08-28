@@ -14,13 +14,14 @@
 //   • owner gate — after the transfer the OLD owner's lifecycle calls
 //                  must be rejected and the NEW owner's accepted
 //
-// Needs a RUNNING source agent (for the ServeProof) owned by OWNER_PRIV,
-// and REPUTATION_ADDR (the client-less registry bound to this AgenticID).
+// Needs a RUNNING source agent (for the ServeProof) owned by OWNER_PRIV, and
+// VERIFIED_FEEDBACK_ADDR (the VerifiedFeedbackRegistry bound to this
+// AgenticID; the canonical 8004 reputation registry is discovered from it).
 // Costs real money: clone mints, feedback + transfer + funding spend gas.
 //
 // Usage:
 //   OWNER_PRIV=0x… ATTESTOR_URL=http://… AGENT_URL=http://8080-<sandbox>.<proxy> \
-//   SEAL_ID=0x… AGENT_ID=61 REPUTATION_ADDR=0x… node scripts/lifecycle-e2e.cjs
+//   SEAL_ID=0x… AGENT_ID=61 VERIFIED_FEEDBACK_ADDR=0x… node scripts/lifecycle-e2e.cjs
 'use strict';
 const { AgenticID } = require('../dist/index.js');
 const { generatePrivateKey, privateKeyToAccount } = require('viem/accounts');
@@ -33,7 +34,7 @@ const ATTESTOR_URL = need('ATTESTOR_URL').replace(/\/$/, '');
 const AGENT_URL = need('AGENT_URL').replace(/\/$/, '');
 const SEAL_ID = need('SEAL_ID');
 const AGENT_ID = BigInt(need('AGENT_ID'));
-const REPUTATION_ADDR = need('REPUTATION_ADDR');
+const VERIFIED_FEEDBACK_ADDR = need('VERIFIED_FEEDBACK_ADDR');
 
 let failures = 0;
 const check = (name, ok, detail) => {
@@ -58,7 +59,7 @@ async function patientWait(waitFn, hash, label) {
 // networks where curl can (same workaround as agent-e2e.cjs).
 // clientAddr, when given, is echoed as X-Client-Address so the TEE binds the
 // serve-proof's `submitter` to it — required for the proof to be redeemable via
-// giveFeedback (the contract enforces submitter == msg.sender).
+// attestFeedback (the verified registry enforces submitter == msg.sender).
 function curlHelloHeader(base, clientAddr) {
   const hdr = clientAddr ? `-H 'X-Client-Address: ${clientAddr}'` : '';
   const raw = execSync(`curl -sm20 -D - -o /dev/null ${hdr} '${base}/hello'`, { encoding: 'utf8' });
@@ -74,7 +75,9 @@ function mkClient(privKey, cfg) {
     addresses: {
       agenticID: cfg.agentic_id_addr,
       teeDataVerifier: Z,
-      reputationRegistry: REPUTATION_ADDR,
+      verifiedFeedback: VERIFIED_FEEDBACK_ADDR,
+      // optional: exercises the atomic EIP-7702 path when set (or served by /config)
+      feedbackBatcher: process.env.FEEDBACK_BATCHER_ADDR || cfg.feedback_batcher_addr || undefined,
       tappRegistry: cfg.tapp_registry_addr,
       sandboxServing: cfg.sandbox_serving_addr ?? Z,
     },
@@ -179,7 +182,9 @@ function mkClient(privKey, cfg) {
     agentId: AGENT_ID, clientAddresses: [], tag1: '', tag2: '', includeRevoked: false,
   });
   const beforeCount = (await readAll()).length;
-  const fbTx = await B.reputation.giveFeedback({
+  // Bundled flow: canonical giveFeedback (mined inside the call, so the
+  // assigned index can be read) + attestFeedback on the verified registry.
+  const fb = await B.reputation.giveFeedback({
     agentId: AGENT_ID,
     value: 5n,
     valueDecimals: 0,
@@ -190,12 +195,16 @@ function mkClient(privKey, cfg) {
     feedbackHash: '0x' + '00'.repeat(32),
     serveProof: proof,
   });
-  await patientWait((h) => B.reputation.waitForTransaction(h), fbTx, 'giveFeedback');
+  await patientWait((h) => B.reputation.waitForTransaction(h), fb.attestTx, 'attestFeedback');
   const after = await readAll();
-  check('feedback recorded on-chain', after.length === beforeCount + 1, `count ${beforeCount}→${after.length}`);
-  const mine = after[after.length - 1];
-  check('feedback attributed to wallet B (client-less msg.sender)',
-    !!mine && (await B.reputation.getClients(AGENT_ID)).map((a) => a.toLowerCase()).includes(acctB.address.toLowerCase()));
+  check('feedback recorded on the canonical 8004 registry', after.length === beforeCount + 1, `count ${beforeCount}→${after.length}`);
+  check('feedback attributed to wallet B (native msg.sender)',
+    (await B.reputation.getClients(AGENT_ID)).map((a) => a.toLowerCase()).includes(acctB.address.toLowerCase()));
+  check('entry carries the TEE verification mark',
+    await B.reputation.isVerified(AGENT_ID, acctB.address, fb.feedbackIndex),
+    `feedbackIndex=${fb.feedbackIndex}`);
+  const vsum = await B.reputation.getVerifiedSummary({ agentId: AGENT_ID, clientAddresses: [acctB.address] });
+  check('verified summary counts the entry', vsum.count >= 1n, `count=${vsum.count}`);
 
   // ── 2b. /stop owner gate — a forged owner field must not pass ─────────
   // The SDK always sets `owner` to its own address, so an honest non-owner

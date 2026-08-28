@@ -7,7 +7,7 @@
  */
 
 import { CliError } from './errors';
-import { loadConfig, loadKey } from './config';
+import { loadConfig, loadKey, normalizeKey } from './config';
 
 /** Resolved CLI environment. All values come from `process.env`. */
 export interface CliEnv {
@@ -37,7 +37,13 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
   const fileKey = loadKey(env);
   return {
     attestorUrl: (pick('AGENTIC_ATTESTOR_URL') ?? file.attestorUrl)?.replace(/\/$/, ''),
-    privateKey: (pick('AGENTIC_PRIVATE_KEY') ?? fileKey ?? undefined) as `0x${string}` | undefined,
+    // env keys are normalized like login input (0x prefix optional); a
+    // malformed value passes through so requirePrivateKey can name the problem.
+    privateKey: (() => {
+      const raw = pick('AGENTIC_PRIVATE_KEY');
+      if (raw) return normalizeKey(raw) ?? (raw as `0x${string}`);
+      return fileKey ?? undefined;
+    })(),
     rpcUrl: pick('AGENTIC_RPC_URL') ?? file.rpcUrl,
   };
 }
@@ -62,7 +68,7 @@ export function requirePrivateKey(env: CliEnv): `0x${string}` {
     });
   }
   if (!/^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
-    throw new CliError('WALLET_REQUIRED', 'AGENTIC_PRIVATE_KEY is set but malformed (expected 0x + 64 hex chars)', {
+    throw new CliError('WALLET_REQUIRED', 'AGENTIC_PRIVATE_KEY is set but malformed (expected 64 hex chars, 0x prefix optional)', {
       remedy: 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
     });
   }

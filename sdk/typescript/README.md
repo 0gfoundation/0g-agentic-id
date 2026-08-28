@@ -28,7 +28,7 @@ One entry point, two namespaces + top-level ops.
 | `ag.deposit()` / `ag.getBalance()` | fund / read the prepaid sandbox balance (pay-as-you-go runtime) |
 | `ag.getBalanceDetail()` / `ag.requestRefund()` / `ag.withdrawRefund()` | full 3-value account view; withdraw prepaid funds (time-locked two-step) |
 
-Backends (AgenticID / ReputationRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't decide which call is on-chain and which is HTTP.
+Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedbackRegistry / TappRegistry / SandboxServing contracts + the attestor's HTTP endpoints) are hidden behind the facade — you don't decide which call is on-chain and which is HTTP.
 
 ## Quickstart
 
@@ -131,7 +131,7 @@ Convert freely: `getSealId` / `getAgentIdBySealId` / `getAgentSeal`.
 
 ## `ag.reputation` — serve-proof + feedback
 
-The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
+The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Feedback is **stored in the official canonical ERC-8004 Reputation Registry** (every 8004 reader sees it natively); the local VerifiedFeedbackRegistry records which entries were proof-backed — `giveFeedback` bundles the two calls. The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -148,18 +148,36 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
 await ag.reputation.verifyProof(proof);
 // → { ok, signerMatches, notExpired, dataOnChain, reasons }
 
-// 3. submit feedback — recorded under msg.sender. An owner CANNOT rate their own agent (contract rejects it).
-const txHash = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
-// optional: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
+// 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
+//    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
+//    is advertised) both land in ONE atomic type-4 tx; otherwise two sequential
+//    txs. An owner CANNOT attest feedback on their own agent (the verified
+//    registry rejects it).
+const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+// → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
+await ag.reputation.waitForTransaction(fb.attestTx);
+// optional params: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
+// escape hatch: attestFeedback(agentId, idx, proof) marks an entry submitted separately
 
-// reads
+// canonical reads (raw 8004 feedback — permissionless, verified or not)
 await ag.reputation.getLastIndex(agentId, buyer);          // → 2n
 await ag.reputation.readFeedback(agentId, buyer, idx);     // → { value, valueDecimals, tag1, tag2, isRevoked }
 await ag.reputation.getSummary({ agentId });               // → { count, summaryValue, summaryValueDecimals }
-await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
 await ag.reputation.readAllFeedback({ agentId });          // filters: clientAddresses / tags / includeRevoked
 await ag.reputation.getClients(agentId);                   // → ["0x…", …]
 await ag.reputation.getResponseCount(agentId, buyer, idx, [owner]);   // → 1n
+
+// verified reads (TEE marks — intersect these with the canonical entries)
+await ag.reputation.isVerified(agentId, buyer, idx);       // → true
+await ag.reputation.getVerifiedSummary({ agentId });       // proof-backed entries only
+await ag.reputation.getVerifiedClients(agentId);           // clients with ≥1 verified entry
+await ag.reputation.getVerifiedIndexes(agentId, buyer);    // → [1n, …]
+await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
+// task-receipt opening: pass `task` (method/uri/body hashes/status of the rated
+// interaction) to giveFeedback and the contract verifies it against the proof's
+// taskHash, recording the URI as the entry's TEE-verified endpoint:
+await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);            // → "/hello" ("" if unrevealed)
+await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');    // per-interface verified aggregate
 
 // owner responds to an entry; the client who left it can revoke
 await ag.reputation.appendResponse({ agentId, clientAddress: buyer, feedbackIndex: idx, responseURI: 'ipfs://…', responseHash: keccak256(toBytes('thanks')) });
@@ -185,7 +203,7 @@ const depositTx = await ag.deposit({ amountWei: parseEther('0.5') });
 await ag.waitForTransaction(depositTx);
 ```
 
-`deploy()`/`clone()` **preflight** both prerequisites (all components acked + balance ≥ 0.1 OG). Bare writes (`ack`/`deposit`/`topUpAgentSeal`/`giveFeedback`) return before mining — `await ag.waitForTransaction(tx)` before reading state back (more in the [guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent)).
+`deploy()`/`clone()` **preflight** both prerequisites (all components acked + balance ≥ 0.1 OG). Bare writes (`ack`/`deposit`/`topUpAgentSeal`) return before mining — `await ag.waitForTransaction(tx)` before reading state back; `giveFeedback` mines the canonical write internally and returns a pending `attestTx` to wait on (more in the [guide](./GUIDE.md#top-level-ops-not-scoped-to-one-agent)).
 
 ## iData & framework
 

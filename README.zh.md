@@ -273,7 +273,7 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 | 合约 | 职责 |
 |---|---|
 | **ERC-7857**（`ERC7857Upgradeable` + 扩展）| 功能数据（IntelligentData[]）与转让/克隆协议 |
-| **ERC-8004**（`ERC8004IdentityRegistry` + `AgenticIDReputationRegistry`）| 身份注册 + 声誉 |
+| **ERC-8004**（`ERC8004IdentityRegistry` + canonical `ReputationRegistry`，由 `VerifiedFeedbackRegistry` 盖验证章）| 身份注册 + 声誉 |
 | **AgentSeal 注册表**（`AgenticID.sol`）| agent 的动态身份凭证（set-once）+ `validFrameworkHashes` 白名单 |
 | **TappRegistry** | 所有 Tapp 组件的代码指纹注册表 |
 

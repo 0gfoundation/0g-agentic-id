@@ -8,14 +8,18 @@
 ## 1. Architecture
 
 Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
-`AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
-Implementation**. All three beacons are owned by one **TimelockController**;
-upgrades are two-phase `schedule → wait → execute`.
+`VerifiedFeedbackRegistry` / the deprecated `AgenticIDReputationRegistry`)
+uses **BeaconProxy + UpgradeableBeacon + Implementation**. All beacons are
+owned by one **TimelockController**; upgrades are two-phase
+`schedule → wait → execute`. `FeedbackBatcher` is the one non-upgradeable
+piece: stateless and privilege-free (an EIP-7702 delegate target), it is
+replaced by deploying a new one and re-delegating.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
 ERC-8004 Identity Registry** (binding semantics in §2).
-`AgenticIDReputationRegistry` extends ERC-8004 reputation; `giveFeedback` requires
-a TEE-signed ServeProof (§2.2).
+Reputation is split (§2.1): feedback lives in the canonical ERC-8004
+Reputation Registry; `VerifiedFeedbackRegistry` stamps TEE verification marks
+(ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated.
 
 Each contract has a `string public constant VERSION`, bumped whenever the impl
 changes — **the version scheme + upgrade procedure are in
@@ -57,6 +61,18 @@ views are unaffected. `owner` can `setPauser` at any time.
   `isSealIdBound(bytes32)` disambiguates `getAgentIdBySealId`'s 0 return.
 - **`initialize` gained a `canonical_` param** (last arg), defaulting by chainId;
   override with `CANONICAL_8004`.
+- **Reputation is canonical too**: feedback lives in the official ERC-8004
+  Reputation Registry (Galileo `0x8004B663…8713`, mainnet `0x8004BAa1…9b63`,
+  chosen by chainId, override with `CANONICAL_8004_REPUTATION`); the local
+  `VerifiedFeedbackRegistry` anchors to it and stores only ServeProof
+  verification marks. The `AgenticIDReputationRegistry` fork is deprecated
+  (live on existing environments, absent from fresh deploys).
+  Deploy `VerifiedFeedbackRegistry` through `Deploy.s.sol` only — the script's
+  fail-fast checks (`getVersion`, `getIdentityRegistry() == canonical`) are
+  what validate the anchoring; `initialize` itself only zero-checks the
+  addresses. And treat the §6 proxy address as **the** registry: any second
+  instance anchored to the same pair could redeem the same proofs
+  independently, so readers must pin one aggregator address per deployment.
 - **setAgentWallet is the official 4-arg form** (no nonce): signed by `newWallet`
   over `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`
   under domain `"ERC8004IdentityRegistry"/"1"`, `owner` = the AgenticID contract,
@@ -76,14 +92,16 @@ signers must mirror these exactly:
 
 `erc7857` = the AgenticID contract address (the token contract calling the verifier).
 
-**ServeProof is deliberately NOT envelope-domain-separated**, and carries **no
-`client`** (attribution is `msg.sender` at giveFeedback; signed digest =
-`keccak256(abi.encode(agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`).
-Cross-chain / cross-contract replay is prevented at the **key layer**: agentSeal is
-derived per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS
-derivation, agentic-id#38), so the same agentId on another deployment resolves to a
-different agentSeal and the recovered signer won't match — keeping the off-chain
-`sealed` signer's envelope free of chainId/contract fields.
+**ServeProof is envelope-domain-separated and submitter-bound** (since
+reputation registry 1.2.0): signed digest =
+`keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`,
+where `identityRegistry` = the AgenticID proxy and `submitter` = the only wallet
+allowed to redeem the proof (`== msg.sender` at redemption). Consumed by
+`VerifiedFeedbackRegistry.attestFeedback` (and the deprecated fork registry's
+`giveFeedback`). The **key layer** adds defense in depth: agentSeal is derived
+per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS derivation,
+agentic-id#38), so the same agentId on another deployment resolves to a
+different agentSeal regardless.
 
 Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
 `chainId ‖ erc7857`; the `sealed` runtime is unchanged.
@@ -120,23 +138,24 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 
 ## 3. Deploy
 
-`script/Deploy.s.sol` deploys all 10 contracts in one run (Timelock + 3 × (impl +
-beacon + proxy)); reputation/verifier bind to the freshly-minted AgenticID, and
-AgenticID binds to `CANONICAL_8004` (chainId default):
+`script/Deploy.s.sol` deploys all 11 contracts in one run (Timelock + 3 × (impl +
+beacon + proxy) + FeedbackBatcher); verified-feedback/verifier bind to the freshly-minted AgenticID,
+AgenticID binds to `CANONICAL_8004`, and the verified-feedback registry anchors to
+`CANONICAL_8004_REPUTATION` (both chainId defaults):
 
 ```bash
 export OWNER=0x...
 export PAUSER=0x...
 export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
 export TIMELOCK_DELAY=172800      # prod ≥ 2 days; dev may be 0
-# optional: CANONICAL_8004, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
+# optional: CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
   --priority-gas-price 2000000000 --gas-price 5000000000
 ```
 
 `PROPOSERS`/`EXECUTORS` default to proposers=[OWNER], executors=[0x0] (open
-execution). The run prints all 10 addresses — record them in §6.
+execution). The run prints all 11 addresses — record them in §6.
 
 **Required post-deploy (fresh contract = empty allowlists):** the owner must
 `addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`)
@@ -239,9 +258,13 @@ owner `0xB831…`.
 | AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | AgenticID impl | `0x99484dd890Ce0A507949af703544098Aa9312F70` | |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` | |
-| ReputationRegistry proxy | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
+| ReputationRegistry proxy (DEPRECATED — see VerifiedFeedback) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
+| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
+| VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
+| VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577` | v3, deployed 2026-08-28 (adds `receive()` so a delegated EOA still accepts plain ETH; supersedes `0x59921B…48BF` and `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
@@ -278,12 +301,27 @@ beacon upgrade and was verified post-upgrade — see changelog):
 |---|---|---|
 | AgenticID | **1.1.0** | **1.1.0** |
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
-| AgenticIDReputationRegistry | **1.2.0** | **1.2.0** |
+| AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
+| VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
 
 Changelog:
+
+- **VerifiedFeedbackRegistry 1.1.0, dev beacon-upgraded 2026-08-28** —
+  task-receipt opening (`attestFeedbackWithTask`, `getVerifiedEndpoint`,
+  `getVerifiedSummaryForEndpoint`; `FeedbackVerified` gains taskHash + uri).
+  Impl `0x6d785265d1C6c97C245988e50478605760D9b021`, two-phase via the dev
+  Timelock (`minDelay=0`); post-upgrade `VERSION()` verified 1.1.0 on chain.
+  `FeedbackBatcher` redeployed for the TaskReveal pass-through
+  (`0x59921B…48BF`), then again as v3 `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577`
+  adding `receive()` — a delegated EOA executes the delegate code on plain
+  value transfers too, so without it faucet/exchange sends to delegated
+  users reverted (review round-2 finding).
+- **VerifiedFeedbackRegistry 1.0.0, dev deployed 2026-08-27** — initial
+  (canonical-reputation split, PR #144), via `DeployVerifiedFeedback.s.sol`;
+  atomicity of the 7702 batch verified live (bad-proof rollback).
 
 - **Audit batch (PR #103), test beacon-upgraded 2026-08-10** — proposer/executor
   `0xea69…`, timelock `0x111b6c…`, `minDelay=0`, open execution. Reused the

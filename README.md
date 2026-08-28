@@ -339,7 +339,7 @@ chain from on-chain registration to each signed response.
 | Contract | Responsibility |
 |---|---|
 | **ERC-7857** (`ERC7857Upgradeable` + extensions) | Functional data (IntelligentData[]) and the transfer / clone protocol |
-| **ERC-8004** (`ERC8004IdentityRegistry` + `AgenticIDReputationRegistry`) | Identity registration + reputation |
+| **ERC-8004** (`ERC8004IdentityRegistry` + the canonical `ReputationRegistry`, marked by `VerifiedFeedbackRegistry`) | Identity registration + reputation |
 | **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) + the `validFrameworkHashes` allowlist |
 | **TappRegistry** | Code-fingerprint registry for all Tapp components |
 

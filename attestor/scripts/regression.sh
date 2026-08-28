@@ -9,8 +9,11 @@
 #                    self-contained legs also fund ephemeral wallets from it
 #   API_KEY          inference key injected into containers (default a dummy;
 #                    fine — the checks don't exercise the model)
-#   REPUTATION_ADDR  client-less reputation registry bound to this AgenticID;
-#                    if unset, the feedback/lifecycle leg is skipped
+#   VERIFIED_FEEDBACK_ADDR  VerifiedFeedbackRegistry bound to this AgenticID
+#                    (canonical 8004 reputation registry is discovered from
+#                    it); if unset, the feedback/lifecycle leg is skipped
+#   FEEDBACK_BATCHER_ADDR  optional EIP-7702 batcher for the atomic feedback
+#                    path; unset falls back to /config, then to two txs
 #   RUN_UNIT=1       also run the free T0 suites (cargo/go) first
 #   SKIP_TRANSFER=1  skip the (slow, ~10 min) self-contained transfer-live leg
 #
@@ -100,10 +103,10 @@ if [ -n "${SEAL_ID:-}" ]; then
   SANDBOX=$(owner_deployments | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
   AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
   echo "source url refreshed post-reset: $AGENT_URL"
-  if [ -n "${REPUTATION_ADDR:-}" ]; then
-    step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' REPUTATION_ADDR='$REPUTATION_ADDR' node scripts/lifecycle-e2e.cjs"
+  if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
+    step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' VERIFIED_FEEDBACK_ADDR='$VERIFIED_FEEDBACK_ADDR' FEEDBACK_BATCHER_ADDR='${FEEDBACK_BATCHER_ADDR:-}' node scripts/lifecycle-e2e.cjs"
   else
-    skip "lifecycle-e2e (clone+feedback+transfer+gate)" "REPUTATION_ADDR unset"
+    skip "lifecycle-e2e (clone+feedback+transfer+gate)" "VERIFIED_FEEDBACK_ADDR unset"
   fi
 fi
 
