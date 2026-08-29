@@ -276,8 +276,8 @@ owner `0xB831…`.
 | VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
-| CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.0** (deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — agent 355 forked from 352 under DevCloneAuthorizer `0xd5639D72…36FBe`, deny path exact) |
-| CloneGate impl | `0x7cED9b2d9ccCdBFe5568cF6c1A292eDd2019FD02` | |
+| CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — agent 355 forked from 352 under DevCloneAuthorizer `0xd5639D72…36FBe`, deny path exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
+| CloneGate impl | `0xfCF587f38E27570efF795501aA5b173472dC354c` | 1.0.0 impl was `0x7cED9b2d9ccCdBFe5568cF6c1A292eDd2019FD02` |
 | CloneGate beacon | `0xeD63552eEbe2480367C28b16F653c4181aB15e1A` | |
 | DevCloneAuthorizer (EXAMPLE policy, admin 0xB831) | `0xd5639D72Ebcba1E4556B18BEC772d418a0636FBe` | reference ICloneAuthorizer for integrators; not protocol |
 | FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577` | v3, deployed 2026-08-28 (adds `receive()` so a delegated EOA still accepts plain ETH; supersedes `0x59921B…48BF` and `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
