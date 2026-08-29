@@ -344,9 +344,11 @@ trusted-attestor 白名单内（它经 `registerWithSeal` 铸造）；AgenticID 
 
 1. **发布者一次性 opt-in：** `CloneGate.setCloneAuthorizer(tokenId, authorizer)`——
    `ICloneAuthorizer` 的纯 view `canClone(source, to, caller, authData)` 决定
-   contract 模式克隆是否放行。token 换 owner 时自动清空（owner 意图）；
-   `cloneSourceOf` 血统跨转让保留（历史事实）。authorizer 为零 → contract
-   模式 fail-closed。
+   contract 模式克隆是否放行。配置绑定设置它的 owner：token 换手即失效
+   （`cloneAuthorizerOf` 返回**生效中**的 authorizer，owner 变了就返回 0）。
+   注意失效是**休眠而非抹除**：原 owner 回购 token（A→B→A）后旧政策会静默
+   复活；要永久清除需显式 `setCloneAuthorizer(id, 0)`。`cloneSourceOf` 血统
+   跨转让保留（历史事实）。authorizer 为零 → contract 模式 fail-closed。
 2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
    目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer
    只能转运意图，不能换 auth_data 重放，也不能跨政策轮换搬运），经 attestor

@@ -310,6 +310,22 @@ contract CloneGateTest is AgenticIDTestBase {
         gate.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
     }
 
+    function test_cloneFrom_arityMismatchReportsSealedKeysSide() public {
+        (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
+        vm.prank(owner);
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+
+        // dataHashes arity matches (1); only sealedKeys is off — the error
+        // must carry the sealedKeys length, not repeat dataHashes.length.
+        bytes32[] memory hashes = new bytes32[](1);
+        hashes[0] = dataHash;
+        bytes[] memory keys = new bytes[](3);
+        keys[0] = hex"aa"; keys[1] = hex"bb"; keys[2] = hex"cc";
+        vm.prank(attestor);
+        vm.expectRevert(abi.encodeWithSelector(CloneGateArityMismatch.selector, 1, 3));
+        gate.cloneFrom(sourceId, buyer, hashes, keys, CLONE_SEAL, CLONE_SEAL_ID, buyer, AUTH_DATA);
+    }
+
     function test_cloneFrom_revertsOnSealIdCollision() public {
         (uint256 sourceId, bytes32 dataHash) = _mintSealedSource();
         vm.prank(owner);
@@ -348,6 +364,32 @@ contract CloneGateTest is AgenticIDTestBase {
         agenticId.transferFrom(owner, buyer, sourceId);
 
         assertEq(gate.cloneAuthorizerOf(sourceId), address(0), "authorizer cleared on transfer");
+    }
+
+    function test_authorizerRevivesOnTransferBack() public {
+        // Pins the owner-at-set semantics: the config goes DORMANT on
+        // transfer, it is not erased. A→B→A silently revives A's old policy;
+        // erasing permanently requires an explicit setCloneAuthorizer(id, 0).
+        (uint256 sourceId,) = _mintSealedSource();
+        vm.prank(owner);
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+
+        vm.prank(owner);
+        agenticId.transferFrom(owner, buyer, sourceId);
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(0), "dormant while held by B");
+
+        vm.prank(buyer);
+        agenticId.transferFrom(buyer, owner, sourceId);
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(toggle), "revives when A re-acquires");
+
+        // The intermediate holder CAN erase for good.
+        vm.prank(owner);
+        agenticId.transferFrom(owner, buyer, sourceId);
+        vm.prank(buyer);
+        gate.setCloneAuthorizer(sourceId, address(0));
+        vm.prank(buyer);
+        agenticId.transferFrom(buyer, owner, sourceId);
+        assertEq(gate.cloneAuthorizerOf(sourceId), address(0), "explicit clear survives the round-trip");
     }
 
     function test_lineageSurvivesTransfer() public {

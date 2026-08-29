@@ -1004,7 +1004,7 @@ export const cloneGateAbi = [
     type: 'function',
     name: 'cloneSourceOf',
     stateMutability: 'view',
-    inputs: [{ name: 'agentId', type: 'uint256' }],
+    inputs: [{ name: 'agentId_', type: 'uint256' }],
     outputs: [{ name: '', type: 'uint256' }],
   },
   {
@@ -1021,7 +1021,7 @@ export const cloneGateAbi = [
       { name: 'caller', type: 'address' },
       { name: 'authData', type: 'bytes' },
     ],
-    outputs: [{ name: 'agentId', type: 'uint256' }],
+    outputs: [{ name: 'agentId_', type: 'uint256' }],
   },
   {
     type: 'event',

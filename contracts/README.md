@@ -363,8 +363,11 @@ cloning; the marketplace-fork flow:
    pure-view verdict decides contract-mode clones. The config binds the owner
    who set it: an ownership transfer auto-invalidates it (no transfer hook
    needed — `cloneAuthorizerOf` returns the EFFECTIVE authorizer, 0 when the
-   owner changed). `cloneSourceOf` lineage survives transfers (historical
-   fact). Zero authorizer → contract mode fails closed.
+   owner changed). Invalidation means dormant, not erased: if the setting
+   owner re-acquires the token (A→B→A) their old policy silently becomes
+   effective again — clear with `setCloneAuthorizer(id, 0)` to erase for
+   good. `cloneSourceOf` lineage survives transfers (historical fact). Zero
+   authorizer → contract mode fails closed.
 2. **Buyer forks:** signs a clone-intent whose canonical binds the operation
    (idempotency key, source, target) **and its policy context**
    (`keccak256(auth_data)` + the authorizer address — so a relayer can

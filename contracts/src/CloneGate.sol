@@ -51,12 +51,18 @@ error CloneGateArityMismatch(uint256 expected, uint256 got);
 ///         and is effective only while `ownerOf(source)` still equals that
 ///         owner — an ownership transfer auto-invalidates the previous
 ///         owner's policy, fail-closed, exactly as issue #133 requires.
+///         One semantic delta vs a hook-based clear: the config goes DORMANT,
+///         it is not erased. If the owner who set it re-acquires the token
+///         (A→B→A), their old policy becomes effective again silently; any
+///         holder can erase it permanently via `setCloneAuthorizer(id, 0)`.
 contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
     /// @notice Current implementation version. See contracts/UPGRADING.md.
     /// @dev 1.0.0 — initial (policy-mode cloning satellite; supersedes the
     ///      in-AgenticID cloneFrom of the unreleased 1.2.0, which exceeded
     ///      the EIP-170 deploy limit).
-    string public constant VERSION = "1.0.0";
+    ///      1.0.1 — CloneGateArityMismatch reports the sealedKeys length when
+    ///      that is the mismatched side (was always dataHashes.length).
+    string public constant VERSION = "1.0.1";
 
     /// @notice A token's clone policy was set or cleared (authorizer 0 = cleared).
     event CloneAuthorizerSet(uint256 indexed tokenId, address indexed authorizer, address owner);
@@ -111,7 +117,12 @@ contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
 
     /// @notice Set or clear (0) the clone authorizer for a token you own.
     ///         The config expresses YOUR intent: it auto-invalidates if the
-    ///         token changes hands (fail-closed for the next owner).
+    ///         token changes hands (fail-closed for the next owner). Dormant,
+    ///         not erased — if you re-acquire the token later your old config
+    ///         is effective again; clear with 0 if that is not what you want.
+    /// @dev Deliberately NOT `whenNotPaused`: revoking a policy must remain
+    ///      possible while AgenticID is paused (the clone MINT path is already
+    ///      blocked by registerWithSeal's own pause gate).
     function setCloneAuthorizer(uint256 tokenId, address authorizer) external {
         CloneGateStorage storage $ = _getCloneGateStorage();
         address tokenOwner = $.agenticId.ownerOf(tokenId); // reverts on nonexistent
@@ -186,8 +197,11 @@ contract CloneGate is Initializable, ReentrancyGuardUpgradeable {
         // stale snapshot (source evolved after the TEE re-seal) would mint
         // keys that decrypt nothing — reject, re-seal, retry.
         IntelligentData[] memory datas = IERC7857Metadata(address(id)).intelligentDatasOf(sourceAgentId);
-        if (dataHashes.length != datas.length || sealedKeys.length != datas.length) {
+        if (dataHashes.length != datas.length) {
             revert CloneGateArityMismatch(datas.length, dataHashes.length);
+        }
+        if (sealedKeys.length != datas.length) {
+            revert CloneGateArityMismatch(datas.length, sealedKeys.length);
         }
         for (uint256 i = 0; i < datas.length; i++) {
             if (datas[i].dataHash != dataHashes[i]) {
