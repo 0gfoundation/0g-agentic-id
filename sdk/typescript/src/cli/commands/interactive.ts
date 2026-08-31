@@ -999,11 +999,22 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
     const orig = stdout.write.bind(stdout);
     // Echo the typed/pasted characters as `*` so there IS visible feedback
-    // (an all-silent prompt reads as a hang). The prompt line and control
-    // sequences pass through unchanged.
+    // (an all-silent prompt reads as a hang). Masking must survive readline's
+    // LINE REDRAWS: Backspace/Del/arrows arrive as ONE chunk
+    // "ESC[2K ESC[1G <prompt> <typed secret>" — so escape sequences and the
+    // prompt are preserved but every other printable character is masked
+    // (passing ESC-prefixed or prompt-bearing chunks through raw leaked the
+    // full secret on the first edit keystroke).
     stdout.write = (s: string): boolean => {
-      if (!s || s.includes(prompt) || s.startsWith('\x1b') || s === '\r\n' || s === '\n') return orig(s);
-      return orig('*'.repeat(s.length));
+      if (!s || s === '\r\n' || s === '\n') return orig(s);
+      const masked = s
+        .split(/(\x1b\[[0-9;?]*[A-Za-z~]|\x1b.)/) // capture ANSI escape sequences
+        .map((seg, i) => {
+          if (i % 2 === 1 || !seg) return seg; // an escape sequence — keep
+          return seg.split(prompt).map((part) => part.replace(/[^\r\n]/g, '*')).join(prompt);
+        })
+        .join('');
+      return orig(masked);
     };
     void ask(prompt).then(
       (ans) => {
