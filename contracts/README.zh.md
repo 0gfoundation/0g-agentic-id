@@ -349,6 +349,15 @@ trusted-attestor 白名单内（它经 `registerWithSeal` 铸造）；AgenticID 
    注意失效是**休眠而非抹除**：原 owner 回购 token（A→B→A）后旧政策会静默
    复活；要永久清除需显式 `setCloneAuthorizer(id, 0)`。`cloneSourceOf` 血统
    跨转让保留（历史事实）。authorizer 为零 → contract 模式 fail-closed。
+
+   不想自己写政策合约的发布者，可将 token 指向**官方通用政策
+   `StandardCloneAuthorizer`**（不可升级、无任何特权角色）：购买凭证按
+   `(sourceAgentId, purchaseId) → buyer` 隔离，`grant`/`revoke` 只有源
+   token 的**当前 owner**（即卖家，无平台管理员）能调，且每条凭证带与
+   gate 配置一致的 owner-at-grant 惰性失效。一次性消费有意留在链下
+   （attestor 幂等键 + 卖家看到 `ClonedFrom` 事件后 `revoke`）——理由见
+   `ICloneAuthorizer` 的信任模型注释。`examples/DevCloneAuthorizer`
+   仍作为自写政策的最简参考骨架保留。
 2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
    目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer
    只能转运意图，不能换 auth_data 重放，也不能跨政策轮换搬运），经 attestor

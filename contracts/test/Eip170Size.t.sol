@@ -24,6 +24,7 @@ contract Eip170SizeTest is Test {
         _assertDeployable("AgenticID.sol:AgenticID");
         _assertDeployable("VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry");
         _assertDeployable("CloneGate.sol:CloneGate");
+        _assertDeployable("StandardCloneAuthorizer.sol:StandardCloneAuthorizer");
         _assertDeployable("FeedbackBatcher.sol:FeedbackBatcher");
         _assertDeployable("TEEDataVerifier.sol:TEEDataVerifier");
     }

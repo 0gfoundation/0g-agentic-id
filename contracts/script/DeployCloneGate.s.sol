@@ -8,6 +8,7 @@ import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/Upgradeabl
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
 
 import {CloneGate} from "../src/CloneGate.sol";
+import {StandardCloneAuthorizer} from "../src/StandardCloneAuthorizer.sol";
 
 /// @notice Incremental deploy: add a CloneGate (impl + beacon + proxy) to an
 ///         EXISTING AgenticID environment (DEPLOYMENT.md section 6). Fresh
@@ -28,6 +29,9 @@ contract DeployCloneGate is Script {
         BeaconProxy cgProxy = new BeaconProxy(
             address(cgBeacon), abi.encodeCall(CloneGate.initialize, (agenticId))
         );
+        // Official stock policy (immutable, no roles) — sellers point their
+        // token at it via setCloneAuthorizer and manage purchases themselves.
+        StandardCloneAuthorizer std = new StandardCloneAuthorizer(agenticId);
         vm.stopBroadcast();
 
         impl = address(cgImpl);
@@ -36,6 +40,7 @@ contract DeployCloneGate is Script {
         console2.log("CloneGate impl:  ", impl);
         console2.log("CloneGate beacon:", beacon);
         console2.log("CloneGate proxy: ", proxy);
+        console2.log("StandardCloneAuthorizer:", address(std));
         console2.log("REMINDER: AgenticID owner must addTrustedAttestor(proxy)");
     }
 }

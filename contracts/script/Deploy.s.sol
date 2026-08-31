@@ -11,6 +11,7 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 import {AgenticID} from "../src/AgenticID.sol";
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {CloneGate} from "../src/CloneGate.sol";
+import {StandardCloneAuthorizer} from "../src/StandardCloneAuthorizer.sol";
 import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
 
@@ -60,6 +61,7 @@ contract Deploy is Script {
         address cloneGateImpl;
         address cloneGateBeacon;
         address cloneGate;
+        address standardCloneAuthorizer;
     }
 
     function run() external returns (Deployed memory d) {
@@ -146,6 +148,9 @@ contract Deploy is Script {
         d.cloneGateBeacon = address(cgBeacon);
         d.cloneGate = address(cgProxy);
 
+        // Official stock clone policy (immutable, no roles, not proxied).
+        d.standardCloneAuthorizer = address(new StandardCloneAuthorizer(address(agenticIdProxy)));
+
         vm.stopBroadcast();
 
         _printDeployed(d);
@@ -200,6 +205,7 @@ contract Deploy is Script {
         console2.log("CloneGate impl:             ", d.cloneGateImpl);
         console2.log("CloneGate beacon:           ", d.cloneGateBeacon);
         console2.log("CloneGate proxy:            ", d.cloneGate);
+        console2.log("StandardCloneAuthorizer:    ", d.standardCloneAuthorizer);
     }
 
     /// @dev Canonical ERC-8004 IdentityRegistry by chainId. ERC-8004 is deployed
