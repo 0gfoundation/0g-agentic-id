@@ -310,6 +310,11 @@ from the dev-host attestor's `GET /config` (`tapp_registry_addr` /
   Timelock `0x8048C341CD31c422c51525f5179C573EAEb3e4B9`.
 - **UUPS-only trial** (`DeployAndMint.s.sol`, agent id 10): AgenticID
   `0x375316a8f05206fBFC1E76Ad8D7C6647F7bAc409`, TEEDataVerifier `0xcD2D0Cfa6f6DC559B5BAdc0E47DcC66A3DD3ae1D`.
+- **StandardCloneAuthorizer v1** (dev, purchaseId-keyed, superseded same day by
+  the per-buyer-switch design): `0x744e38c628dA2971A414218CbCE77D8c10A5e281`;
+  superseded FeedbackBatchers: v3 `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577`,
+  v2 `0x59921B5c874b4ED311AECB43CbFB97D43dc748BF` (wallets delegated to these
+  keep running the old code until their next giveFeedback re-delegates).
 
 ## 7. Contract versions & changelog
 
