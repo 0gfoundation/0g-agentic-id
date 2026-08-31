@@ -1,0 +1,212 @@
+[
+ {
+  "type": "constructor",
+  "inputs": [
+   {
+    "name": "agenticId_",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "agenticId",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "contract IERC721OwnerOf"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "canClone",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "targetOwner",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "caller",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "data",
+    "type": "bytes",
+    "internalType": "bytes"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "grant",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "purchaseId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "buyer",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "purchaseOf",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "purchaseId",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "buyer",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "grantor",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "effective",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "revoke",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "purchaseId",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "event",
+  "name": "PurchaseGranted",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "purchaseId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "buyer",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "seller",
+    "type": "address",
+    "indexed": false,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PurchaseRevoked",
+  "inputs": [
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "purchaseId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "seller",
+    "type": "address",
+    "indexed": false,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "error",
+  "name": "StdCloneAuthNotSeller",
+  "inputs": [
+   {
+    "name": "caller",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "sourceAgentId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "seller",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ }
+]

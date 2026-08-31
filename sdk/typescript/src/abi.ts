@@ -1053,6 +1053,92 @@ export const cloneGateAbi = [
 ] as const;
 
 /**
+ * StandardCloneAuthorizer — the OFFICIAL stock clone policy: purchases keyed
+ * (sourceAgentId, purchaseId) → buyer, grant/revoke gated on the source's
+ * current owner. The SDK's grantPurchase/revokePurchase/purchaseOf helpers
+ * speak this ABI to whatever authorizer the token has configured — they only
+ * work when that policy IS the standard one (a custom policy has its own
+ * management surface).
+ */
+export const standardCloneAuthorizerAbi = [
+  {
+    type: 'function',
+    name: 'grant',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'purchaseId', type: 'uint256' },
+      { name: 'buyer', type: 'address' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'revoke',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'purchaseId', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'purchaseOf',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'purchaseId', type: 'uint256' },
+    ],
+    outputs: [
+      { name: 'buyer', type: 'address' },
+      { name: 'grantor', type: 'address' },
+      { name: 'effective', type: 'bool' },
+    ],
+  },
+  {
+    type: 'function',
+    name: 'canClone',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'targetOwner', type: 'address' },
+      { name: 'caller', type: 'address' },
+      { name: 'data', type: 'bytes' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'error',
+    name: 'StdCloneAuthNotSeller',
+    inputs: [
+      { name: 'caller', type: 'address' },
+      { name: 'sourceAgentId', type: 'uint256' },
+      { name: 'seller', type: 'address' },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'PurchaseGranted',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256', indexed: true },
+      { name: 'purchaseId', type: 'uint256', indexed: true },
+      { name: 'buyer', type: 'address', indexed: true },
+      { name: 'seller', type: 'address', indexed: false },
+    ],
+  },
+  {
+    type: 'event',
+    name: 'PurchaseRevoked',
+    inputs: [
+      { name: 'sourceAgentId', type: 'uint256', indexed: true },
+      { name: 'purchaseId', type: 'uint256', indexed: true },
+      { name: 'seller', type: 'address', indexed: false },
+    ],
+  },
+] as const;
+
+/**
  * TappRegistry — trust-root acknowledgement. `ack` acknowledges the set of
  * TEE components (attestor, kms, sandbox) the deploy/sandbox flow depends on.
  */

@@ -14,7 +14,7 @@
  */
 
 import * as readline from 'node:readline';
-import { parseEther, keccak256, toBytes, hexToBytes, concat } from 'viem';
+import { parseEther, keccak256, toBytes, hexToBytes, concat, encodeAbiParameters, isAddress, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
@@ -28,7 +28,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
@@ -281,6 +281,17 @@ const L1_HELP_FULL = `manager commands
   start <id>              start a stopped agent
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (asks framework + key)
+  clone <id> [to]         clone YOUR agent (owner mode); mints to you unless
+                          <to> is given. New agent lands offline — reset to run
+  clone <id> --purchase N clone SOMEONE ELSE's agent as a buyer: spends the
+                          purchase the seller granted you (contract mode)
+  transfer <id> <to>      transfer YOUR agent to another wallet (irreversible;
+                          new owner acks + resets to take over the runtime)
+  authorizer <id> [a|off] show the agent's fork policy; owner sets a policy
+                          contract address to open fork sales, off to close
+  grant <id> <pid> <buyer> seller: issue purchase <pid> to <buyer> (standard
+                          policy only; grant again to redirect, see revoke)
+  revoke <id> <pid>       seller: delete a purchase (refund / one-shot consume)
   balance                 prepaid sandbox balance, burn rate, runway
   deposit [og]            fund the prepaid balance (default 1 OG)
   withdraw [og]           get prepaid funds back: shows balance + pending,
@@ -540,6 +551,96 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.agent.reset(row.sealId, { framework, apiKey });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
         if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        continue;
+      }
+
+      if (cmd === 'authorizer') {
+        if (!args[0]) { out('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
+        if (!args[1]) {
+          // Read-only: anyone can inspect any agent's fork policy.
+          const ag = await clientFor(ctx, false);
+          const id = await mintedTokenId(ag, args[0]);
+          const a = await ag.agent.cloneAuthorizerOf(id);
+          out(a === ZERO_ADDR
+            ? `agent ${id}: fork sales closed (no effective policy)\n`
+            : `agent ${id}: fork policy ${a}\n`);
+          continue;
+        }
+        const ag = await withWallet(ctx);
+        const id = await mintedTokenId(ag, args[0]);
+        const target = args[1].toLowerCase() === 'off' ? ZERO_ADDR : args[1];
+        if (target !== ZERO_ADDR && !isAddress(target)) { out('authorizer must be an address or `off`\n'); continue; }
+        const tx = await ag.agent.setCloneAuthorizer(id, target as Address);
+        await ag.agent.waitForTransaction(tx);
+        out(target === ZERO_ADDR
+          ? `agent ${id}: fork sales closed\n`
+          : `agent ${id}: fork policy set to ${target}\n    issue purchases with: grant ${id} <purchaseId> <buyer>\n`);
+        continue;
+      }
+
+      if (cmd === 'grant' || cmd === 'revoke') {
+        if (!args[0] || !args[1] || (cmd === 'grant' && !args[2])) {
+          out(cmd === 'grant' ? 'usage: grant <agentId|sealId> <purchaseId> <buyer>\n' : 'usage: revoke <agentId|sealId> <purchaseId>\n');
+          continue;
+        }
+        let pid: bigint;
+        try { pid = BigInt(args[1]); } catch { out('purchaseId must be an integer\n'); continue; }
+        if (cmd === 'grant' && !isAddress(args[2])) { out('buyer must be a 0x address\n'); continue; }
+        const ag = await withWallet(ctx);
+        const id = await mintedTokenId(ag, args[0]);
+        const tx = cmd === 'grant'
+          ? await ag.agent.grantPurchase(id, pid, args[2] as Address)
+          : await ag.agent.revokePurchase(id, pid);
+        await ag.agent.waitForTransaction(tx);
+        out(cmd === 'grant'
+          ? `purchase ${pid} on agent ${id} granted to ${args[2]}\n    they clone with: clone ${id} --purchase ${pid}\n`
+          : `purchase ${pid} on agent ${id} revoked\n`);
+        continue;
+      }
+
+      if (cmd === 'transfer') {
+        if (!args[0] || !args[1]) { out('usage: transfer <agentId|sealId> <to>\n'); continue; }
+        if (!isAddress(args[1])) { out('to must be a 0x address\n'); continue; }
+        const ag = await withWallet(ctx);
+        const id = await mintedTokenId(ag, args[0]);
+        const from = await ag.agent.ownerOf(id);
+        const yn = (await ask(`transfer agent ${id} to ${args[1]} — IRREVERSIBLE. proceed? [y/N]: `)).trim().toLowerCase();
+        if (yn !== 'y' && yn !== 'yes') { out('transfer cancelled\n'); continue; }
+        const tx = await ag.agent.transferFrom(from, args[1] as Address, id);
+        await ag.agent.waitForTransaction(tx);
+        out(`agent ${id} transferred to ${args[1]}\n`);
+        out('the new owner acks + resets to take over the runtime; any fork policy you set is now dormant\n');
+        continue;
+      }
+
+      if (cmd === 'clone') {
+        if (!args[0]) { out('usage: clone <agentId|sealId> [to]  |  clone <id> --purchase <n>\n'); continue; }
+        const ag = await withWallet(ctx);
+        const id = await mintedTokenId(ag, args[0]);
+        const key = ctx.env.privateKey ?? loadKey();
+        const me = (await addressOf(key as `0x${string}`)) as Address;
+        const pIdx = args.indexOf('--purchase');
+        let params: Parameters<typeof ag.agent.clone>[0];
+        if (pIdx >= 0) {
+          // Buyer mode: spend a purchase the seller granted to THIS wallet.
+          let pid: bigint;
+          try { pid = BigInt(args[pIdx + 1] ?? ''); } catch { out('--purchase needs an integer purchase id\n'); continue; }
+          params = {
+            sourceAgentId: id,
+            targetOwner: me,
+            authorization: { authData: encodeAbiParameters([{ type: 'uint256' }], [pid]) },
+          };
+        } else {
+          // Owner mode: clone your own agent; optional recipient.
+          const to = args[1] && !args[1].startsWith('--') ? args[1] : me;
+          if (!isAddress(to)) { out('to must be a 0x address\n'); continue; }
+          params = { sourceAgentId: id, targetOwner: to as Address };
+        }
+        if (!(await ensureOwnerReady(ag, ask))) { out('clone cancelled — prepaid balance too low\n'); continue; }
+        out(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
+        const r = await ag.agent.clone(params, { wait: 'minted' });
+        out(`cloned: new agent ${r.agentId} → ${params.targetOwner}\n`);
+        out(`it lands offline — its owner brings it up with: reset ${r.agentId}\n`);
         continue;
       }
 
@@ -894,6 +995,16 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
       },
     );
   });
+}
+
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+
+/** Resolve an agent ref to its minted tokenId (works on ANY agent, not just mine). */
+async function mintedTokenId(ag: AgenticID, refInput: string): Promise<bigint> {
+  const row = await findAgentRow(ag, refInput);
+  if (!row) throw new CliError('UNKNOWN', `no agent matching ${refInput} on this attestor`);
+  if (row.agentId == null) throw new CliError('UNKNOWN', `agent ${refInput} is not minted yet — nothing on-chain to act on`);
+  return BigInt(row.agentId);
 }
 
 async function addressOf(key: `0x${string}`): Promise<string> {

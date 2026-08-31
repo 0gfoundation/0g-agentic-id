@@ -93,6 +93,7 @@ export type { ContractAddresses } from './constants';
 export {
   agenticIDAbi,
   cloneGateAbi,
+  standardCloneAuthorizerAbi,
   canonicalReputationAbi,
   verifiedFeedbackAbi,
   feedbackBatcherAbi,

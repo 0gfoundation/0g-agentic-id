@@ -11,7 +11,7 @@ import {
   type TransactionReceipt,
   type WriteContractReturnType,
 } from 'viem';
-import { agenticIDAbi, cloneGateAbi } from './abi';
+import { agenticIDAbi, cloneGateAbi, standardCloneAuthorizerAbi } from './abi';
 import { RECEIPT_WAIT } from './constants';
 import { requireWallet, type Ctx } from './context';
 
@@ -169,6 +169,61 @@ export class AgenticIDClient {
     return this.ctx.publicClient.readContract({
       address: this.cloneGateAddress, abi: cloneGateAbi, functionName: 'cloneSourceOf', args: [agentId],
     }) as Promise<bigint>;
+  }
+
+  // ── Standard-policy purchase management (StandardCloneAuthorizer) ─────────
+  // These helpers speak the OFFICIAL stock policy's ABI to whatever authorizer
+  // the token has configured (resolved live via cloneAuthorizerOf). They only
+  // work when that policy IS the StandardCloneAuthorizer — a custom policy has
+  // its own management surface and these calls would revert against it.
+
+  /** The token's effective authorizer, or a named error when none is configured. */
+  private async requireAuthorizer(sourceAgentId: bigint): Promise<Address> {
+    const a = await this.cloneAuthorizerOf(sourceAgentId);
+    if (a === '0x0000000000000000000000000000000000000000') {
+      throw new Error(
+        `agent ${sourceAgentId} has no effective clone authorizer — the owner must ` +
+        `setCloneAuthorizer first (and still hold the token)`,
+      );
+    }
+    return a;
+  }
+
+  /** Seller: record that `buyer` holds purchase `purchaseId` for this agent. */
+  async grantPurchase(sourceAgentId: bigint, purchaseId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    const authorizer = await this.requireAuthorizer(sourceAgentId);
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
+      address: authorizer,
+      abi: standardCloneAuthorizerAbi,
+      functionName: 'grant',
+      args: [sourceAgentId, purchaseId, buyer],
+      account,
+      chain: this.ctx.chain,
+    });
+  }
+
+  /** Seller: delete a purchase (refund, sold out, or manual one-shot consumption). */
+  async revokePurchase(sourceAgentId: bigint, purchaseId: bigint): Promise<WriteContractReturnType> {
+    const authorizer = await this.requireAuthorizer(sourceAgentId);
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
+      address: authorizer,
+      abi: standardCloneAuthorizerAbi,
+      functionName: 'revoke',
+      args: [sourceAgentId, purchaseId],
+      account,
+      chain: this.ctx.chain,
+    });
+  }
+
+  /** The purchase record plus whether it is currently effective (grantor still owns the source). */
+  async purchaseOf(sourceAgentId: bigint, purchaseId: bigint): Promise<{ buyer: Address; grantor: Address; effective: boolean }> {
+    const authorizer = await this.requireAuthorizer(sourceAgentId);
+    const [buyer, grantor, effective] = (await this.ctx.publicClient.readContract({
+      address: authorizer, abi: standardCloneAuthorizerAbi, functionName: 'purchaseOf', args: [sourceAgentId, purchaseId],
+    })) as readonly [Address, Address, boolean];
+    return { buyer, grantor, effective };
   }
 
   async balanceOf(owner: Address): Promise<bigint> {

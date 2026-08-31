@@ -201,6 +201,25 @@ export class AgentApi {
     return this.id.cloneSourceOf(agentId);
   }
 
+  // Standard-policy purchase helpers — resolve the token's configured
+  // authorizer live and speak the OFFICIAL StandardCloneAuthorizer ABI to it.
+  // Against a custom policy these revert; use that policy's own surface.
+
+  /** Seller: record that `buyer` holds purchase `purchaseId` for this agent (standard policy only). */
+  async grantPurchase(sourceAgentId: bigint, purchaseId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.grantPurchase(sourceAgentId, purchaseId, buyer);
+  }
+
+  /** Seller: delete a purchase — refund, sold out, or manual one-shot consumption (standard policy only). */
+  async revokePurchase(sourceAgentId: bigint, purchaseId: bigint): Promise<WriteContractReturnType> {
+    return this.id.revokePurchase(sourceAgentId, purchaseId);
+  }
+
+  /** A purchase record + whether it is currently effective (standard policy only). */
+  async purchaseOf(sourceAgentId: bigint, purchaseId: bigint): Promise<{ buyer: Address; grantor: Address; effective: boolean }> {
+    return this.id.purchaseOf(sourceAgentId, purchaseId);
+  }
+
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
     return this.id.transferFrom(from, to, tokenId);
