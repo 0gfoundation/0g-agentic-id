@@ -120,6 +120,7 @@ pub async fn handle(
         agent_uri: String::new(),
         agent_card: serde_json::Value::Object(Default::default()),
         i_data: Vec::new(),
+        clone_params: None,
         phase: derive_phase(
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,

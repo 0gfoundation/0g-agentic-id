@@ -43,6 +43,7 @@ pub struct ConfigResponse {
     pub verified_feedback_addr: Option<String>,
     pub feedback_batcher_addr: Option<String>,
     pub clone_gate_addr: Option<String>,
+    pub standard_clone_authorizer_addr: Option<String>,
     pub tee_data_verifier_addr: Option<String>,
 
     /// Frameworks deploys may select, each with the sealed image for its
@@ -92,6 +93,10 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         clone_gate_addr: state
             .cfg
             .clone_gate_addr
+            .map(|a| format!("{:#x}", a)),
+        standard_clone_authorizer_addr: state
+            .cfg
+            .standard_clone_authorizer_addr
             .map(|a| format!("{:#x}", a)),
         tee_data_verifier_addr: state
             .cfg
