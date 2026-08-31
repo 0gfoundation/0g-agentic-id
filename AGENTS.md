@@ -8,7 +8,7 @@ Guidance for AI coding agents working in this repository. (Claude Code loads thi
 
 | Dir | What | Language |
 |---|---|---|
-| `contracts/` | AgenticID (ERC-721 + ERC-7857 iData) + VerifiedFeedbackRegistry (TEE marks over the canonical 8004 reputation registry) + TEEDataVerifier, beacon-upgradeable behind a Timelock | Solidity / Foundry |
+| `contracts/` | AgenticID (ERC-721 + ERC-7857 iData) + VerifiedFeedbackRegistry (TEE marks over the canonical 8004 reputation registry) + CloneGate (policy-mode cloning satellite) + FeedbackBatcher (EIP-7702 delegate) + TEEDataVerifier, beacon-upgradeable behind a Timelock | Solidity / Foundry |
 | `attestor/` | Deploy orchestrator: HTTP API + async worker + chain indexer, Postgres-backed job queue. Mints agents, provisions TEE containers, relays owner-signed sandbox envelopes | Rust workspace (crates: `shared`, `api`, `worker`, `indexer`) |
 | `sealed/` | Agent runtime container (PID 1 in the sandbox): restores the agent from chain, spawns the framework subprocess (openclaw), reverse-proxies `:8080`, watches for state drift and uploads it | Go (module `seal-verify`) |
 | `sdk/typescript/` | Client SDK `@0gfoundation/agentic-sdk` — facade over contracts + attestor HTTP | TypeScript (viem) |
@@ -18,7 +18,7 @@ Guidance for AI coding agents working in this repository. (Claude Code loads thi
 ```bash
 # contracts — submodules first, once:
 git submodule update --init --recursive
-cd contracts && forge build && forge test          # 209 tests / 22 suites; 2 fork tests skip unless FORK_RPC is set
+cd contracts && forge build && forge test          # 223 tests / 24 suites; 2 fork tests skip unless FORK_RPC is set
 forge test --match-contract TransferFlow           # one suite
 forge test --match-test test_iCloneFrom_succeeds   # one test
 

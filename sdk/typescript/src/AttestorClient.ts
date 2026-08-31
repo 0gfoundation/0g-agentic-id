@@ -11,7 +11,7 @@
 import type { Address } from 'viem';
 import { keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
-import { agenticIDAbi } from './abi';
+import { agenticIDAbi, cloneGateAbi } from './abi';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
 export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
@@ -427,6 +427,18 @@ export class AttestorClient {
    * transported by the marketplace backend verbatim (relayer can submit, not
    * alter).
    */
+  /** CloneGate address, required for contract-mode clones. */
+  private cloneGateAddr(): `0x${string}` {
+    const a = this.ctx.addresses.cloneGate;
+    if (!a || a === '0x0000000000000000000000000000000000000000') {
+      throw new Error(
+        'contract-mode clone requires a CloneGate in this environment ' +
+        '(the attestor /config reports no clone_gate_addr)',
+      );
+    }
+    return a;
+  }
+
   async clone(params: CloneParams): Promise<DeployCloneResponse> {
     const { walletClient, account } = requireWallet(this.ctx);
     if (params.sourceAgentId > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -449,8 +461,8 @@ export class AttestorClient {
       authDataKeccak = keccak256(params.authorization.authData);
       authorizer = params.authorization.authorizer
         ?? (await this.ctx.publicClient.readContract({
-          address: this.ctx.addresses.agenticID,
-          abi: agenticIDAbi,
+          address: this.cloneGateAddr(),
+          abi: cloneGateAbi,
           functionName: 'cloneAuthorizerOf',
           args: [params.sourceAgentId],
         }) as Address);

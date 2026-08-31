@@ -70,6 +70,19 @@ sol!(
     }
 );
 
+// CloneGate (contracts/src/CloneGate.sol) — the policy-mode cloning SATELLITE
+// of AgenticID (the core contract sits at the EIP-170 bytecode ceiling, so
+// clone policy + lineage live in this companion). Inline interface: only the
+// two calls the attestor makes.
+sol!(
+    #[sol(rpc)]
+    interface ICloneGate {
+        function cloneAuthorizerOf(uint256 tokenId) external view returns (address);
+        function cloneFrom(uint256 sourceAgentId, address to, bytes32[] calldata dataHashes, bytes[] calldata sealedKeys, address newAgentSeal, bytes32 newSealId, address caller, bytes calldata authData) external returns (uint256 agentId);
+        event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
+    }
+);
+
 /// Wall-time bound for the authorizer pre-check eth_call. A hostile or
 /// looping authorizer must not pin an attestor worker thread indefinitely;
 /// expiry maps to `Err` (fail-closed reject — the idempotency key is not
@@ -140,6 +153,10 @@ where
 {
     provider: P,
     contract_addr: Address,
+    /// CloneGate satellite (policy-mode cloning); None = feature not
+    /// deployed in this environment — clone contract-mode calls fail with a
+    /// named error.
+    clone_gate: Option<Address>,
     sender: Address,
     priority_fee_wei: u128,
     max_fee_wei: u128,
@@ -169,10 +186,12 @@ where
         priority_fee_gwei: u64,
         max_fee_gwei: u64,
         tapp_registry: Option<(Address, String)>,
+        clone_gate: Option<Address>,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
             contract_addr,
+            clone_gate,
             sender,
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
@@ -207,6 +226,7 @@ pub fn connect_http(
     priority_fee_gwei: u64,
     max_fee_gwei: u64,
     tapp_registry: Option<(Address, String)>,
+    clone_gate: Option<Address>,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
@@ -227,6 +247,7 @@ pub fn connect_http(
         priority_fee_gwei,
         max_fee_gwei,
         tapp_registry,
+        clone_gate,
     );
     Ok(chain)
 }
@@ -315,15 +336,15 @@ where
                 let success = receipt.status();
                 let block_number = receipt.block_number.unwrap_or(0);
 
-                // Mint-transaction agent ids: `Registered` (deploy /
-                // registerWithSeal) or `ClonedFrom.newAgentId` (policy-mode
-                // cloneFrom — cloneFrom emits no Registered, by design the
-                // mint symmetry event is ITransferred + ClonedFrom).
+                // Mint-transaction agent ids: `Registered` (deploy and every
+                // registerWithSeal — the gate's cloneFrom mints through it, so
+                // clone receipts carry it too) with the gate's `ClonedFrom`
+                // as a redundant fallback.
                 let agent_id = receipt.inner.logs().iter().find_map(|log| {
                     if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
                         return Some(ev.data.agentId);
                     }
-                    AgenticID::ClonedFrom::decode_log(&log.inner, true)
+                    ICloneGate::ClonedFrom::decode_log(&log.inner, true)
                         .ok()
                         .map(|ev| ev.data.newAgentId)
                 });
@@ -359,7 +380,10 @@ where
     }
 
     async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
-        let c = AgenticID::new(self.contract_addr, self.provider.clone());
+        let gate = self.clone_gate.ok_or_else(|| {
+            anyhow::anyhow!("clone gate not configured (ATTESTOR_CLONE_GATE_ADDR unset)")
+        })?;
+        let c = ICloneGate::new(gate, self.provider.clone());
         Ok(c.cloneAuthorizerOf(agent_id).call().await?._0)
     }
 
@@ -393,7 +417,10 @@ where
         // Encode the call and construct the tx request from scratch — same
         // explicit-gas pattern as register_with_seal (mempool tip-cap quirk,
         // 20% gas buffer, submit_lock-serialized broadcast).
-        let call_data = AgenticID::cloneFromCall {
+        let gate = self.clone_gate.ok_or_else(|| {
+            anyhow::anyhow!("clone gate not configured (ATTESTOR_CLONE_GATE_ADDR unset)")
+        })?;
+        let call_data = ICloneGate::cloneFromCall {
             sourceAgentId: params.source_agent_id,
             to: params.to,
             dataHashes: params.data_hashes,
@@ -407,7 +434,7 @@ where
 
         let mut tx = TransactionRequest::default()
             .with_from(self.sender)
-            .with_to(self.contract_addr)
+            .with_to(gate)
             .with_input(call_data);
 
         let gas = self

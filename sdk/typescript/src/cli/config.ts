@@ -72,12 +72,15 @@ export function loadCredentials(env: NodeJS.ProcessEnv = process.env): Credentia
   try {
     const t = readFileSync(credentials, 'utf8').trim();
     if (!t) return {};
+    // Keys normalize on read (0x prefix optional — heals files written by
+    // pre-normalization builds); anything else is dropped as corrupt.
     if (t.startsWith('{')) {
       const c = JSON.parse(t) as Credentials;
-      const pk = c.privateKey && /^0x[0-9a-fA-F]{64}$/.test(c.privateKey) ? c.privateKey : undefined;
+      const pk = c.privateKey ? normalizeKey(c.privateKey) : null;
       return { ...(pk ? { privateKey: pk } : {}), ...(c.apiKey ? { apiKey: c.apiKey } : {}) };
     }
-    return /^0x[0-9a-fA-F]{64}$/.test(t) ? { privateKey: t as `0x${string}` } : {};
+    const pk = normalizeKey(t);
+    return pk ? { privateKey: pk } : {};
   } catch {
     return {};
   }
@@ -93,9 +96,13 @@ export function saveCredentials(patch: Credentials, env: NodeJS.ProcessEnv = pro
   chmodSync(credentials, 0o600); // enforce even if the file pre-existed with looser bits
 }
 
-/** The owner key, or null. */
+/** The owner key, or null. Normalizes on read (old CLI builds saved login
+ *  input verbatim, so a pre-normalization file may hold a 0x-less key);
+ *  an un-normalizable value passes through raw so the caller can name it. */
 export function loadKey(env: NodeJS.ProcessEnv = process.env): `0x${string}` | null {
-  return loadCredentials(env).privateKey ?? null;
+  const raw = loadCredentials(env).privateKey ?? null;
+  if (!raw) return null;
+  return normalizeKey(raw) ?? raw;
 }
 
 /** Normalize a pasted private key: trims, and prepends the 0x that wallet

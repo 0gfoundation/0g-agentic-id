@@ -132,10 +132,13 @@ defense-in-depth).
   - **Contract mode** (marketplace fork) — the BUYER signs a
     `AgenticID.CloneContract.v1` intent whose canonical binds
     `keccak256(auth_data)` and the authorizer address; the attestor reads the
-    authorizer live (`cloneAuthorizerOf`), pre-checks `canClone` (fail-closed),
-    and the worker mints via `cloneFrom` — the on-chain policy consult is
-    atomic with the mint. The source owner opts in per token via
-    `setCloneAuthorizer` (cleared on transfer; `cloneSourceOf` lineage survives).
+    authorizer live (`CloneGate.cloneAuthorizerOf`), pre-checks `canClone`
+    (fail-closed), and the worker mints via `CloneGate.cloneFrom` — the
+    on-chain policy consult is atomic with the mint (the gate calls
+    registerWithSeal; it must be on the trusted-attestor allowlist). The
+    source owner opts in per token via `CloneGate.setCloneAuthorizer`
+    (auto-invalidated when the token changes owner; `cloneSourceOf` lineage
+    survives). Set `ATTESTOR_CLONE_GATE_ADDR`; unset = contract mode off.
 - **Non-seal agent** = a data blob. Plain transfers stay disabled; ownership moves
   only via proof-gated `iTransferFrom` (re-encrypts `dataKey` to the buyer);
   `iCloneFrom` works as before.
@@ -273,7 +276,11 @@ owner `0xB831…`.
 | VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
-| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577` | v3, deployed 2026-08-28 (adds `receive()` so a delegated EOA still accepts plain ETH; supersedes `0x59921B…48BF` and `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
+| CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — allow + deny paths exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
+| CloneGate impl | `0xfCF587f38E27570efF795501aA5b173472dC354c` | |
+| CloneGate beacon | `0xeD63552eEbe2480367C28b16F653c4181aB15e1A` | |
+| StandardCloneAuthorizer | `0x0663b7Abbdff1B451dDA292Ec9dd16a9DE34CA83` | official stock clone policy (immutable, no proxy; per-buyer switch keyed (agent, buyer); live-verified — agent 366 forked from 352 via CLI `clone 352` after `grant 352 <buyer>`) |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x749A57eB4E647d43836C14585f3AF763Ae91A703` | v4, deployed 2026-08-31 (adds `onERC721Received` — a delegated wallet must stay a valid safeMint/safeTransfer receiver, else clone mints to it revert ERC721InvalidReceiver; supersedes v3 `0x91dE43…9577` and earlier); v3 added `receive()`; atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
@@ -308,26 +315,49 @@ beacon upgrade and was verified post-upgrade — see changelog):
 
 | Contract | dev VERSION | test VERSION |
 |---|---|---|
-| AgenticID | **1.1.0** (1.2.0 impl in PR #145, pending beacon upgrade) | **1.1.0** (same) |
+| AgenticID | **1.1.0** | **1.1.0** |
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
 | VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
+| CloneGate | **1.0.1** | — (not deployed) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
-> AgenticID **1.2.0** (policy-mode cloning, issue #133 / PR #145) is implemented
-> and tested but NOT yet live on either environment — upgrade via the dev/test
-> Timelock after merge.
+> Policy-mode cloning (issue #133) ships as the **CloneGate satellite** (1.0.1
+> on dev) — AgenticID stays 1.1.0 (see the changelog entry for why: EIP-170).
 
 Changelog:
 
-- **AgenticID 1.2.0 (PR #145, pending beacon upgrade)** — policy-mode cloning
-  (issue #133): ERC-7201-appended `cloneAuthorizers` + `cloneSource` storage
-  (layout-compatible), `setCloneAuthorizer` (owner-only; cleared on transfer in
-  `_update`), `cloneAuthorizerOf` / `cloneSourceOf` reads, `cloneFrom` — a
-  trusted-attestor-only mint consulting the owner-configured
-  `ICloneAuthorizer` atomically with the mint (`nonReentrant`, parity with
-  iTransferFrom/iCloneFrom). New events `CloneAuthorizerSet`, `ClonedFrom`.
+- **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
+  `CloneGateArityMismatch` reports the sealedKeys length when that side
+  mismatches (was always dataHashes.length; review F5). Diagnostic-only.
+- **StandardCloneAuthorizer (official stock clone policy), dev deployed
+  2026-08-31** — a per-buyer permission switch keyed `(sourceAgentId, buyer)`:
+  `grant`/`revoke` gated on the source's CURRENT owner (no platform roles),
+  `authData` ignored, owner-at-grant lazy invalidation. Immutable, unproxied;
+  included in `Deploy.s.sol` / `DeployCloneGate.s.sol`. Deliberately not
+  per-ticket (view `canClone` cannot consume; N grants == 1 grant), so order
+  bookkeeping stays off chain — see `ICloneAuthorizer`'s trust-model natspec.
+- **FeedbackBatcher v4, dev deployed 2026-08-31** — adds `onERC721Received`:
+  a 7702-delegated wallet answers the ERC-721 safe-transfer/safeMint receiver
+  probe, so wallets that used the atomic feedback path can still receive
+  clone mints and safe transfers (v3 delegations made them revert
+  `ERC721InvalidReceiver`). Delegations self-migrate on the SDK's next
+  giveFeedback.
+
+- **CloneGate 1.0.0 (supersedes PR #145's in-AgenticID design)** — policy-mode
+  cloning (issue #133) as a SATELLITE contract. PR #145 originally grew
+  AgenticID to 1.2.0, which measured 26,722 runtime bytes — 2,146 OVER the
+  EIP-170 deploy limit (the 1.1.0 impl already sat at 24,567/24,576; local
+  test EVMs don't enforce the limit, so the suite was green while the deploy
+  reverted on chain). The gate carries `setCloneAuthorizer` (owner-only;
+  auto-invalidated on ownership transfer via an owner-at-set binding, no
+  transfer hook), `cloneAuthorizerOf` (EFFECTIVE authorizer), `cloneSourceOf`
+  lineage, and `cloneFrom` — trusted-attestor-only, consults the
+  owner-configured `ICloneAuthorizer` atomically and mints through AgenticID's
+  existing `registerWithSeal` (the gate itself must be allowlisted via
+  `addTrustedAttestor`). AgenticID is UNCHANGED at 1.1.0. Events
+  `CloneAuthorizerSet` / `ClonedFrom` are emitted by the gate.
   Wire counterpart: attestor dual-mode `POST /clone` (contract-mode buyer
   intents bind `keccak256(auth_data)` + the authorizer) and SDK
   `ag.agent.clone({ authorization: { authData } })`.

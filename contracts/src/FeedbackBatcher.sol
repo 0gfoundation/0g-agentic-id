@@ -47,6 +47,15 @@ contract FeedbackBatcher {
         verifiedFeedback = IVerifiedFeedbackRegistry(verifiedFeedback_);
     }
 
+    /// @dev A delegated EOA executes THIS code when asked "can you receive
+    ///      this NFT?" (ERC-721 safeMint/safeTransfer probe the receiver once
+    ///      the account has code). Answer yes — without this, a wallet that
+    ///      ever used the atomic feedback path could no longer be the target
+    ///      of a clone mint or a safe transfer (ERC721InvalidReceiver).
+    function onERC721Received(address, address, uint256, bytes calldata) external pure returns (bytes4) {
+        return this.onERC721Received.selector;
+    }
+
     /// @dev A delegated EOA executes THIS code on every incoming call — a
     ///      plain value transfer included (empty calldata resolves to
     ///      receive()). Without it, faucets/exchanges/friends sending ETH to a

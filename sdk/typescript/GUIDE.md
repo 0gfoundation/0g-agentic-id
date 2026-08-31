@@ -144,8 +144,10 @@ const cl = await ag.agent.clone({ sourceAgentId: agentId, targetOwner: newOwner 
 // ONCE on chain; after that, buyers clone themselves (the connected wallet IS
 // the buyer; the source owner is not involved per request):
 //   1. publisher: await ag.agent.setCloneAuthorizer(agentId, marketPolicyAddr)
-//      (a marketplace's ICloneAuthorizer contract; revoke with the zero address,
-//       or just transfer the token — the contract clears it automatically)
+//      (a marketplace's ICloneAuthorizer contract, configured on the CloneGate
+//       satellite; revoke with the zero address. A transfer only SUSPENDS the
+//       config — it is effective while you hold the token and silently revives
+//       if you re-acquire it, so revoke explicitly if you mean forever)
 //   2. buyer:     await ag.agent.clone({
 //                    sourceAgentId: agentId,
 //                    targetOwner: buyerAddress,          // must equal the connected wallet

@@ -201,6 +201,25 @@ export class AgentApi {
     return this.id.cloneSourceOf(agentId);
   }
 
+  // Standard-policy purchase helpers — resolve the token's configured
+  // authorizer live and speak the OFFICIAL StandardCloneAuthorizer ABI to it.
+  // Against a custom policy these revert; use that policy's own surface.
+
+  /** Seller: allow `buyer` to fork this agent — a permission switch (standard policy only). */
+  async grantClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.grantClone(sourceAgentId, buyer);
+  }
+
+  /** Seller: close the door for `buyer` — refund or manual one-shot consumption (standard policy only). */
+  async revokeClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.revokeClone(sourceAgentId, buyer);
+  }
+
+  /** A grant's seller + whether it is currently effective (standard policy only). */
+  async cloneGrantOf(sourceAgentId: bigint, buyer: Address): Promise<{ grantor: Address; effective: boolean }> {
+    return this.id.cloneGrantOf(sourceAgentId, buyer);
+  }
+
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
     return this.id.transferFrom(from, to, tokenId);
@@ -679,6 +698,17 @@ export class AgentApi {
       if (row?.phase === 'failed') {
         let reason = row.lastProvisionError ?? null;
         if (reason == null) {
+          // Pre-mint failures live in the per-stage reasons of the PUBLIC
+          // detail endpoint (e.g. mint_stage.reason = the revert data), not
+          // in lastProvisionError — read them before giving up on a cause.
+          try {
+            const d = (await (await fetch(
+              `${this.ctx.attestorUrl?.replace(/\/$/, '')}/deployment/${sealId}`,
+            )).json()) as { mint_stage?: { reason?: string }; storage_stage?: { reason?: string }; container_stage?: { reason?: string } };
+            reason = d.mint_stage?.reason ?? d.storage_stage?.reason ?? d.container_stage?.reason ?? null;
+          } catch { /* detail unreachable — try the owner-scoped fallback */ }
+        }
+        if (reason == null) {
           try {
             const mine = (await this.listMyDeployments()).find((r) => r.sealId === sealId);
             reason = mine?.lastProvisionError ?? null;
@@ -848,6 +878,7 @@ export class AgenticID {
         agenticID: addr(cfg.agentic_id_addr),
         verifiedFeedback: addr(cfg.verified_feedback_addr),
         feedbackBatcher: addr(cfg.feedback_batcher_addr),
+        cloneGate: addr(cfg.clone_gate_addr),
         teeDataVerifier: addr(cfg.tee_data_verifier_addr),
         tappRegistry: addr(cfg.tapp_registry_addr),
         sandboxServing: addr(cfg.sandbox_serving_addr),

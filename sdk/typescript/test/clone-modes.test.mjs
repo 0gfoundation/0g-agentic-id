@@ -77,7 +77,7 @@ function stubCtx(accountAddress, cloneAuthorizer) {
         return cloneAuthorizer;
       },
     };
-    ctx.addresses = { agenticID: '0x0000000000000000000000000000000000000a9d' };
+    ctx.addresses = { agenticID: '0x0000000000000000000000000000000000000a9d', cloneGate: '0x0000000000000000000000000000000000000c1e' };
   }
   return { ctx, signed };
 }

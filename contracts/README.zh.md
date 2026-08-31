@@ -327,25 +327,44 @@ canonical 条目做交集。
   （issue #133）：**owner 模式**——源 agent 现任 owner 签
   `AgenticID.Clone.v1` 意图；**contract 模式**（市场分叉）——**买家**签
   `AgenticID.CloneContract.v1` 意图（canonical 绑定 `keccak256(auth_data)` 与
-  authorizer 地址），由 owner 配置的 `ICloneAuthorizer` 在 `cloneFrom` 里
+  authorizer 地址），由 owner 配置的 `ICloneAuthorizer` 在 `CloneGate.cloneFrom`
+  里（卫星合约——AgenticID 顶着 EIP-170 字节码上限，本体不动）
   原子决策。
 - **无 seal agent**（数据 blob）：普通 transfer 保持禁用；ownership 只能走下面
   proof 门禁的 `iTransferFrom`，原子地把 dataKey 重加密给买家。`iCloneFrom` 可用。
 
-### 政策模式克隆（issue #133）：`setCloneAuthorizer` + `cloneFrom`
+### 政策模式克隆（issue #133）：`CloneGate` 卫星合约
 
 seal 绑定 agent 的 owner 可以把 fork 授权委托给一个政策合约——市场分叉流程：
 
-1. **发布者一次性 opt-in：** `setCloneAuthorizer(tokenId, authorizer)`——
+所有政策克隆逻辑都在 `CloneGate` 卫星里——AgenticID 本体不动（它顶着 EIP-170
+上限；新能力一律以伴生合约交付，同 `VerifiedFeedbackRegistry`）。gate 需在
+trusted-attestor 白名单内（它经 `registerWithSeal` 铸造）；AgenticID 暂停即
+克隆暂停。流程：
+
+1. **发布者一次性 opt-in：** `CloneGate.setCloneAuthorizer(tokenId, authorizer)`——
    `ICloneAuthorizer` 的纯 view `canClone(source, to, caller, authData)` 决定
-   contract 模式克隆是否放行。token 换 owner 时自动清空（owner 意图）；
-   `cloneSourceOf` 血统跨转让保留（历史事实）。authorizer 为零 → contract
-   模式 fail-closed。
+   contract 模式克隆是否放行。配置绑定设置它的 owner：token 换手即失效
+   （`cloneAuthorizerOf` 返回**生效中**的 authorizer，owner 变了就返回 0）。
+   注意失效是**休眠而非抹除**：原 owner 回购 token（A→B→A）后旧政策会静默
+   复活；要永久清除需显式 `setCloneAuthorizer(id, 0)`。`cloneSourceOf` 血统
+   跨转让保留（历史事实）。authorizer 为零 → contract 模式 fail-closed。
+
+   不想自己写政策合约的发布者，可将 token 指向**官方通用政策
+   `StandardCloneAuthorizer`**（不可升级、无任何特权角色）：按
+   `(sourceAgentId, buyer)` 记录的**纯放行开关**——`grant`/`revoke` 只有源
+   token 的**当前 owner**（即卖家，无平台管理员）能调，`authData` 一律忽略，
+   且每条授权带与 gate 配置一致的 owner-at-grant 惰性失效。有意不做按张
+   计票：view 版 `canClone` 信任模型下 N 张票等于 1 张票，订单对账留在
+   卖家自己的记录里，一次性消费 = 卖家看到 `ClonedFrom` 事件后 `revoke`
+   ——理由见 `ICloneAuthorizer` 的信任模型注释。`examples/DevCloneAuthorizer`
+   仍作为自写政策的最简参考骨架保留。
 2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
    目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer
    只能转运意图，不能换 auth_data 重放，也不能跨政策轮换搬运），经 attestor
    `/clone`（或 SDK 的 `ag.agent.clone({ authorization: { authData } })`）提交。
-3. **原子门禁：** attestor worker 走 `cloneFrom` 铸造，`canClone` 与铸造同交易
+3. **原子门禁：** attestor worker 走 `CloneGate.cloneFrom` 铸造（内部调
+   `registerWithSeal`），`canClone` 与铸造同交易
    执行——迟到的 deny、被清空的 authorizer、过期的 re-seal 都会让整笔交易
    revert。`nonReentrant`，与 iTransferFrom/iCloneFrom 同款。revert 的
    authorizer 冒泡自己的 revert 数据（fail-closed、保留诊断信息）；

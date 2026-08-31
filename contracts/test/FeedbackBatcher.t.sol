@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {CanonicalReputationRegistryMock} from "./mocks/CanonicalReputationRegistryMock.sol";
@@ -222,6 +223,17 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         assertEq(address(batcher).balance, 0, "the batcher contract itself holds nothing");
     }
 
+    function test_delegatedEOA_stillReceivesSafeMintedNFTs() public {
+        // Regression: a wallet that ever used the atomic feedback path keeps
+        // the delegation designator; ERC-721 safeMint/safeTransfer probe any
+        // code-bearing receiver via onERC721Received. v3 lacked the hook, so
+        // clone mints to such wallets reverted ERC721InvalidReceiver.
+        vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);
+        MinimalERC721 nft = new MinimalERC721();
+        nft.safeMint(clientWallet.addr, 1);
+        assertEq(nft.ownerOf(1), clientWallet.addr, "safeMint lands on the delegated EOA");
+    }
+
     // ── Constructor guards ────────────────────────────────────────────────────
 
     function test_constructor_rejectsZeroAddresses() public {
@@ -229,5 +241,14 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
         new FeedbackBatcher(address(0), address(registry));
         vm.expectRevert(bytes("verifiedFeedback=0"));
         new FeedbackBatcher(address(canonicalRep), address(0));
+    }
+}
+
+/// @dev Just enough ERC-721 to exercise the safeMint receiver probe.
+contract MinimalERC721 is ERC721 {
+    constructor() ERC721("T", "T") {}
+
+    function safeMint(address to, uint256 id) external {
+        _safeMint(to, id);
     }
 }

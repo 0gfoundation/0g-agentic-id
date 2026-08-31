@@ -121,6 +121,10 @@ pub struct Config {
     /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
     /// presence as "the atomic path works here". Discovery-only.
     pub feedback_batcher_addr: Option<Address>,
+    /// CloneGate — policy-mode cloning satellite of AgenticID (issue #133).
+    /// The attestor CALLS this one (contract-mode /clone mints through it);
+    /// unset = contract-mode cloning disabled, owner-mode unaffected.
+    pub clone_gate_addr: Option<Address>,
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
@@ -292,6 +296,8 @@ impl Config {
             verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
                 .and_then(|s| s.parse().ok()),
             feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
+                .and_then(|s| s.parse().ok()),
+            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),

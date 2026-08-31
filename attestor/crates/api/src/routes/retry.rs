@@ -146,6 +146,7 @@ mod tests {
             reputation_registry_addr: None,
             verified_feedback_addr: None,
             feedback_batcher_addr: None,
+            clone_gate_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
