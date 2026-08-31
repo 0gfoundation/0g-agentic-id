@@ -554,7 +554,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'authorizer') {
-        if (!args[0]) { out('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
+        // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
+        // clear?) — refuse rather than silently act on a guess.
+        if (!args[0] || args.length > 2) { out('usage: authorizer <agentId|sealId> [address|off]\n'); continue; }
         if (!args[1]) {
           // Read-only: anyone can inspect any agent's fork policy.
           const ag = await clientFor(ctx, false);
@@ -573,7 +575,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.agent.waitForTransaction(tx);
         out(target === ZERO_ADDR
           ? `agent ${id}: fork sales closed\n`
-          : `agent ${id}: fork policy set to ${target}\n    issue purchases with: grant ${id} <purchaseId> <buyer>\n`);
+          : `agent ${id}: fork policy set to ${target}\n    allow buyers with: grant ${id} <buyer>\n`);
         continue;
       }
 
