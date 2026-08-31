@@ -17,6 +17,9 @@ export interface CliEnv {
   /** `AGENTIC_PRIVATE_KEY` — optional owner key. Enables `--mine`,
    *  owner-tier failure reasons, and doctor's owner checks. */
   privateKey?: `0x${string}`;
+  /** Where `privateKey` came from — a malformed-key error must name the
+   *  right place to fix (unset env vs re-run login). */
+  privateKeySource?: 'env' | 'file';
   /** `AGENTIC_RPC_URL` — optional RPC override (explicit-wins over the
    *  attestor /config's advertised RPC). */
   rpcUrl?: string;
@@ -39,10 +42,11 @@ export function readEnv(env: NodeJS.ProcessEnv = process.env): CliEnv {
     attestorUrl: (pick('AGENTIC_ATTESTOR_URL') ?? file.attestorUrl)?.replace(/\/$/, ''),
     // env keys are normalized like login input (0x prefix optional); a
     // malformed value passes through so requirePrivateKey can name the problem.
-    privateKey: (() => {
+    ...((): Pick<CliEnv, 'privateKey' | 'privateKeySource'> => {
       const raw = pick('AGENTIC_PRIVATE_KEY');
-      if (raw) return normalizeKey(raw) ?? (raw as `0x${string}`);
-      return fileKey ?? undefined;
+      if (raw) return { privateKey: normalizeKey(raw) ?? (raw as `0x${string}`), privateKeySource: 'env' };
+      if (fileKey) return { privateKey: fileKey, privateKeySource: 'file' };
+      return {};
     })(),
     rpcUrl: pick('AGENTIC_RPC_URL') ?? file.rpcUrl,
   };
@@ -68,9 +72,19 @@ export function requirePrivateKey(env: CliEnv): `0x${string}` {
     });
   }
   if (!/^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
-    throw new CliError('WALLET_REQUIRED', 'AGENTIC_PRIVATE_KEY is set but malformed (expected 64 hex chars, 0x prefix optional)', {
-      remedy: 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
-    });
+    // Name the actual source — blaming the env var when the bad value sits in
+    // the credentials file sends the user to `unset` something that isn't set.
+    throw new CliError(
+      'WALLET_REQUIRED',
+      env.privateKeySource === 'file'
+        ? 'the saved owner key (login credentials file) is malformed (expected 64 hex chars, 0x prefix optional)'
+        : 'AGENTIC_PRIVATE_KEY is set but malformed (expected 64 hex chars, 0x prefix optional)',
+      {
+        remedy: env.privateKeySource === 'file'
+          ? 'run `login` and re-enter the key'
+          : 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>   # or unset it to use the login-saved key',
+      },
+    );
   }
   return env.privateKey;
 }

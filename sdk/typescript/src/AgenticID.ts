@@ -698,6 +698,17 @@ export class AgentApi {
       if (row?.phase === 'failed') {
         let reason = row.lastProvisionError ?? null;
         if (reason == null) {
+          // Pre-mint failures live in the per-stage reasons of the PUBLIC
+          // detail endpoint (e.g. mint_stage.reason = the revert data), not
+          // in lastProvisionError — read them before giving up on a cause.
+          try {
+            const d = (await (await fetch(
+              `${this.ctx.attestorUrl?.replace(/\/$/, '')}/deployment/${sealId}`,
+            )).json()) as { mint_stage?: { reason?: string }; storage_stage?: { reason?: string }; container_stage?: { reason?: string } };
+            reason = d.mint_stage?.reason ?? d.storage_stage?.reason ?? d.container_stage?.reason ?? null;
+          } catch { /* detail unreachable — try the owner-scoped fallback */ }
+        }
+        if (reason == null) {
           try {
             const mine = (await this.listMyDeployments()).find((r) => r.sealId === sealId);
             reason = mine?.lastProvisionError ?? null;
