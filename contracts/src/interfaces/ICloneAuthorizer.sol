@@ -5,10 +5,10 @@ pragma solidity ^0.8.20;
 /// @notice Policy contract that decides whether a `cloneFrom` mint may proceed.
 ///
 ///         The source agent's owner configures ONE authorizer per token via
-///         `AgenticID.setCloneAuthorizer` (issue #133: marketplace-style fork
+///         `CloneGate.setCloneAuthorizer` (issue #133: marketplace-style fork
 ///         flows — "publisher issues once, users fork") and the trusted
 ///         attestor submits every policy-mode clone through
-///         `AgenticID.cloneFrom`, which consults the configured authorizer
+///         `CloneGate.cloneFrom`, which consults the configured authorizer
 ///         atomically with the mint.
 ///
 ///         Division of labor:
@@ -22,14 +22,14 @@ pragma solidity ^0.8.20;
 ///             so identity authorization cannot reach it (issue #133).
 ///
 ///         Power scope: an authorizer can ONLY answer true/false. It is called
-///         via STATICCALL from `cloneFrom`, gains no on-chain privilege, and
+///         via STATICCALL from `CloneGate.cloneFrom`, gains no on-chain privilege, and
 ///         cannot transfer, mutate or pause anything. ERC-721 operator
 ///         approval would be strictly broader (transfer authority) — hence a
 ///         separate, clone-only primitive.
 ///
 /// @dev Implementations MUST be pure `view` and MUST NOT revert to signal
 ///      "deny" — return `false` instead. A reverting authorizer still fails
-///      the clone closed, but its revert data BUBBLES from `cloneFrom`
+///      the clone closed, but its revert data BUBBLES from `CloneGate.cloneFrom`
 ///      unchanged (there is no try/catch around the consult) — clients see
 ///      the authorizer's own error, not `AgenticIDCloneDenied` (which is
 ///      reserved for an unconfigured/zero authorizer and a clean `false`).

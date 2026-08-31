@@ -56,6 +56,10 @@ export interface ContractAddresses {
    *  Optional: only advertised on 7702-enabled chains; absent/zero → the SDK
    *  uses the sequential two-tx flow. */
   feedbackBatcher?: `0x${string}`;
+  /** CloneGate — policy-mode cloning satellite (issue #133). Optional:
+   *  absent/zero → setCloneAuthorizer/contract-mode clone are unavailable
+   *  in this environment. */
+  cloneGate?: `0x${string}`;
   /** TappRegistry — trust-root acknowledgement (ack) */
   tappRegistry: `0x${string}`;
   /** SandboxServing — prepaid sandbox balance (deposit) */
