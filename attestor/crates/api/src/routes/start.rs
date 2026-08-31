@@ -122,6 +122,7 @@ mod tests {
             verified_feedback_addr: None,
             feedback_batcher_addr: None,
             clone_gate_addr: None,
+            standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
@@ -186,6 +187,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            clone_params: None,
             phase: derive_phase(
                 &StageStatus::NotStarted,
                 &StageStatus::NotStarted,

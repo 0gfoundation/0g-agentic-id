@@ -116,3 +116,7 @@ CREATE TABLE IF NOT EXISTS indexer_checkpoints (
     last_block BIGINT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Clone retry recipe (issue #147): the static params needed to re-drive a
+-- failed clone under the same sealId. NULL on deploy rows.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS clone_params JSONB;

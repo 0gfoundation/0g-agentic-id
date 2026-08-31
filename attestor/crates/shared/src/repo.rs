@@ -91,6 +91,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let provision_deadline: Option<DateTime<Utc>> = row.try_get("provision_deadline")?;
     let last_provision_error: Option<String> = row.try_get("last_provision_error")?;
     let last_provision_error_at: Option<DateTime<Utc>> = row.try_get("last_provision_error_at")?;
+    let clone_params_json: Option<serde_json::Value> = row.try_get("clone_params")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -104,6 +105,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     };
 
     let i_data: Vec<IDataArtifact> = serde_json::from_value(i_data_json)?;
+    let clone_params = clone_params_json.map(serde_json::from_value).transpose()?;
     let storage_stage: StageStatus = serde_json::from_value(storage_stage)?;
     let mint_stage: StageStatus = serde_json::from_value(mint_stage)?;
     let container_stage: StageStatus = serde_json::from_value(container_stage)?;
@@ -117,6 +119,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         agent_uri,
         agent_card,
         i_data,
+        clone_params,
         phase,
         storage_stage,
         mint_stage,
@@ -140,16 +143,16 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             r#"
             INSERT INTO deployments (
                 seal_id, agent_seal_addr, owner, agent_id,
-                agent_uri, agent_card, i_data,
+                agent_uri, agent_card, i_data, clone_params,
                 phase, storage_stage, mint_stage, container_stage,
                 sandbox_id, provisioned_at,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4,
-                $5, $6, $7,
-                $8, $9, $10, $11,
-                $12, $13,
-                $14, $15
+                $5, $6, $7, $8,
+                $9, $10, $11, $12,
+                $13, $14,
+                $15, $16
             )
             "#,
         )
@@ -160,6 +163,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(&d.agent_uri)
         .bind(&d.agent_card)
         .bind(serde_json::to_value(&d.i_data)?)
+        .bind(d.clone_params.as_ref().map(serde_json::to_value).transpose()?)
         .bind(d.phase.serde_tag())
         .bind(serde_json::to_value(&d.storage_stage)?)
         .bind(serde_json::to_value(&d.mint_stage)?)

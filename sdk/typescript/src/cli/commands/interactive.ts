@@ -290,6 +290,7 @@ const L1_HELP_FULL = `manager commands
                           new owner acks + resets to take over the runtime)
   authorizer <id> [a|off] show the agent's fork policy; owner sets a policy
                           contract address to open fork sales, off to close
+                          ('standard' = the official policy from /config)
   grant <id> <buyer>      seller: allow <buyer> to fork this agent (standard
                           policy only; a switch — revoke closes it again)
   revoke <id> <buyer>     seller: close the door for <buyer>
@@ -597,8 +598,19 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
-        const target = args[1].toLowerCase() === 'off' ? ZERO_ADDR : args[1];
-        if (target !== ZERO_ADDR && !isAddress(target)) { out('authorizer must be an address or `off`\n'); continue; }
+        let target = args[1].toLowerCase() === 'off' ? ZERO_ADDR : args[1];
+        if (target.toLowerCase() === 'standard') {
+          // Resolve the OFFICIAL stock policy from the attestor /config so
+          // publishers don't hand-copy addresses out of DEPLOYMENT.md.
+          const cfg = await (await fetch(`${requireAttestorUrl(ctx.env)}/config`)).json() as { standard_clone_authorizer_addr?: string };
+          if (!cfg.standard_clone_authorizer_addr) {
+            out('this attestor does not advertise a standard clone policy (standard_clone_authorizer_addr missing from /config) — pass the policy address explicitly\n');
+            continue;
+          }
+          target = cfg.standard_clone_authorizer_addr;
+          out(`standard policy: ${target}\n`);
+        }
+        if (target !== ZERO_ADDR && !isAddress(target)) { out('authorizer must be an address, `standard`, or `off`\n'); continue; }
         const tx = await ag.agent.setCloneAuthorizer(id, target as Address);
         await ag.agent.waitForTransaction(tx);
         out(target === ZERO_ADDR

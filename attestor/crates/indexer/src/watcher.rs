@@ -563,6 +563,7 @@ impl Watcher {
             agent_uri: uri,
             agent_card,
             i_data: artifacts,
+            clone_params: None,
             phase: derive_phase(&storage_stage, &mint_stage, &container_stage),
             storage_stage,
             mint_stage,
@@ -673,6 +674,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
                 &StageStatus::Confirmed { at: now },
