@@ -28,7 +28,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 import type { CommandContext } from '../types';
@@ -281,6 +281,8 @@ const L1_HELP_FULL = `manager commands
   start <id>              start a stopped agent
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (asks framework + key)
+  retry <id|sealId>       resume a FAILED deploy/clone under the same identity
+                          (re-runs the failed on-chain stages; reset after)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -553,6 +555,29 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         await ag.agent.reset(row.sealId, { framework, apiKey });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
         if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
+        continue;
+      }
+
+      if (cmd === 'retry') {
+        // Resume a FAILED deploy/clone under the SAME identity (sealId) —
+        // the attestor re-runs the failed idempotent stages (storage, mint,
+        // setAgentURI). Never redeploy a failed row: that would orphan the
+        // identity. Container work isn't retried here — once minted, use
+        // `reset <id>` to bring the agent up.
+        if (!args[0]) { out('usage: retry <agentId|sealId>\n'); continue; }
+        const ag = await withWallet(ctx);
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        if (row.phase !== 'failed') { out(`agent ${row.agentId ?? row.sealId} is ${row.phase} — retry only applies to failed rows\n`); continue; }
+        out(`retrying seal ${row.sealId} — re-running the failed stages… (Esc-proof; may take a minute)\n`);
+        await ag.agent.retry(row.sealId);
+        try {
+          const agentId = await ag.agent.waitForMint(row.sealId);
+          out(`recovered: agent ${agentId} minted under the same seal\n`);
+          out(`it lands offline — bring it up with: reset ${agentId}\n`);
+        } catch (e) {
+          out(`still failing: ${(e as Error).message}\n`);
+        }
         continue;
       }
 
