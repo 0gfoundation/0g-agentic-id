@@ -150,10 +150,12 @@ registerWithSeal / iCloneFrom all start with an empty payment wallet (locked by 
 
 ## 3. Deploy
 
-`script/Deploy.s.sol` deploys all 11 contracts in one run (Timelock + 3 × (impl +
-beacon + proxy) + FeedbackBatcher); verified-feedback/verifier bind to the freshly-minted AgenticID,
-AgenticID binds to `CANONICAL_8004`, and the verified-feedback registry anchors to
-`CANONICAL_8004_REPUTATION` (both chainId defaults):
+`script/Deploy.s.sol` deploys all 15 contracts in one run (Timelock + 4 × (impl +
+beacon + proxy: TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry / CloneGate)
++ FeedbackBatcher + StandardCloneAuthorizer); verified-feedback/verifier/clone-gate
+bind to the freshly-minted AgenticID, AgenticID binds to `CANONICAL_8004`, and the
+verified-feedback registry anchors to `CANONICAL_8004_REPUTATION` (both chainId
+defaults):
 
 ```bash
 export OWNER=0x...
@@ -167,11 +169,13 @@ forge script script/Deploy.s.sol \
 ```
 
 `PROPOSERS`/`EXECUTORS` default to proposers=[OWNER], executors=[0x0] (open
-execution). The run prints all 11 addresses — record them in §6.
+execution). The run prints all 15 addresses — record them in §6.
 
 **Required post-deploy (fresh contract = empty allowlists):** the owner must
-`addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`)
-and `addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in
+`addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`),
+`addTrustedAttestor(<CloneGate proxy>)` (the gate is the `msg.sender` of clone
+mints — without it every `cloneFrom` reverts), and
+`addValidFrameworkHash(<sealed image hash>)` (else `image_hash not in
 validFrameworkHashes`).
 
 ## 4. Upgrade
