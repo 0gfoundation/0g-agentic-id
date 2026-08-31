@@ -22,7 +22,7 @@ import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
-import { loadKey, saveKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef } from '../ref';
 import { pandaLines, svgPixelLines } from '../logo';
 
@@ -362,7 +362,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const hasKey = !!(ctx.env.privateKey ?? loadKey());
         const key = (await askSecret(ask, `owner private key [${hasKey ? 'set — Enter to keep' : 'unset'}]: `)).trim();
         if (key) {
-          try { saveKey(key); ctx.env.privateKey = key as `0x${string}`; }
+          // Cache what was SAVED, not what was typed — saveKey normalizes
+          // (0x prefix optional), and a raw un-prefixed value in ctx.env
+          // makes every later command see a "malformed" key until restart.
+          try { saveKey(key); ctx.env.privateKey = normalizeKey(key)!; ctx.env.privateKeySource = 'file'; }
           catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
         }
 
