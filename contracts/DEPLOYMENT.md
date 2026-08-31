@@ -276,11 +276,10 @@ owner `0xB831…`.
 | VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
-| CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — agent 355 forked from 352 under DevCloneAuthorizer `0xd5639D72…36FBe`, deny path exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
+| CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — allow + deny paths exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
 | CloneGate impl | `0xfCF587f38E27570efF795501aA5b173472dC354c` | |
 | CloneGate beacon | `0xeD63552eEbe2480367C28b16F653c4181aB15e1A` | |
 | StandardCloneAuthorizer | `0x0663b7Abbdff1B451dDA292Ec9dd16a9DE34CA83` | official stock clone policy (immutable, no proxy; per-buyer switch keyed (agent, buyer); live-verified — agent 366 forked from 352 via CLI `clone 352` after `grant 352 <buyer>`) |
-| DevCloneAuthorizer (EXAMPLE policy, admin 0xB831) | `0xd5639D72Ebcba1E4556B18BEC772d418a0636FBe` | reference ICloneAuthorizer for integrators; not protocol |
 | FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x749A57eB4E647d43836C14585f3AF763Ae91A703` | v4, deployed 2026-08-31 (adds `onERC721Received` — a delegated wallet must stay a valid safeMint/safeTransfer receiver, else clone mints to it revert ERC721InvalidReceiver; supersedes v3 `0x91dE43…9577` and earlier); v3 added `receive()`; atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
@@ -320,13 +319,31 @@ beacon upgrade and was verified post-upgrade — see changelog):
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
 | VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
+| CloneGate | **1.0.1** | — (not deployed) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
-> Policy-mode cloning (issue #133) ships as the **CloneGate 1.0.0 satellite** —
-> AgenticID stays 1.1.0 (see the changelog entry for why: EIP-170).
+> Policy-mode cloning (issue #133) ships as the **CloneGate satellite** (1.0.1
+> on dev) — AgenticID stays 1.1.0 (see the changelog entry for why: EIP-170).
 
 Changelog:
+
+- **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
+  `CloneGateArityMismatch` reports the sealedKeys length when that side
+  mismatches (was always dataHashes.length; review F5). Diagnostic-only.
+- **StandardCloneAuthorizer (official stock clone policy), dev deployed
+  2026-08-31** — a per-buyer permission switch keyed `(sourceAgentId, buyer)`:
+  `grant`/`revoke` gated on the source's CURRENT owner (no platform roles),
+  `authData` ignored, owner-at-grant lazy invalidation. Immutable, unproxied;
+  included in `Deploy.s.sol` / `DeployCloneGate.s.sol`. Deliberately not
+  per-ticket (view `canClone` cannot consume; N grants == 1 grant), so order
+  bookkeeping stays off chain — see `ICloneAuthorizer`'s trust-model natspec.
+- **FeedbackBatcher v4, dev deployed 2026-08-31** — adds `onERC721Received`:
+  a 7702-delegated wallet answers the ERC-721 safe-transfer/safeMint receiver
+  probe, so wallets that used the atomic feedback path can still receive
+  clone mints and safe transfers (v3 delegations made them revert
+  `ERC721InvalidReceiver`). Delegations self-migrate on the SDK's next
+  giveFeedback.
 
 - **CloneGate 1.0.0 (supersedes PR #145's in-AgenticID design)** — policy-mode
   cloning (issue #133) as a SATELLITE contract. PR #145 originally grew
