@@ -1053,12 +1053,12 @@ export const cloneGateAbi = [
 ] as const;
 
 /**
- * StandardCloneAuthorizer — the OFFICIAL stock clone policy: purchases keyed
- * (sourceAgentId, purchaseId) → buyer, grant/revoke gated on the source's
- * current owner. The SDK's grantPurchase/revokePurchase/purchaseOf helpers
- * speak this ABI to whatever authorizer the token has configured — they only
- * work when that policy IS the standard one (a custom policy has its own
- * management surface).
+ * StandardCloneAuthorizer — the OFFICIAL stock clone policy: a per-buyer
+ * permission switch keyed (sourceAgentId, buyer), grant/revoke gated on the
+ * source's current owner. The SDK's grantClone/revokeClone/cloneGrantOf
+ * helpers speak this ABI to whatever authorizer the token has configured —
+ * they only work when that policy IS the standard one (a custom policy has
+ * its own management surface).
  */
 export const standardCloneAuthorizerAbi = [
   {
@@ -1067,7 +1067,6 @@ export const standardCloneAuthorizerAbi = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'sourceAgentId', type: 'uint256' },
-      { name: 'purchaseId', type: 'uint256' },
       { name: 'buyer', type: 'address' },
     ],
     outputs: [],
@@ -1078,20 +1077,19 @@ export const standardCloneAuthorizerAbi = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'sourceAgentId', type: 'uint256' },
-      { name: 'purchaseId', type: 'uint256' },
+      { name: 'buyer', type: 'address' },
     ],
     outputs: [],
   },
   {
     type: 'function',
-    name: 'purchaseOf',
+    name: 'grantOf',
     stateMutability: 'view',
     inputs: [
       { name: 'sourceAgentId', type: 'uint256' },
-      { name: 'purchaseId', type: 'uint256' },
+      { name: 'buyer', type: 'address' },
     ],
     outputs: [
-      { name: 'buyer', type: 'address' },
       { name: 'grantor', type: 'address' },
       { name: 'effective', type: 'bool' },
     ],
@@ -1119,20 +1117,19 @@ export const standardCloneAuthorizerAbi = [
   },
   {
     type: 'event',
-    name: 'PurchaseGranted',
+    name: 'CloneGranted',
     inputs: [
       { name: 'sourceAgentId', type: 'uint256', indexed: true },
-      { name: 'purchaseId', type: 'uint256', indexed: true },
       { name: 'buyer', type: 'address', indexed: true },
       { name: 'seller', type: 'address', indexed: false },
     ],
   },
   {
     type: 'event',
-    name: 'PurchaseRevoked',
+    name: 'CloneRevoked',
     inputs: [
       { name: 'sourceAgentId', type: 'uint256', indexed: true },
-      { name: 'purchaseId', type: 'uint256', indexed: true },
+      { name: 'buyer', type: 'address', indexed: true },
       { name: 'seller', type: 'address', indexed: false },
     ],
   },

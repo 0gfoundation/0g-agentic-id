@@ -205,19 +205,19 @@ export class AgentApi {
   // authorizer live and speak the OFFICIAL StandardCloneAuthorizer ABI to it.
   // Against a custom policy these revert; use that policy's own surface.
 
-  /** Seller: record that `buyer` holds purchase `purchaseId` for this agent (standard policy only). */
-  async grantPurchase(sourceAgentId: bigint, purchaseId: bigint, buyer: Address): Promise<WriteContractReturnType> {
-    return this.id.grantPurchase(sourceAgentId, purchaseId, buyer);
+  /** Seller: allow `buyer` to fork this agent — a permission switch (standard policy only). */
+  async grantClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.grantClone(sourceAgentId, buyer);
   }
 
-  /** Seller: delete a purchase — refund, sold out, or manual one-shot consumption (standard policy only). */
-  async revokePurchase(sourceAgentId: bigint, purchaseId: bigint): Promise<WriteContractReturnType> {
-    return this.id.revokePurchase(sourceAgentId, purchaseId);
+  /** Seller: close the door for `buyer` — refund or manual one-shot consumption (standard policy only). */
+  async revokeClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.revokeClone(sourceAgentId, buyer);
   }
 
-  /** A purchase record + whether it is currently effective (standard policy only). */
-  async purchaseOf(sourceAgentId: bigint, purchaseId: bigint): Promise<{ buyer: Address; grantor: Address; effective: boolean }> {
-    return this.id.purchaseOf(sourceAgentId, purchaseId);
+  /** A grant's seller + whether it is currently effective (standard policy only). */
+  async cloneGrantOf(sourceAgentId: bigint, buyer: Address): Promise<{ grantor: Address; effective: boolean }> {
+    return this.id.cloneGrantOf(sourceAgentId, buyer);
   }
 
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {

@@ -189,41 +189,41 @@ export class AgenticIDClient {
     return a;
   }
 
-  /** Seller: record that `buyer` holds purchase `purchaseId` for this agent. */
-  async grantPurchase(sourceAgentId: bigint, purchaseId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+  /** Seller: allow `buyer` to fork this agent (a permission switch; idempotent). */
+  async grantClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
     const authorizer = await this.requireAuthorizer(sourceAgentId);
     const { walletClient, account } = requireWallet(this.ctx);
     return walletClient.writeContract({
       address: authorizer,
       abi: standardCloneAuthorizerAbi,
       functionName: 'grant',
-      args: [sourceAgentId, purchaseId, buyer],
+      args: [sourceAgentId, buyer],
       account,
       chain: this.ctx.chain,
     });
   }
 
-  /** Seller: delete a purchase (refund, sold out, or manual one-shot consumption). */
-  async revokePurchase(sourceAgentId: bigint, purchaseId: bigint): Promise<WriteContractReturnType> {
+  /** Seller: close the door for `buyer` (refund, or manual one-shot consumption). */
+  async revokeClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
     const authorizer = await this.requireAuthorizer(sourceAgentId);
     const { walletClient, account } = requireWallet(this.ctx);
     return walletClient.writeContract({
       address: authorizer,
       abi: standardCloneAuthorizerAbi,
       functionName: 'revoke',
-      args: [sourceAgentId, purchaseId],
+      args: [sourceAgentId, buyer],
       account,
       chain: this.ctx.chain,
     });
   }
 
-  /** The purchase record plus whether it is currently effective (grantor still owns the source). */
-  async purchaseOf(sourceAgentId: bigint, purchaseId: bigint): Promise<{ buyer: Address; grantor: Address; effective: boolean }> {
+  /** The grant's recorded seller + whether it is currently effective ((0x0, false) = no grant). */
+  async cloneGrantOf(sourceAgentId: bigint, buyer: Address): Promise<{ grantor: Address; effective: boolean }> {
     const authorizer = await this.requireAuthorizer(sourceAgentId);
-    const [buyer, grantor, effective] = (await this.ctx.publicClient.readContract({
-      address: authorizer, abi: standardCloneAuthorizerAbi, functionName: 'purchaseOf', args: [sourceAgentId, purchaseId],
-    })) as readonly [Address, Address, boolean];
-    return { buyer, grantor, effective };
+    const [grantor, effective] = (await this.ctx.publicClient.readContract({
+      address: authorizer, abi: standardCloneAuthorizerAbi, functionName: 'grantOf', args: [sourceAgentId, buyer],
+    })) as readonly [Address, boolean];
+    return { grantor, effective };
   }
 
   async balanceOf(owner: Address): Promise<bigint> {

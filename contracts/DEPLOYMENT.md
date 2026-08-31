@@ -277,9 +277,9 @@ owner `0xB831…`.
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
 | CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — agent 355 forked from 352 under DevCloneAuthorizer `0xd5639D72…36FBe`, deny path exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
-| CloneGate impl | `0xfCF587f38E27570efF795501aA5b173472dC354c` | 1.0.0 impl was `0x7cED9b2d9ccCdBFe5568cF6c1A292eDd2019FD02` |
+| CloneGate impl | `0xfCF587f38E27570efF795501aA5b173472dC354c` | |
 | CloneGate beacon | `0xeD63552eEbe2480367C28b16F653c4181aB15e1A` | |
-| StandardCloneAuthorizer | `0x744e38c628dA2971A414218CbCE77D8c10A5e281` | official stock clone policy (immutable, no proxy; deployed 2026-08-31; live-verified — agent 364 forked from 352 under purchase (352,1), revoke → deny) |
+| StandardCloneAuthorizer | `0x0663b7Abbdff1B451dDA292Ec9dd16a9DE34CA83` | official stock clone policy (immutable, no proxy; per-buyer switch keyed (agent, buyer); live-verified — agent 366 forked from 352 via CLI `clone 352` after `grant 352 <buyer>`) |
 | DevCloneAuthorizer (EXAMPLE policy, admin 0xB831) | `0xd5639D72Ebcba1E4556B18BEC772d418a0636FBe` | reference ICloneAuthorizer for integrators; not protocol |
 | FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x91dE43B1455F3dF7F09CCA8F0E35e2Eb9E829577` | v3, deployed 2026-08-28 (adds `receive()` so a delegated EOA still accepts plain ETH; supersedes `0x59921B…48BF` and `0x8E8997…524f`); atomicity verified live (type-4 batch, bad-proof rollback). **Supersede consequence**: an EOA delegated to a superseded batcher keeps executing the OLD code until its next giveFeedback re-delegates (the SDK does so automatically on designator mismatch) — one more reason batcher fixes should land before an address is advertised beyond dev |
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |

@@ -351,12 +351,13 @@ trusted-attestor 白名单内（它经 `registerWithSeal` 铸造）；AgenticID 
    跨转让保留（历史事实）。authorizer 为零 → contract 模式 fail-closed。
 
    不想自己写政策合约的发布者，可将 token 指向**官方通用政策
-   `StandardCloneAuthorizer`**（不可升级、无任何特权角色）：购买凭证按
-   `(sourceAgentId, purchaseId) → buyer` 隔离，`grant`/`revoke` 只有源
-   token 的**当前 owner**（即卖家，无平台管理员）能调，且每条凭证带与
-   gate 配置一致的 owner-at-grant 惰性失效。一次性消费有意留在链下
-   （attestor 幂等键 + 卖家看到 `ClonedFrom` 事件后 `revoke`）——理由见
-   `ICloneAuthorizer` 的信任模型注释。`examples/DevCloneAuthorizer`
+   `StandardCloneAuthorizer`**（不可升级、无任何特权角色）：按
+   `(sourceAgentId, buyer)` 记录的**纯放行开关**——`grant`/`revoke` 只有源
+   token 的**当前 owner**（即卖家，无平台管理员）能调，`authData` 一律忽略，
+   且每条授权带与 gate 配置一致的 owner-at-grant 惰性失效。有意不做按张
+   计票：view 版 `canClone` 信任模型下 N 张票等于 1 张票，订单对账留在
+   卖家自己的记录里，一次性消费 = 卖家看到 `ClonedFrom` 事件后 `revoke`
+   ——理由见 `ICloneAuthorizer` 的信任模型注释。`examples/DevCloneAuthorizer`
    仍作为自写政策的最简参考骨架保留。
 2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
    目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer

@@ -14,7 +14,7 @@
  */
 
 import * as readline from 'node:readline';
-import { parseEther, keccak256, toBytes, hexToBytes, concat, encodeAbiParameters, isAddress, type Address } from 'viem';
+import { parseEther, keccak256, toBytes, hexToBytes, concat, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
@@ -281,17 +281,16 @@ const L1_HELP_FULL = `manager commands
   start <id>              start a stopped agent
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (asks framework + key)
-  clone <id> [to]         clone YOUR agent (owner mode); mints to you unless
-                          <to> is given. New agent lands offline — reset to run
-  clone <id> --purchase N clone SOMEONE ELSE's agent as a buyer: spends the
-                          purchase the seller granted you (contract mode)
+  clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
+                          Someone else's: goes through its fork policy — works
+                          iff the seller granted YOUR wallet. Lands offline
   transfer <id> <to>      transfer YOUR agent to another wallet (irreversible;
                           new owner acks + resets to take over the runtime)
   authorizer <id> [a|off] show the agent's fork policy; owner sets a policy
                           contract address to open fork sales, off to close
-  grant <id> <pid> <buyer> seller: issue purchase <pid> to <buyer> (standard
-                          policy only; grant again to redirect, see revoke)
-  revoke <id> <pid>       seller: delete a purchase (refund / one-shot consume)
+  grant <id> <buyer>      seller: allow <buyer> to fork this agent (standard
+                          policy only; a switch — revoke closes it again)
+  revoke <id> <buyer>     seller: close the door for <buyer>
   balance                 prepaid sandbox balance, burn rate, runway
   deposit [og]            fund the prepaid balance (default 1 OG)
   withdraw [og]           get prepaid funds back: shows balance + pending,
@@ -579,22 +578,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'grant' || cmd === 'revoke') {
-        if (!args[0] || !args[1] || (cmd === 'grant' && !args[2])) {
-          out(cmd === 'grant' ? 'usage: grant <agentId|sealId> <purchaseId> <buyer>\n' : 'usage: revoke <agentId|sealId> <purchaseId>\n');
+        if (!args[0] || !args[1]) {
+          out(`usage: ${cmd} <agentId|sealId> <buyer>\n`);
           continue;
         }
-        let pid: bigint;
-        try { pid = BigInt(args[1]); } catch { out('purchaseId must be an integer\n'); continue; }
-        if (cmd === 'grant' && !isAddress(args[2])) { out('buyer must be a 0x address\n'); continue; }
+        if (!isAddress(args[1])) { out('buyer must be a 0x address\n'); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const tx = cmd === 'grant'
-          ? await ag.agent.grantPurchase(id, pid, args[2] as Address)
-          : await ag.agent.revokePurchase(id, pid);
+          ? await ag.agent.grantClone(id, args[1] as Address)
+          : await ag.agent.revokeClone(id, args[1] as Address);
         await ag.agent.waitForTransaction(tx);
         out(cmd === 'grant'
-          ? `purchase ${pid} on agent ${id} granted to ${args[2]}\n    they clone with: clone ${id} --purchase ${pid}\n`
-          : `purchase ${pid} on agent ${id} revoked\n`);
+          ? `${args[1]} may now fork agent ${id}\n    they clone with: clone ${id}\n`
+          : `${args[1]} may no longer fork agent ${id}\n`);
         continue;
       }
 
@@ -614,27 +611,23 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'clone') {
-        if (!args[0]) { out('usage: clone <agentId|sealId> [to]  |  clone <id> --purchase <n>\n'); continue; }
+        if (!args[0]) { out('usage: clone <agentId|sealId> [to]\n'); continue; }
         const ag = await withWallet(ctx);
         const id = await mintedTokenId(ag, args[0]);
         const key = ctx.env.privateKey ?? loadKey();
         const me = (await addressOf(key as `0x${string}`)) as Address;
-        const pIdx = args.indexOf('--purchase');
+        // Route by identity: the source's owner clones directly (owner mode,
+        // optional recipient); anyone else can only go through the token's
+        // fork policy (the seller must have granted THIS wallet).
+        const sourceOwner = await ag.agent.ownerOf(id);
         let params: Parameters<typeof ag.agent.clone>[0];
-        if (pIdx >= 0) {
-          // Buyer mode: spend a purchase the seller granted to THIS wallet.
-          let pid: bigint;
-          try { pid = BigInt(args[pIdx + 1] ?? ''); } catch { out('--purchase needs an integer purchase id\n'); continue; }
-          params = {
-            sourceAgentId: id,
-            targetOwner: me,
-            authorization: { authData: encodeAbiParameters([{ type: 'uint256' }], [pid]) },
-          };
-        } else {
-          // Owner mode: clone your own agent; optional recipient.
-          const to = args[1] && !args[1].startsWith('--') ? args[1] : me;
+        if (sourceOwner.toLowerCase() === me.toLowerCase()) {
+          const to = args[1] ?? me;
           if (!isAddress(to)) { out('to must be a 0x address\n'); continue; }
           params = { sourceAgentId: id, targetOwner: to as Address };
+        } else {
+          if (args[1]) { out('policy clones always mint to YOUR wallet — drop the <to> argument\n'); continue; }
+          params = { sourceAgentId: id, targetOwner: me, authorization: { authData: '0x' } };
         }
         if (!(await ensureOwnerReady(ag, ask))) { out('clone cancelled — prepaid balance too low\n'); continue; }
         out(`cloning agent ${id}… (TEE re-seal + on-chain mint, may take a minute)\n`);
@@ -794,8 +787,37 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     } catch (e) {
       // Keep the REPL alive on operational errors; show the remedy if present.
       const ce = e as CliError;
-      out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
+      out(`error: ${friendlyChainError(e) ?? ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`);
     }
+  }
+}
+
+/**
+ * Translate the custom contract errors our commands can hit into one human
+ * sentence, instead of viem's raw revert dump (signature + arg tuple + call
+ * frame). Returns undefined for anything unrecognized — caller falls back to
+ * the error's own message.
+ */
+function friendlyChainError(e: unknown): string | undefined {
+  const revert = (e as { walk?: (fn: (x: unknown) => boolean) => unknown }).walk?.(
+    (x) => x instanceof ContractFunctionRevertedError,
+  ) as ContractFunctionRevertedError | undefined;
+  const d = revert?.data;
+  if (!d?.errorName) return undefined;
+  const a = (d.args ?? []) as readonly unknown[];
+  switch (d.errorName) {
+    case 'CloneGateNotTokenOwner':
+      return `agent ${a[1]} is not yours — its owner is ${a[2]} (you signed as ${a[0]})`;
+    case 'StdCloneAuthNotSeller':
+      return `only agent ${a[1]}'s owner (${a[2]}) can manage its fork grants — you signed as ${a[0]}`;
+    case 'CloneGateDenied':
+      return a[1] === ZERO_ADDR
+        ? `agent ${a[0]} has no fork policy configured — its owner opens sales with: authorizer ${a[0]} <policy>`
+        : `agent ${a[0]}'s fork policy (${a[1]}) declined — ask the seller to: grant ${a[0]} <your wallet>`;
+    case 'CloneGateNotTrustedAttestor':
+      return 'cloneFrom may only be submitted by a trusted attestor — use the attestor /clone flow, not a direct tx';
+    default:
+      return `${d.errorName}(${a.map(String).join(', ')})`;
   }
 }
 

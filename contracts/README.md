@@ -371,14 +371,16 @@ cloning; the marketplace-fork flow:
 
    Publishers who don't want to write a policy point their token at the
    OFFICIAL stock policy, **`StandardCloneAuthorizer`** (immutable, no
-   roles): purchases are keyed `(sourceAgentId, purchaseId) → buyer`,
-   `grant`/`revoke` are gated on the source's CURRENT owner (the seller —
-   no platform admin), and each grant carries the same owner-at-set lazy
-   invalidation as the gate config itself. One-time consumption stays off
-   chain by design (attestor idempotency + seller `revoke` after the
-   `ClonedFrom` event) — see `ICloneAuthorizer`'s trust-model natspec.
-   `examples/DevCloneAuthorizer` remains the bare-bones skeleton for
-   integrators writing their own.
+   roles): a pure per-buyer permission SWITCH keyed
+   `(sourceAgentId, buyer)` — `grant`/`revoke` are gated on the source's
+   CURRENT owner (the seller — no platform admin), `authData` is ignored,
+   and each grant carries the same owner-at-set lazy invalidation as the
+   gate config itself. It is deliberately not per-ticket: under the view
+   `canClone` trust model N grants would equal 1 grant, so order
+   bookkeeping stays in the seller's records and one-time consumption is
+   the seller revoking after the `ClonedFrom` event — see
+   `ICloneAuthorizer`'s trust-model natspec. `examples/DevCloneAuthorizer`
+   remains the bare-bones skeleton for integrators writing their own.
 2. **Buyer forks:** signs a clone-intent whose canonical binds the operation
    (idempotency key, source, target) **and its policy context**
    (`keccak256(auth_data)` + the authorizer address — so a relayer can

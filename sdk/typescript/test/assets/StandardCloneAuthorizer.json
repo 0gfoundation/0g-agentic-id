@@ -43,7 +43,7 @@
     "internalType": "address"
    },
    {
-    "name": "data",
+    "name": "",
     "type": "bytes",
     "internalType": "bytes"
    }
@@ -67,11 +67,6 @@
     "internalType": "uint256"
    },
    {
-    "name": "purchaseId",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
     "name": "buyer",
     "type": "address",
     "internalType": "address"
@@ -82,7 +77,7 @@
  },
  {
   "type": "function",
-  "name": "purchaseOf",
+  "name": "grantOf",
   "inputs": [
    {
     "name": "sourceAgentId",
@@ -90,17 +85,12 @@
     "internalType": "uint256"
    },
    {
-    "name": "purchaseId",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "outputs": [
-   {
     "name": "buyer",
     "type": "address",
     "internalType": "address"
-   },
+   }
+  ],
+  "outputs": [
    {
     "name": "grantor",
     "type": "address",
@@ -124,9 +114,9 @@
     "internalType": "uint256"
    },
    {
-    "name": "purchaseId",
-    "type": "uint256",
-    "internalType": "uint256"
+    "name": "buyer",
+    "type": "address",
+    "internalType": "address"
    }
   ],
   "outputs": [],
@@ -134,16 +124,10 @@
  },
  {
   "type": "event",
-  "name": "PurchaseGranted",
+  "name": "CloneGranted",
   "inputs": [
    {
     "name": "sourceAgentId",
-    "type": "uint256",
-    "indexed": true,
-    "internalType": "uint256"
-   },
-   {
-    "name": "purchaseId",
     "type": "uint256",
     "indexed": true,
     "internalType": "uint256"
@@ -165,7 +149,7 @@
  },
  {
   "type": "event",
-  "name": "PurchaseRevoked",
+  "name": "CloneRevoked",
   "inputs": [
    {
     "name": "sourceAgentId",
@@ -174,10 +158,10 @@
     "internalType": "uint256"
    },
    {
-    "name": "purchaseId",
-    "type": "uint256",
+    "name": "buyer",
+    "type": "address",
     "indexed": true,
-    "internalType": "uint256"
+    "internalType": "address"
    },
    {
     "name": "seller",
