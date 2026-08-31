@@ -125,6 +125,11 @@ pub struct Config {
     /// The attestor CALLS this one (contract-mode /clone mints through it);
     /// unset = contract-mode cloning disabled, owner-mode unaffected.
     pub clone_gate_addr: Option<Address>,
+    /// StandardCloneAuthorizer — the OFFICIAL stock clone policy. Discovery
+    /// only (the attestor never calls it): publishers' tooling resolves
+    /// `authorizer <id> standard` through this instead of hand-copying the
+    /// address from DEPLOYMENT.md.
+    pub standard_clone_authorizer_addr: Option<Address>,
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
@@ -298,6 +303,8 @@ impl Config {
             feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
                 .and_then(|s| s.parse().ok()),
             clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
+                .and_then(|s| s.parse().ok()),
+            standard_clone_authorizer_addr: env_opt("ATTESTOR_STANDARD_CLONE_AUTHORIZER_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),

@@ -329,6 +329,15 @@ pub struct Deployment {
 
     pub i_data: Vec<IDataArtifact>,
 
+    /// Set on CLONE rows at accept (issue #147): the static recipe /retry
+    /// needs to re-drive `handle_clone` under the same identity. Clones
+    /// deliberately persist NO re-seal output (a stored snapshot rots the
+    /// moment the source evolves — the #27 lesson); the perishable material
+    /// is recomputed from live chain state on every run, and this field
+    /// carries only the immutable intent. None on deploy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clone_params: Option<CloneRetryParams>,
+
     pub phase: DeploymentPhase,
     pub storage_stage: StageStatus,
     pub mint_stage: StageStatus,
@@ -497,6 +506,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            clone_params: None,
             phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,
             mint_stage: StageStatus::NotStarted,
@@ -1068,5 +1078,21 @@ impl Default for JobCloneAuth {
     fn default() -> Self {
         Self::Owner
     }
+}
+
+/// The static recipe of a clone, persisted on the clone's deployment row at
+/// accept (issue #147). Everything here is immutable INTENT — source, target
+/// metadata, and the verified authorization fact. The perishable half (live
+/// iData, seal derivations, re-sealed keys) is deliberately absent: /retry
+/// recomputes it from chain + KMS so the materials are fresh by construction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CloneRetryParams {
+    pub source_seal_id: SealId,
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub authorization: JobCloneAuth,
 }
 

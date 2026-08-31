@@ -25,7 +25,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
     auth::clone::{verify_clone_contract_intent, verify_clone_signature},
-    derive_phase, CloneRequest, CloneResponse, Deployment, DeploymentPhase, JobCloneAuth,
+    derive_phase, CloneRequest, CloneResponse, CloneRetryParams, Deployment, DeploymentPhase, JobCloneAuth,
     JobPayload, SealId, StageStatus, WsEvent,
 };
 use axum::extract::State;
@@ -225,6 +225,16 @@ pub async fn handle(
         agent_uri: String::new(),
         agent_card: serde_json::Value::Object(Default::default()),
         i_data: Vec::new(),
+        // The retry recipe (issue #147): /retry re-drives handle_clone from
+        // this row-persisted intent — the jobs-table copy is GC'd within an
+        // hour, and the re-seal output is deliberately never persisted.
+        clone_params: Some(CloneRetryParams {
+            source_seal_id: source.seal_id,
+            name: name.clone(),
+            description: description.clone(),
+            image: image.clone(),
+            authorization: job_authorization.clone(),
+        }),
         phase: derive_phase(
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,
@@ -341,6 +351,7 @@ mod tests {
             verified_feedback_addr: None,
             feedback_batcher_addr: None,
             clone_gate_addr: None,
+            standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
@@ -405,6 +416,7 @@ mod tests {
             agent_uri: "oss://card".into(),
             agent_card: serde_json::json!({ "name": "Sage" }),
             i_data: vec![art],
+            clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
                 &StageStatus::Confirmed { at: now },
