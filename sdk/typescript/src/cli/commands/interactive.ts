@@ -1533,11 +1533,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // the current line, erased by the next delta. TTY only — pipes get the
       // clean payload.
       let activityShown = false;
+      let sawToolActivity = false;
       const clearActivity = (): void => {
         if (activityShown) { out('\r\x1b[2K'); activityShown = false; }
       };
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
+            if (label.startsWith('tool/')) sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
             // Never overwrite the agent's own partial line — break to a fresh
             // one first (the visual break marks where the tool ran).
@@ -1569,6 +1571,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.framework = await pickFramework(s.attestorUrl, ask);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
+      }
+      // A turn that ran tools but produced no text is WORK, not failure —
+      // dsh agents legitimately end tool-only turns silently. Say what
+      // happened instead of crying wolf (the true-failure path — no deltas,
+      // no activity — still reports as an error).
+      if (failure && sawToolActivity && /without any output/.test(failure)) {
+        out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
+        failure = null;
       }
       if (failure) out(`\n(chat failed: ${failure})`);
       out('\n');
