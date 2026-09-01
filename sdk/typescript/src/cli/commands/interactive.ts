@@ -31,6 +31,10 @@ import { pandaLines, svgPixelLines } from '../logo';
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
+
+// The live readline interface — askSecret scrubs submitted secrets out of
+// its history (display masking alone leaves the plaintext one ↑ away).
+let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -218,6 +222,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     if (w) w.res(l);
     else pendingLines.push(l);
   });
+  activeRl = rl;
   let stdinClosed = false;
   rl.on('close', () => {
     // EOF while a question is pending — surface the same code rl.question
@@ -1125,6 +1130,15 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
     void ask(prompt).then(
       (ans) => {
         stdout.write = orig;
+        // Masking only covers the SCREEN — readline also recorded the line in
+        // its history, where ↑ at any later prompt replays the secret in
+        // plaintext. Scrub every matching entry.
+        const hist = (activeRl as unknown as { history?: string[] } | null)?.history;
+        if (hist && ans) {
+          for (let i = hist.length - 1; i >= 0; i--) {
+            if (hist[i] === ans) hist.splice(i, 1);
+          }
+        }
         process.stdout.write('\n');
         res(ans);
       },
