@@ -326,9 +326,25 @@ export function makeAgentClient(params: {
         if (c) yield c;
         return;
       }
+      // A silent stream is a FAILED stream: when the bridge's upstream model
+      // call errors (e.g. provider 400), the SSE connection itself is 200 but
+      // carries zero deltas — swallowing that leaves the user staring at an
+      // empty reply with the real cause only in /agentlog. Surface it.
+      // (feedback.md F15)
+      let sawContent = false;
+      let streamErr: string | null = null;
       for await (const chunk of iterSseChunks(r.body)) {
+        const e = (chunk as { error?: { message?: string } | string }).error;
+        if (e) streamErr = typeof e === 'string' ? e : e.message ?? JSON.stringify(e);
         const d = chunkDelta(chunk);
-        if (d.content) yield d.content;
+        if (d.content) { sawContent = true; yield d.content; }
+      }
+      if (!sawContent) {
+        throw new Error(
+          streamErr
+            ? `chat: upstream error: ${streamErr}`
+            : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
+        );
       }
     };
   }

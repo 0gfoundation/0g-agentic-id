@@ -44,13 +44,13 @@ INTERACTIVE (default — no command)
                             use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
                             hello <agentId|seal> any agent's public /hello
-                                                 (banks a rating ticket if a
+                                                 (identity + services + proof;
+                                                 banks a rating ticket if a
                                                  wallet is configured)
                             call <id> [path]     use an agent's service (banks
                                                  a rating ticket)
                             rate <id> [score]    rate an agent on-chain, spending
                                                  a ticket from call/hello (<1h)
-                                                 (identity + services + proof)
                             deploy               new-agent wizard, then chat
                             start/stop/reset <id> lifecycle without entering
                                                  the session (reset asks the
@@ -195,9 +195,17 @@ main()
   .catch((e: unknown) => {
     // node:util's parseArgs errors carry ERR_PARSE_ARGS_* codes — usage, exit 2.
     const nodeCode = (e as { code?: string }).code ?? '';
+    // Own wording, not node:util's raw parseArgs prose (its "place it at the
+    // end of the command after '--'" advice means nothing to end users).
     const err =
       nodeCode.startsWith('ERR_PARSE_ARGS')
-        ? new CliError('BAD_FLAG', (e as Error).message, { remedy: '0g-agenticid --help' })
+        ? new CliError(
+            'BAD_FLAG',
+            nodeCode === 'ERR_PARSE_ARGS_UNKNOWN_OPTION'
+              ? `unknown flag: ${((e as Error).message.match(/'(--?[^']+)'/) ?? [])[1] ?? '(see --help)'}`
+              : 'malformed command-line arguments',
+            { remedy: '0g-agenticid --help' },
+          )
         : toCliError(e);
     process.exitCode = emitError(err, wantJson);
   });
