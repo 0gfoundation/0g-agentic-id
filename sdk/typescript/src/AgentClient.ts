@@ -109,7 +109,15 @@ export interface AgentClient {
    * side stops the turn where the framework supports cancellation (dsh does).
    * The generator then throws the abort error (`err.name === "AbortError"`).
    */
-  chatStream?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): AsyncGenerator<string>;
+  chatStream?(messages: ChatMessage[], opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    /** Tool-activity progress, when the agent's bridge streams it (SSE
+     *  ": activity tool/call <name>" comments — dsh does). Labels like
+     *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
+     *  means the bridge doesn't narrate. */
+    onActivity?: (label: string) => void;
+  }): AsyncGenerator<string>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -139,7 +147,10 @@ function matchRoute(routes: AgentRoute[], path: string): AgentRoute | undefined 
  * core behind both `chat` (fold into one completion) and `chatStream` (map to
  * content deltas).
  */
-async function* iterSseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
+async function* iterSseChunks(
+  body: ReadableStream<Uint8Array>,
+  onComment?: (text: string) => void,
+): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -147,7 +158,12 @@ async function* iterSseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
-      // Skip SSE comments (":...") and non-data fields ("event:", "id:", ...).
+      // SSE comments (":...") are invisible to the payload, but a caller may
+      // want them: the dsh bridge streams tool-activity progress as
+      // ": activity <kind>" comments (keepalives pass through too — the
+      // callback filters).
+      if (t.startsWith(':') && onComment) onComment(t.slice(1).trim());
+      // Skip comments and non-data fields ("event:", "id:", ...).
       if (!t.startsWith('data:')) continue;
       const data = t.slice(5).trim();
       if (data === '' || data === '[DONE]') continue;
@@ -333,7 +349,10 @@ export function makeAgentClient(params: {
       // (feedback.md F15)
       let sawContent = false;
       let streamErr: string | null = null;
-      for await (const chunk of iterSseChunks(r.body)) {
+      const onComment = opts?.onActivity
+        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(c.slice(9)); }
+        : undefined;
+      for await (const chunk of iterSseChunks(r.body, onComment)) {
         const e = (chunk as { error?: { message?: string } | string }).error;
         if (e) streamErr = typeof e === 'string' ? e : e.message ?? JSON.stringify(e);
         const d = chunkDelta(chunk);

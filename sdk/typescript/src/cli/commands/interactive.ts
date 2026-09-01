@@ -1523,12 +1523,34 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
+      // Tool-activity status line: an agent turn spends most of its time in
+      // tools with zero output — narrate it (the dsh bridge streams
+      // ": activity tool/call <name>" SSE comments). Transient: rendered on
+      // the current line, erased by the next delta. TTY only — pipes get the
+      // clean payload.
+      let activityShown = false;
+      const clearActivity = (): void => {
+        if (activityShown) { out('\r\x1b[2K'); activityShown = false; }
+      };
+      const onActivity = process.stdout.isTTY
+        ? (label: string): void => {
+            if (label.startsWith('turn/end')) { clearActivity(); return; }
+            // Never overwrite the agent's own partial line — break to a fresh
+            // one first (the visual break marks where the tool ran).
+            if (!activityShown && reply && !reply.endsWith('\n')) out('\n');
+            out(`\r\x1b[2K  ⚙ ${label}…`);
+            activityShown = true;
+          }
+        : undefined;
       try {
-        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal };
+        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal, ...(onActivity ? { onActivity } : {}) };
         for await (const delta of s.client.chatStream(messages, opts)) {
+          clearActivity();
           out(delta); reply += delta;
         }
+        clearActivity();
       } catch (e) {
+        clearActivity();
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
           out('\n(interrupted)');
