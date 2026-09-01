@@ -230,6 +230,7 @@ function serialize(fn) {
  */
 async function runTurn(ctx, agent, text, onDelta, onActivity) {
   let full = ''
+  let lastThinkingAt = 0
   const off = ctx.on('session/event', (session, event) => {
     if (session !== agent.session) return
     if (event.type === 'assistant/chunk') {
@@ -238,6 +239,15 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
       if (c.type === 'text-delta' && typeof c.text === 'string') {
         full += c.text
         if (onDelta) onDelta(c.text)
+      }
+      // Reasoning deltas carry no forwardable text, but they are the ONLY
+      // signal alive during the long pre-reply thinking phase (0gm models
+      // think by default) — surface them as THROTTLED activity so the
+      // client isn't staring at a dead stream. Observability only: nothing
+      // about the agent's behavior changes.
+      if (onActivity && typeof c.type === 'string' && /reasoning|thinking/.test(c.type)) {
+        const now = Date.now()
+        if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity('thinking') }
       }
       return
     }
