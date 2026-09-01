@@ -201,7 +201,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // exists to prevent), emitted cursor control sequences that NO_COLOR
     // can't suppress, and its line editor raced the async banner for early
     // input. (feedback.md F11/F6/F5)
-    terminal: process.stdin.isTTY === true,
+    terminal: process.stdin.isTTY === true && process.stdout.isTTY === true,
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
@@ -1380,14 +1380,18 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
   // for it, but bounded: advisory reads must not hold the prompt hostage.
+  // A losing (slow) read must NOT print later mid-turn — that's the original
+  // F17 symptom through the back door (review F-A): gate on a window flag.
+  let advisoryWindowOpen = true;
   await Promise.race([
     s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
-      if (rc.sealGasWei < parseEther('0.005')) {
+      if (advisoryWindowOpen && rc.sealGasWei < parseEther('0.005')) {
         out(`⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
       }
     }),
     new Promise<void>((r) => setTimeout(r, 2500).unref()),
   ]).catch(() => { /* advisory only */ });
+  advisoryWindowOpen = false;
   const messages: ChatMessage[] = [];
   for (;;) {
     activeCompletions = L2_WORDS;
@@ -1457,7 +1461,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const deadline = Date.now() + 45_000;
         while (Date.now() < deadline) {
           try {
-            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as { phase?: string };
+            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as { phase?: string };
             if (d.phase && d.phase !== 'running') { s.phase = d.phase; break; }
           } catch { /* transient — keep waiting */ }
           await new Promise((r) => setTimeout(r, 2000));
@@ -1497,7 +1501,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
         if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
-        const res = await fetch(`${s.url}/log`);
+        const res = await fetch(`${s.url}/log`, { signal: AbortSignal.timeout(10_000) });
         out(res.ok
           ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n`
           : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);

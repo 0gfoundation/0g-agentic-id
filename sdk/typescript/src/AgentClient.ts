@@ -336,10 +336,13 @@ export function makeAgentClient(params: {
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        // Server didn't stream — yield the whole reply as one delta.
+        // Server didn't stream — yield the whole reply as one delta. An EMPTY
+        // reply is the same silent-failure symptom as a delta-less stream
+        // (review F-C) — surface it, don't swallow it.
         const full = (await r.json()) as ChatCompletion;
         const c = full.choices?.[0]?.message?.content;
-        if (c) yield c;
+        if (!c) throw new Error('chat: empty non-streamed reply — the agent-side model call likely failed (see /agentlog)');
+        yield c;
         return;
       }
       // A silent stream is a FAILED stream: when the bridge's upstream model
@@ -377,6 +380,7 @@ export function makeAgentClient(params: {
       const { message, signature } = await logAuth();
       const r = await fetch(`${base}/log/agent`, {
         headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+        signal: AbortSignal.timeout(30_000),
       });
       if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${await r.text()}`);
       const text = await r.text();
