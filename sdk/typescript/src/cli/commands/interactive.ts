@@ -529,8 +529,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             out(`ack     : (unreadable: ${(e as Error).message})\n`);
           }
           try {
-            const d = await (await withWallet(ctx)).getBalanceDetail();
-            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}\n`);
+            const ag2 = await withWallet(ctx);
+            const d = await ag2.getBalanceDetail();
+            const eff = await ag2.getEffectiveBalance().catch(() => null);
+            const effNote = eff && eff.availableWei < eff.balanceWei
+              ? ` — AVAILABLE ${og(eff.availableWei)} (${og(eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei)} owed/queued off-chain)`
+              : '';
+            out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}${effNote}\n`);
           } catch { /* serving not configured — skip the line */ }
         } else {
           // Degrade like the other lines instead of silently omitting the
