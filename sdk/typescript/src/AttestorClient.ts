@@ -207,7 +207,7 @@ export class AttestorClient {
    * Requires the attestor /config to advertise `sandbox_endpoint`.
    */
   async getEffectiveBalance(): Promise<{
-    balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; availableWei: bigint;
+    balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint;
   }> {
     const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
       .then((r) => r.json())) as { sandbox_endpoint?: string };
@@ -224,11 +224,13 @@ export class AttestorClient {
       signal: AbortSignal.timeout(10_000),
     });
     if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
-    const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; available?: string };
+    const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; pending_settlement?: string; available?: string };
     return {
       balanceWei: BigInt(b.balance ?? '0'),
       reservedWei: BigInt(b.reserved ?? '0'),
       outstandingDebtWei: BigInt(b.outstanding_debt ?? '0'),
+      // queued-but-unsettled vouchers (0g-sandbox#89) — as committed as debt
+      pendingSettlementWei: BigInt(b.pending_settlement ?? '0'),
       availableWei: BigInt(b.available ?? '0'),
     };
   }

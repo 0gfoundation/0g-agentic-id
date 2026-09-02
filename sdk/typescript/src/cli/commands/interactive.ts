@@ -447,8 +447,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // The provider's EFFECTIVE view — debt accrues off-chain between
         // settlements, so the chain number alone can be badly optimistic.
         const eff = await ag.getEffectiveBalance().catch(() => null);
-        if (eff && (eff.outstandingDebtWei > 0n || eff.reservedWei > 0n)) {
-          out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (accrued off-chain; settles from deposits first)\n`);
+        if (eff && eff.availableWei < eff.balanceWei) {
+          if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+          if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
           if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
           out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
         }
@@ -1205,13 +1206,14 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
   const eff = await ag.getEffectiveBalance().catch(() => null);
   const bal = eff ? eff.availableWei : await ag.getBalance();
   if (bal < parseEther('0.1')) {
-    if (eff && eff.outstandingDebtWei > 0n) {
-      out(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(eff.outstandingDebtWei)} outstanding off-chain debt. Deposits settle the debt first.\n`);
+    if (eff && eff.availableWei < eff.balanceWei) {
+      const owed = eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei;
+      out(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(owed)} owed/queued off-chain. Deposits settle those first.\n`);
     } else {
       out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
     }
-    const suggest = eff && eff.outstandingDebtWei > 0n
-      ? (Number(eff.outstandingDebtWei - eff.balanceWei) / 1e18 + 1).toFixed(1)
+    const suggest = eff && eff.availableWei < parseEther('0.1')
+      ? Math.max(1, Number(parseEther('0.1') - eff.availableWei) / 1e18 + 1).toFixed(1)
       : '1';
     const amt = (await ask(`deposit how much OG now? [${suggest}, empty to cancel]: `)).trim() || suggest;
     if (!(await ask(`deposit ${amt} OG? [Y/n]: `)).trim().toLowerCase().startsWith('n')) {
