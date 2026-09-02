@@ -118,10 +118,23 @@ export class AgentApi {
     }
     if (this.ctx.addresses.sandboxServing !== ZERO) {
       try {
-        const bal = await this.infra.getBalance(who);
+        // Prefer the provider's EFFECTIVE balance (on-chain minus reservations
+        // minus outstanding off-chain debt) — the number its create/start
+        // gates actually enforce. The raw chain read is the fallback and can
+        // be optimistic: debt accrues off-chain between settlements.
+        let bal: bigint;
+        let effective = true;
+        try {
+          bal = (await this.attestor.getEffectiveBalance()).availableWei;
+        } catch {
+          effective = false;
+          bal = await this.infra.getBalance(who);
+        }
         if (bal < MIN_SANDBOX_BALANCE_WEI) {
           throw new Error(
-            `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
+            effective
+              ? `effective sandbox balance is ${bal} wei (on-chain minus outstanding off-chain debt), below the 0.1 OG minimum — call deposit({ amountWei }) to cover the debt plus headroom, then retry`
+              : `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
           );
         }
       } catch (e) {
@@ -992,6 +1005,16 @@ export class AgenticID {
    */
   getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     return this.infra.getBalanceDetail(opts?.user, opts?.provider);
+  }
+  /**
+   * The EFFECTIVE spendable balance from the sandbox provider (owner-signed):
+   * on-chain balance minus in-flight reservations minus outstanding off-chain
+   * debt — the number the provider's create/start gates actually enforce.
+   * {@link getBalance} (raw chain read) can be optimistic between settlements.
+   * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
+   */
+  getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; availableWei: bigint }> {
+    return new AttestorClient(this.ctx).getEffectiveBalance();
   }
   /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
   requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }

@@ -44,6 +44,11 @@ pub struct ConfigResponse {
     pub feedback_batcher_addr: Option<String>,
     pub clone_gate_addr: Option<String>,
     pub standard_clone_authorizer_addr: Option<String>,
+    /// The sandbox provider's management API base — SDK clients call its
+    /// owner-signed GET /api/balance for the EFFECTIVE spendable balance
+    /// (on-chain minus reservations and outstanding off-chain debt), which
+    /// is what the provider's create/start gates actually enforce.
+    pub sandbox_endpoint: Option<String>,
     pub tee_data_verifier_addr: Option<String>,
 
     /// Frameworks deploys may select, each with the sealed image for its
@@ -98,6 +103,7 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .cfg
             .standard_clone_authorizer_addr
             .map(|a| format!("{:#x}", a)),
+        sandbox_endpoint: Some(state.cfg.sandbox_endpoint.clone()).filter(|s| !s.is_empty()),
         tee_data_verifier_addr: state
             .cfg
             .tee_data_verifier_addr

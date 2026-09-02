@@ -444,6 +444,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
         out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
+        // The provider's EFFECTIVE view — debt accrues off-chain between
+        // settlements, so the chain number alone can be badly optimistic.
+        const eff = await ag.getEffectiveBalance().catch(() => null);
+        if (eff && (eff.outstandingDebtWei > 0n || eff.reservedWei > 0n)) {
+          out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (accrued off-chain; settles from deposits first)\n`);
+          if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
+          out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+        }
         if (detail && detail.pendingRefund > 0n) {
           out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
@@ -1191,14 +1199,26 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
 async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
-  const bal = await ag.getBalance();
+  // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
+  // off-chain debt) when reachable — that's what its create gate enforces;
+  // the raw chain read is the fallback.
+  const eff = await ag.getEffectiveBalance().catch(() => null);
+  const bal = eff ? eff.availableWei : await ag.getBalance();
   if (bal < parseEther('0.1')) {
-    out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
-    const amt = (await ask('deposit how much OG now? [1, empty to cancel]: ')).trim();
-    if (!amt) { out('cancelled — top up later with `deposit`.\n'); return false; }
-    const tx = await ag.deposit({ amountWei: parseEther(amt || '1') });
-    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
-    await ag.waitForTransaction(tx);
+    if (eff && eff.outstandingDebtWei > 0n) {
+      out(`available balance is ${og(bal)} — on-chain ${og(eff.balanceWei)} minus ${og(eff.outstandingDebtWei)} outstanding off-chain debt. Deposits settle the debt first.\n`);
+    } else {
+      out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
+    }
+    const suggest = eff && eff.outstandingDebtWei > 0n
+      ? (Number(eff.outstandingDebtWei - eff.balanceWei) / 1e18 + 1).toFixed(1)
+      : '1';
+    const amt = (await ask(`deposit how much OG now? [${suggest}, empty to cancel]: `)).trim() || suggest;
+    if (!(await ask(`deposit ${amt} OG? [Y/n]: `)).trim().toLowerCase().startsWith('n')) {
+      const tx = await ag.deposit({ amountWei: parseEther(amt) });
+      out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
+      await ag.waitForTransaction(tx);
+    } else { out('cancelled — deposit later with `deposit`.\n'); return false; }
   }
   return true;
 }

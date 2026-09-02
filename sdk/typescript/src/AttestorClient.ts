@@ -198,6 +198,42 @@ export class AttestorClient {
   }
 
   /**
+   * The EFFECTIVE spendable balance, from the sandbox provider's
+   * owner-signed `GET /api/balance`: on-chain balance minus in-flight
+   * reservations minus outstanding off-chain debt (accrued fees not yet
+   * settled). This is the number the provider's create/start gates actually
+   * enforce — the on-chain `getBalance` alone can be wildly optimistic
+   * (observed live: 3.6 OG on chain, 25 OG outstanding debt, available 0).
+   * Requires the attestor /config to advertise `sandbox_endpoint`.
+   */
+  async getEffectiveBalance(): Promise<{
+    balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; availableWei: bigint;
+  }> {
+    const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.json())) as { sandbox_endpoint?: string };
+    if (!cfg.sandbox_endpoint) {
+      throw new Error('getEffectiveBalance: this attestor does not advertise sandbox_endpoint');
+    }
+    const env = await this.signEnvelope('balance', '', {}, 180);
+    const r = await fetch(`${cfg.sandbox_endpoint.replace(/\/$/, '')}/api/balance`, {
+      headers: {
+        'X-Wallet-Address': env.wallet_address,
+        'X-Signed-Message': env.signed_message_b64,
+        'X-Wallet-Signature': env.wallet_signature,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; available?: string };
+    return {
+      balanceWei: BigInt(b.balance ?? '0'),
+      reservedWei: BigInt(b.reserved ?? '0'),
+      outstandingDebtWei: BigInt(b.outstanding_debt ?? '0'),
+      availableWei: BigInt(b.available ?? '0'),
+    };
+  }
+
+  /**
    * Owner-signed sandbox action envelope. The sandbox runtime verifies
    * every lifecycle action against the owner wallet; field order must
    * match its `signedRequest` struct exactly
