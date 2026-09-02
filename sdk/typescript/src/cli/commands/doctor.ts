@@ -94,18 +94,19 @@ export async function run(ctx: CommandContext): Promise<void> {
     });
   }
 
-  // 3 — wallet configured
+  // 3 — wallet configured. Absent = skip (matching gas/ack/sandboxBalance,
+  // which also skip without it — feedback.md F21); malformed stays a fail.
   let owner: `0x${string}` | undefined;
   if (!env.privateKey) {
     checks.push({
-      name: 'wallet', status: 'fail', code: 'WALLET_REQUIRED',
-      detail: 'AGENTIC_PRIVATE_KEY is not set',
-      remedy: 'export AGENTIC_PRIVATE_KEY=0x…   # env only — no flag, by design',
+      name: 'wallet', status: 'skip', code: 'WALLET_REQUIRED',
+      detail: 'no owner key configured (owner checks skipped)',
+      remedy: 'run `login`, or export AGENTIC_PRIVATE_KEY=0x…   # env only — no flag, by design',
     });
   } else if (!/^0x[0-9a-fA-F]{64}$/.test(env.privateKey)) {
     checks.push({
       name: 'wallet', status: 'fail', code: 'WALLET_REQUIRED',
-      detail: 'AGENTIC_PRIVATE_KEY is set but malformed (expected 0x + 64 hex chars)',
+      detail: 'the configured owner key is malformed (expected 64 hex chars, 0x prefix optional)',
       remedy: 'export AGENTIC_PRIVATE_KEY=0x<64 hex chars>',
     });
   } else {
@@ -166,7 +167,7 @@ export async function run(ctx: CommandContext): Promise<void> {
             detail: `not acknowledged: ${missing.join(', ')}`,
             // Stage-0 exception (spec §2.2): no `ack` CLI command yet — the
             // remedy is guidance text until stage 1 promotes it to a command.
-            remedy: 'acknowledge once via the deploy console, or SDK: await ag.ack()',
+            remedy: 'run `ack` in the interactive shell (or SDK: await ag.ack())',
           });
         }
       } catch (e) {
@@ -190,7 +191,7 @@ export async function run(ctx: CommandContext): Promise<void> {
           checks.push({
             name: 'sandboxBalance', status: 'fail', code: 'PREFLIGHT_BALANCE',
             detail: `${formatEther(bal)} OG — below the 0.1 OG deploy floor`,
-            remedy: "deposit once via the deploy console, or SDK: await ag.deposit({ amountWei: parseEther('0.1') })",
+            remedy: "run `deposit` in the interactive shell (or SDK: await ag.deposit({ amountWei: parseEther('0.1') }))",
           });
         }
       } catch (e) {

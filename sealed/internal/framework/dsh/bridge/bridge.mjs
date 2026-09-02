@@ -230,6 +230,7 @@ function serialize(fn) {
  */
 async function runTurn(ctx, agent, text, onDelta, onActivity) {
   let full = ''
+  let lastThinkingAt = 0
   const off = ctx.on('session/event', (session, event) => {
     if (session !== agent.session) return
     if (event.type === 'assistant/chunk') {
@@ -239,6 +240,15 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
         full += c.text
         if (onDelta) onDelta(c.text)
       }
+      // Reasoning deltas carry no forwardable text, but they are the ONLY
+      // signal alive during the long pre-reply thinking phase (0gm models
+      // think by default) — surface them as THROTTLED activity so the
+      // client isn't staring at a dead stream. Observability only: nothing
+      // about the agent's behavior changes.
+      if (onActivity && typeof c.type === 'string' && /reasoning|thinking/.test(c.type)) {
+        const now = Date.now()
+        if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity('thinking') }
+      }
       return
     }
     // Progress lines for the log: tool calls, turn boundaries.
@@ -246,7 +256,13 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
       try { log(`turn/end reason: ${JSON.stringify(event.data?.reason ?? event.reason)}`) } catch { /* log only */ }
     }
     if (onActivity && (event.type === 'tool/call' || event.type === 'tool/result' || event.type === 'turn/end')) {
-      onActivity(event.type)
+      // Label with the tool name when the event carries one ("tool/call bash"),
+      // defensively — event shapes differ across framework versions.
+      const d = event.data ?? event
+      const tool = typeof d?.tool === 'string' ? d.tool
+                 : typeof d?.name === 'string' ? d.name
+                 : typeof d?.toolName === 'string' ? d.toolName : ''
+      onActivity(tool ? `${event.type} ${tool}` : event.type)
     }
   })
   try {
@@ -403,7 +419,12 @@ async function handleChat(req, res) {
     try {
       await runMine(
         (delta) => safeWrite(chunkFrame(id, model, { content: delta })),
-        (kind) => log(`  ${kind}`),
+        // Tool activity rides the stream as SSE COMMENTS: every compliant SSE
+        // parser skips lines starting with ':', so the payload stays a
+        // standard OpenAI stream — but a client that WANTS progress (the CLI
+        // renders transient status lines) can read them. Without this, a
+        // tool-heavy turn is minutes of silence broken only by keepalives.
+        (kind) => { log(`  ${kind}`); safeWrite(`: activity ${kind}\n\n`) },
       )
     } catch (err) {
       failure = String((err && err.message) || err)

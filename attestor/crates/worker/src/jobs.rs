@@ -672,13 +672,47 @@ async fn handle_sandbox_recreate(
     // sandbox runtime GC eventually reclaims either way.
     if persisted_new {
         if let Some(old) = old_sandbox_id.filter(|o| !o.is_empty() && *o != resp.id) {
-            if let Err(e) = ctx.sandbox.admin_delete(&old).await {
-                tracing::warn!(
-                    ?seal_id,
-                    old_sandbox_id = %old,
-                    error = %e,
-                    "orphan admin_delete failed (non-fatal)"
-                );
+            // Retry transient refusals: a back-to-back reset hits the OLD
+            // sandbox while it is still mid-creation and the provider answers
+            // 409 "state change in progress" — which clears within a minute.
+            // One-shot best-effort left a healthy started orphan running (and
+            // billing) forever with this agent's seal: nothing GCs a healthy
+            // sandbox, so the old "runtime GC reclaims either way" assumption
+            // was wrong. Bounded: 5 tries over ~100s, then warn and move on.
+            let mut deleted = false;
+            for attempt in 1..=5u32 {
+                match ctx.sandbox.admin_delete(&old).await {
+                    Ok(()) => {
+                        deleted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let transient = e
+                            .downcast_ref::<SandboxError>()
+                            .map(|se| se.is_transient())
+                            .unwrap_or(false);
+                        if !transient || attempt == 5 {
+                            tracing::warn!(
+                                ?seal_id,
+                                old_sandbox_id = %old,
+                                error = %e,
+                                attempt,
+                                "orphan admin_delete failed (non-fatal) — old sandbox may keep running AND billing; delete it manually"
+                            );
+                            break;
+                        }
+                        tracing::info!(
+                            ?seal_id,
+                            old_sandbox_id = %old,
+                            attempt,
+                            "orphan admin_delete refused transiently (e.g. 409 state change in progress) — retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    }
+                }
+            }
+            if deleted {
+                tracing::info!(?seal_id, old_sandbox_id = %old, "orphan sandbox deleted");
             }
         }
     }
@@ -3669,6 +3703,49 @@ mod tests {
         assert!(!d.agent_uri.is_empty());
         // Ciphertext cleared by phase 2's tail.
         assert!(d.i_data.iter().all(|a| a.ciphertext.is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recreate_retries_orphan_delete_past_transient_409() {
+        // The back-to-back-reset leak: deleting the OLD sandbox while it is
+        // still mid-creation gets a 409 "state change in progress". One-shot
+        // best-effort left it running (and billing) forever — the retry must
+        // push past transient refusals. (start_paused: the 20s backoffs
+        // auto-advance.)
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        let art = artifact_with_ciphertext(0x75);
+        seed_deployment(
+            &t.deployments,
+            seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(31u64)),
+            Some("sb-old".into()),
+        );
+        write_stub_card(&t.deployments, seal, "Sage");
+        // First two deletes answer 409, third succeeds.
+        t.sandbox.admin_delete_fail_times.store(2, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(409);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox state change in progress".into());
+
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .expect("recreate must succeed");
+
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            3,
+            "must retry past transient 409s until the delete lands"
+        );
+        assert_eq!(
+            t.sandbox.last_admin_delete_id.lock().unwrap().as_deref(),
+            Some("sb-old"),
+            "must target the OLD sandbox"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some("mock-id"), "deployment points at the new sandbox");
     }
 
     #[tokio::test]
