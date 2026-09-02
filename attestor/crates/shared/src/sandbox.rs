@@ -94,6 +94,12 @@ pub struct CanonicalSignedMessage {
     pub expires_at: i64,
     pub nonce: String,
     pub payload: serde_json::Value,
+    /// Destination provider binding (0g-sandbox#93, anti cross-provider
+    /// replay): the provider's TEE signer address. Omitted-when-absent keeps
+    /// the legacy byte layout; the provider rejects a mismatch, and (once
+    /// AUTH_STRICT flips) requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     pub resource_id: String,
 }
 
@@ -209,6 +215,10 @@ pub struct HttpSandbox {
     /// sandbox's `ADMIN_ADDRESSES` allowlist. None disables admin calls
     /// (orphans get GC'd by sandbox runtime instead).
     admin_signer: Option<AdminSigner>,
+    /// The provider's TEE signer address — bound into every envelope this
+    /// client SIGNS itself (0g-sandbox#93). Relayed owner envelopes are
+    /// untouched (the owner binds their own).
+    provider_addr: Option<String>,
     http: reqwest::Client,
 }
 
@@ -219,6 +229,7 @@ impl HttpSandbox {
         extra_env: Vec<(String, String)>,
         public_ports: Vec<u16>,
         admin_signer: Option<AdminSigner>,
+        provider_addr: Option<String>,
     ) -> Self {
         Self {
             base_url: base_url.into(),
@@ -226,6 +237,7 @@ impl HttpSandbox {
             extra_env,
             public_ports,
             admin_signer,
+            provider_addr,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -387,6 +399,7 @@ impl SandboxClient for HttpSandbox {
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
             payload: serde_json::Value::Object(Default::default()),
+            provider: self.provider_addr.clone(),
             resource_id: sandbox_id.to_string(),
         };
         let msg_bytes = serde_json::to_vec(&canonical).map_err(|e| {
@@ -467,6 +480,7 @@ impl SandboxClient for HttpSandbox {
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
             payload: serde_json::Value::Object(Default::default()),
+            provider: self.provider_addr.clone(),
             resource_id: sandbox_id.to_string(),
         };
         let msg_bytes = serde_json::to_vec(&canonical)
@@ -646,6 +660,7 @@ mod tests {
                 "sealed":   true,
                 "env":      { "K": "V" },
             }),
+            provider: None,
             resource_id: "".to_string(),
         };
         let msg_bytes = serde_json::to_vec(&canonical).unwrap();
@@ -779,6 +794,7 @@ mod tests {
             expires_at: 9_999_999_999,
             nonce: "deadbeefcafebabedeadbeefcafebabe".into(),
             payload: serde_json::Value::Object(Default::default()),
+            provider: None,
             resource_id: "sb-orphan-xyz".into(),
         };
         let msg_bytes = serde_json::to_vec(&canonical).unwrap();

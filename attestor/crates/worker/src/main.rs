@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             // port is publicly reachable. Empty = all-ports-public (default).
             cfg.sandbox_public_ports.clone(),
             admin_signer,
+            cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
         ))
     };
 
