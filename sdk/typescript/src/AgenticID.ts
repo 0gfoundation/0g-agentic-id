@@ -1013,7 +1013,7 @@ export class AgenticID {
    * {@link getBalance} (raw chain read) can be optimistic between settlements.
    * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
    */
-  getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; availableWei: bigint }> {
+  getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint }> {
     return new AttestorClient(this.ctx).getEffectiveBalance();
   }
   /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
