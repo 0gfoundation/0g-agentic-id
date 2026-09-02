@@ -8,7 +8,8 @@ juggling):
 
 ```bash
 OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 \
-  REPUTATION_ADDR=0x<client-less registry> \
+  VERIFIED_FEEDBACK_ADDR=0x<verified-feedback registry> \
+  FEEDBACK_BATCHER_ADDR=0x<7702 batcher, optional> \
   [RUN_UNIT=1] [SKIP_TRANSFER=1] bash attestor/scripts/regression.sh
 ```
 
@@ -128,18 +129,36 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
   SEAL_ID=0x… AGENT_ID=<id> node scripts/agent-e2e.cjs
 
 # lifecycle: clone (sibling for a 2nd wallet, same iData / fresh keys),
-# client-less feedback carrying the live ServeProof, ERC-721 transfer +
+# canonical-8004 feedback + TEE verification mark, ERC-721 transfer +
 # indexer owner sync, and the post-transfer owner gate (old owner
-# rejected, new owner can recreate). Needs REPUTATION_ADDR = the
-# client-less registry bound to this AgenticID.
+# rejected, new owner can recreate). Needs VERIFIED_FEEDBACK_ADDR = the
+# VerifiedFeedbackRegistry bound to this AgenticID (the canonical 8004
+# reputation registry is discovered from it). FEEDBACK_BATCHER_ADDR is
+# optional: set → the feedback leg goes through the atomic EIP-7702 path;
+# unset → the script falls back to the attestor /config's advertised value,
+# and to the sequential two-tx flow when that is absent too.
 OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
-  SEAL_ID=0x… AGENT_ID=<id> REPUTATION_ADDR=0x… node scripts/lifecycle-e2e.cjs
+  SEAL_ID=0x… AGENT_ID=<id> VERIFIED_FEEDBACK_ADDR=0x… node scripts/lifecycle-e2e.cjs
 
 # clone LIVE: clone to self, bring the clone ONLINE, and prove it
 # decrypts its re-sealed iData (dataKey re-sealed to the clone's fresh
 # agentSeal) and serves — the crypto lifecycle-e2e checks only on-chain.
 #   ai.agent.clone({sourceAgentId, targetOwner: self}) → reset(cloneSeal,
 #   {apiKey}) → verify-agent.sh AGENT_ID=<clone> (decrypt: 0 FAIL)
+#
+# clone CONTRACT-MODE wire (issue #133; exercised by unit tests, hand-test
+# against a dev authorizer): POST /clone with
+#   { idempotency_key, source_agent_id, target_owner,
+#     authorization: { mode: "contract", intent_signature,
+#                      intent_signed_message_b64, auth_data } }
+# where the b64 decodes to the buyer-signed canonical
+#   { domain: "AgenticID.CloneContract.v1", idempotency_key,
+#     source_agent_id, target_owner,
+#     auth_data_keccak: keccak256(auth_data), authorizer }
+# — the attestor cross-checks BOTH bound fields against its own live read
+# (auth_data bytes + cloneAuthorizerOf). Owner mode (default): owner_signature /
+# owner_signed_message_b64, canonical domain "AgenticID.Clone.v1", no
+# authorization field.
 
 # transfer LIVE: self-contained — generates a second wallet, funds it,
 # acks + deposits AS that wallet, deploys a source, transfers it, and the

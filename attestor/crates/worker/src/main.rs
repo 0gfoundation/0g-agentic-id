@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
         cfg.tapp_registry_for_chain(),
+        cfg.clone_gate_addr,
     )?;
     let storage: Arc<dyn StorageClient> = if cfg.mock_storage {
         tracing::info!("storage: using MockStorage (MOCK_STORAGE=true)");
@@ -104,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             // port is publicly reachable. Empty = all-ports-public (default).
             cfg.sandbox_public_ports.clone(),
             admin_signer,
+            cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
         ))
     };
 

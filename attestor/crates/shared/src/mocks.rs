@@ -34,6 +34,7 @@ pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
         expires_at: 9_999_999_999,
         nonce: "00000000000000000000000000000000".into(),
         payload: serde_json::Value::Object(Default::default()),
+        provider: None,
         resource_id: String::new(),
     };
     let msg_bytes = serde_json::to_vec(&canonical).expect("serialize canonical");
@@ -65,6 +66,14 @@ pub struct MockChain {
     /// clone reading the authoritative chain state.
     idata: Mutex<Vec<IntelligentData>>,
     sealed_keys: Mutex<Vec<Bytes>>,
+    /// Authorizer returned by `clone_authorizer_of` (0 = none). Seed via
+    /// `set_clone_authorizer` (issue #133 contract-mode clone tests).
+    authorizer: Mutex<Address>,
+    /// Verdict returned by `can_clone`. `None` = revert (fail-closed Err);
+    /// `Some(bool)` = normal policy verdict.
+    can_clone_verdict: Mutex<Option<bool>>,
+    /// Last `clone_from` params (recorder for worker-test assertions).
+    pub last_clone_from: Mutex<Option<CloneFromParams>>,
 }
 
 impl MockChain {
@@ -85,12 +94,27 @@ impl MockChain {
             owner: Mutex::new(Address::ZERO),
             idata: Mutex::new(Vec::new()),
             sealed_keys: Mutex::new(Vec::new()),
+            authorizer: Mutex::new(Address::ZERO),
+            can_clone_verdict: Mutex::new(None),
+            last_clone_from: Mutex::new(None),
         }
     }
 
     /// Set the address `owner_of` returns (test-only).
     pub fn set_owner_of(&self, addr: Address) {
         *self.owner.lock().unwrap() = addr;
+    }
+
+    /// Seed the authorizer `clone_authorizer_of` returns (test-only; 0 =
+    /// none configured → contract-mode clone must fail closed).
+    pub fn set_clone_authorizer(&self, addr: Address) {
+        *self.authorizer.lock().unwrap() = addr;
+    }
+
+    /// Seed the `can_clone` verdict (test-only). `None` makes the mock
+    /// authorizer revert — exercising the fail-closed path.
+    pub fn set_can_clone_verdict(&self, v: Option<bool>) {
+        *self.can_clone_verdict.lock().unwrap() = v;
     }
 
     /// Seed the on-chain iData + sealed keys returned for any agent_id
@@ -201,6 +225,44 @@ impl ChainClient for MockChain {
 
     async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
         Ok(self.sealed_keys.lock().unwrap().clone())
+    }
+
+    async fn clone_authorizer_of(&self, _agent_id: AgentId) -> anyhow::Result<Address> {
+        Ok(*self.authorizer.lock().unwrap())
+    }
+
+    async fn can_clone(
+        &self,
+        _authorizer: Address,
+        _source: AgentId,
+        _target: Address,
+        _caller: Address,
+        _data: Bytes,
+    ) -> anyhow::Result<bool> {
+        match *self.can_clone_verdict.lock().unwrap() {
+            Some(v) => Ok(v),
+            None => anyhow::bail!("mock authorizer: configured to revert (fail-closed)"),
+        }
+    }
+
+    async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash> {
+        let agent_id = U256::from(self.next_agent_id.fetch_add(1, Ordering::SeqCst));
+        self.seal_to_agent
+            .lock()
+            .unwrap()
+            .insert(params.seal_id, agent_id);
+        *self.last_clone_from.lock().unwrap() = Some(params);
+        let tx_hash = self.next_tx_hash();
+        self.tx_to_receipt.lock().unwrap().insert(
+            tx_hash,
+            ReceiptSummary {
+                tx_hash,
+                block_number: 0,
+                success: true,
+                agent_id: Some(agent_id),
+            },
+        );
+        Ok(tx_hash)
     }
 
     async fn set_agent_uri(
@@ -350,6 +412,10 @@ pub struct ConfigurableSandbox {
     pub start_fails: AtomicBool,
     pub stop_fails: AtomicBool,
     pub admin_delete_fails: AtomicBool,
+    /// Fail admin_delete this many times (with fail_error), then succeed —
+    /// exercises the orphan-delete retry (409 clears after the old sandbox
+    /// finishes its state change).
+    pub admin_delete_fail_times: AtomicU64,
     /// When set, create/start fail with this message instead of the generic
     /// "configured to fail" — lets tests inject a specific error such as the
     /// sandbox's 402 "insufficient balance" body.
@@ -373,6 +439,7 @@ impl ConfigurableSandbox {
             start_fails: AtomicBool::new(false),
             stop_fails: AtomicBool::new(false),
             admin_delete_fails: AtomicBool::new(false),
+            admin_delete_fail_times: AtomicU64::new(0),
             fail_msg: Mutex::new(None),
             fail_status: Mutex::new(None),
             create_calls: AtomicU64::new(0),
@@ -468,6 +535,12 @@ impl SandboxClient for ConfigurableSandbox {
         if self.admin_delete_fails.load(Ordering::SeqCst) {
             anyhow::bail!("configured to fail");
         }
+        // Counted transient failures first (see admin_delete_fail_times).
+        let remaining = self.admin_delete_fail_times.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.admin_delete_fail_times.store(remaining - 1, Ordering::SeqCst);
+            return Err(self.fail_error());
+        }
         Ok(())
     }
 
@@ -513,6 +586,12 @@ pub struct ConfigurableChain {
     next_agent_id: AtomicU64,
     tx_counter: AtomicU64,
     receipts: Mutex<HashMap<TxHash, ReceiptSummary>>,
+    /// Authorizer returned by `clone_authorizer_of` (0 = none) — issue #133.
+    authorizer: Mutex<Address>,
+    /// `can_clone` verdict; `None` = revert (fail-closed Err).
+    can_clone_verdict: Mutex<Option<bool>>,
+    /// Last `clone_from` params (worker-test assertions).
+    pub last_clone_from: Mutex<Option<CloneFromParams>>,
 }
 
 impl ConfigurableChain {
@@ -532,6 +611,9 @@ impl ConfigurableChain {
             receipts: Mutex::new(HashMap::new()),
             acked: AtomicBool::new(true),
             balance_wei: Mutex::new(U256::MAX),
+            authorizer: Mutex::new(Address::ZERO),
+            can_clone_verdict: Mutex::new(None),
+            last_clone_from: Mutex::new(None),
         }
     }
 
@@ -558,6 +640,16 @@ impl ConfigurableChain {
     pub fn seed_idata(&self, idata: Vec<IntelligentData>, sealed_keys: Vec<Bytes>) {
         *self.idata.lock().unwrap() = idata;
         *self.sealed_keys.lock().unwrap() = sealed_keys;
+    }
+
+    /// Seed the authorizer `clone_authorizer_of` returns (test-only).
+    pub fn set_clone_authorizer(&self, addr: Address) {
+        *self.authorizer.lock().unwrap() = addr;
+    }
+
+    /// Seed the `can_clone` verdict (test-only); `None` = revert path.
+    pub fn set_can_clone_verdict(&self, v: Option<bool>) {
+        *self.can_clone_verdict.lock().unwrap() = v;
     }
 
     fn next_tx_hash(&self) -> TxHash {
@@ -664,6 +756,44 @@ impl ChainClient for ConfigurableChain {
 
     async fn sealed_keys_of(&self, _agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
         Ok(self.sealed_keys.lock().unwrap().clone())
+    }
+
+    async fn clone_authorizer_of(&self, _agent_id: AgentId) -> anyhow::Result<Address> {
+        Ok(*self.authorizer.lock().unwrap())
+    }
+
+    async fn can_clone(
+        &self,
+        _authorizer: Address,
+        _source: AgentId,
+        _target: Address,
+        _caller: Address,
+        _data: Bytes,
+    ) -> anyhow::Result<bool> {
+        match *self.can_clone_verdict.lock().unwrap() {
+            Some(v) => Ok(v),
+            None => anyhow::bail!("mock authorizer: configured to revert (fail-closed)"),
+        }
+    }
+
+    async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash> {
+        let agent_id = U256::from(self.next_agent_id.fetch_add(1, Ordering::SeqCst));
+        self.seal_to_agent
+            .lock()
+            .unwrap()
+            .insert(params.seal_id, agent_id);
+        *self.last_clone_from.lock().unwrap() = Some(params);
+        let tx_hash = self.next_tx_hash();
+        self.receipts.lock().unwrap().insert(
+            tx_hash,
+            ReceiptSummary {
+                tx_hash,
+                block_number: 0,
+                success: true,
+                agent_id: Some(agent_id),
+            },
+        );
+        Ok(tx_hash)
     }
 
     async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {

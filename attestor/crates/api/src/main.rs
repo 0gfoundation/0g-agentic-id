@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
         cfg.tapp_registry_for_chain(),
+        cfg.clone_gate_addr,
     )?;
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
@@ -80,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
             Vec::new(),
             Vec::new(),
             admin_signer,
+            cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
         ))
     };
 

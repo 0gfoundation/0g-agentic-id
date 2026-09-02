@@ -37,6 +37,17 @@ impl ApiError {
         }
     }
 
+    /// 403 — authenticated but not permitted. The contract-mode clone policy
+    /// gate uses this: the buyer's signature verified, the on-chain
+    /// authorizer (or its pre-check) said no.
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message: msg.into(),
+        }
+    }
+
     /// 402 with a stable code — the deploy-edge preflight uses these so
     /// clients can route "not acked" / "not funded" to the right fix-up
     /// UI instead of parsing prose.

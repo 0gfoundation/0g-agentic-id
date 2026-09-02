@@ -50,8 +50,16 @@ export interface ContractAddresses {
   agenticID: `0x${string}`;
   /** TEEDataVerifier proxy contract address */
   teeDataVerifier: `0x${string}`;
-  /** ReputationRegistry proxy contract address */
-  reputationRegistry: `0x${string}`;
+  /** VerifiedFeedbackRegistry proxy — TEE marks over the canonical 8004 reputation registry (which is discovered FROM this contract via getCanonicalReputation) */
+  verifiedFeedback: `0x${string}`;
+  /** FeedbackBatcher — EIP-7702 delegate making giveFeedback+attest atomic.
+   *  Optional: only advertised on 7702-enabled chains; absent/zero → the SDK
+   *  uses the sequential two-tx flow. */
+  feedbackBatcher?: `0x${string}`;
+  /** CloneGate — policy-mode cloning satellite (issue #133). Optional:
+   *  absent/zero → setCloneAuthorizer/contract-mode clone are unavailable
+   *  in this environment. */
+  cloneGate?: `0x${string}`;
   /** TappRegistry — trust-root acknowledgement (ack) */
   tappRegistry: `0x${string}`;
   /** SandboxServing — prepaid sandbox balance (deposit) */

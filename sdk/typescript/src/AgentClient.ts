@@ -97,14 +97,27 @@ export interface AgentClient {
    * the agent; the completion is reassembled before returning, so the shape is
    * a plain {@link ChatCompletion}.
    */
-  chat?(messages: ChatMessage[], opts?: { model?: string }): Promise<ChatCompletion>;
+  chat?(messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }): Promise<ChatCompletion>;
   /**
    * Like {@link chat}, but yields each content delta as it is generated — for
    * a live-typing UI. Present under the same conditions as `chat`.
    *
    *   for await (const delta of client.chatStream(msgs)) process.stdout.write(delta);
+   *
+   * Pass `signal` to interrupt a turn in flight: aborting tears down the HTTP
+   * connection, which is the OpenAI-conventional cancel signal — the runtime
+   * side stops the turn where the framework supports cancellation (dsh does).
+   * The generator then throws the abort error (`err.name === "AbortError"`).
    */
-  chatStream?(messages: ChatMessage[], opts?: { model?: string }): AsyncGenerator<string>;
+  chatStream?(messages: ChatMessage[], opts?: {
+    model?: string;
+    signal?: AbortSignal;
+    /** Tool-activity progress, when the agent's bridge streams it (SSE
+     *  ": activity tool/call <name>" comments — dsh does). Labels like
+     *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
+     *  means the bridge doesn't narrate. */
+    onActivity?: (label: string) => void;
+  }): AsyncGenerator<string>;
   /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
@@ -134,7 +147,10 @@ function matchRoute(routes: AgentRoute[], path: string): AgentRoute | undefined 
  * core behind both `chat` (fold into one completion) and `chatStream` (map to
  * content deltas).
  */
-async function* iterSseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
+async function* iterSseChunks(
+  body: ReadableStream<Uint8Array>,
+  onComment?: (text: string) => void,
+): AsyncGenerator<Record<string, unknown>> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -142,7 +158,12 @@ async function* iterSseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
-      // Skip SSE comments (":...") and non-data fields ("event:", "id:", ...).
+      // SSE comments (":...") are invisible to the payload, but a caller may
+      // want them: the dsh bridge streams tool-activity progress as
+      // ": activity <kind>" comments (keepalives pass through too — the
+      // callback filters).
+      if (t.startsWith(':') && onComment) onComment(t.slice(1).trim());
+      // Skip comments and non-data fields ("event:", "id:", ...).
       if (!t.startsWith('data:')) continue;
       const data = t.slice(5).trim();
       if (data === '' || data === '[DONE]') continue;
@@ -282,7 +303,7 @@ export function makeAgentClient(params: {
   // deploy. There's no framework-agnostic default (/hello doesn't declare it),
   // so omit the field when the caller doesn't set one rather than sending a
   // bogus value the framework rejects.
-  const chatBody = (messages: ChatMessage[], opts?: { model?: string }) =>
+  const chatBody = (messages: ChatMessage[], opts?: { model?: string; signal?: AbortSignal }) =>
     JSON.stringify(opts?.model ? { model: opts.model, messages, stream: true } : { messages, stream: true });
 
   const chat = routes.find((r) => r.kind === 'chat');
@@ -295,6 +316,7 @@ export function makeAgentClient(params: {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: chatBody(messages, opts),
+        signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
@@ -309,19 +331,42 @@ export function makeAgentClient(params: {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: chatBody(messages, opts),
+        signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
       const ct = r.headers.get('content-type') ?? '';
       if (!r.body || !ct.toLowerCase().includes('text/event-stream')) {
-        // Server didn't stream — yield the whole reply as one delta.
+        // Server didn't stream — yield the whole reply as one delta. An EMPTY
+        // reply is the same silent-failure symptom as a delta-less stream
+        // (review F-C) — surface it, don't swallow it.
         const full = (await r.json()) as ChatCompletion;
         const c = full.choices?.[0]?.message?.content;
-        if (c) yield c;
+        if (!c) throw new Error('chat: empty non-streamed reply — the agent-side model call likely failed (see /agentlog)');
+        yield c;
         return;
       }
-      for await (const chunk of iterSseChunks(r.body)) {
+      // A silent stream is a FAILED stream: when the bridge's upstream model
+      // call errors (e.g. provider 400), the SSE connection itself is 200 but
+      // carries zero deltas — swallowing that leaves the user staring at an
+      // empty reply with the real cause only in /agentlog. Surface it.
+      // (feedback.md F15)
+      let sawContent = false;
+      let streamErr: string | null = null;
+      const onComment = opts?.onActivity
+        ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(c.slice(9)); }
+        : undefined;
+      for await (const chunk of iterSseChunks(r.body, onComment)) {
+        const e = (chunk as { error?: { message?: string } | string }).error;
+        if (e) streamErr = typeof e === 'string' ? e : e.message ?? JSON.stringify(e);
         const d = chunkDelta(chunk);
-        if (d.content) yield d.content;
+        if (d.content) { sawContent = true; yield d.content; }
+      }
+      if (!sawContent) {
+        throw new Error(
+          streamErr
+            ? `chat: upstream error: ${streamErr}`
+            : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
+        );
       }
     };
   }
@@ -335,6 +380,7 @@ export function makeAgentClient(params: {
       const { message, signature } = await logAuth();
       const r = await fetch(`${base}/log/agent`, {
         headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+        signal: AbortSignal.timeout(30_000),
       });
       if (!r.ok) throw new Error(`logs: HTTP ${r.status}: ${await r.text()}`);
       const text = await r.text();

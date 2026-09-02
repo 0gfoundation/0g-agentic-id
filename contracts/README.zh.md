@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 138 tests / 18 suites；1 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 209 tests / 22 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -87,7 +87,12 @@ remappings = [
 ```
 contracts/src/
 ├── AgenticID.sol                               主合约（身份 + 7857 token + seal）
-├── AgenticIDReputationRegistry.sol             声誉注册表（ServeProof）
+├── VerifiedFeedbackRegistry.sol                canonical ERC-8004 声誉注册表之上的
+│                                               TEE 验证层（attestFeedback + ServeProof）
+├── FeedbackBatcher.sol                         EIP-7702 委托目标：canonical feedback + 盖章
+│                                               一笔自调用原子完成（无状态、无 beacon）
+├── AgenticIDReputationRegistry.sol             已废弃的私有声誉分叉——被
+│                                               VerifiedFeedbackRegistry 取代；为存量部署保留
 ├── ERC7857Upgradeable.sol                      7857 核心（iTransferFrom + proof 校验）
 ├── ERC8004CanonicalBoundUpgradeable.sol        ERC-8004 身份，托管绑定到 canonical
 │                                               注册表（read-through / write-forward）
@@ -99,12 +104,14 @@ contracts/src/
 │   ├── BaseDataVerifier.sol                    transfer proof 基类（含 pauser 角色）
 │   └── TEEDataVerifier.sol                     TEE 签名的 ownership proof 实现
 ├── utils/
-│   └── NonceRegistryUpgradeable.sol            防重放（verifier 和声誉注册表各自使用）
+│   └── NonceRegistryUpgradeable.sol            防重放（verifier 和各声誉注册表各自使用）
 ├── proxy/
 │   ├── BeaconProxy.sol                         OZ re-export（为了编译器拉进 artifact）
 │   └── UpgradeableBeacon.sol                   OZ re-export
 └── interfaces/
     ├── ICanonicalIdentityRegistry.sol          AgenticID 绑定的固定 canonical ERC-8004 注册表接口
+    ├── ICanonicalReputationRegistry.sol        验证层锚定的固定 canonical ERC-8004
+    │                                           Reputation Registry 接口
     └── I*.sol                                  其余全部接口定义
 ```
 
@@ -204,7 +211,7 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 `msg.sender == to`，用户自己决定 `sealedKeys[i]` 封给哪个公钥（自己的 EOA 密钥 / 某台 TEE / 自选）。合约**不验证** sealedKey 的加密目标——调用者丢了那把解密 key 会让后续 transfer 无法产生 OwnershipProof，agent 卡死。
 
-此时 agent 没有 `agentSeal`，不能签 ServeProof、不能积累声誉。而且这是永久的：seal 只在 mint 时通过 `registerWithSeal`（路径 A）绑定，没有事后"给已有 agent 补 seal"的调用——`sealId` 声明的是"数据自创建起就一直封在 TEE 内、从未外泄"，这份出身证明无法事后安到一个明文自助上链的 agent 上。要 seal-bound agent 就得走 attestor-mint 路径。
+此时 agent 没有 `agentSeal`，不能签 ServeProof、不能积累已验证声誉。而且这是永久的：seal 只在 mint 时通过 `registerWithSeal`（路径 A）绑定，没有事后"给已有 agent 补 seal"的调用——`sealId` 声明的是"数据自创建起就一直封在 TEE 内、从未外泄"，这份出身证明无法事后安到一个明文自助上链的 agent 上。要 seal-bound agent 就得走 attestor-mint 路径。
 
 ### 关键不变量
 
@@ -221,6 +228,13 @@ AgenticID.register(agentURI, metadata[], intelligentDatas[], sealedKeys[])
 
 ## 5. 流程 2: 声誉积累
 
+Feedback 本体存在**官方 canonical ERC-8004 Reputation Registry**（0G 上：
+mainnet `0x8004BAa1…`、testnet `0x8004B663…`；它绑定的正是 AgenticID 托管的
+canonical Identity Registry，agentId 空间共享）。Client 直接往那里提交
+feedback——per-client 归因是原生的，所有 8004 读方零适配可见。本地的
+`VerifiedFeedbackRegistry` 只存 **TEE 验证章**：哪些 canonical 条目背后有
+ServeProof 证明的真实服务调用。存储归 canonical，信任归本地。
+
 ### ServeProof（链下，Agent TEE 签）
 
 Client 向 Agent TEE 发起一次真实业务调用。Agent TEE 完成后在 TEE 内部构造：
@@ -228,6 +242,7 @@ Client 向 Agent TEE 发起一次真实业务调用。Agent TEE 完成后在 TEE
 ```solidity
 struct ServeProof {
     uint256   agentId;
+    address   submitter;             // 唯一有权兑现这张 proof 的地址
     uint256   timestamp;
     uint256   deadline;              // 过期即 revert
     bytes32   taskHash;              // 任务哈希（输入/输出/合同），由 client 选；验证者只 ecrecover、不强制语义
@@ -237,46 +252,65 @@ struct ServeProof {
 }
 ```
 
-**没有 `client` 字段**：归属由提交时的 `msg.sender` 决定，proof 是不记名凭证，买家用自己的钱包提交（靠签名 nonce 保证一次性）。签名内容：
+签名内容（域 + submitter 双重绑定：跨链/跨部署不可移植，跨钱包不可转让）：
 ```
-inner = keccak256(abi.encode(agentId, timestamp, deadline,
-                             taskHash,
+inner = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
+                             agentId, timestamp, deadline, taskHash,
                              keccak256(abi.encodePacked(dataHashes)),
                              frameworkHash))
 signature = personal_sign(inner, agentSeal_priv)
 ```
 
-### 链上调用 `giveFeedback`
+### 链上提交——client 两笔调用（SDK 打包成一步）
+
+在启用 EIP-7702 的链上（0G Galileo 已实测支持），SDK 会把两笔合成**一笔原子的
+type-4 交易**：client 的 EOA 委托给 `FeedbackBatcher` 后自调用
+`giveFeedbackAndAttest`——代码跑在 EOA 自己的账户上下文里（两个内部调用的
+msg.sender 都是 client 本人），index 在同一笔交易内读取；盖章失败会连
+canonical 写入一起回滚。链不支持 7702 时 SDK 退回下面的两笔顺序流程。
+
+**委托是持久的**：type-4 落链后委托一直挂在 EOA 上（`getCode(你的地址)` 读到
+`0xef0100‖batcher` 即已委托），后续打分因此免重签；注销 = 再签一次指向零地址
+的委托（7702 标准出口）。环境更换 batcher 地址后，已委托的 EOA 在下次
+giveFeedback 时由 SDK 自动迁移。
 
 ```solidity
-AgenticIDReputationRegistry.giveFeedback(
-    agentId, value, valueDecimals,
-    tag1, tag2,
-    endpoint, feedbackURI, feedbackHash,
-    serveProof
-)
+// 1. feedback → canonical 注册表（归因 = msg.sender，原生）
+canonicalReputation.giveFeedback(agentId, value, valueDecimals,
+                                 tag1, tag2, endpoint, feedbackURI, feedbackHash);
+
+// 2. 验证章 → 本地注册表
+VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, serveProof);
 ```
 
-合约做的事：
-1. 重建 `inner`，ecrecover 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名
-2. 通过 NonceRegistry 登记 `key = keccak256("SERVEPROOF", agentId, signature)`，同时校验 `deadline`（每张 proof 只能兑一次）
-3. 以 `msg.sender` 名义 push `FeedbackEntry`，记 `clients`/`isClient`
-4. emit `NewFeedback` + `FeedbackWithProof`
+`attestFeedback` 校验的事：
+1. `agentId == proof.agentId`，且 `proof.submitter == msg.sender`（只有声明的 client 能兑——堵抢跑/盗用）
+2. 重建 `inner`，ecrecover 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名
+3. 调用者不是 agent owner 或被授权 operator（对照**本地** AgenticID 的 owner——canonical 注册表自己查不了，它眼里每个托管 token 的 owner 都是 AgenticID 合约）
+4. canonical 条目 `(agentId, msg.sender, feedbackIndex)` 存在且尚无章
+5. 通过 NonceRegistry 登记 `key = keccak256("SERVEPROOF", agentId, signature)`，同时校验 `deadline`（每张 proof 只能兑一次）
+6. 存下 proof 的 `dataHashes` / `frameworkHash`，emit `FeedbackVerified`
 
-**防 sybil 的核心**：没有 agentSeal 就没有有效的 ServeProof，而 agentSeal_priv 只有 Agent TEE 持有。客户伪造不出 ServeProof，也没法不调 agent 就自己打分。
+**防 sybil 的核心**：没有 agentSeal 就没有有效的 ServeProof，而 agentSeal_priv
+只有 Agent TEE 持有。canonical 注册表是 permissionless 的——谁都能往里写未验证
+的 feedback——但没有真实服务调用就拿不到验证章。在乎真伪的读方拿章的集合和
+canonical 条目做交集。
 
 ### 其他操作
 
-- `appendResponse(agentId, client, feedbackIndex, responseURI, responseHash)`：agent owner 对某条 feedback 回复。每个 (agentId, client, feedbackIndex, responder) 限一次。
-- `revokeFeedback(agentId, feedbackIndex)`：client 撤回自己的 feedback。
+- `revokeFeedback` / `appendResponse`：直接在 canonical 注册表上操作（client 撤回自己的条目；章不动，但 `getVerifiedSummary` 跟随 canonical 的 revoked 标记）。
 
-### 读接口（全兼容 ERC-8004）
+### 读接口
 
-- `readFeedback(agentId, client, idx)` —— 单条
-- `readAllFeedback(agentId, clients[], tag1, tag2, includeRevoked)` —— 过滤读取
-- `getSummary(agentId, clients[], tag1, tag2)` —— 归一到 18 decimals 求和 + 计数
-- `getClients(agentId)` —— 所有曾提交 feedback 的 client
-- `getServeData(agentId, client, idx)` —— 返回该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**
+- `isVerified(agentId, client, idx)` —— 这条 canonical 条目有没有章？
+- `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` —— 枚举已验证集合
+- `getVerifiedSummary(agentId, clients[], tag1, tag2)` —— 聚合指定 client 的**已验证** canonical 条目（值实时从 canonical 读取；跳过 revoked；求和 + 计数，归一到固定 18 decimals；`clients` 必须非空——由调用方决定信谁）。仅限链下 `eth_call`。
+- `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag。
+- `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
+
+> **已废弃**：先前的私有分叉（`AgenticIDReputationRegistry`，proof 门禁的
+> `giveFeedback` + 自有 feedback 存储）被这套拆分取代。存量环境上它仍在运行、
+> 源码保留在仓库，但新部署只带 `VerifiedFeedbackRegistry`。
 
 ---
 
@@ -289,8 +323,52 @@ AgenticIDReputationRegistry.giveFeedback(
   之下，无需重加密；运营权链下随 ownership 走（attestor 给新 owner 重新
   provision）。seal 绑定的 token 调 `iTransferFrom` 和 `iCloneFrom` 都会
   **revert**（`AgenticIDSealedAgentUseTransfer` / `AgenticIDCannotCloneSealedAgent`）。
+  fork 一个 seal 绑定的 agent 走 attestor 的 `/clone` 端点，两种授权模式
+  （issue #133）：**owner 模式**——源 agent 现任 owner 签
+  `AgenticID.Clone.v1` 意图；**contract 模式**（市场分叉）——**买家**签
+  `AgenticID.CloneContract.v1` 意图（canonical 绑定 `keccak256(auth_data)` 与
+  authorizer 地址），由 owner 配置的 `ICloneAuthorizer` 在 `CloneGate.cloneFrom`
+  里（卫星合约——AgenticID 顶着 EIP-170 字节码上限，本体不动）
+  原子决策。
 - **无 seal agent**（数据 blob）：普通 transfer 保持禁用；ownership 只能走下面
   proof 门禁的 `iTransferFrom`，原子地把 dataKey 重加密给买家。`iCloneFrom` 可用。
+
+### 政策模式克隆（issue #133）：`CloneGate` 卫星合约
+
+seal 绑定 agent 的 owner 可以把 fork 授权委托给一个政策合约——市场分叉流程：
+
+所有政策克隆逻辑都在 `CloneGate` 卫星里——AgenticID 本体不动（它顶着 EIP-170
+上限；新能力一律以伴生合约交付，同 `VerifiedFeedbackRegistry`）。gate 需在
+trusted-attestor 白名单内（它经 `registerWithSeal` 铸造）；AgenticID 暂停即
+克隆暂停。流程：
+
+1. **发布者一次性 opt-in：** `CloneGate.setCloneAuthorizer(tokenId, authorizer)`——
+   `ICloneAuthorizer` 的纯 view `canClone(source, to, caller, authData)` 决定
+   contract 模式克隆是否放行。配置绑定设置它的 owner：token 换手即失效
+   （`cloneAuthorizerOf` 返回**生效中**的 authorizer，owner 变了就返回 0）。
+   注意失效是**休眠而非抹除**：原 owner 回购 token（A→B→A）后旧政策会静默
+   复活；要永久清除需显式 `setCloneAuthorizer(id, 0)`。`cloneSourceOf` 血统
+   跨转让保留（历史事实）。authorizer 为零 → contract 模式 fail-closed。
+
+   不想自己写政策合约的发布者，可将 token 指向**官方通用政策
+   `StandardCloneAuthorizer`**（不可升级、无任何特权角色）：按
+   `(sourceAgentId, buyer)` 记录的**纯放行开关**——`grant`/`revoke` 只有源
+   token 的**当前 owner**（即卖家，无平台管理员）能调，`authData` 一律忽略，
+   且每条授权带与 gate 配置一致的 owner-at-grant 惰性失效。有意不做按张
+   计票：view 版 `canClone` 信任模型下 N 张票等于 1 张票，订单对账留在
+   卖家自己的记录里，一次性消费 = 卖家看到 `ClonedFrom` 事件后 `revoke`
+   ——理由见 `ICloneAuthorizer` 的信任模型注释。`examples/DevCloneAuthorizer`
+   仍作为自写政策的最简参考骨架保留。
+2. **买家分叉：** 签一个 clone-intent，canonical 绑定操作本体（幂等键、源、
+   目标）**和政策上下文**（`keccak256(auth_data)` + authorizer 地址——relayer
+   只能转运意图，不能换 auth_data 重放，也不能跨政策轮换搬运），经 attestor
+   `/clone`（或 SDK 的 `ag.agent.clone({ authorization: { authData } })`）提交。
+3. **原子门禁：** attestor worker 走 `CloneGate.cloneFrom` 铸造（内部调
+   `registerWithSeal`），`canClone` 与铸造同交易
+   执行——迟到的 deny、被清空的 authorizer、过期的 re-seal 都会让整笔交易
+   revert。`nonReentrant`，与 iTransferFrom/iCloneFrom 同款。revert 的
+   authorizer 冒泡自己的 revert 数据（fail-closed、保留诊断信息）；
+   `AgenticIDCloneDenied` 只用于未配置/明确拒绝。
 
 ### `iTransferFrom`（无 seal）—— 更换 ownership + 原子交付 dataKey
 
@@ -360,14 +438,14 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 ## 7. 防重放：NonceRegistry
 
 `contracts/src/utils/NonceRegistryUpgradeable.sol` 被 **transfer verifier** 和
-**声誉注册表**继承（各自持有独立存储）。AgenticID 本体不消费 nonce——
+**各声誉注册表**继承（各自持有独立存储）。AgenticID 本体不消费 nonce——
 `setAgentWallet` 转发给 canonical 注册表，后者用 ≤ 5 分钟 deadline（无 nonce）。
 
 | 操作 | 消费方 | nonce key 派生 |
 |---|---|---|
 | transfer access proof | verifier | `keccak256("ERC7857_TRANSFER_ACCESS", erc7857Contract, nonce)` |
 | transfer ownership proof | verifier | `keccak256("ERC7857_TRANSFER_OWNERSHIP", erc7857Contract, nonce)` |
-| ServeProof | 声誉注册表 | `keccak256("SERVEPROOF", agentId, signature)` |
+| ServeProof | verified-feedback 注册表（及已废弃分叉） | `keccak256("SERVEPROOF", agentId, signature)` |
 
 每个 nonce 消费时还会校验 `block.timestamp <= deadline`。Nonce 记录可经 `cleanExpiredNonces(keys)` 回收，前提是 `maxProofAge` 大于业务最长 deadline 窗口。
 
@@ -385,24 +463,26 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 - **mint 对称性**：`register` 和 `registerWithSeal` 都 emit `ITransferred(0x0, to, agentId, entries[])`，indexer 对 mint 和 transfer 统一处理。
 - **dataKey 只在 TEE 内流动**：attestor 生成后丢弃、Agent TEE 持有、Oracle TEE 转让时短暂持有后丢弃。链上只见 sealedKey 密文。
 - **Oracle 加密 pubkey 在 TappRegistry**：通过 0g-Tapp 的 `TappRegistry` 合约（外部依赖、已上线）的 `getNode` / `getNodeList` 视图发布，不进 `TEEDataVerifier` 存储，保持 verifier 简洁。Agent TEE 转让时直接查 registry。
-- **8004 读接口全兼容**：任何读取 ERC-8004 身份/声誉的工具对 AgenticID agent 透明可用；但写接口（`register()` 无参、`giveFeedback` 无 proof）被**有意禁用**，强制使用携带 IntelligentData 或 ServeProof 的扩展版本。
+- **8004 兼容在两条轴上都是 canonical 的**。身份托管绑定 canonical Identity Registry（0x8004… 单例），8004 身份工具原生看到 AgenticID agent。Feedback 由 client **直接提交到 canonical Reputation Registry**（per-client 归因原生、所有 8004 工具可读），本地 `VerifiedFeedbackRegistry` 叠加 TEE 层：给有 ServeProof 背书的 canonical 条目盖章并存审计数据。在乎真伪的读方做交集；不在乎的读方照常拿标准 8004 声誉。身份的无参 `register()` overload 仍**有意禁用**（注册必须携带 IntelligentData）。先前的私有声誉分叉（`AgenticIDReputationRegistry`）**已废弃**——存量环境仍在运行，新部署不再包含。目标 ERC-8004 修订版：**2026-01-25**。
 
 ---
 
 ## 9. 测试
 
-138 个 Foundry tests / 18 suites（137 通过，1 个 fork 测试未设 `FORK_RPC`
+209 个 Foundry tests / 22 suites（207 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
 | Suite | Cases | 覆盖 |
 |---|---|---|
 | `AgenticID.t.sol` | 10 | register / registerWithSeal / 禁用 overload / attestor 白名单 |
-| `AgentSeal.t.sol` | 6 | set-once / sealId 冲突 / 零值 / 补 seal / 非 attestor |
-| `TransferFlow.t.sol` | 19 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
+| `AgentSeal.t.sol` | 5 | set-once / sealId 冲突 / 零值 / 补 seal / 非 attestor |
+| `TransferFlow.t.sol` | 23 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
-| `Reputation.t.sol` | 13 | giveFeedback ServeProof 验签 + revoke / appendResponse 全路径 |
+| `VerifiedFeedback.t.sol` | 27 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评 / 对着 canonical mock 的 verified summary |
+| `FeedbackBatcher.t.sol` | 6 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用 |
+| `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签 + revoke / appendResponse 全路径（含跨实现 digest 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
@@ -410,11 +490,12 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `VerifierAdmin.t.sol` | 7 | oracle 轮换 / pause（pauser 角色）/ maxProofAge / onlyOwner |
 | `AgenticIDAdmin.t.sol` | 7 | attestor 增删 / frameworkHash / setVerifier / onlyOwner |
 | `Upgradeable.t.sol` | 9 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
-| `CanonicalBinding.t.sol` | 7 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id |
+| `CanonicalBinding.t.sol` | 9 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id |
 | `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
+| `StorageLayout.t.sol` | 2 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）|
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
-| `CanonicalForkIntegration.t.sol` | 1 | 对着线上 canonical 注册表 self-mint（仅设了 `FORK_RPC` 才跑，否则跳过）|
+| `CanonicalForkIntegration.t.sol` | 2 | 对着线上 canonical 注册表 self-mint + verified-feedback attest（仅设了 `FORK_RPC` 才跑，否则跳过）|
 
 共享 scaffolding 在 `test/AgenticIDTestBase.sol`：两种 EIP-191 变体
 （hex-encoded 用于 transfer proof，raw-32-byte 用于 ServeProof / wallet sig）、
@@ -424,5 +505,5 @@ proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写�
 ## 10. 进一步阅读
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** —— 部署 / 升级 / Etherscan verify 全套
-  runbook（10 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
+  runbook（11 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
   Galileo testnet 参考地址）。

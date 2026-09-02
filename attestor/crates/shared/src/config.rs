@@ -108,10 +108,28 @@ pub struct Config {
     /// SandboxServing contract address. Separate from TappRegistry; holds
     /// the per-provider business state (price schedule, service URL).
     pub sandbox_serving_addr: Option<Address>,
-    /// ReputationRegistry (client-less) bound to this AgenticID. Served on
+    /// DEPRECATED ReputationRegistry fork bound to this AgenticID. Served on
     /// GET /config purely so clients (SDK env bootstrap) can discover the
     /// full environment from one URL — the attestor itself never calls it.
+    /// New SDKs use `verified_feedback_addr` instead.
     pub reputation_registry_addr: Option<Address>,
+    /// VerifiedFeedbackRegistry bound to this AgenticID (TEE marks over the
+    /// canonical ERC-8004 reputation registry, which SDKs discover FROM it
+    /// via getCanonicalReputation). Same /config-discovery-only purpose.
+    pub verified_feedback_addr: Option<Address>,
+    /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
+    /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
+    /// presence as "the atomic path works here". Discovery-only.
+    pub feedback_batcher_addr: Option<Address>,
+    /// CloneGate — policy-mode cloning satellite of AgenticID (issue #133).
+    /// The attestor CALLS this one (contract-mode /clone mints through it);
+    /// unset = contract-mode cloning disabled, owner-mode unaffected.
+    pub clone_gate_addr: Option<Address>,
+    /// StandardCloneAuthorizer — the OFFICIAL stock clone policy. Discovery
+    /// only (the attestor never calls it): publishers' tooling resolves
+    /// `authorizer <id> standard` through this instead of hand-copying the
+    /// address from DEPLOYMENT.md.
+    pub standard_clone_authorizer_addr: Option<Address>,
     /// TEEDataVerifier bound to this AgenticID. Same /config-discovery
     /// purpose as `reputation_registry_addr`.
     pub tee_data_verifier_addr: Option<Address>,
@@ -279,6 +297,14 @@ impl Config {
             sandbox_serving_addr: env_opt("ATTESTOR_SANDBOX_SERVING_ADDR")
                 .and_then(|s| s.parse().ok()),
             reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
+                .and_then(|s| s.parse().ok()),
+            verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
+                .and_then(|s| s.parse().ok()),
+            feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
+                .and_then(|s| s.parse().ok()),
+            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
+                .and_then(|s| s.parse().ok()),
+            standard_clone_authorizer_addr: env_opt("ATTESTOR_STANDARD_CLONE_AUTHORIZER_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
                 .and_then(|s| s.parse().ok()),

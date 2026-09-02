@@ -23,6 +23,7 @@
  */
 
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
+import { encodeFunctionData } from 'viem';
 import { RECEIPT_WAIT } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
@@ -32,8 +33,9 @@ import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } 
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
-  ServeProof, GiveFeedbackParams, AppendResponseParams, ReadAllFeedbackParams,
-  GetSummaryParams, Feedback, FeedbackSummary, ServeData,
+  ServeProof, GiveFeedbackParams, GiveFeedbackResult, AppendResponseParams,
+  ReadAllFeedbackParams, GetSummaryParams, Feedback, FeedbackSummary, ServeData,
+  TaskReveal,
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -116,16 +118,82 @@ export class AgentApi {
     }
     if (this.ctx.addresses.sandboxServing !== ZERO) {
       try {
-        const bal = await this.infra.getBalance(who);
+        // Prefer the provider's EFFECTIVE balance (on-chain minus reservations
+        // minus outstanding off-chain debt) — the number its create/start
+        // gates actually enforce. The raw chain read is the fallback and can
+        // be optimistic: debt accrues off-chain between settlements.
+        let bal: bigint;
+        let effective = true;
+        try {
+          bal = (await this.attestor.getEffectiveBalance()).availableWei;
+        } catch {
+          effective = false;
+          bal = await this.infra.getBalance(who);
+        }
         if (bal < MIN_SANDBOX_BALANCE_WEI) {
           throw new Error(
-            `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
+            effective
+              ? `effective sandbox balance is ${bal} wei (on-chain minus outstanding off-chain debt), below the 0.1 OG minimum — call deposit({ amountWei }) to cover the debt plus headroom, then retry`
+              : `prepaid sandbox balance is ${bal} wei, below the 0.1 OG minimum — call deposit({ amountWei }) once, then retry`,
           );
         }
       } catch (e) {
         if (e instanceof Error && e.message.includes('sandbox balance')) throw e;
         // provider unknown or read failed — fail open (same backstop)
       }
+    }
+    await this.preflightCanReceiveNfts(who);
+  }
+
+  /**
+   * A wallet carrying an EIP-7702 delegation is code-bearing, so every
+   * safeMint/safeTransfer to it PROBES `onERC721Received` — a delegate that
+   * doesn't answer (the pre-v4 FeedbackBatcher, or any third-party delegate)
+   * makes the mint revert `ERC721InvalidReceiver` minutes later in the
+   * worker, gas spent, with no in-CLI way back. Probe HERE, name the fix.
+   * (feedback.md F13)
+   */
+  private async preflightCanReceiveNfts(who: Address): Promise<void> {
+    let code: string | undefined;
+    try {
+      code = await this.ctx.publicClient.getCode({ address: who });
+    } catch {
+      return; // read failed — fail open, the mint is the backstop
+    }
+    if (!code || code === '0x') return; // plain EOA — always receives
+
+    const SELECTOR_OK = '0x150b7a02'; // onERC721Received magic value
+    let accepts: boolean;
+    try {
+      const res = await this.ctx.publicClient.call({
+        to: who,
+        data: encodeFunctionData({
+          abi: [{
+            type: 'function', name: 'onERC721Received', stateMutability: 'nonpayable',
+            inputs: [
+              { name: 'operator', type: 'address' }, { name: 'from', type: 'address' },
+              { name: 'tokenId', type: 'uint256' }, { name: 'data', type: 'bytes' },
+            ],
+            outputs: [{ name: '', type: 'bytes4' }],
+          }],
+          functionName: 'onERC721Received',
+          args: [who, who, 0n, '0x'],
+        }),
+      });
+      accepts = !!res.data?.startsWith(SELECTOR_OK);
+    } catch (e) {
+      // A REVERT here is exactly what the mint would hit (delegate without
+      // the hook, e.g. the pre-v4 batcher). Transport errors fail open.
+      const s = `${(e as { name?: string }).name ?? ''} ${(e as Error).message ?? ''}`;
+      if (!/revert|CallExecutionError/i.test(s)) return;
+      accepts = false;
+    }
+    if (!accepts) {
+      throw new Error(
+        `wallet ${who} carries a 7702 delegation that rejects NFTs — the mint would revert ERC721InvalidReceiver. ` +
+        'Fix: rate any agent once (the SDK re-delegates to the current batcher, which accepts NFTs), ' +
+        'or clear the delegation with a type-4 tx to the zero address, then retry',
+      );
     }
   }
 
@@ -159,6 +227,12 @@ export class AgentApi {
    * Clone `sourceAgentId` to a new owner. Async like {@link deploy}: returns
    * `{ sealId, agentSealAddr }` on acceptance; `wait: 'minted'` also blocks on
    * the mint (adds `agentId`), `wait: 'running'` also blocks on provision.
+   *
+   * Two modes (issue #133): omit `authorization` for owner mode (the
+   * connected wallet must be the source's current owner); pass
+   * `authorization: { authData }` for contract mode — the marketplace fork
+   * flow, where the connected wallet IS the buyer and the source owner's
+   * on-chain `ICloneAuthorizer` (see {@link setCloneAuthorizer}) decides.
    */
   clone(params: CloneParams, opts: { wait: 'running' } & WaitMintOpts): Promise<RunningResponse>;
   clone(params: CloneParams, opts: { wait: 'minted' } & WaitMintOpts): Promise<MintedResponse>;
@@ -172,6 +246,47 @@ export class AgentApi {
     const agentId = await this.waitForMint(accepted.sealId, opts);
     return { ...accepted, agentId };
   }
+  // ── Policy-mode cloning (issue #133) ──────────────────────────────────────
+
+  /**
+   * Configure (or clear, with the zero address) a token's clone authorizer —
+   * the `ICloneAuthorizer` contract deciding which contract-mode clones may
+   * mint. The publisher's one-time opt-in to marketplace forks; owner-only.
+   * Cleared automatically when the token changes owner.
+   */
+  async setCloneAuthorizer(tokenId: bigint, authorizer: Address): Promise<WriteContractReturnType> {
+    return this.id.setCloneAuthorizer(tokenId, authorizer);
+  }
+
+  /** The configured clone authorizer (`0x0` = none → contract-mode clones fail closed). */
+  async cloneAuthorizerOf(tokenId: bigint): Promise<Address> {
+    return this.id.cloneAuthorizerOf(tokenId);
+  }
+
+  /** For a clone, the agentId it was forked from (0n = not a clone; survives transfers). */
+  async cloneSourceOf(agentId: bigint): Promise<bigint> {
+    return this.id.cloneSourceOf(agentId);
+  }
+
+  // Standard-policy purchase helpers — resolve the token's configured
+  // authorizer live and speak the OFFICIAL StandardCloneAuthorizer ABI to it.
+  // Against a custom policy these revert; use that policy's own surface.
+
+  /** Seller: allow `buyer` to fork this agent — a permission switch (standard policy only). */
+  async grantClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.grantClone(sourceAgentId, buyer);
+  }
+
+  /** Seller: close the door for `buyer` — refund or manual one-shot consumption (standard policy only). */
+  async revokeClone(sourceAgentId: bigint, buyer: Address): Promise<WriteContractReturnType> {
+    return this.id.revokeClone(sourceAgentId, buyer);
+  }
+
+  /** A grant's seller + whether it is currently effective (standard policy only). */
+  async cloneGrantOf(sourceAgentId: bigint, buyer: Address): Promise<{ grantor: Address; effective: boolean }> {
+    return this.id.cloneGrantOf(sourceAgentId, buyer);
+  }
+
   async transferFrom(from: Address, to: Address, tokenId: bigint): Promise<WriteContractReturnType> {
     assertSealBound(await this.id.getAgentSeal(tokenId), 'transferFrom');
     return this.id.transferFrom(from, to, tokenId);
@@ -241,10 +356,29 @@ export class AgentApi {
    * a model picker before deploy.
    */
   async listModels(): Promise<string[]> {
-    const r = await fetch('https://router-api.0g.ai/v1/models');
+    return (await this.listModelCaps()).map((m) => m.id);
+  }
+
+  /**
+   * Models with the capability bits a picker needs: `chat` (a chatbot at all —
+   * the router also lists image/audio models) and `tools` (function calling —
+   * required by tool-driven frameworks; a chat-only model deploys fine and
+   * then fails EVERY turn). 10s timeout: a wedged router must not hang the
+   * deploy wizard.
+   */
+  async listModelCaps(): Promise<Array<{ id: string; chat: boolean; tools: boolean }>> {
+    const r = await fetch('https://router-api.0g.ai/v1/models', { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
-    const body = (await r.json()) as { data?: Array<{ id?: string }> };
-    return (body.data ?? []).map((m) => m.id).filter((x): x is string => !!x);
+    const body = (await r.json()) as {
+      data?: Array<{ id?: string; type?: string; supported_parameters?: string[] }>;
+    };
+    return (body.data ?? [])
+      .filter((m): m is { id: string; type?: string; supported_parameters?: string[] } => !!m.id)
+      .map((m) => ({
+        id: m.id,
+        chat: (m.type ?? 'chatbot') === 'chatbot',
+        tools: (m.supported_parameters ?? []).includes('tools'),
+      }));
   }
 
   /**
@@ -482,7 +616,9 @@ export class AgentApi {
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
-    const rows = (await (await fetch(`${this.attestorBase()}/deployments`)).json()) as Array<Record<string, unknown>>;
+    // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
+    // predating the param ignore it.
+    const rows = (await (await fetch(`${this.attestorBase()}/deployments?slim=1`)).json()) as Array<Record<string, unknown>>;
     return rows.map((r) => this.normalizeDeploymentRow(r));
   }
 
@@ -500,7 +636,7 @@ export class AgentApi {
     const owner = account.address;
     const message = `0GDeployments:${owner}:${Math.floor(Date.now() / 1000)}`;
     const signature = await walletClient.signMessage({ account, message });
-    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}`, {
+    const res = await fetch(`${this.attestorBase()}/deployments?owner=${owner}&slim=1`, {
       headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
     });
     if (!res.ok) throw new Error(`listMyDeployments: HTTP ${res.status}: ${await res.text()}`);
@@ -648,6 +784,17 @@ export class AgentApi {
       if (row?.phase === 'failed') {
         let reason = row.lastProvisionError ?? null;
         if (reason == null) {
+          // Pre-mint failures live in the per-stage reasons of the PUBLIC
+          // detail endpoint (e.g. mint_stage.reason = the revert data), not
+          // in lastProvisionError — read them before giving up on a cause.
+          try {
+            const d = (await (await fetch(
+              `${this.ctx.attestorUrl?.replace(/\/$/, '')}/deployment/${sealId}`,
+            )).json()) as { mint_stage?: { reason?: string }; storage_stage?: { reason?: string }; container_stage?: { reason?: string } };
+            reason = d.mint_stage?.reason ?? d.storage_stage?.reason ?? d.container_stage?.reason ?? null;
+          } catch { /* detail unreachable — try the owner-scoped fallback */ }
+        }
+        if (reason == null) {
           try {
             const mine = (await this.listMyDeployments()).find((r) => r.sealId === sealId);
             reason = mine?.lastProvisionError ?? null;
@@ -738,17 +885,27 @@ export class ReputationApi {
   parseServeProofHeader(value: string): ServeProof { return parseServeProofHeader(value); }
   verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
 
-  // — feedback —
-  giveFeedback(params: GiveFeedbackParams): Promise<WriteContractReturnType> { return this.rep.giveFeedback(params); }
+  // — feedback (canonical write + TEE verification mark, bundled) —
+  giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> { return this.rep.giveFeedback(params); }
+  attestFeedback(agentId: bigint, feedbackIndex: bigint, proof: ServeProof): Promise<WriteContractReturnType> { return this.rep.attestFeedback(agentId, feedbackIndex, proof); }
+  attestFeedbackWithTask(agentId: bigint, feedbackIndex: bigint, proof: ServeProof, task: TaskReveal): Promise<WriteContractReturnType> { return this.rep.attestFeedbackWithTask(agentId, feedbackIndex, proof, task); }
   revokeFeedback(agentId: bigint, feedbackIndex: bigint): Promise<WriteContractReturnType> { return this.rep.revokeFeedback(agentId, feedbackIndex); }
   appendResponse(params: AppendResponseParams): Promise<WriteContractReturnType> { return this.rep.appendResponse(params); }
+  // — canonical reads (raw feedback, verified or not) —
   readFeedback(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<Feedback> { return this.rep.readFeedback(agentId, client, feedbackIndex); }
   readAllFeedback(params: ReadAllFeedbackParams): Promise<Feedback[]> { return this.rep.readAllFeedback(params); }
   getSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getSummary(params); }
-  getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   getClients(agentId: bigint): Promise<Address[]> { return this.rep.getClients(agentId); }
   getLastIndex(agentId: bigint, client: Address): Promise<bigint> { return this.rep.getLastIndex(agentId, client); }
   getResponseCount(agentId: bigint, client: Address, feedbackIndex: bigint, responders: Address[]): Promise<bigint> { return this.rep.getResponseCount(agentId, client, feedbackIndex, responders); }
+  // — verified reads (TEE marks) —
+  isVerified(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<boolean> { return this.rep.isVerified(agentId, client, feedbackIndex); }
+  getVerifiedIndexes(agentId: bigint, client: Address): Promise<bigint[]> { return this.rep.getVerifiedIndexes(agentId, client); }
+  getVerifiedClients(agentId: bigint): Promise<Address[]> { return this.rep.getVerifiedClients(agentId); }
+  getVerifiedSummary(params: GetSummaryParams): Promise<FeedbackSummary> { return this.rep.getVerifiedSummary(params); }
+  getVerifiedEndpoint(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<string> { return this.rep.getVerifiedEndpoint(agentId, client, feedbackIndex); }
+  getVerifiedSummaryForEndpoint(agentId: bigint, uri: string, clients?: Address[]): Promise<FeedbackSummary> { return this.rep.getVerifiedSummaryForEndpoint(agentId, uri, clients); }
+  getServeData(agentId: bigint, client: Address, feedbackIndex: bigint): Promise<ServeData> { return this.rep.getServeData(agentId, client, feedbackIndex); }
   waitForTransaction(txHash: Hash): Promise<TransactionReceipt> { return this.rep.waitForTransaction(txHash); }
 }
 
@@ -805,7 +962,9 @@ export class AgenticID {
       rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
       addresses: {
         agenticID: addr(cfg.agentic_id_addr),
-        reputationRegistry: addr(cfg.reputation_registry_addr),
+        verifiedFeedback: addr(cfg.verified_feedback_addr),
+        feedbackBatcher: addr(cfg.feedback_batcher_addr),
+        cloneGate: addr(cfg.clone_gate_addr),
         teeDataVerifier: addr(cfg.tee_data_verifier_addr),
         tappRegistry: addr(cfg.tapp_registry_addr),
         sandboxServing: addr(cfg.sandbox_serving_addr),
@@ -839,4 +998,26 @@ export class AgenticID {
     }
     return this.infra.getBalance(userOrOpts, provider);
   }
+  /**
+   * Full prepaid-account view: spendable `balance`, plus `pendingRefund` and
+   * `refundUnlockAt` (funds mid-refund and when they unlock — invisible to
+   * {@link getBalance}, which returns only the spendable part).
+   */
+  getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
+    return this.infra.getBalanceDetail(opts?.user, opts?.provider);
+  }
+  /**
+   * The EFFECTIVE spendable balance from the sandbox provider (owner-signed):
+   * on-chain balance minus in-flight reservations minus outstanding off-chain
+   * debt — the number the provider's create/start gates actually enforce.
+   * {@link getBalance} (raw chain read) can be optimistic between settlements.
+   * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
+   */
+  getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint }> {
+    return new AttestorClient(this.ctx).getEffectiveBalance();
+  }
+  /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
+  requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }
+  /** Claim the pending refund once `refundUnlockAt` has passed (reverts earlier); pays out to the caller's wallet. */
+  withdrawRefund(opts?: { provider?: Address }): Promise<WriteContractReturnType> { return this.infra.withdrawRefund(opts?.provider); }
 }

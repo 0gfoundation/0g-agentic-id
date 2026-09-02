@@ -134,19 +134,30 @@ export class SandboxClient {
   // ── deposit ──────────────────────────────────────────────────────────────
 
   /**
-   * Read a user's prepaid sandbox balance against a provider (wei).
+   * Read a user's *spendable* prepaid sandbox balance against a provider (wei).
    * Both args optional: `user` defaults to the configured account,
    * `provider` to the attestor /config's provider.
+   * Funds mid-refund are excluded — see {@link getBalanceDetail}.
    */
   async getBalance(user?: Address, provider?: Address): Promise<bigint> {
+    return (await this.getBalanceDetail(user, provider)).balance;
+  }
+
+  /**
+   * Full prepaid-account view: spendable `balance`, `pendingRefund` (moved out
+   * by requestRefund, locked), and `refundUnlockAt` (unix seconds when the
+   * pending refund becomes withdrawable; 0 if none). All wei/bigint.
+   */
+  async getBalanceDetail(user?: Address, provider?: Address): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     const addr = user ?? this.ctx.account?.address;
     if (!addr) throw new Error('no user address (pass one or set account)');
-    return this.ctx.publicClient.readContract({
+    const [balance, pendingRefund, refundUnlockAt] = (await this.ctx.publicClient.readContract({
       address: this.sandboxServing,
       abi: sandboxServingAbi,
       functionName: 'getBalance',
       args: [addr, await this.resolveProvider(provider)],
-    }) as Promise<bigint>;
+    })) as [bigint, bigint, bigint];
+    return { balance, pendingRefund, refundUnlockAt };
   }
 
   /** Provider's registered service entry (endpoint + price schedule). Provider defaults from /config. */
@@ -175,6 +186,40 @@ export class SandboxClient {
       functionName: 'deposit',
       args: [params.recipient ?? account.address, await this.resolveProvider(params.provider)],
       value: params.amountWei,
+      account,
+      chain: this.ctx.chain,
+    });
+  }
+
+  /**
+   * Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund`,
+   * locked until `refundUnlockAt` (contract-set delay). NB the contract
+   * REPLACES any existing pending refund (re-absorbing it into the spendable
+   * balance first) and restarts the lock — `amountWei` is the new total, and
+   * may go up to `balance + pendingRefund`. Claim with {@link withdrawRefund}
+   * once unlocked; track via {@link getBalanceDetail}. Provider defaults to
+   * the attestor /config's.
+   */
+  async requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
+      address: this.sandboxServing,
+      abi: sandboxServingAbi,
+      functionName: 'requestRefund',
+      args: [await this.resolveProvider(params.provider), params.amountWei],
+      account,
+      chain: this.ctx.chain,
+    });
+  }
+
+  /** Claim the pending refund (reverts before `refundUnlockAt`); pays out to the caller's wallet. */
+  async withdrawRefund(provider?: Address): Promise<WriteContractReturnType> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    return walletClient.writeContract({
+      address: this.sandboxServing,
+      abi: sandboxServingAbi,
+      functionName: 'withdrawRefund',
+      args: [await this.resolveProvider(provider)],
       account,
       chain: this.ctx.chain,
     });

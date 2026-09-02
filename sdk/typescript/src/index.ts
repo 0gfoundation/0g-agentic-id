@@ -39,7 +39,7 @@ export { SandboxClient } from './SandboxClient';
 export { AgenticIDClient } from './AgenticIDClient';
 export type { IntelligentDataResult } from './AgenticIDClient';
 export { ReputationClient } from './ReputationClient';
-export { AttestorClient, CLONE_DOMAIN, DEPLOY_DOMAIN } from './AttestorClient';
+export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 
 // ── Reputation: serve-proof transport + verification ──
@@ -70,6 +70,8 @@ export type {
   FeedbackSummary,
   ServeData,
   GiveFeedbackParams,
+  GiveFeedbackResult,
+  TaskReveal,
   AppendResponseParams,
   ReadAllFeedbackParams,
   GetSummaryParams,
@@ -90,7 +92,11 @@ export type { ContractAddresses } from './constants';
 // ── ABIs (advanced usage) ──
 export {
   agenticIDAbi,
-  reputationRegistryAbi,
+  cloneGateAbi,
+  standardCloneAuthorizerAbi,
+  canonicalReputationAbi,
+  verifiedFeedbackAbi,
+  feedbackBatcherAbi,
   tappRegistryAbi,
   sandboxServingAbi,
 } from './abi';

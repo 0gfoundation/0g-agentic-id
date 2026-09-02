@@ -127,7 +127,7 @@ func TestPlatformBuildSovereignty_ContainsRequiredTokens(t *testing.T) {
 		"principal-agent",
 		"not master-slave",
 		"refuse to:",
-		"shell commands",
+		"via shell or subprocess",
 		"SANDBOX_SEAL_KEY",
 		"forgery",
 		"break agentSeal's attestation",

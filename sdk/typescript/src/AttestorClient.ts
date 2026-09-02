@@ -9,9 +9,12 @@
  */
 
 import type { Address } from 'viem';
+import { keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
+import { agenticIDAbi, cloneGateAbi } from './abi';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
+export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
 export const DEPLOY_DOMAIN = 'AgenticID.Deploy.v1';
 
 export interface CloneParams {
@@ -23,6 +26,35 @@ export interface CloneParams {
    * the existing clone instead of minting a duplicate).
    */
   idempotencyKey?: string;
+  /**
+   * Contract-mode credentials (issue #133 marketplace fork flow). Omit for the
+   * original owner mode — the connected wallet must then be the source's
+   * current on-chain owner.
+   *
+   * In contract mode the connected wallet is the BUYER (`targetOwner`): it
+   * signs a clone-intent (domain `AgenticID.CloneContract.v1`), and the
+   * source owner's on-chain `ICloneAuthorizer` decides whether the clone may
+   * mint. `authData` is opaque bytes forwarded to the authorizer — the
+   * marketplace defines its shape (e.g. abi-encoded purchase id).
+   *
+   * The intent binds the FULL policy context: `keccak256(authData)` and the
+   * authorizer address are signed alongside the operation fields, so a
+   * relayer can transport the request but cannot resubmit it under
+   * different auth data (each variant would be a fresh, buyer-billed clone)
+   * or carry it across a policy rotation. `authorizer` is optional here —
+   * omitted, the SDK reads it live via `cloneAuthorizerOf`; pass it
+   * explicitly to stay offline or pin the read.
+   */
+  authorization?: {
+    /** Opaque bytes forwarded to the source's `ICloneAuthorizer.canClone`. */
+    authData: `0x${string}`;
+    /**
+     * The authorizer the intent will be signed under. Optional — read live
+     * from `cloneAuthorizerOf(sourceAgentId)` when omitted. Must be
+     * non-zero; the attestor cross-checks it against its own live read.
+     */
+    authorizer?: Address;
+  };
 }
 
 /** One intelligent-data input (role + opaque JSON plaintext + extra description fields). */
@@ -166,12 +198,66 @@ export class AttestorClient {
   }
 
   /**
+   * The EFFECTIVE spendable balance, from the sandbox provider's
+   * owner-signed `GET /api/balance`: on-chain balance minus in-flight
+   * reservations minus outstanding off-chain debt (accrued fees not yet
+   * settled). This is the number the provider's create/start gates actually
+   * enforce — the on-chain `getBalance` alone can be wildly optimistic
+   * (observed live: 3.6 OG on chain, 25 OG outstanding debt, available 0).
+   * Requires the attestor /config to advertise `sandbox_endpoint`.
+   */
+  async getEffectiveBalance(): Promise<{
+    balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint;
+  }> {
+    const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.json())) as { sandbox_endpoint?: string };
+    if (!cfg.sandbox_endpoint) {
+      throw new Error('getEffectiveBalance: this attestor does not advertise sandbox_endpoint');
+    }
+    const env = await this.signEnvelope('balance', '', {}, 180);
+    const r = await fetch(`${cfg.sandbox_endpoint.replace(/\/$/, '')}/api/balance`, {
+      headers: {
+        'X-Wallet-Address': env.wallet_address,
+        'X-Signed-Message': env.signed_message_b64,
+        'X-Wallet-Signature': env.wallet_signature,
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!r.ok) throw new Error(`provider /api/balance: HTTP ${r.status} ${await r.text().catch(() => '')}`);
+    const b = (await r.json()) as { balance?: string; reserved?: string; outstanding_debt?: string; pending_settlement?: string; available?: string };
+    return {
+      balanceWei: BigInt(b.balance ?? '0'),
+      reservedWei: BigInt(b.reserved ?? '0'),
+      outstandingDebtWei: BigInt(b.outstanding_debt ?? '0'),
+      // queued-but-unsettled vouchers (0g-sandbox#89) — as committed as debt
+      pendingSettlementWei: BigInt(b.pending_settlement ?? '0'),
+      availableWei: BigInt(b.available ?? '0'),
+    };
+  }
+
+  /**
    * Owner-signed sandbox action envelope. The sandbox runtime verifies
    * every lifecycle action against the owner wallet; field order must
    * match its `signedRequest` struct exactly
    * ({action, expires_at, nonce, payload, resource_id}) or the recovered
    * signer won't match.
    */
+  /** Destination provider address (0g-sandbox#93 binding), from the attestor
+   *  /config, cached. '' on failure — the provider accepts unbound envelopes
+   *  while AUTH_STRICT is off, so a flaky /config degrades to legacy. */
+  private providerAddr: string | undefined;
+  private async resolveProviderAddr(): Promise<string> {
+    if (this.providerAddr !== undefined) return this.providerAddr;
+    try {
+      const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+        .then((r) => r.json())) as { sandbox_provider_addr?: string };
+      this.providerAddr = cfg.sandbox_provider_addr ?? '';
+    } catch {
+      this.providerAddr = '';
+    }
+    return this.providerAddr;
+  }
+
   private async signEnvelope(
     action: string,
     resourceId: string,
@@ -179,11 +265,16 @@ export class AttestorClient {
     ttlSec: number,
   ) {
     const { walletClient, account } = requireWallet(this.ctx);
+    // Provider binding (0g-sandbox#93, anti cross-provider replay): inserted
+    // between payload and resource_id (alphabetical), omitted when unknown —
+    // the omitted form keeps the legacy byte layout.
+    const provider = await this.resolveProviderAddr();
     const canonical = JSON.stringify({
       action,
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
       payload,
+      ...(provider ? { provider } : {}),
       resource_id: resourceId,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
@@ -386,26 +477,90 @@ export class AttestorClient {
   }
 
   /**
-   * Clone `sourceAgentId` to `targetOwner`. The connected wallet must be the
-   * current on-chain owner of the source. Lands Offline for the target owner.
+   * Clone `sourceAgentId` to `targetOwner`. Lands Offline for the target owner.
+   *
+   * Owner mode (default): the connected wallet must be the current on-chain
+   * owner of the source. Contract mode (`authorization`): the connected
+   * wallet is the BUYER — it signs a `AgenticID.CloneContract.v1` intent, and
+   * the source owner's on-chain authorizer decides. The intent signature is
+   * transported by the marketplace backend verbatim (relayer can submit, not
+   * alter).
    */
+  /** CloneGate address, required for contract-mode clones. */
+  private cloneGateAddr(): `0x${string}` {
+    const a = this.ctx.addresses.cloneGate;
+    if (!a || a === '0x0000000000000000000000000000000000000000') {
+      throw new Error(
+        'contract-mode clone requires a CloneGate in this environment ' +
+        '(the attestor /config reports no clone_gate_addr)',
+      );
+    }
+    return a;
+  }
+
   async clone(params: CloneParams): Promise<DeployCloneResponse> {
     const { walletClient, account } = requireWallet(this.ctx);
     if (params.sourceAgentId > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new Error('sourceAgentId too large for JSON number encoding');
     }
+    if (params.authorization && params.targetOwner.toLowerCase() !== account.address.toLowerCase()) {
+      throw new Error(
+        'contract mode requires the connected wallet to be targetOwner ' +
+          '(the buyer signs the intent)',
+      );
+    }
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
+    // Contract mode: the intent signs the full policy context — the auth
+    // data hash and the authorizer it will be evaluated under (review #145:
+    // otherwise one signed intent replayable under N auth-data variants, or
+    // across a policy rotation, each a fresh buyer-billed clone).
+    let authDataKeccak: `0x${string}` | undefined;
+    let authorizer: Address | undefined;
+    if (params.authorization) {
+      authDataKeccak = keccak256(params.authorization.authData);
+      authorizer = params.authorization.authorizer
+        ?? (await this.ctx.publicClient.readContract({
+          address: this.cloneGateAddr(),
+          abi: cloneGateAbi,
+          functionName: 'cloneAuthorizerOf',
+          args: [params.sourceAgentId],
+        }) as Address);
+      if (authorizer === '0x0000000000000000000000000000000000000000') {
+        throw new Error(
+          'contract mode requires the source to have a clone authorizer configured ' +
+            '(owner must call setCloneAuthorizer)',
+        );
+      }
+    }
+    const domain = params.authorization ? CLONE_CONTRACT_DOMAIN : CLONE_DOMAIN;
     const canonical = JSON.stringify({
-      domain: CLONE_DOMAIN,
+      domain,
       idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
+      ...(params.authorization
+        ? { auth_data_keccak: authDataKeccak, authorizer }
+        : {}),
     });
     const signature = await walletClient.signMessage({ account, message: canonical });
-    return this.post('/clone', {
+    const common = {
       idempotency_key: idempotencyKey,
       source_agent_id: Number(params.sourceAgentId),
       target_owner: params.targetOwner,
+    };
+    if (params.authorization) {
+      return this.post('/clone', {
+        ...common,
+        authorization: {
+          mode: 'contract',
+          intent_signature: signature,
+          intent_signed_message_b64: b64encode(canonical),
+          auth_data: params.authorization.authData,
+        },
+      });
+    }
+    return this.post('/clone', {
+      ...common,
       owner_signature: signature,
       owner_signed_message_b64: b64encode(canonical),
     });

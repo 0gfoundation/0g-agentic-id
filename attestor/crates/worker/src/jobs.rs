@@ -1,13 +1,13 @@
 //! Job handlers. Worker core logic.
 
-use alloy::primitives::{Address, Bytes};
+use alloy::primitives::{Address, B256, Bytes};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     oss::OssClient,
     sandbox::SandboxError,
-    AgentId, ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IDataArtifact,
-    IDataInput, IntelligentData, JobPayload, MintParams, SandboxClient, SandboxEnvelope,
-    SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
+    AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo, EventBus,
+    IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobPayload, MintParams,
+    SandboxClient, SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -114,7 +114,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     .unwrap_or(false);
                 if transient {
                     let reason = if e.to_string().to_lowercase().contains("balance") {
-                        "insufficient sandbox balance — top up to resume".to_string()
+                        "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then resume".to_string()
                     } else {
                         "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
                     };
@@ -285,6 +285,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             name,
             description,
             image,
+            authorization,
         } => {
             handle_clone(
                 ctx,
@@ -294,6 +295,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 name,
                 description,
                 image,
+                authorization,
             )
             .await
         }
@@ -370,6 +372,47 @@ async fn handle_resume_deploy(
         .await?
         .ok_or_else(|| anyhow::anyhow!("resume: deployment vanished"))?;
 
+    // ── Clone rows: re-drive the original clone, not the deploy tracks ──
+    // A clone persists NO artifacts (the re-seal output would go stale the
+    // moment the source evolves — the #27 lesson), so the deploy-shaped
+    // resume below would re-submit an EMPTY mint (ERC7857EmptyData, #147).
+    // Instead the row carries the clone's static recipe; recompute the
+    // perishable materials from live chain state by re-running handle_clone.
+    if let Some(cp) = d.clone_params.clone() {
+        if d.agent_id.is_none() && !matches!(d.mint_stage, StageStatus::Confirmed { .. }) {
+            // Receipt-loss guard first (mirrors the mint track): if the
+            // original mint actually landed, record it instead of re-minting
+            // (handle_clone has no such check and would revert SealIdTaken).
+            if let Some(agent_id) = ctx.chain.get_agent_id_by_seal_id(seal_id).await? {
+                tracing::info!(?seal_id, %agent_id, "resume(clone): mint already on chain, recording");
+                ctx.deployments.set_agent_id(seal_id, agent_id).await?;
+                let now = Utc::now();
+                ctx.deployments
+                    .set_mint_stage(seal_id, StageStatus::Confirmed { at: now })
+                    .await?;
+                ctx.events
+                    .publish(WsEvent::MintConfirmed { seal_id, agent_id })
+                    .await?;
+                run_phase2(ctx, seal_id, &cp.name, &cp.description, cp.image.as_deref()).await?;
+                return Ok(());
+            }
+            tracing::info!(?seal_id, "resume(clone): re-running handle_clone from the persisted recipe");
+            return handle_clone(
+                ctx,
+                seal_id,
+                cp.source_seal_id,
+                d.owner,
+                cp.name,
+                cp.description,
+                cp.image,
+                cp.authorization,
+            )
+            .await;
+        }
+        // Minted already — nothing pre-mint to redo; fall through so the
+        // idempotent phase-2 finalize below can complete if it hadn't.
+    }
+
     // ── Storage track retry ──
     if matches!(d.storage_stage, StageStatus::Failed { .. }) {
         tracing::info!(?seal_id, "resume: re-running storage track");
@@ -397,6 +440,24 @@ async fn handle_resume_deploy(
         } else {
             // Mint never made it on chain. Resubmit using the artifacts
             // carried by the job — same dataHashes / sealedKeys / agentSeal.
+            // Known-dead interception: with nothing to mint, the tx would
+            // revert ERC7857EmptyData on chain — fail HERE with the real
+            // cause instead of burning gas on a guaranteed revert. (Reached
+            // by pre-#147 clone rows, whose recipe was never persisted.)
+            if artifacts.is_empty() {
+                let now = Utc::now();
+                let reason = "resume: no persisted mint artifacts — unrecoverable \
+                              (clone row from before the retry recipe was stored? \
+                              re-run the clone itself)"
+                    .to_string();
+                ctx.deployments
+                    .set_mint_stage(seal_id, StageStatus::Failed { at: now, reason: reason.clone() })
+                    .await?;
+                ctx.events
+                    .publish(WsEvent::MintFailed { seal_id, reason: reason.clone() })
+                    .await?;
+                anyhow::bail!(reason);
+            }
             let mint_params = MintParams {
                 to: d.owner,
                 agent_uri: String::new(),
@@ -555,7 +616,7 @@ async fn handle_sandbox_recreate(
                 .unwrap_or(false);
             let balance = e.to_string().to_lowercase().contains("balance");
             let reason = if transient && balance {
-                "insufficient sandbox balance — top up, then bring back online".to_string()
+                "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then bring back online".to_string()
             } else if transient {
                 "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
@@ -611,13 +672,47 @@ async fn handle_sandbox_recreate(
     // sandbox runtime GC eventually reclaims either way.
     if persisted_new {
         if let Some(old) = old_sandbox_id.filter(|o| !o.is_empty() && *o != resp.id) {
-            if let Err(e) = ctx.sandbox.admin_delete(&old).await {
-                tracing::warn!(
-                    ?seal_id,
-                    old_sandbox_id = %old,
-                    error = %e,
-                    "orphan admin_delete failed (non-fatal)"
-                );
+            // Retry transient refusals: a back-to-back reset hits the OLD
+            // sandbox while it is still mid-creation and the provider answers
+            // 409 "state change in progress" — which clears within a minute.
+            // One-shot best-effort left a healthy started orphan running (and
+            // billing) forever with this agent's seal: nothing GCs a healthy
+            // sandbox, so the old "runtime GC reclaims either way" assumption
+            // was wrong. Bounded: 5 tries over ~100s, then warn and move on.
+            let mut deleted = false;
+            for attempt in 1..=5u32 {
+                match ctx.sandbox.admin_delete(&old).await {
+                    Ok(()) => {
+                        deleted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let transient = e
+                            .downcast_ref::<SandboxError>()
+                            .map(|se| se.is_transient())
+                            .unwrap_or(false);
+                        if !transient || attempt == 5 {
+                            tracing::warn!(
+                                ?seal_id,
+                                old_sandbox_id = %old,
+                                error = %e,
+                                attempt,
+                                "orphan admin_delete failed (non-fatal) — old sandbox may keep running AND billing; delete it manually"
+                            );
+                            break;
+                        }
+                        tracing::info!(
+                            ?seal_id,
+                            old_sandbox_id = %old,
+                            attempt,
+                            "orphan admin_delete refused transiently (e.g. 409 state change in progress) — retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    }
+                }
+            }
+            if deleted {
+                tracing::info!(?seal_id, old_sandbox_id = %old, "orphan sandbox deleted");
             }
         }
     }
@@ -954,12 +1049,22 @@ async fn handle_deploy(
 /// derivation lets us re-derive the source priv to unseal, then seal to the
 /// new pub); `storage_root`/`data_hash`/`description` are reused verbatim — the
 /// source ciphertext on 0g-storage is shared, nothing is re-uploaded. Then
-/// mint via `run_mint_track` and finalize identity via `run_phase2`; the clone
-/// lands Offline for `target_owner` to bring online later.
+/// mint and finalize identity via `run_phase2`; the clone lands Offline for
+/// `target_owner` to bring online later.
+///
+/// Mint path is selected by `authorization` (issue #133):
+/// - `Owner` — `run_mint_track` (`registerWithSeal`), as before.
+/// - `Contract` — `run_clone_from_track` (AgenticID `cloneFrom`): the owner's
+///   on-chain `ICloneAuthorizer` is consulted ATOMICALLY inside the mint tx,
+///   and the submitted dataHashes must match the source's live iData. A
+///   policy deny / authorizer cleared by a transfer / stale re-seal reverts
+///   the whole tx — the clone is simply not minted (fail-closed by
+///   construction; the route's pre-check was UX only).
 ///
 /// A pre-mint re-seal failure flips `mint_stage = Failed` (phase → Failed, so
 /// the dead clone is visible, not stuck Deploying) and bails. Clone failures
 /// aren't retryable via `/retry` in v0 — re-POST `/clone` with a new key.
+#[allow(clippy::too_many_arguments)]
 async fn handle_clone(
     ctx: &Ctx,
     new_seal_id: SealId,
@@ -968,6 +1073,7 @@ async fn handle_clone(
     name: String,
     description: String,
     image: Option<String>,
+    authorization: JobCloneAuth,
 ) -> anyhow::Result<()> {
     let source = ctx
         .deployments
@@ -1056,23 +1162,132 @@ async fn handle_clone(
         })
         .await?;
 
-    // Mint the clone to the target owner: the source's CURRENT on-chain iData
-    // (descriptions + dataHashes) with keys re-sealed to the clone's agentSeal.
-    let mint_params = MintParams {
-        to: target_owner,
-        agent_uri: String::new(),
-        metadata: Vec::new(),
-        intelligent_datas: idatas,
-        sealed_keys,
-        agent_seal: new_kp.address,
-        seal_id: new_seal_id,
-    };
-    run_mint_track(ctx, new_seal_id, mint_params).await?;
+    // Mint the clone to the target owner. Owner mode: the source's CURRENT
+    // on-chain iData (descriptions + dataHashes) with keys re-sealed to the
+    // clone's agentSeal, via registerWithSeal. Contract mode: the same
+    // artifacts via the policy-gated cloneFrom — the on-chain authorizer
+    // consult is atomic with the mint, and the dataHashes we submit (read
+    // live above, re-sealed just now) must match on-chain storage at mint
+    // time or the tx reverts (stale re-seal → clean failure).
+    let data_hashes: Vec<B256> = idatas.iter().map(|d| d.data_hash).collect();
+    match authorization {
+        JobCloneAuth::Owner => {
+            let mint_params = MintParams {
+                to: target_owner,
+                agent_uri: String::new(),
+                metadata: Vec::new(),
+                intelligent_datas: idatas,
+                sealed_keys,
+                agent_seal: new_kp.address,
+                seal_id: new_seal_id,
+            };
+            run_mint_track(ctx, new_seal_id, mint_params).await?;
+        }
+        JobCloneAuth::Contract { authorizer, auth_data, caller } => {
+            let clone_params = CloneFromParams {
+                source_agent_id,
+                to: target_owner,
+                data_hashes: data_hashes,
+                sealed_keys,
+                agent_seal: new_kp.address,
+                seal_id: new_seal_id,
+                caller,
+                authorizer,
+                auth_data,
+            };
+            run_clone_from_track(ctx, new_seal_id, clone_params).await?;
+        }
+    }
 
     // Identity finalize (card + setAgentURI, empty url). Container never
     // runs → clone lands Offline; target owner brings it online later.
     run_phase2(ctx, new_seal_id, &name, &description, image.as_deref()).await?;
 
+    Ok(())
+}
+
+/// Contract-mode clone mint: submit AgenticID `cloneFrom` and drive the mint
+/// stage machine, mirroring `run_mint_track`'s transitions. The tx reverts
+/// (policy deny / authorizer cleared / dataHash mismatch) surface as
+/// `mint_stage = Failed` with the decoded revert reason — the clone is not
+/// minted, fail-closed by construction.
+async fn run_clone_from_track(
+    ctx: &Ctx,
+    seal_id: SealId,
+    params: CloneFromParams,
+) -> anyhow::Result<()> {
+    // NB: explicit trait call — a bare `ctx.chain.clone_from(...)` would
+    // resolve to `Clone::clone_from` on the Arc wrapper, not the chain method.
+    let submit = match ChainClient::clone_from(ctx.chain.as_ref(), params).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            let now = Utc::now();
+            let reason = format!("cloneFrom submit: {e}");
+            ctx.deployments
+                .set_mint_stage(
+                    seal_id,
+                    StageStatus::Failed {
+                        at: now,
+                        reason: reason.clone(),
+                    },
+                )
+                .await?;
+            ctx.events
+                .publish(WsEvent::MintFailed {
+                    seal_id,
+                    reason: reason.clone(),
+                })
+                .await?;
+            anyhow::bail!(reason);
+        }
+    };
+
+    let now = Utc::now();
+    ctx.deployments
+        .set_mint_stage(
+            seal_id,
+            StageStatus::Submitted { at: now, tx_hash: Some(submit) },
+        )
+        .await?;
+    ctx.events
+        .publish(WsEvent::MintSubmitted {
+            seal_id,
+            tx_hash: submit,
+        })
+        .await?;
+
+    let receipt = ctx.chain.wait_receipt(submit).await?;
+    if !receipt.success {
+        let now = Utc::now();
+        let reason = "cloneFrom reverted on chain".to_string();
+        ctx.deployments
+            .set_mint_stage(
+                seal_id,
+                StageStatus::Failed {
+                    at: now,
+                    reason: reason.clone(),
+                },
+            )
+            .await?;
+        ctx.events
+            .publish(WsEvent::MintFailed {
+                seal_id,
+                reason: reason.clone(),
+            })
+            .await?;
+        anyhow::bail!(reason);
+    }
+    let agent_id = receipt
+        .agent_id
+        .ok_or_else(|| anyhow::anyhow!("cloneFrom receipt missing ClonedFrom event"))?;
+    let now = Utc::now();
+    ctx.deployments
+        .set_mint_stage(seal_id, StageStatus::Confirmed { at: now })
+        .await?;
+    ctx.deployments.set_agent_id(seal_id, agent_id).await?;
+    ctx.events
+        .publish(WsEvent::MintConfirmed { seal_id, agent_id })
+        .await?;
     Ok(())
 }
 
@@ -1399,7 +1614,7 @@ async fn run_container_track(
                 .map(|se| se.is_transient())
                 .unwrap_or(false);
             let reason = if transient && e.to_string().to_lowercase().contains("balance") {
-                "insufficient sandbox balance — top up and deploy again".to_string()
+                "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then deploy again".to_string()
             } else if transient {
                 "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
@@ -1491,6 +1706,10 @@ mod tests {
             sandbox_provider_addr: None,
             sandbox_serving_addr: None,
             reputation_registry_addr: None,
+            verified_feedback_addr: None,
+            feedback_batcher_addr: None,
+            clone_gate_addr: None,
+            standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
@@ -1615,6 +1834,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data,
+            clone_params: None,
             phase: derive_phase(&storage_stage, &mint_stage, &StageStatus::NotStarted),
             storage_stage,
             mint_stage,
@@ -1630,6 +1850,52 @@ mod tests {
             updated_at: now,
         };
         repo.seed(d);
+    }
+
+    /// A clone row whose mint failed, carrying the persisted retry recipe
+    /// (issue #147). owner = the clone's target.
+    fn seed_failed_clone_row(
+        repo: &InMemoryDeploymentRepo,
+        seal_id: SealId,
+        agent_seal_addr: Address,
+        owner: Address,
+        source_seal_id: SealId,
+        authorization: JobCloneAuth,
+    ) {
+        let now = Utc::now();
+        repo.seed(Deployment {
+            seal_id,
+            agent_seal_addr,
+            owner,
+            agent_id: None,
+            agent_uri: String::new(),
+            agent_card: serde_json::Value::Object(Default::default()),
+            i_data: Vec::new(),
+            clone_params: Some(CloneRetryParams {
+                source_seal_id,
+                name: "Sage".into(),
+                description: "d".into(),
+                image: None,
+                authorization,
+            }),
+            phase: derive_phase(
+                &StageStatus::Confirmed { at: now },
+                &StageStatus::Failed { at: now, reason: "receiver rejected".into() },
+                &StageStatus::NotStarted,
+            ),
+            storage_stage: StageStatus::Confirmed { at: now },
+            mint_stage: StageStatus::Failed { at: now, reason: "receiver rejected".into() },
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        });
     }
 
     fn dummy_envelope(action: &str) -> SandboxEnvelope {
@@ -1768,6 +2034,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            clone_params: None,
             phase: derive_phase(
                 &StageStatus::NotStarted,
                 &StageStatus::NotStarted,
@@ -1821,9 +2088,18 @@ mod tests {
         );
         seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
 
-        handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None)
-            .await
-            .expect("clone must succeed");
+        handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            target,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Owner,
+        )
+        .await
+        .expect("clone must succeed");
 
         // Minted to the target owner with the clone's new agentSeal, and the
         // minted sealed_key re-seals correctly: decrypting it with the NEW
@@ -1845,6 +2121,76 @@ mod tests {
         assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
         assert!(clone.agent_id.is_some(), "clone must be minted");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_clone_contract_mode_mints_via_clone_from() {
+        // Issue #133: a contract-mode clone must mint through the policy-
+        // gated `cloneFrom` (NOT registerWithSeal), carrying the live
+        // authorizer, the buyer's auth_data and the re-sealed keys.
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let buyer = Address::from([0xbb; 20]);
+        let authorizer = Address::from([0xa7; 20]);
+        let auth_data = Bytes::from_static(b"purchase-1");
+
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
+        let known_key = vec![0x9u8; 32];
+        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        t.chain.seed_idata(
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
+            vec![Bytes::from(sealed)],
+        );
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_fresh_row(&t.deployments, new_seal, new_kp.address, buyer);
+
+        handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            buyer,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Contract { authorizer, auth_data: auth_data.clone(), caller: buyer },
+        )
+        .await
+        .expect("contract-mode clone must succeed");
+
+        // Minted via cloneFrom with the full policy context…
+        let p = t.chain.last_clone_from.lock().unwrap().clone().unwrap();
+        assert_eq!(p.to, buyer, "cloneFrom mints to the buyer");
+        assert_eq!(p.agent_seal, new_kp.address);
+        assert_eq!(p.seal_id, new_seal);
+        assert_eq!(p.caller, buyer, "caller = the buyer (route-proven)");
+        assert_eq!(p.authorizer, authorizer, "live authorizer forwarded");
+        assert_eq!(p.auth_data, auth_data, "buyer auth_data forwarded");
+        assert_eq!(p.data_hashes, vec![B256::repeat_byte(0x33)], "live dataHashes submitted");
+        // …and NOT via registerWithSeal.
+        assert!(
+            t.chain.last_register.lock().unwrap().is_none(),
+            "contract mode must not touch registerWithSeal"
+        );
+        // The re-sealed key decrypts under the clone's agentSeal.
+        let got = t.ctx.crypto.ecies_decrypt(&p.sealed_keys[0], &new_kp.priv_key).unwrap();
+        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey");
+        // Identity finalized as usual.
+        let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
+        assert!(clone.agent_id.is_some(), "clone must be minted");
     }
 
     #[tokio::test]
@@ -1873,7 +2219,17 @@ mod tests {
         );
         seed_fresh_row(&t.deployments, new_seal, new_kp.address, target);
 
-        let res = handle_clone(&t.ctx, new_seal, source_seal, target, "Sage".into(), "d".into(), None).await;
+        let res = handle_clone(
+            &t.ctx,
+            new_seal,
+            source_seal,
+            target,
+            "Sage".into(),
+            "d".into(),
+            None,
+            JobCloneAuth::Owner,
+        )
+        .await;
         assert!(res.is_err(), "re-seal failure must bail");
         let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
         assert!(
@@ -1886,6 +2242,112 @@ mod tests {
             0,
             "mint must not run when re-seal failed"
         );
+    }
+
+    // ── clone retry (issue #147): resume re-drives handle_clone ─────────────
+
+    #[tokio::test]
+    async fn resume_clone_row_reruns_handle_clone_from_recipe() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
+        let known_key = vec![0x9u8; 32];
+        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        t.chain.seed_idata(
+            vec![IntelligentData { description: "{}".into(), data_hash: B256::repeat_byte(0x33) }],
+            vec![Bytes::from(sealed)],
+        );
+        seed_deployment(
+            &t.deployments,
+            source_seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(5u64)),
+            None,
+        );
+        seed_failed_clone_row(
+            &t.deployments, new_seal, new_kp.address, target, source_seal, JobCloneAuth::Owner,
+        );
+
+        // NOTE: empty artifacts — pre-#147 this path minted an empty iData
+        // array (ERC7857EmptyData). The recipe dispatch must re-seal instead.
+        handle_resume_deploy(&t.ctx, new_seal, Vec::new(), None)
+            .await
+            .expect("clone resume must succeed");
+
+        let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
+        assert_eq!(to, target, "re-run must mint to the recipe's target");
+        assert_eq!(agent_seal, new_kp.address, "re-run must keep the SAME sealId identity");
+        let got = t.ctx.crypto.ecies_decrypt(&keys[0], &new_kp.priv_key).unwrap();
+        assert_eq!(got, known_key, "materials must be freshly re-sealed, not read from the row");
+        let d = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert!(d.agent_id.is_some(), "clone minted on retry");
+        assert_eq!(d.phase, DeploymentPhase::Offline, "clone lands Offline after retry");
+    }
+
+    #[tokio::test]
+    async fn resume_clone_row_records_receipt_loss_without_reminting() {
+        let t = make_test_ctx();
+        let source_seal = B256::repeat_byte(0x11);
+        let new_seal = B256::repeat_byte(0x22);
+        let target = Address::from([0xbb; 20]);
+        let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
+        seed_failed_clone_row(
+            &t.deployments, new_seal, new_kp.address, target, source_seal, JobCloneAuth::Owner,
+        );
+        // Chain says the original clone mint actually landed.
+        t.chain.seed_minted(new_seal, U256::from(77u64));
+
+        handle_resume_deploy(&t.ctx, new_seal, Vec::new(), None)
+            .await
+            .expect("receipt-loss resume must succeed");
+
+        assert_eq!(
+            t.chain.register_calls.load(Ordering::SeqCst),
+            0,
+            "must NOT re-mint a clone the chain already shows minted"
+        );
+        let d = t.deployments.get(new_seal).await.unwrap().unwrap();
+        assert_eq!(d.agent_id, Some(U256::from(77u64)));
+        assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resume_legacy_empty_row_fails_with_clear_reason_not_empty_mint() {
+        // A pre-#147 clone row: no recipe, no artifacts. The deploy-shaped
+        // mint retry must fail HERE with a named cause instead of submitting
+        // an empty mint that reverts ERC7857EmptyData on chain.
+        let t = make_test_ctx();
+        let seal = B256::repeat_byte(0x44);
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(), // nothing persisted
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Failed { at: Utc::now(), reason: "boom".into() },
+            None,
+            None,
+        );
+
+        let err = handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect_err("empty-artifact resume must fail");
+        assert!(
+            err.to_string().contains("no persisted mint artifacts"),
+            "must name the real cause, got: {err}"
+        );
+        assert_eq!(
+            t.chain.register_calls.load(Ordering::SeqCst),
+            0,
+            "must not submit a guaranteed-revert mint"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(&d.mint_stage, StageStatus::Failed { reason, .. } if reason.contains("no persisted mint artifacts")));
     }
 
     // ── handle_resume_deploy ──────────────────────────────────────────
@@ -2111,6 +2573,7 @@ mod tests {
             agent_uri: "http://oss.example/card.json".into(),
             agent_card: serde_json::json!({"name": "Sage"}),
             i_data: Vec::new(),
+            clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
                 &StageStatus::Confirmed { at: now },
@@ -3240,6 +3703,49 @@ mod tests {
         assert!(!d.agent_uri.is_empty());
         // Ciphertext cleared by phase 2's tail.
         assert!(d.i_data.iter().all(|a| a.ciphertext.is_empty()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recreate_retries_orphan_delete_past_transient_409() {
+        // The back-to-back-reset leak: deleting the OLD sandbox while it is
+        // still mid-creation gets a 409 "state change in progress". One-shot
+        // best-effort left it running (and billing) forever — the retry must
+        // push past transient refusals. (start_paused: the 20s backoffs
+        // auto-advance.)
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        let art = artifact_with_ciphertext(0x75);
+        seed_deployment(
+            &t.deployments,
+            seal,
+            vec![art],
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(31u64)),
+            Some("sb-old".into()),
+        );
+        write_stub_card(&t.deployments, seal, "Sage");
+        // First two deletes answer 409, third succeeds.
+        t.sandbox.admin_delete_fail_times.store(2, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(409);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox state change in progress".into());
+
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .expect("recreate must succeed");
+
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            3,
+            "must retry past transient 409s until the delete lands"
+        );
+        assert_eq!(
+            t.sandbox.last_admin_delete_id.lock().unwrap().as_deref(),
+            Some("sb-old"),
+            "must target the OLD sandbox"
+        );
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.sandbox_id.as_deref(), Some("mock-id"), "deployment points at the new sandbox");
     }
 
     #[tokio::test]

@@ -53,9 +53,41 @@ sol!(
 sol!(
     #[sol(rpc)]
     interface SandboxServing {
-        function getBalance(address user, address provider) external view returns (uint256);
+        function getBalance(address user, address provider) external view returns (uint256 balance, uint256 pendingRefund, uint256 refundUnlockAt);
     }
 );
+
+// ICloneAuthorizer (contracts/src/interfaces/ICloneAuthorizer.sol) — the
+// per-token policy contract source owners configure for marketplace fork
+// flows (issue #133). Inline interface (like TappRegistry above): the
+// authorizer is an arbitrary third-party address, so its ABI must not ride
+// the AgenticID JSON binding. Only the pre-check rides here; the
+// authoritative consult happens inside the AgenticID `cloneFrom` tx.
+sol!(
+    #[sol(rpc)]
+    interface ICloneAuthorizer {
+        function canClone(uint256 sourceAgentId, address targetOwner, address caller, bytes calldata data) external view returns (bool allowed);
+    }
+);
+
+// CloneGate (contracts/src/CloneGate.sol) — the policy-mode cloning SATELLITE
+// of AgenticID (the core contract sits at the EIP-170 bytecode ceiling, so
+// clone policy + lineage live in this companion). Inline interface: only the
+// two calls the attestor makes.
+sol!(
+    #[sol(rpc)]
+    interface ICloneGate {
+        function cloneAuthorizerOf(uint256 tokenId) external view returns (address);
+        function cloneFrom(uint256 sourceAgentId, address to, bytes32[] calldata dataHashes, bytes[] calldata sealedKeys, address newAgentSeal, bytes32 newSealId, address caller, bytes calldata authData) external returns (uint256 agentId);
+        event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
+    }
+);
+
+/// Wall-time bound for the authorizer pre-check eth_call. A hostile or
+/// looping authorizer must not pin an attestor worker thread indefinitely;
+/// expiry maps to `Err` (fail-closed reject — the idempotency key is not
+/// burned and the client may retry).
+const CAN_CLONE_TIMEOUT_SECS: u64 = 5;
 
 /// Try to decode a revert reason embedded in an alloy RPC error string.
 /// Looks for `data: "0x<hex>"` and decodes against AgenticID's full set
@@ -121,6 +153,10 @@ where
 {
     provider: P,
     contract_addr: Address,
+    /// CloneGate satellite (policy-mode cloning); None = feature not
+    /// deployed in this environment — clone contract-mode calls fail with a
+    /// named error.
+    clone_gate: Option<Address>,
     sender: Address,
     priority_fee_wei: u128,
     max_fee_wei: u128,
@@ -150,10 +186,12 @@ where
         priority_fee_gwei: u64,
         max_fee_gwei: u64,
         tapp_registry: Option<(Address, String)>,
+        clone_gate: Option<Address>,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
             contract_addr,
+            clone_gate,
             sender,
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
@@ -188,6 +226,7 @@ pub fn connect_http(
     priority_fee_gwei: u64,
     max_fee_gwei: u64,
     tapp_registry: Option<(Address, String)>,
+    clone_gate: Option<Address>,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
@@ -208,6 +247,7 @@ pub fn connect_http(
         priority_fee_gwei,
         max_fee_gwei,
         tapp_registry,
+        clone_gate,
     );
     Ok(chain)
 }
@@ -296,10 +336,17 @@ where
                 let success = receipt.status();
                 let block_number = receipt.block_number.unwrap_or(0);
 
+                // Mint-transaction agent ids: `Registered` (deploy and every
+                // registerWithSeal — the gate's cloneFrom mints through it, so
+                // clone receipts carry it too) with the gate's `ClonedFrom`
+                // as a redundant fallback.
                 let agent_id = receipt.inner.logs().iter().find_map(|log| {
-                    AgenticID::Registered::decode_log(&log.inner, true)
+                    if let Ok(ev) = AgenticID::Registered::decode_log(&log.inner, true) {
+                        return Some(ev.data.agentId);
+                    }
+                    ICloneGate::ClonedFrom::decode_log(&log.inner, true)
                         .ok()
-                        .map(|ev| ev.data.agentId)
+                        .map(|ev| ev.data.newAgentId)
                 });
 
                 tracing::info!(
@@ -330,6 +377,93 @@ where
     async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
         let c = AgenticID::new(self.contract_addr, self.provider.clone());
         Ok(c.ownerOf(agent_id).call().await?._0)
+    }
+
+    async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
+        let gate = self.clone_gate.ok_or_else(|| {
+            anyhow::anyhow!("clone gate not configured (ATTESTOR_CLONE_GATE_ADDR unset)")
+        })?;
+        let c = ICloneGate::new(gate, self.provider.clone());
+        Ok(c.cloneAuthorizerOf(agent_id).call().await?._0)
+    }
+
+    async fn can_clone(
+        &self,
+        authorizer: Address,
+        source: AgentId,
+        target: Address,
+        caller: Address,
+        data: Bytes,
+    ) -> anyhow::Result<bool> {
+        let c = ICloneAuthorizer::new(authorizer, self.provider.clone());
+        // Fail-closed: revert, RPC error or timeout all surface as Err — the
+        // route rejects and the idempotency key is not burned. (Deliberately
+        // a wall-time bound rather than a call-gas cap: an eth_call charges
+        // nobody, the protected resource is OUR wall clock + RPC worker.)
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CAN_CLONE_TIMEOUT_SECS),
+            c.canClone(source, target, caller, data).call(),
+        )
+        .await
+        {
+            Ok(res) => Ok(res?.allowed),
+            Err(_) => anyhow::bail!(
+                "canClone pre-check timed out after {CAN_CLONE_TIMEOUT_SECS}s (fail-closed)"
+            ),
+        }
+    }
+
+    async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash> {
+        // Encode the call and construct the tx request from scratch — same
+        // explicit-gas pattern as register_with_seal (mempool tip-cap quirk,
+        // 20% gas buffer, submit_lock-serialized broadcast).
+        let gate = self.clone_gate.ok_or_else(|| {
+            anyhow::anyhow!("clone gate not configured (ATTESTOR_CLONE_GATE_ADDR unset)")
+        })?;
+        let call_data = ICloneGate::cloneFromCall {
+            sourceAgentId: params.source_agent_id,
+            to: params.to,
+            dataHashes: params.data_hashes,
+            sealedKeys: params.sealed_keys,
+            newAgentSeal: params.agent_seal,
+            newSealId: params.seal_id,
+            caller: params.caller,
+            authData: params.auth_data,
+        }
+        .abi_encode();
+
+        let mut tx = TransactionRequest::default()
+            .with_from(self.sender)
+            .with_to(gate)
+            .with_input(call_data);
+
+        let gas = self
+            .provider
+            .estimate_gas(&tx)
+            .await
+            .map_err(decode_err)? as u128;
+        let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
+        tx.set_gas_limit(gas_limit);
+        tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
+        tx.set_max_fee_per_gas(self.max_fee_wei);
+
+        tracing::info!(
+            gas_limit,
+            authorizer = %params.authorizer,
+            source = %params.source_agent_id,
+            "alloy: sending cloneFrom (policy-gated mint)"
+        );
+
+        let pending = {
+            let _guard = self.submit_lock.lock().await;
+            self.provider
+                .send_transaction(tx)
+                .await
+                .map_err(decode_err)?
+        };
+        let tx_hash = *pending.tx_hash();
+        tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
+        Ok(tx_hash)
     }
 
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool> {
@@ -369,7 +503,9 @@ where
         provider: Address,
     ) -> anyhow::Result<alloy::primitives::U256> {
         let s = SandboxServing::new(serving, self.provider.clone());
-        Ok(s.getBalance(user, provider).call().await?._0)
+        // Only the spendable balance is consumed here; the contract also
+        // returns (pendingRefund, refundUnlockAt) — see issue #136.
+        Ok(s.getBalance(user, provider).call().await?.balance)
     }
 
     async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String> {
