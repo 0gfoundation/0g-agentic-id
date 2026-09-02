@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
             Vec::new(),
             Vec::new(),
             admin_signer,
+            cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
         ))
     };
 

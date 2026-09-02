@@ -242,6 +242,22 @@ export class AttestorClient {
    * ({action, expires_at, nonce, payload, resource_id}) or the recovered
    * signer won't match.
    */
+  /** Destination provider address (0g-sandbox#93 binding), from the attestor
+   *  /config, cached. '' on failure — the provider accepts unbound envelopes
+   *  while AUTH_STRICT is off, so a flaky /config degrades to legacy. */
+  private providerAddr: string | undefined;
+  private async resolveProviderAddr(): Promise<string> {
+    if (this.providerAddr !== undefined) return this.providerAddr;
+    try {
+      const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+        .then((r) => r.json())) as { sandbox_provider_addr?: string };
+      this.providerAddr = cfg.sandbox_provider_addr ?? '';
+    } catch {
+      this.providerAddr = '';
+    }
+    return this.providerAddr;
+  }
+
   private async signEnvelope(
     action: string,
     resourceId: string,
@@ -249,11 +265,16 @@ export class AttestorClient {
     ttlSec: number,
   ) {
     const { walletClient, account } = requireWallet(this.ctx);
+    // Provider binding (0g-sandbox#93, anti cross-provider replay): inserted
+    // between payload and resource_id (alphabetical), omitted when unknown —
+    // the omitted form keeps the legacy byte layout.
+    const provider = await this.resolveProviderAddr();
     const canonical = JSON.stringify({
       action,
       expires_at: Math.floor(Date.now() / 1000) + ttlSec,
       nonce: randHex(16),
       payload,
+      ...(provider ? { provider } : {}),
       resource_id: resourceId,
     });
     const signature = await walletClient.signMessage({ account, message: canonical });

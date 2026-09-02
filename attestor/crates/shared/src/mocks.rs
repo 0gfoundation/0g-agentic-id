@@ -34,6 +34,7 @@ pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
         expires_at: 9_999_999_999,
         nonce: "00000000000000000000000000000000".into(),
         payload: serde_json::Value::Object(Default::default()),
+        provider: None,
         resource_id: String::new(),
     };
     let msg_bytes = serde_json::to_vec(&canonical).expect("serialize canonical");
