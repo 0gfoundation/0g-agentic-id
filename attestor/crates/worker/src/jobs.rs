@@ -114,7 +114,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     .unwrap_or(false);
                 if transient {
                     let reason = if e.to_string().to_lowercase().contains("balance") {
-                        "insufficient sandbox balance — top up to resume".to_string()
+                        "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then resume".to_string()
                     } else {
                         "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
                     };
@@ -616,7 +616,7 @@ async fn handle_sandbox_recreate(
                 .unwrap_or(false);
             let balance = e.to_string().to_lowercase().contains("balance");
             let reason = if transient && balance {
-                "insufficient sandbox balance — top up, then bring back online".to_string()
+                "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then bring back online".to_string()
             } else if transient {
                 "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
@@ -1614,7 +1614,7 @@ async fn run_container_track(
                 .map(|se| se.is_transient())
                 .unwrap_or(false);
             let reason = if transient && e.to_string().to_lowercase().contains("balance") {
-                "insufficient sandbox balance — top up and deploy again".to_string()
+                "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then deploy again".to_string()
             } else if transient {
                 "sandbox temporarily unavailable — try bring online again in a moment".to_string()
             } else {
