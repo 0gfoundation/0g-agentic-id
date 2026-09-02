@@ -411,6 +411,10 @@ pub struct ConfigurableSandbox {
     pub start_fails: AtomicBool,
     pub stop_fails: AtomicBool,
     pub admin_delete_fails: AtomicBool,
+    /// Fail admin_delete this many times (with fail_error), then succeed —
+    /// exercises the orphan-delete retry (409 clears after the old sandbox
+    /// finishes its state change).
+    pub admin_delete_fail_times: AtomicU64,
     /// When set, create/start fail with this message instead of the generic
     /// "configured to fail" — lets tests inject a specific error such as the
     /// sandbox's 402 "insufficient balance" body.
@@ -434,6 +438,7 @@ impl ConfigurableSandbox {
             start_fails: AtomicBool::new(false),
             stop_fails: AtomicBool::new(false),
             admin_delete_fails: AtomicBool::new(false),
+            admin_delete_fail_times: AtomicU64::new(0),
             fail_msg: Mutex::new(None),
             fail_status: Mutex::new(None),
             create_calls: AtomicU64::new(0),
@@ -528,6 +533,12 @@ impl SandboxClient for ConfigurableSandbox {
         *self.last_admin_delete_id.lock().unwrap() = Some(sandbox_id.to_string());
         if self.admin_delete_fails.load(Ordering::SeqCst) {
             anyhow::bail!("configured to fail");
+        }
+        // Counted transient failures first (see admin_delete_fail_times).
+        let remaining = self.admin_delete_fail_times.load(Ordering::SeqCst);
+        if remaining > 0 {
+            self.admin_delete_fail_times.store(remaining - 1, Ordering::SeqCst);
+            return Err(self.fail_error());
         }
         Ok(())
     }
