@@ -23,6 +23,7 @@
  */
 
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
+import { encodeFunctionData } from 'viem';
 import { RECEIPT_WAIT } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
@@ -127,6 +128,59 @@ export class AgentApi {
         if (e instanceof Error && e.message.includes('sandbox balance')) throw e;
         // provider unknown or read failed — fail open (same backstop)
       }
+    }
+    await this.preflightCanReceiveNfts(who);
+  }
+
+  /**
+   * A wallet carrying an EIP-7702 delegation is code-bearing, so every
+   * safeMint/safeTransfer to it PROBES `onERC721Received` — a delegate that
+   * doesn't answer (the pre-v4 FeedbackBatcher, or any third-party delegate)
+   * makes the mint revert `ERC721InvalidReceiver` minutes later in the
+   * worker, gas spent, with no in-CLI way back. Probe HERE, name the fix.
+   * (feedback.md F13)
+   */
+  private async preflightCanReceiveNfts(who: Address): Promise<void> {
+    let code: string | undefined;
+    try {
+      code = await this.ctx.publicClient.getCode({ address: who });
+    } catch {
+      return; // read failed — fail open, the mint is the backstop
+    }
+    if (!code || code === '0x') return; // plain EOA — always receives
+
+    const SELECTOR_OK = '0x150b7a02'; // onERC721Received magic value
+    let accepts: boolean;
+    try {
+      const res = await this.ctx.publicClient.call({
+        to: who,
+        data: encodeFunctionData({
+          abi: [{
+            type: 'function', name: 'onERC721Received', stateMutability: 'nonpayable',
+            inputs: [
+              { name: 'operator', type: 'address' }, { name: 'from', type: 'address' },
+              { name: 'tokenId', type: 'uint256' }, { name: 'data', type: 'bytes' },
+            ],
+            outputs: [{ name: '', type: 'bytes4' }],
+          }],
+          functionName: 'onERC721Received',
+          args: [who, who, 0n, '0x'],
+        }),
+      });
+      accepts = !!res.data?.startsWith(SELECTOR_OK);
+    } catch (e) {
+      // A REVERT here is exactly what the mint would hit (delegate without
+      // the hook, e.g. the pre-v4 batcher). Transport errors fail open.
+      const s = `${(e as { name?: string }).name ?? ''} ${(e as Error).message ?? ''}`;
+      if (!/revert|CallExecutionError/i.test(s)) return;
+      accepts = false;
+    }
+    if (!accepts) {
+      throw new Error(
+        `wallet ${who} carries a 7702 delegation that rejects NFTs — the mint would revert ERC721InvalidReceiver. ` +
+        'Fix: rate any agent once (the SDK re-delegates to the current batcher, which accepts NFTs), ' +
+        'or clear the delegation with a type-4 tx to the zero address, then retry',
+      );
     }
   }
 
@@ -289,10 +343,29 @@ export class AgentApi {
    * a model picker before deploy.
    */
   async listModels(): Promise<string[]> {
-    const r = await fetch('https://router-api.0g.ai/v1/models');
+    return (await this.listModelCaps()).map((m) => m.id);
+  }
+
+  /**
+   * Models with the capability bits a picker needs: `chat` (a chatbot at all —
+   * the router also lists image/audio models) and `tools` (function calling —
+   * required by tool-driven frameworks; a chat-only model deploys fine and
+   * then fails EVERY turn). 10s timeout: a wedged router must not hang the
+   * deploy wizard.
+   */
+  async listModelCaps(): Promise<Array<{ id: string; chat: boolean; tools: boolean }>> {
+    const r = await fetch('https://router-api.0g.ai/v1/models', { signal: AbortSignal.timeout(10_000) });
     if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
-    const body = (await r.json()) as { data?: Array<{ id?: string }> };
-    return (body.data ?? []).map((m) => m.id).filter((x): x is string => !!x);
+    const body = (await r.json()) as {
+      data?: Array<{ id?: string; type?: string; supported_parameters?: string[] }>;
+    };
+    return (body.data ?? [])
+      .filter((m): m is { id: string; type?: string; supported_parameters?: string[] } => !!m.id)
+      .map((m) => ({
+        id: m.id,
+        chat: (m.type ?? 'chatbot') === 'chatbot',
+        tools: (m.supported_parameters ?? []).includes('tools'),
+      }));
   }
 
   /**

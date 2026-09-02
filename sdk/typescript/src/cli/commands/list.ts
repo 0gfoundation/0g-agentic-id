@@ -18,7 +18,7 @@ import type { CommandContext } from '../types';
 
 /** 0x79f3e987…d91feb — human-mode display form of a 66-char sealId. */
 function shortSeal(s: string): string {
-  return `${s.slice(0, 10)}…${s.slice(-6)}`;
+  return `${s.slice(0, 12)}…${s.slice(-6)}`; // same 0x+10-hex…6 form as the REPL list (review F-D)
 }
 
 /** The deployment phases derive_phase() can produce — the valid --phase values. */

@@ -41,8 +41,26 @@ interface StatusData {
 type Row = Awaited<ReturnType<AgenticID['agent']['listDeployments']>>[number];
 
 export async function run(ctx: CommandContext): Promise<void> {
-  const ref = parseAgentRef(ctx.positionals[0]);
+  let ref = parseAgentRef(ctx.positionals[0]);
   const ag = await buildClient(ctx.env);
+
+  // A truncated sealId (as printed by `list`) resolves against the listing —
+  // unique prefix or bust.
+  if (ref.kind === 'sealPrefix') {
+    const prefix = ref.prefix;
+    const rows = await ag.agent.listDeployments();
+    const hits = rows.filter((r) => r.sealId?.toLowerCase().startsWith(prefix));
+    if (hits.length !== 1) {
+      throw new CliError(
+        hits.length ? 'BAD_AGENT_REF' : 'AGENT_NOT_FOUND',
+        hits.length
+          ? `"${ctx.positionals[0]}" matches ${hits.length} agents — add more hex chars`
+          : `no agent matching ${ctx.positionals[0]} on this attestor`,
+        { remedy: '0g-agenticid list   # to discover existing agents' },
+      );
+    }
+    ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
+  }
 
   // — resolve the coordinate pair (either direction) —
   let agentId: bigint | null = null;

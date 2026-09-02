@@ -23,7 +23,7 @@ import { saveProof, listProofs, removeProof, toServeProof, type SavedProof } fro
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
-import { parseAgentRef } from '../ref';
+import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
@@ -31,6 +31,10 @@ import { pandaLines, svgPixelLines } from '../logo';
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
+
+// The live readline interface — askSecret scrubs submitted secrets out of
+// its history (display masking alone leaves the plaintext one ↑ away).
+let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -191,7 +195,13 @@ export async function run(ctx: CommandContext): Promise<void> {
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
-    terminal: true,
+    // TTY features only on an actual TTY. Hardcoding true broke every piped
+    // use at once: readline echoed raw input back to stdout (INCLUDING the
+    // login private key — the exact leak the no---private-key-flag rule
+    // exists to prevent), emitted cursor control sequences that NO_COLOR
+    // can't suppress, and its line editor raced the async banner for early
+    // input. (feedback.md F11/F6/F5)
+    terminal: process.stdin.isTTY === true && process.stdout.isTTY === true,
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
@@ -201,7 +211,40 @@ export async function run(ctx: CommandContext): Promise<void> {
       return [hits.length ? hits : activeCompletions, line];
     },
   });
-  const ask = (q: string): Promise<string> => new Promise((res) => rl.question(q, res));
+  // `ask` is a line QUEUE, not rl.question: lines that arrive while no
+  // question is pending (piped input racing the ~4s async banner) used to be
+  // consumed by readline with no listener and silently dropped — commands
+  // vanished with exit 0 (feedback.md F5). Buffer them instead.
+  const pendingLines: string[] = [];
+  const waiters: Array<{ res: (s: string) => void; rej: (e: Error) => void }> = [];
+  rl.on('line', (l) => {
+    const w = waiters.shift();
+    if (w) w.res(l);
+    else pendingLines.push(l);
+  });
+  activeRl = rl;
+  let stdinClosed = false;
+  rl.on('close', () => {
+    // EOF while a question is pending — surface the same code rl.question
+    // would, which run() already treats as a normal way to leave.
+    stdinClosed = true;
+    for (const w of waiters.splice(0)) {
+      w.rej(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+  });
+  const ask = (q: string): Promise<string> => {
+    const buffered = pendingLines.shift();
+    if (buffered !== undefined) {
+      out(`${q}${buffered}\n`); // keep the transcript readable in pipes/logs
+      return Promise.resolve(buffered);
+    }
+    if (stdinClosed) {
+      return Promise.reject(Object.assign(new Error('stdin closed'), { code: 'ERR_USE_AFTER_CLOSE' }));
+    }
+    rl.setPrompt(q);
+    rl.prompt();
+    return new Promise((res, rej) => waiters.push({ res, rej }));
+  };
   const irq: Interrupt = { streaming: null };
 
   let lastSigint = 0;
@@ -221,6 +264,10 @@ export async function run(ctx: CommandContext): Promise<void> {
   try {
     // Shortcut: `0g-agenticid <agent>` links straight into L2, then drops to L1.
     if (ctx.positionals[0]) {
+      // Validate the argument BEFORE demanding a wallet: a typo'd agent ref
+      // must exit 2 (BAD_AGENT_REF) per the --help EXIT CODES contract, not
+      // masquerade as a missing-wallet error. (feedback.md F1)
+      parseAgentRef(ctx.positionals[0]);
       const ag = await withWallet(ctx);
       const s = await attach(ag, requireAttestorUrl(ctx.env), ctx.positionals[0], ask);
       await sessionRepl(s, ask, irq, ctx);
@@ -240,14 +287,12 @@ export async function run(ctx: CommandContext): Promise<void> {
 async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
-  const row = rows.find((r) =>
-    ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+  const row = pickRow(ref, refInput, rows);
   if (!row) {
     // Say WHICH of the two things went wrong: the agent doesn't exist here,
     // or it exists but belongs to another wallet (owner-only action).
     const pub = await ag.agent.listDeployments().catch(() => []);
-    const exists = pub.some((r) =>
-      ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+    const exists = !!pickRow(ref, refInput, pub);
     throw new CliError(
       'AGENT_NOT_FOUND',
       exists
@@ -341,8 +386,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
   out('\n');
-  if (!ctx.env.attestorUrl || !key || !hasApiKey) {
+  if (!ctx.env.attestorUrl || !key) {
     out('  first run? type `login` — one guided setup for the attestor + keys\n\n');
+  } else if (!hasApiKey) {
+    // API key is only needed for deploy/reset — don't re-onboard a
+    // configured user over an optional item (feedback.md F8).
+    out('  `help` commands · `use <id>` chat · (no inference API key — `login` adds one when you deploy)\n\n');
   } else {
     out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
@@ -474,6 +523,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             const d = await (await withWallet(ctx)).getBalanceDetail();
             out(`balance : ${og(d.balance)} prepaid${d.pendingRefund > 0n ? ` (+${og(d.pendingRefund)} pending refund)` : ''}\n`);
           } catch { /* serving not configured — skip the line */ }
+        } else {
+          // Degrade like the other lines instead of silently omitting the
+          // fourth one (feedback.md F7).
+          out(`ack     : ${key ? '(needs an attestor URL — run `login`)' : '(needs a wallet — run `login`)'}\n`);
         }
         continue;
       }
@@ -517,12 +570,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!rows.length) { out('no agents on this attestor\n'); continue; }
         for (const r of rows) {
           const owned = mySeals?.has(r.sealId) ? '*' : ' ';
-          // Minted rows: short sealId (agentId is the working handle). Unminted
-          // rows ('?'): FULL sealId — it is the only handle commands accept.
-          const seal = r.agentId != null ? `${r.sealId.slice(0, 8)}…${r.sealId.slice(-6)}` : r.sealId;
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(17)} ${r.name ?? ''}\n`);
+          // Everyone gets the short form — commands accept a unique sealId
+          // PREFIX, so unminted rows ('?') stay referenceable without a
+          // 66-char column blowout. (feedback.md F12)
+          const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${r.name ?? ''}\n`);
         }
         if (mySeals) out('(* = owned by your wallet)\n');
+        if (rows.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + rows.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
         continue;
       }
 
@@ -685,8 +740,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await clientFor(ctx, false);
         const ref = parseAgentRef(args[0]);
         const rows = await ag.agent.listDeployments();
-        const row = rows.find((r) =>
-          ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+        const row = pickRow(ref, args[0], rows);
         if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
         // With a wallet configured, declare it as the proof's redeemer so this
@@ -966,12 +1020,29 @@ async function helloWithTicket(
   return callAgentWithTicket(ag, url, '/hello', 'GET', undefined, clientAddr);
 }
 
-/** Public-listing row for an agentId/sealId reference, or undefined. */
+/** Public-listing row for an agentId/sealId(/unique-prefix) reference, or undefined. */
 async function findAgentRow(ag: AgenticID, refInput: string): Promise<Awaited<ReturnType<AgenticID['agent']['listDeployments']>>[number] | undefined> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
-  return rows.find((r) =>
-    ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId);
+  return pickRow(ref, refInput, rows);
+}
+
+/** Match rows against a ref; a sealId PREFIX must be unique (ambiguity throws). */
+function pickRow<T extends { agentId?: unknown; sealId?: string }>(
+  ref: AgentRef,
+  refInput: string,
+  rows: T[],
+): T | undefined {
+  const hits = rows.filter((r) =>
+    ref.kind === 'agentId'
+      ? String(r.agentId ?? '') === String(ref.agentId)
+      : !!r.sealId && refMatchesSeal(ref, r.sealId));
+  if (ref.kind === 'sealPrefix' && hits.length > 1) {
+    throw new CliError('BAD_AGENT_REF', `"${refInput}" matches ${hits.length} agents — add more hex chars`, {
+      remedy: 'use `list` and copy a longer prefix (or the full sealId)',
+    });
+  }
+  return hits[0];
 }
 
 /** The agent's registered service table (from its /hello; empty on failure). */
@@ -1059,6 +1130,15 @@ function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise
     void ask(prompt).then(
       (ans) => {
         stdout.write = orig;
+        // Masking only covers the SCREEN — readline also recorded the line in
+        // its history, where ↑ at any later prompt replays the secret in
+        // plaintext. Scrub every matching entry.
+        const hist = (activeRl as unknown as { history?: string[] } | null)?.history;
+        if (hist && ans) {
+          for (let i = hist.length - 1; i >= 0; i--) {
+            if (hist[i] === ans) hist.splice(i, 1);
+          }
+        }
         process.stdout.write('\n');
         res(ans);
       },
@@ -1124,7 +1204,9 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
 }
 
 async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string) => Promise<string>, ctx: CommandContext, irq: Interrupt): Promise<Session | null> {
-  const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
+  const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
+    .then((r) => r.json())
+    .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   let framework = 'openclaw';
   if (fws.length) {
@@ -1136,8 +1218,18 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
     framework = !raw ? fws[di] : Number.isInteger(i) && fws[i] ? fws[i] : fws.includes(raw) ? raw : fws[di];
   }
 
-  const all = await ag.agent.listModels();
-  const models = framework === 'hermes' ? all.filter((m) => !m.startsWith('claude')) : all;
+  // Only offer models the chosen framework can actually run: chatbots only
+  // (the router also lists image/audio models), and function-calling models
+  // for the tool-driven frameworks — a chat-only model deploys "successfully"
+  // and then fails EVERY turn, with no way to fix it in-CLI (feedback.md F14).
+  const NEEDS_TOOLS = new Set(['openclaw', 'dsh', 'prime-agent']);
+  const caps = await ag.agent.listModelCaps();
+  const models = caps
+    .filter((m) => m.chat)
+    .filter((m) => !NEEDS_TOOLS.has(framework) || m.tools)
+    .map((m) => m.id)
+    .filter((m) => framework !== 'hermes' || !m.startsWith('claude'));
+  if (!models.length) throw new CliError('UNKNOWN', `no compatible models advertised for ${framework}`, { remedy: 'try again later, or another framework' });
   out('\nmodels:\n');
   models.forEach((m, i) => out(`  ${i}. ${m}\n`));
   const model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
@@ -1170,9 +1262,8 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
-  const row = rows.find((r: { agentId?: unknown; sealId?: string }) =>
-    ref.kind === 'agentId' ? String(r.agentId ?? '') === String(ref.agentId) : r.sealId === ref.sealId,
-  ) as { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null } | undefined;
+  const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
+    { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null } | undefined;
   if (!row) {
     throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
       remedy: 'use `list` to see the agents this wallet owns here',
@@ -1250,7 +1341,9 @@ async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Prom
 /** Numbered framework picker from /config — the user chooses; never guess.
  *  (The attestor exposes no framework name post-mint.) */
 async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<string>, current?: string): Promise<string> {
-  const cfg = (await (await fetch(`${attestorUrl}/config`)).json().catch(() => ({}))) as { frameworks?: { name: string }[] };
+  const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
+    .then((r) => r.json())
+    .catch(() => ({}))) as { frameworks?: { name: string }[] };
   const fws = (cfg.frameworks ?? []).map((f) => f.name);
   if (!fws.length) return current ?? 'openclaw';
   const di = Math.max(0, current ? fws.indexOf(current) : 0);
@@ -1284,13 +1377,21 @@ const L2_HELP_FULL = `session commands
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
   out(`\nagent ${s.agentId} session — ${s.phase} · type to chat · Tab completes /commands · /help for details\n`);
-  // Low-gas heads-up on entry: advisory, so it must not block the prompt
-  // (3-4 chain reads). Runs in the background and only speaks up when low.
-  void s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
-    if (rc.sealGasWei < parseEther('0.005')) {
-      out(`\n⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
-    }
-  }).catch(() => { /* advisory only */ });
+  // Low-gas heads-up WITH the entry card. It used to run detached and could
+  // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
+  // for it, but bounded: advisory reads must not hold the prompt hostage.
+  // A losing (slow) read must NOT print later mid-turn — that's the original
+  // F17 symptom through the back door (review F-A): gate on a window flag.
+  let advisoryWindowOpen = true;
+  await Promise.race([
+    s.ag.agent.runtimeCosts(BigInt(s.agentId)).then((rc) => {
+      if (advisoryWindowOpen && rc.sealGasWei < parseEther('0.005')) {
+        out(`⚠ agentSeal gas is ${og(rc.sealGasWei)} — evolution commits may fail; fund with /topup [og]\n`);
+      }
+    }),
+    new Promise<void>((r) => setTimeout(r, 2500).unref()),
+  ]).catch(() => { /* advisory only */ });
+  advisoryWindowOpen = false;
   const messages: ChatMessage[] = [];
   for (;;) {
     activeCompletions = L2_WORDS;
@@ -1312,7 +1413,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
 
     try {
       if (line === '/hello') {
-        if (!s.url) { out(`agent is ${s.phase} — /start or /reset first\n`); continue; }
+        if (s.phase !== 'running' || !s.url) { out(`agent is ${s.phase} — not reachable; /start or /reset first\n`); continue; }
         await showHello(s.ag, s.url);
         continue;
       }
@@ -1340,13 +1441,31 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         const amt = line.split(/\s+/)[1] || (await ask('  amount OG [0.1]: ')).trim() || '0.1';
         const tx = await s.ag.agent.topUpAgentSeal(s.agentSeal, parseEther(amt));
-        out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx}\n`);
+        out(`topUpAgentSeal(${s.agentSeal}, ${amt} OG) → ${tx} (waiting…)\n`);
+        // Parity with L1 `deposit`: return only once the chain agrees, so an
+        // immediate /balance shows the new number (feedback.md S2).
+        await s.ag.agent.waitForTransaction(tx);
+        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId)).catch(() => null);
+        out(rc ? `confirmed — agentSeal gas now ${og(rc.sealGasWei)}\n` : 'confirmed\n');
         continue;
       }
       if (line === '/stop') {
         if (s.phase !== 'running' || !s.sandboxId) { out(`agent is ${s.phase} — nothing to stop\n`); continue; }
         out('stopping…\n'); await s.ag.agent.stop(s.sealId, s.sandboxId);
         s.phase = 'stopped'; s.url = undefined; s.client = undefined;
+        // Stop is async server-side: until the attestor row flips, the
+        // loop-top auto-refresh would happily reconnect to the dying
+        // container (typed text then "chats" into the void) and a bare-Enter
+        // refresh would contradict the 'stopped.' we just printed
+        // (feedback.md F16/F17). Wait for the row, bounded.
+        const deadline = Date.now() + 45_000;
+        while (Date.now() < deadline) {
+          try {
+            const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as { phase?: string };
+            if (d.phase && d.phase !== 'running') { s.phase = d.phase; break; }
+          } catch { /* transient — keep waiting */ }
+          await new Promise((r) => setTimeout(r, 2000));
+        }
         out('stopped. /start brings it back.\n');
         continue;
       }
@@ -1382,8 +1501,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!s.url) { try { await refreshSession(s); } catch { /* gate below reports */ } }
         if (!s.url) { out(`no container yet (${s.phase}) — nothing to read; /start or /reset creates one\n`); continue; }
         const n = Number(line.split(/\s+/)[1]) || 200;
-        const res = await fetch(`${s.url}/log`);
-        out(res.ok ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n` : `/log → HTTP ${res.status}\n`);
+        const res = await fetch(`${s.url}/log`, { signal: AbortSignal.timeout(10_000) });
+        out(res.ok
+          ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n`
+          : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);
         continue;
       }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
@@ -1406,12 +1527,36 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
+      // Tool-activity status line: an agent turn spends most of its time in
+      // tools with zero output — narrate it (the dsh bridge streams
+      // ": activity tool/call <name>" SSE comments). Transient: rendered on
+      // the current line, erased by the next delta. TTY only — pipes get the
+      // clean payload.
+      let activityShown = false;
+      let sawToolActivity = false;
+      const clearActivity = (): void => {
+        if (activityShown) { out('\r\x1b[2K'); activityShown = false; }
+      };
+      const onActivity = process.stdout.isTTY
+        ? (label: string): void => {
+            if (label.startsWith('tool/')) sawToolActivity = true;
+            if (label.startsWith('turn/end')) { clearActivity(); return; }
+            // Never overwrite the agent's own partial line — break to a fresh
+            // one first (the visual break marks where the tool ran).
+            if (!activityShown && reply && !reply.endsWith('\n')) out('\n');
+            out(`\r\x1b[2K  ⚙ ${label}…`);
+            activityShown = true;
+          }
+        : undefined;
       try {
-        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal };
+        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal, ...(onActivity ? { onActivity } : {}) };
         for await (const delta of s.client.chatStream(messages, opts)) {
+          clearActivity();
           out(delta); reply += delta;
         }
+        clearActivity();
       } catch (e) {
+        clearActivity();
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
           out('\n(interrupted)');
@@ -1426,6 +1571,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         s.framework = await pickFramework(s.attestorUrl, ask);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
+      }
+      // A turn that ran tools but produced no text is WORK, not failure —
+      // dsh agents legitimately end tool-only turns silently. Say what
+      // happened instead of crying wolf (the true-failure path — no deltas,
+      // no activity — still reports as an error).
+      if (failure && sawToolActivity && /without any output/.test(failure)) {
+        out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
+        failure = null;
       }
       if (failure) out(`\n(chat failed: ${failure})`);
       out('\n');
