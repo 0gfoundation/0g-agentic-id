@@ -260,7 +260,7 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |
 | SandboxServing (attestor infra, external) | `0x3490B9053AC46F7Bf71A1ceBffcB2be2C1405b41` | from attestor `GET /config` |
-| owner / pauser / oracle / deployer | `0xea695C312CE119dE347425B29AFf85371c9d1837` | |
+| owner / pauser (all contracts) | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` | migrated 2026-09-07 from `0xea69…1837`; Timelock proposer + canceller + admin also = `0x7344…431b` (fully migrated). `0xea69…1837` remains the oracle/deployer of record |
 
 TappRegistry / SandboxServing are attestor-deployment infrastructure (external
 contracts the attestor is configured with, **not** deployed by this repo's
@@ -296,8 +296,8 @@ owner `0xB831…`.
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | |
-| owner / pauser / oracle / deployer | `0xB831371eb2703305f1d9F8542163633D0675CEd7` | |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + admin = `0x7344…431b` (2026-09-07); canceller migration pending — still `0xB831…CEd7` |
+| owner / pauser (all contracts) | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` | migrated 2026-09-07 from `0xB831…CEd7` (deployer/oracle history) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
 in this repo (they're attestor-deployment infra, configured via
