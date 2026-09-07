@@ -38,6 +38,18 @@ let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
+
+/** Build a container URL from a sandbox id + proxy host, matching the
+ *  attestor's build_agent_url scheme rule: a bare host (a TLS domain like
+ *  art.0g.ai) is https; a host:port (dev IP behind plain-HTTP nginx) is
+ *  http. Writing http:// for a bare domain hits :80, which prod nginx
+ *  doesn't serve — "running but unreachable". Only used as a fallback when
+ *  the attestor didn't hand back a `url`. */
+function containerUrl(sandboxId: string, proxy: string): string {
+  return proxy.includes(':')
+    ? `http://8080-${sandboxId}.${proxy}`
+    : `https://8080-${sandboxId}.${proxy}`;
+}
 const og = (wei: bigint | null | undefined): string => (wei == null ? 'n/a' : `${(Number(wei) / 1e18).toFixed(6)} OG`);
 const out = (s: string): void => void process.stdout.write(s);
 
@@ -100,7 +112,7 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
   };
   s.phase = d.phase ?? s.phase;
   const proxy = await proxyAddrOf(s.attestorUrl);
-  const url = d.url ?? (d.sandbox_id && proxy ? `http://8080-${d.sandbox_id}.${proxy}` : undefined);
+  const url = d.url ?? (d.sandbox_id && proxy ? containerUrl(d.sandbox_id, proxy) : undefined);
   if (s.phase === 'running' && url) {
     if (!s.client || s.url !== url) await connectSession(s, url);
   } else {
@@ -139,7 +151,7 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       };
       lastPhase = d.phase ?? lastPhase;
       if (lastPhase !== lastShown) { out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
-      const url = d.url ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? `http://8080-${d.sandbox_id}.${cfg.sandbox_proxy_addr}` : undefined);
+      const url = d.url ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
       if (d.phase === 'running' && url) return { url };
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
       if (d.phase === 'failed' || reason) {
