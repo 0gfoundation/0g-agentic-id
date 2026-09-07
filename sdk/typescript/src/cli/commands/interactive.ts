@@ -108,11 +108,16 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
   const before = s.phase;
   const d = (await (await fetch(`${s.attestorUrl}/deployment/${s.sealId}`)).json()) as {
     phase?: string; url?: string; sandbox_id?: string;
+    agent_card?: { url?: string };
     container_stage?: { state?: string; reason?: string };
   };
   s.phase = d.phase ?? s.phase;
   const proxy = await proxyAddrOf(s.attestorUrl);
-  const url = d.url ?? (d.sandbox_id && proxy ? containerUrl(d.sandbox_id, proxy) : undefined);
+  // Prefer the attestor's own URL; some builds leave the top-level `url`
+  // empty but fill agent_card.url (already the correct https base) — use
+  // that (stripping the /hello path) before falling back to self-assembly.
+  const cardBase = d.agent_card?.url?.replace(/\/hello$/, '');
+  const url = d.url ?? cardBase ?? (d.sandbox_id && proxy ? containerUrl(d.sandbox_id, proxy) : undefined);
   if (s.phase === 'running' && url) {
     if (!s.client || s.url !== url) await connectSession(s, url);
   } else {
@@ -147,11 +152,13 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
     try {
       const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
         phase?: string; url?: string; sandbox_id?: string;
+        agent_card?: { url?: string };
         container_stage?: { state?: string; reason?: string };
       };
       lastPhase = d.phase ?? lastPhase;
       if (lastPhase !== lastShown) { out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
-      const url = d.url ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
+      const cardBase = d.agent_card?.url?.replace(/\/hello$/, '');
+      const url = d.url ?? cardBase ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
       if (d.phase === 'running' && url) return { url };
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
       if (d.phase === 'failed' || reason) {
