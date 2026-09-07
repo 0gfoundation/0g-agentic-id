@@ -248,6 +248,14 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` | |
+| **VerifiedFeedback proxy** | `0xc0C902666078774435429d1fdEB5B1b17D95D583` | **1.1.0** (deployed 2026-09-07 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
+| VerifiedFeedback impl | `0x8BD29e2eb59116214b1d932AC071a07173339c8F` | |
+| VerifiedFeedback beacon | `0x8A3E9C65c017CA21618639F48438413CB641abFa` | |
+| **CloneGate proxy** | `0xACcDcC5A6569AB25aA144ccCFdDB882fEaDaBb89` | **1.0.1** (deployed 2026-09-07 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor) |
+| CloneGate impl | `0xf9664c7135776251670ecE9A38Ca9B48f75dBcF3` | |
+| CloneGate beacon | `0x6e0291f3d104D37B405872e692C5d2652C548F0B` | |
+| StandardCloneAuthorizer | `0x013a65AEA5BE739a4BfbD2B368863ABa6FB98e6E` | official stock clone policy (immutable, no proxy) |
+| FeedbackBatcher (EIP-7702 delegate, stateless — no beacon) | `0x1869B3EFd3C61d96832B4E78d6c5F848fc56ac1a` | v4 (onERC721Received; deployed 2026-09-07) |
 | TimelockController | `0x111b6c32fb3e04AC6ec2E1B38E7CC8e6fCa787F9` | |
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |
@@ -327,8 +335,8 @@ beacon upgrade and was verified post-upgrade — see changelog):
 | AgenticID | **1.1.0** | **1.1.0** |
 | TEEDataVerifier | **1.1.0** | **1.1.0** |
 | AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
-| VerifiedFeedbackRegistry | **1.1.0** | — (not deployed) |
-| CloneGate | **1.0.1** | — (not deployed) |
+| VerifiedFeedbackRegistry | **1.1.0** | **1.1.0** (2026-09-07) |
+| CloneGate | **1.0.1** | **1.0.1** (2026-09-07) |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
