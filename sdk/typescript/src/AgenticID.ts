@@ -1006,6 +1006,13 @@ export class AgenticID {
   getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     return this.infra.getBalanceDetail(opts?.user, opts?.provider);
   }
+  /** The caller wallet's NATIVE gas balance (wei) — the funds that pay tx
+   *  fees AND back a deposit's principal. A prepaid top-up can't exceed it. */
+  async nativeBalance(address?: Address): Promise<bigint> {
+    const who = address ?? this.ctx.account?.address;
+    if (!who) throw new Error('nativeBalance: no address and no connected account');
+    return this.ctx.publicClient.getBalance({ address: who });
+  }
   /**
    * The EFFECTIVE spendable balance from the sandbox provider (owner-signed):
    * on-chain balance minus in-flight reservations minus outstanding off-chain
