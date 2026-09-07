@@ -1236,10 +1236,25 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     } else {
       out(`prepaid sandbox balance is ${og(bal)} — deploy/run needs ≥ 0.1 OG.\n`);
     }
-    const suggest = eff && eff.availableWei < parseEther('0.1')
-      ? Math.max(1, Number(parseEther('0.1') - eff.availableWei) / 1e18 + 1).toFixed(1)
-      : '1';
-    const amt = (await ask(`deposit how much OG now? [${suggest}, empty to cancel]: `)).trim() || suggest;
+    // What the wallet can actually afford: native balance minus a gas
+    // reserve. A deposit's principal + fee both come out of native, so
+    // suggesting more than this guarantees an "insufficient funds" revert.
+    const native = await ag.nativeBalance().catch(() => null);
+    const shortfallWei = parseEther('0.1') - (bal < 0n ? 0n : bal);
+    const GAS_RESERVE = parseEther('0.05');
+    const affordableWei = native != null && native > GAS_RESERVE ? native - GAS_RESERVE : 0n;
+    if (native != null && affordableWei < shortfallWei) {
+      out(`wallet has only ${og(native)} native gas — not enough to cover a ${og(shortfallWei)} deposit plus fees. Fund the wallet, or use one with more OG.\n`);
+      return false;
+    }
+    // Suggest the shortfall (no arbitrary padding), capped at what's affordable.
+    let suggestWei = shortfallWei > 0n ? shortfallWei : parseEther('0.1');
+    if (affordableWei > 0n && suggestWei > affordableWei) suggestWei = affordableWei;
+    const suggest = og(suggestWei).replace(/ OG$/, '');
+    // Empty = cancel (as the prompt says). To deposit the suggested amount,
+    // the user types it — no silent default that contradicts "empty to cancel".
+    const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
+    if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
     if (!(await ask(`deposit ${amt} OG? [Y/n]: `)).trim().toLowerCase().startsWith('n')) {
       const tx = await ag.deposit({ amountWei: parseEther(amt) });
       out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
