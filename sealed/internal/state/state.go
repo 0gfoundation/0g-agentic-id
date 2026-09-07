@@ -113,7 +113,7 @@ func New() *Agent {
 func (a *Agent) Snapshot() (priv []byte, upstream, sealID, owner string, dataHashes map[string]DimHashes) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.agentSealPriv, a.upstreamURL, a.sealID, a.owner, a.currentMapLocked()
+	return append([]byte(nil), a.agentSealPriv...), a.upstreamURL, a.sealID, a.owner, a.currentMapLocked()
 }
 
 // Phase returns the current lifecycle phase.
@@ -139,7 +139,7 @@ func (a *Agent) SetPhase(p Phase) {
 func (a *Agent) Set(priv []byte, upstream, sealID, owner, agentID, frameworkHash, chainID, identityAddr string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.agentSealPriv = priv
+	a.agentSealPriv = append([]byte(nil), priv...)
 	a.upstreamURL = upstream
 	a.sealID = sealID
 	a.owner = owner
