@@ -296,7 +296,7 @@ owner `0xB831…`.
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + admin = `0x7344…431b` (2026-09-07); canceller migration pending — still `0xB831…CEd7` |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x7344…431b` (fully migrated 2026-09-07; verified on chainscan) |
 | owner / pauser (all contracts) | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` | migrated 2026-09-07 from `0xB831…CEd7` (deployer/oracle history) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
