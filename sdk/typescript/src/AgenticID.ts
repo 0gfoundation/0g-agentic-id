@@ -24,7 +24,7 @@
 
 import type { Address, Hash, TransactionReceipt, WriteContractReturnType } from 'viem';
 import { encodeFunctionData } from 'viem';
-import { RECEIPT_WAIT } from './constants';
+import { RECEIPT_WAIT, ZERO_G_TESTNET, ZERO_G_MAINNET } from './constants';
 import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
@@ -956,10 +956,23 @@ export class AgenticID {
     const Z = '0x0000000000000000000000000000000000000000' as Address;
     const addr = (v: string | undefined): Address => (v && v.length === 42 ? (v as Address) : Z);
     const { overrides, ...rest } = opts ?? {};
+    // The signing chain MUST match what the attestor targets, or every tx is
+    // signed with the wrong chainId and the node rejects it ("have X want Y").
+    // Derive the viem chain from /config.chain_id — without this the SDK fell
+    // back to the hardcoded testnet default (16602), so a mainnet attestor's
+    // RPC got testnet-signed txs.
+    const cfgChainId = cfg.chain_id ? Number(cfg.chain_id) : undefined;
+    const chainFromCfg = rest.chain
+      ?? (cfgChainId === ZERO_G_MAINNET.id ? (ZERO_G_MAINNET as unknown as import('viem').Chain)
+        : cfgChainId === ZERO_G_TESTNET.id ? (ZERO_G_TESTNET as unknown as import('viem').Chain)
+        : cfgChainId != null
+          ? ({ id: cfgChainId, name: `chain-${cfgChainId}`, nativeCurrency: { name: '0G', symbol: '0G', decimals: 18 }, rpcUrls: { default: { http: [cfg.chain_rpc ?? ''] } } } as unknown as import('viem').Chain)
+          : undefined);
     return new AgenticID({
       ...rest,
       attestorUrl: base,
       rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
+      ...(chainFromCfg ? { chain: chainFromCfg } : {}),
       addresses: {
         agenticID: addr(cfg.agentic_id_addr),
         verifiedFeedback: addr(cfg.verified_feedback_addr),

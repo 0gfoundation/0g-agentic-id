@@ -305,6 +305,30 @@ in this repo (they're attestor-deployment infra, configured via
 from the dev-host attestor's `GET /config` (`tapp_registry_addr` /
 `sandbox_serving_addr`).
 
+### 6.2m mainnet environment — 2026-09-09 (0G mainnet, chain 16661)
+
+Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). Governance
+mirrors testnet: owner / pauser / proposer / TEE-oracle = `0x7344…431b`,
+Timelock `minDelay=0`, open execution. **The mainnet checklist (§8) is NOT
+yet satisfied — multisig owner, non-zero delay, and a real TEE oracle are
+follow-ups before this carries real user value.**
+
+| Contract | Address |
+|---|---|
+| AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0) |
+| AgenticID impl / beacon | `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817` / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
+| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`) |
+| VerifiedFeedback impl / beacon | `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31` / `0x1C23A210806568bf0815c3289E56719325c36827` |
+| CloneGate proxy | `0x1d33086b367a9dF4b4f4d7A29b35fC1187380303` (1.0.1; allowlisted via addTrustedAttestor) |
+| CloneGate impl / beacon | `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29` / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
+| StandardCloneAuthorizer | `0xEa7C23874a7530C9dd42c6C2CDAa52Eab0E19FF9` |
+| FeedbackBatcher (no beacon) | `0x8FbB46AeDc21e1f5CD853d014F47642Fa65d80B8` (v4) |
+| TEEDataVerifier proxy | `0x6867b17d0092E8d497D1b5110484138285E4D1B2` (1.1.0) |
+| TEEDataVerifier impl / beacon | `0x6D82f34CD671E4593A7E3BCDa253B23a2722403a` / `0xf74242B94dc958c3973Eb3e6219435c5956563fC` |
+| TimelockController | `0x399ab112B03104f20524Df0f9a4A2F0C199A0cF7` |
+| Canonical ERC-8004 identity / reputation | `0x8004A169…a432` / `0x8004BAa1…9b63` (v2.0.0, pre-existing) |
+| owner / pauser / proposer / TEE-oracle | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` |
+
 ### 6.3 Superseded / do not use
 
 - **Pre-canonical-binding self-implemented** (old self-implemented AgenticID, not

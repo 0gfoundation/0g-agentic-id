@@ -21,8 +21,8 @@ export const ZERO_G_TESTNET = {
 
 /**
  * 0G mainnet chain definition — a viem `Chain` (values match viem's
- * `zeroGMainnet`). NOTE: AgenticID is testnet-only today — no mainnet contract
- * deployment exists yet; this is here for when the protocol goes to mainnet.
+ * `zeroGMainnet`). AgenticID is now deployed on mainnet too (chain 16661);
+ * fromAttestor selects this automatically from /config.chain_id.
  */
 export const ZERO_G_MAINNET = {
   id: 16661,
