@@ -1297,18 +1297,28 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 
   const name = (await ask(`name [chat-${framework}]: `)).trim() || `chat-${framework}`;
 
-  const apiKey = await inferenceKey(ctx, ask);
-  if (!(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
-  out(`\ndeploying ${name} (${framework} · ${model})…\n`);
+  // Mint-only: register the agent on chain without spinning up (or paying
+  // for) a container. It lands Offline; `reset`/`start` brings it online
+  // later. The prepaid-balance gate and the inference key only matter when a
+  // container is actually provisioned, so skip both in mint-only mode.
+  const provision = !(await ask('bring it online now (start a container)? [Y/n]: ')).trim().toLowerCase().startsWith('n');
+
+  const apiKey = provision ? await inferenceKey(ctx, ask) : undefined;
+  if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
+  out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
   const dep = await ag.agent.deploy({
     name,
     description: 'deployed from 0g-agenticid',
     framework,
     inference: { provider: '0g-compute', model },
-    sandbox: { apiKey },
+    ...(provision ? { sandbox: { apiKey: apiKey! } } : {}),
   });
   const mint = await ag.agent.waitForMint(dep.sealId, { timeoutMs: 180000 });
   const agentId = String((mint as { agentId?: unknown }).agentId ?? mint);
+  if (!provision) {
+    out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
+    return null;
+  }
   out(`minted agentId ${agentId} — waiting for the container (can take minutes; Esc stops waiting, not the deploy)…\n`);
   const r = await waitRunningInterruptible(irq, attestorUrl, dep.sealId, agentId);
   if (!r) return null; // Esc: the attestor keeps deploying — only the wait ends
