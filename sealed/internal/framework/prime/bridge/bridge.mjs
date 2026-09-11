@@ -346,7 +346,19 @@ async function runTurn(session, text, onDelta, onActivity) {
 		if (line && onActivity) onActivity(line, event.type);
 	});
 	try {
-		await session.prompt(text);
+		// streamingBehavior is REQUIRED by prime whenever a turn may already be
+		// in flight (the SDK rejects an un-annotated prompt with "Agent is
+		// already processing"). Our own serialize() chain can still race prime's
+		// server-side turn state — e.g. a prior turn aborted/truncated on the
+		// client but is still running in prime — so always annotate. "followUp"
+		// queues behind the running turn (don't drop the owner's message, don't
+		// interrupt work in progress); queueIfBusy/resumeIfIdle make the enqueue
+		// robust whether prime is mid-turn or idle-with-backlog.
+		await session.prompt(text, {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+		});
 	} finally {
 		// subscribe() may return an unsubscribe function or nothing; tolerate both
 		// so a stale listener can't leak deltas into the next turn.
