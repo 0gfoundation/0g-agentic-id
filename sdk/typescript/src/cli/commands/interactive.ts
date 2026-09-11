@@ -465,12 +465,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
         // The provider's EFFECTIVE view — debt accrues off-chain between
         // settlements, so the chain number alone can be badly optimistic.
-        const eff = await ag.getEffectiveBalance().catch(() => null);
+        // A failed lookup must NOT be silent: "nothing owed" and "couldn't
+        // check" are different answers, and hiding the latter cost a debug
+        // session once already.
+        let effErr: string | null = null;
+        const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
         if (eff && eff.availableWei < eff.balanceWei) {
           if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
           if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
           if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
           out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+        } else if (eff) {
+          out(`available       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+        } else {
+          out(`available       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — chain number above may be optimistic)\n`);
         }
         if (detail && detail.pendingRefund > 0n) {
           out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
