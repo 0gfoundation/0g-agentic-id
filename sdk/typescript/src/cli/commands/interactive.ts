@@ -1490,10 +1490,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (line === '/balance') {
         // Agent-focused: this agent's own evolution-gas (agentSeal) balance,
-        // with the account-level prepaid alongside for context.
-        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
+        // with the account-level prepaid alongside for context. The provider's
+        // effective view (debt/queued fees) rides along when it says less is
+        // spendable than the chain shows — same lines as the L1 `balance`.
+        const [rc, eff] = await Promise.all([
+          s.ag.agent.runtimeCosts(BigInt(s.agentId)),
+          s.ag.getEffectiveBalance().catch(() => null),
+        ]);
         out(`agentSeal gas   : ${og(rc.sealGasWei)}  (${s.agentSeal ?? '?'})\n`);
         out(`sandbox prepaid : ${og(rc.prepaidBalanceWei)}  (account-level; see \`balance\` in the manager)\n`);
+        if (eff && eff.availableWei < eff.balanceWei) {
+          if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+          if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+          if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
+          out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+        }
         out('top up this agent with /topup [amount OG]\n');
         continue;
       }
