@@ -60,6 +60,8 @@ fn slim_card(mut card: serde_json::Value, slim: bool) -> serde_json::Value {
 struct PublicDeployment {
     seal_id: SealId,
     agent_id: Option<AgentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    framework: Option<String>,
     agent_card: serde_json::Value,
     phase: DeploymentPhase,
     created_at: DateTime<Utc>,
@@ -70,6 +72,7 @@ impl From<Deployment> for PublicDeployment {
         Self {
             seal_id: d.seal_id,
             agent_id: d.agent_id,
+            framework: d.framework,
             agent_card: d.agent_card,
             phase: d.phase,
             created_at: d.created_at,
@@ -84,6 +87,8 @@ impl From<Deployment> for PublicDeployment {
 struct OwnerDeployment {
     seal_id: SealId,
     agent_id: Option<AgentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    framework: Option<String>,
     agent_card: serde_json::Value,
     phase: DeploymentPhase,
     created_at: DateTime<Utc>,
@@ -106,6 +111,7 @@ impl From<Deployment> for OwnerDeployment {
         Self {
             seal_id: d.seal_id,
             agent_id: d.agent_id,
+            framework: d.framework.clone(),
             agent_card: d.agent_card,
             phase: d.phase,
             created_at: d.created_at,

@@ -120,6 +120,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         agent_card,
         i_data,
         clone_params,
+        framework: row.try_get::<Option<String>, _>("framework").unwrap_or(None),
         phase,
         storage_stage,
         mint_stage,
@@ -146,13 +147,13 @@ impl DeploymentRepo for PostgresDeploymentRepo {
                 agent_uri, agent_card, i_data, clone_params,
                 phase, storage_stage, mint_stage, container_stage,
                 sandbox_id, provisioned_at,
-                created_at, updated_at
+                created_at, updated_at, framework
             ) VALUES (
                 $1, $2, $3, $4,
                 $5, $6, $7, $8,
                 $9, $10, $11, $12,
                 $13, $14,
-                $15, $16
+                $15, $16, $17
             )
             "#,
         )
@@ -172,6 +173,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(d.provisioned_at)
         .bind(d.created_at)
         .bind(d.updated_at)
+        .bind(d.framework.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

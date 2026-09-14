@@ -612,7 +612,7 @@ export class AgentApi {
    * fields for your own agents.
    */
   async listDeployments(): Promise<Array<{
-    agentId: bigint | null; sealId: Hash; phase: string;
+    agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
@@ -649,7 +649,7 @@ export class AgentApi {
    *  {@link AgentApi.listMyDeployments}; fields absent on the public tier
    *  (owner/sandboxId/lastProvisionError) simply come through as null. */
   private normalizeDeploymentRow(r: Record<string, unknown>): {
-    agentId: bigint | null; sealId: Hash; phase: string;
+    agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   } {
@@ -685,6 +685,7 @@ export class AgentApi {
       agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
       sealId: r.seal_id as Hash,
       phase,
+      framework: (r.framework as string) ?? null,
       sandboxId: (r.sandbox_id as string) ?? null,
       url,
       owner: (r.owner as Address) ?? null,

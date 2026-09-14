@@ -337,6 +337,9 @@ pub struct Deployment {
     /// carries only the immutable intent. None on deploy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clone_params: Option<CloneRetryParams>,
+    /// Framework name from the deploy-time iData binding. None on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
 
     pub phase: DeploymentPhase,
     pub storage_stage: StageStatus,
@@ -506,6 +509,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: DeploymentPhase::Deploying,
             storage_stage: StageStatus::NotStarted,

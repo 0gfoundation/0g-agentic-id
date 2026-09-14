@@ -199,6 +199,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Failed { at: now, reason: "x".into() },

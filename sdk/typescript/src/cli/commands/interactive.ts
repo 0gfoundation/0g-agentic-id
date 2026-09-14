@@ -1369,7 +1369,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
   const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
-    { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null } | undefined;
+    { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;
   if (!row) {
     throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
       remedy: 'use `list` to see the agents this wallet owns here',
@@ -1383,6 +1383,11 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     ag, attestorUrl, sealId: row.sealId, agentId,
     phase: row.phase ?? 'unknown',
     sandboxId: row.url ? sbid(row.url) : undefined,
+    // The attestor row remembers which harness this agent runs (deploy-time
+    // iData binding) — nobody should have to. Feeds the chat model selector
+    // and the reset default; legacy rows (pre-column) come through null and
+    // fall back to the old ask-once flow.
+    framework: row.framework ?? undefined,
   };
   if (row.phase === 'running' && row.url) await connectSession(s, row.url);
   // Entry status card: the agent's own pixel avatar (the attestor renders
@@ -1740,7 +1745,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);
-        s.framework = await pickFramework(s.attestorUrl, ask);
+        s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
       }

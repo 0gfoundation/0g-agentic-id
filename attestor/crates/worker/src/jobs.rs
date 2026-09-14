@@ -1834,6 +1834,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data,
+            framework: None,
             clone_params: None,
             phase: derive_phase(&storage_stage, &mint_stage, &StageStatus::NotStarted),
             storage_stage,
@@ -1871,6 +1872,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: Some(CloneRetryParams {
                 source_seal_id,
                 name: "Sage".into(),
@@ -2034,6 +2036,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::NotStarted,
@@ -2573,6 +2576,7 @@ mod tests {
             agent_uri: "http://oss.example/card.json".into(),
             agent_card: serde_json::json!({"name": "Sage"}),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },

@@ -228,6 +228,7 @@ pub async fn handle(
         // The retry recipe (issue #147): /retry re-drives handle_clone from
         // this row-persisted intent — the jobs-table copy is GC'd within an
         // hour, and the re-seal output is deliberately never persisted.
+        framework: source.framework.clone(),
         clone_params: Some(CloneRetryParams {
             source_seal_id: source.seal_id,
             name: name.clone(),
@@ -416,6 +417,7 @@ mod tests {
             agent_uri: "oss://card".into(),
             agent_card: serde_json::json!({ "name": "Sage" }),
             i_data: vec![art],
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
