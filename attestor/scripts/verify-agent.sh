@@ -62,6 +62,13 @@ say "row: phase=$PHASE seal_addr=$DB_ADDR sandbox=$SANDBOX"
 [ "$PHASE" = "running" ] && ok "phase=running" || bad "phase=$PHASE (expected running)"
 [ -n "$SANDBOX" ] || { bad "no sandbox_id on the row"; exit 1; }
 
+# Agent base URL: prefer the row's agent_card.url origin — it carries the
+# CORRECT scheme (production art.0g.ai is 443-only; a hand-built http:// URL
+# times out there, #128). Fall back to constructing from the proxy config
+# for rows without a card url (e.g. -dev environments).
+AGENT_BASE=$(echo "$ROW" | jq -r '.agent_card.url // ""' | sed -E 's#^(https?://[^/]+).*#\1#')
+[ -n "$AGENT_BASE" ] || AGENT_BASE="http://${SERVE_PORT}-${SANDBOX}.${PROXY}"
+
 # ── 1a. chain: getAgentSeal must equal the row ──────────────────────────
 if command -v cast >/dev/null 2>&1; then
   CHAIN_ADDR=$(cast call --rpc-url "$RPC" "$CONTRACT" "getAgentSeal(uint256)(address)" "$AGENT_ID" | tr '[:upper:]' '[:lower:]')
@@ -72,7 +79,7 @@ else
 fi
 
 # ── 1b + 2. sealed bootstrap log: provisioned addr + decrypt health ─────
-LOG_URL="http://${SERVE_PORT}-${SANDBOX}.${PROXY}/log.html"
+LOG_URL="${AGENT_BASE}/log.html"
 LOG=$(curl -fsS -m 20 "$LOG_URL" | sed 's/<[^>]*>/\n/g')
 # The log page abbreviates addresses ("0xBbab...d211"), so compare by
 # prefix+suffix instead of full equality.
@@ -97,7 +104,7 @@ else
 fi
 
 # ── 3. /hello + X-Agent-Proof ───────────────────────────────────────────
-HELLO_URL="http://${SERVE_PORT}-${SANDBOX}.${PROXY}/hello"
+HELLO_URL="${AGENT_BASE}/hello"
 HDRS=$(mktemp); BODY=$(mktemp)
 HTTP=$(curl -s -m 20 -D "$HDRS" -o "$BODY" -w "%{http_code}" "$HELLO_URL" || echo 000)
 PROOF=$(grep -ai "^x-agent-proof:" "$HDRS" | head -1 || true)
