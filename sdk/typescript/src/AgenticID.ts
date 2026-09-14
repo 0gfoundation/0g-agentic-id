@@ -1020,6 +1020,14 @@ export class AgenticID {
   getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     return this.infra.getBalanceDetail(opts?.user, opts?.provider);
   }
+  /** Lazily-cached AttestorClient — its instance caches (provider address,
+   *  sandbox endpoint) only pay the /config round-trips once per session
+   *  instead of on every effective-balance call (was 2 extra fetches each). */
+  private _attestorClient?: AttestorClient;
+  private attestorClient(): AttestorClient {
+    if (!this._attestorClient) this._attestorClient = new AttestorClient(this.ctx);
+    return this._attestorClient;
+  }
   /** The caller wallet's NATIVE gas balance (wei) — the funds that pay tx
    *  fees AND back a deposit's principal. A prepaid top-up can't exceed it. */
   async nativeBalance(address?: Address): Promise<bigint> {
@@ -1035,7 +1043,7 @@ export class AgenticID {
    * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
    */
   getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint }> {
-    return new AttestorClient(this.ctx).getEffectiveBalance();
+    return this.attestorClient().getEffectiveBalance();
   }
   /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
   requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }

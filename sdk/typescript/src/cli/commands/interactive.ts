@@ -576,16 +576,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
         if (key && ctx.env.attestorUrl) {
-          try {
-            const { allAcked, missing } = await (await withWallet(ctx)).ackStatus();
+          // The three status reads are independent — fetch them in parallel
+          // (they were serial: 2.9s measured; parallel is bounded by the
+          // slowest, ~1.5s).
+          const ag2 = await withWallet(ctx);
+          const [ackRes, dRes, eff] = await Promise.all([
+            ag2.ackStatus().then((r) => ({ ok: true as const, r })).catch((e: Error) => ({ ok: false as const, e })),
+            ag2.getBalanceDetail().then((r) => ({ ok: true as const, r })).catch((e: Error) => ({ ok: false as const, e })),
+            ag2.getEffectiveBalance().catch(() => null),
+          ]);
+          if (ackRes.ok) {
+            const { allAcked, missing } = ackRes.r;
             out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
-          } catch (e) {
-            out(`ack     : (unreadable: ${(e as Error).message})\n`);
+          } else {
+            out(`ack     : (unreadable: ${ackRes.e.message})\n`);
           }
           try {
-            const ag2 = await withWallet(ctx);
-            const d = await ag2.getBalanceDetail();
-            const eff = await ag2.getEffectiveBalance().catch(() => null);
+            if (!dRes.ok) throw dRes.e;
+            const d = dRes.r;
             const effNote = eff && eff.availableWei < eff.balanceWei
               ? ` — AVAILABLE ${og(eff.availableWei)} (${og(eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei)} owed/queued off-chain)`
               : '';
