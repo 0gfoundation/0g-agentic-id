@@ -643,7 +643,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
         if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
         const shortAddr = (a?: string | null): string => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
-        out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'FRAMEWORK'.padEnd(11)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
+        out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
         for (const r of shown) {
           const owned = mine?.has(r.sealId) ? '*' : ' ';
           // Everyone gets the short form — commands accept a unique sealId
@@ -651,7 +651,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // 66-char column blowout. (feedback.md F12)
           const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
           const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${(r.framework ?? '').padEnd(11)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${r.name ?? ''}\n`);
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${r.name ?? ''}\n`);
         }
         if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
         if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
