@@ -330,7 +330,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 
 /** Resolve an agent ref to this wallet's deployment row (owner listing —
  *  lifecycle verbs need sandboxId, which the public listing withholds). */
-async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string }> {
+async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
   const row = pickRow(ref, refInput, rows);
@@ -347,7 +347,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
       { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
     );
   }
-  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined };
+  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
 }
 
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
@@ -680,8 +680,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
           continue;
         }
-        // reset
-        const framework = await pickFramework(attestorUrl, ask);
+        // reset — the row remembers its framework; ask only when unknown
+        // (legacy rows). `reset <id> pick` forces the menu to change harness.
+        const forcePick = args[1] === 'pick';
+        const framework = row.framework && !forcePick
+          ? (out(`framework: ${row.framework} (recorded — \`reset ${args[0]} pick\` to change)\n`), row.framework)
+          : await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
