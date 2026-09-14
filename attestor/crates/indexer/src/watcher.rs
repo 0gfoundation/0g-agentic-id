@@ -560,6 +560,9 @@ impl Watcher {
             agent_seal_addr: agent_seal,
             owner,
             agent_id: Some(agent_id),
+            // Chain-discovered row (indexer catch-up): the framework binding
+            // lives in encrypted iData we can't read here — unknown.
+            framework: None,
             agent_uri: uri,
             agent_card,
             i_data: artifacts,
