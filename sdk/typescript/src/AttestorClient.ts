@@ -247,9 +247,12 @@ export class AttestorClient {
    *  consumer already degrades on missing fields. */
   private cfgPromise: Promise<Record<string, string | undefined>> | undefined;
   private attestorConfig(): Promise<Record<string, string | undefined>> {
+    // Memoize SUCCESS only: a transient /config failure at session start must
+    // not go sticky for the instance's lifetime (review #154 N3b) — clear the
+    // memo on failure so the next caller retries.
     this.cfgPromise ??= fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
       .then((r) => r.json() as Promise<Record<string, string | undefined>>)
-      .catch(() => ({}));
+      .catch(() => { this.cfgPromise = undefined; return {}; });
     return this.cfgPromise;
   }
   private async resolveProviderAddr(): Promise<string> {
@@ -294,9 +297,9 @@ export class AttestorClient {
    */
   private async resolveSealedImage(explicit?: string, framework?: string): Promise<string> {
     if (explicit) return explicit;
-    const cfg: any = await fetch(`${this.baseUrl()}/config`)
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null);
+    // Rides the instance's memoized /config (review #154 N3a) — this was the
+    // one remaining uncached fetch on the deploy/reset/first-start path.
+    const cfg: any = await this.attestorConfig();
     if (framework && Array.isArray(cfg?.frameworks)) {
       const fw = cfg.frameworks.find((f: any) => f?.name === framework);
       if (fw?.image) return fw.image;

@@ -58,6 +58,23 @@ pub async fn handle(
     // attacker-supplied field and was forgeable — see {lifecycle_auth}.
     authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
 
+    // First-provision (action="create") may carry a framework, same contract
+    // as /reset: validate against the supported list and persist so a legacy
+    // mint-only row stops asking on later resets (review #154 N1). A resume
+    // (action="start") never changes harness — ignore the field there.
+    if action == "create" {
+        if let Some(fw) = &req.framework {
+            let supported = state.cfg.framework_names();
+            if !supported.iter().any(|n| n == fw) {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported framework {fw:?}; supported: {}",
+                    supported.join(", ")
+                )));
+            }
+            state.deployments.set_framework(req.seal_id, fw.clone()).await?;
+        }
+    }
+
     let payload = if action == "start" {
         JobPayload::SandboxStart {
             seal_id: req.seal_id,

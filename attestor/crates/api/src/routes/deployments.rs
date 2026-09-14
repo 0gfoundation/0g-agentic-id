@@ -223,3 +223,49 @@ fn verify_owner_auth(state: &AppState, headers: &HeaderMap, owner: Address) -> A
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attestor_shared::{Deployment, DeploymentPhase, StageStatus};
+    use chrono::Utc;
+
+    fn row(minted: bool) -> Deployment {
+        let now = Utc::now();
+        Deployment {
+            seal_id: alloy::primitives::B256::from([7u8; 32]),
+            agent_seal_addr: Address::from([1u8; 20]),
+            owner: Address::from([2u8; 20]),
+            agent_id: minted.then(|| alloy::primitives::U256::from(42u64)),
+            agent_uri: String::new(),
+            agent_card: serde_json::json!({}),
+            i_data: Vec::new(),
+            framework: Some("dsh".into()),
+            clone_params: None,
+            phase: DeploymentPhase::Deploying,
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_tier_owner_only_when_minted() {
+        // Ownership is chain-public once minted (ownerOf); before mint it is
+        // withheld — the ONLY genuinely private case (review #154 F4/F9).
+        let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
+        assert!(minted.get("owner").is_some(), "minted rows expose owner");
+        assert_eq!(minted["framework"], "dsh");
+        let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
+        assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
+    }
+}
