@@ -60,6 +60,11 @@ fn slim_card(mut card: serde_json::Value, slim: bool) -> serde_json::Value {
 struct PublicDeployment {
     seal_id: SealId,
     agent_id: Option<AgentId>,
+    /// Present only for MINTED rows: ownership is chain-public once the
+    /// agent exists (ERC-721 ownerOf), so withholding it here was privacy
+    /// theater. Unminted rows keep it withheld — nothing is on chain yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<Address>,
     #[serde(skip_serializing_if = "Option::is_none")]
     framework: Option<String>,
     agent_card: serde_json::Value,
@@ -71,6 +76,7 @@ impl From<Deployment> for PublicDeployment {
     fn from(d: Deployment) -> Self {
         Self {
             seal_id: d.seal_id,
+            owner: d.agent_id.is_some().then_some(d.owner),
             agent_id: d.agent_id,
             framework: d.framework,
             agent_card: d.agent_card,
