@@ -844,6 +844,12 @@ pub struct LifecycleRequest {
     pub seal_id: SealId,
     pub owner: Address,
     pub sandbox_envelope: SandboxEnvelope,
+    /// Optional framework name for reset/first-start: keeps the row's
+    /// recorded framework in sync when the owner switches harness (the SDK
+    /// resolves the sealed image from the same name). Validated against the
+    /// supported list; absent = leave the row as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framework: Option<String>,
 }
 
 /// Request body for `POST /retry` — owner-triggered recovery.

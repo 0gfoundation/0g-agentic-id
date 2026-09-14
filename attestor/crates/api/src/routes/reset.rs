@@ -76,6 +76,21 @@ pub async fn handle(
     // lifecycle e2e used to hit.)
     super::preflight::check_owner_ready(&state, req.sandbox_envelope.wallet_address).await?;
 
+    // Keep the row's recorded framework in sync when the owner switches
+    // harness on reset (review #154 F1): without this the next default reset
+    // silently reverts an explicit `pick`. Validated against the supported
+    // list — same edge as deploy. Absent = leave the record alone.
+    if let Some(fw) = &req.framework {
+        let supported = state.cfg.framework_names();
+        if !supported.iter().any(|n| n == fw) {
+            return Err(ApiError::bad_request(format!(
+                "unsupported framework {fw:?}; supported: {}",
+                supported.join(", ")
+            )));
+        }
+        state.deployments.set_framework(req.seal_id, fw.clone()).await?;
+    }
+
     state
         .jobs
         .submit(JobPayload::SandboxRecreate {
@@ -163,7 +178,7 @@ mod tests {
     /// A lifecycle request whose envelope is validly signed by `priv_bytes`.
     fn signed_req(seal_id: SealId, priv_bytes: &[u8; 32], action: &str) -> LifecycleRequest {
         let env = attestor_shared::mocks::signed_envelope(priv_bytes, action);
-        LifecycleRequest { seal_id, owner: env.wallet_address, sandbox_envelope: env }
+        LifecycleRequest { seal_id, owner: env.wallet_address, sandbox_envelope: env, framework: None }
     }
 
     struct Setup {
@@ -255,6 +270,7 @@ mod tests {
             seal_id,
             owner,
             sandbox_envelope: envelope_with_action(action),
+            framework: None,
         }
     }
 
@@ -274,6 +290,37 @@ mod tests {
             JobPayload::SandboxRecreate { seal_id, .. } => assert_eq!(*seal_id, s.seal_id),
             other => panic!("expected SandboxRecreate, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn reset_with_framework_updates_the_row() {
+        // Review #154 F1: a harness switch on reset must update the row's
+        // recorded framework, or the next default reset silently reverts it.
+        let s = make_setup();
+        let mut req = signed_req(s.seal_id, &OWNER_PRIV, "create");
+        req.framework = Some("openclaw".into());
+        let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect("must accept");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let d = s.state.deployments.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(d.framework.as_deref(), Some("openclaw"));
+    }
+
+    #[tokio::test]
+    async fn reset_with_unsupported_framework_is_rejected() {
+        let s = make_setup();
+        let mut req = signed_req(s.seal_id, &OWNER_PRIV, "create");
+        req.framework = Some("not-a-framework".into());
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .err()
+            .expect("must reject");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        // and the row must be untouched
+        let d = s.state.deployments.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(d.framework, None);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

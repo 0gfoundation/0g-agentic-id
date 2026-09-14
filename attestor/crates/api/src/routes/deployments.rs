@@ -3,10 +3,12 @@
 //! Two response shapes, by privacy tier (issue #64):
 //!
 //! - **No query param → public, minimal.** Anyone can list, but each row
-//!   carries only non-sensitive fields (seal_id, agent_id, agent_card, phase,
-//!   created_at). Used by the Discovery page. Deliberately omits `owner`,
-//!   `sandbox_id`, provisioning stages/errors — those leaked wallet↔agent
-//!   mappings and fleet/URL enumeration to the whole world.
+//!   carries only non-sensitive fields (seal_id, agent_id, owner-when-minted,
+//!   framework, agent_card, phase, created_at). Used by the Discovery page.
+//!   `owner` appears only for MINTED rows — chain-public via ownerOf anyway;
+//!   unminted rows keep it withheld. Deliberately omits `sandbox_id` and
+//!   provisioning stages/errors — those leaked fleet/URL enumeration to the
+//!   whole world.
 //! - **`?owner=0x…` → authenticated, full(er).** Gated by an EIP-191 owner
 //!   signature (`X-Auth-Message` = `0GDeployments:<owner>:<ts>`,
 //!   `X-Auth-Signature`); the recovered signer must equal `<owner>` and the

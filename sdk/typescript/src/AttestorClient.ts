@@ -372,7 +372,10 @@ export class AttestorClient {
     const res = await fetch(`${this.baseUrl()}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope }),
+      // `framework` rides along so the attestor can keep the row's recorded
+      // framework in sync when a reset switches harness (review #154 F1) —
+      // optional; old attestors ignore unknown fields.
+      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');

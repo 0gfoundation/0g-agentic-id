@@ -136,6 +136,7 @@ mod tests {
             seal_id,
             owner: env.wallet_address,
             sandbox_envelope: env,
+            framework: None,
         }
     }
 

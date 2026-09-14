@@ -120,7 +120,7 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         agent_card,
         i_data,
         clone_params,
-        framework: row.try_get::<Option<String>, _>("framework").unwrap_or(None),
+        framework: row.try_get::<Option<String>, _>("framework")?,
         phase,
         storage_stage,
         mint_stage,
@@ -265,6 +265,15 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(seal_id.as_slice())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn set_framework(&self, seal_id: SealId, framework: String) -> anyhow::Result<()> {
+        sqlx::query("UPDATE deployments SET framework = $2, updated_at = now() WHERE seal_id = $1")
+            .bind(seal_id.as_slice())
+            .bind(&framework)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

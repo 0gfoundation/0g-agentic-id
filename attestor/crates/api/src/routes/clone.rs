@@ -225,10 +225,11 @@ pub async fn handle(
         agent_uri: String::new(),
         agent_card: serde_json::Value::Object(Default::default()),
         i_data: Vec::new(),
+        // Inherits the source row's binding name; None on legacy sources.
+        framework: source.framework.clone(),
         // The retry recipe (issue #147): /retry re-drives handle_clone from
         // this row-persisted intent — the jobs-table copy is GC'd within an
         // hour, and the re-seal output is deliberately never persisted.
-        framework: source.framework.clone(),
         clone_params: Some(CloneRetryParams {
             source_seal_id: source.seal_id,
             name: name.clone(),
@@ -417,7 +418,7 @@ mod tests {
             agent_uri: "oss://card".into(),
             agent_card: serde_json::json!({ "name": "Sage" }),
             i_data: vec![art],
-            framework: None,
+            framework: Some("dsh".into()),
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
@@ -539,6 +540,10 @@ mod tests {
             .await
             .expect("clone should be accepted");
         assert_ne!(resp.0.seal_id, s.source_seal, "clone gets a fresh seal_id");
+        // Framework inheritance (review #154): the clone row remembers the
+        // source's harness, so its resets/model-selector need no asking.
+        let cloned = s.state.deployments.get(resp.0.seal_id).await.unwrap().unwrap();
+        assert_eq!(cloned.framework.as_deref(), Some("dsh"), "clone inherits source framework");
 
         let submitted = s.jobs.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);

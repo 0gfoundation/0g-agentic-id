@@ -607,7 +607,8 @@ export class AgentApi {
    * This is the PUBLIC listing: the attestor now returns only non-sensitive
    * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
    * `lastProvisionError` come back **null** here. `agentId`/`sealId`/`phase`/
-   * `url`/`name` are still present (fine for discovery + `waitForRunning`).
+   * `url`/`name` are still present, and `owner` appears for MINTED rows
+   * (chain-public via ownerOf; unminted rows keep it withheld).
    * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
    * fields for your own agents.
    */
@@ -624,7 +625,7 @@ export class AgentApi {
 
   /**
    * Owner-scoped, authenticated listing — your own agents WITH the fields the
-   * public {@link AgentApi.listDeployments} withholds (`owner`, `sandboxId`,
+   * public {@link AgentApi.listDeployments} withholds (`sandboxId`,
    * `lastProvisionError`, stages). Signs `0GDeployments:<owner>:<ts>` with
    * `ctx.account` and sends it as `X-Auth-Message`/`X-Auth-Signature`; the
    * attestor verifies the signer controls `<owner>` before returning its rows.
@@ -709,10 +710,13 @@ export class AgentApi {
    *    use this, not `reset` (which means "recreate an existing container").
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void>;
-  start(sealId: Hash, arg?: string | { sealedImage?: string; apiKey?: string }): Promise<void> {
+  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void>;
+  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
-    return this.attestor.lifecycle('start', { sealId, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
+    // `framework` resolves the right sealed image for a first provision (a
+    // mint-only hermes/prime agent otherwise boots the default snapshot) —
+    // same resolution deploy/reset use. (review #154 opportunity)
+    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain

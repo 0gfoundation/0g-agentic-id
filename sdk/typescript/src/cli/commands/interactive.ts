@@ -371,7 +371,8 @@ const L1_HELP_FULL = `manager commands
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
-  reset <id>              recreate an agent's container (asks framework + key)
+  reset <id>              recreate an agent's container (uses the recorded
+                          framework — 'reset <id> pick' to change; asks the key)
   retry <id|sealId>       resume a FAILED deploy/clone under the same identity
                           (re-runs the failed on-chain stages; reset after)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
@@ -622,10 +623,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'list') {
-        // Public listing — no wallet needed. The public rows carry no owner
-        // field (owner-only since #64), so "mine" cannot be derived from
-        // them: with a key configured, ALSO fetch the owner-signed listing
-        // and mark rows by sealId membership.
+        // Public listing — no wallet needed. Minted rows carry owner (chain-
+        // public via ownerOf); "mine" marks still come from the owner-signed
+        // listing so unminted rows attribute correctly too.
         let key = ctx.env.privateKey ?? loadKey() ?? undefined;
         let ag: AgenticID;
         try {
@@ -639,8 +639,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const mineOnly = args.includes('--mine') || args.includes('mine');
         if (mineOnly && !key) { out('list --mine needs a wallet — run `login` first\n'); continue; }
         // The two listings are independent — fetch them in parallel. The
-        // owner-signed rows also carry `owner`, which the public tier
-        // withholds; keep them keyed by sealId so the table can show it.
+        // owner-signed rows carry `owner` for UNMINTED rows too (the public
+        // tier shows it only once minted); keyed by sealId for the table.
         const [rows, myRows] = await Promise.all([
           ag.agent.listDeployments(),
           key
@@ -648,6 +648,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
             : Promise.resolve(null),
         ]);
         const mine = myRows ? new Map(myRows.map((r) => [r.sealId, r])) : null;
+        // A failed owner listing must not read as an empty wallet (F2): with
+        // --mine it aborts with the reason; without, fall back unmarked.
+        if (key && !mine) {
+          if (mineOnly) { out('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
+          out('warning: owner listing unavailable — showing unmarked rows\n');
+        }
         const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
         if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
         const shortAddr = (a?: string | null): string => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
@@ -691,9 +697,13 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // reset — the row remembers its framework; ask only when unknown
         // (legacy rows). `reset <id> pick` forces the menu to change harness.
         const forcePick = args[1] === 'pick';
-        const framework = row.framework && !forcePick
-          ? (out(`framework: ${row.framework} (recorded — \`reset ${args[0]} pick\` to change)\n`), row.framework)
-          : await pickFramework(attestorUrl, ask, row.framework ?? undefined);
+        let framework: string;
+        if (row.framework && !forcePick) {
+          framework = row.framework;
+          out(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
+        } else {
+          framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
+        }
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
@@ -1474,7 +1484,7 @@ async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Prom
 }
 
 /** Numbered framework picker from /config — the user chooses; never guess.
- *  (The attestor exposes no framework name post-mint.) */
+ *  (The deployment row records the framework post-#154; this picker is the fallback for legacy rows and explicit switches.) */
 async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<string>, current?: string): Promise<string> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
     .then((r) => r.json())
@@ -1778,7 +1788,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);
-        s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
+        s.framework = await pickFramework(s.attestorUrl, ask);
         retriedWithPick = true;
         continue; // retry the same user message once with the selector
       }

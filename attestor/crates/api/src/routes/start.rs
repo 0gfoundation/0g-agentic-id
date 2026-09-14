@@ -155,6 +155,7 @@ mod tests {
             seal_id,
             owner: env.wallet_address,
             sandbox_envelope: env,
+            framework: None,
         }
     }
 
@@ -246,6 +247,7 @@ mod tests {
             seal_id,
             owner,
             sandbox_envelope: envelope_with_action(action),
+            framework: None,
         }
     }
 
