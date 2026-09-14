@@ -1488,7 +1488,8 @@ const L2_HELP_FULL = `session commands
   /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
   /start                  start (only from stopped)
   /stop                   stop the running container
-  /reset                  recreate the container (asks framework + key; also
+  /reset                  recreate the container (uses the recorded framework;
+                          /reset pick to choose another; asks the key; also
                           clears the local chat history)
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
@@ -1625,8 +1626,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         await connectSession(s, r.url);
         out(`running at ${s.url}\n`); continue;
       }
-      if (line === '/reset') {
-        s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
+      if (line === '/reset' || line === '/reset pick') {
+        // Known framework (the attestor row remembers it, or this session
+        // already picked one): use it without asking — changing harness on
+        // reset is the rare case, and '/reset pick' forces the menu for it.
+        // Unknown (legacy rows): menu as before.
+        if (s.framework && line !== '/reset pick') {
+          out(`framework: ${s.framework} (recorded — use /reset pick to change)\n`);
+        } else {
+          s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
+        }
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
