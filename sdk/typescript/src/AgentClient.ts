@@ -119,6 +119,15 @@ export interface AgentClient {
     onActivity?: (label: string) => void;
   }): AsyncGenerator<string>;
   /**
+   * Stop the agent's CURRENT task — whoever started it. Esc semantics: the
+   * turn stops issuing new tool calls / output; already-executed actions are
+   * NOT rolled back. Also the cure for orphaned turns (a turn whose
+   * originating connection died keeps running server-side; only this — or a
+   * full /reset — stops it). Present under the same conditions as `chat`.
+   * `aborted: false` + note means the agent image predates the endpoint.
+   */
+  interrupt?(): Promise<{ aborted: boolean; note?: string }>;
+  /**
    * Present only when this handle holds the owner key: fetch the agent's own
    * process log (the framework subprocess stdout/stderr the runtime serves at
    * `/log/agent`). Owner-private — each call signs a fresh `0GSealLog` owner
@@ -156,6 +165,11 @@ async function* iterSseChunks(
   let buf = '';
 
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
+    // Named SSE events matter: hermes streams turn activity as
+    // "event: hermes.tool.progress" frames on the same chat stream. Track the
+    // event name within the frame and attach it to the parsed payload as
+    // __sseEvent so chatStream can route it (unnamed frames = normal chunks).
+    let eventName = '';
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
       // SSE comments (":...") are invisible to the payload, but a caller may
@@ -163,12 +177,14 @@ async function* iterSseChunks(
       // ": activity <kind>" comments (keepalives pass through too — the
       // callback filters).
       if (t.startsWith(':') && onComment) onComment(t.slice(1).trim());
-      // Skip comments and non-data fields ("event:", "id:", ...).
+      if (t.startsWith('event:')) { eventName = t.slice(6).trim(); continue; }
       if (!t.startsWith('data:')) continue;
       const data = t.slice(5).trim();
       if (data === '' || data === '[DONE]') continue;
       try {
-        yield JSON.parse(data) as Record<string, unknown>;
+        const parsed = JSON.parse(data) as Record<string, unknown>;
+        if (eventName) { (parsed as { __sseEvent?: string }).__sseEvent = eventName; eventName = ''; }
+        yield parsed;
       } catch {
         // Non-JSON keepalive payload — ignore.
       }
@@ -311,6 +327,29 @@ export function makeAgentClient(params: {
     // OpenAI-compatible convention: completions sit at `<prefix>chat/completions`.
     const path = `${chat.prefix}chat/completions`;
 
+    client.interrupt = async () => {
+      // dsh/prime bridges expose a real endpoint; call it. openclaw/hermes
+      // serve /v1 themselves (404 here) and both stop the turn when the
+      // client disconnects — LAB- and live-verified for openclaw (the run
+      // ends stopReason=aborted the moment the stream drops; no
+      // auto-continuation). Do NOT send a '/stop' chat message as a fallback:
+      // openclaw's /v1 path treats it as a plain user message and burns a
+      // full model turn on it (~10s), which is exactly what made the message
+      // AFTER an Esc feel slow.
+      try {
+        const r = await doFetch(`${chat.prefix}interrupt`, { method: 'POST', signal: AbortSignal.timeout(10_000) });
+        if (r.ok) {
+          const j = (await r.json()) as { aborted?: boolean; note?: string };
+          return { aborted: !!j.aborted, note: j.note };
+        }
+        if (r.status === 404) return { aborted: false, note: 'no bridge endpoint — this framework stops its turn when the stream disconnects' };
+        throw new Error(`interrupt: HTTP ${r.status}: ${await r.text()}`);
+      } catch (e) {
+        if ((e as Error).message.startsWith('interrupt:')) throw e;
+        return { aborted: false, note: 'interrupt transport failed — this framework stops its turn when the stream disconnects' };
+      }
+    };
+
     client.chat = async (messages, opts) => {
       const r = await doFetch(path, {
         method: 'POST',
@@ -355,9 +394,36 @@ export function makeAgentClient(params: {
       const onComment = opts?.onActivity
         ? (c: string): void => { if (c.startsWith('activity ')) opts.onActivity!(c.slice(9)); }
         : undefined;
+      let lastThinkingAt = 0;
+      const thinking = (): void => {
+        // Throttled: reasoning/thinking progress fires many times a second.
+        const now = Date.now();
+        if (now - lastThinkingAt > 2000) { lastThinkingAt = now; opts!.onActivity!('thinking'); }
+      };
       for await (const chunk of iterSseChunks(r.body, onComment)) {
+        // hermes streams turn activity as NAMED SSE events on the chat stream
+        // (event: hermes.tool.progress / tool.started / tool.completed / …).
+        // Route them to onActivity — they are progress, not reply content.
+        const ev = (chunk as { __sseEvent?: string }).__sseEvent;
+        if (ev) {
+          if (opts?.onActivity) {
+            const tool = (chunk as { tool_name?: string }).tool_name ?? '';
+            if (tool === '_thinking') thinking();
+            else if (ev === 'hermes.tool.progress') { if (tool) opts.onActivity(`tool/call ${tool}`); }
+            else opts.onActivity(tool ? `${ev.replace(/^hermes\./, '')} ${tool}` : ev.replace(/^hermes\./, ''));
+          }
+          continue;
+        }
         const e = (chunk as { error?: { message?: string } | string }).error;
         if (e) streamErr = typeof e === 'string' ? e : e.message ?? JSON.stringify(e);
+        // OpenAI-standard tool-call deltas (openclaw emits these when the
+        // agent invokes a tool mid-turn): narrate, nothing to yield.
+        if (opts?.onActivity) {
+          const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
+          const delta = choice?.delta as { tool_calls?: Array<{ function?: { name?: string } }> } | undefined;
+          const fn = delta?.tool_calls?.[0]?.function?.name;
+          if (fn) opts.onActivity(`tool/call ${fn}`);
+        }
         const d = chunkDelta(chunk);
         if (d.content) { sawContent = true; yield d.content; }
       }

@@ -481,6 +481,26 @@ const server = createServer((req, res) => {
     })
   }
 
+  // Owner's brake pedal: unconditionally cancel the CURRENT turn, whoever
+  // started it — Esc means "stop the task", not "stop watching", and this is
+  // the only way (short of /reset) to stop an orphaned turn whose originating
+  // connection is gone. Cancel is not a rollback: tool calls already executed
+  // stay executed; the turn just stops issuing new ones.
+  if (req.method === 'POST' && path === '/v1/interrupt') {
+    return (async () => {
+      try {
+        const { agent } = await getAgent()
+        try { agent.cancel('interrupted by owner') } catch (err) {
+          return sendJSON(res, 200, { ok: true, aborted: false, note: String((err && err.message) || err) })
+        }
+        log('interrupt: current turn cancelled by owner')
+        return sendJSON(res, 200, { ok: true, aborted: true })
+      } catch (err) {
+        return sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
+      }
+    })()
+  }
+
   return sendJSON(res, 404, { error: { message: `no route for ${req.method} ${path}` } })
 })
 

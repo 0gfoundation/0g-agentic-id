@@ -142,8 +142,25 @@ class WaitCancelled extends Error { constructor() { super('wait cancelled'); } }
 
 async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000, signal?: AbortSignal): Promise<{ url: string }> {
   const deadline = Date.now() + timeoutMs;
+  const t0 = Date.now();
   let lastPhase = 'unknown';
   let lastShown = '';
+  // Transient progress line between phase changes — a deploy sits minutes in
+  // one phase with zero output otherwise. Repainted each second; phase-change
+  // lines and the final result overwrite it. TTY only.
+  const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+  let spin = 0;
+  let spinnerShown = false;
+  const clearSpinner = (): void => { if (spinnerShown) { out('\r\x1b[2K'); spinnerShown = false; } };
+  const ticker = process.stdout.isTTY
+    ? setInterval(() => {
+        if (signal?.aborted) return;
+        spin = (spin + 1) % SPIN.length;
+        out(`\r\x1b[2K  ${SPIN[spin]} ${lastPhase}… (${Math.floor((Date.now() - t0) / 1000)}s · esc stops waiting, not the deploy)`);
+        spinnerShown = true;
+      }, 1000)
+    : null;
+  try {
   // The DETAIL endpoint carries no `url` field (only the listing does), so a
   // running agent's URL is constructed from its sandbox_id + the sandbox
   // proxy address the attestor /config advertises.
@@ -156,7 +173,7 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
         container_stage?: { state?: string; reason?: string };
       };
       lastPhase = d.phase ?? lastPhase;
-      if (lastPhase !== lastShown) { out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
+      if (lastPhase !== lastShown) { clearSpinner(); out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
       const cardBase = d.agent_card?.url?.replace(/\/hello$/, '');
       const url = d.url ?? cardBase ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
       if (d.phase === 'running' && url) return { url };
@@ -179,6 +196,10 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
     await new Promise((r) => setTimeout(r, 4000));
     if (signal?.aborted) throw new WaitCancelled();
   }
+  } finally {
+    if (ticker) clearInterval(ticker);
+    clearSpinner();
+  }
 }
 
 /** pollRunning wired to the Esc/Ctrl-C interrupt: cancelling abandons the
@@ -199,9 +220,13 @@ async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sea
   }
 }
 
-/** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it. */
+/** Shared interrupt state: set while an L2 turn streams; Esc/Ctrl-C abort it.
+ *  `brake` is the server-side stop for the CURRENT session's agent — wired
+ *  while inside an L2 session so Esc at an idle prompt can still stop a task
+ *  running in the background (e.g. an orphaned turn whose stream died). */
 interface Interrupt {
   streaming: AbortController | null;
+  brake: (() => void) | null;
 }
 
 export async function run(ctx: CommandContext): Promise<void> {
@@ -264,7 +289,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     rl.prompt();
     return new Promise((res, rej) => waiters.push({ res, rej }));
   };
-  const irq: Interrupt = { streaming: null };
+  const irq: Interrupt = { streaming: null, brake: null };
 
   let lastSigint = 0;
   rl.on('SIGINT', () => {
@@ -277,7 +302,9 @@ export async function run(ctx: CommandContext): Promise<void> {
   });
   readline.emitKeypressEvents(process.stdin, rl);
   process.stdin.on('keypress', (_s, key) => {
-    if (key?.name === 'escape' && irq.streaming) irq.streaming.abort();
+    if (key?.name !== 'escape') return;
+    if (irq.streaming) { irq.streaming.abort(); return; }
+    irq.brake?.(); // idle Esc in a session: stop a background/orphaned task
   });
 
   try {
@@ -465,12 +492,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
         // The provider's EFFECTIVE view — debt accrues off-chain between
         // settlements, so the chain number alone can be badly optimistic.
-        const eff = await ag.getEffectiveBalance().catch(() => null);
+        // A failed lookup must NOT be silent: "nothing owed" and "couldn't
+        // check" are different answers, and hiding the latter cost a debug
+        // session once already.
+        let effErr: string | null = null;
+        const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
         if (eff && eff.availableWei < eff.balanceWei) {
           if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
           if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
           if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
           out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+        } else if (eff) {
+          out(`available       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+        } else {
+          out(`available       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — chain number above may be optimistic)\n`);
         }
         if (detail && detail.pendingRefund > 0n) {
           out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
@@ -1463,7 +1498,22 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     new Promise<void>((r) => setTimeout(r, 2500).unref()),
   ]).catch(() => { /* advisory only */ });
   advisoryWindowOpen = false;
+  // Esc at the idle prompt = stop whatever this agent is doing server-side.
+  // Throttled: hammering Esc must not queue N interrupts.
+  let lastBrake = 0;
+  irq.brake = () => {
+    const now = Date.now();
+    if (now - lastBrake < 2000) return;
+    lastBrake = now;
+    const c = s.client;
+    if (!c?.interrupt) { out('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
+    c.interrupt().then(
+      (r) => out(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
+      (e) => out(`\n(interrupt failed: ${(e as Error).message})\n`),
+    );
+  };
   const messages: ChatMessage[] = [];
+  try {
   for (;;) {
     activeCompletions = L2_WORDS;
     // While not connected (deploying/stopped/offline) the phase is in flux —
@@ -1490,10 +1540,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (line === '/balance') {
         // Agent-focused: this agent's own evolution-gas (agentSeal) balance,
-        // with the account-level prepaid alongside for context.
-        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
+        // with the account-level prepaid alongside for context. The provider's
+        // effective view (debt/queued fees) rides along when it says less is
+        // spendable than the chain shows — same lines as the L1 `balance`.
+        const [rc, eff] = await Promise.all([
+          s.ag.agent.runtimeCosts(BigInt(s.agentId)),
+          s.ag.getEffectiveBalance().catch(() => null),
+        ]);
         out(`agentSeal gas   : ${og(rc.sealGasWei)}  (${s.agentSeal ?? '?'})\n`);
         out(`sandbox prepaid : ${og(rc.prepaidBalanceWei)}  (account-level; see \`balance\` in the manager)\n`);
+        if (eff && eff.availableWei < eff.balanceWei) {
+          if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+          if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+          if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
+          out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+        }
         out('top up this agent with /topup [amount OG]\n');
         continue;
       }
@@ -1598,43 +1659,83 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       let reply = '';
       let interrupted = false;
       let failure: string | null = null;
-      // Tool-activity status line: an agent turn spends most of its time in
-      // tools with zero output — narrate it (the dsh bridge streams
-      // ": activity tool/call <name>" SSE comments). Transient: rendered on
-      // the current line, erased by the next delta. TTY only — pipes get the
-      // clean payload.
-      let activityShown = false;
+      // ── Live status line (CC-style) ────────────────────────────────────
+      // An agent turn spends most of its time producing NOTHING visible —
+      // model thinking, tools running. One transient line keeps the wait
+      // legible: a spinner, what it's doing (last activity label, or
+      // "thinking" as the default guess), elapsed seconds, and the way out.
+      //     ⠹ tool/call bash… (14s · esc to interrupt)
+      // Repainted once a second; any real output erases it. TTY only —
+      // pipes get the clean payload.
+      const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
+      const turnT0 = Date.now();
+      let spin = 0;
+      let status = 'thinking';
+      let statusShown = false;
       let sawToolActivity = false;
       const clearActivity = (): void => {
-        if (activityShown) { out('\r\x1b[2K'); activityShown = false; }
+        if (statusShown) { out('\r\x1b[2K'); statusShown = false; }
+      };
+      const paintStatus = (): void => {
+        if (!process.stdout.isTTY || ac.signal.aborted) return;
+        // Never overwrite the agent's own partial line — break to a fresh
+        // one first (the visual break marks where the status began).
+        if (!statusShown && reply && !reply.endsWith('\n')) out('\n');
+        const secs = Math.floor((Date.now() - turnT0) / 1000);
+        spin = (spin + 1) % SPIN.length;
+        out(`\r\x1b[2K  ${SPIN[spin]} ${status}… (${secs}s · esc to interrupt)`);
+        statusShown = true;
       };
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             if (label.startsWith('tool/')) sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
-            // Never overwrite the agent's own partial line — break to a fresh
-            // one first (the visual break marks where the tool ran).
-            if (!activityShown && reply && !reply.endsWith('\n')) out('\n');
-            out(`\r\x1b[2K  ⚙ ${label}…`);
-            activityShown = true;
+            status = label;
+            paintStatus();
           }
         : undefined;
+      // Ticker: repaint elapsed/spinner during silence. Starts after a short
+      // grace (instant replies never see it), stops at first delta unless the
+      // agent goes silent again mid-turn (tools) — then the last label keeps
+      // counting.
+      let lastOutputAt = Date.now();
+      const ticker = process.stdout.isTTY
+        ? setInterval(() => {
+            if (ac.signal.aborted) return;
+            if (Date.now() - lastOutputAt >= 2000) paintStatus();
+          }, 1000)
+        : null;
       try {
         const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal, ...(onActivity ? { onActivity } : {}) };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
           out(delta); reply += delta;
+          lastOutputAt = Date.now();
+          status = 'writing';
         }
         clearActivity();
       } catch (e) {
         clearActivity();
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
-          out('\n(interrupted)');
+          // Esc means "stop the TASK", not "stop watching": tearing down the
+          // HTTP stream alone leaves the turn running server-side (the
+          // disconnect hooks are best-effort and deliberately never kill a
+          // turn another connection started). Tell the bridge to brake.
+          const stopped = await s.client.interrupt?.().catch(() => null);
+          // No /v1/interrupt endpoint (openclaw/hermes serve their own /v1
+          // directly): both stop the turn on client disconnect — openclaw via
+          // watchClientDisconnect→AbortController, hermes via its abandoned-SSE
+          // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
+          out(stopped?.aborted || (stopped && /predates|disconnects|\/stop/.test(stopped.note ?? ''))
+            ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
+            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
         } else {
           failure = (e as Error).message;
         }
       } finally {
+        if (ticker) clearInterval(ticker);
+        clearActivity();
         irq.streaming = null;
       }
       if (failure && !s.framework && !retriedWithPick) {
@@ -1656,5 +1757,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
     }
+  }
+  } finally {
+    irq.brake = null; // leaving the session: idle-Esc no longer targets this agent
   }
 }
