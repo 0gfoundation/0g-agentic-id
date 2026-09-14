@@ -421,8 +421,10 @@ export function makeAgentClient(params: {
         if (opts?.onActivity) {
           const choice = (chunk.choices as Array<Record<string, unknown>> | undefined)?.[0];
           const delta = choice?.delta as { tool_calls?: Array<{ function?: { name?: string } }> } | undefined;
-          const fn = delta?.tool_calls?.[0]?.function?.name;
-          if (fn) opts.onActivity(`tool/call ${fn}`);
+          for (const tc of delta?.tool_calls ?? []) {
+            const fn = tc?.function?.name;
+            if (fn) opts.onActivity(`tool/call ${fn}`);
+          }
         }
         const d = chunkDelta(chunk);
         if (d.content) { sawContent = true; yield d.content; }
