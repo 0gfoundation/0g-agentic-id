@@ -331,6 +331,12 @@ function authorized(req) {
 async function runTurn(session, text, onDelta, onActivity) {
 	let full = "";
 	let lastThinkingAt = 0;
+	// Per-assistant-message accounting for the message_end backfill: `full` is
+	// cumulative across the whole turn, so compare each message only against
+	// what streamed SINCE ITS OWN message_start — a turn with two assistant
+	// messages where the second isn't streamed must still backfill the second
+	// (review F3).
+	let msgStartLen = 0;
 	// Extract plain text from a prime message's content (array of {type,text}
 	// blocks, or a bare string).
 	const messageText = (message) => {
@@ -367,14 +373,20 @@ async function runTurn(session, text, onDelta, onActivity) {
 		// Backfill: if this assistant message's text wasn't already streamed,
 		// forward whatever text_delta didn't cover. Diagnostic-logged so we can
 		// see, per turn, whether text arrived via deltas or only here.
+		if (event.type === "message_start" && event.message?.role === "assistant") {
+			msgStartLen = full.length;
+			return;
+		}
 		if (event.type === "message_end" && event.message?.role === "assistant") {
 			const whole = messageText(event.message);
-			log(`message_end: role=assistant textLen=${whole.length} streamedLen=${full.length}`);
-			if (whole && !full) { if (onDelta) onDelta(whole); full += whole; }
-			else if (whole && full && whole.length > full.length && whole.startsWith(full)) {
-				const tail = whole.slice(full.length);
+			const streamed = full.slice(msgStartLen);
+			log(`message_end: role=assistant textLen=${whole.length} streamedLen=${streamed.length}`);
+			if (whole && !streamed) { if (onDelta) onDelta(whole); full += whole; }
+			else if (whole && streamed && whole.length > streamed.length && whole.startsWith(streamed)) {
+				const tail = whole.slice(streamed.length);
 				if (onDelta) onDelta(tail); full += tail;
 			}
+			msgStartLen = full.length;
 			return;
 		}
 		// Everything else is turn progress. An agent turn spends most of its time
@@ -610,7 +622,11 @@ const server = createServer((req, res) => {
 				// never resolves, so a resume chained after it never runs — the
 				// session wedges until /reset. requestAbort already did the actual
 				// stopping; the idle wait buys us nothing but a hang.
-				if (typeof session.requestAbort === "function") {
+				if (typeof session.requestAbort === "function" && typeof session.resumeQueuedWork === "function") {
+					// Guard the PAIR: requestAbort suspends the input pump and only
+					// resumeQueuedWork lifts it — an SDK bump that renames one but
+					// not the other must fall through to abort() (safe alone), not
+					// wedge the session (review F1).
 					session.requestAbort();
 					// requestAbort() stops the main loop + bash, but NOT spawned
 					// subagents — a task like "stand up a service" delegates work
@@ -626,7 +642,7 @@ const server = createServer((req, res) => {
 						try { session._cancelActiveRlmChildRuns("interrupted by owner"); }
 						catch (e) { log(`interrupt: cancel child runs failed: ${(e && e.message) || e}`); }
 					}
-					if (typeof session.resumeQueuedWork === "function") session.resumeQueuedWork();
+					session.resumeQueuedWork();
 					// Record the interruption IN THE TRANSCRIPT. Aborting kills the
 					// in-flight calls, but the model's context still shows a task
 					// half-done — on the next message it happily resumes the work

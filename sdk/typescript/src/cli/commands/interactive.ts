@@ -143,7 +143,7 @@ class WaitCancelled extends Error { constructor() { super('wait cancelled'); } }
 async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000, signal?: AbortSignal): Promise<{ url: string }> {
   const deadline = Date.now() + timeoutMs;
   const t0 = Date.now();
-  let lastPhase = 'unknown';
+  let lastPhase = 'contacting attestor';
   let lastShown = '';
   // Transient progress line between phase changes — a deploy sits minutes in
   // one phase with zero output otherwise. Repainted each second; phase-change
@@ -1727,7 +1727,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // directly): both stop the turn on client disconnect — openclaw via
           // watchClientDisconnect→AbortController, hermes via its abandoned-SSE
           // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
-          out(stopped?.aborted || (stopped && /predates|disconnects|\/stop/.test(stopped.note ?? ''))
+          out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
         } else {
