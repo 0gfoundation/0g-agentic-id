@@ -1033,6 +1033,10 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| d.agent_id = Some(agent_id))
     }
 
+    async fn set_framework(&self, seal_id: SealId, framework: String) -> anyhow::Result<()> {
+        self.mut_with(seal_id, |d| d.framework = Some(framework))
+    }
+
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
         self.set_sandbox_id_calls.fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| d.sandbox_id = Some(sandbox_id))

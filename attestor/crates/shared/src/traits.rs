@@ -243,6 +243,9 @@ pub trait DeploymentRepo: Send + Sync {
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
 
+    /// Update the recorded framework (reset/first-start harness switch).
+    async fn set_framework(&self, seal_id: SealId, framework: String) -> anyhow::Result<()>;
+
     /// Persist 0g-sandbox's resource id after container track submits.
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
 

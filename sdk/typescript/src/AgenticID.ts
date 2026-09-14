@@ -607,12 +607,13 @@ export class AgentApi {
    * This is the PUBLIC listing: the attestor now returns only non-sensitive
    * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
    * `lastProvisionError` come back **null** here. `agentId`/`sealId`/`phase`/
-   * `url`/`name` are still present (fine for discovery + `waitForRunning`).
+   * `url`/`name` are still present, and `owner` appears for MINTED rows
+   * (chain-public via ownerOf; unminted rows keep it withheld).
    * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
    * fields for your own agents.
    */
   async listDeployments(): Promise<Array<{
-    agentId: bigint | null; sealId: Hash; phase: string;
+    agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
@@ -624,7 +625,7 @@ export class AgentApi {
 
   /**
    * Owner-scoped, authenticated listing — your own agents WITH the fields the
-   * public {@link AgentApi.listDeployments} withholds (`owner`, `sandboxId`,
+   * public {@link AgentApi.listDeployments} withholds (`sandboxId`,
    * `lastProvisionError`, stages). Signs `0GDeployments:<owner>:<ts>` with
    * `ctx.account` and sends it as `X-Auth-Message`/`X-Auth-Signature`; the
    * attestor verifies the signer controls `<owner>` before returning its rows.
@@ -649,7 +650,7 @@ export class AgentApi {
    *  {@link AgentApi.listMyDeployments}; fields absent on the public tier
    *  (owner/sandboxId/lastProvisionError) simply come through as null. */
   private normalizeDeploymentRow(r: Record<string, unknown>): {
-    agentId: bigint | null; sealId: Hash; phase: string;
+    agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
     createdAt: string | null; lastProvisionError: string | null;
   } {
@@ -685,6 +686,7 @@ export class AgentApi {
       agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
       sealId: r.seal_id as Hash,
       phase,
+      framework: (r.framework as string) ?? null,
       sandboxId: (r.sandbox_id as string) ?? null,
       url,
       owner: (r.owner as Address) ?? null,
@@ -708,10 +710,13 @@ export class AgentApi {
    *    use this, not `reset` (which means "recreate an existing container").
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { sealedImage?: string; apiKey?: string }): Promise<void>;
-  start(sealId: Hash, arg?: string | { sealedImage?: string; apiKey?: string }): Promise<void> {
+  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void>;
+  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
-    return this.attestor.lifecycle('start', { sealId, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
+    // `framework` resolves the right sealed image for a first provision (a
+    // mint-only hermes/prime agent otherwise boots the default snapshot) —
+    // same resolution deploy/reset use. (review #154 opportunity)
+    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -914,6 +919,9 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
+  /** Long-lived so its instance caches (/config: provider address, sandbox
+   *  endpoint) are paid once per session, not per call. */
+  private readonly attestor: AttestorClient;
   private readonly ctx: Ctx;
 
   constructor(config: AgenticIDConfig) {
@@ -922,6 +930,7 @@ export class AgenticID {
     this.agent = new AgentApi(ctx);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
+    this.attestor = new AttestorClient(ctx);
   }
 
   /**
@@ -1034,7 +1043,9 @@ export class AgenticID {
    * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
    */
   getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint }> {
-    return new AttestorClient(this.ctx).getEffectiveBalance();
+    // Reuse the facade's long-lived AttestorClient — its instance caches
+    // (config/provider address) pay the /config round-trips once, not per call.
+    return this.attestor.getEffectiveBalance();
   }
   /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
   requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }

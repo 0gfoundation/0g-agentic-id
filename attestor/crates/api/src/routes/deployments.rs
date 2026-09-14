@@ -3,10 +3,12 @@
 //! Two response shapes, by privacy tier (issue #64):
 //!
 //! - **No query param → public, minimal.** Anyone can list, but each row
-//!   carries only non-sensitive fields (seal_id, agent_id, agent_card, phase,
-//!   created_at). Used by the Discovery page. Deliberately omits `owner`,
-//!   `sandbox_id`, provisioning stages/errors — those leaked wallet↔agent
-//!   mappings and fleet/URL enumeration to the whole world.
+//!   carries only non-sensitive fields (seal_id, agent_id, owner-when-minted,
+//!   framework, agent_card, phase, created_at). Used by the Discovery page.
+//!   `owner` appears only for MINTED rows — chain-public via ownerOf anyway;
+//!   unminted rows keep it withheld. Deliberately omits `sandbox_id` and
+//!   provisioning stages/errors — those leaked fleet/URL enumeration to the
+//!   whole world.
 //! - **`?owner=0x…` → authenticated, full(er).** Gated by an EIP-191 owner
 //!   signature (`X-Auth-Message` = `0GDeployments:<owner>:<ts>`,
 //!   `X-Auth-Signature`); the recovered signer must equal `<owner>` and the
@@ -60,6 +62,13 @@ fn slim_card(mut card: serde_json::Value, slim: bool) -> serde_json::Value {
 struct PublicDeployment {
     seal_id: SealId,
     agent_id: Option<AgentId>,
+    /// Present only for MINTED rows: ownership is chain-public once the
+    /// agent exists (ERC-721 ownerOf), so withholding it here was privacy
+    /// theater. Unminted rows keep it withheld — nothing is on chain yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<Address>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    framework: Option<String>,
     agent_card: serde_json::Value,
     phase: DeploymentPhase,
     created_at: DateTime<Utc>,
@@ -69,7 +78,9 @@ impl From<Deployment> for PublicDeployment {
     fn from(d: Deployment) -> Self {
         Self {
             seal_id: d.seal_id,
+            owner: d.agent_id.is_some().then_some(d.owner),
             agent_id: d.agent_id,
+            framework: d.framework,
             agent_card: d.agent_card,
             phase: d.phase,
             created_at: d.created_at,
@@ -84,6 +95,8 @@ impl From<Deployment> for PublicDeployment {
 struct OwnerDeployment {
     seal_id: SealId,
     agent_id: Option<AgentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    framework: Option<String>,
     agent_card: serde_json::Value,
     phase: DeploymentPhase,
     created_at: DateTime<Utc>,
@@ -106,6 +119,7 @@ impl From<Deployment> for OwnerDeployment {
         Self {
             seal_id: d.seal_id,
             agent_id: d.agent_id,
+            framework: d.framework.clone(),
             agent_card: d.agent_card,
             phase: d.phase,
             created_at: d.created_at,
@@ -208,4 +222,50 @@ fn verify_owner_auth(state: &AppState, headers: &HeaderMap, owner: Address) -> A
         return Err(ApiError::unauthorized("signer is not the owner"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use attestor_shared::{Deployment, DeploymentPhase, StageStatus};
+    use chrono::Utc;
+
+    fn row(minted: bool) -> Deployment {
+        let now = Utc::now();
+        Deployment {
+            seal_id: alloy::primitives::B256::from([7u8; 32]),
+            agent_seal_addr: Address::from([1u8; 20]),
+            owner: Address::from([2u8; 20]),
+            agent_id: minted.then(|| alloy::primitives::U256::from(42u64)),
+            agent_uri: String::new(),
+            agent_card: serde_json::json!({}),
+            i_data: Vec::new(),
+            framework: Some("dsh".into()),
+            clone_params: None,
+            phase: DeploymentPhase::Deploying,
+            storage_stage: StageStatus::NotStarted,
+            mint_stage: StageStatus::NotStarted,
+            container_stage: StageStatus::NotStarted,
+            sandbox_id: None,
+            provisioned_at: None,
+            container_pubkey: None,
+            container_pubkey_mac: None,
+            provision_deadline: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn public_tier_owner_only_when_minted() {
+        // Ownership is chain-public once minted (ownerOf); before mint it is
+        // withheld — the ONLY genuinely private case (review #154 F4/F9).
+        let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
+        assert!(minted.get("owner").is_some(), "minted rows expose owner");
+        assert_eq!(minted["framework"], "dsh");
+        let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
+        assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
+    }
 }

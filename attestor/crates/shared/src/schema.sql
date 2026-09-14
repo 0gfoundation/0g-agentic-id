@@ -27,6 +27,11 @@ CREATE INDEX IF NOT EXISTS idx_deployments_phase    ON deployments (phase);
 -- Columns added after initial schema. Use IF NOT EXISTS so the file
 -- remains idempotent across schema versions.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
+-- Framework name from the deploy-time iData binding (role="framework"),
+-- validated against /config's supported list. NULL on rows minted before
+-- this column existed. Read by clients so nobody has to REMEMBER which
+-- harness an agent runs (reset defaults, chat model selector, sealed image).
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS framework TEXT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
 -- Container-pubkey binding for /provision freshness bypass on restart.

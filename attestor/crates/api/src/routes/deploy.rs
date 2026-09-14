@@ -121,6 +121,7 @@ pub async fn handle(
         agent_card: serde_json::Value::Object(Default::default()),
         i_data: Vec::new(),
         clone_params: None,
+        framework: Some(framework.clone()),
         phase: derive_phase(
             &StageStatus::NotStarted,
             &StageStatus::NotStarted,

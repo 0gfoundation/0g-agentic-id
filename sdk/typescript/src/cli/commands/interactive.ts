@@ -330,7 +330,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 
 /** Resolve an agent ref to this wallet's deployment row (owner listing —
  *  lifecycle verbs need sandboxId, which the public listing withholds). */
-async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string }> {
+async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
   const row = pickRow(ref, refInput, rows);
@@ -347,7 +347,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
       { remedy: exists ? 'check `whoami` — are you on the right wallet? `list` marks yours with *' : 'check `list` for the agents that exist here' },
     );
   }
-  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined };
+  return { sealId: row.sealId, agentId: String(row.agentId ?? '?'), phase: row.phase ?? 'unknown', sandboxId: (row as { sandboxId?: string | null }).sandboxId ?? undefined, framework: (row as { framework?: string | null }).framework ?? null };
 }
 
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
@@ -371,7 +371,8 @@ const L1_HELP_FULL = `manager commands
   deploy                  new-agent wizard (framework + model), then chat
   start <id>              start a stopped agent
   stop <id>               stop a running agent
-  reset <id>              recreate an agent's container (asks framework + key)
+  reset <id>              recreate an agent's container (uses the recorded
+                          framework — 'reset <id> pick' to change; asks the key)
   retry <id|sealId>       resume a FAILED deploy/clone under the same identity
                           (re-runs the failed on-chain stages; reset after)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
@@ -481,10 +482,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        const [est, rows, detail] = await Promise.all([
+        let effErr: string | null = null;
+        const [est, rows, detail, eff] = await Promise.all([
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
+          ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
@@ -495,8 +498,6 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // A failed lookup must NOT be silent: "nothing owed" and "couldn't
         // check" are different answers, and hiding the latter cost a debug
         // session once already.
-        let effErr: string | null = null;
-        const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
         if (eff && eff.availableWei < eff.balanceWei) {
           if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
           if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
@@ -576,16 +577,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
         out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
         if (key && ctx.env.attestorUrl) {
-          try {
-            const { allAcked, missing } = await (await withWallet(ctx)).ackStatus();
+          // The three status reads are independent — fetch them in parallel
+          // (they were serial: 2.9s measured; parallel is bounded by the
+          // slowest, ~1.5s).
+          const ag2 = await withWallet(ctx);
+          const [ackRes, dRes, eff] = await Promise.all([
+            ag2.ackStatus().then((r) => ({ ok: true as const, r })).catch((e: Error) => ({ ok: false as const, e })),
+            ag2.getBalanceDetail().then((r) => ({ ok: true as const, r })).catch((e: Error) => ({ ok: false as const, e })),
+            ag2.getEffectiveBalance().catch(() => null),
+          ]);
+          if (ackRes.ok) {
+            const { allAcked, missing } = ackRes.r;
             out(`ack     : ${allAcked ? 'ok (trust root acknowledged)' : `missing ${missing.join(', ')} — run \`ack\``}\n`);
-          } catch (e) {
-            out(`ack     : (unreadable: ${(e as Error).message})\n`);
+          } else {
+            out(`ack     : (unreadable: ${ackRes.e.message})\n`);
           }
           try {
-            const ag2 = await withWallet(ctx);
-            const d = await ag2.getBalanceDetail();
-            const eff = await ag2.getEffectiveBalance().catch(() => null);
+            if (!dRes.ok) throw dRes.e;
+            const d = dRes.r;
             const effNote = eff && eff.availableWei < eff.balanceWei
               ? ` — AVAILABLE ${og(eff.availableWei)} (${og(eff.outstandingDebtWei + eff.pendingSettlementWei + eff.reservedWei)} owed/queued off-chain)`
               : '';
@@ -614,10 +623,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       }
 
       if (cmd === 'list') {
-        // Public listing — no wallet needed. The public rows carry no owner
-        // field (owner-only since #64), so "mine" cannot be derived from
-        // them: with a key configured, ALSO fetch the owner-signed listing
-        // and mark rows by sealId membership.
+        // Public listing — no wallet needed. Minted rows carry owner (chain-
+        // public via ownerOf); "mine" marks still come from the owner-signed
+        // listing so unminted rows attribute correctly too.
         let key = ctx.env.privateKey ?? loadKey() ?? undefined;
         let ag: AgenticID;
         try {
@@ -628,24 +636,39 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           key = undefined;
           ag = await clientFor(ctx, false);
         }
-        // The two listings are independent — fetch them in parallel.
-        const [rows, mySeals] = await Promise.all([
+        const mineOnly = args.includes('--mine') || args.includes('mine');
+        if (mineOnly && !key) { out('list --mine needs a wallet — run `login` first\n'); continue; }
+        // The two listings are independent — fetch them in parallel. The
+        // owner-signed rows carry `owner` for UNMINTED rows too (the public
+        // tier shows it only once minted); keyed by sealId for the table.
+        const [rows, myRows] = await Promise.all([
           ag.agent.listDeployments(),
           key
-            ? ag.agent.listMyDeployments().then((rs) => new Set(rs.map((r) => r.sealId))).catch(() => null)
+            ? ag.agent.listMyDeployments().catch(() => null)
             : Promise.resolve(null),
         ]);
-        if (!rows.length) { out('no agents on this attestor\n'); continue; }
-        for (const r of rows) {
-          const owned = mySeals?.has(r.sealId) ? '*' : ' ';
+        const mine = myRows ? new Map(myRows.map((r) => [r.sealId, r])) : null;
+        // A failed owner listing must not read as an empty wallet (F2): with
+        // --mine it aborts with the reason; without, fall back unmarked.
+        if (key && !mine) {
+          if (mineOnly) { out('could not fetch your owner-signed listing — try again or check the attestor\n'); continue; }
+          out('warning: owner listing unavailable — showing unmarked rows\n');
+        }
+        const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
+        if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
+        const shortAddr = (a?: string | null): string => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
+        out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
+        for (const r of shown) {
+          const owned = mine?.has(r.sealId) ? '*' : ' ';
           // Everyone gets the short form — commands accept a unique sealId
           // PREFIX, so unminted rows ('?') stay referenceable without a
           // 66-char column blowout. (feedback.md F12)
           const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${r.name ?? ''}\n`);
+          const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${r.name ?? ''}\n`);
         }
-        if (mySeals) out('(* = owned by your wallet)\n');
-        if (rows.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + rows.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
+        if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
+        if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
         continue;
       }
 
@@ -671,8 +694,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
           continue;
         }
-        // reset
-        const framework = await pickFramework(attestorUrl, ask);
+        // reset — the row remembers its framework; ask only when unknown
+        // (legacy rows). `reset <id> pick` forces the menu to change harness.
+        const forcePick = args[1] === 'pick';
+        let framework: string;
+        if (row.framework && !forcePick) {
+          framework = row.framework;
+          out(`framework: ${framework} (recorded — \`reset ${args[0]} pick\` to change)\n`);
+        } else {
+          framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
+        }
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
@@ -1257,12 +1288,15 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
  *  Gates every balance-spending action (deploy/start/reset). Returns false
  *  when the user declines (caller should abort the action). */
 async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
+  // ack (may send a tx) and the effective-balance read are independent —
+  // overlap them; the balance gate below still waits for both.
+  const effPromise = ag.getEffectiveBalance().catch(() => null);
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
   // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
   // off-chain debt) when reachable — that's what its create gate enforces;
   // the raw chain read is the fallback.
-  const eff = await ag.getEffectiveBalance().catch(() => null);
+  const eff = await effPromise;
   const bal = eff ? eff.availableWei : await ag.getBalance();
   if (bal < parseEther('0.1')) {
     if (eff && eff.availableWei < eff.balanceWei) {
@@ -1369,7 +1403,7 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listDeployments();
   const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
-    { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null } | undefined;
+    { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;
   if (!row) {
     throw new CliError('AGENT_NOT_FOUND', `no deployment matches ${refInput} on this attestor`, {
       remedy: 'use `list` to see the agents this wallet owns here',
@@ -1383,6 +1417,11 @@ async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask:
     ag, attestorUrl, sealId: row.sealId, agentId,
     phase: row.phase ?? 'unknown',
     sandboxId: row.url ? sbid(row.url) : undefined,
+    // The attestor row remembers which harness this agent runs (deploy-time
+    // iData binding) — nobody should have to. Feeds the chat model selector
+    // and the reset default; legacy rows (pre-column) come through null and
+    // fall back to the old ask-once flow.
+    framework: row.framework ?? undefined,
   };
   if (row.phase === 'running' && row.url) await connectSession(s, row.url);
   // Entry status card: the agent's own pixel avatar (the attestor renders
@@ -1445,7 +1484,7 @@ async function failureReasonOf(attestorUrl: string, sealId: `0x${string}`): Prom
 }
 
 /** Numbered framework picker from /config — the user chooses; never guess.
- *  (The attestor exposes no framework name post-mint.) */
+ *  (The deployment row records the framework post-#154; this picker is the fallback for legacy rows and explicit switches.) */
 async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<string>, current?: string): Promise<string> {
   const cfg = (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(10_000) })
     .then((r) => r.json())
@@ -1474,7 +1513,8 @@ const L2_HELP_FULL = `session commands
   /topup [og]             fund this agent's agentSeal gas (default 0.1 OG)
   /start                  start (only from stopped)
   /stop                   stop the running container
-  /reset                  recreate the container (asks framework + key; also
+  /reset                  recreate the container (uses the recorded framework;
+                          /reset pick to choose another; asks the key; also
                           clears the local chat history)
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
@@ -1611,8 +1651,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         await connectSession(s, r.url);
         out(`running at ${s.url}\n`); continue;
       }
-      if (line === '/reset') {
-        s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
+      if (line === '/reset' || line === '/reset pick') {
+        // Known framework (the attestor row remembers it, or this session
+        // already picked one): use it without asking — changing harness on
+        // reset is the rare case, and '/reset pick' forces the menu for it.
+        // Unknown (legacy rows): menu as before.
+        if (s.framework && line !== '/reset pick') {
+          out(`framework: ${s.framework} (recorded — use /reset pick to change)\n`);
+        } else {
+          s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
+        }
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);

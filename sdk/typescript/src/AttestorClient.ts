@@ -209,8 +209,7 @@ export class AttestorClient {
   async getEffectiveBalance(): Promise<{
     balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint;
   }> {
-    const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
-      .then((r) => r.json())) as { sandbox_endpoint?: string };
+    const cfg = (await this.attestorConfig()) as { sandbox_endpoint?: string };
     if (!cfg.sandbox_endpoint) {
       throw new Error('getEffectiveBalance: this attestor does not advertise sandbox_endpoint');
     }
@@ -242,20 +241,22 @@ export class AttestorClient {
    * ({action, expires_at, nonce, payload, resource_id}) or the recovered
    * signer won't match.
    */
-  /** Destination provider address (0g-sandbox#93 binding), from the attestor
-   *  /config, cached. '' on failure — the provider accepts unbound envelopes
-   *  while AUTH_STRICT is off, so a flaky /config degrades to legacy. */
-  private providerAddr: string | undefined;
+  /** One cached /config fetch per client instance — the provider address
+   *  (0g-sandbox#93 envelope binding), sandbox endpoint (effective balance),
+   *  and future needs ride the same round-trip. {} on failure: every
+   *  consumer already degrades on missing fields. */
+  private cfgPromise: Promise<Record<string, string | undefined>> | undefined;
+  private attestorConfig(): Promise<Record<string, string | undefined>> {
+    // Memoize SUCCESS only: a transient /config failure at session start must
+    // not go sticky for the instance's lifetime (review #154 N3b) — clear the
+    // memo on failure so the next caller retries.
+    this.cfgPromise ??= fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.json() as Promise<Record<string, string | undefined>>)
+      .catch(() => { this.cfgPromise = undefined; return {}; });
+    return this.cfgPromise;
+  }
   private async resolveProviderAddr(): Promise<string> {
-    if (this.providerAddr !== undefined) return this.providerAddr;
-    try {
-      const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
-        .then((r) => r.json())) as { sandbox_provider_addr?: string };
-      this.providerAddr = cfg.sandbox_provider_addr ?? '';
-    } catch {
-      this.providerAddr = '';
-    }
-    return this.providerAddr;
+    return (await this.attestorConfig()).sandbox_provider_addr ?? '';
   }
 
   private async signEnvelope(
@@ -296,9 +297,9 @@ export class AttestorClient {
    */
   private async resolveSealedImage(explicit?: string, framework?: string): Promise<string> {
     if (explicit) return explicit;
-    const cfg: any = await fetch(`${this.baseUrl()}/config`)
-      .then((r) => (r.ok ? r.json() : null))
-      .catch(() => null);
+    // Rides the instance's memoized /config (review #154 N3a) — this was the
+    // one remaining uncached fetch on the deploy/reset/first-start path.
+    const cfg: any = await this.attestorConfig();
     if (framework && Array.isArray(cfg?.frameworks)) {
       const fw = cfg.frameworks.find((f: any) => f?.name === framework);
       if (fw?.image) return fw.image;
@@ -374,7 +375,10 @@ export class AttestorClient {
     const res = await fetch(`${this.baseUrl()}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope }),
+      // `framework` rides along so the attestor can keep the row's recorded
+      // framework in sync when a reset switches harness (review #154 F1) —
+      // optional; old attestors ignore unknown fields.
+      body: JSON.stringify({ seal_id: params.sealId, owner: account.address, sandbox_envelope: envelope, ...(params.framework ? { framework: params.framework } : {}) }),
     });
     if (!res.ok) {
       const text = await res.text().catch(() => '');
