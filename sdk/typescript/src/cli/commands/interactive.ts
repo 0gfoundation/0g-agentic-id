@@ -628,24 +628,33 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           key = undefined;
           ag = await clientFor(ctx, false);
         }
-        // The two listings are independent — fetch them in parallel.
-        const [rows, mySeals] = await Promise.all([
+        const mineOnly = args.includes('--mine') || args.includes('mine');
+        if (mineOnly && !key) { out('list --mine needs a wallet — run `login` first\n'); continue; }
+        // The two listings are independent — fetch them in parallel. The
+        // owner-signed rows also carry `owner`, which the public tier
+        // withholds; keep them keyed by sealId so the table can show it.
+        const [rows, myRows] = await Promise.all([
           ag.agent.listDeployments(),
           key
-            ? ag.agent.listMyDeployments().then((rs) => new Set(rs.map((r) => r.sealId))).catch(() => null)
+            ? ag.agent.listMyDeployments().catch(() => null)
             : Promise.resolve(null),
         ]);
-        if (!rows.length) { out('no agents on this attestor\n'); continue; }
-        for (const r of rows) {
-          const owned = mySeals?.has(r.sealId) ? '*' : ' ';
+        const mine = myRows ? new Map(myRows.map((r) => [r.sealId, r])) : null;
+        const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
+        if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
+        const shortAddr = (a?: string | null): string => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
+        out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'FRAMEWORK'.padEnd(11)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
+        for (const r of shown) {
+          const owned = mine?.has(r.sealId) ? '*' : ' ';
           // Everyone gets the short form — commands accept a unique sealId
           // PREFIX, so unminted rows ('?') stay referenceable without a
           // 66-char column blowout. (feedback.md F12)
           const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${r.name ?? ''}\n`);
+          const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${(r.framework ?? '').padEnd(11)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${r.name ?? ''}\n`);
         }
-        if (mySeals) out('(* = owned by your wallet)\n');
-        if (rows.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + rows.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
+        if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
+        if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');
         continue;
       }
 
