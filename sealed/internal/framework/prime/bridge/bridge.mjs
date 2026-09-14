@@ -330,12 +330,51 @@ function authorized(req) {
  */
 async function runTurn(session, text, onDelta, onActivity) {
 	let full = "";
+	let lastThinkingAt = 0;
+	// Extract plain text from a prime message's content (array of {type,text}
+	// blocks, or a bare string).
+	const messageText = (message) => {
+		const content = message?.content;
+		if (typeof content === "string") return content;
+		if (Array.isArray(content)) {
+			return content.map((b) => (b && b.type === "text" && typeof b.text === "string" ? b.text : "")).join("");
+		}
+		return "";
+	};
 	const unsubscribe = session.subscribe((event) => {
 		if (event.type === "message_update") {
 			const e = event.assistantMessageEvent;
-			if (!e || e.type !== "text_delta" || typeof e.delta !== "string") return;
-			full += e.delta;
-			if (onDelta) onDelta(e.delta);
+			if (e && e.type === "text_delta" && typeof e.delta === "string") {
+				full += e.delta;
+				if (onDelta) onDelta(e.delta);
+				return;
+			}
+			// A non-text message_update is the model THINKING (reasoning deltas —
+			// prime's reasoning-capable models emit these before any answer). Like
+			// dsh, surface it as a throttled "thinking" activity so a long silent
+			// pre-answer phase isn't mistaken for a hang. Throttle: reasoning
+			// fires many deltas/sec.
+			if (e && onActivity && /reason|think/i.test(e.type || "")) {
+				const now = Date.now();
+				if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity("thinking", "thinking"); }
+			}
+			return;
+		}
+		// message_end carries the COMPLETE assistant message. Some models (or
+		// non-streaming provider paths) deliver the answer here rather than as
+		// incremental text_delta — in which case the loop above forwarded
+		// nothing and the turn looks empty ("stream ended without output").
+		// Backfill: if this assistant message's text wasn't already streamed,
+		// forward whatever text_delta didn't cover. Diagnostic-logged so we can
+		// see, per turn, whether text arrived via deltas or only here.
+		if (event.type === "message_end" && event.message?.role === "assistant") {
+			const whole = messageText(event.message);
+			log(`message_end: role=assistant textLen=${whole.length} streamedLen=${full.length}`);
+			if (whole && !full) { if (onDelta) onDelta(whole); full += whole; }
+			else if (whole && full && whole.length > full.length && whole.startsWith(full)) {
+				const tail = whole.slice(full.length);
+				if (onDelta) onDelta(tail); full += tail;
+			}
 			return;
 		}
 		// Everything else is turn progress. An agent turn spends most of its time
@@ -346,7 +385,19 @@ async function runTurn(session, text, onDelta, onActivity) {
 		if (line && onActivity) onActivity(line, event.type);
 	});
 	try {
-		await session.prompt(text);
+		// streamingBehavior is REQUIRED by prime whenever a turn may already be
+		// in flight (the SDK rejects an un-annotated prompt with "Agent is
+		// already processing"). Our own serialize() chain can still race prime's
+		// server-side turn state — e.g. a prior turn aborted/truncated on the
+		// client but is still running in prime — so always annotate. "followUp"
+		// queues behind the running turn (don't drop the owner's message, don't
+		// interrupt work in progress); queueIfBusy/resumeIfIdle make the enqueue
+		// robust whether prime is mid-turn or idle-with-backlog.
+		await session.prompt(text, {
+			streamingBehavior: "followUp",
+			queueIfBusy: true,
+			resumeIfIdle: true,
+		});
 	} finally {
 		// subscribe() may return an unsubscribe function or nothing; tolerate both
 		// so a stale listener can't leak deltas into the next turn.
@@ -447,6 +498,13 @@ async function handleChat(req, res) {
 					(line, type) => {
 						log(`  ${line}`);
 						broadcastActivity({ turn: id, kind: type, text: line });
+						// Also ride the chat stream as an SSE COMMENT so the owner's
+						// CLI can render a ⚙ status line — a prime turn is mostly
+						// silent (thinking, tools, subagents) and an un-narrated
+						// stream looks dead. Mirrors the dsh bridge's `: activity`.
+						// SSE comments are ignored by any spec-compliant client that
+						// doesn't opt in, so this is backward-safe.
+						safeWrite(`: activity ${line}\n\n`);
 					},
 				),
 			);
@@ -523,6 +581,83 @@ const server = createServer((req, res) => {
 			if (res.headersSent) return res.end();
 			sendJSON(res, 500, { error: { message: String((err && err.message) || err) } });
 		});
+	}
+
+	// Owner's brake pedal: unconditionally abort the CURRENT turn, whoever
+	// started it. This is what makes Esc mean "stop the task" rather than
+	// "stop watching" — and the only way (short of /reset) to stop an orphaned
+	// turn whose originating connection is gone. Aborting is not a rollback:
+	// tool calls already executed stay executed; the turn just stops issuing
+	// new ones. Queued follow-ups survive and run next.
+	if (req.method === "POST" && path === "/v1/interrupt") {
+		return (async () => {
+			try {
+				const session = await getSession();
+				// Stopping a prime turn, done right. Two synchronous steps, NO
+				// awaiting — every wedge we hit came from waiting on something
+				// that never completes:
+				//   1. requestAbort() — SYNCHRONOUS and immediate: aborts the bash
+				//      AbortController (killProcessTree on the detached group),
+				//      aborts the agent/model call, cancels the turn, and suspends
+				//      the input pump (_sessionInputPumpSuspended=true).
+				//   2. resumeQueuedWork() — SYNCHRONOUS: lifts that suspension so
+				//      the next message is admitted. The pump otherwise only
+				//      auto-resumes on a NON-streaming prompt, and our chat is
+				//      streaming (followUp), so without this every later message
+				//      is silently swallowed.
+				// NOT abort(): abort() = requestAbort() + await waitForIdle(). If
+				// the turn is stuck (bash mid-syscall, model retry) waitForIdle
+				// never resolves, so a resume chained after it never runs — the
+				// session wedges until /reset. requestAbort already did the actual
+				// stopping; the idle wait buys us nothing but a hang.
+				if (typeof session.requestAbort === "function") {
+					session.requestAbort();
+					// requestAbort() stops the main loop + bash, but NOT spawned
+					// subagents — a task like "stand up a service" delegates work
+					// to RLM child runs that keep going after requestAbort (prime's
+					// own comment: the child's terminal update "is delayed
+					// indefinitely when the child is stuck mid-stream, which is
+					// exactly when users reach for the kill"). abort() cancels them
+					// via _cancelActiveRlmChildRuns; replicate that here — it's
+					// synchronous — instead of calling abort() (which then awaits
+					// waitForIdle and hangs). Underscore = private-by-convention,
+					// not enforced; guard so an SDK bump that renames it degrades.
+					if (typeof session._cancelActiveRlmChildRuns === "function") {
+						try { session._cancelActiveRlmChildRuns("interrupted by owner"); }
+						catch (e) { log(`interrupt: cancel child runs failed: ${(e && e.message) || e}`); }
+					}
+					if (typeof session.resumeQueuedWork === "function") session.resumeQueuedWork();
+					// Record the interruption IN THE TRANSCRIPT. Aborting kills the
+					// in-flight calls, but the model's context still shows a task
+					// half-done — on the next message it happily resumes the work
+					// (observed live: post-interrupt turns kept running ipython to
+					// finish the cancelled task while the owner's new message waited).
+					// A custom message makes the cancellation visible to the model,
+					// same as the CLI's own "[interrupted]" transcript marker. This
+					// relays the OWNER's action — mechanism, not behavioral steering.
+					if (typeof session.sendCustomMessage === "function") {
+						session.sendCustomMessage(
+							{
+								customType: "owner_interrupt",
+								content: "[The owner interrupted the current task. Stop working on it — do not resume it unless the owner asks again. Await the owner's next message.]",
+								display: true,
+							},
+							{ deliverAs: "nextTurn" },
+						).catch((e) => log(`interrupt: sendCustomMessage failed: ${(e && e.message) || e}`));
+					}
+					log("interrupt: requestAbort + cancelChildRuns + resumeQueuedWork by owner");
+					return sendJSON(res, 200, { ok: true, aborted: true });
+				}
+				if (typeof session.abort === "function") {
+					session.abort().catch((e) => log(`interrupt: abort() rejected: ${(e && e.message) || e}`));
+					log("interrupt: abort() invoked by owner (no requestAbort)");
+					return sendJSON(res, 200, { ok: true, aborted: true });
+				}
+				return sendJSON(res, 200, { ok: true, aborted: false, note: "this SDK exposes no abort" });
+			} catch (err) {
+				return sendJSON(res, 500, { error: { message: String((err && err.message) || err) } });
+			}
+		})();
 	}
 
 	return sendJSON(res, 404, { error: { message: `no route for ${req.method} ${path}` } });
