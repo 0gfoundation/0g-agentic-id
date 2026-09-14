@@ -915,6 +915,9 @@ export class AgenticID {
   readonly agent: AgentApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
+  /** Long-lived so its instance caches (/config: provider address, sandbox
+   *  endpoint) are paid once per session, not per call. */
+  private readonly attestor: AttestorClient;
   private readonly ctx: Ctx;
 
   constructor(config: AgenticIDConfig) {
@@ -923,6 +926,7 @@ export class AgenticID {
     this.agent = new AgentApi(ctx);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
+    this.attestor = new AttestorClient(ctx);
   }
 
   /**
@@ -1020,14 +1024,6 @@ export class AgenticID {
   getBalanceDetail(opts?: { user?: Address; provider?: Address }): Promise<{ balance: bigint; pendingRefund: bigint; refundUnlockAt: bigint }> {
     return this.infra.getBalanceDetail(opts?.user, opts?.provider);
   }
-  /** Lazily-cached AttestorClient — its instance caches (provider address,
-   *  sandbox endpoint) only pay the /config round-trips once per session
-   *  instead of on every effective-balance call (was 2 extra fetches each). */
-  private _attestorClient?: AttestorClient;
-  private attestorClient(): AttestorClient {
-    if (!this._attestorClient) this._attestorClient = new AttestorClient(this.ctx);
-    return this._attestorClient;
-  }
   /** The caller wallet's NATIVE gas balance (wei) — the funds that pay tx
    *  fees AND back a deposit's principal. A prepaid top-up can't exceed it. */
   async nativeBalance(address?: Address): Promise<bigint> {
@@ -1043,7 +1039,9 @@ export class AgenticID {
    * Needs a wallet and an attestor /config that advertises `sandbox_endpoint`.
    */
   getEffectiveBalance(): Promise<{ balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint }> {
-    return this.attestorClient().getEffectiveBalance();
+    // Reuse the facade's long-lived AttestorClient — its instance caches
+    // (config/provider address) pay the /config round-trips once, not per call.
+    return this.attestor.getEffectiveBalance();
   }
   /** Start withdrawing prepaid funds: moves `amountWei` into `pendingRefund` (time-locked). REPLACES any existing pending refund and restarts its lock (`amountWei` = new total). Claim with {@link withdrawRefund}. */
   requestRefund(params: { amountWei: bigint; provider?: Address }): Promise<WriteContractReturnType> { return this.infra.requestRefund(params); }

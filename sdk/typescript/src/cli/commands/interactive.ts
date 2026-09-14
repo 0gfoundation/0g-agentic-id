@@ -481,10 +481,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        const [est, rows, detail] = await Promise.all([
+        let effErr: string | null = null;
+        const [est, rows, detail, eff] = await Promise.all([
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
+          ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
@@ -495,8 +497,6 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // A failed lookup must NOT be silent: "nothing owed" and "couldn't
         // check" are different answers, and hiding the latter cost a debug
         // session once already.
-        let effErr: string | null = null;
-        const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
         if (eff && eff.availableWei < eff.balanceWei) {
           if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
           if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
@@ -1278,12 +1278,15 @@ async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<str
  *  Gates every balance-spending action (deploy/start/reset). Returns false
  *  when the user declines (caller should abort the action). */
 async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<string>): Promise<boolean> {
+  // ack (may send a tx) and the effective-balance read are independent —
+  // overlap them; the balance gate below still waits for both.
+  const effPromise = ag.getEffectiveBalance().catch(() => null);
   const ackTx = await ag.ack();
   if (ackTx) { out(`ack() → ${ackTx} (waiting…)\n`); await ag.agent.waitForTransaction(ackTx); }
   // Gate on the provider's EFFECTIVE balance (on-chain minus outstanding
   // off-chain debt) when reachable — that's what its create gate enforces;
   // the raw chain read is the fallback.
-  const eff = await ag.getEffectiveBalance().catch(() => null);
+  const eff = await effPromise;
   const bal = eff ? eff.availableWei : await ag.getBalance();
   if (bal < parseEther('0.1')) {
     if (eff && eff.availableWei < eff.balanceWei) {

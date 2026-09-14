@@ -209,8 +209,7 @@ export class AttestorClient {
   async getEffectiveBalance(): Promise<{
     balanceWei: bigint; reservedWei: bigint; outstandingDebtWei: bigint; pendingSettlementWei: bigint; availableWei: bigint;
   }> {
-    const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
-      .then((r) => r.json())) as { sandbox_endpoint?: string };
+    const cfg = (await this.attestorConfig()) as { sandbox_endpoint?: string };
     if (!cfg.sandbox_endpoint) {
       throw new Error('getEffectiveBalance: this attestor does not advertise sandbox_endpoint');
     }
@@ -242,20 +241,19 @@ export class AttestorClient {
    * ({action, expires_at, nonce, payload, resource_id}) or the recovered
    * signer won't match.
    */
-  /** Destination provider address (0g-sandbox#93 binding), from the attestor
-   *  /config, cached. '' on failure — the provider accepts unbound envelopes
-   *  while AUTH_STRICT is off, so a flaky /config degrades to legacy. */
-  private providerAddr: string | undefined;
+  /** One cached /config fetch per client instance — the provider address
+   *  (0g-sandbox#93 envelope binding), sandbox endpoint (effective balance),
+   *  and future needs ride the same round-trip. {} on failure: every
+   *  consumer already degrades on missing fields. */
+  private cfgPromise: Promise<Record<string, string | undefined>> | undefined;
+  private attestorConfig(): Promise<Record<string, string | undefined>> {
+    this.cfgPromise ??= fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
+      .then((r) => r.json() as Promise<Record<string, string | undefined>>)
+      .catch(() => ({}));
+    return this.cfgPromise;
+  }
   private async resolveProviderAddr(): Promise<string> {
-    if (this.providerAddr !== undefined) return this.providerAddr;
-    try {
-      const cfg = (await fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
-        .then((r) => r.json())) as { sandbox_provider_addr?: string };
-      this.providerAddr = cfg.sandbox_provider_addr ?? '';
-    } catch {
-      this.providerAddr = '';
-    }
-    return this.providerAddr;
+    return (await this.attestorConfig()).sandbox_provider_addr ?? '';
   }
 
   private async signEnvelope(
