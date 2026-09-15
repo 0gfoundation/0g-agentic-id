@@ -1793,7 +1793,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       };
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
-            if (label.startsWith('tool/')) sawToolActivity = true;
+            // "did work this turn" detector, across bridges' label dialects:
+            // dsh "tool/call bash", prime "tool_execution_start — bash" /
+            // "bash_command_start", hermes "tool/call web_search". Thinking
+            // alone doesn't count — a think-only turn with no output is still
+            // a failure worth reporting.
+            if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
             status = label;
             paintStatus();

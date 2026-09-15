@@ -796,6 +796,21 @@ const server = createServer((req, res) => {
 								try { session._cancelActiveRlmChildRuns("cancelled via /v1/responses"); } catch { /* best effort */ }
 							}
 							session.resumeQueuedWork();
+							// Same transcript marker as /v1/interrupt, for the same reason:
+							// without it the model sees a half-done task in context and
+							// RESUMES it on the next prompt (live-verified — a cancelled
+							// service build kept going and answered the next turn with its
+							// progress report instead of the user's message).
+							if (typeof session.sendCustomMessage === "function") {
+								session.sendCustomMessage(
+									{
+										customType: "owner_interrupt",
+										content: "[The owner interrupted the current task. Stop working on it — do not resume it unless the owner asks again. Await the owner's next message.]",
+										display: true,
+									},
+									{ deliverAs: "nextTurn" },
+								).catch((e) => log(`responses cancel: sendCustomMessage failed: ${(e && e.message) || e}`));
+							}
 						} else if (typeof session.abort === "function") {
 							session.abort().catch(() => {});
 						}
