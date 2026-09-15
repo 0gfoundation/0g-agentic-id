@@ -272,3 +272,46 @@ func TestPersonaPinIsDurable(t *testing.T) {
 		t.Errorf("apiKey should reference %s, got: %s", apiKeyEnvRef, out)
 	}
 }
+
+// models.json is chain-tracked, so agents minted before modelEntry.MaxTokens
+// existed restore a copy without it and fall back to the SDK's 16384 default —
+// fatal for reasoning models, whose thinking shares the output budget (live:
+// glm-5.3, ~6min of reasoning, empty visible reply). Start's backfill must
+// fill the field from the catalog exactly once and leave existing values —
+// the agent's own edits included — alone.
+func TestBackfillMaxTokens(t *testing.T) {
+	primeHome = t.TempDir()
+	ctx := context.Background()
+
+	legacy := []byte(`{"providers":{"0g-compute":{"baseUrl":"https://router-api.0g.ai/v1","api":"openai-completions","apiKey":"SEAL_MODEL_API_KEY","authHeader":true,"models":[{"id":"glm-5.3"}]}}}`)
+	if err := os.WriteFile(modelsJSONPath(), legacy, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	backfillMaxTokens(ctx)
+	provider, model := readPin()
+	if provider != "0g-compute" || model != "glm-5.3" {
+		t.Fatalf("backfill corrupted the pin: %q/%q", provider, model)
+	}
+	raw, _ := os.ReadFile(modelsJSONPath())
+	var cfg modelsConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("backfilled file unparseable: %v", err)
+	}
+	got := cfg.Providers["0g-compute"].Models[0].MaxTokens
+	if got <= 0 {
+		t.Fatalf("maxTokens not backfilled: %d", got)
+	}
+
+	// Idempotent + non-clobbering: a hand-set value survives another Start.
+	cfg.Providers["0g-compute"].Models[0].MaxTokens = 1234
+	if err := writeModelsJSON(cfg); err != nil {
+		t.Fatal(err)
+	}
+	backfillMaxTokens(ctx)
+	raw, _ = os.ReadFile(modelsJSONPath())
+	_ = json.Unmarshal(raw, &cfg)
+	if cfg.Providers["0g-compute"].Models[0].MaxTokens != 1234 {
+		t.Fatalf("backfill clobbered an existing value: %d", cfg.Providers["0g-compute"].Models[0].MaxTokens)
+	}
+}

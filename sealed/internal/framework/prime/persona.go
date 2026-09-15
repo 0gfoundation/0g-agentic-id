@@ -113,12 +113,12 @@ func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byt
 	// kept the pin in memory only, and every boot after that first commit came up
 	// with no model at all — found live, on agent 271.
 	if seed.Inference.Provider != "" && seed.Inference.Model != "" {
-		provider, api, baseURL := resolveInference(ctx, seed.Inference.Provider, seed.Inference.Model)
+		provider, api, baseURL, maxTokens := resolveInference(ctx, seed.Inference.Provider, seed.Inference.Model)
 		if baseURL == "" {
 			// A native provider is a built-in: nothing to register, and writing a
 			// half-filled entry would shadow the built-in with a broken one.
 			logger.Logf("prime.HandleLegacy[persona]: native provider %q — no models.json entry needed", provider)
-		} else if err := writeModelsJSON(buildModelsConfig(provider, seed.Inference.Model, api, baseURL)); err != nil {
+		} else if err := writeModelsJSON(buildModelsConfig(provider, seed.Inference.Model, api, baseURL, maxTokens)); err != nil {
 			return fmt.Errorf("prime.HandleLegacy[persona]: %w", err)
 		}
 	}

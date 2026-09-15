@@ -2,9 +2,12 @@ package prime
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"seal-verify/internal/logger"
 )
 
 // role="models.json" — the inference pin, in the framework's own format.
@@ -32,6 +35,11 @@ const apiKeyEnvRef = "SEAL_MODEL_API_KEY"
 
 type modelEntry struct {
 	ID string `json:"id"`
+	// MaxTokens is the model's OUTPUT budget per call (the SDK sends it as
+	// max_tokens). Filled from the router catalog's max_completion_tokens
+	// (see resolveInference); omitted (SDK default 16384) only for values the
+	// catalog didn't provide.
+	MaxTokens int `json:"maxTokens,omitempty"`
 }
 
 type providerCfg struct {
@@ -52,7 +60,7 @@ type modelsConfig struct {
 // compat disables the `developer` role and `reasoning_effort`: a third-party
 // OpenAI-compatible endpoint generally understands neither, and the package's
 // own docs recommend turning both off for that class of server.
-func buildModelsConfig(provider, model, api, baseURL string) modelsConfig {
+func buildModelsConfig(provider, model, api, baseURL string, maxTokens int) modelsConfig {
 	return modelsConfig{Providers: map[string]providerCfg{
 		provider: {
 			BaseURL:    baseURL,
@@ -60,7 +68,7 @@ func buildModelsConfig(provider, model, api, baseURL string) modelsConfig {
 			APIKey:     apiKeyEnvRef,
 			AuthHeader: true,
 			Compat:     map[string]bool{"supportsDeveloperRole": false, "supportsReasoningEffort": false},
-			Models:     []modelEntry{{ID: model}},
+			Models:     []modelEntry{{ID: model, MaxTokens: maxTokens}},
 		},
 	}}
 }
@@ -116,6 +124,48 @@ func readPin() (provider, model string) {
 		return name, ""
 	}
 	return "", ""
+}
+
+// backfillMaxTokens fills modelEntry.MaxTokens from the router catalog for
+// registered (non-builtin) providers whose entries predate the field —
+// models.json is a chain-tracked role, so every agent minted before the field
+// existed restores a copy without it on each reset and falls back to the
+// SDK's 16384 default (the empty-reply failure resolveInference documents).
+// Idempotent: entries that already carry a budget are left alone, so this
+// never fights the agent's own edits; the updated file rides the next drift
+// commit back to chain. Failures are logged, not fatal — the pin still works,
+// just with the SDK default.
+func backfillMaxTokens(ctx context.Context) {
+	raw, err := os.ReadFile(modelsJSONPath())
+	if err != nil {
+		return // no file (native provider or first boot pre-persona) — nothing to fix
+	}
+	var cfg modelsConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return
+	}
+	changed := false
+	for name, p := range cfg.Providers {
+		if p.BaseURL == "" {
+			continue // builtin shape — the SDK owns its limits
+		}
+		for i, m := range p.Models {
+			if m.MaxTokens != 0 || m.ID == "" {
+				continue
+			}
+			if _, _, _, maxTokens := resolveInference(ctx, name, m.ID); maxTokens > 0 {
+				p.Models[i].MaxTokens = maxTokens
+				cfg.Providers[name] = p
+				changed = true
+				logger.Logf("prime: models.json backfill — %s/%s maxTokens=%d (router catalog)", name, m.ID, maxTokens)
+			}
+		}
+	}
+	if changed {
+		if err := writeModelsJSON(cfg); err != nil {
+			logger.Logf("prime: models.json backfill write failed: %v", err)
+		}
+	}
 }
 
 // evoModelsJSON returns the canonical plaintext for the role. A missing or

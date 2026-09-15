@@ -96,11 +96,13 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if p, m := readPin(); p != "" && m != "" {
 		provider, model = p, m
 	}
+	// Heal pre-maxTokens pins restored from chain (idempotent; see the func doc).
+	backfillMaxTokens(ctx)
 	if provider == "" || model == "" {
 		return framework.StartResult{}, fmt.Errorf(
 			"prime.Start: no inference pin — neither %s nor the persona seed named a provider/model", modelsJSONPath())
 	}
-	sdkProvider, modelAPI, baseURL := resolveInference(ctx, provider, model)
+	sdkProvider, modelAPI, baseURL, _ := resolveInference(ctx, provider, model)
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the
 	// bridge injects it as a virtual context file at session creation. No
@@ -180,17 +182,24 @@ const zgComputeProvider = "0g-compute"
 // hardcoded OpenAI assumption turned every first inference into a 400
 // (FRAMEWORK_ADAPTER.md §12, item 19). This function only decides HOW the
 // framework is told about a resolved route.
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string) {
+// maxTokens is the model's output budget from the router catalog (0 for a
+// native provider — nothing is registered, so no budget is written). It must
+// reach models.json: the SDK's 16384 default is fatal with reasoning models,
+// where thinking and the reply SHARE the budget — glm-5.3 thinking through a
+// big task burns >16k tokens on reasoning alone and the visible reply comes
+// out EMPTY (live on agent 404: three ~6min turns → textLen=0; the catalog
+// says the model supports 131k output).
+func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string, maxTokens int) {
 	if provider != zgComputeProvider {
 		// A native provider ("anthropic", "openai", …) is a built-in: the SDK
 		// knows its endpoint, so nothing needs registering.
-		return provider, "", ""
+		return provider, "", "", 0
 	}
 	route := inference.ResolveZG(ctx, model)
 	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL
+		return provider, "anthropic-messages", route.BaseURL, route.MaxTokens
 	}
-	return provider, "openai-completions", route.BaseURL
+	return provider, "openai-completions", route.BaseURL, route.MaxTokens
 }
 
 // verifyInstalled checks that the framework baked into this image is the one
