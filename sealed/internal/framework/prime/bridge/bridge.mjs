@@ -436,27 +436,19 @@ async function handleChat(req, res) {
 	const id = `chatcmpl-${created()}`;
 	const model = body.model || `${PROVIDER || "prime"}/${MODEL_ID || "default"}`;
 
-	// Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
-	// signal. The SDK session exposes abort() — stop the turn when the client
-	// goes away, guarded so a QUEUED request's disconnect never aborts someone
-	// else's active turn (turns are serialized), which also un-blocks the queue.
-	let myTurnActive = false;
+	// A dropped connection is NOT an interrupt. Networks blip, laptops sleep,
+	// and the sandbox preview proxy hard-caps request duration (~300s on
+	// mainnet, 0g-sandbox#122) — aborting on disconnect made every long task
+	// die with its stream, which broke the platform's core promise (agents
+	// work autonomously; the stream is just a window). Deliberate stops go
+	// through POST /v1/interrupt, which the CLI's Esc already calls — so the
+	// turn RUNS TO COMPLETION here and the owner reattaches via /agentlog or
+	// a follow-up message (queued behind the running turn).
 	let disconnected = false;
 	const onGone = () => {
 		if (disconnected) return;
 		disconnected = true;
-		if (myTurnActive) {
-			// session.abort(): Promise<void> — verified against the installed SDK
-			// (dist/core/agent-session.d.ts). Guarded anyway: on an SDK where it
-			// is absent the turn must keep its old run-to-completion behaviour
-			// with a loud log, not a TypeError.
-			if (typeof session.abort === "function") {
-				log("client disconnected mid-turn — aborting");
-				Promise.resolve(session.abort()).catch((err) => log(`WARN session.abort: ${(err && err.message) || err}`));
-			} else {
-				log("WARN client disconnected mid-turn but this SDK exposes no session.abort() — turn continues server-side");
-			}
-		}
+		log("client disconnected mid-turn — turn continues server-side (stop it explicitly via /v1/interrupt)");
 	};
 	res.on("close", () => { if (!res.writableEnded) onGone(); });
 	// Writes after a disconnect throw (incl. from the keepalive interval, where
@@ -466,9 +458,11 @@ async function handleChat(req, res) {
 		try { res.write(s); } catch { /* client raced us to the close */ }
 	};
 	const runMine = (fn) => serialize(() => {
+		// Still skip STARTING a turn whose requester is already gone — that
+		// message's author can re-send; but a turn already running keeps
+		// running (see onGone).
 		if (disconnected) return "";
-		myTurnActive = true;
-		return Promise.resolve(fn()).finally(() => { myTurnActive = false; });
+		return Promise.resolve(fn());
 	});
 
 	if (body.stream) {

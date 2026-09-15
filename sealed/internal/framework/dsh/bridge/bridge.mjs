@@ -359,26 +359,17 @@ async function handleChat(req, res) {
   const id = `chatcmpl-${created()}`
   const model = body.model || `${PROVIDER}/${MODEL_ID}`
 
-  // Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
-  // signal (chat/completions has no cancel endpoint). When the client goes
-  // away mid-turn, stop the turn via DSH's native agent.cancel() — the abort
-  // propagates into every running tool and the in-flight LLM request, and the
-  // turn settles cleanly in the session. Two details matter:
-  //   - Guard on "MY turn is the active one": turns are serialized, so a
-  //     queued request's disconnect must not cancel someone else's turn.
-  //   - This also un-blocks the queue: without it, an abandoned long turn
-  //     stalls every request behind it.
-  let myTurnActive = false
+  // A dropped connection is NOT an interrupt. Networks blip, laptops sleep,
+  // and the sandbox preview proxy hard-caps request duration (~300s on
+  // mainnet, 0g-sandbox#122) — cancelling on disconnect made every long task
+  // die with its stream. Deliberate stops go through POST /v1/interrupt
+  // (the CLI's Esc calls it), so the turn RUNS TO COMPLETION here; the owner
+  // reattaches via /agentlog or a follow-up message (queued behind it).
   let disconnected = false
   const onGone = () => {
     if (disconnected) return
     disconnected = true
-    if (myTurnActive) {
-      log('client disconnected mid-turn — cancelling')
-      try { agent.cancel('client disconnected') } catch (err) {
-        log(`WARN agent.cancel: ${(err && err.message) || err}`)
-      }
-    }
+    log('client disconnected mid-turn — turn continues server-side (stop it explicitly via /v1/interrupt)')
   }
   res.on('close', () => { if (!res.writableEnded) onGone() })
 
@@ -393,10 +384,7 @@ async function handleChat(req, res) {
   const runMine = (onDelta, onActivity) =>
     serialize(() => {
       if (disconnected) return '' // client left while queued — skip, don't run
-      myTurnActive = true
-      return runTurn(ctx, agent, text, onDelta, onActivity).finally(() => {
-        myTurnActive = false
-      })
+      return runTurn(ctx, agent, text, onDelta, onActivity)
     })
 
   if (body.stream) {

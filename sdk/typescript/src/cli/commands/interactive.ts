@@ -1778,6 +1778,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
+        } else if (/fetch failed|terminated|ECONNRESET|socket|network|aborted by the server|other side closed/i.test((e as Error).message)) {
+          // Connection dropped WITHOUT the user asking (proxy duration caps,
+          // network blips, sleep). The bridges deliberately keep the turn
+          // running through disconnects (only /v1/interrupt stops work), so
+          // this is a lost window, not a failed task — say so instead of
+          // crying failure, and route the user to the reattach paths.
+          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Follow it with /agentlog; send a message later to get results, or Esc/${'/'}reset to stop it)\n`);
+          messages.push({ role: 'assistant', content: `${reply} [connection dropped mid-turn — task continued server-side]` });
+          break;
         } else {
           failure = (e as Error).message;
         }
