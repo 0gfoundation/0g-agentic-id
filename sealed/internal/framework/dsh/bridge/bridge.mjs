@@ -71,6 +71,14 @@ const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
 const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
+// Router-catalog model facts the adapter resolved (see spawn.go): the output
+// budget, and whether the model takes reasoning_effort. The latter is not an
+// optimization: an always-thinking model (glm-5.3) reasons WITHOUT BOUND when
+// the parameter is absent — measured 100k+ chars of reasoning, zero reply,
+// stream killed upstream; effort "low" converges in minutes. "low" because
+// glm-5.3 accepts only low/high/max and low is the portable intersection.
+const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
+const MODEL_REASONING = process.env.SEAL_MODEL_REASONING === '1'
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -143,7 +151,17 @@ async function boot() {
       [PROVIDER]: {
         apiKeyEnv: 'SEAL_MODEL_API_KEY',
         ...(MODEL_BASE_URL ? { api: MODEL_API, baseURL: MODEL_BASE_URL } : {}),
-        models: [{ id: MODEL_ID }],
+        // Bounded reasoning (see MODEL_REASONING above): declare the level set
+        // the model accepts (keys = offered levels, values = wire spellings)
+        // so pi-ai marks it reasoning-capable, and default the profile to
+        // "low". resolveReasoningLevel validates against this set, so an
+        // unsupported level fails loudly here instead of as an upstream 400.
+        ...(MODEL_REASONING ? { reasoning: 'low' } : {}),
+        models: [{
+          id: MODEL_ID,
+          ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
+          ...(MODEL_REASONING ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+        }],
       },
     },
   })
@@ -272,6 +290,180 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
     if (typeof off === 'function') off()
   }
   return full
+}
+
+// ── /v1/responses (OpenAI Responses API subset) ─────────────────────────────
+//
+// The long-task surface (verbatim port of the prime bridge's implementation).
+// chat/completions couples the TURN to one HTTP connection — fatal for agent
+// work that legitimately runs longer than any proxy allows a request to live
+// (0g-sandbox#122: ~300s on mainnet). The Responses shape decouples them:
+//
+//   POST /v1/responses {input, stream:true}   → SSE; first event carries id
+//   GET  /v1/responses/:id                    → poll {status, output_text}
+//   GET  /v1/responses/:id?stream=true&starting_after=N
+//                                             → replay events > N, then live
+//   POST /v1/responses/:id/cancel             → cancel the running turn
+//
+// Subset only: input as string or messages-style items (last user text wins,
+// same as handleChat — the agent is a stateful session, not a stateless
+// completion). Events carry sequence_number for resume. Responses are kept in
+// a bounded in-memory ring (survives disconnects, not bridge restarts — the
+// agent's own session state is the durable record).
+
+import { randomBytes } from 'node:crypto'
+
+const RESPONSES_MAX = 16
+const responses = new Map() // id -> record
+const responseOrder = []
+
+function newResponseRecord(text) {
+  const id = 'resp_' + randomBytes(12).toString('hex')
+  const rec = {
+    id,
+    status: 'queued', // queued | in_progress | completed | failed | cancelled
+    prompt: text.slice(0, 200),
+    events: [], // {seq, name, data}
+    seq: 0,
+    outputText: '',
+    error: null,
+    listeners: new Set(), // live followers: (evt) => void
+  }
+  responses.set(id, rec)
+  responseOrder.push(id)
+  while (responseOrder.length > RESPONSES_MAX) {
+    const old = responseOrder.shift()
+    responses.delete(old)
+  }
+  return rec
+}
+
+function pushResponseEvent(rec, name, data) {
+  const evt = { seq: ++rec.seq, name, data }
+  rec.events.push(evt)
+  // Bound memory: cap the retained delta log (~1MB of text per response).
+  if (rec.events.length > 4096) rec.events.splice(0, rec.events.length - 4096)
+  for (const l of rec.listeners) {
+    try { l(evt) } catch { /* dead follower */ }
+  }
+  return evt
+}
+
+function responseSnapshot(rec) {
+  return {
+    id: rec.id,
+    object: 'response',
+    status: rec.status,
+    output_text: rec.outputText,
+    ...(rec.error ? { error: { message: rec.error } } : {}),
+  }
+}
+
+/** Run one agent turn under a response record. The turn is owned by the
+ *  record, NOT by any HTTP connection — followers attach and detach freely. */
+function startResponseTurn(rec, text) {
+  rec.turn = serialize(async () => {
+    // A cancel can land while this task is still QUEUED behind another turn
+    // (the cancel path then only marks the status — agent.cancel() would hit
+    // the wrong, currently-running task). Honor it here instead of silently
+    // overwriting it and running a dead task (review B1).
+    if (rec.status === 'cancelled') {
+      pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
+      pushResponseEvent(rec, 'response.completed', { type: 'response.completed', response: responseSnapshot(rec) })
+      return
+    }
+    rec.status = 'in_progress'
+    pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
+    try {
+      const { ctx, agent } = await getAgent()
+      const full = await runTurn(
+        ctx,
+        agent,
+        text,
+        (delta) => {
+          rec.outputText += delta
+          pushResponseEvent(rec, 'response.output_text.delta', {
+            type: 'response.output_text.delta',
+            delta,
+            sequence_number: rec.seq + 1,
+          })
+        },
+        (line) => {
+          log(`  ${line}`)
+          // Activity rides as a non-standard event so resumed followers
+          // see progress too; standard clients ignore unknown names.
+          pushResponseEvent(rec, 'response.activity', { type: 'response.activity', label: line })
+        },
+      )
+      if (rec.status !== 'cancelled') {
+        rec.outputText = full || rec.outputText
+        rec.status = 'completed'
+      }
+      pushResponseEvent(rec, 'response.completed', { type: 'response.completed', response: responseSnapshot(rec) })
+    } catch (err) {
+      rec.status = rec.status === 'cancelled' ? 'cancelled' : 'failed'
+      rec.error = String((err && err.message) || err)
+      pushResponseEvent(rec, 'response.failed', { type: 'response.failed', response: responseSnapshot(rec) })
+    }
+  })
+}
+
+/** SSE-stream a record to `res` from sequence > startingAfter: replay the
+ *  buffered events, then follow live until a terminal event. */
+function streamResponse(req, res, rec, startingAfter) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  if (typeof res.flushHeaders === 'function') res.flushHeaders()
+  let closed = false
+  const write = (evt) => {
+    if (closed || res.writableEnded || res.destroyed) return
+    try {
+      res.write(`id: ${evt.seq}\nevent: ${evt.name}\ndata: ${JSON.stringify({ ...evt.data, sequence_number: evt.seq })}\n\n`)
+    } catch { closed = true }
+  }
+  const isTerminal = (evt) => evt.name === 'response.completed' || evt.name === 'response.failed'
+  const beat = setInterval(() => {
+    if (!closed && !res.writableEnded && !res.destroyed) { try { res.write(': keepalive\n\n') } catch { closed = true } }
+  }, 10_000)
+  const finish = () => {
+    clearInterval(beat)
+    rec.listeners.delete(follow)
+    if (!res.writableEnded && !res.destroyed) { try { res.end() } catch { /* raced */ } }
+  }
+  const follow = (evt) => { write(evt); if (isTerminal(evt)) finish() }
+  // Replay history strictly after the resume point.
+  let sawTerminal = false
+  for (const evt of rec.events) {
+    if (evt.seq <= startingAfter) continue
+    write(evt)
+    if (isTerminal(evt)) sawTerminal = true
+  }
+  if (sawTerminal || rec.status === 'completed' || rec.status === 'failed' || rec.status === 'cancelled') {
+    finish()
+    return
+  }
+  rec.listeners.add(follow)
+  res.on('close', () => { closed = true; finish() })
+}
+
+/** Extract the user text from a Responses `input` (string or items array). */
+function responseInputText(input) {
+  if (typeof input === 'string') return input
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const it = input[i]
+      if (!it || (it.role && it.role !== 'user')) continue
+      if (typeof it.content === 'string') return it.content
+      if (Array.isArray(it.content)) {
+        const t = it.content.filter((c) => c && typeof c.text === 'string').map((c) => c.text).join('\n')
+        if (t) return t
+      }
+    }
+  }
+  return ''
 }
 
 // ── OpenAI wire shapes (verbatim from the prime bridge) ─────────────────────
@@ -467,6 +659,61 @@ const server = createServer((req, res) => {
       if (res.headersSent) return res.end()
       sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
     })
+  }
+
+  // ── /v1/responses — the long-task surface (see the module block above) ──
+  if (req.method === 'POST' && path === '/v1/responses') {
+    return (async () => {
+      const raw = await readBody(req)
+      let body
+      try { body = JSON.parse(raw || '{}') } catch { return sendJSON(res, 400, { error: { message: 'invalid JSON body' } }) }
+      const text = responseInputText(body.input)
+      if (!text) return sendJSON(res, 400, { error: { message: 'input is required (string or messages-style items)' } })
+      const rec = newResponseRecord(text)
+      startResponseTurn(rec, text)
+      log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)`)
+      if (body.stream) return streamResponse(req, res, rec, 0)
+      // Non-stream (background-style): hand back the id immediately.
+      return sendJSON(res, 200, responseSnapshot(rec))
+    })().catch((err) => {
+      log(`ERROR ${err && err.stack ? err.stack : err}`)
+      if (!res.headersSent) sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
+    })
+  }
+  {
+    const m = path.match(/^\/v1\/responses\/(resp_[0-9a-f]+)(\/cancel)?$/)
+    if (m) {
+      const rec = responses.get(m[1])
+      if (!rec) return sendJSON(res, 404, { error: { message: `no such response ${m[1]} (the bridge keeps the last ${RESPONSES_MAX})` } })
+      if (req.method === 'POST' && m[2] === '/cancel') {
+        return (async () => {
+          // QUEUED: hasn't touched the agent — agent.cancel() would abort the
+          // wrong, currently-running task (review B1). Mark only; the
+          // turn-body guard no-ops it at dequeue.
+          if (rec.status === 'queued') {
+            rec.status = 'cancelled'
+            log(`responses: ${rec.id} cancelled while queued`)
+            return sendJSON(res, 200, responseSnapshot(rec))
+          }
+          if (rec.status === 'in_progress') {
+            rec.status = 'cancelled'
+            const { agent } = await getAgent()
+            try { agent.cancel('cancelled via /v1/responses') } catch { /* idle already */ }
+            log(`responses: ${rec.id} cancelled`)
+          }
+          return sendJSON(res, 200, responseSnapshot(rec))
+        })().catch((err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }))
+      }
+      if (req.method === 'GET' && !m[2]) {
+        const q = new URLSearchParams((req.url || '').split('?')[1] || '')
+        if (q.get('stream') === 'true') {
+          const after = Number(q.get('starting_after') || '0') || 0
+          return streamResponse(req, res, rec, after)
+        }
+        return sendJSON(res, 200, responseSnapshot(rec))
+      }
+      return sendJSON(res, 405, { error: { message: 'method not allowed' } })
+    }
   }
 
   // Owner's brake pedal: unconditionally cancel the CURRENT turn, whoever

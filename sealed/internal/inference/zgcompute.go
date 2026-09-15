@@ -45,6 +45,15 @@ const (
 // tests can point it at a httptest server.
 var zgModelsURL = "https://router-api.0g.ai/v1/models"
 
+// SetCatalogURLForTest points the catalog at a test server and returns a
+// restore func. For adapter tests in other packages (this package's own tests
+// can set zgModelsURL directly).
+func SetCatalogURLForTest(u string) (restore func()) {
+	prev := zgModelsURL
+	zgModelsURL = u
+	return func() { zgModelsURL = prev }
+}
+
 // Route is a resolved routing decision for one model on 0g-compute.
 type Route struct {
 	Format  WireFormat
@@ -55,7 +64,30 @@ type Route struct {
 	EnvKey        string
 	ContextWindow int
 	MaxTokens     int
+	// SupportsReasoningEffort reports whether the catalog lists
+	// reasoning_effort among the model's supported_parameters. It matters
+	// beyond optimization: always-thinking models (glm-5.3) reason WITHOUT
+	// BOUND when the parameter is absent — measured live: 23k chars of
+	// reasoning over 10 minutes, zero visible reply, stream killed upstream —
+	// while reasoning_effort=low converges in ~2.5min with a full reply.
+	// False on the heuristic fallback (can't know, and sending the parameter
+	// to a model that rejects it is a hard 400).
+	SupportsReasoningEffort bool
+	// CatalogSourced reports that the limits above came from the live catalog
+	// rather than the name heuristic. Callers that PERSIST limits into
+	// chain-tracked config must gate on it: a heuristic guess written to disk
+	// during a catalog outage looks hand-set forever after and poisons the
+	// agent (review P1 — 8192 starves a reasoning model's shared
+	// thinking+reply budget into permanently empty replies).
+	CatalogSourced bool
 }
+
+// HeuristicOpenAIMaxTokens is the conservative output budget the name
+// heuristic assumes for OpenAI-format models when the catalog is unreachable.
+// Exported so config healers can recognize it as a machine-written value
+// (eligible for healing once the catalog is reachable again) rather than a
+// hand-set one.
+const HeuristicOpenAIMaxTokens = 8192
 
 // ResolveZG returns the routing decision for a model on 0g-compute.
 //
@@ -76,6 +108,13 @@ func ResolveZG(ctx context.Context, model string) Route {
 		if entry.MaxCompletionTokens > 0 {
 			r.MaxTokens = entry.MaxCompletionTokens
 		}
+		for _, p := range entry.SupportedParameters {
+			if p == "reasoning_effort" {
+				r.SupportsReasoningEffort = true
+				break
+			}
+		}
+		r.CatalogSourced = true
 		return r
 	}
 	// Fallback heuristic — keep boot working through a catalog outage.
@@ -93,7 +132,7 @@ func heuristicRoute(model string) Route {
 	if strings.HasPrefix(strings.ToLower(model), "claude") {
 		return anthropicRoute(200000, 64000)
 	}
-	return openAIRoute(128000, 8192)
+	return openAIRoute(128000, HeuristicOpenAIMaxTokens)
 }
 
 func routeForFormats(formats []string, model string) Route {
@@ -134,6 +173,7 @@ type zgCatalogEntry struct {
 	SupportedFormats    []string `json:"supported_formats"`
 	ContextLength       int      `json:"context_length"`
 	MaxCompletionTokens int      `json:"max_completion_tokens"`
+	SupportedParameters []string `json:"supported_parameters"`
 }
 
 func fetchZGCatalogEntry(ctx context.Context, model string) (zgCatalogEntry, bool) {

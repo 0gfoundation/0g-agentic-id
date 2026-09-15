@@ -18,7 +18,7 @@ func TestZGAugmentationWritesKeyThenStripped(t *testing.T) {
 	hermesHome = t.TempDir()
 	route := &inference.Route{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"}
 
-	if err := applyZGComputeAugmentation("0g-compute", "0gm-1.0-35b-a3b", "sk-secret-router-key", route); err != nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "0gm-1.0-35b-a3b", "sk-secret-router-key", route); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,7 +52,59 @@ func TestZGAugmentationWritesKeyThenStripped(t *testing.T) {
 func TestZGAugmentationRejectsAnthropicFormat(t *testing.T) {
 	hermesHome = t.TempDir()
 	route := &inference.Route{Format: inference.WireAnthropic, BaseURL: inference.ZGAnthropicBaseURL}
-	if err := applyZGComputeAugmentation("0g-compute", "claude-opus-4-8", "sk-x", route); err == nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "claude-opus-4-8", "sk-x", route); err == nil {
 		t.Error("expected anthropic-format model to be rejected")
+	}
+}
+
+// Bounded reasoning: when the catalog says the model takes reasoning_effort,
+// the augmentation seeds agent.reasoning_effort="low" (hermes's global
+// reasoning chokepoint) — and never overwrites a value the owner/agent set,
+// including boolean false ("thinking disabled").
+func TestZGAugmentationSeedsReasoningEffort(t *testing.T) {
+	hermesHome = t.TempDir()
+	route := &inference.Route{
+		Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL,
+		EnvKey: "OPENAI_API_KEY", SupportsReasoningEffort: true, CatalogSourced: true,
+	}
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", route); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfigYAML()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg["agent"].(map[string]any)["reasoning_effort"]; got != "low" {
+		t.Fatalf("agent.reasoning_effort = %v, want low", got)
+	}
+
+	// Owner-set value survives (false = deliberately disabled thinking).
+	if err := updateConfigYAML(func(c map[string]any) {
+		c["agent"].(map[string]any)["reasoning_effort"] = false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", route); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, _ := loadConfigYAML()
+	if got := cfg2["agent"].(map[string]any)["reasoning_effort"]; got != false {
+		t.Fatalf("owner-set reasoning_effort clobbered: %v", got)
+	}
+}
+
+// Models without the parameter (per catalog) get NO reasoning_effort seed —
+// sending it to a model that rejects it is a hard 400.
+func TestZGAugmentationNoEffortWhenUnsupported(t *testing.T) {
+	hermesHome = t.TempDir()
+	route := &inference.Route{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"}
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "some-plain-model", "sk-x", route); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := loadConfigYAML()
+	if agent, ok := cfg["agent"].(map[string]any); ok {
+		if _, set := agent["reasoning_effort"]; set {
+			t.Fatalf("reasoning_effort seeded for a model the catalog doesn't flag: %v", agent)
+		}
 	}
 }

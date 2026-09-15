@@ -52,6 +52,19 @@ export interface ChatMessage {
   content: string;
 }
 
+/**
+ * Snapshot of one long-running task (a "response" in OpenAI Responses API
+ * terms) on the agent. Returned by {@link AgentClient.task} /
+ * {@link AgentClient.cancelTask}.
+ */
+export interface AgentTask {
+  id: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
+  /** Assistant text produced so far (full text once completed). */
+  output_text: string;
+  error?: { message: string };
+}
+
 export interface ChatCompletion {
   choices: Array<{ message: { role: string; content: string } }>;
   [k: string]: unknown;
@@ -117,7 +130,41 @@ export interface AgentClient {
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
+    /** Fires once with the server-side task id, as soon as the agent assigns
+     *  one. Only on the responses transport (see {@link AgentClient.task}):
+     *  save it and you can re-attach to this turn after a process restart via
+     *  {@link AgentClient.followTask}, or stop it via
+     *  {@link AgentClient.cancelTask}. */
+    onTask?: (id: string) => void;
   }): AsyncGenerator<string>;
+  /**
+   * Poll one task's snapshot (status + text so far). Present only when the
+   * agent declares a `kind: "responses"` route — the long-task surface where
+   * a turn is owned by a server-side id rather than an HTTP connection, so it
+   * survives dropped connections and proxy request-duration caps. On such
+   * agents `chat`/`chatStream` already ride this transport transparently
+   * (auto-resuming when the connection drops); these methods are for
+   * re-attaching later or from elsewhere.
+   */
+  task?(id: string): Promise<AgentTask>;
+  /**
+   * Re-attach to a running (or finished) task and stream its remaining
+   * output. `startingAfter` is the last event sequence number already seen
+   * (0 = from the beginning — the agent replays buffered events first, then
+   * follows live). Ends when the task completes; throws if it failed.
+   * Present under the same conditions as {@link task}.
+   */
+  followTask?(id: string, opts?: {
+    startingAfter?: number;
+    signal?: AbortSignal;
+    onActivity?: (label: string) => void;
+  }): AsyncGenerator<string>;
+  /**
+   * Stop one task by id — the responses-transport form of {@link interrupt}.
+   * Already-executed actions are not rolled back. Present under the same
+   * conditions as {@link task}.
+   */
+  cancelTask?(id: string): Promise<AgentTask>;
   /**
    * Stop the agent's CURRENT task — whoever started it. Esc semantics: the
    * turn stops issuing new tool calls / output; already-executed actions are
@@ -164,6 +211,8 @@ async function* iterSseChunks(
   const decoder = new TextDecoder();
   let buf = '';
 
+  try {
+
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     // Named SSE events matter: hermes streams turn activity as
     // "event: hermes.tool.progress" frames on the same chat stream. Track the
@@ -204,6 +253,12 @@ async function* iterSseChunks(
     }
   }
   if (buf.trim()) yield* parseFrame(buf); // flush a trailing frame with no blank line
+  } finally {
+    // A consumer that breaks or throws out of the loop (e.g. the responses
+    // transport tearing down on a sequence gap) must not leave the HTTP
+    // connection dangling until GC.
+    try { await reader.cancel(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -436,6 +491,190 @@ export function makeAgentClient(params: {
             : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
         );
       }
+    };
+  }
+
+  // ── Responses transport (the long-task surface) ──────────────────────────
+  //
+  // When the agent declares a `kind: "responses"` route (prime/dsh bridges
+  // natively; openclaw/hermes via the sealed proxy's synthesized layer), a
+  // turn is owned by a server-side response id, not by the HTTP connection —
+  // so it survives network drops and the sandbox preview proxy's request-
+  // duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
+  // REPLACED to ride it: same signatures, but a dropped connection now means
+  // "resume from the last sequence number", not "the task died". task/
+  // followTask/cancelTask expose the id-level surface for re-attaching later.
+  const responsesRoute = routes.find((r) => r.kind === 'responses');
+  if (responsesRoute && canAuth) {
+    const rPrefix = responsesRoute.prefix.replace(/\/$/, '');
+
+    const taskSnapshot = async (id: string): Promise<AgentTask> => {
+      const r = await doFetch(`${rPrefix}/${id}`);
+      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${await r.text()}`);
+      return (await r.json()) as AgentTask;
+    };
+
+    // Normalize activity labels across serving layers: hermes narrates its
+    // reasoning phase as tool_name "_thinking" many times a second — collapse
+    // to the throttled "thinking" label the callers already understand.
+    const wrapActivity = (onActivity?: (label: string) => void): ((label: string) => void) | undefined => {
+      if (!onActivity) return undefined;
+      let lastThinkingAt = 0;
+      return (label: string) => {
+        if (label === '_thinking' || label === 'thinking') {
+          const now = Date.now();
+          if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity('thinking'); }
+          return;
+        }
+        onActivity(label);
+      };
+    };
+
+    /**
+     * Follow one response to its terminal event, yielding text deltas.
+     * `first` is an already-opened submit stream; without it (or after the
+     * connection drops) the loop (re)opens
+     * GET {prefix}/{id}?stream=true&starting_after={seq} — every event
+     * carries a sequence_number, so nothing is duplicated or lost across
+     * reconnects. Only an explicit abort or a terminal event ends the loop;
+     * repeated reconnect failures give up with the id in the message so the
+     * caller can re-attach later.
+     */
+    async function* followResponse(args: {
+      first?: Response;
+      id?: string;
+      startingAfter?: number;
+      signal?: AbortSignal;
+      onActivity?: (label: string) => void;
+      onTask?: (id: string) => void;
+    }): AsyncGenerator<string> {
+      let id = args.id;
+      let seq = args.startingAfter ?? 0;
+      let sawText = false;
+      let terminal: AgentTask | undefined;
+      let res: Response | undefined = args.first;
+      let failures = 0;
+
+      for (;;) {
+        if (!res) {
+          try {
+            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: args.signal });
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            res = r;
+          } catch (e) {
+            if (args.signal?.aborted) throw e;
+            if (++failures > 5) {
+              throw new Error(
+                `task ${id}: lost the agent while following (${(e as Error).message}) — ` +
+                `the task may still be running; re-attach with followTask("${id}")`,
+              );
+            }
+            await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
+            continue;
+          }
+        }
+        if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+          throw new Error('task: expected an SSE stream from the responses route');
+        }
+        try {
+          for await (const chunk of iterSseChunks(res.body)) {
+            const sn = (chunk as { sequence_number?: number }).sequence_number;
+            if (typeof sn === 'number') {
+              // Continuity guard (review B2): after a reconnect the replay may
+              // overlap what we already consumed — skip those. A FORWARD jump
+              // means the server dropped events for us (lagging-follower
+              // detach); don't consume past the hole — tear down and resume
+              // from the last good sequence, which replays the missing span
+              // from the server's retained log.
+              if (sn <= seq) continue;
+              if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
+              seq = sn; failures = 0;
+            }
+            switch ((chunk as { type?: string }).type) {
+              case 'response.created': {
+                const resp = (chunk as { response?: AgentTask }).response;
+                if (resp?.id && !id) { id = resp.id; args.onTask?.(resp.id); }
+                break;
+              }
+              case 'response.output_text.delta': {
+                const d = (chunk as { delta?: string }).delta;
+                if (typeof d === 'string' && d) { sawText = true; yield d; }
+                break;
+              }
+              case 'response.activity': {
+                const label = (chunk as { label?: string }).label;
+                if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                break;
+              }
+              case 'response.completed':
+              case 'response.failed': {
+                terminal = (chunk as { response?: AgentTask }).response;
+                break;
+              }
+            }
+            if (terminal) break;
+          }
+        } catch (e) {
+          if (args.signal?.aborted) throw e;
+          // Network cut mid-stream (this is the whole point): reconnect below.
+        }
+        if (terminal) break;
+        if (args.signal?.aborted) {
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          throw err;
+        }
+        if (!id) throw new Error('task: the stream ended before the agent assigned an id — cannot resume');
+        res = undefined; // reconnect via GET resume
+      }
+
+      if (terminal.status === 'failed') {
+        throw new Error(`chat: ${terminal.error?.message ?? 'task failed'}`);
+      }
+      if (terminal.status === 'cancelled') return; // owner stopped it — partial text already yielded
+      if (!sawText) {
+        // Deltas can fall past the agent's replay horizon on a very late
+        // re-attach; the terminal snapshot still carries the full text.
+        if (terminal.output_text) { yield terminal.output_text; return; }
+        throw new Error('chat: the task completed without any output — the agent-side model call likely failed (see /agentlog)');
+      }
+    }
+
+    client.chatStream = async function* (messages, opts) {
+      const payload: Record<string, unknown> = { input: messages, stream: true };
+      if (opts?.model) payload.model = opts.model;
+      const r = await doFetch(rPrefix, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: opts?.signal,
+      });
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      yield* followResponse({
+        first: r,
+        signal: opts?.signal,
+        onActivity: wrapActivity(opts?.onActivity),
+        onTask: opts?.onTask,
+      });
+    };
+
+    client.chat = async (messages, opts) => {
+      let content = '';
+      for await (const delta of client.chatStream!(messages, opts)) content += delta;
+      return { choices: [{ message: { role: 'assistant', content } }] } as ChatCompletion;
+    };
+
+    client.task = taskSnapshot;
+    client.followTask = (id, opts) => followResponse({
+      id,
+      startingAfter: opts?.startingAfter ?? 0,
+      signal: opts?.signal,
+      onActivity: wrapActivity(opts?.onActivity),
+    });
+    client.cancelTask = async (id) => {
+      const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
+      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${await r.text()}`);
+      return (await r.json()) as AgentTask;
     };
   }
 
