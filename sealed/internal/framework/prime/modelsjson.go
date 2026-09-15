@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 )
 
@@ -158,24 +159,38 @@ func backfillMaxTokens(ctx context.Context) {
 			continue // builtin shape — the SDK owns its limits
 		}
 		for i, m := range p.Models {
-			if m.ID == "" || (m.MaxTokens != 0 && m.Reasoning) {
-				continue // fully migrated (or hand-set) — leave it alone
+			if m.ID == "" {
+				continue
 			}
-			_, _, _, maxTokens, reasoningEffort := resolveInference(ctx, name, m.ID)
-			if m.MaxTokens == 0 && maxTokens > 0 {
-				p.Models[i].MaxTokens = maxTokens
-				changed = true
+			entryChanged := false
+			// Treat the heuristic's known machine-written budget as unset so a
+			// value poisoned during a catalog outage heals once the catalog is
+			// back (review P1); genuinely hand-set values stay untouched. The
+			// clearing itself persists even while the catalog is still down —
+			// the SDK's own default (16384) beats the poisoned 8192.
+			if m.MaxTokens == inference.HeuristicOpenAIMaxTokens {
+				m.MaxTokens = 0
+				p.Models[i].MaxTokens = 0
+				entryChanged = true
 			}
-			if !m.Reasoning && reasoningEffort {
-				p.Models[i].Reasoning = true
-				if p.Compat == nil {
-					p.Compat = map[string]bool{}
+			if m.MaxTokens == 0 || !m.Reasoning {
+				_, _, _, maxTokens, reasoningEffort := resolveInference(ctx, name, m.ID)
+				if m.MaxTokens == 0 && maxTokens > 0 {
+					p.Models[i].MaxTokens = maxTokens
+					entryChanged = true
 				}
-				p.Compat["supportsReasoningEffort"] = true
-				changed = true
+				if !m.Reasoning && reasoningEffort {
+					p.Models[i].Reasoning = true
+					if p.Compat == nil {
+						p.Compat = map[string]bool{}
+					}
+					p.Compat["supportsReasoningEffort"] = true
+					entryChanged = true
+				}
 			}
-			if changed {
+			if entryChanged {
 				cfg.Providers[name] = p
+				changed = true
 				logger.Logf("prime: models.json backfill — %s/%s maxTokens=%d reasoning=%v (router catalog)",
 					name, m.ID, p.Models[i].MaxTokens, p.Models[i].Reasoning)
 			}

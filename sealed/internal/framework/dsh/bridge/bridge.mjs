@@ -71,6 +71,14 @@ const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
 const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
+// Router-catalog model facts the adapter resolved (see spawn.go): the output
+// budget, and whether the model takes reasoning_effort. The latter is not an
+// optimization: an always-thinking model (glm-5.3) reasons WITHOUT BOUND when
+// the parameter is absent — measured 100k+ chars of reasoning, zero reply,
+// stream killed upstream; effort "low" converges in minutes. "low" because
+// glm-5.3 accepts only low/high/max and low is the portable intersection.
+const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
+const MODEL_REASONING = process.env.SEAL_MODEL_REASONING === '1'
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -143,7 +151,17 @@ async function boot() {
       [PROVIDER]: {
         apiKeyEnv: 'SEAL_MODEL_API_KEY',
         ...(MODEL_BASE_URL ? { api: MODEL_API, baseURL: MODEL_BASE_URL } : {}),
-        models: [{ id: MODEL_ID }],
+        // Bounded reasoning (see MODEL_REASONING above): declare the level set
+        // the model accepts (keys = offered levels, values = wire spellings)
+        // so pi-ai marks it reasoning-capable, and default the profile to
+        // "low". resolveReasoningLevel validates against this set, so an
+        // unsupported level fails loudly here instead of as an upstream 400.
+        ...(MODEL_REASONING ? { reasoning: 'low' } : {}),
+        models: [{
+          id: MODEL_ID,
+          ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
+          ...(MODEL_REASONING ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+        }],
       },
     },
   })
@@ -345,6 +363,15 @@ function responseSnapshot(rec) {
  *  record, NOT by any HTTP connection — followers attach and detach freely. */
 function startResponseTurn(rec, text) {
   rec.turn = serialize(async () => {
+    // A cancel can land while this task is still QUEUED behind another turn
+    // (the cancel path then only marks the status — agent.cancel() would hit
+    // the wrong, currently-running task). Honor it here instead of silently
+    // overwriting it and running a dead task (review B1).
+    if (rec.status === 'cancelled') {
+      pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
+      pushResponseEvent(rec, 'response.completed', { type: 'response.completed', response: responseSnapshot(rec) })
+      return
+    }
     rec.status = 'in_progress'
     pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
     try {
@@ -660,7 +687,15 @@ const server = createServer((req, res) => {
       if (!rec) return sendJSON(res, 404, { error: { message: `no such response ${m[1]} (the bridge keeps the last ${RESPONSES_MAX})` } })
       if (req.method === 'POST' && m[2] === '/cancel') {
         return (async () => {
-          if (rec.status === 'in_progress' || rec.status === 'queued') {
+          // QUEUED: hasn't touched the agent — agent.cancel() would abort the
+          // wrong, currently-running task (review B1). Mark only; the
+          // turn-body guard no-ops it at dequeue.
+          if (rec.status === 'queued') {
+            rec.status = 'cancelled'
+            log(`responses: ${rec.id} cancelled while queued`)
+            return sendJSON(res, 200, responseSnapshot(rec))
+          }
+          if (rec.status === 'in_progress') {
             rec.status = 'cancelled'
             const { agent } = await getAgent()
             try { agent.cancel('cancelled via /v1/responses') } catch { /* idle already */ }

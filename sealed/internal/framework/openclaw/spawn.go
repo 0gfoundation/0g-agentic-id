@@ -106,6 +106,17 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		logger.Logf("openclaw restart: skipping npm install + config rewrite (preserving agent self-modifications)")
 	}
 
+	// EVERY Start, initialized or not: heal machine-written config shapes that
+	// predate later fixes (bounded reasoning, catalog budgets, watchdog
+	// headroom). The augmentation above only ever runs on a fresh agent's
+	// first Start and never recognizes a chain-restored resolved pin again —
+	// without this, existing agents keep failing exactly the way the fixes
+	// address (review P0). Only sealed-written shapes are touched; agent/owner
+	// self-modifications are preserved. Failures are logged, not fatal.
+	if err := healOpenclawConfig(ctx); err != nil {
+		logger.Logf("openclaw: config heal skipped: %v", err)
+	}
+
 	// Always export the inference provider API key into bootstrap's env so
 	// spawnGateway's whitelist can pass it to the new openclaw subprocess.
 	// The env NAME follows the wire format, not the provider label: on

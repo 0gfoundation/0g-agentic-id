@@ -91,7 +91,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf(
 			"dsh.Start: no inference pin — neither %s nor the persona seed named a provider/model", settingsYAMLPath())
 	}
-	sdkProvider, api, baseURL := resolveInference(ctx, provider, model)
+	sdkProvider, api, baseURL, maxTokens, reasoningEffort := resolveInference(ctx, provider, model)
 
 	// Agent doc → a file OUTSIDE the framework home; the bridge injects it as a
 	// system-prompt section (the authoritative channel). No markers, nothing a
@@ -124,13 +124,15 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 
 	cmd, err := spawnBridge(bridgeEnv{
-		token:       token,
-		apiKey:      rt.APIKey,
-		sdkProvider: sdkProvider,
-		model:       model,
-		modelAPI:    api,
-		baseURL:     baseURL,
-		rt:          rt,
+		token:           token,
+		apiKey:          rt.APIKey,
+		sdkProvider:     sdkProvider,
+		model:           model,
+		modelAPI:        api,
+		baseURL:         baseURL,
+		maxTokens:       maxTokens,
+		reasoningEffort: reasoningEffort,
+		rt:              rt,
 	})
 	if err != nil {
 		return framework.StartResult{}, fmt.Errorf("dsh.Start: %w", err)
@@ -154,15 +156,29 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 // A native provider is a catalog built-in (empty baseURL); 0g-compute resolves
 // to the router endpoint for the model's wire format. Provider knowledge lives
 // in internal/inference (the openclaw hardcoded-OpenAI regression, §12/19).
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string) {
+// maxTokens and reasoningEffort come from the router catalog (0/false for a
+// native provider). Both must reach the bridge's pi-ai route: without an
+// output budget the SDK default applies, and without a bounded reasoning
+// effort an always-thinking model (glm-5.3) reasons WITHOUT BOUND — measured
+// 100k+ chars of reasoning with zero reply before the stream is killed
+// upstream, while effort=low converges in minutes (Route doc has the numbers).
+func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string, maxTokens int, reasoningEffort bool) {
 	if provider != zgComputeProvider {
-		return provider, "", ""
+		return provider, "", "", 0, false
 	}
 	route := inference.ResolveZG(ctx, model)
-	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL
+	// Only catalog-sourced budgets reach the bridge (review P1): the
+	// heuristic's guess (8192) would starve a reasoning model's shared
+	// thinking+reply budget; with 0 the bridge omits maxTokens and pi-ai's
+	// own defaults apply.
+	maxTokens = 0
+	if route.CatalogSourced {
+		maxTokens = route.MaxTokens
 	}
-	return provider, "openai-completions", route.BaseURL
+	if route.Format == inference.WireAnthropic {
+		return provider, "anthropic-messages", route.BaseURL, maxTokens, route.SupportsReasoningEffort
+	}
+	return provider, "openai-completions", route.BaseURL, maxTokens, route.SupportsReasoningEffort
 }
 
 // verifyInstalled checks the framework baked into this image matches the
@@ -215,13 +231,15 @@ func materializeBridge() error {
 
 // bridgeEnv carries the per-Start values the bridge process needs.
 type bridgeEnv struct {
-	token       string
-	apiKey      string
-	sdkProvider string
-	model       string
-	modelAPI    string
-	baseURL     string
-	rt          framework.RuntimeContext
+	token           string
+	apiKey          string
+	sdkProvider     string
+	model           string
+	modelAPI        string
+	baseURL         string
+	maxTokens       int  // catalog output budget; 0 = let pi-ai default
+	reasoningEffort bool // catalog says the model takes reasoning_effort
+	rt              framework.RuntimeContext
 }
 
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
@@ -266,6 +284,12 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		if be.modelAPI != "" {
 			env = append(env, "SEAL_MODEL_API="+be.modelAPI)
 		}
+	}
+	if be.maxTokens > 0 {
+		env = append(env, fmt.Sprintf("SEAL_MODEL_MAX_TOKENS=%d", be.maxTokens))
+	}
+	if be.reasoningEffort {
+		env = append(env, "SEAL_MODEL_REASONING=1")
 	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {

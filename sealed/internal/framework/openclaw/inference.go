@@ -1,9 +1,11 @@
 package openclaw
 
 import (
+	"context"
 	"encoding/json"
 
 	"seal-verify/internal/inference"
+	"seal-verify/internal/logger"
 )
 
 // Inference resolution helpers used at Start time to read provider+model
@@ -134,8 +136,10 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 	// when no /think directive is present; "low" because glm-5.3 accepts only
 	// low/high/max (medium is a hard 400) and low is the portable
 	// intersection. Only set when the catalog says the model takes the
-	// parameter — for every other model the directive would be noise.
-	if route.SupportsReasoningEffort {
+	// parameter — for every other model the directive would be noise — and
+	// only when absent, so an owner-set level (high / off) survives (review
+	// F1).
+	if route.SupportsReasoningEffort && !hasAgentsDefault(cfg, "thinkingDefault") {
 		_ = setAgentsDefaults(cfg, "thinkingDefault", json.RawMessage(`"low"`))
 	}
 
@@ -146,7 +150,14 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 		"input":         []string{"text"},
 		"cost":          map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
 		"contextWindow": route.ContextWindow,
-		"maxTokens":     route.MaxTokens,
+	}
+	// Output budget: only a CATALOG-sourced value may be persisted (review
+	// P1). During an outage the heuristic's 8192 would be written into the
+	// chain-tracked config and — with reasoning and the reply SHARING the
+	// budget — permanently starve replies. With the field absent openclaw
+	// sends no max_tokens at all and the model's own ceiling applies.
+	if route.CatalogSourced && route.MaxTokens > 0 {
+		modelDef["maxTokens"] = route.MaxTokens
 	}
 	if route.Format == inference.WireOpenAI {
 		modelDef["compat"] = map[string]any{
@@ -210,22 +221,119 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 	order[clawProvider] = []any{clawProvider + ":api"}
 	authBlock["order"] = order
 	cfg["auth"] = authBlock
+}
 
-	// Stuck-session watchdog headroom. openclaw aborts an active run after
-	// diagnostics.stuckSessionAbortMs with no observed progress while a
-	// message is queued — default 360s (warn 120s × 3), tuned for fast
-	// models. A thinking model on the 0g router legitimately produces no
-	// "progress" for many minutes (live: a PR-review run was killed at 446s
-	// as "stalled_agent_run" and surfaced to the owner as "internal error").
-	// 15min keeps the watchdog as a real deadlock backstop while clearing
-	// slow-reasoning turns; deliberate stops don't depend on it (the owner
-	// has Esc / cancel).
-	diagnostics, _ := cfg["diagnostics"].(map[string]any)
-	if diagnostics == nil {
-		diagnostics = map[string]any{}
+// hasAgentsDefault reports whether agents.defaults carries the given key.
+func hasAgentsDefault(cfg map[string]any, key string) bool {
+	agents, _ := cfg["agents"].(map[string]any)
+	defaults, _ := agents["defaults"].(map[string]any)
+	_, ok := defaults[key]
+	return ok
+}
+
+// healOpenclawConfig runs on EVERY Start (review P0). applyZGComputeAugmentation
+// only runs on the FIRST Start of a fresh agent — and it rewrites the pin's
+// provider from "0g-compute" to the resolved "openai"/"anthropic" form, which
+// is what gets drift-committed. So an existing agent's chain-restored
+// openclaw.json is already in resolved form, the augmentation never recognizes
+// it again, and fixes shipped after mint (bounded reasoning, watchdog
+// headroom, catalog budgets) never reach it. This healer recognizes the
+// SHAPES sealed itself wrote — provider entries pinned to the 0g router's
+// endpoints, and machine defaults that were absent — and updates only those:
+//
+//   - modelDef reasoning / compat.supportsReasoningEffort: false → true when
+//     the catalog says the model takes reasoning_effort (the old machine
+//     shape hard-coded false; an unbounded thinking model dies without it).
+//   - modelDef maxTokens: absent or the heuristic's 8192 → the catalog value
+//     (only CatalogSourced; absent otherwise so openclaw omits the parameter).
+//     Any other value is treated as hand-set and left alone.
+//   - provider timeoutSeconds: absent → 600 (pre-c2dd5f9 agents).
+//   - agents.defaults.thinkingDefault: absent → "low" (owner-set levels stay).
+//   - diagnostics.stuckSessionAbortMs: absent → 900s. Deliberately OUTSIDE
+//     the router-shape gate (review F3): the watchdog-vs-slow-turns tuning is
+//     orthogonal to routing, and a native-provider thinking model can also
+//     legitimately show no progress for >6min.
+//
+// No-op (no write, no drift) when nothing needs healing.
+func healOpenclawConfig(ctx context.Context) error {
+	cfg, err := loadOpenclawJSON()
+	if err != nil {
+		return err
 	}
-	if _, set := diagnostics["stuckSessionAbortMs"]; !set {
+	changed := false
+
+	if diagnostics, _ := cfg["diagnostics"].(map[string]any); diagnostics == nil {
+		cfg["diagnostics"] = map[string]any{"stuckSessionAbortMs": 900_000}
+		changed = true
+	} else if _, set := diagnostics["stuckSessionAbortMs"]; !set {
+		// Stuck-session watchdog headroom: default 360s (warn 120s × 3) is
+		// tuned for fast models; a thinking model legitimately shows no
+		// "progress" for minutes (live: a PR-review run killed at 446s as
+		// stalled_agent_run → owner saw "internal error"). 900s must stay
+		// ABOVE the provider timeoutSeconds (600s): a single silent model
+		// call dies to the idle timeout first, so 600–900s only ever catches
+		// real deadlocks. Deliberate stops don't depend on it (Esc / cancel).
 		diagnostics["stuckSessionAbortMs"] = 900_000
+		changed = true
 	}
-	cfg["diagnostics"] = diagnostics
+
+	models, _ := cfg["models"].(map[string]any)
+	providers, _ := models["providers"].(map[string]any)
+	for _, pv := range providers {
+		p, _ := pv.(map[string]any)
+		baseURL, _ := p["baseUrl"].(string)
+		if baseURL != inference.ZGOpenAIBaseURL && baseURL != inference.ZGAnthropicBaseURL {
+			continue // not a sealed-written router pin — never touch
+		}
+		if _, set := p["timeoutSeconds"]; !set {
+			p["timeoutSeconds"] = 600
+			changed = true
+		}
+		modelList, _ := p["models"].([]any)
+		for _, mv := range modelList {
+			m, _ := mv.(map[string]any)
+			id, _ := m["id"].(string)
+			if m == nil || id == "" {
+				continue
+			}
+			route := inference.ResolveZG(ctx, id)
+			if route.SupportsReasoningEffort {
+				if r, _ := m["reasoning"].(bool); !r {
+					m["reasoning"] = true
+					changed = true
+				}
+				if compat, _ := m["compat"].(map[string]any); compat != nil {
+					if s, _ := compat["supportsReasoningEffort"].(bool); !s {
+						compat["supportsReasoningEffort"] = true
+						changed = true
+					}
+				}
+				if !hasAgentsDefault(cfg, "thinkingDefault") {
+					_ = setAgentsDefaults(cfg, "thinkingDefault", json.RawMessage(`"low"`))
+					changed = true
+				}
+			}
+			mt, _ := m["maxTokens"].(float64)
+			machineValue := mt == 0 || int(mt) == inference.HeuristicOpenAIMaxTokens
+			if machineValue {
+				switch {
+				case route.CatalogSourced && route.MaxTokens > 0 && int(mt) != route.MaxTokens:
+					m["maxTokens"] = route.MaxTokens
+					changed = true
+				case !route.CatalogSourced && mt != 0:
+					// Poisoned heuristic value and no catalog to correct it:
+					// drop the field — openclaw then omits max_tokens and the
+					// model's own ceiling applies.
+					delete(m, "maxTokens")
+					changed = true
+				}
+			}
+		}
+	}
+
+	if !changed {
+		return nil
+	}
+	logger.Logf("openclaw: config heal applied (bounded reasoning / budgets / watchdog — see healOpenclawConfig)")
+	return saveOpenclawJSON(cfg)
 }

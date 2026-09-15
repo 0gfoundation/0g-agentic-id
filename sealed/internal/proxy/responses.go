@@ -61,8 +61,10 @@ const (
 	// synthMaxRecords bounds the ring of retained responses.
 	synthMaxRecords = 16
 	// synthMaxEvents bounds the retained event log per response (~1MB of
-	// delta text); older events fall off, resume before the horizon replays
-	// what remains plus the snapshot's full output_text.
+	// delta text). Older events fall off: a resume whose starting_after
+	// precedes the horizon replays only what remains — the deltas beyond the
+	// horizon are gone from the stream, and GET /{id}'s snapshot
+	// (output_text) is the way to recover the full text (review B3).
 	synthMaxEvents = 4096
 	// synthKeepalive is the SSE comment cadence on follower streams.
 	synthKeepalive = 10 * time.Second
@@ -123,9 +125,12 @@ func (h *synthHub) get(id string) *synthRecord {
 	return h.byID[id]
 }
 
-// push appends an event, notifies live followers, and returns it. A follower
-// whose channel is full is skipped — it can recover the gap via
-// starting_after, which replays from the retained log.
+// push appends an event and notifies live followers. A follower whose buffer
+// is full (stalled consumer: GC pause, slow link, laptop sleep) is DETACHED
+// and its channel closed rather than silently skipped — a silent skip would
+// leave an undetectable hole in the text (review B2). The closed channel ends
+// that follower's stream without a terminal event, and the client resumes
+// with starting_after, replaying what it missed from the retained log.
 func (r *synthRecord) push(name string, data map[string]any) {
 	r.mu.Lock()
 	r.seq++
@@ -138,6 +143,8 @@ func (r *synthRecord) push(name string, data map[string]any) {
 		select {
 		case ch <- evt:
 		default:
+			delete(r.listeners, ch)
+			close(ch)
 		}
 	}
 	r.mu.Unlock()
@@ -498,7 +505,13 @@ func (s *Server) streamSynthRecord(w http.ResponseWriter, r *http.Request, rec *
 		case <-beat.C:
 			fmt.Fprint(w, ": keepalive\n\n")
 			fl.Flush()
-		case evt := <-ch:
+		case evt, ok := <-ch:
+			if !ok {
+				// Detached by push() as a lagging consumer: end the stream
+				// WITHOUT a terminal event so the client reconnects with
+				// starting_after and replays the hole from the log.
+				return
+			}
 			if evt.Seq <= seen {
 				continue
 			}

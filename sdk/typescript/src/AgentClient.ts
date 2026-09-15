@@ -211,6 +211,8 @@ async function* iterSseChunks(
   const decoder = new TextDecoder();
   let buf = '';
 
+  try {
+
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     // Named SSE events matter: hermes streams turn activity as
     // "event: hermes.tool.progress" frames on the same chat stream. Track the
@@ -251,6 +253,12 @@ async function* iterSseChunks(
     }
   }
   if (buf.trim()) yield* parseFrame(buf); // flush a trailing frame with no blank line
+  } finally {
+    // A consumer that breaks or throws out of the loop (e.g. the responses
+    // transport tearing down on a sequence gap) must not leave the HTTP
+    // connection dangling until GC.
+    try { await reader.cancel(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -571,7 +579,17 @@ export function makeAgentClient(params: {
         try {
           for await (const chunk of iterSseChunks(res.body)) {
             const sn = (chunk as { sequence_number?: number }).sequence_number;
-            if (typeof sn === 'number') { seq = sn; failures = 0; }
+            if (typeof sn === 'number') {
+              // Continuity guard (review B2): after a reconnect the replay may
+              // overlap what we already consumed — skip those. A FORWARD jump
+              // means the server dropped events for us (lagging-follower
+              // detach); don't consume past the hole — tear down and resume
+              // from the last good sequence, which replays the missing span
+              // from the server's retained log.
+              if (sn <= seq) continue;
+              if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
+              seq = sn; failures = 0;
+            }
             switch ((chunk as { type?: string }).type) {
               case 'response.created': {
                 const resp = (chunk as { response?: AgentTask }).response;

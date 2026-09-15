@@ -200,10 +200,20 @@ func resolveInference(ctx context.Context, provider, model string) (sdkProvider,
 		return provider, "", "", 0, false
 	}
 	route := inference.ResolveZG(ctx, model)
-	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL, route.MaxTokens, route.SupportsReasoningEffort
+	// Persisted-config poison guard (review P1): models.json is chain-tracked,
+	// so only CATALOG-sourced limits may be written. During a catalog outage
+	// the heuristic's guess (8192) would otherwise be persisted, look hand-set
+	// forever, and permanently starve a reasoning model's shared
+	// thinking+reply budget. maxTokens=0 → the field is omitted; the backfill
+	// heals it on a later Start once the catalog is reachable.
+	maxTokens = 0
+	if route.CatalogSourced {
+		maxTokens = route.MaxTokens
 	}
-	return provider, "openai-completions", route.BaseURL, route.MaxTokens, route.SupportsReasoningEffort
+	if route.Format == inference.WireAnthropic {
+		return provider, "anthropic-messages", route.BaseURL, maxTokens, route.SupportsReasoningEffort
+	}
+	return provider, "openai-completions", route.BaseURL, maxTokens, route.SupportsReasoningEffort
 }
 
 // verifyInstalled checks that the framework baked into this image is the one

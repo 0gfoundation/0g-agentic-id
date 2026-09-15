@@ -168,6 +168,11 @@ async function buildSession() {
 	// for every other model this is a no-op.
 	if (typeof session.setThinkingLevel === "function") {
 		try { session.setThinkingLevel("low"); log("thinking level: low (bounded reasoning)"); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
+	} else {
+		// SDK surface changed under us: without a thinking level the SDK sends
+		// no reasoning_effort, and an always-thinking model reasons unboundedly
+		// — long tasks will silently die. Say so instead of degrading quietly.
+		log("WARN: session.setThinkingLevel missing — reasoning_effort will NOT be sent; long tasks on always-thinking models will fail (update the prime SDK pin)");
 	}
 	log(`session ready (platform doc: ${doc ? `${doc.length} bytes` : "ABSENT"})`);
 	return session;
@@ -317,6 +322,15 @@ function responseSnapshot(rec) {
  *  record, NOT by any HTTP connection — followers attach and detach freely. */
 function startResponseTurn(rec, text) {
 	rec.turn = serialize(async () => {
+		// A cancel can land while this task is still QUEUED behind another turn
+		// (the cancel path then only marks the status — aborting would hit the
+		// wrong, currently-running task). Honor it here instead of silently
+		// overwriting it with in_progress and running a dead task (review B1).
+		if (rec.status === "cancelled") {
+			pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
+			pushResponseEvent(rec, "response.completed", { type: "response.completed", response: responseSnapshot(rec) });
+			return;
+		}
 		rec.status = "in_progress";
 		pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
 		try {
@@ -800,7 +814,16 @@ const server = createServer((req, res) => {
 			if (!rec) return sendJSON(res, 404, { error: { message: `no such response ${m[1]} (the bridge keeps the last ${RESPONSES_MAX})` } });
 			if (req.method === "POST" && m[2] === "/cancel") {
 				return (async () => {
-					if (rec.status === "in_progress" || rec.status === "queued") {
+					// A QUEUED task hasn't touched the session: aborting would hit
+					// whatever turn is currently running — a different task (review
+					// B1). Mark it cancelled and let the turn-body guard no-op it
+					// when the serializer reaches it.
+					if (rec.status === "queued") {
+						rec.status = "cancelled";
+						log(`responses: ${rec.id} cancelled while queued`);
+						return sendJSON(res, 200, responseSnapshot(rec));
+					}
+					if (rec.status === "in_progress") {
 						rec.status = "cancelled";
 						const session = await getSession();
 						if (typeof session.requestAbort === "function" && typeof session.resumeQueuedWork === "function") {
