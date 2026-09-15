@@ -127,11 +127,22 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 	_ = setAgentsDefaults(cfg, "model", json.RawMessage(mustMarshal(map[string]any{
 		"primary": primary,
 	})))
+	// Always-thinking models (glm-5.3) reason WITHOUT BOUND unless the request
+	// carries reasoning_effort (Route.SupportsReasoningEffort documents the
+	// measurement: 23k chars / 10min of reasoning, zero reply, upstream kill;
+	// effort=low → full reply in ~2.5min). thinkingDefault supplies the level
+	// when no /think directive is present; "low" because glm-5.3 accepts only
+	// low/high/max (medium is a hard 400) and low is the portable
+	// intersection. Only set when the catalog says the model takes the
+	// parameter — for every other model the directive would be noise.
+	if route.SupportsReasoningEffort {
+		_ = setAgentsDefaults(cfg, "thinkingDefault", json.RawMessage(`"low"`))
+	}
 
 	modelDef := map[string]any{
 		"id":            model,
 		"name":          model,
-		"reasoning":     false,
+		"reasoning":     route.SupportsReasoningEffort,
 		"input":         []string{"text"},
 		"cost":          map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
 		"contextWindow": route.ContextWindow,
@@ -142,7 +153,7 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 			"requiresStringContent":    true,
 			"supportsStore":            false,
 			"supportsDeveloperRole":    false,
-			"supportsReasoningEffort":  false,
+			"supportsReasoningEffort":  route.SupportsReasoningEffort,
 			"supportsUsageInStreaming": false,
 			"supportsStrictMode":       false,
 			"maxTokensField":           "max_tokens",
@@ -199,4 +210,22 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 	order[clawProvider] = []any{clawProvider + ":api"}
 	authBlock["order"] = order
 	cfg["auth"] = authBlock
+
+	// Stuck-session watchdog headroom. openclaw aborts an active run after
+	// diagnostics.stuckSessionAbortMs with no observed progress while a
+	// message is queued — default 360s (warn 120s × 3), tuned for fast
+	// models. A thinking model on the 0g router legitimately produces no
+	// "progress" for many minutes (live: a PR-review run was killed at 446s
+	// as "stalled_agent_run" and surfaced to the owner as "internal error").
+	// 15min keeps the watchdog as a real deadlock backstop while clearing
+	// slow-reasoning turns; deliberate stops don't depend on it (the owner
+	// has Esc / cancel).
+	diagnostics, _ := cfg["diagnostics"].(map[string]any)
+	if diagnostics == nil {
+		diagnostics = map[string]any{}
+	}
+	if _, set := diagnostics["stuckSessionAbortMs"]; !set {
+		diagnostics["stuckSessionAbortMs"] = 900_000
+	}
+	cfg["diagnostics"] = diagnostics
 }
