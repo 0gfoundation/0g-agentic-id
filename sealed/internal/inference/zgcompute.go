@@ -55,6 +55,15 @@ type Route struct {
 	EnvKey        string
 	ContextWindow int
 	MaxTokens     int
+	// SupportsReasoningEffort reports whether the catalog lists
+	// reasoning_effort among the model's supported_parameters. It matters
+	// beyond optimization: always-thinking models (glm-5.3) reason WITHOUT
+	// BOUND when the parameter is absent — measured live: 23k chars of
+	// reasoning over 10 minutes, zero visible reply, stream killed upstream —
+	// while reasoning_effort=low converges in ~2.5min with a full reply.
+	// False on the heuristic fallback (can't know, and sending the parameter
+	// to a model that rejects it is a hard 400).
+	SupportsReasoningEffort bool
 }
 
 // ResolveZG returns the routing decision for a model on 0g-compute.
@@ -75,6 +84,12 @@ func ResolveZG(ctx context.Context, model string) Route {
 		}
 		if entry.MaxCompletionTokens > 0 {
 			r.MaxTokens = entry.MaxCompletionTokens
+		}
+		for _, p := range entry.SupportedParameters {
+			if p == "reasoning_effort" {
+				r.SupportsReasoningEffort = true
+				break
+			}
 		}
 		return r
 	}
@@ -134,6 +149,7 @@ type zgCatalogEntry struct {
 	SupportedFormats    []string `json:"supported_formats"`
 	ContextLength       int      `json:"context_length"`
 	MaxCompletionTokens int      `json:"max_completion_tokens"`
+	SupportedParameters []string `json:"supported_parameters"`
 }
 
 func fetchZGCatalogEntry(ctx context.Context, model string) (zgCatalogEntry, bool) {

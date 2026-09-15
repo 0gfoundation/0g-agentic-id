@@ -156,6 +156,19 @@ async function buildSession() {
 		authStorage,
 		modelRegistry,
 	});
+	// Thinking models need a bounded effort level: the session default is
+	// "off", which makes the SDK send NO reasoning_effort — and an
+	// always-thinking model (glm-5.3) then reasons without bound and never
+	// writes a reply (measured: 23k chars / 10min of reasoning, killed
+	// upstream, zero text; effort=low converges in ~2.5min with a full
+	// reply). "low" and not "medium": glm-5.3 accepts only low/high/max —
+	// medium is a hard 400 — and low is the portable intersection. Set
+	// unconditionally: the SDK only puts reasoning_effort on the wire when
+	// models.json marks the model reasoning-capable AND compat allows it, so
+	// for every other model this is a no-op.
+	if (typeof session.setThinkingLevel === "function") {
+		try { session.setThinkingLevel("low"); log("thinking level: low (bounded reasoning)"); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
+	}
 	log(`session ready (platform doc: ${doc ? `${doc.length} bytes` : "ABSENT"})`);
 	return session;
 }

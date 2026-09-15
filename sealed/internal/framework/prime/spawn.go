@@ -102,7 +102,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf(
 			"prime.Start: no inference pin — neither %s nor the persona seed named a provider/model", modelsJSONPath())
 	}
-	sdkProvider, modelAPI, baseURL, _ := resolveInference(ctx, provider, model)
+	sdkProvider, modelAPI, baseURL, _, _ := resolveInference(ctx, provider, model)
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the
 	// bridge injects it as a virtual context file at session creation. No
@@ -189,17 +189,21 @@ const zgComputeProvider = "0g-compute"
 // big task burns >16k tokens on reasoning alone and the visible reply comes
 // out EMPTY (live on agent 404: three ~6min turns → textLen=0; the catalog
 // says the model supports 131k output).
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string, maxTokens int) {
+//
+// reasoningEffort reports catalog support for the reasoning_effort parameter
+// (Route.SupportsReasoningEffort — see its doc for why an always-thinking
+// model MUST get it: unbounded reasoning, zero reply, upstream kill).
+func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string, maxTokens int, reasoningEffort bool) {
 	if provider != zgComputeProvider {
 		// A native provider ("anthropic", "openai", …) is a built-in: the SDK
 		// knows its endpoint, so nothing needs registering.
-		return provider, "", "", 0
+		return provider, "", "", 0, false
 	}
 	route := inference.ResolveZG(ctx, model)
 	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL, route.MaxTokens
+		return provider, "anthropic-messages", route.BaseURL, route.MaxTokens, route.SupportsReasoningEffort
 	}
-	return provider, "openai-completions", route.BaseURL, route.MaxTokens
+	return provider, "openai-completions", route.BaseURL, route.MaxTokens, route.SupportsReasoningEffort
 }
 
 // verifyInstalled checks that the framework baked into this image is the one

@@ -40,6 +40,12 @@ type modelEntry struct {
 	// (see resolveInference); omitted (SDK default 16384) only for values the
 	// catalog didn't provide.
 	MaxTokens int `json:"maxTokens,omitempty"`
+	// Reasoning marks the model as a thinking model. Required for the SDK to
+	// send reasoning_effort at all (its gate is reasoning && compat
+	// supportsReasoningEffort && a session thinking level) — and glm-5.3
+	// without that parameter reasons unboundedly and never writes a reply
+	// (see Route.SupportsReasoningEffort). Set from the same catalog signal.
+	Reasoning bool `json:"reasoning,omitempty"`
 }
 
 type providerCfg struct {
@@ -57,18 +63,20 @@ type modelsConfig struct {
 
 // buildModelsConfig renders the pin as the framework's model registration.
 //
-// compat disables the `developer` role and `reasoning_effort`: a third-party
-// OpenAI-compatible endpoint generally understands neither, and the package's
-// own docs recommend turning both off for that class of server.
-func buildModelsConfig(provider, model, api, baseURL string, maxTokens int) modelsConfig {
+// compat disables the `developer` role: a third-party OpenAI-compatible
+// endpoint generally doesn't understand it. reasoning_effort follows the
+// catalog (reasoningEffort): off for endpoints that would 400 on the unknown
+// parameter, ON for models that list it — always-thinking models depend on it
+// to bound their reasoning (see modelEntry.Reasoning).
+func buildModelsConfig(provider, model, api, baseURL string, maxTokens int, reasoningEffort bool) modelsConfig {
 	return modelsConfig{Providers: map[string]providerCfg{
 		provider: {
 			BaseURL:    baseURL,
 			API:        api,
 			APIKey:     apiKeyEnvRef,
 			AuthHeader: true,
-			Compat:     map[string]bool{"supportsDeveloperRole": false, "supportsReasoningEffort": false},
-			Models:     []modelEntry{{ID: model, MaxTokens: maxTokens}},
+			Compat:     map[string]bool{"supportsDeveloperRole": false, "supportsReasoningEffort": reasoningEffort},
+			Models:     []modelEntry{{ID: model, MaxTokens: maxTokens, Reasoning: reasoningEffort}},
 		},
 	}}
 }
@@ -150,14 +158,26 @@ func backfillMaxTokens(ctx context.Context) {
 			continue // builtin shape — the SDK owns its limits
 		}
 		for i, m := range p.Models {
-			if m.MaxTokens != 0 || m.ID == "" {
-				continue
+			if m.ID == "" || (m.MaxTokens != 0 && m.Reasoning) {
+				continue // fully migrated (or hand-set) — leave it alone
 			}
-			if _, _, _, maxTokens := resolveInference(ctx, name, m.ID); maxTokens > 0 {
+			_, _, _, maxTokens, reasoningEffort := resolveInference(ctx, name, m.ID)
+			if m.MaxTokens == 0 && maxTokens > 0 {
 				p.Models[i].MaxTokens = maxTokens
-				cfg.Providers[name] = p
 				changed = true
-				logger.Logf("prime: models.json backfill — %s/%s maxTokens=%d (router catalog)", name, m.ID, maxTokens)
+			}
+			if !m.Reasoning && reasoningEffort {
+				p.Models[i].Reasoning = true
+				if p.Compat == nil {
+					p.Compat = map[string]bool{}
+				}
+				p.Compat["supportsReasoningEffort"] = true
+				changed = true
+			}
+			if changed {
+				cfg.Providers[name] = p
+				logger.Logf("prime: models.json backfill — %s/%s maxTokens=%d reasoning=%v (router catalog)",
+					name, m.ID, p.Models[i].MaxTokens, p.Models[i].Reasoning)
 			}
 		}
 	}
