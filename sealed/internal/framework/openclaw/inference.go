@@ -151,6 +151,13 @@ func applyZGComputeToConfig(cfg map[string]any, model string, route inference.Ro
 	providerEntry := map[string]any{
 		"baseUrl": route.BaseURL,
 		"api":     api,
+		// Model idle timeout. openclaw's default gives up long before a
+		// reasoning model's silent thinking phase ends (glm on the 0g router
+		// measures ~150s to the first token on complex prompts), killing every
+		// long-horizon task with "model did not produce a response before the
+		// model idle timeout". 600 matches agents.defaults.timeoutSeconds's
+		// own default — the run ceiling openclaw enforces anyway.
+		"timeoutSeconds": 600,
 		"apiKey": map[string]any{
 			"source":   "env",
 			"provider": "default",
