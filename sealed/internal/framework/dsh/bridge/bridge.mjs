@@ -150,6 +150,7 @@ async function boot() {
   // Inference: one self-declared llm-pi-ai route for the resolved provider.
   // baseURL comes pre-resolved from the adapter (0g-compute → router /v1);
   // empty baseURL means a catalog provider pi-ai already knows.
+  log(`thinking level: ${MODEL_REASONING ? (OWNER_THINKING || 'low') : 'n/a (model takes no reasoning_effort)'}${OWNER_THINKING ? ' (owner)' : ''}`)
   await ctx.plugin(PiAi, {
     providers: {
       [PROVIDER]: {
