@@ -149,8 +149,8 @@ export interface DeployParams {
      *  Omit (or pass '') to use the attestor /config's current image —
      *  the operator-maintained default. */
     sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high'); travels in the signed payload env. */
-    thinking?: 'low' | 'high';
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
     apiKey: string;
     sealed?: boolean;
     resourceId?: string;
@@ -354,8 +354,8 @@ export class AttestorClient {
        *  `snapshot`; only relevant for `reset`). Explicit wins over the
        *  framework-resolved image. */
       sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high'); travels in the signed payload env. */
-    thinking?: 'low' | 'high';
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
        *  comes back alive but can't call its model. */
@@ -423,8 +423,8 @@ export class AttestorClient {
      *  (same as deploy) when `sealedImage` isn't given. */
     framework?: string;
     sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high'); travels in the signed payload env. */
-    thinking?: 'low' | 'high';
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
     apiKey?: string;
     envelopeTtlSec?: number;
   }): Promise<void> {

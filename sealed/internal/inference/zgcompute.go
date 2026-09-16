@@ -96,11 +96,12 @@ func NormalizeEffort(effort string) string {
 	case "high":
 		return "high"
 	case "max":
-		// Measured twice on the 0g router: glm-5.3 at max reasons past the
-		// router's ~600s stream kill even on a trivial prompt (78k chars of
-		// reasoning, zero reply, finish_reason=null) — the level is
-		// physically unusable there. Degrade to the deepest usable level.
-		return "high"
+		// Allowed at the owner's explicit request, with eyes open: measured
+		// twice on the 0g router, glm-5.3 at max reasons past the router's
+		// ~600s stream kill even on a trivial prompt (78k chars of reasoning,
+		// zero reply). The CLI warns at selection; the platform passes the
+		// owner's choice through rather than second-guessing it.
+		return "max"
 	default:
 		return ""
 	}

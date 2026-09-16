@@ -47,7 +47,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
-  '/think': ['low', 'high'],
+  '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
@@ -96,7 +96,7 @@ interface Session {
   /** Owner-chosen reasoning-effort level (/think). On prime it applies
    *  per-message immediately; on other frameworks it takes effect at the
    *  next /reset (passed in the signed payload). */
-  thinking?: 'low' | 'high';
+  thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
 }
@@ -1566,7 +1566,7 @@ const L2_HELP_FULL = `session commands
   /reset                  recreate the container (uses the recorded framework;
                           /reset pick to choose another; asks the key; also
                           clears the local chat history)
-  /think [low|high]       reasoning depth for thinking models (glm etc.);
+  /think [low|high|max]   reasoning depth for thinking models (glm etc.);
                           no arg shows current. prime: applies per message;
                           other frameworks: takes effect at the next /reset
   /tasks                  this session's long tasks with live status — on
@@ -1752,8 +1752,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(`thinking level: ${s.thinking ?? '(platform default: low)'}\n`);
           continue;
         }
-        if (!['low', 'high'].includes(arg)) { out(arg === 'max' ? 'max is unusable on the 0g router (the model out-thinks the ~10min stream limit — measured); use high\n' : 'usage: /think low|high\n'); continue; }
-        s.thinking = arg as 'low' | 'high';
+        if (!['low', 'high', 'max'].includes(arg)) { out('usage: /think low|high|max\n'); continue; }
+        if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
+        s.thinking = arg as 'low' | 'high' | 'max';
         // prime's bridge takes a per-message level; the other frameworks'
         // HTTP surfaces don't — there the choice rides the next /reset.
         out(s.framework === 'prime-agent'
