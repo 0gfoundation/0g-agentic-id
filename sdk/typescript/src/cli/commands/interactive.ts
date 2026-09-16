@@ -29,7 +29,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 
 // The live readline interface — askSecret scrubs submitted secrets out of
@@ -69,6 +69,12 @@ interface Session {
   url?: string;
   sandboxId?: string;
   client?: AgentClient;
+  /** Tasks started from THIS session on the responses transport (newest
+   *  last): lets /tasks list them and /result re-attach after a drop. The
+   *  agent itself keeps the authoritative ring; this is just the ids. */
+  tasks?: Array<{ id: string; prompt: string; at: number }>;
+  /** Task id of the chat turn currently in flight (responses transport). */
+  currentTask?: string | null;
 }
 
 /** (Re)establish the connection half of a session from a running URL. */
@@ -1502,7 +1508,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1516,6 +1522,11 @@ const L2_HELP_FULL = `session commands
   /reset                  recreate the container (uses the recorded framework;
                           /reset pick to choose another; asks the key; also
                           clears the local chat history)
+  /tasks                  this session's long tasks with live status — on
+                          agents with the responses transport a chat turn
+                          survives dropped connections and keeps running
+  /result [id]            re-attach to a task (default: latest): prints a
+                          finished one, follows a running one live
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
@@ -1687,6 +1698,52 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);
         continue;
       }
+      if (line === '/tasks') {
+        // Long-task surface (responses transport). The list is this session's
+        // memory of submitted ids; status is fetched live from the agent.
+        if (!s.client?.task) { out('(this agent has no task surface — chat turns are connection-bound here)\n'); continue; }
+        if (!s.tasks?.length) { out('no tasks started from this session yet — every chat turn on this agent is one; /result <id> also re-attaches by id\n'); continue; }
+        const rows = await Promise.all(s.tasks.map(async (t) => {
+          const snap = await s.client!.task!(t.id).catch(() => null);
+          return { ...t, status: snap?.status ?? 'unknown (evicted or agent restarted)' };
+        }));
+        for (const t of rows.reverse()) {
+          out(`  ${t.id}  ${t.status.padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${t.prompt}\n`);
+        }
+        out('re-attach with /result [id] (default: latest)\n');
+        continue;
+      }
+      if (line === '/result' || line.startsWith('/result ')) {
+        if (!s.client?.task || !s.client.followTask) { out('(this agent has no task surface)\n'); continue; }
+        const id = line.split(/\s+/)[1] ?? s.tasks?.[s.tasks.length - 1]?.id;
+        if (!id) { out('no task to show — /result <id>, or start one by chatting\n'); continue; }
+        const snap = await s.client.task(id).catch((e) => { out(`(${(e as Error).message})\n`); return null; });
+        if (!snap) continue;
+        if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
+          out(`task ${id} — ${snap.status}\n`);
+          if (snap.output_text) out(`${snap.output_text}\n`);
+          if (snap.error) out(`error: ${snap.error.message}\n`);
+          continue;
+        }
+        // Still running: re-attach live. Text so far arrives via the replay
+        // (followTask starts at sequence 0), so don't pre-print the snapshot.
+        // Esc here stops WATCHING only (the deliberate stop stays on the chat
+        // turn's Esc / the task's cancel).
+        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task)\nagent> `);
+        const ac = new AbortController();
+        irq.streaming = ac;
+        try {
+          for await (const delta of s.client.followTask(id, { signal: ac.signal })) out(delta);
+          out('\n');
+        } catch (e) {
+          out(ac.signal.aborted
+            ? '\n(stopped watching — the task continues; /result re-attaches, Esc during a chat turn cancels)\n'
+            : `\n(${(e as Error).message})\n`);
+        } finally {
+          irq.streaming = null;
+        }
+        continue;
+      }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
       out(`error: ${(e as Error).message}\n`); continue;
@@ -1736,7 +1793,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       };
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
-            if (label.startsWith('tool/')) sawToolActivity = true;
+            // "did work this turn" detector, across bridges' label dialects:
+            // dsh "tool/call bash", prime "tool_execution_start — bash" /
+            // "bash_command_start", hermes "tool/call web_search". Thinking
+            // alone doesn't count — a think-only turn with no output is still
+            // a failure worth reporting.
+            if (/tool|bash|subagent|rlm_child/i.test(label) && label !== 'thinking') sawToolActivity = true;
             if (label.startsWith('turn/end')) { clearActivity(); return; }
             status = label;
             paintStatus();
@@ -1754,7 +1816,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           }, 1000)
         : null;
       try {
-        const opts = { ...(s.framework ? { model: s.framework } : {}), signal: ac.signal, ...(onActivity ? { onActivity } : {}) };
+        const opts = {
+          ...(s.framework ? { model: s.framework } : {}),
+          signal: ac.signal,
+          ...(onActivity ? { onActivity } : {}),
+          // Responses transport only: remember the server-side task id, so
+          // Esc cancels THIS task and /tasks//result can re-attach to it.
+          onTask: (id: string): void => {
+            s.currentTask = id;
+            (s.tasks ??= []).push({ id, prompt: line.slice(0, 60), at: Date.now() });
+          },
+        };
         for await (const delta of s.client.chatStream(messages, opts)) {
           clearActivity();
           out(delta); reply += delta;
@@ -1767,10 +1839,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if ((e as Error).name === 'AbortError' || ac.signal.aborted) {
           interrupted = true;
           // Esc means "stop the TASK", not "stop watching": tearing down the
-          // HTTP stream alone leaves the turn running server-side (the
-          // disconnect hooks are best-effort and deliberately never kill a
-          // turn another connection started). Tell the bridge to brake.
-          const stopped = await s.client.interrupt?.().catch(() => null);
+          // HTTP stream alone leaves the turn running server-side (on the
+          // responses transport that survival is the FEATURE). Cancel by task
+          // id when we have one (works on all four frameworks), else fall
+          // back to the bridge-wide /v1/interrupt.
+          const stopped: { aborted: boolean; note?: string } | null | undefined =
+            s.currentTask && s.client.cancelTask
+              ? await s.client.cancelTask(s.currentTask).then(
+                  (t) => ({ aborted: t.status === 'cancelled' || t.status === 'completed' }),
+                  () => null,
+                )
+              : await s.client.interrupt?.().catch(() => null);
           // No /v1/interrupt endpoint (openclaw/hermes serve their own /v1
           // directly): both stop the turn on client disconnect — openclaw via
           // watchClientDisconnect→AbortController, hermes via its abandoned-SSE
@@ -1778,6 +1857,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
             : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
+        } else if (/lost the agent while following/.test((e as Error).message)) {
+          // Responses transport: the SDK already auto-resumed through drops
+          // and only gives up after repeated reconnect failures — the agent
+          // (or the network to it) is down, but the task itself may well
+          // still be running inside the container.
+          out(`\n(lost the connection after ${Math.round((Date.now() - turnT0) / 1000)}s of retrying — the task likely CONTINUES on the agent. /result re-attaches when it's reachable again; /tasks lists this session's tasks)\n`);
+          messages.push({ role: 'assistant', content: `${reply} [connection lost mid-turn — task continued server-side]` });
+          break;
         } else if (/fetch failed|terminated|ECONNRESET|socket|network|aborted by the server|other side closed/i.test((e as Error).message)) {
           // Connection dropped WITHOUT the user asking (proxy duration caps,
           // network blips, sleep). The bridges deliberately keep the turn
@@ -1794,6 +1881,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (ticker) clearInterval(ticker);
         clearActivity();
         irq.streaming = null;
+        s.currentTask = null;
       }
       if (failure && !s.framework && !retriedWithPick) {
         out(`\n(chat failed: ${failure})\nthis framework may need a model selector — pick it:\n`);

@@ -77,7 +77,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		// provider; sealed rewrites that to hermes's custom-endpoint form
 		// (provider=custom + base_url + api_key) so hermes can dial the 0G
 		// router. No-op for any other provider name.
-		if err := applyZGComputeAugmentation(provider, model, rt.APIKey, zgRoute); err != nil {
+		if err := applyZGComputeAugmentation(ctx, provider, model, rt.APIKey, zgRoute); err != nil {
 			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
@@ -183,7 +183,32 @@ func resolveInferenceFromConfigYAML() (provider, model string, err error) {
 //
 // Anthropic-format-only models (route.Format != openai) cannot ride the
 // custom endpoint; fail loud at deploy time rather than 400 at first chat.
-func applyZGComputeAugmentation(provider, model, apiKey string, route *inference.Route) error {
+
+// ensureReasoningEffort writes agent.reasoning_effort="low" when ABSENT —
+// hermes's single chokepoint for reasoning depth (hermes_constants.
+// resolve_reasoning_config: per-model override > global agent.reasoning_effort;
+// every surface reads it). Always-thinking models (glm-5.3) reason WITHOUT
+// BOUND when no effort reaches the wire — measured 100k+ chars of reasoning,
+// zero reply, upstream kill; effort=low converges in minutes (see
+// inference.Route.SupportsReasoningEffort). Absent-only: an owner/agent-set
+// value (including boolean false = "thinking disabled") is never overwritten.
+// The top-level `agent` key is NOT in ownedHermesKeys, so this never reaches
+// chain — and therefore must be re-applied each container boot, which the
+// callers' first-Start paths do.
+func ensureReasoningEffort(cfg map[string]any) bool {
+	agent, _ := cfg["agent"].(map[string]any)
+	if agent == nil {
+		agent = map[string]any{}
+	}
+	if _, set := agent["reasoning_effort"]; set {
+		return false
+	}
+	agent["reasoning_effort"] = "low"
+	cfg["agent"] = agent
+	return true
+}
+
+func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey string, route *inference.Route) error {
 	// Already-augmented config (chain-restored): a previous life's first boot
 	// rewrote the provider to hermes's `custom` form, and the drift commit
 	// uploaded it WITHOUT the key (stripSecrets — secrets never ride the
@@ -195,6 +220,11 @@ func applyZGComputeAugmentation(provider, model, apiKey string, route *inference
 		if apiKey == "" {
 			return fmt.Errorf("config.yaml is the resolved custom form but no API key was provided — hermes would dial its endpoint unauthenticated")
 		}
+		// The resolved form lost the provider name, so re-derive the model's
+		// reasoning capability from the catalog for the bounded-reasoning
+		// default (the `agent` key is local-only and needs re-applying every
+		// container boot — same reason the api_key does).
+		effortRoute := inference.ResolveZG(ctx, model)
 		return updateConfigYAML(func(cfg map[string]any) {
 			m, _ := cfg["model"].(map[string]any)
 			if m == nil {
@@ -202,6 +232,9 @@ func applyZGComputeAugmentation(provider, model, apiKey string, route *inference
 			}
 			m["api_key"] = apiKey
 			cfg["model"] = m
+			if effortRoute.SupportsReasoningEffort && ensureReasoningEffort(cfg) {
+				logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
+			}
 		})
 	}
 	if provider != "0g-compute" {
@@ -225,6 +258,9 @@ func applyZGComputeAugmentation(provider, model, apiKey string, route *inference
 			m["api_key"] = apiKey
 		}
 		cfg["model"] = m
+		if route.SupportsReasoningEffort && ensureReasoningEffort(cfg) {
+			logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
+		}
 	})
 }
 

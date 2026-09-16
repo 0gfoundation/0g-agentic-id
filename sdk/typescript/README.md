@@ -257,6 +257,16 @@ const r = await agent.fetch('/v1/models');                            // attache
 const { response, proof } = await agent.fetchWithProof('/api/summarize', { method: 'POST', body });
 if (agent.logs) await agent.logs({ tail: 200 });                      // owner-only: the agent's own process log
 
+// Long tasks: when /hello declares a kind "responses" route, chat/chatStream
+// already ride it — the turn is owned by a server-side task id, survives
+// dropped connections (auto-resume by sequence number), and can be
+// re-attached or stopped by id:
+let taskId = '';
+for await (const d of agent.chatStream!(msgs, { onTask: (id) => (taskId = id) })) process.stdout.write(d);
+await agent.task!(taskId);                        // poll {status, output_text}
+for await (const d of agent.followTask!(taskId)) process.stdout.write(d);  // re-attach: replay + live
+await agent.cancelTask!(taskId);                  // stop the turn
+
 // opinionated shortcuts over client():
 const auth = await ag.agent.authenticate(agentId);   // mints the owner token up front (needs a wallet)
 const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (never attaches a token)

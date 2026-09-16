@@ -310,6 +310,21 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			Description: "OpenAI-compatible chat/completions API (sealed bridge). STATEFUL: the conversation lives in a server-side session and only the last user message is read, so re-sending an edited history does not rewind it. Turns are serialized.",
 		},
 		{
+			Prefix:  "/v1/responses",
+			Kind:    "responses",
+			Auth:    "bearer",
+			Signed:  false,
+			Backend: backend,
+			// Same upstream as /v1/ (longest-prefix wins is a no-op here); the
+			// separate entry exists so /hello ADVERTISES the capability — the SDK
+			// picks Responses over chat/completions when it sees this kind. This
+			// is the long-task surface: the turn is owned by a server-side
+			// response id, not by the HTTP connection, so it survives proxy
+			// request-duration caps and network drops (resume via
+			// GET /v1/responses/{id}?stream=true&starting_after=N).
+			Description: "OpenAI Responses API subset (sealed bridge): POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. Same stateful session as the chat route.",
+		},
+		{
 			Prefix:  "/activity",
 			Kind:    "activity",
 			Auth:    "bearer",

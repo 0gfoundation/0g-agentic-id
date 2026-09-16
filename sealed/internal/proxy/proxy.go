@@ -65,6 +65,10 @@ type Server struct {
 	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
 	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
 	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+
+	// synth backs the synthesized /v1/responses surface (responses.go) for
+	// adapters that don't serve one natively.
+	synth *synthHub
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the
@@ -74,7 +78,7 @@ type Server struct {
 // The framework adapter is attached later via SetAdapter, once the chain
 // bootstrap has resolved which framework this agent is.
 func New(agent *state.Agent, publicURL string) *Server {
-	return &Server{agent: agent, publicURL: publicURL}
+	return &Server{agent: agent, publicURL: publicURL, synth: newSynthHub()}
 }
 
 // SetAdapter late-binds the resolved framework adapter and derives the
@@ -139,14 +143,37 @@ func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
 func (s *Server) frameworkRoutesForHello() []report.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]report.Route, 0, len(s.fwRoutes))
+	out := make([]report.Route, 0, len(s.fwRoutes)+1)
+	native := false
+	hasChat := false
 	for _, rt := range s.fwRoutes {
+		if rt.Kind == "responses" {
+			native = true
+		}
+		if strings.HasPrefix("/v1/chat/completions", rt.Prefix) {
+			hasChat = true
+		}
 		out = append(out, report.Route{
 			Prefix:      rt.Prefix,
 			Kind:        rt.Kind,
 			Auth:        rt.Auth,
 			Signed:      false,
 			Description: rt.Description,
+		})
+	}
+	// Advertise the synthesized long-task surface (responses.go) when the
+	// adapter has a chat route but no native Responses one — the SDK picks
+	// its transport off this kind.
+	if hasChat && !native {
+		out = append(out, report.Route{
+			Prefix: "/v1/responses",
+			Kind:   "responses",
+			Auth:   "bearer",
+			Signed: false,
+			Description: "OpenAI Responses API subset (synthesized by the sealed proxy in front of the framework's chat API): " +
+				"POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; " +
+				"GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. " +
+				"The turn survives client disconnects; same stateful session as the chat route.",
 		})
 	}
 	return out
@@ -442,6 +469,21 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Long-task surface: when the adapter serves no native Responses route
+	// (openclaw, hermes — see responses.go for why theirs don't qualify), the
+	// proxy synthesizes /v1/responses* in front of the framework's own
+	// chat/completions. Checked before route matching: the adapters' declared
+	// "/v1/" prefix would otherwise forward these paths to a server that
+	// 404s them or gives them connection-coupled semantics.
+	if strings.HasPrefix(r.URL.Path, "/v1/responses") && !s.nativeResponsesDeclared() {
+		chatUpstream := upstream
+		if rt, ok := s.matchFrameworkRoute("/v1/chat/completions"); ok && rt.Backend != "" {
+			chatUpstream = rt.Backend
+		}
+		s.handleSynthResponses(w, r, chatUpstream)
 		return
 	}
 
