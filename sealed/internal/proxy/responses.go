@@ -275,7 +275,7 @@ func (s *Server) handleSynthCreate(w http.ResponseWriter, r *http.Request, chatU
 	}
 
 	rec := s.synth.create()
-	go s.runSynthTurn(rec, chatUpstream, token, text, body.Model)
+	go s.runSynthTurn(rec, chatUpstream, token, body.Input, body.Model)
 	logger.Logf("responses: %s accepted (%.60s…)", rec.id, text)
 
 	if body.Stream {
@@ -289,7 +289,7 @@ func (s *Server) handleSynthCreate(w http.ResponseWriter, r *http.Request, chatU
 // framework's own chat/completions (streaming) on loopback and translate its
 // SSE into Responses events. The upstream connection belongs to this
 // goroutine, not to any client.
-func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token, text, model string) {
+func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, input json.RawMessage, model string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rec.mu.Lock()
@@ -317,7 +317,7 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token, text, model
 	}
 
 	payload := map[string]any{
-		"messages": []map[string]any{{"role": "user", "content": text}},
+		"messages": synthInputMessages(input),
 		"stream":   true,
 	}
 	if model != "" {
@@ -561,9 +561,61 @@ func synthBearerOK(r *http.Request, token string) bool {
 	return strings.TrimSpace(h[len(prefix):]) == token
 }
 
+// synthInputMessages returns the conversation to forward upstream. THE FULL
+// history, not just the last user message: the synth layer fronts frameworks
+// whose chat surfaces are stateless per request — hermes reconstructs the
+// conversation from the request body, so dropping history gave every turn
+// amnesia (live: the agent forgot the previous turn entirely). String input
+// becomes a single user message; items pass through with their roles.
+func synthInputMessages(input json.RawMessage) []map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	var s string
+	if json.Unmarshal(input, &s) == nil {
+		if s == "" {
+			return nil
+		}
+		return []map[string]any{{"role": "user", "content": s}}
+	}
+	var items []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(input, &items) != nil {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(items))
+	for _, it := range items {
+		role := it.Role
+		if role == "" {
+			role = "user"
+		}
+		var text string
+		if json.Unmarshal(it.Content, &text) != nil {
+			var parts []struct {
+				Text string `json:"text"`
+			}
+			if json.Unmarshal(it.Content, &parts) == nil {
+				for i, p := range parts {
+					if i > 0 {
+						text += "\n"
+					}
+					text += p.Text
+				}
+			}
+		}
+		if text == "" {
+			continue
+		}
+		out = append(out, map[string]any{"role": role, "content": text})
+	}
+	return out
+}
+
 // synthInputText extracts the user text from a Responses `input` (string or
-// messages-style items; last user item wins — the framework session is
-// stateful, same as the chat route).
+// messages-style items; last user item wins — used for the record's prompt
+// label and validation, not for the upstream call).
 func synthInputText(input json.RawMessage) string {
 	if len(input) == 0 {
 		return ""

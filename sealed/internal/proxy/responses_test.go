@@ -43,6 +43,10 @@ func newSynthTestServer(t *testing.T, upstream string) *httptest.Server {
 // chatUpstream streams `words` as OpenAI deltas with a tool_calls frame and a
 // hermes-style named event in between, then [DONE]. delay paces the deltas.
 func chatUpstream(t *testing.T, words int, delay time.Duration, sawCancel *atomic.Bool) *httptest.Server {
+	return chatUpstreamCounting(t, words, delay, sawCancel, nil)
+}
+
+func chatUpstreamCounting(t *testing.T, words int, delay time.Duration, sawCancel *atomic.Bool, gotMessages *atomic.Int64) *httptest.Server {
 	t.Helper()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -57,6 +61,9 @@ func chatUpstream(t *testing.T, words int, delay time.Duration, sawCancel *atomi
 		if !body.Stream || len(body.Messages) == 0 {
 			http.Error(w, "want streaming chat body", http.StatusBadRequest)
 			return
+		}
+		if gotMessages != nil {
+			gotMessages.Store(int64(len(body.Messages)))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -299,5 +306,41 @@ func TestSynthInputText(t *testing.T) {
 		if got := synthInputText(json.RawMessage(c.in)); got != c.want {
 			t.Errorf("synthInputText(%s) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+
+// The synth layer fronts STATELESS chat surfaces: hermes (and openclaw's
+// per-request runs) reconstruct the conversation from the request body, so
+// the FULL history must be forwarded — forwarding only the last user message
+// gave every turn amnesia (live: the agent denied ever seeing the previous
+// turn). Regression guard for exactly that.
+func TestSynthResponses_ForwardsFullHistory(t *testing.T) {
+	var msgCount atomic.Int64
+	up := chatUpstreamCounting(t, 1, 0, nil, &msgCount)
+	ts := newSynthTestServer(t, up.URL)
+
+	input := `[{"role":"user","content":"turn one"},{"role":"assistant","content":"reply one"},{"role":"user","content":"turn two"}]`
+	resp, err := synthPost(t, ts.URL+"/v1/responses", "tok", `{"input":`+input+`}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	id := snap["id"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		s := synthGetJSON(t, ts.URL+"/v1/responses/"+id)
+		if s["status"] == "completed" || s["status"] == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never finished")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := msgCount.Load(); got != 3 {
+		t.Fatalf("upstream received %d messages, want the full 3-message history", got)
 	}
 }
