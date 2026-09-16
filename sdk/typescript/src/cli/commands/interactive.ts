@@ -31,6 +31,26 @@ import { pandaLines, svgPixelLines } from '../logo';
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
 const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
+// First-argument completion per command (Tab after the command word).
+// Static lists inline; AGENT resolves to the ids seen in the latest
+// listing (banner / `list` / myRow refresh them as a side effect).
+let knownAgentIds: string[] = [];
+const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
+  const ids = rows.map((r) => String(r.agentId ?? '')).filter((x) => x && x !== 'undefined');
+  if (ids.length) knownAgentIds = [...new Set(ids)];
+};
+const AGENT = (): string[] => knownAgentIds;
+const L1_ARGS: Record<string, string[] | (() => string[])> = {
+  use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
+  retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
+  grant: AGENT, revoke: AGENT, authorizer: AGENT,
+  list: ['--mine'],
+};
+const L2_ARGS: Record<string, string[] | (() => string[])> = {
+  '/think': ['low', 'high'],
+  '/reset': ['pick'],
+};
+let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
@@ -260,9 +280,19 @@ export async function run(ctx: CommandContext): Promise<void> {
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
     completer: (line: string): [string[], string] => {
-      if (line.includes(' ')) return [[], line];
-      const hits = activeCompletions.filter((c) => c.startsWith(line));
-      return [hits.length ? hits : activeCompletions, line];
+      const sp = line.indexOf(' ');
+      if (sp === -1) {
+        const hits = activeCompletions.filter((c) => c.startsWith(line));
+        return [hits.length ? hits : activeCompletions, line];
+      }
+      // Complete the FIRST argument from the command's candidate table
+      // (later arguments are free-form: keys, amounts, prompts).
+      const rest = line.slice(sp + 1);
+      if (rest.includes(' ')) return [[], line];
+      const cand = activeArgs[line.slice(0, sp)];
+      const list = typeof cand === 'function' ? cand() : (cand ?? []);
+      const hits = list.filter((c) => c.startsWith(rest));
+      return [hits.length ? hits : list, rest];
     },
   });
   // `ask` is a line QUEUE, not rl.question: lines that arrive while no
@@ -343,6 +373,7 @@ export async function run(ctx: CommandContext): Promise<void> {
 async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
   const ref = parseAgentRef(refInput);
   const rows = await ag.agent.listMyDeployments();
+  rememberAgentIds(rows);
   const row = pickRow(ref, refInput, rows);
   if (!row) {
     // Say WHICH of the two things went wrong: the agent doesn't exist here,
@@ -454,6 +485,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   }
   for (;;) {
     activeCompletions = L1_WORDS;
+    activeArgs = L1_ARGS;
     const line = (await ask('\n0g-agenticid> ')).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
@@ -499,6 +531,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           ag.getBalanceDetail().catch(() => null),
           ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
+        rememberAgentIds(rows);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
@@ -849,6 +882,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await clientFor(ctx, false);
         const ref = parseAgentRef(args[0]);
         const rows = await ag.agent.listDeployments();
+        rememberAgentIds(rows);
         const row = pickRow(ref, args[0], rows);
         if (!row) { out(`agent ${args[0]} does not exist\n`); continue; }
         if (row.phase !== 'running' || !row.url) { out(`agent ${args[0]} is ${row.phase ?? 'unknown'} — not reachable\n`); continue; }
@@ -1574,6 +1608,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   try {
   for (;;) {
     activeCompletions = L2_WORDS;
+    activeArgs = L2_ARGS;
     // While not connected (deploying/stopped/offline) the phase is in flux —
     // auto-refresh before every prompt, printing only when it moves (and
     // connecting the moment it reaches running). Once connected, skip: no
