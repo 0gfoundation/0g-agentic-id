@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -115,6 +116,20 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// self-modifications are preserved. Failures are logged, not fatal.
 	if err := healOpenclawConfig(ctx); err != nil {
 		logger.Logf("openclaw: config heal skipped: %v", err)
+	}
+	// Owner-chosen thinking default (deploy/reset --thinking): an explicit
+	// owner value outranks both the chain-restored config and the platform
+	// default, so write it unconditionally — and every Start, because the env
+	// carries the owner's standing choice for this container. heal never
+	// touches an explicit value, so the two stay out of each other's way.
+	if rt.OwnerThinking != "" {
+		if err := updateOpenclawJSON(func(cfg map[string]any) {
+			_ = setAgentsDefaults(cfg, "thinkingDefault", json.RawMessage(`"`+rt.OwnerThinking+`"`))
+		}); err != nil {
+			logger.Logf("openclaw: owner thinkingDefault=%s not applied: %v", rt.OwnerThinking, err)
+		} else {
+			logger.Logf("openclaw: thinkingDefault=%s (owner)", rt.OwnerThinking)
+		}
 	}
 
 	// Always export the inference provider API key into bootstrap's env so

@@ -130,6 +130,11 @@ export interface AgentClient {
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
+    /** Per-message reasoning-effort override for thinking models. Only the
+     *  prime bridge honors it today (other frameworks' HTTP surfaces don't
+     *  take a per-request level — their default is set at deploy/reset via
+     *  `thinking`); unsupported bridges ignore it. */
+    thinking?: 'low' | 'high' | 'max';
     /** Fires once with the server-side task id, as soon as the agent assigns
      *  one. Only on the responses transport (see {@link AgentClient.task}):
      *  save it and you can re-attach to this turn after a process restart via
@@ -643,6 +648,7 @@ export function makeAgentClient(params: {
     client.chatStream = async function* (messages, opts) {
       const payload: Record<string, unknown> = { input: messages, stream: true };
       if (opts?.model) payload.model = opts.model;
+      if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

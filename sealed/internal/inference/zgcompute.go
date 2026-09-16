@@ -82,6 +82,25 @@ type Route struct {
 	CatalogSourced bool
 }
 
+// NormalizeEffort maps a requested reasoning-effort level onto the portable
+// set {low, high, max}. glm-5.3 accepts ONLY these three (medium is a hard
+// 400), and the catalog does not declare per-model level sets — so the
+// platform speaks the intersection: medium/minimal degrade to low, unknown
+// values normalize to "" (caller treats as unset). Shared by every adapter so
+// an owner-supplied level can never reach a wire that rejects it.
+func NormalizeEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "medium", "minimal":
+		return "low"
+	case "high":
+		return "high"
+	case "max":
+		return "max"
+	default:
+		return ""
+	}
+}
+
 // HeuristicOpenAIMaxTokens is the conservative output budget the name
 // heuristic assumes for OpenAI-format models when the catalog is unreachable.
 // Exported so config healers can recognize it as a machine-written value

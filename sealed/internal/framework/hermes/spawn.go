@@ -77,7 +77,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		// provider; sealed rewrites that to hermes's custom-endpoint form
 		// (provider=custom + base_url + api_key) so hermes can dial the 0G
 		// router. No-op for any other provider name.
-		if err := applyZGComputeAugmentation(ctx, provider, model, rt.APIKey, zgRoute); err != nil {
+		if err := applyZGComputeAugmentation(ctx, provider, model, rt.APIKey, rt.OwnerThinking, zgRoute); err != nil {
 			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
 		}
 
@@ -195,10 +195,20 @@ func resolveInferenceFromConfigYAML() (provider, model string, err error) {
 // The top-level `agent` key is NOT in ownedHermesKeys, so this never reaches
 // chain — and therefore must be re-applied each container boot, which the
 // callers' first-Start paths do.
-func ensureReasoningEffort(cfg map[string]any) bool {
+func ensureReasoningEffort(cfg map[string]any, ownerLevel string) bool {
 	agent, _ := cfg["agent"].(map[string]any)
 	if agent == nil {
 		agent = map[string]any{}
+	}
+	if ownerLevel != "" {
+		// An explicit owner choice (deploy/reset --thinking) outranks whatever
+		// is on disk — including an earlier owner choice this boot replaces.
+		if v, set := agent["reasoning_effort"]; set && v == ownerLevel {
+			return false
+		}
+		agent["reasoning_effort"] = ownerLevel
+		cfg["agent"] = agent
+		return true
 	}
 	if _, set := agent["reasoning_effort"]; set {
 		return false
@@ -208,7 +218,7 @@ func ensureReasoningEffort(cfg map[string]any) bool {
 	return true
 }
 
-func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey string, route *inference.Route) error {
+func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey, ownerThinking string, route *inference.Route) error {
 	// Already-augmented config (chain-restored): a previous life's first boot
 	// rewrote the provider to hermes's `custom` form, and the drift commit
 	// uploaded it WITHOUT the key (stripSecrets — secrets never ride the
@@ -232,7 +242,7 @@ func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey str
 			}
 			m["api_key"] = apiKey
 			cfg["model"] = m
-			if effortRoute.SupportsReasoningEffort && ensureReasoningEffort(cfg) {
+			if effortRoute.SupportsReasoningEffort && ensureReasoningEffort(cfg, ownerThinking) {
 				logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
 			}
 		})
@@ -258,7 +268,7 @@ func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey str
 			m["api_key"] = apiKey
 		}
 		cfg["model"] = m
-		if route.SupportsReasoningEffort && ensureReasoningEffort(cfg) {
+		if route.SupportsReasoningEffort && ensureReasoningEffort(cfg, ownerThinking) {
 			logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
 		}
 	})

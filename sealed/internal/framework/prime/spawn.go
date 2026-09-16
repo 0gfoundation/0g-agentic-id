@@ -131,13 +131,14 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 
 	cmd, err := spawnBridge(bridgeEnv{
-		token:       token,
-		apiKey:      rt.APIKey,
-		sdkProvider: sdkProvider,
-		model:       model,
-		modelAPI:    modelAPI,
-		baseURL:     baseURL,
-		rt:          rt,
+		token:         token,
+		apiKey:        rt.APIKey,
+		sdkProvider:   sdkProvider,
+		model:         model,
+		modelAPI:      modelAPI,
+		baseURL:       baseURL,
+		ownerThinking: rt.OwnerThinking,
+		rt:            rt,
 	})
 	if err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
@@ -285,13 +286,14 @@ func materializeBridge() error {
 }
 
 type bridgeEnv struct {
-	token       string
-	apiKey      string
-	sdkProvider string
-	model       string
-	modelAPI    string
-	baseURL     string
-	rt          framework.RuntimeContext
+	token         string
+	apiKey        string
+	sdkProvider   string
+	model         string
+	modelAPI      string
+	baseURL       string
+	ownerThinking string // normalized owner default (RuntimeContext.OwnerThinking)
+	rt            framework.RuntimeContext
 }
 
 // spawnBridge starts the node bridge with a strict environment allowlist.
@@ -357,6 +359,12 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		if be.modelAPI != "" {
 			env = append(env, "SEAL_MODEL_API="+be.modelAPI)
 		}
+	}
+	if be.ownerThinking != "" {
+		// Owner-chosen thinking default (already normalized in main.go); the
+		// bridge uses it as the session level and as the baseline a per-message
+		// override restores to.
+		env = append(env, "SEAL_OWNER_THINKING="+be.ownerThinking)
 	}
 	// Public on-chain facts the agent benefits from knowing directly, mirroring
 	// the openclaw allowlist. The authoritative copy is the injected doc.

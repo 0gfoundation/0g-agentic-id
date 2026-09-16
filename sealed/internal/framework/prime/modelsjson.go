@@ -47,6 +47,18 @@ type modelEntry struct {
 	// without that parameter reasons unboundedly and never writes a reply
 	// (see Route.SupportsReasoningEffort). Set from the same catalog signal.
 	Reasoning bool `json:"reasoning,omitempty"`
+	// ThinkingLevelMap declares which levels this model takes and their wire
+	// spellings. Without it the SDK clamps to ITS standard set, which lacks
+	// "max" — an owner-chosen max silently degraded to high (lab-measured).
+	// The platform's portable set {low, high, max} (+ medium→low) matches
+	// what the 0g router's always-thinking models accept.
+	ThinkingLevelMap map[string]string `json:"thinkingLevelMap,omitempty"`
+}
+
+// portableThinkingLevels is the level set written for catalog-flagged
+// thinking models — see modelEntry.ThinkingLevelMap.
+func portableThinkingLevels() map[string]string {
+	return map[string]string{"low": "low", "medium": "low", "high": "high", "max": "max"}
 }
 
 type providerCfg struct {
@@ -77,7 +89,17 @@ func buildModelsConfig(provider, model, api, baseURL string, maxTokens int, reas
 			APIKey:     apiKeyEnvRef,
 			AuthHeader: true,
 			Compat:     map[string]bool{"supportsDeveloperRole": false, "supportsReasoningEffort": reasoningEffort},
-			Models:     []modelEntry{{ID: model, MaxTokens: maxTokens, Reasoning: reasoningEffort}},
+			Models: []modelEntry{{
+				ID:        model,
+				MaxTokens: maxTokens,
+				Reasoning: reasoningEffort,
+				ThinkingLevelMap: func() map[string]string {
+					if reasoningEffort {
+						return portableThinkingLevels()
+					}
+					return nil
+				}(),
+			}},
 		},
 	}}
 }
@@ -185,6 +207,10 @@ func backfillMaxTokens(ctx context.Context) {
 						p.Compat = map[string]bool{}
 					}
 					p.Compat["supportsReasoningEffort"] = true
+					entryChanged = true
+				}
+				if (m.Reasoning || reasoningEffort) && len(p.Models[i].ThinkingLevelMap) == 0 {
+					p.Models[i].ThinkingLevelMap = portableThinkingLevels()
 					entryChanged = true
 				}
 			}

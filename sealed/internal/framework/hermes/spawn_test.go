@@ -18,7 +18,7 @@ func TestZGAugmentationWritesKeyThenStripped(t *testing.T) {
 	hermesHome = t.TempDir()
 	route := &inference.Route{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"}
 
-	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "0gm-1.0-35b-a3b", "sk-secret-router-key", route); err != nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "0gm-1.0-35b-a3b", "sk-secret-router-key", "", route); err != nil {
 		t.Fatal(err)
 	}
 
@@ -52,7 +52,7 @@ func TestZGAugmentationWritesKeyThenStripped(t *testing.T) {
 func TestZGAugmentationRejectsAnthropicFormat(t *testing.T) {
 	hermesHome = t.TempDir()
 	route := &inference.Route{Format: inference.WireAnthropic, BaseURL: inference.ZGAnthropicBaseURL}
-	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "claude-opus-4-8", "sk-x", route); err == nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "claude-opus-4-8", "sk-x", "", route); err == nil {
 		t.Error("expected anthropic-format model to be rejected")
 	}
 }
@@ -67,7 +67,7 @@ func TestZGAugmentationSeedsReasoningEffort(t *testing.T) {
 		Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL,
 		EnvKey: "OPENAI_API_KEY", SupportsReasoningEffort: true, CatalogSourced: true,
 	}
-	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", route); err != nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", "", route); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := loadConfigYAML()
@@ -84,12 +84,22 @@ func TestZGAugmentationSeedsReasoningEffort(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", route); err != nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", "", route); err != nil {
 		t.Fatal(err)
 	}
 	cfg2, _ := loadConfigYAML()
 	if got := cfg2["agent"].(map[string]any)["reasoning_effort"]; got != false {
 		t.Fatalf("owner-set reasoning_effort clobbered: %v", got)
+	}
+
+	// An explicit owner level (deploy/reset --thinking) DOES override — the
+	// owner's standing choice for this container outranks what's on disk.
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "glm-5.3", "sk-x", "high", route); err != nil {
+		t.Fatal(err)
+	}
+	cfg3, _ := loadConfigYAML()
+	if got := cfg3["agent"].(map[string]any)["reasoning_effort"]; got != "high" {
+		t.Fatalf("owner thinking=high not applied: %v", got)
 	}
 }
 
@@ -98,7 +108,7 @@ func TestZGAugmentationSeedsReasoningEffort(t *testing.T) {
 func TestZGAugmentationNoEffortWhenUnsupported(t *testing.T) {
 	hermesHome = t.TempDir()
 	route := &inference.Route{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"}
-	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "some-plain-model", "sk-x", route); err != nil {
+	if err := applyZGComputeAugmentation(context.Background(), "0g-compute", "some-plain-model", "sk-x", "", route); err != nil {
 		t.Fatal(err)
 	}
 	cfg, _ := loadConfigYAML()

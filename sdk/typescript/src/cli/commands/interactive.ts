@@ -29,7 +29,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 
 // The live readline interface — askSecret scrubs submitted secrets out of
@@ -73,6 +73,10 @@ interface Session {
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number }>;
+  /** Owner-chosen reasoning-effort level (/think). On prime it applies
+   *  per-message immediately; on other frameworks it takes effect at the
+   *  next /reset (passed in the signed payload). */
+  thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
 }
@@ -1508,7 +1512,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1522,6 +1526,9 @@ const L2_HELP_FULL = `session commands
   /reset                  recreate the container (uses the recorded framework;
                           /reset pick to choose another; asks the key; also
                           clears the local chat history)
+  /think [low|high|max]   reasoning depth for thinking models (glm etc.);
+                          no arg shows current. prime: applies per message;
+                          other frameworks: takes effect at the next /reset
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -1675,7 +1682,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
-        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
+        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey, thinking: s.thinking });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
         await connectSession(s, r.url);
@@ -1696,6 +1703,21 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out(res.ok
           ? `${(await res.text()).split('\n').slice(-n).join('\n')}\n`
           : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);
+        continue;
+      }
+      if (line === '/think' || line.startsWith('/think ')) {
+        const arg = line.split(/\s+/)[1];
+        if (!arg) {
+          out(`thinking level: ${s.thinking ?? '(platform default: low)'}\n`);
+          continue;
+        }
+        if (!['low', 'high', 'max'].includes(arg)) { out('usage: /think low|high|max\n'); continue; }
+        s.thinking = arg as 'low' | 'high' | 'max';
+        // prime's bridge takes a per-message level; the other frameworks'
+        // HTTP surfaces don't — there the choice rides the next /reset.
+        out(s.framework === 'prime-agent'
+          ? `thinking level: ${arg} — applies to your next messages\n`
+          : `thinking level: ${arg} — this framework has no per-message control; it will apply at the next /reset\n`);
         continue;
       }
       if (line === '/tasks') {
@@ -1818,6 +1840,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       try {
         const opts = {
           ...(s.framework ? { model: s.framework } : {}),
+          ...(s.thinking ? { thinking: s.thinking } : {}),
           signal: ac.signal,
           ...(onActivity ? { onActivity } : {}),
           // Responses transport only: remember the server-side task id, so

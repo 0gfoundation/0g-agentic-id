@@ -149,6 +149,8 @@ export interface DeployParams {
      *  Omit (or pass '') to use the attestor /config's current image —
      *  the operator-maintained default. */
     sealedImage?: string;
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
     apiKey: string;
     sealed?: boolean;
     resourceId?: string;
@@ -307,13 +309,25 @@ export class AttestorClient {
     return (cfg && cfg.sandbox_snapshot) || '';
   }
 
+
+  /** env block for a sandbox create payload: inference key + optional
+   *  owner-chosen thinking default (deploy/reset --thinking). Rides the
+   *  owner-signed payload verbatim; sealed reads SEAL_OWNER_THINKING and
+   *  normalizes it, adapters apply it over the chain-restored config. */
+  private sandboxEnv(apiKey: string | undefined, thinking?: string): Record<string, string> {
+    const env: Record<string, string> = {};
+    if (apiKey) env.API_KEY = apiKey;
+    if (thinking) env.SEAL_OWNER_THINKING = thinking;
+    return env;
+  }
+
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
   private async sandboxEnvelope(sandbox: NonNullable<DeployParams['sandbox']>, ttlSec: number, framework?: string) {
     const snapshot = await this.resolveSealedImage(sandbox.sealedImage, framework);
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot, sealed: sandbox.sealed ?? true, env: { API_KEY: sandbox.apiKey } },
+      { snapshot, sealed: sandbox.sealed ?? true, env: this.sandboxEnv(sandbox.apiKey, sandbox.thinking) },
       ttlSec,
     );
   }
@@ -340,6 +354,8 @@ export class AttestorClient {
        *  `snapshot`; only relevant for `reset`). Explicit wins over the
        *  framework-resolved image. */
       sealedImage?: string;
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
        *  comes back alive but can't call its model. */
@@ -361,7 +377,9 @@ export class AttestorClient {
         {
           snapshot,
           sealed: true,
-          ...(params.apiKey ? { env: { API_KEY: params.apiKey } } : {}),
+          ...(params.apiKey || params.thinking
+            ? { env: this.sandboxEnv(params.apiKey, params.thinking) }
+            : {}),
         },
         ttl,
       );
@@ -405,6 +423,8 @@ export class AttestorClient {
      *  (same as deploy) when `sealedImage` isn't given. */
     framework?: string;
     sealedImage?: string;
+    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
+    thinking?: 'low' | 'high' | 'max';
     apiKey?: string;
     envelopeTtlSec?: number;
   }): Promise<void> {
@@ -415,7 +435,7 @@ export class AttestorClient {
       body.sandbox_envelope = await this.signEnvelope(
         'create',
         '',
-        { snapshot, sealed: true, env: { API_KEY: params.apiKey } },
+        { snapshot, sealed: true, env: this.sandboxEnv(params.apiKey, params.thinking) },
         params.envelopeTtlSec ?? 180,
       );
     }

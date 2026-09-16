@@ -79,6 +79,10 @@ const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
 // glm-5.3 accepts only low/high/max and low is the portable intersection.
 const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
 const MODEL_REASONING = process.env.SEAL_MODEL_REASONING === '1'
+// Owner-chosen default level (deploy/reset --thinking; pre-normalized by
+// sealed). Empty → platform default 'low'. Only meaningful when the model
+// takes reasoning_effort at all (MODEL_REASONING).
+const OWNER_THINKING = ['low', 'high', 'max'].includes(process.env.SEAL_OWNER_THINKING) ? process.env.SEAL_OWNER_THINKING : ''
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -156,7 +160,7 @@ async function boot() {
         // so pi-ai marks it reasoning-capable, and default the profile to
         // "low". resolveReasoningLevel validates against this set, so an
         // unsupported level fails loudly here instead of as an upstream 400.
-        ...(MODEL_REASONING ? { reasoning: 'low' } : {}),
+        ...(MODEL_REASONING ? { reasoning: OWNER_THINKING || 'low' } : {}),
         models: [{
           id: MODEL_ID,
           ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
