@@ -307,6 +307,12 @@ type RuntimeContext struct {
 	ContractAddr string // AgenticID (identity registry) address; signed into serve-proof domain
 	ChainID      string // chain id (decimal); signed into serve-proof domain separation
 	AttestorURL  string // attestor endpoint URL
+	// OwnerThinking is the owner-chosen default reasoning-effort level for
+	// this agent (deploy/reset --thinking), delivered via the owner-signed
+	// sandbox payload's env (SEAL_OWNER_THINKING) and already normalized to
+	// {low, high} (empty = owner expressed no preference; adapters fall
+	// back to the platform default "low" for catalog-flagged thinking models).
+	OwnerThinking string
 
 	// Inference routing (populated by spawn.go after resolving provider).
 	Provider        string // inference provider (e.g. "openai")

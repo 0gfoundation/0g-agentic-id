@@ -47,6 +47,20 @@ type modelEntry struct {
 	// without that parameter reasons unboundedly and never writes a reply
 	// (see Route.SupportsReasoningEffort). Set from the same catalog signal.
 	Reasoning bool `json:"reasoning,omitempty"`
+	// ThinkingLevelMap declares this model's accepted levels and their wire
+	// spellings, so the SDK validates against OUR set instead of clamping to
+	// its own (which silently rewrites levels — lab-measured). Every entry
+	// resolves to a level the 0g router can actually finish: low and high
+	// verbatim; medium (router 400s it) and max (measured-unusable there:
+	// reasoning out-runs the ~600s stream kill) both land on safe values, so
+	// even an agent that sets its own session level never dials a lethal one.
+	ThinkingLevelMap map[string]string `json:"thinkingLevelMap,omitempty"`
+}
+
+// portableThinkingLevels is the level set written for catalog-flagged
+// thinking models — see modelEntry.ThinkingLevelMap.
+func portableThinkingLevels() map[string]string {
+	return map[string]string{"low": "low", "medium": "low", "high": "high", "max": "high"}
 }
 
 type providerCfg struct {
@@ -77,7 +91,17 @@ func buildModelsConfig(provider, model, api, baseURL string, maxTokens int, reas
 			APIKey:     apiKeyEnvRef,
 			AuthHeader: true,
 			Compat:     map[string]bool{"supportsDeveloperRole": false, "supportsReasoningEffort": reasoningEffort},
-			Models:     []modelEntry{{ID: model, MaxTokens: maxTokens, Reasoning: reasoningEffort}},
+			Models: []modelEntry{{
+				ID:        model,
+				MaxTokens: maxTokens,
+				Reasoning: reasoningEffort,
+				ThinkingLevelMap: func() map[string]string {
+					if reasoningEffort {
+						return portableThinkingLevels()
+					}
+					return nil
+				}(),
+			}},
 		},
 	}}
 }
@@ -185,6 +209,10 @@ func backfillMaxTokens(ctx context.Context) {
 						p.Compat = map[string]bool{}
 					}
 					p.Compat["supportsReasoningEffort"] = true
+					entryChanged = true
+				}
+				if (m.Reasoning || reasoningEffort) && len(p.Models[i].ThinkingLevelMap) == 0 {
+					p.Models[i].ThinkingLevelMap = portableThinkingLevels()
 					entryChanged = true
 				}
 			}

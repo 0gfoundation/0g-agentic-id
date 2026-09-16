@@ -132,6 +132,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		baseURL:         baseURL,
 		maxTokens:       maxTokens,
 		reasoningEffort: reasoningEffort,
+		ownerThinking:   rt.OwnerThinking,
 		rt:              rt,
 	})
 	if err != nil {
@@ -237,8 +238,9 @@ type bridgeEnv struct {
 	model           string
 	modelAPI        string
 	baseURL         string
-	maxTokens       int  // catalog output budget; 0 = let pi-ai default
-	reasoningEffort bool // catalog says the model takes reasoning_effort
+	maxTokens       int    // catalog output budget; 0 = let pi-ai default
+	reasoningEffort bool   // catalog says the model takes reasoning_effort
+	ownerThinking   string // owner default level (RuntimeContext.OwnerThinking)
 	rt              framework.RuntimeContext
 }
 
@@ -290,6 +292,11 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	}
 	if be.reasoningEffort {
 		env = append(env, "SEAL_MODEL_REASONING=1")
+	}
+	if be.ownerThinking != "" {
+		// Owner-chosen default level (already normalized); the bridge uses it
+		// as the pi-ai profile level instead of the platform default "low".
+		env = append(env, "SEAL_OWNER_THINKING="+be.ownerThinking)
 	}
 	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
 	if be.rt.PublicURL != "" {

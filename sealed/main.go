@@ -39,6 +39,7 @@ import (
 	"seal-verify/internal/framework/hermes"
 	"seal-verify/internal/framework/openclaw"
 	"seal-verify/internal/framework/prime"
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manager"
 	"seal-verify/internal/manifest"
@@ -606,6 +607,10 @@ func startAgent(
 			ContractAddr: cfg.ContractAddr,
 			ChainID:      chainIDStr,
 			AttestorURL:  cfg.AttestorURL,
+			// Owner-chosen thinking default (deploy/reset --thinking; travels in
+			// the owner-signed sandbox payload's env). Normalized here so no
+			// adapter can forward a level some model hard-rejects.
+			OwnerThinking: inference.NormalizeEffort(os.Getenv("SEAL_OWNER_THINKING")),
 
 			// Sealed runtime metadata.
 			SealedVersion: sealedVersion,

@@ -710,13 +710,13 @@ export class AgentApi {
    *    use this, not `reset` (which means "recreate an existing container").
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void>;
-  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
+  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' }): Promise<void>;
+  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
+    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, thinking: arg?.thinking });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -727,8 +727,8 @@ export class AgentApi {
    * attestor never stores it, which is also WHY it must be passed
    * again on every recreate.
    */
-  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking });
   }
 
   /**
@@ -743,8 +743,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied because
    * the attestor never stores it.
    */
-  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
-    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' }): Promise<void> {
+    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking });
   }
 
   /**

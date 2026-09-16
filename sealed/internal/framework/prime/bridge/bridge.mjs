@@ -55,6 +55,24 @@ const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
 const MODEL_ID = process.env.SEAL_MODEL_ID || "";
 const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
+// Owner-chosen default thinking level for this agent (deploy/reset
+// --thinking, delivered via the owner-signed sandbox payload's env). Falls
+// back to the platform default "low" — see the setThinkingLevel comment in
+// buildSession for why a bounded level is load-bearing, not a preference.
+const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low";
+
+/** Normalize a requested reasoning effort to the USABLE set {low, high}.
+ *  glm-5.3's wire set is low/high/max (medium hard-400s), but max is
+ *  measured-unusable on the 0g router (out-thinks the ~600s stream kill on a
+ *  trivial prompt), so it degrades to high. Unknown values → "". */
+function normalizeEffort(effort) {
+	if (typeof effort !== "string") return "";
+	const e = effort.toLowerCase();
+	if (e === "low" || e === "high") return e;
+	if (e === "max") return "high"; // measured: max out-thinks the router's ~600s stream kill even on trivial prompts
+	if (e === "medium" || e === "minimal") return "low";
+	return "";
+}
 // Set when the model is served by an OpenAI/Anthropic-compatible endpoint that
 // is NOT the provider's own (the 0G compute router). Then the model has to be
 // REGISTERED (models.json), which the adapter writes as a tracked role.
@@ -66,7 +84,7 @@ if (!TOKEN) {
 	process.exit(2);
 }
 
-const log = (...args) => console.log(`[bridge] ${args.join(" ")}`);
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [bridge] ${args.join(" ")}`);
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
@@ -167,7 +185,7 @@ async function buildSession() {
 	// models.json marks the model reasoning-capable AND compat allows it, so
 	// for every other model this is a no-op.
 	if (typeof session.setThinkingLevel === "function") {
-		try { session.setThinkingLevel("low"); log("thinking level: low (bounded reasoning)"); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
+		try { session.setThinkingLevel(OWNER_THINKING); log(`thinking level: ${OWNER_THINKING} (bounded reasoning)`); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
 	} else {
 		// SDK surface changed under us: without a thinking level the SDK sends
 		// no reasoning_effort, and an always-thinking model reasons unboundedly
@@ -320,7 +338,7 @@ function responseSnapshot(rec) {
 
 /** Run one agent turn under a response record. The turn is owned by the
  *  record, NOT by any HTTP connection — followers attach and detach freely. */
-function startResponseTurn(rec, text) {
+function startResponseTurn(rec, text, effort) {
 	rec.turn = serialize(async () => {
 		// A cancel can land while this task is still QUEUED behind another turn
 		// (the cancel path then only marks the status — aborting would hit the
@@ -335,6 +353,12 @@ function startResponseTurn(rec, text) {
 		pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
 		try {
 			const session = await getSession();
+			// Per-message thinking override (request reasoning.effort). Set for
+			// THIS turn only; the finally below restores the agent default. Safe
+			// under the serializer: exactly one turn touches the session at a time.
+			if (effort && effort !== OWNER_THINKING && typeof session.setThinkingLevel === "function") {
+				try { session.setThinkingLevel(effort); log(`thinking level: ${effort} (this turn)`); } catch (e) { log(`setThinkingLevel(${effort}) failed: ${(e && e.message) || e}`); }
+			}
 			const full = await runTurn(
 				session,
 				text,
@@ -363,6 +387,12 @@ function startResponseTurn(rec, text) {
 			rec.status = rec.status === "cancelled" ? "cancelled" : "failed";
 			rec.error = String((err && err.message) || err);
 			pushResponseEvent(rec, "response.failed", { type: "response.failed", response: responseSnapshot(rec) });
+		} finally {
+			// Restore the agent default so a one-turn override never leaks into
+			// the next turn (which may not carry an effort of its own).
+			if (effort && effort !== OWNER_THINKING) {
+				try { const s = await getSession(); if (typeof s.setThinkingLevel === "function") s.setThinkingLevel(OWNER_THINKING); } catch { /* best effort */ }
+			}
 		}
 	});
 }
@@ -796,9 +826,13 @@ const server = createServer((req, res) => {
 			try { body = JSON.parse(raw || "{}"); } catch { return sendJSON(res, 400, { error: { message: "invalid JSON body" } }); }
 			const text = responseInputText(body.input);
 			if (!text) return sendJSON(res, 400, { error: { message: "input is required (string or messages-style items)" } });
+			const effort = normalizeEffort(body.reasoning && body.reasoning.effort);
+			if (body.reasoning && body.reasoning.effort && !effort) {
+				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low" or "high"` } });
+			}
 			const rec = newResponseRecord(text);
-			startResponseTurn(rec, text);
-			log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)`);
+			startResponseTurn(rec, text, effort);
+			log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)${effort ? ` [think:${effort}]` : ""}`);
 			if (body.stream) return streamResponse(req, res, rec, 0);
 			// Non-stream (background-style): hand back the id immediately.
 			return sendJSON(res, 200, responseSnapshot(rec));
