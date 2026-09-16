@@ -483,6 +483,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   } else {
     out('  `help` commands · `use <id>` chat · Esc interrupts a turn\n\n');
   }
+  // Prefill the completion id cache in the background: without it, `use
+  // <Tab>` is dead until the first list/balance/agent op of the session.
+  // Fire-and-forget — a slow attestor costs the completions, never the prompt.
+  if (key && ctx.env.attestorUrl) {
+    withWallet(ctx).then((ag) => ag.agent.listMyDeployments()).then(rememberAgentIds).catch(() => { /* completions only */ });
+  }
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
