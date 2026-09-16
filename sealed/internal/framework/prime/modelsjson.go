@@ -47,11 +47,13 @@ type modelEntry struct {
 	// without that parameter reasons unboundedly and never writes a reply
 	// (see Route.SupportsReasoningEffort). Set from the same catalog signal.
 	Reasoning bool `json:"reasoning,omitempty"`
-	// ThinkingLevelMap declares which levels this model takes and their wire
-	// spellings. Without it the SDK clamps to ITS standard set, which lacks
-	// "max" — an owner-chosen max silently degraded to high (lab-measured).
-	// The platform's portable set {low, high, max} (+ medium→low) matches
-	// what the 0g router's always-thinking models accept.
+	// ThinkingLevelMap declares this model's accepted levels and their wire
+	// spellings, so the SDK validates against OUR set instead of clamping to
+	// its own (which silently rewrites levels — lab-measured). Every entry
+	// resolves to a level the 0g router can actually finish: low and high
+	// verbatim; medium (router 400s it) and max (measured-unusable there:
+	// reasoning out-runs the ~600s stream kill) both land on safe values, so
+	// even an agent that sets its own session level never dials a lethal one.
 	ThinkingLevelMap map[string]string `json:"thinkingLevelMap,omitempty"`
 }
 

@@ -253,6 +253,12 @@ func (s *Server) handleSynthCreate(w http.ResponseWriter, r *http.Request, chatU
 		writeSynthJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"message": "read body: " + err.Error()}})
 		return
 	}
+	// reasoning.{effort} is deliberately ABSENT from this struct: the synth
+	// layer fronts frameworks whose chat surfaces take no per-request level
+	// (openclaw's schema field is decorative, hermes reads global config), so
+	// a per-message effort here would be a silent no-op pretending otherwise.
+	// The field is dropped at THIS layer — the one place all such traffic
+	// passes — which is what makes it safe for clients to always send it.
 	var body struct {
 		Input  json.RawMessage `json:"input"`
 		Stream bool            `json:"stream"`

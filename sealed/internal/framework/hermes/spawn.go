@@ -243,7 +243,11 @@ func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey, ow
 			m["api_key"] = apiKey
 			cfg["model"] = m
 			if effortRoute.SupportsReasoningEffort && ensureReasoningEffort(cfg, ownerThinking) {
-				logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
+				level := ownerThinking
+				if level == "" {
+					level = "low"
+				}
+				logger.Logf("hermes: agent.reasoning_effort=%s (bounded reasoning, router catalog)", level)
 			}
 		})
 	}
@@ -269,7 +273,11 @@ func applyZGComputeAugmentation(ctx context.Context, provider, model, apiKey, ow
 		}
 		cfg["model"] = m
 		if route.SupportsReasoningEffort && ensureReasoningEffort(cfg, ownerThinking) {
-			logger.Logf("hermes: agent.reasoning_effort=low (bounded reasoning, router catalog)")
+			level := ownerThinking
+			if level == "" {
+				level = "low"
+			}
+			logger.Logf("hermes: agent.reasoning_effort=%s (bounded reasoning, router catalog)", level)
 		}
 	})
 }

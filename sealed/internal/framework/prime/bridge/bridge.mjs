@@ -61,9 +61,10 @@ const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
 // buildSession for why a bounded level is load-bearing, not a preference.
 const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low";
 
-/** Normalize a requested reasoning effort to the portable set. glm-5.3
- *  accepts only low/high/max (medium is a hard 400), so "medium" maps down
- *  to "low" rather than being forwarded verbatim. Unknown values → "". */
+/** Normalize a requested reasoning effort to the USABLE set {low, high}.
+ *  glm-5.3's wire set is low/high/max (medium hard-400s), but max is
+ *  measured-unusable on the 0g router (out-thinks the ~600s stream kill on a
+ *  trivial prompt), so it degrades to high. Unknown values → "". */
 function normalizeEffort(effort) {
 	if (typeof effort !== "string") return "";
 	const e = effort.toLowerCase();
@@ -827,7 +828,7 @@ const server = createServer((req, res) => {
 			if (!text) return sendJSON(res, 400, { error: { message: "input is required (string or messages-style items)" } });
 			const effort = normalizeEffort(body.reasoning && body.reasoning.effort);
 			if (body.reasoning && body.reasoning.effort && !effort) {
-				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low", "high" or "max"` } });
+				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low" or "high"` } });
 			}
 			const rec = newResponseRecord(text);
 			startResponseTurn(rec, text, effort);
