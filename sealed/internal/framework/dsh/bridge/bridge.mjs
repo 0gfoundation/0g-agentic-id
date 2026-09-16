@@ -95,7 +95,7 @@ if (!PROVIDER || !MODEL_ID) {
   process.exit(2)
 }
 
-const log = (...args) => console.log(`[bridge] ${args.join(' ')}`)
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [bridge] ${args.join(' ')}`)
 
 /**
  * Neutralize `{{` in owner/platform text. DSH's prompt renderer interpolates

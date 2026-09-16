@@ -82,7 +82,7 @@ if (!TOKEN) {
 	process.exit(2);
 }
 
-const log = (...args) => console.log(`[bridge] ${args.join(" ")}`);
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [bridge] ${args.join(" ")}`);
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
