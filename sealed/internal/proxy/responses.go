@@ -567,6 +567,13 @@ func synthBearerOK(r *http.Request, token string) bool {
 // conversation from the request body, so dropping history gave every turn
 // amnesia (live: the agent forgot the previous turn entirely). String input
 // becomes a single user message; items pass through with their roles.
+//
+// TEXT history only, a documented limitation (review): items without a
+// role/content text form — function_call / function_call_output / reasoning
+// items, image-only parts — are dropped, so in tool-heavy conversations the
+// upstream model does not see earlier tool RESULTS, only what was said about
+// them. Rendering tool items into messages would need per-framework dialect
+// choices; revisit if it bites.
 func synthInputMessages(input json.RawMessage) []map[string]any {
 	if len(input) == 0 {
 		return nil
@@ -597,8 +604,11 @@ func synthInputMessages(input json.RawMessage) []map[string]any {
 				Text string `json:"text"`
 			}
 			if json.Unmarshal(it.Content, &parts) == nil {
-				for i, p := range parts {
-					if i > 0 {
+				for _, p := range parts {
+					if p.Text == "" {
+						continue // empty parts contribute nothing, not a newline
+					}
+					if text != "" {
 						text += "\n"
 					}
 					text += p.Text
@@ -613,47 +623,16 @@ func synthInputMessages(input json.RawMessage) []map[string]any {
 	return out
 }
 
-// synthInputText extracts the user text from a Responses `input` (string or
-// messages-style items; last user item wins — used for the record's prompt
-// label and validation, not for the upstream call).
+// synthInputText extracts the last user text from a Responses `input` — used
+// for the record's prompt label and request validation only. Delegates to
+// synthInputMessages so the label and the upstream payload can never diverge
+// (review: two parallel parsers drift).
 func synthInputText(input json.RawMessage) string {
-	if len(input) == 0 {
-		return ""
-	}
-	var s string
-	if json.Unmarshal(input, &s) == nil {
-		return s
-	}
-	var items []struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
-	}
-	if json.Unmarshal(input, &items) != nil {
-		return ""
-	}
-	for i := len(items) - 1; i >= 0; i-- {
-		if items[i].Role != "" && items[i].Role != "user" {
-			continue
-		}
-		var text string
-		if json.Unmarshal(items[i].Content, &text) == nil && text != "" {
-			return text
-		}
-		var parts []struct {
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(items[i].Content, &parts) == nil {
-			var b strings.Builder
-			for _, p := range parts {
-				if p.Text != "" {
-					if b.Len() > 0 {
-						b.WriteString("\n")
-					}
-					b.WriteString(p.Text)
-				}
-			}
-			if b.Len() > 0 {
-				return b.String()
+	msgs := synthInputMessages(input)
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i]["role"] == "user" {
+			if t, _ := msgs[i]["content"].(string); t != "" {
+				return t
 			}
 		}
 	}

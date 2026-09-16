@@ -46,7 +46,7 @@ func chatUpstream(t *testing.T, words int, delay time.Duration, sawCancel *atomi
 	return chatUpstreamCounting(t, words, delay, sawCancel, nil)
 }
 
-func chatUpstreamCounting(t *testing.T, words int, delay time.Duration, sawCancel *atomic.Bool, gotMessages *atomic.Int64) *httptest.Server {
+func chatUpstreamCounting(t *testing.T, words int, delay time.Duration, sawCancel *atomic.Bool, gotMessages *atomic.Value) *httptest.Server {
 	t.Helper()
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer tok" {
@@ -63,7 +63,8 @@ func chatUpstreamCounting(t *testing.T, words int, delay time.Duration, sawCance
 			return
 		}
 		if gotMessages != nil {
-			gotMessages.Store(int64(len(body.Messages)))
+			b, _ := json.Marshal(body.Messages)
+			gotMessages.Store(string(b))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fl := w.(http.Flusher)
@@ -309,15 +310,14 @@ func TestSynthInputText(t *testing.T) {
 	}
 }
 
-
 // The synth layer fronts STATELESS chat surfaces: hermes (and openclaw's
 // per-request runs) reconstruct the conversation from the request body, so
 // the FULL history must be forwarded — forwarding only the last user message
 // gave every turn amnesia (live: the agent denied ever seeing the previous
 // turn). Regression guard for exactly that.
 func TestSynthResponses_ForwardsFullHistory(t *testing.T) {
-	var msgCount atomic.Int64
-	up := chatUpstreamCounting(t, 1, 0, nil, &msgCount)
+	var gotMessages atomic.Value
+	up := chatUpstreamCounting(t, 1, 0, nil, &gotMessages)
 	ts := newSynthTestServer(t, up.URL)
 
 	input := `[{"role":"user","content":"turn one"},{"role":"assistant","content":"reply one"},{"role":"user","content":"turn two"}]`
@@ -340,7 +340,10 @@ func TestSynthResponses_ForwardsFullHistory(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if got := msgCount.Load(); got != 3 {
-		t.Fatalf("upstream received %d messages, want the full 3-message history", got)
+	// Lock roles, order AND content — not just the count (review): a refactor
+	// flattening every role to "user" must fail here.
+	want := `[{"Role":"user","Content":"turn one"},{"Role":"assistant","Content":"reply one"},{"Role":"user","Content":"turn two"}]`
+	if got, _ := gotMessages.Load().(string); got != want {
+		t.Fatalf("upstream messages = %s, want %s", got, want)
 	}
 }
