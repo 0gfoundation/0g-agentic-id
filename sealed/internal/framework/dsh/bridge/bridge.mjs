@@ -82,7 +82,7 @@ const MODEL_REASONING = process.env.SEAL_MODEL_REASONING === '1'
 // Owner-chosen default level (deploy/reset --thinking; pre-normalized by
 // sealed). Empty → platform default 'low'. Only meaningful when the model
 // takes reasoning_effort at all (MODEL_REASONING).
-const OWNER_THINKING = ['low', 'high', 'max'].includes(process.env.SEAL_OWNER_THINKING) ? process.env.SEAL_OWNER_THINKING : ''
+const OWNER_THINKING = ['low', 'high'].includes(process.env.SEAL_OWNER_THINKING) ? process.env.SEAL_OWNER_THINKING : (process.env.SEAL_OWNER_THINKING === 'max' ? 'high' : '')
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -165,7 +165,7 @@ async function boot() {
         models: [{
           id: MODEL_ID,
           ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
-          ...(MODEL_REASONING ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+          ...(MODEL_REASONING ? { reasoningEfforts: { low: 'low', high: 'high' } } : {}),
         }],
       },
     },

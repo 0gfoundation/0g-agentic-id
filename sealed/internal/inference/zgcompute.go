@@ -82,12 +82,13 @@ type Route struct {
 	CatalogSourced bool
 }
 
-// NormalizeEffort maps a requested reasoning-effort level onto the portable
-// set {low, high, max}. glm-5.3 accepts ONLY these three (medium is a hard
-// 400), and the catalog does not declare per-model level sets — so the
-// platform speaks the intersection: medium/minimal degrade to low, unknown
-// values normalize to "" (caller treats as unset). Shared by every adapter so
-// an owner-supplied level can never reach a wire that rejects it.
+// NormalizeEffort maps a requested reasoning-effort level onto the USABLE
+// set {low, high}. The wire set glm-5.3 accepts is low/high/max (medium is a
+// hard 400) — but max is measured-unusable on the 0g router (see the case
+// below), and the catalog declares no per-model level sets, so the platform
+// speaks the safe intersection: medium/minimal degrade to low, max to high,
+// unknown values normalize to "" (caller treats as unset). Shared by every
+// adapter so an owner-supplied level can never reach a wire that kills it.
 func NormalizeEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "low", "medium", "minimal":
@@ -95,7 +96,11 @@ func NormalizeEffort(effort string) string {
 	case "high":
 		return "high"
 	case "max":
-		return "max"
+		// Measured twice on the 0g router: glm-5.3 at max reasons past the
+		// router's ~600s stream kill even on a trivial prompt (78k chars of
+		// reasoning, zero reply, finish_reason=null) — the level is
+		// physically unusable there. Degrade to the deepest usable level.
+		return "high"
 	default:
 		return ""
 	}

@@ -58,7 +58,7 @@ type modelEntry struct {
 // portableThinkingLevels is the level set written for catalog-flagged
 // thinking models — see modelEntry.ThinkingLevelMap.
 func portableThinkingLevels() map[string]string {
-	return map[string]string{"low": "low", "medium": "low", "high": "high", "max": "max"}
+	return map[string]string{"low": "low", "medium": "low", "high": "high", "max": "high"}
 }
 
 type providerCfg struct {

@@ -67,7 +67,8 @@ const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low"
 function normalizeEffort(effort) {
 	if (typeof effort !== "string") return "";
 	const e = effort.toLowerCase();
-	if (e === "low" || e === "high" || e === "max") return e;
+	if (e === "low" || e === "high") return e;
+	if (e === "max") return "high"; // measured: max out-thinks the router's ~600s stream kill even on trivial prompts
 	if (e === "medium" || e === "minimal") return "low";
 	return "";
 }
