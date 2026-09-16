@@ -310,7 +310,7 @@ type RuntimeContext struct {
 	// OwnerThinking is the owner-chosen default reasoning-effort level for
 	// this agent (deploy/reset --thinking), delivered via the owner-signed
 	// sandbox payload's env (SEAL_OWNER_THINKING) and already normalized to
-	// {low, high} (empty = owner expressed no preference; adapters fall
+	// {low, high, max} (empty = owner expressed no preference; adapters fall
 	// back to the platform default "low" for catalog-flagged thinking models).
 	OwnerThinking string
 

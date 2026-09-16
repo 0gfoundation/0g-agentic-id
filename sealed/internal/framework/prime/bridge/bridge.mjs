@@ -61,15 +61,14 @@ const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
 // buildSession for why a bounded level is load-bearing, not a preference.
 const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low";
 
-/** Normalize a requested reasoning effort to the USABLE set {low, high}.
- *  glm-5.3's wire set is low/high/max (medium hard-400s), but max is
- *  measured-unusable on the 0g router (out-thinks the ~600s stream kill on a
- *  trivial prompt), so it degrades to high. Unknown values → "". */
+/** Normalize a requested reasoning effort to the wire set {low, high, max}
+ *  (medium hard-400s on glm-5.3 and maps to low). max is allowed but
+ *  measured-risky on the 0g router (can out-think the ~600s stream kill);
+ *  the CLI warns at selection. Unknown values → "". */
 function normalizeEffort(effort) {
 	if (typeof effort !== "string") return "";
 	const e = effort.toLowerCase();
-	if (e === "low" || e === "high") return e;
-	if (e === "max") return "high"; // measured: max out-thinks the router's ~600s stream kill even on trivial prompts
+	if (e === "low" || e === "high" || e === "max") return e;
 	if (e === "medium" || e === "minimal") return "low";
 	return "";
 }
@@ -828,7 +827,7 @@ const server = createServer((req, res) => {
 			if (!text) return sendJSON(res, 400, { error: { message: "input is required (string or messages-style items)" } });
 			const effort = normalizeEffort(body.reasoning && body.reasoning.effort);
 			if (body.reasoning && body.reasoning.effort && !effort) {
-				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low" or "high"` } });
+				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low", "high" or "max"` } });
 			}
 			const rec = newResponseRecord(text);
 			startResponseTurn(rec, text, effort);
