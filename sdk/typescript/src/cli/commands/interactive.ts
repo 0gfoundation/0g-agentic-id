@@ -1610,6 +1610,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       (e) => out(`\n(interrupt failed: ${(e as Error).message})\n`),
     );
   };
+  // A friendly message that hides WHICH failure happened costs a whole
+  // debugging round trip: "no headers ever arrived" and "the stream was cut
+  // mid-way" have different causes and used to print identically. Append the
+  // transport in use and the runtime's own error identity.
+  const failureDetail = (e: unknown, transport: string): string => {
+    const err = e as { name?: string; message?: string; cause?: { code?: string; message?: string; name?: string } };
+    const code = err?.cause?.code ?? err?.cause?.name ?? err?.name ?? '';
+    const msg = err?.cause?.message ?? err?.message ?? '';
+    return ` [${transport}${code ? ` · ${code}` : ''}${msg && msg !== code ? ` · ${msg.slice(0, 80)}` : ''}]`;
+  };
   const messages: ChatMessage[] = [];
   try {
   for (;;) {
@@ -1927,7 +1937,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // and only gives up after repeated reconnect failures — the agent
           // (or the network to it) is down, but the task itself may well
           // still be running inside the container.
-          out(`\n(lost the connection after ${Math.round((Date.now() - turnT0) / 1000)}s of retrying — the task likely CONTINUES on the agent. /result re-attaches when it's reachable again; /tasks lists this session's tasks)\n`);
+          out(`\n(lost the connection after ${Math.round((Date.now() - turnT0) / 1000)}s of retrying — the task likely CONTINUES on the agent. /result re-attaches when it's reachable again; /tasks lists this session's tasks)${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
           messages.push({ role: 'assistant', content: `${reply} [connection lost mid-turn — task continued server-side]` });
           break;
         } else if (/fetch failed|terminated|ECONNRESET|socket|network|aborted by the server|other side closed/i.test((e as Error).message)) {
@@ -1936,7 +1946,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // running through disconnects (only /v1/interrupt stops work), so
           // this is a lost window, not a failed task — say so instead of
           // crying failure, and route the user to the reattach paths.
-          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Follow it with /agentlog; send a message later to get results, or Esc/${'/'}reset to stop it)\n`);
+          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Follow it with /agentlog; send a message later to get results, or Esc/${'/'}reset to stop it)${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
           messages.push({ role: 'assistant', content: `${reply} [connection dropped mid-turn — task continued server-side]` });
           break;
         } else {

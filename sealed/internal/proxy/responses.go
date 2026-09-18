@@ -460,6 +460,9 @@ func (s *Server) streamSynthRecord(w http.ResponseWriter, r *http.Request, rec *
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
+	// Paired with the "accepted" line — see the bridges' equivalent: accepted
+	// without "stream open" localizes the failure to this layer.
+	logger.Logf("responses: %s stream open (from seq %d)", rec.id, startingAfter)
 
 	write := func(evt synthEvent) {
 		data := make(map[string]any, len(evt.Data)+1)
@@ -504,12 +507,14 @@ func (s *Server) streamSynthRecord(w http.ResponseWriter, r *http.Request, rec *
 
 	beat := time.NewTicker(synthKeepalive)
 	defer beat.Stop()
+	beats := 0 // numbered so a client trace can tell "none" from "first N then silence"
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-beat.C:
-			fmt.Fprint(w, ": keepalive\n\n")
+			beats++
+			fmt.Fprintf(w, ": keepalive %d\n\n", beats)
 			fl.Flush()
 		case evt, ok := <-ch:
 			if !ok {
