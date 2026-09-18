@@ -319,6 +319,11 @@ export function makeAgentClient(params: {
    *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
    *  protection). Omit for anonymous calls (proofs come back unredeemable). */
   clientAddress?: string;
+  /** Stall threshold in ms for the responses transport: no bytes for this long
+   *  and the follow stream is torn down and resumed by sequence number.
+   *  Defaults to 90s (nine missed 10s keepalives). Exposed so tests can drive
+   *  the recovery in milliseconds; tune only with a reason. */
+  stallMs?: number;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
   const { services, routes, reauth, clientAddress } = params;
@@ -536,27 +541,33 @@ export function makeAgentClient(params: {
     };
 
     /**
-     * Follow one response to its terminal event, yielding text deltas.
-     * `first` is an already-opened submit stream; without it (or after the
-     * connection drops) the loop (re)opens
-     * GET {prefix}/{id}?stream=true&starting_after={seq} — every event
-     * carries a sequence_number, so nothing is duplicated or lost across
-     * reconnects. Only an explicit abort or a terminal event ends the loop;
-     * repeated reconnect failures give up with the id in the message so the
-     * caller can re-attach later.
+     * Follow one response to its terminal event, yielding text deltas. The
+     * task id is always known before this runs (chatStream submits first), so
+     * every attempt is a fresh GET
+     * {prefix}/{id}?stream=true&starting_after={seq} — every event carries a
+     * sequence_number, so nothing is duplicated or lost across reconnects.
+     * Only an explicit abort or a terminal event ends the loop; repeated
+     * failures (connection errors or barren attempts) give up with the id in
+     * the message so the caller can re-attach later.
      */
     // No bytes for this long means something between us and the agent has
     // gone quiet: the bridges keepalive every 10s, so 90s of true silence is
     // already pathological. Reconnecting then beats waiting out the runtime's
     // own timeout (undici: 300s), and makes the SDK independent of it.
-    const STALL_MS = 90_000;
+    // Injectable so tests can exercise the recovery in milliseconds instead
+    // of waiting out the real threshold.
+    const STALL_MS = params.stallMs ?? 90_000;
+    // How often the watchdog checks. Derived from the threshold rather than
+    // fixed: a hardcoded interval silently coarsens the effective deadline
+    // (a 15s poll turned a 90s stall into a 105s recovery) and makes the
+    // guarantee untestable at small thresholds.
+    const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
 
     async function* followResponse(args: {
       id?: string;
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
-      onTask?: (id: string) => void;
     }): AsyncGenerator<string> {
       const id = args.id;
       let seq = args.startingAfter ?? 0;
@@ -569,14 +580,32 @@ export function makeAgentClient(params: {
       let attempt: AbortController | undefined;
       let lastByteAt = Date.now();
 
+      // Consecutive attempts that produced NOTHING (no headers, no chunk)
+      // count against the same give-up budget as connection errors: without
+      // that, a server which accepts and then stays silent forever produces
+      // reconnect churn at the stall cadence and never surfaces an error.
+      let barren = 0;
+
       for (;;) {
         if (!res) {
+          let armed: ReturnType<typeof setInterval> | undefined;
+          let onOuterAbort: (() => void) | undefined;
           try {
             attempt = new AbortController();
             if (args.signal) {
               if (args.signal.aborted) attempt.abort();
-              else args.signal.addEventListener('abort', () => attempt?.abort(), { once: true });
+              else {
+                onOuterAbort = () => attempt?.abort();
+                args.signal.addEventListener('abort', onOuterAbort, { once: true });
+              }
             }
+            // Arm the watchdog BEFORE the fetch: a follow GET that never
+            // returns headers is exactly the failure this PR is about, and
+            // waiting for it would fall back to the runtime's 300s.
+            lastByteAt = Date.now();
+            armed = setInterval(() => {
+              if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+            }, STALL_POLL_MS);
             const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
             if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
             res = r;
@@ -591,6 +620,9 @@ export function makeAgentClient(params: {
             }
             await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
             continue;
+          } finally {
+            if (armed) clearInterval(armed);
+            if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
           }
         }
         if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
@@ -598,7 +630,7 @@ export function makeAgentClient(params: {
         }
         const watchdog = setInterval(() => {
           if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
-        }, 15_000);
+        }, STALL_POLL_MS);
         try {
           // The comment callback counts keepalives as liveness — they are
           // exactly what the bridges send during a quiet turn.

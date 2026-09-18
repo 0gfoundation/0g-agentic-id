@@ -15,7 +15,12 @@
 // framework's own /v1/chat/completions on the container-local loopback —
 // where no request-duration cap exists:
 //
-//	POST /v1/responses {input, stream}          → SSE; first event carries id
+//	POST /v1/responses {input}                  → JSON {id, status}; the
+//	                                              SDK's primary path — submit
+//	                                              and follow are separate so
+//	                                              the id exists before any
+//	                                              long-lived byte
+//	POST /v1/responses {input, stream:true}     → SSE; first event carries id
 //	GET  /v1/responses/{id}                     → poll {status, output_text}
 //	GET  /v1/responses/{id}?stream=true&starting_after=N
 //	                                            → replay events > N, then live
