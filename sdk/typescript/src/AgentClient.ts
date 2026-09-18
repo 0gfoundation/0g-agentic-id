@@ -319,6 +319,11 @@ export function makeAgentClient(params: {
    *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
    *  protection). Omit for anonymous calls (proofs come back unredeemable). */
   clientAddress?: string;
+  /** Stall threshold in ms for the responses transport: no bytes for this long
+   *  and the follow stream is torn down and resumed by sequence number.
+   *  Defaults to 90s (nine missed 10s keepalives). Exposed so tests can drive
+   *  the recovery in milliseconds; tune only with a reason. */
+  stallMs?: number;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
   const { services, routes, reauth, clientAddress } = params;
@@ -536,36 +541,75 @@ export function makeAgentClient(params: {
     };
 
     /**
-     * Follow one response to its terminal event, yielding text deltas.
-     * `first` is an already-opened submit stream; without it (or after the
-     * connection drops) the loop (re)opens
-     * GET {prefix}/{id}?stream=true&starting_after={seq} — every event
-     * carries a sequence_number, so nothing is duplicated or lost across
-     * reconnects. Only an explicit abort or a terminal event ends the loop;
-     * repeated reconnect failures give up with the id in the message so the
-     * caller can re-attach later.
+     * Follow one response to its terminal event, yielding text deltas. The
+     * task id is always known before this runs (chatStream submits first), so
+     * every attempt is a fresh GET
+     * {prefix}/{id}?stream=true&starting_after={seq} — every event carries a
+     * sequence_number, so nothing is duplicated or lost across reconnects.
+     * Only an explicit abort or a terminal event ends the loop; repeated
+     * failures (connection errors or barren attempts) give up with the id in
+     * the message so the caller can re-attach later.
      */
+    // No bytes for this long means something between us and the agent has
+    // gone quiet: the bridges keepalive every 10s, so 90s of true silence is
+    // already pathological. Reconnecting then beats waiting out the runtime's
+    // own timeout (undici: 300s), and makes the SDK independent of it.
+    // Injectable so tests can exercise the recovery in milliseconds instead
+    // of waiting out the real threshold.
+    const STALL_MS = params.stallMs ?? 90_000;
+    // How often the watchdog checks. Derived from the threshold rather than
+    // fixed: a hardcoded interval silently coarsens the effective deadline
+    // (a 15s poll turned a 90s stall into a 105s recovery) and makes the
+    // guarantee untestable at small thresholds.
+    const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
+
     async function* followResponse(args: {
-      first?: Response;
       id?: string;
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
-      onTask?: (id: string) => void;
     }): AsyncGenerator<string> {
-      let id = args.id;
+      const id = args.id;
       let seq = args.startingAfter ?? 0;
       let sawText = false;
       let terminal: AgentTask | undefined;
-      let res: Response | undefined = args.first;
+      let res: Response | undefined;
       let failures = 0;
+      // Per-attempt controller: the stall watchdog aborts THIS attempt without
+      // touching the caller's signal (which means "stop the task").
+      let attempt: AbortController | undefined;
+      let lastByteAt = Date.now();
+
+      // Consecutive attempts that produced NOTHING (no headers, no chunk)
+      // count against the same give-up budget as connection errors: without
+      // that, a server which accepts and then stays silent forever produces
+      // reconnect churn at the stall cadence and never surfaces an error.
+      let barren = 0;
 
       for (;;) {
         if (!res) {
+          let armed: ReturnType<typeof setInterval> | undefined;
+          let onOuterAbort: (() => void) | undefined;
           try {
-            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: args.signal });
+            attempt = new AbortController();
+            if (args.signal) {
+              if (args.signal.aborted) attempt.abort();
+              else {
+                onOuterAbort = () => attempt?.abort();
+                args.signal.addEventListener('abort', onOuterAbort, { once: true });
+              }
+            }
+            // Arm the watchdog BEFORE the fetch: a follow GET that never
+            // returns headers is exactly the failure this PR is about, and
+            // waiting for it would fall back to the runtime's 300s.
+            lastByteAt = Date.now();
+            armed = setInterval(() => {
+              if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+            }, STALL_POLL_MS);
+            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
             if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
             res = r;
+            lastByteAt = Date.now();
           } catch (e) {
             if (args.signal?.aborted) throw e;
             if (++failures > 5) {
@@ -576,13 +620,22 @@ export function makeAgentClient(params: {
             }
             await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
             continue;
+          } finally {
+            if (armed) clearInterval(armed);
+            if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
           }
         }
         if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
           throw new Error('task: expected an SSE stream from the responses route');
         }
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+        }, STALL_POLL_MS);
         try {
-          for await (const chunk of iterSseChunks(res.body)) {
+          // The comment callback counts keepalives as liveness — they are
+          // exactly what the bridges send during a quiet turn.
+          for await (const chunk of iterSseChunks(res.body, () => { lastByteAt = Date.now(); })) {
+            lastByteAt = Date.now();
             const sn = (chunk as { sequence_number?: number }).sequence_number;
             if (typeof sn === 'number') {
               // Continuity guard (review B2): after a reconnect the replay may
@@ -596,11 +649,9 @@ export function makeAgentClient(params: {
               seq = sn; failures = 0;
             }
             switch ((chunk as { type?: string }).type) {
-              case 'response.created': {
-                const resp = (chunk as { response?: AgentTask }).response;
-                if (resp?.id && !id) { id = resp.id; args.onTask?.(resp.id); }
-                break;
-              }
+              case 'response.created':
+                break; // the id is already known — we submitted before following
+
               case 'response.output_text.delta': {
                 const d = (chunk as { delta?: string }).delta;
                 if (typeof d === 'string' && d) { sawText = true; yield d; }
@@ -621,7 +672,10 @@ export function makeAgentClient(params: {
           }
         } catch (e) {
           if (args.signal?.aborted) throw e;
-          // Network cut mid-stream (this is the whole point): reconnect below.
+          // Network cut mid-stream, or our own stall watchdog firing — either
+          // way the cure is the same: resume from the last sequence number.
+        } finally {
+          clearInterval(watchdog);
         }
         if (terminal) break;
         if (args.signal?.aborted) {
@@ -629,8 +683,7 @@ export function makeAgentClient(params: {
           err.name = 'AbortError';
           throw err;
         }
-        if (!id) throw new Error('task: the stream ended before the agent assigned an id — cannot resume');
-        res = undefined; // reconnect via GET resume
+        res = undefined; // reconnect via GET resume (the id is always known here)
       }
 
       if (terminal.status === 'failed') {
@@ -646,7 +699,14 @@ export function makeAgentClient(params: {
     }
 
     client.chatStream = async function* (messages, opts) {
-      const payload: Record<string, unknown> = { input: messages, stream: true };
+      // SUBMIT and FOLLOW are deliberately two requests. With `stream: true`
+      // the submit IS the long-lived stream, which leaves one unresumable
+      // window: a failure before the id arrives cannot be re-attached, and
+      // the caller can only report a dead task. Submitting WITHOUT stream
+      // returns the id in milliseconds, so every long-lived byte after that
+      // travels on a GET we can always resume by id. One extra round trip
+      // buys the guarantee that a task is never lost to a dropped connection.
+      const payload: Record<string, unknown> = { input: messages };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -656,11 +716,14 @@ export function makeAgentClient(params: {
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      const submitted = (await r.json()) as AgentTask;
+      if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
+      opts?.onTask?.(submitted.id);
       yield* followResponse({
-        first: r,
+        id: submitted.id,
+        startingAfter: 0,
         signal: opts?.signal,
         onActivity: wrapActivity(opts?.onActivity),
-        onTask: opts?.onTask,
       });
     };
 
