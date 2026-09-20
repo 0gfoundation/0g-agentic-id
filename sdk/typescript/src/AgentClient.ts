@@ -563,6 +563,12 @@ export function makeAgentClient(params: {
     // guarantee untestable at small thresholds.
     const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
 
+    const lostAgent = (id: string | undefined, why: string): Error =>
+      new Error(
+        `task ${id}: lost the agent while following (${why}) — ` +
+        `the task may still be running; re-attach with followTask("${id}")`,
+      );
+
     async function* followResponse(args: {
       id?: string;
       startingAfter?: number;
@@ -573,117 +579,117 @@ export function makeAgentClient(params: {
       let seq = args.startingAfter ?? 0;
       let sawText = false;
       let terminal: AgentTask | undefined;
-      let res: Response | undefined;
       let failures = 0;
       // Per-attempt controller: the stall watchdog aborts THIS attempt without
       // touching the caller's signal (which means "stop the task").
       let attempt: AbortController | undefined;
       let lastByteAt = Date.now();
 
-      // Consecutive attempts that produced NOTHING (no headers, no chunk)
-      // count against the same give-up budget as connection errors: without
-      // that, a server which accepts and then stays silent forever produces
-      // reconnect churn at the stall cadence and never surfaces an error.
-      let barren = 0;
-
       for (;;) {
-        if (!res) {
-          let armed: ReturnType<typeof setInterval> | undefined;
-          let onOuterAbort: (() => void) | undefined;
+        // ONE lifecycle per attempt: the caller's abort link and the stall
+        // watchdog are installed before the fetch and torn down only when the
+        // attempt is over — headers arriving is not the end of an attempt.
+        // (Removing the abort link at the header boundary silently broke Esc
+        // mid-stream: the body phase had nothing connecting the caller's
+        // signal to this attempt. Review R1.)
+        attempt = new AbortController();
+        let onOuterAbort: (() => void) | undefined;
+        if (args.signal) {
+          if (args.signal.aborted) attempt.abort();
+          else {
+            onOuterAbort = () => attempt?.abort();
+            args.signal.addEventListener('abort', onOuterAbort, { once: true });
+          }
+        }
+        lastByteAt = Date.now();
+        const progressAt = { seq };
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+        }, STALL_POLL_MS);
+
+        try {
+          // ── open (or re-open) the follow stream ────────────────────────
+          let res: Response;
           try {
-            attempt = new AbortController();
-            if (args.signal) {
-              if (args.signal.aborted) attempt.abort();
-              else {
-                onOuterAbort = () => attempt?.abort();
-                args.signal.addEventListener('abort', onOuterAbort, { once: true });
-              }
-            }
-            // Arm the watchdog BEFORE the fetch: a follow GET that never
-            // returns headers is exactly the failure this PR is about, and
-            // waiting for it would fall back to the runtime's 300s.
-            lastByteAt = Date.now();
-            armed = setInterval(() => {
-              if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
-            }, STALL_POLL_MS);
             const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
             if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
             res = r;
             lastByteAt = Date.now();
           } catch (e) {
             if (args.signal?.aborted) throw e;
-            if (++failures > 5) {
-              throw new Error(
-                `task ${id}: lost the agent while following (${(e as Error).message}) — ` +
-                `the task may still be running; re-attach with followTask("${id}")`,
-              );
-            }
+            if (++failures > 5) throw lostAgent(id, (e as Error).message);
             await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
             continue;
-          } finally {
-            if (armed) clearInterval(armed);
-            if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
           }
-        }
-        if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
-          throw new Error('task: expected an SSE stream from the responses route');
-        }
-        const watchdog = setInterval(() => {
-          if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
-        }, STALL_POLL_MS);
-        try {
-          // The comment callback counts keepalives as liveness — they are
-          // exactly what the bridges send during a quiet turn.
-          for await (const chunk of iterSseChunks(res.body, () => { lastByteAt = Date.now(); })) {
-            lastByteAt = Date.now();
-            const sn = (chunk as { sequence_number?: number }).sequence_number;
-            if (typeof sn === 'number') {
-              // Continuity guard (review B2): after a reconnect the replay may
-              // overlap what we already consumed — skip those. A FORWARD jump
-              // means the server dropped events for us (lagging-follower
-              // detach); don't consume past the hole — tear down and resume
-              // from the last good sequence, which replays the missing span
-              // from the server's retained log.
-              if (sn <= seq) continue;
-              if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
-              seq = sn; failures = 0;
-            }
-            switch ((chunk as { type?: string }).type) {
-              case 'response.created':
-                break; // the id is already known — we submitted before following
+          if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+            throw new Error('task: expected an SSE stream from the responses route');
+          }
 
-              case 'response.output_text.delta': {
-                const d = (chunk as { delta?: string }).delta;
-                if (typeof d === 'string' && d) { sawText = true; yield d; }
-                break;
+          // ── consume it ─────────────────────────────────────────────────
+          try {
+            // The comment callback counts keepalives as liveness — they are
+            // exactly what the bridges send during a quiet turn.
+            for await (const chunk of iterSseChunks(res.body, () => { lastByteAt = Date.now(); })) {
+              lastByteAt = Date.now();
+              const sn = (chunk as { sequence_number?: number }).sequence_number;
+              if (typeof sn === 'number') {
+                // Continuity guard: after a reconnect the replay may overlap
+                // what we already consumed — skip those. A FORWARD jump means
+                // the server dropped events for us (lagging-follower detach);
+                // don't consume past the hole — tear down and resume from the
+                // last good sequence, replaying the missing span.
+                if (sn <= seq) continue;
+                if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
+                seq = sn; failures = 0;
               }
-              case 'response.activity': {
-                const label = (chunk as { label?: string }).label;
-                if (args.onActivity && typeof label === 'string') args.onActivity(label);
-                break;
+              switch ((chunk as { type?: string }).type) {
+                case 'response.created':
+                  break; // the id is already known — we submitted before following
+
+                case 'response.output_text.delta': {
+                  const d = (chunk as { delta?: string }).delta;
+                  if (typeof d === 'string' && d) { sawText = true; yield d; }
+                  break;
+                }
+                case 'response.activity': {
+                  const label = (chunk as { label?: string }).label;
+                  if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                  break;
+                }
+                case 'response.completed':
+                case 'response.failed': {
+                  terminal = (chunk as { response?: AgentTask }).response;
+                  break;
+                }
               }
-              case 'response.completed':
-              case 'response.failed': {
-                terminal = (chunk as { response?: AgentTask }).response;
-                break;
-              }
+              if (terminal) break;
             }
-            if (terminal) break;
+          } catch (e) {
+            if (args.signal?.aborted) throw e;
+            // Network cut mid-stream, or our own stall watchdog firing —
+            // either way the cure is the same: resume from the last sequence.
           }
-        } catch (e) {
-          if (args.signal?.aborted) throw e;
-          // Network cut mid-stream, or our own stall watchdog firing — either
-          // way the cure is the same: resume from the last sequence number.
+
+          if (terminal) break;
+          if (args.signal?.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+          }
+          // An attempt that delivered NO new event is barren. Real mute
+          // servers flush their headers and then say nothing, so those
+          // attempts never reach the connection-error budget above — count
+          // them here or the client reconnects at the stall cadence for ever
+          // (review R2: measured 33 reconnects in 6s before this).
+          if (seq === progressAt.seq) {
+            if (++failures > 5) throw lostAgent(id, `no events for ${Math.round(STALL_MS / 1000)}s across ${failures} attempts`);
+            await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
+          }
+          // reconnect via GET resume (the id is always known here)
         } finally {
           clearInterval(watchdog);
+          if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
         }
-        if (terminal) break;
-        if (args.signal?.aborted) {
-          const err = new Error('aborted');
-          err.name = 'AbortError';
-          throw err;
-        }
-        res = undefined; // reconnect via GET resume (the id is always known here)
       }
 
       if (terminal.status === 'failed') {
