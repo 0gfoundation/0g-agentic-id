@@ -562,6 +562,12 @@ export function makeAgentClient(params: {
     // (a 15s poll turned a 90s stall into a 105s recovery) and makes the
     // guarantee untestable at small thresholds.
     const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
+    // Backoff between attempts, capped by the threshold as well as by the
+    // absolute ceiling: a fixed ladder dominates the give-up horizon whenever
+    // the threshold is small (at stallMs=150 it made the give-up path 24s of
+    // a 29s suite) and is the last constant not derived from the threshold.
+    const backoffFor = (n: number): number =>
+      Math.min(500 * 2 ** n, 8_000, Math.max(50, STALL_MS * 4));
 
     const lostAgent = (id: string | undefined, why: string): Error =>
       new Error(
@@ -580,6 +586,7 @@ export function makeAgentClient(params: {
       let sawText = false;
       let terminal: AgentTask | undefined;
       let failures = 0;
+      const followedAt = Date.now(); // for the give-up message: total wait, not per-attempt
       // Per-attempt controller: the stall watchdog aborts THIS attempt without
       // touching the caller's signal (which means "stop the task").
       let attempt: AbortController | undefined;
@@ -618,7 +625,7 @@ export function makeAgentClient(params: {
           } catch (e) {
             if (args.signal?.aborted) throw e;
             if (++failures > 5) throw lostAgent(id, (e as Error).message);
-            await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
             continue;
           }
           if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
@@ -682,8 +689,10 @@ export function makeAgentClient(params: {
           // them here or the client reconnects at the stall cadence for ever
           // (review R2: measured 33 reconnects in 6s before this).
           if (seq === progressAt.seq) {
-            if (++failures > 5) throw lostAgent(id, `no events for ${Math.round(STALL_MS / 1000)}s across ${failures} attempts`);
-            await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
+            if (++failures > 5) {
+              throw lostAgent(id, `no events across ${failures} attempts over ${Math.round((Date.now() - followedAt) / 1000)}s`);
+            }
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
           }
           // reconnect via GET resume (the id is always known here)
         } finally {
