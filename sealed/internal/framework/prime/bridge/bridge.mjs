@@ -405,6 +405,10 @@ function streamResponse(req, res, rec, startingAfter) {
 		connection: "keep-alive",
 	});
 	if (typeof res.flushHeaders === "function") res.flushHeaders();
+	// Paired with the "accepted" line: if a report shows accepted WITHOUT
+	// stream open, the failure is inside this bridge; with both, the bytes
+	// left here and the loss is upstream of us.
+	log(`responses: ${rec.id} stream open (from seq ${startingAfter})`);
 	let closed = false;
 	const write = (evt) => {
 		if (closed || res.writableEnded || res.destroyed) return;
@@ -413,8 +417,12 @@ function streamResponse(req, res, rec, startingAfter) {
 		} catch { closed = true; }
 	};
 	const isTerminal = (evt) => evt.name === "response.completed" || evt.name === "response.failed";
+	// Numbered keepalives: a client trace can then distinguish "never got a
+	// byte" from "got the first N then silence" — the two have different
+	// causes and used to be indistinguishable from the outside.
+	let beats = 0;
 	const beat = setInterval(() => {
-		if (!closed && !res.writableEnded && !res.destroyed) { try { res.write(": keepalive\n\n"); } catch { closed = true; } }
+		if (!closed && !res.writableEnded && !res.destroyed) { try { res.write(`: keepalive ${++beats}\n\n`); } catch { closed = true; } }
 	}, 10_000);
 	const finish = () => {
 		clearInterval(beat);

@@ -319,6 +319,11 @@ export function makeAgentClient(params: {
    *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
    *  protection). Omit for anonymous calls (proofs come back unredeemable). */
   clientAddress?: string;
+  /** Stall threshold in ms for the responses transport: no bytes for this long
+   *  and the follow stream is torn down and resumed by sequence number.
+   *  Defaults to 90s (nine missed 10s keepalives). Exposed so tests can drive
+   *  the recovery in milliseconds; tune only with a reason. */
+  stallMs?: number;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
   const { services, routes, reauth, clientAddress } = params;
@@ -536,101 +541,164 @@ export function makeAgentClient(params: {
     };
 
     /**
-     * Follow one response to its terminal event, yielding text deltas.
-     * `first` is an already-opened submit stream; without it (or after the
-     * connection drops) the loop (re)opens
-     * GET {prefix}/{id}?stream=true&starting_after={seq} — every event
-     * carries a sequence_number, so nothing is duplicated or lost across
-     * reconnects. Only an explicit abort or a terminal event ends the loop;
-     * repeated reconnect failures give up with the id in the message so the
-     * caller can re-attach later.
+     * Follow one response to its terminal event, yielding text deltas. The
+     * task id is always known before this runs (chatStream submits first), so
+     * every attempt is a fresh GET
+     * {prefix}/{id}?stream=true&starting_after={seq} — every event carries a
+     * sequence_number, so nothing is duplicated or lost across reconnects.
+     * Only an explicit abort or a terminal event ends the loop; repeated
+     * failures (connection errors or barren attempts) give up with the id in
+     * the message so the caller can re-attach later.
      */
+    // No bytes for this long means something between us and the agent has
+    // gone quiet: the bridges keepalive every 10s, so 90s of true silence is
+    // already pathological. Reconnecting then beats waiting out the runtime's
+    // own timeout (undici: 300s), and makes the SDK independent of it.
+    // Injectable so tests can exercise the recovery in milliseconds instead
+    // of waiting out the real threshold.
+    const STALL_MS = params.stallMs ?? 90_000;
+    // How often the watchdog checks. Derived from the threshold rather than
+    // fixed: a hardcoded interval silently coarsens the effective deadline
+    // (a 15s poll turned a 90s stall into a 105s recovery) and makes the
+    // guarantee untestable at small thresholds.
+    const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
+    // Backoff between attempts, capped by the threshold as well as by the
+    // absolute ceiling: a fixed ladder dominates the give-up horizon whenever
+    // the threshold is small (at stallMs=150 it made the give-up path 24s of
+    // a 29s suite) and is the last constant not derived from the threshold.
+    const backoffFor = (n: number): number =>
+      Math.min(500 * 2 ** n, 8_000, Math.max(50, STALL_MS * 4));
+
+    const lostAgent = (id: string | undefined, why: string): Error =>
+      new Error(
+        `task ${id}: lost the agent while following (${why}) — ` +
+        `the task may still be running; re-attach with followTask("${id}")`,
+      );
+
     async function* followResponse(args: {
-      first?: Response;
       id?: string;
       startingAfter?: number;
       signal?: AbortSignal;
       onActivity?: (label: string) => void;
-      onTask?: (id: string) => void;
     }): AsyncGenerator<string> {
-      let id = args.id;
+      const id = args.id;
       let seq = args.startingAfter ?? 0;
       let sawText = false;
       let terminal: AgentTask | undefined;
-      let res: Response | undefined = args.first;
       let failures = 0;
+      const followedAt = Date.now(); // for the give-up message: total wait, not per-attempt
+      // Per-attempt controller: the stall watchdog aborts THIS attempt without
+      // touching the caller's signal (which means "stop the task").
+      let attempt: AbortController | undefined;
+      let lastByteAt = Date.now();
 
       for (;;) {
-        if (!res) {
+        // ONE lifecycle per attempt: the caller's abort link and the stall
+        // watchdog are installed before the fetch and torn down only when the
+        // attempt is over — headers arriving is not the end of an attempt.
+        // (Removing the abort link at the header boundary silently broke Esc
+        // mid-stream: the body phase had nothing connecting the caller's
+        // signal to this attempt. Review R1.)
+        attempt = new AbortController();
+        let onOuterAbort: (() => void) | undefined;
+        if (args.signal) {
+          if (args.signal.aborted) attempt.abort();
+          else {
+            onOuterAbort = () => attempt?.abort();
+            args.signal.addEventListener('abort', onOuterAbort, { once: true });
+          }
+        }
+        lastByteAt = Date.now();
+        const progressAt = { seq };
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+        }, STALL_POLL_MS);
+
+        try {
+          // ── open (or re-open) the follow stream ────────────────────────
+          let res: Response;
           try {
-            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: args.signal });
+            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
             if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
             res = r;
+            lastByteAt = Date.now();
           } catch (e) {
             if (args.signal?.aborted) throw e;
-            if (++failures > 5) {
-              throw new Error(
-                `task ${id}: lost the agent while following (${(e as Error).message}) — ` +
-                `the task may still be running; re-attach with followTask("${id}")`,
-              );
-            }
-            await new Promise((t) => setTimeout(t, Math.min(500 * 2 ** failures, 8000)));
+            if (++failures > 5) throw lostAgent(id, (e as Error).message);
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
             continue;
           }
-        }
-        if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
-          throw new Error('task: expected an SSE stream from the responses route');
-        }
-        try {
-          for await (const chunk of iterSseChunks(res.body)) {
-            const sn = (chunk as { sequence_number?: number }).sequence_number;
-            if (typeof sn === 'number') {
-              // Continuity guard (review B2): after a reconnect the replay may
-              // overlap what we already consumed — skip those. A FORWARD jump
-              // means the server dropped events for us (lagging-follower
-              // detach); don't consume past the hole — tear down and resume
-              // from the last good sequence, which replays the missing span
-              // from the server's retained log.
-              if (sn <= seq) continue;
-              if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
-              seq = sn; failures = 0;
-            }
-            switch ((chunk as { type?: string }).type) {
-              case 'response.created': {
-                const resp = (chunk as { response?: AgentTask }).response;
-                if (resp?.id && !id) { id = resp.id; args.onTask?.(resp.id); }
-                break;
-              }
-              case 'response.output_text.delta': {
-                const d = (chunk as { delta?: string }).delta;
-                if (typeof d === 'string' && d) { sawText = true; yield d; }
-                break;
-              }
-              case 'response.activity': {
-                const label = (chunk as { label?: string }).label;
-                if (args.onActivity && typeof label === 'string') args.onActivity(label);
-                break;
-              }
-              case 'response.completed':
-              case 'response.failed': {
-                terminal = (chunk as { response?: AgentTask }).response;
-                break;
-              }
-            }
-            if (terminal) break;
+          if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+            throw new Error('task: expected an SSE stream from the responses route');
           }
-        } catch (e) {
-          if (args.signal?.aborted) throw e;
-          // Network cut mid-stream (this is the whole point): reconnect below.
+
+          // ── consume it ─────────────────────────────────────────────────
+          try {
+            // The comment callback counts keepalives as liveness — they are
+            // exactly what the bridges send during a quiet turn.
+            for await (const chunk of iterSseChunks(res.body, () => { lastByteAt = Date.now(); })) {
+              lastByteAt = Date.now();
+              const sn = (chunk as { sequence_number?: number }).sequence_number;
+              if (typeof sn === 'number') {
+                // Continuity guard: after a reconnect the replay may overlap
+                // what we already consumed — skip those. A FORWARD jump means
+                // the server dropped events for us (lagging-follower detach);
+                // don't consume past the hole — tear down and resume from the
+                // last good sequence, replaying the missing span.
+                if (sn <= seq) continue;
+                if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
+                seq = sn; failures = 0;
+              }
+              switch ((chunk as { type?: string }).type) {
+                case 'response.created':
+                  break; // the id is already known — we submitted before following
+
+                case 'response.output_text.delta': {
+                  const d = (chunk as { delta?: string }).delta;
+                  if (typeof d === 'string' && d) { sawText = true; yield d; }
+                  break;
+                }
+                case 'response.activity': {
+                  const label = (chunk as { label?: string }).label;
+                  if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                  break;
+                }
+                case 'response.completed':
+                case 'response.failed': {
+                  terminal = (chunk as { response?: AgentTask }).response;
+                  break;
+                }
+              }
+              if (terminal) break;
+            }
+          } catch (e) {
+            if (args.signal?.aborted) throw e;
+            // Network cut mid-stream, or our own stall watchdog firing —
+            // either way the cure is the same: resume from the last sequence.
+          }
+
+          if (terminal) break;
+          if (args.signal?.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+          }
+          // An attempt that delivered NO new event is barren. Real mute
+          // servers flush their headers and then say nothing, so those
+          // attempts never reach the connection-error budget above — count
+          // them here or the client reconnects at the stall cadence for ever
+          // (review R2: measured 33 reconnects in 6s before this).
+          if (seq === progressAt.seq) {
+            if (++failures > 5) {
+              throw lostAgent(id, `no events across ${failures} attempts over ${Math.round((Date.now() - followedAt) / 1000)}s`);
+            }
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
+          }
+          // reconnect via GET resume (the id is always known here)
+        } finally {
+          clearInterval(watchdog);
+          if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
         }
-        if (terminal) break;
-        if (args.signal?.aborted) {
-          const err = new Error('aborted');
-          err.name = 'AbortError';
-          throw err;
-        }
-        if (!id) throw new Error('task: the stream ended before the agent assigned an id — cannot resume');
-        res = undefined; // reconnect via GET resume
       }
 
       if (terminal.status === 'failed') {
@@ -646,7 +714,14 @@ export function makeAgentClient(params: {
     }
 
     client.chatStream = async function* (messages, opts) {
-      const payload: Record<string, unknown> = { input: messages, stream: true };
+      // SUBMIT and FOLLOW are deliberately two requests. With `stream: true`
+      // the submit IS the long-lived stream, which leaves one unresumable
+      // window: a failure before the id arrives cannot be re-attached, and
+      // the caller can only report a dead task. Submitting WITHOUT stream
+      // returns the id in milliseconds, so every long-lived byte after that
+      // travels on a GET we can always resume by id. One extra round trip
+      // buys the guarantee that a task is never lost to a dropped connection.
+      const payload: Record<string, unknown> = { input: messages };
       if (opts?.model) payload.model = opts.model;
       if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
       const r = await doFetch(rPrefix, {
@@ -656,11 +731,14 @@ export function makeAgentClient(params: {
         signal: opts?.signal,
       });
       if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      const submitted = (await r.json()) as AgentTask;
+      if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
+      opts?.onTask?.(submitted.id);
       yield* followResponse({
-        first: r,
+        id: submitted.id,
+        startingAfter: 0,
         signal: opts?.signal,
         onActivity: wrapActivity(opts?.onActivity),
-        onTask: opts?.onTask,
       });
     };
 

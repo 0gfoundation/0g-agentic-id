@@ -1,2 +1,4 @@
 node_modules/
 dist/
+_regr-deploy.cjs
+.watch*.mjs
