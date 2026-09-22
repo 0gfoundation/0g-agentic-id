@@ -281,13 +281,12 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 
 // FrameworkRoutes implements framework.RouteProvider.
 //
-// ONE route, and it is the bridge's: Prime Agent's daemon speaks JSONL over a
+// These routes are all the bridge's: Prime Agent's daemon speaks JSONL over a
 // local socket, so the only HTTP surface in the container is the sealed-owned
-// bridge, which exposes exactly one OpenAI-shaped chat endpoint. Nothing of
-// the framework's own is reachable — there is no web dashboard, no file or
-// exec endpoint to audit (FRAMEWORK_ADAPTER.md §11 step 10), and because we
-// author the bridge, the exposed surface is a whitelist by construction
-// rather than something we have to fence off.
+// bridge. Nothing of the framework's own is reachable — there is no web
+// dashboard, file or exec endpoint to audit (FRAMEWORK_ADAPTER.md §11 step
+// 10), and because we author the bridge, the exposed surface is a whitelist by
+// construction rather than something we have to fence off.
 //
 // Signed is false: this is the owner↔agent steering channel. The proxy
 // enforces that for every framework route regardless; false here keeps the
@@ -295,6 +294,14 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 func (a *Adapter) FrameworkRoutes() []framework.Route {
 	backend := fmt.Sprintf("http://127.0.0.1:%d", bridgePort)
 	return []framework.Route{
+		{
+			Prefix:      "/v1/sessions",
+			Kind:        "sessions",
+			Auth:        "bearer",
+			Signed:      false,
+			Backend:     backend,
+			Description: "Bounded Prime conversation registry: POST creates an idempotent UUID-named session, GET reports availability, POST /:id/reload activates updated persona/skills on an idle session without losing its history, and DELETE disposes an idle session. Chat and Responses requests select it with session_id; omitted session_id retains the legacy shared conversation.",
+		},
 		{
 			Prefix:  "/v1/",
 			Kind:    "chat",
@@ -307,7 +314,7 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// last user message of `messages` is read. A caller that re-sends an
 			// edited history to rewind gets no such thing, and `kind: "chat"`
 			// alone would not tell them.
-			Description: "OpenAI-compatible chat/completions API (sealed bridge). STATEFUL: the conversation lives in a server-side session and only the last user message is read, so re-sending an edited history does not rewind it. Turns are serialized.",
+			Description: "OpenAI-compatible chat/completions API (sealed bridge). STATEFUL: the conversation lives in the server-side session selected by session_id (or the legacy shared session when omitted), and only the last user message is read. Turns are serialized per session.",
 		},
 		{
 			Prefix:  "/v1/responses",
@@ -322,7 +329,7 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 			// response id, not by the HTTP connection, so it survives proxy
 			// request-duration caps and network drops (resume via
 			// GET /v1/responses/{id}?stream=true&starting_after=N).
-			Description: "OpenAI Responses API subset (sealed bridge): POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. Same stateful session as the chat route.",
+			Description: "OpenAI Responses API subset (sealed bridge): POST /v1/responses {input, stream, session_id?} → events with sequence_number; GET /{id} polls; GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops that response in its original session.",
 		},
 		{
 			Prefix:  "/activity",

@@ -174,6 +174,7 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 	// Signing mechanics
 	if rs.SealSignSock != "" && rs.AgentSeal != "" {
 		b.WriteString(buildSigningSection(rs.SealSignSock))
+		b.WriteString(buildConnectionsSection())
 	}
 
 	// Public URL + service exposure
@@ -182,6 +183,13 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 	}
 
 	return b.String()
+}
+
+func buildConnectionsSection() string {
+	return "### Connected accounts\n\n" +
+		"The owner can allow a connected-account operation in Studio and revoke it at any time. Discover currently installed grants with `curl --unix-socket \"$SEAL_SIGN_SOCK\" http://localhost/connections`. Each entry has an `id` and an `operation`; credentials are never returned.\n\n" +
+		"Invoke an installed grant by POSTing JSON to `http://localhost/connections/invoke` over the same Unix socket: `{\"grant_id\":\"<id>\",\"invocation_id\":\"<unique UUID>\",\"input\":{...}}`. Use a new invocation ID for each deliberate operation, and retain it if transport failed; the engine rejects a duplicate instead of repeating provider work. Never automatically retry with a new ID after an uncertain result. The sole exception is an explicit `connection_refresh_in_progress` response with `retryWithNewInvocationId: true`: no provider tool call began, so wait one second and use a new ID. When the framework exposes `seal_connections` and `seal_connection_call`, use those structured tools; do not bypass its shell guard.\n\n" +
+		"Supported operations: `calendar.check_availability` takes `{\"timeMin\":\"<RFC3339>\",\"timeMax\":\"<RFC3339>\"}` for at most 14 days on the primary calendar; `notion.search_shared_titles` takes `{\"query\":\"<search text>\"}` and searches shared pages. The engine validates each input and rechecks ownership and revocation before admitting work. An access-denied result means the owner must reconnect or reauthorize; never ask for provider tokens. Installed grants are local to this sandbox boot; global identity and skill files must never contain credentials.\n\n"
 }
 
 func buildSigningSection(signSock string) string {

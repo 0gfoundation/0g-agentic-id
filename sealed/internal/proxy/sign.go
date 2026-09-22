@@ -87,6 +87,8 @@ func (s *Server) ListenInternal(sockPath string) {
 	mux.HandleFunc("/sign/typed_data", s.handleSignTypedData)
 	mux.HandleFunc("/sign/transaction", s.handleSignTransaction)
 	mux.HandleFunc("/services", s.handleServices)
+	mux.HandleFunc("/connections", s.handleAgentConnections)
+	mux.HandleFunc("/connections/invoke", s.handleAgentConnections)
 
 	go func() {
 		logger.Logf("OK   sign socket listening at unix://%s "+
@@ -233,10 +235,10 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		Value                string `json:"value"` // wei (decimal or 0x hex); default 0
 		Data                 string `json:"data"`  // 0x hex
 		GasLimit             uint64 `json:"gas_limit"`
-		GasPrice             string `json:"gas_price"`               // legacy only
-		MaxFeePerGas         string `json:"max_fee_per_gas"`         // dynamic (EIP-1559)
+		GasPrice             string `json:"gas_price"`                // legacy only
+		MaxFeePerGas         string `json:"max_fee_per_gas"`          // dynamic (EIP-1559)
 		MaxPriorityFeePerGas string `json:"max_priority_fee_per_gas"` // dynamic (EIP-1559)
-		Type                 string `json:"type"`                    // "dynamic" (default) | "legacy"
+		Type                 string `json:"type"`                     // "dynamic" (default) | "legacy"
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeSignError(w, http.StatusBadRequest, "decode body: "+err.Error())

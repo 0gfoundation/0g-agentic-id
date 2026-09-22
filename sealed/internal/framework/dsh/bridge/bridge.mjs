@@ -122,13 +122,13 @@ async function boot() {
 
   // Spine: session/tools/system-prompt/agent/agent-loop/skills/shell-env/
   // tool-bash/llm seam + retry. Spine extras (jobs tools, goals, workspace
-  // context) are off — see the header. Persona goes into DSH's reserved
-  // order-0 persona slot; the platform doc is registered separately below so
-  // it renders AFTER tool guidance — platform mechanics are the final word.
-  const persona = depot(readOptional(PERSONA_PATH, 'persona'))
+  // context) are off — see the header. Leave Spine's static persona slot
+  // empty and add a file-backed order-0 section after it mounts. DSH evaluates
+  // section callbacks for every prompt assembly, so an APPEND_SYSTEM.md edit
+  // takes effect on the next model step without replacing the Agent/session.
   await ctx.plugin(Spine, {
     dshHome: DSH_HOME,
-    persona,
+    persona: '',
     workspaceContext: false,
     toolJobs: false,
     maxParallelToolCalls: 1,
@@ -137,6 +137,11 @@ async function boot() {
     // rc.1 the session/created dispatch trips the scope-carrier check; these
     // are dev diagnostics, not runtime requirements, so disable them.
     invariants: { enabled: false },
+  })
+  ctx.systemPrompt.section({
+    name: 'seal:persona',
+    order: 0,
+    text: () => depot(readOptional(PERSONA_PATH, 'persona')),
   })
 
   // Credentials: apiKeyEnv references resolve through ctx.credentials; the
@@ -218,7 +223,7 @@ async function boot() {
     meta: { cwd: DSH_HOME },
     agentOptions: { provider: PROVIDER, model: MODEL_ID },
   })
-  log(`agent ready (persona: ${persona.length} bytes, platform doc: ${doc ? `${doc.length} bytes` : 'ABSENT'})`)
+  log(`agent ready (persona: file-backed per prompt assembly, platform doc: ${doc ? `${doc.length} bytes` : 'ABSENT'})`)
   return { ctx, agent: handle.agent }
 }
 

@@ -194,6 +194,13 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "bootstrap: "+err.Error())
 		return
 	}
+	sealedProxy.SetStudioOwnerResolver(func(ctx context.Context) (string, error) {
+		owner, err := res.client.OwnerOf(ctx, res.agentID)
+		if err != nil {
+			return "", err
+		}
+		return owner.Hex(), nil
+	})
 
 	// The on-chain framework binding is the authoritative adapter
 	// selector — the agent's identity, not deploy config, decides which
