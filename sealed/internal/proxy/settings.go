@@ -185,7 +185,7 @@ func (s *Server) handleAgentSettings(w http.ResponseWriter, r *http.Request) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		http.Error(w,
-			"this endpoint accepts {\"thinking\"} and nothing else — provider, model and the framework section are your owner's to change, through their signed settings channel: "+err.Error(),
+			"this endpoint accepts {\"thinking\"} and nothing else — provider, model and the `others` section are your owner's to change, through their signed settings channel: "+err.Error(),
 			http.StatusForbidden)
 		return
 	}

@@ -68,10 +68,10 @@ func render(t *testing.T, a *Adapter, d settings.Doc) map[string]string {
 func TestRenderSettings_Idempotent(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	doc := settings.Doc{
-		Provider:  inference.ZGComputeProvider,
-		Model:     "glm-5.3",
-		Thinking:  "high",
-		Framework: json.RawMessage(`{"toolJobs":true,"maxParallelToolCalls":3}`),
+		Provider: inference.ZGComputeProvider,
+		Model:    "glm-5.3",
+		Thinking: "high",
+		Others:   json.RawMessage(`{"toolJobs":true,"maxParallelToolCalls":3}`),
 	}
 	resolved := settings.Resolve(context.Background(), doc, "sk-test")
 
@@ -150,7 +150,7 @@ func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 		Provider: inference.ZGComputeProvider,
 		Model:    "glm-5.3",
 		Thinking: "low",
-		Framework: json.RawMessage(`{
+		Others: json.RawMessage(`{
 			"toolJobs": true,
 			"maxParallelToolCalls": 4,
 			"model": "owner-picks-something-else",
@@ -224,7 +224,7 @@ func TestRenderSettings_BadOverlayValuesNeverFailTheRender(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			a := New()
 			err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(),
-				settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Framework: json.RawMessage(c.overlay)}, "sk-test"))
+				settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.overlay)}, "sk-test"))
 			if err != nil {
 				t.Fatalf("render must not fail on an owner-authored overlay: %v", err)
 			}
@@ -250,9 +250,9 @@ func TestRenderSettings_WorkspaceContextKnobIsRefused(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	a := New()
 	env := render(t, a, settings.Doc{
-		Provider:  inference.ZGComputeProvider,
-		Model:     "glm-5.3",
-		Framework: json.RawMessage(`{"workspaceContext":true,"toolJobs":true}`),
+		Provider: inference.ZGComputeProvider,
+		Model:    "glm-5.3",
+		Others:   json.RawMessage(`{"workspaceContext":true,"toolJobs":true}`),
 	})
 	for k, v := range env {
 		if strings.Contains(k, "WORKSPACE") {

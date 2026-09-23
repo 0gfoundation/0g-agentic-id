@@ -41,8 +41,12 @@ type Doc struct {
 	Model string `json:"model,omitempty"`
 	// Thinking is the owner's reasoning-depth preference, one of Levels.
 	Thinking string `json:"thinking,omitempty"`
-	// Framework is this framework's own knobs. Opaque to the platform.
-	Framework json.RawMessage `json:"framework,omitempty"`
+	// Others is everything beyond the platform's three named settings: the
+	// running framework's OWN knobs, passed through opaquely. Named "others"
+	// and not "framework" because a live drill showed the obvious reading of
+	// that word — choosing WHICH framework runs — is exactly what this field
+	// cannot do (the framework binding is minted identity).
+	Others json.RawMessage `json:"others,omitempty"`
 }
 
 // Levels is the reasoning-depth vocabulary the owner may choose from.
@@ -111,8 +115,8 @@ func (d Doc) Validate() error {
 			return fmt.Errorf("settings: thinking %q is not one of %v", d.Thinking, Levels)
 		}
 	}
-	if len(d.Framework) > 0 && !json.Valid(d.Framework) {
-		return fmt.Errorf("settings: framework section is not valid JSON")
+	if len(d.Others) > 0 && !json.Valid(d.Others) {
+		return fmt.Errorf("settings: others section is not valid JSON")
 	}
 	return nil
 }

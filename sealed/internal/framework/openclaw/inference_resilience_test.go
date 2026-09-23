@@ -182,7 +182,7 @@ func TestRenderSettings_OutageRenderIsIdempotent(t *testing.T) {
 
 	s := settings.Resolve(context.Background(),
 		settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"}, "sk-test")
-	s.Framework = json.RawMessage(`{"logging":{"level":"debug"}}`)
+	s.Others = json.RawMessage(`{"logging":{"level":"debug"}}`)
 
 	a := New()
 	ctx := context.Background()
@@ -325,7 +325,7 @@ func TestWriteRuntimeSectionsRestoresTheGatewayToken(t *testing.T) {
 func TestRenderSettings_OverlayModelSiblingsSurviveThePin(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = json.RawMessage(`{"agents":{"defaults":{"model":{"fallback":"openai/glm-4.5","maxRetries":2}}}}`)
+	s.Others = json.RawMessage(`{"agents":{"defaults":{"model":{"fallback":"openai/glm-4.5","maxRetries":2}}}}`)
 
 	cfg := renderInto(t, s)
 	model, _ := agentsDefaults(t, cfg)["model"].(map[string]any)
@@ -345,10 +345,10 @@ func TestRenderSettings_OverlayModelSiblingsSurviveThePin(t *testing.T) {
 func TestRenderSettings_OverlayKeyRemovedFromTheDocumentIsDropped(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = json.RawMessage(`{"logging":{"level":"debug","file":"/tmp/x.log"},"experimental":{"beta":true}}`)
+	s.Others = json.RawMessage(`{"logging":{"level":"debug","file":"/tmp/x.log"},"experimental":{"beta":true}}`)
 	renderInto(t, s)
 
-	s.Framework = json.RawMessage(`{"logging":{"level":"debug"}}`)
+	s.Others = json.RawMessage(`{"logging":{"level":"debug"}}`)
 	cfg := renderInto(t, s)
 
 	if _, present := cfg["experimental"]; present {
@@ -369,7 +369,7 @@ func TestRenderSettings_OverlayKeyRemovedFromTheDocumentIsDropped(t *testing.T) 
 func TestRenderSettings_AgentEditOfAFormerOverlayKeySurvives(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = json.RawMessage(`{"logging":{"level":"debug"}}`)
+	s.Others = json.RawMessage(`{"logging":{"level":"debug"}}`)
 	renderInto(t, s)
 
 	// The agent edits the same key while running.
@@ -382,7 +382,7 @@ func TestRenderSettings_AgentEditOfAFormerOverlayKeySurvives(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s.Framework = nil
+	s.Others = nil
 	cfg = renderInto(t, s)
 	logging, _ := cfg["logging"].(map[string]any)
 	if logging["level"] != "trace" {
@@ -444,7 +444,7 @@ func TestRenderSettings_SwitchingToANativeProviderDropsTheRouterEntry(t *testing
 func TestRenderSettings_OwnerDeclaredProviderIsNotPruned(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireAnthropic, "claude-sonnet-5")
-	s.Framework = json.RawMessage(`{"models":{"providers":{"lmstudio":{"baseUrl":"http://127.0.0.1:1234/v1","api":"openai-completions"}}}}`)
+	s.Others = json.RawMessage(`{"models":{"providers":{"lmstudio":{"baseUrl":"http://127.0.0.1:1234/v1","api":"openai-completions"}}}}`)
 	cfg := renderInto(t, s)
 
 	providers := cfg["models"].(map[string]any)["providers"].(map[string]any)

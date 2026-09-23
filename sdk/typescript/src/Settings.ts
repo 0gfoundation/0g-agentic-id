@@ -15,7 +15,7 @@
  * That layering is the point: widening the vocabulary — a new field, a new
  * framework knob — is a container change only. Nothing here or in the
  * attestor has to learn about it. {@link SettingsDoc} therefore mirrors the
- * Go `settings.Doc` exactly, and `framework` stays deliberately opaque.
+ * Go `settings.Doc` exactly, and `others` stays deliberately opaque.
  *
  * It is NOT on chain. Configuration is re-suppliable (an owner re-picks a
  * model in ten seconds); memory is not, and only memory earns chain storage.
@@ -75,11 +75,15 @@ export interface SettingsDoc {
   /** Reasoning-depth preference — one of {@link THINKING_LEVELS}. */
   thinking?: ThinkingLevel;
   /**
-   * This framework's own knobs. Opaque: the platform neither parses nor
-   * validates them, nor promises they survive a framework upgrade. Any
+   * Everything beyond the three named settings: the running framework's OWN
+   * knobs, passed through opaquely. Named `others` and not `framework`
+   * because a live drill showed the obvious reading of that word — choosing
+   * WHICH framework runs — is exactly what this field cannot do (the
+   * framework binding is minted identity). The platform neither parses nor
+   * validates the contents, nor promises they survive a framework upgrade. Any
    * JSON value. `undefined`/`null` omits the section entirely.
    */
-  framework?: unknown;
+  others?: unknown;
   /**
    * The document is EXTENSIBLE by design: the container defines the
    * vocabulary, so a field newer than this SDK is legitimate. It is carried
@@ -94,7 +98,7 @@ export const ZG_COMPUTE_PROVIDER = '0g-compute';
 
 /** The fields the PLATFORM names and guarantees, in Go declaration order.
  *  Everything else in a document belongs to the container. */
-export const SETTINGS_FIELDS = ['provider', 'model', 'thinking', 'framework'] as const;
+export const SETTINGS_FIELDS = ['provider', 'model', 'thinking', 'others'] as const;
 
 /**
  * THE serialization. Its output is what gets hashed into the signed header
@@ -103,7 +107,7 @@ export const SETTINGS_FIELDS = ['provider', 'model', 'thinking', 'framework'] as
  * away from a bogus "signer mismatch".
  *
  * Field order follows the Go struct's declaration order and empty fields are
- * dropped, matching `encoding/json` + `omitempty`. `framework` is passed
+ * dropped, matching `encoding/json` + `omitempty`. `others` is passed
  * through as raw JSON — the platform does not interpret it.
  *
  * It is NOT byte-identical to Go's `settings.Doc.Marshal`, and does not have
@@ -125,9 +129,9 @@ export function canonicalSettings(doc: SettingsDoc): string {
   put('thinking', doc.thinking);
   // Go's `omitempty` on a json.RawMessage drops only a nil/empty member — an
   // explicit `{}` is content and stays. null/undefined here mean "no section".
-  if (doc.framework !== undefined && doc.framework !== null) {
-    const raw = JSON.stringify(doc.framework);
-    if (raw !== undefined) parts.push(`"framework":${raw}`);
+  if (doc.others !== undefined && doc.others !== null) {
+    const raw = JSON.stringify(doc.others);
+    if (raw !== undefined) parts.push(`"others":${raw}`);
   }
   // Anything this SDK version has never heard of goes through untouched, in
   // its own order. The container owns the vocabulary, so a field newer than

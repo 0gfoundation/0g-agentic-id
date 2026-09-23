@@ -41,7 +41,7 @@ vocabulary:
 | `provider` | who serves the model. `inference.ZGComputeProvider` = `"0g-compute"` (`internal/inference/zgcompute.go:109`) means the PLATFORM supplies the endpoint; any other value names a framework built-in that wires itself |
 | `model` | the model id, spelled the way that provider spells it |
 | `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:52`) |
-| `framework` | this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`) |
+| `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
 
 `framework` is opaque on purpose, and the opacity is load-bearing in three
 places at once: the platform does not parse it, attestor does not know it
@@ -195,7 +195,7 @@ or to the container: the field is `skip_serializing`
 (`attestor/crates/shared/src/types.rs` (`Deployment`)), so `GET /deployment/:seal_id`
 does not carry it, the owner tier of `/deployments` deliberately omits it
 (`routes/deployments.rs` (`OwnerDeployment`)), and `GET /settings` is owner-signed (§5).
-That matters because the opaque `framework` section is owner-authored free
+That matters because the opaque `others` section is owner-authored free
 text — nothing strips a literal credential an owner pastes into it
 (`framework/prime/modelsjson.go:53-59`).
 
@@ -311,7 +311,7 @@ ask about (`internal/proxy/settings.go`, `handleAgentSettings`).
 Session-only durability alone was the wrong bound, and scoping is the fix for
 a hole the PR #164 review demonstrated: an unscoped overlay let the agent
 re-point `provider`/`model` — the owner's spend and routing — and replace the
-owner's `framework` section wholesale, for the container's remaining life,
+owner's `others` section wholesale, for the container's remaining life,
 which can be long. The lever this path exists for is "think harder on this
 task"; that is one field, so one field is what the socket accepts.
 

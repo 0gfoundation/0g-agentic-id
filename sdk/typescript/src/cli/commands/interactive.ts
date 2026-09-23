@@ -52,7 +52,7 @@ const L1_ARGS: Record<string, string[] | (() => string[])> = {
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
-  '/settings': ['provider=', 'model=', 'thinking=', 'framework='],
+  '/settings': ['provider=', 'model=', 'thinking=', 'others='],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
@@ -424,7 +424,7 @@ const L1_HELP_FULL = `manager commands
   settings <id> [k=v …]   show the agent's configuration document (which model
                           it thinks with, and how hard); with assignments —
                           model=… provider=… thinking=low|high|max
-                          framework=<json> — merge and write it (owner-signed)
+                          others=<json> — merge and write it (owner-signed)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline

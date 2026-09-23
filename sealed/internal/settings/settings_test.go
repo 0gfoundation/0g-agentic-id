@@ -25,18 +25,18 @@ func TestParseEmptyBlobIsEmptyDoc(t *testing.T) {
 
 // The framework section survives byte-for-byte: the platform must not
 // reformat a document it does not understand.
-func TestFrameworkSectionIsPassedThrough(t *testing.T) {
-	in := []byte(`{"model":"glm-5.3","framework":{"maxParallelToolCalls":3,"nested":{"a":[1,2]}}}`)
+func TestOthersSectionIsPassedThrough(t *testing.T) {
+	in := []byte(`{"model":"glm-5.3","others":{"maxParallelToolCalls":3,"nested":{"a":[1,2]}}}`)
 	d, err := Parse(in)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var got map[string]any
-	if err := json.Unmarshal(d.Framework, &got); err != nil {
-		t.Fatalf("framework section not preserved as JSON: %v", err)
+	if err := json.Unmarshal(d.Others, &got); err != nil {
+		t.Fatalf("others section not preserved as JSON: %v", err)
 	}
 	if got["maxParallelToolCalls"] != float64(3) {
-		t.Fatalf("framework section lost content: %v", got)
+		t.Fatalf("others section lost content: %v", got)
 	}
 }
 
@@ -50,7 +50,7 @@ func TestValidate(t *testing.T) {
 		{"level off the vocabulary", Doc{Model: "m", Thinking: "ultra"}, true},
 		{"level is case-insensitive", Doc{Model: "m", Thinking: "HIGH"}, false},
 		{"no level is fine", Doc{Model: "m"}, false},
-		{"malformed framework section", Doc{Model: "m", Framework: json.RawMessage(`{`)}, true},
+		{"malformed framework section", Doc{Model: "m", Others: json.RawMessage(`{`)}, true},
 		// A framework built-in is legitimately absent from the router
 		// catalog; refusing it would lock owners onto 0g-compute.
 		{"native provider model", Doc{Provider: "anthropic", Model: "claude-sonnet-5"}, false},

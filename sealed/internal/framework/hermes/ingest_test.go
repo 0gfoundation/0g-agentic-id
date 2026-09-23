@@ -65,8 +65,8 @@ func TestHandleLegacy_ConfigYAML_RecoversTheOwnersProvider(t *testing.T) {
 	// approvals + terminal are a photograph of the framework's own on-disk
 	// defaults at the last drift commit, not an owner's choice; carrying them
 	// would freeze one release's defaults into the document forever.
-	if len(doc.Framework) != 0 {
-		t.Errorf("framework section = %s, want empty", doc.Framework)
+	if len(doc.Others) != 0 {
+		t.Errorf("framework section = %s, want empty", doc.Others)
 	}
 }
 
@@ -194,7 +194,7 @@ func TestHandleLegacy_ConfigYAML_IdempotentAndWritesNoConfig(t *testing.T) {
 			continue
 		}
 		if doc.Provider != first.Provider || doc.Model != first.Model ||
-			doc.Thinking != first.Thinking || len(doc.Framework) != len(first.Framework) {
+			doc.Thinking != first.Thinking || len(doc.Others) != len(first.Others) {
 			t.Fatalf("run %d recovered %+v, want %+v — recovery must be idempotent", i, doc, first)
 		}
 	}

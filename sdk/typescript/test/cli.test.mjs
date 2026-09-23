@@ -83,11 +83,11 @@ test('error code → exit code mapping (gene contract)', () => {
 });
 
 test('tokenize: quotes hold a value with spaces together (the REPL used to split it)', () => {
-  // The finding: `/settings framework={"tools": {"bash": true}}` arrived as
+  // The finding: `/settings others={"tools": {"bash": true}}` arrived as
   // four arguments, and the error told the user to quote — which the REPL
   // then passed through as literal quote characters.
-  assert.deepEqual(tokenize(`settings 286 framework='{"a": 1}'`), ['settings', '286', 'framework={"a": 1}']);
-  assert.deepEqual(tokenize('settings 286 framework="{\\"a\\": 1}"'), ['settings', '286', 'framework={"a": 1}']);
+  assert.deepEqual(tokenize(`settings 286 others='{"a": 1}'`), ['settings', '286', 'others={"a": 1}']);
+  assert.deepEqual(tokenize('settings 286 others="{\\"a\\": 1}"'), ['settings', '286', 'others={"a": 1}']);
   assert.deepEqual(tokenize('a\\ b c'), ['a b', 'c']);
   // unquoted behaviour is exactly what it was
   assert.deepEqual(tokenize('  settings   286  model=x '), ['settings', '286', 'model=x']);
@@ -96,38 +96,38 @@ test('tokenize: quotes hold a value with spaces together (the REPL used to split
   assert.deepEqual(tokenize(`thinking= ''`), ['thinking=', '']);
   // a half-typed quote is taken as written — the grammar check reports it,
   // not a parse error about quoting
-  assert.deepEqual(tokenize(`framework='{"a": 1}`), ['framework={"a": 1}']);
+  assert.deepEqual(tokenize(`others='{"a": 1}`), ['others={"a": 1}']);
 });
 
 test('tokenize + parseAssignments: quoted JSON with spaces reaches the parser intact', () => {
-  const [assignment] = parseAssignments(tokenize(`framework='{"tools": {"bash": true}}'`));
-  assert.deepEqual(assignment, { key: 'framework', value: { tools: { bash: true } } });
+  const [assignment] = parseAssignments(tokenize(`others='{"tools": {"bash": true}}'`));
+  assert.deepEqual(assignment, { key: 'others', value: { tools: { bash: true } } });
 });
 
 test('tokenize: an UNQUOTED JSON value keeps the quotes it is made of', () => {
   // The regression the quote-aware splitter introduced: a shell splitter eats
   // exactly the characters JSON is written with, so the unquoted form the help
-  // and the GUIDE print (`framework={"a":1}`) arrived as `framework={a:1}` and
+  // and the GUIDE print (`others={"a":1}`) arrived as `others={a:1}` and
   // parsed as nothing. A literal in value position is data, copied as typed.
-  assert.deepEqual(tokenize('settings 286 framework={"a":1}'), ['settings', '286', 'framework={"a":1}']);
+  assert.deepEqual(tokenize('settings 286 others={"a":1}'), ['settings', '286', 'others={"a":1}']);
   // spaces and nesting INSIDE the literal are part of the value, not separators
-  assert.deepEqual(tokenize('settings 286 framework={"tools": {"bash": true}}'),
-    ['settings', '286', 'framework={"tools": {"bash": true}}']);
-  assert.deepEqual(tokenize('settings 286 model=x framework={"a": 1} thinking=high'),
-    ['settings', '286', 'model=x', 'framework={"a": 1}', 'thinking=high']);
+  assert.deepEqual(tokenize('settings 286 others={"tools": {"bash": true}}'),
+    ['settings', '286', 'others={"tools": {"bash": true}}']);
+  assert.deepEqual(tokenize('settings 286 model=x others={"a": 1} thinking=high'),
+    ['settings', '286', 'model=x', 'others={"a": 1}', 'thinking=high']);
   // a brace inside a JSON string does not close the literal
-  assert.deepEqual(tokenize('settings 286 framework={"a": "}"}'), ['settings', '286', 'framework={"a": "}"}']);
+  assert.deepEqual(tokenize('settings 286 others={"a": "}"}'), ['settings', '286', 'others={"a": "}"}']);
   // quoting still works — and still wins, since the quote comes first
-  assert.deepEqual(tokenize(`settings 286 framework='{"a": 1}'`), ['settings', '286', 'framework={"a": 1}']);
+  assert.deepEqual(tokenize(`settings 286 others='{"a": 1}'`), ['settings', '286', 'others={"a": 1}']);
   // a bracket that is NOT where a value starts stays an ordinary character
   assert.deepEqual(tokenize('rate 42 5 /api/x[0]'), ['rate', '42', '5', '/api/x[0]']);
   // unbalanced: taken as written, like an unterminated quote
-  assert.deepEqual(tokenize('settings 286 framework={nope'), ['settings', '286', 'framework={nope']);
+  assert.deepEqual(tokenize('settings 286 others={nope'), ['settings', '286', 'others={nope']);
 });
 
 test('tokenize + parseAssignments: an unquoted JSON assignment parses', () => {
-  const [assignment] = parseAssignments(tokenize('settings 286 framework={"a":1}').slice(2));
-  assert.deepEqual(assignment, { key: 'framework', value: { a: 1 } });
+  const [assignment] = parseAssignments(tokenize('settings 286 others={"a":1}').slice(2));
+  assert.deepEqual(assignment, { key: 'others', value: { a: 1 } });
 });
 
 test('splitHead: a free-form last argument is taken verbatim, never re-joined', () => {
@@ -456,7 +456,7 @@ test('settings: bad grammar fails as usage BEFORE any network call', async () =>
     ['settings', SET_SEAL, 'thinking=deep'],
     ['settings', SET_SEAL, 'temperature=0.7'],
     ['settings', SET_SEAL, 'model'],
-    ['settings', SET_SEAL, 'framework={nope'],
+    ['settings', SET_SEAL, 'others={nope'],
   ]) {
     // 127.0.0.1:1 is unreachable — reaching it would be the failure.
     const r = await run([...args, '--json'], { AGENTIC_ATTESTOR_URL: 'http://127.0.0.1:1' });
@@ -525,7 +525,7 @@ function replAttestor(agentUrl, stored = null) {
           seal_id: REPL_SEAL,
           agent_id: '42',
           phase: 'running',
-          framework: 'openclaw',
+          others: 'openclaw',
           owner: '0x' + '11'.repeat(20),
           agent_card: { name: 'echo', url: agentUrl ? `${agentUrl}/hello` : null },
           created_at: '2026-09-01T00:00:00Z',
@@ -569,7 +569,7 @@ test('REPL `call <id> <path> <body>`: the JSON body is POSTed exactly as typed',
   }
 });
 
-test('REPL `settings <id> framework={…}`: the unquoted document is written as typed', async () => {
+test('REPL `settings <id> others={…}`: the unquoted document is written as typed', async () => {
   // The same splitter, the other command with a free-form value: unquoted JSON
   // used to reach the parser as `{a:1}` and fail as "must be JSON".
   const att = await replAttestor(null, { provider: '0g-compute', model: 'glm-4.6' });
@@ -578,11 +578,11 @@ test('REPL `settings <id> framework={…}`: the unquoted document is written as 
       AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${att.server.address().port}`,
       ...KEY_ENV,
       NO_COLOR: '1',
-    }, 'settings 42 framework={"tools": {"bash": true}}\nquit\n');
+    }, 'settings 42 others={"tools": {"bash": true}}\nquit\n');
     const raw = att.posted();
     assert.ok(raw, `nothing was written: ${r.stdout}\n${r.stderr}`);
     assert.deepEqual(JSON.parse(raw).settings, {
-      provider: '0g-compute', model: 'glm-4.6', framework: { tools: { bash: true } },
+      provider: '0g-compute', model: 'glm-4.6', others: { tools: { bash: true } },
     });
   } finally {
     att.server.closeAllConnections?.();

@@ -96,7 +96,7 @@ func TestRenderIdempotent(t *testing.T) {
 	s := routed("glm-5.3", "high", inference.ModelFacts{
 		MaxTokens: 131072, SupportsReasoningEffort: true, CatalogSourced: true,
 	})
-	s.Framework = json.RawMessage(`{"approvals":{"mode":"off"}}`)
+	s.Others = json.RawMessage(`{"approvals":{"mode":"off"}}`)
 
 	if err := a.RenderSettings(ctx, s); err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestRenderOverlayAppliedButLoses(t *testing.T) {
 	s := routed("glm-5.3", "high", inference.ModelFacts{
 		SupportsReasoningEffort: true, CatalogSourced: true,
 	})
-	s.Framework = json.RawMessage(`{
+	s.Others = json.RawMessage(`{
 		"approvals": {"mode": "off"},
 		"terminal": {"backend": "tmux"},
 		"agent": {"reasoning_effort": false, "name": "hermes"},
@@ -396,7 +396,7 @@ func TestRenderOverlayMergesIntoSection(t *testing.T) {
 	writeFile(t, configYAMLPath(), "model:\n  provider: anthropic\n  default: seeded-model\n")
 
 	if err := a.RenderSettings(context.Background(), settings.Resolved{
-		Doc: settings.Doc{Framework: json.RawMessage(`{"model":{"temperature":0.2}}`)},
+		Doc: settings.Doc{Others: json.RawMessage(`{"model":{"temperature":0.2}}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -463,7 +463,7 @@ func TestRenderIdempotentTrickyOverlay(t *testing.T) {
 	s := routed("glm-5.3", "high", inference.ModelFacts{
 		SupportsReasoningEffort: true, CatalogSourced: true,
 	})
-	s.Framework = json.RawMessage(`{"z":{"b":1,"a":[1,2,{"k":"v"}]},"num":1.0,"big":1e9,"s":"yes","t":true,"n":null,"date":"2026-01-02","model":{"temperature":0.2}}`)
+	s.Others = json.RawMessage(`{"z":{"b":1,"a":[1,2,{"k":"v"}]},"num":1.0,"big":1e9,"s":"yes","t":true,"n":null,"date":"2026-01-02","model":{"temperature":0.2}}`)
 
 	var prev string
 	for i := 0; i < 3; i++ {

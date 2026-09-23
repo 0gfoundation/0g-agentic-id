@@ -13,16 +13,16 @@
 //   - config.go      private config types
 //   - paths.go       on-disk path constants
 //   - disk.go        tar.gz helpers + openclaw.json read/merge/write +
-//                    workspace I/O
+//     workspace I/O
 //   - restore.go     Restore: parse iData → cfg → write workspace files
 //   - evolution.go   EvolutionFor: read workspace → pack iData plaintext
-//                    (this is the "reverse mapping" the uploader needs to
-//                    publish actual current state)
+//     (this is the "reverse mapping" the uploader needs to
+//     publish actual current state)
 //   - inference.go   RenderSettings: owner settings → openclaw.json (the
-//                    platform-owned keys re-rendered every Start, never
-//                    chain-tracked)
+//     platform-owned keys re-rendered every Start, never
+//     chain-tracked)
 //   - spawn.go       Start: install + spawn openclaw + runtime config
-//                    sections (gateway.token, controlUi)
+//     sections (gateway.token, controlUi)
 //   - identitymd.go / soulmd.go / toolsmd.go  platform-injected sections
 package openclaw
 

@@ -9,13 +9,13 @@
  *   settings <agent>                       show the current document
  *   settings <agent> model=0gm-1.0-35b-a3b change one field
  *   settings <agent> thinking=             clear one field
- *   settings <agent> framework='{"a": 1}'  the framework's own opaque knobs
+ *   settings <agent> others='{"a": 1}'      the framework's own opaque knobs
  *
  * Assignments MERGE into the stored document — the owner is editing one
  * field, not re-authoring the whole thing. The wire write is still a whole
  * document; the merge happens here.
  *
- * Quoting works at both layers: a shell hands `framework='{"a": 1}'` over as
+ * Quoting works at both layers: a shell hands `others='{"a": 1}'` over as
  * one argument, and the REPL's own splitter (`cli/tokenize.ts`) honours the
  * same quotes rather than breaking the JSON on its spaces.
  */
@@ -23,7 +23,7 @@
 import { CliError } from './errors';
 import { SETTINGS_FIELDS, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../Settings';
 
-/** The document's named fields. `framework` is opaque JSON; the rest are
+/** The document's named fields. `others` is opaque JSON; the rest are
  *  strings. Anything else a container understands is writable through the
  *  SDK, but not through this grammar — the CLI refuses keys it cannot
  *  describe, so a typo can never become a stored field. */
@@ -36,15 +36,15 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agenticid settings <agent> [provider=… model=… thinking=low|high|max framework=<json>]';
+const USAGE = '0g-agenticid settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
 
 /** How to quote a JSON value, in either place it can be typed. */
 const FRAMEWORK_QUOTING =
-  `settings <agent> framework='{"key": "value"}'   # quote it — inside the REPL too`;
+  `settings <agent> others='{"key": "value"}'   # quote it — inside the REPL too`;
 
 /**
  * Parse `key=value` positionals. Throws `BAD_FLAG` (exit 2) on an unknown
- * key, a bad thinking level, or a `framework=` value that is not JSON — all
+ * key, a bad thinking level, or an `others=` value that is not JSON — all
  * usage errors worth failing on before any network work.
  */
 export function parseAssignments(args: string[]): Assignment[] {
@@ -60,7 +60,7 @@ export function parseAssignments(args: string[]): Assignment[] {
       throw new CliError(
         'BAD_FLAG',
         `unknown setting "${key}" — the platform's named fields are ${SETTINGS_KEYS.join(', ')} ` +
-          '(anything framework-specific goes inside framework=<json>)',
+          '(anything framework-specific goes inside others=<json>)',
         { remedy: USAGE },
       );
     }
@@ -73,12 +73,12 @@ export function parseAssignments(args: string[]): Assignment[] {
         remedy: USAGE,
       });
     }
-    if (key === 'framework') {
+    if (key === 'others') {
       let parsed: unknown;
       try {
         parsed = JSON.parse(raw);
       } catch (e) {
-        throw new CliError('BAD_FLAG', `framework= must be JSON: ${(e as Error).message}`, {
+        throw new CliError('BAD_FLAG', `others= must be JSON: ${(e as Error).message}`, {
           remedy: FRAMEWORK_QUOTING,
         });
       }
@@ -95,7 +95,7 @@ export function applyAssignments(base: SettingsDoc | null, assignments: Assignme
   const doc: SettingsDoc = { ...(base ?? {}) };
   for (const a of assignments) {
     if (a.value === undefined) delete doc[a.key];
-    else if (a.key === 'framework') doc.framework = a.value;
+    else if (a.key === 'others') doc.others = a.value;
     else doc[a.key] = a.value as string & ThinkingLevel;
   }
   return doc;

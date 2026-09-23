@@ -60,7 +60,7 @@ import (
 func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error {
 	cfg, rebuilt := loadConfigForRender()
 
-	overlay := frameworkOverlay(s.Framework)
+	overlay := frameworkOverlay(s.Others)
 	dropRemovedOverlayKeys(cfg, loadAppliedOverlay(), overlay)
 	mergeInto(cfg, overlay)
 
@@ -969,13 +969,13 @@ func (a *Adapter) ensureConfigAcceptable(ctx context.Context) error {
 	a.mu.RLock()
 	rendered := a.rendered
 	a.mu.RUnlock()
-	if rendered == nil || len(bytes.TrimSpace(rendered.Framework)) == 0 {
+	if rendered == nil || len(bytes.TrimSpace(rendered.Others)) == 0 {
 		return fmt.Errorf("openclaw rejects the rendered config and no owner overlay is in force — platform bug, not booting on it: %w", firstErr)
 	}
 
 	logger.Logf("WARN openclaw rejected the rendered config (%v); withdrawing the owner's framework overlay and booting on the platform half — fix the overlay via the settings channel", firstErr)
 	stripped := *rendered
-	stripped.Framework = nil
+	stripped.Others = nil
 	if err := a.RenderSettings(ctx, stripped); err != nil {
 		return fmt.Errorf("re-render without the owner overlay: %w", err)
 	}

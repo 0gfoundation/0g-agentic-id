@@ -116,21 +116,21 @@ test('canonicalSettings: Go declaration order, omitempty, raw framework', () => 
   assert.equal(canonicalSettings({ model: '', provider: undefined }), '{}');
   // framework is opaque: passed through, never interpreted
   assert.equal(
-    canonicalSettings({ model: 'm', framework: { tools: { bash: true } } }),
-    '{"model":"m","framework":{"tools":{"bash":true}}}',
+    canonicalSettings({ model: 'm', others: { tools: { bash: true } } }),
+    '{"model":"m","others":{"tools":{"bash":true}}}',
   );
   // an explicit empty object is content (Go omitempty only drops a nil member)
-  assert.equal(canonicalSettings({ framework: {} }), '{"framework":{}}');
+  assert.equal(canonicalSettings({ others: {} }), '{"others":{}}');
   // null/undefined mean "no section"
-  assert.equal(canonicalSettings({ framework: null }), '{}');
+  assert.equal(canonicalSettings({ others: null }), '{}');
 });
 
 test('canonicalSettings: a field this build never heard of survives a round trip', () => {
   // The container owns the vocabulary — an older client must not erase a
   // newer setting when it reads, edits one field, and writes back.
   assert.equal(
-    canonicalSettings({ model: 'm', temperature: 0.7, framework: { a: 1 } }),
-    '{"model":"m","framework":{"a":1},"temperature":0.7}',
+    canonicalSettings({ model: 'm', temperature: 0.7, others: { a: 1 } }),
+    '{"model":"m","others":{"a":1},"temperature":0.7}',
   );
   assert.equal(canonicalSettings({ future: { nested: ['x'] } }), '{"future":{"nested":["x"]}}');
 });
@@ -162,7 +162,7 @@ test('sha256Hex matches node:crypto over the UTF-8 bytes', async () => {
 test('setSettings: header contract, and ONE serialization behind digest + body', async () => {
   const cap = await mockAttestor();
   try {
-    const doc = { provider: '0g-compute', model: '0gm-1.0-35b-a3b', thinking: 'high', framework: { note: 'café 你好' } };
+    const doc = { provider: '0g-compute', model: '0gm-1.0-35b-a3b', thinking: 'high', others: { note: 'café 你好' } };
     const { version } = await clientAt(cap.port).setSettings({ sealId: SEAL, settings: doc, baseVersion: 3 });
     assert.equal(version, 7);
 
@@ -243,7 +243,7 @@ test('setSettings: a 409 re-reads and reports the conflict — it never retries'
 test('setSettings: a non-ASCII document does not disturb the signed header', async () => {
   const cap = await mockAttestor();
   try {
-    const doc = { model: 'モデル', framework: { 说明: '中文配置' } };
+    const doc = { model: 'モデル', others: { 说明: '中文配置' } };
     await clientAt(cap.port).setSettings({ sealId: SEAL, settings: doc, baseVersion: 1 });
     const { headers, raw } = cap.last();
     const digest = headers['x-auth-message'].split(':')[4];

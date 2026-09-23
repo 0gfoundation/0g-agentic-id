@@ -171,7 +171,7 @@ type Framework interface {
 	//   - Idempotent. Same Resolved in, same bytes on disk out; the watcher
 	//     hashes those bytes and a non-deterministic render would report
 	//     drift on every tick.
-	//   - Platform values win. Apply s.Framework (the owner's opaque
+	//   - Platform values win. Apply s.Others (the owner's opaque
 	//     per-framework overlay) FIRST, then write the platform-owned keys
 	//     over it — endpoint, effort bound, output budget, and any
 	//     credential or per-boot token. Ordering, not an exclusion list, is

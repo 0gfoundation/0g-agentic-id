@@ -206,10 +206,10 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 // inference.ZGComputeProvider is for.
 func renderModelsJSON(s settings.Resolved) ([]byte, error) {
 	doc := map[string]any{}
-	if len(bytes.TrimSpace(s.Framework)) > 0 {
+	if len(bytes.TrimSpace(s.Others)) > 0 {
 		// Opaque by contract: decoded as generic JSON, never interpreted.
 		// UseNumber so an owner's integer never round-trips into 1e+06.
-		dec := json.NewDecoder(bytes.NewReader(s.Framework))
+		dec := json.NewDecoder(bytes.NewReader(s.Others))
 		dec.UseNumber()
 		if err := dec.Decode(&doc); err != nil {
 			// A malformed overlay is the owner's mistake and must not take the

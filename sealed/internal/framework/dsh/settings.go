@@ -159,7 +159,7 @@ type renderedSettings struct {
 // agent that will not boot, and the owner's push path rolls the document back
 // on one.
 func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error {
-	knobs := parseKnobs(s.Framework)
+	knobs := parseKnobs(s.Others)
 	env := settingsEnv(s, knobs)
 
 	a.mu.Lock()

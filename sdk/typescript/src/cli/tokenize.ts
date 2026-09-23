@@ -4,7 +4,7 @@
  *
  * Outside the REPL the user's shell does this and the CLI never sees quotes.
  * Inside it, a bare `line.split(/\s+/)` made every value containing a space
- * unreachable — `framework={"tools": {"bash": true}}` arrived as four
+ * unreachable — `others={"tools": {"bash": true}}` arrived as four
  * arguments, and the error message helpfully suggested quoting, which the
  * splitter then handed through as literal `'` characters. Quoting has to
  * actually work, or the advice is a dead end.
@@ -19,15 +19,15 @@
  *
  * That last rule is what keeps a shell splitter honest about JSON. Quote
  * characters are how a shell protects a value, but they are also what JSON is
- * MADE of, so stripping them turns `framework={"a":1}` — the unquoted form the
- * help and the GUIDE print — into `framework={a:1}`, which parses as nothing.
+ * MADE of, so stripping them turns `others={"a":1}` — the unquoted form the
+ * help and the GUIDE print — into `others={a:1}`, which parses as nothing.
  * A literal opening where a value begins (the start of a token, or right after
  * an `=`) is therefore data: copied, not interpreted. Elsewhere a bracket is
  * an ordinary character, so `/api/x[0]` is still one plain token.
  *
  * No variable expansion, no globbing, no operators — a REPL argument is data,
  * and a splitter that interprets it would be a surprise, not a convenience.
- * Adjacent pieces join into one token (`framework='{"a": 1}'` is one word),
+ * Adjacent pieces join into one token (`others='{"a": 1}'` is one word),
  * which is the whole point.
  *
  * A command whose LAST argument is free-form text rather than a value in a

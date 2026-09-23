@@ -99,8 +99,8 @@ COMMANDS
                    Show the agent's configuration document (which model it
                    thinks with, and how hard); with key=value assignments,
                    change it. Keys: provider, model, thinking (low|high|max),
-                   framework (opaque JSON for that framework's own knobs —
-                   quote it: framework='{"a": 1}'). Assignments merge into the
+                   others (opaque JSON for that framework's own knobs —
+                   quote it: others='{"a": 1}'). Assignments merge into the
                    stored document; an empty value (thinking=) clears a field.
                    The document is the owner's, so BOTH reading and writing
                    are owner-signed and need AGENTIC_PRIVATE_KEY. A write is a

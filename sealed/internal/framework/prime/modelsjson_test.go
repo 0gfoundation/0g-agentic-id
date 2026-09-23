@@ -77,10 +77,10 @@ func TestRenderSettingsIsIdempotent(t *testing.T) {
 	a := New()
 
 	s := settings.Resolve(context.Background(), settings.Doc{
-		Provider:  inference.ZGComputeProvider,
-		Model:     "glm-5.3",
-		Thinking:  "high",
-		Framework: json.RawMessage(`{"providers":{"my-own":{"baseUrl":"http://127.0.0.1:1234","models":[{"id":"local"}]}}}`),
+		Provider: inference.ZGComputeProvider,
+		Model:    "glm-5.3",
+		Thinking: "high",
+		Others:   json.RawMessage(`{"providers":{"my-own":{"baseUrl":"http://127.0.0.1:1234","models":[{"id":"local"}]}}}`),
 	}, "sk-live-secret")
 
 	if err := a.RenderSettings(context.Background(), s); err != nil {
@@ -172,7 +172,7 @@ func TestOverlayAppliesButNeverBeatsAPlatformKey(t *testing.T) {
 	}}`
 	s := settings.Resolve(context.Background(), settings.Doc{
 		Provider: inference.ZGComputeProvider, Model: "glm-5.3", Thinking: "high",
-		Framework: json.RawMessage(overlay),
+		Others: json.RawMessage(overlay),
 	}, "sk")
 	if err := a.RenderSettings(context.Background(), s); err != nil {
 		t.Fatalf("RenderSettings: %v", err)
@@ -275,7 +275,7 @@ func TestBuiltinProviderOverlayCannotRewireThePinnedModel(t *testing.T) {
 	}}}`
 	s := settings.Resolve(context.Background(), settings.Doc{
 		Provider: "anthropic", Model: "glm-5.3", Thinking: "high",
-		Framework: json.RawMessage(overlay),
+		Others: json.RawMessage(overlay),
 	}, "sk-live-secret")
 	if s.Endpoint != nil {
 		t.Fatalf("precondition: a built-in provider must resolve to no endpoint, got %+v", s.Endpoint)
@@ -328,7 +328,7 @@ func TestBuiltinProviderLeavesAnUndeclaredPinAlone(t *testing.T) {
 
 	s := settings.Resolve(context.Background(), settings.Doc{
 		Provider: "anthropic", Model: "glm-5.3", Thinking: "high",
-		Framework: json.RawMessage(`{"providers":{"my-own":{"baseUrl":"http://127.0.0.1:1234","models":[{"id":"local"}]}}}`),
+		Others: json.RawMessage(`{"providers":{"my-own":{"baseUrl":"http://127.0.0.1:1234","models":[{"id":"local"}]}}}`),
 	}, "sk")
 	if err := a.RenderSettings(context.Background(), s); err != nil {
 		t.Fatalf("RenderSettings: %v", err)
@@ -546,8 +546,8 @@ func TestHandleLegacy_ModelsJSON_RecoversThePin(t *testing.T) {
 	if doc.Thinking != "" {
 		t.Errorf("thinking = %q; the retired entry records which levels are OFFERED, never which one the owner chose — inventing one configures the agent for them", doc.Thinking)
 	}
-	if len(doc.Framework) != 0 {
-		t.Errorf("framework overlay = %s; nothing in the legacy entry is owner-authored framework knobs", doc.Framework)
+	if len(doc.Others) != 0 {
+		t.Errorf("framework overlay = %s; nothing in the legacy entry is owner-authored framework knobs", doc.Others)
 	}
 
 	// A document that fails validation is the same outage this migration

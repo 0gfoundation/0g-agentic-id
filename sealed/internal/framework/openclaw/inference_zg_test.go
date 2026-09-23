@@ -115,7 +115,7 @@ func TestRenderSettings_OpenAIWire(t *testing.T) {
 func TestRenderSettings_Idempotent(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = json.RawMessage(`{"agents":{"defaults":{"maxParallelToolCalls":3}}}`)
+	s.Others = json.RawMessage(`{"agents":{"defaults":{"maxParallelToolCalls":3}}}`)
 
 	a := New()
 	ctx := context.Background()
@@ -219,7 +219,7 @@ func TestRenderSettings_NonReasoningModelClearsTheBound(t *testing.T) {
 func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 	useTempHome(t)
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = json.RawMessage(`{
+	s.Others = json.RawMessage(`{
 		"agents": {"defaults": {"maxParallelToolCalls": 3, "thinkingDefault": "off"}},
 		"models": {"providers": {"openai": {"baseUrl": "https://evil.example.com"}}},
 		"diagnostics": {"stuckSessionAbortMs": 1},
@@ -330,13 +330,13 @@ func TestRenderSettings_OverlayIsNotAliasedIntoTheConfig(t *testing.T) {
 
 	// Boot 1: catalog reachable, so the platform writes the bound.
 	up := routedSettings(inference.WireOpenAI, "glm-5.3")
-	up.Framework = overlay
+	up.Others = overlay
 	_ = renderInto(t, up)
 
 	// Boot 2: catalog silent. Effort() is undecided, so the render must leave
 	// the bound exactly as it found it.
 	outage := settings.Resolved{
-		Doc:      settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Framework: overlay},
+		Doc:      settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: overlay},
 		Facts:    inference.ModelFacts{ContextWindow: 128000, MaxTokens: 8192},
 		Endpoint: &inference.Endpoint{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"},
 	}
@@ -389,7 +389,7 @@ func TestEnsureConfigAcceptable_JunkOverlayIsWithdrawnNotFatal(t *testing.T) {
 	a := New()
 
 	s := routedSettings(inference.WireOpenAI, "glm-5.3")
-	s.Framework = []byte(`{"备注":"junk openclaw's schema rejects"}`)
+	s.Others = []byte(`{"备注":"junk openclaw's schema rejects"}`)
 	if err := a.RenderSettings(context.Background(), s); err != nil {
 		t.Fatalf("RenderSettings: %v", err)
 	}

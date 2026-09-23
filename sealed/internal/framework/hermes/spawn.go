@@ -181,7 +181,7 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 			return fmt.Errorf("platform-routed endpoint but no API key for this boot — hermes would dial %s unauthenticated", s.Endpoint.BaseURL)
 		}
 	}
-	overlay, err := frameworkOverlay(s.Framework)
+	overlay, err := frameworkOverlay(s.Others)
 	if err != nil {
 		return err
 	}

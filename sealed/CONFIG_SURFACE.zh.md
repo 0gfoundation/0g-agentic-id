@@ -35,9 +35,9 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 | `provider` | 谁来服务这个模型。`inference.ZGComputeProvider` = `"0g-compute"`(`internal/inference/zgcompute.go:109`)表示**由平台**提供 endpoint;其他任何取值都指向一个自带接线的框架内置 provider |
 | `model` | 模型 id,按该 provider 自己的拼法 |
 | `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:52`) |
-| `framework` | 该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`) |
+| `others` | 三个具名设置之外的一切:该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`)。曾名 `framework`,真机演练里 owner 的第一反应是"能选框架?"——而这恰恰是它做不到的事(框架绑定是 mint 时的身份),故改名 |
 
-`framework` 的不透明是刻意的,而且同时在三处承重:平台不解析它,attestor 根本不知道它
+`others` 的不透明是刻意的,而且同时在三处承重:平台不解析它,attestor 根本不知道它
 存在,SDK 也只把它映射成一个无类型成员。于是**扩充词汇表 ——** 给某一个框架加一个旋钮
 **—— 只是一个 adapter 的改动**,而不是横跨三个代码库的 schema 迁移。平台的保证只覆盖那
 三个具名字段;overlay 里的键是 owner 与那个 adapter 之间的事,并不承诺能扛过框架升级。
@@ -54,7 +54,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
   (`framework/prime/spawn.go:78`、`framework/dsh/spawn.go:77`),另两家只告警然后无模型
   运行(`framework/openclaw/spawn.go:63`、`framework/hermes/spawn.go:273`);
 - `thinking` 必须属于 `Levels`,大小写不敏感;
-- `framework` 必须是合法 JSON,仅此而已。
+- `others` 必须是合法 JSON,仅此而已。
 
 **router 目录里没有的模型不会被拒。**那份目录只覆盖 0g router,`anthropic/claude-…`
 本来就不在里面;拒绝未列出的模型等于把 owner 锁死在 `0g-compute` 上。CLI 在签名前会跑
@@ -159,7 +159,7 @@ create 时的 env,现在不再如此(`sdk/typescript/src/AttestorClient.ts` 的 
 该字段是 `skip_serializing`(`attestor/crates/shared/src/types.rs` (`Deployment`)),所以
 `GET /deployment/:seal_id` 不带它,`/deployments` 的 owner 层也刻意省略它
 (`routes/deployments.rs` (`OwnerDeployment`)),而 `GET /settings` 需要 owner 签名(§5)。这一点重要,
-因为不透明的 `framework` 段是 owner 自由撰写的文本 —— **owner 粘进去的字面密钥没有任何
+因为不透明的 `others` 段是 owner 自由撰写的文本 —— **owner 粘进去的字面密钥没有任何
 东西会剥掉**(`framework/prime/modelsjson.go:53-59`)。
 
 **解密失败的 settings blob 会被记录并丢弃,而不是致命错误**
@@ -249,7 +249,7 @@ agent 问不到的部分不归它。
 
 只靠"会话级持久性"是不够的边界,收窄范围是对 PR #164 评审演示的洞的修复:不设范围的
 覆盖让 agent 能改 `provider`/`model` —— owner 的钱和路由 —— 还能整段替换 owner 的
-`framework` 节,有效期是容器余下的整个生命,而容器可以活很久。这条路径存在的理由是
+`others` 节,有效期是容器余下的整个生命,而容器可以活很久。这条路径存在的理由是
 "这个任务我想深一点";那是一个字段,socket 就只收一个字段。
 
 同样的校验、同样的渲染、同样的重启 —— 但**什么都不持久化**,响应里明说
@@ -274,7 +274,7 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 
 1. **幂等。**同样的 `Resolved` 进去,磁盘上同样的字节出来。watcher 每 30 秒哈希一次磁盘
    状态(`internal/watcher/watcher.go:36`);不确定性的渲染会让每一个 tick 都报漂移。
-2. **平台的值胜出。**先铺 owner 那份不透明的 `framework` overlay,**再**把平台自己的键
+2. **平台的值胜出。**先铺 owner 那份不透明的 `others` overlay,**再**把平台自己的键
    写在它上面 —— endpoint、推理上界、输出预算,以及任何凭据或每次启动生成的 token。
    **是顺序、而不是排除清单**,在阻止 overlay 关掉有界推理、或钉死一个目录后来改掉的
    wire format;而且以后新增平台键时这条规则依然成立。
@@ -560,7 +560,7 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
   不构成保密边界。真正的修法形状是"能用而不可见" —— #163 connections 设计给 OAuth token
   的待遇 —— 推理密钥还没有拿到这个待遇。agent 圣经里也该
   直说这个机制:**写进记忆的东西会随资产转让。**这是可观测性事实,不是行为指令。
-- **owner 的不透明 overlay 是未经扫描的自由文本。**owner 把字面密钥粘进 `framework`,
+- **owner 的不透明 overlay 是未经扫描的自由文本。**owner 把字面密钥粘进 `others`,
   它就进了一个普通 JSONB 列,在 prime 上还会进到容器里的一个文件
   (`prime/modelsjson.go:53-59`)。没有东西剥它;唯一的保护是那个列和那个文件都既不公开
   也不上链(§4)。

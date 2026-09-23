@@ -70,7 +70,7 @@ func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byt
 //
 //   - persona.SystemPrompt → ~/.openclaw/workspace/SOUL.md
 //   - persona.Inference    → ~/.openclaw/openclaw.json (agents.defaults.model.primary
-//                            + auth.{order,profiles})
+//   - auth.{order,profiles})
 //
 // Idempotent: re-invoking with the same plaintext yields the same disk
 // state. Provider/model are written as the user's literal choice; per-
