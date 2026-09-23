@@ -599,7 +599,9 @@ func startAgent(
 		if seeder, ok := any(adapter).(framework.LegacySettingsSeeder); ok {
 			if recovered, found := seeder.SeededSettings(); found {
 				settingsDoc = recovered
-				logger.Logf("owner settings: recovered from the legacy config role (provider=%s model=%s)",
+				// The adapter does not say WHICH retired role it read (config role or
+				// the mint persona seed) — claiming one here misled a live drill.
+				logger.Logf("owner settings: recovered from a retired chain role (provider=%s model=%s)",
 					recovered.Provider, recovered.Model)
 				if blob, err := recovered.Marshal(); err == nil {
 					report.SeedSettings(cfg.AttestorURL, agentSealPriv, sealID, blob)
