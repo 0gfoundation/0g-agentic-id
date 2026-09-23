@@ -505,7 +505,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
-    // framework='{"a": 1}'`) survives the way it does in a real shell.
+    // others='{"a": 1}'`) survives the way it does in a real shell.
     const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
@@ -799,7 +799,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'settings') {
         // The document is the owner's in both directions — reading it is
         // owner-signed too — so the wallet is needed even for a bare show.
-        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… framework=<json>]\n'); continue; }
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json>]\n'); continue; }
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
@@ -1117,7 +1117,7 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[]):
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
     for (const l of renderSettings(current)) out(`  ${l}\n`);
-    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · framework=\'<json>\' (quote it)\n');
+    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
     return current;
   }
   const next = applyAssignments(current, assignments);
@@ -1642,7 +1642,7 @@ const L2_HELP_FULL = `session commands
   /settings [k=v …]       the owner's configuration document: which model
                           this agent thinks with, and how hard. Bare shows it;
                           model=… provider=… thinking=low|high|max
-                          framework=<json> merge into it and write it back
+                          others=<json> merge into it and write it back
                           (owner-signed). Applies at the next boot — /reset
                           applies it now
   /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
