@@ -22,11 +22,12 @@ import { run as doctor } from './commands/doctor';
 import { run as status } from './commands/status';
 import { run as list } from './commands/list';
 import { run as update } from './commands/update';
+import { run as settings } from './commands/settings';
 import { run as interactive } from './commands/interactive';
 
 /** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
  *  routes to the default interactive shell. */
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
@@ -55,6 +56,8 @@ INTERACTIVE (default — no command)
                             start/stop/reset <id> lifecycle without entering
                                                  the session (reset asks the
                                                  framework + key)
+                            settings <id> [k=v]  show/change the agent's
+                                                 configuration document
                             balance              prepaid balance + burn rate
                             deposit [og]         fund the prepaid balance
                             withdraw [og]        refund prepaid funds (time-
@@ -72,8 +75,8 @@ INTERACTIVE (default — no command)
                           In a session: type to talk; Esc / Ctrl-C interrupts
                           the turn in flight (and cancels a /start or /reset
                           wait). Slash: /hello /balance /topup [og] /stop
-                          /start /reset /agentlog [n] /startuplog [n]
-                          /back (or /unuse) /quit. The framework (for /reset
+                          /start /reset /settings [k=v] /agentlog [n]
+                          /startuplog [n] /back (or /unuse) /quit. The framework (for /reset
                           and the chat model selector) is picked by you, never
                           guessed. Config persists to ~/.config/0g-agenticid
                           (config.json + credentials at 0600); AGENTIC_* env
@@ -92,6 +95,20 @@ COMMANDS
   list             List deployments. --mine (owner-signed, needs
                    AGENTIC_PRIVATE_KEY) adds owner-only fields such as the
                    failure reason and sandboxId.
+  settings <agent> [k=v …]
+                   Show the agent's configuration document (which model it
+                   thinks with, and how hard); with key=value assignments,
+                   change it. Keys: provider, model, thinking (low|high|max),
+                   framework (opaque JSON for that framework's own knobs —
+                   quote it: framework='{"a": 1}'). Assignments merge into the
+                   stored document; an empty value (thinking=) clears a field.
+                   The document is the owner's, so BOTH reading and writing
+                   are owner-signed and need AGENTIC_PRIVATE_KEY. A write is a
+                   compare-and-swap against the version just read: if another
+                   client changed the document meanwhile, it is refused (exit
+                   3, SETTINGS_CONFLICT) rather than overwriting them. The
+                   model is checked against the 0G router catalog first — an
+                   absence is a warning only, never a refusal.
   update           Self-update: compare against the npm registry and
                    npm install -g the latest (a git-checkout/npm-link copy
                    is reported, not overwritten). --json only reports.
@@ -130,6 +147,8 @@ EXAMPLES
   0g-agenticid 286                   # attach to agent 286 and chat
   0g-agenticid doctor
   0g-agenticid status 33
+  0g-agenticid settings 286
+  0g-agenticid settings 286 model=0gm-1.0-35b-a3b thinking=high
   0g-agenticid list --mine --phase failed --json | jq -r '.data[].sealId'`;
 
 /** Package version, read at runtime from the SDK's own package.json

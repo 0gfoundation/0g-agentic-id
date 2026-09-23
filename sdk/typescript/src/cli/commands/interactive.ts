@@ -24,12 +24,15 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
+import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
+import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
+import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -43,12 +46,13 @@ const AGENT = (): string[] => knownAgentIds;
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
-  grant: AGENT, revoke: AGENT, authorizer: AGENT,
+  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
+  '/settings': ['provider=', 'model=', 'thinking=', 'framework='],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
@@ -93,9 +97,10 @@ interface Session {
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number }>;
-  /** Owner-chosen reasoning-effort level (/think). On prime it applies
-   *  per-message immediately; on other frameworks it takes effect at the
-   *  next /reset (passed in the signed payload). */
+  /** The reasoning level /think last wrote to the settings document, mirrored
+   *  here ONLY as the per-message override for frameworks whose bridge takes
+   *  one (prime). The durable copy is the document; this is a session echo of
+   *  it, set after a successful write and never on its own. */
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
@@ -394,7 +399,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -416,6 +421,10 @@ const L1_HELP_FULL = `manager commands
                           framework — 'reset <id> pick' to change; asks the key)
   retry <id|sealId>       resume a FAILED deploy/clone under the same identity
                           (re-runs the failed on-chain stages; reset after)
+  settings <id> [k=v …]   show the agent's configuration document (which model
+                          it thinks with, and how hard); with assignments —
+                          model=… provider=… thinking=low|high|max
+                          framework=<json> — merge and write it (owner-signed)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -495,7 +504,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const line = (await ask('\n0g-agenticid> ')).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
-    const [cmd, ...args] = line ? line.split(/\s+/) : ['whoami'];
+    // Quote-aware, so a value with a space in it (`settings 286
+    // framework='{"a": 1}'`) survives the way it does in a real shell.
+    const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
@@ -785,6 +796,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'settings') {
+        // The document is the owner's in both directions — reading it is
+        // owner-signed too — so the wallet is needed even for a bare show.
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… framework=<json>]\n'); continue; }
+        const ag = await withWallet(ctx);
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        await settingsOp(ag, row.sealId, args.slice(1));
+        continue;
+      }
+
       if (cmd === 'authorizer') {
         // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
         // clear?) — refuse rather than silently act on a guess.
@@ -922,7 +944,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
         const path = args[1];
         if (!path.startsWith('/')) { out('path must start with /\n'); continue; }
-        const body = args.slice(2).join(' ') || undefined;
+        // The body is free-form — take it VERBATIM from the line. Running it
+        // through the shell-style splitter and re-joining the pieces eats the
+        // quote characters a JSON body is made of (`{"a":1}` → `{a:1}`, POSTed
+        // as garbage) and rewrites its spacing; the tail after `call <id>
+        // <path>` is the body exactly as typed, which is what the agent parses.
+        const body = splitHead(line, 3).rest || undefined;
         const registered = services.find((sv) => sv.path === path);
         const method = registered?.method ?? (body ? 'POST' : 'GET');
         if (!registered && path !== '/hello') out(`note: ${path} is not in the agent's service table — calling anyway\n`);
@@ -1071,6 +1098,52 @@ function friendlyChainError(e: unknown): string | undefined {
  *  what made the REPL feel slow. login/env changes invalidate naturally
  *  because the cache key changes. */
 let cachedClient: { key: string; ag: AgenticID } | null = null;
+/**
+ * Show, or merge-and-write, an agent's settings document — the owner's
+ * configuration (which model it thinks with, and how hard). Shared by L1
+ * `settings <id>`, L2 `/settings` and L2 `/think`, so the grammar, the
+ * refusals and the conflict handling are the same in all three.
+ *
+ * A bare call shows; `key=value` args merge onto the stored document and
+ * write it back, owner-signed — reading is owner-signed too, so `ag` must
+ * carry a wallet either way. The catalog check inside setSettings warns
+ * before signing and never blocks — the container is the gate.
+ *
+ * Returns the document now in force (unchanged on a bare show), so a caller
+ * like /think can report the level that actually landed.
+ */
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[]): Promise<SettingsDoc | null> {
+  const assignments = parseAssignments(args); // throws CliError on a bad key/level
+  const { settings: current, version } = await ag.agent.getSettings(sealId);
+  if (!assignments.length) {
+    for (const l of renderSettings(current)) out(`  ${l}\n`);
+    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · framework=\'<json>\' (quote it)\n');
+    return current;
+  }
+  const next = applyAssignments(current, assignments);
+  // A document with no model is the one the container hard-fails on and
+  // last-known-good cannot cover — refuse before signing, and say so.
+  assertModelPresent(next, current !== null);
+  try {
+    const { version: written } = await ag.agent.setSettings(sealId, next, {
+      baseVersion: version,
+      onWarn: (w) => out(`⚠ ${w}\n`),
+    });
+    for (const l of renderSettings(next)) out(`  ${l}\n`);
+    out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+    return next;
+  } catch (e) {
+    if (!(e instanceof SettingsConflictError)) throw e;
+    // Someone else edited this agent between the read and the write. Show
+    // what is there now and let the owner decide — a quiet retry here would
+    // be this REPL choosing to discard the other change.
+    out(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
+    for (const l of renderSettings(e.current)) out(`    ${l}\n`);
+    out('  nothing was written — repeat your command to apply it on top of that\n');
+    return e.current;
+  }
+}
+
 async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<AgenticID> {
   const cacheKey = `${ctx.env.attestorUrl}|${withWalletOpt ? ctx.env.privateKey ?? '' : ''}`;
   if (cachedClient?.key === cacheKey) return cachedClient.ag;
@@ -1552,7 +1625,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1566,9 +1639,18 @@ const L2_HELP_FULL = `session commands
   /reset                  recreate the container (uses the recorded framework;
                           /reset pick to choose another; asks the key; also
                           clears the local chat history)
-  /think [low|high|max]   reasoning depth for thinking models (glm etc.);
-                          no arg shows current. prime: applies per message;
-                          other frameworks: takes effect at the next /reset
+  /settings [k=v …]       the owner's configuration document: which model
+                          this agent thinks with, and how hard. Bare shows it;
+                          model=… provider=… thinking=low|high|max
+                          framework=<json> merge into it and write it back
+                          (owner-signed). Applies at the next boot — /reset
+                          applies it now
+  /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
+                          shorthand for /settings thinking=…, so it is written
+                          to the owner's document (owner-signed) and applies at
+                          the agent's next boot; /reset applies it now. prime
+                          also takes it per message, from the next one on.
+                          No arg shows the level currently stored
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -1733,7 +1815,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
-        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey, thinking: s.thinking });
+        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
         await connectSession(s, r.url);
@@ -1756,20 +1838,39 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);
         continue;
       }
+      if (line === '/settings' || line.startsWith('/settings ')) {
+        // The owner's configuration document: which model this agent thinks
+        // with, and how hard. Bare shows it; key=value writes it (merged).
+        // Owner-signed in both directions, so it needs the wallet client and
+        // not the session's (possibly keyless) one.
+        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1));
+        continue;
+      }
       if (line === '/think' || line.startsWith('/think ')) {
-        const arg = line.split(/\s+/)[1];
+        // /think is `/settings thinking=…` with a shorter name: it writes the
+        // owner's document, which is the only place a reasoning level lives
+        // now. (It used to set a session variable that rode a container
+        // environment variable on the next /reset — nothing reads that any
+        // more, so the command announced a change it was not making.)
+        const arg = tokenize(line)[1];
+        const ag = await withWallet(ctx);
         if (!arg) {
-          out(`thinking level: ${s.thinking ?? '(platform default: low)'}\n`);
+          const doc = await ag.agent.getSettings(s.sealId);
+          out(`thinking level: ${(doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)'}\n`);
           continue;
         }
-        if (!['low', 'high', 'max'].includes(arg)) { out('usage: /think low|high|max\n'); continue; }
+        if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        s.thinking = arg as 'low' | 'high' | 'max';
-        // prime's bridge takes a per-message level; the other frameworks'
-        // HTTP surfaces don't — there the choice rides the next /reset.
-        out(s.framework === 'prime-agent'
-          ? `thinking level: ${arg} — applies to your next messages\n`
-          : `thinking level: ${arg} — this framework has no per-message control; it will apply at the next /reset\n`);
+        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`]);
+        // Only mirror it into this session once the write actually landed —
+        // a refused or conflicted write must not leave the per-message
+        // override claiming a level the agent was never given.
+        if (written?.thinking === arg) {
+          s.thinking = arg as ThinkingLevel;
+          out(s.framework === 'prime-agent'
+            ? '  this framework also takes it per message, so your next message uses it already\n'
+            : '  /reset applies it now; otherwise it lands at the agent\'s next boot\n');
+        }
         continue;
       }
       if (line === '/tasks') {
@@ -1820,7 +1921,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
-      out(`error: ${(e as Error).message}\n`); continue;
+      // Show the remedy too: an error whose whole point is "do this instead"
+      // (a refused settings write, a missing wallet) is useless without it.
+      const ce = e as CliError;
+      out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
 
     // a chat turn (interruptible)
