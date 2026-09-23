@@ -2,8 +2,8 @@ package proxy
 
 // Connected-account capabilities stay in sealed's memory. The agent can use
 // an installed operation over the private Unix socket, but neither that tool
-// nor owner inventory reads return credentials. OAuth tokens stay at the
-// account provider boundary in the engine; these are narrow, revocable grants.
+// nor owner inventory reads return credentials. OAuth tokens and API keys stay
+// at the provider boundary in the engine; these are narrow, revocable grants.
 
 import (
 	"bytes"
@@ -20,12 +20,19 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const maxConnectionBody = 1_048_576
+const maxAPIRequestBody = 64 * 1024
+const maxAPIQueryEntries = 50
+const maxAPIQueryNameRunes = 128
+const maxAPIQueryValueRunes = 2048
 
 var connectionID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 var connectionCapability = regexp.MustCompile(`^acap_[A-Za-z0-9_-]{20,240}$`)
+var connectionInvocationUUID = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+var connectionOperations = []string{"api.request", "calendar.check_availability", "notion.search_shared_titles"}
 var (
 	errConnectionInput       = errors.New("invalid_connection_request")
 	errConnectionMissing     = errors.New("connection_not_installed")
@@ -39,13 +46,18 @@ type connectionInstall struct {
 	EngineOrigin string `json:"engine_origin"`
 	Capability   string `json:"capability"`
 	Operation    string `json:"operation"`
+	Label        string `json:"label,omitempty"`
+	SkillID      string `json:"skill_id,omitempty"`
 }
 type connectionSummary struct {
 	ID        string `json:"id"`
 	Operation string `json:"operation"`
+	Label     string `json:"label,omitempty"`
+	SkillID   string `json:"skill_id,omitempty"`
 }
 type connectionCall struct {
 	GrantID      string          `json:"grant_id"`
+	Operation    string          `json:"operation,omitempty"`
 	InvocationID string          `json:"invocation_id"`
 	Input        json.RawMessage `json:"input"`
 }
@@ -138,7 +150,8 @@ func connectionOrigin(raw string) (string, error) {
 
 func (h *connectionHub) install(id string, grant connectionInstall) error {
 	if !connectionID.MatchString(id) || !connectionCapability.MatchString(grant.Capability) ||
-		(grant.Operation != "calendar.check_availability" && grant.Operation != "notion.search_shared_titles") {
+		!supportedConnectionOperation(grant.Operation) || !utf8.ValidString(grant.Label) || utf8.RuneCountInString(grant.Label) > 128 ||
+		(grant.SkillID != "" && !connectionID.MatchString(grant.SkillID)) {
 		return errConnectionInput
 	}
 	origin, err := connectionOrigin(grant.EngineOrigin)
@@ -155,12 +168,29 @@ func (h *connectionHub) install(id string, grant connectionInstall) error {
 	return nil
 }
 
-func (h *connectionHub) list() []connectionSummary {
+func supportedConnectionOperation(operation string) bool {
+	for _, supported := range connectionOperations {
+		if operation == supported {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *connectionHub) operations() []string {
+	return append([]string(nil), connectionOperations...)
+}
+
+func (h *connectionHub) list(owner bool) []connectionSummary {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	items := make([]connectionSummary, 0, len(h.grants))
 	for id, grant := range h.grants {
-		items = append(items, connectionSummary{ID: id, Operation: grant.Operation})
+		item := connectionSummary{ID: id, Operation: grant.Operation, Label: grant.Label}
+		if owner {
+			item.SkillID = grant.SkillID
+		}
+		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
 	return items
@@ -177,6 +207,12 @@ func (h *connectionHub) invoke(ctx context.Context, call connectionCall) (json.R
 	if !ok {
 		return nil, errConnectionMissing
 	}
+	if (call.Operation != "" && call.Operation != grant.Operation) || (grant.Operation == "api.request" && call.Operation != "api.request") {
+		return nil, errConnectionInput
+	}
+	if grant.Operation == "api.request" && (!connectionInvocationUUID.MatchString(call.InvocationID) || !validAPIRequestInput(call.Input)) {
+		return nil, errConnectionInput
+	}
 	body, err := json.Marshal(struct {
 		InvocationID string          `json:"invocationId"`
 		Input        json.RawMessage `json:"input"`
@@ -184,7 +220,11 @@ func (h *connectionHub) invoke(ctx context.Context, call connectionCall) (json.R
 	if err != nil {
 		return nil, errConnectionInput
 	}
-	r, err := http.NewRequestWithContext(ctx, http.MethodPost, grant.EngineOrigin+"/connections/runtime/agent-grants/"+call.GrantID+"/invoke", bytes.NewReader(body))
+	grantKind := "agent-grants"
+	if grant.Operation == "api.request" {
+		grantKind = "api-grants"
+	}
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, grant.EngineOrigin+"/connections/runtime/"+grantKind+"/"+call.GrantID+"/invoke", bytes.NewReader(body))
 	if err != nil {
 		return nil, errConnectionInput
 	}
@@ -225,6 +265,37 @@ func (h *connectionHub) invoke(ctx context.Context, call connectionCall) (json.R
 		return nil, errConnectionUnavailable
 	}
 	return content, nil
+}
+
+func validAPIRequestInput(raw json.RawMessage) bool {
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil || compact.Len() > maxAPIRequestBody {
+		return false
+	}
+	var input struct {
+		Query json.RawMessage `json:"query,omitempty"`
+		Body  json.RawMessage `json:"body,omitempty"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF {
+		return false
+	}
+	if input.Query != nil {
+		var query map[string]string
+		if bytes.Equal(bytes.TrimSpace(input.Query), []byte("null")) || json.Unmarshal(input.Query, &query) != nil {
+			return false
+		}
+		if len(query) > maxAPIQueryEntries {
+			return false
+		}
+		for name, value := range query {
+			if name == "" || utf8.RuneCountInString(name) > maxAPIQueryNameRunes || utf8.RuneCountInString(value) > maxAPIQueryValueRunes {
+				return false
+			}
+		}
+	}
+	return input.Body == nil || json.Valid(input.Body)
 }
 
 func decodeConnectionBody(w http.ResponseWriter, r *http.Request, target any) bool {
@@ -273,7 +344,7 @@ func (s *Server) handleStudioConnections(w http.ResponseWriter, r *http.Request)
 	}
 	const prefix = "/_seal/studio/connections"
 	if r.URL.Path == prefix && r.Method == http.MethodGet {
-		writeSynthJSON(w, http.StatusOK, map[string]any{"connections": s.connections.list()})
+		writeSynthJSON(w, http.StatusOK, map[string]any{"operations": s.connections.operations(), "connections": s.connections.list(true)})
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, prefix+"/")
@@ -291,7 +362,14 @@ func (s *Server) handleStudioConnections(w http.ResponseWriter, r *http.Request)
 			connectionError(w, err)
 			return
 		}
-		writeSynthJSON(w, http.StatusOK, map[string]any{"id": id, "operation": grant.Operation})
+		result := map[string]any{"id": id, "operation": grant.Operation}
+		if grant.Label != "" {
+			result["label"] = grant.Label
+		}
+		if grant.SkillID != "" {
+			result["skill_id"] = grant.SkillID
+		}
+		writeSynthJSON(w, http.StatusOK, result)
 	case http.MethodDelete:
 		s.connections.remove(id)
 		writeSynthJSON(w, http.StatusOK, map[string]any{"removed": true})
@@ -304,7 +382,7 @@ func (s *Server) handleStudioConnections(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleAgentConnections(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if r.URL.Path == "/connections" && r.Method == http.MethodGet {
-		writeSynthJSON(w, http.StatusOK, map[string]any{"connections": s.connections.list()})
+		writeSynthJSON(w, http.StatusOK, map[string]any{"connections": s.connections.list(false)})
 		return
 	}
 	if r.URL.Path != "/connections/invoke" || r.Method != http.MethodPost {

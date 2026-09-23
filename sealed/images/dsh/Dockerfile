@@ -118,6 +118,14 @@ RUN apt-get update \
  && apt-get purge -y python3 make g++ && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/* /root/.npm
 
+# Validate every embedded platform tool against the exact dsh-tools schema
+# compiler baked into this image. Unit fixtures also enforce the schema subset,
+# but this catches package-version behavior before an image can boot-loop.
+COPY internal/framework/dsh/bridge/seal-tools.mjs /usr/local/lib/seal-dsh-schema-check/seal-tools.mjs
+RUN node --input-type=module -e \
+      "const m=await import('file:///usr/local/lib/seal-dsh-schema-check/seal-tools.mjs'); m.apply({systemPrompt:{section(){}},tools:{register(){}}})" \
+ && rm -rf /usr/local/lib/seal-dsh-schema-check
+
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 

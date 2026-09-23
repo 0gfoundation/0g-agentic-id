@@ -24,7 +24,7 @@ const AGENT_SEAL = process.env.AGENT_SEAL || ''
 const MAX_SOCKET_RESPONSE = 1_048_576
 const SOCKET_TIMEOUT_MS = 15_000
 const CONNECTION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
-const CONNECTION_OPERATIONS = new Set(['calendar.check_availability', 'notion.search_shared_titles'])
+const CONNECTION_OPERATIONS = new Set(['api.request', 'calendar.check_availability', 'notion.search_shared_titles'])
 
 /** Call the private socket and resolve one bounded JSON response. */
 function sockJSON(method, path, body, signal) {
@@ -103,6 +103,17 @@ function sockJSON(method, path, body, signal) {
 
 const sockGet = (path, signal) => sockJSON('GET', path, undefined, signal)
 const sockPost = (path, body, signal) => sockJSON('POST', path, body, signal)
+
+function connectionInput(operation, input) {
+  if (operation !== 'api.request' || !Array.isArray(input?.query)) return input
+  const seen = new Set()
+  const query = input.query.map(({ name, value }) => {
+    if (seen.has(name)) throw new Error(`duplicate api.request query name: ${name}`)
+    seen.add(name)
+    return [name, value]
+  })
+  return { ...input, query: Object.fromEntries(query) }
+}
 
 export function apply(ctx) {
   ctx.systemPrompt.section({
@@ -209,6 +220,7 @@ export function apply(ctx) {
               properties: {
                 id: { type: 'string', required: true },
                 operation: { type: 'string', enum: [...CONNECTION_OPERATIONS], required: true },
+                label: { type: 'string' },
               },
             },
           },
@@ -217,7 +229,7 @@ export function apply(ctx) {
       render: (_args, value) => [{
         type: 'text',
         text: value.connections.length
-          ? value.connections.map((item) => `${item.id}: ${item.operation}`).join('\n')
+          ? value.connections.map((item) => `${item.id}: ${item.operation}${item.label ? ` (${item.label})` : ''}`).join('\n')
           : 'no connected-account grants are installed',
       }],
     },
@@ -228,7 +240,11 @@ export function apply(ctx) {
         ? out.connections
           .filter((item) => item && typeof item.id === 'string' && CONNECTION_ID.test(item.id) && CONNECTION_OPERATIONS.has(item.operation))
           .slice(0, 50)
-          .map((item) => ({ id: item.id, operation: item.operation }))
+          .map((item) => ({
+            id: item.id,
+            operation: item.operation,
+            ...(typeof item.label === 'string' && item.label.length <= 128 ? { label: item.label } : {}),
+          }))
         : []
       return { connections }
     },
@@ -242,6 +258,7 @@ export function apply(ctx) {
       'never ask for or pass provider credentials.',
     parameters: {
       grant_id: { type: 'string', required: true, description: 'Opaque grant id returned by seal_connections.' },
+      operation: { type: 'string', enum: [...CONNECTION_OPERATIONS], required: true, description: 'Operation returned for this grant by seal_connections.' },
       invocation_id: { type: 'string', required: true, description: 'A unique UUID for this deliberate operation.' },
       input: {
         required: true,
@@ -262,6 +279,26 @@ export function apply(ctx) {
               query: { type: 'string', required: true, description: 'Text to search in titles of shared Notion pages.' },
             },
           },
+          {
+            type: 'object',
+            description: 'Fixed-destination api.request input; query and body together must serialize to at most 64 KiB.',
+            additionalProperties: false,
+            properties: {
+              query: {
+                type: 'array',
+                description: 'Up to 50 optional query values. The engine owns the destination and HTTP method.',
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    name: { type: 'string', required: true, description: 'Non-empty query name, at most 128 characters.' },
+                    value: { type: 'string', required: true, description: 'Query value, at most 2048 characters.' },
+                  },
+                },
+              },
+              body: { type: 'json', description: 'Optional JSON request body within the shared 64 KiB input limit. Never include credentials.' },
+            },
+          },
         ],
       },
     },
@@ -277,8 +314,9 @@ export function apply(ctx) {
     async execute(args, exec) {
       const out = await sockPost('/connections/invoke', {
         grant_id: args.grant_id,
+        operation: args.operation,
         invocation_id: args.invocation_id,
-        input: args.input,
+        input: connectionInput(args.operation, args.input),
       }, exec.signal)
       if (!out || typeof out !== 'object' || !Object.hasOwn(out, 'result')) {
         throw new Error('sign socket /connections/invoke returned no result')

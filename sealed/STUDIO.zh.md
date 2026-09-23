@@ -58,20 +58,26 @@ POST `/v1/sessions/:id/reload` 调用固定 SDK 的 `session.reload()` 并保留
 ## 已连接账号操作
 
 owner 通过 PUT `/_seal/studio/connections/:grant_id` 安装
-`{engine_origin,capability,operation}`。engine 必须是公网 HTTPS;拒绝
+`{engine_origin,capability,operation,label?,skill_id?}`。engine 必须是公网 HTTPS;拒绝
 私网目标、重定向及不安全 DNS 解析。GET `/_seal/studio/connections`
-只返回 `{connections:[{id,operation}]}`;DELETE 移除本地权限。最多 50 项,
+返回支持的 `operations` 和不含路由凭证的
+`connections:[{id,operation,label?,skill_id?}]`;DELETE 移除本地权限。最多 50 项,
 capability 只在 sealed 内存,不进入 agent prompt、文件、环境或链状态。
 
 agent 私有 Unix socket 提供 GET `/connections` 和 POST
-`/connections/invoke`,参数 `{grant_id,invocation_id,input}`。sealed 使用
+`/connections/invoke`,参数 `{grant_id,operation?,invocation_id,input}`。sealed 使用
 Authorization capability 请求 engine 的
-`/connections/runtime/agent-grants/:grant_id/invoke`。OAuth token 留在 engine。
+`/connections/runtime/agent-grants/:grant_id/invoke`。`api.request` 要求 socket
+请求带 operation,并使用 `/connections/runtime/api-grants/:grant_id/invoke`。
+OAuth token 和 API key 留在 engine。
 DSH 使用 `seal_connections` 和 `seal_connection_call`,保留 shell guard;
 其他框架可使用文档中的 Unix socket。
 
-支持 Calendar availability (`timeMin,timeMax`) 和 Notion shared-title
-search (`query`)。engine 每次重新检查 owner、账号及撤销状态,invocation id
+支持 Calendar availability (`timeMin,timeMax`)、Notion shared-title
+search (`query`) 和固定目标 API 请求
+(`query?:Record<string,string>,body?:JSON`)。API 请求不能覆盖目标、method 或
+header。序列化 API input 最多 64 KiB;query 最多 50 项,名称非空且最多
+128 字符,value 最多 2048 字符。engine 每次重新检查 owner、账号及撤销状态,invocation id
 只准入一次。已经准入的操作可能在撤销后完成。未知结果不得自动换 id 重试。
 唯一明确例外是 503 `connection_refresh_in_progress`,同时包含
 `retryWithNewInvocationId:true` 和 `Retry-After:1`,证明工具尚未执行。

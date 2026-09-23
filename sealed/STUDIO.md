@@ -77,21 +77,28 @@ restart loses process-local conversations; saved client work is not restoration.
 
 Owners install a revocable narrow capability using
 `PUT /_seal/studio/connections/:grant_id` with
-`{engine_origin,capability,operation}`. Engine origins must be public HTTPS;
+`{engine_origin,capability,operation,label?,skill_id?}`. Engine origins must be public HTTPS;
 private destinations, redirects and unsafe DNS resolutions are refused. GET
-`/_seal/studio/connections` returns only `{connections:[{id,operation}]}`.
+`/_seal/studio/connections` returns supported `operations` and
+`connections:[{id,operation,label?,skill_id?}]` without routing credentials.
 DELETE removes local access. The 50-entry inventory and capabilities live only
 in sealed memory, outside agent prompts, files, environment and chain state.
 
 The agent-private Unix socket exposes GET `/connections` and POST
-`/connections/invoke` with `{grant_id,invocation_id,input}`. Sealed forwards to
-the engine's `/connections/runtime/agent-grants/:grant_id/invoke` with the
-capability in an Authorization header. Provider OAuth tokens remain at the
-engine. DSH uses `seal_connections` and `seal_connection_call`; its shell guard
-remains enabled. Other frameworks can use the documented Unix socket.
+`/connections/invoke` with `{grant_id,operation?,invocation_id,input}`. Sealed forwards to
+the engine's `/connections/runtime/agent-grants/:grant_id/invoke` for OAuth
+operations. `api.request` requires the operation in the socket request and uses
+`/connections/runtime/api-grants/:grant_id/invoke`. Both routes receive the
+capability in an Authorization header. Provider OAuth tokens and API keys remain
+at the engine. DSH uses `seal_connections` and `seal_connection_call`; its shell
+guard remains enabled. Other frameworks can use the documented Unix socket.
 
-Supported operations are Calendar availability (`timeMin,timeMax`) and Notion
-shared-title search (`query`). The engine rechecks ownership/account/revocation
+Supported operations are Calendar availability (`timeMin,timeMax`), Notion
+shared-title search (`query`), and fixed-destination API requests
+(`query?:Record<string,string>,body?:JSON`). API requests cannot override the
+destination, method or headers. Serialized API input is limited to 64 KiB;
+query input is limited to 50 entries, 128-character non-empty names and
+2048-character values. The engine rechecks ownership/account/revocation
 and admits each invocation ID once. Admitted work may finish after revocation.
 Unknown outcomes must not automatically retry under a new ID. The sole explicit
 exception is `503 connection_refresh_in_progress` with
