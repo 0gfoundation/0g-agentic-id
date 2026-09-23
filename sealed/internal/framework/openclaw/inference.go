@@ -1,9 +1,12 @@
 package openclaw
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 
@@ -929,4 +932,55 @@ func legacyThinking(defaults map[string]any) string {
 	logger.Logf("openclaw.HandleLegacy[%s]: thinkingDefault %q is not one of %v; recovering the pin without a level",
 		legacyConfigRole, raw, settings.Levels)
 	return ""
+}
+
+// ── overlay acceptance ────────────────────────────────────────────────────────
+
+// validateOpenclawConfig asks openclaw itself whether the on-disk config is
+// acceptable. A func var so tests can stand in for the CLI; production runs
+// `openclaw config validate`, which is the same judgment the gateway applies
+// at startup — the platform deliberately holds no copy of that schema.
+var validateOpenclawConfig = func() error {
+	out, err := exec.Command("openclaw", "config", "validate").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ensureConfigAcceptable makes the rendered config one openclaw will run.
+//
+// The platform half is always written; the OWNER's opaque overlay is applied
+// on trust and checked here against openclaw's own validator, because openclaw
+// rejects unknown keys at the root and a rejected config takes the whole agent
+// offline (live: agent 411). If the file is rejected and an overlay is in
+// force, the overlay is withdrawn (a re-render with an empty Framework section
+// — dropRemovedOverlayKeys reverts exactly the keys the previous render's
+// sidecar attributes to the overlay, and never an agent edit) and the result
+// is validated once more. A failure with NO overlay in play is the platform's
+// own bug and fails the start loudly rather than shipping a config openclaw
+// already said it will not run.
+func (a *Adapter) ensureConfigAcceptable(ctx context.Context) error {
+	firstErr := validateOpenclawConfig()
+	if firstErr == nil {
+		return nil
+	}
+
+	a.mu.RLock()
+	rendered := a.rendered
+	a.mu.RUnlock()
+	if rendered == nil || len(bytes.TrimSpace(rendered.Framework)) == 0 {
+		return fmt.Errorf("openclaw rejects the rendered config and no owner overlay is in force — platform bug, not booting on it: %w", firstErr)
+	}
+
+	logger.Logf("WARN openclaw rejected the rendered config (%v); withdrawing the owner's framework overlay and booting on the platform half — fix the overlay via the settings channel", firstErr)
+	stripped := *rendered
+	stripped.Framework = nil
+	if err := a.RenderSettings(ctx, stripped); err != nil {
+		return fmt.Errorf("re-render without the owner overlay: %w", err)
+	}
+	if err := validateOpenclawConfig(); err != nil {
+		return fmt.Errorf("openclaw still rejects the config with the owner overlay withdrawn — platform bug: %w", err)
+	}
+	return nil
 }

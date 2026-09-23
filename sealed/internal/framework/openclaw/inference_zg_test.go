@@ -3,6 +3,7 @@ package openclaw
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -375,5 +376,78 @@ func TestRenderSettings_ModelWithoutProviderKeepsTheRouterEntry(t *testing.T) {
 	}
 	if got := primaryPin(t, cfg); got == "" {
 		t.Fatal("the pin itself was dropped")
+	}
+}
+
+// The T2 drill's first live catch (agent 411): openclaw validates its config
+// STRICTLY, so one junk key in the owner's opaque overlay — merged into the
+// same file — took the whole agent offline. The gate uses openclaw's own
+// validator and, on rejection, withdraws the overlay and boots the platform
+// half. The owner's junk costs the owner their knobs, never their agent.
+func TestEnsureConfigAcceptable_JunkOverlayIsWithdrawnNotFatal(t *testing.T) {
+	useTempHome(t)
+	a := New()
+
+	s := routedSettings(inference.WireOpenAI, "glm-5.3")
+	s.Framework = []byte(`{"备注":"junk openclaw's schema rejects"}`)
+	if err := a.RenderSettings(context.Background(), s); err != nil {
+		t.Fatalf("RenderSettings: %v", err)
+	}
+
+	// Stand in for `openclaw config validate`: reject any config that still
+	// carries the junk key, exactly as the real validator did live.
+	prev := validateOpenclawConfig
+	defer func() { validateOpenclawConfig = prev }()
+	calls := 0
+	validateOpenclawConfig = func() error {
+		calls++
+		cfg, err := loadOpenclawJSON()
+		if err != nil {
+			return err
+		}
+		if _, bad := cfg["备注"]; bad {
+			return fmt.Errorf("<root>: Invalid input")
+		}
+		return nil
+	}
+
+	if err := a.ensureConfigAcceptable(context.Background()); err != nil {
+		t.Fatalf("ensureConfigAcceptable = %v — a junk overlay must cost the overlay, not the boot", err)
+	}
+	if calls != 2 {
+		t.Fatalf("validator ran %d times, want reject-then-accept", calls)
+	}
+
+	cfg, err := loadOpenclawJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, still := cfg["备注"]; still {
+		t.Fatal("junk key survived the withdrawal")
+	}
+	if got := primaryPin(t, cfg); got != "openai/glm-5.3" {
+		t.Fatalf("platform half lost in the re-render: pin=%q", got)
+	}
+}
+
+// A rejection with NO overlay in force is the platform's own bug: booting on a
+// config openclaw already refused would just move the failure somewhere
+// harder to read. Fail the start loudly instead.
+func TestEnsureConfigAcceptable_PlatformBugFailsLoudly(t *testing.T) {
+	useTempHome(t)
+	a := New()
+	if err := a.RenderSettings(context.Background(), routedSettings(inference.WireOpenAI, "glm-5.3")); err != nil {
+		t.Fatal(err)
+	}
+	prev := validateOpenclawConfig
+	defer func() { validateOpenclawConfig = prev }()
+	validateOpenclawConfig = func() error { return fmt.Errorf("<root>: Invalid input") }
+
+	err := a.ensureConfigAcceptable(context.Background())
+	if err == nil {
+		t.Fatal("expected a loud failure when the platform's own render is rejected")
+	}
+	if !strings.Contains(err.Error(), "platform bug") {
+		t.Fatalf("error %q must say whose bug it is", err)
 	}
 }

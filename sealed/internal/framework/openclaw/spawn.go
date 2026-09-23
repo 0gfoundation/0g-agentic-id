@@ -88,7 +88,23 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		if err := installOpenclaw(cfg.framework.PackageVersion); err != nil {
 			return framework.StartResult{}, err
 		}
+	}
 
+	// openclaw validates its config STRICTLY — an unknown key at the root is
+	// "<root>: Invalid input" and the gateway refuses to run. The owner's
+	// opaque overlay is merged into that same file, so a single junk key in it
+	// used to take the agent OFFLINE (live: agent 411, overlay {"备注": …},
+	// caught by the T2 drill). The platform cannot know openclaw's schema —
+	// that is the whole point of the overlay being opaque — so it uses
+	// openclaw's own judgment instead: validate, and if the file is rejected
+	// while an overlay is present, strip the overlay, re-render, and boot on
+	// the platform half alone. The owner's junk costs the owner their knobs,
+	// never their agent; the log and the settings channel are how they learn.
+	if err := a.ensureConfigAcceptable(ctx); err != nil {
+		return framework.StartResult{}, err
+	}
+
+	if !initialized {
 		if out, err := exec.Command("openclaw", "config", "set", "gateway.mode", "local").CombinedOutput(); err != nil {
 			return framework.StartResult{}, fmt.Errorf("openclaw config set: %v: %s", err, strings.TrimSpace(string(out)))
 		}
