@@ -1220,6 +1220,67 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(affected)
     }
 
+    async fn set_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut version = None;
+        self.mut_with(seal_id, |d| {
+            if d.settings_version == base_version {
+                d.settings = Some(settings);
+                d.settings_version += 1;
+                d.settings_attempts = 0;
+                version = Some(d.settings_version);
+            }
+        })?;
+        Ok(version)
+    }
+
+    async fn seed_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut version = None;
+        self.mut_with(seal_id, |d| {
+            if d.settings_version == 0 && d.settings.is_none() {
+                d.settings = Some(settings);
+                d.settings_version += 1;
+                d.settings_attempts = 0;
+                version = Some(d.settings_version);
+            }
+        })?;
+        Ok(version)
+    }
+
+    async fn promote_settings_last_good(&self, seal_id: SealId) -> anyhow::Result<Option<i64>> {
+        let mut promoted = None;
+        self.mut_with(seal_id, |d| {
+            let served_the_current_document =
+                d.settings_attempts >= 1 && (d.settings_attempts == 1 || d.settings_last_good.is_none());
+            if d.settings_confirmed_version < d.settings_version && served_the_current_document {
+                d.settings_last_good = d.settings.clone();
+                d.settings_confirmed_version = d.settings_version;
+                d.settings_attempts = 0;
+                promoted = Some(d.settings_version);
+            }
+        })?;
+        Ok(promoted)
+    }
+
+    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>> {
+        let mut attempts = None;
+        self.mut_with(seal_id, |d| {
+            if d.settings_version > d.settings_confirmed_version {
+                d.settings_attempts += 1;
+                attempts = Some(d.settings_attempts);
+            }
+        })?;
+        Ok(attempts)
+    }
+
     async fn stale_running_candidates(
         &self,
         now: chrono::DateTime<chrono::Utc>,

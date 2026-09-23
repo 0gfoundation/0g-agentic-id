@@ -184,6 +184,11 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
             created_at: now,
             updated_at: now,
         };
