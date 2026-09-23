@@ -152,6 +152,40 @@ func TestAgentSettings_PartialChangeKeepsTheRest(t *testing.T) {
 	}
 }
 
+// The socket's scope IS the security property (PR #164 review): session-only
+// durability still left the agent free to re-point provider/model — the
+// owner's spend and routing — and to discard the owner's framework overlay
+// for the container's whole life. One field in, everything else refused, and
+// refused LOUDLY: a silently-ignored key teaches the agent nothing.
+func TestAgentSettings_OnlyThinkingIsInScope(t *testing.T) {
+	for name, body := range map[string]string{
+		"model":            `{"model":"gpt-5-pro"}`,
+		"provider":         `{"provider":"openai","thinking":"low"}`,
+		"framework":        `{"framework":{"maxParallelToolCalls":99}}`,
+		"thinking + model": `{"thinking":"low","model":"gpt-5-pro"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, applied := settingsServer(t, "0x00")
+			r := httptest.NewRequest(http.MethodPost, "/settings", strings.NewReader(body))
+			w := httptest.NewRecorder()
+			s.handleAgentSettings(w, r)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("HTTP %d (%s), want 403 — out-of-scope fields must be refused, not absorbed", w.Code, w.Body.String())
+			}
+			if applied.Model != "" && applied.Model != "glm-5.2" {
+				t.Fatalf("applied = %+v — nothing may change on a refused request", *applied)
+			}
+			if applied.Thinking != "" {
+				t.Fatalf("applied = %+v — a refused request must not half-apply", *applied)
+			}
+			if !strings.Contains(w.Body.String(), "owner") {
+				t.Fatalf("refusal %q must name the owner channel, so the agent learns where those change", w.Body.String())
+			}
+		})
+	}
+}
+
 // The grammar bug a client-side test surfaced: an audience is a URL and
 // carries its own colons, so a digest appended AFTER it lands in the wrong
 // field and every request 401s — which looks like a signature problem and is

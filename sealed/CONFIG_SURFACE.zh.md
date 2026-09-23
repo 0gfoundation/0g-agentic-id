@@ -241,13 +241,19 @@ POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第�
 唯一可能的调用者,也就不涉及任何签名 —— **socket 本身就是凭据**
 (`internal/proxy/sign.go:90`、`internal/proxy/settings.go:148`)。
 
-agent 发的是**局部**文档:处理器从当前生效的文档出发,再把 agent 的 body 反序列化覆盖
-上去 —— 因为它没问到的部分并不归它,而一份局部文档否则会把 pin 抹掉
-(`internal/proxy/settings.go:167-174`)。
+agent 只能改 **`thinking`,别的都不行**。处理器对 body 做严格的单字段解码
+(`DisallowUnknownFields`),带任何其它键就以 403 拒绝,并在错误里点名 owner 通道 ——
+**响亮地拒,不是悄悄丢弃**,让 agent 学会边界在哪,而不是往里重试
+(`internal/proxy/settings.go`,`handleAgentSettings`)。文档其余部分取当前生效的那份:
+agent 问不到的部分不归它。
+
+只靠"会话级持久性"是不够的边界,收窄范围是对 PR #164 评审演示的洞的修复:不设范围的
+覆盖让 agent 能改 `provider`/`model` —— owner 的钱和路由 —— 还能整段替换 owner 的
+`framework` 节,有效期是容器余下的整个生命,而容器可以活很久。这条路径存在的理由是
+"这个任务我想深一点";那是一个字段,socket 就只收一个字段。
 
 同样的校验、同样的渲染、同样的重启 —— 但**什么都不持久化**,响应里明说
-(`"durable": false`)。这个不对称正是把这个权限交出去仍然安全的原因:agent 的正当用法是
-"这个任务我想深一点",不是"永久重配自己" —— 钱和资产都是 owner 的。结构性的后果是
+(`"durable": false`)。钱和资产都是 owner 的。结构性的后果是
 **agent 没有能力把自己配置成起不来的状态**,而 agent 3586004 正是手工编辑框架配置把自己
 砖了的(`internal/proxy/settings.go:120-129`)。如果 agent 那份文档渲染失败,`main.go`
 会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:726-734`)。
@@ -355,9 +361,9 @@ dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext
 文件**自我修复**:那些字节归平台所有,所以 agent 弄坏的文件会被重建,而不是让 agent 起
 不来、直到有人 reset 容器。
 
-> `RuntimeContext.OwnerThinking` **仍然声明着**(`framework.go:350-355`),它的文档注释
-> 也还在描述已退役的 `SEAL_OWNER_THINKING` 沙盒 env 投递方式,但**没有任何东西写它、也
-> 没有任何东西读它**。删掉它是这次改动最后一个没做完的步骤。
+> `RuntimeContext.OwnerThinking` 已**删除**;它原来的位置上留有一段注释
+> (`framework.go`,RuntimeContext),记录为什么不许再有同类字段回来:凡是放进这个
+> 结构体的东西都在开机时冻结、每次重启原样重放。
 
 prime 的桥仍然读一个**名叫** `SEAL_OWNER_THINKING` 的环境变量
 (`prime/bridge/bridge.mjs:64`)。那个名字是桥自己的契约,而桥是随 sealed 二进制一起发布
@@ -536,7 +542,8 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
 
 ## 13. 尚未解决的缺口
 
-- **迁移覆盖。**四家里有三家不恢复自己退役的配置角色(§10)。
+- ~~迁移覆盖~~ —— 已关闭。四家都恢复两个遗留来源(退役配置角色 + mint 时的 persona
+  种子),显式排位、有测试(§10)。
 - **容器侧的两条推送路径都还没有客户端。**`/_seal/settings` 与
   `$SEAL_SIGN_SOCK/settings` 已实现、已有测试,但 SDK、CLI 与任何桥都没有调用它们,
   agent 圣经(`internal/platform`)里也没有提到那个 socket,所以 agent 无从得知这个杠杆
@@ -547,10 +554,13 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
   storage,**并在转让时一并交给下一任主人**。没有任何东西拦得住 —— 而那两份现已删除的
   `stripSecrets` 本来也只作用于那两个配置文件。**扫描不是解法**:散文里的密钥("我的
   key 是 sk- 开头那个")识别不可靠。解法是把凭据通道从一个变量扩成一张命名表,装在
-  owner 签名的信封里、导出成环境变量,**让密钥有个比记忆更好的去处**。agent 圣经里也该
+  owner 签名的信封里、导出成环境变量,**让密钥有个比记忆更好的去处**。这一条同样适用于
+  **推理密钥本身**:§7 把它放在框架进程 env(openclaw/prime/dsh)或 hermes 的
+  `config.yaml` 盘上,而对一个 agent 有 shell、有文件访问的框架来说,"只在进程 env 里"
+  不构成保密边界。真正的修法形状是"能用而不可见" —— #163 connections 设计给 OAuth token
+  的待遇 —— 推理密钥还没有拿到这个待遇。agent 圣经里也该
   直说这个机制:**写进记忆的东西会随资产转让。**这是可观测性事实,不是行为指令。
 - **owner 的不透明 overlay 是未经扫描的自由文本。**owner 把字面密钥粘进 `framework`,
   它就进了一个普通 JSONB 列,在 prime 上还会进到容器里的一个文件
   (`prime/modelsjson.go:53-59`)。没有东西剥它;唯一的保护是那个列和那个文件都既不公开
   也不上链(§4)。
-- **`RuntimeContext.OwnerThinking` 已死但仍然声明着**(§8)。

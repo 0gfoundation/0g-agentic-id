@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -143,6 +144,16 @@ func (s *Server) SetSessionSettings(apply SessionSettingsApplier) {
 // process is the only possible caller and no signature is involved — the same
 // basis on which that socket already hands out agentSeal signatures.
 //
+// THE AGENT MAY CHANGE `thinking`, AND NOTHING ELSE. Session-lifetime
+// durability alone was the wrong bound (PR #164 review): a container can live
+// a long time, and an unscoped overlay let the agent re-point provider/model —
+// spend and routing, which are the owner's — and discard the owner's framework
+// section wholesale for that whole life. The lever this endpoint exists for is
+// "think harder on this task"; that is one field, so one field is what the
+// socket accepts. Anything else in the body is refused loudly (not silently
+// dropped — the agent should learn the boundary, not retry into it), naming
+// the owner channel as the way those change.
+//
 // The response says plainly that the change is not durable, because the agent
 // reads it and would otherwise have no way to know.
 func (s *Server) handleAgentSettings(w http.ResponseWriter, r *http.Request) {
@@ -164,14 +175,25 @@ func (s *Server) handleAgentSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Start from what is in force and let the agent change a field, rather
-	// than making it restate the whole document: it does not own the parts it
-	// did not ask about, and a partial document would otherwise blank the pin.
-	doc := read()
-	if err := json.Unmarshal(body, &doc); err != nil {
-		http.Error(w, "parse: "+err.Error(), http.StatusBadRequest)
+	// Strict decode into a one-field shape: an unknown key is a scope
+	// violation, not noise. DisallowUnknownFields is what turns "provider
+	// silently ignored" into an error the agent can read and adapt to.
+	var req struct {
+		Thinking string `json:"thinking"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w,
+			"this endpoint accepts {\"thinking\"} and nothing else — provider, model and the framework section are your owner's to change, through their signed settings channel: "+err.Error(),
+			http.StatusForbidden)
 		return
 	}
+
+	// The rest of the document is what is in force: the agent does not own
+	// the parts it cannot ask about.
+	doc := read()
+	doc.Thinking = req.Thinking
 	if err := doc.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return

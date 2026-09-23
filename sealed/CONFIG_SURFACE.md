@@ -301,16 +301,23 @@ over the 0600 unix socket inside the container, so the agent process is the
 only possible caller and no signature is involved — the socket is the
 credential (`internal/proxy/sign.go:90`, `internal/proxy/settings.go:148`).
 
-The agent sends a **partial** document: the handler starts from what is in
-force and unmarshals the agent's body over it, because the agent does not own
-the parts it did not ask about and a partial document would otherwise blank
-the pin (`internal/proxy/settings.go:167-174`).
+The agent may change **`thinking`, and nothing else**. The handler strict-
+decodes a one-field body (`DisallowUnknownFields`) and refuses anything more
+with a 403 that names the owner channel — loudly, not by silently dropping the
+key, so the agent learns the boundary instead of retrying into it. The rest of
+the document is what is in force: the agent does not own the parts it cannot
+ask about (`internal/proxy/settings.go`, `handleAgentSettings`).
+
+Session-only durability alone was the wrong bound, and scoping is the fix for
+a hole the PR #164 review demonstrated: an unscoped overlay let the agent
+re-point `provider`/`model` — the owner's spend and routing — and replace the
+owner's `framework` section wholesale, for the container's remaining life,
+which can be long. The lever this path exists for is "think harder on this
+task"; that is one field, so one field is what the socket accepts.
 
 Same validation, same render, same restart — but **nothing is persisted**, and
-the response says so (`"durable": false`). That asymmetry is what makes the
-access safe to grant: the agent's legitimate use is "think harder on this
-task", not "permanently reconfigure yourself" — the money and the asset are
-the owner's. The structural consequence is that an agent cannot configure
+the response says so (`"durable": false`). The money and the asset are the
+owner's. The structural consequence is that an agent cannot configure
 itself into a state it will not boot from, which is how agent 3586004 bricked
 itself by hand-editing its framework config
 (`internal/proxy/settings.go:120-129`). If a render of the agent's document
@@ -445,10 +452,10 @@ spawn also makes the config file self-repairing: the platform owns those
 bytes, so a file the agent corrupted is rebuilt rather than leaving the agent
 unable to start until a container reset.
 
-> `RuntimeContext.OwnerThinking` is still **declared**
-> (`framework.go:350-355`) and its doc comment still describes the retired
-> `SEAL_OWNER_THINKING` sandbox-env delivery, but nothing sets it and nothing
-> reads it. Deleting it is the last unfinished step of this change.
+> `RuntimeContext.OwnerThinking` has been **deleted**; a comment at the spot
+> it occupied (`framework.go`, RuntimeContext) records why nothing like it may
+> return: anything carried in that struct is frozen at boot and replayed on
+> every restart.
 
 The prime bridge still reads an environment variable *named*
 `SEAL_OWNER_THINKING` (`prime/bridge/bridge.mjs:64`). That name is the
@@ -677,8 +684,8 @@ chain dissolved the problem they addressed.
 
 ## 13. Open gaps
 
-- **Migration coverage.** Three of four adapters do not recover their retired
-  config role (§10).
+- ~~Migration coverage~~ — closed. All four adapters recover both legacy
+  sources (retired config role + mint-time persona seed), ranked, tested (§10).
 - **Neither container-side push path has a shipped client.** `/_seal/settings`
   and `$SEAL_SIGN_SOCK/settings` are implemented and tested, but nothing in
   the SDK, the CLI or any bridge calls them, and the agent doc
@@ -696,7 +703,13 @@ chain dissolved the problem they addressed.
   ("my key is the sk- one") is not reliably detectable. The fix is to widen
   the credential channel from one variable to a named map carried in the
   owner-signed envelope and exported as env, so there is somewhere better than
-  memory to put it. The agent doc should also state the mechanism plainly:
+  memory to put it. The same entry applies to the **inference key itself**:
+  §7 puts it in the framework process env (openclaw/prime/dsh) or on disk in
+  `config.yaml` (hermes), and for a framework whose agent has shell or file
+  reach, "process env only" is not a confidentiality boundary. Use-without-
+  seeing — the treatment #163's connections design gives OAuth tokens — is the
+  shape of the real fix, and nothing gives the inference key that treatment
+  yet. The agent doc should also state the mechanism plainly:
   *what you write into memory transfers with the asset.* That is an
   observability fact, not a behavioural instruction.
 - **The owner's opaque overlay is unscanned free text.** An owner who pastes a
@@ -704,4 +717,3 @@ chain dissolved the problem they addressed.
   prime, into a file inside the container
   (`prime/modelsjson.go:53-59`). Nothing strips it; the only protection is
   that neither the column nor the file is public or chain-tracked (§4).
-- **`RuntimeContext.OwnerThinking` is dead and still declared** (§8).
