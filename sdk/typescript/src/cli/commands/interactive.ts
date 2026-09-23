@@ -56,6 +56,28 @@ const L2_ARGS: Record<string, string[] | (() => string[])> = {
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
 
+// Commands whose LATER arguments also complete (the generic rule is "first
+// argument only; the rest is free-form" — right for prompts and amounts,
+// wrong for settings' k=v list, where the keys are a closed set the user
+// should never have to remember).
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others='];
+const TAIL_ARGS: Record<string, string[]> = {
+  'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
+  '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
+};
+
+// completeTail finishes the word being typed in a k=v run: key names, and
+// the value set for thinking=.
+function completeTail(cmd: string, word: string): string[] {
+  const keys = TAIL_ARGS[cmd];
+  if (!keys) return [];
+  if (word.startsWith('thinking=')) {
+    return ['low', 'high', 'max'].map((v) => 'thinking=' + v).filter((c) => c.startsWith(word));
+  }
+  const hits = keys.filter((c) => c.startsWith(word));
+  return hits.length ? hits : keys;
+}
+
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
@@ -291,9 +313,14 @@ export async function run(ctx: CommandContext): Promise<void> {
         return [hits.length ? hits : activeCompletions, line];
       }
       // Complete the FIRST argument from the command's candidate table
-      // (later arguments are free-form: keys, amounts, prompts).
+      // (later arguments are free-form: keys, amounts, prompts — except the
+      // commands in TAIL_ARGS, whose k=v words complete anywhere).
       const rest = line.slice(sp + 1);
-      if (rest.includes(' ')) return [[], line];
+      if (rest.includes(' ')) {
+        const word = rest.slice(rest.lastIndexOf(' ') + 1);
+        const hits = completeTail(line.slice(0, sp), word);
+        return hits.length ? [hits, word] : [[], line];
+      }
       const cand = activeArgs[line.slice(0, sp)];
       const list = typeof cand === 'function' ? cand() : (cand ?? []);
       const hits = list.filter((c) => c.startsWith(rest));
