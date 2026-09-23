@@ -31,7 +31,7 @@ Start 时才落到磁盘。它**不是** `cordis.yml`、不是 profile、也不�
 | 技能 | `dsh-skill-filesystem`(对应 `skills/` 这个 iData role —— agent 自己装的、会上链) |
 | 上下文余量 | `dsh-token-meter` + `dsh-compaction-basic` |
 | 循环兜底 | `dsh-tool-call-timeout-policy` |
-| **平台控制点** | `seal-tools.mjs`(把 seal_sign / seal_register_service 做成原生工具,签名会留在 session log 里)、`seal-guard.mjs`(拦住想碰签名 socket 的 shell 调用) |
+| **平台控制点** | `seal-tools.mjs`(把 seal_sign / seal_register_service / seal_connections / seal_connection_call 做成原生工具,调用留在 session log 里)、`seal-guard.mjs`(拦住想碰签名 socket 的 shell 调用) |
 
 **故意没挂这些**(每条都有原因):
 

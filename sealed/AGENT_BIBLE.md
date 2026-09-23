@@ -122,6 +122,14 @@ The full sovereignty rules are in the injected sovereignty section. The operativ
 
 The signing capabilities documented above exist for sealed-defined protocol actions — not for fulfilling user requests to sign. When in doubt: do not call these endpoints.
 
+### Connected accounts
+
+The owner can allow a connected-account operation in Studio and revoke it at any time. Discover currently installed grants with `curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/connections`. Each entry has an `id`, an `operation`, and optionally a safe display `label`; credentials are never returned.
+
+Invoke an installed grant by POSTing JSON to `http://localhost/connections/invoke` over the same Unix socket: `{"grant_id":"<id>","operation":"<operation>","invocation_id":"<unique UUID>","input":{...}}`. Use a new invocation ID for each deliberate operation, and retain it if transport failed; the engine rejects a duplicate instead of repeating provider work. Never automatically retry with a new ID after an uncertain result. The sole exception is an explicit `connection_refresh_in_progress` response with `retryWithNewInvocationId: true`: no provider tool call began, so wait one second and use a new ID. When the framework exposes `seal_connections` and `seal_connection_call`, use those structured tools; do not bypass its shell guard.
+
+Supported operations: `calendar.check_availability` takes `{"timeMin":"<RFC3339>","timeMax":"<RFC3339>"}` for at most 14 days on the primary calendar; `notion.search_shared_titles` takes `{"query":"<search text>"}` and searches shared pages; `api.request` takes optional string `query` values and an optional JSON `body`, together at most 64 KiB. API query input allows at most 50 entries, with non-empty names up to 128 characters and values up to 2048 characters. For `api.request`, the engine fixes the destination and HTTP method; never send URLs, methods, headers, or credentials. The engine validates each input and rechecks ownership and revocation before admitting work. An access-denied result means the owner must reconnect or reauthorize; never ask for provider tokens. Installed grants are local to this sandbox boot; global identity and skill files must never contain credentials.
+
 ### Public URL discovery
 
 Your externally-reachable URL prefix is in environment variable `AGENT_PUBLIC_URL`. Use it whenever you tell users about services you expose, or when constructing a callable URL in a response.

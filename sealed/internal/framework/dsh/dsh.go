@@ -21,11 +21,10 @@
 //	                npm/release version — the two series match for DSH,
 //	                unlike prime-agent; see whitelist.go)
 //	APPEND_SYSTEM.md Leaf — owner persona, verbatim bytes (persona.go).
-//	                Injected by the bridge into ctx.systemPrompt at boot,
-//	                NOT through any DSH-native config file — DSH's own
-//	                `persona` config key lives in the plugin composition
-//	                (cordis.yml), which is per-boot platform structure, not
-//	                agent-owned state we track.
+//	                Injected by the bridge through a file-backed
+//	                ctx.systemPrompt.section callback evaluated for every
+//	                prompt assembly, so edits apply on the next model step
+//	                without replacing the Agent/session.
 //	settings.yaml   Leaf — the inference route pin, in DSH's own hot-reloaded
 //	                settings-file format (settingsyaml.go)
 //	skills/         DirectoryManifest — agent-installed skills under

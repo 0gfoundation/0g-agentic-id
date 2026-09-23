@@ -29,6 +29,10 @@ Prerequisite reading: [ARCHITECTURE.md](ARCHITECTURE.md) §1 (boot
 sequence), §4–5 (snapshot pair + evolution pipeline). This document
 assumes you know what iData, roles, and the watcher/uploader loop are.
 
+Optional owner-native resource management implements `studio.Provider` alongside
+the framework interface. Its route, revision/checkpoint and activation contracts,
+Prime sessions and connected-account tools are documented in [STUDIO.md](STUDIO.md).
+
 ---
 
 ## 1. The division of labor
@@ -973,8 +977,9 @@ prime-agent, guarding `settings.yaml` instead of `models.json`).
    `DefaultResourceLoader` does; its own `persona` concept is a *config value*
    inside the plugin composition, which is per-boot platform structure this
    adapter authors, not agent state. So this role's bytes reach the model
-   through the bridge's own code — a `ctx.systemPrompt.section()` call after
-   boot settles — never through a file DSH itself reads. That
+   through the bridge's own code — a `ctx.systemPrompt.section()` text callback
+   rereads the file for every prompt assembly, preserving the existing session —
+   never through a file DSH itself reads. That
    also means, like prime-agent, no marker stripping is needed: nothing
    platform-authored ever shares this role's bytes.
 3. **`settings.yaml`** — the inference route pin, kept in DSH's settings-file

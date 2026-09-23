@@ -8,8 +8,9 @@
  * exactly one framework process to supervise and no second protocol hop.
  *
  * Because sealed authors this file, the exposed surface is a whitelist by
- * construction: one OpenAI-shaped chat endpoint, nothing else. There is no
- * dashboard, file browser or exec endpoint to fence off.
+ * construction: OpenAI-shaped chat/Responses endpoints, an explicit session
+ * registry, activity, and interrupt. There is no dashboard, file browser or
+ * exec endpoint to fence off.
  *
  * Deliberate properties, each load-bearing:
  *
@@ -26,15 +27,17 @@
  *     the SDK documents as not persisted to disk. The key therefore never
  *     touches a tracked path, so unlike a config-file framework there is no
  *     secret to strip before iData.
- *   - Requests are serialized. An SDK session is a single conversation; this
- *     is the owner↔agent steering channel, so queueing is right and
- *     interleaving two turns onto one session would corrupt both.
+ *   - Requests are serialized per SDK session. Legacy callers share one
+ *     session; clients that opt into /v1/sessions get independent conversation
+ *     objects and queues, so one busy conversation never blocks another.
  *
  * Run: node bridge.mjs   (plain ESM — no build step in the image)
  */
 
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // The official release package (`prime-agent`), installed globally in the
 // image. NOT the @earendil-works/pi-coding-agent npm package: that one ships
@@ -47,6 +50,7 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
+	SessionManager,
 } from "prime-agent";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
@@ -87,7 +91,16 @@ const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
-let sessionPromise = null;
+const SESSIONS_MAX = 50;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const sessions = new Map();
+const deletingSessions = new Set();
+
+function newSessionSlot(id) {
+	return { id, sessionPromise: null, rlmSessionDir: null, tail: Promise.resolve(), pending: 0 };
+}
+
+const legacySession = newSessionSlot(null);
 
 function readAgentDoc() {
 	if (!AGENT_DOC) return null;
@@ -127,7 +140,7 @@ function resolveModel(modelRegistry) {
 	return pinned;
 }
 
-async function buildSession() {
+async function buildSession(slot) {
 	const agentDir = getAgentDir();
 	const authStorage = AuthStorage.create();
 	// Also hand the key over at runtime (not persisted). Native providers need
@@ -167,11 +180,27 @@ async function buildSession() {
 
 	const model = resolveModel(modelRegistry);
 	log(`model resolved: ${model.provider}/${model.id}`);
+	// Opted-in conversations are intentionally ephemeral and get independent
+	// transcript managers AND Python runtime directories. Distinct AgentSession
+	// objects are insufficient by themselves: Prime's IPython kernel and local
+	// harness use RLM_SESSION_DIR / RLM_HARNESS_STATE_DIR. Supplying the SDK's
+	// rlmSessionDir option makes it inject those values into this session's own
+	// kernel without mutating the bridge process environment.
+	const isolated = slot.id
+		? (() => {
+			if (!slot.rlmSessionDir) slot.rlmSessionDir = mkdtempSync(join(tmpdir(), "seal-prime-session-"));
+			return {
+				sessionManager: SessionManager.inMemory(process.cwd(), slot.rlmSessionDir),
+				rlmSessionDir: slot.rlmSessionDir,
+			};
+		})()
+		: {};
 	const { session } = await createAgentSession({
 		model,
 		resourceLoader: loader,
 		authStorage,
 		modelRegistry,
+		...isolated,
 	});
 	// Thinking models need a bounded effort level: the session default is
 	// "off", which makes the SDK send NO reasoning_effort — and an
@@ -195,14 +224,24 @@ async function buildSession() {
 	return session;
 }
 
-function getSession() {
-	if (!sessionPromise) {
-		sessionPromise = buildSession().catch((err) => {
-			sessionPromise = null; // let the next request retry a failed build
+function getSession(slot) {
+	if (!slot.sessionPromise) {
+		slot.sessionPromise = buildSession(slot).catch((err) => {
+			slot.sessionPromise = null; // let the next request retry a failed build
 			throw err;
 		});
 	}
-	return sessionPromise;
+	return slot.sessionPromise;
+}
+
+function requestSessionSlot(sessionID) {
+	if (sessionID === undefined || sessionID === null) return legacySession;
+	if (typeof sessionID !== "string") return null;
+	return sessions.get(sessionID) || null;
+}
+
+function sessionSnapshot(slot) {
+	return { id: slot.id, object: "session", status: slot.pending > 0 ? "busy" : "available" };
 }
 
 // ── Activity stream ─────────────────────────────────────────────────────────
@@ -256,15 +295,15 @@ function handleActivity(req, res) {
 
 // ── Turn serialization ──────────────────────────────────────────────────────
 
-let tail = Promise.resolve();
-function serialize(fn) {
-	const run = tail.then(fn, fn);
+function serialize(slot, fn) {
+	slot.pending += 1;
+	const run = slot.tail.then(fn, fn);
 	// Keep the chain alive regardless of individual failures.
-	tail = run.then(
+	slot.tail = run.then(
 		() => undefined,
 		() => undefined,
 	);
-	return run;
+	return run.finally(() => { slot.pending -= 1; });
 }
 
 // ── /v1/responses (OpenAI Responses API subset) ─────────────────────────────
@@ -293,12 +332,14 @@ const RESPONSES_MAX = 16;
 const responses = new Map(); // id -> record
 const responseOrder = [];
 
-function newResponseRecord(text) {
+function newResponseRecord(text, slot, sessionID) {
 	const id = "resp_" + randomBytes(12).toString("hex");
 	const rec = {
 		id,
 		status: "queued", // queued | in_progress | completed | failed | cancelled
 		prompt: text.slice(0, 200),
+		slot,
+		sessionID,
 		events: [],       // {seq, name, data}
 		seq: 0,
 		outputText: "",
@@ -331,6 +372,7 @@ function responseSnapshot(rec) {
 		object: "response",
 		status: rec.status,
 		output_text: rec.outputText,
+		...(rec.sessionID ? { session_id: rec.sessionID } : {}),
 		...(rec.error ? { error: { message: rec.error } } : {}),
 	};
 }
@@ -338,7 +380,7 @@ function responseSnapshot(rec) {
 /** Run one agent turn under a response record. The turn is owned by the
  *  record, NOT by any HTTP connection — followers attach and detach freely. */
 function startResponseTurn(rec, text, effort) {
-	rec.turn = serialize(async () => {
+	rec.turn = serialize(rec.slot, async () => {
 		// A cancel can land while this task is still QUEUED behind another turn
 		// (the cancel path then only marks the status — aborting would hit the
 		// wrong, currently-running task). Honor it here instead of silently
@@ -351,7 +393,7 @@ function startResponseTurn(rec, text, effort) {
 		rec.status = "in_progress";
 		pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
 		try {
-			const session = await getSession();
+			const session = await getSession(rec.slot);
 			// Per-message thinking override (request reasoning.effort). Set for
 			// THIS turn only; the finally below restores the agent default. Safe
 			// under the serializer: exactly one turn touches the session at a time.
@@ -390,7 +432,7 @@ function startResponseTurn(rec, text, effort) {
 			// Restore the agent default so a one-turn override never leaks into
 			// the next turn (which may not carry an effort of its own).
 			if (effort && effort !== OWNER_THINKING) {
-				try { const s = await getSession(); if (typeof s.setThinkingLevel === "function") s.setThinkingLevel(OWNER_THINKING); } catch { /* best effort */ }
+				try { const s = await getSession(rec.slot); if (typeof s.setThinkingLevel === "function") s.setThinkingLevel(OWNER_THINKING); } catch { /* best effort */ }
 			}
 		}
 	});
@@ -656,13 +698,16 @@ async function handleChat(req, res) {
 	} catch {
 		return sendJSON(res, 400, { error: { message: "invalid JSON body" } });
 	}
+	const slot = requestSessionSlot(body.session_id);
+	if (!slot) {
+		return sendJSON(res, 404, { error: { message: `no such session ${JSON.stringify(body.session_id)}` } });
+	}
 
 	const text = lastUserText(body.messages);
 	if (!text) {
 		return sendJSON(res, 400, { error: { message: "no user message in `messages`" } });
 	}
 
-	const session = await getSession();
 	const id = `chatcmpl-${created()}`;
 	const model = body.model || `${PROVIDER || "prime"}/${MODEL_ID || "default"}`;
 
@@ -687,7 +732,7 @@ async function handleChat(req, res) {
 		if (disconnected || res.writableEnded || res.destroyed) return;
 		try { res.write(s); } catch { /* client raced us to the close */ }
 	};
-	const runMine = (fn) => serialize(() => {
+	const runMine = (fn) => serialize(slot, () => {
 		// Still skip STARTING a turn whose requester is already gone — that
 		// message's author can re-send; but a turn already running keeps
 		// running (see onGone).
@@ -726,9 +771,9 @@ async function handleChat(req, res) {
 		broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
 		let failure = null;
 		try {
-			await runMine(() =>
+			await runMine(async () =>
 				runTurn(
-					session,
+					await getSession(slot),
 					text,
 					(delta) => safeWrite(chunkFrame(id, model, { content: delta })),
 					(line, type) => {
@@ -777,8 +822,8 @@ async function handleChat(req, res) {
 
 	const t0 = Date.now();
 	broadcastActivity({ turn: id, kind: "turn_start", text: text.slice(0, 200) });
-	const full = await runMine(() =>
-		runTurn(session, text, null, (line, type) => {
+	const full = await runMine(async () =>
+		runTurn(await getSession(slot), text, null, (line, type) => {
 			log(`  ${line}`);
 			broadcastActivity({ turn: id, kind: type, text: line });
 		}),
@@ -811,6 +856,69 @@ const server = createServer((req, res) => {
 		return handleActivity(req, res);
 	}
 
+	if (req.method === "POST" && path === "/v1/sessions") {
+		return (async () => {
+			const raw = await readBody(req);
+			let body;
+			try { body = JSON.parse(raw || "{}"); } catch { return sendJSON(res, 400, { error: { message: "invalid JSON body" } }); }
+			if (typeof body.id !== "string" || !CANONICAL_UUID.test(body.id)) {
+				return sendJSON(res, 400, { error: { message: "id must be a canonical lowercase UUID" } });
+			}
+			const existing = sessions.get(body.id);
+			if (existing) return sendJSON(res, 200, sessionSnapshot(existing));
+			if (deletingSessions.has(body.id)) {
+				return sendJSON(res, 409, { error: { message: `session ${body.id} is being deleted` } });
+			}
+			if (sessions.size + deletingSessions.size >= SESSIONS_MAX) {
+				return sendJSON(res, 409, { error: { message: `session limit reached (${SESSIONS_MAX}); delete an idle session before creating another` } });
+			}
+			const slot = newSessionSlot(body.id);
+			sessions.set(body.id, slot);
+			return sendJSON(res, 201, sessionSnapshot(slot));
+		})().catch((err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }));
+	}
+	{
+		const match = path.match(/^\/v1\/sessions\/([0-9a-f-]+)(\/reload)?$/);
+		if (match) {
+			const slot = sessions.get(match[1]);
+			if (!slot) return sendJSON(res, 404, { error: { message: `no such session ${match[1]}` } });
+			if (req.method === "GET" && !match[2]) return sendJSON(res, 200, sessionSnapshot(slot));
+			if (req.method === "POST" && match[2] === "/reload") {
+				if (slot.pending > 0) return sendJSON(res, 409, { error: { message: `session ${slot.id} is busy` } });
+				return serialize(slot, async () => {
+					const session = await getSession(slot);
+					if (typeof session.reload !== "function") throw new Error("this Prime SDK exposes no session.reload()");
+					await session.reload();
+				}).then(
+					() => sendJSON(res, 200, sessionSnapshot(slot)),
+					(err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }),
+				);
+			}
+			if (req.method === "DELETE" && !match[2]) {
+				if (slot.pending > 0) return sendJSON(res, 409, { error: { message: `session ${slot.id} is busy` } });
+				// Remove the slot before asynchronous disposal so a racing request
+				// cannot enqueue work onto a session that is already being torn down.
+				sessions.delete(slot.id);
+				deletingSessions.add(slot.id);
+				return (async () => {
+					const session = slot.sessionPromise ? await slot.sessionPromise : null;
+					try {
+						if (session && typeof session.disposeAsync === "function") await session.disposeAsync();
+						else if (session && typeof session.dispose === "function") await session.dispose();
+					} finally {
+						try {
+							if (slot.rlmSessionDir) rmSync(slot.rlmSessionDir, { recursive: true, force: true });
+						} finally {
+							deletingSessions.delete(slot.id);
+						}
+					}
+					return sendJSON(res, 200, { id: slot.id, object: "session", deleted: true });
+				})().catch((err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }));
+			}
+			return sendJSON(res, 405, { error: { message: "method not allowed" } });
+		}
+	}
+
 	if (req.method === "POST" && path === "/v1/chat/completions") {
 		return handleChat(req, res).catch((err) => {
 			log(`ERROR ${err && err.stack ? err.stack : err}`);
@@ -831,13 +939,15 @@ const server = createServer((req, res) => {
 			const raw = await readBody(req);
 			let body;
 			try { body = JSON.parse(raw || "{}"); } catch { return sendJSON(res, 400, { error: { message: "invalid JSON body" } }); }
+			const slot = requestSessionSlot(body.session_id);
+			if (!slot) return sendJSON(res, 404, { error: { message: `no such session ${JSON.stringify(body.session_id)}` } });
 			const text = responseInputText(body.input);
 			if (!text) return sendJSON(res, 400, { error: { message: "input is required (string or messages-style items)" } });
 			const effort = normalizeEffort(body.reasoning && body.reasoning.effort);
 			if (body.reasoning && body.reasoning.effort && !effort) {
 				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low", "high" or "max"` } });
 			}
-			const rec = newResponseRecord(text);
+			const rec = newResponseRecord(text, slot, body.session_id ?? null);
 			startResponseTurn(rec, text, effort);
 			log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)${effort ? ` [think:${effort}]` : ""}`);
 			if (body.stream) return streamResponse(req, res, rec, 0);
@@ -866,7 +976,7 @@ const server = createServer((req, res) => {
 					}
 					if (rec.status === "in_progress") {
 						rec.status = "cancelled";
-						const session = await getSession();
+						const session = await getSession(rec.slot);
 						if (typeof session.requestAbort === "function" && typeof session.resumeQueuedWork === "function") {
 							session.requestAbort();
 							if (typeof session._cancelActiveRlmChildRuns === "function") {
@@ -911,7 +1021,7 @@ const server = createServer((req, res) => {
 	if (req.method === "POST" && path === "/v1/interrupt") {
 		return (async () => {
 			try {
-				const session = await getSession();
+				const session = await getSession(legacySession);
 				// Stopping a prime turn, done right. Two synchronous steps, NO
 				// awaiting — every wedge we hit came from waiting on something
 				// that never completes:

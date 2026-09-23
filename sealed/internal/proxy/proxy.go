@@ -2,14 +2,14 @@
 //
 // Endpoints (in priority order, all served by the single mux):
 //
-//   GET  /healthz       - container liveness probe (always 200)
-//   GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
-//   GET  /log.html      - same log, color-coded HTML view for frontends
-//   GET  /log/agent     - framework subprocess log (plaintext, owner-only)
-//   GET  /log/agent.html - same log, color-coded HTML view (owner-only)
-//   GET  /hello         - signed A2A self-introduction (returns 503 until armed)
-//   POST /_seal/auth    - owner-only flow returning the framework auth token
-//   *    /              - signed reverse proxy to agent upstream (returns 503 until armed)
+//	GET  /healthz       - container liveness probe (always 200)
+//	GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
+//	GET  /log.html      - same log, color-coded HTML view for frontends
+//	GET  /log/agent     - framework subprocess log (plaintext, owner-only)
+//	GET  /log/agent.html - same log, color-coded HTML view (owner-only)
+//	GET  /hello         - signed A2A self-introduction (returns 503 until armed)
+//	POST /_seal/auth    - owner-only flow returning the framework auth token
+//	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
 // X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
@@ -22,6 +22,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -44,6 +45,7 @@ import (
 	"seal-verify/internal/logger"
 	"seal-verify/internal/report"
 	"seal-verify/internal/state"
+	studioapi "seal-verify/internal/studio"
 )
 
 const authWindowSec = 300
@@ -60,11 +62,14 @@ type Server struct {
 	// chain scan is in flight). Until SetAdapter runs, adapter-backed
 	// endpoints degrade: /_seal/auth 503s, /hello omits services,
 	// /log/agent reports unavailable.
-	mu           sync.RWMutex
-	adapter      framework.Framework
-	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
-	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
-	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+	mu            sync.RWMutex
+	adapter       framework.Framework
+	agentLogPath  string            // adapter's subprocess log file; empty renders "not available"
+	services      []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
+	fwRoutes      []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+	studio        *studioapi.Manager
+	ownerResolver func(context.Context) (string, error)
+	connections   *connectionHub
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
 	// adapters that don't serve one natively.
@@ -78,7 +83,16 @@ type Server struct {
 // The framework adapter is attached later via SetAdapter, once the chain
 // bootstrap has resolved which framework this agent is.
 func New(agent *state.Agent, publicURL string) *Server {
-	return &Server{agent: agent, publicURL: publicURL, synth: newSynthHub()}
+	return &Server{agent: agent, publicURL: publicURL, synth: newSynthHub(), connections: newConnectionHub()}
+}
+
+// SetStudioOwnerResolver installs the live chain owner lookup used by every
+// Studio and connection-management request. The bootstrap owner remains the
+// authorization anchor until restart; a transfer therefore fails closed.
+func (s *Server) SetStudioOwnerResolver(resolve func(context.Context) (string, error)) {
+	s.mu.Lock()
+	s.ownerResolver = resolve
+	s.mu.Unlock()
 }
 
 // SetAdapter late-binds the resolved framework adapter and derives the
@@ -104,10 +118,15 @@ func (s *Server) SetAdapter(fw framework.Framework) {
 	if rp, ok := fw.(framework.RouteProvider); ok {
 		fwRoutes = rp.FrameworkRoutes()
 	}
+	var studioManager *studioapi.Manager
+	if provider, ok := fw.(studioapi.Provider); ok {
+		studioManager = studioapi.New(provider, s.agent)
+	}
 	s.mu.Lock()
 	s.adapter = fw
 	s.agentLogPath = agentLogPath
 	s.fwRoutes = fwRoutes
+	s.studio = studioManager
 	s.mu.Unlock()
 	if len(fwRoutes) == 0 {
 		logger.Logf("proxy: adapter %q declares no routes; only agent /api/* services are reachable (all other paths 404)", fw.Name())
@@ -161,6 +180,12 @@ func (s *Server) frameworkRoutesForHello() []report.Route {
 			Description: rt.Description,
 		})
 	}
+	if s.studio != nil {
+		out = append(out, report.Route{
+			Prefix: "/_seal/studio/", Kind: "studio", Auth: "bearer", Signed: false,
+			Description: "Owner-only semantic state discovery, read, mutation, and checkpoint receipts.",
+		})
+	}
 	// Advertise the synthesized long-task surface (responses.go) when the
 	// adapter has a chat route but no native Responses one — the SDK picks
 	// its transport off this kind.
@@ -203,6 +228,9 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/log/agent.html", s.handleAgentLogHTML)
 	mux.HandleFunc("/hello", s.handleHello)
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
+	mux.HandleFunc("/_seal/studio/", s.handleStudio)
+	mux.HandleFunc("/_seal/studio/connections", s.handleStudioConnections)
+	mux.HandleFunc("/_seal/studio/connections/", s.handleStudioConnections)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

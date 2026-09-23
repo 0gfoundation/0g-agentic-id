@@ -8,8 +8,9 @@
  * level — and leaves nothing in the audit trail but an opaque command
  * string. This guard closes that road: any bash/subprocess tool call whose
  * arguments reference the sign socket is denied at tools/pre-execute, with a
- * pointer to the structured tools (seal_sign / seal_register_service, see
- * seal-tools.mjs) that leave a session-log record.
+ * pointer to the structured tools (seal_sign / seal_register_service /
+ * seal_connections / seal_connection_call, see seal-tools.mjs) that leave a
+ * session-log record.
  *
  * Registered via ctx.tools.guard(): monotonic — a later listener cannot turn
  * the denial back into permission. This is channel narrowing, not content
@@ -41,7 +42,8 @@ export function apply(ctx) {
     if (text.includes(SOCK) || text.includes('seal-sign.sock')) {
       return (
         `shell access to the sign socket is closed. Use the seal_sign tool to sign, ` +
-        `or seal_register_service to publish services — those calls are recorded in your session log; ` +
+        `seal_register_service to publish services, seal_connections to list installed connected-account grants, ` +
+        `or seal_connection_call to invoke a grant — those calls are recorded in your session log; ` +
         `a shell command is not.`
       )
     }

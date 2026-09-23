@@ -24,6 +24,10 @@ bridge,见 §13)。第四个 `claudecode`(CLI 型框架,
 §4–5(双 snapshot + 进化管线)。本文假设你已经知道 iData、role、
 watcher/uploader 循环是什么。
 
+可选的 owner 原生资源管理在框架接口之外实现 `studio.Provider`。
+路由、revision/checkpoint、生效方式、Prime session 以及已连接账号工具契约
+见 [STUDIO.zh.md](STUDIO.zh.md)。
+
 ---
 
 ## 1. 分工
@@ -826,7 +830,8 @@ Start 时落盘),跟本仓库为 prime-agent 自建 HTTP bridge 是同一件事�
    `DefaultResourceLoader` 那种"从文件追加到系统提示"的原生约定;它自己的
    `persona` 概念是插件组合里的一个**配置值**,那是这个 adapter 自己撰写的
    平台结构,不是 agent 状态。所以这个角色的字节靠 bridge 自己的代码
-   送到模型面前——boot 稳定之后调一次 `ctx.systemPrompt.section()`——而不是
+   送到模型面前——`ctx.systemPrompt.section()` 的 text 回调在每次 prompt
+   组装时重新读取文件,并保留现有 session——而不是
    经过 DSH 自己会读的某个文件。这也意味着跟 prime-agent 一样不需要剥
    marker:没有任何平台产出的文字会跟这个角色的字节共用一处。
 3. **`settings.yaml`** —— 推理路由 pin,沿用 DSH settings 文件的 YAML 形状
