@@ -45,6 +45,7 @@ without touching any crypto or chain code:
 | the agent-only sign socket (`/run/seal-sign.sock`) | surfacing runtime facts (sign socket path, public URL, chain identity) to the agent, in whatever way your framework consumes context |
 | drift detection (30s watcher) + wholesale `chain.Update` | deciding what counts as agent state (vs runtime noise) |
 | process supervision, restart backoff, attestor heartbeat | the owner-auth payload (`AuthResponse`) |
+| the owner's settings document: fetching it at `/provision`, parsing it, and re-resolving it against the live model catalog on every spawn | putting that resolved document where YOUR framework reads it (`RenderSettings`) |
 
 Your adapter never sees `agent_seal_priv`, never talks to the chain, and
 never encrypts anything. It converts between **canonical plaintext bytes**
@@ -54,15 +55,15 @@ native disk/memory state** — in both directions.
 ## 2. Where the seam is, exactly
 
 `framework.Framework` (in `internal/framework/framework.go`) is the
-contract. Four sealed components consume it, each through a narrow slice:
+contract. Five sealed components consume it, each through a narrow slice:
 
 | Consumer | Methods it calls | When |
 |---|---|---|
-| bootstrap (`main.go`) | `Roles`, `Defaults`, `Restore`, `RestoreEntry`, `HandleLegacy`, `EvolutionFor` (snapshot seeding) | once, Phase 3 |
-| manager (`internal/manager`) | `Start`, `Stop`, `Liveness`, `Readiness`, `MonitorExit` | Start once; probes every 5s; Stop/Start on restart & reload |
+| bootstrap (`main.go`) | `Roles`, `Defaults`, `Restore`, `RestoreEntry`, `HandleLegacy`, `SeededSettings` (optional), `EvolutionFor` (snapshot seeding) | once, Phase 3 |
+| manager (`internal/manager`) | `Start`, `Stop`, `Liveness`, `Readiness`, `MonitorExit`; `RenderSettings` indirectly, through `StartParams.PreStart` | Start once; probes every 5s; Stop/Start on restart & reload; **PreStart before every one of those spawns** |
 | watcher (`internal/watcher`) | `Roles`, `EvolutionFor` | every 30s tick |
 | uploader (`internal/uploader`) | `Roles`, `Defaults`, `EvolutionFor`, `LoadEntry` | on drift, inside `Apply` |
-| proxy (`internal/proxy`) | `AuthResponse` | on each verified `POST /_seal/auth` |
+| proxy (`internal/proxy`) | `AuthResponse`; `RenderSettings` again, through the appliers `main.go` registers | on each verified `POST /_seal/auth`; on each accepted `POST /_seal/settings` (owner) and `POST $SEAL_SIGN_SOCK/settings` (agent) |
 
 ### 2.1 What is abstract vs what still needs out-of-repo work
 
@@ -83,7 +84,8 @@ components hold only the interface (or a narrow subset of it) and need
   binary is one registration line in `main.go`.
 - **Per-framework behaviours** are optional capability interfaces the
   core type-asserts and degrades without (§2.2): version reconcile,
-  subprocess log page, settle delay. (Service exposure is NOT one of
+  subprocess log page, settle delay, legacy settings recovery. (Service
+  exposure is NOT one of
   these — it's a sealed platform capability now, not per-framework:
   agents register services via `POST $SEAL_SIGN_SOCK/services` and sealed
   routes + signs them through `/hello` and the proxy; adapters declare no
@@ -99,6 +101,17 @@ components hold only the interface (or a narrow subset of it) and need
   sealed image hash. Supporting a new framework in an ecosystem we already
   carry does not require a new image, just (optionally) one more warm-cache
   line; a new ecosystem does.
+
+- **The owner's configuration is core-owned end to end but the last
+  step.** attestor stores the owner's settings document as an opaque blob
+  and ships it down the `/provision` response, ECIES-encrypted to the same
+  container pubkey that already carries `agent_seal_priv`
+  (`internal/provision/provision.go`). `internal/settings` parses it into a
+  `Doc` and `settings.Resolve` adds what only the platform can know for this
+  boot — endpoint, output budget, whether the model takes a reasoning bound
+  (§5.5). The only framework-specific step left is `RenderSettings`, because
+  only your adapter knows your framework's dialect. Nothing about this is in
+  your adapter's `Roles()`.
 
   **Which adapter runs is still never decided by the image** — that is the
   on-chain binding's job (§2.1 above), and the sealed binary in every image
@@ -145,6 +158,7 @@ and degrades gracefully when absent):
 | `VersionReconciler` | `ReconcileFramework(ctx)` | drift handler, on `framework` role drift | drift is committed on chain as-is (audit stays honest, enforcement off) |
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | log page reports unavailable |
 | `SettleDelayer` | `SettleDelay()` | bootstrap baseline capture | conservative 5s default |
+| `LegacySettingsSeeder` *(transitional)* | `SeededSettings()` | bootstrap, right after the Phase C `HandleLegacy` round | an agent minted before the settings channel keeps no pin (§5.5, *Migration*) |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -169,7 +183,8 @@ persistent state that you own end-to-end. `Roles()` declares your set as
 Two shapes (`framework.Shape`):
 
 - **`Leaf`** — the role's on-chain iData points to one encrypted blob
-  whose plaintext IS the role's canonical bytes (e.g. a config JSON).
+  whose plaintext IS the role's canonical bytes (e.g. the `framework`
+  binding JSON, or hermes's `SOUL.md`).
 - **`DirectoryManifest`** — the iData points to an encrypted *manifest*
   (see §4) whose entries each point to their own encrypted content blob.
   Use this for anything directory-shaped or large: it buys per-entry
@@ -178,8 +193,26 @@ Two shapes (`framework.Shape`):
 Conventions and rules:
 
 - **Naming**: trailing `/` for manifest roles, no slash for leaves
-  (`workspace/skills/` vs `openclaw.json`). Informational only — `Shape`
+  (`workspace/skills/` vs `SOUL.md`). Informational only — `Shape`
   is authoritative — but follow it; tooling reads role names.
+- **Do not declare a role for your framework's config file.** No shipping
+  adapter does any more:
+
+  | Adapter | Roles | Config file, and where it comes from |
+  |---|---|---|
+  | openclaw (`openclaw.go:146`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
+  | hermes (`hermes.go:121`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
+  | prime-agent (`prime.go:135`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
+  | dsh (`dsh.go:145`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the bridge's process environment |
+
+  `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
+  roles until the owner's settings document became the pin's durable home.
+  Anchoring a derived artifact on chain hands a mint-time copy back to an
+  agent whose configuration has since changed, which is how every fix
+  shipped after mint — bounded reasoning, catalog budgets, the watchdog
+  headroom, the model idle timeout — stopped at the mint-time copy
+  (`openclaw/inference.go:14-30`). Rendering the file from the document on
+  every spawn makes the same fix reach every agent on its next Start.
 - **The `framework` role is protocol-reserved.** Every adapter must
   declare it as a `Leaf` whose plaintext is the binding JSON:
 
@@ -217,9 +250,9 @@ Conventions and rules:
 
 `Defaults(role)` returns the canonical **empty** plaintext: an empty
 manifest (`{"schema_version":1,"kind":"directory_manifest","entries":[]}`)
-for manifest roles, your natural zero value for leaves (openclaw returns
-`{}` for its config, the current binding for `framework`, `nil` where no
-default is meaningful).
+for manifest roles, your natural zero value for leaves (the current
+binding for `framework`; `nil` where no default is meaningful, as hermes
+returns for `SOUL.md` and prime for `harness_state.json`).
 
 The uploader enforces a two-way invariant with it:
 
@@ -328,7 +361,10 @@ requirements:
   into a managed file (logs, session caches, wizard flags), use an
   **allowlist** of identity-bearing keys, not a denylist — future
   framework versions will add keys you didn't anticipate, and each one
-  becomes phantom drift under a denylist.
+  becomes phantom drift under a denylist. This applies to a TRACKED role
+  that happens to be a key-filtered file (prime's `harness_state.json` is
+  the only one left); your framework's own config file is not a role at
+  all any more (§3, §5.5), so there is nothing to filter there.
 - **Cheap.** It runs every 30s per role; probe-heavy work should be
   cached or amortized.
 - Return `framework.ErrUnsupportedDim` for unknown roles (callers skip,
@@ -356,20 +392,28 @@ what the owner signs is what gets minted); the deploy client (SDK
 
 ```json
 {"system_prompt": "You are <name>. <description>\n",
- "inference": {"provider": "anthropic", "model": "claude-opus-4-6"}}
+ "inference": {"provider": "0g-compute", "model": "0gm-1.0-35b-a3b"}}
 ```
 
 — and the attestor never speaks any framework's config schema. Your
 adapter is the
-translator: map `system_prompt` and the inference pin onto your own
-path-driven artifacts (openclaw → SOUL.md + openclaw.json model/auth;
-the retired claudecode port → CLAUDE.md + settings.json `model`). An
-adapter that ignores
-`persona` silently drops the owner's mint-time prompt and model choice —
-the claudecode port shipped with exactly this bug before the rule was
-written down. If your framework can't honour part of the pin (e.g. a
-non-native inference provider), log it and keep your default rather than
-writing config your framework can't resolve.
+translator for the **`system_prompt` half**: map it onto your own
+path-driven artifact (openclaw → `SOUL.md`, hermes → `SOUL.md`, prime and
+dsh → `APPEND_SYSTEM.md`). An adapter that ignores `persona` silently drops
+the owner's mint-time prompt — the claudecode port shipped with exactly this
+bug before the rule was written down.
+
+The **`inference` half is no longer yours to persist.** The owner's settings
+document owns the pin (§5.5), and `RenderSettings` rebuilds the framework's
+configuration from it before every spawn, so anything an ingestion writes is
+overwritten moments later. Keeping a copy would only create a second source of
+truth, and the stale one wins on exactly the boots where the document is
+empty. prime and dsh therefore log the seed's pin and do not apply it
+(`prime/persona.go:108-129`, `dsh/persona.go:118-130`); openclaw and hermes
+still write it, which now matters only for an agent whose document carries no
+model (`hermes/ingest.go:51-55`). If your framework can't honour part of a
+seed, log it and keep your default rather than writing config your framework
+can't resolve.
 
 Note the asymmetry: ingested roles are read-only inputs. The uploader
 drops any chain entry outside `Roles()` from the next wholesale
@@ -377,7 +421,224 @@ drops any chain entry outside `Roles()` from the next wholesale
 chain at first drift-commit, leaving the path-driven roles as the
 durable form.
 
-### 5.5 Process lifecycle: `Start`, `Stop`, `Liveness`, `Readiness`, `MonitorExit`
+### 5.5 Settings: `RenderSettings`
+
+`RenderSettings(ctx, s settings.Resolved) error` puts the owner's
+configuration where THIS framework reads it — a config file for openclaw and
+hermes, the bridge process's environment for prime-agent and dsh (prime also
+writes a `models.json` provider registration, because that is the only way to
+register a provider its SDK has no built-in for). It is the one piece of the
+configuration channel that cannot be shared, because only your adapter knows
+your framework's dialect.
+
+**What you are handed.** `settings.Resolved` is the owner's document plus
+what the platform computed for this boot; none of the computed half is ever
+persisted, because a stored copy goes stale and then fights the computed
+value (`settings/settings.go` package doc).
+
+| Field | What it is |
+|---|---|
+| `s.Provider`, `s.Model`, `s.Thinking` | what the OWNER chose |
+| `s.Framework` (`json.RawMessage`) | the owner's opaque per-framework overlay; the platform never parses, validates, or promises to keep it working across a framework upgrade |
+| `s.Facts` (`inference.ModelFacts`) | what is true of the model whoever serves it: context window, output budget, whether it accepts `reasoning_effort`, and `CatalogSourced` |
+| `s.Endpoint` (`*inference.Endpoint`) | non-nil **only** when the platform routes this model; nil for a framework built-in, which brings its own wiring |
+| `s.APIKey` | this boot's inference credential; arrives by env, is never part of the document, is never persisted |
+
+The Facts/Endpoint split is load-bearing, and it is why a native provider now
+still gets a reasoning bound. The two used to share one struct behind a single
+`provider == "0g-compute"` check, so picking a native provider silently
+skipped the bound along with the endpoint wiring — hermes and dsh both did
+this (`inference/zgcompute.go:57-65`). Facts apply to every provider; only
+`Endpoint` is gated on routing.
+
+Two accessors carry the gating you must not re-invent:
+
+- `s.Effort() (level string, decided bool)` — **three outcomes, and
+  collapsing any two is a live bug.** `("high", true)`: apply this level.
+  `("", true)`: CLEAR any level, because the catalog says this model rejects
+  `reasoning_effort` and sending it is a hard 400. `("", false)`: LEAVE
+  whatever is there alone — the catalog was unreachable or silent, so the
+  platform knows nothing. Folding "unknown" into "clear" means an outage boot
+  strips the bound off an always-thinking model, which then reasons without
+  end and never writes a reply: measured live on glm-5.3 at 23k characters of
+  reasoning over ten minutes, zero visible output, stream killed upstream.
+- `s.PersistableMaxTokens() int` — 0 means "write nothing". It returns 0
+  whenever the facts are not catalog-sourced, because a heuristic 8192
+  written to disk during an outage looks hand-set forever after and starves a
+  reasoning model's shared thinking+reply budget (live on agent 404: three
+  ~6-minute turns, `textLen=0` — `prime/modelsjson.go:28-36`).
+
+#### Rule 1 — idempotent
+
+Same `Resolved` in, same bytes on disk out. The interface states the reason as
+the drift hash (`framework.go:169-174`): the watcher hashes every tracked
+role's canonical plaintext, and a non-deterministic render inside one would
+report drift on every 30s tick.
+
+None of the four bundled adapters renders into a tracked path today —
+`openclaw.json` sits beside `workspace/` rather than inside it, `config.yaml`
+is on hermes's explicit never-tracked list (`hermes/paths.go`), `models.json`
+sits under `primeHome` but under none of the tracked paths (`prime/paths.go`),
+and dsh renders to environment variables. So for today's adapters the rule is
+a standing guarantee for the first adapter that does render into a role, plus
+a plain operational one: the render runs on every spawn, and a file whose
+bytes differ boot to boot is a file nobody can reason about. Every bundled
+adapter tests it anyway (`TestRenderSettings_Idempotent` in openclaw and dsh,
+`TestRenderIdempotent` in hermes, `TestRenderSettingsIsIdempotent` in prime),
+including under a catalog outage (`TestRenderSettings_OutageRenderIsIdempotent`),
+because carrying facts forward must itself be a fixed point.
+
+#### Rule 2 — platform values win, and ordering is what makes them win
+
+Apply `s.Framework` **first**, then write the platform-owned keys over it:
+endpoint wiring, the effort bound, the output budget, and any credential or
+per-boot token.
+
+Ordering, not an exclusion list, is what stops an overlay disabling a platform
+protection — pinning a stale base URL, or turning off the reasoning bound the
+`Effort()` tri-state exists to protect. An exclusion list has to be maintained
+key by key, and the key it silently stops covering is the one added next. dsh
+states this plainly at its own merge site: today the ordering is
+belt-and-braces there, since `parseKnobs` reads only keys it knows and emits
+each under a fixed name, but the ordering is what keeps that true when a knob
+is added later, with nobody maintaining a list (`dsh/settings.go:settingsEnv`).
+
+The corollary the gating above forces: **a value the platform does not
+actually know is not written, and does not erase what is already on disk
+either.** Write a platform key from `Facts` only when `CatalogSourced`; carry
+the previous entry's value forward otherwise, and omit what has never been
+known so your framework applies its own default rather than a number sealed
+invented and left looking hand-set (`openclaw/inference.go:applyEndpointToConfig`).
+
+One more consequence of owning these bytes: **read your pin back from what
+you rendered, not from the file you wrote.** hermes's `Start` takes
+provider/model from the `Resolved` its render stashed and hard-fails if no
+render has run, because `config.yaml` stopped being a chain-tracked role and
+is now an artifact of this method — reading it back would let an agent edit
+re-point inference (`hermes/spawn.go:51-58`).
+
+#### Three things that must never come out of the owner's overlay
+
+1. **A per-boot credential the platform writes *after* the render.** openclaw
+   deletes `gateway` from the overlay outright and logs the drop
+   (`openclaw/inference.go:frameworkOverlay`). Ordering cannot protect that
+   key: `gateway.token` is minted at first Start and merged in by
+   `writeRuntimeSections`, which runs *after* RenderSettings, so a later
+   render that merged an owner-supplied `gateway` would overwrite the live
+   auth token instead of being overwritten by it. Ordering protects the keys
+   the render itself writes; for any key it does not write, drop it from the
+   overlay and say so in the log.
+2. **The inference credential.** hermes writes the key into `model.api_key`
+   on disk rather than by env, because its `custom` provider declares
+   `env_vars=()` and reads the key from nowhere else — injecting by env
+   produced a live 401 from the router, hermes having dialled it keyless
+   (`hermes/spawn.go:163-170`). The platform writes that key every render,
+   and **deletes** it when the document supplies none: without the delete, a
+   boot that switches to a framework built-in keeps the previous boot's 0G
+   router key on disk and hands it to whichever provider now owns the
+   section. The old capture-path defence is gone with the role — nothing
+   captures `config.yaml` any more, so the key cannot ride to chain and needs
+   no `stripSecrets` on the way out.
+3. **A provider block for a route the platform owns.** openclaw rewrites
+   `models.providers.<label>` unconditionally whenever `s.Endpoint != nil`,
+   and prunes the entries a previous pin left behind — precisely so the entry
+   can carry a fix shipped later. Both that prune and the retired
+   `healOpenclawConfig` only ever touch entries pointing at a 0g router base
+   URL ("not a sealed-written router pin — never touch"), which is exactly
+   why a hand-written entry under the same label escaped every heal that
+   shipped after it. An owner-declared provider of their own is legitimate
+   and deliberately left alone
+   (`TestRenderSettings_OwnerDeclaredProviderIsNotPruned`); an overlay entry
+   aimed at the route the platform is already configuring is not, because
+   the platform's fixes land in the platform's entry and never in theirs.
+
+#### Where it is called from
+
+- **`manager.StartParams.PreStart`, before EVERY spawn** — the initial Start,
+  `manager.Reload`, and each crash-restart attempt. `manager.preStart` is the
+  single call site all three paths share, "so none can be added later without
+  it" (`manager/manager.go:224-231`). A `PreStart` error aborts that start
+  exactly like a `Start` error. `main.go` points the hook at
+  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`, so
+  `Resolve` re-runs too and the endpoint, budget and reasoning flags come from
+  the live catalog each time.
+
+  It is a hook rather than a field on `RuntimeContext` because that struct is
+  captured at the initial Start and replayed verbatim afterwards: anything
+  carried in it is frozen for the container's life, and a change applied at
+  runtime is silently reverted by the next restart. That is exactly what
+  happened to the owner's thinking level, which used to ride
+  `RuntimeContext.OwnerThinking` (`manager/manager.go:105-118`). Re-rendering
+  on every start also makes the config file self-repairing: the platform owns
+  those bytes, so a file the agent corrupted is rebuilt instead of leaving the
+  agent unable to start.
+- **`POST /_seal/settings` (owner).** Owner-signed, and the POST's signature
+  is additionally bound to a sha256 of the body — without that the signature
+  attests only to who is calling, and anything able to alter the request in
+  flight could keep a valid signature while substituting a different document
+  (`proxy/settings.go`). `main.go` swaps the in-force document, renders, then
+  reloads; **a failed render rolls the swap back**, so a document that cannot
+  be rendered never becomes the one the next crash-restart would pick up.
+- **`POST $SEAL_SIGN_SOCK/settings` (agent).** Reachable only over the 0600
+  in-container unix socket, so no signature is involved — the socket is the
+  credential, the same basis on which it already hands out agentSeal
+  signatures. Same validation, same render, same reload, but **nothing is
+  persisted**: the change lasts this container's lifetime and the owner's
+  document comes back on the next restart. That asymmetry is what makes the
+  agent's access safe to grant, and it means an agent cannot configure itself
+  into a state it will not boot from. On a render error `main.go` immediately
+  re-renders the owner's document, so a rejected agent attempt cannot leave
+  the framework configured from a half-applied one.
+
+Because two of those three run before the process exists or while it is being
+replaced, **do not fail on anything the owner or the agent wrote.** An error
+on the PreStart path is not a rejected push, it is an agent that will not
+boot — and it keeps not booting, because the document that caused it is the
+one attestor stores. dsh takes every malformed overlay value back to the
+shipped default and logs it, one policy for out-of-range, wrong-typed, and
+not-an-object alike (`dsh/settings.go:parseKnobs`); openclaw sets an
+unparseable `openclaw.json` aside and rebuilds it rather than propagating the
+parse error, which used to be terminal *and* self-perpetuating — Start refuses
+to run without a successful render and nothing repaired the file, so the agent
+stayed offline until a container reset
+(`openclaw/inference.go:loadConfigForRender`). Reserve a hard error for
+something the *platform* got wrong: hermes returns one when a platform-routed
+endpoint speaks a wire format it cannot use, or when such an endpoint arrives
+with no credential — better than a 400 at first chat.
+
+#### Migration: `framework.LegacySettingsSeeder` (transitional)
+
+An agent minted before this channel existed carries its pin in the old chain
+role. That role is gone from `Roles()`, so bootstrap hands the surviving chain
+entry to `HandleLegacy` in round C (§5.4) — and the optional
+`SeededSettings() (settings.Doc, bool)` is how the adapter gives what it
+recovered back to the platform. `main.go` consults it **only** when the stored
+document names no model, so a real owner document always outranks a recovered
+one, and persists the result through `report.SeedSettings`
+(`main.go:583-608`).
+
+The timing is the whole point. The uploader rebuilds the chain entry list from
+`Roles()` and commits it wholesale, so the watcher's first tick drops the
+now-undeclared role. If the pin has not been read out and persisted by then it
+is gone — and two adapters hard-fail Start without one.
+
+`report.SeedSettings` is signed with the agentSeal, not the owner key, because
+no owner is present at boot. attestor therefore treats it as strictly weaker
+than an owner write: **seed only**, rejected on a row that already has
+settings. The container may recover a lost document; it must never be able to
+change one the owner authored (`report/report.go:66-85`). The call is
+best-effort — a failure is logged, the agent runs on the recovered pin either
+way, and the next boot retries.
+
+Exactly one adapter implements the interface today: dsh, for its retired
+`settings.yaml` role (`dsh/settings.go:280-332`). openclaw, hermes and prime
+do not, so a pre-channel agent on those three comes up on whatever document
+attestor already holds; prime's `HandleLegacy` says so in as many words and
+calls lifting those pins "the platform's job", not yet landed
+(`prime/persona.go:108-129`). Implement it if your framework ever had a
+chain-tracked pin; delete it once no live agent carries the old role.
+
+### 5.6 Process lifecycle: `Start`, `Stop`, `Liveness`, `Readiness`, `MonitorExit`
 
 `Start(ctx, rt RuntimeContext) (StartResult, error)` spawns your
 framework from previously-Restored state and returns
@@ -410,7 +671,7 @@ the same check as Liveness if your framework has no warm-up phase.
 
 `MonitorExit`: see §2.2.
 
-### 5.6 Owner auth: `AuthResponse`
+### 5.7 Owner auth: `AuthResponse`
 
 `proxy` handles the whole `/_seal/auth` verification (owner signs
 `0GSealAuth:0x<sealId>:<ts>` with EIP-191; proxy checks the recovered
@@ -435,8 +696,16 @@ boot (Phase 3 of main.go):
     SeedChainSnapshot(sha256(Defaults(role)))
   round C  per chain entry NOT in Roles():
     HandleLegacy(role, plaintext)
+  owner settings:
+    settings.Parse(/provision blob)    the document attestor stored
+    SeededSettings()                   optional; only if the document names no
+                                       model — recovers a pre-channel pin, which
+                                       main.go persists via report.SeedSettings
+                                       BEFORE the watcher's first tick drops the
+                                       stale role
   seed #1: EvolutionFor(role) ∀ roles  → currentSnapshot (pre-Start)
   manager.Start:
+    PreStart → RenderSettings(settings.Resolve(doc, apiKey))
     Start(ctx, RuntimeContext)         spawn; return once upstream listens
     MonitorExit(cb)                    arm death watcher
     Liveness(ctx) every 5s             probe loop begins
@@ -451,6 +720,15 @@ steady state:
                 uploader.Apply: Defaults()/LoadEntry() as needed → one chain.Update
   on death    MonitorExit fires: non-nil err ⇒ restart (Stop+Start w/ backoff);
               nil ⇒ wait for Liveness verdict
+  every spawn manager.preStart → RenderSettings  (initial, Reload, crash-restart;
+              settings.Resolve re-runs, so endpoint/budget/reasoning flags come
+              from the live catalog each time)
+  on POST /_seal/settings (owner-signed, body-bound)
+              swap document → RenderSettings → manager.Reload
+              (render fails ⇒ swap rolled back, nothing persisted)
+  on POST $SEAL_SIGN_SOCK/settings (agent)
+              RenderSettings → manager.Reload; NOT persisted — the owner's
+              document returns on the next restart
   on /_seal/auth (verified)  AuthResponse(ctx)
 ```
 
@@ -465,15 +743,29 @@ fallback.
 
 | Field | Contents | Notes |
 |---|---|---|
-| `APIKey` | inference provider key from the deploy envelope | translate to your framework's expected env var(s) |
 | `PublicURL` | `http://8080-<sandboxId>.<proxyDomain>` | empty in local dev; surface it to the agent (env / file / config) so it knows its own address |
 | `SealSignSock` | `/run/seal-sign.sock` | the agent-only sign endpoint (§8); tell your agent where it is |
 | `AgentSeal` | 0x address derived from `agent_seal_priv` | the agent's TEE identity address |
-| `AgentID`, `Owner`, `ChainRPC`, `ContractAddr`, `AttestorURL` | chain bootstrap outputs | public on-chain facts, not secrets; inject into the agent's context so it can reason about its own identity |
-| `Provider`, `Model`, `ZGComputeRouted` | resolved inference routing | filled in by the adapter's own Start path today (openclaw `spawn.go`) |
+| `AgentID`, `Owner`, `ChainRPC`, `ContractAddr`, `ChainID`, `AttestorURL` | chain bootstrap outputs | public on-chain facts, not secrets; inject into the agent's context so it can reason about its own identity |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
+| `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
 
-What to *do* with these is adapter policy, but the openclaw adapter is
+**What is deliberately NOT here: configuration.** `RuntimeContext` is captured
+at the initial Start and replayed verbatim on every restart, so anything
+carried in it is frozen for the container's life and a change applied at
+runtime is silently reverted by the next restart — which is what happened to
+the owner's thinking level while it rode `RuntimeContext.OwnerThinking`
+(`manager/manager.go:105-118`). The owner's document reaches your adapter
+through `RenderSettings`, re-rendered before every spawn (§5.5).
+
+Five fields are left over from before that split and nothing in the shipping
+tree populates or reads them any more: `APIKey`, `Provider`, `Model`,
+`ZGComputeRouted` and `OwnerThinking` are declared in the struct but dead.
+Take the credential and the pin from `settings.Resolved` instead — reading
+`RuntimeContext.APIKey` is the defect that dialled a platform-routed endpoint
+keyless and 401'd live (`openclaw/spawn.go:253-259`, `dsh/spawn.go:222-225`).
+
+What to *do* with the rest is adapter policy, but the openclaw adapter is
 the reference: it injects marker-wrapped sections into the agent's
 context files — identity facts (IDENTITY), sign-refusal doctrine (SOUL),
 sign-socket usage + public URL (TOOLS) — and passes a small env allowlist
@@ -494,7 +786,7 @@ You get these for free; design your framework's surface assuming them:
   `data_hashes`, `public_url`, and the agent-declared service list (built
   from sealed's service registry — agents register via
   `POST $SEAL_SIGN_SOCK/services`, not a per-framework manifest file).
-- **`POST /_seal/auth`** — the owner-auth flow of §5.6.
+- **`POST /_seal/auth`** — the owner-auth flow of §5.7.
 - **`unix:///run/seal-sign.sock`** — `POST /sign/personal_sign`,
   `/sign/typed_data`, `/sign/transaction`; container-local only. This is
   how the agent signs as its AgentSeal identity without ever holding the
@@ -519,13 +811,20 @@ into either an infinite re-upload loop or silent identity divergence.
 - [ ] Manifest output is empty-ptr, entries sorted by path, dir entries via deterministic tar.gz.
 - [ ] `LoadEntry` bytes hash to the `content_hash` `EvolutionFor` declared.
 - [ ] Everything the platform/runtime injects into managed files is marker-wrapped and stripped before hashing.
-- [ ] Managed config uses a key allowlist; framework-owned runtime keys never enter the plaintext.
+- [ ] Any tracked role whose plaintext is a key-filtered file uses a key allowlist, not a denylist (prime's `harness_state.json` is the last one; config files are no longer roles at all).
+- [ ] No role is declared for your framework's config file, and nothing `RenderSettings` writes is inside a tracked path.
+- [ ] `RenderSettings` is idempotent — the same `Resolved` rendered twice yields byte-identical output, including on a catalog-outage boot.
+- [ ] `RenderSettings` merges the owner's `framework` overlay FIRST and writes platform-owned keys over it; no platform value is defended by an exclusion list.
+- [ ] `RenderSettings` never returns an error for anything the owner or the agent wrote — it runs before every spawn, so an error there is an agent that will not boot.
+- [ ] A platform key is written only when the platform knows it: `Effort()`'s three outcomes stay three, and `PersistableMaxTokens() == 0` means write nothing rather than write a guess.
+- [ ] A per-boot credential, and any provider block the platform owns, cannot be supplied through the overlay.
+- [ ] `Start` takes the pin from what `RenderSettings` stashed, never by re-parsing the file it wrote.
 - [ ] Restore calls commute across roles and are idempotent per role.
 - [ ] `HandleLegacy` is idempotent and never errors on unknown roles.
 - [ ] `Start` returns only after upstream accepts connections; restart never redoes first-boot work or clobbers agent self-modifications.
 - [ ] `Stop` leaves no orphan holding the upstream port.
 - [ ] `MonitorExit` fires exactly once per spawned process; exit-0 is not treated as a crash by your code (the manager handles it).
-- [ ] `FrameworkFacts()` returns a non-empty `Tracked` set — the agent is told where its durable state persists (§11 step 9).
+- [ ] `FrameworkFacts()` returns a non-empty `Tracked` set — the agent is told where its durable state persists (§11 step 10).
 
 ## 10. Testing your adapter
 
@@ -550,7 +849,7 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-Every bundled adapter runs it (`openclaw/`, `hermes/`, `prime/`
+Every bundled adapter runs it (`openclaw/`, `hermes/`, `prime/`, `dsh/`
 `conformance_test.go`; the retired claudecode port ran it too); its first
 run against openclaw immediately caught two real bugs (§12), so treat a
 red conformance test as a production incident you got for free. It is
@@ -566,11 +865,24 @@ Two hard-won rules the suite enforces structurally:
   byte-identically against `EvolutionFor` output, so write them in your
   adapter's canonical encoding (compact JSON, sorted keys).
 
+**The conformance suite does not cover `RenderSettings`** — it exercises the
+role pipeline only, which is a pure function of disk state, while a render
+depends on the live router catalog. Test it yourself, and test it against a
+real outage rather than a stub return: the openclaw suite points the catalog
+at a server that 500s (`inference.SetCatalogURLForTest`) so
+`settings.Resolve` produces the genuine outage shape — heuristic facts,
+`CatalogSourced=false`, an undecided `Effort()` — because the defect it guards
+against lived in the seam between the two, not in either half
+(`openclaw/inference_resilience_test.go`).
+
 Beyond conformance, add adapter-specific tests for: injection strip
 round-trip (inject, then assert `EvolutionFor` and `LoadEntry` outputs
 unchanged — see `platform/markers_test.go` and openclaw's
-`evolution_paths_test.go`), allowlist
-filtering of secret-bearing keys, and foreign-binding rejection.
+`evolution_paths_test.go`); render idempotence, including across an outage;
+the overlay rules — a platform key survives an overlay that contradicts it, an
+overlay sibling survives the platform's pin, and a key the owner REMOVES from
+the document leaves disk while an agent's later edit of that same key does
+not; and foreign-binding rejection.
 
 Wire your adapter into the real loop locally by running sealed without
 `ATTESTOR_URL` (it serves `/healthz` + `/log` and skips
@@ -578,6 +890,19 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
 [ARCHITECTURE.md](ARCHITECTURE.md) §8 for the env surface.
 
 ## 11. Porting checklist
+
+Four obligations this list used to carry are gone, and they went together
+because they were all consequences of one decision — that the framework's
+config file was a chain role:
+
+| No longer your job | Why it disappeared |
+|---|---|
+| Decide where the model pin durably lives | The owner's settings document is its home, stored by attestor and delivered on every boot (§5.5). You render from it; you persist nothing. |
+| Define a config-key allowlist so framework bookkeeping stays out of the plaintext | There is no plaintext: the file is not a role, so nothing about it is hashed, uploaded, or anchored. |
+| Wire the owner's thinking level through `Start` | `Resolved.Effort()` hands you the bound, for every provider, on every render. |
+| Strip secrets on the capture path | Nothing captures the file, so a credential in it cannot reach chain. Both `stripSecrets` implementations are deleted, and so are `healOpenclawConfig` and `backfillMaxTokens` — retrofits that existed only to heal a restored mint-time copy. |
+
+The one obligation that replaced all four is step 4.
 
 1. Implement `framework.Framework` + `MonitorExit` in
    `internal/framework/<yourfw>/`, self-registering via
@@ -588,18 +913,29 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    but note §12's caveat: a per-request CLI can't host public services.
 2. Declare your role set, including the reserved `framework` leaf (with
    the empty-version → whitelistMax rule); decide Leaf vs
-   DirectoryManifest per role.
+   DirectoryManifest per role. **Do not declare one for your config
+   file** (§3) — that file is an output of step 4, not agent state.
 3. Implement `HandleLegacy["persona"]` — the mandatory protocol seed
-   translation (§5.4).
-4. Implement the optional capability interfaces that apply (§2.2) — at
+   translation of the `system_prompt` half (§5.4). Log the seed's
+   `inference` half rather than persisting it.
+4. Implement `RenderSettings` (§5.5): place `settings.Resolved` where your
+   framework reads it, idempotently, owner overlay first and platform keys
+   over it. Keep per-boot credentials and platform-owned provider blocks out
+   of the overlay, gate every platform key on the platform actually knowing
+   the value, and never return an error for owner- or agent-authored input.
+   If your framework ever had a chain-tracked pin, also implement the
+   transitional `framework.LegacySettingsSeeder` so a pre-channel agent's pin
+   is recovered before the watcher drops the old role.
+5. Implement the optional capability interfaces that apply (§2.2) — at
    minimum `VersionReconciler` + a version allowlist if your framework is
    package-manager-installable, with compile-time assertions. CLI shims
    go `go:embed` in your package, materialized at Start — never baked
    into the image.
-5. Run the conformance suite (§10) with fixtures for every role; add the
-   injection-strip, secrets-filtering, persona-ingestion, and
+6. Run the conformance suite (§10) with fixtures for every role; add the
+   render tests conformance does not cover (idempotence, catalog outage,
+   overlay ordering), plus the injection-strip, persona-ingestion, and
    version-less-binding tests.
-6. If your framework is npm-installable, optionally add one warm-cache
+7. If your framework is npm-installable, optionally add one warm-cache
    line to `images/sealed/Dockerfile`; either way the universal image
    rebuild's hash goes through the attestor allowlist process. A new
    runtime ecosystem (Python, JVM) is the only thing that structurally
@@ -608,35 +944,42 @@ provision/bootstrap) or against the 0G testnet with a dev sandbox — see
    FROM the openclaw base image (`images/openclaw/`), not the universal
    one; `images/sealed/` is the universal-image target this instruction
    is scoped to, and applies once your deployment ships it as the base.)
-7. Add your framework's name to attestor's supported-names list so
+8. Add your framework's name to attestor's supported-names list so
    deploys can select it — attestor treats the name as an opaque string
    (validated pre-mint, written into the version-less binding, listed in
    the UI) and needs no other change (this repo's `attestor/`).
-8. Install a sign-refusal doctrine equivalent to openclaw's SOUL section
+9. Install a sign-refusal doctrine equivalent to openclaw's SOUL section
    (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md)) so the sign socket isn't
    an open signer for prompt-injected requests. With the shared
    `platform.Build` content this is one delivery function (see the
    retired `claudecode/claudemd.go` in git history — CLAUDE.md got the
    whole PlatformContext as a single marker section).
-9. Fill in your framework's OWN facts via the required `FrameworkFacts()`
-   method — VALUES, not prose. `platform.RenderFrameworkFacts` owns every
-   sentence of platform mechanics (sealing, gas, version reconcile, config
-   drift) and renders them identically for every framework; you return a
-   `platform.FrameworkFacts` struct filling only what differs by framework:
-   `Home`, `Tracked`/`Untracked` paths (each with a note), `DurableHints`,
-   the version whitelist + `ReconcileHow` command, `ConfigFile` +
-   `ConfigKeys`. `platform.AssembleAgentDoc(pc, facts)` splices the platform
-   halves with your rendered facts — single-file frameworks (hermes) inject
-   the whole result into one context file; openclaw distributes the platform
-   halves across IDENTITY/SOUL/TOOLS but sources its facts through the same
-   method (`platform.RenderFrameworkFacts`). conformance's
-   `FrameworkFactsNonEmpty` fails the build if you leave it empty. This is
-   skip-proof by construction: the platform-mechanics prose isn't yours to
-   write, so you can neither restate a mechanism wrong nor silently omit one
-   — the gap that once let a fresh hermes agent write memory to an untracked
-   path. openclaw's and hermes's fill-in live in their `platformtext.go`; the
-   rendered template with `()` blanks is [AGENT_BIBLE.md](AGENT_BIBLE.md).
-10. **SECURITY — audit any control/management UI before declaring a route
+10. Fill in your framework's OWN facts via the required `FrameworkFacts()`
+    method — VALUES, not prose. `platform.RenderFrameworkFacts` owns every
+    sentence of platform mechanics (sealing, gas, version reconcile, config
+    drift) and renders them identically for every framework; you return a
+    `platform.FrameworkFacts` struct filling only what differs by framework:
+    `Home`, `Tracked`/`Untracked` paths (each with a note), `DurableHints`,
+    the version whitelist + `ReconcileHow` command, and — only if one of your
+    TRACKED roles is a key-filtered file — `ConfigFile` + `ConfigKeys`, which
+    render the "considers only these top-level keys" paragraph. Prime's
+    `harness_state.json` is the last user of that pair; openclaw, hermes and
+    dsh leave it empty and instead list their rendered config file under
+    `Untracked`, telling the agent in as many words that the platform
+    rewrites those keys every boot and that nothing in the file survives a
+    container reset (`openclaw/platformtext.go:35`).
+    `platform.AssembleAgentDoc(pc, facts)` splices the platform
+    halves with your rendered facts — single-file frameworks (hermes) inject
+    the whole result into one context file; openclaw distributes the platform
+    halves across IDENTITY/SOUL/TOOLS but sources its facts through the same
+    method (`platform.RenderFrameworkFacts`). conformance's
+    `FrameworkFactsNonEmpty` fails the build if you leave it empty. This is
+    skip-proof by construction: the platform-mechanics prose isn't yours to
+    write, so you can neither restate a mechanism wrong nor silently omit one
+    — the gap that once let a fresh hermes agent write memory to an untracked
+    path. openclaw's and hermes's fill-in live in their `platformtext.go`; the
+    rendered template with `()` blanks is [AGENT_BIBLE.md](AGENT_BIBLE.md).
+11. **SECURITY — audit any control/management UI before declaring a route
     for it.** `FrameworkRoutes` decides what the sealed proxy exposes to a
     token-bearing owner. Declare ONLY constrained, semantically-narrow
     surfaces (a chat API is the safe default — it can't shell or read
@@ -766,7 +1109,12 @@ parts of it:
     the verifiable-inference trust layer for this framework. The base
     URL is chain-tracked through an env sub-allowlist (routing is
     identity, auditable), while credentials stay in the sandbox env and
-    never reach chain plaintext.
+    never reach chain plaintext. *(The chain-tracked half of that was
+    reversed later: routing is configuration, not identity, and lives in
+    the owner's settings document — see §5.5. The env sub-allowlist went
+    with the role. Credentials still never reach chain, now because
+    nothing captures the config file at all rather than because a strip
+    removed them on the way out.)*
 19. Item 18's ecosystem shift promptly broke the openclaw adapter live
     (its 0g augmentation hardcoded the OpenAI wire format; claude-* is
     Anthropic-format-only on the router → deploy green, first inference
@@ -874,14 +1222,17 @@ watcher, so the port is worth recording.
    bridge (embedding the SDK, `go:embed`ed in the sealed binary). Writing the
    bridge means the public surface is a *whitelist by construction* — one
    OpenAI-shaped chat endpoint — instead of a built-in dashboard whose every
-   endpoint has to be audited for shell/file/exec reach (§11 step 10). A
+   endpoint has to be audited for shell/file/exec reach (§11 step 11). A
    framework that hands you its own control UI is the harder case, not the
    easier one.
 4. **Prefer a runtime-key API over config-file secrets.** The SDK accepts the
    inference key via `authStorage.setRuntimeApiKey()`, documented as not
-   persisted. So unlike hermes (`api_key` lands in `config.yaml` and must be
-   stripped before iData) there is no secret to strip, because none is ever
-   written.
+   persisted, so no secret is ever written to disk. *(The contrast this
+   finding drew — hermes's `api_key` landing in `config.yaml` and needing a
+   strip before iData — no longer exists: `config.yaml` stopped being a role
+   when the settings channel landed, so nothing captures it and both
+   `stripSecrets` implementations are deleted. The preference still stands on
+   its own merits; the iData argument for it is spent.)*
 5. **The state half can ship before the process half.** Roles, canonicalization,
    Defaults and FrameworkFacts were finished and fully green under the
    conformance suite with the framework not installed at all — the invariants
@@ -912,6 +1263,16 @@ watcher, so the port is worth recording.
     entry instead. The bridge logs the resolved provider/model at startup so
     `/log/agent` shows which path was taken — the failure mode this guards
     against is §12 finding 19's "deploy green, first inference 400".
+    **Answered, live on 0G Galileo (2026-08-13): the env vars are ignored.**
+    Setting `OPENAI_BASE_URL` leaves the request going to `api.openai.com`
+    with the router's key, which returns 401 "incorrect API key" — a
+    credential-shaped error hiding a routing cause. A `models.json` provider
+    entry is the only way to register a provider the SDK has no built-in for,
+    and it also carries the flags that let the SDK put `reasoning_effort` on
+    the wire at all. That file is no longer a chain role: `RenderSettings`
+    rebuilds it from the owner's document before every spawn, and writes it
+    only when the platform actually routes the model
+    (`prime/modelsjson.go:15-60`).
 
 **A mistake worth recording — check which artifact carries which half.**
 The first version of this port installed the framework from npm
@@ -958,9 +1319,10 @@ it lives in the sealed-owned bridge (`bridge/bridge.mjs`, go:embed'd,
 materialized at Start), the same way this repo already ships the prime-agent
 bridge. The state half — `Roles`, `Defaults`, `Restore`/`EvolutionFor`,
 `HandleLegacy["persona"]`, `FrameworkFacts` — is green under
-`conformance.Run` plus adapter-specific tests for secret-stripping and
-persona ingestion (the same in-memory-pin regression test §13 describes for
-prime-agent, guarding `settings.yaml` instead of `models.json`).
+`conformance.Run` plus adapter-specific tests for persona ingestion and, since
+the settings channel landed, for the render itself
+(`dsh/settings_test.go`: idempotence, overlay parsing, and recovery of the
+retired role's pin).
 
 **Role set, and the reasoning distinct from the other three adapters:**
 
@@ -977,21 +1339,25 @@ prime-agent, guarding `settings.yaml` instead of `models.json`).
    boot settles — never through a file DSH itself reads. That
    also means, like prime-agent, no marker stripping is needed: nothing
    platform-authored ever shares this role's bytes.
-3. **`settings.yaml`** — the inference route pin, kept in DSH's settings-file
-   YAML shape (`$DSH_HOME/settings.yaml`). Note the bridge deliberately does
-   NOT mount `@deepseek-ai/dsh-settings-file` (its hot-reload would layer
-   this file over the composition, letting an agent edit inject an arbitrary
-   inference route) — the adapter reads the pin itself and passes it to the
-   bridge as env; DSH never reads the file. This is the
-   `models.json`/`config.yaml` role again, for the same reason: the mint-time
-   `persona` seed disappears from chain at the first drift commit, so the pin
-   needs a path-driven, durable home. Wire form is canonical JSON; on-disk
-   form is YAML — the
-   same split hermes's `config.yaml` uses (`yamlio.go`), reused here rather
-   than invented fresh. `apiKeyEnv` names an environment variable, never a
-   literal key, and `stripSecrets` deletes any `apiKey`/`api_key` that
-   reaches the file anyway, defense in depth against a future
-   settings-writing tool (this adapter's own writer never produces one).
+3. **No config role at all** — and this adapter is where that became the
+   rule. It used to declare `settings.yaml`, the inference route pin in DSH's
+   own settings-file YAML shape, for the reason `models.json` and
+   `config.yaml` existed: the mint-time `persona` seed disappears from chain
+   at the first drift commit, so the pin needed a path-driven durable home.
+   The owner's settings document is a better one (§5.5), so the role is gone
+   and with it the file — nothing writes `$DSH_HOME/settings.yaml`, nothing
+   reads it, and `stripSecrets` and the JSON/YAML wire split it needed are
+   deleted. The bridge still deliberately does not mount
+   `@deepseek-ai/dsh-settings-file`, whose hot-reload would layer that file
+   over the composition and let an agent edit inject an arbitrary inference
+   route; the security property is unchanged, there is simply nothing left
+   for it to protect. "Where this framework reads its settings" is now the
+   bridge process's ENVIRONMENT: `RenderSettings` computes those variables
+   deterministically and `Start` hands them to the process it spawns
+   (`dsh/settings.go:15-34`). The one remaining trace is the CHAIN entry an
+   agent minted while the role existed still carries, which `HandleLegacy`
+   reads the pin out of exactly once — this adapter is the only implementor
+   of `framework.LegacySettingsSeeder` (§5.5).
 4. **`skills/`** — `DirectoryManifest` over `$DSH_HOME/skills/`, DSH's own
    rank-400 ("user-dsh") skill discovery root (`docs/subsystems/skills.md`).
    Unlike prime-agent's Python-package skills (directories only), DSH skills
@@ -1019,7 +1385,7 @@ hermes track; DSH's own harness code stays untracked and confined to one
 container's lifetime, which costs nothing beyond that one capability DSH
 happens to expose that the others don't.
 
-**What a per-endpoint audit found on DSH's own web app (§11 step 10).** DSH
+**What a per-endpoint audit found on DSH's own web app (§11 step 11).** DSH
 ships a full dashboard (`apps/web`) with a file browser and a settings page
 that can disable any composition plugin — including the one this
 adapter registers for doctrine injection — from the UI, bypassing the agent entirely.

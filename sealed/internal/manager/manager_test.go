@@ -10,6 +10,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/platform"
+	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 )
 
@@ -30,11 +31,11 @@ type fakeAdapter struct {
 	exitCB func(err error)
 }
 
-func (f *fakeAdapter) Name() string                                            { return "fake" }
+func (f *fakeAdapter) Name() string { return "fake" }
 func (f *fakeAdapter) FrameworkFacts() platform.FrameworkFacts {
 	return platform.FrameworkFacts{Home: "~/.fake/", Tracked: []platform.PathNote{{Path: "~/.fake/state", Note: "fake"}}}
 }
-func (f *fakeAdapter) Version(ctx context.Context) (string, error)             { return "1.0", nil }
+func (f *fakeAdapter) Version(ctx context.Context) (string, error) { return "1.0", nil }
 func (f *fakeAdapter) Roles() []framework.RoleSpec {
 	return []framework.RoleSpec{{Name: "config", Shape: framework.Leaf}}
 }
@@ -50,8 +51,10 @@ func (f *fakeAdapter) LoadEntry(context.Context, string, string) ([]byte, error)
 func (f *fakeAdapter) RestoreEntry(context.Context, string, string, []byte) error {
 	return framework.ErrUnsupportedDim
 }
-func (f *fakeAdapter) Readiness(ctx context.Context) error                           { return nil }
-func (f *fakeAdapter) AuthResponse(ctx context.Context) (any, error)                 { return map[string]any{}, nil }
+func (f *fakeAdapter) Readiness(ctx context.Context) error           { return nil }
+func (f *fakeAdapter) AuthResponse(ctx context.Context) (any, error) { return map[string]any{}, nil }
+
+func (f *fakeAdapter) RenderSettings(context.Context, settings.Resolved) error { return nil }
 
 func (f *fakeAdapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
 	atomic.AddInt32(&f.startCalls, 1)
@@ -307,5 +310,72 @@ func TestStop_HaltsLivenessLoop(t *testing.T) {
 	post := atomic.LoadInt32(&probeCount)
 	if post-prev > 1 {
 		t.Errorf("liveness loop kept probing after Stop: prev=%d post=%d", prev, post)
+	}
+}
+
+// PreStart must run before EVERY spawn, not just the first. Anything that
+// only runs on the initial Start is frozen at container boot — which is how
+// the owner's thinking level used to get reverted by the next harness
+// restart, since it rode the replayed RuntimeContext.
+func TestPreStartRunsBeforeEveryStart(t *testing.T) {
+	fake := &fakeAdapter{}
+	agent := state.New()
+	m := New(fake, agent, Config{MaxRetries: 1, LivenessProbeInterval: time.Hour})
+
+	var calls int
+	var order []string
+	fake.startFn = func(framework.RuntimeContext) (framework.StartResult, error) {
+		order = append(order, "start")
+		return framework.StartResult{Upstream: "http://127.0.0.1:0"}, nil
+	}
+
+	err := m.Start(context.Background(), StartParams{
+		PreStart: func(context.Context) error {
+			calls++
+			order = append(order, "pre")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := m.Reload(context.Background()); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+
+	if calls != 2 {
+		t.Fatalf("PreStart ran %d times, want 2 (initial + reload)", calls)
+	}
+	want := []string{"pre", "start", "pre", "start"}
+	if len(order) != len(want) {
+		t.Fatalf("call order = %v, want %v", order, want)
+	}
+	for i := range want {
+		if order[i] != want[i] {
+			t.Fatalf("call order = %v, want %v — PreStart must precede each spawn", order, want)
+		}
+	}
+}
+
+// A failing PreStart must abort the start rather than spawning against a
+// configuration that was never rendered.
+func TestPreStartFailureAbortsStart(t *testing.T) {
+	fake := &fakeAdapter{}
+	m := New(fake, state.New(), Config{MaxRetries: 1, LivenessProbeInterval: time.Hour})
+
+	started := false
+	fake.startFn = func(framework.RuntimeContext) (framework.StartResult, error) {
+		started = true
+		return framework.StartResult{Upstream: "http://127.0.0.1:0"}, nil
+	}
+
+	err := m.Start(context.Background(), StartParams{
+		PreStart: func(context.Context) error { return errors.New("render failed") },
+	})
+	if err == nil {
+		t.Fatal("expected Start to fail when PreStart does")
+	}
+	if started {
+		t.Fatal("adapter.Start must not run after a failed PreStart")
 	}
 }

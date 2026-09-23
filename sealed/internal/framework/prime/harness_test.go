@@ -173,8 +173,10 @@ func TestRestoreFramework_VersionResolution(t *testing.T) {
 	}
 }
 
-// HandleLegacy("persona") must land the system prompt in APPEND_SYSTEM.md and
-// record the inference pin, and must never error on an unknown role.
+// HandleLegacy("persona") must land the system prompt in APPEND_SYSTEM.md, and
+// must never error on an unknown role. The seed's inference pin is REPORTED to
+// the platform (seedFromPersona → SeededSettings) rather than written to disk —
+// persona_legacy_test.go owns that half; this test owns the prompt half.
 func TestHandleLegacyPersona(t *testing.T) {
 	primeHome = t.TempDir()
 	a := New()
@@ -192,10 +194,6 @@ func TestHandleLegacyPersona(t *testing.T) {
 	if string(content) != "You are Ada. A careful assistant.\n" {
 		t.Errorf("persona not ingested: %q", content)
 	}
-	if a.personaProvider != "0g-compute" || a.personaModel != "0gm-1.0-35b-a3b" {
-		t.Errorf("inference pin not recorded: %s/%s", a.personaProvider, a.personaModel)
-	}
-
 	if err := a.HandleLegacy(ctx, "totally-unknown", []byte("x")); err != nil {
 		t.Errorf("HandleLegacy(unknown) = %v, want nil (log-and-ignore)", err)
 	}
@@ -238,80 +236,3 @@ func TestEvoSkills_SkipsDotDirs(t *testing.T) {
 }
 
 func contains(haystack, needle string) bool { return strings.Contains(haystack, needle) }
-
-// The bug this guards: `persona` is a mint-time seed that leaves the chain at
-// the first drift commit, so an inference pin kept only in memory is gone on
-// every later boot. HandleLegacy must land it in the tracked models.json, and it
-// must survive a fresh adapter that never sees persona again.
-func TestPersonaPinIsDurable(t *testing.T) {
-	primeHome = t.TempDir()
-	ctx := context.Background()
-
-	seed := []byte(`{"system_prompt":"You are Ada.\n","inference":{"provider":"0g-compute","model":"glm-5.2"}}`)
-	if err := New().HandleLegacy(ctx, "persona", seed); err != nil {
-		t.Fatalf("HandleLegacy(persona): %v", err)
-	}
-
-	// A NEW adapter — as after a container rebuild, where persona is no longer on
-	// chain and HandleLegacy never runs — must still find the pin.
-	provider, model := readPin()
-	if provider != "0g-compute" || model != "glm-5.2" {
-		t.Fatalf("pin not durable: got %q/%q, want 0g-compute/glm-5.2", provider, model)
-	}
-
-	// And it must be a tracked role, so it actually reaches chain.
-	out, err := New().EvolutionFor(ctx, "models.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor(models.json): %v", err)
-	}
-	if !contains(string(out), `"glm-5.2"`) || !contains(string(out), "router-api.0g.ai") {
-		t.Errorf("models.json does not carry the pin: %s", out)
-	}
-	// The credential is referenced by env-var NAME, never embedded.
-	if !contains(string(out), apiKeyEnvRef) {
-		t.Errorf("apiKey should reference %s, got: %s", apiKeyEnvRef, out)
-	}
-}
-
-// models.json is chain-tracked, so agents minted before modelEntry.MaxTokens
-// existed restore a copy without it and fall back to the SDK's 16384 default —
-// fatal for reasoning models, whose thinking shares the output budget (live:
-// glm-5.3, ~6min of reasoning, empty visible reply). Start's backfill must
-// fill the field from the catalog exactly once and leave existing values —
-// the agent's own edits included — alone.
-func TestBackfillMaxTokens(t *testing.T) {
-	primeHome = t.TempDir()
-	ctx := context.Background()
-
-	legacy := []byte(`{"providers":{"0g-compute":{"baseUrl":"https://router-api.0g.ai/v1","api":"openai-completions","apiKey":"SEAL_MODEL_API_KEY","authHeader":true,"models":[{"id":"glm-5.3"}]}}}`)
-	if err := os.WriteFile(modelsJSONPath(), legacy, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	backfillMaxTokens(ctx)
-	provider, model := readPin()
-	if provider != "0g-compute" || model != "glm-5.3" {
-		t.Fatalf("backfill corrupted the pin: %q/%q", provider, model)
-	}
-	raw, _ := os.ReadFile(modelsJSONPath())
-	var cfg modelsConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		t.Fatalf("backfilled file unparseable: %v", err)
-	}
-	got := cfg.Providers["0g-compute"].Models[0].MaxTokens
-	if got <= 0 {
-		t.Fatalf("maxTokens not backfilled: %d", got)
-	}
-
-	// Idempotent + non-clobbering: a hand-set value survives another Start.
-	cfg.Providers["0g-compute"].Models[0].MaxTokens = 1234
-	if err := writeModelsJSON(cfg); err != nil {
-		t.Fatal(err)
-	}
-	backfillMaxTokens(ctx)
-	raw, _ = os.ReadFile(modelsJSONPath())
-	_ = json.Unmarshal(raw, &cfg)
-	if cfg.Providers["0g-compute"].Models[0].MaxTokens != 1234 {
-		t.Fatalf("backfill clobbered an existing value: %d", cfg.Providers["0g-compute"].Models[0].MaxTokens)
-	}
-}

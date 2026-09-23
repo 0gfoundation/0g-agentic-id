@@ -9,8 +9,9 @@
 // bridge (bridge/bridge.mjs), embedded via go:embed and materialized at
 // Start, and New() self-registers so an on-chain "dsh" binding selects it.
 // The composition is authored IN the bridge (not a loader/profile/cordis.yml
-// and not any $DSH_HOME patch layer), so it rides the image hash and an agent
-// editing its home cannot alter what mounts next boot. Like prime-agent, the
+// and not any $DSH_HOME patch layer), so the plugin SET rides the image hash
+// and an agent editing its home cannot alter what mounts next boot. Two spine
+// options are the owner's (README.md), delivered as env at spawn. Like prime-agent, the
 // process half wants a live-boot pass to confirm on first deploy (model
 // streams end-to-end, bash/skills work de-privileged); the state half needed
 // no such loop (FRAMEWORK_ADAPTER.md §13 point 5).
@@ -26,10 +27,15 @@
 //	                `persona` config key lives in the plugin composition
 //	                (cordis.yml), which is per-boot platform structure, not
 //	                agent-owned state we track.
-//	settings.yaml   Leaf — the inference route pin, in DSH's own hot-reloaded
-//	                settings-file format (settingsyaml.go)
 //	skills/         DirectoryManifest — agent-installed skills under
 //	                $DSH_HOME/skills/ (skills.go)
+//
+// There is no config role: the inference pin is not chain state but the
+// owner's settings document, rendered into the bridge's environment at every
+// Start (RenderSettings in settings.go). So a routing fix reaches an
+// already-minted agent on its next boot instead of only at mint time, and
+// $DSH_HOME/settings.yaml — which DSH itself never read, see settings.go —
+// is gone entirely.
 //
 // What makes this adapter unusual among the shipped set: DSH is the only
 // framework here whose composition is not fixed by the adapter but assembled
@@ -45,7 +51,8 @@
 //	paths.go        on-disk paths this adapter manages (+ what it does not)
 //	whitelist.go    validated DSH version set
 //	persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
-//	settingsyaml.go the settings.yaml role (inference pin, YAML on disk / canonical JSON on chain)
+//	settings.go     RenderSettings: the owner's settings → bridge env (no config
+//	                file), plus recovery of the retired settings.yaml role
 //	skills.go       the skills/ manifest role
 //	platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
 //	spawn.go        Start/Stop/probes + the bridge lifecycle
@@ -63,6 +70,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/settings"
 )
 
 // frameworkName is the adapter id and the `name` field of the framework
@@ -83,6 +91,24 @@ type Adapter struct {
 	// verified owner. Minted once per container (memory-only), so a reset
 	// rotates it.
 	bridgeToken string
+
+	// rendered is what RenderSettings last produced from the owner's settings
+	// document: the resolved pin Start boots on, plus the bridge environment
+	// derived from it. nil means RenderSettings has not run — a programming
+	// error Start refuses to paper over, because there is no file left to
+	// recover a pin from (settings.go).
+	rendered *renderedSettings
+
+	// seededPin is the inference pin recovered from the retired
+	// "settings.yaml" role by HandleLegacy, handed back to the platform
+	// through SeededSettings so it can be persisted as the owner's settings
+	// document. nil for any agent minted after the settings channel shipped,
+	// which is every new one — this is transitional (settings.go).
+	seededPin *settings.Doc
+	// seededFrom ranks where seededPin came from, because two retired chain
+	// roles can carry a pin and bootstrap's Phase C walks them in arrival
+	// order — see stashSeededPin (settings.go).
+	seededFrom legacySource
 
 	// initialized flips after the first successful Start. A supervisor restart
 	// reuses the installed framework + token and never rewrites agent state.
@@ -124,7 +150,6 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 	return []framework.RoleSpec{
 		{Name: "framework", Shape: framework.Leaf},
 		{Name: "APPEND_SYSTEM.md", Shape: framework.Leaf},
-		{Name: "settings.yaml", Shape: framework.Leaf},
 		{Name: "skills/", Shape: framework.DirectoryManifest},
 	}
 }
@@ -142,7 +167,7 @@ func (a *Adapter) Defaults(role string) []byte {
 			return nil
 		}
 		return b
-	case "APPEND_SYSTEM.md", "settings.yaml":
+	case "APPEND_SYSTEM.md":
 		return nil
 	case "skills/":
 		b, err := manifest.New().Marshal()
@@ -162,8 +187,6 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 		return a.restoreFramework(plaintext)
 	case "APPEND_SYSTEM.md":
 		return a.restoreAppendSystem(plaintext)
-	case "settings.yaml":
-		return a.restoreSettingsYAML(plaintext)
 	case "skills/":
 		return a.restoreManifestDir(plaintext)
 	}
@@ -229,8 +252,6 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 		return out, nil
 	case "APPEND_SYSTEM.md":
 		return a.evoAppendSystem()
-	case "settings.yaml":
-		return a.evoSettingsYAML()
 	case "skills/":
 		return a.evoSkills()
 	}
@@ -264,4 +285,7 @@ func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext
 // attested container (see spawn.go verifyInstalled).
 var (
 	_ framework.Framework = (*Adapter)(nil)
+	// Transitional: recovers the pin from the retired "settings.yaml" role
+	// for agents minted before the settings channel (settings.go).
+	_ framework.LegacySettingsSeeder = (*Adapter)(nil)
 )

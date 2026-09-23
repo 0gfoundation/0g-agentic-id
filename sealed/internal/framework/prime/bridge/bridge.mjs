@@ -55,10 +55,12 @@ const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
 const MODEL_ID = process.env.SEAL_MODEL_ID || "";
 const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
-// Owner-chosen default thinking level for this agent (deploy/reset
-// --thinking, delivered via the owner-signed sandbox payload's env). Falls
-// back to the platform default "low" — see the setThinkingLevel comment in
-// buildSession for why a bounded level is load-bearing, not a preference.
+// The session's thinking level. Set by the adapter from the owner's settings
+// document (settings.Resolved.Effort -> bridgeEnvFor -> SEAL_OWNER_THINKING),
+// and unset whenever the platform has no level to name: the router catalog
+// says the model takes no bound, or it could not be reached. Floored at "low"
+// here — see the setThinkingLevel comment in buildSession for why a bounded
+// level is load-bearing, not a preference.
 const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low";
 
 /** Normalize a requested reasoning effort to the wire set {low, high, max}
@@ -74,7 +76,8 @@ function normalizeEffort(effort) {
 }
 // Set when the model is served by an OpenAI/Anthropic-compatible endpoint that
 // is NOT the provider's own (the 0G compute router). Then the model has to be
-// REGISTERED (models.json), which the adapter writes as a tracked role.
+// REGISTERED (models.json), which the adapter renders before this process
+// starts.
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || "";
 const MODEL_API = process.env.SEAL_MODEL_API || "openai-completions";
 
@@ -101,9 +104,11 @@ function readAgentDoc() {
 	}
 }
 
-// models.json (the model registration) is written by the ADAPTER, not here: it
-// is a chain-tracked role, so sealed owns it and Restore lands it before this
-// process starts. The registry picks it up from the agent dir automatically.
+// models.json (the model registration) is written by the ADAPTER, not here:
+// sealed renders it from the owner's settings document before every start
+// (modelsjson.go), so it is already in place when this process runs. It is not
+// a tracked role and not restored — an edit to it lasts until the next boot.
+// The registry picks it up from the agent dir automatically.
 
 /**
  * Resolve the pinned model, and FAIL if it cannot be resolved.
@@ -180,9 +185,11 @@ async function buildSession() {
 	// upstream, zero text; effort=low converges in ~2.5min with a full
 	// reply). "low" and not "medium": glm-5.3 accepts only low/high/max —
 	// medium is a hard 400 — and low is the portable intersection. Set
-	// unconditionally: the SDK only puts reasoning_effort on the wire when
-	// models.json marks the model reasoning-capable AND compat allows it, so
-	// for every other model this is a no-op.
+	// unconditionally: the SDK only puts reasoning_effort on the wire when the
+	// RESOLVED MODEL's registry entry marks it reasoning-capable and its
+	// provider's compat allows it — from models.json for a provider registered
+	// there, from the SDK's own built-in tables otherwise — so for every other
+	// model this is a no-op.
 	if (typeof session.setThinkingLevel === "function") {
 		try { session.setThinkingLevel(OWNER_THINKING); log(`thinking level: ${OWNER_THINKING} (bounded reasoning)`); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
 	} else {

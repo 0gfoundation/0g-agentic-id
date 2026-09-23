@@ -157,8 +157,8 @@ func TestUpsertPlatformSection_EmptyContextStripsSection(t *testing.T) {
 // TestUpsertPlatformSection_IncludesConstraints verifies that TOOLS.md
 // carries BOTH the platform constraints (drift mechanics) and the
 // adapter-authored framework facts (version whitelist from
-// supportedOpenclawVersions, config allowlist, persistent-state layout)
-// — the authorship split of the platform/adapter refactor.
+// supportedOpenclawVersions, persistent-state layout) — the authorship
+// split of the platform/adapter refactor.
 func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 	useTestWhitelist(t, []string{"2026.5.6", "2026.6.8"})
 	tmp := t.TempDir() + "/TOOLS.md"
@@ -186,11 +186,19 @@ func TestUpsertPlatformSection_IncludesConstraints(t *testing.T) {
 	if !strings.Contains(body, "npm install openclaw@<max>") {
 		t.Errorf("missing openclaw reconcile fact: %q", body)
 	}
-	if !strings.Contains(body, "`~/.openclaw/openclaw.json`") {
+	if !strings.Contains(body, "`~/.openclaw/workspace/*.md`") {
 		t.Errorf("missing persistent-state tracked paths: %q", body)
 	}
-	if !strings.Contains(body, "Config allowlist") {
-		t.Errorf("missing config allowlist fact: %q", body)
+	// The config-allowlist paragraph described a CHAIN-TRACKED openclaw.json
+	// and there is no longer one: the file is rendered from the owner's
+	// settings at every Start. Telling the agent which of its keys reach
+	// chain would now be a lie, so the paragraph must be gone — and the file
+	// must be named among the untracked paths instead.
+	if strings.Contains(body, "Config allowlist") {
+		t.Errorf("config allowlist paragraph should be gone — openclaw.json is not chain-tracked: %q", body)
+	}
+	if !strings.Contains(body, "re-rendered from the owner's settings at every boot") {
+		t.Errorf("openclaw.json must be declared untracked + rendered: %q", body)
 	}
 }
 

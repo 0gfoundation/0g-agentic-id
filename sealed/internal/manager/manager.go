@@ -102,6 +102,24 @@ type StartParams struct {
 	AgentSealPriv []byte
 	SealID        string
 	Owner         string
+
+	// PreStart runs immediately before EVERY adapter.Start — the first one,
+	// a Reload, and a crash-restart alike. main.go points it at the settings
+	// render.
+	//
+	// It is a hook rather than a field on Runtime because Runtime is
+	// captured once and replayed verbatim on every restart: anything routed
+	// through it is frozen at container boot, so a configuration change
+	// applied at runtime would be silently reverted by the next restart.
+	// That is exactly what happened to the owner's thinking level, which used
+	// to ride RuntimeContext.OwnerThinking.
+	//
+	// Re-rendering on every start also makes the config file self-repairing:
+	// the platform owns those bytes, so a file the agent corrupted is rebuilt
+	// rather than leaving the agent unable to start until a container reset.
+	//
+	// An error here aborts the start, same as an adapter.Start error.
+	PreStart func(context.Context) error
 }
 
 // Manager wires an Adapter to the shared agent state, supervised.
@@ -147,6 +165,9 @@ func New(adapter Adapter, agent *state.Agent, cfg Config) *Manager {
 func (m *Manager) Start(ctx context.Context, params StartParams) error {
 	m.params = params
 
+	if err := m.preStart(ctx); err != nil {
+		return err
+	}
 	res, err := m.adapter.Start(ctx, params.Runtime)
 	if err != nil {
 		return err
@@ -185,6 +206,10 @@ func (m *Manager) Reload(ctx context.Context) error {
 		return fmt.Errorf("reload stop: %w", err)
 	}
 	logger.Logf("manager: reload — spawning replacement")
+	if err := m.preStart(ctx); err != nil {
+		m.agent.SetPhase(state.PhaseFailed)
+		return fmt.Errorf("reload pre-start: %w", err)
+	}
 	res, err := m.adapter.Start(ctx, m.params.Runtime)
 	if err != nil {
 		m.agent.SetPhase(state.PhaseFailed)
@@ -194,6 +219,16 @@ func (m *Manager) Reload(ctx context.Context) error {
 	m.hookLifecycle(ctx)
 	logger.Logf("manager: reload complete; back to Running")
 	return nil
+}
+
+// preStart runs the caller's pre-start hook, if any. Kept separate so all
+// three start paths (initial, reload, crash-restart) share one call site and
+// none can be added later without it.
+func (m *Manager) preStart(ctx context.Context) error {
+	if m.params.PreStart == nil {
+		return nil
+	}
+	return m.params.PreStart(ctx)
 }
 
 // ── Internal lifecycle ──────────────────────────────────────────────────────
@@ -222,10 +257,10 @@ func (m *Manager) armState(res framework.StartResult) {
 //
 //   - non-zero exit  → real crash; restart immediately (don't wait for probe)
 //   - exit 0         → may be a framework-internal restart that fork-exec'd a
-//                      child to take over the socket (e.g. openclaw 5.x's
-//                      handleRestartAfterServerClose path). Defer to the
-//                      liveness probe; if the child actually took over,
-//                      probe stays green and we don't compete.
+//     child to take over the socket (e.g. openclaw 5.x's
+//     handleRestartAfterServerClose path). Defer to the
+//     liveness probe; if the child actually took over,
+//     probe stays green and we don't compete.
 //
 // Without this distinction we race openclaw's self-restart and crashloop the
 // agent (each spawn briefly listens, then exits 0 to hand off to a child we
@@ -298,6 +333,11 @@ func (m *Manager) restart(ctx context.Context) {
 		// Best-effort stop in case the adapter still holds a stale process.
 		_ = m.adapter.Stop(ctx, m.cfg.GracefulStopTimeout)
 
+		if err := m.preStart(ctx); err != nil {
+			logger.Logf("manager: restart attempt %d: pre-start failed: %v", attempt, err)
+			lastErr = err
+			continue
+		}
 		res, err := m.adapter.Start(ctx, m.params.Runtime)
 		if err != nil {
 			logger.Logf("manager: restart attempt %d failed: %v", attempt, err)

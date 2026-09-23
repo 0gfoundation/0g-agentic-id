@@ -29,13 +29,6 @@ func TestConformance(t *testing.T) {
 				Leaf: []byte("# Persona\n\nOwner-authored persona.\n"),
 			},
 			{
-				// Canonical form: single plugin section, single provider route,
-				// struct fields sorted at every level, apiKeyEnv an env-var NAME
-				// rather than a secret.
-				Role: "settings.yaml",
-				Leaf: []byte(`{"llm-pi-ai":{"providers":{"0g-compute":{"apiKeyEnv":"SEAL_MODEL_API_KEY","models":[{"id":"glm-5.2"}]}}}}`),
-			},
-			{
 				Role: "skills/",
 				Dirs: map[string]map[string][]byte{
 					"weather": {

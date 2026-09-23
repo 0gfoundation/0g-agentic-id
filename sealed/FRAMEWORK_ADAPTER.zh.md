@@ -40,6 +40,7 @@ watcher/uploader 循环是什么。
 | agent 专用签名 socket(`/run/seal-sign.sock`) | 把运行时事实(sign socket 路径、public URL、链上身份)以你的框架消费 context 的方式交给 agent |
 | 漂移检测(30s watcher)+ 整体替换式 `chain.Update` | 决定什么算 agent 状态(什么算运行时噪音) |
 | 进程监工、重启退避、attestor 心跳 | owner 鉴权载荷(`AuthResponse`) |
+| owner 的 settings 文档:在 `/provision` 取回、解析,并在每次 spawn 前对着实时模型目录重新 resolve | 把 resolve 好的文档放到**你的**框架读得到的地方(`RenderSettings`) |
 
 adapter 永远看不到 `agent_seal_priv`,永远不直接上链,也不做任何加密。
 它做的是在 **canonical plaintext 字节**(sealed 拿去 hash、加密、锚定
@@ -48,15 +49,15 @@ adapter 永远看不到 `agent_seal_priv`,永远不直接上链,也不做任何�
 ## 2. 接缝到底在哪
 
 契约就是 `framework.Framework`(`internal/framework/framework.go`)。
-sealed 的四个组件各自通过一个窄切面消费它:
+sealed 的五个组件各自通过一个窄切面消费它:
 
 | 消费方 | 调用的方法 | 时机 |
 |---|---|---|
-| bootstrap(`main.go`) | `Roles`、`Defaults`、`Restore`、`RestoreEntry`、`HandleLegacy`、`EvolutionFor`(snapshot 播种) | Phase 3,一次性 |
-| manager(`internal/manager`) | `Start`、`Stop`、`Liveness`、`Readiness`、`MonitorExit` | Start 一次;探针每 5s;重启和 reload 时 Stop/Start |
+| bootstrap(`main.go`) | `Roles`、`Defaults`、`Restore`、`RestoreEntry`、`HandleLegacy`、`SeededSettings`(可选)、`EvolutionFor`(snapshot 播种) | Phase 3,一次性 |
+| manager(`internal/manager`) | `Start`、`Stop`、`Liveness`、`Readiness`、`MonitorExit`;经 `StartParams.PreStart` 间接调 `RenderSettings` | Start 一次;探针每 5s;重启和 reload 时 Stop/Start;**PreStart 在上述每一次 spawn 之前** |
 | watcher(`internal/watcher`) | `Roles`、`EvolutionFor` | 每 30s tick |
 | uploader(`internal/uploader`) | `Roles`、`Defaults`、`EvolutionFor`、`LoadEntry` | 有漂移时,在 `Apply` 内 |
-| proxy(`internal/proxy`) | `AuthResponse` | 每次验证通过的 `POST /_seal/auth` |
+| proxy(`internal/proxy`) | `AuthResponse`;经 `main.go` 注册的 applier 再次调 `RenderSettings` | 每次验证通过的 `POST /_seal/auth`;每次被接受的 `POST /_seal/settings`(owner)和 `POST $SEAL_SIGN_SOCK/settings`(agent) |
 
 ### 2.1 哪些已经抽象,哪些仍在仓库之外
 
@@ -74,7 +75,7 @@ sealed 的四个组件各自通过一个窄切面消费它:
   记一条 warning。把你的 adapter 加进二进制只需在 `main.go` 加一行
   注册。
 - **框架相关行为** 走可选能力接口(§2.2),core type-assert 后优雅
-  降级:版本回正、子进程日志页、settle 延迟。
+  降级:版本回正、子进程日志页、settle 延迟、legacy settings 回收。
 - **按运行时分镜像**(不是按框架):`images/sealed/` 带 node,
   `images/hermes/` 带 python/uv,`images/prime/` 两者都带(Prime Agent 是
   TypeScript harness 驱动 Python kernel)。共用同一运行时的框架共用镜像,
@@ -83,6 +84,15 @@ sealed 的四个组件各自通过一个窄切面消费它:
   时落盘(已下线的 claudecode bridge 和 prime-agent 的 HTTP bridge 都是这
   个模式),这样它的度量跟着 sealed 镜像哈希走。接入一个我们已有生态的新
   框架不需要新镜像,顶多加一行热缓存;新生态则需要。
+
+- **owner 的配置从头到尾归 core,只剩最后一步归你。** attestor 把 owner 的
+  settings 文档当不透明 blob 存着,并在 `/provision` 响应里下发——用 ECIES
+  加密到跟 `agent_seal_priv` 同一个容器公钥
+  (`internal/provision/provision.go`)。`internal/settings` 把它解析成
+  `Doc`,`settings.Resolve` 再补上只有平台才知道的本次开机信息:endpoint、
+  输出预算、这个模型吃不吃 reasoning bound(§5.5)。唯一留给框架的步骤是
+  `RenderSettings`,因为只有你的 adapter 懂你框架的方言。这件事跟你的
+  `Roles()` 毫无关系。
 
   **跑哪个 adapter 仍然与镜像无关** —— 那是链上 binding 决定的(见上面
   §2.1),每个镜像里的 sealed 二进制都注册了全部 adapter。但镜像必须真的
@@ -123,6 +133,7 @@ sealed 的四个组件各自通过一个窄切面消费它:
 | `VersionReconciler` | `ReconcileFramework(ctx)` | drift handler,`framework` role 漂移时 | 漂移原样上链(审计诚实,强制关闭) |
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | 日志页报不可用 |
 | `SettleDelayer` | `SettleDelay()` | bootstrap 基线采集 | 保守的 5s 默认值 |
+| `LegacySettingsSeeder`(过渡性) | `SeededSettings()` | bootstrap,Phase C 的 `HandleLegacy` 轮之后 | settings 通道之前铸造的 agent 拿不回自己的 pin(§5.5 *迁移*) |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -144,7 +155,8 @@ sealed 的四个组件各自通过一个窄切面消费它:
 两种 Shape(`framework.Shape`):
 
 - **`Leaf`** ——该 role 链上 iData 指向一个加密 blob,其 plaintext
-  就是 role 的 canonical 字节本身(比如一份配置 JSON)。
+  就是 role 的 canonical 字节本身(比如 `framework` binding JSON,或
+  hermes 的 `SOUL.md`)。
 - **`DirectoryManifest`** ——iData 指向一份加密的 *manifest*(见
   §4),manifest 的每个条目各自指向独立的加密内容 blob。目录形态或
   体积大的东西走这条:换来按条目增量上传(没变的 5MB skill 永远不会
@@ -153,8 +165,24 @@ sealed 的四个组件各自通过一个窄切面消费它:
 约定与规则:
 
 - **命名**:manifest role 以 `/` 结尾,leaf 不带斜杠
-  (`workspace/skills/` vs `openclaw.json`)。只是信息性约定——
+  (`workspace/skills/` vs `SOUL.md`)。只是信息性约定——
   `Shape` 才是权威——但请遵守;工具链会读 role 名。
+- **不要为你框架的配置文件声明 role。** 出货的四个 adapter 现在都没有:
+
+  | Adapter | Roles | 配置文件,以及它从哪来 |
+  |---|---|---|
+  | openclaw(`openclaw.go:146`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
+  | hermes(`hermes.go:121`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
+  | prime-agent(`prime.go:135`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
+  | dsh(`dsh.go:145`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——桥进程的环境变量 |
+
+  `openclaw.json`、`config.yaml`、`models.json`、`settings.yaml` 曾经都是
+  role,直到 owner 的 settings 文档成为推理 pin 的持久归宿。把一个派生产物
+  锚在链上,等于把 mint 时的副本还给一个配置早就变过的 agent——这正是
+  mint 之后发布的每个修复(有界推理、目录预算、watchdog 余量、模型 idle
+  超时)统统止步于 mint 时那份副本的原因
+  (`openclaw/inference.go:14-30`)。改成每次 spawn 从文档渲染这个文件,
+  同一个修复就能在下一次 Start 到达每个 agent。
 - **`framework` role 是协议保留的。** 每个 adapter 必须把它声明为
   `Leaf`,plaintext 是 binding JSON:
 
@@ -188,8 +216,8 @@ sealed 的四个组件各自通过一个窄切面消费它:
 
 `Defaults(role)` 返回 canonical 的 **空** plaintext:manifest role 是
 空 manifest(`{"schema_version":1,"kind":"directory_manifest","entries":[]}`),
-leaf 是你的自然零值(openclaw 的主配置是 `{}`,`framework` 是当前
-binding,没有有意义默认值的返回 nil)。
+leaf 是你的自然零值(`framework` 是当前 binding;没有有意义默认值的返回
+nil,比如 hermes 的 `SOUL.md`、prime 的 `harness_state.json`)。
 
 uploader 用它维持一条双向不变量:
 
@@ -289,7 +317,9 @@ canonical plaintext。它在 **每个 30s watcher tick 对每个声明的 role**
 - **过滤运行时噪音。** 如果你的框架会往被管理文件里写非身份键(日志、
   会话缓存、向导标记),对身份键用 **allowlist** 而不是 denylist——
   框架未来版本会加你没预料到的键,denylist 下每个新键都是一次
-  phantom drift。
+  phantom drift。这条只适用于"本身就是按键过滤的文件"的**被追踪
+  role**(现在只剩 prime 的 `harness_state.json`);你框架自己的配置文件
+  已经完全不是 role 了(§3、§5.5),那边没有东西需要过滤。
 - **要便宜。** 每个 role 每 30s 跑一次;重探测的活要缓存或摊销。
 - 不认识的 role 返回 `framework.ErrUnsupportedDim`(调用方会跳过,
   不会失败)。
@@ -314,23 +344,200 @@ role,为它拒绝启动比部分迁移更糟。
 
 ```json
 {"system_prompt": "You are <name>. <description>\n",
- "inference": {"provider": "anthropic", "model": "claude-opus-4-6"}}
+ "inference": {"provider": "0g-compute", "model": "0gm-1.0-35b-a3b"}}
 ```
 
-——从不书写任何框架的配置 schema。翻译是你的 adapter 的职责:把
-`system_prompt` 和推理钉选映射到你自己的路径驱动产物上(openclaw →
-SOUL.md + openclaw.json 的 model/auth;已下线的 claudecode 移植 →
-CLAUDE.md + settings.json 的 `model`)。忽略 `persona` 的 adapter 会把 owner 在
-mint 时写的 prompt 和模型选择静默丢掉——claudecode 移植初版恰好带着
-这个 bug 出厂,这条规则因此成文。框架无法兑现钉选的某部分时(比如非
-原生的推理 provider),记日志、保留自己的默认值,不要写下框架解析不了
-的配置。
+——从不书写任何框架的配置 schema。**`system_prompt` 那一半**的翻译是你的
+adapter 的职责:映射到你自己的路径驱动产物上(openclaw → `SOUL.md`,
+hermes → `SOUL.md`,prime 和 dsh → `APPEND_SYSTEM.md`)。忽略 `persona`
+的 adapter 会把 owner 在 mint 时写的 prompt 静默丢掉——claudecode 移植初版
+恰好带着这个 bug 出厂,这条规则因此成文。
+
+**`inference` 那一半已经不归你持久化了。** 推理 pin 的归宿是 owner 的
+settings 文档(§5.5),`RenderSettings` 会在每次 spawn 前从它重建框架配置,
+所以摄入写下去的东西过一会就被覆盖。留一份副本只会制造第二个真相源,而且
+恰恰在文档为空的那些开机上,陈旧的那份会赢。所以 prime 和 dsh 只把种子里的
+pin 记进日志、不落盘(`prime/persona.go:108-129`、`dsh/persona.go:118-130`);
+openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent 有意义
+(`hermes/ingest.go:51-55`)。框架无法兑现种子的某部分时,记日志、保留自己
+的默认值,不要写下框架解析不了的配置。
 
 注意不对称性:被摄入的 role 是只读输入。uploader 会把 `Roles()` 之外
 的链上条目从下一次整体替换 `update` 里丢掉,所以 `persona` 首次开机
 被消费、首次漂移提交后从链上消失,留下路径驱动的 role 作为持久形态。
 
-### 5.5 进程生命周期:`Start`、`Stop`、`Liveness`、`Readiness`、`MonitorExit`
+### 5.5 设置:`RenderSettings`
+
+`RenderSettings(ctx, s settings.Resolved) error` 把 owner 的配置放到**这个**
+框架读得到的地方——openclaw 和 hermes 是配置文件,prime-agent 和 dsh 是桥进程
+的环境变量(prime 还会写一份 `models.json` provider 注册,因为那是给它的 SDK
+注册一个没有内置 provider 的唯一办法)。这是整条配置通道里唯一没法共享的一步,
+因为只有你的 adapter 懂你框架的方言。
+
+**你拿到的东西。** `settings.Resolved` = owner 的文档 + 平台为本次开机算出来
+的部分;算出来的那一半从不持久化,因为存下来的副本会过期,然后跟算出来的值
+打架(`settings/settings.go` 包注释)。
+
+| 字段 | 是什么 |
+|---|---|
+| `s.Provider`、`s.Model`、`s.Thinking` | **owner** 选的 |
+| `s.Framework`(`json.RawMessage`) | owner 的不透明 per-framework overlay;平台不解析、不校验,也不保证它跨框架升级还能用 |
+| `s.Facts`(`inference.ModelFacts`) | 这个模型本身为真的事实,与谁来服务无关:context window、输出预算、吃不吃 `reasoning_effort`,以及 `CatalogSourced` |
+| `s.Endpoint`(`*inference.Endpoint`) | **只有**平台亲自路由这个模型时才非 nil;框架内置 provider 自带 wiring,这里是 nil |
+| `s.APIKey` | 本次开机的推理凭据;走 env 进来,不属于文档,也从不持久化 |
+
+Facts/Endpoint 这个拆分是承重的,也正是"原生 provider 现在照样拿得到
+reasoning bound"的原因。两者原本共用一个结构、挡在同一个
+`provider == "0g-compute"` 判断后面,所以选原生 provider 会连 bound 带 endpoint
+一起被静默跳过——hermes 和 dsh 都犯过(`inference/zgcompute.go:57-65`)。Facts
+对每个 provider 都适用;只有 `Endpoint` 以"是否平台路由"为门。
+
+两个 accessor 封装了你不该自己重造的 gating:
+
+- `s.Effort() (level string, decided bool)` —— **三种结果,合并任意两种都是
+  线上 bug。** `("high", true)`:照这个级别写。`("", true)`:**清掉**任何级别,
+  因为目录说这个模型拒收 `reasoning_effort`,发过去是硬 400。`("", false)`:
+  **原样别动**——目录不可达或没收录,平台什么都不知道。把"不知道"折进"清掉",
+  意味着一次目录故障的开机就会把 bound 从一个"永远在思考"的模型上剥掉,它随后
+  无界推理、永远写不出回复:glm-5.3 实测 10 分钟 23k 字符推理、零可见输出、
+  流被上游掐断。
+- `s.PersistableMaxTokens() int` —— 返回 0 表示"什么都别写"。只要 facts 不是
+  目录来源就返回 0,因为目录故障期间写进磁盘的启发式 8192 从此看起来像手工设定,
+  会把推理模型"思考 + 回复"共享的预算长期饿死(agent 404 实测:三个约 6 分钟的
+  回合,`textLen=0` —— `prime/modelsjson.go:28-36`)。
+
+#### 规则一 —— 幂等
+
+同样的 `Resolved` 进来,磁盘上同样的字节出去。接口给的理由是漂移哈希
+(`framework.go:169-174`):watcher 对每个被追踪 role 的 canonical plaintext 做
+哈希,渲染若不确定,每个 30s tick 都会报一次漂移。
+
+今天四个随包 adapter 没有一个渲染进被追踪路径——`openclaw.json` 在
+`workspace/` 旁边而不是里面,`config.yaml` 在 hermes 明确的"永不追踪"清单上
+(`hermes/paths.go`),`models.json` 在 `primeHome` 之下但不在任何被追踪路径下
+(`prime/paths.go`),dsh 渲染的是环境变量。所以对今天的 adapter 而言,这条既是
+给"第一个真的渲染进 role 的 adapter"留的保证,也是一条朴素的运维理由:渲染每次
+spawn 都跑,一个字节逐次开机都变的文件谁也没法推理。四个 adapter 还是都测了
+(openclaw 和 dsh 的 `TestRenderSettings_Idempotent`、hermes 的
+`TestRenderIdempotent`、prime 的 `TestRenderSettingsIsIdempotent`),包括目录
+故障下的那次(`TestRenderSettings_OutageRenderIsIdempotent`)——因为"把事实
+顺延下来"本身也必须是不动点。
+
+#### 规则二 —— 平台的值赢,而让它赢的是顺序
+
+先套用 `s.Framework`,**然后**把平台自有的键写在它上面:endpoint wiring、
+effort bound、输出预算,以及任何凭据或 per-boot token。
+
+**是顺序、不是排除清单**,拦住 overlay 关掉平台的保护——比如钉死一个过期的
+base URL,或者关掉 `Effort()` 三态特意要守住的 reasoning bound。排除清单得一个
+键一个键地维护,而它悄悄漏掉的那个键,永远是下一个被加进来的。dsh 在自己的合并
+处把这点写明了:今天那里的顺序只是双保险——`parseKnobs` 只读它认识的键、每个键
+落在固定的变量名下,owner 写什么都撞不到平台变量——但当以后有人加一个新 knob 时,
+是这个顺序而不是某份清单让它继续成立(`dsh/settings.go:settingsEnv`)。
+
+上面的 gating 推出来的一条推论:**平台并不真的知道的值就不写,也不去擦掉磁盘上
+已有的值。** 只有 `CatalogSourced` 时才用 `Facts` 写平台键;否则把上一份条目的
+值顺延下来,从来没知道过的就干脆不写,让你的框架用它自己的默认值,而不是用一个
+sealed 编出来、看上去像手工设定的数字
+(`openclaw/inference.go:applyEndpointToConfig`)。
+
+拥有这些字节还有一个后果:**pin 要从你渲染出来的东西里读回,而不是从你写出去的
+那个文件里读。** hermes 的 `Start` 从渲染时存下的 `Resolved` 取 provider/model,
+没渲染过就硬失败——因为 `config.yaml` 已经不是链上追踪的 role、而是这个方法的
+产物,再读回来等于让 agent 改一下文件就能重定向推理(`hermes/spawn.go:51-58`)。
+
+#### 三样东西绝不能从 owner 的 overlay 里来
+
+1. **平台在渲染*之后*才写的 per-boot 凭据。** openclaw 直接把 `gateway` 从
+   overlay 里删掉并记日志(`openclaw/inference.go:frameworkOverlay`)。顺序保护
+   不了这个键:`gateway.token` 是首次 Start 铸出来、由 `writeRuntimeSections`
+   在 RenderSettings **之后**合并进去的,所以后续某次渲染如果把 owner 提供的
+   `gateway` 合进来,结果是它覆盖掉活着的 auth token,而不是被覆盖。顺序保护的
+   是渲染自己会写的键;凡是渲染不写的键,就从 overlay 里丢掉并在日志里说明。
+2. **推理凭据。** hermes 把 key 写进磁盘上的 `model.api_key` 而不是走 env,因为
+   它的 `custom` provider 声明 `env_vars=()`,只从这个键读 key——用 env 注入实测
+   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:163-170`)。
+   这个键由平台每次渲染写入,并且在文档没给凭据时**删除**:不删的话,一次切到
+   框架内置 provider 的开机会把上一次的 0G router key 留在盘上,交给现在占着这
+   一节的那个 provider。老的"采集路径上剥密钥"这道防线随 role 一起没了——已经
+   没有东西采集 `config.yaml`,key 上不了链,出口也不需要 `stripSecrets`。
+3. **平台自己拥有的那条路由的 provider 块。** 只要 `s.Endpoint != nil`,openclaw
+   就无条件重写 `models.providers.<label>`,并把上一个 pin 留下的条目清掉——正是
+   为了让这个条目能承载后来发布的修复。那个清理和已经下线的 `healOpenclawConfig`
+   都只碰 baseUrl 指向 0g router 的条目("不是 sealed 写的 router pin —— 绝不
+   碰"),而这恰恰就是**一条手写的同名条目能逃掉它之后每一次修复**的原因。owner
+   自己声明的 provider 是正当的,并且被刻意放过
+   (`TestRenderSettings_OwnerDeclaredProviderIsNotPruned`);对准平台正在配置的
+   那条路由的 overlay 条目则不是——因为平台的修复只会落在平台自己的条目里,永远
+   落不到它那份上。
+
+#### 它从哪里被调用
+
+- **`manager.StartParams.PreStart`,在每一次 spawn 之前** —— 首次 Start、
+  `manager.Reload`、以及每一次 crash-restart 尝试。`manager.preStart` 是三条路径
+  共用的唯一调用点,"这样以后加路径的人不可能漏掉它"
+  (`manager/manager.go:224-231`)。`PreStart` 报错会像 `Start` 报错一样中止这次
+  启动。`main.go` 把钩子指向
+  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`,所以
+  `Resolve` 也每次重跑,endpoint、预算、reasoning 标志都来自实时目录。
+
+  它是钩子而不是 `RuntimeContext` 上的一个字段,是因为那个结构在首次 Start 时
+  被捕获、之后每次重启原样重放:装在里面的东西就被冻在容器这一辈子里,运行期
+  改的配置会被下一次重启悄悄退回。owner 的 thinking level 当初挂在
+  `RuntimeContext.OwnerThinking` 上时出的就是这个事(`manager/manager.go:105-118`)。
+  每次启动都重渲染还顺带让配置文件自愈:这些字节归平台所有,agent 弄坏了就重建,
+  而不是把 agent 卡在起不来的状态。
+- **`POST /_seal/settings`(owner)。** owner 签名,而且 POST 的签名额外绑定到
+  body 的 sha256——没有这一层,签名只证明"谁在调用",任何能在传输中改请求的人
+  都能保着一个有效签名换掉文档(`proxy/settings.go`)。`main.go` 先换掉在用的
+  文档,再渲染,再 reload;**渲染失败会把这次替换回滚**,所以一份渲染不出来的
+  文档永远不会变成下一次 crash-restart 会捡起来的那份。
+- **`POST $SEAL_SIGN_SOCK/settings`(agent)。** 只能从容器内 0600 的 unix socket
+  到达,所以不涉及签名——socket 本身就是凭据,跟它已经在发 agentSeal 签名的依据
+  同一条。同样的校验、同样的渲染、同样的 reload,但**什么都不持久化**:改动只活
+  这个容器一辈子,下次重启回到 owner 的文档。正是这个不对称让"把这个杠杆交给
+  agent"变得安全,也意味着 agent 没法把自己配成一个起不来的状态。渲染报错时
+  `main.go` 立刻把 owner 的文档重渲染一遍,免得一次被拒的 agent 尝试把框架留在
+  半套配置上。
+
+三条路径里有两条跑在进程还不存在、或正在被替换的时刻,所以**不要对 owner 或
+agent 写的任何东西报错**。PreStart 路径上的错误不是"一次被拒的推送",而是一个
+起不来的 agent——而且会一直起不来,因为造成它的那份文档正是 attestor 存着的那份。
+dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、类型不对、整个不是
+对象,一个策略处理到底(`dsh/settings.go:parseKnobs`);openclaw 把解析不了的
+`openclaw.json` 挪到一边重建,而不是把 parse 错误抛出去——那曾经既致命又自我
+延续:Start 没有成功的渲染就拒绝运行,而又没有任何东西修这个文件,agent 一直
+离线到有人重置容器(`openclaw/inference.go:loadConfigForRender`)。硬错误留给
+**平台**自己搞错的情况:hermes 在平台路由的 endpoint 说着它用不了的 wire format、
+或者这种 endpoint 没带凭据时才返回错误——比第一次聊天时 400 强。
+
+#### 迁移:`framework.LegacySettingsSeeder`(过渡性)
+
+在这条通道存在之前铸造的 agent,它的 pin 在旧的链上 role 里。那个 role 已经不在
+`Roles()` 中,所以 bootstrap 把链上还留着的那条交给 C 轮的 `HandleLegacy`
+(§5.4)——而可选的 `SeededSettings() (settings.Doc, bool)` 就是 adapter 把回收
+到的文档交还给平台的方式。`main.go` **只在**已存文档没有 model 时才问它,所以
+真正的 owner 文档永远压过回收来的那份;拿到后用 `report.SeedSettings` 持久化
+(`main.go:583-608`)。
+
+时机就是全部意义所在。uploader 会按 `Roles()` 重建链上条目表并整体替换提交,所以
+watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那之前 pin 没被读出来
+并持久化,它就没了——而有两个 adapter 没有 pin 就硬失败在 Start。
+
+`report.SeedSettings` 用 agentSeal 而不是 owner key 签名,因为开机时没有 owner
+在场。所以 attestor 必须把它当作严格弱于 owner 写入的东西:**只做 seed**,行上
+已经有 settings 就拒绝。容器可以找回一份丢失的文档;它绝不能改动 owner 亲自写下
+的那份(`report/report.go:66-85`)。这个调用是 best-effort ——失败只记日志,agent
+无论如何跑在回收到的 pin 上,下次开机再试。
+
+今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role
+(`dsh/settings.go:280-332`)。openclaw、hermes、prime 都没实现,所以这三个上面
+的"通道之前"的 agent 会用 attestor 已经存着的那份文档开机;prime 的
+`HandleLegacy` 把这件事写得明明白白,并称把这些 pin 抬进文档"是平台的活",尚未
+落地(`prime/persona.go:108-129`)。你的框架曾经有过链上追踪的 pin 就实现它;等
+到线上不再有 agent 带着旧 role,就删掉。
+
+### 5.6 进程生命周期:`Start`、`Stop`、`Liveness`、`Readiness`、`MonitorExit`
 
 `Start(ctx, rt RuntimeContext) (StartResult, error)` 基于之前 Restore
 好的状态拉起你的框架,返回 `StartResult{Upstream, PID}`,其中
@@ -359,7 +566,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 
 `MonitorExit`:见 §2.2。
 
-### 5.6 Owner 鉴权:`AuthResponse`
+### 5.7 Owner 鉴权:`AuthResponse`
 
 `/_seal/auth` 的完整验证由 proxy 负责(owner 用 EIP-191 签
 `0GSealAuth:0x<sealId>:<ts>`;proxy 校验恢复出的地址 == 链上 owner,
@@ -382,8 +589,15 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
     SeedChainSnapshot(sha256(Defaults(role)))
   C 轮  每个不在 Roles() 里的链上条目:
     HandleLegacy(role, plaintext)
+  owner settings:
+    settings.Parse(/provision 下发的 blob)   attestor 存着的那份文档
+    SeededSettings()                   可选;仅当文档里没有 model 时——回收
+                                       通道之前的 pin,main.go 用
+                                       report.SeedSettings 持久化,发生在
+                                       watcher 第一个 tick 丢掉旧 role 之前
   播种 #1:对所有 role 跑 EvolutionFor  → currentSnapshot(Start 前)
   manager.Start:
+    PreStart → RenderSettings(settings.Resolve(doc, apiKey))
     Start(ctx, RuntimeContext)         spawn;上游监听后才返回
     MonitorExit(cb)                    布置死亡监视
     Liveness(ctx) 每 5s                探针循环开始
@@ -398,6 +612,15 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
                 uploader.Apply:按需调 Defaults()/LoadEntry() → 一笔 chain.Update
   进程死亡    MonitorExit 触发:err 非 nil ⇒ 重启(带退避的 Stop+Start);
               nil ⇒ 等 Liveness 裁决
+  每次 spawn  manager.preStart → RenderSettings(首启、Reload、crash-restart;
+              settings.Resolve 每次重跑,endpoint/预算/reasoning 标志都取自
+              实时目录)
+  POST /_seal/settings(owner 签名 + 绑定 body 摘要)
+              换文档 → RenderSettings → manager.Reload
+              (渲染失败 ⇒ 回滚这次替换,什么都不持久化)
+  POST $SEAL_SIGN_SOCK/settings(agent)
+              RenderSettings → manager.Reload;**不**持久化——下次重启回到
+              owner 的文档
   /_seal/auth(验证通过) AuthResponse(ctx)
 ```
 
@@ -410,15 +633,26 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 
 | 字段 | 内容 | 说明 |
 |---|---|---|
-| `APIKey` | deploy envelope 里的推理 provider key | 翻译成你的框架期望的 env 变量 |
 | `PublicURL` | `http://8080-<sandboxId>.<proxyDomain>` | 本地开发时为空;通过 env / 文件 / 配置暴露给 agent,让它知道自己的地址 |
 | `SealSignSock` | `/run/seal-sign.sock` | agent 专用签名端点(§8);告诉你的 agent 它在哪 |
 | `AgentSeal` | 从 `agent_seal_priv` 公钥派生的 0x 地址 | agent 的 TEE 身份地址 |
-| `AgentID`、`Owner`、`ChainRPC`、`ContractAddr`、`AttestorURL` | 链上 bootstrap 输出 | 公开链上事实,不是秘密;注入 agent 的 context 让它能推理自己的身份 |
-| `Provider`、`Model`、`ZGComputeRouted` | 解析后的推理路由 | 今天由 adapter 自己的 Start 路径填(openclaw `spawn.go`) |
+| `AgentID`、`Owner`、`ChainRPC`、`ContractAddr`、`ChainID`、`AttestorURL` | 链上 bootstrap 输出 | 公开链上事实,不是秘密;注入 agent 的 context 让它能推理自己的身份 |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
+| `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
 
-拿这些做什么是 adapter 的策略,但 openclaw adapter 是参考实现:它往
+**这里刻意没有的东西:配置。** `RuntimeContext` 在首次 Start 时被捕获、之后
+每次重启原样重放,所以装在里面的东西就被冻在容器这一辈子里,运行期改的配置会被
+下一次重启悄悄退回——owner 的 thinking level 挂在 `RuntimeContext.OwnerThinking`
+上时出的就是这个事(`manager/manager.go:105-118`)。owner 的文档通过
+`RenderSettings` 到达你的 adapter,每次 spawn 前重渲染一遍(§5.5)。
+
+有五个字段是这次拆分之前留下的,出货树里已经没有任何地方写或读它们:`APIKey`、
+`Provider`、`Model`、`ZGComputeRouted`、`OwnerThinking` 还在结构里,但都是死的。
+凭据和 pin 一律从 `settings.Resolved` 取——读 `RuntimeContext.APIKey` 正是那个
+"平台路由的 endpoint 被空着 key 拨出去、线上 401"的缺陷
+(`openclaw/spawn.go:253-259`、`dsh/spawn.go:222-225`)。
+
+剩下的拿来做什么是 adapter 的策略,但 openclaw adapter 是参考实现:它往
 agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY)、
 拒签教义(SOUL)、签名 socket 用法 + public URL(TOOLS)——并给子进程
 传一个小的 env allowlist(`AGENT_PUBLIC_URL`、provider API key、
@@ -436,7 +670,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
   `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
   注册过)agent 自声明的服务列表。
-- **`POST /_seal/auth`** ——§5.6 的 owner 鉴权流程。
+- **`POST /_seal/auth`** ——§5.7 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是
   靠它以 AgentSeal 身份签名而永远不持有私钥。socket 本身只是传输——
@@ -461,13 +695,20 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 - [ ] Manifest 输出是 empty-ptr,条目按 path 排序,dir 条目走确定性 tar.gz。
 - [ ] `LoadEntry` 的字节 hash 等于 `EvolutionFor` 声明的 `content_hash`。
 - [ ] 平台/运行时注入进被管理文件的一切都有 marker 包裹并在 hash 前剥除。
-- [ ] 被管理配置用键 allowlist;框架自有的运行时键永远进不了 plaintext。
+- [ ] 任何"plaintext 是按键过滤的文件"的被追踪 role 用键 allowlist、不用 denylist(现在只剩 prime 的 `harness_state.json`;配置文件已经完全不是 role)。
+- [ ] 没有为框架的配置文件声明 role,且 `RenderSettings` 写出的东西都不在被追踪路径里。
+- [ ] `RenderSettings` 幂等——同一份 `Resolved` 渲染两次字节相同,目录故障的开机也一样。
+- [ ] `RenderSettings` 先合并 owner 的 `framework` overlay,再把平台自有的键写在上面;没有任何平台值靠排除清单来守。
+- [ ] `RenderSettings` 对 owner 或 agent 写的任何东西都不返回错误——它在每次 spawn 前跑,报错就等于一个起不来的 agent。
+- [ ] 平台键只在平台真的知道时才写:`Effort()` 的三种结果保持三种,`PersistableMaxTokens() == 0` 意味着什么都不写,而不是写个猜测。
+- [ ] per-boot 凭据、以及平台自己拥有的 provider 块,都不能从 overlay 供给。
+- [ ] `Start` 从 `RenderSettings` 存下的东西取 pin,绝不重新解析它写出去的文件。
 - [ ] Restore 跨 role 可交换、单 role 幂等。
 - [ ] `HandleLegacy` 幂等,对未知 role 永不报错。
 - [ ] `Start` 在上游接受连接后才返回;重启不重做首启工作、不覆盖 agent 自我修改。
 - [ ] `Stop` 不留占着上游端口的孤儿。
 - [ ] `MonitorExit` 每个 spawn 的进程恰好触发一次;exit-0 不由你的代码当 crash 处理(manager 负责)。
-- [ ] `FrameworkFacts()` 返回非空 `Tracked`——agent 被告知持久状态落在哪(§11 步骤 9)。
+- [ ] `FrameworkFacts()` 返回非空 `Tracked`——agent 被告知持久状态落在哪(§11 步骤 10)。
 
 ## 10. 测试你的 adapter
 
@@ -489,8 +730,8 @@ func TestConformance(t *testing.T) {
 }
 ```
 
-树内 adapter 在跑它(`openclaw/conformance_test.go`;已下线的
-claudecode 移植当时也跑);它对 openclaw 的第一次运行就当场
+四个树内 adapter 都在跑它(`openclaw/`、`hermes/`、`prime/`、`dsh/` 的
+`conformance_test.go`;已下线的 claudecode 移植当时也跑);它对 openclaw 的第一次运行就当场
 抓出两个真实 bug(§12)——把 conformance 红灯当成白捡的生产事故看待。
 
 套件结构性强制的两条血泪规则:
@@ -502,11 +743,20 @@ claudecode 移植当时也跑);它对 openclaw 的第一次运行就当场
   输出做字节级比较,所以要按你的 adapter 的 canonical 编码写(紧凑
   JSON、键排序)。
 
+**conformance 套件不覆盖 `RenderSettings`** —— 它只跑 role 管线,而那是磁盘
+状态的纯函数;渲染依赖实时的 router 目录。这部分要你自己测,而且要对着真实故障
+测、别用 stub 返回值:openclaw 的测试把目录指向一个 500 的服务器
+(`inference.SetCatalogURLForTest`),让 `settings.Resolve` 产出真正的故障形态
+——启发式 facts、`CatalogSourced=false`、未决的 `Effort()` ——因为它要防的缺陷
+就长在这两半的接缝里,不在任何一半内部
+(`openclaw/inference_resilience_test.go`)。
+
 conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 后断言 `EvolutionFor` 和 `LoadEntry` 输出不变——见
-`platform/markers_test.go` 与 openclaw 的 `evolution_paths_test.go`)、
-密钥类键的 allowlist
-过滤、异框架 binding 拒绝。
+`platform/markers_test.go` 与 openclaw 的 `evolution_paths_test.go`);渲染幂等
+(含目录故障那条);overlay 规则——overlay 跟平台键冲突时平台键存活、平台写 pin
+时 overlay 的兄弟键存活、owner 从文档里**删掉**的键要从盘上消失而 agent 后来
+对同一个键的改动不能被撤;以及异框架 binding 拒绝。
 
 想在真实循环里接入你的 adapter:本地不设 `ATTESTOR_URL` 跑 sealed
 (只服务 `/healthz` + `/log`,跳过 provision/bootstrap),或用 dev
@@ -515,6 +765,18 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
 
 ## 11. 移植清单
 
+这份清单原本带着的四项义务没了,而且是一起没的——因为它们都是同一个决定的
+后果:框架的配置文件曾经是一个链上 role。
+
+| 不再是你的活 | 为什么消失了 |
+|---|---|
+| 决定模型 pin 的持久归宿在哪 | 归宿是 owner 的 settings 文档,attestor 存着、每次开机下发(§5.5)。你只渲染,什么都不持久化。 |
+| 定义配置键 allowlist,把框架自己的簿记挡在 plaintext 外 | 根本没有 plaintext:这个文件不是 role,不会被哈希、上传或锚定。 |
+| 把 owner 的 thinking level 接进 `Start` | `Resolved.Effort()` 在每次渲染时、对每个 provider,把 bound 直接交给你。 |
+| 在采集路径上剥密钥 | 没有东西采集这个文件,里面的凭据上不了链。两份 `stripSecrets` 都已删除,`healOpenclawConfig` 和 `backfillMaxTokens` 也一并删除——它们存在的唯一理由就是修补一份被恢复回来的 mint 时副本。 |
+
+替代这四项的唯一一项是步骤 4。
+
 1. 在 `internal/framework/<yourfw>/` 实现 `framework.Framework` +
    `MonitorExit`,在你的 `New()` 里 `framework.Register` 自注册;在
    `main.go` 加一行注册。CLI 型框架照 git 历史里已下线的
@@ -522,13 +784,23 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    照 `openclaw/`。
 2. 声明你的 role 集,包括保留的 `framework` leaf(含空版本 →
    whitelistMax 规则);逐 role 决定 Leaf 还是 DirectoryManifest。
-3. 实现 `HandleLegacy["persona"]`——强制的协议种子翻译(§5.4)。
-4. 实现适用的可选能力接口(§2.2)——框架能用包管理器安装的话至少
+   **不要为你的配置文件声明 role**(§3)——那个文件是步骤 4 的产物,
+   不是 agent 状态。
+3. 实现 `HandleLegacy["persona"]`——强制的协议种子翻译,只翻
+   `system_prompt` 那一半(§5.4)。种子里的 `inference` 记日志,不要落盘。
+4. 实现 `RenderSettings`(§5.5):把 `settings.Resolved` 放到你的框架读得到
+   的地方,幂等,owner overlay 在先、平台键写在上面。per-boot 凭据和平台
+   自有的 provider 块不许从 overlay 来;每个平台键都以"平台真的知道这个值"
+   为门;对 owner 或 agent 写的东西一律不返回错误。你的框架曾经有过链上
+   追踪的 pin 的话,还要实现过渡性的 `framework.LegacySettingsSeeder`,
+   好在 watcher 丢掉旧 role 之前把"通道之前"的 agent 的 pin 回收出来。
+5. 实现适用的可选能力接口(§2.2)——框架能用包管理器安装的话至少
    实现 `VersionReconciler` + 版本 allowlist,并写编译期断言。CLI
    shim 用 `go:embed` 放进你的包、Start 时落盘——绝不烧进镜像。
-5. 用每个 role 的 fixture 跑 conformance 套件(§10);补注入剥除、
-   密钥过滤、persona 摄入、无版本 binding 测试。
-6. 框架是 npm 可装的话,可选地往 `images/sealed/Dockerfile` 加一行
+6. 用每个 role 的 fixture 跑 conformance 套件(§10);补 conformance 不覆盖
+   的渲染测试(幂等、目录故障、overlay 顺序),以及注入剥除、persona 摄入、
+   无版本 binding 测试。
+7. 框架是 npm 可装的话,可选地往 `images/sealed/Dockerfile` 加一行
    热缓存;无论加不加,通用镜像重建后的 hash 都走 attestor 的
    allowlist 流程。只有新的运行时生态(Python、JVM)才会结构性地
    增大镜像。(关于实际线上路径的如实说明:今天真正在跑的 runtime
@@ -536,30 +808,35 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    镜像(`images/openclaw/`),不是通用镜像;本条指令针对的是
    `images/sealed/` 这个通用镜像目标,在你的部署把它作为 base
    发布之后才落到实处。)
-7. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
+8. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
    attestor 把名字当不透明字符串(mint 前校验、写进无版本 binding、
    UI 里列出),除此之外零改动(本仓库 `attestor/`)。
-8. 装一套等价于 openclaw SOUL 段的拒签教义(见
+9. 装一套等价于 openclaw SOUL 段的拒签教义(见
    [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md)),别让签名 socket
    变成 prompt 注入请求的开放签名器。有共享的 `platform.Build` 内容,
    这只是一个 delivery 函数(见 git 历史里已下线的
    `claudecode/claudemd.go`——整个 PlatformContext 作为单个 marker
    段落进 CLAUDE.md)。
-9. 用必答的 `FrameworkFacts()` 方法填入你框架自己的事实——填**值**,不写文字。
-   `platform.RenderFrameworkFacts` 持有全部平台机制文字(sealing、gas、版本
-   回正、配置 drift),对每个框架逐字一致地渲染;你只返回一个
-   `platform.FrameworkFacts` 结构,填因框架而异的部分:`Home`、`Tracked`/
-   `Untracked` 路径(每条带一句说明)、`DurableHints`、版本白名单 +
-   `ReconcileHow` 命令、`ConfigFile` + `ConfigKeys`。
-   `platform.AssembleAgentDoc(pc, facts)` 把平台那几段和你渲染出的事实拼起来
-   ——单文件框架(hermes)整份注入一个 context 文件;openclaw 把平台段分散到
-   IDENTITY/SOUL/TOOLS,但事实同样经 `platform.RenderFrameworkFacts` 取得。
-   conformance 的 `FrameworkFactsNonEmpty` 会在你留空时让构建失败。这是构造上
-   防漏的:平台机制文字不归你写,所以你既不会把机制讲错、也不会悄悄漏掉一段
-   ——正是当初让新起的 hermes agent 把记忆写到不追踪路径的那个坑。openclaw 和
-   hermes 的填空在各自 `platformtext.go`;渲染出的带 `()` 占位模板见
-   [AGENT_BIBLE.md](AGENT_BIBLE.md)。
-10. **安全——为框架的任何控制/管理 UI 声明 route 之前,先审计它。**
+10. 用必答的 `FrameworkFacts()` 方法填入你框架自己的事实——填**值**,不写文字。
+    `platform.RenderFrameworkFacts` 持有全部平台机制文字(sealing、gas、版本
+    回正、配置 drift),对每个框架逐字一致地渲染;你只返回一个
+    `platform.FrameworkFacts` 结构,填因框架而异的部分:`Home`、`Tracked`/
+    `Untracked` 路径(每条带一句说明)、`DurableHints`、版本白名单 +
+    `ReconcileHow` 命令,以及——仅当你某个**被追踪** role 本身是按键过滤的
+    文件时——`ConfigFile` + `ConfigKeys`,它们渲染出"只看这几个顶层键"那段。
+    prime 的 `harness_state.json` 是这一对最后的用户;openclaw、hermes、dsh
+    都留空,改为把自己渲染出来的配置文件列在 `Untracked` 里,明白告诉 agent
+    平台每次开机都会重写那些键、而且文件里什么都活不过一次容器重置
+    (`openclaw/platformtext.go:35`)。
+    `platform.AssembleAgentDoc(pc, facts)` 把平台那几段和你渲染出的事实拼起来
+    ——单文件框架(hermes)整份注入一个 context 文件;openclaw 把平台段分散到
+    IDENTITY/SOUL/TOOLS,但事实同样经 `platform.RenderFrameworkFacts` 取得。
+    conformance 的 `FrameworkFactsNonEmpty` 会在你留空时让构建失败。这是构造上
+    防漏的:平台机制文字不归你写,所以你既不会把机制讲错、也不会悄悄漏掉一段
+    ——正是当初让新起的 hermes agent 把记忆写到不追踪路径的那个坑。openclaw 和
+    hermes 的填空在各自 `platformtext.go`;渲染出的带 `()` 占位模板见
+    [AGENT_BIBLE.md](AGENT_BIBLE.md)。
+11. **安全——为框架的任何控制/管理 UI 声明 route 之前,先审计它。**
     `FrameworkRoutes` 决定 sealed proxy 向持 token 的 owner 暴露什么。
     只声明**受限的、语义收窄的**接口(chat API 是安全默认——它无法开
     shell 或读文件)。**在逐一审计过框架 web dashboard / 控制台底下的每个
@@ -664,7 +941,10 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
     `persona.inference.provider = "0g-compute"` 经 `settings.json` 的
     `env.ANTHROPIC_BASE_URL` 路由到 0G router——该框架的可验证推理
     信任层就此补全。base URL 通过 env 子键白名单上链(路由去向属于
-    身份,可审计),凭据留在 sandbox env,永不进链上明文。
+    身份,可审计),凭据留在 sandbox env,永不进链上明文。*(其中"上链"
+    这一半后来被推翻了:路由属于配置而不是身份,现在住在 owner 的 settings
+    文档里——见 §5.5。env 子键白名单随 role 一起没了。凭据依然永不上链,
+    只是理由从"出口处剥掉"变成了"根本没有东西采集这个配置文件"。)*
 19. 第 18 条的生态变化随即在线上打爆了 openclaw adapter(它的 0g
     增强硬编码 OpenAI 线格式;claude-* 在 router 上只有 Anthropic
     格式 → 部署全绿、首次推理 400)。根因是分层:provider 知识按
@@ -747,12 +1027,14 @@ Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
    是本地 socket 上的 JSONL,所以 sealed 自己带一个 bridge(内嵌 SDK,
    `go:embed` 在 sealed 二进制里)。自己写 bridge 意味着对外面是**按构造
    白名单的** —— 一个 OpenAI 形状的 chat 端点,而不是一个自带 dashboard、
-   需要逐个 endpoint 审有没有 shell/文件/exec 可达(§11 step 10)。一个把
+   需要逐个 endpoint 审有没有 shell/文件/exec 可达(§11 step 11)。一个把
    自己的控制台交给你的框架是更难的情况,不是更简单的。
 4. **优先选运行时注入密钥的 API,而不是写配置文件。**这个 SDK 通过
-   `authStorage.setRuntimeApiKey()` 接收推理 key,文档明确写了不落盘。所以
-   不像 hermes(`api_key` 会落进 `config.yaml`,必须在进 iData 前剥掉),
-   这里没有秘密需要剥,因为根本没写过。
+   `authStorage.setRuntimeApiKey()` 接收推理 key,文档明确写了不落盘,所以
+   根本没有秘密落在磁盘上。*(这条当初用来对照的情形——hermes 的 `api_key`
+   落进 `config.yaml`、必须在进 iData 前剥掉——已经不存在了:settings 通道
+   落地后 `config.yaml` 不再是 role,没有东西采集它,两份 `stripSecrets` 都
+   已删除。这条偏好本身仍然成立,只是它的 iData 论据用完了。)*
 5. **状态那一半可以先于进程那一半上线。**角色、规范化、Defaults 和
    FrameworkFacts 在框架完全没安装的情况下就写完并且 conformance 全绿 ——
    因为这些不变量是磁盘状态的纯函数。先落这一半、生命周期方法返回明确错误、
@@ -777,7 +1059,14 @@ Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
 10. SDK 是否认约定的 `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 来走 0G
     router,还是需要一条 `models.json` 记录。bridge 在启动时会打印解析出的
     provider/model,`/log/agent` 能看到走的是哪条路 —— 这条防的正是 §12
-    第 19 条那种"部署绿了、首次推理 400"。
+    第 19 条那种"部署绿了、首次推理 400"。**已在 0G Galileo 实机确认
+    (2026-08-13):这两个 env 被无视。** 设了 `OPENAI_BASE_URL`,请求照样
+    打到 `api.openai.com`,带着 router 的 key 换回 401 "incorrect API key"
+    ——一个长得像凭据问题、实际是路由问题的错误。给 SDK 注册一个它没有内置
+    的 provider,`models.json` 的 provider 条目是唯一途径,而且那条目还带着
+    让 SDK 能把 `reasoning_effort` 发上线的标志位。这个文件已经不是链上
+    role:`RenderSettings` 在每次 spawn 前从 owner 的文档重建它,而且只在
+    平台真的路由这个模型时才写(`prime/modelsjson.go:15-60`)。
 
 **一个值得记下来的错误 —— 先确认哪个产物装着哪一半。**
 这次移植的第一版是从 npm 装框架的(`@earendil-works/pi-coding-agent`),理由是
@@ -813,9 +1102,9 @@ skill、会话、存储、乃至系统提示本身,每一样都是独立版本�
 平台结构:它放在 sealed 自己的桥里(`bridge/bridge.mjs`,go:embed 进二进制,
 Start 时落盘),跟本仓库为 prime-agent 自建 HTTP bridge 是同一件事。状态那一半
 ——`Roles`、`Defaults`、`Restore`/`EvolutionFor`、`HandleLegacy["persona"]`、
-`FrameworkFacts`——在 `conformance.Run` 之外还配了密钥剥离和 persona 注入的
-专项测试(就是 §13 讲的 prime-agent"推理 pin 只存内存、第一次漂移提交后消失"
-那个回归测试的同款,只是这里守的是 `settings.yaml` 而不是 `models.json`)。
+`FrameworkFacts`——在 `conformance.Run` 之外还配了 persona 注入的专项测试;
+settings 通道落地后,渲染本身也有专项测试(`dsh/settings_test.go`:幂等、
+overlay 解析、以及从已下线 role 回收 pin)。
 
 **角色集,以及跟另外三个 adapter 不一样的地方:**
 
@@ -829,17 +1118,20 @@ Start 时落盘),跟本仓库为 prime-agent 自建 HTTP bridge 是同一件事�
    送到模型面前——boot 稳定之后调一次 `ctx.systemPrompt.section()`——而不是
    经过 DSH 自己会读的某个文件。这也意味着跟 prime-agent 一样不需要剥
    marker:没有任何平台产出的文字会跟这个角色的字节共用一处。
-3. **`settings.yaml`** —— 推理路由 pin,沿用 DSH settings 文件的 YAML 形状
-   (`$DSH_HOME/settings.yaml`)。注意:桥**故意不挂** `@deepseek-ai/dsh-settings-file`
-   ——它的热重载会把这个文件叠在组合之上,agent 改一下就能给自己注入任意推理
-   路由。所以这个 pin 由 adapter 自己读、用环境变量传给桥,DSH 本身根本不读
-   这个文件。这又是一次 `models.json`/`config.yaml` 角色,原因相同:mint 时的
+3. **完全没有配置 role** —— 而且这条规则正是在这个 adapter 身上成型的。它
+   曾经声明过 `settings.yaml`,即以 DSH 自己 settings 文件 YAML 形状承载的
+   推理路由 pin,理由和 `models.json`、`config.yaml` 一样:mint 时的
    `persona` 种子在第一次漂移提交后就从链上消失,所以这个 pin 需要一个路径
-   驱动的持久归宿。链上编码是规范 JSON;盘上是 YAML——跟 hermes `config.yaml` 用的是
-   同一套拆分(`yamlio.go`),这里是复用不是重新发明。`apiKeyEnv` 存的是
-   环境变量的名字,从来不是字面 key,`stripSecrets` 会把落进文件里的任何
-   `apiKey`/`api_key` 删掉——这是防将来某个会写 settings 的工具用的纵深防御
-   (这个 adapter 自己的写入路径从来不会产出这种东西)。
+   驱动的持久归宿。owner 的 settings 文档是更好的归宿(§5.5),于是这个 role
+   没了,文件也一起没了——没有东西写 `$DSH_HOME/settings.yaml`,没有东西读它,
+   `stripSecrets` 和它需要的 JSON/YAML 双形态拆分都已删除。桥仍然**故意不挂**
+   `@deepseek-ai/dsh-settings-file`——它的热重载会把那个文件叠在组合之上,
+   agent 改一下就能给自己注入任意推理路由;安全性质没变,只是已经没有东西
+   需要它保护了。"这个框架从哪读设置"现在的答案是桥进程的**环境变量**:
+   `RenderSettings` 确定性地算出这些变量,`Start` 把它们交给它 spawn 的进程
+   (`dsh/settings.go:15-34`)。唯一残留的痕迹是"role 还在时铸造的 agent"链上
+   仍带着的那条记录,`HandleLegacy` 会从里面把 pin 读出来,只读一次——这个
+   adapter 是 `framework.LegacySettingsSeeder` 唯一的实现者(§5.5)。
 4. **`skills/`** —— `DirectoryManifest`,指向 `$DSH_HOME/skills/`,DSH 自己
    skill 发现表里 rank 400("user-dsh")的那个根(`docs/subsystems/skills.md`)。
    跟 prime-agent 只有 Python 包(纯目录)形状的 skill 不同,DSH 的 skill 要么
@@ -861,7 +1153,7 @@ skill、推理 pin),跟 openclaw、hermes 追踪的是同一个面;DSH 自己的
 代码不追踪,只活在单个容器的生命周期里——除了 DSH 恰好比另外两个多暴露的这一
 项能力,不损失别的东西。
 
-**对 DSH 自己 web app 的逐端点审计(§11 step 10)发现了什么。**DSH 自带一个
+**对 DSH 自己 web app 的逐端点审计(§11 step 11)发现了什么。**DSH 自带一个
 完整的 dashboard(`apps/web`),带文件浏览器,还有一个能从界面上直接关掉任意
 组合插件的设置页——包括本 adapter 注入 doctrine 用的那一个,完全
 绕开 agent。按本文档的既定规则,不为它声明 route。界面缺席时真正需要一个人类

@@ -31,12 +31,30 @@ type Attestation struct {
 	Ts        int64  `json:"ts"`
 }
 
+// Result is what /provision hands the container.
+type Result struct {
+	// AgentSealPriv is the agent's signing key. Nil on any failure.
+	AgentSealPriv []byte
+	// Settings is the owner's configuration document, or nil when this
+	// agent has none stored yet. attestor keeps it as an opaque blob and
+	// encrypts it to the same container pubkey as the key above, so it
+	// rides the channel that already exists rather than needing a new one.
+	//
+	// It comes down on EVERY boot, including a resume — which is the whole
+	// reason it is here and not in the sandbox env: env is supplied only on
+	// container create, so a resumed container would come up with no
+	// configuration at all.
+	Settings []byte
+}
+
 // FromAttestor calls attestorURL/provision with the sandbox's identity proof
-// and returns the decrypted agent_seal_priv bytes.
+// and returns the decrypted payload.
 //
-// On any failure (HTTP error, malformed response, ECIES decrypt failure)
-// returns nil; details are logged.
-func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) []byte {
+// On any failure (HTTP error, malformed response, ECIES decrypt failure) the
+// key is nil; details are logged. A settings blob that fails to decrypt is
+// logged and dropped rather than being fatal: an agent that boots on its
+// last-good configuration beats one that refuses to boot.
+func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result {
 	imageHashHex := strings.TrimPrefix(a.ImageHash, "sha256:")
 	reqBody, _ := json.Marshal(map[string]any{
 		"seal_id":           "0x" + a.SealID,
@@ -50,36 +68,50 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) []byte
 	resp, err := client.Post(attestorURL+"/provision", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("FAIL provision: POST error: %v", err)
-		return nil
+		return Result{}
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("FAIL provision: HTTP %d: %s", resp.StatusCode, string(body))
-		return nil
+		return Result{}
 	}
 	var out struct {
 		EncryptedAgentSealPriv string `json:"encrypted_agent_seal_priv"`
+		EncryptedSettings      string `json:"encrypted_settings"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		logger.Logf("FAIL provision: decode response: %v", err)
-		return nil
+		return Result{}
 	}
 	if out.EncryptedAgentSealPriv == "" {
 		logger.Logf("FAIL provision: empty encrypted_agent_seal_priv")
-		return nil
+		return Result{}
 	}
+	priv := eciesgo.NewPrivateKeyFromBytes(sealKeyBytes)
+
 	ctBytes, err := hex.DecodeString(strings.TrimPrefix(out.EncryptedAgentSealPriv, "0x"))
 	if err != nil {
 		logger.Logf("FAIL provision: decode ciphertext hex: %v", err)
-		return nil
+		return Result{}
 	}
-	priv := eciesgo.NewPrivateKeyFromBytes(sealKeyBytes)
 	plaintext, err := eciesgo.Decrypt(priv, ctBytes)
 	if err != nil {
 		logger.Logf("FAIL provision: ECIES decrypt: %v", err)
-		return nil
+		return Result{}
+	}
+
+	var settingsBlob []byte
+	if out.EncryptedSettings != "" {
+		if ct, err := hex.DecodeString(strings.TrimPrefix(out.EncryptedSettings, "0x")); err != nil {
+			logger.Logf("warn: provision: decode settings hex: %v (booting without owner settings)", err)
+		} else if pt, err := eciesgo.Decrypt(priv, ct); err != nil {
+			logger.Logf("warn: provision: settings ECIES decrypt: %v (booting without owner settings)", err)
+		} else {
+			settingsBlob = pt
+			logger.Logf("OK   provisioned owner settings (%d bytes)", len(pt))
+		}
 	}
 	// Confirm size + derived address only — never log the priv bytes.
 	if len(plaintext) > 0 {
@@ -90,7 +122,7 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) []byte
 			logger.Logf("OK   provisioned agent_seal_priv (%d bytes)", len(plaintext))
 		}
 	}
-	return plaintext
+	return Result{AgentSealPriv: plaintext, Settings: settingsBlob}
 }
 
 // fmt is referenced indirectly via fmt.Errorf elsewhere in this package once

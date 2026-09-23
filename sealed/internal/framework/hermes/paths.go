@@ -5,11 +5,17 @@ package hermes
 // Hermes Agent keeps all mutable state under <home> (~/.hermes): config.yaml
 // (settings), SOUL.md (identity), memories/*.md (distilled long-term memory),
 // skills/ (agentskills.io SKILL.md folders — both bundled-at-install and
-// agent-created). Sealed owns these paths during Restore (writing iData
+// agent-created).
+//
+// Sealed owns SOUL.md, memories/ and skills/ during Restore (writing iData
 // content to disk) and EvolutionFor (reading back to detect agent
-// self-modification).
+// self-modification). config.yaml is NOT among them: it is never chain-
+// tracked, and RenderSettings (spawn.go) rewrites the model-wiring keys it
+// owns there before every Start.
 //
 // Deliberately NOT managed (never on chain):
+//   - config.yaml               model wiring; owned by RenderSettings, and
+//                               it holds this boot's inference credential
 //   - .env, auth.json           secrets
 //   - state.db / *.db           conversation history + runtime task state
 //   - sessions/, logs/, bin/,   ephemeral / cache / process bookkeeping
