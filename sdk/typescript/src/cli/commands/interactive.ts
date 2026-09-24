@@ -37,6 +37,11 @@ let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
 // listing (banner / `list` / myRow refresh them as a side effect).
+// This CLI process's identity for the agent's single-driver seat (WeChat
+// semantics: entering a session claims the agent; a displaced window is told
+// on its next message and re-enters to claim it back).
+const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
+
 let knownAgentIds: string[] = [];
 const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
   const ids = rows.map((r) => String(r.agentId ?? '')).filter((x) => x && x !== 'undefined');
@@ -185,8 +190,14 @@ interface Session {
 async function connectSession(s: Session, url: string): Promise<void> {
   s.url = url;
   s.sandboxId = sbid(url);
-  s.client = await s.ag.agent.client(url);
+  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId });
   s.phase = 'running';
+  // Take the single-driver seat (WeChat: the new login just wins; whoever
+  // held it is told on their next message). Best-effort — a pre-seat
+  // container 404s, and no seat is better than no session.
+  try {
+    await s.ag.agent.claimAgent(url, BigInt(s.agentId), clientInstanceId);
+  } catch { /* container predates the seat, or agentId unresolved — proceed */ }
   if (!s.agentSeal) {
     try {
       const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
@@ -2154,6 +2165,14 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // dsh agents legitimately end tool-only turns silently. Say what
       // happened instead of crying wolf (the true-failure path — no deltas,
       // no activity — still reports as an error).
+      // Displaced by another window (occupancy.go): WeChat semantics — this
+      // window bows out to the manager (same exit as /back; the try/finally
+      // still releases the Esc brake). Entering the session again claims the
+      // seat back.
+      if (failure && /displaced|in use by another client/i.test(failure)) {
+        out(`\n⚠ 该 agent 已在另一个客户端登录 — 本窗口退出会话(use ${s.agentId} 重新进入即可接管)\n`);
+        return;
+      }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
         out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
         failure = null;

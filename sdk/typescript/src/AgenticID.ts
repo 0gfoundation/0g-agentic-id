@@ -398,7 +398,7 @@ export class AgentApi {
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
    */
-  async client(idOrUrl: bigint | string): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
@@ -411,7 +411,7 @@ export class AgentApi {
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
     const logAuth = owner ? () => this.signOwner('0GSealLog', base, agentId!) : undefined;
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth, clientAddress: this.ctx.account?.address });
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth, clientAddress: this.ctx.account?.address, instanceId: opts?.instanceId });
   }
 
   /**
@@ -518,6 +518,32 @@ export class AgentApi {
     });
     if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${await r.text()}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * Take the agent's single-driver seat, WeChat-style: the claim always wins
+   * and whoever held the seat learns via 409 the next time they speak. Call it
+   * on entering a session; re-entering after being displaced claims the seat
+   * back. Owner-signed with the body digest bound in (tag `0GSealClaim`).
+   *
+   * Best-effort by contract: a container from before the seat existed 404s —
+   * callers should treat any failure as "no occupancy on this agent".
+   */
+  async claimAgent(base: string, agentId: bigint, instanceId: string): Promise<{ displaced?: boolean }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = JSON.stringify({ instance: instanceId });
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealClaim:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/claim`, {
+      method: 'POST',
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature, 'content-type': 'application/json' },
+      body,
+    });
+    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { displaced?: boolean };
   }
 
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */

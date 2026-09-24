@@ -75,6 +75,9 @@ type Server struct {
 	applySettings SettingsApplier
 	applySession  SessionSettingsApplier
 
+	// seat is the single active owner client (see occupancy.go).
+	seat occupantSeat
+
 	// liveOwner reads the CURRENT on-chain owner. Late-bound like adapter:
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
@@ -225,6 +228,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/hello", s.handleHello)
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
+	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
@@ -571,6 +575,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// One driver at a time (occupancy.go): a chat POST from a displaced
+	// client gets its 409 here, before any turn is dispatched. GETs (status,
+	// log reads, stream re-attach) and headerless callers pass untouched —
+	// reading never steals the seat, and the check protects mutation only.
+	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/") && !s.occupancyGate(w, r) {
 		return
 	}
 

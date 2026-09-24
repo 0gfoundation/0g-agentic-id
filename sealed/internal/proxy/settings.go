@@ -75,6 +75,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, read())
 
 	case http.MethodPost:
+		if !s.occupancyGate(w, r) {
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxSettingsBody+1))
 		if err != nil {
 			http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
