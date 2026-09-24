@@ -81,17 +81,17 @@ const TAIL_ARGS: Record<string, string[]> = {
 
 // completeTail finishes the word being typed in a k=v run: key names, and
 // the value set for thinking=.
-function completeTail(cmd: string, word: string): string[] {
+export function completeTail(cmd: string, word: string, models: string[]): string[] {
   const keys = TAIL_ARGS[cmd];
   if (!keys) return [];
   // Value completion for the keys whose values are a known set. thinking is a
-  // fixed trio; model is the router catalog (cached); provider is the one name
-  // the platform routes. others= is opaque JSON — nothing to suggest.
+  // fixed trio; model is the router catalog; provider is the one name the
+  // platform routes. others= is opaque JSON — nothing to suggest.
   if (word.startsWith('thinking=')) {
     return ['low', 'high', 'max'].map((v) => 'thinking=' + v).filter((c) => c.startsWith(word));
   }
   if (word.startsWith('model=')) {
-    const hits = chatModelIds.map((id) => 'model=' + id).filter((c) => c.startsWith(word));
+    const hits = models.map((id) => 'model=' + id).filter((c) => c.startsWith(word));
     return hits.length ? hits : ['model='];
   }
   if (word.startsWith('provider=')) {
@@ -99,6 +99,36 @@ function completeTail(cmd: string, word: string): string[] {
   }
   const hits = keys.filter((c) => c.startsWith(word));
   return hits.length ? hits : keys;
+}
+
+// completeLine is the whole completer as a pure function, so the dispatch — the
+// part that has now broken twice — is unit-testable without a tty. The live
+// completer is a one-line adapter that hands it the mutable module state.
+export function completeLine(
+  line: string,
+  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[] },
+): [string[], string] {
+  const sp = line.indexOf(' ');
+  if (sp === -1) {
+    const hits = state.completions.filter((c) => c.startsWith(line));
+    return [hits.length ? hits : state.completions, line];
+  }
+  const cmd = line.slice(0, sp);
+  const rest = line.slice(sp + 1);
+  const word = rest.slice(rest.lastIndexOf(' ') + 1);
+  // k=v commands (settings / /settings) complete keys AND values at every
+  // position. The exception is L1 `settings <agent> …`, whose first token is
+  // the agent id; the in-session `/settings` has no agent token, so its first
+  // word is already k=v. This split is exactly what broke `/settings model=`.
+  const firstTokenIsAgent = cmd === 'settings' && !rest.includes(' ');
+  if (TAIL_ARGS[cmd] && !firstTokenIsAgent) {
+    const hits = completeTail(cmd, word, state.models);
+    return hits.length ? [hits, word] : [[], line];
+  }
+  const cand = state.args[cmd];
+  const list = typeof cand === 'function' ? cand() : (cand ?? []);
+  const hits = list.filter((c) => c.startsWith(rest));
+  return [hits.length ? hits : list, rest];
 }
 
 // The live readline interface — askSecret scrubs submitted secrets out of
@@ -329,26 +359,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
-    completer: (line: string): [string[], string] => {
-      const sp = line.indexOf(' ');
-      if (sp === -1) {
-        const hits = activeCompletions.filter((c) => c.startsWith(line));
-        return [hits.length ? hits : activeCompletions, line];
-      }
-      // Complete the FIRST argument from the command's candidate table
-      // (later arguments are free-form: keys, amounts, prompts — except the
-      // commands in TAIL_ARGS, whose k=v words complete anywhere).
-      const rest = line.slice(sp + 1);
-      if (rest.includes(' ')) {
-        const word = rest.slice(rest.lastIndexOf(' ') + 1);
-        const hits = completeTail(line.slice(0, sp), word);
-        return hits.length ? [hits, word] : [[], line];
-      }
-      const cand = activeArgs[line.slice(0, sp)];
-      const list = typeof cand === 'function' ? cand() : (cand ?? []);
-      const hits = list.filter((c) => c.startsWith(rest));
-      return [hits.length ? hits : list, rest];
-    },
+    completer: (line: string): [string[], string] =>
+      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds }),
   });
   // `ask` is a line QUEUE, not rl.question: lines that arrive while no
   // question is pending (piped input racing the ~4s async banner) used to be
