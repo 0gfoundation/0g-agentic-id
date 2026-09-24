@@ -43,6 +43,19 @@ const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
   if (ids.length) knownAgentIds = [...new Set(ids)];
 };
 const AGENT = (): string[] => knownAgentIds;
+
+// Model ids for `model=` completion. Filled once, best-effort, from the router
+// catalog (chat models only — it also lists image/audio ones). Completion is
+// synchronous, so this must be a plain cache: a fire-and-forget refresh on
+// REPL entry populates it, and until it lands `model=<tab>` simply offers
+// nothing rather than blocking on the network.
+let chatModelIds: string[] = [];
+function prefetchModelIds(ag: AgenticID): void {
+  ag.agent
+    .listModelCaps()
+    .then((caps) => { chatModelIds = caps.filter((m) => m.chat).map((m) => m.id); })
+    .catch(() => { /* a wedged router must not break the prompt; leave the cache empty */ });
+}
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
@@ -71,8 +84,18 @@ const TAIL_ARGS: Record<string, string[]> = {
 function completeTail(cmd: string, word: string): string[] {
   const keys = TAIL_ARGS[cmd];
   if (!keys) return [];
+  // Value completion for the keys whose values are a known set. thinking is a
+  // fixed trio; model is the router catalog (cached); provider is the one name
+  // the platform routes. others= is opaque JSON — nothing to suggest.
   if (word.startsWith('thinking=')) {
     return ['low', 'high', 'max'].map((v) => 'thinking=' + v).filter((c) => c.startsWith(word));
+  }
+  if (word.startsWith('model=')) {
+    const hits = chatModelIds.map((id) => 'model=' + id).filter((c) => c.startsWith(word));
+    return hits.length ? hits : ['model='];
+  }
+  if (word.startsWith('provider=')) {
+    return ['provider=0g-compute'].filter((c) => c.startsWith(word));
   }
   const hits = keys.filter((c) => c.startsWith(word));
   return hits.length ? hits : keys;
@@ -523,7 +546,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // <Tab>` is dead until the first list/balance/agent op of the session.
   // Fire-and-forget — a slow attestor costs the completions, never the prompt.
   if (key && ctx.env.attestorUrl) {
-    withWallet(ctx).then((ag) => ag.agent.listMyDeployments()).then(rememberAgentIds).catch(() => { /* completions only */ });
+    withWallet(ctx).then((ag) => {
+      ag.agent.listMyDeployments().then(rememberAgentIds).catch(() => { /* completions only */ });
+      prefetchModelIds(ag); // so `model=<Tab>` has the catalog ready
+    }).catch(() => { /* completions only */ });
   }
   for (;;) {
     activeCompletions = L1_WORDS;
