@@ -534,6 +534,39 @@ function lastUserText(messages) {
 	return "";
 }
 
+// ── session restore after a bridge restart ───────────────────────────────────
+//
+// The conversation lives in THIS process's memory (the session object), but a
+// configuration change restarts the harness (manager.Reload), and a fresh
+// process used to greet a mid-conversation owner with total amnesia: the
+// client resends the full transcript on every turn — it always has — yet the
+// bridge took only the last user line. On the FIRST turn of a fresh process,
+// if the request carries history, replay it as a framed transcript ahead of
+// the prompt. Meeting minutes, not native memory: tool-call internals are not
+// reconstructed, but the conversation continues instead of restarting.
+const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
+let sessionSeeded = false; // flips when the first turn is dispatched
+
+function restoreTranscript(messages) {
+	if (sessionSeeded || !Array.isArray(messages)) return "";
+	let lastUser = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i] && messages[i].role === "user") { lastUser = i; break; }
+	}
+	// History = everything before the final user message (that one IS the turn).
+	const prior = messages
+		.slice(0, lastUser === -1 ? messages.length : lastUser)
+		.filter((m) => m && (m.role === "user" || m.role === "assistant"))
+		.map((m) => ({ role: m.role, text: lastUserText([{ role: "user", content: m.content }]) }))
+		.filter((m) => m.text.trim().length > 0);
+	if (!prior.length) return "";
+	let body = prior.map((m) => `${m.role}: ${m.text}`).join("\n\n");
+	let truncated = false;
+	if (body.length > RESTORE_CAP) { body = body.slice(-RESTORE_CAP); truncated = true; }
+	log(`session restore: replaying client transcript (${prior.length} msgs, ${body.length} chars${truncated ? ", oldest truncated" : ""})`);
+	return `[Context restore: this session was restarted mid-conversation. Prior transcript${truncated ? " (oldest part truncated)" : ""}:]\n\n${body}\n\n[End of prior transcript. Continue the conversation; do not re-answer old messages.]\n\n`;
+}
+
 // ── Request handling ────────────────────────────────────────────────────────
 
 function readBody(req) {
@@ -668,6 +701,8 @@ async function handleChat(req, res) {
 	if (!text) {
 		return sendJSON(res, 400, { error: { message: "no user message in `messages`" } });
 	}
+	const prompt = restoreTranscript(body.messages) + text;
+	sessionSeeded = true;
 
 	const session = await getSession();
 	const id = `chatcmpl-${created()}`;
@@ -736,7 +771,7 @@ async function handleChat(req, res) {
 			await runMine(() =>
 				runTurn(
 					session,
-					text,
+					prompt,
 					(delta) => safeWrite(chunkFrame(id, model, { content: delta })),
 					(line, type) => {
 						log(`  ${line}`);
@@ -844,8 +879,10 @@ const server = createServer((req, res) => {
 			if (body.reasoning && body.reasoning.effort && !effort) {
 				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low", "high" or "max"` } });
 			}
+			const prompt = (Array.isArray(body.input) ? restoreTranscript(body.input) : "") + text;
+			sessionSeeded = true;
 			const rec = newResponseRecord(text);
-			startResponseTurn(rec, text, effort);
+			startResponseTurn(rec, prompt, effort);
 			log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)${effort ? ` [think:${effort}]` : ""}`);
 			if (body.stream) return streamResponse(req, res, rec, 0);
 			// Non-stream (background-style): hand back the id immediately.
