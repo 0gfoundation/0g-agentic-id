@@ -544,10 +544,11 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
 
 - ~~迁移覆盖~~ —— 已关闭。四家都恢复两个遗留来源(退役配置角色 + mint 时的 persona
   种子),显式排位、有测试(§10)。
-- **容器侧的两条推送路径都还没有客户端。**`/_seal/settings` 与
-  `$SEAL_SIGN_SOCK/settings` 已实现、已有测试,但 SDK、CLI 与任何桥都没有调用它们,
-  agent 圣经(`internal/platform`)里也没有提到那个 socket,所以 agent 无从得知这个杠杆
-  存在。在客户端落地之前,可行路径仍是 §5.1 加一次 reset。
+- **agent socket 这半条推送路径还没有客户端。**owner 那半已经有了:CLI 的
+  `settings` 命令在持久写入后会推给运行中的容器,会话内的 `/settings` 与 `/think`
+  同样热推。仍未接线的是 AGENT 那半 —— 没有任何东西调用
+  `$SEAL_SIGN_SOCK/settings`,agent 圣经(`internal/platform`)也没提到这个
+  socket,agent 无从得知这个杠杆存在。
 - **凭据通道仍然只有一条。**就是那个单数的 `API_KEY` 环境变量。一个干真活的 agent 迟早
   需要第二个凭据 —— 一个付费 API、一个 webhook secret —— 而它**没地方放**,于是它会写进
   文件;`memories/`、`skills/` 与人格文件**都是被追踪的角色**,凭据就这样加密上了 0g

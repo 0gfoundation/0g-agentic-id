@@ -686,12 +686,12 @@ chain dissolved the problem they addressed.
 
 - ~~Migration coverage~~ — closed. All four adapters recover both legacy
   sources (retired config role + mint-time persona seed), ranked, tested (§10).
-- **Neither container-side push path has a shipped client.** `/_seal/settings`
-  and `$SEAL_SIGN_SOCK/settings` are implemented and tested, but nothing in
-  the SDK, the CLI or any bridge calls them, and the agent doc
-  (`internal/platform`) does not mention the socket, so an agent has no way to
-  learn the lever exists. Until a client lands, the practical path is §5.1
-  plus a reset.
+- **The agent-socket push path has no shipped client.** The owner path now
+  does: the CLI `settings` command pushes to the running container after the
+  durable write, and the in-session `/settings` and `/think` do the same. The
+  AGENT half is still unwired — nothing calls `$SEAL_SIGN_SOCK/settings`, and
+  the agent doc (`internal/platform`) does not mention the socket, so an agent
+  has no way to learn the lever exists.
 - **There is still only one credential channel.** The single `API_KEY`
   environment variable is it. An agent doing real work will need a second
   credential — a paid API, a webhook secret — and has nowhere to put it, so it
