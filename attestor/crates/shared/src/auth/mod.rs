@@ -25,6 +25,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 
 pub mod clone;
 pub mod deploy;
+pub mod settings;
 pub mod status;
 
 /// Canonical signed message — tagged with a domain constant to prevent

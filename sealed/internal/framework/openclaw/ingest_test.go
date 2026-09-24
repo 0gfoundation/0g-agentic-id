@@ -83,19 +83,29 @@ func TestHandleLegacy_Persona_PreservesUserChoiceFor0GCompute(t *testing.T) {
 	}
 }
 
-func TestHandleLegacy_Persona_EmptyPlaintextRejected(t *testing.T) {
+// An unreadable seed is stepped over, not fatal. Phase C propagates whatever
+// HandleLegacy returns (main.go), so erroring here is the difference between
+// an agent that boots degraded and a container that never comes up — and the
+// config branch has never had that power. See ingest.go.
+func TestHandleLegacy_Persona_EmptyPlaintextIsNotFatal(t *testing.T) {
 	useTempHome(t)
 	a := &Adapter{}
-	if err := a.HandleLegacy(context.Background(), "persona", nil); err == nil {
-		t.Errorf("expected error on empty plaintext, got nil")
+	if err := a.HandleLegacy(context.Background(), "persona", nil); err != nil {
+		t.Errorf("empty plaintext must be a no-op, got error: %v", err)
+	}
+	if _, err := os.Stat(soulMDPath()); !os.IsNotExist(err) {
+		t.Errorf("empty plaintext wrote SOUL.md (stat err = %v); there was nothing to translate", err)
 	}
 }
 
-func TestHandleLegacy_Persona_MalformedJSONRejected(t *testing.T) {
+func TestHandleLegacy_Persona_MalformedJSONIsNotFatal(t *testing.T) {
 	useTempHome(t)
 	a := &Adapter{}
-	if err := a.HandleLegacy(context.Background(), "persona", []byte("{ not json")); err == nil {
-		t.Errorf("expected error on malformed JSON, got nil")
+	if err := a.HandleLegacy(context.Background(), "persona", []byte("{ not json")); err != nil {
+		t.Errorf("malformed JSON must be a no-op, got error: %v", err)
+	}
+	if doc, ok := a.SeededSettings(); ok {
+		t.Errorf("SeededSettings() = %+v, true from a seed that did not parse", doc)
 	}
 }
 

@@ -3,17 +3,17 @@
 //
 // Env vars consumed:
 //
-//   SANDBOX_SEAL_KEY            (required) hex-encoded ephemeral private key
-//   SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
-//   TEE_SIGNER_ADDRESS          (optional) 0x-prefixed Ethereum address; if set,
-//                               the attestation signer must match exactly
-//   API_KEY                     (optional) inference provider API key (anthropic/openai)
-//   ATTESTOR_URL                (optional) provisioning endpoint root URL
-//   CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
-//   AGENTIC_ID_ADDR             (optional) AgenticID contract address
-//   INDEXER_URL                 (optional) 0g-storage indexer fallback URL
-//   AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
-//                               framework binding (local dev); the binding is authoritative
+//	SANDBOX_SEAL_KEY            (required) hex-encoded ephemeral private key
+//	SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
+//	TEE_SIGNER_ADDRESS          (optional) 0x-prefixed Ethereum address; if set,
+//	                            the attestation signer must match exactly
+//	API_KEY                     (optional) inference provider API key (anthropic/openai)
+//	ATTESTOR_URL                (optional) provisioning endpoint root URL
+//	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
+//	AGENTIC_ID_ADDR             (optional) AgenticID contract address
+//	INDEXER_URL                 (optional) 0g-storage indexer fallback URL
+//	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
+//	                            framework binding (local dev); the binding is authoritative
 //
 // After provisioning succeeds, SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION /
 // API_KEY MUST be cleared from the environment to deny a malicious or

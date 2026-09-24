@@ -24,33 +24,117 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
+import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
+import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
+import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
-const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
 // listing (banner / `list` / myRow refresh them as a side effect).
+// This CLI process's identity for the agent's single-driver seat (WeChat
+// semantics: entering a session claims the agent; a displaced window is told
+// on its next message and re-enters to claim it back).
+const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
+
 let knownAgentIds: string[] = [];
 const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
   const ids = rows.map((r) => String(r.agentId ?? '')).filter((x) => x && x !== 'undefined');
   if (ids.length) knownAgentIds = [...new Set(ids)];
 };
 const AGENT = (): string[] => knownAgentIds;
+
+// Model ids for `model=` completion. Filled once, best-effort, from the router
+// catalog (chat models only — it also lists image/audio ones). Completion is
+// synchronous, so this must be a plain cache: a fire-and-forget refresh on
+// REPL entry populates it, and until it lands `model=<tab>` simply offers
+// nothing rather than blocking on the network.
+let chatModelIds: string[] = [];
+function prefetchModelIds(ag: AgenticID): void {
+  ag.agent
+    .listModelCaps()
+    .then((caps) => { chatModelIds = caps.filter((m) => m.chat).map((m) => m.id); })
+    .catch(() => { /* a wedged router must not break the prompt; leave the cache empty */ });
+}
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
   retry: AGENT, clone: AGENT, transfer: AGENT, call: AGENT, rate: AGENT,
-  grant: AGENT, revoke: AGENT, authorizer: AGENT,
+  grant: AGENT, revoke: AGENT, authorizer: AGENT, settings: AGENT,
   list: ['--mine'],
 };
 const L2_ARGS: Record<string, string[] | (() => string[])> = {
   '/think': ['low', 'high', 'max'],
   '/reset': ['pick'],
+  '/settings': ['provider=', 'model=', 'thinking=', 'others='],
 };
 let activeArgs: Record<string, string[] | (() => string[])> = L1_ARGS;
+
+// Commands whose LATER arguments also complete (the generic rule is "first
+// argument only; the rest is free-form" — right for prompts and amounts,
+// wrong for settings' k=v list, where the keys are a closed set the user
+// should never have to remember).
+const SETTING_KEYS = ['provider=', 'model=', 'thinking=', 'others='];
+const TAIL_ARGS: Record<string, string[]> = {
+  'settings': SETTING_KEYS,  // L1: settings <agent> k=v k=v …
+  '/settings': SETTING_KEYS, // L2: /settings k=v k=v …
+};
+
+// completeTail finishes the word being typed in a k=v run: key names, and
+// the value set for thinking=.
+export function completeTail(cmd: string, word: string, models: string[]): string[] {
+  const keys = TAIL_ARGS[cmd];
+  if (!keys) return [];
+  // Value completion for the keys whose values are a known set. thinking is a
+  // fixed trio; model is the router catalog; provider is the one name the
+  // platform routes. others= is opaque JSON — nothing to suggest.
+  if (word.startsWith('thinking=')) {
+    return ['low', 'high', 'max'].map((v) => 'thinking=' + v).filter((c) => c.startsWith(word));
+  }
+  if (word.startsWith('model=')) {
+    const hits = models.map((id) => 'model=' + id).filter((c) => c.startsWith(word));
+    return hits.length ? hits : ['model='];
+  }
+  if (word.startsWith('provider=')) {
+    return ['provider=0g-compute'].filter((c) => c.startsWith(word));
+  }
+  const hits = keys.filter((c) => c.startsWith(word));
+  return hits.length ? hits : keys;
+}
+
+// completeLine is the whole completer as a pure function, so the dispatch — the
+// part that has now broken twice — is unit-testable without a tty. The live
+// completer is a one-line adapter that hands it the mutable module state.
+export function completeLine(
+  line: string,
+  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[] },
+): [string[], string] {
+  const sp = line.indexOf(' ');
+  if (sp === -1) {
+    const hits = state.completions.filter((c) => c.startsWith(line));
+    return [hits.length ? hits : state.completions, line];
+  }
+  const cmd = line.slice(0, sp);
+  const rest = line.slice(sp + 1);
+  const word = rest.slice(rest.lastIndexOf(' ') + 1);
+  // k=v commands (settings / /settings) complete keys AND values at every
+  // position. The exception is L1 `settings <agent> …`, whose first token is
+  // the agent id; the in-session `/settings` has no agent token, so its first
+  // word is already k=v. This split is exactly what broke `/settings model=`.
+  const firstTokenIsAgent = cmd === 'settings' && !rest.includes(' ');
+  if (TAIL_ARGS[cmd] && !firstTokenIsAgent) {
+    const hits = completeTail(cmd, word, state.models);
+    return hits.length ? [hits, word] : [[], line];
+  }
+  const cand = state.args[cmd];
+  const list = typeof cand === 'function' ? cand() : (cand ?? []);
+  const hits = list.filter((c) => c.startsWith(rest));
+  return [hits.length ? hits : list, rest];
+}
 
 // The live readline interface — askSecret scrubs submitted secrets out of
 // its history (display masking alone leaves the plaintext one ↑ away).
@@ -93,9 +177,10 @@ interface Session {
    *  last): lets /tasks list them and /result re-attach after a drop. The
    *  agent itself keeps the authoritative ring; this is just the ids. */
   tasks?: Array<{ id: string; prompt: string; at: number }>;
-  /** Owner-chosen reasoning-effort level (/think). On prime it applies
-   *  per-message immediately; on other frameworks it takes effect at the
-   *  next /reset (passed in the signed payload). */
+  /** The reasoning level /think last wrote to the settings document, mirrored
+   *  here ONLY as the per-message override for frameworks whose bridge takes
+   *  one (prime). The durable copy is the document; this is a session echo of
+   *  it, set after a successful write and never on its own. */
   thinking?: 'low' | 'high' | 'max';
   /** Task id of the chat turn currently in flight (responses transport). */
   currentTask?: string | null;
@@ -105,8 +190,14 @@ interface Session {
 async function connectSession(s: Session, url: string): Promise<void> {
   s.url = url;
   s.sandboxId = sbid(url);
-  s.client = await s.ag.agent.client(url);
+  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId });
   s.phase = 'running';
+  // Take the single-driver seat (WeChat: the new login just wins; whoever
+  // held it is told on their next message). Best-effort — a pre-seat
+  // container 404s, and no seat is better than no session.
+  try {
+    await s.ag.agent.claimAgent(url, BigInt(s.agentId), clientInstanceId);
+  } catch { /* container predates the seat, or agentId unresolved — proceed */ }
   if (!s.agentSeal) {
     try {
       const hello = (await (await fetch(`${url}/hello`)).json()) as { agent?: string };
@@ -279,21 +370,8 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Tab completion on the command word. One readline serves both levels,
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
-    completer: (line: string): [string[], string] => {
-      const sp = line.indexOf(' ');
-      if (sp === -1) {
-        const hits = activeCompletions.filter((c) => c.startsWith(line));
-        return [hits.length ? hits : activeCompletions, line];
-      }
-      // Complete the FIRST argument from the command's candidate table
-      // (later arguments are free-form: keys, amounts, prompts).
-      const rest = line.slice(sp + 1);
-      if (rest.includes(' ')) return [[], line];
-      const cand = activeArgs[line.slice(0, sp)];
-      const list = typeof cand === 'function' ? cand() : (cand ?? []);
-      const hits = list.filter((c) => c.startsWith(rest));
-      return [hits.length ? hits : list, rest];
-    },
+    completer: (line: string): [string[], string] =>
+      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds }),
   });
   // `ask` is a line QUEUE, not rl.question: lines that arrive while no
   // question is pending (piped input racing the ~4s async banner) used to be
@@ -394,7 +472,7 @@ async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${st
 // ── L1: manager REPL ─────────────────────────────────────────────────────────
 
 const L1_HELP =
-  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
+  'commands: list · use <id> · hello <id> · call <id> · rate <id> · deploy · start/stop/reset <id> · settings <id> · balance · deposit · withdraw · ack · login · whoami · help · quit';
 
 const L1_HELP_FULL = `manager commands
   list                    agents on this attestor (* = owned by your wallet)
@@ -416,6 +494,10 @@ const L1_HELP_FULL = `manager commands
                           framework — 'reset <id> pick' to change; asks the key)
   retry <id|sealId>       resume a FAILED deploy/clone under the same identity
                           (re-runs the failed on-chain stages; reset after)
+  settings <id> [k=v …]   show the agent's configuration document (which model
+                          it thinks with, and how hard); with assignments —
+                          model=… provider=… thinking=low|high|max
+                          others=<json> — merge and write it (owner-signed)
   clone <id> [to]         clone an agent. Yours: mints to you (or <to>).
                           Someone else's: goes through its fork policy — works
                           iff the seller granted YOUR wallet. Lands offline
@@ -487,7 +569,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // <Tab>` is dead until the first list/balance/agent op of the session.
   // Fire-and-forget — a slow attestor costs the completions, never the prompt.
   if (key && ctx.env.attestorUrl) {
-    withWallet(ctx).then((ag) => ag.agent.listMyDeployments()).then(rememberAgentIds).catch(() => { /* completions only */ });
+    withWallet(ctx).then((ag) => {
+      ag.agent.listMyDeployments().then(rememberAgentIds).catch(() => { /* completions only */ });
+      prefetchModelIds(ag); // so `model=<Tab>` has the catalog ready
+    }).catch(() => { /* completions only */ });
   }
   for (;;) {
     activeCompletions = L1_WORDS;
@@ -495,7 +580,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     const line = (await ask('\n0g-agenticid> ')).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
-    const [cmd, ...args] = line ? line.split(/\s+/) : ['whoami'];
+    // Quote-aware, so a value with a space in it (`settings 286
+    // others='{"a": 1}'`) survives the way it does in a real shell.
+    const [cmd, ...args] = line ? tokenize(line) : ['whoami'];
     try {
       if (cmd === 'quit' || cmd === 'exit') return;
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
@@ -785,6 +872,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         continue;
       }
 
+      if (cmd === 'settings') {
+        // The document is the owner's in both directions — reading it is
+        // owner-signed too — so the wallet is needed even for a bare show.
+        if (!args[0]) { out('usage: settings <agentId|sealId> [model=… thinking=low|high|max provider=… others=<json>]\n'); continue; }
+        const ag = await withWallet(ctx);
+        const row = await findAgentRow(ag, args[0]);
+        if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined);
+        continue;
+      }
+
       if (cmd === 'authorizer') {
         // Extra args are ambiguous (`authorizer <id> <addr> off` — set or
         // clear?) — refuse rather than silently act on a guess.
@@ -922,7 +1020,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
         const path = args[1];
         if (!path.startsWith('/')) { out('path must start with /\n'); continue; }
-        const body = args.slice(2).join(' ') || undefined;
+        // The body is free-form — take it VERBATIM from the line. Running it
+        // through the shell-style splitter and re-joining the pieces eats the
+        // quote characters a JSON body is made of (`{"a":1}` → `{a:1}`, POSTed
+        // as garbage) and rewrites its spacing; the tail after `call <id>
+        // <path>` is the body exactly as typed, which is what the agent parses.
+        const body = splitHead(line, 3).rest || undefined;
         const registered = services.find((sv) => sv.path === path);
         const method = registered?.method ?? (body ? 'POST' : 'GET');
         if (!registered && path !== '/hello') out(`note: ${path} is not in the agent's service table — calling anyway\n`);
@@ -1071,6 +1174,69 @@ function friendlyChainError(e: unknown): string | undefined {
  *  what made the REPL feel slow. login/env changes invalidate naturally
  *  because the cache key changes. */
 let cachedClient: { key: string; ag: AgenticID } | null = null;
+/**
+ * Show, or merge-and-write, an agent's settings document — the owner's
+ * configuration (which model it thinks with, and how hard). Shared by L1
+ * `settings <id>`, L2 `/settings` and L2 `/think`, so the grammar, the
+ * refusals and the conflict handling are the same in all three.
+ *
+ * A bare call shows; `key=value` args merge onto the stored document and
+ * write it back, owner-signed — reading is owner-signed too, so `ag` must
+ * carry a wallet either way. The catalog check inside setSettings warns
+ * before signing and never blocks — the container is the gate.
+ *
+ * Returns the document now in force (unchanged on a bare show), so a caller
+ * like /think can report the level that actually landed.
+ */
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string): Promise<SettingsDoc | null> {
+  const assignments = parseAssignments(args); // throws CliError on a bad key/level
+  const { settings: current, version } = await ag.agent.getSettings(sealId);
+  if (!assignments.length) {
+    for (const l of renderSettings(current)) out(`  ${l}\n`);
+    out('  change with: model=<id> · thinking=low|high|max · provider=<name> · others=\'<json>\' (quote it)\n');
+    return current;
+  }
+  const next = applyAssignments(current, assignments);
+  // A document with no model is the one the container hard-fails on and
+  // last-known-good cannot cover — refuse before signing, and say so.
+  assertModelPresent(next, current !== null);
+  try {
+    const { version: written } = await ag.agent.setSettings(sealId, next, {
+      baseVersion: version,
+      onWarn: (w) => out(`⚠ ${w}\n`),
+    });
+    for (const l of renderSettings(next)) out(`  ${l}\n`);
+    // Push to the running container so a change made mid-conversation takes
+    // effect NOW, not at the next boot. Best-effort: the write above is
+    // durable, so a push failure is a note, never an error. The command-line
+    // `settings` already did this; the in-session /settings and /think — the
+    // likeliest place to retune an agent you are talking to — used to defer to
+    // a reset (found live: /settings thinking=high said "next boot" while the
+    // agent was running).
+    if (serveBase) {
+      try {
+        const agentId = await ag.agent.getAgentIdBySealId(sealId);
+        const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
+        out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
+      } catch (e2) {
+        out(`written — version ${written}; stored, but the running container did not take it (${(e2 as Error).message}) — it applies on the next boot\n`);
+      }
+    } else {
+      out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+    }
+    return next;
+  } catch (e) {
+    if (!(e instanceof SettingsConflictError)) throw e;
+    // Someone else edited this agent between the read and the write. Show
+    // what is there now and let the owner decide — a quiet retry here would
+    // be this REPL choosing to discard the other change.
+    out(`⚠ ${e.message}\n  the document now stored (version ${e.currentVersion}):\n`);
+    for (const l of renderSettings(e.current)) out(`    ${l}\n`);
+    out('  nothing was written — repeat your command to apply it on top of that\n');
+    return e.current;
+  }
+}
+
 async function clientFor(ctx: CommandContext, withWalletOpt: boolean): Promise<AgenticID> {
   const cacheKey = `${ctx.env.attestorUrl}|${withWalletOpt ? ctx.env.privateKey ?? '' : ''}`;
   if (cachedClient?.key === cacheKey) return cachedClient.ag;
@@ -1552,7 +1718,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1566,9 +1732,18 @@ const L2_HELP_FULL = `session commands
   /reset                  recreate the container (uses the recorded framework;
                           /reset pick to choose another; asks the key; also
                           clears the local chat history)
-  /think [low|high|max]   reasoning depth for thinking models (glm etc.);
-                          no arg shows current. prime: applies per message;
-                          other frameworks: takes effect at the next /reset
+  /settings [k=v …]       the owner's configuration document: which model
+                          this agent thinks with, and how hard. Bare shows it;
+                          model=… provider=… thinking=low|high|max
+                          others=<json> merge into it and write it back
+                          (owner-signed). Applies at the next boot — /reset
+                          applies it now
+  /think [low|high|max]   reasoning depth for thinking models (glm etc.) —
+                          shorthand for /settings thinking=…, so it is written
+                          to the owner's document (owner-signed) and applies at
+                          the agent's next boot; /reset applies it now. prime
+                          also takes it per message, from the next one on.
+                          No arg shows the level currently stored
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -1733,7 +1908,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         const apiKey = await inferenceKey(ctx, ask);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
-        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey, thinking: s.thinking });
+        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
         await connectSession(s, r.url);
@@ -1756,20 +1931,39 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           : `container refused /log (HTTP ${res.status}) — agent is ${s.phase}; /agentlog has the runtime log once it's up\n`);
         continue;
       }
+      if (line === '/settings' || line.startsWith('/settings ')) {
+        // The owner's configuration document: which model this agent thinks
+        // with, and how hard. Bare shows it; key=value writes it (merged).
+        // Owner-signed in both directions, so it needs the wallet client and
+        // not the session's (possibly keyless) one.
+        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined);
+        continue;
+      }
       if (line === '/think' || line.startsWith('/think ')) {
-        const arg = line.split(/\s+/)[1];
+        // /think is `/settings thinking=…` with a shorter name: it writes the
+        // owner's document, which is the only place a reasoning level lives
+        // now. (It used to set a session variable that rode a container
+        // environment variable on the next /reset — nothing reads that any
+        // more, so the command announced a change it was not making.)
+        const arg = tokenize(line)[1];
+        const ag = await withWallet(ctx);
         if (!arg) {
-          out(`thinking level: ${s.thinking ?? '(platform default: low)'}\n`);
+          const doc = await ag.agent.getSettings(s.sealId);
+          out(`thinking level: ${(doc.settings?.thinking as string | undefined) ?? '(unset — the platform bounds thinking models at low)'}\n`);
           continue;
         }
-        if (!['low', 'high', 'max'].includes(arg)) { out('usage: /think low|high|max\n'); continue; }
+        if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        s.thinking = arg as 'low' | 'high' | 'max';
-        // prime's bridge takes a per-message level; the other frameworks'
-        // HTTP surfaces don't — there the choice rides the next /reset.
-        out(s.framework === 'prime-agent'
-          ? `thinking level: ${arg} — applies to your next messages\n`
-          : `thinking level: ${arg} — this framework has no per-message control; it will apply at the next /reset\n`);
+        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], s.client && s.url ? s.url : undefined);
+        // Only mirror it into this session once the write actually landed —
+        // a refused or conflicted write must not leave the per-message
+        // override claiming a level the agent was never given.
+        if (written?.thinking === arg) {
+          s.thinking = arg as ThinkingLevel;
+          out(s.framework === 'prime-agent'
+            ? '  this framework also takes it per message, so your next message uses it already\n'
+            : '  /reset applies it now; otherwise it lands at the agent\'s next boot\n');
+        }
         continue;
       }
       if (line === '/tasks') {
@@ -1820,7 +2014,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
     } catch (e) {
-      out(`error: ${(e as Error).message}\n`); continue;
+      // Show the remedy too: an error whose whole point is "do this instead"
+      // (a refused settings write, a missing wallet) is useless without it.
+      const ce = e as CliError;
+      out(`error: ${ce.message}${ce.remedy ? `\n  → ${ce.remedy}` : ''}\n`); continue;
     }
 
     // a chat turn (interruptible)
@@ -1968,11 +2165,25 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // dsh agents legitimately end tool-only turns silently. Say what
       // happened instead of crying wolf (the true-failure path — no deltas,
       // no activity — still reports as an error).
+      // Displaced by another window (occupancy.go): WeChat semantics — this
+      // window bows out to the manager (same exit as /back; the try/finally
+      // still releases the Esc brake). Entering the session again claims the
+      // seat back.
+      if (failure && /displaced|in use by another client/i.test(failure)) {
+        out(`\n⚠ 该 agent 已在另一个客户端登录 — 本窗口退出会话(use ${s.agentId} 重新进入即可接管)\n`);
+        return;
+      }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
         out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
         failure = null;
       }
-      if (failure) out(`\n(chat failed: ${failure})`);
+      // The catch-all failure — a model the backend rejects (e.g. a catalog
+      // max_tokens over the model's real cap), a bad key, an upstream 400 —
+      // arrives here as the gateway's terse transcript ("LLM request failed"),
+      // while the actual cause (the 400 body) is only in the container log. A
+      // turn that fails EVERY time is usually the model or config it was just
+      // given, so point at the log the way the connection-drop branches do.
+      if (failure) out(`\n(chat failed: ${failure}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;

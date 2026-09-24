@@ -1,10 +1,9 @@
 // Package openclaw is the framework adapter for openclaw agents.
 //
 // Current path-driven role set (see sealed/ARCHITECTURE.zh.md §6 for the
-// full role table). The 5 declared roles:
+// full role table). The 4 declared roles:
 //
 //	framework            Leaf — 3-field binding JSON
-//	openclaw.json        Leaf — main openclaw config (whitelist-filtered)
 //	workspace/           DirectoryManifest — workspace root .md files
 //	workspace/skills/    DirectoryManifest — each slug = one entry (tar.gz)
 //	workspace/canvas/    DirectoryManifest — file + dir entries
@@ -14,14 +13,16 @@
 //   - config.go      private config types
 //   - paths.go       on-disk path constants
 //   - disk.go        tar.gz helpers + openclaw.json read/merge/write +
-//                    workspace I/O
-//   - restore.go     Restore: parse iData → cfg → write openclaw.json +
-//                    workspace files
-//   - evolution.go   EvolutionFor: read openclaw.json + workspace → pack
-//                    iData plaintext (this is the "reverse mapping" the
-//                    uploader needs to publish actual current state)
+//     workspace I/O
+//   - restore.go     Restore: parse iData → cfg → write workspace files
+//   - evolution.go   EvolutionFor: read workspace → pack iData plaintext
+//     (this is the "reverse mapping" the uploader needs to
+//     publish actual current state)
+//   - inference.go   RenderSettings: owner settings → openclaw.json (the
+//     platform-owned keys re-rendered every Start, never
+//     chain-tracked)
 //   - spawn.go       Start: install + spawn openclaw + runtime config
-//                    sections (gateway.token, controlUi)
+//     sections (gateway.token, controlUi)
 //   - identitymd.go / soulmd.go / toolsmd.go  platform-injected sections
 package openclaw
 
@@ -39,6 +40,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/settings"
 )
 
 const (
@@ -59,18 +61,49 @@ const (
 // Adapter is the openclaw implementation of framework.Framework.
 type Adapter struct {
 	mu        sync.RWMutex
-	cfg       *config   // composed from the 5 dim Restore calls
+	cfg       *config   // composed from the declared roles' Restore calls
 	authToken string    // gateway auth token; generated on first Start, reused on every restart
 	cmd       *exec.Cmd // running gateway process; nil before Start / after exit
+
+	// rendered is the settings document RenderSettings last wrote to disk.
+	// Start takes the provider/model pin from here: openclaw.json is an
+	// output of the render now, so re-parsing it would just read back what
+	// we already know — and would read the WRONG thing once the file no
+	// longer comes from chain. nil means RenderSettings hasn't run.
+	rendered *settings.Resolved
+
+	// seededPin is the pin recovered by HandleLegacy from a retired chain
+	// role — the "openclaw.json" config role, or the mint-time "persona"
+	// seed for an agent that never drifted far enough to have one — handed
+	// back to the platform through SeededSettings so it can be persisted as
+	// the owner's settings document. nil for every agent minted after the
+	// settings channel shipped, which is every new one — this is
+	// transitional (inference.go).
+	seededPin *settings.Doc
+
+	// seededFrom is which retired role seededPin came from. Two branches can
+	// recover a pin and bootstrap runs them in chain order, so the stash is
+	// arbitrated by this rank rather than by whichever ran last: see
+	// legacySource in inference.go for the rule and why it goes that way.
+	seededFrom legacySource
+
+	// configRebuilt is set by RenderSettings when it had to rebuild
+	// openclaw.json from scratch because the file on disk no longer parsed.
+	// The gateway subtree (auth token, controlUi flags) lives in that same
+	// file and went with it, so the next Start re-writes it even on a
+	// restart — otherwise the gateway would come up rejecting the token
+	// this adapter still hands owners via /_seal/auth.
+	configRebuilt bool
 
 	// initialized flips after the first successful Start. Subsequent Start
 	// calls (i.e. supervisor restarts) skip the npm install + token
 	// generation steps so agent self-modifications (dashboard upgrade,
 	// plugin install, config edits) are not silently overwritten.
 	// Platform principle: outer framework does not interfere with
-	// agent self-modification; it only keeps the agent alive.
-	// (See ARCHITECTURE.zh.md §6 on openclaw.json whitelist + sealed-
-	// section markers.)
+	// agent self-modification; it only keeps the agent alive. (The one
+	// exception is openclaw.json's inference half, which RenderSettings
+	// re-renders from the owner's settings on every Start — it is a
+	// platform artifact, not agent state.)
 	initialized bool
 }
 
@@ -106,10 +139,15 @@ func (a *Adapter) Version(ctx context.Context) (string, error) {
 }
 
 // Roles returns the path-driven role set this adapter declares
-// (see sealed/ARCHITECTURE.zh.md §6 role table). Five entries:
+// (see sealed/ARCHITECTURE.zh.md §6 role table). Four entries — openclaw.json
+// is NOT among them: the config file is rendered from the owner's settings
+// document at every Start (see RenderSettings), so chain-tracking it would
+// anchor a derived artifact and hand a mint-time copy back to an agent whose
+// settings have since changed.
+//
+// Four entries:
 //
 //   - "framework"          (leaf)      framework binding metadata
-//   - "openclaw.json"      (leaf)      filtered openclaw config
 //   - "workspace/"         (manifest)  root markdown files
 //   - "workspace/skills/"  (manifest)  each skill subdir is an entry
 //   - "workspace/canvas/"  (manifest)  each top-level item is an entry
@@ -123,7 +161,6 @@ func (a *Adapter) Version(ctx context.Context) (string, error) {
 func (a *Adapter) Roles() []framework.RoleSpec {
 	return []framework.RoleSpec{
 		{Name: "framework", Shape: framework.Leaf},
-		{Name: "openclaw.json", Shape: framework.Leaf},
 		{Name: "workspace/", Shape: framework.DirectoryManifest},
 		{Name: "workspace/skills/", Shape: framework.DirectoryManifest},
 		{Name: "workspace/canvas/", Shape: framework.DirectoryManifest},
@@ -136,7 +173,6 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 // entry for a role.
 //
 //   - "framework": current adapter name + whitelistMax version + schema 1
-//   - "openclaw.json": empty JSON object
 //   - manifest roles: empty Manifest (schema_version=1, kind, entries=[])
 func (a *Adapter) Defaults(role string) []byte {
 	switch role {
@@ -151,8 +187,6 @@ func (a *Adapter) Defaults(role string) []byte {
 			return nil
 		}
 		return b
-	case "openclaw.json":
-		return []byte("{}")
 	case "workspace/", "workspace/skills/", "workspace/canvas/":
 		b, err := manifest.New().Marshal()
 		if err != nil {

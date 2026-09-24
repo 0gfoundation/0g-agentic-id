@@ -55,12 +55,6 @@ func TestConformance(t *testing.T) {
 				Leaf: []byte(`{"name":"openclaw","package_version":"2026.5.6","schema_version":1}`),
 			},
 			{
-				// Canonical encoding: compact JSON, sorted keys, only the
-				// ownedOpenclawKeys allowlist (agents/auth/models).
-				Role: "openclaw.json",
-				Leaf: []byte(`{"agents":{"defaults":{"model":{"primary":"glm-5.2"}}},"auth":{"mode":"none"},"models":{}}`),
-			},
-			{
 				Role: "workspace/",
 				Files: map[string][]byte{
 					"MEMORY.md": []byte("long-term memory content\n"),

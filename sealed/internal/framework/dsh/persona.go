@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"seal-verify/internal/logger"
+	"seal-verify/internal/settings"
 )
 
 // role="APPEND_SYSTEM.md" — the owner persona, and the mint-time `persona`
@@ -75,15 +76,28 @@ type personaSeed struct {
 	} `json:"inference"`
 }
 
-// HandleLegacy translates mint-only ingestion roles into this adapter's
-// path-driven artifacts. Unknown roles are logged and ignored — never an
-// error — because chains may carry experimental roles a given adapter
-// version does not understand.
+// HandleLegacy translates mint-only ingestion roles, and roles this adapter
+// has retired, into what the running container needs. Unknown roles are
+// logged and ignored — never an error — because chains may carry experimental
+// roles a given adapter version does not understand.
+//
+//	persona       the mint seed (below)
+//	settings.yaml the retired inference-pin role; its provider+model are
+//	              recovered into the owner's settings document (settings.go)
 func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byte) error {
-	if role != "persona" {
-		logger.Logf("dsh.HandleLegacy: ignoring unknown role %q (%d bytes)", role, len(plaintext))
-		return nil
+	switch role {
+	case "persona":
+		return a.handleLegacyPersona(plaintext)
+	case legacySettingsRole:
+		return a.handleLegacySettings(plaintext)
 	}
+	logger.Logf("dsh.HandleLegacy: ignoring unknown role %q (%d bytes)", role, len(plaintext))
+	return nil
+}
+
+// handleLegacyPersona ingests the protocol seed role every adapter must
+// handle (FRAMEWORK_ADAPTER.md §5.4).
+func (a *Adapter) handleLegacyPersona(plaintext []byte) error {
 	if len(strings.TrimSpace(string(plaintext))) == 0 {
 		logger.Logf("dsh.HandleLegacy[persona]: empty seed, nothing to ingest")
 		return nil
@@ -96,24 +110,64 @@ func (a *Adapter) HandleLegacy(ctx context.Context, role string, plaintext []byt
 		return nil
 	}
 
+	// The pin BEFORE the prompt's disk write: it is the half only this boot
+	// can recover (the watcher's first wholesale commit drops this entry), it
+	// cannot fail, and a disk that refuses APPEND_SYSTEM.md must not also
+	// cost the owner their model.
+	a.seedFromPersona(seed.Inference.Provider, seed.Inference.Model)
+
 	if seed.SystemPrompt != "" {
 		if err := a.restoreAppendSystem([]byte(seed.SystemPrompt)); err != nil {
-			return fmt.Errorf("dsh.HandleLegacy[persona]: %w", err)
+			// Logged, never returned: Phase C propagates an error (main.go
+			// returns on it), so an unwritable persona file would take the
+			// container OFFLINE — strictly worse than running on the stock
+			// system prompt, and worse than what the pre-migration code did
+			// with the same disk.
+			logger.Logf("dsh.HandleLegacy[persona]: WARN write APPEND_SYSTEM.md: %v", err)
 		}
 	}
 
-	// Translate the inference pin into the tracked settings.yaml role. This
-	// MUST be persisted, not merely remembered: `persona` is a mint-time seed
-	// that leaves the chain at the first drift commit (§5.4), so an
-	// in-memory-only pin would survive exactly until then — the bug found live
-	// on prime-agent's agent 271 (FRAMEWORK_ADAPTER.md §13), fixed there by
-	// tracking models.json. Same fix here, DSH's own file.
-	if seed.Inference.Provider != "" && seed.Inference.Model != "" {
-		if err := writeSettingsYAML(buildSettingsRoute(seed.Inference.Provider, seed.Inference.Model)); err != nil {
-			return fmt.Errorf("dsh.HandleLegacy[persona]: %w", err)
-		}
-	}
-	logger.Logf("dsh.HandleLegacy[persona]: system_prompt=%d bytes, inference=%s/%s",
-		len(seed.SystemPrompt), seed.Inference.Provider, seed.Inference.Model)
+	logger.Logf("dsh.HandleLegacy[persona]: system_prompt=%d bytes", len(seed.SystemPrompt))
 	return nil
+}
+
+// seedFromPersona REPORTS the mint-time pin to the platform
+// (framework.LegacySettingsSeeder → report.SeedSettings), closing the gap the
+// settings migration left: attestor mints exactly two iData roles, `framework`
+// and `persona`, so an agent minted before the channel that never committed
+// drift carries its pin HERE and nowhere else — the retired settings.yaml role
+// settings.go recovers from only exists on chain after a drift commit. For dsh
+// an unrecovered pin is an outage, not a degradation: Start hard-fails without
+// one (spawn.go), and the pre-migration code booted these agents fine.
+//
+// The pin is deliberately NOT written into a settings.yaml on disk. It used to
+// be, and that translation was itself the fix for a live bug (prime-agent's
+// agent 271: the seed leaves the chain at the first drift commit and an
+// in-memory pin died with it) — but the durable home is the owner's document
+// now, and a second on-disk source of truth is the ambiguity that bug was
+// made of.
+//
+// The provider is carried VERBATIM: the seed records what the owner picked
+// ("0g-compute" for a routed model), which is already the spelling
+// settings.Resolve turns back into the router endpoint. Both halves or
+// nothing, exactly as the settings.yaml branch: what comes back is PERSISTED
+// as the owner's document, and a half-pin would fail every future boot while
+// outranking this recovery each time.
+func (a *Adapter) seedFromPersona(provider, model string) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+	if provider == "" || model == "" {
+		if provider != "" || model != "" {
+			logger.Logf("dsh.HandleLegacy[persona]: seed pins provider=%q model=%q; half a pin is not a recovery", provider, model)
+		}
+		return
+	}
+	doc := settings.Doc{Provider: provider, Model: model}
+	if !a.stashSeededPin(sourcePersona, doc) {
+		logger.Logf("dsh.HandleLegacy[persona]: the mint seed pins %s/%s, but the retired %s role already recovered this agent's later pin; keeping that one",
+			provider, model, legacySettingsRole)
+		return
+	}
+	logger.Logf("dsh.HandleLegacy[persona]: recovered pin provider=%s model=%s from the mint seed; the platform will persist it as the owner's settings document",
+		provider, model)
 }

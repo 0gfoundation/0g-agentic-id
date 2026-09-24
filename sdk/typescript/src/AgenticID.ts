@@ -29,6 +29,7 @@ import { AgenticIDClient, type IntelligentDataResult } from './AgenticIDClient';
 import { ReputationClient } from './ReputationClient';
 import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
+import { sha256Hex, type SettingsDoc } from './Settings';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
@@ -397,7 +398,7 @@ export class AgentApi {
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
    */
-  async client(idOrUrl: bigint | string): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
@@ -410,7 +411,7 @@ export class AgentApi {
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
     const logAuth = owner ? () => this.signOwner('0GSealLog', base, agentId!) : undefined;
-    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth, clientAddress: this.ctx.account?.address });
+    return makeAgentClient({ base, services: disc.services, routes: disc.routes, reauth, logAuth, clientAddress: this.ctx.account?.address, instanceId: opts?.instanceId });
   }
 
   /**
@@ -467,6 +468,82 @@ export class AgentApi {
     const message = `${tag}:${sealId}:${Math.floor(Date.now() / 1000)}:${audience}`;
     const signature = await walletClient.signMessage({ account, message });
     return { message, signature };
+  }
+
+  /**
+   * Push a settings document into a RUNNING container, so a change takes
+   * effect without rebuilding it.
+   *
+   * This is the second half of a settings write and it is deliberately
+   * separate from the first. {@link AttestorClient.setSettings} stores the
+   * document — that is the authoritative act, and it is what a future boot
+   * reads. This call only makes the change visible NOW. If it fails, the
+   * document is still stored and the next boot picks it up, which is why the
+   * caller treats a failure here as a warning rather than an error.
+   *
+   * The signed message carries a field the other owner tags do not: the
+   * sha256 of the body, placed before the audience (see the comment on the
+   * message below for why the order is forced). Without it the signature attests only to who is
+   * calling, and anything able to alter the request in flight could keep a
+   * valid signature while substituting a different document — harmless on the
+   * read-only routes the tag scheme started with, not harmless on one that
+   * accepts a payload.
+   *
+   * Applying it restarts the framework process, so whatever the agent was
+   * doing is interrupted. The container says so in its response and callers
+   * should pass that on rather than reporting a silent success.
+   */
+  async pushSettingsToContainer(base: string, agentId: bigint, doc: unknown): Promise<{ note?: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = JSON.stringify(doc);
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    // Digest BEFORE audience. An audience is a URL and carries its own colons,
+    // so the container can only keep it whole as the final field of a limited
+    // split; a digest appended after it lands in the digest's slot as
+    // "//host:port:<digest>" and every request 401s — a signature-shaped
+    // failure that is not a signature problem.
+    const message = `0GSealSettings:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+
+    const r = await fetch(`${base}/_seal/settings`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'application/json',
+      },
+      body,
+    });
+    if (!r.ok) throw new Error(`pushSettingsToContainer: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * Take the agent's single-driver seat, WeChat-style: the claim always wins
+   * and whoever held the seat learns via 409 the next time they speak. Call it
+   * on entering a session; re-entering after being displaced claims the seat
+   * back. Owner-signed with the body digest bound in (tag `0GSealClaim`).
+   *
+   * Best-effort by contract: a container from before the seat existed 404s —
+   * callers should treat any failure as "no occupancy on this agent".
+   */
+  async claimAgent(base: string, agentId: bigint, instanceId: string): Promise<{ displaced?: boolean }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = JSON.stringify({ instance: instanceId });
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealClaim:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/claim`, {
+      method: 'POST',
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature, 'content-type': 'application/json' },
+      body,
+    });
+    if (!r.ok) throw new Error(`claimAgent: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { displaced?: boolean };
   }
 
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
@@ -606,7 +683,9 @@ export class AgentApi {
    *
    * This is the PUBLIC listing: the attestor now returns only non-sensitive
    * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
-   * `lastProvisionError` come back **null** here. `agentId`/`sealId`/`phase`/
+   * `lastProvisionError` come back **null** here. No tier carries the owner's
+   * settings document — read it with {@link AgentApi.getSettings}, which is
+   * owner-signed. `agentId`/`sealId`/`phase`/
    * `url`/`name` are still present, and `owner` appears for MINTED rows
    * (chain-public via ownerOf; unminted rows keep it withheld).
    * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
@@ -693,6 +772,10 @@ export class AgentApi {
       name: (card.name as string) ?? null,
       createdAt: (r.created_at as string) ?? null,
       lastProvisionError: failureReason,
+      // No `settings`: the owner's configuration document is owner-gated on
+      // READ as well as write and is served only by {@link getSettings}. No
+      // listing tier carries it, so advertising it here would have meant a
+      // field that is null even for a configured agent.
     };
   }
 
@@ -710,13 +793,13 @@ export class AgentApi {
    *    use this, not `reset` (which means "recreate an existing container").
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max' }): Promise<void>;
-  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max' }): Promise<void> {
+  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void>;
+  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, thinking: arg?.thinking });
+    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -727,8 +810,70 @@ export class AgentApi {
    * attestor never stores it, which is also WHY it must be passed
    * again on every recreate.
    */
-  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max' }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking });
+  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
+  }
+
+  /**
+   * The agent's current settings document — which model it thinks with, and
+   * how hard — with the version to write it back against. `settings: null`
+   * means it has never been configured; `version: 0` then, which is exactly
+   * the `baseVersion` a first write takes.
+   *
+   * OWNER-SIGNED: the document is the owner's, not public, so this needs a
+   * wallet and the attestor checks it against the LIVE on-chain owner. It is
+   * not carried on {@link listDeployments} rows or anywhere else.
+   *
+   * Configuration deliberately does NOT live on chain: it is re-suppliable
+   * (an owner re-picks a model in ten seconds), where the agent's memory is
+   * not. The attestor holds this blob opaquely and hands it to the container
+   * on every boot.
+   */
+  async getSettings(sealId: Hash): Promise<{ settings: SettingsDoc | null; version: number }> {
+    return this.attestor.getSettings(sealId);
+  }
+
+  /**
+   * Replace the agent's settings document (owner-signed; the attestor
+   * verifies the signer against the LIVE on-chain owner). Returns the new
+   * version.
+   *
+   * WHOLE-DOCUMENT, COMPARE-AND-SWAP write — what you pass becomes the
+   * document, and `baseVersion` is the version you read before editing:
+   *
+   * ```typescript
+   * const { settings, version } = await ag.agent.getSettings(sealId);
+   * await ag.agent.setSettings(
+   *   sealId,
+   *   { ...(settings ?? {}), model: '0gm-1.0-35b-a3b' },
+   *   { baseVersion: version },
+   * );
+   * ```
+   *
+   * If the stored version has moved on — another client, another device — the
+   * write is refused with {@link SettingsConflictError}, which carries the
+   * document that is actually there. Show it and let a human decide; do not
+   * loop on it, or the other writer's change is what disappears.
+   *
+   * The container applies it on its next boot and reports back, which
+   * promotes it to last-known-good; a container that keeps coming back
+   * without ever confirming one is handed the last document a boot did
+   * confirm, so a document that prevents boot costs a boot, not the agent.
+   *
+   * Pass `onWarn` for the advisory model check before signing (a model
+   * missing from the 0G router catalog is reported, never blocked).
+   */
+  async setSettings(
+    sealId: Hash,
+    settings: SettingsDoc,
+    opts: { baseVersion: number; onWarn?: (warning: string) => void },
+  ): Promise<{ version: number }> {
+    return this.attestor.setSettings({
+      sealId,
+      settings,
+      baseVersion: opts.baseVersion,
+      onWarn: opts.onWarn,
+    });
   }
 
   /**
@@ -743,8 +888,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied because
    * the attestor never stores it.
    */
-  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max' }): Promise<void> {
-    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking });
+  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string }): Promise<void> {
+    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey });
   }
 
   /**

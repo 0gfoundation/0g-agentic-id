@@ -12,6 +12,10 @@ import type { Address } from 'viem';
 import { keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
 import { agenticIDAbi, cloneGateAbi } from './abi';
+import {
+  canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
+  type SettingsDoc,
+} from './Settings';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
 export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
@@ -149,8 +153,6 @@ export interface DeployParams {
      *  Omit (or pass '') to use the attestor /config's current image —
      *  the operator-maintained default. */
     sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
-    thinking?: 'low' | 'high' | 'max';
     apiKey: string;
     sealed?: boolean;
     resourceId?: string;
@@ -167,10 +169,31 @@ export interface DeployCloneResponse {
 // its own frontend renders). It's omitted here — programmatic callers track
 // completion by polling instead (getAgentIdBySealId(seal_id) / GET /deployment).
 
-function b64encode(s: string): string {
+/**
+ * base64 of a string's UTF-8 bytes — on every runtime.
+ *
+ * The global `btoa` is LATIN-1: it takes a binary string, one byte per code
+ * unit. Handing it a JS string directly throws `InvalidCharacterError` on
+ * anything above U+00FF (so any CJK payload died outright), and silently
+ * encodes the WRONG bytes for U+0080..U+00FF — "café" shipped `Y2Fm6Q==`
+ * where the signature covered the UTF-8 `Y2Fmw6k=`. The attestor then
+ * recovered a different signer and reported the misleading
+ * "signer mismatch". So encode to UTF-8 first and feed btoa the bytes, the
+ * same form the attestor's own console uses (attestor/crates/api/web/index.html).
+ */
+export function b64encode(s: string): string {
+  const bytes = new TextEncoder().encode(s);
   const g = globalThis as { btoa?: (d: string) => string };
-  if (typeof g.btoa === 'function') return g.btoa(s);
-  return Buffer.from(s, 'utf8').toString('base64');
+  if (typeof g.btoa === 'function') {
+    // Chunked: `String.fromCharCode(...bytes)` overflows the argument stack
+    // on a large iData payload.
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    return g.btoa(binary);
+  }
+  return Buffer.from(bytes).toString('base64');
 }
 
 function randHex(bytes: number): string {
@@ -189,6 +212,33 @@ function randHex(bytes: number): string {
   }
   cryptoObj.getRandomValues(a);
   return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** `GET /settings`'s body → the pair every caller wants. An unset document is
+ *  `{settings: null, version: 0}`, and 0 is exactly the `baseVersion` a first
+ *  write takes, so "never configured" needs no special case anywhere above.
+ *  `settings_version` is accepted alongside `version` because that is the
+ *  column's name on the attestor's own row shape. */
+function parseSettingsBody(body: unknown): { settings: SettingsDoc | null; version: number } {
+  const b = (body ?? {}) as {
+    settings?: SettingsDoc | null;
+    version?: number | string | null;
+    settings_version?: number | string | null;
+  };
+  const raw = b.version ?? b.settings_version;
+  return { settings: b.settings ?? null, version: raw == null ? 0 : Number(raw) };
+}
+
+/** Best-effort version out of a 409 body — used only when the re-read that
+ *  follows a conflict ALSO fails, so a number is better than nothing and a
+ *  wrong guess is never acted on (the error is reported, never retried). */
+function versionInBody(text: string): number {
+  try {
+    const v = parseSettingsBody(JSON.parse(text)).version;
+    if (v) return v;
+  } catch { /* not JSON — fall through to the text scan */ }
+  const m = text.match(/version[^0-9]{0,20}(\d+)/i);
+  return m ? Number(m[1]) : 0;
 }
 
 export class AttestorClient {
@@ -310,14 +360,15 @@ export class AttestorClient {
   }
 
 
-  /** env block for a sandbox create payload: inference key + optional
-   *  owner-chosen thinking default (deploy/reset --thinking). Rides the
-   *  owner-signed payload verbatim; sealed reads SEAL_OWNER_THINKING and
-   *  normalizes it, adapters apply it over the chain-restored config. */
-  private sandboxEnv(apiKey: string | undefined, thinking?: string): Record<string, string> {
+  /** env block for a sandbox create payload: the inference key, and nothing
+   *  else. Reasoning depth used to ride here as `SEAL_OWNER_THINKING`; it
+   *  does not any more — the container reads `thinking` from the owner's
+   *  settings document, which reaches it on EVERY boot (including a resume,
+   *  which a create-time variable misses) and can be changed without a
+   *  recreate. See {@link SettingsDoc}. */
+  private sandboxEnv(apiKey: string | undefined): Record<string, string> {
     const env: Record<string, string> = {};
     if (apiKey) env.API_KEY = apiKey;
-    if (thinking) env.SEAL_OWNER_THINKING = thinking;
     return env;
   }
 
@@ -327,7 +378,7 @@ export class AttestorClient {
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot, sealed: sandbox.sealed ?? true, env: this.sandboxEnv(sandbox.apiKey, sandbox.thinking) },
+      { snapshot, sealed: sandbox.sealed ?? true, env: this.sandboxEnv(sandbox.apiKey) },
       ttlSec,
     );
   }
@@ -354,8 +405,6 @@ export class AttestorClient {
        *  `snapshot`; only relevant for `reset`). Explicit wins over the
        *  framework-resolved image. */
       sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
-    thinking?: 'low' | 'high' | 'max';
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
        *  comes back alive but can't call its model. */
@@ -377,9 +426,7 @@ export class AttestorClient {
         {
           snapshot,
           sealed: true,
-          ...(params.apiKey || params.thinking
-            ? { env: this.sandboxEnv(params.apiKey, params.thinking) }
-            : {}),
+          ...(params.apiKey ? { env: this.sandboxEnv(params.apiKey) } : {}),
         },
         ttl,
       );
@@ -404,6 +451,152 @@ export class AttestorClient {
     }
   }
 
+  // ── owner settings ──────────────────────────────────────────────────────
+  // One document per agent, stored by the attestor as an OPAQUE blob and
+  // applied by the container. Its rule, in BOTH directions, is "signed by the
+  // agent's current ON-CHAIN owner" (read live at request time, the way
+  // lifecycle_auth.rs does — an indexed column that lags would let a seller
+  // keep reading and configuring an agent they already sold), and a write
+  // additionally has to name the version it is replacing.
+
+  /**
+   * The agent's current settings document, as the attestor is holding it, plus
+   * the version to write it back against. `settings: null` means the agent has
+   * never been configured — not an error — and `version: 0` is exactly the
+   * `baseVersion` such a first write takes.
+   *
+   * OWNER-SIGNED, like the write, and against the same LIVE on-chain owner:
+   * the document is the owner's, it can name a private endpoint or a paid
+   * model, and it is no more public than the wallet that authored it. It is
+   * therefore NOT on the deployment row and NOT in any listing —
+   * `GET /settings?seal_id=…` with an owner signature is the only way to read
+   * it. The message is the write's minus the digest (there is no body), so it
+   * ends at the base version, which a reader sends as 0.
+   *
+   * Requires a wallet.
+   */
+  async getSettings(sealId: `0x${string}`): Promise<{ settings: SettingsDoc | null; version: number }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const seal = sealId.toLowerCase() as `0x${string}`;
+    const message = settingsAuthMessage(seal, Math.floor(Date.now() / 1000), 0);
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.baseUrl()}/settings?seal_id=${seal}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 401) {
+        throw new Error(
+          `getSettings: rejected (HTTP 401) — ${account.address} is not agent ${seal}'s current on-chain owner. ${text}`,
+        );
+      }
+      throw new Error(`getSettings: /settings HTTP ${res.status} ${text}`);
+    }
+    return parseSettingsBody(await res.json());
+  }
+
+  /**
+   * Write a new settings document (owner-signed, compare-and-swap).
+   *
+   * The wire contract, exactly:
+   *   - body   `{"seal_id": "0x…", "base_version": <n>, "settings": <the document>}`
+   *   - header `X-Auth-Message:   AgenticID.Settings.v1:0x<sealId>:<ts>:<base_version>:<sha256-hex>`
+   *   - header `X-Auth-Signature: 0x<65-byte EIP-191 signature over that message>`
+   *
+   * `baseVersion` is the version {@link getSettings} returned before the edit
+   * (0 = "there is no document yet"). The attestor refuses with HTTP 409 when
+   * it no longer matches, which this method surfaces as
+   * {@link SettingsConflictError} carrying the re-read document. It never
+   * retries: a silent retry is precisely how the other writer's change
+   * vanishes.
+   *
+   * The signature covers a DIGEST of the document rather than the document
+   * itself — the signed statement rides a header, so it has to stay short and
+   * ASCII. The digest and the body are produced from ONE serialization
+   * ({@link canonicalSettings}, spliced into the body verbatim below): hashing
+   * one string and sending another is how a correct signature turns into a
+   * phantom "signer mismatch". The server side has to match that: hash the
+   * RAW `settings` slice of the body it received (serde_json's `&RawValue`),
+   * never a re-serialization of the parsed value — which is also the form
+   * that keeps the blob opaque to it.
+   *
+   * Pass `onWarn` to run the advisory model check BEFORE signing — a model
+   * absent from the 0G router catalog is reported, never blocked (a framework
+   * built-in is legitimately absent, and the container is the real gate). Omit
+   * it and no catalog request is made at all.
+   */
+  async setSettings(params: {
+    sealId: `0x${string}`;
+    settings: SettingsDoc;
+    /** The version {@link getSettings} returned before this edit; 0 for a
+     *  first write. A mismatch is an HTTP 409 → {@link SettingsConflictError}. */
+    baseVersion: number;
+    onWarn?: (warning: string) => void;
+  }): Promise<{ version: number }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    if (params.onWarn) {
+      for (const w of await modelAdvisory(params.settings)) params.onWarn(w);
+    }
+    // ONE serialization: hashed here, spliced into the body below.
+    const canonical = canonicalSettings(params.settings);
+    const sealId = params.sealId.toLowerCase() as `0x${string}`;
+    // The body below is assembled by hand, so anything that is not a plain
+    // integer here (undefined from a JS caller, a NaN from a bad parse) would
+    // ship as invalid JSON under a signature that still verified. Refuse now.
+    const base = Number(params.baseVersion);
+    if (!Number.isSafeInteger(base) || base < 0) {
+      throw new Error(
+        `setSettings: baseVersion must be a non-negative integer (read it from getSettings), got ${String(params.baseVersion)}`,
+      );
+    }
+    const message = settingsAuthMessage(
+      sealId,
+      Math.floor(Date.now() / 1000),
+      base,
+      await sha256Hex(canonical),
+    );
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.baseUrl()}/settings`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+      },
+      // Hand-assembled so the `settings` member is byte-for-byte the string
+      // that was hashed. `JSON.stringify({seal_id, settings})` would re-encode
+      // the document and put the digest one serializer quirk away from wrong.
+      body: `{"seal_id":${JSON.stringify(sealId)},"base_version":${base},"settings":${canonical}}`,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 401) {
+        throw new Error(
+          `setSettings: rejected (HTTP 401) — ${account.address} is not agent ${sealId}'s current on-chain owner. ${text}`,
+        );
+      }
+      if (res.status === 409) {
+        // Re-read so the caller can SEE what it would have overwritten. The
+        // read is the same owner-signed call, so it can fail on its own (a
+        // transferred agent, a flaky attestor) — in that case fall back to the
+        // version the refusal named, and say the document could not be read
+        // rather than inventing one.
+        const live = await this.getSettings(sealId).catch(() => null);
+        throw new SettingsConflictError({
+          sealId,
+          baseVersion: base,
+          currentVersion: live?.version ?? versionInBody(text),
+          current: live?.settings ?? null,
+          detail: live ? undefined : `could not re-read the current document: ${text.slice(0, 200)}`,
+        });
+      }
+      throw new Error(`/settings failed: HTTP ${res.status} ${text}`);
+    }
+    const body = (await res.json()) as { version?: number | string };
+    return { version: Number(body.version ?? 0) };
+  }
+
   /**
    * Soft-retry a stuck deployment (owner-signed) instead of redeploying —
    * which would orphan an already-minted identity. The attestor re-runs every
@@ -423,8 +616,6 @@ export class AttestorClient {
      *  (same as deploy) when `sealedImage` isn't given. */
     framework?: string;
     sealedImage?: string;
-    /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
-    thinking?: 'low' | 'high' | 'max';
     apiKey?: string;
     envelopeTtlSec?: number;
   }): Promise<void> {
@@ -435,7 +626,7 @@ export class AttestorClient {
       body.sandbox_envelope = await this.signEnvelope(
         'create',
         '',
-        { snapshot, sealed: true, env: this.sandboxEnv(params.apiKey, params.thinking) },
+        { snapshot, sealed: true, env: this.sandboxEnv(params.apiKey) },
         params.envelopeTtlSec ?? 180,
       );
     }

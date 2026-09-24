@@ -39,8 +39,24 @@ export { SandboxClient } from './SandboxClient';
 export { AgenticIDClient } from './AgenticIDClient';
 export type { IntelligentDataResult } from './AgenticIDClient';
 export { ReputationClient } from './ReputationClient';
-export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN } from './AttestorClient';
+export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
+
+// ── Owner settings (the opaque-to-attestor configuration document) ──
+export {
+  SETTINGS_DOMAIN,
+  THINKING_LEVELS,
+  SETTINGS_FIELDS,
+  ZG_COMPUTE_PROVIDER,
+  ROUTER_MODELS_URL,
+  canonicalSettings,
+  settingsAuthMessage,
+  SettingsConflictError,
+  sha256Hex,
+  modelAdvisory,
+  fetchRouterModelIds,
+} from './Settings';
+export type { SettingsDoc, ThinkingLevel } from './Settings';
 
 // ── Reputation: serve-proof transport + verification ──
 export {

@@ -2,7 +2,6 @@ package hermes
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,48 +14,6 @@ import (
 
 // Path-driven Restore + LoadEntry + RestoreEntry for the role set declared
 // by Adapter.Roles(). Counterpart to evolution_paths.go (read path).
-
-// ── Restore: role="config.yaml" ─────────────────────────────────────────────
-
-// ownedHermesKeys lists the top-level config.yaml keys sealed writes onto
-// chain — the only keys that belong in iData. Everything else (gateway
-// runtime state, messaging platform blocks, hermes's own bookkeeping,
-// future keys we haven't validated) stays local.
-//
-// Allow-list rather than deny-list, same rationale as the openclaw twin:
-// a deny-list silently re-introduces phantom drift every time the
-// framework adds a new top-level field.
-//
-//	model      inference routing (provider/base_url/default; api_key stripped)
-//	approvals  exec approval policy — agent self-tuning worth tracking
-//	terminal   terminal backend selection — ditto
-var ownedHermesKeys = []string{"approvals", "model", "terminal"}
-
-// restoreConfigYAML applies the canonical JSON plaintext (owned keys only)
-// onto the on-disk YAML: owned keys present in the plaintext are replaced,
-// owned keys absent from it are deleted, unowned keys are left untouched.
-// nil/empty plaintext means "chain has no entry" → owned keys cleared.
-func (a *Adapter) restoreConfigYAML(plaintext []byte) error {
-	parsed := map[string]any{}
-	if len(plaintext) > 0 {
-		if err := json.Unmarshal(plaintext, &parsed); err != nil {
-			return fmt.Errorf("hermes.Restore[config.yaml]: parse: %w", err)
-		}
-	}
-	if err := updateConfigYAML(func(cfg map[string]any) {
-		for _, k := range ownedHermesKeys {
-			if v, ok := parsed[k]; ok {
-				cfg[k] = v
-			} else {
-				delete(cfg, k)
-			}
-		}
-	}); err != nil {
-		return fmt.Errorf("hermes.Restore[config.yaml]: %w", err)
-	}
-	logger.Logf("hermes.Restore[config.yaml]: %d bytes", len(plaintext))
-	return nil
-}
 
 // ── Restore: role="SOUL.md" ─────────────────────────────────────────────────
 

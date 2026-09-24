@@ -8,12 +8,18 @@ import (
 )
 
 // EvolutionFor produces canonical iData plaintext bytes for `role` by
-// reading the live state from disk: ~/.openclaw/openclaw.json + the
-// workspace markdown files + skills / canvas subtrees. Reading from disk
-// (rather than a stale in-memory cfg) is what makes evolution detection
-// correct — when the agent self-modifies its config (dashboard upgrade,
-// plugin install, MEMORY.md write), the watcher's next tick observes
+// reading the live state from disk: the workspace markdown files + skills
+// / canvas subtrees. Reading from disk (rather than a stale in-memory cfg)
+// is what makes evolution detection correct — when the agent self-modifies
+// its state (new skill, MEMORY.md write), the watcher's next tick observes
 // those changes.
+//
+// openclaw.json is deliberately absent: its platform-owned half is
+// re-rendered from the owner's settings at every Start (RenderSettings) and
+// the remainder is openclaw's own per-boot bookkeeping, so tracking the file
+// would anchor a derived artifact and hand a mint-time copy back to an agent
+// whose settings have since changed. Nothing in it reaches chain — including
+// any edit the agent makes there, which is what the agent doc tells it.
 //
 // Output MUST be deterministic: same on-disk state → byte-identical
 // output. Per-role helpers in evolution_paths.go enforce this through
@@ -22,8 +28,6 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 	switch role {
 	case "framework":
 		return a.evoFramework(ctx)
-	case "openclaw.json":
-		return a.evoOpenclawJSON()
 	case "workspace/":
 		return a.evoWorkspace()
 	case "workspace/skills/":

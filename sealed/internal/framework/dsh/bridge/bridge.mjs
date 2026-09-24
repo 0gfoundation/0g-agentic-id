@@ -20,13 +20,14 @@
  *                            every watcher tick, and its format is pinned at
  *                            v0 with no compatibility promise. One Agent
  *                            object in process memory instead.
- *   settings-file          — its hot-reload layers settings.yaml OVER the
- *                            composition; mounting it would let an agent
- *                            edit of settings.yaml inject an arbitrary
- *                            baseURL route live. The tracked settings.yaml
- *                            role is read by the ADAPTER (readPin) and
- *                            reaches this bridge as env — DSH never reads
- *                            the file.
+ *   settings-file          — its hot-reload layers $DSH_HOME/settings.yaml
+ *                            OVER the composition; mounting it would let an
+ *                            agent edit of that file inject an arbitrary
+ *                            baseURL route live. The inference pin reaches
+ *                            this bridge as SEAL_MODEL_* env, rendered from
+ *                            the owner's settings document before Start
+ *                            (the adapter's settings.go) — no file involved
+ *                            on either side.
  *   tool-cordis            — in-process tool definition; unaudited and
  *                            gone on restart (untrackable self-modification).
  *   sandbox stack          — privsep (kernel uid split) is the wall; DSH's
@@ -34,9 +35,18 @@
  *                            bwrap/Landlock, which slim TEE containers lack.
  *   web/*, e2b/*, subagent — capability tiers deferred to the preset menu
  *                            (phase 2); the agent has curl via bash.
- *   workspaceContext/jobs/goals (spine extras) — off; workspaceContext reads
- *                            ~/.dsh/AGENTS.md, which is an open phase-2
- *                            question for the tracked-role set.
+ *   goals (spine extra)    — off; no owner-facing surface for it yet.
+ *
+ * toolJobs / maxParallelToolCalls are OWNER knobs, not platform decisions:
+ * they arrive as SEAL_DSH_* env from the settings document's `framework`
+ * section and default to the values this bridge used to hardcode (off / 1).
+ *
+ * workspaceContext is NOT one of them and is pinned off here. It reads
+ * ~/.dsh/AGENTS.md into every turn's context, and that file is agent-writable
+ * and belongs to no chain-tracked role — an untracked channel into the system
+ * prompt is a platform-boundary decision, not a composition preference. The
+ * adapter refuses the knob (settings.go); tracking AGENTS.md as a role is
+ * what would make it offerable.
  *
  * Run: node bridge.mjs  (plain ESM; @deepseek-ai/* resolved via NODE_PATH)
  */
@@ -71,18 +81,26 @@ const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
 const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
-// Router-catalog model facts the adapter resolved (see spawn.go): the output
-// budget, and whether the model takes reasoning_effort. The latter is not an
-// optimization: an always-thinking model (glm-5.3) reasons WITHOUT BOUND when
-// the parameter is absent — measured 100k+ chars of reasoning, zero reply,
-// stream killed upstream; effort "low" converges in minutes. "low" because
-// glm-5.3 accepts only low/high/max and low is the portable intersection.
+// Router-catalog output budget, resolved by the adapter (settings.go). Only a
+// CATALOG-sourced value is ever passed: 0 means "let pi-ai default" rather
+// than a name-heuristic guess (8192), which would starve a reasoning model's
+// shared thinking+reply budget into permanently empty replies.
 const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
-const MODEL_REASONING = process.env.SEAL_MODEL_REASONING === '1'
-// Owner-chosen default level (deploy/reset --thinking; pre-normalized by
-// sealed). Empty → platform default 'low'. Only meaningful when the model
-// takes reasoning_effort at all (MODEL_REASONING).
-const OWNER_THINKING = ['low', 'high', 'max'].includes(process.env.SEAL_OWNER_THINKING) ? process.env.SEAL_OWNER_THINKING : ''
+// The reasoning bound, already resolved by the adapter (settings.Resolved's
+// Effort() folds the model's catalog support, the owner's level and the "low"
+// floor into one value; it is provider-independent, so a native provider gets
+// bounded too). Empty/absent = this model takes NO bound, and then nothing
+// reasoning-related is declared — the parameter is a hard 400 on a model that
+// rejects it. Not an optimization: an always-thinking model (glm-5.3) reasons
+// WITHOUT BOUND when the parameter is absent — measured 100k+ chars of
+// reasoning, zero reply, stream killed upstream; "low" converges in minutes.
+const MODEL_EFFORT = ['low', 'high', 'max'].includes(process.env.SEAL_MODEL_EFFORT) ? process.env.SEAL_MODEL_EFFORT : ''
+
+// Owner composition knobs (settings document `framework` section → adapter →
+// env). Defaults are the literals this bridge hardcoded before the section
+// existed, so an owner who sets nothing gets exactly the shipped composition.
+const TOOL_JOBS = process.env.SEAL_DSH_TOOL_JOBS === '1'
+const MAX_PARALLEL_TOOL_CALLS = Number(process.env.SEAL_DSH_MAX_PARALLEL_TOOL_CALLS || '1') || 1
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -90,8 +108,8 @@ if (!TOKEN) {
 }
 if (!PROVIDER || !MODEL_ID) {
   // Same stance as prime's resolveModel: substituting a model the owner never
-  // pinned must be an error, not a fallback.
-  console.error('bridge: SEAL_MODEL_PROVIDER and SEAL_MODEL_ID are required (the inference pin is on-chain identity)')
+  // picked must be an error, not a fallback.
+  console.error("bridge: SEAL_MODEL_PROVIDER and SEAL_MODEL_ID are required (the owner's settings name the model; the adapter renders them here)")
   process.exit(2)
 }
 
@@ -121,17 +139,20 @@ async function boot() {
   const ctx = new Context()
 
   // Spine: session/tools/system-prompt/agent/agent-loop/skills/shell-env/
-  // tool-bash/llm seam + retry. Spine extras (jobs tools, goals, workspace
-  // context) are off — see the header. Persona goes into DSH's reserved
-  // order-0 persona slot; the platform doc is registered separately below so
-  // it renders AFTER tool guidance — platform mechanics are the final word.
+  // tool-bash/llm seam + retry. The workspace-context / jobs / parallelism
+  // extras are the owner's to set (see the header); goals stays off. Persona
+  // goes into DSH's reserved order-0 persona slot; the platform doc is
+  // registered separately below so it renders AFTER tool guidance — platform
+  // mechanics are the final word.
   const persona = depot(readOptional(PERSONA_PATH, 'persona'))
+  log(`composition: toolJobs=${TOOL_JOBS} maxParallelToolCalls=${MAX_PARALLEL_TOOL_CALLS} (workspaceContext pinned off)`)
   await ctx.plugin(Spine, {
     dshHome: DSH_HOME,
     persona,
+    // Pinned off, not owner-settable: see the header.
     workspaceContext: false,
-    toolJobs: false,
-    maxParallelToolCalls: 1,
+    toolJobs: TOOL_JOBS,
+    maxParallelToolCalls: MAX_PARALLEL_TOOL_CALLS,
     // The spine bundle unconditionally mounts a set of relational invariant
     // self-checks (scope/session/agent/agent-loop) meant for development. On
     // rc.1 the session/created dispatch trips the scope-carrier check; these
@@ -150,22 +171,22 @@ async function boot() {
   // Inference: one self-declared llm-pi-ai route for the resolved provider.
   // baseURL comes pre-resolved from the adapter (0g-compute → router /v1);
   // empty baseURL means a catalog provider pi-ai already knows.
-  log(`thinking level: ${MODEL_REASONING ? (OWNER_THINKING || 'low') : 'n/a (model takes no reasoning_effort)'}${OWNER_THINKING ? ' (owner)' : ''}`)
+  log(`thinking level: ${MODEL_EFFORT || 'n/a (model takes no reasoning_effort)'}`)
   await ctx.plugin(PiAi, {
     providers: {
       [PROVIDER]: {
         apiKeyEnv: 'SEAL_MODEL_API_KEY',
         ...(MODEL_BASE_URL ? { api: MODEL_API, baseURL: MODEL_BASE_URL } : {}),
-        // Bounded reasoning (see MODEL_REASONING above): declare the level set
+        // Bounded reasoning (see MODEL_EFFORT above): declare the level set
         // the model accepts (keys = offered levels, values = wire spellings)
-        // so pi-ai marks it reasoning-capable, and default the profile to
-        // "low". resolveReasoningLevel validates against this set, so an
-        // unsupported level fails loudly here instead of as an upstream 400.
-        ...(MODEL_REASONING ? { reasoning: OWNER_THINKING || 'low' } : {}),
+        // so pi-ai marks it reasoning-capable, and default the profile to the
+        // resolved level. resolveReasoningLevel validates against this set, so
+        // an unsupported level fails loudly here instead of as an upstream 400.
+        ...(MODEL_EFFORT ? { reasoning: MODEL_EFFORT } : {}),
         models: [{
           id: MODEL_ID,
           ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
-          ...(MODEL_REASONING ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+          ...(MODEL_EFFORT ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
         }],
       },
     },
@@ -518,6 +539,39 @@ function lastUserText(messages) {
   return ''
 }
 
+// ── session restore after a bridge restart ───────────────────────────────────
+//
+// The conversation lives in THIS process's memory (the session object), but a
+// configuration change restarts the harness (manager.Reload), and a fresh
+// process used to greet a mid-conversation owner with total amnesia: the
+// client resends the full transcript on every turn — it always has — yet the
+// bridge took only the last user line. On the FIRST turn of a fresh process,
+// if the request carries history, replay it as a framed transcript ahead of
+// the prompt. Meeting minutes, not native memory: tool-call internals are not
+// reconstructed, but the conversation continues instead of restarting.
+const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
+let sessionSeeded = false; // flips when the first turn is dispatched
+
+function restoreTranscript(messages) {
+  if (sessionSeeded || !Array.isArray(messages)) return "";
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === "user") { lastUser = i; break; }
+  }
+  // History = everything before the final user message (that one IS the turn).
+  const prior = messages
+    .slice(0, lastUser === -1 ? messages.length : lastUser)
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({ role: m.role, text: lastUserText([{ role: "user", content: m.content }]) }))
+    .filter((m) => m.text.trim().length > 0);
+  if (!prior.length) return "";
+  let body = prior.map((m) => `${m.role}: ${m.text}`).join("\n\n");
+  let truncated = false;
+  if (body.length > RESTORE_CAP) { body = body.slice(-RESTORE_CAP); truncated = true; }
+  log(`session restore: replaying client transcript (${prior.length} msgs, ${body.length} chars${truncated ? ", oldest truncated" : ""})`);
+  return `[Context restore: this session was restarted mid-conversation. Prior transcript${truncated ? " (oldest part truncated)" : ""}:]\n\n${body}\n\n[End of prior transcript. Continue the conversation; do not re-answer old messages.]\n\n`;
+}
+
 // ── Request handling ────────────────────────────────────────────────────────
 
 function readBody(req) {
@@ -558,6 +612,8 @@ async function handleChat(req, res) {
   if (!text) {
     return sendJSON(res, 400, { error: { message: 'no user message in `messages`' } })
   }
+  const prompt = restoreTranscript(body.messages) + text
+  sessionSeeded = true
 
   const { ctx, agent } = await getAgent()
   const id = `chatcmpl-${created()}`
@@ -588,7 +644,7 @@ async function handleChat(req, res) {
   const runMine = (onDelta, onActivity) =>
     serialize(() => {
       if (disconnected) return '' // client left while queued — skip, don't run
-      return runTurn(ctx, agent, text, onDelta, onActivity)
+      return runTurn(ctx, agent, prompt, onDelta, onActivity)
     })
 
   if (body.stream) {
@@ -681,8 +737,10 @@ const server = createServer((req, res) => {
       try { body = JSON.parse(raw || '{}') } catch { return sendJSON(res, 400, { error: { message: 'invalid JSON body' } }) }
       const text = responseInputText(body.input)
       if (!text) return sendJSON(res, 400, { error: { message: 'input is required (string or messages-style items)' } })
+      const prompt = (Array.isArray(body.input) ? restoreTranscript(body.input) : '') + text
+      sessionSeeded = true
       const rec = newResponseRecord(text)
-      startResponseTurn(rec, text)
+      startResponseTurn(rec, prompt)
       log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)`)
       if (body.stream) return streamResponse(req, res, rec, 0)
       // Non-stream (background-style): hand back the id immediately.

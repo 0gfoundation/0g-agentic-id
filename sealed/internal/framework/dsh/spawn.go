@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"seal-verify/internal/framework"
-	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
 	"seal-verify/internal/privsep"
@@ -53,21 +52,54 @@ const (
 	// spine package's version equals the `@deepseek-ai/dsh` version the
 	// whitelist names.
 	versionPackage = "@deepseek-ai/dsh-agent-spine-demo"
-
-	// zgComputeProvider is the persona-seed provider name meaning "route
-	// through the 0G compute router".
-	zgComputeProvider = "0g-compute"
 )
 
 func bridgeScriptPath() string { return filepath.Join(bridgeScriptDir, "bridge.mjs") }
 
-// Start: verify the framework is the one the binding asks for → resolve the
-// inference pin → write the agent doc → materialize the bridge → spawn it
-// de-privileged → wait for it to listen.
+// Start: take the pin RenderSettings resolved → verify the framework is the
+// one the binding asks for → write the agent doc → materialize the bridge →
+// spawn it de-privileged → wait for it to listen.
 func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
 	a.mu.RLock()
 	initialized, token, version := a.initialized, a.bridgeToken, a.binding.PackageVersion
+	rendered := a.rendered
 	a.mu.RUnlock()
+
+	// The pin comes from the owner's settings document, not from parsing a
+	// file: settings.yaml stopped being a role and stopped existing, so there
+	// is nothing on disk to read back and nothing an agent edit could
+	// re-point (settings.go). A missing render is a bootstrap bug — not
+	// something an owner can cause — so it fails before anything is spawned.
+	if rendered == nil {
+		return framework.StartResult{}, fmt.Errorf("dsh.Start: RenderSettings has not run before Start (bootstrap must render the owner's settings first)")
+	}
+	provider, model := rendered.resolved.Provider, rendered.resolved.Model
+	if provider == "" || model == "" {
+		return framework.StartResult{}, fmt.Errorf(
+			"dsh.Start: no inference pin — the owner's settings name provider=%q model=%q; substituting a model the owner never picked is not an option", provider, model)
+	}
+
+	// The credential comes from the RESOLVED SETTINGS, never from
+	// RuntimeContext: RuntimeContext is captured at the first Start and
+	// replayed verbatim on every restart (so a key rotated at runtime would be
+	// silently reverted), it is losing these fields, and reading the key from
+	// it is what dialled a platform-routed endpoint keyless and 401'd live.
+	//
+	// Missing and platform-routed is fatal here rather than at the first turn:
+	// the 0G router answers an unauthenticated call with a 401, so the
+	// container would come up healthy, serve /hello, and fail every single
+	// chat with an error the owner cannot place.
+	apiKey := rendered.resolved.APIKey
+	if apiKey == "" {
+		if ep := rendered.resolved.Endpoint; ep != nil {
+			return framework.StartResult{}, fmt.Errorf(
+				"dsh.Start: the platform routes %s to %s but this boot has no inference key — the bridge would dial it unauthenticated and 401 on the first turn (check API_KEY in the container's environment)", model, ep.BaseURL)
+		}
+		// A framework built-in supplies its own endpoint, and only its own
+		// provider knows whether that endpoint needs a key at all. Say so and
+		// keep booting.
+		logger.Logf("warn: dsh.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
+	}
 
 	if !initialized {
 		if err := verifyInstalled(version); err != nil {
@@ -82,16 +114,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	} else {
 		logger.Logf("dsh restart: reusing installed framework + bridge token")
 	}
-
-	// The inference pin's durable home is the tracked settings.yaml (readPin).
-	// `persona` is a mint-time seed gone from chain at the first drift commit,
-	// so later boots have only the file — same fix prime made with models.json.
-	provider, model := readPin()
-	if provider == "" || model == "" {
-		return framework.StartResult{}, fmt.Errorf(
-			"dsh.Start: no inference pin — neither %s nor the persona seed named a provider/model", settingsYAMLPath())
-	}
-	sdkProvider, api, baseURL, maxTokens, reasoningEffort := resolveInference(ctx, provider, model)
 
 	// Agent doc → a file OUTSIDE the framework home; the bridge injects it as a
 	// system-prompt section (the authoritative channel). No markers, nothing a
@@ -110,7 +132,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		SealSignSock:     rt.SealSignSock,
 		Provider:         provider,
 		Model:            model,
-		ZGComputeRouted:  provider == zgComputeProvider,
+		ZGComputeRouted:  rendered.resolved.Endpoint != nil,
 		BootTime:         time.Now(),
 	})
 	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
@@ -124,16 +146,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	}
 
 	cmd, err := spawnBridge(bridgeEnv{
-		token:           token,
-		apiKey:          rt.APIKey,
-		sdkProvider:     sdkProvider,
-		model:           model,
-		modelAPI:        api,
-		baseURL:         baseURL,
-		maxTokens:       maxTokens,
-		reasoningEffort: reasoningEffort,
-		ownerThinking:   rt.OwnerThinking,
-		rt:              rt,
+		token:       token,
+		apiKey:      apiKey,
+		settingsEnv: rendered.env,
+		rt:          rt,
 	})
 	if err != nil {
 		return framework.StartResult{}, fmt.Errorf("dsh.Start: %w", err)
@@ -150,36 +166,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("dsh.Start: bridge not listening: %w", err)
 	}
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
-}
-
-// resolveInference translates the pin into what the bridge's llm-pi-ai route
-// needs: the provider name to register under, the wire API, and the endpoint.
-// A native provider is a catalog built-in (empty baseURL); 0g-compute resolves
-// to the router endpoint for the model's wire format. Provider knowledge lives
-// in internal/inference (the openclaw hardcoded-OpenAI regression, §12/19).
-// maxTokens and reasoningEffort come from the router catalog (0/false for a
-// native provider). Both must reach the bridge's pi-ai route: without an
-// output budget the SDK default applies, and without a bounded reasoning
-// effort an always-thinking model (glm-5.3) reasons WITHOUT BOUND — measured
-// 100k+ chars of reasoning with zero reply before the stream is killed
-// upstream, while effort=low converges in minutes (Route doc has the numbers).
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string, maxTokens int, reasoningEffort bool) {
-	if provider != zgComputeProvider {
-		return provider, "", "", 0, false
-	}
-	route := inference.ResolveZG(ctx, model)
-	// Only catalog-sourced budgets reach the bridge (review P1): the
-	// heuristic's guess (8192) would starve a reasoning model's shared
-	// thinking+reply budget; with 0 the bridge omits maxTokens and pi-ai's
-	// own defaults apply.
-	maxTokens = 0
-	if route.CatalogSourced {
-		maxTokens = route.MaxTokens
-	}
-	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL, maxTokens, route.SupportsReasoningEffort
-	}
-	return provider, "openai-completions", route.BaseURL, maxTokens, route.SupportsReasoningEffort
 }
 
 // verifyInstalled checks the framework baked into this image matches the
@@ -232,16 +218,54 @@ func materializeBridge() error {
 
 // bridgeEnv carries the per-Start values the bridge process needs.
 type bridgeEnv struct {
-	token           string
-	apiKey          string
-	sdkProvider     string
-	model           string
-	modelAPI        string
-	baseURL         string
-	maxTokens       int    // catalog output budget; 0 = let pi-ai default
-	reasoningEffort bool   // catalog says the model takes reasoning_effort
-	ownerThinking   string // owner default level (RuntimeContext.OwnerThinking)
-	rt              framework.RuntimeContext
+	token string
+	// apiKey is settings.Resolved.APIKey — the credential the platform
+	// resolved for THIS boot. Never framework.RuntimeContext.APIKey: that
+	// field is going away, and it is frozen at the first Start, so a key that
+	// changed since would be silently reverted by the next restart.
+	apiKey string
+	// settingsEnv is what RenderSettings produced (settings.go): the model
+	// pin, the endpoint wiring, the reasoning bound and the owner's
+	// composition knobs, already rendered as sorted KEY=VALUE entries.
+	settingsEnv []string
+	rt          framework.RuntimeContext
+}
+
+// environ builds the bridge process's whole environment.
+//
+// A strict whitelist, NOT the inherited env: a leaked SANDBOX_SEAL_KEY must
+// not be readable via /proc/self/environ (or plain `env`) from inside the
+// agent process, which runs arbitrary model-authored bash.
+func (be bridgeEnv) environ(nodePath string) []string {
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"NODE_PATH=" + nodePath, // belt for any CJS child; ESM resolves by ancestor walk
+		"DSH_HOME=" + dshHome,
+		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
+		"SEAL_BRIDGE_TOKEN=" + be.token,
+		"SEAL_AGENT_DOC=" + agentDocPath(),
+		"SEAL_PERSONA_PATH=" + appendSystemPath(),
+	}
+	// Everything the owner's settings decide (pin, endpoint, reasoning bound,
+	// composition knobs) — rendered once, deterministically, before Start.
+	env = append(env, be.settingsEnv...)
+	if be.apiKey != "" {
+		// Resolved by ctx.credentials from the process env (top, read-only
+		// layer), so the key never touches a credentials file.
+		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
+	}
+	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
+	if be.rt.PublicURL != "" {
+		env = append(env, "AGENT_PUBLIC_URL="+be.rt.PublicURL)
+	}
+	if be.rt.SealSignSock != "" {
+		env = append(env, "SEAL_SIGN_SOCK="+be.rt.SealSignSock)
+	}
+	if be.rt.AgentSeal != "" {
+		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
+	}
+	return env
 }
 
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
@@ -260,55 +284,7 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Dir = dshHome
-
-	// Strict env whitelist — do NOT inherit bootstrap's env so a leaked
-	// SANDBOX_SEAL_KEY can't be read via /proc/self/environ from inside the
-	// agent process.
-	env := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-		"NODE_PATH=" + nodePath, // belt for any CJS child; ESM resolves by ancestor walk
-		"DSH_HOME=" + dshHome,
-		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
-		"SEAL_BRIDGE_TOKEN=" + be.token,
-		"SEAL_AGENT_DOC=" + agentDocPath(),
-		"SEAL_PERSONA_PATH=" + appendSystemPath(),
-		"SEAL_MODEL_PROVIDER=" + be.sdkProvider,
-		"SEAL_MODEL_ID=" + be.model,
-	}
-	if be.apiKey != "" {
-		// Resolved by ctx.credentials from the process env (top, read-only
-		// layer), so the key never touches a credentials file.
-		env = append(env, "SEAL_MODEL_API_KEY="+be.apiKey)
-	}
-	if be.baseURL != "" {
-		env = append(env, "SEAL_MODEL_BASE_URL="+be.baseURL)
-		if be.modelAPI != "" {
-			env = append(env, "SEAL_MODEL_API="+be.modelAPI)
-		}
-	}
-	if be.maxTokens > 0 {
-		env = append(env, fmt.Sprintf("SEAL_MODEL_MAX_TOKENS=%d", be.maxTokens))
-	}
-	if be.reasoningEffort {
-		env = append(env, "SEAL_MODEL_REASONING=1")
-	}
-	if be.ownerThinking != "" {
-		// Owner-chosen default level (already normalized); the bridge uses it
-		// as the pi-ai profile level instead of the platform default "low".
-		env = append(env, "SEAL_OWNER_THINKING="+be.ownerThinking)
-	}
-	// Public on-chain facts the agent (and seal-tools) benefit from knowing.
-	if be.rt.PublicURL != "" {
-		env = append(env, "AGENT_PUBLIC_URL="+be.rt.PublicURL)
-	}
-	if be.rt.SealSignSock != "" {
-		env = append(env, "SEAL_SIGN_SOCK="+be.rt.SealSignSock)
-	}
-	if be.rt.AgentSeal != "" {
-		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
-	}
-	cmd.Env = env
+	cmd.Env = be.environ(nodePath)
 
 	// Run the bridge (and every tool subprocess it spawns) as the low-privilege
 	// agent user when the image provides one (no-op otherwise — internal/privsep).
@@ -323,8 +299,7 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		logFile.Close()
 		return nil, fmt.Errorf("start bridge: %w", err)
 	}
-	logger.Logf("dsh: bridge started (pid %d, port %d, provider %s/%s)",
-		cmd.Process.Pid, bridgePort, be.sdkProvider, be.model)
+	logger.Logf("dsh: bridge started (pid %d, port %d)", cmd.Process.Pid, bridgePort)
 	return cmd, nil
 }
 
