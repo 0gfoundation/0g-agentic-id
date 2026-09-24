@@ -830,7 +830,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         const ag = await withWallet(ctx);
         const row = await findAgentRow(ag, args[0]);
         if (!row) { out(`no agent matching ${args[0]} on this attestor\n`); continue; }
-        await settingsOp(ag, row.sealId, args.slice(1));
+        await settingsOp(ag, row.sealId, args.slice(1), row.phase === 'running' && row.url ? row.url : undefined);
         continue;
       }
 
@@ -1139,7 +1139,7 @@ let cachedClient: { key: string; ag: AgenticID } | null = null;
  * Returns the document now in force (unchanged on a bare show), so a caller
  * like /think can report the level that actually landed.
  */
-async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[]): Promise<SettingsDoc | null> {
+async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], serveBase?: string): Promise<SettingsDoc | null> {
   const assignments = parseAssignments(args); // throws CliError on a bad key/level
   const { settings: current, version } = await ag.agent.getSettings(sealId);
   if (!assignments.length) {
@@ -1157,7 +1157,24 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[]):
       onWarn: (w) => out(`⚠ ${w}\n`),
     });
     for (const l of renderSettings(next)) out(`  ${l}\n`);
-    out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+    // Push to the running container so a change made mid-conversation takes
+    // effect NOW, not at the next boot. Best-effort: the write above is
+    // durable, so a push failure is a note, never an error. The command-line
+    // `settings` already did this; the in-session /settings and /think — the
+    // likeliest place to retune an agent you are talking to — used to defer to
+    // a reset (found live: /settings thinking=high said "next boot" while the
+    // agent was running).
+    if (serveBase) {
+      try {
+        const agentId = await ag.agent.getAgentIdBySealId(sealId);
+        const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
+        out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
+      } catch (e2) {
+        out(`written — version ${written}; stored, but the running container did not take it (${(e2 as Error).message}) — it applies on the next boot\n`);
+      }
+    } else {
+      out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);
+    }
     return next;
   } catch (e) {
     if (!(e instanceof SettingsConflictError)) throw e;
@@ -1870,7 +1887,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with, and how hard. Bare shows it; key=value writes it (merged).
         // Owner-signed in both directions, so it needs the wallet client and
         // not the session's (possibly keyless) one.
-        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1));
+        await settingsOp(await withWallet(ctx), s.sealId, tokenize(line).slice(1), s.client && s.url ? s.url : undefined);
         continue;
       }
       if (line === '/think' || line.startsWith('/think ')) {
@@ -1888,7 +1905,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         }
         if (!(THINKING_LEVELS as readonly string[]).includes(arg)) { out(`usage: /think ${THINKING_LEVELS.join('|')}\n`); continue; }
         if (arg === 'max') out('⚠ max is measured-risky here: thinking can exceed the router\'s ~10min single-request limit and the turn dies empty. Your call.\n');
-        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`]);
+        const written = await settingsOp(ag, s.sealId, [`thinking=${arg}`], s.client && s.url ? s.url : undefined);
         // Only mirror it into this session once the write actually landed —
         // a refused or conflicted write must not leave the per-message
         // override claiming a level the agent was never given.
