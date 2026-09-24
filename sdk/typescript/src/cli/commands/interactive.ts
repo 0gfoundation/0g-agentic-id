@@ -2158,7 +2158,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
         failure = null;
       }
-      if (failure) out(`\n(chat failed: ${failure})`);
+      // The catch-all failure — a model the backend rejects (e.g. a catalog
+      // max_tokens over the model's real cap), a bad key, an upstream 400 —
+      // arrives here as the gateway's terse transcript ("LLM request failed"),
+      // while the actual cause (the 400 body) is only in the container log. A
+      // turn that fails EVERY time is usually the model or config it was just
+      // given, so point at the log the way the connection-drop branches do.
+      if (failure) out(`\n(chat failed: ${failure}) — /agentlog has the agent's full error (a turn that fails every time usually means the model or config just set)`);
       out('\n');
       messages.push({ role: 'assistant', content: interrupted ? `${reply} [interrupted]` : reply });
       break;
