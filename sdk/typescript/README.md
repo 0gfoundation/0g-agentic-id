@@ -145,6 +145,8 @@ Every write is a **compare-and-swap** on `baseVersion` — the version you read 
 
 The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
 
+`start` / `reset` / `retry` seal `apiKey` to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'`.
+
 **Three IDs, same agent:**
 
 | Identifier | What it is | Used by |
