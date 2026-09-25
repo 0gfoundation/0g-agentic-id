@@ -384,7 +384,7 @@ openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent �
 | `s.Framework`(`json.RawMessage`) | owner 的不透明 per-framework overlay;平台不解析、不校验,也不保证它跨框架升级还能用 |
 | `s.Facts`(`inference.ModelFacts`) | 这个模型本身为真的事实,与谁来服务无关:context window、输出预算、吃不吃 `reasoning_effort`,以及 `CatalogSourced` |
 | `s.Endpoint`(`*inference.Endpoint`) | **只有**平台亲自路由这个模型时才非 nil;框架内置 provider 自带 wiring,这里是 nil |
-| `s.APIKey` | 本次开机的推理凭据;走 env 进来,不属于文档,也从不持久化 |
+| `s.APIKey` | 本次开机的推理凭据;走 env 进来(`API_KEY`,或在任何 adapter 运行前从 `SEAL_SECRET_ENV` 解出),不属于文档,也从不持久化 |
 
 Facts/Endpoint 这个拆分是承重的,也正是"原生 provider 现在照样拿得到
 reasoning bound"的原因。两者原本共用一个结构、挡在同一个

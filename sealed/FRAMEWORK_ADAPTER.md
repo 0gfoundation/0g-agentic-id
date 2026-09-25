@@ -442,7 +442,7 @@ value (`settings/settings.go` package doc).
 | `s.Framework` (`json.RawMessage`) | the owner's opaque per-framework overlay; the platform never parses, validates, or promises to keep it working across a framework upgrade |
 | `s.Facts` (`inference.ModelFacts`) | what is true of the model whoever serves it: context window, output budget, whether it accepts `reasoning_effort`, and `CatalogSourced` |
 | `s.Endpoint` (`*inference.Endpoint`) | non-nil **only** when the platform routes this model; nil for a framework built-in, which brings its own wiring |
-| `s.APIKey` | this boot's inference credential; arrives by env, is never part of the document, is never persisted |
+| `s.APIKey` | this boot's inference credential; arrives by env (`API_KEY`, or opened from `SEAL_SECRET_ENV` before any adapter runs), is never part of the document, is never persisted |
 
 The Facts/Endpoint split is load-bearing, and it is why a native provider now
 still gets a reasoning bound. The two used to share one struct behind a single
