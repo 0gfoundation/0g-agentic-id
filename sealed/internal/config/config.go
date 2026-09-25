@@ -7,7 +7,10 @@
 //   SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
 //   TEE_SIGNER_ADDRESS          (optional) 0x-prefixed Ethereum address; if set,
 //                               the attestation signer must match exactly
-//   API_KEY                     (optional) inference provider API key (anthropic/openai)
+//   API_KEY                     (optional, legacy) inference provider API key in clear
+//   SEAL_SECRET_ENV             (optional) the owner's secret env (API_KEY) sealed to the
+//                               agentSeal key; opened after provisioning, wins over API_KEY
+//                               (internal/secretenv, issue #166)
 //   ATTESTOR_URL                (optional) provisioning endpoint root URL
 //   CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //   AGENTIC_ID_ADDR             (optional) AgenticID contract address
@@ -16,7 +19,7 @@
 //                               framework binding (local dev); the binding is authoritative
 //
 // After provisioning succeeds, SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION /
-// API_KEY MUST be cleared from the environment to deny a malicious or
+// API_KEY / SEAL_SECRET_ENV MUST be cleared from the environment to deny a malicious or
 // prompt-injected agent the ability to read them via /proc/self/environ
 // or shell helpers — see ScrubProvisioningSecrets.
 package config
@@ -48,6 +51,12 @@ type Bootstrap struct {
 	ChainRPC        string
 	ContractAddr    string
 	FallbackIndexer string
+
+	// SecretEnv is the raw SEAL_SECRET_ENV value: ciphertext only. It can
+	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
+	// bound to the on-chain owner, so main opens it after Phase 2 and
+	// overwrites APIKey with the result (internal/secretenv).
+	SecretEnv string
 
 	// Framework is the raw AGENT_FRAMEWORK env value (may be empty). The
 	// authoritative adapter selector is the on-chain framework binding
@@ -105,6 +114,7 @@ func Load() (*Bootstrap, error) {
 		Attestation:     a,
 		TEESigner:       teeSignerPtr,
 		APIKey:          os.Getenv("API_KEY"),
+		SecretEnv:       os.Getenv("SEAL_SECRET_ENV"),
 		AttestorURL:     os.Getenv("ATTESTOR_URL"),
 		ChainRPC:        os.Getenv("CHAIN_RPC_URL"),
 		ContractAddr:    os.Getenv("AGENTIC_ID_ADDR"),
@@ -215,6 +225,7 @@ func ScrubProvisioningSecrets(keyBytes []byte) {
 	os.Unsetenv("SANDBOX_SEAL_KEY")
 	os.Unsetenv("SANDBOX_SEAL_ATTESTATION")
 	os.Unsetenv("API_KEY")
+	os.Unsetenv("SEAL_SECRET_ENV")
 	for i := range keyBytes {
 		keyBytes[i] = 0
 	}

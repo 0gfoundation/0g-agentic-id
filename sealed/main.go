@@ -47,6 +47,7 @@ import (
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
+	"seal-verify/internal/secretenv"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
 	"seal-verify/internal/watcher"
@@ -150,6 +151,9 @@ func main() {
 	} else {
 		logger.Logf("API_KEY (from env): <unset>")
 	}
+	if cfg.SecretEnv != "" {
+		logger.Logf("%s (from env): <set, %d chars sealed to agentSeal; opened after provisioning>", secretenv.EnvVar, len(cfg.SecretEnv))
+	}
 	logger.Logf("")
 
 	// Phase 1+2+3: provision + bootstrap from chain + start agent.
@@ -195,6 +199,11 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		return
 	}
 
+	// The owner's sealed secret env needs both agentSeal_priv (Phase 1) and
+	// the on-chain owner (Phase 2), so it opens here, before any adapter
+	// reads the inference key.
+	applySecretEnv(cfg, agentSealPriv, res)
+
 	// The on-chain framework binding is the authoritative adapter
 	// selector — the agent's identity, not deploy config, decides which
 	// framework interprets its iData. AGENT_FRAMEWORK survives only as
@@ -225,6 +234,30 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
 
 	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "running", "")
+}
+
+// applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
+// key the one the adapters use; see secretenv.ResolveAPIKey for precedence
+// and failure behavior. The ciphertext is dropped from memory either way.
+func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
+	if cfg.SecretEnv == "" {
+		return
+	}
+	var readOwner func() (string, error)
+	if res.client != nil && res.agentID != nil {
+		readOwner = func() (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			owner, err := res.client.OwnerOf(ctx, res.agentID)
+			if err != nil {
+				return "", err
+			}
+			return owner.Hex(), nil
+		}
+	}
+	chainOwner := secretenv.LiveOwner(res.owner, readOwner, 3, 2*time.Second, logger.Logf)
+	cfg.APIKey = secretenv.ResolveAPIKey(cfg.APIKey, cfg.SecretEnv, agentSealPriv, chainOwner, logger.Logf)
+	cfg.SecretEnv = ""
 }
 
 // ── framework adapter resolution ─────────────────────────────────────────────
