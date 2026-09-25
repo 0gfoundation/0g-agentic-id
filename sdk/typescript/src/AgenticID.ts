@@ -711,16 +711,19 @@ export class AgentApi {
    *    use this, not `reset` (which means "recreate an existing container").
    *    The key is sealed to the agent when the attestor supports it, so the
    *    wallet prompt shows ciphertext, not the key (`secretEnv`, default
-   *    `'auto'`; `'sealed'` refuses to send it in clear).
+   *    `'auto'`; `'sealed'` refuses to send it in clear). When a server
+   *    supplies the key, pass its {@link sealApiKey} output as
+   *    `sealedSecretEnv` instead of `apiKey`, so the key never reaches the
+   *    signer at all.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; secretEnv?: SecretEnvMode }): Promise<void>;
-  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; secretEnv?: SecretEnvMode }): Promise<void> {
+  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
+  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, thinking: arg?.thinking, secretEnv: arg?.secretEnv });
+    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, thinking: arg?.thinking, secretEnv: arg?.secretEnv });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -734,8 +737,25 @@ export class AgentApi {
    * refuses the clear path). The attestor keeps no reusable copy, which
    * is WHY it must be passed again on every recreate.
    */
-  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking, secretEnv: opts?.secretEnv });
+  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, thinking: opts?.thinking, secretEnv: opts?.secretEnv });
+  }
+
+  /**
+   * Seal an inference key to one agent WITHOUT signing anything — for the
+   * integrator whose server supplies the key while the agent's owner signs
+   * in a browser. The server calls this (a read-only client is enough: no
+   * wallet), hands the browser only the returned ciphertext, and the browser
+   * calls `start` / `reset` / `retry` with `{ sealedSecretEnv }`. The key
+   * never reaches the browser, and the wallet prompt shows only ciphertext.
+   *
+   * `owner` must be the address that will sign; the agent's container
+   * applies the secret only while that address owns the agent on chain.
+   * Requires the attestor to advertise `secret_env_scheme`. Refusals throw
+   * {@link SecretEnvRefusedError}.
+   */
+  sealApiKey(sealId: Hash, opts: { owner: Address; apiKey: string }): Promise<string> {
+    return this.attestor.sealApiKey({ sealId, owner: opts.owner, apiKey: opts.apiKey });
   }
 
   /**
@@ -750,8 +770,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied (and is
    * sealed the same way, see `secretEnv`).
    */
-  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, thinking: opts?.thinking, secretEnv: opts?.secretEnv });
+  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; thinking?: 'low' | 'high' | 'max'; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, thinking: opts?.thinking, secretEnv: opts?.secretEnv });
   }
 
   /**

@@ -129,7 +129,7 @@ await ag.agent.listMyDeployments();           // owner-signed; full detail
 
 The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
 
-`start` / `reset` / `retry` seal `apiKey` to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'`.
+`start` / `reset` / `retry` seal `apiKey` to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. When your server supplies the key and a user signs, seal it on the server with `agent.sealApiKey(sealId, { owner, apiKey })` and pass the result to the browser's `start` / `reset` / `retry` as `sealedSecretEnv`, so the key never reaches the browser. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'` and `SecretEnvRefusedError`.
 
 **Three IDs, same agent:**
 

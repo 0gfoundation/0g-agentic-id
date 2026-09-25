@@ -15,7 +15,12 @@
  *      not leave a signed envelope with the key behind), and nothing falls
  *      back to clear text once sealing was chosen;
  *   4. compatibility: an attestor without the scheme still gets `API_KEY`
- *      (default `'auto'`), and a one-shot deploy keeps its legacy shape.
+ *      (default `'auto'`), and a one-shot deploy keeps its legacy shape;
+ *   5. the integrator flow: a server seals the key with `sealApiKey` (no
+ *      wallet), and the browser signs only that ciphertext
+ *      (`sealedSecretEnv`), so the key never reaches the signer.
+ *
+ * Every refusal is a SecretEnvRefusedError with `signed === false`.
  *
  * The attestor is an in-process http server; the wallet is a stub account
  * whose signMessage records the message and returns a fixed signature.
@@ -31,7 +36,14 @@ import { sha256 } from '@noble/hashes/sha2';
 import { gcm } from '@noble/ciphers/aes';
 import { getAddress } from 'viem';
 
-import { AttestorClient, SECRET_ENV_SCHEME, SECRET_ENV_VAR, sealSecretEnv } from '../dist/index.js';
+import {
+  AttestorClient,
+  AgenticID,
+  SECRET_ENV_SCHEME,
+  SECRET_ENV_VAR,
+  SecretEnvRefusedError,
+  sealSecretEnv,
+} from '../dist/index.js';
 
 // Well-known test key (also in sealed/internal/secretenv/secretenv_test.go).
 const SEAL_PRIV = '4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318';
@@ -67,7 +79,8 @@ function openSecretEnv(b64) {
 
 /**
  * Stub attestor. `opts.config` is the GET /config body (or a number = that
- * HTTP status); `opts.pubkey` the GET /agent-seal-pubkey answer.
+ * HTTP status, or a function returning either, read per request);
+ * `opts.pubkey` the GET /agent-seal-pubkey answer.
  */
 function stubAttestor(opts = {}) {
   const hits = [];
@@ -83,10 +96,12 @@ function stubAttestor(opts = {}) {
         res.end(JSON.stringify(body));
       };
       if (req.method === 'GET' && url.pathname === '/config') {
-        const cfg = opts.config ?? { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
+        const raw = typeof opts.config === 'function' ? opts.config() : opts.config;
+        const cfg = raw ?? { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
         return typeof cfg === 'number' ? json(cfg, { error: 'unavailable' }) : json(200, cfg);
       }
       if (req.method === 'GET' && url.pathname === '/agent-seal-pubkey') {
+        if (typeof opts.pubkey === 'number') return json(opts.pubkey, { error: 'unavailable' });
         return json(200, opts.pubkey ?? {
           seal_id: url.searchParams.get('seal_id'),
           agent_seal_addr: SEAL_ADDR.toLowerCase(),
@@ -127,6 +142,39 @@ async function withAttestor(opts, fn) {
 
 function envOf(signedMessage) {
   return JSON.parse(signedMessage).payload.env;
+}
+
+/** A refusal: typed, with a code, and flagged as "nothing was signed". */
+function refused(code, message) {
+  return (e) => {
+    assert.ok(e instanceof SecretEnvRefusedError, `expected SecretEnvRefusedError, got ${e?.name}: ${e?.message}`);
+    assert.equal(e.code, code);
+    assert.equal(e.signed, false);
+    if (message) assert.match(e.message, message);
+    return true;
+  };
+}
+
+/** Chain stub: `readContract` answers for one minted (or unminted) agent. */
+function chainStub({ agentSeal = SEAL_ADDR, agentId = 42n, bound = true, owner = OWNER, fail } = {}) {
+  const reads = [];
+  return {
+    reads,
+    ctx: {
+      addresses: { agenticID: '0x0000000000000000000000000000000000000a9d' },
+      publicClient: {
+        readContract: async ({ functionName, args }) => {
+          reads.push(functionName);
+          if (fail === functionName) throw new Error(`rpc down (${functionName})`);
+          if (functionName === 'getAgentIdBySealId') return agentId;
+          if (functionName === 'isSealIdBound') return bound;
+          if (functionName === 'getAgentSeal') { assert.equal(args[0], agentId); return agentSeal; }
+          if (functionName === 'ownerOf') { assert.equal(args[0], agentId); return owner; }
+          throw new Error(`unexpected read ${functionName}`);
+        },
+      },
+    },
+  };
 }
 
 // ── 1. wire format ──────────────────────────────────────────────────────────
@@ -228,18 +276,21 @@ test('the key is checked against the on-chain agentSeal once minted', async () =
 // ── 3. refusals happen before signing ───────────────────────────────────────
 
 test('a key that does not hash to agent_seal_addr is refused before signing', async () => {
-  await withAttestor({ pubkey: { agent_seal_addr: SEAL_ADDR, agent_seal_pubkey: OTHER_PUB } }, async (a) => {
+  await withAttestor({ pubkey: { seal_id: SEAL_ID, agent_seal_addr: SEAL_ADDR, agent_seal_pubkey: OTHER_PUB } }, async (a) => {
     const { c, signed } = client(a.port);
-    await assert.rejects(c.lifecycle('start', { sealId: SEAL_ID, apiKey: KEY }), /does not belong to agent_seal_addr/);
+    await assert.rejects(
+      c.lifecycle('start', { sealId: SEAL_ID, apiKey: KEY }),
+      refused('pubkey_mismatch', /does not belong to agent_seal_addr/),
+    );
     assert.equal(signed.length, 0);
     assert.equal(a.posts.length, 0);
   });
 });
 
 test('a malformed agent_seal_pubkey is refused before signing', async () => {
-  await withAttestor({ pubkey: { agent_seal_addr: SEAL_ADDR, agent_seal_pubkey: '0x1234' } }, async (a) => {
+  await withAttestor({ pubkey: { seal_id: SEAL_ID, agent_seal_addr: SEAL_ADDR, agent_seal_pubkey: '0x1234' } }, async (a) => {
     const { c, signed } = client(a.port);
-    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }), /33- or 65-byte/);
+    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }), refused('pubkey_invalid', /33- or 65-byte/));
     assert.equal(signed.length, 0);
   });
 });
@@ -249,7 +300,7 @@ test("an unreadable /config stops 'auto' instead of signing the key in clear", a
     const { c, signed } = client(a.port);
     await assert.rejects(
       c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, sealedImage: '0g-sealed' }),
-      /GET \/config/,
+      refused('config_unreadable', /GET \/config/),
     );
     assert.equal(signed.length, 0);
     assert.equal(a.posts.length, 0);
@@ -261,7 +312,7 @@ test("'sealed' refuses an attestor that does not advertise the scheme", async ()
     const { c, signed } = client(a.port);
     await assert.rejects(
       c.lifecycle('start', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'sealed' }),
-      /does not advertise secret_env_scheme/,
+      refused('scheme_unsupported', /does not advertise secret_env_scheme/),
     );
     assert.equal(signed.length, 0);
   });
@@ -270,7 +321,10 @@ test("'sealed' refuses an attestor that does not advertise the scheme", async ()
 test('an unknown secretEnv mode is rejected', async () => {
   await withAttestor({}, async (a) => {
     const { c, signed } = client(a.port);
-    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'maybe' }), /secretEnv must be/);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'maybe' }),
+      refused('invalid_mode', /secretEnv must be/),
+    );
     assert.equal(signed.length, 0);
   });
 });
@@ -280,14 +334,72 @@ test("deploy with sandbox and 'sealed' throws before the first signature", async
     const { c, signed } = client(a.port);
     await assert.rejects(
       c.deploy({ name: 'n', description: 'd', sandbox: { apiKey: KEY, secretEnv: 'sealed' } }),
-      /cannot be sealed/,
+      refused('sealed_needs_agent', /cannot be sealed/),
     );
     assert.equal(signed.length, 0, 'not even the deploy canonical');
     assert.equal(a.posts.length, 0);
   });
 });
 
+test('deploy with an unknown secretEnv throws before the first signature', async () => {
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.deploy({ name: 'n', description: 'd', sandbox: { apiKey: KEY, secretEnv: 'seal' } }),
+      refused('invalid_mode'),
+    );
+    assert.equal(signed.length, 0, 'not even the deploy canonical');
+    assert.equal(a.posts.length, 0);
+  });
+});
+
+test('a /agent-seal-pubkey answer for another seal_id is refused before signing', async () => {
+  await withAttestor(
+    { pubkey: { seal_id: '0x' + '77'.repeat(32), agent_seal_addr: SEAL_ADDR, agent_seal_pubkey: SEAL_PUB } },
+    async (a) => {
+      const { c, signed } = client(a.port);
+      await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }), refused('pubkey_mismatch', /another seal_id/));
+      assert.equal(signed.length, 0);
+    },
+  );
+});
+
+test('a failed chain read is refused before signing, not skipped', async () => {
+  await withAttestor({}, async (a) => {
+    const chain = chainStub({ fail: 'getAgentSeal' });
+    const { c, signed } = client(a.port, chain.ctx);
+    await assert.rejects(c.lifecycle('start', { sealId: SEAL_ID, apiKey: KEY }), refused('chain_read_failed', /rpc down/));
+    assert.equal(signed.length, 0);
+  });
+});
+
+test('a failing /agent-seal-pubkey is refused before signing', async () => {
+  await withAttestor({ pubkey: 503 }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(c.lifecycle('start', { sealId: SEAL_ID, apiKey: KEY }), refused('pubkey_unavailable', /HTTP 503/));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
+  });
+});
+
 // ── 4. compatibility ────────────────────────────────────────────────────────
+
+test('the seal-or-not decision re-reads /config, so a flag rollback reaches a long-lived client', async () => {
+  let scheme = SECRET_ENV_SCHEME;
+  await withAttestor({ config: () => ({ sandbox_snapshot: '0g-sealed', secret_env_scheme: scheme }) }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
+    assert.ok(envOf(signed[0])[SECRET_ENV_VAR], 'sealed while advertised');
+    scheme = undefined; // the operator turns ATTESTOR_SECRET_ENV_ENABLED off
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
+    assert.deepEqual(envOf(signed[1]), { API_KEY: KEY }, "'auto' follows the attestor");
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'sealed' }),
+      refused('scheme_unsupported'),
+    );
+    assert.equal(signed.length, 2);
+  });
+});
 
 test("an attestor without the scheme keeps the legacy API_KEY ('auto')", async () => {
   await withAttestor({ config: { sandbox_snapshot: '0g-sealed' } }, async (a) => {
@@ -325,5 +437,121 @@ test('no key: thinking alone needs no seal, and a resume signs an empty payload'
     await c.lifecycle('start', { sealId: SEAL_ID, sandboxId: 'sb-1' });
     assert.deepEqual(JSON.parse(signed[1]).payload, {});
     assert.ok(!a.hits.some((h) => h.startsWith('/agent-seal-pubkey')));
+  });
+});
+
+// ── 5. integrator flow: the server seals, the browser signs ciphertext ──────
+
+test('sealApiKey needs no wallet and returns a ciphertext bound to the owner', async () => {
+  await withAttestor({}, async (a) => {
+    const chain = chainStub();
+    const server = new AttestorClient({ attestorUrl: `http://127.0.0.1:${a.port}`, ...chain.ctx });
+    const sealed = await server.sealApiKey({ sealId: SEAL_ID, owner: OWNER, apiKey: KEY });
+    assert.ok(!sealed.includes(KEY));
+    assert.deepEqual(openSecretEnv(sealed), { v: 1, owner: getAddress(OWNER), env: { API_KEY: KEY } });
+    assert.deepEqual(chain.reads, ['getAgentIdBySealId', 'getAgentSeal', 'ownerOf']);
+  });
+});
+
+test('the facade exposes sealApiKey on a read-only AgenticID', async () => {
+  await withAttestor({}, async (a) => {
+    const ag = new AgenticID({
+      attestorUrl: `http://127.0.0.1:${a.port}`,
+      // No agenticID address: the chain checks are skipped (a bare client).
+      addresses: {},
+    });
+    const sealed = await ag.agent.sealApiKey(SEAL_ID, { owner: OWNER, apiKey: KEY });
+    assert.equal(openSecretEnv(sealed).env.API_KEY, KEY);
+  });
+});
+
+test('sealApiKey refuses an owner that does not own the agent on chain', async () => {
+  await withAttestor({}, async (a) => {
+    const chain = chainStub({ owner: '0x00000000000000000000000000000000000000bb' });
+    const server = new AttestorClient({ attestorUrl: `http://127.0.0.1:${a.port}`, ...chain.ctx });
+    await assert.rejects(
+      server.sealApiKey({ sealId: SEAL_ID, owner: OWNER, apiKey: KEY }),
+      refused('owner_mismatch', /on-chain owner/),
+    );
+  });
+});
+
+test('sealApiKey refuses a missing key or an owner that is not an address, before any request', async () => {
+  await withAttestor({}, async (a) => {
+    const server = new AttestorClient({ attestorUrl: `http://127.0.0.1:${a.port}` });
+    await assert.rejects(server.sealApiKey({ sealId: SEAL_ID, owner: OWNER, apiKey: '' }), refused('invalid_input'));
+    await assert.rejects(server.sealApiKey({ sealId: SEAL_ID, owner: 'alice', apiKey: KEY }), refused('invalid_input'));
+    assert.equal(a.hits.length, 0);
+  });
+});
+
+test('sealApiKey refuses an attestor that does not advertise the scheme', async () => {
+  await withAttestor({ config: { sandbox_snapshot: '0g-sealed' } }, async (a) => {
+    const server = new AttestorClient({ attestorUrl: `http://127.0.0.1:${a.port}` });
+    await assert.rejects(server.sealApiKey({ sealId: SEAL_ID, owner: OWNER, apiKey: KEY }), refused('scheme_unsupported'));
+    assert.ok(!a.hits.some((h) => h.startsWith('/agent-seal-pubkey')));
+  });
+});
+
+for (const op of ['start', 'reset', 'retry']) {
+  test(`${op} with sealedSecretEnv signs exactly that ciphertext, and the signer never has the key`, async () => {
+    await withAttestor({}, async (a) => {
+      const server = new AttestorClient({ attestorUrl: `http://127.0.0.1:${a.port}` });
+      const sealed = await server.sealApiKey({ sealId: SEAL_ID, owner: OWNER, apiKey: KEY });
+
+      const { c, signed } = client(a.port);
+      const pubkeyHits = a.hits.filter((h) => h.startsWith('/agent-seal-pubkey')).length;
+      if (op === 'retry') await c.retry({ sealId: SEAL_ID, sealedSecretEnv: sealed, thinking: 'low' });
+      else await c.lifecycle(op, { sealId: SEAL_ID, sealedSecretEnv: sealed, thinking: 'low' });
+
+      assert.equal(signed.length, 1);
+      assert.ok(!signed[0].includes(KEY));
+      assert.deepEqual(envOf(signed[0]), { [SECRET_ENV_VAR]: sealed, SEAL_OWNER_THINKING: 'low' });
+      assert.equal(
+        a.hits.filter((h) => h.startsWith('/agent-seal-pubkey')).length,
+        pubkeyHits,
+        'the signer does not seal again',
+      );
+      const post = a.posts.at(-1);
+      assert.equal(post.path, `/${op}`);
+      assert.ok(post.body.sandbox_envelope, 'a create envelope is attached');
+    });
+  });
+}
+
+test('sealedSecretEnv is refused before signing when the attestor does not advertise the scheme', async () => {
+  const sealed = sealSecretEnv(SEAL_PUB, OWNER, { API_KEY: KEY });
+  await withAttestor({ config: { sandbox_snapshot: '0g-sealed' } }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: sealed }),
+      refused('scheme_unsupported', /sealedSecretEnv/),
+    );
+    await assert.rejects(c.retry({ sealId: SEAL_ID, sealedSecretEnv: sealed }), refused('scheme_unsupported'));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
+  });
+});
+
+test('sealedSecretEnv refuses conflicting inputs and values that are not a sealed secret', async () => {
+  const sealed = sealSecretEnv(SEAL_PUB, OWNER, { API_KEY: KEY });
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: sealed, apiKey: KEY }),
+      refused('conflicting_inputs'),
+    );
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: sealed, secretEnv: 'plaintext' }),
+      refused('conflicting_inputs'),
+    );
+    // A raw key passed by mistake must not be signed.
+    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: KEY }), refused('invalid_sealed_secret_env'));
+    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: '' }), refused('invalid_sealed_secret_env'));
+    // Base64 of something that is not ECIES output.
+    const notEcies = Buffer.from('x'.repeat(200)).toString('base64');
+    await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: notEcies }), refused('invalid_sealed_secret_env'));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
   });
 });
