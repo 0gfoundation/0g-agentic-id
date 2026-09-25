@@ -36,28 +36,51 @@ type runtimeStatus struct {
 	mu      sync.Mutex
 	level   string // "running" | "warning" | "error"
 	message string
+	// pinned is an owner-recoverable condition that no runtime event
+	// clears for the life of this boot (today: an owner-supplied sealed
+	// key that did not apply, so the agent cannot call its model). While
+	// the runtime itself is "running", it shows as a "warning" with this
+	// message, so a later drift success or heartbeat cannot report the
+	// agent healthy. A real warning or error still takes precedence.
+	pinned string
 }
 
 var currentStatus = &runtimeStatus{level: "running"}
 
-// Get returns the current level + message snapshot.
-func (s *runtimeStatus) Get() (string, string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// effective is what a /status report should declare. Caller holds mu.
+func (s *runtimeStatus) effective() (string, string) {
+	if s.level == "running" && s.pinned != "" {
+		return "warning", s.pinned
+	}
 	return s.level, s.message
 }
 
-// Set replaces the current level + message. Returns the previous level
-// so callers can decide whether the transition warrants pushing a
-// /status report immediately (rather than waiting for the next
-// heartbeat).
+// Get returns the current effective level + message snapshot.
+func (s *runtimeStatus) Get() (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.effective()
+}
+
+// Set replaces the current level + message. Returns the previous
+// effective level so callers can decide whether the transition warrants
+// pushing a /status report immediately (rather than waiting for the next
+// heartbeat); they report Get(), which accounts for a pinned warning.
 func (s *runtimeStatus) Set(level, message string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	prev := s.level
+	prev, _ := s.effective()
 	s.level = level
 	s.message = message
 	return prev
+}
+
+// Pin sets (or, with "", clears) the pinned warning described on
+// runtimeStatus. The message must carry no secret values.
+func (s *runtimeStatus) Pin(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pinned = message
 }
 
 // severityOf classifies a runtime error into one of the 3 severity

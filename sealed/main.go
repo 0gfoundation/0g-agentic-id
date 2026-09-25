@@ -233,12 +233,19 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
 
-	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "running", "")
+	// "running" unless something is already wrong, e.g. a pinned
+	// secret_env_not_applied warning (applySecretEnv).
+	level, msg := currentStatus.Get()
+	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg)
 }
 
 // applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
 // key the one the adapters use; see secretenv.ResolveAPIKey for precedence
-// and failure behavior. The ciphertext is dropped from memory either way.
+// and failure behavior. When the owner supplied a sealed key that did not
+// apply and no key is left, it pins a "warning" status naming the reason
+// class (never a value), so the attestor and owner see why the agent
+// cannot call its model instead of a healthy "running". The ciphertext is
+// dropped from memory either way.
 func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
 	if cfg.SecretEnv == "" {
 		return
@@ -256,8 +263,12 @@ func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBoots
 		}
 	}
 	chainOwner := secretenv.LiveOwner(res.owner, readOwner, 3, 2*time.Second, logger.Logf)
-	cfg.APIKey = secretenv.ResolveAPIKey(cfg.APIKey, cfg.SecretEnv, agentSealPriv, chainOwner, logger.Logf)
+	key, issue := secretenv.ResolveAPIKey(cfg.APIKey, cfg.SecretEnv, agentSealPriv, chainOwner, logger.Logf)
+	cfg.APIKey = key
 	cfg.SecretEnv = ""
+	if issue != "" {
+		currentStatus.Pin(issue)
+	}
 }
 
 // ── framework adapter resolution ─────────────────────────────────────────────
@@ -844,7 +855,8 @@ func handleDrift(
 			// immediately on the first transition so the UI prompts the
 			// owner without waiting for the next heartbeat.
 			if prev := currentStatus.Set("warning", summary); prev != "warning" {
-				report.Status(attestorURL, agentSealPriv, sealID, "warning", summary)
+				level, msg := currentStatus.Get()
+				report.Status(attestorURL, agentSealPriv, sealID, level, msg)
 			}
 			return
 		}
@@ -862,8 +874,11 @@ func handleDrift(
 	consecutiveApplyFailures = 0
 	// Success: if we were previously in warning / error, push a "running"
 	// status now so the UI clears without waiting for the next heartbeat.
+	// A pinned warning (applySecretEnv) survives this: report the effective
+	// status, not a literal "running".
 	if prev := currentStatus.Set("running", ""); prev != "running" {
-		report.Status(attestorURL, agentSealPriv, sealID, "running", "")
+		level, msg := currentStatus.Get()
+		report.Status(attestorURL, agentSealPriv, sealID, level, msg)
 	}
 }
 

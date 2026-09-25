@@ -51,6 +51,38 @@ var supported = map[string]bool{
 	"API_KEY": true,
 }
 
+// Reason classes for an Open failure. They name a cause, never a value, so
+// they are safe in a status report that leaves the container.
+const (
+	ReasonMalformed          = "malformed"
+	ReasonUnsupportedVersion = "unsupported_version"
+	ReasonNotSealedToAgent   = "not_sealed_to_this_agent"
+	ReasonOwnerUnknown       = "owner_unknown"
+	ReasonOwnerMismatch      = "owner_mismatch"
+	ReasonInternal           = "internal"
+)
+
+// Error is an Open failure with its reason class.
+type Error struct {
+	Reason string
+	err    error
+}
+
+func (e *Error) Error() string { return e.err.Error() }
+func (e *Error) Unwrap() error { return e.err }
+
+func fail(reason string, err error) error { return &Error{Reason: reason, err: err} }
+
+// Reason returns the reason class of an Open error (ReasonMalformed for an
+// error Open did not classify).
+func Reason(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Reason
+	}
+	return ReasonMalformed
+}
+
 // Opened is the validated content of a sealed secret env.
 type Opened struct {
 	// Env holds only supported names with non-empty values.
@@ -74,39 +106,39 @@ type payload struct {
 func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, error) {
 	encoded = strings.TrimSpace(encoded)
 	if encoded == "" {
-		return nil, errors.New("empty")
+		return nil, fail(ReasonMalformed, errors.New("empty"))
 	}
 	ct, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, fmt.Errorf("base64: %w", err)
+		return nil, fail(ReasonMalformed, fmt.Errorf("base64: %w", err))
 	}
 	if len(agentSealPriv) != 32 {
-		return nil, fmt.Errorf("agentSeal key must be 32 bytes, got %d", len(agentSealPriv))
+		return nil, fail(ReasonInternal, fmt.Errorf("agentSeal key must be 32 bytes, got %d", len(agentSealPriv)))
 	}
 	pt, err := eciesgo.Decrypt(eciesgo.NewPrivateKeyFromBytes(agentSealPriv), ct)
 	if err != nil {
 		// Not sealed to this agent's key (wrong agent, or corrupted).
-		return nil, fmt.Errorf("ecies decrypt: %w", err)
+		return nil, fail(ReasonNotSealedToAgent, fmt.Errorf("ecies decrypt: %w", err))
 	}
 
 	var p payload
 	dec := json.NewDecoder(bytes.NewReader(pt))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&p); err != nil {
-		return nil, errors.New("plaintext is not a v1 secret env document")
+		return nil, fail(ReasonMalformed, errors.New("plaintext is not a v1 secret env document"))
 	}
 	if p.V != Version {
-		return nil, fmt.Errorf("unsupported version %d (want %d)", p.V, Version)
+		return nil, fail(ReasonUnsupportedVersion, fmt.Errorf("unsupported version %d (want %d)", p.V, Version))
 	}
 	if !common.IsHexAddress(p.Owner) {
-		return nil, errors.New("owner is not an address")
+		return nil, fail(ReasonMalformed, errors.New("owner is not an address"))
 	}
 	if !common.IsHexAddress(chainOwner) {
-		return nil, errors.New("on-chain owner unknown; refusing to apply an owner-bound secret")
+		return nil, fail(ReasonOwnerUnknown, errors.New("on-chain owner unknown; refusing to apply an owner-bound secret"))
 	}
 	if common.HexToAddress(p.Owner) != common.HexToAddress(chainOwner) {
-		return nil, fmt.Errorf("sealed for owner %s, but the agent's owner is %s",
-			common.HexToAddress(p.Owner).Hex(), common.HexToAddress(chainOwner).Hex())
+		return nil, fail(ReasonOwnerMismatch, fmt.Errorf("sealed for owner %s, but the agent's owner is %s",
+			common.HexToAddress(p.Owner).Hex(), common.HexToAddress(chainOwner).Hex()))
 	}
 
 	out := &Opened{Env: map[string]string{}}
@@ -116,49 +148,58 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, err
 			continue
 		}
 		if value == "" || strings.ContainsRune(value, 0) {
-			return nil, fmt.Errorf("%s: empty or invalid value", name)
+			return nil, fail(ReasonMalformed, fmt.Errorf("%s: empty or invalid value", name))
 		}
 		out.Env[name] = value
 	}
 	sort.Strings(out.Ignored)
 	if len(out.Env) == 0 {
-		return nil, errors.New("no supported names")
+		return nil, fail(ReasonMalformed, errors.New("no supported names"))
 	}
 	return out, nil
 }
 
+// NotAppliedPrefix starts the status detail ResolveAPIKey returns when an
+// owner supplied a sealed key that did not apply.
+const NotAppliedPrefix = "secret_env_not_applied: "
+
 // ResolveAPIKey returns the inference key the adapters should use, given the
-// plain API_KEY env value and the raw SEAL_SECRET_ENV value:
+// plain API_KEY env value and the raw SEAL_SECRET_ENV value, plus an issue
+// for the attestor (empty when there is nothing to report):
 //
 //   - no secret env: plainKey, unchanged;
 //   - a secret env that opens (owner-bound) and carries API_KEY: that value,
 //     which wins over plainKey;
-//   - a secret env that fails to open: plainKey, with a FAIL line. The agent
-//     boots without a sealed key, the same outcome as a create envelope with
-//     no key (it cannot call its model), and /log says why.
+//   - a secret env that fails to open: plainKey, with a FAIL line. If that
+//     leaves no key at all, the agent boots but cannot call its model, so
+//     issue is "secret_env_not_applied: <reason>" (a reason class, never a
+//     value) for the caller to report as an owner-recoverable warning.
 //
 // logf lines name variables and lengths only, never values.
-func ResolveAPIKey(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) string {
+func ResolveAPIKey(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) (key, issue string) {
 	if encoded == "" {
-		return plainKey
+		return plainKey, ""
 	}
 	opened, err := Open(encoded, agentSealPriv, chainOwner)
 	if err != nil {
 		logf("FAIL %s not applied: %v", EnvVar, err)
-		return plainKey
+		if plainKey == "" {
+			issue = NotAppliedPrefix + Reason(err)
+		}
+		return plainKey, issue
 	}
 	for _, name := range opened.Ignored {
 		logf("warn: %s: ignoring unsupported name %q", EnvVar, name)
 	}
-	key := opened.Env["API_KEY"]
+	key = opened.Env["API_KEY"]
 	if key == "" {
-		return plainKey
+		return plainKey, ""
 	}
 	if plainKey != "" {
 		logf("warn: both API_KEY and %s are set; using the sealed value", EnvVar)
 	}
 	logf("OK   API_KEY (from %s, owner-bound): <set, %d chars>", EnvVar, len(key))
-	return key
+	return key, ""
 }
 
 // LiveOwner returns known when it is set. Otherwise (the boot-time ownerOf

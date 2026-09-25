@@ -90,18 +90,19 @@ func TestOpenRejects(t *testing.T) {
 		enc        string
 		chainOwner string
 		want       string
+		reason     string
 	}{
-		{"empty", "  ", testOwner, "empty"},
-		{"bad base64", "!!!", testOwner, "base64"},
-		{"sealed to another agent", base64.StdEncoding.EncodeToString(otherCT), testOwner, "ecies decrypt"},
-		{"previous owner's ciphertext", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "0x00000000000000000000000000000000000000bb", "sealed for owner"},
-		{"owner unknown on chain", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "", "on-chain owner unknown"},
-		{"future version", seal(t, map[string]any{"v": 2, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), testOwner, "unsupported version"},
-		{"unknown field", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}, "x": 1}), testOwner, "not a v1"},
-		{"not an owner address", seal(t, map[string]any{"v": 1, "owner": "alice", "env": map[string]string{"API_KEY": secret}}), testOwner, "owner is not an address"},
-		{"nothing supported", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"OTHER": secret}}), testOwner, "no supported names"},
-		{"empty value", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": ""}}), testOwner, "empty or invalid"},
-		{"NUL in value", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret + "\x00"}}), testOwner, "empty or invalid"},
+		{"empty", "  ", testOwner, "empty", ReasonMalformed},
+		{"bad base64", "!!!", testOwner, "base64", ReasonMalformed},
+		{"sealed to another agent", base64.StdEncoding.EncodeToString(otherCT), testOwner, "ecies decrypt", ReasonNotSealedToAgent},
+		{"previous owner's ciphertext", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "0x00000000000000000000000000000000000000bb", "sealed for owner", ReasonOwnerMismatch},
+		{"owner unknown on chain", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "", "on-chain owner unknown", ReasonOwnerUnknown},
+		{"future version", seal(t, map[string]any{"v": 2, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), testOwner, "unsupported version", ReasonUnsupportedVersion},
+		{"unknown field", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}, "x": 1}), testOwner, "not a v1", ReasonMalformed},
+		{"not an owner address", seal(t, map[string]any{"v": 1, "owner": "alice", "env": map[string]string{"API_KEY": secret}}), testOwner, "owner is not an address", ReasonMalformed},
+		{"nothing supported", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"OTHER": secret}}), testOwner, "no supported names", ReasonMalformed},
+		{"empty value", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": ""}}), testOwner, "empty or invalid", ReasonMalformed},
+		{"NUL in value", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret + "\x00"}}), testOwner, "empty or invalid", ReasonMalformed},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -112,6 +113,9 @@ func TestOpenRejects(t *testing.T) {
 			if !strings.Contains(err.Error(), c.want) {
 				t.Fatalf("error %q does not mention %q", err, c.want)
 			}
+			if got := Reason(err); got != c.reason {
+				t.Fatalf("Reason = %q, want %q", got, c.reason)
+			}
 			if strings.Contains(err.Error(), secret) {
 				t.Fatal("error text leaks the secret")
 			}
@@ -120,8 +124,12 @@ func TestOpenRejects(t *testing.T) {
 }
 
 func TestOpenRejectsShortKey(t *testing.T) {
-	if _, err := Open(sdkVector, []byte{1, 2, 3}, testOwner); err == nil {
+	_, err := Open(sdkVector, []byte{1, 2, 3}, testOwner)
+	if err == nil {
 		t.Fatal("a non-32-byte key must be rejected")
+	}
+	if Reason(err) != ReasonInternal {
+		t.Fatalf("Reason = %q", Reason(err))
 	}
 }
 
@@ -132,22 +140,27 @@ func TestResolveAPIKey(t *testing.T) {
 	good := seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": "sk-sealed"}})
 	const other = "0x00000000000000000000000000000000000000bb"
 	cases := []struct {
-		name, plain, secret, chainOwner, want, logWant string
+		name, plain, secret, chainOwner, want, logWant, issue string
 	}{
-		{"no secret env keeps the plain key", "sk-plain", "", testOwner, "sk-plain", ""},
-		{"sealed key applies", "", good, testOwner, "sk-sealed", "OK   API_KEY (from SEAL_SECRET_ENV"},
-		{"sealed key wins over a plain key", "sk-plain", good, testOwner, "sk-sealed", "using the sealed value"},
-		{"owner mismatch applies nothing", "", good, other, "", "FAIL SEAL_SECRET_ENV not applied"},
-		{"owner mismatch keeps the plain key", "sk-plain", good, other, "sk-plain", "FAIL SEAL_SECRET_ENV not applied"},
-		{"garbage applies nothing", "", "not-base64!", testOwner, "", "FAIL SEAL_SECRET_ENV not applied"},
+		{"no secret env keeps the plain key", "sk-plain", "", testOwner, "sk-plain", "", ""},
+		{"no key at all is not an issue", "", "", testOwner, "", "", ""},
+		{"sealed key applies", "", good, testOwner, "sk-sealed", "OK   API_KEY (from SEAL_SECRET_ENV", ""},
+		{"sealed key wins over a plain key", "sk-plain", good, testOwner, "sk-sealed", "using the sealed value", ""},
+		{"owner mismatch applies nothing", "", good, other, "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: owner_mismatch"},
+		{"owner mismatch keeps the plain key", "sk-plain", good, other, "sk-plain", "FAIL SEAL_SECRET_ENV not applied", ""},
+		{"unknown owner applies nothing", "", good, "", "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: owner_unknown"},
+		{"garbage applies nothing", "", "not-base64!", testOwner, "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: malformed"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			var lines []string
 			logf := func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }
-			got := ResolveAPIKey(c.plain, c.secret, testPriv(t), c.chainOwner, logf)
+			got, issue := ResolveAPIKey(c.plain, c.secret, testPriv(t), c.chainOwner, logf)
 			if got != c.want {
 				t.Fatalf("key = %q, want %q", got, c.want)
+			}
+			if issue != c.issue {
+				t.Fatalf("issue = %q, want %q", issue, c.issue)
 			}
 			all := strings.Join(lines, "\n")
 			if c.logWant != "" && !strings.Contains(all, c.logWant) {
@@ -201,7 +214,7 @@ func TestLiveOwner(t *testing.T) {
 	}
 	// An owner that stays unknown still fails closed in Open.
 	good := seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": "sk-sealed"}})
-	if key := ResolveAPIKey("", good, testPriv(t), LiveOwner("", down, 1, 0, noLog), noLog); key != "" {
-		t.Fatal("an unknown owner must not apply a sealed key")
+	if key, issue := ResolveAPIKey("", good, testPriv(t), LiveOwner("", down, 1, 0, noLog), noLog); key != "" || issue == "" {
+		t.Fatalf("an unknown owner must not apply a sealed key, and must be reported (issue %q)", issue)
 	}
 }
