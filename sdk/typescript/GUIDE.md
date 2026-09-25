@@ -438,9 +438,21 @@ await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …
 ```
 
 `sandbox.apiKey` is required in practice — without it the agent boots but
-cannot reach its model. It travels inside the owner-signed envelope into
-the TEE container's environment; the attestor never stores it (which is
-why `reset()` needs it again).
+cannot reach its model. It travels inside the owner-signed "create"
+envelope into the TEE container's environment, and the attestor keeps no
+reusable copy (which is why `reset()` needs it again).
+
+The owner's wallet shows that envelope verbatim when it signs. When the
+attestor's `GET /config` advertises `secret_env_scheme`, `start` / `reset` /
+`retry` seal the key to the agent's agentSeal public key first
+(`SEAL_SECRET_ENV`, ECIES; only the agent's TEE container opens it), so the
+wallet prompt, the attestor and the sandbox provider see ciphertext, never
+the key. A one-shot `deploy` with `sandbox` cannot do this: it signs the
+envelope before the agent exists, so its key still rides in clear. To keep
+a key out of the wallet prompt, deploy without `sandbox`, then call
+`start(sealId, { apiKey })`. Pass `secretEnv: 'sealed'` to make any call
+throw rather than sign a key in clear, or `'plaintext'` to force the legacy
+`API_KEY` path (for a sealed image that predates `SEAL_SECRET_ENV`).
 
 ## What does my agent cost to run?
 

@@ -9,9 +9,18 @@
  */
 
 import type { Address } from 'viem';
-import { keccak256 } from 'viem';
+import { getAddress, hexToBytes, keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
 import { agenticIDAbi, cloneGateAbi } from './abi';
+import {
+  SECRET_ENV_SCHEME,
+  SECRET_ENV_VAR,
+  parseAgentSealPubkey,
+  publicKeyToAddress,
+  randomBytes,
+  sealSecretEnv,
+  type SecretEnvMode,
+} from './secretEnv';
 
 export const CLONE_DOMAIN = 'AgenticID.Clone.v1';
 export const CLONE_CONTRACT_DOMAIN = 'AgenticID.CloneContract.v1';
@@ -151,7 +160,15 @@ export interface DeployParams {
     sealedImage?: string;
     /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
     thinking?: 'low' | 'high' | 'max';
+    /** Inference API key. On this one-shot path the create envelope is
+     *  signed before the agent (and its agentSeal key) exists, so the key
+     *  cannot be sealed and rides the envelope in clear: the wallet prompt
+     *  shows it. To keep it out of the prompt, deploy without `sandbox`,
+     *  wait for the mint, then `start(sealId, { apiKey })`. */
     apiKey: string;
+    /** See {@link SecretEnvMode}. `'sealed'` makes this call throw before
+     *  anything is signed, because a one-shot deploy cannot seal the key. */
+    secretEnv?: SecretEnvMode;
     sealed?: boolean;
     resourceId?: string;
   };
@@ -174,22 +191,15 @@ function b64encode(s: string): string {
 }
 
 function randHex(bytes: number): string {
-  const a = new Uint8Array(bytes);
-  type WebCrypto = { getRandomValues(x: Uint8Array): Uint8Array };
-  // Browsers and Node >= 19 expose WebCrypto globally; Node 18 (the
-  // engines floor) needs the node:crypto fallback — without it the
-  // unguarded access crashed deploy() before any request was sent.
-  let cryptoObj = (globalThis as { crypto?: WebCrypto }).crypto;
-  if (!cryptoObj?.getRandomValues && typeof require === 'function') {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    cryptoObj = (require('crypto') as { webcrypto?: WebCrypto }).webcrypto;
-  }
-  if (!cryptoObj?.getRandomValues) {
-    throw new Error('AttestorClient: no WebCrypto available (need a browser or Node >= 18 with crypto.webcrypto)');
-  }
-  cryptoObj.getRandomValues(a);
-  return Array.from(a, (b) => b.toString(16).padStart(2, '0')).join('');
+  // randomBytes carries the Node 18 node:crypto fallback — without it the
+  // unguarded WebCrypto access crashed deploy() before any request was sent.
+  return Array.from(randomBytes(bytes), (b) => b.toString(16).padStart(2, '0')).join('');
 }
+
+const SEALED_NEEDS_AGENT =
+  "secretEnv 'sealed': a deploy with `sandbox` signs its create envelope before the agent " +
+  '(and its agentSeal key) exists, so the key cannot be sealed. Deploy without `sandbox`, ' +
+  'wait for the mint, then call start(sealId, { apiKey }).';
 
 export class AttestorClient {
   constructor(private readonly ctx: Ctx) {}
@@ -253,7 +263,12 @@ export class AttestorClient {
     // not go sticky for the instance's lifetime (review #154 N3b) — clear the
     // memo on failure so the next caller retries.
     this.cfgPromise ??= fetch(`${this.baseUrl()}/config`, { signal: AbortSignal.timeout(10_000) })
-      .then((r) => r.json() as Promise<Record<string, string | undefined>>)
+      .then((r) => {
+        // An error page is not a config: treat a non-2xx like a network
+        // failure (consumers degrade on {}, and the memo is cleared).
+        if (!r.ok) throw new Error(`GET /config: HTTP ${r.status}`);
+        return r.json() as Promise<Record<string, string | undefined>>;
+      })
       .catch(() => { this.cfgPromise = undefined; return {}; });
     return this.cfgPromise;
   }
@@ -310,15 +325,121 @@ export class AttestorClient {
   }
 
 
-  /** env block for a sandbox create payload: inference key + optional
-   *  owner-chosen thinking default (deploy/reset --thinking). Rides the
-   *  owner-signed payload verbatim; sealed reads SEAL_OWNER_THINKING and
-   *  normalizes it, adapters apply it over the chain-restored config. */
-  private sandboxEnv(apiKey: string | undefined, thinking?: string): Record<string, string> {
+  /**
+   * The agent's agentSeal public key (compressed hex), verified before
+   * anything is sealed to it: it must hash to the `agent_seal_addr` the
+   * attestor reports and, once the agent is minted, to the agentSeal on chain
+   * (`getAgentSeal`), so a relaying proxy cannot substitute its own key.
+   */
+  async agentSealPubkey(sealId: `0x${string}`): Promise<`0x${string}`> {
+    const res = await fetch(`${this.baseUrl()}/agent-seal-pubkey?seal_id=${encodeURIComponent(sealId)}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      throw new Error(`/agent-seal-pubkey failed: HTTP ${res.status} ${await res.text().catch(() => '')}`);
+    }
+    const body = (await res.json()) as { agent_seal_addr?: string; agent_seal_pubkey?: string };
+    const pubkey = parseAgentSealPubkey(String(body.agent_seal_pubkey ?? ''));
+    const derived = publicKeyToAddress(hexToBytes(pubkey));
+    if (!body.agent_seal_addr || getAddress(body.agent_seal_addr) !== derived) {
+      throw new Error('/agent-seal-pubkey: the key does not belong to agent_seal_addr — refusing to seal to it');
+    }
+    const onChain = await this.onChainAgentSeal(sealId);
+    if (onChain && getAddress(onChain) !== derived) {
+      throw new Error(`/agent-seal-pubkey: the key does not belong to the on-chain agentSeal ${onChain} — refusing to seal to it`);
+    }
+    return pubkey;
+  }
+
+  /** On-chain agentSeal of a minted agent; null before the mint (or when this
+   *  client has no chain context, e.g. a bare AttestorClient in tests). */
+  private async onChainAgentSeal(sealId: `0x${string}`): Promise<Address | null> {
+    const registry = this.ctx.addresses?.agenticID;
+    if (!registry || !this.ctx.publicClient) return null;
+    const agentId = (await this.ctx.publicClient.readContract({
+      address: registry,
+      abi: agenticIDAbi,
+      functionName: 'getAgentIdBySealId',
+      args: [sealId],
+    })) as bigint;
+    // 0 means "not minted" OR agent #0 (a valid canonical id): disambiguate.
+    if (agentId === 0n) {
+      const bound = (await this.ctx.publicClient.readContract({
+        address: registry,
+        abi: agenticIDAbi,
+        functionName: 'isSealIdBound',
+        args: [sealId],
+      })) as boolean;
+      if (!bound) return null;
+    }
+    return (await this.ctx.publicClient.readContract({
+      address: registry,
+      abi: agenticIDAbi,
+      functionName: 'getAgentSeal',
+      args: [agentId],
+    })) as Address;
+  }
+
+  /**
+   * env block for a sandbox create payload: the inference key + an optional
+   * owner-chosen thinking default (deploy/reset --thinking). The block rides
+   * the owner-signed payload verbatim, so the wallet prompt shows it.
+   * sealed reads SEAL_OWNER_THINKING and normalizes it; adapters apply it
+   * over the chain-restored config.
+   */
+  private async sandboxEnv(p: {
+    sealId?: `0x${string}`;
+    apiKey?: string;
+    thinking?: string;
+    mode?: SecretEnvMode;
+  }): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
-    if (apiKey) env.API_KEY = apiKey;
-    if (thinking) env.SEAL_OWNER_THINKING = thinking;
+    if (p.apiKey) Object.assign(env, await this.keyEnv(p.apiKey, p.mode ?? 'auto', p.sealId));
+    if (p.thinking) env.SEAL_OWNER_THINKING = p.thinking;
     return env;
+  }
+
+  /**
+   * How the inference key rides the create payload (issue #166):
+   *  - sealed to the agent as `SEAL_SECRET_ENV` (see secretEnv.ts) when the
+   *    agent already exists (`sealId`) and the attestor advertises
+   *    `secret_env_scheme`, so the wallet prompt shows ciphertext only;
+   *  - otherwise in clear as `API_KEY` (older attestors and images, and a
+   *    one-shot `deploy`, whose agent does not exist when it signs), unless
+   *    `mode` is `'sealed'`, which throws instead.
+   * Once sealing is chosen, every error throws: nothing falls back to clear
+   * text after the fact.
+   */
+  private async keyEnv(apiKey: string, mode: SecretEnvMode, sealId?: `0x${string}`): Promise<Record<string, string>> {
+    if (mode !== 'auto' && mode !== 'sealed' && mode !== 'plaintext') {
+      throw new Error(`secretEnv must be 'auto', 'sealed' or 'plaintext', got ${JSON.stringify(mode)}`);
+    }
+    if (mode === 'plaintext') return { API_KEY: apiKey };
+    if (!sealId) {
+      if (mode === 'sealed') throw new Error(SEALED_NEEDS_AGENT);
+      return { API_KEY: apiKey };
+    }
+    const cfg = await this.attestorConfig();
+    // attestorConfig() answers {} when /config is unreachable. Reading that
+    // as "unsupported" would put the key in clear in front of the wallet on
+    // a transient error, so stop instead.
+    if (Object.keys(cfg).length === 0) {
+      throw new Error(
+        "cannot read the attestor's GET /config to decide how to deliver apiKey; retry, or pass secretEnv: 'plaintext' explicitly",
+      );
+    }
+    if (cfg.secret_env_scheme !== SECRET_ENV_SCHEME) {
+      if (mode === 'sealed') {
+        throw new Error(
+          `secretEnv 'sealed': this attestor does not advertise secret_env_scheme=${SECRET_ENV_SCHEME} ` +
+            'in GET /config, so its sealed images cannot open a sealed key',
+        );
+      }
+      return { API_KEY: apiKey };
+    }
+    const { account } = requireWallet(this.ctx);
+    const pubkey = await this.agentSealPubkey(sealId);
+    return { [SECRET_ENV_VAR]: sealSecretEnv(pubkey, account.address, { API_KEY: apiKey }) };
   }
 
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
@@ -327,7 +448,12 @@ export class AttestorClient {
     return this.signEnvelope(
       'create',
       sandbox.resourceId ?? '',
-      { snapshot, sealed: sandbox.sealed ?? true, env: this.sandboxEnv(sandbox.apiKey, sandbox.thinking) },
+      {
+        snapshot,
+        sealed: sandbox.sealed ?? true,
+        // No sealId: the agent does not exist until /deploy answers.
+        env: await this.sandboxEnv({ apiKey: sandbox.apiKey, thinking: sandbox.thinking, mode: sandbox.secretEnv }),
+      },
       ttlSec,
     );
   }
@@ -358,8 +484,11 @@ export class AttestorClient {
     thinking?: 'low' | 'high' | 'max';
       /** Inference API key for `reset` — the fresh container needs a fresh
        *  env (the attestor doesn't cache the LLM key). Without it the agent
-       *  comes back alive but can't call its model. */
+       *  comes back alive but can't call its model. Sealed to the agent when
+       *  the attestor supports it (see `secretEnv`). */
       apiKey?: string;
+      /** How `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
+      secretEnv?: SecretEnvMode;
       envelopeTtlSec?: number;
     },
   ): Promise<void> {
@@ -378,7 +507,14 @@ export class AttestorClient {
           snapshot,
           sealed: true,
           ...(params.apiKey || params.thinking
-            ? { env: this.sandboxEnv(params.apiKey, params.thinking) }
+            ? {
+                env: await this.sandboxEnv({
+                  sealId: params.sealId,
+                  apiKey: params.apiKey,
+                  thinking: params.thinking,
+                  mode: params.secretEnv,
+                }),
+              }
             : {}),
         },
         ttl,
@@ -412,10 +548,12 @@ export class AttestorClient {
    *
    * Without `apiKey`: posts `{ seal_id, owner }` — idempotent stages only, no
    * container work (the cheap owner-field auth path). With `apiKey` (and
-   * optionally `sealedImage`): attaches the same encrypted "create" envelope
-   * deploy/reset use, so the worker may continue past the idempotent stages
-   * into container creation. The attestor never stores the LLM key, so — as
-   * with reset — continuing into a container needs it re-supplied.
+   * optionally `sealedImage`): attaches the same owner-signed "create"
+   * envelope reset uses (the key sealed to the agent when the attestor
+   * supports it, see `secretEnv`), so the worker may continue past the
+   * idempotent stages into container creation. The attestor keeps no copy of
+   * the key outside that job, so — as with reset — continuing into a
+   * container needs it re-supplied.
    */
   async retry(params: {
     sealId: `0x${string}`;
@@ -426,6 +564,8 @@ export class AttestorClient {
     /** Owner default reasoning-effort for thinking models ('low' | 'high' | 'max'); travels in the signed payload env. */
     thinking?: 'low' | 'high' | 'max';
     apiKey?: string;
+    /** How `apiKey` travels; see {@link SecretEnvMode}. Default `'auto'`. */
+    secretEnv?: SecretEnvMode;
     envelopeTtlSec?: number;
   }): Promise<void> {
     const { account } = requireWallet(this.ctx);
@@ -435,7 +575,16 @@ export class AttestorClient {
       body.sandbox_envelope = await this.signEnvelope(
         'create',
         '',
-        { snapshot, sealed: true, env: this.sandboxEnv(params.apiKey, params.thinking) },
+        {
+          snapshot,
+          sealed: true,
+          env: await this.sandboxEnv({
+            sealId: params.sealId,
+            apiKey: params.apiKey,
+            thinking: params.thinking,
+            mode: params.secretEnv,
+          }),
+        },
         params.envelopeTtlSec ?? 180,
       );
     }
@@ -457,6 +606,11 @@ export class AttestorClient {
    */
   async deploy(params: DeployParams): Promise<DeployCloneResponse> {
     const { walletClient, account } = requireWallet(this.ctx);
+    // Fail before the first signature: a one-shot deploy signs its create
+    // envelope before the agent exists, so it can never seal the key.
+    if (params.sandbox?.apiKey && params.sandbox.secretEnv === 'sealed') {
+      throw new Error(SEALED_NEEDS_AGENT);
+    }
     const owner = account.address;
     const idempotencyKey = params.idempotencyKey ?? `sdk-${randHex(16)}`;
     const source = params.iData?.length

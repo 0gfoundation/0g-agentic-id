@@ -56,6 +56,10 @@ export interface AttestorPublicConfig {
   /** Selectable frameworks + the sealed image each needs (`image` omitted →
    *  `sandbox_snapshot`). The SDK resolves a deploy's image from here. */
   frameworks?: Array<{ name: string; image?: string }>;
+  /** Present when this attestor's sealed images open a sealed secret env
+   *  (`'agent-seal-ecies-v1'`, issue #166): start/reset/retry then seal the
+   *  inference key to the agent instead of signing it in clear. */
+  secret_env_scheme?: string;
 }
 
 /** Resolved context shared by the internal clients. */
