@@ -410,7 +410,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 
 | 字段 | 内容 | 说明 |
 |---|---|---|
-| `APIKey` | deploy envelope 里的推理 provider key | 翻译成你的框架期望的 env 变量 |
+| `APIKey` | create envelope 里的推理 provider key（`API_KEY`，或在任何 adapter 运行前从 `SEAL_SECRET_ENV` 解出） | 翻译成你的框架期望的 env 变量 |
 | `PublicURL` | `http://8080-<sandboxId>.<proxyDomain>` | 本地开发时为空;通过 env / 文件 / 配置暴露给 agent,让它知道自己的地址 |
 | `SealSignSock` | `/run/seal-sign.sock` | agent 专用签名端点(§8);告诉你的 agent 它在哪 |
 | `AgentSeal` | 从 `agent_seal_priv` 公钥派生的 0x 地址 | agent 的 TEE 身份地址 |

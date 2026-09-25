@@ -465,7 +465,7 @@ fallback.
 
 | Field | Contents | Notes |
 |---|---|---|
-| `APIKey` | inference provider key from the deploy envelope | translate to your framework's expected env var(s) |
+| `APIKey` | inference provider key from the create envelope (`API_KEY`, or opened from `SEAL_SECRET_ENV` before any adapter runs) | translate to your framework's expected env var(s) |
 | `PublicURL` | `http://8080-<sandboxId>.<proxyDomain>` | empty in local dev; surface it to the agent (env / file / config) so it knows its own address |
 | `SealSignSock` | `/run/seal-sign.sock` | the agent-only sign endpoint (§8); tell your agent where it is |
 | `AgentSeal` | 0x address derived from `agent_seal_priv` | the agent's TEE identity address |

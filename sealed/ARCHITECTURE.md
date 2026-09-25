@@ -360,7 +360,8 @@ Environment variables are sealed's main configuration surface
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
-| `API_KEY` | LLM provider key, forwarded by attestor in deploy / Recreate envelope; spawn.go translates it into provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` etc. |
+| `API_KEY` | LLM provider key in clear (legacy path), forwarded by attestor in deploy / Recreate envelope; spawn.go translates it into provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` etc. |
+| `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. A value that does not open is logged as `FAIL` and ignored (`internal/secretenv`); if that leaves the agent with no key, its status stays `warning` with detail `secret_env_not_applied: <reason>` (a reason class such as `owner_mismatch`, never a value) instead of `running` |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | used to build `AGENT_PUBLIC_URL`, in the form `http://8080-<sandbox_id>.<proxy_domain>`; the agent's own exposed port is hard-coded `:8080` by sealed proxy |
 
 ### How `AGENT_PUBLIC_URL` is surfaced to the agent

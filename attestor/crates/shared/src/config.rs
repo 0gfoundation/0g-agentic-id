@@ -137,6 +137,14 @@ pub struct Config {
     /// headless: only the HTTP API (SDK surface) is exposed; "/" and
     /// static assets 404. Default true.
     pub console_enabled: bool,
+    /// Whether the sealed images this attestor launches open a sealed
+    /// secret env (`SEAL_SECRET_ENV`, issue #166). When true, GET /config
+    /// advertises `secret_env_scheme` and the SDK seals the owner's inference
+    /// key to the agent's agentSeal key (see `GET /agent-seal-pubkey`) instead
+    /// of signing it into the create envelope in clear. Turn it on only once
+    /// every image in `sandbox_snapshot` / `frameworks` reads SEAL_SECRET_ENV:
+    /// an older image ignores it and boots without a key. Default false.
+    pub secret_env_enabled: bool,
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
@@ -311,6 +319,7 @@ impl Config {
             console_enabled: env_opt("ATTESTOR_CONSOLE_ENABLED")
                 .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "off" | "no"))
                 .unwrap_or(true),
+            secret_env_enabled: parse_opt_in(env_opt("ATTESTOR_SECRET_ENV_ENABLED").as_deref()),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
             sandbox_public_ports: env_opt("ATTESTOR_SANDBOX_PUBLIC_PORTS")
@@ -379,6 +388,26 @@ fn default_canonical_8004(chain_id: u64) -> anyhow::Result<Address> {
     Ok(addr.parse()?)
 }
 
+/// The `secret_env_scheme` value GET /config advertises when
+/// `secret_env_enabled`: the SDK seals `{"v":1,"owner",env}` with ECIES to
+/// the agentSeal public key and ships it as `env.SEAL_SECRET_ENV`; sealed
+/// opens it after /provision (sealed/internal/secretenv). A new wire format
+/// gets a new value, so an older SDK never sends what an image cannot open.
+pub const SECRET_ENV_SCHEME: &str = "agent-seal-ecies-v1";
+
+/// An opt-in flag: only an explicit true/1/on/yes enables it; unset, empty
+/// or anything else leaves it off (a typo must not enable a feature the
+/// images may not support).
+fn parse_opt_in(raw: Option<&str>) -> bool {
+    raw.map(|v| {
+        matches!(
+            v.trim().to_lowercase().as_str(),
+            "true" | "1" | "on" | "yes"
+        )
+    })
+    .unwrap_or(false)
+}
+
 fn env(key: &str) -> anyhow::Result<String> {
     std::env::var(key).map_err(|_| anyhow::anyhow!("missing env var: {key}"))
 }
@@ -417,6 +446,17 @@ fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_env_flag_is_opt_in() {
+        for on in ["true", "1", "on", "yes", " TRUE "] {
+            assert!(parse_opt_in(Some(on)), "{on:?} must enable");
+        }
+        for off in ["", "false", "0", "off", "no", "ture", "enabled"] {
+            assert!(!parse_opt_in(Some(off)), "{off:?} must not enable");
+        }
+        assert!(!parse_opt_in(None), "unset must not enable");
+    }
 
     #[test]
     fn parse_frameworks_name_and_image() {

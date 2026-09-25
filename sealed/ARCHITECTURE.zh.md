@@ -342,7 +342,8 @@ sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关�
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
-| `API_KEY` | LLM provider key，由 attestor 在 deploy / Recreate envelope 里转发；spawn.go 翻译成 provider 专属的 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等 |
+| `API_KEY` | 明文 LLM provider key（旧路径），由 attestor 在 deploy / Recreate envelope 里转发；spawn.go 翻译成 provider 专属的 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 等 |
+| `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
 
 ### `AGENT_PUBLIC_URL` 怎么暴露给 agent

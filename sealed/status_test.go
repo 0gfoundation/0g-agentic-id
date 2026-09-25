@@ -166,3 +166,42 @@ func TestRuntimeStatus_ConcurrentSetGetSafe(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// A pinned warning (an owner-supplied sealed key that did not apply) is what
+// a "running" runtime reports, so neither a drift success nor a heartbeat can
+// report the keyless agent healthy; a real warning or error still wins, and
+// the pin shows again once they clear.
+func TestRuntimeStatus_PinnedWarningOverridesRunning(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	s.Pin("secret_env_not_applied: owner_mismatch")
+	if level, msg := s.Get(); level != "warning" || msg != "secret_env_not_applied: owner_mismatch" {
+		t.Fatalf("pinned Get = (%q, %q)", level, msg)
+	}
+
+	s.Set("warning", "insufficient funds")
+	if level, msg := s.Get(); level != "warning" || msg != "insufficient funds" {
+		t.Fatalf("a real warning must win: (%q, %q)", level, msg)
+	}
+	if prev := s.Set("running", ""); prev != "warning" {
+		t.Fatalf("recover Set returned %q", prev)
+	}
+	if level, msg := s.Get(); level != "warning" || msg != "secret_env_not_applied: owner_mismatch" {
+		t.Fatalf("after recovery the pin shows again: (%q, %q)", level, msg)
+	}
+	// Set reports the effective previous level, so a caller that pushes on
+	// a transition away from "running" does not mistake the pin for health.
+	if prev := s.Set("running", ""); prev != "warning" {
+		t.Fatalf("Set with only the pin returned %q; want warning", prev)
+	}
+
+	s.Set("error", "openclaw exit")
+	if level, _ := s.Get(); level != "error" {
+		t.Fatalf("an error must win over the pin, got %q", level)
+	}
+
+	s.Set("running", "")
+	s.Pin("")
+	if level, msg := s.Get(); level != "running" || msg != "" {
+		t.Fatalf("cleared pin: (%q, %q)", level, msg)
+	}
+}

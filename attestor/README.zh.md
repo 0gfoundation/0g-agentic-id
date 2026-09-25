@@ -120,6 +120,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `GET /deployments` | 列出当前 deployment |
 | `GET /deployment/:seal_id` | 单条 deployment 详情 |
+| `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
 
 详细签名 canonical 见 `crates/shared/src/auth/`。
@@ -169,6 +170,7 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SANDBOX_SNAPSHOT` | 实例化新 agent 用的 sealed runtime snapshot 名（升 image 时改这里）|
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
+| `ATTESTOR_SECRET_ENV_ENABLED` | 显式开启（`true`/`1`/`on`/`yes`）。开启后 `GET /config` 公布 `secret_env_scheme`，SDK 在 start/reset/retry 时把推理 key 加密给 agentSeal 公钥，而不是明文签进 envelope。只有当 `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` 里所有镜像都能读 `SEAL_SECRET_ENV` 时才开启。默认关闭 |
 | `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
 
