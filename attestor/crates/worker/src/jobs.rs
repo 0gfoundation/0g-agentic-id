@@ -1712,6 +1712,7 @@ mod tests {
             standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
+            secret_env_enabled: false,
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
