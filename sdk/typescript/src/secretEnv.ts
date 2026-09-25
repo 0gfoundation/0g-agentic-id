@@ -17,6 +17,12 @@
  * `/provision`, and the attestor's KMS derivation). The container checks that
  * `owner` is the agent's live on-chain owner before applying it.
  *
+ * Who seals: the SDK seals `apiKey` itself on start/reset/retry. When an
+ * integrator supplies the key (its own billed account) and a user signs, the
+ * integrator's server seals it with `sealApiKey` and hands the browser only
+ * the ciphertext, which the browser passes as `sealedSecretEnv`. The key then
+ * never reaches the user's browser at all.
+ *
  * ECIES is the eciesjs-compatible scheme the attestor and sealed already use
  * for `sealedKeys`: secp256k1 ECDH, HKDF-SHA256 over
  * `ephemeralPub(65) ‖ sharedPoint(65)` (no salt, no info), AES-256-GCM with a
@@ -45,6 +51,52 @@ export const SECRET_ENV_VAR = 'SEAL_SECRET_ENV';
  *    before `SEAL_SECRET_ENV` existed.
  */
 export type SecretEnvMode = 'auto' | 'sealed' | 'plaintext';
+
+/** Why a secret-env step refused. Every refusal happens before anything is
+ *  signed or sent. */
+export type SecretEnvRefusalCode =
+  /** `secretEnv` is not 'auto' | 'sealed' | 'plaintext'. */
+  | 'invalid_mode'
+  /** Both `apiKey` and `sealedSecretEnv`, or `sealedSecretEnv` with 'plaintext'. */
+  | 'conflicting_inputs'
+  /** A required input is missing or malformed (e.g. `sealApiKey` without a key or a valid owner). */
+  | 'invalid_input'
+  /** The call signs before the agent exists (one-shot deploy), so nothing can be sealed to it. */
+  | 'sealed_needs_agent'
+  /** GET /config could not be read, so the SDK cannot tell whether sealing is supported. */
+  | 'config_unreadable'
+  /** The attestor does not advertise `secret_env_scheme`. */
+  | 'scheme_unsupported'
+  /** GET /agent-seal-pubkey failed (network error or non-2xx). */
+  | 'pubkey_unavailable'
+  /** The served agentSeal public key is not a valid secp256k1 point. */
+  | 'pubkey_invalid'
+  /** The served key belongs to another seal, another agent_seal_addr, or not to the on-chain agentSeal. */
+  | 'pubkey_mismatch'
+  /** A chain read needed for a check failed. */
+  | 'chain_read_failed'
+  /** `owner` is not the agent's on-chain owner, so its container would refuse the secret. */
+  | 'owner_mismatch'
+  /** `sealedSecretEnv` is not an ECIES ciphertext in the expected wire format. */
+  | 'invalid_sealed_secret_env';
+
+/**
+ * A secret-env refusal. `signed` is always false: the SDK checks everything
+ * before it asks the wallet to sign and before it posts anything, so an
+ * integrator can treat this error as "nothing left the process".
+ */
+export class SecretEnvRefusedError extends Error {
+  readonly signed = false as const;
+  constructor(
+    readonly code: SecretEnvRefusalCode,
+    message: string,
+    options?: { cause?: unknown },
+  ) {
+    super(message);
+    this.name = 'SecretEnvRefusedError';
+    if (options && 'cause' in options) (this as { cause?: unknown }).cause = options.cause;
+  }
+}
 
 type WebCrypto = { getRandomValues<T extends Uint8Array>(x: T): T };
 
@@ -129,7 +181,53 @@ export function sealSecretEnv(agentSealPubkey: Hex, owner: Address, env: Record<
  *  its canonical compressed hex. Throws on anything that is not a curve point. */
 export function parseAgentSealPubkey(pubkey: string): Hex {
   if (!/^0x([0-9a-fA-F]{66}|[0-9a-fA-F]{130})$/.test(pubkey)) {
-    throw new Error('agent_seal_pubkey must be a 33- or 65-byte hex secp256k1 public key');
+    throw new SecretEnvRefusedError(
+      'pubkey_invalid',
+      'agent_seal_pubkey must be a 33- or 65-byte hex secp256k1 public key',
+    );
   }
-  return toHex(secp256k1.ProjectivePoint.fromHex(hexToBytes(pubkey as Hex)).toRawBytes(true));
+  try {
+    return toHex(secp256k1.ProjectivePoint.fromHex(hexToBytes(pubkey as Hex)).toRawBytes(true));
+  } catch (e) {
+    throw new SecretEnvRefusedError('pubkey_invalid', 'agent_seal_pubkey is not a secp256k1 curve point', {
+      cause: e,
+    });
+  }
+}
+
+function fromBase64(s: string): Uint8Array {
+  const g = globalThis as { atob?: (d: string) => string };
+  if (typeof g.atob === 'function') {
+    const bin = g.atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  return new Uint8Array(Buffer.from(s, 'base64'));
+}
+
+/** Smallest `{"v":1,"owner":"0x…40","env":{"API_KEY":"x"}}` plaintext, in bytes. */
+const MIN_PLAINTEXT = 70;
+
+/**
+ * Check that `value` has the shape `sealSecretEnv` produces (standard base64
+ * of `ephemeralPub(65) ‖ nonce(16) ‖ tag(16) ‖ ct`, with a valid ephemeral
+ * point) and return it trimmed. The SDK cannot decrypt it, so this does not
+ * prove which agent it was sealed to; it stops a caller from signing
+ * something that is plainly not a sealed secret (a raw key passed by
+ * mistake, say) into the envelope.
+ */
+export function checkSealedSecretEnv(value: string): string {
+  const v = typeof value === 'string' ? value.trim() : '';
+  const refuse = (why: string) =>
+    new SecretEnvRefusedError('invalid_sealed_secret_env', `sealedSecretEnv ${why}; pass the value sealApiKey returned`);
+  if (!v || v.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(v)) throw refuse('is not standard base64');
+  const raw = fromBase64(v);
+  if (raw.length < 65 + 16 + 16 + MIN_PLAINTEXT || raw[0] !== 0x04) throw refuse('is not an ECIES ciphertext');
+  try {
+    secp256k1.ProjectivePoint.fromHex(raw.subarray(0, 65));
+  } catch {
+    throw refuse('does not start with a valid ephemeral public key');
+  }
+  return v;
 }

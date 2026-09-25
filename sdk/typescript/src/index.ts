@@ -43,8 +43,8 @@ export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
 // agentSeal key instead of riding the signed envelope in clear.
-export { SECRET_ENV_SCHEME, SECRET_ENV_VAR, sealSecretEnv } from './secretEnv';
-export type { SecretEnvMode } from './secretEnv';
+export { SECRET_ENV_SCHEME, SECRET_ENV_VAR, SecretEnvRefusedError, sealSecretEnv } from './secretEnv';
+export type { SecretEnvMode, SecretEnvRefusalCode } from './secretEnv';
 
 // ── Owner settings (the opaque-to-attestor configuration document) ──
 export {
