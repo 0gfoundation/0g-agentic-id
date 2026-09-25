@@ -129,7 +129,7 @@ stay up.
 |---|---|
 | `GET /deployments` | List current deployments |
 | `GET /deployment/:seal_id` | Single deployment detail |
-| `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK seals the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166) |
+| `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
 Detailed signing canonicals live in `crates/shared/src/auth/`.

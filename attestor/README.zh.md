@@ -120,7 +120,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `GET /deployments` | 列出当前 deployment |
 | `GET /deployment/:seal_id` | 单条 deployment 详情 |
-| `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK 用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166） |
+| `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
 
 详细签名 canonical 见 `crates/shared/src/auth/`。

@@ -15,7 +15,11 @@
 //! Only seal_ids with a deployment row are answered, so the route is not a
 //! KMS-derivation oracle for arbitrary seals. The key is deterministic per
 //! seal, so each process caches it: a lookup costs one KMS round-trip per
-//! seal, not one per request.
+//! seal, not one per request. Cache misses derive through a small
+//! process-wide permit pool, so a burst of misses on this unauthenticated
+//! route queues here instead of loading the KMS that `/provision` also
+//! depends on, and a KMS failure answers a generic 500 (the detail goes to
+//! the log, not to anonymous callers).
 //!
 //! One path segment plus a query string (like `GET /deployments?owner=`), so
 //! allow-listing proxies in front of the attestor can admit it by name.
@@ -29,6 +33,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use tokio::sync::Semaphore;
 
 #[derive(Debug, Deserialize)]
 pub struct AgentSealPubkeyQuery {
@@ -43,9 +48,16 @@ pub struct AgentSealPubkeyResponse {
     pub agent_seal_pubkey: String,
 }
 
-/// Bound on cached keys; the cache is cleared when full (a miss only costs
-/// one KMS derivation).
+/// Bound on cached keys; a full cache evicts one entry per insert (a miss
+/// only costs one KMS derivation).
 const CACHE_CAP: usize = 4096;
+
+/// KMS derivations this route may have in flight at once, process-wide.
+const MAX_CONCURRENT_DERIVATIONS: usize = 4;
+static DERIVE_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_DERIVATIONS);
+
+/// What an anonymous caller sees when the KMS derivation fails.
+const DERIVE_FAILED: &str = "agentSeal public key unavailable; retry later";
 
 /// seal_id → (agentSeal address the key was checked against, compressed key).
 type Cache = Mutex<HashMap<SealId, (Address, Vec<u8>)>>;
@@ -78,34 +90,19 @@ async fn lookup(
         .await?
         .ok_or_else(|| ApiError::not_found("deployment not found"))?;
 
-    let cached = cache()
-        .lock()
-        .ok()
-        .and_then(|c| c.get(&seal_id).cloned())
-        .filter(|(addr, _)| *addr == d.agent_seal_addr)
-        .map(|(_, key)| key);
-    let pub_key = match cached {
+    let pub_key = match cached(seal_id, d.agent_seal_addr) {
         Some(key) => key,
         None => {
-            let kp = crypto
-                .derive_agent_seal(seal_id)
+            let _permit = DERIVE_PERMITS
+                .acquire()
                 .await
-                .map_err(|e| ApiError::internal(format!("derive agentSeal: {e}")))?;
-            // Never hand out a key that does not belong to the row's
-            // agentSeal: a mis-pointed KMS or chain config would otherwise
-            // have owners seal secrets no container of theirs can open.
-            if kp.address != d.agent_seal_addr {
-                return Err(ApiError::internal(
-                    "derived agentSeal does not match this deployment's agent_seal_addr",
-                ));
+                .map_err(|_| ApiError::internal(DERIVE_FAILED))?;
+            // A concurrent request for the same seal may have filled the
+            // cache while this one waited for a permit.
+            match cached(seal_id, d.agent_seal_addr) {
+                Some(key) => key,
+                None => derive_and_cache(crypto, seal_id, d.agent_seal_addr).await?,
             }
-            if let Ok(mut c) = cache().lock() {
-                if c.len() >= CACHE_CAP {
-                    c.clear();
-                }
-                c.insert(seal_id, (kp.address, kp.pub_key.clone()));
-            }
-            kp.pub_key
         }
     };
 
@@ -114,6 +111,45 @@ async fn lookup(
         agent_seal_addr: format!("{:#x}", d.agent_seal_addr),
         agent_seal_pubkey: format!("0x{}", hex::encode(&pub_key)),
     })
+}
+
+/// The cached key for `seal_id`, if it was checked against `agent_seal_addr`.
+fn cached(seal_id: SealId, agent_seal_addr: Address) -> Option<Vec<u8>> {
+    cache()
+        .lock()
+        .ok()
+        .and_then(|c| c.get(&seal_id).cloned())
+        .filter(|(addr, _)| *addr == agent_seal_addr)
+        .map(|(_, key)| key)
+}
+
+async fn derive_and_cache(
+    crypto: &dyn CryptoModule,
+    seal_id: SealId,
+    agent_seal_addr: Address,
+) -> ApiResult<Vec<u8>> {
+    let kp = crypto.derive_agent_seal(seal_id).await.map_err(|e| {
+        tracing::warn!(seal_id = ?seal_id, error = %e, "agent-seal-pubkey: agentSeal derivation failed");
+        ApiError::internal(DERIVE_FAILED)
+    })?;
+    // Never hand out a key that does not belong to the row's agentSeal: a
+    // mis-pointed KMS or chain config would otherwise have owners seal
+    // secrets no container of theirs can open.
+    if kp.address != agent_seal_addr {
+        tracing::error!(seal_id = ?seal_id, "agent-seal-pubkey: derived agentSeal does not match the deployment row");
+        return Err(ApiError::internal(
+            "derived agentSeal does not match this deployment's agent_seal_addr",
+        ));
+    }
+    if let Ok(mut c) = cache().lock() {
+        if c.len() >= CACHE_CAP {
+            if let Some(evict) = c.keys().next().copied() {
+                c.remove(&evict);
+            }
+        }
+        c.insert(seal_id, (kp.address, kp.pub_key.clone()));
+    }
+    Ok(kp.pub_key)
 }
 
 #[cfg(test)]
@@ -212,6 +248,59 @@ mod tests {
             "msg: {}",
             err.message
         );
+    }
+
+    /// RealCrypto whose KMS derivation fails with an internal-looking error.
+    struct FailingKms(RealCrypto);
+
+    #[async_trait::async_trait]
+    impl CryptoModule for FailingKms {
+        fn generate_seal_id(&self) -> SealId {
+            self.0.generate_seal_id()
+        }
+        async fn derive_agent_seal(
+            &self,
+            _seal_id: SealId,
+        ) -> anyhow::Result<attestor_shared::AgentSealKeyPair> {
+            anyhow::bail!("kms node 10.0.0.7:8443 refused: dprf share 2/3 missing")
+        }
+        fn aes_gcm_encrypt(&self, p: &[u8], k: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+            self.0.aes_gcm_encrypt(p, k)
+        }
+        fn aes_gcm_decrypt(&self, c: &[u8], k: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+            self.0.aes_gcm_decrypt(c, k)
+        }
+        fn ecies_encrypt(&self, d: &[u8], p: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.0.ecies_encrypt(d, p)
+        }
+        fn ecies_decrypt(&self, d: &[u8], p: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+            self.0.ecies_decrypt(d, p)
+        }
+        fn random_key_32(&self) -> [u8; 32] {
+            self.0.random_key_32()
+        }
+        fn keccak256(&self, d: &[u8]) -> [u8; 32] {
+            self.0.keccak256(d)
+        }
+        fn hmac_binding(&self, i: &[u8], d: &[u8]) -> [u8; 32] {
+            self.0.hmac_binding(i, d)
+        }
+        fn recover_signer(&self, d: &[u8; 32], s: &[u8]) -> anyhow::Result<Address> {
+            self.0.recover_signer(d, s)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kms_failure_answers_a_generic_500() {
+        // The route is public: KMS internals stay in the log.
+        let crypto = FailingKms(RealCrypto::new_for_test([7u8; 32]));
+        let repo = InMemoryDeploymentRepo::new();
+        let seal_id = B256::repeat_byte(0xa5);
+        repo.seed(row(seal_id, Address::from([0x44; 20])));
+        let err = lookup(&repo, &crypto, seal_id).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, DERIVE_FAILED);
+        assert!(!err.message.contains("kms"), "msg: {}", err.message);
     }
 
     #[tokio::test]
