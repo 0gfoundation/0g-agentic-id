@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
+mod agent_seal_pubkey;
 mod avatar;
 mod clone;
 mod config;
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/reset", post(reset::handle))
         .route("/deployment/:seal_id", get(deployment::handle))
         .route("/deployments", get(deployments::handle))
+        .route("/agent-seal-pubkey", get(agent_seal_pubkey::handle))
         .route("/ws/subscribe", get(ws::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

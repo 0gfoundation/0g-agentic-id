@@ -129,6 +129,7 @@ stay up.
 |---|---|
 | `GET /deployments` | List current deployments |
 | `GET /deployment/:seal_id` | Single deployment detail |
+| `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK seals the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166) |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
 Detailed signing canonicals live in `crates/shared/src/auth/`.
@@ -181,6 +182,7 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
+| `ATTESTOR_SECRET_ENV_ENABLED` | Opt-in (`true`/`1`/`on`/`yes`). `GET /config` then advertises `secret_env_scheme`, and the SDK seals the inference key of start/reset/retry to the agentSeal key instead of signing it in clear. Enable only once every image in `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` reads `SEAL_SECRET_ENV`. Default off |
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 
