@@ -451,6 +451,7 @@ mod tests {
             console_enabled: true,
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
+            secret_env_enabled: false,
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
