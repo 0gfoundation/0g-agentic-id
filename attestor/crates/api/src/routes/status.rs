@@ -159,6 +159,31 @@ pub async fn handle(
             // sealed re-emits this on every heartbeat while the condition
             // holds, so a missed event self-heals within heartbeatInterval.
             let reason = report.error_detail.unwrap_or_else(|| "unknown".into());
+            // A warning container BOOTED — it consumed the settings version it
+            // was served, so the version is confirmed here exactly as under
+            // Running. The concrete case: a sealed key that did not apply pins
+            // `secret_env_not_applied` for the boot's whole life (issue #166),
+            // and without this arm that boot would never confirm, the attempts
+            // counter would grow, and `/provision` would wedge the agent onto
+            // last-known-good forever — a key problem masquerading as a
+            // settings problem. Rolling settings back cannot fix a key.
+            match state
+                .deployments
+                .promote_settings_last_good(report.seal_id)
+                .await
+            {
+                Ok(Some(version)) => tracing::info!(
+                    seal_id = ?report.seal_id,
+                    version,
+                    "container booted (warning) on this settings version — promoted to last known good"
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    seal_id = ?report.seal_id,
+                    error = %e,
+                    "promote_settings_last_good failed (non-fatal)"
+                ),
+            }
             state
                 .events
                 .publish(WsEvent::ContainerWarning {
@@ -379,6 +404,37 @@ mod tests {
             "a container that booted on the document confirms it"
         );
         assert_eq!(d.settings_confirmed_version, 1);
+        assert_eq!(d.settings_attempts, 0, "the attempt is spent");
+    }
+
+    #[tokio::test]
+    async fn a_warning_boot_also_promotes() {
+        // The #166 pinned warning: a sealed key that did not apply keeps the
+        // boot at `warning` for its whole life. That container still BOOTED on
+        // the settings version it was served — without promotion here the
+        // version never confirms, attempts grow, and /provision wedges the
+        // agent onto last-known-good over a key problem settings rollback
+        // cannot fix.
+        let doc = serde_json::json!({"model": "m1"});
+        let s = make_setup(
+            Some(doc.clone()),
+            None,
+            0,
+            1,
+            StageStatus::Confirmed { at: Utc::now() },
+        );
+        let report = signed_report(
+            &s.agent_seal,
+            s.seal_id,
+            ContainerReportStatus::Warning,
+            Some("secret_env_not_applied: owner_mismatch".into()),
+        );
+        let (code, _) = handle(State(s.state.clone()), Json(report))
+            .await
+            .expect("report must be accepted");
+        assert_eq!(code, StatusCode::OK);
+        let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
+        assert_eq!(d.settings_confirmed_version, 1, "a warning boot consumed the document");
         assert_eq!(d.settings_attempts, 0, "the attempt is spent");
     }
 
