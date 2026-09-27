@@ -42,6 +42,19 @@ export interface AgenticIDConfig {
    * the standard set (attestor / kms / sandbox provider).
    */
   componentAppIds?: string[];
+  /**
+   * Sticky memory for the secret-env scheme (issue #166): once an attestor
+   * has advertised `secret_env_scheme`, its later absence is treated as
+   * tampering and refused (`scheme_withdrawn`) rather than silently falling
+   * back to a clear-text key. Every client remembers within its own
+   * lifetime; supply this store to remember across processes (the CLI backs
+   * it with a file). `seen` answers whether the URL ever advertised the
+   * scheme; `record` is called when it does.
+   */
+  secretEnvPin?: {
+    seen(attestorUrl: string): boolean | Promise<boolean>;
+    record(attestorUrl: string): void | Promise<void>;
+  };
 }
 
 /** The slice of the attestor's GET /config the SDK auto-configures from. */
@@ -80,6 +93,11 @@ export interface Ctx {
    *  callers don't hand-copy them per deployment — the hardcoded-default
    *  footgun that made ack() revert "app not found" on non-prod envs. */
   attestorConfig: () => Promise<AttestorPublicConfig | null>;
+  /** See {@link AgenticIDConfig.secretEnvPin}. */
+  secretEnvPin?: {
+    seen(attestorUrl: string): boolean | Promise<boolean>;
+    record(attestorUrl: string): void | Promise<void>;
+  };
 }
 
 const DEFAULT_COMPONENT_APP_IDS = ['0g-attestor', '0g-kms', '0g-sandbox-provider'];
@@ -124,6 +142,7 @@ export function buildCtx(config: AgenticIDConfig): Ctx {
     componentAppIds: config.componentAppIds ?? DEFAULT_COMPONENT_APP_IDS,
     componentAppIdsExplicit: config.componentAppIds !== undefined,
     attestorConfig,
+    secretEnvPin: config.secretEnvPin,
     publicClient: createPublicClient({ chain, transport: http(rpcUrl) }),
   };
 }

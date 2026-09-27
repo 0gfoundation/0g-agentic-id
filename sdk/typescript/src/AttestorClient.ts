@@ -276,6 +276,9 @@ function schemeUnsupported(what: string): SecretEnvRefusedError {
 }
 
 export class AttestorClient {
+  /** In-memory half of the secret-env sticky pin (see secretEnvScheme). */
+  private schemeSeen = false;
+
   constructor(private readonly ctx: Ctx) {}
 
   private baseUrl(): string {
@@ -549,7 +552,29 @@ export class AttestorClient {
         "cannot read the attestor's GET /config to decide how to deliver the key; retry, or pass secretEnv: 'plaintext' explicitly",
       );
     }
-    return cfg.secret_env_scheme === SECRET_ENV_SCHEME ? SECRET_ENV_SCHEME : '';
+    const advertised = cfg.secret_env_scheme === SECRET_ENV_SCHEME;
+    // Sticky pin: the seal-or-not decision rides an answer a relaying proxy
+    // can edit, and for 'auto' a stripped `secret_env_scheme` is
+    // indistinguishable from an old attestor — the one downgrade the sealing
+    // is meant to prevent. So the scheme can appear but never disappear:
+    // once this client (or, through `secretEnvPin`, this machine) has seen
+    // it, its absence is a refusal, not a clear-text fallback. A deliberate
+    // operator rollback is expressed by the caller as secretEnv: 'plaintext'.
+    const url = this.baseUrl();
+    if (advertised) {
+      this.schemeSeen = true;
+      await this.ctx.secretEnvPin?.record(url);
+      return SECRET_ENV_SCHEME;
+    }
+    if (this.schemeSeen || (await this.ctx.secretEnvPin?.seen(url))) {
+      throw new SecretEnvRefusedError(
+        'scheme_withdrawn',
+        `this attestor advertised secret_env_scheme=${SECRET_ENV_SCHEME} before but no longer does — ` +
+          "a relaying proxy may be stripping it to force a clear-text key. Refusing to downgrade; " +
+          "if the attestor really rolled the flag back, pass secretEnv: 'plaintext' explicitly",
+      );
+    }
+    return '';
   }
 
   private async requireSecretEnvScheme(what: string): Promise<void> {

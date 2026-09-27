@@ -519,8 +519,24 @@ falls back to `API_KEY`.
 
 Every refusal on these paths throws `SecretEnvRefusedError` (exported) before
 anything is signed or sent: `signed` is always `false`, and `code` names the
-cause (`config_unreadable`, `scheme_unsupported`, `pubkey_mismatch`,
-`owner_mismatch`, …). A caller can treat it as "nothing left the process".
+cause (`config_unreadable`, `scheme_unsupported`, `scheme_withdrawn`,
+`pubkey_mismatch`, `owner_mismatch`, …). A caller can treat it as "nothing
+left the process".
+
+**The scheme can appear but never disappear.** The seal-or-not decision rides
+a `GET /config` answer that a relaying proxy could edit, and for `'auto'` a
+stripped `secret_env_scheme` would be indistinguishable from an old attestor
+— the exact downgrade the sealing exists to prevent. So the SDK pins the
+sighting: once a client (or, through the CLI's pin file, this machine) has
+seen an attestor advertise the scheme, a later absence throws
+`scheme_withdrawn` instead of falling back to a clear-text key. A deliberate
+operator rollback is expressed by the caller as `secretEnv: 'plaintext'`.
+
+**`'auto'` is transitional.** It exists so old attestors and old sealed
+images keep working while the fleet upgrades. The exit path: once every
+image in the fleet opens `SEAL_SECRET_ENV`, the default becomes `'sealed'`
+(a clear-text key is then always an explicit `'plaintext'` choice), and the
+legacy clear path is removed with the last legacy image.
 
 ## What does my agent cost to run?
 

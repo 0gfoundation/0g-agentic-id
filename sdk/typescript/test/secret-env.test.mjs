@@ -383,20 +383,53 @@ test('a failing /agent-seal-pubkey is refused before signing', async () => {
 
 // ── 4. compatibility ────────────────────────────────────────────────────────
 
-test('the seal-or-not decision re-reads /config, so a flag rollback reaches a long-lived client', async () => {
+test('a scheme that disappears is a refusal, never a downgrade (sticky pin)', async () => {
+  // The seal-or-not decision rides a /config answer a relaying proxy can
+  // edit; for 'auto' a stripped `secret_env_scheme` is indistinguishable
+  // from an old attestor. Once a client has seen the scheme, its absence is
+  // scheme_withdrawn — a deliberate rollback is expressed as 'plaintext'.
   let scheme = SECRET_ENV_SCHEME;
   await withAttestor({ config: () => ({ sandbox_snapshot: '0g-sealed', secret_env_scheme: scheme }) }, async (a) => {
     const { c, signed } = client(a.port);
     await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
     assert.ok(envOf(signed[0])[SECRET_ENV_VAR], 'sealed while advertised');
-    scheme = undefined; // the operator turns ATTESTOR_SECRET_ENV_ENABLED off
-    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
-    assert.deepEqual(envOf(signed[1]), { API_KEY: KEY }, "'auto' follows the attestor");
+    scheme = undefined; // stripped by a proxy — or a real operator rollback
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }),
+      refused('scheme_withdrawn'),
+    );
     await assert.rejects(
       c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'sealed' }),
-      refused('scheme_unsupported'),
+      refused('scheme_withdrawn'),
     );
-    assert.equal(signed.length, 2);
+    // The deliberate escape hatch never consults /config at all.
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, secretEnv: 'plaintext' });
+    assert.deepEqual(envOf(signed[1]), { API_KEY: KEY });
+    assert.equal(signed.length, 2, 'the refused calls signed nothing');
+  });
+});
+
+test('the sticky pin crosses clients through secretEnvPin (the CLI backs it with a file)', async () => {
+  const pins = {};
+  const secretEnvPin = {
+    seen: (url) => !!pins[url],
+    record: (url) => {
+      pins[url] = true;
+    },
+  };
+  let scheme = SECRET_ENV_SCHEME;
+  await withAttestor({ config: () => ({ sandbox_snapshot: '0g-sealed', secret_env_scheme: scheme }) }, async (a) => {
+    const first = client(a.port, { secretEnvPin });
+    await first.c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
+    assert.ok(pins[`http://127.0.0.1:${a.port}`], 'the sighting is recorded');
+
+    scheme = undefined;
+    const second = client(a.port, { secretEnvPin }); // fresh client, no in-memory state
+    await assert.rejects(
+      second.c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }),
+      refused('scheme_withdrawn'),
+    );
+    assert.equal(second.signed.length, 0);
   });
 });
 

@@ -78,7 +78,14 @@ export type SecretEnvRefusalCode =
   /** `owner` is not the agent's on-chain owner, so its container would refuse the secret. */
   | 'owner_mismatch'
   /** `sealedSecretEnv` is not an ECIES ciphertext in the expected wire format. */
-  | 'invalid_sealed_secret_env';
+  | 'invalid_sealed_secret_env'
+  /** This attestor advertised `secret_env_scheme` before and no longer does.
+   *  For `'auto'` that is indistinguishable from a relaying proxy stripping
+   *  the field to force a clear-text key, so the SDK refuses instead of
+   *  downgrading (a sticky pin, per client and — via `secretEnvPin` — per
+   *  machine). A deliberate operator rollback is expressed by the caller as
+   *  `secretEnv: 'plaintext'`. */
+  | 'scheme_withdrawn';
 
 /**
  * A secret-env refusal. `signed` is always false: the SDK checks everything
