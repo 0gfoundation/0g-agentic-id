@@ -399,6 +399,15 @@ owner knob must not be able to make it (`dsh/settings.go:46-57`).
 
 The inference API key is `Resolved.APIKey` (`settings.go:66`): it arrives in
 the container's environment, is never part of `Doc`, and is persisted nowhere.
+Since #167 it can arrive sealed: when the attestor advertises
+`secret_env_scheme`, the SDK ships it as `SEAL_SECRET_ENV` — ECIES to the
+agentSeal public key, owner-bound — and `main.go` opens it after Phase 2,
+before any adapter runs, so `Resolved.APIKey` is the same thing either way
+(`internal/secretenv`). A sealed value that does not open pins a
+`secret_env_not_applied` warning for the boot's life; that boot still
+confirms its settings version (the document was consumed — a settings
+rollback cannot fix a key), which is why the attestor promotes on `warning`
+exactly as on `running`.
 It still reaches each framework differently, and that is not tidiable — it is
 what each framework's client actually reads:
 
@@ -703,13 +712,17 @@ chain dissolved the problem they addressed.
   ("my key is the sk- one") is not reliably detectable. The fix is to widen
   the credential channel from one variable to a named map carried in the
   owner-signed envelope and exported as env, so there is somewhere better than
-  memory to put it. The same entry applies to the **inference key itself**:
-  §7 puts it in the framework process env (openclaw/prime/dsh) or on disk in
-  `config.yaml` (hermes), and for a framework whose agent has shell or file
-  reach, "process env only" is not a confidentiality boundary. Use-without-
-  seeing — the treatment #163's connections design gives OAuth tokens — is the
-  shape of the real fix, and nothing gives the inference key that treatment
-  yet. The agent doc should also state the mechanism plainly:
+  memory to put it. The **transport** half of this
+  is now built: #167 seals the inference key to the agentSeal key
+  (`SEAL_SECRET_ENV`), so the wallet prompt, relays and the attestor's job
+  store see ciphertext — and the envelope's `env` is already a named map, the
+  natural place a second secret would ride. What remains open is the
+  **at-rest** half: §7 still puts the opened key in the framework process env
+  (openclaw/prime/dsh) or on disk in `config.yaml` (hermes), and for a
+  framework whose agent has shell or file reach, "process env only" is not a
+  confidentiality boundary. Use-without-seeing — the treatment #163's
+  connections design gives OAuth tokens — is the shape of that remaining fix,
+  and nothing gives the inference key that treatment yet. The agent doc should also state the mechanism plainly:
   *what you write into memory transfers with the asset.* That is an
   observability fact, not a behavioural instruction.
 - **The owner's opaque overlay is unscanned free text.** An owner who pastes a

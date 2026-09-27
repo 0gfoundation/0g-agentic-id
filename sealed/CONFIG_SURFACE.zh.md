@@ -317,7 +317,13 @@ dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext
 ## 7. 凭据
 
 推理 API key 是 `Resolved.APIKey`(`settings.go:66`):它从容器环境到来,从不属于 `Doc`,
-也不在任何地方持久化。它到达各框架的方式依然不同,而这**不是可以统一的** —— 那就是各框架
+也不在任何地方持久化。自 #167 起它可以密文到达:attestor 声明 `secret_env_scheme` 时,
+SDK 把它装进 `SEAL_SECRET_ENV` —— 用 agentSeal 公钥 ECIES 加密、绑定 owner ——
+`main.go` 在 Phase 2 之后、任何 adapter 运行之前解开,所以两条路殊途同归到同一个
+`Resolved.APIKey`(`internal/secretenv`)。解不开的密文把 `secret_env_not_applied`
+warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 settings 版本**(文档确实被
+消费了 —— 回退 settings 治不了 key 的病),这正是 attestor 在 `warning` 上和 `running`
+一样晋升的原因。它到达各框架的方式依然不同,而这**不是可以统一的** —— 那就是各框架
 客户端实际读取的地方:
 
 | | 密钥怎么到达框架 |
@@ -555,11 +561,14 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
   storage,**并在转让时一并交给下一任主人**。没有任何东西拦得住 —— 而那两份现已删除的
   `stripSecrets` 本来也只作用于那两个配置文件。**扫描不是解法**:散文里的密钥("我的
   key 是 sk- 开头那个")识别不可靠。解法是把凭据通道从一个变量扩成一张命名表,装在
-  owner 签名的信封里、导出成环境变量,**让密钥有个比记忆更好的去处**。这一条同样适用于
-  **推理密钥本身**:§7 把它放在框架进程 env(openclaw/prime/dsh)或 hermes 的
-  `config.yaml` 盘上,而对一个 agent 有 shell、有文件访问的框架来说,"只在进程 env 里"
-  不构成保密边界。真正的修法形状是"能用而不可见" —— #163 connections 设计给 OAuth token
-  的待遇 —— 推理密钥还没有拿到这个待遇。agent 圣经里也该
+  owner 签名的信封里、导出成环境变量,**让密钥有个比记忆更好的去处**。这件事的**运输**一半
+  现在有了:#167 把推理密钥加密到 agentSeal 公钥(`SEAL_SECRET_ENV`),钱包弹窗、中转
+  各方、attestor 的任务存储看到的都是密文 —— 而且信封里的 `env` 本来就是一张命名表,
+  第二个凭据天然有地方骑。仍然敞着的是**落地**一半:§7 把解开后的 key 放在框架进程
+  env(openclaw/prime/dsh)或 hermes 的 `config.yaml` 盘上,而对一个 agent 有 shell、
+  有文件访问的框架来说,"只在进程 env 里"不构成保密边界。那剩下一半的修法形状是
+  "能用而不可见" —— #163 connections 设计给 OAuth token 的待遇 —— 推理密钥还没有拿到
+  这个待遇。agent 圣经里也该
   直说这个机制:**写进记忆的东西会随资产转让。**这是可观测性事实,不是行为指令。
 - **owner 的不透明 overlay 是未经扫描的自由文本。**owner 把字面密钥粘进 `others`,
   它就进了一个普通 JSONB 列,在 prime 上还会进到容器里的一个文件
