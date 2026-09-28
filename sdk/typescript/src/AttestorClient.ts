@@ -400,17 +400,27 @@ export class AttestorClient {
     // hermes/prime/dsh agent fell back to the DEFAULT (openclaw) image and
     // booted a container without its framework installed (observed live,
     // agent 452) — the CLI wizard papered over it by asking; the SDK is the
-    // right place for the lookup. Best-effort: an unreadable row falls
-    // through to the default exactly as before.
+    // right place for the lookup. An UNREADABLE row refuses rather than
+    // falling through: silently choosing the default image re-creates the
+    // exact bug this lookup exists to prevent, and the subsequent POST goes
+    // to the same attestor anyway. A row without a framework (a legacy or
+    // never-provisioned agent) still gets the default — that is data, not a
+    // failed read.
     if (!fw && sealId) {
+      let row: { framework?: string | null };
       try {
         const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
           signal: AbortSignal.timeout(10_000),
         });
-        if (r.ok) fw = ((await r.json()) as { framework?: string | null }).framework ?? undefined;
-      } catch {
-        /* fall through to the default snapshot */
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        row = (await r.json()) as { framework?: string | null };
+      } catch (e) {
+        throw new Error(
+          `cannot read /deployment/${sealId} to pick the sealed image (${errMsg(e)}); ` +
+            "retry, or pass `framework` (or `sealedImage`) explicitly",
+        );
       }
+      fw = row.framework ?? undefined;
     }
     // Rides the instance's memoized /config (review #154 N3a) — this was the
     // one remaining uncached fetch on the deploy/reset/first-start path.

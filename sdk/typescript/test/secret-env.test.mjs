@@ -101,6 +101,7 @@ function stubAttestor(opts = {}) {
         return typeof cfg === 'number' ? json(cfg, { error: 'unavailable' }) : json(200, cfg);
       }
       if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) {
+        if (opts.rowStatus) return json(opts.rowStatus, { error: 'unavailable' });
         return json(200, { seal_id: SEAL_ID, framework: opts.rowFramework ?? null });
       }
       if (req.method === 'GET' && url.pathname === '/agent-seal-pubkey') {
@@ -511,6 +512,32 @@ test('an explicit framework wins over the row, and no row read happens', async (
     await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, framework: 'hermes' });
     assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed-hermes');
     assert.ok(!a.hits.some((h) => h.startsWith('/deployment/')), 'no row read when the caller chose');
+  });
+});
+
+test('an unreadable deployment row refuses instead of defaulting the image', async () => {
+  const config = {
+    sandbox_snapshot: '0g-sealed',
+    secret_env_scheme: SECRET_ENV_SCHEME,
+    frameworks: [{ name: 'prime-agent', image: '0g-sealed-prime' }],
+  };
+  await withAttestor({ config, rowStatus: 500 }, async (a) => {
+    const { c, signed } = client(a.port);
+    await assert.rejects(
+      c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY }),
+      /cannot read \/deployment\/.*pick the sealed image/,
+    );
+    assert.equal(signed.length, 0, 'nothing was signed');
+    // A row WITHOUT a framework is data, not a failed read: default applies.
+  });
+});
+
+test('a row with no framework still gets the default image', async () => {
+  const config = { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
+  await withAttestor({ config, rowFramework: null }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
+    assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed');
   });
 });
 
