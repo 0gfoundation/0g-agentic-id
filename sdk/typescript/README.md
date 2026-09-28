@@ -254,7 +254,7 @@ await ag.agent.runtimeCosts(agentId);    // + that agent's evolution-gas balance
 
 ## Interacting with a running agent
 
-`ag.agent.client(agentId)` resolves the URL on chain — one handle for every caller; owner ops (`chat`/`chatStream`/`logs`) are present only when `ag` holds the owner key.
+`ag.agent.client(agentId)` resolves the URL on chain — one handle for every caller; owner ops (`chat`/`chatStream`/`logs`) are present only when `ag` holds the owner key. Multi-window apps: pass `{ instanceId }` — the container seats ONE driving client at a time (a displaced window gets 409; `claimAgent` takes the seat over; callers without an id bypass the gate). See the [guide](./GUIDE.md#agagent--lifecycle--reads).
 
 ```ts
 const { hello, verification } = await ag.agent.sayHi(agentUrl);

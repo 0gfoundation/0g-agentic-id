@@ -623,6 +623,19 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
   is enough (owner ops still gated on `ag` having a key).
 
+  **Multi-window clients: the single-driver seat.** The container admits ONE
+  driving client at a time (WeChat login semantics — configuration is global,
+  so two windows steering one agent silently fight). Pass a stable random id
+  as `client(agentId, { instanceId })`; it rides every chat request as
+  `X-Client-Instance`. The first id to speak takes the seat; a different id
+  gets **HTTP 409** (`"in use by another client since …"`) until it takes the
+  seat over with `ag.agent.claimAgent(serveBase, agentId, instanceId)`
+  (owner-signed; always wins — the displaced window learns on its next
+  message). Omit `instanceId` and the gate ignores you entirely: it is
+  self-collision protection among your own windows, deliberately not a
+  security boundary. The seat lives in proxy memory; a container restart
+  clears it.
+
   ```ts
   const agent = await ag.agent.client(agentId);
   // agent.routes / agent.services — the declared surface (same as /hello)
