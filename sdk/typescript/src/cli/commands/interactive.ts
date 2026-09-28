@@ -2170,7 +2170,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // still releases the Esc brake). Entering the session again claims the
       // seat back.
       if (failure && /displaced|in use by another client/i.test(failure)) {
-        out(`\n⚠ 该 agent 已在另一个客户端登录 — 本窗口退出会话(use ${s.agentId} 重新进入即可接管)\n`);
+        out(`\n⚠ this agent is now driven by another client — leaving the session (use ${s.agentId} re-enters and takes the seat back)\n`);
         return;
       }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
