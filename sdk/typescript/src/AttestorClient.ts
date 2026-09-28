@@ -564,9 +564,11 @@ export class AttestorClient {
   }
 
   /**
-   * A FRESH read of `GET /config` for the seal-or-not decision, so a flag
-   * change on the attestor (on, or rolled back off) reaches long-lived
-   * clients on their next call. Returns the scheme ('' when not
+   * A FRESH read of `GET /config` for the seal-or-not decision, so turning
+   * the flag ON reaches long-lived clients on their next call. The other
+   * direction is deliberately NOT symmetric: after this client (or machine)
+   * has seen the scheme once, its absence throws `scheme_withdrawn` — see
+   * the sticky pin below. Returns the scheme ('' when never seen and not
    * advertised); throws when /config cannot be read at all.
    */
   private async secretEnvScheme(): Promise<string> {

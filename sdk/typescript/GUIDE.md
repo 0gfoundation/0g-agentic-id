@@ -421,11 +421,14 @@ The `sealedImage` is the sealed runtime image bundling a framework's adapter
 (0g-sandbox's own wire field for it is still called `snapshot`). Frameworks
 whose runtime isn't in the default image ship their own — openclaw runs on the
 default `sandbox_snapshot`, hermes on a Python/uv image. **You don't pass it at
-deploy** (nor at `reset`/`retry`): the SDK resolves the right image for your
-`framework` from `GET /config`'s `frameworks[]` (each entry `{ name, image? }`;
-no image → the default snapshot). `reset`/`retry` take `framework` too — pass
-the same name you deployed. Pass `sandbox.sealedImage` (or `sealedImage` on
-reset/retry) only to pin a specific image. Which frameworks are live is whatever
+deploy** (nor at `reset`/`retry`): at deploy the SDK resolves the right image
+for your `framework` from `GET /config`'s `frameworks[]` (each entry
+`{ name, image? }`; no image → the default snapshot). For an EXISTING agent,
+`reset`/`start`/`retry` need neither — the SDK reads the framework off the
+agent's own deployment row and resolves the same way (an unreadable row
+refuses rather than guessing the default). Pass `framework` only to override
+the row, and `sandbox.sealedImage` (or `sealedImage` on reset/retry) only to
+pin a specific image. Which frameworks are live is whatever
 `/config.frameworks[]` advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
@@ -470,9 +473,10 @@ minting is the owner's freedom; whether the content actually boots is the
 **sealed runtime's contract**. Each framework runs on the sealed image
 `/config.frameworks[]` declares for it (openclaw = the default snapshot,
 hermes = its own Python/uv image); at **deploy** the SDK resolves that image
-from `framework`, so you don't pass one. **reset** and **retry** take
-`framework` too and resolve the image the same way (pass `sealedImage` only to
-pin a specific one). Pick with `framework`;
+from `framework`, so you don't pass one. **reset**/**start**/**retry** on an
+existing agent resolve it from the agent's own deployment row, so a bare call
+is enough (`framework` overrides the row; `sealedImage` pins a specific
+image). Pick with `framework`;
 the name must be in `/config.frameworks[]`. openclaw's persona seed supports
 `inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
 router). For the router's live model catalog:
