@@ -377,6 +377,26 @@ prime 的桥仍然读一个**名叫** `SEAL_OWNER_THINKING` 的环境变量
 (`prime/spawn.go:245-257`、`:376`)。prime 的逐条消息覆盖(`bridge.mjs:365`)没有变,
 它仍然是全系统唯一真正"热"的配置变更。
 
+### 8.1 单驾驶座
+
+"生效即重启"造出一个**这条通道自己引入的**交互隐患:owner 开着两个窗口,窗口 A 推一次
+settings,窗口 B 正聊着的 harness 就被重启 —— B 的会话死掉,它对话的模型被悄悄换掉。
+驾驶座用微信登录语义堵住它:**同时只有一个驾驶员,新登录的赢,被顶掉的窗口在下一次
+开口时得知。**
+
+- **占座。**`POST /_seal/claim` —— owner 签名(tag `0GSealClaim`,与 settings 推送
+  相同的 `<tag>:0x<sealID>:<ts>:<sha256(body)>:<audience>` 文法),body
+  `{"instance": <id>}`。claim 永远赢下座位(`internal/proxy/occupancy.go`)。CLI 每个
+  会话生成随机 instance id,连接时尽力 claim。
+- **开口。**每个聊天 `POST /v1/*` 和 settings 推送都带 `X-Client-Instance`。座位空着时
+  第一个带 id 开口的人直接坐下;座位有人时不同 id 得到 **409**("in use by another
+  client since …"),CLI 把它变成一条提示并退出会话 —— 重新进入即可抢座。
+- **边界 —— 刻意不是安全边界。**不带 header 的调用者原样绕过:agent 自己的脚本、旧版
+  CLI、调用 agent 公开服务的第三方都感知不到它。驾驶座是 owner 自己各客户端之间的
+  防自撞,授权仍在原处(owner 签名、agent socket)。
+- **重启即清空。**座位只存在于 proxy 内存 —— 容器重启清掉,下一个开口的人坐下。不持久
+  化,不触达 attestor 或链。
+
 ## 9. 一份文档起不来时
 
 危险的组合是:owner 推了一份会阻止开机的文档,**并且**容器被重建 —— 重建会抹掉容器自己

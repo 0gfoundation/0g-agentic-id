@@ -474,6 +474,34 @@ document via `Resolved.Effort()` (`prime/spawn.go:245-257`, `:376`). prime's
 per-turn override (`bridge.mjs:365`) is unchanged, and is still the only
 genuinely hot configuration change in the system.
 
+### 8.1 The single-driver seat
+
+Restart-on-apply creates an interaction hazard **this channel itself
+introduces**: with two owner windows open, a settings push from window A
+restarts the harness under window B mid-conversation — B's session dies and
+the model it was talking to silently changes. The seat closes it with WeChat
+login semantics: **one driver at a time, the newest login wins, the displaced
+window finds out the moment it next speaks.**
+
+- **Claim.** `POST /_seal/claim` — owner-signed (tag `0GSealClaim`, the same
+  `<tag>:0x<sealID>:<ts>:<sha256(body)>:<audience>` grammar as the settings
+  push), body `{"instance": <id>}`. A claim always wins the seat
+  (`internal/proxy/occupancy.go`). The CLI generates a random instance id per
+  session and claims best-effort on connect.
+- **Speak.** Every chat `POST /v1/*` and the settings push carry
+  `X-Client-Instance`. First speaker with an id sits down without a claim; a
+  different id while the seat is held gets **409** ("in use by another client
+  since …"), which the CLI turns into a notice and a session exit — re-enter
+  to take the seat over.
+- **Boundary — deliberately NOT a security boundary.** Headerless callers
+  bypass the gate untouched: agent scripts, older CLIs, and third parties
+  calling the agent's public services never see it. The seat is
+  self-collision protection among the owner's own cooperating clients;
+  authorization stays where it was (owner signatures, agent socket).
+- **Restart clears it.** The seat lives in proxy memory only — a container
+  restart empties it, and the next speaker sits down. Nothing is persisted,
+  nothing reaches attestor or chain.
+
 ## 9. When a document will not boot
 
 The dangerous combination is an owner pushing a document that prevents boot
