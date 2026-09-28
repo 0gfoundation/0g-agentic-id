@@ -154,11 +154,22 @@ pub async fn handle(
                 .await?;
         }
         ContainerReportStatus::Warning => {
-            // Warning is a transient UI signal — agent stays operational
-            // (StageStatus stays whatever it was, typically Confirmed).
-            // sealed re-emits this on every heartbeat while the condition
-            // holds, so a missed event self-heals within heartbeatInterval.
+            // Warning is "up, degraded" — the agent is operational. sealed
+            // re-emits it on every heartbeat while the condition holds, so a
+            // missed event self-heals within heartbeatInterval.
             let reason = report.error_detail.unwrap_or_else(|| "unknown".into());
+            // Confirm the container stage exactly as under Running. A #166
+            // pinned warning (secret_env_not_applied) replaces the boot's
+            // `running` report for the boot's whole life, so before this line
+            // such a boot never reached the Running arm and its stage starved
+            // at Submitted — `derive_phase` showed the owner "deploying"
+            // forever for a container that was up and heartbeating (observed
+            // live, agent 452). Idempotent for the transient-warning case,
+            // where the stage is already Confirmed.
+            state
+                .deployments
+                .set_container_stage(report.seal_id, StageStatus::Confirmed { at: now })
+                .await?;
             // A warning container BOOTED — it consumed the settings version it
             // was served, so the version is confirmed here exactly as under
             // Running. The concrete case: a sealed key that did not apply pins
@@ -436,6 +447,14 @@ mod tests {
         let d = s.repo.get(s.seal_id).await.unwrap().unwrap();
         assert_eq!(d.settings_confirmed_version, 1, "a warning boot consumed the document");
         assert_eq!(d.settings_attempts, 0, "the attempt is spent");
+        // And it is UP: the stage must confirm exactly as under Running, or
+        // derive_phase shows "deploying" forever for a live, heartbeating
+        // container (observed live: a pinned secret_env_not_applied boot).
+        assert!(
+            matches!(d.container_stage, StageStatus::Confirmed { .. }),
+            "a warning container is up — stage must be Confirmed, got {:?}",
+            d.container_stage
+        );
     }
 
     #[tokio::test]
