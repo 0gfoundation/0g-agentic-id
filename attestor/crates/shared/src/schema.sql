@@ -125,3 +125,60 @@ CREATE TABLE IF NOT EXISTS indexer_checkpoints (
 -- Clone retry recipe (issue #147): the static params needed to re-drive a
 -- failed clone under the same sealId. NULL on deploy rows.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS clone_params JSONB;
+
+-- ── Owner settings document (issue: owner configuration channel) ────────
+--
+-- ONE document per agent, authored by the owner, stored here as an OPAQUE
+-- blob. attestor never parses it, never validates its contents and never
+-- logs them: all meaning lives in the sealed container
+-- (`sealed/internal/settings`). That is the point — widening the settings
+-- vocabulary (a new provider, a new framework knob) must never require an
+-- attestor change, so nothing here may grow knowledge of what a field means.
+--
+-- Deliberately NOT on chain: configuration is re-suppliable (an owner
+-- re-picks a model in ten seconds), memory is not. Only the latter earns
+-- chain storage.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings JSONB;
+
+-- Last document a container actually BOOTED on: promoted from `settings`
+-- when the container reports its post-boot success (`POST /status`
+-- status=running while the container track was not already Confirmed).
+-- Last-known-good lives server-side, not on the container's disk, because
+-- the dangerous case is an owner pushing a document that prevents boot AND
+-- the container being recreated — which wipes any local copy. Two framework
+-- adapters hard-fail startup without a usable model pin, so that combination
+-- would take the agent offline with nothing to fall back to. Also opaque:
+-- attestor copies bytes, it does not read them.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_last_good JSONB;
+
+-- Monotonic counter of accepted settings writes. It is also the CAS token:
+-- an owner write carries the version it believes is current (`base_version`
+-- in the signed message) and lands only if it still matches, so a captured
+-- request cannot be replayed to reinstate a superseded document and two
+-- clients editing the same agent cannot silently overwrite each other.
+-- Counts writes; says nothing about the contents, which attestor does not
+-- inspect. 0 = never configured.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_version BIGINT NOT NULL DEFAULT 0;
+
+-- The version `settings_last_good` holds, i.e. the newest document a
+-- container has actually BOOTED on. Promotion is keyed on this and nothing
+-- else: a `running` report promotes only while
+-- `settings_confirmed_version < settings_version`, which makes it idempotent
+-- by construction — the 5-minute heartbeat repeats the same report and must
+-- not be able to bless a document no boot exercised. (The earlier rule
+-- inferred "this is the post-boot report" from the container track not being
+-- Confirmed; several paths demote a still-running container out of Confirmed
+-- without any boot, so that inference promoted documents nothing had run.)
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_confirmed_version BIGINT NOT NULL DEFAULT 0;
+
+-- How many boots have been served the current unconfirmed document. Bumped
+-- by `/provision` while `settings_version > settings_confirmed_version`,
+-- reset to 0 whenever a document is written or promoted. Past the first
+-- attempt `/provision` serves `settings_last_good` instead: the first boot
+-- after a push gets the new document, a container that keeps coming back
+-- without ever confirming gets the last one that worked. Keyed on repeated
+-- attempts rather than on an error report, because an error report arrives
+-- on every failing heartbeat — rolling back there made it impossible to land
+-- a configuration change while an agent is unhealthy, which is exactly when
+-- an owner most needs to.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL DEFAULT 0;

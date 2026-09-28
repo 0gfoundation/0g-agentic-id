@@ -27,6 +27,10 @@ package prime
 //   - the `refinements` array inside harness_state.json — an append-only
 //     self-modification event log (see harness.go); runtime audit data, not
 //     identity, and monotonically growing.
+//   - models.json — the model registration. It is RENDERED from the owner's
+//     settings at every Start rather than restored, so a fix shipped after an
+//     agent was minted reaches it; tracking a rendered artifact would only
+//     anchor a copy that goes stale (see modelsjson.go).
 //   - everything outside primeHome, including the sealed platform/doctrine
 //     text: the bridge injects that in code at session creation (see
 //     agentDocPath), so no platform-injected bytes ever land in a tracked
@@ -55,8 +59,10 @@ func harnessStateDir() string  { return primeHome + "/harness" }
 func skillsDir() string        { return primeHome + "/skills" }
 func appendSystemPath() string { return primeHome + "/APPEND_SYSTEM.md" }
 
-// modelsJSONPath is the framework's native model registration, and this
-// adapter's durable home for the inference pin (see modelsjson.go).
+// modelsJSONPath is the framework's native model registration. NOT a tracked
+// role and not a durable store: RenderSettings rebuilds it from the owner's
+// settings document at every Start (see modelsjson.go), so an agent edit here
+// survives exactly until the next boot.
 func modelsJSONPath() string { return primeHome + "/models.json" }
 
 // kernelVenvPython is the interpreter the framework's IPython kernel runs, in

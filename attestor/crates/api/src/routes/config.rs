@@ -57,6 +57,20 @@ pub struct ConfigResponse {
     /// deploy route enforces the name list pre-mint (this copy is UX, that
     /// copy is the boundary).
     pub frameworks: Vec<attestor_shared::Framework>,
+
+    /// Present (`"agent-seal-ecies-v1"`) when this deployment's sealed
+    /// images open a sealed secret env (issue #166): the SDK then seals the
+    /// inference key to the agent's agentSeal key (`GET /agent-seal-pubkey`)
+    /// instead of signing it into the create envelope in clear. Omitted when
+    /// `ATTESTOR_SECRET_ENV_ENABLED` is off, so older SDKs and images keep
+    /// the plain `API_KEY` path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_env_scheme: Option<&'static str>,
+}
+
+/// The advertised secret-env scheme, if the operator enabled it.
+fn secret_env_scheme(enabled: bool) -> Option<&'static str> {
+    enabled.then_some(attestor_shared::config::SECRET_ENV_SCHEME)
 }
 
 pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
@@ -109,5 +123,17 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .tee_data_verifier_addr
             .map(|a| format!("{:#x}", a)),
         frameworks: state.cfg.frameworks.clone(),
+        secret_env_scheme: secret_env_scheme(state.cfg.secret_env_enabled),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_env_scheme_is_advertised_only_when_enabled() {
+        assert_eq!(secret_env_scheme(true), Some("agent-seal-ecies-v1"));
+        assert_eq!(secret_env_scheme(false), None);
+    }
 }

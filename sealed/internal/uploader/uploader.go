@@ -7,13 +7,13 @@
 //     declared role and passes the (role → plaintext) map to Apply.
 //  2. Apply reads current chain entries + sealedKeys.
 //  3. For each declared role:
-//       - plaintext == sha256(Defaults): omit from newDatas. §16.10
-//         "plaintext = defaults ↔ no chain entry".
-//       - plaintext == chainSnapshot.ContentHash: reuse chain entry
-//         verbatim (no re-encrypt, no upload).
-//       - otherwise: encrypt + upload to 0g-storage, build fresh entry;
-//         reuse data_key when chain has prior entry (so manifest child
-//         blobs stay decipherable), mint fresh otherwise.
+//     - plaintext == sha256(Defaults): omit from newDatas. §16.10
+//     "plaintext = defaults ↔ no chain entry".
+//     - plaintext == chainSnapshot.ContentHash: reuse chain entry
+//     verbatim (no re-encrypt, no upload).
+//     - otherwise: encrypt + upload to 0g-storage, build fresh entry;
+//     reuse data_key when chain has prior entry (so manifest child
+//     blobs stay decipherable), mint fresh otherwise.
 //  4. Anything on chain whose role is outside adapter.Roles() (e.g. mint-
 //     only `persona` after bootstrap translation) is dropped — never
 //     visited in the per-role loop, never written into newDatas.

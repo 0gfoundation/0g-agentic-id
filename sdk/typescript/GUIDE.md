@@ -218,6 +218,50 @@ await ag.agent.listDeployments();
 //          transfer-teardown; on-chain identity persists, use start({apiKey}) or reset) | 'failed'
 ```
 
+### Settings — the owner's configuration document
+
+One document per agent says which model it thinks with and how hard. It is **not** on chain: configuration is re-suppliable (an owner re-picks a model in ten seconds), where the agent's memory is not, and only the latter earns chain storage.
+
+```ts
+const { settings, version } = await ag.agent.getSettings(sealId);
+// settings → { provider?, model?, thinking?: 'low'|'high'|'max', framework?: <any JSON> } | null
+//            null = never configured (not an error)
+// version  → what to write back against; 0 when there is no document yet
+
+await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3b', thinking: 'high' }, {
+  baseVersion: version,               // compare-and-swap (see below)
+  onWarn: (w) => console.warn(w),     // advisory model check, run BEFORE signing
+});                                   // → { version: 12 }
+```
+
+**Whole-document write.** `setSettings` replaces the document — read it first and spread it to change one field.
+
+**Who may read or write it.** Owner-signed, both directions, against the **live on-chain owner** read at request time — so a seller cannot keep configuring (or reading) an agent they already sold. The SDK signs `AgenticID.Settings.v1:<sealId>:<ts>:<base_version>:<sha256 of the document>` (EIP-191) for a write, and the same message minus the digest for a read (`GET /settings`, no body, base version 0). A rejected call is a clearly-worded HTTP 401. The document is on **no** listing tier and on no public deployment row: `getSettings` is the only way to read it.
+
+**Compare-and-swap.** `baseVersion` is the version you read before editing. If the stored version has moved on — another client, another device, a replayed request — the write is refused with `SettingsConflictError`, which carries the live document and its version:
+
+```ts
+import { SettingsConflictError } from '@0gfoundation/0g-agenticid-sdk';
+
+try {
+  await ag.agent.setSettings(sealId, next, { baseVersion: version });
+} catch (e) {
+  if (!(e instanceof SettingsConflictError)) throw e;
+  console.warn(`someone else wrote version ${e.currentVersion}:`, e.current);
+  // re-apply your edit onto e.current and write again against e.currentVersion
+}
+```
+
+Do not wrap that in a retry loop. The refusal exists so a human sees the other writer's change before deciding what survives; a loop makes the change disappear silently, which is the failure the version guard was added to prevent.
+
+**Why the signature covers a digest and not the document.** The signed statement rides an HTTP header, so it must stay short and ASCII, while the document is large and may be non-ASCII. The SDK produces the digest and the request body from **one** serialization, so the two can never disagree.
+
+**Who understands the contents.** The attestor does not: it stores the blob opaquely, serves it to the container, and gates the write. All meaning lives in the sealed container, which is why widening the vocabulary — a new field, a new framework knob — never requires an attestor change. `framework` is the explicitly opaque section for a framework's own knobs; the platform's guarantees cover the named fields only. The SDK follows the same rule: a field it has never heard of survives a read-modify-write untouched, so an older client can never erase a newer setting.
+
+**When it takes effect.** The container receives it on **every** boot — including a resume, which a container-create-time environment variable would miss — and the first `running` report after a push promotes it to last-known-good. A container that keeps coming back without ever confirming one is handed the last document a boot did confirm instead, so pushing a document that prevents boot costs a boot rather than the agent. Nothing rolls a document back on an error report: an unhealthy agent is exactly when an owner needs to be able to land a fix.
+
+**The model check is advisory.** `onWarn` runs the 0G router's public catalog check before signing. A model the catalog does not list is *reported*, never blocked: a framework built-in (`anthropic/claude-…`) is legitimately absent from a catalog that covers the 0G router alone, and the container is the real gate. An unreachable catalog produces no warning at all. Omit `onWarn` and no catalog request is made.
+
 **Which identifier does what** — three IDs refer to the same agent from different angles:
 
 | Identifier | What it is | Used by |
@@ -377,11 +421,14 @@ The `sealedImage` is the sealed runtime image bundling a framework's adapter
 (0g-sandbox's own wire field for it is still called `snapshot`). Frameworks
 whose runtime isn't in the default image ship their own — openclaw runs on the
 default `sandbox_snapshot`, hermes on a Python/uv image. **You don't pass it at
-deploy** (nor at `reset`/`retry`): the SDK resolves the right image for your
-`framework` from `GET /config`'s `frameworks[]` (each entry `{ name, image? }`;
-no image → the default snapshot). `reset`/`retry` take `framework` too — pass
-the same name you deployed. Pass `sandbox.sealedImage` (or `sealedImage` on
-reset/retry) only to pin a specific image. Which frameworks are live is whatever
+deploy** (nor at `reset`/`retry`): at deploy the SDK resolves the right image
+for your `framework` from `GET /config`'s `frameworks[]` (each entry
+`{ name, image? }`; no image → the default snapshot). For an EXISTING agent,
+`reset`/`start`/`retry` need neither — the SDK reads the framework off the
+agent's own deployment row and resolves the same way (an unreadable row
+refuses rather than guessing the default). Pass `framework` only to override
+the row, and `sandbox.sealedImage` (or `sealedImage` on reset/retry) only to
+pin a specific image. Which frameworks are live is whatever
 `/config.frameworks[]` advertises.
 
 **The shape of iData**: an array of `{ role, plaintext, extra }` entries —
@@ -426,9 +473,10 @@ minting is the owner's freedom; whether the content actually boots is the
 **sealed runtime's contract**. Each framework runs on the sealed image
 `/config.frameworks[]` declares for it (openclaw = the default snapshot,
 hermes = its own Python/uv image); at **deploy** the SDK resolves that image
-from `framework`, so you don't pass one. **reset** and **retry** take
-`framework` too and resolve the image the same way (pass `sealedImage` only to
-pin a specific one). Pick with `framework`;
+from `framework`, so you don't pass one. **reset**/**start**/**retry** on an
+existing agent resolve it from the agent's own deployment row, so a bare call
+is enough (`framework` overrides the row; `sealedImage` pins a specific
+image). Pick with `framework`;
 the name must be in `/config.frameworks[]`. openclaw's persona seed supports
 `inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
 router). For the router's live model catalog:
@@ -438,9 +486,61 @@ await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …
 ```
 
 `sandbox.apiKey` is required in practice — without it the agent boots but
-cannot reach its model. It travels inside the owner-signed envelope into
-the TEE container's environment; the attestor never stores it (which is
-why `reset()` needs it again).
+cannot reach its model. It travels inside the owner-signed "create"
+envelope into the TEE container's environment, and the attestor keeps no
+reusable copy (which is why `reset()` needs it again).
+
+The owner's wallet shows that envelope verbatim when it signs. When the
+attestor's `GET /config` advertises `secret_env_scheme`, `start` / `reset` /
+`retry` seal the key to the agent's agentSeal public key first
+(`SEAL_SECRET_ENV`, ECIES; only the agent's TEE container opens it), so the
+wallet prompt, the attestor and the sandbox provider see ciphertext, never
+the key. A one-shot `deploy` with `sandbox` cannot do this: it signs the
+envelope before the agent exists, so its key still rides in clear. To keep
+a key out of the wallet prompt, deploy without `sandbox`, then call
+`start(sealId, { apiKey })`. Pass `secretEnv: 'sealed'` to make any call
+throw rather than sign a key in clear, or `'plaintext'` to force the legacy
+`API_KEY` path (for a sealed image that predates `SEAL_SECRET_ENV`).
+
+**When your app supplies the key and the user signs.** Sealing in the
+browser still means the key reaches the user's browser. Seal it on your
+server instead, and hand the browser only the ciphertext:
+
+```ts
+// server: a read-only client is enough (no wallet)
+const ag = new AgenticID({ attestorUrl, addresses, rpcUrl, chain });
+const sealed = await ag.agent.sealApiKey(sealId, { owner, apiKey });
+
+// browser: signs ciphertext only; the key never reaches it
+await ag.agent.start(sealId, { sealedSecretEnv: sealed });
+```
+
+`owner` must be the wallet that signs: the container applies the secret only
+while that address owns the agent on chain, so `sealApiKey` checks `ownerOf`
+once the agent is minted. `sealedSecretEnv` is accepted by `start` / `reset`
+/ `retry`, requires the attestor to advertise `secret_env_scheme`, and never
+falls back to `API_KEY`.
+
+Every refusal on these paths throws `SecretEnvRefusedError` (exported) before
+anything is signed or sent: `signed` is always `false`, and `code` names the
+cause (`config_unreadable`, `scheme_unsupported`, `scheme_withdrawn`,
+`pubkey_mismatch`, `owner_mismatch`, …). A caller can treat it as "nothing
+left the process".
+
+**The scheme can appear but never disappear.** The seal-or-not decision rides
+a `GET /config` answer that a relaying proxy could edit, and for `'auto'` a
+stripped `secret_env_scheme` would be indistinguishable from an old attestor
+— the exact downgrade the sealing exists to prevent. So the SDK pins the
+sighting: once a client (or, through the CLI's pin file, this machine) has
+seen an attestor advertise the scheme, a later absence throws
+`scheme_withdrawn` instead of falling back to a clear-text key. A deliberate
+operator rollback is expressed by the caller as `secretEnv: 'plaintext'`.
+
+**`'auto'` is transitional.** It exists so old attestors and old sealed
+images keep working while the fleet upgrades. The exit path: once every
+image in the fleet opens `SEAL_SECRET_ENV`, the default becomes `'sealed'`
+(a clear-text key is then always an explicit `'plaintext'` choice), and the
+legacy clear path is removed with the last legacy image.
 
 ## What does my agent cost to run?
 
@@ -522,6 +622,19 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   AgentCard's serve `url`, no attestor); an `agentUrl` reads the agent's signed
   `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
   is enough (owner ops still gated on `ag` having a key).
+
+  **Multi-window clients: the single-driver seat.** The container admits ONE
+  driving client at a time (WeChat login semantics — configuration is global,
+  so two windows steering one agent silently fight). Pass a stable random id
+  as `client(agentId, { instanceId })`; it rides every chat request as
+  `X-Client-Instance`. The first id to speak takes the seat; a different id
+  gets **HTTP 409** (`"in use by another client since …"`) until it takes the
+  seat over with `ag.agent.claimAgent(serveBase, agentId, instanceId)`
+  (owner-signed; always wins — the displaced window learns on its next
+  message). Omit `instanceId` and the gate ignores you entirely: it is
+  self-collision protection among your own windows, deliberately not a
+  security boundary. The seat lives in proxy memory; a container restart
+  clears it.
 
   ```ts
   const agent = await ag.agent.client(agentId);
@@ -680,7 +793,7 @@ The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`
 
 ## CLI: `0g-agenticid`
 
-The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agenticid` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list` remain scriptable diagnostics subcommands.
+The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agenticid` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
 
 ```bash
 npm install @0gfoundation/0g-agenticid-sdk
@@ -691,9 +804,9 @@ npx 0g-agenticid --help
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
+Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
 Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
@@ -704,6 +817,7 @@ Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attest
 | `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
 | `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
+| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `framework` (opaque JSON — quote it: `framework='{"a": 1}'`, in the REPL too). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against the 0G router catalog before signing — an absence is a warning on stderr, never a refusal. |
 
 Environment variables (override the config files):
 

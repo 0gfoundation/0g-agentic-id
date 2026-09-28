@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -13,10 +12,10 @@ import (
 	"time"
 
 	"seal-verify/internal/framework"
-	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
 	"seal-verify/internal/privsep"
+	"seal-verify/internal/settings"
 )
 
 // Start does the heavy lifting of bringing openclaw up, in two flavours:
@@ -24,77 +23,88 @@ import (
 //   - First call (initialized=false): npm-install the version pinned by the
 //     framework dim, write the runtime sections of openclaw.json (gateway
 //     token, controlUi flags), refresh `gateway.mode = local`, then spawn.
-//     iData-derived sections were already written by Restore -- Start does
-//     NOT re-compose them.
+//     The chain-restored workspace files were already written by Restore and
+//     the inference sections by RenderSettings -- Start re-composes neither.
 //
 //   - Subsequent calls (supervisor restart): just spawn. We don't re-install
-//     openclaw or re-write any config -- agent self-modifications survive
-//     restart untouched (see ARCHITECTURE.zh.md §6: platform doesn't
-//     interfere with agent's own evolution).
+//     openclaw -- agent self-modifications survive restart untouched (see
+//     ARCHITECTURE.zh.md §6: platform doesn't interfere with agent's own
+//     evolution). The one exception is a restart after RenderSettings had to
+//     rebuild a corrupt openclaw.json: the gateway section went with the old
+//     file, so it is written again (same token).
+//
+// RenderSettings must have run first, both times: it owns the inference
+// half of openclaw.json and hands Start the provider/model pin.
 //
 // The auth token is generated on first init and cached in a.authToken; the
 // dashboard stays signed in across restarts because the token is stable.
 func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
 	a.mu.RLock()
 	cfg := a.cfg
+	rendered := a.rendered
 	cachedToken := a.authToken
 	initialized := a.initialized
+	configRebuilt := a.configRebuilt
 	a.mu.RUnlock()
 	if cfg == nil {
 		return framework.StartResult{}, fmt.Errorf("openclaw: no config restored before Start")
 	}
-
-	// Resolve inference provider+model from the on-disk openclaw.json
-	// that path-driven Restore just wrote. Empty values are not a hard
-	// fail here — openclaw will report the missing config more clearly
-	// at first inference, and the manager will surface that to attestor.
-	pick, err := resolveInferenceFromOpenclawJSON()
-	if err != nil {
-		return framework.StartResult{}, fmt.Errorf("read openclaw.json: %w", err)
+	// The pin comes from the settings document, not from parsing
+	// openclaw.json: that file is an OUTPUT of RenderSettings now. A missing
+	// render is a platform sequencing bug, not an owner mistake — fail loud
+	// rather than spawning a gateway with no model wired up.
+	if rendered == nil {
+		return framework.StartResult{}, fmt.Errorf("openclaw: Start called before RenderSettings (programming error: the platform must render the owner's settings before every Start)")
 	}
-	provider := pick.Provider
-	model := pick.Model
+	resolved := *rendered
+	provider := resolved.Provider
+	model := resolved.Model
 	if provider == "" || model == "" {
-		logger.Logf("warn: openclaw.json has no agents.defaults.model.primary; openclaw will fail at first chat")
+		logger.Logf("warn: settings carry no provider/model pin; openclaw will fail at first chat")
 	}
 
 	authToken := cachedToken
 
-	// Resolve the 0g-compute route ONCE per boot. The config dialect
-	// (augmentation) and the exported key env name below must come from
-	// the same answer — two independent ResolveZG calls could disagree
-	// across a catalog flap (config says anthropic-messages, env exports
-	// OPENAI_API_KEY → openclaw keyless at inference) and each miss is a
-	// separate catalog fetch with an 8s timeout.
-	var zgRoute *inference.Route
-	if provider == "0g-compute" {
-		r := inference.ResolveZG(ctx, model)
-		zgRoute = &r
-	}
-
-	if !initialized {
-		newToken, err := randomTokenHex(32)
-		if err != nil {
-			return framework.StartResult{}, fmt.Errorf("generate openclaw auth token: %w", err)
+	// The gateway subtree lives in openclaw.json, which RenderSettings
+	// rebuilds from scratch when it finds the file corrupt. Re-write it
+	// after such a rebuild even on a restart: the token this adapter still
+	// hands owners via /_seal/auth is only good if the gateway has it too.
+	if !initialized || configRebuilt {
+		if !initialized {
+			newToken, err := randomTokenHex(32)
+			if err != nil {
+				return framework.StartResult{}, fmt.Errorf("generate openclaw auth token: %w", err)
+			}
+			authToken = newToken
+		} else {
+			logger.Logf("openclaw: openclaw.json was rebuilt from the owner's settings; re-writing the gateway section with the existing token")
 		}
-		authToken = newToken
-
 		if err := writeRuntimeSections(authToken); err != nil {
 			return framework.StartResult{}, err
 		}
+	}
 
-		// 0g-compute runtime augmentation: owner specifies "0g-compute"
-		// as a provider name; sealed rewrites that to "openai" with the
-		// 0G router endpoint + compat flags so openclaw can dial it.
-		// No-op for any other provider name.
-		if err := applyZGComputeAugmentation(provider, model, zgRoute); err != nil {
-			return framework.StartResult{}, fmt.Errorf("0g-compute augmentation: %w", err)
-		}
-
+	if !initialized {
 		if err := installOpenclaw(cfg.framework.PackageVersion); err != nil {
 			return framework.StartResult{}, err
 		}
+	}
 
+	// openclaw validates its config STRICTLY — an unknown key at the root is
+	// "<root>: Invalid input" and the gateway refuses to run. The owner's
+	// opaque overlay is merged into that same file, so a single junk key in it
+	// used to take the agent OFFLINE (live: agent 411, overlay {"备注": …},
+	// caught by the T2 drill). The platform cannot know openclaw's schema —
+	// that is the whole point of the overlay being opaque — so it uses
+	// openclaw's own judgment instead: validate, and if the file is rejected
+	// while an overlay is present, strip the overlay, re-render, and boot on
+	// the platform half alone. The owner's junk costs the owner their knobs,
+	// never their agent; the log and the settings channel are how they learn.
+	if err := a.ensureConfigAcceptable(ctx); err != nil {
+		return framework.StartResult{}, err
+	}
+
+	if !initialized {
 		if out, err := exec.Command("openclaw", "config", "set", "gateway.mode", "local").CombinedOutput(); err != nil {
 			return framework.StartResult{}, fmt.Errorf("openclaw config set: %v: %s", err, strings.TrimSpace(string(out)))
 		}
@@ -104,41 +114,25 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		if _, err := exec.Command("openclaw", "--version").Output(); err != nil {
 			return framework.StartResult{}, fmt.Errorf("openclaw binary missing on restart: %w", err)
 		}
-		logger.Logf("openclaw restart: skipping npm install + config rewrite (preserving agent self-modifications)")
-	}
-
-	// EVERY Start, initialized or not: heal machine-written config shapes that
-	// predate later fixes (bounded reasoning, catalog budgets, watchdog
-	// headroom). The augmentation above only ever runs on a fresh agent's
-	// first Start and never recognizes a chain-restored resolved pin again —
-	// without this, existing agents keep failing exactly the way the fixes
-	// address (review P0). Only sealed-written shapes are touched; agent/owner
-	// self-modifications are preserved. Failures are logged, not fatal.
-	if err := healOpenclawConfig(ctx); err != nil {
-		logger.Logf("openclaw: config heal skipped: %v", err)
-	}
-	// Owner-chosen thinking default (deploy/reset --thinking): an explicit
-	// owner value outranks both the chain-restored config and the platform
-	// default, so write it unconditionally — and every Start, because the env
-	// carries the owner's standing choice for this container. heal never
-	// touches an explicit value, so the two stay out of each other's way.
-	if rt.OwnerThinking != "" {
-		if err := updateOpenclawJSON(func(cfg map[string]any) {
-			_ = setAgentsDefaults(cfg, "thinkingDefault", json.RawMessage(`"`+rt.OwnerThinking+`"`))
-		}); err != nil {
-			logger.Logf("openclaw: owner thinkingDefault=%s not applied: %v", rt.OwnerThinking, err)
-		} else {
-			logger.Logf("openclaw: thinkingDefault=%s (owner)", rt.OwnerThinking)
-		}
+		logger.Logf("openclaw restart: skipping npm install (preserving agent self-modifications)")
 	}
 
 	// Always export the inference provider API key into bootstrap's env so
 	// spawnGateway's whitelist can pass it to the new openclaw subprocess.
 	// The env NAME follows the wire format, not the provider label: on
 	// 0g-compute a claude-* model rides the Anthropic-format endpoint and
-	// openclaw's anthropic client reads ANTHROPIC_API_KEY.
-	apiKeyEnv := apiKeyEnvName(provider, zgRoute)
-	if err := exportAPIKey(apiKeyEnv, rt.APIKey); err != nil {
+	// openclaw's anthropic client reads ANTHROPIC_API_KEY. It comes from the
+	// same resolved Endpoint the render wrote into the config, so the config
+	// dialect and the exported key can't disagree (they once did, across a
+	// catalog flap, and openclaw went keyless at inference).
+	//
+	// Both halves come from the RESOLVED SETTINGS, never from
+	// RuntimeContext: the credential belongs to the inference document the
+	// platform resolved for this boot (RuntimeContext is losing the field),
+	// and reading it from the other struct is how a platform-routed
+	// endpoint once got dialled keyless and 401'd live.
+	apiKeyEnv, apiKey := inferenceCredential(resolved)
+	if err := exportAPIKey(apiKeyEnv, apiKey); err != nil {
 		return framework.StartResult{}, err
 	}
 
@@ -184,7 +178,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			rt.AgentSeal, rt.PublicURL, rt.SealSignSock)
 	}
 
-	cmd, err := spawnGateway(apiKeyEnv, rt)
+	cmd, err := spawnGateway(apiKeyEnv, apiKey, rt)
 	if err != nil {
 		return framework.StartResult{}, err
 	}
@@ -192,6 +186,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	a.cmd = cmd
 	a.authToken = authToken
 	a.initialized = true
+	a.configRebuilt = false
 	a.mu.Unlock()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", upstreamPort)
@@ -210,8 +205,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 }
 
 // writeRuntimeSections merges per-boot config (gateway.token, controlUi
-// flags) into openclaw.json. Restore already wrote the iData-derived
-// sections; this function only touches keys that aren't on chain.
+// flags) into openclaw.json. RenderSettings already wrote the inference
+// sections; this function only touches the gateway subtree, which carries
+// a credential minted for this boot and therefore never comes from the
+// owner's settings overlay.
 //
 // `gateway.controlUi.*` flags relax openclaw's CORS / device-auth checks
 // because the sealed sandbox proxy at :8080 is the trust boundary --
@@ -269,21 +266,29 @@ var probeOpenclawVersion = func(ctx context.Context) string {
 	return fields[1]
 }
 
+// inferenceCredential is the (env var, value) pair openclaw's client needs
+// for this boot. Both halves come from the resolved settings document —
+// the credential is settings.Resolved.APIKey, NOT
+// framework.RuntimeContext.APIKey, which is going away and which was never
+// the thing settings.Resolve authenticated the endpoint with.
+func inferenceCredential(s settings.Resolved) (envName, apiKey string) {
+	return apiKeyEnvName(s), s.APIKey
+}
+
 // apiKeyEnvName resolves which env var openclaw's client will read the
-// inference key from. Direct providers map by name; 0g-compute maps by
-// the model's wire format, taken from the route Start resolved once for
-// the whole boot (the same one the config augmentation used — the two
-// must agree or openclaw ends up keyless).
-func apiKeyEnvName(provider string, zgRoute *inference.Route) string {
-	switch provider {
+// inference key from. A platform-routed model takes the name off its
+// resolved Endpoint (the wire format decides: ANTHROPIC_API_KEY for the
+// router's anthropic endpoint, OPENAI_API_KEY for the openai one); a
+// framework built-in maps by provider name, matching openclaw's own table.
+func apiKeyEnvName(s settings.Resolved) string {
+	if s.Endpoint != nil {
+		return s.Endpoint.EnvKey
+	}
+	switch s.Provider {
 	case "anthropic":
 		return "ANTHROPIC_API_KEY"
 	case "openai":
 		return "OPENAI_API_KEY"
-	case "0g-compute":
-		if zgRoute != nil {
-			return zgRoute.EnvKey
-		}
 	}
 	return ""
 }
@@ -295,7 +300,7 @@ func exportAPIKey(envName, apiKey string) error {
 	if err := os.Setenv(envName, apiKey); err != nil {
 		return fmt.Errorf("set %s: %w", envName, err)
 	}
-	logger.Logf("OK   exported %s from API_KEY", envName)
+	logger.Logf("OK   exported %s from the resolved settings", envName)
 	return nil
 }
 
@@ -314,7 +319,35 @@ func installOpenclaw(packageVersion string) error {
 	return nil
 }
 
-func spawnGateway(apiKeyEnv string, rt framework.RuntimeContext) (*exec.Cmd, error) {
+// gatewayEnv is the strict environment the openclaw subprocess gets.
+//
+// A whitelist, not the inherited env: a leaked SANDBOX_SEAL_KEY must not be
+// readable via "env" or /proc/self/environ from inside the agent process.
+//
+// apiKey is the credential from the resolved settings document; passing
+// rt.APIKey here instead is the defect that dialled a platform-routed
+// endpoint keyless.
+func gatewayEnv(apiKeyEnv, apiKey string, rt framework.RuntimeContext) []string {
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+	}
+	if apiKey != "" && apiKeyEnv != "" {
+		env = append(env, apiKeyEnv+"="+apiKey)
+	}
+	if rt.PublicURL != "" {
+		env = append(env, "AGENT_PUBLIC_URL="+rt.PublicURL)
+	}
+	if rt.SealSignSock != "" {
+		env = append(env, "SEAL_SIGN_SOCK="+rt.SealSignSock)
+	}
+	if rt.AgentSeal != "" {
+		env = append(env, "AGENT_SEAL="+rt.AgentSeal)
+	}
+	return env
+}
+
+func spawnGateway(apiKeyEnv, apiKey string, rt framework.RuntimeContext) (*exec.Cmd, error) {
 	logFile, err := os.OpenFile("/tmp/openclaw.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("open openclaw.log: %w", err)
@@ -325,26 +358,7 @@ func spawnGateway(apiKeyEnv string, rt framework.RuntimeContext) (*exec.Cmd, err
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
-	// Strict env whitelist -- do NOT inherit bootstrap's env so a leaked
-	// SANDBOX_SEAL_KEY can't be read via "env" or /proc/self/environ from
-	// inside the agent process.
-	envWhitelist := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
-	}
-	if rt.APIKey != "" && apiKeyEnv != "" {
-		envWhitelist = append(envWhitelist, apiKeyEnv+"="+rt.APIKey)
-	}
-	if rt.PublicURL != "" {
-		envWhitelist = append(envWhitelist, "AGENT_PUBLIC_URL="+rt.PublicURL)
-	}
-	if rt.SealSignSock != "" {
-		envWhitelist = append(envWhitelist, "SEAL_SIGN_SOCK="+rt.SealSignSock)
-	}
-	if rt.AgentSeal != "" {
-		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
-	}
-	cmd.Env = envWhitelist
+	cmd.Env = gatewayEnv(apiKeyEnv, apiKey, rt)
 
 	// Run the framework as the low-privilege agent user when the image
 	// provides one (no-op otherwise — see internal/privsep). Restore wrote

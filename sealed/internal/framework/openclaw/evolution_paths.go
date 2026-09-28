@@ -1,7 +1,6 @@
 package openclaw
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,40 +14,6 @@ import (
 // The dispatch case-table lives in evolution.go's EvolutionFor; the per-
 // role builders live here so the old 5-dim file stays focused on the
 // legacy implementation until Phase 4 cleanup.
-
-// ── role="openclaw.json" ────────────────────────────────────────────────────
-
-// ownedOpenclawKeys lists the top-level keys sealed writes into
-// openclaw.json — the only keys that belong on chain. Everything else
-// (gateway auth tokens, openclaw's own logging / discovery / wizard /
-// push runtime state, future keys we haven't seen yet) is openclaw
-// process bookkeeping and stays local.
-//
-// Allow-list rather than deny-list: a deny-list silently re-introduces
-// drift every time openclaw adds a new top-level field, and we already
-// saw that play out (logging/wizard-shape per-boot writes triggered an
-// extra chain.Update on every restart).
-var ownedOpenclawKeys = []string{"agents", "auth", "models"}
-
-// evoOpenclawJSON reads ~/.openclaw/openclaw.json, keeps only the keys
-// sealed owns, and returns the canonical plaintext bytes used for chain
-// upload.
-//
-// Determinism: encoding/json marshals map[string]any with sorted keys,
-// so the same on-disk state always produces the same bytes.
-func (a *Adapter) evoOpenclawJSON() ([]byte, error) {
-	cfg, err := loadOpenclawJSON()
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]any, len(ownedOpenclawKeys))
-	for _, k := range ownedOpenclawKeys {
-		if v, ok := cfg[k]; ok {
-			out[k] = v
-		}
-	}
-	return json.Marshal(out)
-}
 
 // ── role="workspace/" ───────────────────────────────────────────────────────
 

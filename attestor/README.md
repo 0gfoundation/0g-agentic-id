@@ -114,14 +114,17 @@ stay up.
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
 | `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
+| `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |
 
 ### Container handshake (agent runtime → attestor)
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `POST /provision` | Container exchanges credentials for `agentSeal_priv` | sandbox TEE signature + TappRegistry node validation + `validFrameworkHashes` allowlist |
-| `POST /status` | sealed heartbeat and status report | agentSeal EIP-191 |
+| `POST /provision` | Container exchanges credentials for `agentSeal_priv`, plus the owner's settings document (`encrypted_settings`, ECIES to the same container pubkey). This channel — not the sandbox env — because it runs on EVERY boot including a resume. The first boot after a push gets the new document; a container that keeps coming back without ever confirming it gets the last one that worked. The document half is additionally gated on a sandbox being on record (ghost container — every container this agent ever had holds the agentSeal key); the key half is not, because who may hold it is settled by the attestation | sandbox TEE signature + TappRegistry node validation + `validFrameworkHashes` allowlist |
+| `POST /status` | sealed heartbeat and status report. A `running` report promotes the settings version this boot was served to last-known-good — once, keyed on the version, so the repeating heartbeat cannot bless a document no boot exercised. An `error` report leaves the document alone: it fires on every failing heartbeat, and rolling back there made it impossible to land a change while an agent is unhealthy | agentSeal EIP-191 |
+| `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
 
@@ -129,6 +132,7 @@ stay up.
 |---|---|
 | `GET /deployments` | List current deployments |
 | `GET /deployment/:seal_id` | Single deployment detail |
+| `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
 Detailed signing canonicals live in `crates/shared/src/auth/`.
@@ -181,6 +185,7 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
+| `ATTESTOR_SECRET_ENV_ENABLED` | Opt-in (`true`/`1`/`on`/`yes`). `GET /config` then advertises `secret_env_scheme`, and the SDK seals the inference key of start/reset/retry to the agentSeal key instead of signing it in clear. Enable only once every image in `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` reads `SEAL_SECRET_ENV`. Default off |
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 

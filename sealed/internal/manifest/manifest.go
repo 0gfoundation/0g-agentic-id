@@ -58,7 +58,7 @@ type StoragePtr struct {
 
 // Entry is one item inside a Manifest. See EntryKind for the two cases.
 type Entry struct {
-	Path        string     `json:"path"`         // relative to role root; dirs end in "/"
+	Path        string     `json:"path"` // relative to role root; dirs end in "/"
 	Kind        EntryKind  `json:"kind"`
 	ContentHash string     `json:"content_hash"` // 0x-prefixed hex of plaintext sha256
 	Size        int        `json:"size"`         // plaintext byte count

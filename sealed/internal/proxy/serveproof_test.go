@@ -18,7 +18,9 @@ import (
 // signer — it must equal the agentSeal address. This pins the Go signing to
 // AgenticIDReputationRegistry._verifyServeProof's expectations:
 // keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp,
-//   deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)),
+//
+//	deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash)),
+//
 // EIP-191 wrapped.
 func TestWriteServeProof_RecoversToAgentSeal(t *testing.T) {
 	priv, _ := crypto.GenerateKey()
@@ -143,12 +145,12 @@ func TestServeProofDigest_KnownAnswerVector(t *testing.T) {
 	packed := append(append([]byte{}, dh0...), dh1...)
 
 	encoded := concat(
-		word256(big.NewInt(16602)), // chainId
+		word256(big.NewInt(16602)),                             // chainId
 		addrWord("0x00000000000000000000000000000000000000A9"), // identityRegistry
 		addrWord("0x00000000000000000000000000000000000000C1"), // submitter
-		word256(big.NewInt(42)),         // agentId
-		word256(big.NewInt(1700000000)), // timestamp
-		word256(big.NewInt(1700003600)), // deadline
+		word256(big.NewInt(42)),                                // agentId
+		word256(big.NewInt(1700000000)),                        // timestamp
+		word256(big.NewInt(1700003600)),                        // deadline
 		taskHash,
 		crypto.Keccak256(packed),
 		fwBytes,

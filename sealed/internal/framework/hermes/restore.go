@@ -25,8 +25,6 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 	switch role {
 	case "framework":
 		return a.restoreFramework(plaintext)
-	case "config.yaml":
-		return a.restoreConfigYAML(plaintext)
 	case "SOUL.md":
 		return a.restoreSoulMD(plaintext)
 	case "memories/":

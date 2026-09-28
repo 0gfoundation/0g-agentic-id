@@ -112,6 +112,11 @@ struct OwnerDeployment {
     provisioned_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_provision_error: Option<String>,
+    // Deliberately no `settings`: the owner's configuration document is
+    // served by `GET /settings` alone, which proves the caller is the LIVE
+    // on-chain owner. This tier authenticates against the `owner` query
+    // parameter matched to the indexed column, which lags a transfer — good
+    // enough for stage bookkeeping, not for the owner's own document.
 }
 
 impl From<Deployment> for OwnerDeployment {
@@ -253,6 +258,11 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
             created_at: now,
             updated_at: now,
         }
@@ -267,5 +277,19 @@ mod tests {
         assert_eq!(minted["framework"], "dsh");
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
         assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
+    }
+
+    #[test]
+    fn no_tier_of_this_listing_carries_the_settings_document() {
+        // Not even the owner tier: it authenticates against the `owner`
+        // QUERY parameter matched to the indexed column, which lags a
+        // transfer. The document is served by `GET /settings` alone, gated
+        // on the live on-chain owner.
+        let mut d = row(true);
+        d.settings = Some(serde_json::json!({"model": "the-owners-business"}));
+        let owner_tier = serde_json::to_value(OwnerDeployment::from(d.clone())).unwrap();
+        assert!(owner_tier.get("settings").is_none());
+        let public_tier = serde_json::to_value(PublicDeployment::from(d)).unwrap();
+        assert!(public_tier.get("settings").is_none());
     }
 }

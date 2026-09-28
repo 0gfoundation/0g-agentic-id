@@ -92,6 +92,11 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let last_provision_error: Option<String> = row.try_get("last_provision_error")?;
     let last_provision_error_at: Option<DateTime<Utc>> = row.try_get("last_provision_error_at")?;
     let clone_params_json: Option<serde_json::Value> = row.try_get("clone_params")?;
+    let settings: Option<serde_json::Value> = row.try_get("settings")?;
+    let settings_last_good: Option<serde_json::Value> = row.try_get("settings_last_good")?;
+    let settings_version: i64 = row.try_get("settings_version")?;
+    let settings_confirmed_version: i64 = row.try_get("settings_confirmed_version")?;
+    let settings_attempts: i32 = row.try_get("settings_attempts")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -132,6 +137,11 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         provision_deadline,
         last_provision_error,
         last_provision_error_at,
+        settings,
+        settings_last_good,
+        settings_version,
+        settings_confirmed_version,
+        settings_attempts,
         created_at,
         updated_at,
     })
@@ -650,6 +660,108 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         }
         let _ = reason;
         Ok(out)
+    }
+
+    async fn set_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        // The document goes in verbatim — no shape check, no key rewrite.
+        // `settings_version = $3` is the compare-and-swap: a write whose
+        // base is stale matches no row, so the statement is the whole race
+        // window. RETURNING hands the caller the version to echo back.
+        // settings_attempts goes back to 0 — a new document is owed its own
+        // first boot regardless of what the previous one spent.
+        let row = sqlx::query(
+            "UPDATE deployments
+             SET settings          = $1,
+                 settings_version  = settings_version + 1,
+                 settings_attempts = 0,
+                 updated_at        = now()
+             WHERE seal_id = $2
+               AND settings_version = $3
+             RETURNING settings_version",
+        )
+        .bind(&settings)
+        .bind(seal_id.as_slice())
+        .bind(base_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(r.try_get("settings_version")?),
+            None => None,
+        })
+    }
+
+    async fn seed_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+    ) -> anyhow::Result<Option<i64>> {
+        // `settings_version = 0` in the predicate is what makes this
+        // seed-only AND single-use: a row that has ever held a document
+        // matches nothing, forever, so a captured seed request cannot be
+        // replayed onto it later.
+        let row = sqlx::query(
+            "UPDATE deployments
+             SET settings          = $1,
+                 settings_version  = settings_version + 1,
+                 settings_attempts = 0,
+                 updated_at        = now()
+             WHERE seal_id = $2
+               AND settings_version = 0
+               AND settings IS NULL
+             RETURNING settings_version",
+        )
+        .bind(&settings)
+        .bind(seal_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(r.try_get("settings_version")?),
+            None => None,
+        })
+    }
+
+    async fn promote_settings_last_good(&self, seal_id: SealId) -> anyhow::Result<Option<i64>> {
+        let row = sqlx::query(
+            "UPDATE deployments
+             SET settings_last_good         = settings,
+                 settings_confirmed_version = settings_version,
+                 settings_attempts          = 0,
+                 updated_at                 = now()
+             WHERE seal_id = $1
+               AND settings_confirmed_version < settings_version
+               AND settings_attempts >= 1
+               AND (settings_attempts = 1 OR settings_last_good IS NULL)
+             RETURNING settings_version",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(r.try_get("settings_version")?),
+            None => None,
+        })
+    }
+
+    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>> {
+        let row = sqlx::query(
+            "UPDATE deployments
+             SET settings_attempts = settings_attempts + 1, updated_at = now()
+             WHERE seal_id = $1
+               AND settings_version > settings_confirmed_version
+             RETURNING settings_attempts",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(r.try_get("settings_attempts")?),
+            None => None,
+        })
     }
 
     async fn stale_running_candidates(

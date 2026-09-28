@@ -7,6 +7,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
+mod agent_seal_pubkey;
 mod avatar;
 mod clone;
 mod config;
@@ -19,6 +20,7 @@ mod probe;
 mod provision;
 mod reset;
 mod retry;
+mod settings;
 mod start;
 mod status;
 mod stop;
@@ -68,12 +70,18 @@ pub fn router(state: AppState) -> Router {
         .route("/provision", post(provision::handle))
         .route("/probe", post(probe::handle))
         .route("/status", post(status::handle))
+        // GET and POST alike are owner-gated: the settings document is the
+        // owner's, so it is not in any public tier and this is the only way
+        // to read it.
+        .route("/settings", get(settings::handle_get).post(settings::handle))
+        .route("/settings/seed", post(settings::handle_seed))
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
         .route("/retry", post(retry::handle))
         .route("/reset", post(reset::handle))
         .route("/deployment/:seal_id", get(deployment::handle))
         .route("/deployments", get(deployments::handle))
+        .route("/agent-seal-pubkey", get(agent_seal_pubkey::handle))
         .route("/ws/subscribe", get(ws::handle))
         .layer(TraceLayer::new_for_http())
         .with_state(state)

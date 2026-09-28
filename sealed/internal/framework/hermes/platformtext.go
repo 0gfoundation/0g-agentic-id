@@ -26,7 +26,6 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 	return platform.FrameworkFacts{
 		Home: "~/.hermes/",
 		Tracked: []platform.PathNote{
-			{Path: "~/.hermes/config.yaml", Note: "your config — but only the `model`, `approvals`, `terminal` sections reach chain (see the config allowlist below)"},
 			{Path: "~/.hermes/SOUL.md", Note: "your identity / persona"},
 			{Path: "~/.hermes/memories/*.md", Note: "`MEMORY.md`, `USER.md`, and any `.md` you create here. **This is where long-term memory belongs.**"},
 			{Path: "~/.hermes/skills/<name>/", Note: "each skill subdirectory you create. Skills that ship bundled with the framework (listed in `skills/.bundled_manifest`) are NOT tracked — they're reproducible from the pinned version"},
@@ -35,6 +34,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Note: "`~/.hermes/cron/` — scheduled jobs. Deliberately not persisted: migrating them across an owner transfer would keep the OLD owner's timers firing in the NEW owner's container"},
 			{Note: "`~/.hermes/state.db`, `sessions/`, `logs/` — conversation history and runtime state"},
 			{Note: "`.env` — secrets"},
+			{Note: "`~/.hermes/config.yaml` — your model wiring. Never reaches chain. At every boot the platform rewrites the five keys it owns (`model.default`, `model.provider`, `model.base_url`, `model.api_key`, `agent.reasoning_effort`) from your owner's settings, and re-applies whatever else those settings carry; your edits to those keys do not survive a restart, edits to the rest of the file do"},
 		},
 		DurableHints: []platform.DurableHint{
 			{Ask: "Remember this long-term", Place: "`memories/MEMORY.md` (or a new `.md` under `memories/`)"},
@@ -44,8 +44,9 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 		Versions:      supportedHermesVersions,
 		VersionMax:    whitelistMax(),
 		ReconcileHow:  "`git checkout <max>` + `uv sync --locked`",
-		ConfigFile:    "config.yaml",
-		ConfigKeys:    ownedHermesKeys,
-		ConfigSecret:  "api_key",
+		// No ConfigFile/ConfigKeys: config.yaml is not chain-tracked any
+		// more, so there is no allowlist clause to render — what the agent
+		// needs is the list of keys the render owns, which the Untracked note
+		// above names (keep it in step with RenderSettings).
 	}
 }

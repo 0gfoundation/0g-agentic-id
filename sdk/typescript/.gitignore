@@ -2,3 +2,6 @@ node_modules/
 dist/
 _regr-deploy.cjs
 .watch*.mjs
+# scratch scripts this repo's sessions create at the package root (.chat.mjs,
+# .reset*.mjs, …) — a broad `git add` must never sweep one in again
+.*.mjs

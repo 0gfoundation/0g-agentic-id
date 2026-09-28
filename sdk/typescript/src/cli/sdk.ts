@@ -9,6 +9,7 @@
 
 import { AgenticID } from '../AgenticID';
 import { CliError } from './errors';
+import { loadSecretEnvPins, recordSecretEnvPin } from './config';
 import { requireAttestorUrl, requirePrivateKey, type CliEnv } from './env';
 
 /**
@@ -44,6 +45,12 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
       ...(account ? { account } : {}),
       ...(env.rpcUrl ? { rpcUrl: env.rpcUrl } : {}),
       ...(Object.keys(overrides).length ? { overrides } : {}),
+      // Once this machine has seen an attestor advertise secret_env_scheme,
+      // its absence is tampering, not a downgrade (issue #166).
+      secretEnvPin: {
+        seen: (url) => !!loadSecretEnvPins()[url],
+        record: (url) => recordSecretEnvPin(url),
+      },
     });
   } catch (e) {
     if (e instanceof CliError) throw e;

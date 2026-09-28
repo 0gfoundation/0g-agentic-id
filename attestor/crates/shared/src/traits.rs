@@ -399,6 +399,82 @@ pub trait DeploymentRepo: Send + Sync {
         reason: String,
     ) -> anyhow::Result<Vec<SealId>>;
 
+    // ── Owner settings (opaque document) ────────────────────────────
+    //
+    // attestor stores and serves the document; it never parses it. The
+    // methods below move bytes between columns and nothing else — no
+    // method here may grow an argument that names a settings field.
+
+    /// Compare-and-swap the owner's settings document.
+    ///
+    /// `base_version` is the `settings_version` the writer believes is
+    /// current (0 = "I believe there is no document yet"). The write lands
+    /// only if it still matches, which is what makes a captured request
+    /// unreplayable once the version has moved and stops two clients from
+    /// silently overwriting each other. Returns `Ok(Some(new version))` on
+    /// success and `Ok(None)` when `base_version` was stale — the caller
+    /// re-reads the row to tell the client which version to rebase on.
+    ///
+    /// Also resets `settings_attempts`: a freshly written document is owed
+    /// its own first boot, whatever the previous one spent.
+    ///
+    /// Callers MUST have verified the writer is the agent's current
+    /// on-chain owner (`routes::settings`).
+    async fn set_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>>;
+
+    /// Write a document ONLY onto a row that has never had one — the
+    /// container-seeded recovery path (`POST /settings/seed`), which is
+    /// agentSeal-signed and so must never be able to overwrite what an owner
+    /// authored. The guard is `settings_version = 0`, not `settings IS
+    /// NULL`: once any document has existed the seed is spent for good, so a
+    /// captured seed request cannot re-plant itself later. Returns
+    /// `Some(new version)` when it seeded, `None` when the row was already
+    /// configured.
+    async fn seed_settings(
+        &self,
+        seal_id: SealId,
+        settings: serde_json::Value,
+    ) -> anyhow::Result<Option<i64>>;
+
+    /// Promote `settings` to last-known-good: a container reported `running`
+    /// on it.
+    ///
+    /// Keyed on the version, so it advances only while
+    /// `settings_confirmed_version < settings_version` and the repeating
+    /// heartbeat that carries the same `running` status promotes exactly
+    /// once. Two further conditions, both about what the booting container
+    /// was actually SERVED — `settings_attempts` records that, and
+    /// `/provision` is the only writer of it:
+    ///
+    ///  - `settings_attempts >= 1`: some boot has been handed this version.
+    ///    A document pushed while the agent runs has not (the write resets
+    ///    the counter and the container does not re-provision), and the
+    ///    heartbeat five minutes later must not bless it.
+    ///  - `settings_attempts = 1`, unless there is no `settings_last_good`
+    ///    at all: past the first attempt `/provision` serves the last known
+    ///    good instead, so a `running` report then says that the FALLBACK
+    ///    boots and nothing about the current document. Promoting on it
+    ///    would overwrite the only document known to work with the one that
+    ///    is failing — and then there is no way back.
+    ///
+    /// Also clears `settings_attempts`. Returns the version promoted, or
+    /// `None` when there was nothing to promote.
+    async fn promote_settings_last_good(&self, seal_id: SealId) -> anyhow::Result<Option<i64>>;
+
+    /// Count one boot served the current unconfirmed document and return the
+    /// new attempt count. Bumps only while
+    /// `settings_version > settings_confirmed_version` (re-checked in the
+    /// statement, so it is atomic against a concurrent promotion); returns
+    /// `None` when the document is already confirmed and nothing was
+    /// counted. `/provision` uses the count to decide whether this boot gets
+    /// the new document (first attempt) or the last one that worked.
+    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>>;
+
     /// Read-only: running deployments whose last heartbeat is older than
     /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
     /// (the worker's reconcile sweep) can check each sandbox's real state and

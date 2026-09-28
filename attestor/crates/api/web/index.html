@@ -2275,6 +2275,63 @@ window.toggleSecret = function (inputId, btnId) {
   btn.textContent = showing ? 'show' : 'hide';
 };
 
+// ── Sealed secret env (issue #166) ──────────────────────────────────
+// The owner's wallet shows the create envelope verbatim, so an existing
+// agent's inference key is sealed to its agentSeal public key first and
+// the envelope carries SEAL_SECRET_ENV (ciphertext) instead of API_KEY.
+// Same wire format as the SDK (sdk/typescript/src/secretEnv.ts) and
+// sealed/internal/secretenv: base64(ECIES(agentSeal_pub,
+// {"v":1,"owner","env"})), eciesjs-compatible (secp256k1 ECDH,
+// HKDF-SHA256 over ephemeralPub‖sharedPoint, AES-256-GCM, 16-byte nonce;
+// ephemeralPub(65) ‖ nonce(16) ‖ tag(16) ‖ ct). Only when /config
+// advertises the scheme; otherwise the legacy API_KEY shape is kept.
+const SECRET_ENV_SCHEME = 'agent-seal-ecies-v1';
+
+function bytesToB64(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+async function eciesEncryptTo(pubkeyHex, plaintext) {
+  const ephemeral = new ethers.SigningKey(ethers.hexlify(crypto.getRandomValues(new Uint8Array(32))));
+  const ephPub = ethers.getBytes(ephemeral.publicKey);                        // 65 bytes, 0x04…
+  const shared = ethers.getBytes(ephemeral.computeSharedSecret(pubkeyHex));   // 65 bytes, 0x04…
+  const ikm = new Uint8Array(ephPub.length + shared.length);
+  ikm.set(ephPub, 0);
+  ikm.set(shared, ephPub.length);
+  const hk = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const keyBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new Uint8Array(0) }, hk, 256);
+  const aes = await crypto.subtle.importKey('raw', keyBits, 'AES-GCM', false, ['encrypt']);
+  const nonce = crypto.getRandomValues(new Uint8Array(16));
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aes, plaintext));
+  const out = new Uint8Array(65 + 16 + sealed.length);
+  out.set(ephPub, 0);
+  out.set(nonce, 65);
+  out.set(sealed.subarray(sealed.length - 16), 81);                           // tag
+  out.set(sealed.subarray(0, sealed.length - 16), 97);                        // ciphertext
+  return out;
+}
+
+// env for a create envelope on an EXISTING agent: the key sealed to the
+// agent when the attestor advertises the scheme, else legacy API_KEY.
+// Throws (before anything is signed) if sealing was chosen and fails.
+async function keyEnvFor(sealId, apiKey) {
+  if (!apiKey) return {};
+  if (!State.config || State.config.secret_env_scheme !== SECRET_ENV_SCHEME) return { API_KEY: apiKey };
+  const r = await fetch(`/agent-seal-pubkey?seal_id=${encodeURIComponent(sealId)}`);
+  if (!r.ok) throw new Error(`/agent-seal-pubkey ${r.status}: ${await r.text()}`);
+  const b = await r.json();
+  if (String(b.seal_id || '').toLowerCase() !== String(sealId).toLowerCase() ||
+      ethers.computeAddress(b.agent_seal_pubkey) !== ethers.getAddress(b.agent_seal_addr)) {
+    throw new Error('/agent-seal-pubkey returned a key that is not this agent\'s agentSeal');
+  }
+  const doc = JSON.stringify({ v: 1, owner: ethers.getAddress(State.ownerAddr), env: { API_KEY: apiKey } });
+  const ct = await eciesEncryptTo(b.agent_seal_pubkey, new TextEncoder().encode(doc));
+  return { SEAL_SECRET_ENV: bytesToB64(ct) };
+}
+
 async function signSandboxEnvelope(action, resourceId, payload = {}) {
   const canonical = JSON.stringify({
     action,
@@ -3022,6 +3079,10 @@ window.submitDeploy = async function () {
     // bootstrap reads the agent config's `inference.provider` and
     // translates `API_KEY` to the provider-specific env name openclaw
     // expects (e.g. ANTHROPIC_API_KEY when provider="anthropic").
+    //
+    // This one-shot deploy signs before the agent (and its agentSeal key)
+    // exists, so the key cannot be sealed here and the wallet prompt shows
+    // it (issue #166). Restore/Reset seal it (keyEnvFor).
     const env = apiKey ? { API_KEY: apiKey } : {};
     // Snapshot identifier comes from attestor /config — operators bump
     // ATTESTOR_SANDBOX_SNAPSHOT to point new deploys at a newer image
@@ -4497,7 +4558,7 @@ window.bringOnline = async function (sealId, sandboxId, useStart) {
         confirmLabel: 'Restore',
       });
       if (!result) return;
-      const env = result.apiKey ? { API_KEY: result.apiKey } : {};
+      const env = await keyEnvFor(sealId, result.apiKey);
       // Snapshot name comes from /config so a bump of ATTESTOR_SANDBOX_SNAPSHOT
       // takes effect on Restore/Reset, not just fresh deploys.
       const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
@@ -4566,10 +4627,11 @@ window.resetAgent = async function (sealId, sandboxId) {
   try {
     // Same envelope shape as the bringOnline create branch — fresh
     // sandbox needs a fresh env, and attestor doesn't (and shouldn't)
-    // cache the LLM key. apiKey came from the modal above. Snapshot
+    // cache the LLM key. apiKey came from the modal above, sealed to the
+    // agent when the attestor supports it (keyEnvFor, issue #166). Snapshot
     // pulled from /config so an operator bump of ATTESTOR_SANDBOX_SNAPSHOT
     // also drives Reset (not just fresh deploys).
-    const env = result.apiKey ? { API_KEY: result.apiKey } : {};
+    const env = await keyEnvFor(sealId, result.apiKey);
     const snapshot = (State.config && State.config.sandbox_snapshot) || '0g-test-sealed';
     const payload = { snapshot, sealed: true, env };
     const { envelope } = await signSandboxEnvelope('create', '', payload);

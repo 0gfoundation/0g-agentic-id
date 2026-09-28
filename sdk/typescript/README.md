@@ -125,9 +125,27 @@ await ag.agent.listDeployments();             // public listing; owner/sandboxId
 await ag.agent.listMyDeployments();           // owner-signed; full detail
 // row → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
+
+// settings — the owner's configuration document (which model the agent thinks
+// with, and how hard). Stored by the attestor as an OPAQUE blob and applied by
+// the container, so widening the vocabulary never needs an attestor change.
+// Owner-signed BOTH ways — it is on no listing and on no public row.
+const { settings, version } = await ag.agent.getSettings(sealId);
+//   settings → { provider, model, thinking, framework } | null   (null = never configured)
+//   version  → the number to write back against (0 when there is no document)
+await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3b', thinking: 'high' }, {
+  baseVersion: version,                       // compare-and-swap: a stale one is refused, not applied
+  onWarn: console.warn,                       // advisory 0G-router catalog check, run before signing
+});                                           // → { version }
 ```
 
+`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: a model absent from the 0G router catalog is reported, never blocked (a framework built-in is legitimately absent, and the container is the real gate).
+
+Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
+
 The [lifecycle guide](./GUIDE.md#agagent--lifecycle--reads) covers async phases, transfer teardown, mint-only vs first-provision, `apiKey` handling, and failure reasons.
+
+`start` / `reset` / `retry` seal `apiKey` to the agent (`SEAL_SECRET_ENV`) when the attestor advertises `secret_env_scheme`, so the owner's wallet prompt never shows it. A one-shot `deploy` with `sandbox` still signs it in clear; to avoid that, deploy without `sandbox`, then `start(sealId, { apiKey })`. When your server supplies the key and a user signs, seal it on the server with `agent.sealApiKey(sealId, { owner, apiKey })` and pass the result to the browser's `start` / `reset` / `retry` as `sealedSecretEnv`, so the key never reaches the browser. See the [guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) for `secretEnv: 'sealed' | 'plaintext'` and `SecretEnvRefusedError`.
 
 **Three IDs, same agent:**
 
@@ -236,7 +254,7 @@ await ag.agent.runtimeCosts(agentId);    // + that agent's evolution-gas balance
 
 ## Interacting with a running agent
 
-`ag.agent.client(agentId)` resolves the URL on chain — one handle for every caller; owner ops (`chat`/`chatStream`/`logs`) are present only when `ag` holds the owner key.
+`ag.agent.client(agentId)` resolves the URL on chain — one handle for every caller; owner ops (`chat`/`chatStream`/`logs`) are present only when `ag` holds the owner key. Multi-window apps: pass `{ instanceId }` — the container seats ONE driving client at a time (a displaced window gets 409; `claimAgent` takes the seat over; callers without an id bypass the gate). See the [guide](./GUIDE.md#agagent--lifecycle--reads).
 
 ```ts
 const { hello, verification } = await ag.agent.sayHi(agentUrl);

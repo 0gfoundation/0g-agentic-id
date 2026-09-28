@@ -394,6 +394,43 @@ pub struct Deployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_provision_error_at: Option<DateTime<Utc>>,
 
+    /// The owner's configuration document — OPAQUE. attestor stores it as
+    /// received, serves it to the container over `/provision`, and never
+    /// parses, validates or logs its contents; the vocabulary lives in the
+    /// sealed container (`sealed/internal/settings`). None = never
+    /// configured.
+    ///
+    /// Never serialized outward with the rest of the row: it is the owner's
+    /// document, and `GET /deployment/:seal_id` is unauthenticated. The one
+    /// way to read it is `GET /settings`, which proves the caller is the
+    /// live on-chain owner.
+    #[serde(default, skip_serializing)]
+    pub settings: Option<serde_json::Value>,
+
+    /// The last document a container booted on successfully (promoted from
+    /// `settings` when a `running` report arrives for a version no boot had
+    /// confirmed). Internal recovery material, not part of what clients
+    /// edit — never serialized outward.
+    #[serde(default, skip_serializing)]
+    pub settings_last_good: Option<serde_json::Value>,
+
+    /// Number of accepted settings writes, and the CAS token an owner write
+    /// must match (`base_version` in the signed message). Echoed to the
+    /// owner by `POST /settings` and `GET /settings`; 0 = never configured.
+    #[serde(default)]
+    pub settings_version: i64,
+
+    /// The version `settings_last_good` holds. Promotion happens only while
+    /// this is behind `settings_version`, which is what keeps a repeated
+    /// heartbeat from promoting a document no boot exercised.
+    #[serde(default, skip_serializing)]
+    pub settings_confirmed_version: i64,
+
+    /// How many boots have been served the current unconfirmed document.
+    /// Past the first, `/provision` serves `settings_last_good` instead.
+    #[serde(default, skip_serializing)]
+    pub settings_attempts: i32,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -408,6 +445,35 @@ impl Deployment {
             && self.container_pubkey.is_some()
             && self.container_pubkey_mac.is_some()
     }
+
+    /// True when the owner's current document has spent its boot and every
+    /// boot from here is served `settings_last_good` instead.
+    ///
+    /// Stable on purpose — flapping between a document that boots and one
+    /// that does not would be worse than staying on the one that works — and
+    /// therefore terminal until the owner pushes again: `/provision` serves
+    /// the current document only on its first attempt, and promotion refuses
+    /// an attempt past the first because that boot exercised the FALLBACK,
+    /// not the current document. A write resets the counter, so re-pushing
+    /// IS the retry.
+    ///
+    /// Read by `GET /settings` so that state is visible to the owner, whose
+    /// agent is otherwise silently running a configuration they did not
+    /// choose.
+    pub fn settings_fallback_active(&self) -> bool {
+        self.settings_version > self.settings_confirmed_version
+            && settings_fallback_serves(self.settings_attempts, self.settings_last_good.is_some())
+    }
+}
+
+/// Does the boot counted as attempt number `attempts` get
+/// `settings_last_good` rather than the owner's current document?
+///
+/// The one rule `/provision` decides with (on the attempt it just counted)
+/// and `GET /settings` reports on (on the count stored in the row), so what
+/// the owner is told and what the container is handed cannot drift.
+pub fn settings_fallback_serves(attempts: i32, has_last_good: bool) -> bool {
+    attempts > 1 && has_last_good
 }
 
 // ── Sandbox create response ─────────────────────────────────────────────
@@ -499,6 +565,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_settings_document_never_rides_the_row_serialization() {
+        // `GET /deployment/:seal_id` serializes a whole Deployment and is
+        // unauthenticated. The owner's document (and the recovery material
+        // beside it) must not be in there — `GET /settings` is the only way
+        // to read it, and it proves the caller is the live on-chain owner.
+        let mut d = empty_deployment();
+        d.settings = Some(serde_json::json!({"model": "the-owners-business"}));
+        d.settings_last_good = Some(serde_json::json!({"model": "older"}));
+        d.settings_version = 3;
+        let json = serde_json::to_value(&d).unwrap();
+        assert!(json.get("settings").is_none());
+        assert!(json.get("settings_last_good").is_none());
+        assert!(json.get("settings_confirmed_version").is_none());
+        assert!(json.get("settings_attempts").is_none());
+    }
+
     fn empty_deployment() -> Deployment {
         let now = Utc::now();
         Deployment {
@@ -522,6 +605,11 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
             created_at: now,
             updated_at: now,
         }
@@ -798,6 +886,14 @@ pub struct ProvisionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionResponse {
     pub encrypted_agent_seal_priv: Bytes,
+    /// The owner's settings document, ECIES-encrypted to the SAME
+    /// `container_pubkey` the seal key went to. Omitted when the agent has
+    /// no stored document. Rides `/provision` because that call runs on
+    /// EVERY boot including a resume, whereas the sandbox env is supplied
+    /// only at container create — a resumed container would otherwise come
+    /// up unconfigured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_settings: Option<Bytes>,
 }
 
 // ── /status ─────────────────────────────────────────────────────────────
@@ -831,6 +927,52 @@ pub struct StatusReport {
     /// `auth::status::canonical_message`. This matches the attestation
     /// signing style of `/provision` (TEE machine-to-machine, no
     /// EIP-191 prefix, no JSON/base64 envelope).
+    pub agent_seal_signature: Bytes,
+}
+
+// ── /settings ───────────────────────────────────────────────────────────
+//
+// The owner's configuration document. attestor is a dumb store here: it
+// keeps the blob, hands it to the container, and refuses a write that is
+// not signed by the agent's current on-chain owner. Nothing below mirrors
+// the document's fields — that knowledge lives in the sealed container.
+
+/// Body of `POST /settings`.
+///
+/// `settings` is captured as a `RawValue` (the bytes exactly as they arrived)
+/// so the sha256 digest carried in the signed `X-Auth-Message` can be checked
+/// against what the owner actually signed. Re-serializing a parsed `Value`
+/// would re-order object keys and break a signature made over the client's
+/// own encoding.
+///
+/// The write is compare-and-swap: the signed message also carries the
+/// `settings_version` the writer believes is current, and the write lands
+/// only if it still matches (409 with the current version otherwise). There
+/// is no field for it here — it is signed, not asserted.
+///
+/// No `Debug` derive on purpose: the document is the owner's and must never
+/// reach a log line.
+#[derive(Deserialize)]
+pub struct SettingsWriteRequest {
+    pub seal_id: SealId,
+    pub settings: Box<serde_json::value::RawValue>,
+    /// The same base version the signed message carries, echoed in the body
+    /// for readability. Unsigned, so it decides nothing — the route only
+    /// refuses a request whose two copies disagree, which catches a client
+    /// that built the body and the signature from different reads.
+    #[serde(default)]
+    pub base_version: Option<i64>,
+}
+
+/// Body of `POST /settings/seed` — the CONTAINER handing back a document it
+/// recovered from a pre-settings-channel chain role, so the recovery survives
+/// the container being recreated. Signed with the agentSeal (no owner is
+/// present at boot), which makes it strictly weaker than an owner write:
+/// seed-only, never an overwrite.
+#[derive(Deserialize)]
+pub struct SettingsSeedRequest {
+    pub seal_id: SealId,
+    pub settings: Box<serde_json::value::RawValue>,
     pub agent_seal_signature: Bytes,
 }
 

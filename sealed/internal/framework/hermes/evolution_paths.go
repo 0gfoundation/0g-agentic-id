@@ -2,7 +2,6 @@ package hermes
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,30 +14,6 @@ import (
 
 // EvolutionFor per-role canonical plaintext builders (read path).
 // Counterpart to restore_paths.go.
-
-// ── role="config.yaml" ──────────────────────────────────────────────────────
-
-// evoConfigYAML reads ~/.hermes/config.yaml, keeps only ownedHermesKeys,
-// strips secrets, and returns canonical JSON (encoding/json marshals maps
-// with sorted keys — deterministic).
-func (a *Adapter) evoConfigYAML() ([]byte, error) {
-	cfg, err := loadConfigYAML()
-	if err != nil {
-		return nil, fmt.Errorf("hermes evoConfigYAML: %w", err)
-	}
-	out := make(map[string]any, len(ownedHermesKeys))
-	for _, k := range ownedHermesKeys {
-		if v, ok := cfg[k]; ok {
-			out[k] = v
-		}
-	}
-	stripSecrets(out)
-	b, err := json.Marshal(out)
-	if err != nil {
-		return nil, fmt.Errorf("hermes evoConfigYAML: marshal: %w", err)
-	}
-	return b, nil
-}
 
 // ── role="SOUL.md" ──────────────────────────────────────────────────────────
 

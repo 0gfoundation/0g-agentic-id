@@ -319,6 +319,10 @@ export function makeAgentClient(params: {
    *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
    *  protection). Omit for anonymous calls (proofs come back unredeemable). */
   clientAddress?: string;
+  /** Per-process client id for the agent's single-driver seat (occupancy.go):
+   *  ride it on every request so a displaced window is told with a 409 the
+   *  moment it next speaks. Absent = this client does not participate. */
+  instanceId?: string;
   /** Stall threshold in ms for the responses transport: no bytes for this long
    *  and the follow stream is torn down and resumed by sequence number.
    *  Defaults to 90s (nine missed 10s keepalives). Exposed so tests can drive
@@ -326,7 +330,7 @@ export function makeAgentClient(params: {
   stallMs?: number;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
-  const { services, routes, reauth, clientAddress } = params;
+  const { services, routes, reauth, clientAddress, instanceId } = params;
   const canAuth = !!(reauth || params.token);
 
   let cached: string | undefined = params.token;
@@ -350,6 +354,9 @@ export function makeAgentClient(params: {
       // set the header explicitly.
       if (clientAddress && !headers.has('X-Client-Address')) {
         headers.set('X-Client-Address', clientAddress);
+      }
+      if (instanceId && !headers.has('X-Client-Instance')) {
+        headers.set('X-Client-Instance', instanceId);
       }
       return fetch(url, { ...init, headers });
     };

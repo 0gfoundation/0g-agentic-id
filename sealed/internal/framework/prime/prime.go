@@ -28,6 +28,7 @@
 //   - harness.go      harness_state.json canonicalization (the identity anchor)
 //   - skills.go       the skills/ manifest role
 //   - persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
+//   - modelsjson.go   RenderSettings: the owner's settings as models.json
 //   - platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
 //   - spawn.go        Start/Stop/probes + version pin + bridge supervision
 //   - bridge/bridge.mjs  the go:embed'ed HTTP bridge (see spawn.go)
@@ -50,6 +51,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/settings"
 )
 
 // frameworkName is the adapter id and the `name` field of the framework
@@ -63,11 +65,28 @@ type Adapter struct {
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
 
-	// persona* hold the mint-time inference pin from the `persona` seed. Prime
-	// Agent is model-agnostic, so the pin becomes a session setting at Start
-	// rather than a config-file rewrite.
-	personaProvider string
-	personaModel    string
+	// settings is the last Resolved that RenderSettings applied: this
+	// adapter's only copy of the inference pin. nil until RenderSettings
+	// runs, which Start treats as a bootstrap-sequence bug rather than an
+	// owner error — the pin has no durable on-disk home left to be re-read
+	// from (see modelsjson.go).
+	settings *settings.Resolved
+
+	// seededPin is the inference pin HandleLegacy recovered for an agent
+	// minted before the settings channel existed, handed back to the platform
+	// through SeededSettings so it can be persisted as the owner's settings
+	// document. Two retired chain roles can carry one — the registration role
+	// "models.json" (modelsjson.go) and, for an agent that never committed
+	// drift and so still carries only its mint seed, "persona" (persona.go) —
+	// and seededFrom records which of them this pin came from, because the
+	// ranking and not Phase C's arrival order decides between them
+	// (legacySource).
+	//
+	// nil for any agent minted after the settings channel shipped, which is
+	// every new one — purely transitional, and deletable with the rest of that
+	// migration (modelsjson.go).
+	seededPin  *settings.Doc
+	seededFrom legacySource
 
 	// cmd is the running bridge process; nil before Start / after Stop.
 	cmd *exec.Cmd
@@ -134,7 +153,6 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 		{Name: "framework", Shape: framework.Leaf},
 		{Name: "harness_state.json", Shape: framework.Leaf},
 		{Name: "APPEND_SYSTEM.md", Shape: framework.Leaf},
-		{Name: "models.json", Shape: framework.Leaf},
 		{Name: "skills/", Shape: framework.DirectoryManifest},
 	}
 }
@@ -158,7 +176,7 @@ func (a *Adapter) Defaults(role string) []byte {
 			return nil
 		}
 		return b
-	case "harness_state.json", "APPEND_SYSTEM.md", "models.json":
+	case "harness_state.json", "APPEND_SYSTEM.md":
 		return nil
 	case "skills/":
 		b, err := manifest.New().Marshal()
@@ -180,8 +198,6 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 		return a.restoreHarnessState(plaintext)
 	case "APPEND_SYSTEM.md":
 		return a.restoreAppendSystem(plaintext)
-	case "models.json":
-		return a.restoreModelsJSON(plaintext)
 	case "skills/":
 		return a.restoreManifestDir(plaintext)
 	}
@@ -254,8 +270,6 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 		return a.evoHarnessState()
 	case "APPEND_SYSTEM.md":
 		return a.evoAppendSystem()
-	case "models.json":
-		return a.evoModelsJSON()
 	case "skills/":
 		return a.evoSkills()
 	}

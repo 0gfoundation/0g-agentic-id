@@ -112,7 +112,7 @@ func TestStreamRelay_VerbatimUnsignedFlushed(t *testing.T) {
 		Header: http.Header{
 			"Content-Type":                {"text/event-stream"},
 			"Content-Length":              {"999"}, // must be dropped
-			"Access-Control-Allow-Origin": {"*"},    // must be skipped (cors sets ours)
+			"Access-Control-Allow-Origin": {"*"},   // must be skipped (cors sets ours)
 		},
 		Body: io.NopCloser(strings.NewReader(payload)),
 	}

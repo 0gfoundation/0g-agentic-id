@@ -8,8 +8,8 @@ import (
 )
 
 // EvolutionFor produces canonical iData plaintext bytes for `role` by
-// reading the live state from disk: ~/.hermes/config.yaml + SOUL.md +
-// memories/ + skills/. Reading from disk (rather than a stale in-memory
+// reading the live state from disk: ~/.hermes/SOUL.md + memories/ +
+// skills/ (config.yaml is not tracked — RenderSettings owns it). Reading from disk (rather than a stale in-memory
 // cfg) is what makes evolution detection correct — when the agent
 // self-modifies (config set, memory write, learned skill), the watcher's
 // next tick observes it.
@@ -21,8 +21,6 @@ func (a *Adapter) EvolutionFor(ctx context.Context, role string) ([]byte, error)
 	switch role {
 	case "framework":
 		return a.evoFramework(ctx)
-	case "config.yaml":
-		return a.evoConfigYAML()
 	case "SOUL.md":
 		return a.evoSoulMD()
 	case "memories/":

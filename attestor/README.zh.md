@@ -105,14 +105,17 @@ cargo run -p attestor-indexer# 第三个终端
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
 | `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
+| `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
 
 ### 容器对接（agent runtime → attestor）
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
-| `POST /provision` | 容器换 `agentSeal_priv` | sandbox TEE 签名 + TappRegistry 节点验证 + `validFrameworkHashes` 白名单 |
-| `POST /status` | sealed 心跳 / 状态汇报 | agentSeal EIP-191 |
+| `POST /provision` | 容器换 `agentSeal_priv`，外加 owner 的配置文档（`encrypted_settings`，ECIES 给同一个容器公钥）。走这条而不是 sandbox env：**每次启动**（含 resume）都会调它。推送后的第一次启动拿新文档；反复重启却始终没确认的，改发上一次能跑起来的那份。文档这一半额外要求行上有 sandbox 记录（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）；密钥那一半不加这道闸，因为谁能拿密钥由 attestation 决定 | sandbox TEE 签名 + TappRegistry 节点验证 + `validFrameworkHashes` 白名单 |
+| `POST /status` | sealed 心跳 / 状态汇报。`running` 把这次启动真正拿到的那个 settings 版本提升为 last-known-good——按版本号记账，只提升一次，重复心跳不会给没人启动过的文档背书。`error` 不动文档：它在每次失败心跳都会来，在那里回滚会导致 agent 不健康时反而改不了配置 | agentSeal EIP-191 |
+| `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
 
 ### 读 / 实时
 
@@ -120,6 +123,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `GET /deployments` | 列出当前 deployment |
 | `GET /deployment/:seal_id` | 单条 deployment 详情 |
+| `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
 
 详细签名 canonical 见 `crates/shared/src/auth/`。
@@ -169,6 +173,7 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SANDBOX_SNAPSHOT` | 实例化新 agent 用的 sealed runtime snapshot 名（升 image 时改这里）|
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
+| `ATTESTOR_SECRET_ENV_ENABLED` | 显式开启（`true`/`1`/`on`/`yes`）。开启后 `GET /config` 公布 `secret_env_scheme`，SDK 在 start/reset/retry 时把推理 key 加密给 agentSeal 公钥，而不是明文签进 envelope。只有当 `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` 里所有镜像都能读 `SEAL_SECRET_ENV` 时才开启。默认关闭 |
 | `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
 

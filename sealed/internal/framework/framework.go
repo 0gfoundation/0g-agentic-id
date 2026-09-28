@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"seal-verify/internal/platform"
+	"seal-verify/internal/settings"
 )
 
 // Shape declares how a role's plaintext maps to 0g-storage blobs.
@@ -155,6 +156,29 @@ type Framework interface {
 	// than running with a partial migration.
 	HandleLegacy(ctx context.Context, role string, plaintext []byte) error
 
+	// RenderSettings places the owner's settings where THIS framework reads
+	// them — a config file for openclaw and hermes, process environment for
+	// the prime and dsh bridges. It is the one piece of the configuration
+	// channel that cannot be shared, because only the adapter knows its own
+	// dialect.
+	//
+	// Called before every Start, and again whenever the owner pushes a
+	// change, so a fix shipped after an agent was minted reaches it on the
+	// next boot instead of only at mint time.
+	//
+	// Two rules the platform relies on:
+	//
+	//   - Idempotent. Same Resolved in, same bytes on disk out; the watcher
+	//     hashes those bytes and a non-deterministic render would report
+	//     drift on every tick.
+	//   - Platform values win. Apply s.Others (the owner's opaque
+	//     per-framework overlay) FIRST, then write the platform-owned keys
+	//     over it — endpoint, effort bound, output budget, and any
+	//     credential or per-boot token. Ordering, not an exclusion list, is
+	//     what keeps an overlay from disabling bounded reasoning or pinning
+	//     a wire format the catalog later changes.
+	RenderSettings(ctx context.Context, s settings.Resolved) error
+
 	// Start spawns the agent process based on the previously-Restored state.
 	// Returns the upstream URL the proxy should forward to.
 	Start(ctx context.Context, rt RuntimeContext) (StartResult, error)
@@ -282,6 +306,22 @@ type RouteProvider interface {
 	FrameworkRoutes() []Route
 }
 
+// LegacySettingsSeeder is implemented by adapters that can recover an owner's
+// configuration from a chain role that predates the settings channel.
+//
+// Before the channel existed, the model pin lived inside a chain-tracked
+// config role. That role is gone from Roles(), so bootstrap now hands the old
+// chain entry to HandleLegacy — and this method is how the adapter gives the
+// recovered document back to the platform, which persists it to attestor
+// (report.SeedSettings) before the watcher's first tick drops the stale role.
+//
+// Returns ok=false when nothing was recovered, which is the normal case for
+// any agent minted after the channel shipped. Purely transitional: once no
+// live agent carries the old role, every implementation can be deleted.
+type LegacySettingsSeeder interface {
+	SeededSettings() (settings.Doc, bool)
+}
+
 // ErrUnsupportedDim is returned by EvolutionFor / Restore when an adapter
 // is asked to act on a dim label it doesn't understand.
 var ErrUnsupportedDim = fmt.Errorf("framework: dim not supported by this adapter")
@@ -307,17 +347,19 @@ type RuntimeContext struct {
 	ContractAddr string // AgenticID (identity registry) address; signed into serve-proof domain
 	ChainID      string // chain id (decimal); signed into serve-proof domain separation
 	AttestorURL  string // attestor endpoint URL
-	// OwnerThinking is the owner-chosen default reasoning-effort level for
-	// this agent (deploy/reset --thinking), delivered via the owner-signed
-	// sandbox payload's env (SEAL_OWNER_THINKING) and already normalized to
-	// {low, high, max} (empty = owner expressed no preference; adapters fall
-	// back to the platform default "low" for catalog-flagged thinking models).
-	OwnerThinking string
+	// There is deliberately no thinking level here. It used to ride this
+	// struct, arriving as SEAL_OWNER_THINKING in the sandbox env — and that
+	// is precisely why it had to leave: RuntimeContext is captured once at
+	// the first Start and replayed verbatim on every restart, so a level
+	// carried here was frozen for the container's life and a change applied
+	// at runtime was silently reverted by the next harness restart. It now
+	// travels in the owner's settings document and reaches an adapter through
+	// RenderSettings, which the manager runs before EVERY spawn.
 
 	// Inference routing (populated by spawn.go after resolving provider).
 	Provider        string // inference provider (e.g. "openai")
 	Model           string // inference model name (e.g. "glm-5.2")
-	ZGComputeRouted bool // whether 0g-compute augmentation was applied
+	ZGComputeRouted bool   // whether 0g-compute augmentation was applied
 
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable

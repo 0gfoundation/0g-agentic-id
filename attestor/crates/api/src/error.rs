@@ -10,6 +10,11 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Extra machine-readable fields merged into the TOP LEVEL of the error
+    /// body, beside `error`. Used where a client needs a value to act on
+    /// rather than prose — the settings compare-and-swap returns the current
+    /// `version` here so a client can rebase without parsing the message.
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -18,6 +23,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "bad_request",
             message: msg.into(),
+            details: None,
         }
     }
 
@@ -26,6 +32,7 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
             message: msg.into(),
+            details: None,
         }
     }
 
@@ -34,6 +41,7 @@ impl ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "unauthorized",
             message: msg.into(),
+            details: None,
         }
     }
 
@@ -45,7 +53,28 @@ impl ApiError {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
             message: msg.into(),
+            details: None,
         }
+    }
+
+    /// 409 — the write is authentic but would clobber something it is not
+    /// allowed to. Two users: the settings compare-and-swap (stale
+    /// `base_version`, with the current version in `details` so the client
+    /// can rebase) and the container-seeded settings path (a seed may fill a
+    /// never-configured row, never replace an owner's document).
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict",
+            message: msg.into(),
+            details: None,
+        }
+    }
+
+    /// Attach machine-readable fields to an error body.
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     /// 402 with a stable code — the deploy-edge preflight uses these so
@@ -56,6 +85,7 @@ impl ApiError {
             status: StatusCode::PAYMENT_REQUIRED,
             code,
             message: msg.into(),
+            details: None,
         }
     }
 
@@ -64,19 +94,25 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal",
             message: msg.into(),
+            details: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(json!({
+        let mut body = json!({
             "error": {
                 "code": self.code,
                 "message": self.message,
             }
-        }));
-        (self.status, body).into_response()
+        });
+        if let (Some(serde_json::Value::Object(extra)), Some(obj)) =
+            (self.details, body.as_object_mut())
+        {
+            obj.extend(extra);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 

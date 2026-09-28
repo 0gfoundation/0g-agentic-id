@@ -32,6 +32,7 @@ export type ErrorCode =
   | 'PREFLIGHT_GAS'
   | 'PREFLIGHT_ACK'
   | 'PREFLIGHT_BALANCE'
+  | 'SETTINGS_CONFLICT'
   // exit 4 — timeout
   | 'TIMEOUT'
   // exit 5 — auth/ownership
@@ -61,6 +62,11 @@ const EXIT_BY_CODE: Record<ErrorCode, number> = {
   PREFLIGHT_GAS: EXIT.REMEDIABLE,
   PREFLIGHT_ACK: EXIT.REMEDIABLE,
   PREFLIGHT_BALANCE: EXIT.REMEDIABLE,
+  // Somebody else wrote the settings document between this command's read and
+  // its write. Remediable, and the remedy is a re-run — but only after the
+  // caller has looked at `details.current`, which is why this is an error and
+  // not a silent retry.
+  SETTINGS_CONFLICT: EXIT.REMEDIABLE,
   TIMEOUT: EXIT.TIMEOUT,
   AUTH_REJECTED: EXIT.AUTH,
 };

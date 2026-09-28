@@ -50,7 +50,7 @@ func (s *Server) handleAgentLogHTML(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
 	}
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner); !ok {
+	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner, ""); !ok {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

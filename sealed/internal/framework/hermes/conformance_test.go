@@ -50,13 +50,6 @@ func TestConformance(t *testing.T) {
 				Leaf: []byte(`{"name":"hermes","package_version":"v2026.7.20","schema_version":1}`),
 			},
 			{
-				// Canonical encoding: compact JSON, sorted keys, only the
-				// ownedHermesKeys allowlist (approvals/model/terminal),
-				// api_key stripped.
-				Role: "config.yaml",
-				Leaf: []byte(`{"approvals":{"mode":"off"},"model":{"base_url":"https://router-api.0g.ai/v1","default":"0gm-1.0-35b-a3b","provider":"custom"}}`),
-			},
-			{
 				Role: "SOUL.md",
 				Leaf: []byte("# Persona\n\nOwner-authored persona.\n"),
 			},
@@ -101,49 +94,6 @@ func TestSkillsExcludeBundled(t *testing.T) {
 	}
 	if s := string(got); !strings.Contains(s, "learned-skill/") || strings.Contains(s, "bundled-skill") {
 		t.Errorf("bundled exclusion broken: %s", s)
-	}
-}
-
-// TestConfigYAMLStripsAPIKey: an agent-written model.api_key (verified
-// live: `hermes config set model.api_key` lands in config.yaml, not .env)
-// must never reach the chain payload.
-func TestConfigYAMLStripsAPIKey(t *testing.T) {
-	a := newTestAdapter(t)
-	ctx := context.Background()
-
-	writeFile(t, configYAMLPath(),
-		"model:\n  provider: custom\n  base_url: https://router-api.0g.ai/v1\n  default: 0gm-1.0-35b-a3b\n  api_key: sk-super-secret\n")
-
-	got, err := a.EvolutionFor(ctx, "config.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `{"model":{"base_url":"https://router-api.0g.ai/v1","default":"0gm-1.0-35b-a3b","provider":"custom"}}`
-	if string(got) != want {
-		t.Errorf("api_key strip:\n got  = %s\n want = %s", got, want)
-	}
-}
-
-// TestConfigYAMLRestorePreservesUnownedKeys: restore replaces owned keys
-// only; hermes's local-only sections survive.
-func TestConfigYAMLRestorePreservesUnownedKeys(t *testing.T) {
-	a := newTestAdapter(t)
-	ctx := context.Background()
-
-	writeFile(t, configYAMLPath(), "gateway:\n  port: 18789\nmodel:\n  provider: stale\n")
-	if err := a.Restore(ctx, "config.yaml", []byte(`{"model":{"default":"0gm-1.0-35b-a3b","provider":"custom"}}`)); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := loadConfigYAML()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := cfg["gateway"]; !ok {
-		t.Error("unowned key \"gateway\" was clobbered by Restore")
-	}
-	m, _ := cfg["model"].(map[string]any)
-	if m == nil || m["provider"] != "custom" {
-		t.Errorf("owned key \"model\" not replaced: %v", cfg["model"])
 	}
 }
 
