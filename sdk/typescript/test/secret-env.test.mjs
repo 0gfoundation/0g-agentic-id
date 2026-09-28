@@ -100,6 +100,9 @@ function stubAttestor(opts = {}) {
         const cfg = raw ?? { sandbox_snapshot: '0g-sealed', secret_env_scheme: SECRET_ENV_SCHEME };
         return typeof cfg === 'number' ? json(cfg, { error: 'unavailable' }) : json(200, cfg);
       }
+      if (req.method === 'GET' && url.pathname.startsWith('/deployment/')) {
+        return json(200, { seal_id: SEAL_ID, framework: opts.rowFramework ?? null });
+      }
       if (req.method === 'GET' && url.pathname === '/agent-seal-pubkey') {
         if (typeof opts.pubkey === 'number') return json(opts.pubkey, { error: 'unavailable' });
         return json(200, opts.pubkey ?? {
@@ -471,6 +474,43 @@ test('no key: a keyless reset needs no seal, and a resume signs an empty payload
     await c.lifecycle('start', { sealId: SEAL_ID, sandboxId: 'sb-1' });
     assert.deepEqual(JSON.parse(signed[1]).payload, {});
     assert.ok(!a.hits.some((h) => h.startsWith('/agent-seal-pubkey')));
+  });
+});
+
+// ── image resolution: the row's framework wins over the default snapshot ────
+
+test('a bare reset resolves the sealed image from the deployment row', async () => {
+  const config = {
+    sandbox_snapshot: '0g-sealed',
+    secret_env_scheme: SECRET_ENV_SCHEME,
+    frameworks: [
+      { name: 'openclaw' },
+      { name: 'prime-agent', image: '0g-sealed-prime' },
+    ],
+  };
+  await withAttestor({ config, rowFramework: 'prime-agent' }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY });
+    assert.equal(
+      JSON.parse(signed[0]).payload.snapshot,
+      '0g-sealed-prime',
+      'a prime agent must not be reset onto the default (openclaw) image',
+    );
+    assert.ok(a.hits.some((h) => h.startsWith(`/deployment/${SEAL_ID}`)), 'the row was consulted');
+  });
+});
+
+test('an explicit framework wins over the row, and no row read happens', async () => {
+  const config = {
+    sandbox_snapshot: '0g-sealed',
+    secret_env_scheme: SECRET_ENV_SCHEME,
+    frameworks: [{ name: 'hermes', image: '0g-sealed-hermes' }, { name: 'prime-agent', image: '0g-sealed-prime' }],
+  };
+  await withAttestor({ config, rowFramework: 'prime-agent' }, async (a) => {
+    const { c, signed } = client(a.port);
+    await c.lifecycle('reset', { sealId: SEAL_ID, apiKey: KEY, framework: 'hermes' });
+    assert.equal(JSON.parse(signed[0]).payload.snapshot, '0g-sealed-hermes');
+    assert.ok(!a.hits.some((h) => h.startsWith('/deployment/')), 'no row read when the caller chose');
   });
 });
 

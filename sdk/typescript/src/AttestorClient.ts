@@ -392,14 +392,32 @@ export class AttestorClient {
    * create envelope makes the provider fail ("sealed containers require an
    * image or snapshot"), so /config is the source of truth.
    */
-  private async resolveSealedImage(explicit?: string, framework?: string): Promise<string> {
+  private async resolveSealedImage(explicit?: string, framework?: string, sealId?: `0x${string}`): Promise<string> {
     if (explicit) return explicit;
+    let fw = framework;
+    // An existing agent already knows what it is: its deployment row records
+    // the framework. Without this read, a bare reset/start/retry of a
+    // hermes/prime/dsh agent fell back to the DEFAULT (openclaw) image and
+    // booted a container without its framework installed (observed live,
+    // agent 452) — the CLI wizard papered over it by asking; the SDK is the
+    // right place for the lookup. Best-effort: an unreadable row falls
+    // through to the default exactly as before.
+    if (!fw && sealId) {
+      try {
+        const r = await fetch(`${this.baseUrl()}/deployment/${sealId}`, {
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (r.ok) fw = ((await r.json()) as { framework?: string | null }).framework ?? undefined;
+      } catch {
+        /* fall through to the default snapshot */
+      }
+    }
     // Rides the instance's memoized /config (review #154 N3a) — this was the
     // one remaining uncached fetch on the deploy/reset/first-start path.
     const cfg: any = await this.attestorConfig();
-    if (framework && Array.isArray(cfg?.frameworks)) {
-      const fw = cfg.frameworks.find((f: any) => f?.name === framework);
-      if (fw?.image) return fw.image;
+    if (fw && Array.isArray(cfg?.frameworks)) {
+      const entry = cfg.frameworks.find((f: any) => f?.name === fw);
+      if (entry?.image) return entry.image;
     }
     return (cfg && cfg.sandbox_snapshot) || '';
   }
@@ -711,7 +729,7 @@ export class AttestorClient {
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
     if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework);
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
       envelope = await this.signEnvelope(
         'create',
         '',
@@ -930,7 +948,7 @@ export class AttestorClient {
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
     if (params.apiKey || params.sealedSecretEnv !== undefined) {
-      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework);
+      const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
       body.sandbox_envelope = await this.signEnvelope(
         'create',
         '',
