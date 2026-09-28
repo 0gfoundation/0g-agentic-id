@@ -487,7 +487,8 @@ window finds out the moment it next speaks.**
   `<tag>:0x<sealID>:<ts>:<sha256(body)>:<audience>` grammar as the settings
   push), body `{"instance": <id>}`. A claim always wins the seat
   (`internal/proxy/occupancy.go`). The CLI generates a random instance id per
-  session and claims best-effort on connect.
+  process (one CLI process drives one session at a time) and claims
+  best-effort on connect.
 - **Speak.** Every chat `POST /v1/*` and the settings push carry
   `X-Client-Instance`. First speaker with an id sits down without a claim; a
   different id while the seat is held gets **409** ("in use by another client

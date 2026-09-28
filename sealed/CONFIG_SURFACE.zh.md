@@ -387,7 +387,7 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 的会话死掉,它
 - **占座。**`POST /_seal/claim` —— owner 签名(tag `0GSealClaim`,与 settings 推送
   相同的 `<tag>:0x<sealID>:<ts>:<sha256(body)>:<audience>` 文法),body
   `{"instance": <id>}`。claim 永远赢下座位(`internal/proxy/occupancy.go`)。CLI 每个
-  会话生成随机 instance id,连接时尽力 claim。
+  进程生成一次随机 instance id(一个 CLI 进程同时只驱动一个会话),连接时尽力 claim。
 - **开口。**每个聊天 `POST /v1/*` 和 settings 推送都带 `X-Client-Instance`。座位空着时
   第一个带 id 开口的人直接坐下;座位有人时不同 id 得到 **409**("in use by another
   client since …"),CLI 把它变成一条提示并退出会话 —— 重新进入即可抢座。
