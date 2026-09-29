@@ -157,12 +157,30 @@ func (a *Adapter) ConversationHistory(_ context.Context) ([]framework.Conversati
 	if err != nil || path == "" {
 		return nil, err
 	}
-	f, err := os.Open(path)
+	// os.OpenRoot: kernel-level containment (review #169 hardening note).
+	// Lexical containment above cannot stop a symlink planted INSIDE
+	// sessionsDir — the tree is agent-writable, so a legit-named .jsonl could
+	// itself point at a root-only file and pass every string check. Root.Open
+	// refuses to follow anything that escapes the directory.
+	rel, err := filepath.Rel(sessionsDir(), path)
+	if err != nil {
+		return nil, err
+	}
+	dirRoot, err := os.OpenRoot(sessionsDir())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil // no sessions dir yet — first turn ever
+		}
+		return nil, err
+	}
+	defer dirRoot.Close()
+	f, err := dirRoot.Open(rel)
 	if os.IsNotExist(err) {
 		return nil, nil // mapped but not yet written — first turn in flight
 	}
 	if err != nil {
-		return nil, err
+		logger.Logf("openclaw conversation: transcript open refused (%v) — degrading to empty history", err)
+		return nil, nil
 	}
 	defer f.Close()
 

@@ -128,7 +128,8 @@ Source-verified traps, recorded:
   file and the return value, so the constructor appends nothing.
 - openclaw's `sessions.json` is AGENT-writable (privsep hands openclawHome to
   the framework user), so a `sessionFile` it names is contained to
-  sessionsDir() before the root-running adapter opens it — otherwise an
+  sessionsDir() lexically AND the open goes through `os.OpenRoot` — lexical
+  checks cannot stop a symlink planted inside the dir itself — otherwise an
   adversarial agent could read any root file into its own upstream request
   (review #169).
 - hermes ROTATES the session id at compaction — a pinned id forks the

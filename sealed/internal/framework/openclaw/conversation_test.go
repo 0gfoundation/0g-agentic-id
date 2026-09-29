@@ -147,3 +147,34 @@ func TestTranscriptPath_ContainsAgentWritableStore(t *testing.T) {
 		}
 	}
 }
+
+// Lexical containment cannot stop a symlink planted INSIDE the agent-writable
+// sessionsDir; os.OpenRoot must refuse to follow it out (review #169
+// hardening note). The turn degrades to empty history, never reads the target.
+func TestConversationHistory_RefusesSymlinkEscape(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	key := a.ConversationHeaders()[sessionKeyHeader]
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secret := filepath.Join(t.TempDir(), "root-only.txt")
+	if err := os.WriteFile(secret, []byte(`{"type":"message","id":"x","message":{"role":"user","content":"EXFILTRATED"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A legit-named transcript that is actually a symlink out of the dir.
+	if err := os.Symlink(secret, filepath.Join(sessionsDir(), "sess-evil.jsonl")); err != nil {
+		t.Skipf("no symlink support: %v", err)
+	}
+	raw, _ := json.Marshal(map[string]sessionEntry{key: {SessionID: "sess-evil"}})
+	if err := os.WriteFile(sessionsStorePath(), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	turns, err := a.ConversationHistory(context.Background())
+	if err != nil {
+		t.Fatalf("must degrade, not error: %v", err)
+	}
+	if len(turns) != 0 {
+		t.Fatalf("symlink escape was followed: %+v", turns)
+	}
+}
