@@ -152,7 +152,40 @@ Source-verified traps, recorded:
   A client that wants to *display* scrollback keeps its own screen buffer —
   UI, not state.
 
-## 6. Rollout — all four SHIPPED (unit/smoke level)
+## 6. Rollout — SHIPPED and T2 LIVE-VERIFIED (2026-09-29, dev)
+
+The drill ran on all four frameworks (agents 436/449/450/452, images at
+cd547ec), every question asked by a BRAND-NEW client holding zero history —
+continuity could only come from the container:
+
+| leg | openclaw 436 | hermes 449 | dsh 450 | prime 452 |
+|---|---|---|---|---|
+| same-boot read-back (fresh client) | ✓ | ✓ | ✓ | ✓ |
+| restart #1 (settings push) → recall | ✓ | ✓ | ✓ | ✓ |
+| restart #2 → recall (the dsh blocker's bite point) | ✓ | ✓ | ✓ | ✓ |
+| /clear → unknown | ✓ | ✓ | ✓ | ✓ |
+| container recreate → unknown, chain memory intact | ✓ (MEMORY.md verified intact) | ✓ | ✓ | ✓ |
+
+Notes from the drill, recorded:
+- openclaw's first /clear run "failed" because the agent had WRITTEN the
+  codeword into MEMORY.md when told to "remember" it — i.e. /clear behaved
+  exactly as designed (transcript cleared, chain memory kept) and the test
+  prompt had conflated the two stores. The accidental live demonstration of
+  the transcript/memory distinction is the strongest evidence this design
+  line has.
+- the poisoned-sessions.json containment could NOT be exercised live: the
+  agent refused, twice, to corrupt its own session store even under an
+  owner-framed drill instruction — itself worth recording. Containment
+  rests on the unit tests (5-case lexical + the os.OpenRoot symlink test),
+  which drive the exact code path with real fixture files.
+- openclaw persist-timing: turn N was in the transcript when turn N+1 asked
+  (same-boot read-back through a fresh client proves the read-back path).
+- hermes compaction rotation was not forced during the drill (requires a
+  long conversation); the follow logic is unit-tested, echo semantics read
+  from gateway source.
+
+Original checklist (all shipped):
+
 
 1. ✅ prime — SessionManager wiring + self-rotation + quarantine + ClearSession
 2. ✅ dsh — bridge event-log backend + seed rebuild + crash repair + ClearSession
