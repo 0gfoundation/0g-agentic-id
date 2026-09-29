@@ -184,6 +184,14 @@ Notes from the drill, recorded:
   long conversation); the follow logic is unit-tested, echo semantics read
   from gateway source.
 
+Repeatable regression guards (review follow-up 2): each bridge ships a
+`sessionstore_regression.mjs` next to its store — dsh replays the full
+4-generation scenario (the finding-1 invariant), crash repair and the stale
+stub; prime covers round-trip, compaction-point rotation and stub quarantine.
+They take the real SDK from `$DSH_SDK_ROOT` / `$PRIME_SDK_ROOT` (the built
+image's node_modules, or a `docker cp`-extracted tree) and SKIP cleanly when
+absent — the repo's convention for environment-gated tests.
+
 Original checklist (all shipped):
 
 

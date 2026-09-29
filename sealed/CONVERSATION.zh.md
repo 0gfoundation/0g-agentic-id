@@ -135,6 +135,12 @@ client(零历史)**发出——连续性只可能来自容器:
 - hermes 压缩轮换未在演练中触发(需要长对话);跟随逻辑有单测,回吐语义读自
   网关源码。
 
+可重复的回归护栏(评审跟进 2):每个桥的 store 旁有一个
+`sessionstore_regression.mjs`——dsh 重放完整四代场景(finding-1 不变量)、崩溃
+修复与残根;prime 覆盖往返、压缩点轮转与残根隔离。真 SDK 取自
+`$DSH_SDK_ROOT` / `$PRIME_SDK_ROOT`(镜像内 node_modules 或 docker cp 抽出的树),
+缺席则干净 SKIP——仓库对环境门控测试的既有惯例。
+
 原清单(全部完成):
 
 
