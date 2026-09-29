@@ -788,6 +788,22 @@ func startAgent(
 	if cs, ok := adapter.(framework.ConversationSession); ok {
 		sealedProxy.SetConversationSession(cs.ConversationHeaders, cs.ObserveConversation)
 	}
+	// Frameworks that persist a transcript their own gateway never reads back
+	// (openclaw): the stateful door takes prior turns from that store and the
+	// client sends only the current turn.
+	if ch, ok := adapter.(framework.ConversationHistory); ok {
+		sealedProxy.SetConversationHistory(func(ctx context.Context) ([]proxy.ConversationTurn, error) {
+			turns, err := ch.ConversationHistory(ctx)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]proxy.ConversationTurn, len(turns))
+			for i, t := range turns {
+				out[i] = proxy.ConversationTurn{Role: t.Role, Text: t.Text}
+			}
+			return out, nil
+		})
+	}
 
 	if clearer, ok := adapter.(framework.SessionClearer); ok {
 		sealedProxy.SetClear(func(ctx context.Context) error {

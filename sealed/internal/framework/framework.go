@@ -325,6 +325,24 @@ type ConversationSession interface {
 	ObserveConversation(h http.Header)
 }
 
+// ConversationTurn is one prior turn of the agent's conversation, in the
+// neutral shape the stateful door assembles upstream requests from.
+type ConversationTurn struct {
+	Role string // "user" | "assistant"
+	Text string
+}
+
+// ConversationHistory is implemented by adapters whose framework PERSISTS a
+// transcript that its own gateway never reads back (openclaw: the OpenAI door
+// takes the client's messages[] as authoritative). The stateful responses
+// door calls this instead of trusting client-sent history: prior turns come
+// from the harness's own store, the client supplies only the current turn.
+// The private on-disk format knowledge stays HERE, in the framework's own
+// package — the caller never parses the store (CONVERSATION.md §3).
+type ConversationHistory interface {
+	ConversationHistory(ctx context.Context) ([]ConversationTurn, error)
+}
+
 // SessionClearer is implemented by adapters whose framework persists the
 // agent's ONE conversation (CONVERSATION.md). ClearSession wipes the persisted
 // store so the NEXT framework start presents a fresh conversation; the caller

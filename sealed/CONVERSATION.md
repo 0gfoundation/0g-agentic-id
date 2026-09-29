@@ -56,59 +56,64 @@ onboarding copy.
    safe boundary — live context rebuilds from there), discard older (git-gc
    shape). A REQUIREMENT, not "someday".
 
-## 3. The architecture: a transparent proxy, per-framework encapsulation
+## 3. The architecture: a generic proxy, per-framework encapsulation
 
-The end state — reached by pushing all framework-specific behaviour OUT of the
-shared proxy and INTO each framework's own encapsulation on the request path,
-so the proxy stops knowing which framework it fronts.
+As designed, all framework-specific conversation knowledge lives in each
+framework's own encapsulation; the shared proxy never branches on a framework
+name. The DELIVERY of that principle was refined during implementation (the
+original sketch said "a new openclaw shim process, then delete the synth
+layer"): instead of a second process per framework, the proxy's stateful door
+asks the adapter through THREE optional capabilities — the `RenderSettings`
+pattern — and each adapter answers in its own dialect, inside its own package.
+Same ownership outcome (zero framework knowledge in shared code), one process
+fewer. The synth layer REMAINS, but only as the shared responses-protocol
+shell (SSE/resume/ring); everything framework-specific it used to imply moved
+behind the capabilities:
 
-- **The proxy is a transparent reverse-proxy.** It does only cross-cutting,
-  framework-AGNOSTIC work — auth, the single-driver seat, serve-proof, CORS —
-  then forwards to the framework's encapsulation. It does not branch on the
-  framework and does not read or assemble any conversation.
-- **Every framework sits behind an encapsulation on the request path that
-  speaks the full protocol, including a stateful `/v1/responses`** (client
-  sends only the current turn; the encapsulation supplies the history from the
-  harness's own store). prime/dsh already have this — their `bridge.mjs`.
-  hermes's own gateway has it natively. openclaw gets a new shim (§4).
-- **The `synth` layer is deleted.** It exists today only to fake a
-  `/v1/responses` in the proxy for frameworks lacking one — a proxy branch
-  that "knows the framework". Once every framework declares a native
-  responses route through its own encapsulation, `nativeResponsesDeclared()`
-  is always true and the synth path is dead code. Removing it is the point:
-  the framework-specific coupling (e.g. openclaw's private on-disk format)
-  moves from shared proxy code into openclaw's own shim, where framework
-  specifics belong.
-- **`/v1/chat/completions` stays** on every framework — stateless, client
-  holds history — so any standard OpenAI client still connects (interop is
-  not sacrificed; statefulness is the *second* door, not a replacement).
-- **`ClearSession`** is the one new obligation the platform names on the
-  encapsulation; the proxy exposes a single owner-signed `POST /_seal/clear`
-  (tag `0GSealClear`, digest-before-audience grammar) that calls through, and
-  the CLI gains `/clear`. Compaction stays the harness's own — the platform
-  never parses the conversation.
+- **`framework.ConversationSession`** — the adapter names headers that bind
+  each stateful upstream call to the agent's ONE conversation, and observes
+  every upstream response (hermes rotates its session id at compaction; not
+  following the echo forks the conversation).
+- **`framework.ConversationHistory`** — for a framework that PERSISTS a
+  transcript its own gateway never reads back (openclaw), the adapter supplies
+  prior turns from that store; the stateful door then ignores client-sent
+  history and takes only the current turn from the client. A history-read
+  failure degrades loudly to the client's input — a broken store must not
+  kill the turn.
+- **`framework.SessionClearer`** — wipe the store; main.go restarts the
+  process after a successful clear. The proxy exposes one owner-signed
+  `POST /_seal/clear` (tag `0GSealClear`, the settings-push grammar,
+  seat-gated) and the CLI gains `/clear`; adapters with client-held history
+  answer 501 and the CLI clears its local echo only.
 
-## 4. Per-framework answers (from SDK source, not docs)
+The transparent `/v1/chat/completions` door NEVER gets conversation headers or
+store history — statefulness there would silently change what standard OpenAI
+clients see. Statefulness is the second door, not a replacement. Compaction
+stays the harness's own; the platform never parses a conversation.
 
-| | encapsulation on the request path | how it persists + resumes | clear |
+## 4. Per-framework answers (as built, verified against SDK source)
+
+| | encapsulation | persist + resume | clear |
 |---|---|---|---|
-| **prime** | `bridge.mjs` (native `/v1/responses`) | pass `sessionManager: SessionManager.open(path)` to `createAgentSession` — the SDK appends every entry (messages, tool calls, compaction, thinking) and `open()` rebuilds context on restart. File `/root/.prime-conversation/owner-chat.jsonl`, outside `primeHome` (the `/tmp/prime-session` pin is harness state, NOT conversation — untouched). | delete file, reopen |
-| **hermes** | its own gateway (native `/v1/responses` + `X-Hermes-Session-Id`) | already stateful over HTTP: a stable session id makes hermes load history from `~/.hermes/state.db` instead of the request body and resume it after restart. We set `API_SERVER_KEY` and pin the id. NB compaction ROTATES the session id (mints a child) — follow the id hermes echoes back, don't hardcode one. | new session id / DB clear |
-| **dsh** | `bridge.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam exists, no concrete subclass; `resume()` rejects without one). The bridge implements the documented replay path with shipped codecs: subscribe `session/event`, `packChunkRuns` → append to disk; on restart `decodeStorageRecord` + `ctx.agents.create({ sessionId, seed, meta:{seedLength} })`, `interruptedTurnClosers` for crash repair. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). | truncate, recreate agent with no seed |
-| **openclaw** | **NEW shim** on the request path, fronting openclaw's gateway (like a bridge). openclaw's OpenAI gateway has NO native responses door and never reads its own transcript back. The shim provides stateful `/v1/responses`: read openclaw's own on-disk transcript (`~/.openclaw/agents/<id>/sessions/*.jsonl`, which openclaw already writes every turn), prepend to the current turn, call openclaw's `/v1/chat/completions`. The private-format coupling lives here, in openclaw's own encapsulation — not in shared code. | delete openclaw's session file |
+| **prime** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` — the SDK appends every entry (messages, tool calls, compaction, thinking) and `open()` rebuilds context on restart. File `/root/.prime-conversation/owner-chat.jsonl`, outside `primeHome`, `privsep`-owned. Self-rotation at the latest compaction entry (header kept, compaction entry re-parented to root, older lines discarded); a corrupt file quarantines (`.corrupt-<ts>`) and a fresh one opens. Verified on the real SDK: rotation 9209B→729B with context rebuilt; torn tail tolerated. | delete file + leftovers, restart |
+| **hermes** | its own gateway, bound via `ConversationSession` | the gateway is already stateful over HTTP: `X-Hermes-Session-Id` (Bearer `API_SERVER_KEY`, already set) loads history from `~/.hermes/state.db`, body's last message is the turn. The adapter mints and persists ONE id (`~/.hermes/.seal-conversation-id`) and FOLLOWS the echoed id — compaction ends the parent session and continues on a child. Unsafe echoes (path-shaped, control chars) are never persisted. Invariant 7 note: the transcript store is hermes's own `state.db` — its store, its compaction; self-rotation does not apply to a file the harness owns. | mint a fresh id (old rows stay in hermes's db, unreferenced), restart |
+| **dsh** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam has no concrete subclass; `resume()` rejects). The bridge is the backend: every committed `session/event` of `owner-chat` appends via `packChunkRuns`; boot decodes (`decodeStorageRecord`) and seeds `ctx.agents.create({ seed, meta:{seedLength} })`; `interruptedTurnClosers` closes a mid-turn crash (closers appended, so the file balances); a seq guard skips re-emitted seed events. Rotation is necessarily cruder: a seed must be contiguous from seq 0, so the head cannot be cut — at the ceiling the store archives and the conversation restarts fresh, loudly. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). Verified on the real SDK: append→load→`Session.fromRestore` (create's validator) passes; crash repair balances. | remove the log + leftovers, restart |
+| **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) but its OpenAI door never reads it back. The adapter pins ONE session key (`x-openclaw-session-key`, persisted at `~/.openclaw/.seal-conversation-key`) so all stateful-door turns land in ONE transcript, and reads that transcript back as history (text turns; tool records skipped — the synth door's documented limitation). The private `version:3` format coupling is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7: openclaw's own compaction REWRITES the persisted transcript, so the harness bounds the file itself. | rotate the key + best-effort remove the superseded transcript (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
 
 Source-verified traps, recorded:
 
 - prime's `createAgentSession` JSDoc advertises `continueSession: true` — **dead
   documentation**, nothing reads it. Persistence rides only `sessionManager`.
 - dsh's on-disk format is `SESSION_FORMAT_VERSION = 0`, no compatibility
-  promise — acceptable because the same image writes and reads it, and an
-  image change (which a format change requires) forces a recreate that clears
+  promise — acceptable: the same image writes and reads it, and a format
+  change arrives with an image change, which forces a recreate that clears
   the file. Nothing but the bridge that wrote it may read it.
-- openclaw's transcript is a private `version:3` JSONL. The shim couples to it;
-  an openclaw upgrade that changes the format is the shim's maintenance
-  burden — localized to openclaw's encapsulation, the same kind of coupling
-  that layer already has (it parses openclaw.json).
+- dsh event grammar: `user/message` events carry the message AS `data` (not
+  wrapped), surface events REQUIRE a `surfaceOp` marker, and messages must be
+  identified (id'd) — `Session.fromRestore` validates all three, which is why
+  the store smoke drives the real validator, not a lookalike.
+- hermes ROTATES the session id at compaction — a pinned id forks the
+  conversation; the echo must be followed.
 
 ## 5. What this deliberately does not do
 
@@ -127,18 +132,19 @@ Source-verified traps, recorded:
   A client that wants to *display* scrollback keeps its own screen buffer —
   UI, not state.
 
-## 6. Rollout
+## 6. Rollout — all four SHIPPED (unit/smoke level)
 
-1. **prime** — pass one `SessionManager.open` option + path + `ClearSession`
-   + tests. Smallest; validates the contract.
-2. **hermes** — declare its native `/v1/responses`, set `API_SERVER_KEY`, pin
-   + follow the session id; proxy forwards transparently.
-3. **dsh** — the bridge's event-log backend + seed-rebuild + crash repair.
-4. **openclaw** — the new shim (fronts the gateway, reads openclaw's transcript);
-   **delete the `synth` layer** once all four declare native responses.
-5. `/_seal/clear` route + CLI `/clear` (can land with 1).
+1. ✅ prime — SessionManager wiring + self-rotation + quarantine + ClearSession
+2. ✅ dsh — bridge event-log backend + seed rebuild + crash repair + ClearSession
+3. ✅ hermes — session-id pin + rotation follow + ClearSession
+4. ✅ openclaw — session-key pin + transcript-as-history + ClearSession
+5. ✅ `/_seal/clear` + SDK `clearConversation` + CLI `/clear`
 
-Per-framework acceptance test, identical each phase: kill the framework
-process mid-conversation → restart → the agent answers a question whose answer
-was set before the kill, with NO client replay; `/clear` → it no longer can;
-container recreate → fresh conversation, chain memory intact.
+Every store path was verified against the REAL SDKs extracted from the built
+images (prime SessionManager round-trip + rotation; dsh append→seed→
+`fromRestore`; hermes/openclaw header semantics read from gateway source).
+Still owed before this is DONE done: the T2 live drill — kill the framework
+process mid-conversation on each framework → restart → the agent answers a
+question established before the kill with NO client replay; `/clear` → it no
+longer can; container recreate → fresh conversation, chain memory intact —
+which needs the four images rebuilt.

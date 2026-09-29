@@ -81,6 +81,10 @@ type Server struct {
 	// calls — the transparent /v1/chat/completions door stays stateless.
 	conversationHeaders func() map[string]string
 	observeConversation func(http.Header)
+	// conversationHistory, when set, replaces CLIENT-sent history on the
+	// stateful door: prior turns come from the framework's own store, the
+	// client's input supplies only the current turn.
+	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
 	applySession  SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
