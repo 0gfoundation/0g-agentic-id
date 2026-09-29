@@ -25,7 +25,7 @@ import (
 // hash and can never drift out of sync with the adapter that spawns them,
 // exactly like the prime bridge.
 //
-//go:embed bridge/bridge.mjs bridge/seal-tools.mjs bridge/seal-guard.mjs
+//go:embed bridge/bridge.mjs bridge/seal-tools.mjs bridge/seal-guard.mjs bridge/sessionstore.mjs
 var bridgeFS embed.FS
 
 const (
@@ -204,7 +204,7 @@ func materializeBridge() error {
 	if err := ensureDir(bridgeScriptDir); err != nil {
 		return err
 	}
-	for _, name := range []string{"bridge.mjs", "seal-tools.mjs", "seal-guard.mjs"} {
+	for _, name := range []string{"bridge.mjs", "seal-tools.mjs", "seal-guard.mjs", "sessionstore.mjs"} {
 		src, err := bridgeFS.ReadFile("bridge/" + name)
 		if err != nil {
 			return fmt.Errorf("read embedded %s: %w", name, err)
@@ -246,6 +246,9 @@ func (be bridgeEnv) environ(nodePath string) []string {
 		"SEAL_BRIDGE_TOKEN=" + be.token,
 		"SEAL_AGENT_DOC=" + agentDocPath(),
 		"SEAL_PERSONA_PATH=" + appendSystemPath(),
+		// The bridge persists the conversation here and re-seeds the session
+		// from it on a process restart (CONVERSATION.md).
+		"SEAL_CONVERSATION_FILE=" + conversationPath(),
 	}
 	// Everything the owner's settings decide (pin, endpoint, reasoning bound,
 	// composition knobs) — rendered once, deterministically, before Start.

@@ -67,7 +67,8 @@ import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import * as TimeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, decodeStorageRecord, interruptedTurnClosers, packChunkRuns } from '@deepseek-ai/dsh-session'
+import { appendEvent, loadSeed } from './sessionstore.mjs'
 
 import * as SealTools from './seal-tools.mjs'
 import * as SealGuard from './seal-guard.mjs'
@@ -77,6 +78,10 @@ const TOKEN = process.env.SEAL_BRIDGE_TOKEN || ''
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || ''
 const PERSONA_PATH = process.env.SEAL_PERSONA_PATH || ''
 const DSH_HOME = process.env.DSH_HOME || '/root/.dsh'
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// Set by the adapter to an untracked path under DSH_HOME; empty disables
+// persistence (in-memory session + the client-replay restoreTranscript path).
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || ''
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
@@ -234,11 +239,28 @@ async function boot() {
     try { log(`agent/error: ${JSON.stringify(args).slice(0, 500)}`) } catch { log('agent/error (unserializable)') }
   })
 
+  // Restore the persisted conversation (CONVERSATION.md): decode the event
+  // log and hand it to create() as the seed — the SDK's documented replay
+  // path. No file / unusable file → fresh conversation, exactly as before.
+  const sdkCodecs = { decodeStorageRecord, interruptedTurnClosers, packChunkRuns }
+  const seed = CONVERSATION_FILE ? loadSeed(CONVERSATION_FILE, sdkCodecs, log) : null
   const handle = await ctx.agents.create({
     sessionId: SessionId('owner-chat'),
-    meta: { cwd: DSH_HOME },
+    meta: { cwd: DSH_HOME, ...(seed ? { seedLength: seed.length } : {}) },
+    ...(seed ? { seed } : {}),
     agentOptions: { provider: PROVIDER, model: MODEL_ID },
   })
+  if (CONVERSATION_FILE) {
+    // Persist every event committed AFTER the seed. The seq guard makes this
+    // robust whichever way create() treats seed publication: re-emitted seed
+    // events are skipped instead of double-written.
+    const seedMaxSeq = seed && seed.length ? (seed[seed.length - 1].seq ?? -1) : -1
+    ctx.on('session/event', (session, event) => {
+      if (session !== handle.agent.session) return
+      if (typeof event.seq === 'number' && event.seq <= seedMaxSeq) return
+      appendEvent(CONVERSATION_FILE, event, sdkCodecs, log)
+    })
+  }
   log(`agent ready (persona: ${persona.length} bytes, platform doc: ${doc ? `${doc.length} bytes` : 'ABSENT'})`)
   return { ctx, agent: handle.agent }
 }
@@ -553,6 +575,11 @@ const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matte
 let sessionSeeded = false; // flips when the first turn is dispatched
 
 function restoreTranscript(messages) {
+  // With the persistent store the session is seeded from DISK at create();
+  // replaying the client's copy on top would double the history. Client
+  // replay survives only as the no-persistence fallback (CONVERSATION.md
+  // invariant 6).
+  if (CONVERSATION_FILE) return "";
   if (sessionSeeded || !Array.isArray(messages)) return "";
   let lastUser = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
