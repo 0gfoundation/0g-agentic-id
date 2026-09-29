@@ -49,6 +49,7 @@ import {
 	ModelRegistry,
 	SessionManager,
 } from "prime-agent";
+import { openConversation } from "./sessionstore.mjs";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
 // Where the harness persists THIS agent's one conversation (CONVERSATION.md).
@@ -186,7 +187,7 @@ async function buildSession() {
 	// replay. Bound to ONE fixed file (invariant: one conversation per agent).
 	// Empty path → inMemory(), the pre-persistence behaviour.
 	const sessionManager = CONVERSATION_FILE
-		? SessionManager.open(CONVERSATION_FILE)
+		? openConversation(SessionManager, CONVERSATION_FILE, log)
 		: SessionManager.inMemory(process.cwd());
 	log(
 		CONVERSATION_FILE
