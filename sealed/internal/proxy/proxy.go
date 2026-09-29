@@ -73,6 +73,7 @@ type Server struct {
 
 	readSettings  SettingsReader
 	applySettings SettingsApplier
+	applyClear    ClearApplier
 	applySession  SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
@@ -229,6 +230,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
+	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

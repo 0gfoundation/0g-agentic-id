@@ -306,6 +306,17 @@ type RouteProvider interface {
 	FrameworkRoutes() []Route
 }
 
+// SessionClearer is implemented by adapters whose framework persists the
+// agent's ONE conversation (CONVERSATION.md). ClearSession wipes the persisted
+// store so the NEXT framework start presents a fresh conversation; the caller
+// (main.go's applier) restarts the process after a successful clear, so the
+// wipe takes effect immediately rather than at the next incidental restart.
+// Adapters whose conversation is client-held (no store) simply don't implement
+// this; the proxy answers 501 for them.
+type SessionClearer interface {
+	ClearSession(ctx context.Context) error
+}
+
 // LegacySettingsSeeder is implemented by adapters that can recover an owner's
 // configuration from a chain role that predates the settings channel.
 //

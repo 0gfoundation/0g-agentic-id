@@ -779,6 +779,22 @@ func startAgent(
 		return mgr.Reload(ctx)
 	})
 
+	// /clear (CONVERSATION.md invariant 5): wipe the framework's persisted
+	// conversation, then restart so the fresh one is presented NOW. Only wired
+	// for adapters that hold a conversation; the proxy answers 501 otherwise.
+	if clearer, ok := adapter.(framework.SessionClearer); ok {
+		sealedProxy.SetClear(func(ctx context.Context) error {
+			if err := clearer.ClearSession(ctx); err != nil {
+				return err
+			}
+			if err := mgr.Reload(ctx); err != nil {
+				return fmt.Errorf("restart: %w", err)
+			}
+			logger.Logf("conversation cleared by owner; framework restarted fresh")
+			return nil
+		})
+	}
+
 	// Once the agent has spawned, give the framework a moment to apply its
 	// own defaults to whatever sections we didn't pre-populate (e.g. memory
 	// engine, session config, plugins on a fresh install). Then re-seed:

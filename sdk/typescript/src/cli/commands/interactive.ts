@@ -32,7 +32,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -1744,6 +1744,9 @@ const L2_HELP_FULL = `session commands
                           the agent's next boot; /reset applies it now. prime
                           also takes it per message, from the next one on.
                           No arg shows the level currently stored
+  /clear                  wipe the agent's conversation and start fresh —
+                          chain-tracked memory (what the agent chose to keep)
+                          is untouched; that is the difference from /reset
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -1913,6 +1916,24 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!r) continue;
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;
+      }
+      if (line === '/clear') {
+        // Wipe the agent's persisted conversation (server-side) and this
+        // window's local echo of it. Chain-tracked memory is untouched — that
+        // is the difference between /clear and /reset. Frameworks whose
+        // history is client-held answer 501; then clearing the local array IS
+        // the clear.
+        if (!s.url) { out(`agent is ${s.phase} — nothing to clear\n`); continue; }
+        try {
+          const r = await s.ag.agent.clearConversation(s.url, BigInt(s.agentId), clientInstanceId);
+          messages.length = 0;
+          out(`${r.note ?? 'conversation cleared'}\n`);
+        } catch (e) {
+          const msg = (e as Error).message;
+          if (/HTTP 501/.test(msg)) { messages.length = 0; out('history is client-held for this framework — local history cleared\n'); }
+          else out(`clear failed: ${msg}\n`);
+        }
+        continue;
       }
       if (line === '/agentlog' || line.startsWith('/agentlog ')) {
         if (!s.client?.logs) { out(s.client ? '(logs unavailable — owner key needed)' : `agent is ${s.phase} — /start or /reset first`); out('\n'); continue; }

@@ -547,6 +547,38 @@ export class AgentApi {
     return (await r.json().catch(() => ({}))) as { displaced?: boolean };
   }
 
+  /**
+   * Wipe the agent's ONE persisted conversation and restart its framework so
+   * a fresh one is presented immediately. Clears WORKING CONTEXT only — the
+   * chain-tracked memory (what the agent chose to keep) is untouched; that is
+   * the difference between /clear and a container reset. Owner-signed (tag
+   * `0GSealClear`, the settings-push grammar); a framework whose history is
+   * client-held answers 501 — there is nothing server-side to clear. Pass
+   * `instanceId` when the caller participates in the single-driver seat: a
+   * clear is a driving action and is refused (409) from a displaced window.
+   */
+  async clearConversation(base: string, agentId: bigint, instanceId?: string): Promise<{ note?: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = '{}';
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealClear:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/clear`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'application/json',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body,
+    });
+    if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
   private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);
