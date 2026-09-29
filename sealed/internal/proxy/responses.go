@@ -336,8 +336,22 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, inpu
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	// Stateful conversation binding (framework.ConversationSession): the
+	// adapter names the headers that pin this call to the agent's ONE
+	// conversation; unset for frameworks whose history is client-held.
+	s.mu.Lock()
+	convHeaders, convObserve := s.conversationHeaders, s.observeConversation
+	s.mu.Unlock()
+	if convHeaders != nil {
+		for k, v := range convHeaders() {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := http.DefaultClient.Do(req)
+	if err == nil && convObserve != nil {
+		convObserve(resp.Header)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			rec.push("response.completed", map[string]any{"type": "response.completed", "response": rec.snapshot()})

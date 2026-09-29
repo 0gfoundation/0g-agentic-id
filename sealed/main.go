@@ -782,6 +782,13 @@ func startAgent(
 	// /clear (CONVERSATION.md invariant 5): wipe the framework's persisted
 	// conversation, then restart so the fresh one is presented NOW. Only wired
 	// for adapters that hold a conversation; the proxy answers 501 otherwise.
+	// Stateful responses door: adapters whose framework holds the
+	// conversation server-side bind each upstream call to it and follow
+	// rotation (hermes: X-Hermes-Session-Id, rotated at compaction).
+	if cs, ok := adapter.(framework.ConversationSession); ok {
+		sealedProxy.SetConversationSession(cs.ConversationHeaders, cs.ObserveConversation)
+	}
+
 	if clearer, ok := adapter.(framework.SessionClearer); ok {
 		sealedProxy.SetClear(func(ctx context.Context) error {
 			if err := clearer.ClearSession(ctx); err != nil {

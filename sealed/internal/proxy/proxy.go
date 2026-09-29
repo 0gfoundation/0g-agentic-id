@@ -74,6 +74,13 @@ type Server struct {
 	readSettings  SettingsReader
 	applySettings SettingsApplier
 	applyClear    ClearApplier
+
+	// Stateful-door conversation binding (framework.ConversationSession),
+	// wired by main.go only for adapters that hold the conversation
+	// server-side. Applied ONLY to the synthesized responses door's upstream
+	// calls — the transparent /v1/chat/completions door stays stateless.
+	conversationHeaders func() map[string]string
+	observeConversation func(http.Header)
 	applySession  SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).

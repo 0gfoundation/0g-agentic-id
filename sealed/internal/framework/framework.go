@@ -12,6 +12,7 @@
 package framework
 
 import (
+	"net/http"
 	"context"
 	"fmt"
 	"sync"
@@ -304,6 +305,24 @@ type Route struct {
 // forwarded to the upstream and every response is signed.
 type RouteProvider interface {
 	FrameworkRoutes() []Route
+}
+
+// ConversationSession is implemented by adapters whose framework holds the
+// conversation SERVER-SIDE, keyed by a session identity the platform must
+// attach to each stateful upstream call — and follow when the framework
+// rotates it (hermes mints a child session id at every compaction). The
+// caller (the proxy's stateful responses door) stays framework-agnostic: it
+// attaches whatever headers the adapter names and shows the adapter every
+// upstream response. The stateless /v1/chat/completions door never gets these
+// headers — statefulness there would silently change what standard clients
+// see.
+type ConversationSession interface {
+	// ConversationHeaders returns the headers that bind an upstream call to
+	// the agent's ONE conversation (minting the identity on first use).
+	ConversationHeaders() map[string]string
+	// ObserveConversation sees every stateful upstream response's headers, so
+	// a rotated session identity can be persisted and followed.
+	ObserveConversation(h http.Header)
 }
 
 // SessionClearer is implemented by adapters whose framework persists the
