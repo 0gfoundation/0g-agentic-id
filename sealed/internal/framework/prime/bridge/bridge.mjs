@@ -47,9 +47,16 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
+	SessionManager,
 } from "prime-agent";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// The adapter sets it to an untracked, off-chain path and self-rotates the
+// file; empty disables persistence (falls back to the in-memory session +
+// the client-replay restoreTranscript path). One agent, one file — never a
+// multi-session store.
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || "";
 const TOKEN = process.env.SEAL_BRIDGE_TOKEN || "";
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
@@ -172,11 +179,26 @@ async function buildSession() {
 
 	const model = resolveModel(modelRegistry);
 	log(`model resolved: ${model.provider}/${model.id}`);
+	// The conversation persists in the harness's OWN store (CONVERSATION.md):
+	// SessionManager.open(path) both creates the file on a first boot and, on a
+	// process restart, re-parses the JSONL and rebuilds the context — so a
+	// settings-push/crash restart resumes the conversation with NO client
+	// replay. Bound to ONE fixed file (invariant: one conversation per agent).
+	// Empty path → inMemory(), the pre-persistence behaviour.
+	const sessionManager = CONVERSATION_FILE
+		? SessionManager.open(CONVERSATION_FILE)
+		: SessionManager.inMemory(process.cwd());
+	log(
+		CONVERSATION_FILE
+			? `conversation store: ${CONVERSATION_FILE} (${sessionManager.getEntries?.().length ?? 0} entries restored)`
+			: "conversation store: in-memory (SEAL_CONVERSATION_FILE unset)",
+	);
 	const { session } = await createAgentSession({
 		model,
 		resourceLoader: loader,
 		authStorage,
 		modelRegistry,
+		sessionManager,
 	});
 	// Thinking models need a bounded effort level: the session default is
 	// "off", which makes the SDK send NO reasoning_effort — and an
@@ -548,6 +570,13 @@ const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matte
 let sessionSeeded = false; // flips when the first turn is dispatched
 
 function restoreTranscript(messages) {
+	// With a persistent conversation store the harness restores its OWN history
+	// from disk (SessionManager.open), so replaying the client's copy would
+	// DOUBLE the history. The client-replay path is the fallback for the
+	// no-persistence case only (CONVERSATION.md invariant 6). A container
+	// recreate — the one case disk cannot cover — starts an empty file, so if
+	// continuity across a recreate is ever wanted this is where it would return.
+	if (CONVERSATION_FILE) return "";
 	if (sessionSeeded || !Array.isArray(messages)) return "";
 	let lastUser = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {

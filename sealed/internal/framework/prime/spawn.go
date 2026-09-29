@@ -102,6 +102,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := ensureDir(sessionStateDir()); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
+	// The bridge's SessionManager.open() needs the parent dir to exist.
+	if err := ensureDir(conversationDir()); err != nil {
+		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
+	}
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the
 	// bridge injects it as a virtual context file at session creation. No
@@ -340,6 +344,10 @@ func (be bridgeEnv) environ(nodePath string) []string {
 		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
 		"SEAL_BRIDGE_TOKEN=" + be.token,
 		"SEAL_AGENT_DOC=" + agentDocPath(),
+		// The harness persists its one conversation here and resumes it on a
+		// process restart (CONVERSATION.md). Off-chain by construction — see
+		// conversationPath. The bridge opens a SessionManager on this file.
+		"SEAL_CONVERSATION_FILE=" + conversationPath(),
 	}
 	if be.provider != "" {
 		env = append(env, "SEAL_MODEL_PROVIDER="+be.provider)
