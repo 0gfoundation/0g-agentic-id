@@ -16,10 +16,14 @@
  * cannot alter what gets mounted at next boot. Deliberately NOT mounted
  * (each a decision, see the adapter's package doc):
  *
- *   session-persistence-*  — the append-only session log would phantom-drift
- *                            every watcher tick, and its format is pinned at
- *                            v0 with no compatibility promise. One Agent
- *                            object in process memory instead.
+ *   session-persistence-*  — the upstream plugin family is not mounted (its
+ *                            append-only log format is pinned v0 with no
+ *                            compatibility promise, and no concrete backend
+ *                            ships). The bridge implements the backend itself:
+ *                            sessionstore.mjs appends every committed session
+ *                            event and re-seeds the session on boot
+ *                            (CONVERSATION.md). One Agent object per process,
+ *                            durable through its event log.
  *   settings-file          — its hot-reload layers $DSH_HOME/settings.yaml
  *                            OVER the composition; mounting it would let an
  *                            agent edit of that file inject an arbitrary
@@ -565,7 +569,9 @@ function lastUserText(messages) {
 //
 // The conversation lives in THIS process's memory (the session object), but a
 // configuration change restarts the harness (manager.Reload), and a fresh
-// process used to greet a mid-conversation owner with total amnesia: the
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
 // client resends the full transcript on every turn — it always has — yet the
 // bridge took only the last user line. On the FIRST turn of a fresh process,
 // if the request carries history, replay it as a framed transcript ahead of

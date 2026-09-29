@@ -28,7 +28,7 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
    而长期记忆跨 session 共享本就破了隔离。与单驾驶座(CONFIG_SURFACE §8.1)对齐:
    一个 agent、一条时间线、一个驾驶员。
 3. **存容器可写层的不追踪路径**——构造上不上链:在所有链上角色之外,watcher 任何
-   一拍都提交不到、任何转让都带不走。平台启动时用 `Roles()` 校验声明路径,冲突即拒。
+   一拍都提交不到、任何转让都带不走。由构造保证而非运行时校验:每个存储路径都是 adapter 里的编译期常量、保持在其角色树之外(`RoleSpec` 刻意不携带文件系统路径,平台层的通用校验根本不可表达)——各 adapter 的 `paths.go` 记录归类。
 4. **容器重建清空——这是设计。**`reset` 即"重新开始";该留的早已蒸馏进链上记忆
    角色(MEMORY.md / memories/ / harness_state.json)。对话是工作上下文,不是资产。
 5. **`/clear`:不重建即清空。**owner 签名,settings 推送同一文法。开新对话,删文件。

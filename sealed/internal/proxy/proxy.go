@@ -9,6 +9,9 @@
 //	GET  /log/agent.html - same log, color-coded HTML view (owner-only)
 //	GET  /hello         - signed A2A self-introduction (returns 503 until armed)
 //	POST /_seal/auth    - owner-only flow returning the framework auth token
+//	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
+//	POST /_seal/claim   - take the single-driver seat (owner-signed)
+//	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
 //	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /

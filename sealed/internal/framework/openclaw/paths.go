@@ -13,6 +13,9 @@ package openclaw
 
 var openclawHome = "/root/.openclaw"
 
+// .seal-conversation-key (conversation.go) is the platform's pinned session
+// key — ours, container-lifetime, untracked; openclaw's own transcript store
+// under agents/<id>/sessions/ is likewise never a role (CONVERSATION.md).
 func openclawJSONPath() string { return openclawHome + "/openclaw.json" }
 func workspaceDir() string     { return openclawHome + "/workspace" }
 

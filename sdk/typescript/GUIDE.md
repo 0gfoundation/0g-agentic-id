@@ -640,6 +640,15 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   const agent = await ag.agent.client(agentId);
   // agent.routes / agent.services — the declared surface (same as /hello)
 
+  // THE CONVERSATION IS SERVER-HELD (CONVERSATION.md): on every bundled
+  // framework the agent persists its one conversation in the container and
+  // resumes it across framework restarts — a client may send only the
+  // current turn on the stateful responses door, and history it does send
+  // there is ignored where the store supplies it. The raw chat route below
+  // stays stateless (send full messages[]) for standard-client interop.
+  // `ag.agent.clearConversation(base, agentId)` (CLI `/clear`) wipes it
+  // without a reset; chain-tracked memory is untouched.
+
   // Chat — present ONLY if the agent declares a chat route AND this ag has a
   // key. Streams under the hood (`stream: true`), so a long reasoning turn
   // keeps bytes flowing and never trips an idle-timeout hop in front of the
@@ -806,7 +815,7 @@ npx 0g-agenticid --help
 
 Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
-The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
+The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/tasks` `/result [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
 Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 

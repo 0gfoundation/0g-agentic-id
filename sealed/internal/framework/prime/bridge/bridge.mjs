@@ -561,7 +561,9 @@ function lastUserText(messages) {
 //
 // The conversation lives in THIS process's memory (the session object), but a
 // configuration change restarts the harness (manager.Reload), and a fresh
-// process used to greet a mid-conversation owner with total amnesia: the
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
 // client resends the full transcript on every turn — it always has — yet the
 // bridge took only the last user line. On the FIRST turn of a fresh process,
 // if the request carries history, replay it as a framed transcript ahead of

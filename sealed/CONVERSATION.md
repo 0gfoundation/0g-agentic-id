@@ -38,8 +38,11 @@ onboarding copy.
    timeline, one driver.
 3. **Stored on the container's writable layer, in an UNTRACKED path** —
    off-chain by construction: outside every chain-tracked role, so no watcher
-   tick commits it and no transfer conveys it. The platform validates the
-   declared path against `Roles()` at boot and refuses a collision.
+   tick commits it and no transfer conveys it. Guaranteed by construction,
+   not by a runtime check: every store path is a compile-time constant the
+   adapter keeps outside its role trees (`RoleSpec` deliberately carries no
+   filesystem path, so a generic platform-side validation is not even
+   expressible) — each adapter's `paths.go` records the classification.
 4. **A container recreate clears it — by design.** `reset` means "fresh
    start"; what should survive is already distilled into the chain-tracked
    memory roles (MEMORY.md / memories/ / harness_state.json). The conversation
