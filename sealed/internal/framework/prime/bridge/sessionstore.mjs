@@ -52,6 +52,16 @@ export function rotateIfOversized(file, log = () => {}) {
 /** Open the persistent conversation; never throws the agent dead. */
 export function openConversation(SessionManager, file, log = () => {}) {
 	try { rotateIfOversized(file, log); } catch (e) { log(`conversation rotation failed (non-fatal): ${(e && e.message) || e}`); }
+	// A stub left by a clear-while-running race (the old process appended past
+	// the removal) has no session-header first line; don't gamble on how
+	// SessionManager.open treats it — quarantine deterministically.
+	try {
+		const first = readFileSync(file, "utf8").split("\n", 1)[0];
+		if (first && JSON.parse(first).type !== "session") {
+			log("conversation store has no session header (a truncated stub) — quarantining and starting fresh");
+			renameSync(file, `${file}.stale-${Date.now()}`);
+		}
+	} catch { /* absent or unparsable first line — open()/quarantine below decide */ }
 	try {
 		return SessionManager.open(file);
 	} catch (e) {

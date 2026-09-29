@@ -57,6 +57,15 @@ export function loadSeed(file, sdk, log = () => {}) {
 			events.push(...sdk.decodeStorageRecord(v)); // malformed chunk row throws → corrupt store
 		}
 		if (!events.length) return null;
+		// A stub left by a clear-while-running race (the old process appended
+		// past the removal) does not start at the log's first seq — feeding it
+		// to create({seed}) trips the contiguous-from-zero validator and BRICKS
+		// the boot in a retry loop. Archive it and start fresh instead.
+		if (typeof events[0].seq === "number" && events[0].seq > 1) {
+			log(`conversation store starts at seq ${events[0].seq} (a truncated stub) — archiving and starting fresh`);
+			archive(file, "stale", log);
+			return null;
+		}
 		const closers = sdk.interruptedTurnClosers(events);
 		if (closers.length) {
 			log(`repairing an interrupted turn: ${closers.length} synthetic closer(s)`);
