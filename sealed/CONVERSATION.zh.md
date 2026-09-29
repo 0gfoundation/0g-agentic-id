@@ -1,118 +1,107 @@
 # 对话:一个 agent 一条时间线,以及什么能活下来
 
-对话持久化的设计记录——每个框架 adapter 必须满足的契约、各框架的答案、边界。
-在实现**之前**写下(CONFIG_SURFACE 的教训:设计记录是合并判据,不是事后补交)。
-英文原版:`CONVERSATION.md`。
+对话持久化的设计记录——契约、架构、各框架的答案、边界。在实现**之前**写下
+(CONFIG_SURFACE 的教训:设计记录是合并判据,不是事后补交)。英文原版:
+`CONVERSATION.md`。
 
 ## 1. 问题
 
-agent 的对话必须活过**框架进程重启**——而 settings 通道落地后,进程重启变成了
-高频事件:每次 settings 推送、每次 `/think` 都是一次 Stop+Start
-(`manager.Reload`),崩溃重启走同一条路。现状:
+agent 的对话必须活过**框架进程重启**——settings 通道落地后重启变高频:每次
+settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走同一条路。
+现在 prime/dsh 把对话记在桥的**进程内存**里,一重启就**彻底失忆**,靠
+`restoreTranscript()` 重放**客户端**那份糊住——层级错位(让客户端替 harness 存
+它自己的状态)且有损(工具内部过程重建不了)。openclaw/hermes 不失忆,只是因为
+客户端每轮重发全量 `messages[]`——也就是客户端就是它们的仓库。
 
-| | 对话活在哪 | 进程重启后 |
-|---|---|---|
-| openclaw / hermes | 客户端(无状态聊天门;客户端每轮重发全量 `messages[]`) | 无感——客户端把历史再送来 |
-| prime / dsh | 桥的**进程内存**(一个 SDK 会话对象 + `const responses = new Map()`) | **彻底失忆** |
-
-prime/dsh 现在靠 `restoreTranscript()` 糊:新进程的第一回合,把**客户端**手里
-那份历史当框定文本重放。这是双重的层级错位——让客户端替 harness 保管它自己的
-状态,而且重放有损(工具内部过程无法重建),还只在"下一个开口的恰好是存了历史
-的客户端"时才起效。
-
-根治就是最显然的那条:**harness 自己把对话持久化在容器里**。两家 SDK 都支持
-(对照从镜像里抽出的 SDK 源码核实,非文档——见 §4);我们只是从来没接。
+根治:**harness 自己把对话持久化在容器里**,客户端零存储。四家 SDK 都能做
+(对照从镜像里抽出的 SDK 源码核实——§4);我们从没接。
 
 ## 2. 不变量(契约)
 
-约束现在和将来的每一个 adapter。`FRAMEWORK_ADAPTER.md` 携带面向接入方的版本。
+约束现在和将来每一个 adapter。`FRAMEWORK_ADAPTER.md` 携带面向接入方的版本。
 
-1. **对话活过进程重启,且归 HARNESS 所有。**不归 proxy(代理再实现一遍会话管理
-   = 第二份有损真相源),不归客户端(客户端是窗口,不是仓库)。`Start` 语义:
-   框架启动时,存在已持久化的对话就必须接上它。
-2. **一个 agent 恰好一条对话。**固定身份(dsh 已硬编码
-   `SessionId('owner-chat')`;其余同型)。多 session 永不启用——这是安全决定,
-   不是简化:跨 session 隔离要押注在未经审计的上游代码上,而 agent 的长期记忆
-   本就跨 session 共享,上游再完美隔离也不密。这也与单驾驶座
-   (CONFIG_SURFACE §8.1)对齐:一个 agent、一条时间线、同时一个驾驶员。
-3. **存容器可写层的不追踪路径。**构造上就不上链:对话文件必须在所有链上角色
-   之外,watcher 任何一拍都提交不到它,任何转让都带不走它。平台在启动时用
-   adapter 的 `Roles()` 校验声明路径,冲突即拒。
-4. **容器重建清空——这是设计。**`reset` 就是"重新开始"。该带过重建的东西,
-   agent 早已蒸馏进链上记忆角色(MEMORY.md / memories/ / harness_state.json)。
-   对话是工作上下文,不是资产。
-5. **`/clear`:owner 可以不重建容器地清空对话。**owner 签名,与 settings 推送
-   同一文法。框架开新对话;持久化文件删除。
-6. **客户端零存储。**`restoreTranscript()` 从"恢复机制"降级为唯一一种磁盘
-   兜不住的场景(容器重建后 owner 仍想续)的尽力兜底,那个场景若判定不值得保,
-   可整体退役。
-7. **文件有界——adapter 自轮转。**持久化对话是追加式的(见下方不变量与 §4),
-   所以文件会一直涨到被轮转为止。它**必须**在尺寸上限处轮转:磁盘有限,一个 runner
-   会把多个 agent 挤在同一块共享盘上(实测 ~4 个/runner;当年转让僵尸就是盘压力),
-   所以无界追加文件是真实的撑爆盘风险,不是理论风险。轮转切在最近一个压缩点——天然的安全切割线,因为当前上下文正是
-   从那里重建的——丢弃之前的内容(git-gc 形状)。这是 adapter 的义务(§3),
-   不是平台的;而且是**必须项**,不是"将来":"纯文本涨得慢"不构成上界。众多
-   agent 撑爆整盘是沙盒层的配额/驱逐问题,不归这个文件管——但这个文件不能当
-   元凶,自轮转就是它保持清白的方式。
+1. **对话活过进程重启,且归 HARNESS 所有**——不归 proxy(代理再实现一遍会话管理
+   = 第二份有损真相源),不归客户端(它是窗口,不是仓库)。框架启动时,存在已
+   持久化的对话就接上它。
+2. **一个 agent 恰好一条对话。**固定身份(dsh 已硬编码 `SessionId('owner-chat')`)。
+   多 session 永不启用——安全决定,非简化:跨 session 隔离要押注未审计的上游代码,
+   而长期记忆跨 session 共享本就破了隔离。与单驾驶座(CONFIG_SURFACE §8.1)对齐:
+   一个 agent、一条时间线、一个驾驶员。
+3. **存容器可写层的不追踪路径**——构造上不上链:在所有链上角色之外,watcher 任何
+   一拍都提交不到、任何转让都带不走。平台启动时用 `Roles()` 校验声明路径,冲突即拒。
+4. **容器重建清空——这是设计。**`reset` 即"重新开始";该留的早已蒸馏进链上记忆
+   角色(MEMORY.md / memories/ / harness_state.json)。对话是工作上下文,不是资产。
+5. **`/clear`:不重建即清空。**owner 签名,settings 推送同一文法。开新对话,删文件。
+6. **客户端零存储。**`restoreTranscript()` 降级为唯一一种磁盘兜不住场景(重建后
+   owner 仍想续)的尽力兜底,可退役。
+7. **文件有界——由框架的封装层自轮转。**存储追加式,不轮转就一直涨;而磁盘有限、
+   一个 runner 多 agent 共享,无界文件是真实撑盘风险,非理论。轮转切在最近压缩点
+   (安全线——当前上下文从那里重建),丢弃更早的(git-gc 形状)。**必须项**,非"将来"。
 
-## 3. 接口(落进 `framework.Framework` 的东西)
+## 3. 架构:一个透明 proxy + 各框架自己的封装
 
-刻意做薄——平台立义务,方言留在 adapter(`RenderSettings` 模式):
+终态——把所有框架专属行为**移出**共享 proxy、**沉进**各框架在请求路径上的封装,
+让 proxy 不再认得自己面对的是哪个框架。
 
-- **`ClearSession(ctx) error`**(新增,进接口或先作可选能力、四家齐后转正):
-  清掉持久化对话,下一回合呈现新对话。proxy 加一条 owner 签名路由
-  (`POST /_seal/clear`,tag `0GSealClear`,digest 在 audience 之前的既有文法)
-  调它,CLI 加 `/clear`。
-- **`ConversationPath() string`**(声明,对话在客户端侧的 adapter 可为空):
-  平台在启动时断言该路径在所有声明角色之外。除此之外平台代码不碰这个文件。
-  adapter 同时对文件**尺寸**负责:必须在上限处自轮转(切在最近压缩点、丢弃更早
-  的——见不变量 7),因为 runner 的共享有限磁盘上,无界追加文件是真实的撑盘风险。平台
-  不轮转它(它从不读这个文件),只校验路径。
-- **`Start` 的文档契约**:"若你的框架持久化了对话,Start 必须接上它"——对既有
-  方法的语义要求,不是新方法。
-
-proxy 明确**不**获得对话存储、压缩逻辑、或对文件的任何读取。压缩始终是
-harness 自己的(prime 原生压缩并记录 `compaction` 条目;dsh 挂载
-`dsh-compaction-basic`)。
+- **proxy 是透明反向代理。**它只做跨框架、**框架无关**的活——鉴权、单驾驶座、
+  serve-proof、CORS——然后转发给框架的封装。它不按框架分支,也不读、不拼任何对话。
+- **每个框架背后都有一个在请求路径上的封装,讲全套协议,含有状态 `/v1/responses`**
+  (客户端只发当前轮,封装从 harness 自己的存储补历史)。prime/dsh 已经有——它们的
+  `bridge.mjs`;hermes 自己的 gateway 原生有;openclaw 新增一个 shim(§4)。
+- **`synth` 层删除。**它今天存在的唯一理由是"在 proxy 里替缺 responses 门的框架
+  伪造一扇"——一个"认框架"的 proxy 分支。一旦每个框架都通过自己的封装声明原生
+  responses 路由,`nativeResponsesDeclared()` 恒真,synth 成死代码。删它正是目的:
+  框架专属耦合(如 openclaw 的私有落盘格式)从共享 proxy 代码搬进 openclaw 自己的
+  shim——框架专属的东西本就该在那里。
+- **`/v1/chat/completions` 每家保留**——无状态、客户端持历史——任何标准 OpenAI
+  客户端照连(互通不牺牲;有状态是**第二扇**门,不是替换)。
+- **`ClearSession`** 是平台在封装上立的唯一新义务;proxy 暴露一条 owner 签名的
+  `POST /_seal/clear`(tag `0GSealClear`,digest 在 audience 之前)转调它,CLI 加
+  `/clear`。压缩始终是 harness 自己的——平台永不解析对话。
 
 ## 4. 各框架的答案(依据 SDK 源码,非文档)
 
-| | 机制 | 文件 | clear |
+| | 请求路径上的封装 | 怎么持久化 + 恢复 | clear |
 |---|---|---|---|
-| **prime** | `createAgentSession({ …, sessionManager: SessionManager.open(path) })` —— SDK 自己逐条追加(完整消息树:消息、工具调用、压缩、思考档位变更),重启时 `open()` 重建上下文。只多传一个选项;追加与重放都是上游代码。 | `/root/.prime-conversation/owner-chat.jsonl` —— 在 `primeHome` 之外,任何被追踪角色永远够不到(与 `/tmp/prime-session` 那个 pin 同一"构造上防上链"论证;那份是 harness 状态,**不是**对话,原样不动) | 删文件,重开一个新 `SessionManager` |
-| **dsh** | 没有现成存储后端(`SessionPersistence` 接缝存在但全树无任何具体子类;没有它 `ctx.agents.resume()` 直接拒绝)。桥用随包发行的编解码器实现官方重放路径:订阅 `ctx.on('session/event')`,`packChunkRuns` 序列化追加落盘;重启时 `decodeStorageRecord` + `ctx.agents.create({ sessionId, seed, meta: { seedLength } })`。seed 规则(从 seq 0 连续、无悬空轮次)用随包的 `interruptedTurnClosers` 崩溃修复保证。 | `/root/.dsh/owner-chat.session.jsonl` —— `paths.go` 本就把"任何 session-persistence 后端的输出"归为刻意不追踪 | 截断文件,dispose 后无 seed 重建 agent |
-| **openclaw / hermes** | **第三阶段,刻意推迟。**它们今天没有失忆(无状态门 + 客户端全量重发),没有坏的东西;给它们容器持有的对话 = "有状态 `/v1/responses` 接它们的原生会话存储(hermes `state.db`、openclaw 会话存储)"那项工作,规格化之前需要单独一轮 SDK 级调研。在那之前它们的 `ConversationPath()` 为空,`ClearSession` 只清 synth 环。 | — | — |
+| **prime** | `bridge.mjs`(原生 `/v1/responses`) | 给 `createAgentSession` 传 `sessionManager: SessionManager.open(path)` —— SDK 自己逐条追加(消息、工具调用、压缩、思考),重启 `open()` 重建上下文。文件 `/root/.prime-conversation/owner-chat.jsonl`,在 `primeHome` 之外(`/tmp/prime-session` 那个 pin 是 harness 状态、**不是**对话,原样不动)。 | 删文件,重开 |
+| **hermes** | 它自己的 gateway(原生 `/v1/responses` + `X-Hermes-Session-Id`) | HTTP 上本就有状态:给个稳定会话号,hermes 就从 `~/.hermes/state.db` 读历史(而非请求体)、重启后恢复。我们设 `API_SERVER_KEY` 并钉住会话号。注意压缩会**换**会话号(生成子会话)——跟着 hermes 回吐的号走,别硬钉一个。 | 换会话号 / 清库 |
+| **dsh** | `bridge.mjs`(原生 `/v1/responses`) | 没有现成后端(`SessionPersistence` 接缝在、无具体子类;没它 `resume()` 拒绝)。桥用随包编解码器实现官方重放:订阅 `session/event`、`packChunkRuns` → 追加落盘;重启 `decodeStorageRecord` + `ctx.agents.create({ sessionId, seed, meta:{seedLength} })`,`interruptedTurnClosers` 崩溃修复。文件 `/root/.dsh/owner-chat.session.jsonl`(本就归为不追踪)。 | 截断,无 seed 重建 agent |
+| **openclaw** | **新增 shim**,在请求路径上、垫在 openclaw gateway 前(像一个 bridge)。openclaw 的 OpenAI gateway **没有**原生 responses 门,也从不回读自己的 transcript。shim 提供有状态 `/v1/responses`:读 openclaw 自己盘上的 transcript(`~/.openclaw/agents/<id>/sessions/*.jsonl`,它每轮都写)、拼上当前轮、调 openclaw 的 `/v1/chat/completions`。私有格式耦合关在这里——openclaw 自己的封装内,不进共享代码。 | 删 openclaw 的会话文件 |
 
-两个源码级的坑,记下来免得再踩:
+源码级的坑,记下来:
 
-- prime 的 `createAgentSession` JSDoc 写着 `continueSession: true`;**那是死
-  文档**——没有任何代码读这个选项。持久化只由 `sessionManager` 对象承载。
-- dsh 的落盘格式是它的 `SESSION_FORMAT_VERSION = 0`,无兼容承诺。此处可接受:
-  文件由同一个镜像写、同一个镜像读——格式变更必随镜像变更到来,而镜像变更
-  要求容器重建,重建本来就清文件。此文件永远不得被写它的桥之外的任何东西读。
+- prime 的 `createAgentSession` JSDoc 写着 `continueSession: true`——**死文档**,
+  没代码读它。持久化只由 `sessionManager` 承载。
+- dsh 落盘格式是 `SESSION_FORMAT_VERSION = 0`,无兼容承诺——可接受:同一镜像写、
+  同一镜像读,格式变更必随镜像变更,而镜像变更逼容器重建、重建清文件。除了写它的
+  桥,任何东西都不得读它。
+- openclaw 的 transcript 是私有 `version:3` JSONL。shim 贴着它;openclaw 升级改
+  格式就是 shim 的维护负担——局限在 openclaw 封装内,和这层本就有的耦合同类
+  (它已经在解析 openclaw.json)。
 
 ## 5. 刻意不做的
 
-- **proxy 不存对话**——已否:对每家 harness 都已拥有的东西做一份有损的二次
-  实现。
-- **不上链**——对话是工作上下文;耐久知识已经走记忆角色。且链上对话会随转让
-  交接,对私人聊天恰好是错的。
-- **不做多 session、不做会话选择器、不做 `previous_response_id` 寻址**——
-  不变量 2。
-- **平台不做压缩/摘要**——**模型上下文**长度由 harness 自己的压缩处理(它追加一条
-  `compaction` 条目、把叶指针前移;文件保留压缩前的条目,所以没有破坏性丢失,分支
-  仍够得到它们)。这也是为什么文件只在**两次轮转之间**增长——"只增"从不等于无界:
-  adapter 在上限处轮转(不变量 7 / §3)。平台既不解析对话,也不轮转它。
-- **不做跨机器/跨客户端同步**——文件随容器;客户端什么都不持有,也就没有
-  可同步的东西。想显示回滚条的客户端自己留屏幕缓冲,那是 UI,不是状态。
+- **proxy 不存对话、没有 `synth` 层**——proxy 透明;对话逻辑在各框架的封装里。
+- **不上链**——工作上下文非资产;耐久知识走记忆角色,链上对话还会随转让交接
+  (对私人聊天是错的)。
+- **不做多 session、不做选择器、不做 `previous_response_id` 寻址**——不变量 2。
+- **平台不做压缩**——**模型上下文**由 harness 自己压(追加 `compaction` 条目、前移
+  叶指针;文件保留旧条目,无破坏性丢失)。文件只在**两次轮转之间**涨;封装负责轮转
+  (不变量 7)。平台永不解析它。
+- **不做跨机器同步**——文件随容器;客户端零持有。想显示回滚条的客户端自留屏幕
+  缓冲——UI,不是状态。
 
 ## 6. 落地顺序
 
-1. **prime**(最小:一个选项 + 路径声明 + ClearSession + 测试);
-2. **dsh**(桥的事件日志后端 + seed 重建 + 崩溃修复 + 测试);
-3. `/_seal/clear` 路由 + CLI `/clear`(可与 1 同落);
-4. **openclaw/hermes** 有状态门——单独调研、在本文档追加设计,然后实现。
+1. **prime**——传一个 `SessionManager.open` 选项 + 路径 + `ClearSession` + 测试。
+   最小;验证契约。
+2. **hermes**——声明它的原生 `/v1/responses`,设 `API_SERVER_KEY`,钉住并跟随
+   会话号;proxy 透明转发。
+3. **dsh**——桥的事件日志后端 + seed 重建 + 崩溃修复。
+4. **openclaw**——新 shim(垫在 gateway 前、读 openclaw 的 transcript);四家都声明
+   原生 responses 后**删除 `synth` 层**。
+5. `/_seal/clear` 路由 + CLI `/clear`(可与 1 同落)。
 
-每 adapter 的验收测试,各阶段同一条:对话进行中杀掉框架进程 → 重启 → agent
-能答出杀前已确立的信息,全程无客户端重放;`/clear` → 答不出了;容器重建 →
-新对话,链上记忆完好。
+每 adapter 的验收测试,各阶段同一条:对话进行中杀掉框架进程 → 重启 → agent 答出
+杀前已确立的信息,**全程无客户端重放**;`/clear` → 答不出;容器重建 → 新对话,
+链上记忆完好。
