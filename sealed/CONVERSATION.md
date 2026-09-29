@@ -166,7 +166,11 @@ Still owed before this is DONE done: the T2 live drill — kill the framework
 process mid-conversation on each framework → restart → the agent answers a
 question established before the kill with NO client replay; `/clear` → it no
 longer can; container recreate → fresh conversation, chain memory intact —
-which needs the four images rebuilt. One openclaw-specific check belongs on
+which needs the four images rebuilt. Per the #169 review, the drill must
+restart the SAME conversation TWICE per framework (the dsh end-seed hole only
+bit on the second restart — one restart proves nothing) and must assert the
+openclaw history read stays confined (a poisoned `sessions.json` sessionFile
+is refused in the log, history degrades to empty, the turn survives). One openclaw-specific check belongs on
 that drill and CANNOT be settled statically: verify the transcript already
 contains turn N when turn N+1 is asked (openclaw persists inside the turn
 pipeline per its source, but if persistence ever lagged the response, our

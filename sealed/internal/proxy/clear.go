@@ -8,6 +8,11 @@
 // This clears WORKING CONTEXT only: the chain-tracked memory roles — the
 // durable knowledge — are untouched, which is exactly the difference between
 // /clear and a container reset.
+//
+// Replay posture (review #169 item 8): the signed message carries no nonce,
+// so a captured clear is replayable within the auth window — deliberately
+// accepted because a replayed clear is IDEMPOTENT (the store is already
+// gone), matching the settings route's posture.
 package proxy
 
 import (
