@@ -64,6 +64,18 @@ the onboarding-facing copy.
    cannot cover (a container recreate where the owner wants continuity
    anyway), and may be retired entirely once that case is judged not worth
    keeping.
+7. **The file is bounded — the adapter self-rotates it.** The persisted
+   conversation is append-only (invariant below and §4), so a file grows
+   until it is rotated. It MUST be rotated at a size ceiling: the sandbox has
+   a hard 18 GB disk cap (the transfer-zombie incident was disk pressure, not
+   sandbox state), so an unbounded file is a real fill-the-disk risk, not a
+   theoretical one. Rotation cuts at the most recent compaction point — the
+   natural safe boundary, since the live context is rebuilt from there — and
+   discards what precedes it (git-gc shape). This is the adapter's obligation
+   (§3), not the platform's, and it is a REQUIREMENT, not "someday": "plain
+   text grows slowly" is not a bound. Whole-disk pressure across many agents
+   is a sandbox-layer quota/eviction concern, not this file's job — but this
+   file must not be the culprit, and self-rotation is how it stays innocent.
 
 ## 3. The interface (what lands in `framework.Framework`)
 
@@ -78,7 +90,11 @@ adapter (the `RenderSettings` pattern):
 - **`ConversationPath() string`** (declaration, may be empty for adapters
   whose conversation is client-held): the platform asserts at boot that the
   path is outside every declared role. No other platform code touches the
-  file.
+  file. The adapter owns the file's SIZE too: it must self-rotate at a
+  ceiling (cut at the latest compaction point, discard older — see invariant
+  7), because the 18 GB sandbox cap makes an unbounded append-only file a
+  real disk-fill risk. The platform does not rotate it (it never reads the
+  file); it only validates the path.
 - **`Start` doc contract**: "if your framework persists a conversation, Start
   must resume it" — a semantic requirement on the existing method, not a new
   one.
@@ -118,7 +134,12 @@ Two source-verified traps recorded so nobody re-trips them:
 - **No multi-session, no session selector, no `previous_response_id`
   addressing** — invariant 2.
 - **No platform compaction/summarization** — the harness's own compaction
-  handles length; the platform never parses the conversation.
+  handles the MODEL CONTEXT length (it appends a `compaction` entry and moves
+  the leaf forward; the file keeps the pre-compaction entries so nothing is
+  destructively lost and a branch can still reach them). This is why the file
+  only grows *between rotations* — "only grows" is never unbounded: the
+  adapter rotates it at a ceiling (invariant 7 / §3). The platform never
+  parses the conversation and never rotates it.
 - **No cross-machine/client sync** — the file is per-container; clients hold
   nothing, so there is nothing to sync. A client that wants to *display*
   scrollback keeps its own screen buffer; that is UI, not state.
