@@ -189,9 +189,16 @@ async function buildSession() {
 	const sessionManager = CONVERSATION_FILE
 		? openConversation(SessionManager, CONVERSATION_FILE, log)
 		: SessionManager.inMemory(process.cwd());
+	const restoredEntries = CONVERSATION_FILE ? (sessionManager.getEntries?.().length ?? 0) : 0;
+	// The client-replay fallback stays armed until the store has actually
+	// restored something: a quarantined/archived store (corrupt file, stub,
+	// ceiling) is precisely "disk could not cover it" — invariant 6 — and
+	// gating replay on the mere PRESENCE of persistence would turn those
+	// recoveries into silent amnesia the old path used to survive.
+	if (restoredEntries > 0) storeRestored = true;
 	log(
 		CONVERSATION_FILE
-			? `conversation store: ${CONVERSATION_FILE} (${sessionManager.getEntries?.().length ?? 0} entries restored)`
+			? `conversation store: ${CONVERSATION_FILE} (${restoredEntries} entries restored)`
 			: "conversation store: in-memory (SEAL_CONVERSATION_FILE unset)",
 	);
 	const { session } = await createAgentSession({
@@ -571,15 +578,16 @@ function lastUserText(messages) {
 // reconstructed, but the conversation continues instead of restarting.
 const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
 let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false; // true when the persistent store supplied history
 
 function restoreTranscript(messages) {
-	// With a persistent conversation store the harness restores its OWN history
-	// from disk (SessionManager.open), so replaying the client's copy would
-	// DOUBLE the history. The client-replay path is the fallback for the
-	// no-persistence case only (CONVERSATION.md invariant 6). A container
-	// recreate — the one case disk cannot cover — starts an empty file, so if
-	// continuity across a recreate is ever wanted this is where it would return.
-	if (CONVERSATION_FILE) return "";
+	// When the persistent store RESTORED history this boot, replaying the
+	// client's copy would DOUBLE it — but when the store came up empty
+	// (fresh agent, quarantined/archived file, container recreate), the
+	// client's copy is the only continuity left and refusing it would be
+	// silent amnesia (CONVERSATION.md invariant 6: replay is the fallback
+	// for exactly the cases disk could not cover).
+	if (storeRestored) return "";
 	if (sessionSeeded || !Array.isArray(messages)) return "";
 	let lastUser = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {

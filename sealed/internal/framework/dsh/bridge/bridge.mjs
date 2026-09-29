@@ -248,6 +248,7 @@ async function boot() {
   // path. No file / unusable file → fresh conversation, exactly as before.
   const sdkCodecs = { decodeStorageRecord, interruptedTurnClosers, packChunkRuns }
   const seed = CONVERSATION_FILE ? loadSeed(CONVERSATION_FILE, sdkCodecs, log) : null
+  if (seed && seed.length) storeRestored = true
   const handle = await ctx.agents.create({
     sessionId: SessionId('owner-chat'),
     meta: { cwd: DSH_HOME, ...(seed ? { seedLength: seed.length } : {}) },
@@ -579,13 +580,14 @@ function lastUserText(messages) {
 // reconstructed, but the conversation continues instead of restarting.
 const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
 let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false // true when the persistent store seeded this boot
 
 function restoreTranscript(messages) {
-  // With the persistent store the session is seeded from DISK at create();
-  // replaying the client's copy on top would double the history. Client
-  // replay survives only as the no-persistence fallback (CONVERSATION.md
-  // invariant 6).
-  if (CONVERSATION_FILE) return "";
+  // When the store SEEDED this boot, replaying the client's copy on top
+  // would double the history — but an empty/quarantined/archived store is
+  // exactly "disk could not cover it" (CONVERSATION.md invariant 6), and
+  // there the client's copy is the only continuity left.
+  if (storeRestored) return "";
   if (sessionSeeded || !Array.isArray(messages)) return "";
   let lastUser = -1;
   for (let i = messages.length - 1; i >= 0; i--) {

@@ -50,14 +50,19 @@ onboarding copy.
 5. **`/clear`: wipe it without a recreate.** Owner-signed, the settings-push
    grammar. Fresh conversation; the file is deleted.
 6. **The client stores nothing.** `restoreTranscript()` is demoted to a
-   best-effort fallback for the one case disk cannot cover (a recreate where
-   the owner wants continuity anyway), and may be retired.
+   best-effort fallback for exactly the cases disk could not cover: a
+   container recreate, AND any boot where the store restored nothing (fresh,
+   quarantined, archived) — the gate keys on "the store actually restored
+   history this boot", not on persistence being configured.
 7. **The file is bounded — the framework's encapsulation self-rotates it.**
    The store is append-only, so it grows until rotated, and disk is finite and
    shared across several agents on a runner — an unbounded file is a real
    disk-fill risk, not theoretical. Rotate at the latest compaction point (the
    safe boundary — live context rebuilds from there), discard older (git-gc
-   shape). A REQUIREMENT, not "someday".
+   shape). A REQUIREMENT, not "someday". Rotation runs at OPEN (boot) — a
+   file cannot be rewritten under a live writer — so a single marathon boot
+   grows until its next restart; with restarts as frequent as settings pushes
+   make them, the ceiling is enforced often in practice.
 
 ## 3. The architecture: a generic proxy, per-framework encapsulation
 
