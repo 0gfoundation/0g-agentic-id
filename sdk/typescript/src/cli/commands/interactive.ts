@@ -1219,7 +1219,15 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
         const r = await ag.agent.pushSettingsToContainer(serveBase, agentId, next);
         out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
-        out(`written — version ${written}; stored, but the running container did not take it (${(e2 as Error).message}) — it applies on the next boot\n`);
+        const msg = (e2 as Error).message;
+        // A container that ANSWERED and refused (HTTP status) will refuse the
+        // same document on the next boot too and fall back to last-known-good;
+        // only an UNREACHABLE container (no HTTP status) applies it next boot.
+        if (/HTTP \d/.test(msg)) {
+          out(`written — version ${written}; stored, but the running container REFUSED it (${msg}) — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts\n`);
+        } else {
+          out(`written — version ${written}; stored, but the running container was unreachable (${msg}) — it applies on the next boot\n`);
+        }
       }
     } else {
       out(`written — version ${written}; the container applies it at its next boot (reset applies it now)\n`);

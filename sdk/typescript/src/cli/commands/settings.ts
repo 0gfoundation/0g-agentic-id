@@ -119,6 +119,12 @@ export async function run(ctx: CommandContext): Promise<void> {
   // saved and the next boot reads it, so reporting the write as failed would
   // be wrong and would tempt the owner into writing it again.
   let applied: string | undefined;
+  // A REJECTION (the container answered and refused to render this document)
+  // is not the same as an UNREACHABLE container: the latter applies on the
+  // next boot, the former will refuse identically on the next boot too and
+  // the agent stays on its last-known-good. Telling the owner "applies next
+  // boot" for a rejection is a lie that hides an un-bootable document.
+  let rejected = false;
   const base = await runningServeBase(ctx.env.attestorUrl, sealId);
   if (base) {
     const agentId = await ag.agent.getAgentIdBySealId(sealId);
@@ -128,23 +134,30 @@ export async function run(ctx: CommandContext): Promise<void> {
         applied = r.note ?? 'applied to the running container';
       })
       .catch((e: unknown) => {
-        const w = `stored, but the running container did not take it: ${
-          e instanceof Error ? e.message : String(e)
-        } — it will apply on the next boot`;
+        const msg = e instanceof Error ? e.message : String(e);
+        // pushSettingsToContainer throws `… HTTP <n>: …` when the container
+        // ANSWERED and refused; a bare fetch failure (no HTTP status) means
+        // it was unreachable.
+        rejected = /HTTP \d/.test(msg);
+        const w = rejected
+          ? `stored, but the running container REFUSED it: ${msg} — a refused document does not boot, so the agent keeps its current configuration until you store one it accepts (e.g. an openai-format model for hermes)`
+          : `stored, but the running container was unreachable: ${msg} — it applies on the next boot`;
         warnings.push(w);
         note(`warning: ${w}`);
       });
   }
 
   if (ctx.json) {
-    emitOk({ sealId, settings: next, version: written.version, warnings, applied: applied ?? null });
+    emitOk({ sealId, settings: next, version: written.version, warnings, applied: applied ?? null, rejected });
     return;
   }
   for (const line of renderSettings(next)) print(line);
   note(
     applied
       ? `written — version ${written.version}; ${applied}`
-      : `written — version ${written.version}. The container applies it on its next boot.`,
+      : rejected
+        ? `written — version ${written.version}, but the running container refused it (see the warning above); it will not boot as-is.`
+        : `written — version ${written.version}. The container applies it on its next boot.`,
   );
 }
 
