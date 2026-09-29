@@ -189,13 +189,26 @@ async function buildSession() {
 	const sessionManager = CONVERSATION_FILE
 		? openConversation(SessionManager, CONVERSATION_FILE, log)
 		: SessionManager.inMemory(process.cwd());
-	const restoredEntries = CONVERSATION_FILE ? (sessionManager.getEntries?.().length ?? 0) : 0;
 	// The client-replay fallback stays armed until the store has actually
 	// restored something: a quarantined/archived store (corrupt file, stub,
 	// ceiling) is precisely "disk could not cover it" — invariant 6 — and
 	// gating replay on the mere PRESENCE of persistence would turn those
 	// recoveries into silent amnesia the old path used to survive.
-	if (restoredEntries > 0) storeRestored = true;
+	// getEntries missing (an SDK rename) must be LOUD and pick the
+	// conservative side — assume restored, keep replay off: doubling a
+	// restored conversation is the failure this gate exists to prevent,
+	// while the cost of the assumption on a genuinely fresh store is nil
+	// (a fresh client has nothing to replay).
+	let restoredEntries = 0;
+	if (CONVERSATION_FILE) {
+		if (typeof sessionManager.getEntries === "function") {
+			restoredEntries = sessionManager.getEntries().length;
+			if (restoredEntries > 0) storeRestored = true;
+		} else {
+			log("WARN: SessionManager.getEntries missing (SDK surface changed) — assuming the store restored history; client replay stays off");
+			storeRestored = true;
+		}
+	}
 	log(
 		CONVERSATION_FILE
 			? `conversation store: ${CONVERSATION_FILE} (${restoredEntries} entries restored)`

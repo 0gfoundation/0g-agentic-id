@@ -85,6 +85,14 @@ synth 层**保留**,但只剩共享的 responses 协议外壳(SSE/续传/环);�
 - dsh 事件文法:`user/message` 的 data **就是**消息本体(不包 `{message:}`),
   surface 事件**必须**带 `surfaceOp` 标记,消息必须有 id——`Session.fromRestore`
   三样都校验,这正是存储冒烟要驱动真校验器、不用仿制品的原因。
+- dsh 的 Session **构造器**在 seed 未以 `session/end-seed` 结尾时,会在
+  `seq = seed.length` 处自行追加该标记——且从不发布到 `session/event`,firehose
+  持久器收不到,**第二次重启**就撞连续性校验砖死(评审 #169 blocker,跨代实证)。
+  `loadSeed` 预先把标记同时写入文件和返回的 seed,构造器便不再追加。
+- openclaw 的 `sessions.json` 是 **agent 可写的**(privsep 把 openclawHome 交给
+  框架用户),所以它命名的 `sessionFile` 在 root 进程打开前必须被约束在
+  sessionsDir() 内——否则对抗性 agent 可让 root 把任意文件读进它自己的上游请求
+  (评审 #169)。
 - hermes 在压缩时**轮换**会话 id——钉死一个 id 会分叉对话;必须跟随回吐。
 
 ## 5. 刻意不做的

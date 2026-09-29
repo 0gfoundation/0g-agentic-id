@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"seal-verify/internal/framework"
+	"seal-verify/internal/logger"
 )
 
 // openclaw persists every gateway turn to a per-session JSONL transcript
@@ -87,6 +88,15 @@ type sessionEntry struct {
 // transcriptPathForKey resolves the pinned key to its transcript file via
 // openclaw's own sessions.json. Empty when the key has no session yet (first
 // turn ever) — that is data, not an error.
+//
+// SECURITY (review #169): sessions.json lives under openclawHome, the tree
+// privsep hands to the de-privileged framework user — i.e. the agent mind can
+// rewrite it. This function runs in the ROOT sealed process and what it reads
+// is piped into the next upstream request body, so a verbatim `sessionFile`
+// would let an adversarial agent point root at any file and read its bytes
+// back across the exact boundary privsep exists to hold. Every candidate is
+// therefore CONTAINED to sessionsDir(); a violation logs and degrades to
+// empty history, never fails the turn.
 func transcriptPathForKey(key string) (string, error) {
 	raw, err := os.ReadFile(sessionsStorePath())
 	if os.IsNotExist(err) {
@@ -104,12 +114,36 @@ func transcriptPathForKey(key string) (string, error) {
 		return "", nil
 	}
 	if entry.SessionFile != "" {
-		return entry.SessionFile, nil
+		if p := containedTranscriptPath(entry.SessionFile); p != "" {
+			return p, nil
+		}
+		logger.Logf("openclaw conversation: sessions.json names a transcript OUTSIDE %s (%q) — refusing it (agent-writable store; see conversation.go)", sessionsDir(), entry.SessionFile)
+		// fall through to the SessionID construction
 	}
 	if entry.SessionID == "" {
 		return "", nil
 	}
+	if strings.ContainsAny(entry.SessionID, "/\\") || strings.Contains(entry.SessionID, "..") {
+		logger.Logf("openclaw conversation: sessions.json sessionId %q is path-shaped — refusing it", entry.SessionID)
+		return "", nil
+	}
 	return filepath.Join(sessionsDir(), entry.SessionID+".jsonl"), nil
+}
+
+// containedTranscriptPath returns the cleaned path when it resolves INSIDE
+// sessionsDir(), else "".
+func containedTranscriptPath(candidate string) string {
+	p := filepath.Clean(candidate)
+	if !filepath.IsAbs(p) {
+		// The v3 store has been observed with absolute paths; a relative one
+		// would resolve against the sealed process's cwd — wrong either way.
+		p = filepath.Join(sessionsDir(), p)
+	}
+	rel, err := filepath.Rel(sessionsDir(), p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return p
 }
 
 // ConversationHistory implements framework.ConversationHistory: prior turns
@@ -156,6 +190,12 @@ func (a *Adapter) ConversationHistory(_ context.Context) ([]framework.Conversati
 		if text := contentText(rec.Message.Content); text != "" {
 			turns = append(turns, framework.ConversationTurn{Role: rec.Message.Role, Text: text})
 		}
+	}
+	if err := sc.Err(); err != nil {
+		// A mid-file scanner failure (or a single line past the buffer cap)
+		// would otherwise truncate history with no trace — CONVERSATION.md
+		// promises loud degradation.
+		logger.Logf("openclaw conversation: transcript read stopped early (%v) — history truncated at %d turns", err, len(turns))
 	}
 	return turns, nil
 }

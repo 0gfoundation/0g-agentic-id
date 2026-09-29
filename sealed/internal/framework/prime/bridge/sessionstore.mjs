@@ -17,9 +17,27 @@
 // can drive it with the real SDK extracted from the image without a global
 // install of `prime-agent`.
 
-import { readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 export const ROTATE_BYTES = Number(process.env.SEAL_CONVERSATION_ROTATE_BYTES || 8 * 1024 * 1024);
+
+// Quarantine keeps only the most recent leftover PER REASON — otherwise
+// .corrupt-*/.stale-* siblings accumulate with conversation volume on a
+// runner's shared disk (review #169), the very risk invariant 7 caps.
+function quarantine(file, why, log) {
+	try {
+		const dir = dirname(file);
+		const prefix = basename(file) + "." + why + "-";
+		for (const name of readdirSync(dir)) {
+			if (name.startsWith(prefix)) rmSync(join(dir, name), { force: true });
+		}
+	} catch { /* pruning is best-effort */ }
+	try {
+		renameSync(file, `${file}.${why}-${Date.now()}`);
+		log(`conversation store quarantined (${why})`);
+	} catch { /* nothing to move */ }
+}
 
 /**
  * Cut the file at its latest compaction entry: keep the header line, the
@@ -59,14 +77,14 @@ export function openConversation(SessionManager, file, log = () => {}) {
 		const first = readFileSync(file, "utf8").split("\n", 1)[0];
 		if (first && JSON.parse(first).type !== "session") {
 			log("conversation store has no session header (a truncated stub) — quarantining and starting fresh");
-			renameSync(file, `${file}.stale-${Date.now()}`);
+			quarantine(file, "stale", log);
 		}
 	} catch { /* absent or unparsable first line — open()/quarantine below decide */ }
 	try {
 		return SessionManager.open(file);
 	} catch (e) {
 		log(`conversation store unreadable (${(e && e.message) || e}) — quarantining and starting fresh`);
-		try { renameSync(file, `${file}.corrupt-${Date.now()}`); } catch { /* best effort */ }
+		quarantine(file, "corrupt", log);
 		return SessionManager.open(file);
 	}
 }

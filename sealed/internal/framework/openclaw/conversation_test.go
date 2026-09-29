@@ -111,3 +111,39 @@ func TestClearSession_RotatesKeyAndRemovesTranscript(t *testing.T) {
 		t.Fatalf("after clear the conversation is fresh: %v %v", turns, err)
 	}
 }
+
+// sessions.json is agent-writable (privsep hands openclawHome to the framework
+// user), so a sessionFile it names must never walk the root-running adapter
+// out of sessionsDir() — that read is piped into the next upstream body.
+func TestTranscriptPath_ContainsAgentWritableStore(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	key := a.ConversationHeaders()[sessionKeyHeader]
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		entry sessionEntry
+		want  string // "" = refused/empty
+	}{
+		{"absolute escape", sessionEntry{SessionFile: "/etc/shadow"}, ""},
+		{"dotdot escape", sessionEntry{SessionFile: sessionsDir() + "/../../../etc/shadow"}, ""},
+		{"path-shaped id", sessionEntry{SessionID: "../../etc/passwd"}, ""},
+		{"legit absolute", sessionEntry{SessionFile: sessionsDir() + "/ok.jsonl"}, sessionsDir() + "/ok.jsonl"},
+		{"legit id", sessionEntry{SessionID: "sess-9"}, sessionsDir() + "/sess-9.jsonl"},
+	}
+	for _, c := range cases {
+		raw, _ := json.Marshal(map[string]sessionEntry{key: c.entry})
+		if err := os.WriteFile(sessionsStorePath(), raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		got, err := transcriptPathForKey(key)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Fatalf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}

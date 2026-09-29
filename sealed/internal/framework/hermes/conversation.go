@@ -1,6 +1,8 @@
 package hermes
 
 import (
+	"seal-verify/internal/logger"
+
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -44,7 +46,12 @@ func currentConversationID() string {
 		}
 	}
 	id := mintConversationID()
-	_ = os.WriteFile(conversationIDPath(), []byte(id), 0o600)
+	if err := os.WriteFile(conversationIDPath(), []byte(id), 0o600); err != nil {
+		// Still never fail the turn — but an unwritable id file means EVERY
+		// turn mints a fresh id (a new hermes conversation each time,
+		// invariant 1 silently broken). Say so.
+		logger.Logf("hermes conversation: cannot persist the session id (%v) — each turn will start a NEW conversation until this is fixed", err)
+	}
 	return id
 }
 
@@ -83,7 +90,9 @@ func (a *Adapter) ObserveConversation(h http.Header) {
 	if b, err := os.ReadFile(conversationIDPath()); err == nil && strings.TrimSpace(string(b)) == echoed {
 		return
 	}
-	_ = os.WriteFile(conversationIDPath(), []byte(echoed), 0o600)
+	if err := os.WriteFile(conversationIDPath(), []byte(echoed), 0o600); err != nil {
+		logger.Logf("hermes conversation: cannot persist the rotated session id (%v) — the next boot will resume the pre-compaction parent", err)
+	}
 }
 
 // ClearSession implements framework.SessionClearer: minting a fresh id IS the

@@ -23,11 +23,22 @@
 // Dependency-injected (the SDK fns are passed in) so tests drive it with the
 // real @deepseek-ai packages extracted from the image.
 
-import { appendFileSync, readFileSync, renameSync, statSync } from "node:fs";
+import { appendFileSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 
 export const ROTATE_BYTES = Number(process.env.SEAL_CONVERSATION_ROTATE_BYTES || 8 * 1024 * 1024);
 
 function archive(file, why, log) {
+	// Keep only the most recent archive PER REASON: leftovers otherwise
+	// accumulate with conversation volume, unbounded, on a runner's shared
+	// disk (review #169) — the very risk invariant 7 exists to cap.
+	try {
+		const dir = dirname(file);
+		const prefix = basename(file) + "." + why + "-";
+		for (const name of readdirSync(dir)) {
+			if (name.startsWith(prefix)) rmSync(join(dir, name), { force: true });
+		}
+	} catch { /* pruning is best-effort */ }
 	try {
 		renameSync(file, `${file}.${why}-${Date.now()}`);
 		log(`conversation store archived (${why})`);
@@ -71,6 +82,22 @@ export function loadSeed(file, sdk, log = () => {}) {
 			log(`repairing an interrupted turn: ${closers.length} synthetic closer(s)`);
 			for (const e of closers) appendEvent(file, e, sdk, log); // balance the file too
 			events.push(...closers);
+		}
+		// Seed-marker hole (review #169 blocker, reproduced against the real
+		// SDK): when a Session is constructed with a seed that does not end in
+		// session/end-seed, the CONSTRUCTOR appends that marker at
+		// seq = seed.length — and it is never published on session/event, so
+		// the firehose appender cannot persist it. The file then carries
+		// 0..n-1, (hole at n), n+1.. and the NEXT boot's create({seed}) trips
+		// the contiguous-from-zero validator: the first restart works, the
+		// second bricks. Pre-mark the seed ourselves — to BOTH the file and
+		// the returned seed — so the constructor finds it already marked and
+		// appends nothing; every later live event stays contiguous.
+		const last = events[events.length - 1];
+		if (last.type !== "session/end-seed") {
+			const marker = { type: "session/end-seed", seq: events.length, time: last.time, data: {} };
+			appendEvent(file, marker, sdk, log);
+			events.push(marker);
 		}
 		log(`conversation restored from disk: ${events.length} events`);
 		return events;

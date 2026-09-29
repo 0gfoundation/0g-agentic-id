@@ -120,6 +120,17 @@ Source-verified traps, recorded:
   wrapped), surface events REQUIRE a `surfaceOp` marker, and messages must be
   identified (id'd) — `Session.fromRestore` validates all three, which is why
   the store smoke drives the real validator, not a lookalike.
+- dsh's Session CONSTRUCTOR appends a `session/end-seed` marker at
+  `seq = seed.length` when the seed does not already end with one — and never
+  publishes it on `session/event`, so a firehose persister misses it and the
+  SECOND restart bricks on the contiguity validator (review #169 blocker,
+  reproduced across generations). `loadSeed` pre-marks the seed to both the
+  file and the return value, so the constructor appends nothing.
+- openclaw's `sessions.json` is AGENT-writable (privsep hands openclawHome to
+  the framework user), so a `sessionFile` it names is contained to
+  sessionsDir() before the root-running adapter opens it — otherwise an
+  adversarial agent could read any root file into its own upstream request
+  (review #169).
 - hermes ROTATES the session id at compaction — a pinned id forks the
   conversation; the echo must be followed.
 
