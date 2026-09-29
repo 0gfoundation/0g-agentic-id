@@ -66,10 +66,10 @@ the onboarding-facing copy.
    keeping.
 7. **The file is bounded — the adapter self-rotates it.** The persisted
    conversation is append-only (invariant below and §4), so a file grows
-   until it is rotated. It MUST be rotated at a size ceiling: the sandbox has
-   a hard 18 GB disk cap (the transfer-zombie incident was disk pressure, not
-   sandbox state), so an unbounded file is a real fill-the-disk risk, not a
-   theoretical one. Rotation cuts at the most recent compaction point — the
+   until it is rotated. It MUST be rotated at a size ceiling: disk is finite and a
+   runner packs several agents onto one shared disk (~4 per runner in
+   practice; the transfer-zombie incident was disk pressure), so an unbounded
+   append-only file is a real fill-the-disk risk, not a theoretical one. Rotation cuts at the most recent compaction point — the
    natural safe boundary, since the live context is rebuilt from there — and
    discards what precedes it (git-gc shape). This is the adapter's obligation
    (§3), not the platform's, and it is a REQUIREMENT, not "someday": "plain
@@ -92,8 +92,8 @@ adapter (the `RenderSettings` pattern):
   path is outside every declared role. No other platform code touches the
   file. The adapter owns the file's SIZE too: it must self-rotate at a
   ceiling (cut at the latest compaction point, discard older — see invariant
-  7), because the 18 GB sandbox cap makes an unbounded append-only file a
-  real disk-fill risk. The platform does not rotate it (it never reads the
+  7), because an unbounded append-only file on a runner's shared, finite disk
+  is a real disk-fill risk. The platform does not rotate it (it never reads the
   file); it only validates the path.
 - **`Start` doc contract**: "if your framework persists a conversation, Start
   must resume it" — a semantic requirement on the existing method, not a new
