@@ -14,8 +14,9 @@
  */
 
 import * as readline from 'node:readline';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { SDK_VERSION } from '../../constants';
 import { parseEther, keccak256, toBytes, hexToBytes, concat, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
@@ -48,9 +49,8 @@ const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()
  *  render different lines from different sources — same wallet, two answers).
  *  prepaid = the chain number; AVAILABLE = the provider's effective view and
  *  is ALWAYS shown ("couldn't check" ≠ "nothing owed"). */
-async function moneyBlock(ag: AgenticID, prepaidWei: bigint | null): Promise<void> {
-  let effErr: string | null = null;
-  const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
+type EffBalance = Awaited<ReturnType<AgenticID['getEffectiveBalance']>>;
+function moneyBlock(prepaidWei: bigint | null, eff: EffBalance | null, effErr: string | null): void {
   out(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
   if (eff && eff.availableWei < eff.balanceWei) {
     if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
@@ -82,7 +82,7 @@ async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
       };
       const latest = cfg.cli_latest?.trim();
       if (!latest) return;
-      const mine = cliVersion();
+      const mine = SDK_VERSION;
       if (compareVersions(mine, latest) >= 0) return;
       // once per (day, latest)
       const stamp = join(configPaths().dir, 'update-hint.json');
@@ -92,7 +92,15 @@ async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
         if (prev.day === today && prev.latest === latest) return;
       } catch { /* first time */ }
       if (!updateHintWindowOpen) return; // banner already closed — stay silent
-      try { writeFileSync(stamp, JSON.stringify({ day: today, latest })); } catch { /* hint anyway */ }
+      // Create the config dir first: a user whose attestorUrl comes from
+      // AGENTIC_* env has never hit a write path, so the dir may not exist —
+      // without this the stamp write ENOENTs, the once-a-day guard never
+      // records, and the hint nags every start (review #170). Don't swallow
+      // silently either.
+      try {
+        mkdirSync(configPaths().dir, { recursive: true });
+        writeFileSync(stamp, JSON.stringify({ day: today, latest }));
+      } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
       out(`\n  update available: ${mine} → ${latest}   npm i -g @0gfoundation/0g-agenticid-sdk\n`);
       if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
     } catch { /* a down attestor never blocks or complains here */ }
@@ -113,15 +121,6 @@ export function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-let cachedCliVersion = '';
-function cliVersion(): string {
-  if (!cachedCliVersion) {
-    try {
-      cachedCliVersion = (JSON.parse(readFileSync(join(__dirname, '..', '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
-    } catch { cachedCliVersion = '0.0.0'; }
-  }
-  return cachedCliVersion;
-}
 
 /** Short environment marker for prompts/errors: the attestor's hostname.
  *  Exported for tests. */
@@ -722,16 +721,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        const [est, rows, detail] = await Promise.all([
+        let effErr: string | null = null;
+        const [est, rows, detail, eff] = await Promise.all([
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
+          ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
         rememberAgentIds(rows);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
-        await moneyBlock(ag, est.prepaidBalanceWei);
+        moneyBlock(est.prepaidBalanceWei, eff, effErr);
         if (detail && detail.pendingRefund > 0n) {
           out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
@@ -1923,9 +1924,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with the account-level prepaid alongside for context. The provider's
         // effective view (debt/queued fees) rides along when it says less is
         // spendable than the chain shows — same lines as the L1 `balance`.
-        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
+        let effErr: string | null = null;
+        const [rc, eff] = await Promise.all([
+          s.ag.agent.runtimeCosts(BigInt(s.agentId)),
+          s.ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
+        ]);
         out(`agentSeal gas   : ${og(rc.sealGasWei)}  (${s.agentSeal ?? '?'})\n`);
-        await moneyBlock(s.ag, rc.prepaidBalanceWei);
+        moneyBlock(rc.prepaidBalanceWei, eff, effErr);
         out('top up this agent with /topup [amount OG] · account-level details: `balance` in the manager\n');
         continue;
       }
@@ -2266,7 +2271,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             out(`reclaim failed: ${(e as Error).message}\n`);
           }
         }
-        out(`left the session — \`use ${s.agentId}\` re-enters\n`);
+        out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
         return;
       }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
