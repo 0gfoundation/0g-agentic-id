@@ -632,29 +632,28 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     out('│   0G AgenticID — interactive shell   │\n');
     out('╰──────────────────────────────────────╯\n\n');
   }
-  // Ack read and the update hint both read the attestor; run them CONCURRENTLY
-  // under ONE 4s ceiling (they were sequential — 8s worst case on a hanging
-  // attestor, and two /config fetches). A hanging (vs refusing) attestor must
-  // not stall the banner either way.
+  // Ack read and the update hint both hit the attestor; they start before the
+  // first await and share ONE wall-clock ceiling (sequential races cost 8s on
+  // a hanging attestor). The hint keeps its OWN /config fetch by design — it
+  // must work for a keyless user too, where no wallet client exists to share
+  // one. A hanging (vs refusing) attestor must not stall the banner.
   let ack = '';
-  if (key && ctx.env.attestorUrl) {
-    updateHintWindowOpen = true;
+  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  {
     const started = Date.now();
-    // Both hit the attestor; start them BEFORE the first await so they run
-    // concurrently under ONE ~4s ceiling (they were sequential — 8s worst
-    // case — and did two /config fetches).
-    const readAck = withWallet(ctx)
-      .then((ag) => ag.ackStatus())
-      .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
-      .catch(() => '(unreachable)');
+    const readAck = key && ctx.env.attestorUrl
+      ? withWallet(ctx)
+          .then((ag) => ag.ackStatus())
+          .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
+          .catch(() => '(unreachable)')
+      : Promise.resolve('');
+    // The hint is NOT key-gated: a pre-login user with an attestor configured
+    // is exactly who may need the newer CLI.
     const hintDone = maybePrintUpdateHint(ctx.env.attestorUrl).catch(() => {});
-    out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
     ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
     const left = Math.max(0, 4000 - (Date.now() - started));
     await Promise.race([hintDone, new Promise<void>((r) => setTimeout(r, left).unref())]);
     updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
-  } else {
-    out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
   }
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
