@@ -715,6 +715,17 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           catch (e) { out(`api key not saved: ${(e as Error).message}\n`); }
         }
         out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
+        // Re-seed the startup-time caches that were filled from the OLD
+        // attestor: without this, Tab completion keeps offering the previous
+        // environment's agent ids and model names until the next `list`
+        // (same root cause as the prompt marker — a login mid-session leaves
+        // startup-seeded state stale). Best-effort, completion-only.
+        if (url && ctx.env.privateKey) {
+          withWallet(ctx).then((ag) => {
+            ag.agent.listMyDeployments().then(rememberAgentIds).catch(() => { /* completions only */ });
+            prefetchModelIds(ag);
+          }).catch(() => { /* completions only */ });
+        }
         continue;
       }
 
