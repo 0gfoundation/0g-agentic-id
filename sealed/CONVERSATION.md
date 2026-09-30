@@ -66,22 +66,37 @@ onboarding copy.
 
 ## 3. The architecture: a generic proxy, per-framework encapsulation
 
-As designed, all framework-specific conversation knowledge lives in each
-framework's own encapsulation; the shared proxy never branches on a framework
-name. The DELIVERY of that principle was refined during implementation (the
-original sketch said "a new openclaw shim process, then delete the synth
-layer"): instead of a second process per framework, the proxy's stateful door
-asks the adapter through THREE optional capabilities — the `RenderSettings`
-pattern — and each adapter answers in its own dialect, inside its own package.
-Same ownership outcome (zero framework knowledge in shared code), one process
-fewer. The synth layer REMAINS, but only as the shared responses-protocol
-shell (SSE/resume/ring); everything framework-specific it used to imply moved
-behind the capabilities:
+All framework-specific conversation knowledge lives in each framework's own
+encapsulation; the shared proxy never branches on a framework name. The
+proxy's stateful door asks the adapter through three optional capabilities —
+the `RenderSettings` pattern — and each adapter answers in its own dialect,
+inside its own package.
+
+**Deviation from the approved design (open).** The approved design had
+hermes declare its gateway's native `/v1/responses`, put openclaw behind a
+request-path shim, and then delete the synth layer. This PR did neither:
+hermes and openclaw still sit behind synth (`internal/proxy/responses.go`,
+since #155), and the first two capabilities below exist to feed it. Synth
+serves any framework that declares no `kind:"responses"` route — today hermes
+and openclaw — by translating `/v1/responses` into the framework's chat API
+and supplying the long-task mechanics (resume via `starting_after`, cancel,
+the event record). Unlike the prime/dsh bridges it does not serialize turns.
+Both gateways do ship a native `/v1/responses` (hermes `api_server.py`;
+openclaw `handleOpenResponsesHttpRequest`, keyed by `x-openclaw-session-key`),
+but neither implements `starting_after` resume. Follow-up, separate PR:
+verify both native doors in a live container (continuity across a restart,
+stream format against the CLI/SDK, disconnect and cancel behavior), then
+forward hermes/openclaw to them and delete synth together with the
+compensations it needs — the hermes id file and its compare-and-swap (§4),
+openclaw's transcript read.
+
+The three capabilities:
 
 - **`framework.ConversationSession`** — the adapter names headers that bind
   each stateful upstream call to the agent's ONE conversation, and observes
-  every upstream response (hermes rotates its session id at compaction; not
-  following the echo forks the conversation).
+  every upstream response together with the headers that turn was sent with
+  (hermes rotates its session id at compaction; not following the echo forks
+  the conversation, and following a stale one resurrects a cleared one).
 - **`framework.ConversationHistory`** — for a framework that PERSISTS a
   transcript its own gateway never reads back (openclaw), the adapter supplies
   prior turns from that store; the stateful door then ignores client-sent
@@ -133,12 +148,18 @@ Source-verified traps, recorded:
   adversarial agent could read any root file into its own upstream request
   (review #169).
 - hermes ROTATES the session id at compaction — a pinned id forks the
-  conversation; the echo must be followed.
+  conversation; the echo must be followed. It is followed by compare-and-swap
+  on the id the turn was SENT with: synth does not serialize turns, so a turn
+  still in flight across a `/clear` (or behind a newer turn's rotation) would
+  otherwise write its stale id back and resurrect the cleared conversation
+  (stale-copy audit, #169).
 
 ## 5. What this deliberately does not do
 
-- **No proxy-held conversation and no `synth` layer** — the proxy is
-  transparent; conversation logic lives in each framework's encapsulation.
+- **No proxy-held conversation, and zero framework knowledge in shared
+  code** — the proxy holds no transcript and never branches on a framework
+  name. It is not yet a pure pass-through: synth survives for frameworks that
+  declare no native door (§3).
 - **No chain storage** — working context, not an asset; durable knowledge
   flows through the memory roles, and a conversation on chain would convey on
   transfer (wrong for private chat).

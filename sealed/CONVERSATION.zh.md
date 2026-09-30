@@ -43,17 +43,29 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
 
 ## 3. 架构:通用 proxy + 各框架自己的封装
 
-按设计,所有框架专属的会话知识都住在各框架自己的封装里;共享 proxy 永不按框架名
-分支。这一原则的**落地方式**在实现中做了精化(最初草案写的是"给 openclaw 新建
-shim 进程、然后删除 synth 层"):不为每个框架再起一个进程,而是让 proxy 的有状态
-门通过**三个可选能力接口**问 adapter——`RenderSettings` 模式——各 adapter 在
-自己的包里用自己的方言作答。所有权结果相同(共享代码里零框架知识),少一个进程。
-synth 层**保留**,但只剩共享的 responses 协议外壳(SSE/续传/环);它曾隐含的所有
-框架专属内容都移到能力接口之后:
+所有框架专属的会话知识都住在各框架自己的封装里;共享 proxy 永不按框架名分支。
+proxy 的有状态门通过三个可选能力接口问 adapter——`RenderSettings` 模式——各
+adapter 在自己的包里用自己的方言作答。
+
+**与已批准设计的偏离(未关闭)。** 已批准的设计是:hermes 声明它网关自带的
+`/v1/responses`,openclaw 放到请求路径上的 shim 后面,然后删除 synth 层。本 PR
+两件都没做:hermes 和 openclaw 仍在 synth 后面(`internal/proxy/responses.go`,
+#155 引入),下面前两个能力接口就是给它用的。synth 服务所有没声明
+`kind:"responses"` 路由的框架——目前是 hermes 和 openclaw——把 `/v1/responses`
+翻译成框架的 chat 接口,并提供长任务机制(`starting_after` 续传、取消、事件记录)。
+和 prime/dsh 的桥不同,它不串行任务。两家网关其实都自带 `/v1/responses`
+(hermes `api_server.py`;openclaw `handleOpenResponsesHttpRequest`,认
+`x-openclaw-session-key`),但都没有实现 `starting_after` 续传。后续(独立 PR):
+先在真容器里验证两扇原生门(重启后能否延续、流格式与 CLI/SDK 是否兼容、断线和
+取消时的行为),再把 hermes/openclaw 改为直接转发过去,并删除 synth 以及它所需的
+补偿机制——hermes 的 id 文件及其比较交换(§4)、openclaw 读 transcript。
+
+三个能力接口:
 
 - **`framework.ConversationSession`** —— adapter 命名把每次有状态上游调用绑定到
-  该 agent 唯一对话的 header,并观察每个上游响应(hermes 在压缩时轮换会话 id;
-  不跟随回吐就会在每次压缩处分叉对话)。
+  该 agent 唯一对话的 header,并连同本轮发出时的 header 一起观察每个上游响应
+  (hermes 在压缩时轮换会话 id;不跟随回吐会分叉对话,跟随了过期的回吐会让已
+  清除的对话复活)。
 - **`framework.ConversationHistory`** —— 框架持久化了 transcript 但它自己的网关
   从不回读(openclaw)时,adapter 从那份存储供给历史;有状态门随即忽略客户端发的
   历史,只取客户端的当前轮。历史读取失败**响亮地**降级为客户端输入——坏存储
@@ -94,12 +106,14 @@ synth 层**保留**,但只剩共享的 responses 协议外壳(SSE/续传/环);�
   sessionsDir() 内,且打开走 `os.OpenRoot`——词法检查拦不住目录**内部**栽的符号链接——否则对抗性 agent 可让 root 把任意文件读进它自己的上游请求
   (评审 #169)。
 - hermes 在压缩时**轮换**会话 id——钉死一个 id 会分叉对话;必须跟随回吐。
+  跟随用的是对本轮**发出时** id 的比较交换:synth 不串行任务,一个跨过 `/clear`
+  (或落在更新一轮的轮换之后)仍在飞的旧轮,否则会把旧 id 写回、让已清除的对话
+  复活(#169 stale-copy 审计)。
 
 ## 5. 刻意不做的
 
-- **proxy 不存对话、共享代码里零框架知识**——synth 层只作为共享的 responses
-  协议外壳存活;一切框架专属事实(header、存储格式、clear 语义)都在三个能力
-  接口之后、各框架自己的包里。
+- **proxy 不存对话、共享代码里零框架知识**——proxy 不持有 transcript,也不按
+  框架名分支。但它还不是纯转发:synth 为没声明原生门的框架保留着(§3)。
 - **不上链**——工作上下文非资产;耐久知识走记忆角色,链上对话还会随转让交接
   (对私人聊天是错的)。
 - **不做多 session、不做选择器、不做 `previous_response_id` 寻址**——不变量 2。
