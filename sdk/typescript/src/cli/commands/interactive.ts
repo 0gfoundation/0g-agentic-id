@@ -99,8 +99,9 @@ async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
   }
 }
 
-/** -1/0/1 numeric dot-compare ("0.1.9" < "0.1.10"). */
-function compareVersions(a: string, b: string): number {
+/** -1/0/1 numeric dot-compare ("0.1.9" < "0.1.10"). Exported for tests —
+ *  a wrong compare either nags forever or never hints. */
+export function compareVersions(a: string, b: string): number {
   // parseInt tolerates suffixes ("7-rc1" → 7); anything unparsable is 0, so a
   // malformed advertised version can never mis-trigger the hint.
   const num = (x: string) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : 0; };
@@ -122,8 +123,9 @@ function cliVersion(): string {
   return cachedCliVersion;
 }
 
-/** Short environment marker for prompts/errors: the attestor's hostname. */
-function hostOf(url?: string): string {
+/** Short environment marker for prompts/errors: the attestor's hostname.
+ *  Exported for tests. */
+export function hostOf(url?: string): string {
   if (!url) return 'unset';
   try { return new URL(url).hostname; } catch { return url.slice(0, 24); }
 }
