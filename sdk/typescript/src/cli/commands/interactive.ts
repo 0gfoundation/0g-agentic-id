@@ -632,25 +632,30 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     out('│   0G AgenticID — interactive shell   │\n');
     out('╰──────────────────────────────────────╯\n\n');
   }
-  // Ack read = /config fetch + chain reads; tolerate a down attestor/RPC so
-  // a dead environment never blocks entering the shell.
+  // Ack read and the update hint both read the attestor; run them CONCURRENTLY
+  // under ONE 4s ceiling (they were sequential — 8s worst case on a hanging
+  // attestor, and two /config fetches). A hanging (vs refusing) attestor must
+  // not stall the banner either way.
   let ack = '';
   if (key && ctx.env.attestorUrl) {
-    const read = withWallet(ctx)
+    updateHintWindowOpen = true;
+    const started = Date.now();
+    // Both hit the attestor; start them BEFORE the first await so they run
+    // concurrently under ONE ~4s ceiling (they were sequential — 8s worst
+    // case — and did two /config fetches).
+    const readAck = withWallet(ctx)
       .then((ag) => ag.ackStatus())
       .then(({ allAcked }) => (allAcked ? 'ok' : 'MISSING — run `ack`'))
       .catch(() => '(unreachable)');
-    // A hanging (vs refusing) attestor must not stall the banner.
-    ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
+    const hintDone = maybePrintUpdateHint(ctx.env.attestorUrl).catch(() => {});
+    out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+    ack = await Promise.race([readAck, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
+    const left = Math.max(0, 4000 - (Date.now() - started));
+    await Promise.race([hintDone, new Promise<void>((r) => setTimeout(r, left).unref())]);
+    updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
+  } else {
+    out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
   }
-  out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  // Bounded like the ack read: the hint prints INSIDE the banner or not at
-  // all — a late async print would land mid-prompt or inside a login question.
-  await Promise.race([
-    maybePrintUpdateHint(ctx.env.attestorUrl),
-    new Promise<void>((r) => setTimeout(r, 4000).unref()),
-  ]);
-  updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
