@@ -310,6 +310,97 @@ func TestSynthInputText(t *testing.T) {
 	}
 }
 
+// With framework.ConversationHistory wired (openclaw), the stateful door
+// takes prior turns from the HARNESS'S OWN STORE and the client's input
+// supplies only the current turn — client-sent history is deliberately
+// ignored (it would double or fork what the store already holds).
+func TestSynthResponses_StoreHistoryReplacesClientHistory(t *testing.T) {
+	var gotMessages atomic.Value
+	up := chatUpstreamCounting(t, 1, 0, nil, &gotMessages)
+	s := &Server{synth: newSynthHub(), adapter: &synthFakeAdapter{token: "tok"}}
+	s.SetConversationHistory(func(context.Context) ([]ConversationTurn, error) {
+		return []ConversationTurn{
+			{Role: "user", Text: "store turn one"},
+			{Role: "assistant", Text: "store reply one"},
+		}, nil
+	})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleSynthResponses(w, r, up.URL)
+	}))
+	t.Cleanup(ts.Close)
+
+	// The client resends ITS OWN (stale) history plus the current turn.
+	input := `[{"role":"user","content":"client stale one"},{"role":"user","content":"current turn"}]`
+	resp, err := synthPost(t, ts.URL+"/v1/responses", "tok", `{"input":`+input+`}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	id := snap["id"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st := synthGetJSON(t, ts.URL+"/v1/responses/"+id)
+		if st["status"] == "completed" || st["status"] == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := gotMessages.Load().(string)
+	for _, want := range []string{"store turn one", "store reply one", "current turn"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("upstream missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "client stale one") {
+		t.Fatalf("client-sent history must be ignored when the store supplies it: %s", got)
+	}
+}
+
+// A history-read failure must degrade to the client's input (a broken store
+// cannot kill the turn), never to an empty context.
+func TestSynthResponses_HistoryFailureFallsBackToClientInput(t *testing.T) {
+	var gotMessages atomic.Value
+	up := chatUpstreamCounting(t, 1, 0, nil, &gotMessages)
+	s := &Server{synth: newSynthHub(), adapter: &synthFakeAdapter{token: "tok"}}
+	s.SetConversationHistory(func(context.Context) ([]ConversationTurn, error) {
+		return nil, fmt.Errorf("store on fire")
+	})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleSynthResponses(w, r, up.URL)
+	}))
+	t.Cleanup(ts.Close)
+
+	input := `[{"role":"user","content":"prior"},{"role":"user","content":"now"}]`
+	resp, err := synthPost(t, ts.URL+"/v1/responses", "tok", `{"input":`+input+`}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	id := snap["id"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st := synthGetJSON(t, ts.URL+"/v1/responses/"+id)
+		if st["status"] == "completed" || st["status"] == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := gotMessages.Load().(string)
+	if !strings.Contains(got, "prior") || !strings.Contains(got, "now") {
+		t.Fatalf("fallback must forward the client's input verbatim: %s", got)
+	}
+}
+
 // The synth layer fronts STATELESS chat surfaces: hermes (and openclaw's
 // per-request runs) reconstruct the conversation from the request body, so
 // the FULL history must be forwarded — forwarding only the last user message

@@ -30,7 +30,7 @@ import (
 // human-facing path and is deliberately unused — it would add a JSONL socket
 // hop and a second process tree for nothing.
 
-//go:embed bridge/bridge.mjs
+//go:embed bridge/bridge.mjs bridge/sessionstore.mjs
 var bridgeFS embed.FS
 
 const (
@@ -100,6 +100,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
 	if err := ensureDir(sessionStateDir()); err != nil {
+		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
+	}
+	// The bridge's SessionManager.open() needs the parent dir to exist.
+	if err := ensureDir(conversationDir()); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
 
@@ -202,15 +206,18 @@ func verifyInstalled(ctx context.Context, version string) error {
 // materializeBridge writes the embedded bridge script to disk. Rewritten on
 // every Start so a sealed upgrade always ships its own bridge.
 func materializeBridge() error {
-	src, err := bridgeFS.ReadFile("bridge/bridge.mjs")
-	if err != nil {
-		return fmt.Errorf("read embedded bridge: %w", err)
-	}
 	if err := ensureDir(bridgeScriptDir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(bridgeScriptPath(), src, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", bridgeScriptPath(), err)
+	for _, name := range []string{"bridge.mjs", "sessionstore.mjs"} {
+		src, err := bridgeFS.ReadFile("bridge/" + name)
+		if err != nil {
+			return fmt.Errorf("read embedded bridge %s: %w", name, err)
+		}
+		dst := filepath.Join(bridgeScriptDir, name)
+		if err := os.WriteFile(dst, src, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
 	}
 	return nil
 }
@@ -313,6 +320,10 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	if privsep.Drop(cmd) {
 		privsep.OwnPath(os.Getenv("HOME"))
 		privsep.OwnTree(primeHome)
+		// The conversation store is OUTSIDE primeHome (off-chain by
+		// construction) and ensureDir created it as root — without this the
+		// de-privileged bridge EACCESes on its very first append.
+		privsep.OwnTree(conversationDir())
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -340,6 +351,10 @@ func (be bridgeEnv) environ(nodePath string) []string {
 		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
 		"SEAL_BRIDGE_TOKEN=" + be.token,
 		"SEAL_AGENT_DOC=" + agentDocPath(),
+		// The harness persists its one conversation here and resumes it on a
+		// process restart (CONVERSATION.md). Off-chain by construction — see
+		// conversationPath. The bridge opens a SessionManager on this file.
+		"SEAL_CONVERSATION_FILE=" + conversationPath(),
 	}
 	if be.provider != "" {
 		env = append(env, "SEAL_MODEL_PROVIDER="+be.provider)

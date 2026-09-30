@@ -100,3 +100,14 @@ func sessionStateDir() string { return "/tmp/prime-session" }
 // and the agent's own rlm.harness.delete_prompt_note cannot touch a channel
 // it does not own.
 func agentDocPath() string { return "/run/seal-agentdoc.md" }
+
+// conversationPath is where the harness persists this agent's ONE conversation
+// (CONVERSATION.md). Deliberately OUTSIDE primeHome — a sibling dir, not under
+// any tracked role — so the watcher never commits it and a transfer never
+// conveys it (off-chain by construction). It is NOT sessionStateDir: that is
+// harness memory/notes pinned under /tmp; this is the message transcript. On
+// the writable layer, so it survives a process restart (settings push, crash)
+// and is cleared by a container recreate — which is exactly the intended
+// lifetime.
+func conversationDir() string  { return "/root/.prime-conversation" }
+func conversationPath() string { return conversationDir() + "/owner-chat.jsonl" }

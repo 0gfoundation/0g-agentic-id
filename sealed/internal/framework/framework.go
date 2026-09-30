@@ -12,6 +12,7 @@
 package framework
 
 import (
+	"net/http"
 	"context"
 	"fmt"
 	"sync"
@@ -304,6 +305,58 @@ type Route struct {
 // forwarded to the upstream and every response is signed.
 type RouteProvider interface {
 	FrameworkRoutes() []Route
+}
+
+// ConversationSession is implemented by adapters whose framework holds the
+// conversation SERVER-SIDE, keyed by a session identity the platform must
+// attach to each stateful upstream call — and follow when the framework
+// rotates it (hermes mints a child session id at every compaction). The
+// caller (the proxy's stateful responses door) stays framework-agnostic: it
+// attaches whatever headers the adapter names and shows the adapter every
+// upstream response. The stateless /v1/chat/completions door never gets these
+// headers — statefulness there would silently change what standard clients
+// see.
+type ConversationSession interface {
+	// ConversationHeaders returns the headers that bind an upstream call to
+	// the agent's ONE conversation (minting the identity on first use).
+	ConversationHeaders() map[string]string
+	// ObserveConversation sees, for one turn, BOTH the headers this turn was
+	// sent with (from ConversationHeaders) and the upstream response's
+	// headers — so a rotated identity can be followed WITHOUT resurrecting a
+	// generation that a concurrent /clear or a later turn has since replaced.
+	// The `sent` map is exactly what ConversationHeaders returned for this
+	// turn; the adapter advances its persisted identity only from that
+	// generation (compare-and-swap), never blindly from the echo.
+	ObserveConversation(sent map[string]string, resp http.Header)
+}
+
+// ConversationTurn is one prior turn of the agent's conversation, in the
+// neutral shape the stateful door assembles upstream requests from.
+type ConversationTurn struct {
+	Role string // "user" | "assistant"
+	Text string
+}
+
+// ConversationHistory is implemented by adapters whose framework PERSISTS a
+// transcript that its own gateway never reads back (openclaw: the OpenAI door
+// takes the client's messages[] as authoritative). The stateful responses
+// door calls this instead of trusting client-sent history: prior turns come
+// from the harness's own store, the client supplies only the current turn.
+// The private on-disk format knowledge stays HERE, in the framework's own
+// package — the caller never parses the store (CONVERSATION.md §3).
+type ConversationHistory interface {
+	ConversationHistory(ctx context.Context) ([]ConversationTurn, error)
+}
+
+// SessionClearer is implemented by adapters whose framework persists the
+// agent's ONE conversation (CONVERSATION.md). ClearSession wipes the persisted
+// store so the NEXT framework start presents a fresh conversation; the caller
+// (main.go's applier) restarts the process after a successful clear, so the
+// wipe takes effect immediately rather than at the next incidental restart.
+// Adapters whose conversation is client-held (no store) simply don't implement
+// this; the proxy answers 501 for them.
+type SessionClearer interface {
+	ClearSession(ctx context.Context) error
 }
 
 // LegacySettingsSeeder is implemented by adapters that can recover an owner's

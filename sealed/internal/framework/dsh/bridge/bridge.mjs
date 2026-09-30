@@ -16,10 +16,14 @@
  * cannot alter what gets mounted at next boot. Deliberately NOT mounted
  * (each a decision, see the adapter's package doc):
  *
- *   session-persistence-*  — the append-only session log would phantom-drift
- *                            every watcher tick, and its format is pinned at
- *                            v0 with no compatibility promise. One Agent
- *                            object in process memory instead.
+ *   session-persistence-*  — the upstream plugin family is not mounted (its
+ *                            append-only log format is pinned v0 with no
+ *                            compatibility promise, and no concrete backend
+ *                            ships). The bridge implements the backend itself:
+ *                            sessionstore.mjs appends every committed session
+ *                            event and re-seeds the session on boot
+ *                            (CONVERSATION.md). One Agent object per process,
+ *                            durable through its event log.
  *   settings-file          — its hot-reload layers $DSH_HOME/settings.yaml
  *                            OVER the composition; mounting it would let an
  *                            agent edit of that file inject an arbitrary
@@ -67,7 +71,8 @@ import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import * as TimeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, decodeStorageRecord, interruptedTurnClosers, packChunkRuns } from '@deepseek-ai/dsh-session'
+import { appendEvent, loadSeed } from './sessionstore.mjs'
 
 import * as SealTools from './seal-tools.mjs'
 import * as SealGuard from './seal-guard.mjs'
@@ -77,6 +82,10 @@ const TOKEN = process.env.SEAL_BRIDGE_TOKEN || ''
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || ''
 const PERSONA_PATH = process.env.SEAL_PERSONA_PATH || ''
 const DSH_HOME = process.env.DSH_HOME || '/root/.dsh'
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// Set by the adapter to an untracked path under DSH_HOME; empty disables
+// persistence (in-memory session + the client-replay restoreTranscript path).
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || ''
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
@@ -234,11 +243,29 @@ async function boot() {
     try { log(`agent/error: ${JSON.stringify(args).slice(0, 500)}`) } catch { log('agent/error (unserializable)') }
   })
 
+  // Restore the persisted conversation (CONVERSATION.md): decode the event
+  // log and hand it to create() as the seed — the SDK's documented replay
+  // path. No file / unusable file → fresh conversation, exactly as before.
+  const sdkCodecs = { decodeStorageRecord, interruptedTurnClosers, packChunkRuns }
+  const seed = CONVERSATION_FILE ? loadSeed(CONVERSATION_FILE, sdkCodecs, log) : null
+  if (seed && seed.length) storeRestored = true
   const handle = await ctx.agents.create({
     sessionId: SessionId('owner-chat'),
-    meta: { cwd: DSH_HOME },
+    meta: { cwd: DSH_HOME, ...(seed ? { seedLength: seed.length } : {}) },
+    ...(seed ? { seed } : {}),
     agentOptions: { provider: PROVIDER, model: MODEL_ID },
   })
+  if (CONVERSATION_FILE) {
+    // Persist every event committed AFTER the seed. The seq guard makes this
+    // robust whichever way create() treats seed publication: re-emitted seed
+    // events are skipped instead of double-written.
+    const seedMaxSeq = seed && seed.length ? (seed[seed.length - 1].seq ?? -1) : -1
+    ctx.on('session/event', (session, event) => {
+      if (session !== handle.agent.session) return
+      if (typeof event.seq === 'number' && event.seq <= seedMaxSeq) return
+      appendEvent(CONVERSATION_FILE, event, sdkCodecs, log)
+    })
+  }
   log(`agent ready (persona: ${persona.length} bytes, platform doc: ${doc ? `${doc.length} bytes` : 'ABSENT'})`)
   return { ctx, agent: handle.agent }
 }
@@ -543,7 +570,9 @@ function lastUserText(messages) {
 //
 // The conversation lives in THIS process's memory (the session object), but a
 // configuration change restarts the harness (manager.Reload), and a fresh
-// process used to greet a mid-conversation owner with total amnesia: the
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
 // client resends the full transcript on every turn — it always has — yet the
 // bridge took only the last user line. On the FIRST turn of a fresh process,
 // if the request carries history, replay it as a framed transcript ahead of
@@ -551,8 +580,14 @@ function lastUserText(messages) {
 // reconstructed, but the conversation continues instead of restarting.
 const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
 let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false // true when the persistent store seeded this boot
 
 function restoreTranscript(messages) {
+  // When the store SEEDED this boot, replaying the client's copy on top
+  // would double the history — but an empty/quarantined/archived store is
+  // exactly "disk could not cover it" (CONVERSATION.md invariant 6), and
+  // there the client's copy is the only continuity left.
+  if (storeRestored) return "";
   if (sessionSeeded || !Array.isArray(messages)) return "";
   let lastUser = -1;
   for (let i = messages.length - 1; i >= 0; i--) {

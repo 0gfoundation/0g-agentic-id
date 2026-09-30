@@ -47,9 +47,17 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
+	SessionManager,
 } from "prime-agent";
+import { openConversation } from "./sessionstore.mjs";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// The adapter sets it to an untracked, off-chain path and self-rotates the
+// file; empty disables persistence (falls back to the in-memory session +
+// the client-replay restoreTranscript path). One agent, one file — never a
+// multi-session store.
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || "";
 const TOKEN = process.env.SEAL_BRIDGE_TOKEN || "";
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
@@ -172,11 +180,46 @@ async function buildSession() {
 
 	const model = resolveModel(modelRegistry);
 	log(`model resolved: ${model.provider}/${model.id}`);
+	// The conversation persists in the harness's OWN store (CONVERSATION.md):
+	// SessionManager.open(path) both creates the file on a first boot and, on a
+	// process restart, re-parses the JSONL and rebuilds the context — so a
+	// settings-push/crash restart resumes the conversation with NO client
+	// replay. Bound to ONE fixed file (invariant: one conversation per agent).
+	// Empty path → inMemory(), the pre-persistence behaviour.
+	const sessionManager = CONVERSATION_FILE
+		? openConversation(SessionManager, CONVERSATION_FILE, log)
+		: SessionManager.inMemory(process.cwd());
+	// The client-replay fallback stays armed until the store has actually
+	// restored something: a quarantined/archived store (corrupt file, stub,
+	// ceiling) is precisely "disk could not cover it" — invariant 6 — and
+	// gating replay on the mere PRESENCE of persistence would turn those
+	// recoveries into silent amnesia the old path used to survive.
+	// getEntries missing (an SDK rename) must be LOUD and pick the
+	// conservative side — assume restored, keep replay off: doubling a
+	// restored conversation is the failure this gate exists to prevent,
+	// while the cost of the assumption on a genuinely fresh store is nil
+	// (a fresh client has nothing to replay).
+	let restoredEntries = 0;
+	if (CONVERSATION_FILE) {
+		if (typeof sessionManager.getEntries === "function") {
+			restoredEntries = sessionManager.getEntries().length;
+			if (restoredEntries > 0) storeRestored = true;
+		} else {
+			log("WARN: SessionManager.getEntries missing (SDK surface changed) — assuming the store restored history; client replay stays off");
+			storeRestored = true;
+		}
+	}
+	log(
+		CONVERSATION_FILE
+			? `conversation store: ${CONVERSATION_FILE} (${restoredEntries} entries restored)`
+			: "conversation store: in-memory (SEAL_CONVERSATION_FILE unset)",
+	);
 	const { session } = await createAgentSession({
 		model,
 		resourceLoader: loader,
 		authStorage,
 		modelRegistry,
+		sessionManager,
 	});
 	// Thinking models need a bounded effort level: the session default is
 	// "off", which makes the SDK send NO reasoning_effort — and an
@@ -538,7 +581,9 @@ function lastUserText(messages) {
 //
 // The conversation lives in THIS process's memory (the session object), but a
 // configuration change restarts the harness (manager.Reload), and a fresh
-// process used to greet a mid-conversation owner with total amnesia: the
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
 // client resends the full transcript on every turn — it always has — yet the
 // bridge took only the last user line. On the FIRST turn of a fresh process,
 // if the request carries history, replay it as a framed transcript ahead of
@@ -546,8 +591,16 @@ function lastUserText(messages) {
 // reconstructed, but the conversation continues instead of restarting.
 const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
 let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false; // true when the persistent store supplied history
 
 function restoreTranscript(messages) {
+	// When the persistent store RESTORED history this boot, replaying the
+	// client's copy would DOUBLE it — but when the store came up empty
+	// (fresh agent, quarantined/archived file, container recreate), the
+	// client's copy is the only continuity left and refusing it would be
+	// silent amnesia (CONVERSATION.md invariant 6: replay is the fallback
+	// for exactly the cases disk could not cover).
+	if (storeRestored) return "";
 	if (sessionSeeded || !Array.isArray(messages)) return "";
 	let lastUser = -1;
 	for (let i = messages.length - 1; i >= 0; i--) {

@@ -159,6 +159,9 @@ and degrades gracefully when absent):
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | log page reports unavailable |
 | `SettleDelayer` | `SettleDelay()` | bootstrap baseline capture | conservative 5s default |
 | `LegacySettingsSeeder` *(transitional)* | `SeededSettings()` | bootstrap, right after the Phase C `HandleLegacy` round | an agent minted before the settings channel keeps no pin (§5.5, *Migration*) |
+| `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | the stateful responses door's upstream calls | the framework holds no server-side conversation keyed by a session identity (see `CONVERSATION.md`) |
+| `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door replaces client-sent history with the harness's own store | client-sent history keeps being forwarded verbatim |
+| `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional

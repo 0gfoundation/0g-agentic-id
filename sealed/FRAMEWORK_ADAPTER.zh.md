@@ -134,6 +134,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `SubprocessLogProvider` | `SubprocessLogPath()` | proxy `/log/agent` | 日志页报不可用 |
 | `SettleDelayer` | `SettleDelay()` | bootstrap 基线采集 | 保守的 5s 默认值 |
 | `LegacySettingsSeeder`(过渡性) | `SeededSettings()` | bootstrap,Phase C 的 `HandleLegacy` 轮之后 | settings 通道之前铸造的 agent 拿不回自己的 pin(§5.5 *迁移*) |
+| `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
+| `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门用 harness 自己的存储替换客户端发的历史 | 客户端历史继续原样转发 |
+| `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。

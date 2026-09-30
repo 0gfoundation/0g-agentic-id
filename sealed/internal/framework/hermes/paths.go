@@ -18,6 +18,9 @@ package hermes
 //                               it holds this boot's inference credential
 //   - .env, auth.json           secrets
 //   - state.db / *.db           conversation history + runtime task state
+//   - .seal-conversation-id     the platform's pinned session identity
+//                               (conversation.go, CONVERSATION.md) — ours,
+//                               container-lifetime, never tracked
 //   - sessions/, logs/, bin/,   ephemeral / cache / process bookkeeping
 //     image_cache/, gateway.*
 //   - cron/                     scheduled behaviour is owner-scoped, not

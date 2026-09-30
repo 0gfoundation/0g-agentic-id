@@ -9,6 +9,9 @@
 //	GET  /log/agent.html - same log, color-coded HTML view (owner-only)
 //	GET  /hello         - signed A2A self-introduction (returns 503 until armed)
 //	POST /_seal/auth    - owner-only flow returning the framework auth token
+//	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
+//	POST /_seal/claim   - take the single-driver seat (owner-signed)
+//	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
 //	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
@@ -73,6 +76,18 @@ type Server struct {
 
 	readSettings  SettingsReader
 	applySettings SettingsApplier
+	applyClear    ClearApplier
+
+	// Stateful-door conversation binding (framework.ConversationSession),
+	// wired by main.go only for adapters that hold the conversation
+	// server-side. Applied ONLY to the synthesized responses door's upstream
+	// calls — the transparent /v1/chat/completions door stays stateless.
+	conversationHeaders func() map[string]string
+	observeConversation func(sent map[string]string, resp http.Header)
+	// conversationHistory, when set, replaces CLIENT-sent history on the
+	// stateful door: prior turns come from the framework's own store, the
+	// client's input supplies only the current turn.
+	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
 	applySession  SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
@@ -229,6 +244,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
+	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

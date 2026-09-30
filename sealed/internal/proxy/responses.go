@@ -322,7 +322,7 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, inpu
 	}
 
 	payload := map[string]any{
-		"messages": synthInputMessages(input),
+		"messages": s.synthUpstreamMessages(ctx, input),
 		"stream":   true,
 	}
 	if model != "" {
@@ -336,8 +336,27 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, inpu
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	// Stateful conversation binding (framework.ConversationSession): the
+	// adapter names the headers that pin this call to the agent's ONE
+	// conversation; unset for frameworks whose history is client-held.
+	s.mu.Lock()
+	convHeaders, convObserve := s.conversationHeaders, s.observeConversation
+	s.mu.Unlock()
+	var sentConv map[string]string
+	if convHeaders != nil {
+		sentConv = convHeaders()
+		for k, v := range sentConv {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := http.DefaultClient.Do(req)
+	if err == nil && convObserve != nil {
+		// Pass what THIS turn was sent with, so the adapter advances its
+		// identity only from that generation (CAS) — never resurrecting one a
+		// concurrent /clear replaced (audit #169).
+		convObserve(sentConv, resp.Header)
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			rec.push("response.completed", map[string]any{"type": "response.completed", "response": rec.snapshot()})
@@ -569,6 +588,44 @@ func synthBearerOK(r *http.Request, token string) bool {
 		return false
 	}
 	return strings.TrimSpace(h[len(prefix):]) == token
+}
+
+// synthUpstreamMessages assembles what goes upstream. Default: the client's
+// input verbatim (full history — see synthInputMessages). When the adapter
+// provides framework.ConversationHistory, prior turns come from the
+// HARNESS'S OWN STORE instead and the client's input supplies only the
+// current turn (its last user message) — the client stores nothing
+// (CONVERSATION.md invariant 6). A history-read failure degrades to the
+// client's input, loudly: a broken store must not kill the turn, but
+// silently answering without context would gaslight the owner.
+func (s *Server) synthUpstreamMessages(ctx context.Context, input json.RawMessage) []map[string]any {
+	s.mu.Lock()
+	historyFn := s.conversationHistory
+	s.mu.Unlock()
+	msgs := synthInputMessages(input)
+	if historyFn == nil {
+		return msgs
+	}
+	var turn map[string]any
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i]["role"] == "user" {
+			turn = msgs[i]
+			break
+		}
+	}
+	history, err := historyFn(ctx)
+	if err != nil {
+		logger.Logf("responses: conversation history unavailable (%v) — falling back to client-sent input", err)
+		return msgs
+	}
+	out := make([]map[string]any, 0, len(history)+1)
+	for _, t := range history {
+		out = append(out, map[string]any{"role": t.Role, "content": t.Text})
+	}
+	if turn != nil {
+		out = append(out, turn)
+	}
+	return out
 }
 
 // synthInputMessages returns the conversation to forward upstream. THE FULL

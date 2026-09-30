@@ -478,7 +478,8 @@ genuinely hot configuration change in the system.
 
 Restart-on-apply creates an interaction hazard **this channel itself
 introduces**: with two owner windows open, a settings push from window A
-restarts the harness under window B mid-conversation — B's session dies and
+restarts the harness under window B mid-conversation — B's in-flight turn is
+killed (the conversation itself now survives the restart — CONVERSATION.md) and
 the model it was talking to silently changes. The seat closes it with WeChat
 login semantics: **one driver at a time, the newest login wins, the displaced
 window finds out the moment it next speaks.**

@@ -28,8 +28,9 @@ package dsh
 //     read by nothing and survives nothing.
 //
 //   - Any session-persistence backend's output. This adapter's composition
-//     mounts NO session-persistence plugin: the bridge keeps one Agent
-//     object alive in process memory for the container's lifetime, so
+//     mounts no UPSTREAM session-persistence plugin; the bridge itself is the
+//     backend now (sessionstore.mjs, CONVERSATION.md) and its output is
+//     conversationPath() below — untracked for the same reason:
 //     `followup()` continuity does not depend on a durable session log —
 //     and DSH's own session log is append-only, growing on every turn, which
 //     would phantom-drift on every 30s tick if it were ever tracked.
@@ -86,3 +87,10 @@ func appendSystemPath() string { return dshHome + "/APPEND_SYSTEM.md" }
 // ctx.systemPrompt.section(). Deliberately OUTSIDE dshHome: per-boot platform
 // text must never be reachable by a tracked role.
 func agentDocPath() string { return "/run/seal-agentdoc.md" }
+
+// conversationPath is where the bridge persists this agent's ONE conversation
+// (CONVERSATION.md): the event log the session is re-seeded from on a process
+// restart. An untracked child of dshHome — this file is exactly the "session-
+// persistence backend's output" the header above classifies as deliberately
+// not chain-tracked; it lives and dies with the container.
+func conversationPath() string { return dshHome + "/owner-chat.session.jsonl" }

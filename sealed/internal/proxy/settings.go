@@ -38,6 +38,31 @@ func (s *Server) SetSettings(read SettingsReader, apply SettingsApplier) {
 	s.readSettings, s.applySettings = read, apply
 }
 
+// SetConversationSession wires framework.ConversationSession into the
+// synthesized responses door: headers attach to each stateful upstream call,
+// and every upstream response's headers are shown back (rotation follow).
+func (s *Server) SetConversationSession(headers func() map[string]string, observe func(sent map[string]string, resp http.Header)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conversationHeaders, s.observeConversation = headers, observe
+}
+
+// ConversationTurn mirrors framework.ConversationTurn without importing the
+// framework package (main.go adapts).
+type ConversationTurn struct {
+	Role string
+	Text string
+}
+
+// SetConversationHistory wires framework.ConversationHistory into the
+// stateful door: history from the harness's own store, current turn from the
+// client.
+func (s *Server) SetConversationHistory(fn func(ctx context.Context) ([]ConversationTurn, error)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conversationHistory = fn
+}
+
 // handleSettings serves the owner's configuration channel.
 //
 //	GET   returns the document in force
