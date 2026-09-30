@@ -67,8 +67,14 @@ async function moneyBlock(ag: AgenticID, prepaidWei: bigint | null): Promise<voi
 /** Once-a-day update hint, driven by the attestor's /config (cli_latest +
  *  cli_notes — operator-set per release). Deliberately minimal: no npm, no
  *  semver lib (numeric dot-compare), silent on any failure. */
+// Deterministic latch for the update hint: Promise.race does NOT cancel the
+// loser, so a fetch resolving just past the deadline could still print into
+// the prompt. The banner closes the window; a late hint then stays silent.
+let updateHintWindowOpen = false;
+
 async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
   if (!attestorUrl) return;
+  updateHintWindowOpen = true;
   {
     try {
       const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
@@ -85,6 +91,7 @@ async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
         const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
         if (prev.day === today && prev.latest === latest) return;
       } catch { /* first time */ }
+      if (!updateHintWindowOpen) return; // banner already closed — stay silent
       try { writeFileSync(stamp, JSON.stringify({ day: today, latest })); } catch { /* hint anyway */ }
       out(`\n  update available: ${mine} → ${latest}   npm i -g @0gfoundation/0g-agenticid-sdk\n`);
       if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
@@ -643,6 +650,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     maybePrintUpdateHint(ctx.env.attestorUrl),
     new Promise<void>((r) => setTimeout(r, 4000).unref()),
   ]);
+  updateHintWindowOpen = false; // a losing fetch that resolves later stays silent
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
