@@ -14,6 +14,8 @@
  */
 
 import * as readline from 'node:readline';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { parseEther, keccak256, toBytes, hexToBytes, concat, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
@@ -41,6 +43,80 @@ let activeCompletions: string[] = L1_WORDS;
 // semantics: entering a session claims the agent; a displaced window is told
 // on its next message and re-enters to claim it back).
 const clientInstanceId = (globalThis.crypto?.randomUUID?.() ?? `cli-${Date.now()}-${Math.floor(Math.random() * 1e9)}`);
+
+/** The ONE money block both layers print (review: the two layers used to
+ *  render different lines from different sources — same wallet, two answers).
+ *  prepaid = the chain number; AVAILABLE = the provider's effective view and
+ *  is ALWAYS shown ("couldn't check" ≠ "nothing owed"). */
+async function moneyBlock(ag: AgenticID, prepaidWei: bigint | null): Promise<void> {
+  let effErr: string | null = null;
+  const eff = await ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; });
+  out(`prepaid balance : ${prepaidWei == null ? '(unreadable)' : og(prepaidWei)}\n`);
+  if (eff && eff.availableWei < eff.balanceWei) {
+    if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
+    if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
+    if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
+    out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
+  } else if (eff) {
+    out(`AVAILABLE       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
+  } else {
+    out(`AVAILABLE       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — the chain number above may be optimistic)\n`);
+  }
+}
+
+/** Once-a-day update hint, driven by the attestor's /config (cli_latest +
+ *  cli_notes — operator-set per release). Deliberately minimal: no npm, no
+ *  semver lib (numeric dot-compare), silent on any failure. */
+function maybePrintUpdateHint(attestorUrl?: string): void {
+  if (!attestorUrl) return;
+  void (async () => {
+    try {
+      const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
+        cli_latest?: string; cli_notes?: string;
+      };
+      const latest = cfg.cli_latest?.trim();
+      if (!latest) return;
+      const mine = cliVersion();
+      if (compareVersions(mine, latest) >= 0) return;
+      // once per (day, latest)
+      const stamp = join(configPaths().dir, 'update-hint.json');
+      const today = new Date().toISOString().slice(0, 10);
+      try {
+        const prev = JSON.parse(readFileSync(stamp, 'utf8')) as { day?: string; latest?: string };
+        if (prev.day === today && prev.latest === latest) return;
+      } catch { /* first time */ }
+      try { writeFileSync(stamp, JSON.stringify({ day: today, latest })); } catch { /* hint anyway */ }
+      out(`\n  update available: ${mine} → ${latest}   npm i -g @0gfoundation/0g-agenticid-sdk\n`);
+      if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
+    } catch { /* a down attestor never blocks or complains here */ }
+  })();
+}
+
+/** -1/0/1 numeric dot-compare ("0.1.9" < "0.1.10"). */
+function compareVersions(a: string, b: string): number {
+  const as = a.split('.').map(Number), bs = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+    const d = (as[i] ?? 0) - (bs[i] ?? 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+let cachedCliVersion = '';
+function cliVersion(): string {
+  if (!cachedCliVersion) {
+    try {
+      cachedCliVersion = (JSON.parse(readFileSync(join(__dirname, '..', '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
+    } catch { cachedCliVersion = '0.0.0'; }
+  }
+  return cachedCliVersion;
+}
+
+/** Short environment marker for prompts/errors: the attestor's hostname. */
+function hostOf(url?: string): string {
+  if (!url) return 'unset';
+  try { return new URL(url).hostname; } catch { return url.slice(0, 24); }
+}
 
 let knownAgentIds: string[] = [];
 const rememberAgentIds = (rows: Array<{ agentId?: unknown }>): void => {
@@ -491,7 +567,8 @@ const L1_HELP_FULL = `manager commands
   start <id>              start a stopped agent
   stop <id>               stop a running agent
   reset <id>              recreate an agent's container (uses the recorded
-                          framework — 'reset <id> pick' to change; asks the key)
+                          framework — 'reset <id> pick' to change; uses the
+                          stored key from \`login\`)
   retry <id|sealId>       resume a FAILED deploy/clone under the same identity
                           (re-runs the failed on-chain stages; reset after)
   settings <id> [k=v …]   show the agent's configuration document (which model
@@ -523,6 +600,11 @@ const L1_HELP_FULL = `manager commands
   quit                    exit (Ctrl-C twice also works)`;
 
 async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<string>, irq: Interrupt): Promise<void> {
+  // The environment marker in every prompt: cross-environment mistakes (a
+  // config.json pointing at prod while working on dev) are silent otherwise —
+  // the banner scrolls away, and a wrong-attestor error reads like a missing
+  // agent.
+  const envHost = hostOf(ctx.env.attestorUrl);
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
@@ -552,6 +634,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
   }
   out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
+  maybePrintUpdateHint(ctx.env.attestorUrl); // fire-and-forget, never blocks the prompt
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
@@ -577,7 +660,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
-    const line = (await ask('\n0g-agenticid> ')).trim();
+    const line = (await ask(`\n0g-agenticid [${envHost}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
@@ -617,33 +700,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Account-level view: prepaid sandbox balance, the burn rate implied
         // by how many of this wallet's agents are running, and the runway.
         const ag = await withWallet(ctx);
-        let effErr: string | null = null;
-        const [est, rows, detail, eff] = await Promise.all([
+        const [est, rows, detail] = await Promise.all([
           ag.agent.estimateCosts(),
           ag.agent.listMyDeployments(),
           ag.getBalanceDetail().catch(() => null),
-          ag.getEffectiveBalance().catch((e: Error) => { effErr = e.message; return null; }),
         ]);
         rememberAgentIds(rows);
         const running = rows.filter((r) => r.phase === 'running').length;
         const burnPerMin = est.costPerMinWei * BigInt(running);
         const runway = burnPerMin > 0n && est.prepaidBalanceWei != null ? Number(est.prepaidBalanceWei / burnPerMin) : null;
-        out(`prepaid balance : ${og(est.prepaidBalanceWei)}\n`);
-        // The provider's EFFECTIVE view — debt accrues off-chain between
-        // settlements, so the chain number alone can be badly optimistic.
-        // A failed lookup must NOT be silent: "nothing owed" and "couldn't
-        // check" are different answers, and hiding the latter cost a debug
-        // session once already.
-        if (eff && eff.availableWei < eff.balanceWei) {
-          if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
-          if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
-          if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
-          out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
-        } else if (eff) {
-          out(`available       : ${og(eff.availableWei)}  (nothing owed or queued off-chain)\n`);
-        } else {
-          out(`available       : (couldn't reach the provider's effective view: ${effErr ?? 'unknown'} — chain number above may be optimistic)\n`);
-        }
+        await moneyBlock(ag, est.prepaidBalanceWei);
         if (detail && detail.pendingRefund > 0n) {
           out(`pending refund  : ${og(detail.pendingRefund)} (unlocks ${new Date(Number(detail.refundUnlockAt) * 1000).toLocaleString()} — claim with \`withdraw\`)\n`);
         }
@@ -1546,13 +1612,13 @@ async function ensureOwnerReady(ag: AgenticID, ask: (q: string) => Promise<strin
     const suggest = og(suggestWei).replace(/ OG$/, '');
     // Empty = cancel (as the prompt says). To deposit the suggested amount,
     // the user types it — no silent default that contradicts "empty to cancel".
+    // Typing the amount IS the confirmation — the prompt already says empty
+    // cancels; a second [Y/n] was pure friction (review of the topup flows).
     const amt = (await ask(`deposit how much OG now? (e.g. ${suggest}, empty to cancel): `)).trim();
     if (!amt) { out('cancelled — deposit later with `deposit`.\n'); return false; }
-    if (!(await ask(`deposit ${amt} OG? [Y/n]: `)).trim().toLowerCase().startsWith('n')) {
-      const tx = await ag.deposit({ amountWei: parseEther(amt) });
-      out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
-      await ag.waitForTransaction(tx);
-    } else { out('cancelled — deposit later with `deposit`.\n'); return false; }
+    const tx = await ag.deposit({ amountWei: parseEther(amt) });
+    out(`deposit ${amt} OG (tx ${tx}, waiting…)\n`);
+    await ag.waitForTransaction(tx);
   }
   return true;
 }
@@ -1763,7 +1829,7 @@ const L2_HELP_FULL = `session commands
   /quit                   exit`;
 
 async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq: Interrupt, ctx: CommandContext): Promise<void> {
-  out(`\nagent ${s.agentId} session — ${s.phase} · type to chat · Tab completes /commands · /help for details\n`);
+  out(`\nagent ${s.agentId} session — ${s.phase} · ${hostOf(s.attestorUrl)} · type to chat · Tab completes /commands · /help for details\n`);
   // Low-gas heads-up WITH the entry card. It used to run detached and could
   // land mid-turn, reading like the agent said it (feedback.md F17) — so wait
   // for it, but bounded: advisory reads must not hold the prompt hostage.
@@ -1835,19 +1901,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // with the account-level prepaid alongside for context. The provider's
         // effective view (debt/queued fees) rides along when it says less is
         // spendable than the chain shows — same lines as the L1 `balance`.
-        const [rc, eff] = await Promise.all([
-          s.ag.agent.runtimeCosts(BigInt(s.agentId)),
-          s.ag.getEffectiveBalance().catch(() => null),
-        ]);
+        const rc = await s.ag.agent.runtimeCosts(BigInt(s.agentId));
         out(`agentSeal gas   : ${og(rc.sealGasWei)}  (${s.agentSeal ?? '?'})\n`);
-        out(`sandbox prepaid : ${og(rc.prepaidBalanceWei)}  (account-level; see \`balance\` in the manager)\n`);
-        if (eff && eff.availableWei < eff.balanceWei) {
-          if (eff.outstandingDebtWei > 0n) out(`outstanding debt: ${og(eff.outstandingDebtWei)}  (parked; settles from deposits first)\n`);
-          if (eff.pendingSettlementWei > 0n) out(`pending settles : ${og(eff.pendingSettlementWei)}  (queued fees, deducted over the next cycles)\n`);
-          if (eff.reservedWei > 0n) out(`reserved        : ${og(eff.reservedWei)}\n`);
-          out(`AVAILABLE       : ${og(eff.availableWei)}  ← what deploy/start can actually spend\n`);
-        }
-        out('top up this agent with /topup [amount OG]\n');
+        await moneyBlock(s.ag, rc.prepaidBalanceWei);
+        out('top up this agent with /topup [amount OG] · account-level details: `balance` in the manager\n');
         continue;
       }
       if (line === '/topup' || line.startsWith('/topup ')) {
@@ -2178,7 +2235,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // still releases the Esc brake). Entering the session again claims the
       // seat back.
       if (failure && /displaced|in use by another client/i.test(failure)) {
-        out(`\n⚠ this agent is now driven by another client — leaving the session (use ${s.agentId} re-enters and takes the seat back)\n`);
+        out(`\n⚠ this agent is now driven by another client\n`);
+        const takeBack = (await ask('press Enter to take the seat back (anything else leaves the session): ')).trim();
+        if (takeBack === '') {
+          try {
+            if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out('seat reclaimed — continue chatting\n'); continue; }
+          } catch (e) {
+            out(`reclaim failed: ${(e as Error).message}\n`);
+          }
+        }
+        out(`left the session — \`use ${s.agentId}\` re-enters\n`);
         return;
       }
       if (failure && sawToolActivity && /without any output/.test(failure)) {

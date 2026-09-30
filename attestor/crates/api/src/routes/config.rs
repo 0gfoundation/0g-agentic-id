@@ -66,6 +66,20 @@ pub struct ConfigResponse {
     /// the plain `API_KEY` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_scheme: Option<&'static str>,
+    /// This attestor's own build version (CARGO_PKG_VERSION).
+    pub attestor_version: &'static str,
+    /// Newest published CLI/SDK version (ATTESTOR_CLI_LATEST) — an older CLI
+    /// prints an update hint. Absent when the operator has not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_latest: Option<String>,
+    /// Operator-written release note shown with the update hint
+    /// (ATTESTOR_CLI_NOTES).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_notes: Option<String>,
+}
+
+fn none_if_empty(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
 /// The advertised secret-env scheme, if the operator enabled it.
@@ -124,6 +138,9 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .map(|a| format!("{:#x}", a)),
         frameworks: state.cfg.frameworks.clone(),
         secret_env_scheme: secret_env_scheme(state.cfg.secret_env_enabled),
+        attestor_version: env!("CARGO_PKG_VERSION"),
+        cli_latest: none_if_empty(&state.cfg.cli_latest),
+        cli_notes: none_if_empty(&state.cfg.cli_notes),
     })
 }
 
