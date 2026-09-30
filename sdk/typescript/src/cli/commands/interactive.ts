@@ -614,8 +614,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // The environment marker in every prompt: cross-environment mistakes (a
   // config.json pointing at prod while working on dev) are silent otherwise —
   // the banner scrolls away, and a wrong-attestor error reads like a missing
-  // agent.
-  const envHost = hostOf(ctx.env.attestorUrl);
+  // agent. Recomputed per prompt, NOT frozen once: `login` can change the
+  // attestor mid-session, and a stale label then disagrees with the real
+  // backend (the exact confusion this marker exists to prevent).
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
   const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
   const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
@@ -681,7 +682,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
-    const line = (await ask(`\n0g-agenticid [${envHost}]> `)).trim();
+    const line = (await ask(`\n0g-agenticid [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
