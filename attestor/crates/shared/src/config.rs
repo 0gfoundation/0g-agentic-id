@@ -145,6 +145,13 @@ pub struct Config {
     /// every image in `sandbox_snapshot` / `frameworks` reads SEAL_SECRET_ENV:
     /// an older image ignores it and boots without a key. Default false.
     pub secret_env_enabled: bool,
+    /// Advertised to clients via GET /config as `cli_latest` — the newest
+    /// published CLI/SDK version. Empty → not advertised. Set per release.
+    pub cli_latest: String,
+    /// Free-text release note shown by an older CLI alongside the update
+    /// hint (operator-written per release; e.g. "added: /clear · breaking:
+    /// none"). Empty → no note.
+    pub cli_notes: String,
     /// Sandbox snapshot identifier the attestor instantiates new agent
     /// containers from (passed into the sandbox `create` envelope's
     /// `snapshot` field). Bumping this points new deploys at a newer
@@ -320,6 +327,8 @@ impl Config {
                 .map(|v| !matches!(v.to_lowercase().as_str(), "false" | "0" | "off" | "no"))
                 .unwrap_or(true),
             secret_env_enabled: parse_opt_in(env_opt("ATTESTOR_SECRET_ENV_ENABLED").as_deref()),
+            cli_latest: env_opt("ATTESTOR_CLI_LATEST").unwrap_or_default(),
+            cli_notes: env_opt("ATTESTOR_CLI_NOTES").unwrap_or_default(),
             sandbox_snapshot: env_opt("ATTESTOR_SANDBOX_SNAPSHOT")
                 .unwrap_or_else(|| "0g-test-sealed".to_string()),
             sandbox_public_ports: env_opt("ATTESTOR_SANDBOX_PUBLIC_PORTS")

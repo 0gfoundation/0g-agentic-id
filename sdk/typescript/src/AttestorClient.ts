@@ -11,6 +11,7 @@
 import type { Address } from 'viem';
 import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
 import { requireWallet, type Ctx } from './context';
+import { SDK_VERSION } from './constants';
 import { agenticIDAbi, cloneGateAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
@@ -1150,7 +1151,10 @@ export class AttestorClient {
       try {
         res = await fetch(`${this.baseUrl()}${path}`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          // X-Agentic-Client: the caller SDK/CLI version - lets the
+          // attestor request logs show the client-version spread, pairing
+          // with /config cli_latest on the advertise side.
+          headers: { 'content-type': 'application/json', 'x-agentic-client': `sdk/${SDK_VERSION}` },
           body: payload,
         });
       } catch (e) {

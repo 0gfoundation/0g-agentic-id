@@ -61,3 +61,28 @@ test('empty model cache degrades to the bare key, never throws', () => {
   const [hits] = completeLine('/settings model=', { ...L2, models: [] });
   assert.deepEqual(hits, ['model=']);
 });
+
+// ── update-hint helpers (interactive.ts) ─────────────────────────────────────
+// A wrong version compare either nags on every start or never hints at all;
+// hostOf feeds every prompt's environment marker.
+const { compareVersions, hostOf } = await import('../dist/cli/commands/interactive.js');
+
+test('compareVersions: numeric dot-compare, not lexicographic', () => {
+  assert.equal(compareVersions('0.1.7', '0.1.7'), 0);
+  assert.equal(compareVersions('0.1.9', '0.1.10'), -1, '9 < 10 numerically (lexicographic would say otherwise)');
+  assert.equal(compareVersions('0.2.0', '0.1.99'), 1);
+  assert.equal(compareVersions('0.1.7', '0.1.7.1'), -1, 'longer tail counts');
+});
+
+test('compareVersions: suffixed and garbage parts never mis-trigger', () => {
+  assert.equal(compareVersions('0.1.7-rc1', '0.1.7'), 0, 'suffix parses to its numeric prefix');
+  assert.equal(compareVersions('0.1.x', '0.1.0'), 0, 'unparsable part counts as 0');
+  assert.equal(compareVersions('garbage', '0.0.1'), -1, 'fully garbage never claims to be newer');
+});
+
+test('hostOf: hostname out of a URL, graceful on garbage', () => {
+  assert.equal(hostOf('https://attestor.35-225-105-127.sslip.io'), 'attestor.35-225-105-127.sslip.io');
+  assert.equal(hostOf('https://agenticid.0g.ai/'), 'agenticid.0g.ai');
+  assert.equal(hostOf(undefined), 'unset');
+  assert.equal(hostOf('not a url'), 'not a url'.slice(0, 24));
+});

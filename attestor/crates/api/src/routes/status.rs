@@ -282,6 +282,8 @@ mod tests {
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             secret_env_enabled: false,
+            cli_latest: String::new(),
+            cli_notes: String::new(),
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,

@@ -66,6 +66,20 @@ pub struct ConfigResponse {
     /// the plain `API_KEY` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_scheme: Option<&'static str>,
+    /// This attestor's own build version (CARGO_PKG_VERSION).
+    pub attestor_version: &'static str,
+    /// Newest published CLI/SDK version (ATTESTOR_CLI_LATEST) — an older CLI
+    /// prints an update hint. Absent when the operator has not set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_latest: Option<String>,
+    /// Operator-written release note shown with the update hint
+    /// (ATTESTOR_CLI_NOTES).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_notes: Option<String>,
+}
+
+fn none_if_empty(s: &str) -> Option<String> {
+    if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
 /// The advertised secret-env scheme, if the operator enabled it.
@@ -124,6 +138,9 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .map(|a| format!("{:#x}", a)),
         frameworks: state.cfg.frameworks.clone(),
         secret_env_scheme: secret_env_scheme(state.cfg.secret_env_enabled),
+        attestor_version: env!("CARGO_PKG_VERSION"),
+        cli_latest: none_if_empty(&state.cfg.cli_latest),
+        cli_notes: none_if_empty(&state.cfg.cli_notes),
     })
 }
 
@@ -135,5 +152,62 @@ mod tests {
     fn secret_env_scheme_is_advertised_only_when_enabled() {
         assert_eq!(secret_env_scheme(true), Some("agent-seal-ecies-v1"));
         assert_eq!(secret_env_scheme(false), None);
+    }
+
+    #[test]
+    fn none_if_empty_maps_blank_to_absent() {
+        assert_eq!(none_if_empty(""), None);
+        assert_eq!(none_if_empty("0.1.8"), Some("0.1.8".to_string()));
+    }
+
+    // The hint channel keys off cli_latest being ABSENT vs present in the
+    // JSON (review #170): pin the actual serialization, not just the helper.
+    fn sample(cli_latest: &str, cli_notes: &str) -> ConfigResponse {
+        ConfigResponse {
+            sandbox_proxy_addr: String::new(),
+            agent_serve_port: 8080,
+            agent_serve_path: "/hello".into(),
+            agent_dashboard_port: 8080,
+            agent_dashboard_path: "/dashboard".into(),
+            chain_rpc: String::new(),
+            chain_id: 16602,
+            agentic_id_addr: String::new(),
+            tapp_registry_addr: String::new(),
+            attestor_app_id: None,
+            kms_app_id: None,
+            sandbox_app_id: None,
+            sandbox_provider_addr: None,
+            sandbox_serving_addr: None,
+            sandbox_snapshot: String::new(),
+            reputation_registry_addr: None,
+            verified_feedback_addr: None,
+            feedback_batcher_addr: None,
+            clone_gate_addr: None,
+            standard_clone_authorizer_addr: None,
+            sandbox_endpoint: None,
+            tee_data_verifier_addr: None,
+            frameworks: vec![],
+            secret_env_scheme: None,
+            attestor_version: "9.9.9",
+            cli_latest: none_if_empty(cli_latest),
+            cli_notes: none_if_empty(cli_notes),
+        }
+    }
+
+    #[test]
+    fn config_serializes_version_fields_present_and_absent() {
+        // attestor_version is always present.
+        let set = serde_json::to_value(sample("0.1.8", "added: /clear")).unwrap();
+        assert_eq!(set["attestor_version"], "9.9.9");
+        assert_eq!(set["cli_latest"], "0.1.8");
+        assert_eq!(set["cli_notes"], "added: /clear");
+
+        // Unset by the operator → the two hint fields are ABSENT (not null),
+        // which is what lets the CLI distinguish "no advertisement" from a
+        // stale value.
+        let unset = serde_json::to_value(sample("", "")).unwrap();
+        assert_eq!(unset["attestor_version"], "9.9.9");
+        assert!(unset.get("cli_latest").is_none(), "cli_latest must be absent when unset");
+        assert!(unset.get("cli_notes").is_none(), "cli_notes must be absent when unset");
     }
 }
