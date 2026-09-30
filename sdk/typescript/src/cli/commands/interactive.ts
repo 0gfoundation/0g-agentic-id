@@ -67,9 +67,9 @@ async function moneyBlock(ag: AgenticID, prepaidWei: bigint | null): Promise<voi
 /** Once-a-day update hint, driven by the attestor's /config (cli_latest +
  *  cli_notes — operator-set per release). Deliberately minimal: no npm, no
  *  semver lib (numeric dot-compare), silent on any failure. */
-function maybePrintUpdateHint(attestorUrl?: string): void {
+async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
   if (!attestorUrl) return;
-  void (async () => {
+  {
     try {
       const cfg = (await (await fetch(`${attestorUrl}/config`, { signal: AbortSignal.timeout(4000) })).json()) as {
         cli_latest?: string; cli_notes?: string;
@@ -89,12 +89,15 @@ function maybePrintUpdateHint(attestorUrl?: string): void {
       out(`\n  update available: ${mine} → ${latest}   npm i -g @0gfoundation/0g-agenticid-sdk\n`);
       if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
     } catch { /* a down attestor never blocks or complains here */ }
-  })();
+  }
 }
 
 /** -1/0/1 numeric dot-compare ("0.1.9" < "0.1.10"). */
 function compareVersions(a: string, b: string): number {
-  const as = a.split('.').map(Number), bs = b.split('.').map(Number);
+  // parseInt tolerates suffixes ("7-rc1" → 7); anything unparsable is 0, so a
+  // malformed advertised version can never mis-trigger the hint.
+  const num = (x: string) => { const n = parseInt(x, 10); return Number.isFinite(n) ? n : 0; };
+  const as = a.split('.').map(num), bs = b.split('.').map(num);
   for (let i = 0; i < Math.max(as.length, bs.length); i++) {
     const d = (as[i] ?? 0) - (bs[i] ?? 0);
     if (d !== 0) return d < 0 ? -1 : 1;
@@ -634,7 +637,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
     ack = await Promise.race([read, new Promise<string>((r) => setTimeout(() => r('(unreachable)'), 4000).unref())]);
   }
   out(`  attestor   ${ctx.env.attestorUrl ?? '(unset)'}\n`);
-  maybePrintUpdateHint(ctx.env.attestorUrl); // fire-and-forget, never blocks the prompt
+  // Bounded like the ack read: the hint prints INSIDE the banner or not at
+  // all — a late async print would land mid-prompt or inside a login question.
+  await Promise.race([
+    maybePrintUpdateHint(ctx.env.attestorUrl),
+    new Promise<void>((r) => setTimeout(r, 4000).unref()),
+  ]);
   out(`  wallet     ${wallet ? (wallet.startsWith('0x') ? short(wallet) : wallet) : '(none)'}\n`);
   out(`  api key    ${hasApiKey ? 'set' : '(none)'}\n`);
   if (ack) out(`  ack        ${ack}\n`);
