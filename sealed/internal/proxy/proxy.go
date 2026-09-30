@@ -83,7 +83,7 @@ type Server struct {
 	// server-side. Applied ONLY to the synthesized responses door's upstream
 	// calls — the transparent /v1/chat/completions door stays stateless.
 	conversationHeaders func() map[string]string
-	observeConversation func(http.Header)
+	observeConversation func(sent map[string]string, resp http.Header)
 	// conversationHistory, when set, replaces CLIENT-sent history on the
 	// stateful door: prior turns come from the framework's own store, the
 	// client's input supplies only the current turn.

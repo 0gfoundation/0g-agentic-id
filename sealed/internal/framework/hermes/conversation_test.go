@@ -31,12 +31,54 @@ func TestConversationID_MintedOnceAndStable(t *testing.T) {
 func TestConversationID_FollowsRotation(t *testing.T) {
 	redirectHome(t)
 	a := &Adapter{}
-	_ = a.ConversationHeaders()
+	sent := a.ConversationHeaders() // pins the current id
 	h := http.Header{}
 	h.Set(sessionIDHeader, "seal-owner-chat-child01")
-	a.ObserveConversation(h)
+	a.ObserveConversation(sent, h) // echo differs from sent → legit rotation
 	if got := a.ConversationHeaders()[sessionIDHeader]; got != "seal-owner-chat-child01" {
 		t.Fatalf("rotation not followed: %q", got)
+	}
+}
+
+// AUDIT #169 F1: a /clear while a turn is in flight must NOT be undone by that
+// turn's late rotation echo. The echo is a stale generation (pinned before the
+// clear); CAS on the sent id drops it.
+func TestConversationID_ClearSurvivesInFlightEcho(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	sent := a.ConversationHeaders() // T1 pinned id A
+	if err := a.ClearSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cleared := a.ConversationHeaders()[sessionIDHeader] // fresh id C
+	// T1's response lands now, echoing A (or a child of A).
+	h := http.Header{}
+	h.Set(sessionIDHeader, "seal-owner-chat-childOfA")
+	a.ObserveConversation(sent, h)
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != cleared {
+		t.Fatalf("clear was resurrected: id is %q, want the post-clear %q", got, cleared)
+	}
+}
+
+// AUDIT #169 F2: a stale concurrent turn's echo must not overwrite the id a
+// newer turn already rotated to.
+func TestConversationID_StaleTurnDoesNotRevertRotation(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	sentA := a.ConversationHeaders() // both turns pinned A
+	// T1 rotates A→B (its sent id is still A, echo is B).
+	hB := http.Header{}
+	hB.Set(sessionIDHeader, "seal-owner-chat-B")
+	a.ObserveConversation(sentA, hB)
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != "seal-owner-chat-B" {
+		t.Fatalf("rotation to B not applied: %q", got)
+	}
+	// T2, pinned to the now-dead A, completes with no rotation (echo A).
+	hA := http.Header{}
+	hA.Set(sessionIDHeader, sentA[sessionIDHeader])
+	a.ObserveConversation(sentA, hA)
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != "seal-owner-chat-B" {
+		t.Fatalf("stale turn reverted the id to %q, want B", got)
 	}
 }
 
@@ -46,11 +88,12 @@ func TestConversationID_FollowsRotation(t *testing.T) {
 func TestConversationID_RejectsUnsafeEcho(t *testing.T) {
 	redirectHome(t)
 	a := &Adapter{}
-	orig := a.ConversationHeaders()[sessionIDHeader]
+	sent := a.ConversationHeaders()
+	orig := sent[sessionIDHeader]
 	for _, bad := range []string{"../../etc/passwd", "a\r\nb", ""} {
 		h := http.Header{}
 		h.Set(sessionIDHeader, bad)
-		a.ObserveConversation(h)
+		a.ObserveConversation(sent, h)
 	}
 	if got := a.ConversationHeaders()[sessionIDHeader]; got != orig {
 		t.Fatalf("unsafe echo persisted: %q", got)

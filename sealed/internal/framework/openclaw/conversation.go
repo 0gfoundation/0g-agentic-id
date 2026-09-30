@@ -76,7 +76,7 @@ func (a *Adapter) ConversationHeaders() map[string]string {
 
 // ObserveConversation implements framework.ConversationSession. openclaw
 // session keys do not rotate — nothing to follow.
-func (a *Adapter) ObserveConversation(http.Header) {}
+func (a *Adapter) ObserveConversation(map[string]string, http.Header) {}
 
 // sessionEntry is the slice of openclaw's sessions.json this package needs:
 // the store is a map keyed by session key.
@@ -257,6 +257,11 @@ func (a *Adapter) ClearSession(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("openclaw.ClearSession: %w", err)
 	}
+	// Remove the superseded transcript outside the lock: at worst an in-flight
+	// turn on oldKey recreates it (openclaw is still appending), leaving an
+	// ORPHAN — the key has already rotated, so ConversationHistory reads the
+	// new key's file and never the orphan (audit #169 F4: leak, not
+	// resurrection). A stray orphan is swept on the next boot's rotation path.
 	if oldKey != "" {
 		if path, perr := transcriptPathForKey(oldKey); perr == nil && path != "" {
 			_ = os.Remove(path)

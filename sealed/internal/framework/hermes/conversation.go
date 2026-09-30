@@ -80,14 +80,25 @@ func (a *Adapter) ConversationHeaders() map[string]string {
 // the EFFECTIVE session id on every response, and compaction rotates it to a
 // child session — persist the echo so the next turn continues the child
 // instead of forking the parent.
-func (a *Adapter) ObserveConversation(h http.Header) {
-	echoed := sanitizeSessionID(h.Get(sessionIDHeader))
-	if echoed == "" {
-		return
+func (a *Adapter) ObserveConversation(sent map[string]string, resp http.Header) {
+	echoed := sanitizeSessionID(resp.Get(sessionIDHeader))
+	sentID := sanitizeSessionID(sent[sessionIDHeader])
+	if echoed == "" || echoed == sentID {
+		return // no echo, or no rotation — nothing to advance
 	}
+	// Compare-and-swap on the generation THIS turn was pinned to: only
+	// advance the file if it still holds sentID. If a concurrent /clear (or a
+	// later turn's rotation) has already moved it off sentID, this echo is a
+	// stale generation and MUST NOT clobber the current one — that is what
+	// resurrected a just-cleared conversation before (audit #169 F1/F2).
 	convMu.Lock()
 	defer convMu.Unlock()
-	if b, err := os.ReadFile(conversationIDPath()); err == nil && strings.TrimSpace(string(b)) == echoed {
+	cur := ""
+	if b, err := os.ReadFile(conversationIDPath()); err == nil {
+		cur = strings.TrimSpace(string(b))
+	}
+	if cur != sentID {
+		logger.Logf("hermes conversation: dropping a stale rotation echo (%s→%s) — the id moved to %s meanwhile (clear or newer turn)", sentID, echoed, cur)
 		return
 	}
 	if err := os.WriteFile(conversationIDPath(), []byte(echoed), 0o600); err != nil {

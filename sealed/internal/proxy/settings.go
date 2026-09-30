@@ -41,7 +41,7 @@ func (s *Server) SetSettings(read SettingsReader, apply SettingsApplier) {
 // SetConversationSession wires framework.ConversationSession into the
 // synthesized responses door: headers attach to each stateful upstream call,
 // and every upstream response's headers are shown back (rotation follow).
-func (s *Server) SetConversationSession(headers func() map[string]string, observe func(http.Header)) {
+func (s *Server) SetConversationSession(headers func() map[string]string, observe func(sent map[string]string, resp http.Header)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.conversationHeaders, s.observeConversation = headers, observe

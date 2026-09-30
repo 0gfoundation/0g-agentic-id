@@ -320,9 +320,14 @@ type ConversationSession interface {
 	// ConversationHeaders returns the headers that bind an upstream call to
 	// the agent's ONE conversation (minting the identity on first use).
 	ConversationHeaders() map[string]string
-	// ObserveConversation sees every stateful upstream response's headers, so
-	// a rotated session identity can be persisted and followed.
-	ObserveConversation(h http.Header)
+	// ObserveConversation sees, for one turn, BOTH the headers this turn was
+	// sent with (from ConversationHeaders) and the upstream response's
+	// headers — so a rotated identity can be followed WITHOUT resurrecting a
+	// generation that a concurrent /clear or a later turn has since replaced.
+	// The `sent` map is exactly what ConversationHeaders returned for this
+	// turn; the adapter advances its persisted identity only from that
+	// generation (compare-and-swap), never blindly from the echo.
+	ObserveConversation(sent map[string]string, resp http.Header)
 }
 
 // ConversationTurn is one prior turn of the agent's conversation, in the

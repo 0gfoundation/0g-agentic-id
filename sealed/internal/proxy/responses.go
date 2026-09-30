@@ -342,15 +342,20 @@ func (s *Server) runSynthTurn(rec *synthRecord, chatUpstream, token string, inpu
 	s.mu.Lock()
 	convHeaders, convObserve := s.conversationHeaders, s.observeConversation
 	s.mu.Unlock()
+	var sentConv map[string]string
 	if convHeaders != nil {
-		for k, v := range convHeaders() {
+		sentConv = convHeaders()
+		for k, v := range sentConv {
 			req.Header.Set(k, v)
 		}
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err == nil && convObserve != nil {
-		convObserve(resp.Header)
+		// Pass what THIS turn was sent with, so the adapter advances its
+		// identity only from that generation (CAS) — never resurrecting one a
+		// concurrent /clear replaced (audit #169).
+		convObserve(sentConv, resp.Header)
 	}
 	if err != nil {
 		if ctx.Err() != nil {
