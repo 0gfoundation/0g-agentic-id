@@ -31,6 +31,7 @@ import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import type { SecretEnvMode } from './secretEnv';
+import { sealSecretsDocument, type OwnerSecret } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
@@ -577,6 +578,82 @@ export class AgentApi {
     });
     if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${await r.text()}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * List the owner's configured secrets — their names and per-secret host
+   * allowlists, plus the version to write against next (SECRETS.md). Values are
+   * never returned (the owner cannot decrypt the sealed blob); the local CLI
+   * cache holds values for re-sealing.
+   */
+  async listSecrets(agentId: bigint): Promise<{ index: Record<string, string[]>; version: number }> {
+    const sealId = await this.id.getSealId(agentId);
+    return this.attestor.getSecrets(sealId);
+  }
+
+  /**
+   * Store the owner's complete desired secret set for an agent: seals the whole
+   * name → {value, hosts} map to the agent's agentSeal key, persists it to the
+   * attestor (CAS on `baseVersion` from {@link listSecrets}), and — when `base`
+   * (a running container URL) is given — pushes it so it takes effect without a
+   * rebuild. Pass the FULL map each time (remove a secret by omitting it; an
+   * empty map clears them all); the owner cannot read old values back, so the
+   * caller (CLI) keeps the plaintext locally and re-seals the whole set.
+   */
+  async putSecrets(
+    agentId: bigint,
+    secrets: Record<string, OwnerSecret>,
+    baseVersion: number,
+    opts?: { base?: string; instanceId?: string },
+  ): Promise<{ version: number; pushed: boolean }> {
+    const { account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const pubkey = await this.attestor.agentSealPubkey(sealId);
+    const blob = sealSecretsDocument(pubkey, account.address, secrets);
+    const index: Record<string, string[]> = {};
+    for (const [name, s] of Object.entries(secrets)) index[name] = s.hosts;
+    const { version } = await this.attestor.setSecrets({ sealId, blob, index, baseVersion });
+    let pushed = false;
+    if (opts?.base) {
+      // Immediate-effect half; a failure is a warning — the stored blob lands
+      // on the next boot either way.
+      try {
+        await this.pushSecretsToContainer(opts.base, agentId, blob, opts.instanceId);
+        pushed = true;
+      } catch {
+        pushed = false;
+      }
+    }
+    return { version, pushed };
+  }
+
+  /**
+   * Push an owner-secrets blob into a RUNNING container so a change takes
+   * effect without rebuilding it (SECRETS.md §6). Like {@link clearConversation}
+   * this is the immediate-effect half; persisting to the attestor store is the
+   * authoritative half a future boot reads. `blob` is the base64 produced by
+   * `sealSecretsDocument` (sealed to agentSeal). Owner-signed, tag
+   * `0GSealSecrets`, the body digest bound in. A failure here is a warning: the
+   * stored blob still lands on the next boot.
+   */
+  async pushSecretsToContainer(base: string, agentId: bigint, blob: string, instanceId?: string): Promise<void> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const digest = await sha256Hex(blob);
+    const audience = new URL(base).origin;
+    const message = `0GSealSecrets:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/secrets`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'text/plain',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body: blob,
+    });
+    if (!r.ok) throw new Error(`pushSecretsToContainer: HTTP ${r.status}: ${await r.text()}`);
   }
 
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */

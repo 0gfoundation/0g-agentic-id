@@ -203,6 +203,27 @@ func (s *Server) handleServices(w http.ResponseWriter, r *http.Request) {
 			writeSignError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// Refuse to front the secret egress proxy: registering it as a service
+		// would expose the secret-substituting endpoint through sealed's signed
+		// surface, letting an external caller drive owner secrets (SECRETS.md).
+		// BEST-EFFORT ONLY (review #171 F5): the agent knows SEAL_SECRET_PROXY
+		// and could bind its own loopback forwarder on another port and
+		// register that. Values still never become visible (redaction + the
+		// per-secret host allowlist hold); what this cannot fully stop is an
+		// agent re-exporting USAGE authority. Airtight enforcement is
+		// network-layer, tracked at 0g-sandbox#137.
+		s.mu.RLock()
+		secretPort := s.secretProxyPort
+		s.mu.RUnlock()
+		if secretPort != "" {
+			for _, e := range entries {
+				if u, perr := url.Parse(e.Backend); perr == nil && u.Port() == secretPort {
+					writeSignError(w, http.StatusBadRequest,
+						"backend "+e.Backend+" is the sealed secret proxy port and cannot be registered as a service")
+					return
+				}
+			}
+		}
 		s.mu.Lock()
 		s.services = entries
 		s.mu.Unlock()

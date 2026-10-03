@@ -210,6 +210,9 @@ impl Watcher {
         // container re-establishes a binding via a fresh attestation. See
         // {provision} step 5.
         self.deployments.clear_container_binding(ev.tokenId).await?;
+        // Drop the previous owner's secrets too — unlike settings, a
+        // seller's credentials must never reach the buyer (SECRETS.md inv. 6).
+        self.deployments.clear_secrets(ev.tokenId).await?;
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -583,6 +586,9 @@ impl Watcher {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         };
@@ -705,6 +711,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         });

@@ -20,6 +20,7 @@ mod probe;
 mod provision;
 mod reset;
 mod retry;
+mod secrets;
 mod settings;
 mod start;
 mod status;
@@ -75,6 +76,7 @@ pub fn router(state: AppState) -> Router {
         // to read it.
         .route("/settings", get(settings::handle_get).post(settings::handle))
         .route("/settings/seed", post(settings::handle_seed))
+        .route("/secrets", get(secrets::handle_get).post(secrets::handle))
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
         .route("/retry", post(retry::handle))

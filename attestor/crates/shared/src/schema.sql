@@ -182,3 +182,27 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_confirmed_version BIGI
 -- a configuration change while an agent is unhealthy, which is exactly when
 -- an owner most needs to.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL DEFAULT 0;
+
+-- ── Owner business secrets (SECRETS.md) ──────────────────────────────────
+--
+-- Credentials the agent USES but must never SEE (Stripe keys, bot tokens).
+-- Unlike `settings`, the attestor stores these OPAQUE: the whole secrets
+-- document is sealed to the agent's agentSeal public key by the SDK, so the
+-- attestor cannot read the values (that is the point). `/provision` delivers
+-- the blob verbatim; only the container (and the KMS derivation) can open it.
+-- Deliberately NOT on chain, and CLEARED on transfer (a seller's credentials
+-- must not reach the buyer) — contrast `settings`, which carry over.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS secrets_blob TEXT;
+
+-- Cleartext index of secret name -> allowed hosts. Hosts are not secret, and
+-- the owner cannot read the sealed blob back (they never hold agentSeal), so
+-- this is what `GET /secrets` lists and what the write validates. Secret
+-- VALUES are never stored here.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS secrets_index JSONB;
+
+-- Monotonic counter / CAS token for secrets writes (mirrors
+-- settings_version): an owner write carries the version it believes current
+-- and lands only if it still matches, so a captured request cannot be
+-- replayed and two clients cannot silently overwrite each other. 0 = never
+-- configured; reset to 0 on transfer.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS secrets_version BIGINT NOT NULL DEFAULT 0;

@@ -45,6 +45,7 @@ type RuntimeSnapshot struct {
 	AttestorURL      string    // attestor endpoint; empty in dev
 	PublicURL        string    // externally reachable URL prefix; empty in dev
 	SealSignSock     string    // unix socket path for signing
+	SecretProxyURL   string    // loopback egress proxy for owner secrets; empty if unavailable
 	Provider         string    // inference provider (e.g. "openai")
 	Model            string    // inference model name (e.g. "glm-5.2")
 	ZGComputeRouted  bool      // whether 0g-compute augmentation was applied
@@ -181,6 +182,28 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 		b.WriteString(buildPublicURLSection(rs.PublicURL))
 	}
 
+	// Owner secrets via the loopback egress proxy
+	if rs.SecretProxyURL != "" {
+		b.WriteString(buildSecretProxySection())
+	}
+
+	return b.String()
+}
+
+// buildSecretProxySection documents the owner-secret egress proxy: MECHANISM
+// only (how to reference a secret), consistent with the no-behavioural-
+// injection rule. The agent never receives a secret value; it names one and
+// the sealed runtime substitutes it at egress for that secret's allowed hosts.
+func buildSecretProxySection() string {
+	var b strings.Builder
+	b.WriteString("### Owner secrets (use without seeing)\n\n")
+	b.WriteString("Your owner may configure credentials (API keys, tokens) for you to USE without ever seeing their values. You reference a secret by name as a placeholder `{{secret:NAME}}`; you never hold the real value, and it is never in your environment, files, or this prompt.\n\n")
+	b.WriteString("To use one, send your outbound HTTP request THROUGH the loopback egress proxy at `$SEAL_SECRET_PROXY` instead of calling the destination directly:\n\n")
+	b.WriteString("    ${SEAL_SECRET_PROXY}/https/<host>/<path>\n\n")
+	b.WriteString("Put `{{secret:NAME}}` wherever the value goes (a header, the query, or the body). The sealed runtime replaces it with the real value **only when `<host>` is in that secret's allowlist**, makes the real TLS connection itself, and redacts the value from the response before you see it. Example:\n\n")
+	b.WriteString("    curl \"$SEAL_SECRET_PROXY/https/api.stripe.com/v1/charges\" \\\n")
+	b.WriteString("      -H \"Authorization: Bearer {{secret:STRIPE}}\"\n\n")
+	b.WriteString("A placeholder sent to a host NOT in its allowlist is left as the literal placeholder (the far end gets a useless token, never the value) - so a request tricked toward the wrong host cannot leak the secret. A call made directly instead of through the proxy simply carries the placeholder, not the value.\n\n")
 	return b.String()
 }
 
