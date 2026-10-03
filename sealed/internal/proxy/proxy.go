@@ -74,9 +74,11 @@ type Server struct {
 	// adapters that don't serve one natively.
 	synth *synthHub
 
-	readSettings  SettingsReader
-	applySettings SettingsApplier
-	applyClear    ClearApplier
+	readSettings    SettingsReader
+	applySettings   SettingsApplier
+	applyClear      ClearApplier
+	applySecrets    SecretsApplier
+	secretProxyPort string
 
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
@@ -88,7 +90,7 @@ type Server struct {
 	// stateful door: prior turns come from the framework's own store, the
 	// client's input supplies only the current turn.
 	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
-	applySession  SessionSettingsApplier
+	applySession        SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
 	seat occupantSeat
@@ -245,6 +247,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
+	mux.HandleFunc("/_seal/secrets", s.handleSecrets)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

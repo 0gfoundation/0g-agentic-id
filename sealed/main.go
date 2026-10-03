@@ -25,6 +25,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -48,6 +50,7 @@ import (
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
 	"seal-verify/internal/secretenv"
+	"seal-verify/internal/secrets"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
@@ -190,6 +193,23 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	// SANDBOX_SEAL_KEY is consumed; scrub before any agent process spawns.
 	config.ScrubProvisioningSecrets(cfg.SealKeyBytes)
 
+	// Loopback egress proxy for owner secrets (SECRETS.md): the agent uses a
+	// secret by {{secret:NAME}} placeholder and this proxy substitutes the real
+	// value at egress ONLY for that secret's allowlisted hosts, so the agent
+	// never sees it. Started before the framework spawns so its address is in
+	// the child env; the store is filled just below (applyOwnerSecrets).
+	secretStore := secrets.NewStore()
+	var secretProxyURL string
+	if ln, lerr := net.Listen("tcp", "127.0.0.1:0"); lerr != nil {
+		logger.Logf("warn: secret egress proxy not started (%v); owner secrets unavailable", lerr)
+	} else {
+		_, port, _ := net.SplitHostPort(ln.Addr().String())
+		secretProxyURL = "http://127.0.0.1:" + port
+		sealedProxy.SetSecretProxyPort(port)
+		go func() { _ = http.Serve(ln, secrets.NewProxy(secretStore, logger.Logf)) }()
+		logger.Logf("secret egress proxy on %s", secretProxyURL)
+	}
+
 	logger.Logf("")
 	logger.Logf("--- Bootstrap from AgenticID %s (rpc %s, fallback indexer %s) ---",
 		cfg.ContractAddr, cfg.ChainRPC, cfg.FallbackIndexer)
@@ -205,6 +225,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	// the on-chain owner (Phase 2), so it opens here, before any adapter
 	// reads the inference key.
 	applySecretEnv(cfg, agentSealPriv, res)
+	applyOwnerSecrets(prov.SecretsBlob, agentSealPriv, res, secretStore, sealedProxy)
 
 	// The on-chain framework binding is the authoritative adapter
 	// selector — the agent's identity, not deploy config, decides which
@@ -245,7 +266,7 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		logger.Logf("FAIL supervisor: max retries exceeded: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error())
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, sealedProxy, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, secretProxyURL, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error())
 		return
@@ -288,6 +309,44 @@ func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBoots
 	if issue != "" {
 		currentStatus.Pin(issue)
 	}
+}
+
+// applyOwnerSecrets opens the owner's secrets document delivered via
+// /provision (sealed to agentSeal, owner-bound) into the in-memory store the
+// egress proxy reads, and wires the /_seal/secrets push so the owner can
+// refresh them in a running container without a restart. A failure to open is
+// logged (reason class, never a value) and leaves the store empty — the agent
+// boots, it just has no usable secrets until the owner re-pushes a good one.
+func applyOwnerSecrets(blob string, agentSealPriv []byte, res *chainBootstrapResult, store *secrets.Store, sealedProxy *proxy.Server) {
+	readOwner := func() (string, error) {
+		if res.client == nil || res.agentID == nil {
+			return "", errors.New("no chain client")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		owner, err := res.client.OwnerOf(ctx, res.agentID)
+		if err != nil {
+			return "", err
+		}
+		return owner.Hex(), nil
+	}
+	open := func(b string) error {
+		chainOwner := secretenv.LiveOwner(res.owner, readOwner, 3, 2*time.Second, logger.Logf)
+		opened, err := secrets.Open(b, agentSealPriv, chainOwner)
+		if err != nil {
+			return fmt.Errorf("%s", secrets.Reason(err))
+		}
+		store.Replace(opened)
+		logger.Logf("OK   owner secrets opened: %d configured", len(opened))
+		return nil
+	}
+	if blob != "" {
+		if err := open(blob); err != nil {
+			logger.Logf("FAIL owner secrets not applied: %v", err)
+		}
+	}
+	// The push path: re-open a freshly delivered blob and swap the store.
+	sealedProxy.SetSecrets(func(_ context.Context, b string) error { return open(b) })
 }
 
 // ── framework adapter resolution ─────────────────────────────────────────────
@@ -521,6 +580,7 @@ func startAgent(
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
 	settingsBlob []byte,
+	secretProxyURL string,
 	sealedProxy *proxy.Server,
 	onFailed func(err error),
 ) error {
@@ -700,10 +760,11 @@ func startAgent(
 	})
 	if err := mgr.Start(context.Background(), manager.StartParams{
 		Runtime: framework.RuntimeContext{
-			APIKey:       apiKey,
-			PublicURL:    publicURL,
-			SealSignSock: sealSignSockPath,
-			AgentSeal:    agentSealAddr,
+			APIKey:         apiKey,
+			PublicURL:      publicURL,
+			SealSignSock:   sealSignSockPath,
+			SecretProxyURL: secretProxyURL,
+			AgentSeal:      agentSealAddr,
 
 			// Chain bootstrap context (public on-chain data, not secrets).
 			AgentID:      res.agentID.String(),

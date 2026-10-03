@@ -94,6 +94,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		AttestorURL:      rt.AttestorURL,
 		PublicURL:        rt.PublicURL,
 		SealSignSock:     rt.SealSignSock,
+		SecretProxyURL:   rt.SecretProxyURL,
 		Provider:         provider,
 		Model:            model,
 		ZGComputeRouted:  rs.Endpoint != nil,
@@ -477,6 +478,9 @@ func gatewayEnv(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.Runti
 	}
 	if rt.SealSignSock != "" {
 		envWhitelist = append(envWhitelist, "SEAL_SIGN_SOCK="+rt.SealSignSock)
+	}
+	if rt.SecretProxyURL != "" {
+		envWhitelist = append(envWhitelist, "SEAL_SECRET_PROXY="+rt.SecretProxyURL)
 	}
 	if rt.AgentSeal != "" {
 		envWhitelist = append(envWhitelist, "AGENT_SEAL="+rt.AgentSeal)
