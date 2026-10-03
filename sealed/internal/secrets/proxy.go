@@ -73,21 +73,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Read the request body (bounded) so a {{secret:…}} in it can be
-	// substituted. Over the cap → pass through untouched (see maxBodyBytes).
+	// substituted. Over the cap → refuse (review #171 F2): forwarding a
+	// truncated prefix breaks Content-Length and leaks nothing useful, so fail
+	// closed, symmetric with the response-size refusal below.
 	bodyBytes, truncated, err := readCapped(r.Body, maxBodyBytes)
 	if err != nil {
 		http.Error(w, "secret proxy: read body", http.StatusBadGateway)
 		return
 	}
-	var allBlocked []string
-	body := string(bodyBytes)
-	if !truncated {
-		var blocked []string
-		body, blocked = p.store.substituteForHost(body, host)
-		allBlocked = append(allBlocked, blocked...)
-	} else {
-		p.logf("warn: secret proxy: request body over %d bytes — forwarded without substitution", maxBodyBytes)
+	if truncated {
+		http.Error(w, fmt.Sprintf("secret proxy: request body over %d bytes not supported", maxBodyBytes), http.StatusRequestEntityTooLarge)
+		return
 	}
+	var allBlocked []string
+	body, blocked := p.store.substituteForHost(string(bodyBytes), host)
+	allBlocked = append(allBlocked, blocked...)
 
 	// Substitute in the target query string too.
 	query := r.URL.RawQuery
@@ -113,15 +113,19 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, v := range vs {
-			sv, blocked := p.store.substituteForHost(v, host)
-			allBlocked = append(allBlocked, blocked...)
+			sv, hblocked := p.store.substituteForHost(v, host)
+			allBlocked = append(allBlocked, hblocked...)
 			up.Header.Add(k, sv)
 		}
 	}
-	if !truncated {
-		up.ContentLength = int64(len(body))
-		up.Header.Del("Content-Length") // let the client set it from the new body
-	}
+	up.ContentLength = int64(len(body))
+	up.Header.Del("Content-Length") // let the client set it from the new body
+	// Force an identity (uncompressed) response so redaction can see the bytes
+	// (review #171 F1): a client-set Accept-Encoding is forwarded and Go's
+	// Transport then does NOT auto-decompress, so a compressed body would reach
+	// redaction as opaque bytes and the agent could decompress the value
+	// locally. We also fail closed below if the upstream encodes anyway.
+	up.Header.Set("Accept-Encoding", "identity")
 
 	if len(allBlocked) > 0 {
 		// A secret was referenced for a host NOT in its allowlist: left as a
@@ -136,6 +140,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// Fail closed on an encoded body (review #171 F1): we asked for identity,
+	// but if the upstream compressed anyway, redaction over the raw bytes would
+	// miss the value and the agent would decompress it locally. Refuse rather
+	// than relay something we cannot scan. (decompress-redact-recompress is v2.)
+	if ce := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); ce != "" && ce != "identity" {
+		p.logf("warn: secret proxy: upstream used Content-Encoding %q despite identity request — refusing to relay unredactable body", ce)
+		http.Error(w, "secret proxy: upstream returned an encoded body that cannot be redacted", http.StatusBadGateway)
+		return
+	}
 
 	// Redact any real value from the response headers before relaying.
 	for k, vs := range resp.Header {
@@ -169,8 +183,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func parseTarget(u *url.URL) (scheme, host, rest string, err error) {
 	path := strings.TrimPrefix(u.EscapedPath(), "/")
 	seg := strings.SplitN(path, "/", 3)
-	if len(seg) < 2 || (seg[0] != "https" && seg[0] != "http") {
-		return "", "", "", fmt.Errorf("path must be /https/<host>/<path> or /http/<host>/<path>")
+	// v1: https only (review #171 F4). http would put the substituted value on
+	// a cleartext stream observable on the egress path; every v1 target is
+	// https, and the allowlist is scheme-less so the owner cannot opt in to
+	// http. See SECRETS.md §5.
+	if len(seg) < 2 || seg[0] != "https" {
+		return "", "", "", fmt.Errorf("path must be /https/<host>/<path> (http is refused: a secret must not ride cleartext)")
 	}
 	scheme = seg[0]
 	host = seg[1]

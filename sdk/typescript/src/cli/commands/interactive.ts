@@ -2098,6 +2098,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               out(`refusing: values for ${missing.join(', ')} are not cached on this machine; re-sealing here would drop them. Run from the machine that created them.\n`);
               continue;
             }
+            // Hosts are cleartext in the index, so a stale local allowlist would
+            // silently revert another machine's host change on re-seal (review
+            // #171 F6). Detect drift and confirm before overwriting.
+            const drifted = Object.keys(index).filter(
+              (n) => n !== name && cache[n] && JSON.stringify([...cache[n].hosts].sort()) !== JSON.stringify([...(index[n] ?? [])].sort()),
+            );
+            if (drifted.length) {
+              out(`warning: your cached host allowlist differs from the stored one for: ${drifted.join(', ')}. Re-sealing will overwrite the stored hosts with your local copy.\n`);
+              const yn = (await ask('proceed and overwrite? [y/N]: ')).trim().toLowerCase();
+              if (yn !== 'y' && yn !== 'yes') { out('aborted\n'); continue; }
+            }
             if (sub === 'set') {
               let hosts: string[] = [];
               const hi = argv.indexOf('--hosts');

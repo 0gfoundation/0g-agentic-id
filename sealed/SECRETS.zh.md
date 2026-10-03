@@ -62,9 +62,10 @@ agent 请求(密钥位 {{secret:NAME}})-> sealed loopback 出口代理
 
 ## 5. 替换机制(显式代理;不冒充、不发证书)
 
-- **显式代理**:agent/框架发给 `http://127.0.0.1:<port>/https/api.stripe.com/...`,
-  头里带 `{{secret:STRIPE}}`;目标域名在 URL 里,代理直读——**不解 TLS、不发证书**——
-  换上真值,由代理自己去连真网站、回传响应。
+- **显式代理(仅 https)**:agent/框架发给 `http://127.0.0.1:<port>/https/api.stripe.com/...`,
+  头里带 `{{secret:STRIPE}}`;`http` scheme 被拒(v1),真值绝不走明文(v1 目标都是
+  https)。目标域名在 URL 里,代理直读——**不解 TLS、不发证书**——换上真值,由代理
+  自己去连真网站、回传响应。
   - 为什么够用:agent 没有真值,不走代理那次调用就用不了密钥(发出去是替身),功能
     失效但不泄露。"用密钥 ⇒ 必走代理"成立,不靠网络层强制。
   - 为什么不冒充(MITM):CONNECT/MITM 会让请求头 Host 与实际拨号目标分离,**破坏按
@@ -100,6 +101,11 @@ agent 请求(密钥位 {{secret:NAME}})-> sealed loopback 出口代理
 - **签名类认证**(AWS SigV4、webhook HMAC):不能简单替换,第一版不支持;后续在代理里
   代算(Fly Tokenizer 的做法)。
 - **非 HTTP 凭证**(数据库密码等):出口替换覆盖不到。
+
+- **`/services` 端口守卫是尽力而为**(评审 #171 F5):它拦注册出口代理端口,
+  但 agent 知道 `$SEAL_SECRET_PROXY`,可自建 loopback 转发器绕过。值仍不可见
+  (脱敏 + 按密钥白名单),拦不住的是 agent 再导出**使用**权;彻底靠网络层
+  (0g-sandbox#137)。
 
 ## 9. 参考
 

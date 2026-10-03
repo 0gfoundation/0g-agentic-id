@@ -151,13 +151,24 @@ func (s *Store) substituteForHost(in, host string) (out string, blocked []string
 func (s *Store) redact(in string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := in
+	// Longest value first (review #171 nit): if one secret's value is a
+	// substring of another's, redacting the shorter first could leave a
+	// fragment of the longer exposed. Deterministic, longest-match-wins.
+	type kv struct {
+		name string
+		val  string
+	}
+	vals := make([]kv, 0, len(s.m))
 	for name, sec := range s.m {
-		if len(sec.Value) < minRedactLen {
-			continue
+		if len(sec.Value) >= minRedactLen {
+			vals = append(vals, kv{name, sec.Value})
 		}
-		if strings.Contains(out, sec.Value) {
-			out = strings.ReplaceAll(out, sec.Value, placeholder(name))
+	}
+	sort.Slice(vals, func(i, j int) bool { return len(vals[i].val) > len(vals[j].val) })
+	out := in
+	for _, v := range vals {
+		if strings.Contains(out, v.val) {
+			out = strings.ReplaceAll(out, v.val, placeholder(v.name))
 		}
 	}
 	return out
@@ -192,8 +203,8 @@ type Error struct {
 	err    error
 }
 
-func (e *Error) Error() string { return e.err.Error() }
-func (e *Error) Unwrap() error { return e.err }
+func (e *Error) Error() string            { return e.err.Error() }
+func (e *Error) Unwrap() error            { return e.err }
 func fail(reason string, err error) error { return &Error{Reason: reason, err: err} }
 
 // Reason returns the reason class of an Open error.
@@ -252,6 +263,12 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (map[string]S
 		}
 		if in.Value == "" || strings.ContainsRune(in.Value, 0) {
 			return nil, fail(ReasonMalformed, fmt.Errorf("%s: empty or invalid value", name))
+		}
+		// Symmetric with the redaction floor (review #171 F3): a value too short
+		// to redact is too short to be a secret — it would be substituted at
+		// egress but echoed back to the agent unredacted. Reject it here.
+		if len(in.Value) < minRedactLen {
+			return nil, fail(ReasonMalformed, fmt.Errorf("%s: value shorter than %d chars cannot be protected", name, minRedactLen))
 		}
 		hosts := make([]string, 0, len(in.Hosts))
 		for _, h := range in.Hosts {

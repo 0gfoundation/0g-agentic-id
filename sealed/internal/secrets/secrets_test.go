@@ -154,3 +154,24 @@ func TestRedact(t *testing.T) {
 		t.Fatalf("redact failed: %q", got)
 	}
 }
+
+func TestOpen_shortValueRejected(t *testing.T) {
+	priv, privBytes, owner := testKeyAndOwner(t)
+	enc := sealDoc(t, priv, owner, map[string]secretIn{"X": {Value: "sk1", Hosts: []string{"a.com"}}})
+	if _, err := Open(enc, privBytes, owner); Reason(err) != ReasonMalformed {
+		t.Fatalf("a value shorter than the redaction floor must be rejected, got %v", Reason(err))
+	}
+}
+
+func TestRedact_longestFirst(t *testing.T) {
+	s := NewStore()
+	// LONG contains SHORT as a substring; redaction must not leave a fragment.
+	s.Replace(map[string]Secret{
+		"SHORT": {Value: "abc123", Hosts: []string{"a.com"}},
+		"LONG":  {Value: "abc123xyz789", Hosts: []string{"a.com"}},
+	})
+	out := s.redact("val=abc123xyz789")
+	if out != "val={{secret:LONG}}" {
+		t.Fatalf("longest-match redaction failed: %q", out)
+	}
+}

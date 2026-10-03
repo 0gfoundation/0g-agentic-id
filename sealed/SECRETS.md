@@ -79,9 +79,11 @@ agent request (secret slot = {{secret:NAME}}) -> sealed loopback egress proxy
 
 ## 5. Substitution (explicit proxy; no impersonation, no cert)
 
-- **Explicit proxy**: the agent/framework sends to
+- **Explicit proxy (https only)**: the agent/framework sends to
   `http://127.0.0.1:<port>/https/api.stripe.com/...` with `{{secret:STRIPE}}`
-  in a header; the destination is in the URL, so the proxy reads it directly —
+  in a header. The `http` scheme is refused (v1), so a value never rides a
+  cleartext stream (every v1 target is https). The destination is in the URL,
+  so the proxy reads it directly —
   **no TLS interception, no CA cert** — substitutes the real value, dials the
   real host itself, and relays the response.
   - Why this is enough: the agent has no real value, so a call that skips the
@@ -132,6 +134,13 @@ agent request (secret slot = {{secret:NAME}}) -> sealed loopback egress proxy
   unsupported in v1 — later, sign in the proxy (Fly Tokenizer's approach).
 - **Non-HTTP credentials** (DB passwords, …): egress substitution cannot cover
   them.
+
+- **The `/services` port guard is best-effort** (review #171 F5): it blocks
+  registering the egress-proxy port, but the agent knows `$SEAL_SECRET_PROXY`
+  and could relay through its own loopback forwarder. Values stay invisible
+  (redaction + per-secret allowlist), so what it cannot fully stop is an agent
+  re-exporting USAGE authority; airtight enforcement is network-layer
+  (0g-sandbox#137).
 
 ## 9. Prior art
 

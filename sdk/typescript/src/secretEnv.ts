@@ -229,6 +229,8 @@ export function sealSecretsDocument(
   for (const [name, s] of Object.entries(secrets)) {
     if (!name || /[{}:\s]/.test(name)) throw new Error(`invalid secret name ${JSON.stringify(name)}`);
     if (!s || !s.value) throw new Error(`secret ${name}: empty value`);
+    if (s.value.includes('\u0000')) throw new Error(`secret ${name}: value contains NUL`);
+    if (s.value.length < 6) throw new Error(`secret ${name}: value shorter than 6 chars cannot be protected`);
     const hosts = (s.hosts ?? []).map((h) => h.trim()).filter(Boolean);
     if (hosts.length === 0) throw new Error(`secret ${name}: at least one host is required`);
     clean[name] = { value: s.value, hosts };
