@@ -35,7 +35,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/secret', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -1530,6 +1530,29 @@ async function withWallet(ctx: CommandContext): Promise<AgenticID> {
 
 /** Prompt for a secret with the typed characters not echoed. readline has no
  *  native masking, so suppress stdout echo for the duration of the question. */
+// ── owner-secret local value cache ───────────────────────────────────────────
+// The owner cannot decrypt the sealed blob, so setting/removing one secret
+// means re-sealing the WHOLE map — which needs every value. This per-agent
+// cache (0600, the owner's own machine, like the login key) holds the
+// plaintext values so a change does not force re-entering them all. The
+// attestor only ever stores names + hosts in the clear; values live here and
+// inside the agent.
+type SecretCache = Record<string, { value: string; hosts: string[] }>;
+function secretCachePath(agentId: string): string {
+  return join(configPaths().dir, `secrets-${agentId}.json`);
+}
+function loadSecretCache(agentId: string): SecretCache {
+  try {
+    return JSON.parse(readFileSync(secretCachePath(agentId), 'utf8')) as SecretCache;
+  } catch {
+    return {};
+  }
+}
+function saveSecretCache(agentId: string, m: SecretCache): void {
+  mkdirSync(configPaths().dir, { recursive: true });
+  writeFileSync(secretCachePath(agentId), JSON.stringify(m), { mode: 0o600 });
+}
+
 function askSecret(ask: (q: string) => Promise<string>, prompt: string): Promise<string> {
   return new Promise((res, rej) => {
     const stdout = process.stdout as unknown as { write: (s: string) => boolean };
@@ -1857,6 +1880,10 @@ const L2_HELP_FULL = `session commands
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
                           is untouched; that is the difference from /reset
+  /secret [ls|set|rm]     owner credentials the agent USES but never SEES: it
+                          references {{secret:NAME}} and the runtime fills the
+                          real value only for that secret's allowed hosts.
+                          set NAME [--hosts a.com,b.com]; values cached locally
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -2037,6 +2064,65 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const msg = (e as Error).message;
           if (/HTTP 501/.test(msg)) { messages.length = 0; out('history is client-held for this framework — local history cleared\n'); }
           else out(`clear failed: ${msg}\n`);
+        }
+        continue;
+      }
+      if (line === '/secret' || line.startsWith('/secret ')) {
+        // Owner secrets: usable by the agent via {{secret:NAME}} placeholders,
+        // never seen by it (SECRETS.md). Values are kept locally (so the whole
+        // map can be re-sealed on each change); the attestor stores names+hosts
+        // only. Refuses to re-seal when another machine holds values this one
+        // doesn't cache, so a change here can't silently drop them.
+        const argv = line.split(/\s+/).slice(1);
+        const sub = argv[0] ?? 'ls';
+        const agentId = BigInt(s.agentId);
+        try {
+          if (sub === 'ls') {
+            const { index, version } = await s.ag.agent.listSecrets(agentId);
+            const cache = loadSecretCache(s.agentId);
+            const names = Object.keys(index).sort();
+            if (names.length === 0) out('no secrets configured\n');
+            else {
+              out(`secrets (version ${version}):\n`);
+              for (const n of names) {
+                out(`  ${n} → ${(index[n] ?? []).join(', ')}${cache[n] ? '' : '   (value not cached on this machine)'}\n`);
+              }
+            }
+          } else if (sub === 'set' || sub === 'rm') {
+            const name = argv[1];
+            if (!name) { out(`usage: /secret ${sub} NAME${sub === 'set' ? ' [--hosts a.com,b.com]' : ''}\n`); continue; }
+            const { index, version } = await s.ag.agent.listSecrets(agentId);
+            const cache = loadSecretCache(s.agentId);
+            const missing = Object.keys(index).filter((n) => n !== name && !cache[n]);
+            if (missing.length) {
+              out(`refusing: values for ${missing.join(', ')} are not cached on this machine; re-sealing here would drop them. Run from the machine that created them.\n`);
+              continue;
+            }
+            if (sub === 'set') {
+              let hosts: string[] = [];
+              const hi = argv.indexOf('--hosts');
+              if (hi >= 0 && argv[hi + 1]) hosts = argv[hi + 1].split(',').map((h) => h.trim()).filter(Boolean);
+              const value = (await askSecret(ask, `value for ${name} (hidden): `)).trim();
+              if (!value) { out('empty value — aborted\n'); continue; }
+              if (hosts.length === 0) {
+                const h = (await ask(`allowed hosts for ${name} (comma-separated, e.g. api.stripe.com): `)).trim();
+                hosts = h.split(',').map((x) => x.trim()).filter(Boolean);
+              }
+              if (hosts.length === 0) { out('a secret must name at least one host — aborted\n'); continue; }
+              cache[name] = { value, hosts };
+            } else {
+              if (!index[name] && !cache[name]) { out(`no such secret: ${name}\n`); continue; }
+              delete cache[name];
+            }
+            const { version: v, pushed } = await s.ag.agent.putSecrets(agentId, cache, version, { base: s.url, instanceId: clientInstanceId });
+            saveSecretCache(s.agentId, cache);
+            const applied = pushed ? ', applied to the running agent' : s.url ? ', stored — applies on next boot' : ', stored';
+            out(`secret ${name} ${sub === 'set' ? 'set' : 'removed'} (version ${v}${applied})\n`);
+          } else {
+            out('usage: /secret [ls | set NAME [--hosts a,b] | rm NAME]\n');
+          }
+        } catch (e) {
+          out(`secret: ${(e as Error).message}\n`);
         }
         continue;
       }

@@ -22,3 +22,15 @@ test('rejects empty value and bad names', () => {
   assert.throws(() => sealSecretsDocument(PUB, OWNER, { 'a b': { value: 'v', hosts: ['a.com'] } }), /invalid secret name/);
   assert.throws(() => sealSecretsDocument(PUB, OWNER, { '{{x}}': { value: 'v', hosts: ['a.com'] } }), /invalid secret name/);
 });
+
+import { secretsAuthMessage, SECRETS_DOMAIN } from '../dist/secretEnv.js';
+
+test('secretsAuthMessage: write ends with digest, read without; domain distinct', () => {
+  assert.equal(SECRETS_DOMAIN, 'AgenticID.Secrets.v1');
+  const seal = '0xABCDEF';
+  const write = secretsAuthMessage(seal, 1700, 3, 'deadbeef');
+  assert.equal(write, 'AgenticID.Secrets.v1:0xabcdef:1700:3:deadbeef');
+  const read = secretsAuthMessage(seal, 1700, 3);
+  assert.equal(read, 'AgenticID.Secrets.v1:0xabcdef:1700:3');
+  assert.ok(!write.startsWith('AgenticID.Settings'), 'distinct from settings domain');
+});

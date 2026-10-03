@@ -31,6 +31,7 @@ import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import type { SecretEnvMode } from './secretEnv';
+import { sealSecretsDocument, type OwnerSecret } from './secretEnv';
 import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
@@ -577,6 +578,53 @@ export class AgentApi {
     });
     if (!r.ok) throw new Error(`clearConversation: HTTP ${r.status}: ${await r.text()}`);
     return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
+  /**
+   * List the owner's configured secrets — their names and per-secret host
+   * allowlists, plus the version to write against next (SECRETS.md). Values are
+   * never returned (the owner cannot decrypt the sealed blob); the local CLI
+   * cache holds values for re-sealing.
+   */
+  async listSecrets(agentId: bigint): Promise<{ index: Record<string, string[]>; version: number }> {
+    const sealId = await this.id.getSealId(agentId);
+    return this.attestor.getSecrets(sealId);
+  }
+
+  /**
+   * Store the owner's complete desired secret set for an agent: seals the whole
+   * name → {value, hosts} map to the agent's agentSeal key, persists it to the
+   * attestor (CAS on `baseVersion` from {@link listSecrets}), and — when `base`
+   * (a running container URL) is given — pushes it so it takes effect without a
+   * rebuild. Pass the FULL map each time (remove a secret by omitting it; an
+   * empty map clears them all); the owner cannot read old values back, so the
+   * caller (CLI) keeps the plaintext locally and re-seals the whole set.
+   */
+  async putSecrets(
+    agentId: bigint,
+    secrets: Record<string, OwnerSecret>,
+    baseVersion: number,
+    opts?: { base?: string; instanceId?: string },
+  ): Promise<{ version: number; pushed: boolean }> {
+    const { account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const pubkey = await this.attestor.agentSealPubkey(sealId);
+    const blob = sealSecretsDocument(pubkey, account.address, secrets);
+    const index: Record<string, string[]> = {};
+    for (const [name, s] of Object.entries(secrets)) index[name] = s.hosts;
+    const { version } = await this.attestor.setSecrets({ sealId, blob, index, baseVersion });
+    let pushed = false;
+    if (opts?.base) {
+      // Immediate-effect half; a failure is a warning — the stored blob lands
+      // on the next boot either way.
+      try {
+        await this.pushSecretsToContainer(opts.base, agentId, blob, opts.instanceId);
+        pushed = true;
+      } catch {
+        pushed = false;
+      }
+    }
+    return { version, pushed };
   }
 
   /**

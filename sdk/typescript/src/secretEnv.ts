@@ -190,6 +190,28 @@ export interface OwnerSecret {
   hosts: string[];
 }
 
+/** Owner-signature domain for the attestor `/secrets` store — distinct from
+ *  Settings so a settings signature cannot be replayed to write secrets. */
+export const SECRETS_DOMAIN = 'AgenticID.Secrets.v1';
+
+/**
+ * The `X-Auth-Message` for a `/secrets` call. One grammar, two forms (mirrors
+ * settings): write ends with the blob's sha256 hex, read ends at the base
+ * version. `baseVersion` is the compare-and-swap term read before editing.
+ *
+ *   write  `AgenticID.Secrets.v1:0x<sealId>:<unix seconds>:<base version>:<sha256-hex>`
+ *   read   `AgenticID.Secrets.v1:0x<sealId>:<unix seconds>:<base version>`
+ */
+export function secretsAuthMessage(
+  sealId: string,
+  unixSeconds: number,
+  baseVersion: number,
+  digestHex?: string,
+): string {
+  const head = `${SECRETS_DOMAIN}:${sealId.toLowerCase()}:${unixSeconds}:${baseVersion}`;
+  return digestHex === undefined ? head : `${head}:${digestHex}`;
+}
+
 /**
  * Seal a named-secret map to the agent's agentSeal key. The sealed runtime
  * opens it with `secrets.Open` and uses each value only at egress, for the
