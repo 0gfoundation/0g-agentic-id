@@ -1855,6 +1855,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         };
@@ -1908,6 +1911,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         });
@@ -2071,6 +2077,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         });
@@ -2616,6 +2625,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         };

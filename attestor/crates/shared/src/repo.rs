@@ -97,6 +97,9 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
     let settings_version: i64 = row.try_get("settings_version")?;
     let settings_confirmed_version: i64 = row.try_get("settings_confirmed_version")?;
     let settings_attempts: i32 = row.try_get("settings_attempts")?;
+    let secrets_blob: Option<String> = row.try_get("secrets_blob")?;
+    let secrets_index: Option<serde_json::Value> = row.try_get("secrets_index")?;
+    let secrets_version: i64 = row.try_get("secrets_version")?;
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
@@ -142,6 +145,9 @@ fn row_to_deployment(row: &sqlx::postgres::PgRow) -> anyhow::Result<Deployment> 
         settings_version,
         settings_confirmed_version,
         settings_attempts,
+        secrets_blob,
+        secrets_index,
+        secrets_version,
         created_at,
         updated_at,
     })
@@ -762,6 +768,53 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             Some(r) => Some(r.try_get("settings_attempts")?),
             None => None,
         })
+    }
+
+    async fn set_secrets(
+        &self,
+        seal_id: SealId,
+        blob: Option<String>,
+        index: Option<serde_json::Value>,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        // CAS on secrets_version, decided inside the UPDATE (mirrors
+        // set_settings). A stale base matches no row -> None. Values are in
+        // `blob`, already sealed to agentSeal; attestor stores them opaque.
+        let row = sqlx::query(
+            "UPDATE deployments
+             SET secrets_blob    = $1,
+                 secrets_index   = $2,
+                 secrets_version = secrets_version + 1,
+                 updated_at      = now()
+             WHERE seal_id = $3
+               AND secrets_version = $4
+             RETURNING secrets_version",
+        )
+        .bind(blob)
+        .bind(index)
+        .bind(seal_id.as_slice())
+        .bind(base_version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(r.try_get("secrets_version")?),
+            None => None,
+        })
+    }
+
+    async fn clear_secrets(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        // Transfer wipe: the previous owner's credentials must not reach the
+        // new owner's container. Reset version to 0 too, so the new owner
+        // starts a fresh CAS lineage.
+        sqlx::query(
+            "UPDATE deployments
+             SET secrets_blob = NULL, secrets_index = NULL, secrets_version = 0, updated_at = now()
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id_to_text(&agent_id))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn stale_running_candidates(

@@ -1281,6 +1281,37 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(attempts)
     }
 
+    async fn set_secrets(
+        &self,
+        seal_id: SealId,
+        blob: Option<String>,
+        index: Option<serde_json::Value>,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut version = None;
+        self.mut_with(seal_id, |d| {
+            if d.secrets_version == base_version {
+                d.secrets_blob = blob;
+                d.secrets_index = index;
+                d.secrets_version += 1;
+                version = Some(d.secrets_version);
+            }
+        })?;
+        Ok(version)
+    }
+
+    async fn clear_secrets(&self, agent_id: AgentId) -> anyhow::Result<()> {
+        let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        self.mut_with(seal, |d| {
+            d.secrets_blob = None;
+            d.secrets_index = None;
+            d.secrets_version = 0;
+        })
+    }
+
     async fn stale_running_candidates(
         &self,
         now: chrono::DateTime<chrono::Utc>,

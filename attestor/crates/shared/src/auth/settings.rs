@@ -48,6 +48,8 @@ use std::str::FromStr;
 pub const SETTINGS_DOMAIN: &str = "AgenticID.Settings.v1";
 /// Domain tag of the container-signed seed message.
 pub const SETTINGS_SEED_DOMAIN: &str = "SettingsSeed";
+/// Domain tag of the owner-signed secrets message (SECRETS.md).
+pub const SECRETS_DOMAIN: &str = "AgenticID.Secrets.v1";
 
 /// sha256 of the settings bytes, lowercase hex — the digest both message
 /// formats carry.
@@ -79,6 +81,27 @@ pub fn owner_read_message(seal_id: SealId, timestamp: i64, base_version: i64) ->
     )
 }
 
+/// The exact string an owner signs for `POST /secrets` (write form).
+pub fn secrets_owner_message(
+    seal_id: SealId,
+    timestamp: i64,
+    base_version: i64,
+    digest_hex: &str,
+) -> String {
+    format!(
+        "{SECRETS_DOMAIN}:0x{}:{timestamp}:{base_version}:{digest_hex}",
+        hex::encode(seal_id.as_slice())
+    )
+}
+
+/// The exact string an owner signs for `GET /secrets` (read form).
+pub fn secrets_owner_read_message(seal_id: SealId, timestamp: i64, base_version: i64) -> String {
+    format!(
+        "{SECRETS_DOMAIN}:0x{}:{timestamp}:{base_version}",
+        hex::encode(seal_id.as_slice())
+    )
+}
+
 /// Parsed `X-Auth-Message`. `digest_hex` is present on the write form and
 /// absent on the read form; the route decides which it requires, so a
 /// message signed to read cannot be replayed to write.
@@ -92,11 +115,23 @@ pub struct OwnerMessage {
 /// Parse either owner form. Structure only — freshness, the version
 /// compare-and-swap, the digest match and signer identity are the caller's.
 pub fn parse_owner_message(msg: &str) -> anyhow::Result<OwnerMessage> {
+    parse_owner_message_in(msg, SETTINGS_DOMAIN)
+}
+
+/// Parse the secrets owner message (`AgenticID.Secrets.v1:...`). Same shape
+/// and rules as the settings owner message, a distinct domain so a signature
+/// made to configure settings cannot be replayed to write secrets.
+pub fn parse_secrets_message(msg: &str) -> anyhow::Result<OwnerMessage> {
+    parse_owner_message_in(msg, SECRETS_DOMAIN)
+}
+
+/// Domain-parametrized core shared by the settings and secrets owner messages.
+pub fn parse_owner_message_in(msg: &str, domain: &str) -> anyhow::Result<OwnerMessage> {
     let parts: Vec<&str> = msg.split(':').collect();
-    if !matches!(parts.len(), 4 | 5) || parts[0] != SETTINGS_DOMAIN {
+    if !matches!(parts.len(), 4 | 5) || parts[0] != domain {
         anyhow::bail!(
-            "X-Auth-Message must be \"{SETTINGS_DOMAIN}:0x<sealId>:<unix seconds>:<base version>\" \
-             (read) or \"{SETTINGS_DOMAIN}:0x<sealId>:<unix seconds>:<base version>:<sha256 hex>\" (write)"
+            "X-Auth-Message must be \"{domain}:0x<sealId>:<unix seconds>:<base version>\" \
+             (read) or \"{domain}:0x<sealId>:<unix seconds>:<base version>:<sha256 hex>\" (write)"
         );
     }
     let seal_id = B256::from_str(parts[1])
