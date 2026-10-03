@@ -579,6 +579,35 @@ export class AgentApi {
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
+  /**
+   * Push an owner-secrets blob into a RUNNING container so a change takes
+   * effect without rebuilding it (SECRETS.md §6). Like {@link clearConversation}
+   * this is the immediate-effect half; persisting to the attestor store is the
+   * authoritative half a future boot reads. `blob` is the base64 produced by
+   * `sealSecretsDocument` (sealed to agentSeal). Owner-signed, tag
+   * `0GSealSecrets`, the body digest bound in. A failure here is a warning: the
+   * stored blob still lands on the next boot.
+   */
+  async pushSecretsToContainer(base: string, agentId: bigint, blob: string, instanceId?: string): Promise<void> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const digest = await sha256Hex(blob);
+    const audience = new URL(base).origin;
+    const message = `0GSealSecrets:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/secrets`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'text/plain',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body: blob,
+    });
+    if (!r.ok) throw new Error(`pushSecretsToContainer: HTTP ${r.status}: ${await r.text()}`);
+  }
+
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
   private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);

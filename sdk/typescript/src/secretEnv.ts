@@ -184,6 +184,39 @@ export function sealSecretEnv(agentSealPubkey: Hex, owner: Address, env: Record<
   return base64(eciesEncrypt(hexToBytes(agentSealPubkey), plaintext));
 }
 
+/** One owner secret: its value and the hosts it may be sent to (SECRETS.md). */
+export interface OwnerSecret {
+  value: string;
+  hosts: string[];
+}
+
+/**
+ * Seal a named-secret map to the agent's agentSeal key. The sealed runtime
+ * opens it with `secrets.Open` and uses each value only at egress, for the
+ * hosts listed — the agent never sees a value. Each secret MUST name at least
+ * one host: a secret with no allowlist is unusable, not a free-for-all, and is
+ * rejected here (matching the sealed side). Returns the base64 blob that rides
+ * the attestor `/secrets` store and the `/_seal/secrets` push.
+ */
+export function sealSecretsDocument(
+  agentSealPubkey: Hex,
+  owner: Address,
+  secrets: Record<string, OwnerSecret>,
+): string {
+  const clean: Record<string, OwnerSecret> = {};
+  for (const [name, s] of Object.entries(secrets)) {
+    if (!name || /[{}:\s]/.test(name)) throw new Error(`invalid secret name ${JSON.stringify(name)}`);
+    if (!s || !s.value) throw new Error(`secret ${name}: empty value`);
+    const hosts = (s.hosts ?? []).map((h) => h.trim()).filter(Boolean);
+    if (hosts.length === 0) throw new Error(`secret ${name}: at least one host is required`);
+    clean[name] = { value: s.value, hosts };
+  }
+  const plaintext = new TextEncoder().encode(
+    JSON.stringify({ v: 1, owner: getAddress(owner), secrets: clean }),
+  );
+  return base64(eciesEncrypt(hexToBytes(agentSealPubkey), plaintext));
+}
+
 /** Parse and validate an agentSeal public key served by the attestor; returns
  *  its canonical compressed hex. Throws on anything that is not a curve point. */
 export function parseAgentSealPubkey(pubkey: string): Hex {
