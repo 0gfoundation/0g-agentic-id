@@ -260,7 +260,7 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |
 | SandboxServing (attestor infra, external) | `0x3490B9053AC46F7Bf71A1ceBffcB2be2C1405b41` | from attestor `GET /config` |
-| owner / pauser (all contracts) | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` | migrated 2026-09-07 from `0xea69…1837`; Timelock proposer + canceller + admin also = `0x7344…431b` (fully migrated). `0xea69…1837` remains the oracle/deployer of record |
+| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xea69…1837`); Timelock proposer + canceller + admin also = `0x9C58…80Bb` (fully migrated). `0xea69…1837` remains the oracle/deployer of record |
 
 TappRegistry / SandboxServing are attestor-deployment infrastructure (external
 contracts the attestor is configured with, **not** deployed by this repo's
@@ -275,7 +275,7 @@ open execution. Mainnet needs a real multisig + non-zero delay + a real TEE orac
 ### 6.2 dev environment — 2026-06-17 (active)
 
 **The dev-host attestor points at this** (`ATTESTOR_AGENTIC_ID_ADDR = 0x5BB5…`),
-owner `0xB831…`.
+owner `0x9C58…80Bb`.
 
 | Contract | Address | VERSION |
 |---|---|---|
@@ -296,8 +296,8 @@ owner `0xB831…`.
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x7344…431b` (fully migrated 2026-09-07; verified on chainscan) |
-| owner / pauser (all contracts) | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` | migrated 2026-09-07 from `0xB831…CEd7` (deployer/oracle history) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x9C58…80Bb` (migrated 2026-10-12 from `0x7344…431b`) |
+| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
 in this repo (they're attestor-deployment infra, configured via
@@ -308,7 +308,8 @@ from the dev-host attestor's `GET /config` (`tapp_registry_addr` /
 ### 6.2m mainnet environment — 2026-09-09 (0G mainnet, chain 16661)
 
 Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). Governance
-mirrors testnet: owner / pauser / proposer / TEE-oracle = `0x7344…431b`,
+mirrors testnet: owner / pauser / proposer / TEE-oracle = `0x8760…621d`
+(from `0x7344…431b` on 2026-10-04),
 Timelock `minDelay=0`, open execution. **The mainnet checklist (§8) is NOT
 yet satisfied — multisig owner, non-zero delay, and a real TEE oracle are
 follow-ups before this carries real user value.**
@@ -327,7 +328,7 @@ follow-ups before this carries real user value.**
 | TEEDataVerifier impl / beacon | `0x6D82f34CD671E4593A7E3BCDa253B23a2722403a` / `0xf74242B94dc958c3973Eb3e6219435c5956563fC` |
 | TimelockController | `0x399ab112B03104f20524Df0f9a4A2F0C199A0cF7` |
 | Canonical ERC-8004 identity / reputation | `0x8004A169…a432` / `0x8004BAa1…9b63` (v2.0.0, pre-existing) |
-| owner / pauser / proposer / TEE-oracle | `0x73443d8C05c74F8C2F5D499Da2597a1EE49E431b` |
+| owner / pauser / proposer / TEE-oracle | `0x87605Ec8E10Eb373C1d070e15E5d78FAC4D7621d` |
 
 ### 6.3 Superseded / do not use
 
