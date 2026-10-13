@@ -16,7 +16,10 @@ import (
 func TestRoles_ExpectedSet(t *testing.T) {
 	a := &Adapter{}
 	got := a.Roles()
-	wantNames := []string{"framework", "openclaw.json", "workspace/", "workspace/skills/", "workspace/canvas/"}
+	// openclaw.json is deliberately NOT here: the config file is rendered
+	// from the owner's settings at every Start, so chain-tracking it would
+	// anchor a derived artifact.
+	wantNames := []string{"framework", "workspace/", "workspace/skills/", "workspace/canvas/"}
 	if len(got) != len(wantNames) {
 		t.Fatalf("Roles count = %d; want %d", len(got), len(wantNames))
 	}
@@ -25,10 +28,10 @@ func TestRoles_ExpectedSet(t *testing.T) {
 			t.Errorf("Roles[%d].Name = %q; want %q", i, got[i].Name, want)
 		}
 	}
-	// framework + openclaw.json are Leaf; rest are DirectoryManifest.
+	// framework is the only Leaf; the rest are DirectoryManifest.
 	for _, r := range got {
 		switch r.Name {
-		case "framework", "openclaw.json":
+		case "framework":
 			if r.Shape != framework.Leaf {
 				t.Errorf("role %q shape = %q; want Leaf", r.Name, r.Shape)
 			}
@@ -40,7 +43,7 @@ func TestRoles_ExpectedSet(t *testing.T) {
 	}
 }
 
-func TestDefaults_RealValuesForLeafRoles(t *testing.T) {
+func TestDefaults_RealValuesForLeafRole(t *testing.T) {
 	a := &Adapter{}
 	// framework: should be a valid frameworkBinding JSON with current
 	// adapter name + whitelistMax version + schema 1.
@@ -58,9 +61,9 @@ func TestDefaults_RealValuesForLeafRoles(t *testing.T) {
 	if fb.SchemaVersion != 1 {
 		t.Errorf("Defaults(framework).SchemaVersion = %d; want 1", fb.SchemaVersion)
 	}
-	// openclaw.json: empty JSON object so spawn can read it without error.
-	if got := string(a.Defaults("openclaw.json")); got != "{}" {
-		t.Errorf("Defaults(openclaw.json) = %q; want {}", got)
+	// A role this adapter doesn't declare has no default.
+	if got := a.Defaults("openclaw.json"); got != nil {
+		t.Errorf("Defaults(openclaw.json) = %q; want nil — the config role is gone", got)
 	}
 }
 
@@ -80,73 +83,6 @@ func TestDefaults_EmptyManifestForDirectoryRoles(t *testing.T) {
 		if len(m.Entries) != 0 {
 			t.Errorf("Defaults(%s) has %d entries; want 0", role, len(m.Entries))
 		}
-	}
-}
-
-// ── EvolutionFor("openclaw.json") ───────────────────────────────────────────
-
-func TestEvoOpenclawJSON_StripsGateway(t *testing.T) {
-	useTempHome(t)
-	// Write an openclaw.json with both kept and stripped sections.
-	cfg := map[string]any{
-		"agents": map[string]any{
-			"defaults": map[string]any{
-				"model": map[string]any{"primary": "anthropic/claude-opus-4-6"},
-			},
-		},
-		"gateway": map[string]any{
-			"auth": map[string]any{"token": "secret-per-boot-token"},
-		},
-	}
-	writeJSONConfig(t, cfg)
-
-	out, err := (&Adapter{}).EvolutionFor(context.Background(), "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor: %v", err)
-	}
-	var parsed map[string]any
-	if err := json.Unmarshal(out, &parsed); err != nil {
-		t.Fatalf("parse output: %v", err)
-	}
-	if _, present := parsed["gateway"]; present {
-		t.Errorf("gateway key not stripped from output: %s", out)
-	}
-	if _, present := parsed["agents"]; !present {
-		t.Errorf("agents key wrongly stripped: %s", out)
-	}
-}
-
-func TestEvoOpenclawJSON_DeterministicAcrossRuns(t *testing.T) {
-	useTempHome(t)
-	cfg := map[string]any{
-		"agents": map[string]any{"defaults": map[string]any{"model": map[string]any{"primary": "x/y"}}},
-		"tools":  []any{},
-	}
-	writeJSONConfig(t, cfg)
-
-	a := &Adapter{}
-	out1, err := a.EvolutionFor(context.Background(), "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor 1: %v", err)
-	}
-	out2, err := a.EvolutionFor(context.Background(), "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor 2: %v", err)
-	}
-	if string(out1) != string(out2) {
-		t.Errorf("not deterministic: %s vs %s", out1, out2)
-	}
-}
-
-func TestEvoOpenclawJSON_MissingFileReturnsEmpty(t *testing.T) {
-	useTempHome(t)
-	// Don't write openclaw.json — loadOpenclawJSON returns empty map.
-	out, err := (&Adapter{}).EvolutionFor(context.Background(), "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor: %v", err)
-	}
-	if string(out) != "{}" {
-		t.Errorf("expected '{}' for missing config, got %s", out)
 	}
 }
 

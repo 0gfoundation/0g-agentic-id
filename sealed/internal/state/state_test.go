@@ -110,9 +110,9 @@ func TestUpdateCurrentSnapshot_AdoptsChainDataHashWhenInSync(t *testing.T) {
 func TestUpdateCurrentSnapshot_PrevDataHashWins(t *testing.T) {
 	a := New()
 	a.SeedChainSnapshot("framework", "h1", "0xroot1")
-	a.UpdateCurrentSnapshot("framework", "h2")           // drift
-	a.RecordChainUpload("framework", "h2", "0xroot2")    // own upload
-	a.UpdateCurrentSnapshot("framework", "h2")           // tick
+	a.UpdateCurrentSnapshot("framework", "h2")        // drift
+	a.RecordChainUpload("framework", "h2", "0xroot2") // own upload
+	a.UpdateCurrentSnapshot("framework", "h2")        // tick
 
 	_, _, _, _, dh := a.Snapshot()
 	if got := dh["framework"].DataHash; got != "0xroot2" {

@@ -2,14 +2,17 @@
 //
 // Endpoints (in priority order, all served by the single mux):
 //
-//   GET  /healthz       - container liveness probe (always 200)
-//   GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
-//   GET  /log.html      - same log, color-coded HTML view for frontends
-//   GET  /log/agent     - framework subprocess log (plaintext, owner-only)
-//   GET  /log/agent.html - same log, color-coded HTML view (owner-only)
-//   GET  /hello         - signed A2A self-introduction (returns 503 until armed)
-//   POST /_seal/auth    - owner-only flow returning the framework auth token
-//   *    /              - signed reverse proxy to agent upstream (returns 503 until armed)
+//	GET  /healthz       - container liveness probe (always 200)
+//	GET  /log           - bootstrap diagnostic log (plaintext, NOT signed)
+//	GET  /log.html      - same log, color-coded HTML view for frontends
+//	GET  /log/agent     - framework subprocess log (plaintext, owner-only)
+//	GET  /log/agent.html - same log, color-coded HTML view (owner-only)
+//	GET  /hello         - signed A2A self-introduction (returns 503 until armed)
+//	POST /_seal/auth    - owner-only flow returning the framework auth token
+//	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
+//	POST /_seal/claim   - take the single-driver seat (owner-signed)
+//	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
+//	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
 // X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
@@ -22,6 +25,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -65,6 +69,45 @@ type Server struct {
 	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
 	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
 	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+
+	// synth backs the synthesized /v1/responses surface (responses.go) for
+	// adapters that don't serve one natively.
+	synth *synthHub
+
+	readSettings  SettingsReader
+	applySettings SettingsApplier
+	applyClear    ClearApplier
+
+	// Stateful-door conversation binding (framework.ConversationSession),
+	// wired by main.go only for adapters that hold the conversation
+	// server-side. Applied ONLY to the synthesized responses door's upstream
+	// calls — the transparent /v1/chat/completions door stays stateless.
+	conversationHeaders func() map[string]string
+	observeConversation func(sent map[string]string, resp http.Header)
+	// conversationHistory, when set, replaces CLIENT-sent history on the
+	// stateful door: prior turns come from the framework's own store, the
+	// client's input supplies only the current turn.
+	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
+	applySession  SessionSettingsApplier
+
+	// seat is the single active owner client (see occupancy.go).
+	seat occupantSeat
+
+	// liveOwner reads the CURRENT on-chain owner. Late-bound like adapter:
+	// the chain client only exists after Phase 2. See verifyOwnerSig for why
+	// the cached owner is not good enough.
+	liveOwner OwnerResolver
+}
+
+// OwnerResolver returns the agent's owner as of right now, by reading the
+// chain. main.go supplies one backed by the bootstrap chain client.
+type OwnerResolver func(ctx context.Context) (string, error)
+
+// SetLiveOwner installs the resolver. Safe to call before or after Listen.
+func (s *Server) SetLiveOwner(r OwnerResolver) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.liveOwner = r
 }
 
 // New constructs a proxy.Server backed by a state.Agent. publicURL is the
@@ -74,7 +117,7 @@ type Server struct {
 // The framework adapter is attached later via SetAdapter, once the chain
 // bootstrap has resolved which framework this agent is.
 func New(agent *state.Agent, publicURL string) *Server {
-	return &Server{agent: agent, publicURL: publicURL}
+	return &Server{agent: agent, publicURL: publicURL, synth: newSynthHub()}
 }
 
 // SetAdapter late-binds the resolved framework adapter and derives the
@@ -139,14 +182,37 @@ func (s *Server) matchFrameworkRoute(path string) (framework.Route, bool) {
 func (s *Server) frameworkRoutesForHello() []report.Route {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]report.Route, 0, len(s.fwRoutes))
+	out := make([]report.Route, 0, len(s.fwRoutes)+1)
+	native := false
+	hasChat := false
 	for _, rt := range s.fwRoutes {
+		if rt.Kind == "responses" {
+			native = true
+		}
+		if strings.HasPrefix("/v1/chat/completions", rt.Prefix) {
+			hasChat = true
+		}
 		out = append(out, report.Route{
 			Prefix:      rt.Prefix,
 			Kind:        rt.Kind,
 			Auth:        rt.Auth,
 			Signed:      false,
 			Description: rt.Description,
+		})
+	}
+	// Advertise the synthesized long-task surface (responses.go) when the
+	// adapter has a chat route but no native Responses one — the SDK picks
+	// its transport off this kind.
+	if hasChat && !native {
+		out = append(out, report.Route{
+			Prefix: "/v1/responses",
+			Kind:   "responses",
+			Auth:   "bearer",
+			Signed: false,
+			Description: "OpenAI Responses API subset (synthesized by the sealed proxy in front of the framework's chat API): " +
+				"POST /v1/responses {input, stream} → events with sequence_number; GET /{id} polls; " +
+				"GET /{id}?stream=true&starting_after=N resumes; POST /{id}/cancel stops the turn. " +
+				"The turn survives client disconnects; same stateful session as the chat route.",
 		})
 	}
 	return out
@@ -176,6 +242,9 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/log/agent.html", s.handleAgentLogHTML)
 	mux.HandleFunc("/hello", s.handleHello)
 	mux.HandleFunc("/_seal/auth", s.handleAuth)
+	mux.HandleFunc("/_seal/settings", s.handleSettings)
+	mux.HandleFunc("/_seal/claim", s.handleClaim)
+	mux.HandleFunc("/_seal/clear", s.handleClear)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
@@ -214,7 +283,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
 	}
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner); !ok {
+	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner, ""); !ok {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -321,9 +390,25 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // when the runtime knows its own public URL (empty in dev — SANDBOX_PROXY_DOMAIN
 // unset — where there is no external endpoint to phish).
 //
+// The owner is read from the CHAIN on every call, not from the value cached
+// at bootstrap. Two reasons, both observed:
+//
+//   - A sold agent keeps answering to its previous owner until the container
+//     happens to restart. attestor closed this same hole on its side by
+//     reading owner_of live (lifecycle_auth.rs) rather than trusting an
+//     indexer that can lag; the container had not.
+//   - When the bootstrap OwnerOf call failed, the cached value stayed empty
+//     and every owner signature was then rejected for the container's entire
+//     life — one transient RPC error locked the owner out of their own agent,
+//     with a single warn line as the only trace.
+//
+// A lookup failure is therefore 503 (transient, retry) and never 401
+// (permanent, you are not the owner). With no resolver installed — local dev
+// before Phase 2 — the bootstrap value is used, which is all dev has.
+//
 // On success returns the server's current unix time; on any failure it writes
 // the HTTP error response and returns ok=false, so callers just `return`.
-func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, owner string) (int64, bool) {
+func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sealID, cachedOwner, wantDigest string) (int64, bool) {
 	msg := r.Header.Get("X-Auth-Message")
 	sigHex := r.Header.Get("X-Auth-Signature")
 	if msg == "" || sigHex == "" {
@@ -331,12 +416,45 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 		return 0, false
 	}
 
-	// audience may itself contain ':' (scheme, host:port), so keep it whole as
-	// the 4th field rather than splitting the entire message on ':'.
-	parts := strings.SplitN(msg, ":", 4)
-	if len(parts) != 4 || parts[0] != tag {
-		http.Error(w, fmt.Sprintf("X-Auth-Message must be %q:0x<sealID>:<ts>:<audience>", tag), http.StatusBadRequest)
+	// Grammar:
+	//
+	//	<tag>:0x<sealID>:<ts>:<audience>                    read-only routes
+	//	<tag>:0x<sealID>:<ts>:<sha256(body)>:<audience>     body-carrying routes
+	//
+	// AUDIENCE IS ALWAYS LAST, and the digest goes BEFORE it. That ordering is
+	// forced, not cosmetic: an audience is a URL and carries its own colons
+	// ("http://host:port"), so it can only survive as the final field of a
+	// limited split. Appending the digest after it instead put
+	// "//host:port:<digest>" in the digest's slot and rejected every request
+	// with a 401 — which reads like a signature problem and is not one. A test
+	// against a 127.0.0.1:<port> audience is what surfaced it; an https
+	// audience with no port would have hidden it.
+	//
+	// The digest itself is why a body-carrying route needs a fifth field at
+	// all: without it a signature attests only to WHO is calling, so anything
+	// able to alter the request in flight could swap the document and keep the
+	// signature valid.
+	want := 4
+	if wantDigest != "" {
+		want = 5
+	}
+	parts := strings.SplitN(msg, ":", want)
+	if len(parts) != want || parts[0] != tag {
+		grammar := fmt.Sprintf("%q:0x<sealID>:<ts>:<audience>", tag)
+		if wantDigest != "" {
+			grammar = fmt.Sprintf("%q:0x<sealID>:<ts>:<sha256(body)>:<audience>", tag)
+		}
+		http.Error(w, "X-Auth-Message must be "+grammar, http.StatusBadRequest)
 		return 0, false
+	}
+	if wantDigest != "" {
+		if !strings.EqualFold(strings.TrimPrefix(parts[3], "0x"), wantDigest) {
+			http.Error(w, "signed body digest does not match the request body", http.StatusUnauthorized)
+			return 0, false
+		}
+		// Shift so the audience check below stays one expression for both
+		// grammars: audience is the last field either way.
+		parts[3] = parts[4]
 	}
 	if !strings.EqualFold(parts[1], "0x"+sealID) {
 		http.Error(w, "seal_id mismatch", http.StatusUnauthorized)
@@ -376,12 +494,43 @@ func (s *Server) verifyOwnerSig(w http.ResponseWriter, r *http.Request, tag, sea
 		http.Error(w, "signature recover: "+err.Error(), http.StatusBadRequest)
 		return 0, false
 	}
+	owner, ok := s.resolveOwner(r.Context(), cachedOwner)
+	if !ok {
+		http.Error(w, "owner lookup unavailable, retry", http.StatusServiceUnavailable)
+		return 0, false
+	}
+
 	recovered := crypto.PubkeyToAddress(*pub).Hex()
 	if !strings.EqualFold(recovered, owner) {
 		http.Error(w, "signer is not the agent owner", http.StatusUnauthorized)
 		return 0, false
 	}
 	return now, true
+}
+
+// resolveOwner returns the owner to check a signature against. With a
+// resolver installed its answer is authoritative and a failure is fatal to
+// THIS request only; without one, the bootstrap value stands. An empty
+// answer from either source is a failure, not a match-nothing sentinel —
+// comparing a recovered address against "" is how the lockout happened.
+func (s *Server) resolveOwner(ctx context.Context, cached string) (string, bool) {
+	s.mu.RLock()
+	resolver := s.liveOwner
+	s.mu.RUnlock()
+
+	if resolver == nil {
+		return cached, cached != ""
+	}
+	owner, err := resolver(ctx)
+	if err != nil {
+		logger.Logf("proxy: live owner lookup failed: %v", err)
+		return "", false
+	}
+	if owner == "" {
+		logger.Logf("proxy: live owner lookup returned empty")
+		return "", false
+	}
+	return owner, true
 }
 
 // handleAuth hands the framework-specific control-UI credential (e.g. the
@@ -397,7 +546,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
 	}
-	now, ok := s.verifyOwnerSig(w, r, "0GSealAuth", sealID, owner)
+	now, ok := s.verifyOwnerSig(w, r, "0GSealAuth", sealID, owner, "")
 	if !ok {
 		return
 	}
@@ -442,6 +591,29 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	chainID, identityAddr := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	// One driver at a time (occupancy.go): a chat POST from a displaced
+	// client gets its 409 here, before any turn is dispatched. GETs (status,
+	// log reads, stream re-attach) and headerless callers pass untouched —
+	// reading never steals the seat, and the check protects mutation only.
+	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/") && !s.occupancyGate(w, r) {
+		return
+	}
+
+	// Long-task surface: when the adapter serves no native Responses route
+	// (openclaw, hermes — see responses.go for why theirs don't qualify), the
+	// proxy synthesizes /v1/responses* in front of the framework's own
+	// chat/completions. Checked before route matching: the adapters' declared
+	// "/v1/" prefix would otherwise forward these paths to a server that
+	// 404s them or gives them connection-coupled semantics.
+	if strings.HasPrefix(r.URL.Path, "/v1/responses") && !s.nativeResponsesDeclared() {
+		chatUpstream := upstream
+		if rt, ok := s.matchFrameworkRoute("/v1/chat/completions"); ok && rt.Backend != "" {
+			chatUpstream = rt.Backend
+		}
+		s.handleSynthResponses(w, r, chatUpstream)
 		return
 	}
 

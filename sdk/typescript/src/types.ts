@@ -38,6 +38,9 @@ export interface MetadataEntry {
 
 /**
  * Sealed key entry — maps a data hash to its encrypted/sealed key.
+ * This is an OUTPUT/EVENT shape only (`iTransferFrom` return values, the
+ * `ITransferred` event). The write functions (`register`, `registerWithSeal`,
+ * `update`, `updateAt`) take flat `bytes` sealed keys — see RegisterParams.
  * @struct
  */
 export interface SealedKeyEntry {
@@ -173,8 +176,8 @@ export interface RegisterParams {
   metadata: MetadataEntry[];
   /** Intelligent data entries */
   intelligentDatas: IntelligentData[];
-  /** Sealed key entries */
-  sealedKeys: SealedKeyEntry[];
+  /** Sealed keys, one per intelligent data entry (flat bytes, matching the contract's `bytes[]`) */
+  sealedKeys: `0x${string}`[];
 }
 
 /**
@@ -197,8 +200,8 @@ export interface UpdateParams {
   tokenId: bigint;
   /** New intelligent data entries (replaces all) */
   newDatas: IntelligentData[];
-  /** New sealed key entries (replaces all) */
-  sealedKeys: SealedKeyEntry[];
+  /** New sealed keys, one per entry (flat bytes, matching the contract's `bytes[]`) */
+  sealedKeys: `0x${string}`[];
 }
 
 /**
@@ -211,8 +214,8 @@ export interface UpdateAtParams {
   index: bigint;
   /** New intelligent data entry */
   newData: IntelligentData;
-  /** New sealed key entry */
-  sealedKey: SealedKeyEntry;
+  /** New sealed key (flat bytes, matching the contract's `bytes`) */
+  sealedKey: `0x${string}`;
 }
 
 /**

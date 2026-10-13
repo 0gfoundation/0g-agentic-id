@@ -4,8 +4,6 @@
 // designed 2026-07 from the live spike against hermes v0.19.0):
 //
 //	framework    Leaf — 3-field binding JSON (package_version = git tag)
-//	config.yaml  Leaf — owned-keys subset of ~/.hermes/config.yaml,
-//	             canonical JSON on chain, YAML on disk, api_key stripped
 //	SOUL.md      Leaf — identity/persona file, verbatim bytes
 //	memories/    DirectoryManifest — ~/.hermes/memories/*.md (hermes caps
 //	             these small: MEMORY.md ~2200 chars, USER.md ~1375)
@@ -14,17 +12,29 @@
 //	             skills/.bundled_manifest) are EXCLUDED — they are
 //	             reproducible from the pinned framework version
 //
+// ~/.hermes/config.yaml is deliberately absent from that list: it is no
+// longer chain-tracked. Instead, the model-wiring keys inside it are rewritten
+// from the owner's settings document before every Start (RenderSettings in
+// spawn.go) — the rest of the file is left as found — so a config fix reaches
+// an already-minted agent on its next boot instead of only at mint time. An
+// agent minted while it WAS a role still carries the old chain entry, and its
+// pin is read out of there exactly once at bootstrap (ingest.go) before the
+// watcher drops the entry; one minted then but never drifted has no such entry
+// at all, and its pin is read out of the mint `persona` seed instead.
+//
 // File map:
 //   - hermes.go      Adapter struct + framework.Framework interface methods
 //   - config.go      private config types
 //   - paths.go       on-disk path constants (+ the do-not-track list)
-//   - yamlio.go      config.yaml read/update + secret strip
+//   - yamlio.go      config.yaml read/update
 //   - restore.go     Restore dispatch + framework leaf
 //   - restore_paths.go  path-driven Restore/LoadEntry/RestoreEntry
 //   - evolution.go   EvolutionFor dispatch + framework live probe
 //   - evolution_paths.go  per-role canonical plaintext builders
-//   - ingest.go      HandleLegacy: mint-only persona translation
-//   - spawn.go       Start: version pin (git tag + uv sync) + gateway spawn
+//   - ingest.go      HandleLegacy: mint-only persona translation, the retired
+//     config.yaml role's pin recovery, and which of the two wins
+//   - spawn.go       Start: version pin (git tag + uv sync) + gateway spawn;
+//     RenderSettings: owner settings -> config.yaml
 package hermes
 
 import (
@@ -41,6 +51,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/settings"
 )
 
 const (
@@ -64,9 +75,29 @@ type Adapter struct {
 	apiServerKey string    // API server bearer key; generated on first Start, reused on restarts
 	cmd          *exec.Cmd // running gateway process; nil before Start / after exit
 
+	// resolved is the settings document last rendered into config.yaml.
+	// Start reads the provider/model pin from here: the config file it used
+	// to parse is now an artifact of this value, not a source of truth.
+	resolved *settings.Resolved
+
+	// seededPin is the model pin HandleLegacy recovered for an agent whose
+	// settings document predates the configuration channel, handed back to the
+	// platform through SeededSettings so it can be persisted as that document.
+	// Either legacy chain entry can supply it — the mint `persona` seed or the
+	// retired "config.yaml" role — and seededFrom records which, because the
+	// seed outranks the role and Phase C reaches them in chain order (the
+	// ranking, and why it goes that way, is in ingest.go).
+	//
+	// nil whenever there was nothing to recover, which is the normal case for
+	// an agent deployed with a document of its own. Transitional.
+	seededPin  *settings.Doc
+	seededFrom legacySource
+
 	// initialized flips after the first successful Start. Subsequent Start
-	// calls (supervisor restarts) skip install + config rewrites so agent
-	// self-modifications survive restart untouched.
+	// calls (supervisor restarts) skip the install: the framework is already
+	// pinned in this container. RenderSettings still runs on every boot
+	// regardless, so the model-wiring keys it owns in config.yaml are not a
+	// place self-modifications survive (the rest of that file is).
 	initialized bool
 }
 
@@ -87,9 +118,9 @@ func (a *Adapter) Name() string { return "hermes" }
 func (a *Adapter) SubprocessLogPath() string { return "/tmp/hermes.log" }
 
 // SettleDelay implements framework.SettleDelayer. Hermes's first boot
-// seeds bundled skills into ~/.hermes/skills/ and may rewrite config.yaml
-// defaults; 10s lets those writes land before the watcher baseline is
-// captured (seeding is file-copy bound, not network bound).
+// seeds bundled skills into ~/.hermes/skills/; 10s lets those writes land
+// before the watcher baseline is captured (seeding is file-copy bound, not
+// network bound).
 func (a *Adapter) SettleDelay() time.Duration { return 10 * time.Second }
 
 // Version probes the installed hermes CLI. Best-effort; "" on error.
@@ -108,7 +139,6 @@ func (a *Adapter) Version(ctx context.Context) (string, error) {
 func (a *Adapter) Roles() []framework.RoleSpec {
 	return []framework.RoleSpec{
 		{Name: "framework", Shape: framework.Leaf},
-		{Name: "config.yaml", Shape: framework.Leaf},
 		{Name: "SOUL.md", Shape: framework.Leaf},
 		{Name: "memories/", Shape: framework.DirectoryManifest},
 		{Name: "skills/", Shape: framework.DirectoryManifest},
@@ -118,7 +148,6 @@ func (a *Adapter) Roles() []framework.RoleSpec {
 // Defaults returns the canonical "empty/zero" plaintext for a role.
 //
 //   - "framework": current adapter name + whitelistMax tag + schema 1
-//   - "config.yaml": empty JSON object (canonical wire encoding is JSON)
 //   - "SOUL.md": nil — an absent/empty identity file is "no content"
 //   - manifest roles: empty Manifest
 func (a *Adapter) Defaults(role string) []byte {
@@ -134,8 +163,6 @@ func (a *Adapter) Defaults(role string) []byte {
 			return nil
 		}
 		return b
-	case "config.yaml":
-		return []byte("{}")
 	case "SOUL.md":
 		return nil
 	case "memories/", "skills/":

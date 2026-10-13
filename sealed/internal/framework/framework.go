@@ -12,12 +12,14 @@
 package framework
 
 import (
+	"net/http"
 	"context"
 	"fmt"
 	"sync"
 	"time"
 
 	"seal-verify/internal/platform"
+	"seal-verify/internal/settings"
 )
 
 // Shape declares how a role's plaintext maps to 0g-storage blobs.
@@ -155,6 +157,29 @@ type Framework interface {
 	// than running with a partial migration.
 	HandleLegacy(ctx context.Context, role string, plaintext []byte) error
 
+	// RenderSettings places the owner's settings where THIS framework reads
+	// them — a config file for openclaw and hermes, process environment for
+	// the prime and dsh bridges. It is the one piece of the configuration
+	// channel that cannot be shared, because only the adapter knows its own
+	// dialect.
+	//
+	// Called before every Start, and again whenever the owner pushes a
+	// change, so a fix shipped after an agent was minted reaches it on the
+	// next boot instead of only at mint time.
+	//
+	// Two rules the platform relies on:
+	//
+	//   - Idempotent. Same Resolved in, same bytes on disk out; the watcher
+	//     hashes those bytes and a non-deterministic render would report
+	//     drift on every tick.
+	//   - Platform values win. Apply s.Others (the owner's opaque
+	//     per-framework overlay) FIRST, then write the platform-owned keys
+	//     over it — endpoint, effort bound, output budget, and any
+	//     credential or per-boot token. Ordering, not an exclusion list, is
+	//     what keeps an overlay from disabling bounded reasoning or pinning
+	//     a wire format the catalog later changes.
+	RenderSettings(ctx context.Context, s settings.Resolved) error
+
 	// Start spawns the agent process based on the previously-Restored state.
 	// Returns the upstream URL the proxy should forward to.
 	Start(ctx context.Context, rt RuntimeContext) (StartResult, error)
@@ -282,6 +307,74 @@ type RouteProvider interface {
 	FrameworkRoutes() []Route
 }
 
+// ConversationSession is implemented by adapters whose framework holds the
+// conversation SERVER-SIDE, keyed by a session identity the platform must
+// attach to each stateful upstream call — and follow when the framework
+// rotates it (hermes mints a child session id at every compaction). The
+// caller (the proxy's stateful responses door) stays framework-agnostic: it
+// attaches whatever headers the adapter names and shows the adapter every
+// upstream response. The stateless /v1/chat/completions door never gets these
+// headers — statefulness there would silently change what standard clients
+// see.
+type ConversationSession interface {
+	// ConversationHeaders returns the headers that bind an upstream call to
+	// the agent's ONE conversation (minting the identity on first use).
+	ConversationHeaders() map[string]string
+	// ObserveConversation sees, for one turn, BOTH the headers this turn was
+	// sent with (from ConversationHeaders) and the upstream response's
+	// headers — so a rotated identity can be followed WITHOUT resurrecting a
+	// generation that a concurrent /clear or a later turn has since replaced.
+	// The `sent` map is exactly what ConversationHeaders returned for this
+	// turn; the adapter advances its persisted identity only from that
+	// generation (compare-and-swap), never blindly from the echo.
+	ObserveConversation(sent map[string]string, resp http.Header)
+}
+
+// ConversationTurn is one prior turn of the agent's conversation, in the
+// neutral shape the stateful door assembles upstream requests from.
+type ConversationTurn struct {
+	Role string // "user" | "assistant"
+	Text string
+}
+
+// ConversationHistory is implemented by adapters whose framework PERSISTS a
+// transcript that its own gateway never reads back (openclaw: the OpenAI door
+// takes the client's messages[] as authoritative). The stateful responses
+// door calls this instead of trusting client-sent history: prior turns come
+// from the harness's own store, the client supplies only the current turn.
+// The private on-disk format knowledge stays HERE, in the framework's own
+// package — the caller never parses the store (CONVERSATION.md §3).
+type ConversationHistory interface {
+	ConversationHistory(ctx context.Context) ([]ConversationTurn, error)
+}
+
+// SessionClearer is implemented by adapters whose framework persists the
+// agent's ONE conversation (CONVERSATION.md). ClearSession wipes the persisted
+// store so the NEXT framework start presents a fresh conversation; the caller
+// (main.go's applier) restarts the process after a successful clear, so the
+// wipe takes effect immediately rather than at the next incidental restart.
+// Adapters whose conversation is client-held (no store) simply don't implement
+// this; the proxy answers 501 for them.
+type SessionClearer interface {
+	ClearSession(ctx context.Context) error
+}
+
+// LegacySettingsSeeder is implemented by adapters that can recover an owner's
+// configuration from a chain role that predates the settings channel.
+//
+// Before the channel existed, the model pin lived inside a chain-tracked
+// config role. That role is gone from Roles(), so bootstrap now hands the old
+// chain entry to HandleLegacy — and this method is how the adapter gives the
+// recovered document back to the platform, which persists it to attestor
+// (report.SeedSettings) before the watcher's first tick drops the stale role.
+//
+// Returns ok=false when nothing was recovered, which is the normal case for
+// any agent minted after the channel shipped. Purely transitional: once no
+// live agent carries the old role, every implementation can be deleted.
+type LegacySettingsSeeder interface {
+	SeededSettings() (settings.Doc, bool)
+}
+
 // ErrUnsupportedDim is returned by EvolutionFor / Restore when an adapter
 // is asked to act on a dim label it doesn't understand.
 var ErrUnsupportedDim = fmt.Errorf("framework: dim not supported by this adapter")
@@ -307,11 +400,19 @@ type RuntimeContext struct {
 	ContractAddr string // AgenticID (identity registry) address; signed into serve-proof domain
 	ChainID      string // chain id (decimal); signed into serve-proof domain separation
 	AttestorURL  string // attestor endpoint URL
+	// There is deliberately no thinking level here. It used to ride this
+	// struct, arriving as SEAL_OWNER_THINKING in the sandbox env — and that
+	// is precisely why it had to leave: RuntimeContext is captured once at
+	// the first Start and replayed verbatim on every restart, so a level
+	// carried here was frozen for the container's life and a change applied
+	// at runtime was silently reverted by the next harness restart. It now
+	// travels in the owner's settings document and reaches an adapter through
+	// RenderSettings, which the manager runs before EVERY spawn.
 
 	// Inference routing (populated by spawn.go after resolving provider).
 	Provider        string // inference provider (e.g. "openai")
 	Model           string // inference model name (e.g. "glm-5.2")
-	ZGComputeRouted bool // whether 0g-compute augmentation was applied
+	ZGComputeRouted bool   // whether 0g-compute augmentation was applied
 
 	// Sealed runtime metadata.
 	SealedVersion string // git short hash of sealed binary; empty if unavailable

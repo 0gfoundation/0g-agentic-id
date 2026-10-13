@@ -2,7 +2,6 @@ package openclaw
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,39 +15,6 @@ import (
 // This file implements the path-driven Restore + LoadEntry + RestoreEntry
 // for the role set declared by Adapter.Roles(). Counterpart to
 // evolution_paths.go (read path).
-
-// ── Restore: role="openclaw.json" ───────────────────────────────────────────
-
-// restoreOpenclawJSON writes the plaintext (already filtered by the encoder
-// to exclude per-boot keys) verbatim to ~/.openclaw/openclaw.json.
-//
-// Per the path-driven model, this role owns the entire file; no merge with
-// other roles is needed. Per-boot sections (gateway.*) get re-added by
-// spawn.go writeRuntimeSections after Restore completes. The model-provider
-// dynamic augmentation (models.providers entries for 0g-compute routing)
-// is handled separately at Start time.
-func (a *Adapter) restoreOpenclawJSON(plaintext []byte) error {
-	if len(plaintext) == 0 {
-		// Required role; an empty plaintext at this layer indicates the
-		// caller wanted to clear the config. Write an empty object so
-		// the file exists.
-		plaintext = []byte("{}")
-	}
-	// Verify it parses — fail loud on garbage rather than silently
-	// corrupting the agent's config file.
-	var cfg map[string]any
-	if err := json.Unmarshal(plaintext, &cfg); err != nil {
-		return fmt.Errorf("openclaw.Restore[openclaw.json]: parse: %w", err)
-	}
-	if err := os.MkdirAll(openclawHome, 0o755); err != nil {
-		return fmt.Errorf("openclaw.Restore[openclaw.json]: mkdir %s: %w", openclawHome, err)
-	}
-	if err := os.WriteFile(openclawJSONPath(), plaintext, 0o600); err != nil {
-		return fmt.Errorf("openclaw.Restore[openclaw.json]: write %s: %w", openclawJSONPath(), err)
-	}
-	logger.Logf("openclaw.Restore[openclaw.json]: %d bytes", len(plaintext))
-	return nil
-}
 
 // ── Restore: role="workspace/" ──────────────────────────────────────────────
 

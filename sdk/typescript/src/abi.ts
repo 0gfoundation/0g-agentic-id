@@ -23,10 +23,7 @@ export const agenticIDAbi = [
         { name: 'dataDescription', type: 'string' },
         { name: 'dataHash', type: 'bytes32' },
       ] },
-      { name: 'sealedKeys', type: 'tuple[]', components: [
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'sealedKey', type: 'bytes' },
-      ] },
+      { name: 'sealedKeys', type: 'bytes[]' },
     ],
     outputs: [{ name: 'agentId', type: 'uint256' }],
   },
@@ -45,10 +42,7 @@ export const agenticIDAbi = [
         { name: 'dataDescription', type: 'string' },
         { name: 'dataHash', type: 'bytes32' },
       ] },
-      { name: 'sealedKeys', type: 'tuple[]', components: [
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'sealedKey', type: 'bytes' },
-      ] },
+      { name: 'sealedKeys', type: 'bytes[]' },
       { name: 'agentSeal_', type: 'address' },
       { name: 'sealId', type: 'bytes32' },
     ],
@@ -236,10 +230,7 @@ export const agenticIDAbi = [
         { name: 'dataDescription', type: 'string' },
         { name: 'dataHash', type: 'bytes32' },
       ] },
-      { name: 'sealedKeys', type: 'tuple[]', components: [
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'sealedKey', type: 'bytes' },
-      ] },
+      { name: 'sealedKeys', type: 'bytes[]' },
     ],
     outputs: [],
   },
@@ -254,10 +245,7 @@ export const agenticIDAbi = [
         { name: 'dataDescription', type: 'string' },
         { name: 'dataHash', type: 'bytes32' },
       ] },
-      { name: 'sealedKey', type: 'tuple', components: [
-        { name: 'dataHash', type: 'bytes32' },
-        { name: 'sealedKey', type: 'bytes' },
-      ] },
+      { name: 'sealedKey', type: 'bytes' },
     ],
     outputs: [],
   },
@@ -300,7 +288,7 @@ export const agenticIDAbi = [
     stateMutability: 'view',
     inputs: [
       { name: 'agentId', type: 'uint256' },
-      { name: 'key', type: 'string' },
+      { name: 'metadataKey', type: 'string' },
     ],
     outputs: [{ name: '', type: 'bytes' }],
   },
@@ -310,8 +298,8 @@ export const agenticIDAbi = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'agentId', type: 'uint256' },
-      { name: 'key', type: 'string' },
-      { name: 'value', type: 'bytes' },
+      { name: 'metadataKey', type: 'string' },
+      { name: 'metadataValue', type: 'bytes' },
     ],
     outputs: [],
   },
@@ -460,29 +448,32 @@ export const agenticIDAbi = [
   },
 
   // ── Events ──
-  {
-    type: 'event',
-    name: 'AgentRegistered',
-    inputs: [
-      { name: 'agentId', type: 'uint256', indexed: true },
-      { name: 'owner', type: 'address', indexed: true },
-      { name: 'agentURI', type: 'string', indexed: false },
-    ],
-  },
+  // Registration has no AgenticID-local event: watch the ERC-721 `Transfer`
+  // (from zero) below, plus `AgentSealSet`; the canonical identity registry
+  // emits its own `Registered`.
   {
     type: 'event',
     name: 'AgentSealSet',
     inputs: [
       { name: 'agentId', type: 'uint256', indexed: true },
-      { name: 'agentSeal', type: 'address', indexed: false },
-      { name: 'sealId', type: 'bytes32', indexed: false },
+      { name: 'agentSeal', type: 'address', indexed: true },
+      { name: 'sealId', type: 'bytes32', indexed: true },
     ],
   },
   {
     type: 'event',
-    name: 'AgentUpdated',
+    name: 'Updated',
     inputs: [
       { name: 'tokenId', type: 'uint256', indexed: true },
+      { name: 'oldDatas', type: 'tuple[]', indexed: false, components: [
+        { name: 'dataDescription', type: 'string' },
+        { name: 'dataHash', type: 'bytes32' },
+      ] },
+      { name: 'newDatas', type: 'tuple[]', indexed: false, components: [
+        { name: 'dataDescription', type: 'string' },
+        { name: 'dataHash', type: 'bytes32' },
+      ] },
+      { name: 'sealedKeys', type: 'bytes[]', indexed: false },
     ],
   },
   {

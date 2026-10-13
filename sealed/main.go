@@ -27,6 +27,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
@@ -46,6 +47,8 @@ import (
 	"seal-verify/internal/provision"
 	"seal-verify/internal/proxy"
 	"seal-verify/internal/report"
+	"seal-verify/internal/secretenv"
+	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 	"seal-verify/internal/uploader"
 	"seal-verify/internal/watcher"
@@ -149,6 +152,9 @@ func main() {
 	} else {
 		logger.Logf("API_KEY (from env): <unset>")
 	}
+	if cfg.SecretEnv != "" {
+		logger.Logf("%s (from env): <set, %d chars sealed to agentSeal; opened after provisioning>", secretenv.EnvVar, len(cfg.SecretEnv))
+	}
 	logger.Logf("")
 
 	// Phase 1+2+3: provision + bootstrap from chain + start agent.
@@ -176,7 +182,8 @@ func main() {
 // reachable even when bootstrap can't complete).
 func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *proxy.Server) {
 	logger.Logf("--- Provisioning from attestor: %s ---", cfg.AttestorURL)
-	agentSealPriv := provision.FromAttestor(cfg.AttestorURL, cfg.SealKeyBytes, cfg.Attestation)
+	prov := provision.FromAttestor(cfg.AttestorURL, cfg.SealKeyBytes, cfg.Attestation)
+	agentSealPriv := prov.AgentSealPriv
 	if agentSealPriv == nil {
 		return
 	}
@@ -194,6 +201,11 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		return
 	}
 
+	// The owner's sealed secret env needs both agentSeal_priv (Phase 1) and
+	// the on-chain owner (Phase 2), so it opens here, before any adapter
+	// reads the inference key.
+	applySecretEnv(cfg, agentSealPriv, res)
+
 	// The on-chain framework binding is the authoritative adapter
 	// selector — the agent's identity, not deploy config, decides which
 	// framework interprets its iData. AGENT_FRAMEWORK survives only as
@@ -207,6 +219,23 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	}
 	sealedProxy.SetAdapter(adapter)
 
+	// Owner-gated endpoints now ask the chain on every call instead of
+	// trusting the address read once here — see proxy.verifyOwnerSig for the
+	// two failures that forced it (a sold agent still answering its seller,
+	// and one failed lookup at boot locking the owner out for the container's
+	// life). Nil client means local dev without a chain; the resolver is then
+	// left unset and the bootstrap value stands.
+	if res.client != nil && res.agentID != nil {
+		client, agentID := res.client, res.agentID
+		sealedProxy.SetLiveOwner(func(ctx context.Context) (string, error) {
+			owner, err := client.OwnerOf(ctx, agentID)
+			if err != nil {
+				return "", err
+			}
+			return owner.Hex(), nil
+		})
+	}
+
 	logger.Logf("")
 	logger.Logf("--- Starting agent ---")
 	// onFailed is invoked by the manager exactly once if the supervisor
@@ -216,14 +245,49 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		logger.Logf("FAIL supervisor: max retries exceeded: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "supervisor exhausted retries: "+err.Error())
 	}
-	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, onFailed); err != nil {
+	if err := startAgent(cfg, adapter, agent, res, agentSealPriv, prov.Settings, sealedProxy, onFailed); err != nil {
 		logger.Logf("FAIL agent: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", err.Error())
 		return
 	}
 	logger.Logf("OK   agent ready (upstream listening, agentState armed, supervisor active)")
 
-	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "running", "")
+	// "running" unless something is already wrong, e.g. a pinned
+	// secret_env_not_applied warning (applySecretEnv).
+	level, msg := currentStatus.Get()
+	report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, level, msg)
+}
+
+// applySecretEnv opens SEAL_SECRET_ENV (issue #166) and makes its inference
+// key the one the adapters use; see secretenv.ResolveAPIKey for precedence
+// and failure behavior. When the owner supplied a sealed key that did not
+// apply and no key is left, it pins a "warning" status naming the reason
+// class (never a value), so the attestor and owner see why the agent
+// cannot call its model instead of a healthy "running". The ciphertext is
+// dropped from memory either way.
+func applySecretEnv(cfg *config.Bootstrap, agentSealPriv []byte, res *chainBootstrapResult) {
+	if cfg.SecretEnv == "" {
+		return
+	}
+	var readOwner func() (string, error)
+	if res.client != nil && res.agentID != nil {
+		readOwner = func() (string, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			owner, err := res.client.OwnerOf(ctx, res.agentID)
+			if err != nil {
+				return "", err
+			}
+			return owner.Hex(), nil
+		}
+	}
+	chainOwner := secretenv.LiveOwner(res.owner, readOwner, 3, 2*time.Second, logger.Logf)
+	key, issue := secretenv.ResolveAPIKey(cfg.APIKey, cfg.SecretEnv, agentSealPriv, chainOwner, logger.Logf)
+	cfg.APIKey = key
+	cfg.SecretEnv = ""
+	if issue != "" {
+		currentStatus.Pin(issue)
+	}
 }
 
 // ── framework adapter resolution ─────────────────────────────────────────────
@@ -456,6 +520,8 @@ func startAgent(
 	agent *state.Agent,
 	res *chainBootstrapResult,
 	agentSealPriv []byte,
+	settingsBlob []byte,
+	sealedProxy *proxy.Server,
 	onFailed func(err error),
 ) error {
 	apiKey := cfg.APIKey
@@ -558,6 +624,46 @@ func startAgent(
 		}
 	}
 
+	// ── Owner settings ──────────────────────────────────────────────────
+	//
+	// The document attestor handed down at /provision, or — for an agent
+	// minted before the settings channel existed — whatever the adapter just
+	// recovered from the legacy config role in Phase C.
+	//
+	// The recovery has to happen HERE, between Phase C and the watcher
+	// starting. The uploader rebuilds the chain entry list from Roles() and
+	// commits it wholesale, so the first tick drops the now-undeclared config
+	// role; if the pin has not been read out and persisted by then it is gone,
+	// and two adapters refuse to start without one.
+	settingsDoc, err := settings.Parse(settingsBlob)
+	if err != nil {
+		return fmt.Errorf("owner settings: %w", err)
+	}
+	if settingsDoc.Model == "" {
+		if seeder, ok := any(adapter).(framework.LegacySettingsSeeder); ok {
+			if recovered, found := seeder.SeededSettings(); found {
+				settingsDoc = recovered
+				// The adapter does not say WHICH retired role it read (config role or
+				// the mint persona seed) — claiming one here misled a live drill.
+				logger.Logf("owner settings: recovered from a retired chain role (provider=%s model=%s)",
+					recovered.Provider, recovered.Model)
+				if blob, err := recovered.Marshal(); err == nil {
+					report.SeedSettings(cfg.AttestorURL, agentSealPriv, sealID, blob)
+				}
+			}
+		}
+	}
+	// Held behind a mutex because two goroutines reach it: the manager's
+	// PreStart hook on every spawn, and an owner push arriving on the proxy.
+	live := &liveSettings{doc: settingsDoc}
+
+	if err := settingsDoc.Validate(); err != nil {
+		// Loud, not silent: an agent with no usable pin will fail to start on
+		// two of the four adapters, and "why is it offline" must not require
+		// reading adapter internals.
+		logger.Logf("WARN owner settings invalid: %v", err)
+	}
+
 	// Build the uploader. The watcher tick handler reuses this single
 	// instance to call upload.Apply each cycle.
 	upload, err := uploader.New(adapter, agent, res.client, res.agentID,
@@ -616,8 +722,100 @@ func startAgent(
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
 		Owner:         res.owner,
+
+		// Re-render the owner's settings into the framework's own dialect
+		// before every spawn — the first one, a reload, and a crash-restart.
+		//
+		// Not once at boot, and not through RuntimeContext: that struct is
+		// captured at the initial Start and replayed verbatim afterwards, so
+		// anything carried in it is frozen for the container's life and a
+		// change applied at runtime gets silently reverted by the next
+		// restart. Re-rendering also rebuilds a config file the agent may
+		// have corrupted, instead of leaving it unable to start.
+		//
+		// Resolve runs each time too: endpoint, output budget and whether the
+		// model accepts a reasoning bound come from the live router catalog,
+		// and a stored copy of those goes stale and then fights the computed
+		// one.
+		PreStart: func(ctx context.Context) error {
+			return adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))
+		},
 	}); err != nil {
 		return err
+	}
+
+	// The owner's hot path: push a document, have it take effect without
+	// rebuilding the container. Registered only now because applying one
+	// needs the manager.
+	//
+	// Order matters. The document is swapped first, then rendered, then the
+	// process is restarted — and if the render fails the swap is rolled back,
+	// so a document that cannot be rendered never becomes the one the next
+	// crash-restart would pick up.
+	sealedProxy.SetSettings(live.get, func(ctx context.Context, doc settings.Doc) error {
+		prev := live.get()
+		live.set(doc)
+		if err := adapter.RenderSettings(ctx, settings.Resolve(ctx, doc, apiKey)); err != nil {
+			live.set(prev)
+			return fmt.Errorf("render: %w", err)
+		}
+		if err := mgr.Reload(ctx); err != nil {
+			return fmt.Errorf("restart: %w", err)
+		}
+		logger.Logf("settings: applied (provider=%s model=%s thinking=%s)", doc.Provider, doc.Model, doc.Thinking)
+		return nil
+	})
+
+	// The agent's own lever: same validation, same render, same restart —
+	// but nothing is persisted, so the owner's document is what comes back
+	// after any restart. See proxy.SessionSettingsApplier for why.
+	sealedProxy.SetSessionSettings(func(ctx context.Context, doc settings.Doc) error {
+		if err := adapter.RenderSettings(ctx, settings.Resolve(ctx, doc, apiKey)); err != nil {
+			// Re-render the owner's document so a rejected agent attempt
+			// cannot leave the framework configured from a half-applied one.
+			_ = adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))
+			return fmt.Errorf("render: %w", err)
+		}
+		return mgr.Reload(ctx)
+	})
+
+	// /clear (CONVERSATION.md invariant 5): wipe the framework's persisted
+	// conversation, then restart so the fresh one is presented NOW. Only wired
+	// for adapters that hold a conversation; the proxy answers 501 otherwise.
+	// Stateful responses door: adapters whose framework holds the
+	// conversation server-side bind each upstream call to it and follow
+	// rotation (hermes: X-Hermes-Session-Id, rotated at compaction).
+	if cs, ok := adapter.(framework.ConversationSession); ok {
+		sealedProxy.SetConversationSession(cs.ConversationHeaders, cs.ObserveConversation)
+	}
+	// Frameworks that persist a transcript their own gateway never reads back
+	// (openclaw): the stateful door takes prior turns from that store and the
+	// client sends only the current turn.
+	if ch, ok := adapter.(framework.ConversationHistory); ok {
+		sealedProxy.SetConversationHistory(func(ctx context.Context) ([]proxy.ConversationTurn, error) {
+			turns, err := ch.ConversationHistory(ctx)
+			if err != nil {
+				return nil, err
+			}
+			out := make([]proxy.ConversationTurn, len(turns))
+			for i, t := range turns {
+				out[i] = proxy.ConversationTurn{Role: t.Role, Text: t.Text}
+			}
+			return out, nil
+		})
+	}
+
+	if clearer, ok := adapter.(framework.SessionClearer); ok {
+		sealedProxy.SetClear(func(ctx context.Context) error {
+			if err := clearer.ClearSession(ctx); err != nil {
+				return err
+			}
+			if err := mgr.Reload(ctx); err != nil {
+				return fmt.Errorf("restart: %w", err)
+			}
+			logger.Logf("conversation cleared by owner; framework restarted fresh")
+			return nil
+		})
 	}
 
 	// Once the agent has spawned, give the framework a moment to apply its
@@ -806,7 +1004,8 @@ func handleDrift(
 			// immediately on the first transition so the UI prompts the
 			// owner without waiting for the next heartbeat.
 			if prev := currentStatus.Set("warning", summary); prev != "warning" {
-				report.Status(attestorURL, agentSealPriv, sealID, "warning", summary)
+				level, msg := currentStatus.Get()
+				report.Status(attestorURL, agentSealPriv, sealID, level, msg)
 			}
 			return
 		}
@@ -824,8 +1023,11 @@ func handleDrift(
 	consecutiveApplyFailures = 0
 	// Success: if we were previously in warning / error, push a "running"
 	// status now so the UI clears without waiting for the next heartbeat.
+	// A pinned warning (applySecretEnv) survives this: report the effective
+	// status, not a literal "running".
 	if prev := currentStatus.Set("running", ""); prev != "running" {
-		report.Status(attestorURL, agentSealPriv, sealID, "running", "")
+		level, msg := currentStatus.Get()
+		report.Status(attestorURL, agentSealPriv, sealID, level, msg)
 	}
 }
 
@@ -928,4 +1130,23 @@ func restoreManifestEntries(
 		}
 	}
 	return nil
+}
+
+// liveSettings is the owner document currently in force, shared between the
+// manager's PreStart hook and an owner push arriving on the proxy.
+type liveSettings struct {
+	mu  sync.RWMutex
+	doc settings.Doc
+}
+
+func (l *liveSettings) get() settings.Doc {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.doc
+}
+
+func (l *liveSettings) set(d settings.Doc) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.doc = d
 }

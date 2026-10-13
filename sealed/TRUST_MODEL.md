@@ -64,7 +64,7 @@ How the implementation maintains this:
 | Disk persistence is encrypted at rest | `agent_seal_priv` is never written to disk in plaintext; provisioned to memory only |
 | Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME`, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
 | No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes |
-| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the container's ephemeral `container_pubkey`; the matching `container_privkey` is generated inside the TEE and never crosses any boundary. Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
+| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go:159-167`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in an envelope signed by a TappRegistry-registered sandbox node key. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:206-221`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
 Any future change to sealed that risks crossing this boundary, even
 indirectly (logging priv bytes, exposing them via a debug endpoint,
@@ -275,8 +275,14 @@ node signer keys.
 
 When a Sealed container boots:
 
-1. Container generates an ephemeral secp256k1 keypair
-   (`container_pubkey`, `container_privkey`) inside its TEE.
+1. The 0g-Sandbox sealing layer generates an ephemeral secp256k1 keypair
+   (`container_pubkey`, `container_privkey`) for the container and injects
+   the private half as the `SANDBOX_SEAL_KEY` env var. The container does
+   **not** generate it: Phase 0 only checks that the injected key derives
+   the compressed `pubkey` inside the signed attestation envelope, and
+   fails loud on a mismatch (`internal/config/config.go:159-167`). The
+   container never learns the pubkey independently either — it forwards
+   the one the envelope carries (`internal/provision/provision.go:58-65`).
 2. 0g-Sandbox observes the container's startup, measures its
    `image_hash`, and signs an attestation envelope:
    `keccak256("ImageAttestation:{seal_id}:0x{container_pubkey}:sha256:{image_hash}:{ts}")`
@@ -320,11 +326,21 @@ is a matter of adding a per-wallet ack of the current
 will be migrated into TappRegistry.
 
 All three must pass. On success, Attestor **ECIES-encrypts**
-`agent_seal_priv` to `container_pubkey` and returns the ciphertext; only
-the matching container can decrypt with `container_privkey` (which never
-leaves the container's TEE). After decryption, `agent_seal_priv` is
+`agent_seal_priv` to `container_pubkey` and returns the ciphertext, which
+only `container_privkey` can open. After decryption, `agent_seal_priv` is
 resident only in TEE-encrypted RAM for the rest of the container's
-lifetime — restoring the [foundational invariant](#foundational-invariant-owner-never-holds-agent_seal_priv).
+lifetime — restoring the [foundational invariant](#foundational-invariant-owner-never-holds-agent_seal_priv)
+— and sealed zeroes the seal key and unsets the env before any agent
+process spawns (`config.ScrubProvisioningSecrets`).
+
+Be precise about what that buys, because the wording here used to
+overclaim. `container_privkey` never leaves *this* container, but it did
+not originate here either: it is injected by the sandbox layer (step 1),
+so the party that minted it is trusted not to keep a copy. That trust is
+not established by any check sealed performs — it comes from the first
+gate above, i.e. from the sandbox `app_id` the user already ack'd. The
+same delivery path also carries the owner's settings document, encrypted
+to the same pubkey, so it inherits exactly this hop's assumptions.
 
 The binding stored on Attestor's side lets restarts skip the 5-minute
 freshness window: if the same 0g-Sandbox-spawned container restarts and

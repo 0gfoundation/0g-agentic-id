@@ -270,60 +270,12 @@ func TestRoundtrip_WorkspaceCanvas(t *testing.T) {
 	roundtripManifest(t, "workspace/canvas/", canvasDir)
 }
 
-// ── openclaw.json (leaf) ────────────────────────────────────────────────────
-
-func TestRoundtrip_OpenclawJSON(t *testing.T) {
-	useTempHome(t)
-	writeJSONConfig(t, map[string]any{
-		"agents": map[string]any{
-			"defaults": map[string]any{
-				"model": map[string]any{"primary": "anthropic/claude-opus-4-6"},
-			},
-		},
-		"auth": map[string]any{
-			"order":    map[string]any{"anthropic": []any{"anthropic:api"}},
-			"profiles": map[string]any{"anthropic:api": map[string]any{"provider": "anthropic", "mode": "api_key"}},
-		},
-		"gateway": map[string]any{"auth": map[string]any{"token": "should-be-stripped"}},
-	})
-
-	a := &Adapter{}
-	ctx := context.Background()
-
-	ptBefore, err := a.EvolutionFor(ctx, "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor: %v", err)
-	}
-	// Sanity: gateway should be absent.
-	if bytes.Contains(ptBefore, []byte("should-be-stripped")) {
-		t.Fatalf("gateway token leaked into evolution output: %s", ptBefore)
-	}
-
-	// Wipe and restore.
-	if err := os.Remove(openclawJSONPath()); err != nil {
-		t.Fatalf("remove: %v", err)
-	}
-	if err := a.Restore(ctx, "openclaw.json", ptBefore); err != nil {
-		t.Fatalf("Restore: %v", err)
-	}
-	ptAfter, err := a.EvolutionFor(ctx, "openclaw.json")
-	if err != nil {
-		t.Fatalf("EvolutionFor after: %v", err)
-	}
-	if !bytes.Equal(ptBefore, ptAfter) {
-		t.Errorf("openclaw.json round-trip mismatch:\n before: %s\n  after: %s", ptBefore, ptAfter)
-	}
-}
-
 // ── LoadEntry error paths ──────────────────────────────────────────────────
 
 func TestLoadEntry_RejectsLeafRoles(t *testing.T) {
 	a := &Adapter{}
 	if _, err := a.LoadEntry(context.Background(), "framework", "anything"); err == nil {
 		t.Errorf("LoadEntry on leaf role 'framework' should error, got nil")
-	}
-	if _, err := a.LoadEntry(context.Background(), "openclaw.json", "anything"); err == nil {
-		t.Errorf("LoadEntry on leaf role 'openclaw.json' should error, got nil")
 	}
 }
 

@@ -1,9 +1,9 @@
 // Package dataplane provides the encryption + 0g-storage primitives used by
 // the bootstrap pipeline. Read path:
 //
-//   1. Download(root, indexer) -> ciphertext bytes
-//   2. UnsealDataKey(sealedKey, agentSealPriv) -> data_key
-//   3. Decrypt(ciphertext, data_key) -> plaintext
+//  1. Download(root, indexer) -> ciphertext bytes
+//  2. UnsealDataKey(sealedKey, agentSealPriv) -> data_key
+//  3. Decrypt(ciphertext, data_key) -> plaintext
 //
 // Phase 4 (uploader) will reuse SealDataKey and Encrypt for the symmetric
 // outbound flow.

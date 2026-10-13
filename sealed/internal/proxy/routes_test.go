@@ -61,13 +61,35 @@ func TestFrameworkRoutesForHello_Maps(t *testing.T) {
 		{Prefix: "/v1/", Kind: "chat", Auth: "bearer", Signed: true, Description: "api"},
 	}}
 	out := s.frameworkRoutesForHello()
-	if len(out) != 1 {
-		t.Fatalf("want 1 route, got %d", len(out))
+	// A chat route with no native "responses" kind gets the synthesized
+	// long-task route appended (responses.go), so /hello advertises it.
+	if len(out) != 2 {
+		t.Fatalf("want 2 routes (declared + synthesized responses), got %d", len(out))
 	}
 	got := out[0]
 	// Signed is forced false for framework routes regardless of the declared
 	// value — the proxy never signs them, so /hello must not claim otherwise.
 	if got.Prefix != "/v1/" || got.Kind != "chat" || got.Auth != "bearer" || got.Signed || got.Description != "api" {
 		t.Errorf("route mapping wrong: %+v", got)
+	}
+	synth := out[1]
+	if synth.Prefix != "/v1/responses" || synth.Kind != "responses" || synth.Auth != "bearer" || synth.Signed {
+		t.Errorf("synthesized route wrong: %+v", synth)
+	}
+}
+
+// An adapter that declares its own Kind "responses" route (prime, dsh) must
+// NOT get a second synthesized entry — the proxy forwards to the native one.
+func TestFrameworkRoutesForHello_NativeResponsesNotDuplicated(t *testing.T) {
+	s := &Server{fwRoutes: []framework.Route{
+		{Prefix: "/v1/", Kind: "chat", Auth: "bearer"},
+		{Prefix: "/v1/responses", Kind: "responses", Auth: "bearer", Description: "native"},
+	}}
+	out := s.frameworkRoutesForHello()
+	if len(out) != 2 {
+		t.Fatalf("want the 2 declared routes only, got %d", len(out))
+	}
+	if out[1].Description != "native" {
+		t.Errorf("native responses route must survive unchanged: %+v", out[1])
 	}
 }

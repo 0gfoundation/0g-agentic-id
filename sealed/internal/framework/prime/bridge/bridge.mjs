@@ -47,17 +47,45 @@ import {
 	DefaultResourceLoader,
 	getAgentDir,
 	ModelRegistry,
+	SessionManager,
 } from "prime-agent";
+import { openConversation } from "./sessionstore.mjs";
 
 const PORT = Number(process.env.SEAL_BRIDGE_PORT || "8791");
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// The adapter sets it to an untracked, off-chain path and self-rotates the
+// file; empty disables persistence (falls back to the in-memory session +
+// the client-replay restoreTranscript path). One agent, one file — never a
+// multi-session store.
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || "";
 const TOKEN = process.env.SEAL_BRIDGE_TOKEN || "";
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || "";
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || "";
 const MODEL_ID = process.env.SEAL_MODEL_ID || "";
 const API_KEY = process.env.SEAL_MODEL_API_KEY || "";
+// The session's thinking level. Set by the adapter from the owner's settings
+// document (settings.Resolved.Effort -> bridgeEnvFor -> SEAL_OWNER_THINKING),
+// and unset whenever the platform has no level to name: the router catalog
+// says the model takes no bound, or it could not be reached. Floored at "low"
+// here — see the setThinkingLevel comment in buildSession for why a bounded
+// level is load-bearing, not a preference.
+const OWNER_THINKING = normalizeEffort(process.env.SEAL_OWNER_THINKING) || "low";
+
+/** Normalize a requested reasoning effort to the wire set {low, high, max}
+ *  (medium hard-400s on glm-5.3 and maps to low). max is allowed but
+ *  measured-risky on the 0g router (can out-think the ~600s stream kill);
+ *  the CLI warns at selection. Unknown values → "". */
+function normalizeEffort(effort) {
+	if (typeof effort !== "string") return "";
+	const e = effort.toLowerCase();
+	if (e === "low" || e === "high" || e === "max") return e;
+	if (e === "medium" || e === "minimal") return "low";
+	return "";
+}
 // Set when the model is served by an OpenAI/Anthropic-compatible endpoint that
 // is NOT the provider's own (the 0G compute router). Then the model has to be
-// REGISTERED (models.json), which the adapter writes as a tracked role.
+// REGISTERED (models.json), which the adapter renders before this process
+// starts.
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || "";
 const MODEL_API = process.env.SEAL_MODEL_API || "openai-completions";
 
@@ -66,7 +94,7 @@ if (!TOKEN) {
 	process.exit(2);
 }
 
-const log = (...args) => console.log(`[bridge] ${args.join(" ")}`);
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [bridge] ${args.join(" ")}`);
 
 // ── Session ─────────────────────────────────────────────────────────────────
 
@@ -84,9 +112,11 @@ function readAgentDoc() {
 	}
 }
 
-// models.json (the model registration) is written by the ADAPTER, not here: it
-// is a chain-tracked role, so sealed owns it and Restore lands it before this
-// process starts. The registry picks it up from the agent dir automatically.
+// models.json (the model registration) is written by the ADAPTER, not here:
+// sealed renders it from the owner's settings document before every start
+// (modelsjson.go), so it is already in place when this process runs. It is not
+// a tracked role and not restored — an edit to it lasts until the next boot.
+// The registry picks it up from the agent dir automatically.
 
 /**
  * Resolve the pinned model, and FAIL if it cannot be resolved.
@@ -150,12 +180,67 @@ async function buildSession() {
 
 	const model = resolveModel(modelRegistry);
 	log(`model resolved: ${model.provider}/${model.id}`);
+	// The conversation persists in the harness's OWN store (CONVERSATION.md):
+	// SessionManager.open(path) both creates the file on a first boot and, on a
+	// process restart, re-parses the JSONL and rebuilds the context — so a
+	// settings-push/crash restart resumes the conversation with NO client
+	// replay. Bound to ONE fixed file (invariant: one conversation per agent).
+	// Empty path → inMemory(), the pre-persistence behaviour.
+	const sessionManager = CONVERSATION_FILE
+		? openConversation(SessionManager, CONVERSATION_FILE, log)
+		: SessionManager.inMemory(process.cwd());
+	// The client-replay fallback stays armed until the store has actually
+	// restored something: a quarantined/archived store (corrupt file, stub,
+	// ceiling) is precisely "disk could not cover it" — invariant 6 — and
+	// gating replay on the mere PRESENCE of persistence would turn those
+	// recoveries into silent amnesia the old path used to survive.
+	// getEntries missing (an SDK rename) must be LOUD and pick the
+	// conservative side — assume restored, keep replay off: doubling a
+	// restored conversation is the failure this gate exists to prevent,
+	// while the cost of the assumption on a genuinely fresh store is nil
+	// (a fresh client has nothing to replay).
+	let restoredEntries = 0;
+	if (CONVERSATION_FILE) {
+		if (typeof sessionManager.getEntries === "function") {
+			restoredEntries = sessionManager.getEntries().length;
+			if (restoredEntries > 0) storeRestored = true;
+		} else {
+			log("WARN: SessionManager.getEntries missing (SDK surface changed) — assuming the store restored history; client replay stays off");
+			storeRestored = true;
+		}
+	}
+	log(
+		CONVERSATION_FILE
+			? `conversation store: ${CONVERSATION_FILE} (${restoredEntries} entries restored)`
+			: "conversation store: in-memory (SEAL_CONVERSATION_FILE unset)",
+	);
 	const { session } = await createAgentSession({
 		model,
 		resourceLoader: loader,
 		authStorage,
 		modelRegistry,
+		sessionManager,
 	});
+	// Thinking models need a bounded effort level: the session default is
+	// "off", which makes the SDK send NO reasoning_effort — and an
+	// always-thinking model (glm-5.3) then reasons without bound and never
+	// writes a reply (measured: 23k chars / 10min of reasoning, killed
+	// upstream, zero text; effort=low converges in ~2.5min with a full
+	// reply). "low" and not "medium": glm-5.3 accepts only low/high/max —
+	// medium is a hard 400 — and low is the portable intersection. Set
+	// unconditionally: the SDK only puts reasoning_effort on the wire when the
+	// RESOLVED MODEL's registry entry marks it reasoning-capable and its
+	// provider's compat allows it — from models.json for a provider registered
+	// there, from the SDK's own built-in tables otherwise — so for every other
+	// model this is a no-op.
+	if (typeof session.setThinkingLevel === "function") {
+		try { session.setThinkingLevel(OWNER_THINKING); log(`thinking level: ${OWNER_THINKING} (bounded reasoning)`); } catch (e) { log(`setThinkingLevel failed: ${(e && e.message) || e}`); }
+	} else {
+		// SDK surface changed under us: without a thinking level the SDK sends
+		// no reasoning_effort, and an always-thinking model reasons unboundedly
+		// — long tasks will silently die. Say so instead of degrading quietly.
+		log("WARN: session.setThinkingLevel missing — reasoning_effort will NOT be sent; long tasks on always-thinking models will fail (update the prime SDK pin)");
+	}
 	log(`session ready (platform doc: ${doc ? `${doc.length} bytes` : "ABSENT"})`);
 	return session;
 }
@@ -232,6 +317,201 @@ function serialize(fn) {
 	return run;
 }
 
+// ── /v1/responses (OpenAI Responses API subset) ─────────────────────────────
+//
+// The long-task surface. chat/completions couples the TURN to one HTTP
+// connection — fatal for agent work that legitimately runs longer than any
+// proxy allows a request to live (0g-sandbox#122: ~300s on mainnet). The
+// Responses shape decouples them, using OpenAI's own standard so foreign
+// clients benefit too:
+//
+//   POST /v1/responses {input, stream:true}   → SSE; first event carries id
+//   GET  /v1/responses/:id                    → poll {status, output_text}
+//   GET  /v1/responses/:id?stream=true&starting_after=N
+//                                             → replay events > N, then live
+//   POST /v1/responses/:id/cancel             → the interrupt chain
+//
+// Subset only: input as string or messages-style items (last user text wins,
+// same as handleChat — the agent is a stateful session, not a stateless
+// completion). Events carry sequence_number for resume. Responses are kept in
+// a bounded in-memory ring (survives disconnects, not bridge restarts — the
+// agent's own session state is the durable record).
+
+import { randomBytes } from "node:crypto";
+
+const RESPONSES_MAX = 16;
+const responses = new Map(); // id -> record
+const responseOrder = [];
+
+function newResponseRecord(text) {
+	const id = "resp_" + randomBytes(12).toString("hex");
+	const rec = {
+		id,
+		status: "queued", // queued | in_progress | completed | failed | cancelled
+		prompt: text.slice(0, 200),
+		events: [],       // {seq, name, data}
+		seq: 0,
+		outputText: "",
+		error: null,
+		listeners: new Set(), // live followers: (evt) => void
+	};
+	responses.set(id, rec);
+	responseOrder.push(id);
+	while (responseOrder.length > RESPONSES_MAX) {
+		const old = responseOrder.shift();
+		responses.delete(old);
+	}
+	return rec;
+}
+
+function pushResponseEvent(rec, name, data) {
+	const evt = { seq: ++rec.seq, name, data };
+	rec.events.push(evt);
+	// Bound memory: cap the retained delta log (~1MB of text per response).
+	if (rec.events.length > 4096) rec.events.splice(0, rec.events.length - 4096);
+	for (const l of rec.listeners) {
+		try { l(evt); } catch { /* dead follower */ }
+	}
+	return evt;
+}
+
+function responseSnapshot(rec) {
+	return {
+		id: rec.id,
+		object: "response",
+		status: rec.status,
+		output_text: rec.outputText,
+		...(rec.error ? { error: { message: rec.error } } : {}),
+	};
+}
+
+/** Run one agent turn under a response record. The turn is owned by the
+ *  record, NOT by any HTTP connection — followers attach and detach freely. */
+function startResponseTurn(rec, text, effort) {
+	rec.turn = serialize(async () => {
+		// A cancel can land while this task is still QUEUED behind another turn
+		// (the cancel path then only marks the status — aborting would hit the
+		// wrong, currently-running task). Honor it here instead of silently
+		// overwriting it with in_progress and running a dead task (review B1).
+		if (rec.status === "cancelled") {
+			pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
+			pushResponseEvent(rec, "response.completed", { type: "response.completed", response: responseSnapshot(rec) });
+			return;
+		}
+		rec.status = "in_progress";
+		pushResponseEvent(rec, "response.created", { type: "response.created", response: responseSnapshot(rec) });
+		try {
+			const session = await getSession();
+			// Per-message thinking override (request reasoning.effort). Set for
+			// THIS turn only; the finally below restores the agent default. Safe
+			// under the serializer: exactly one turn touches the session at a time.
+			if (effort && effort !== OWNER_THINKING && typeof session.setThinkingLevel === "function") {
+				try { session.setThinkingLevel(effort); log(`thinking level: ${effort} (this turn)`); } catch (e) { log(`setThinkingLevel(${effort}) failed: ${(e && e.message) || e}`); }
+			}
+			const full = await runTurn(
+				session,
+				text,
+				(delta) => {
+					rec.outputText += delta;
+					pushResponseEvent(rec, "response.output_text.delta", {
+						type: "response.output_text.delta",
+						delta,
+						sequence_number: rec.seq + 1,
+					});
+				},
+				(line, type) => {
+					log(`  ${line}`);
+					broadcastActivity({ turn: rec.id, kind: type, text: line });
+					// Activity rides as a non-standard event so resumed followers
+					// see progress too; standard clients ignore unknown names.
+					pushResponseEvent(rec, "response.activity", { type: "response.activity", label: line });
+				},
+			);
+			if (rec.status !== "cancelled") {
+				rec.outputText = full || rec.outputText;
+				rec.status = "completed";
+			}
+			pushResponseEvent(rec, "response.completed", { type: "response.completed", response: responseSnapshot(rec) });
+		} catch (err) {
+			rec.status = rec.status === "cancelled" ? "cancelled" : "failed";
+			rec.error = String((err && err.message) || err);
+			pushResponseEvent(rec, "response.failed", { type: "response.failed", response: responseSnapshot(rec) });
+		} finally {
+			// Restore the agent default so a one-turn override never leaks into
+			// the next turn (which may not carry an effort of its own).
+			if (effort && effort !== OWNER_THINKING) {
+				try { const s = await getSession(); if (typeof s.setThinkingLevel === "function") s.setThinkingLevel(OWNER_THINKING); } catch { /* best effort */ }
+			}
+		}
+	});
+}
+
+/** SSE-stream a record to `res` from sequence > startingAfter: replay the
+ *  buffered events, then follow live until a terminal event. */
+function streamResponse(req, res, rec, startingAfter) {
+	res.writeHead(200, {
+		"content-type": "text/event-stream",
+		"cache-control": "no-cache",
+		connection: "keep-alive",
+	});
+	if (typeof res.flushHeaders === "function") res.flushHeaders();
+	// Paired with the "accepted" line: if a report shows accepted WITHOUT
+	// stream open, the failure is inside this bridge; with both, the bytes
+	// left here and the loss is upstream of us.
+	log(`responses: ${rec.id} stream open (from seq ${startingAfter})`);
+	let closed = false;
+	const write = (evt) => {
+		if (closed || res.writableEnded || res.destroyed) return;
+		try {
+			res.write(`id: ${evt.seq}\nevent: ${evt.name}\ndata: ${JSON.stringify({ ...evt.data, sequence_number: evt.seq })}\n\n`);
+		} catch { closed = true; }
+	};
+	const isTerminal = (evt) => evt.name === "response.completed" || evt.name === "response.failed";
+	// Numbered keepalives: a client trace can then distinguish "never got a
+	// byte" from "got the first N then silence" — the two have different
+	// causes and used to be indistinguishable from the outside.
+	let beats = 0;
+	const beat = setInterval(() => {
+		if (!closed && !res.writableEnded && !res.destroyed) { try { res.write(`: keepalive ${++beats}\n\n`); } catch { closed = true; } }
+	}, 10_000);
+	const finish = () => {
+		clearInterval(beat);
+		rec.listeners.delete(follow);
+		if (!res.writableEnded && !res.destroyed) { try { res.end(); } catch { /* raced */ } }
+	};
+	const follow = (evt) => { write(evt); if (isTerminal(evt)) finish(); };
+	// Replay history strictly after the resume point.
+	let sawTerminal = false;
+	for (const evt of rec.events) {
+		if (evt.seq <= startingAfter) continue;
+		write(evt);
+		if (isTerminal(evt)) sawTerminal = true;
+	}
+	if (sawTerminal || rec.status === "completed" || rec.status === "failed" || rec.status === "cancelled") {
+		finish();
+		return;
+	}
+	rec.listeners.add(follow);
+	res.on("close", () => { closed = true; finish(); });
+}
+
+/** Extract the user text from a Responses `input` (string or items array). */
+function responseInputText(input) {
+	if (typeof input === "string") return input;
+	if (Array.isArray(input)) {
+		for (let i = input.length - 1; i >= 0; i--) {
+			const it = input[i];
+			if (!it || (it.role && it.role !== "user")) continue;
+			if (typeof it.content === "string") return it.content;
+			if (Array.isArray(it.content)) {
+				const t = it.content.filter((c) => c && typeof c.text === "string").map((c) => c.text).join("\n");
+				if (t) return t;
+			}
+		}
+	}
+	return "";
+}
+
 // ── OpenAI wire shapes ──────────────────────────────────────────────────────
 
 const created = () => Math.floor(Date.now() / 1000);
@@ -295,6 +575,49 @@ function lastUserText(messages) {
 		}
 	}
 	return "";
+}
+
+// ── session restore after a bridge restart ───────────────────────────────────
+//
+// The conversation lives in THIS process's memory (the session object), but a
+// configuration change restarts the harness (manager.Reload), and a fresh
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
+// client resends the full transcript on every turn — it always has — yet the
+// bridge took only the last user line. On the FIRST turn of a fresh process,
+// if the request carries history, replay it as a framed transcript ahead of
+// the prompt. Meeting minutes, not native memory: tool-call internals are not
+// reconstructed, but the conversation continues instead of restarting.
+const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
+let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false; // true when the persistent store supplied history
+
+function restoreTranscript(messages) {
+	// When the persistent store RESTORED history this boot, replaying the
+	// client's copy would DOUBLE it — but when the store came up empty
+	// (fresh agent, quarantined/archived file, container recreate), the
+	// client's copy is the only continuity left and refusing it would be
+	// silent amnesia (CONVERSATION.md invariant 6: replay is the fallback
+	// for exactly the cases disk could not cover).
+	if (storeRestored) return "";
+	if (sessionSeeded || !Array.isArray(messages)) return "";
+	let lastUser = -1;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (messages[i] && messages[i].role === "user") { lastUser = i; break; }
+	}
+	// History = everything before the final user message (that one IS the turn).
+	const prior = messages
+		.slice(0, lastUser === -1 ? messages.length : lastUser)
+		.filter((m) => m && (m.role === "user" || m.role === "assistant"))
+		.map((m) => ({ role: m.role, text: lastUserText([{ role: "user", content: m.content }]) }))
+		.filter((m) => m.text.trim().length > 0);
+	if (!prior.length) return "";
+	let body = prior.map((m) => `${m.role}: ${m.text}`).join("\n\n");
+	let truncated = false;
+	if (body.length > RESTORE_CAP) { body = body.slice(-RESTORE_CAP); truncated = true; }
+	log(`session restore: replaying client transcript (${prior.length} msgs, ${body.length} chars${truncated ? ", oldest truncated" : ""})`);
+	return `[Context restore: this session was restarted mid-conversation. Prior transcript${truncated ? " (oldest part truncated)" : ""}:]\n\n${body}\n\n[End of prior transcript. Continue the conversation; do not re-answer old messages.]\n\n`;
 }
 
 // ── Request handling ────────────────────────────────────────────────────────
@@ -431,32 +754,26 @@ async function handleChat(req, res) {
 	if (!text) {
 		return sendJSON(res, 400, { error: { message: "no user message in `messages`" } });
 	}
+	const prompt = restoreTranscript(body.messages) + text;
+	sessionSeeded = true;
 
 	const session = await getSession();
 	const id = `chatcmpl-${created()}`;
 	const model = body.model || `${PROVIDER || "prime"}/${MODEL_ID || "default"}`;
 
-	// Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
-	// signal. The SDK session exposes abort() — stop the turn when the client
-	// goes away, guarded so a QUEUED request's disconnect never aborts someone
-	// else's active turn (turns are serialized), which also un-blocks the queue.
-	let myTurnActive = false;
+	// A dropped connection is NOT an interrupt. Networks blip, laptops sleep,
+	// and the sandbox preview proxy hard-caps request duration (~300s on
+	// mainnet, 0g-sandbox#122) — aborting on disconnect made every long task
+	// die with its stream, which broke the platform's core promise (agents
+	// work autonomously; the stream is just a window). Deliberate stops go
+	// through POST /v1/interrupt, which the CLI's Esc already calls — so the
+	// turn RUNS TO COMPLETION here and the owner reattaches via /agentlog or
+	// a follow-up message (queued behind the running turn).
 	let disconnected = false;
 	const onGone = () => {
 		if (disconnected) return;
 		disconnected = true;
-		if (myTurnActive) {
-			// session.abort(): Promise<void> — verified against the installed SDK
-			// (dist/core/agent-session.d.ts). Guarded anyway: on an SDK where it
-			// is absent the turn must keep its old run-to-completion behaviour
-			// with a loud log, not a TypeError.
-			if (typeof session.abort === "function") {
-				log("client disconnected mid-turn — aborting");
-				Promise.resolve(session.abort()).catch((err) => log(`WARN session.abort: ${(err && err.message) || err}`));
-			} else {
-				log("WARN client disconnected mid-turn but this SDK exposes no session.abort() — turn continues server-side");
-			}
-		}
+		log("client disconnected mid-turn — turn continues server-side (stop it explicitly via /v1/interrupt)");
 	};
 	res.on("close", () => { if (!res.writableEnded) onGone(); });
 	// Writes after a disconnect throw (incl. from the keepalive interval, where
@@ -466,9 +783,11 @@ async function handleChat(req, res) {
 		try { res.write(s); } catch { /* client raced us to the close */ }
 	};
 	const runMine = (fn) => serialize(() => {
+		// Still skip STARTING a turn whose requester is already gone — that
+		// message's author can re-send; but a turn already running keeps
+		// running (see onGone).
 		if (disconnected) return "";
-		myTurnActive = true;
-		return Promise.resolve(fn()).finally(() => { myTurnActive = false; });
+		return Promise.resolve(fn());
 	});
 
 	if (body.stream) {
@@ -505,7 +824,7 @@ async function handleChat(req, res) {
 			await runMine(() =>
 				runTurn(
 					session,
-					text,
+					prompt,
 					(delta) => safeWrite(chunkFrame(id, model, { content: delta })),
 					(line, type) => {
 						log(`  ${line}`);
@@ -601,6 +920,91 @@ const server = createServer((req, res) => {
 	// turn whose originating connection is gone. Aborting is not a rollback:
 	// tool calls already executed stay executed; the turn just stops issuing
 	// new ones. Queued follow-ups survive and run next.
+	// ── /v1/responses — the long-task surface (see the module block above) ──
+	if (req.method === "POST" && path === "/v1/responses") {
+		return (async () => {
+			const raw = await readBody(req);
+			let body;
+			try { body = JSON.parse(raw || "{}"); } catch { return sendJSON(res, 400, { error: { message: "invalid JSON body" } }); }
+			const text = responseInputText(body.input);
+			if (!text) return sendJSON(res, 400, { error: { message: "input is required (string or messages-style items)" } });
+			const effort = normalizeEffort(body.reasoning && body.reasoning.effort);
+			if (body.reasoning && body.reasoning.effort && !effort) {
+				return sendJSON(res, 400, { error: { message: `unsupported reasoning.effort ${JSON.stringify(body.reasoning.effort)} — use "low", "high" or "max"` } });
+			}
+			const prompt = (Array.isArray(body.input) ? restoreTranscript(body.input) : "") + text;
+			sessionSeeded = true;
+			const rec = newResponseRecord(text);
+			startResponseTurn(rec, prompt, effort);
+			log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)${effort ? ` [think:${effort}]` : ""}`);
+			if (body.stream) return streamResponse(req, res, rec, 0);
+			// Non-stream (background-style): hand back the id immediately.
+			return sendJSON(res, 200, responseSnapshot(rec));
+		})().catch((err) => {
+			log(`ERROR ${err && err.stack ? err.stack : err}`);
+			if (!res.headersSent) sendJSON(res, 500, { error: { message: String((err && err.message) || err) } });
+		});
+	}
+	{
+		const m = path.match(/^\/v1\/responses\/(resp_[0-9a-f]+)(\/cancel)?$/);
+		if (m) {
+			const rec = responses.get(m[1]);
+			if (!rec) return sendJSON(res, 404, { error: { message: `no such response ${m[1]} (the bridge keeps the last ${RESPONSES_MAX})` } });
+			if (req.method === "POST" && m[2] === "/cancel") {
+				return (async () => {
+					// A QUEUED task hasn't touched the session: aborting would hit
+					// whatever turn is currently running — a different task (review
+					// B1). Mark it cancelled and let the turn-body guard no-op it
+					// when the serializer reaches it.
+					if (rec.status === "queued") {
+						rec.status = "cancelled";
+						log(`responses: ${rec.id} cancelled while queued`);
+						return sendJSON(res, 200, responseSnapshot(rec));
+					}
+					if (rec.status === "in_progress") {
+						rec.status = "cancelled";
+						const session = await getSession();
+						if (typeof session.requestAbort === "function" && typeof session.resumeQueuedWork === "function") {
+							session.requestAbort();
+							if (typeof session._cancelActiveRlmChildRuns === "function") {
+								try { session._cancelActiveRlmChildRuns("cancelled via /v1/responses"); } catch { /* best effort */ }
+							}
+							session.resumeQueuedWork();
+							// Same transcript marker as /v1/interrupt, for the same reason:
+							// without it the model sees a half-done task in context and
+							// RESUMES it on the next prompt (live-verified — a cancelled
+							// service build kept going and answered the next turn with its
+							// progress report instead of the user's message).
+							if (typeof session.sendCustomMessage === "function") {
+								session.sendCustomMessage(
+									{
+										customType: "owner_interrupt",
+										content: "[The owner interrupted the current task. Stop working on it — do not resume it unless the owner asks again. Await the owner's next message.]",
+										display: true,
+									},
+									{ deliverAs: "nextTurn" },
+								).catch((e) => log(`responses cancel: sendCustomMessage failed: ${(e && e.message) || e}`));
+							}
+						} else if (typeof session.abort === "function") {
+							session.abort().catch(() => {});
+						}
+						log(`responses: ${rec.id} cancelled`);
+					}
+					return sendJSON(res, 200, responseSnapshot(rec));
+				})().catch((err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }));
+			}
+			if (req.method === "GET" && !m[2]) {
+				const q = new URLSearchParams((req.url || "").split("?")[1] || "");
+				if (q.get("stream") === "true") {
+					const after = Number(q.get("starting_after") || "0") || 0;
+					return streamResponse(req, res, rec, after);
+				}
+				return sendJSON(res, 200, responseSnapshot(rec));
+			}
+			return sendJSON(res, 405, { error: { message: "method not allowed" } });
+		}
+	}
+
 	if (req.method === "POST" && path === "/v1/interrupt") {
 		return (async () => {
 			try {

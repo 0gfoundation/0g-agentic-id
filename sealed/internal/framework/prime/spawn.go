@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"seal-verify/internal/framework"
-	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/platform"
 	"seal-verify/internal/privsep"
+	"seal-verify/internal/settings"
 )
 
 // Start: version pin → materialize the bridge → write the agent doc → spawn.
@@ -30,7 +30,7 @@ import (
 // human-facing path and is deliberately unused — it would add a JSONL socket
 // hop and a second process tree for nothing.
 
-//go:embed bridge/bridge.mjs
+//go:embed bridge/bridge.mjs bridge/sessionstore.mjs
 var bridgeFS embed.FS
 
 const (
@@ -62,8 +62,23 @@ func bridgeScriptPath() string { return filepath.Join(bridgeScriptDir, "bridge.m
 func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (framework.StartResult, error) {
 	a.mu.RLock()
 	initialized, token, version := a.initialized, a.bridgeToken, a.binding.PackageVersion
-	provider, model := a.personaProvider, a.personaModel
+	cfg := a.settings
 	a.mu.RUnlock()
+
+	// The inference pin comes from the owner's settings, rendered by
+	// RenderSettings before every Start. Nothing on disk backs it up any more,
+	// so a nil here is a bootstrap-sequence bug rather than an owner mistake —
+	// and guessing would run a model the owner never chose, which this adapter
+	// has always refused to do (see the bridge's resolveModel).
+	if cfg == nil {
+		return framework.StartResult{}, fmt.Errorf(
+			"prime.Start: RenderSettings has not run — the owner's settings must be rendered before the bridge is spawned")
+	}
+	provider, model := cfg.Provider, cfg.Model
+	if provider == "" || model == "" {
+		return framework.StartResult{}, fmt.Errorf(
+			"prime.Start: settings carry no inference pin (provider=%q model=%q)", provider, model)
+	}
 
 	if !initialized {
 		if err := verifyInstalled(ctx, version); err != nil {
@@ -87,20 +102,10 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := ensureDir(sessionStateDir()); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
-
-	// The pin's durable home is the tracked models.json, NOT the in-memory
-	// persona: `persona` is a mint-time seed that leaves the chain at the first
-	// drift commit, so on every later boot HandleLegacy does not run and the
-	// in-memory fields are empty. Prefer the file; fall back to memory for the
-	// very first boot, where HandleLegacy has just run but a Restore has not.
-	if p, m := readPin(); p != "" && m != "" {
-		provider, model = p, m
+	// The bridge's SessionManager.open() needs the parent dir to exist.
+	if err := ensureDir(conversationDir()); err != nil {
+		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
-	if provider == "" || model == "" {
-		return framework.StartResult{}, fmt.Errorf(
-			"prime.Start: no inference pin — neither %s nor the persona seed named a provider/model", modelsJSONPath())
-	}
-	sdkProvider, modelAPI, baseURL := resolveInference(ctx, provider, model)
 
 	// The agent doc goes to a standalone file OUTSIDE the framework home; the
 	// bridge injects it as a virtual context file at session creation. No
@@ -119,7 +124,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		SealSignSock:     rt.SealSignSock,
 		Provider:         provider,
 		Model:            model,
-		ZGComputeRouted:  provider == zgComputeProvider,
+		ZGComputeRouted:  cfg.Endpoint != nil,
 		BootTime:         time.Now(),
 	})
 	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
@@ -128,15 +133,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("prime.Start: write agent doc %s: %w", agentDocPath(), err)
 	}
 
-	cmd, err := spawnBridge(bridgeEnv{
-		token:       token,
-		apiKey:      rt.APIKey,
-		sdkProvider: sdkProvider,
-		model:       model,
-		modelAPI:    modelAPI,
-		baseURL:     baseURL,
-		rt:          rt,
-	})
+	cmd, err := spawnBridge(bridgeEnvFor(*cfg, token, rt))
 	if err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
@@ -152,45 +149,6 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		return framework.StartResult{}, fmt.Errorf("prime.Start: bridge not listening: %w", err)
 	}
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
-}
-
-// zgComputeProvider is the persona-seed provider name that means "route through
-// the 0G compute router".
-const zgComputeProvider = "0g-compute"
-
-// resolveInference translates the persona seed's inference pin into what the
-// bridge needs to REGISTER the model: the provider name to register it under,
-// the wire API, and the endpoint.
-//
-// A non-empty baseURL is the bridge's signal that the model is not a built-in
-// and must be written into models.json. That indirection is required: there is
-// no environment variable that redirects a built-in provider at another
-// endpoint. Setting OPENAI_BASE_URL is simply ignored — the request goes to
-// api.openai.com with the router's key and comes back 401 "incorrect API key",
-// which reads like a credential problem and hides the real cause. Verified live
-// on 0G Galileo, 2026-08-13.
-//
-// The provider is registered under its own name (`0g-compute`) rather than
-// masquerading as `openai`: it is a distinct endpoint with distinct credentials,
-// and overriding a built-in provider would make the agent's own /model listing
-// lie about where inference goes.
-//
-// Provider knowledge stays in internal/inference — the openclaw adapter learned
-// that the hard way when the router added Anthropic-format models and a
-// hardcoded OpenAI assumption turned every first inference into a 400
-// (FRAMEWORK_ADAPTER.md §12, item 19). This function only decides HOW the
-// framework is told about a resolved route.
-func resolveInference(ctx context.Context, provider, model string) (sdkProvider, api, baseURL string) {
-	if provider != zgComputeProvider {
-		// A native provider ("anthropic", "openai", …) is a built-in: the SDK
-		// knows its endpoint, so nothing needs registering.
-		return provider, "", ""
-	}
-	route := inference.ResolveZG(ctx, model)
-	if route.Format == inference.WireAnthropic {
-		return provider, "anthropic-messages", route.BaseURL
-	}
-	return provider, "openai-completions", route.BaseURL
 }
 
 // verifyInstalled checks that the framework baked into this image is the one
@@ -248,27 +206,78 @@ func verifyInstalled(ctx context.Context, version string) error {
 // materializeBridge writes the embedded bridge script to disk. Rewritten on
 // every Start so a sealed upgrade always ships its own bridge.
 func materializeBridge() error {
-	src, err := bridgeFS.ReadFile("bridge/bridge.mjs")
-	if err != nil {
-		return fmt.Errorf("read embedded bridge: %w", err)
-	}
 	if err := ensureDir(bridgeScriptDir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(bridgeScriptPath(), src, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", bridgeScriptPath(), err)
+	for _, name := range []string{"bridge.mjs", "sessionstore.mjs"} {
+		src, err := bridgeFS.ReadFile("bridge/" + name)
+		if err != nil {
+			return fmt.Errorf("read embedded bridge %s: %w", name, err)
+		}
+		dst := filepath.Join(bridgeScriptDir, name)
+		if err := os.WriteFile(dst, src, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
 	}
 	return nil
 }
 
+// bridgeEnv is everything the bridge is told about this boot. The settings
+// half of it is built by bridgeEnvFor.
 type bridgeEnv struct {
-	token       string
-	apiKey      string
-	sdkProvider string
-	model       string
-	modelAPI    string
-	baseURL     string
-	rt          framework.RuntimeContext
+	token    string
+	apiKey   string
+	provider string // registration name the bridge resolves the model under
+	model    string
+	modelAPI string // wire API name; empty for a framework built-in
+	baseURL  string // endpoint to register; empty for a framework built-in
+	effort   string // reasoning level for the session; "" = the platform names none
+	rt       framework.RuntimeContext
+}
+
+// bridgeEnvFor maps the owner's resolved settings onto the bridge's
+// environment. A separate function from spawnBridge because this mapping is
+// the whole of the configuration channel for this adapter and has to be
+// testable without an installed framework.
+//
+// The inference credential comes from the RESOLVED SETTINGS, not from
+// RuntimeContext: the resolved document is where the platform decides what
+// this boot runs and what it authenticates with, and the two drifting apart
+// once dialed a platform-routed endpoint keyless and 401'd.
+//
+// Note what is NOT behind the endpoint check: the effort bound. Only the
+// wiring (base URL, wire API) depends on who serves the model — a model that
+// takes a reasoning bound takes it wherever it is served.
+//
+// SEAL_OWNER_THINKING carries the LEVEL, and it is the only thing that does:
+// models.json never holds one (its thinkingLevelMap is a spelling table, not
+// a choice). It is NOT what makes the level reach the wire. The SDK gates
+// that on the resolved model's own reasoning flag and its provider's compat
+// block — rendered into models.json by this adapter for a provider registered
+// there, and read from the SDK's built-in tables for a framework built-in,
+// which this adapter neither writes nor can see (bridge.mjs, buildSession).
+//
+// Both of Effort's empty outcomes pass no level, deliberately: this variable
+// names a level, and neither "the catalog says this model takes no bound" nor
+// "the catalog said nothing" gives the platform one to name. Where the two
+// differ they are kept apart — in the rendered flags, see reasoningClaim in
+// modelsjson.go. The bridge floors an unset variable at "low", so a thinking
+// model the framework knows about stays bounded either way.
+func bridgeEnvFor(cfg settings.Resolved, token string, rt framework.RuntimeContext) bridgeEnv {
+	level, _ := cfg.Effort()
+	be := bridgeEnv{
+		token:    token,
+		apiKey:   cfg.APIKey,
+		provider: cfg.Provider,
+		model:    cfg.Model,
+		effort:   level,
+		rt:       rt,
+	}
+	if cfg.Endpoint != nil {
+		be.baseURL = cfg.Endpoint.BaseURL
+		be.modelAPI = wireAPI(cfg.Endpoint.Format)
+	}
+	return be
 }
 
 // spawnBridge starts the node bridge with a strict environment allowlist.
@@ -301,7 +310,35 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	// cwd-relative discovery (project skills, context files) stays within the
 	// paths this adapter manages.
 	cmd.Dir = primeHome
+	cmd.Env = be.environ(nodePath)
 
+	// Run the bridge (and the IPython kernel it spawns) as the low-privilege
+	// agent user when the image provides one (no-op otherwise — see
+	// internal/privsep). Restore wrote the home as root, so hand it over
+	// now; $HOME itself must also accept new dotfiles. sessionStateDir is
+	// under /tmp (world-writable), no handover needed.
+	if privsep.Drop(cmd) {
+		privsep.OwnPath(os.Getenv("HOME"))
+		privsep.OwnTree(primeHome)
+		// The conversation store is OUTSIDE primeHome (off-chain by
+		// construction) and ensureDir created it as root — without this the
+		// de-privileged bridge EACCESes on its very first append.
+		privsep.OwnTree(conversationDir())
+	}
+
+	if err := cmd.Start(); err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("start bridge: %w", err)
+	}
+	logger.Logf("prime: bridge started (pid %d, port %d, provider %s/%s)",
+		cmd.Process.Pid, bridgePort, be.provider, be.model)
+	return cmd, nil
+}
+
+// environ is the bridge's whole environment: a strict allowlist, built as a
+// pure function of bridgeEnv so what the framework is told can be asserted in
+// a test without spawning anything.
+func (be bridgeEnv) environ(nodePath string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
@@ -314,9 +351,13 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
 		"SEAL_BRIDGE_TOKEN=" + be.token,
 		"SEAL_AGENT_DOC=" + agentDocPath(),
+		// The harness persists its one conversation here and resumes it on a
+		// process restart (CONVERSATION.md). Off-chain by construction — see
+		// conversationPath. The bridge opens a SessionManager on this file.
+		"SEAL_CONVERSATION_FILE=" + conversationPath(),
 	}
-	if be.sdkProvider != "" {
-		env = append(env, "SEAL_MODEL_PROVIDER="+be.sdkProvider)
+	if be.provider != "" {
+		env = append(env, "SEAL_MODEL_PROVIDER="+be.provider)
 	}
 	if be.model != "" {
 		env = append(env, "SEAL_MODEL_ID="+be.model)
@@ -335,6 +376,20 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 			env = append(env, "SEAL_MODEL_API="+be.modelAPI)
 		}
 	}
+	if be.effort != "" {
+		// The reasoning level: the owner's choice, or the platform's low floor
+		// for a model the catalog flags as thinking whose owner expressed no
+		// preference (see settings.Resolved.Effort — an always-thinking model
+		// with no bound reasons forever and never writes a reply). The bridge
+		// uses it as the session level and as the baseline a per-message
+		// override restores to.
+		//
+		// SEAL_OWNER_THINKING keeps its name because it is the bridge's
+		// contract (bridge.mjs), which ships inside this binary; only the
+		// SOURCE of the value changed, from the deploy-time env to the owner's
+		// settings document.
+		env = append(env, "SEAL_OWNER_THINKING="+be.effort)
+	}
 	// Public on-chain facts the agent benefits from knowing directly, mirroring
 	// the openclaw allowlist. The authoritative copy is the injected doc.
 	if be.rt.PublicURL != "" {
@@ -346,25 +401,7 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
 	}
-	cmd.Env = env
-
-	// Run the bridge (and the IPython kernel it spawns) as the low-privilege
-	// agent user when the image provides one (no-op otherwise — see
-	// internal/privsep). Restore wrote the home as root, so hand it over
-	// now; $HOME itself must also accept new dotfiles. sessionStateDir is
-	// under /tmp (world-writable), no handover needed.
-	if privsep.Drop(cmd) {
-		privsep.OwnPath(os.Getenv("HOME"))
-		privsep.OwnTree(primeHome)
-	}
-
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		return nil, fmt.Errorf("start bridge: %w", err)
-	}
-	logger.Logf("prime: bridge started (pid %d, port %d, provider %s/%s)",
-		cmd.Process.Pid, bridgePort, be.sdkProvider, be.model)
-	return cmd, nil
+	return env
 }
 
 // npmGlobalRoot resolves the global node_modules path so the bridge can import

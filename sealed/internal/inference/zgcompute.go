@@ -45,17 +45,119 @@ const (
 // tests can point it at a httptest server.
 var zgModelsURL = "https://router-api.0g.ai/v1/models"
 
-// Route is a resolved routing decision for one model on 0g-compute.
-type Route struct {
+// SetCatalogURLForTest points the catalog at a test server and returns a
+// restore func. For adapter tests in other packages (this package's own tests
+// can set zgModelsURL directly).
+func SetCatalogURLForTest(u string) (restore func()) {
+	prev := zgModelsURL
+	zgModelsURL = u
+	return func() { zgModelsURL = prev }
+}
+
+// ModelFacts is what is true about a model regardless of who serves it:
+// how much it can emit, how much context it takes, whether it accepts a
+// reasoning-effort bound. Every provider needs these applied — a native
+// Anthropic model reasons without bound exactly like a routed one does.
+//
+// Keeping them separate from Endpoint is load-bearing. They used to share
+// one struct behind a single `provider == "0g-compute"` check, so choosing a
+// native provider silently skipped the bound as well as the endpoint wiring
+// (hermes and dsh both did this).
+type ModelFacts struct {
+	ContextWindow int
+	MaxTokens     int
+	// SupportsReasoningEffort reports whether the catalog lists
+	// reasoning_effort among the model's supported_parameters. It matters
+	// beyond optimization: always-thinking models (glm-5.3) reason WITHOUT
+	// BOUND when the parameter is absent — measured live: 23k chars of
+	// reasoning over 10 minutes, zero visible reply, stream killed upstream —
+	// while reasoning_effort=low converges in ~2.5min with a full reply.
+	// False on the heuristic fallback (can't know, and sending the parameter
+	// to a model that rejects it is a hard 400).
+	SupportsReasoningEffort bool
+	// CatalogSourced reports that the limits above came from the live catalog
+	// rather than the name heuristic. Callers that PERSIST limits into
+	// config must gate on it: a heuristic guess written to disk during a
+	// catalog outage looks hand-set forever after and poisons the agent
+	// (review P1 — 8192 starves a reasoning model's shared thinking+reply
+	// budget into permanently empty replies).
+	CatalogSourced bool
+}
+
+// Endpoint is the wiring a framework needs ONLY when the platform, rather
+// than the framework itself, knows where to send the request. Native
+// providers ("anthropic", "openai") ship their own; the 0g router does not
+// exist in any framework's built-in table, so we supply it.
+type Endpoint struct {
 	Format  WireFormat
 	BaseURL string
 	// EnvKey is the environment variable the framework's client reads
 	// for this wire format (ANTHROPIC_API_KEY / OPENAI_API_KEY). The 0g
 	// key itself is format-agnostic; only the variable name differs.
-	EnvKey        string
-	ContextWindow int
-	MaxTokens     int
+	EnvKey string
 }
+
+// Route is a resolved routing decision for one model on 0g-compute: both
+// halves together, since the router supplies both.
+type Route struct {
+	ModelFacts
+	Endpoint
+}
+
+// ZGComputeProvider is the provider name that means "the platform routes
+// this, not the framework". Any other value is a framework built-in.
+const ZGComputeProvider = "0g-compute"
+
+// Resolve returns what the platform knows about (provider, model).
+//
+// ModelFacts always comes back and always applies. Endpoint is non-nil only
+// for platform-routed providers; for a framework built-in it is nil and the
+// framework supplies its own endpoint.
+//
+// For a native provider the router catalog is still consulted by model id —
+// the same model is often listed there — so an effort bound can be applied
+// even off-router. A miss simply yields zero facts, which every caller
+// already treats as "say nothing extra".
+func Resolve(ctx context.Context, provider, model string) (ModelFacts, *Endpoint) {
+	route := ResolveZG(ctx, model)
+	if provider != ZGComputeProvider {
+		return route.ModelFacts, nil
+	}
+	ep := route.Endpoint
+	return route.ModelFacts, &ep
+}
+
+// NormalizeEffort maps a requested reasoning-effort level onto the USABLE
+// set {low, high}. The wire set glm-5.3 accepts is low/high/max (medium is a
+// hard 400) — but max is measured-unusable on the 0g router (see the case
+// below), and the catalog declares no per-model level sets, so the platform
+// speaks the safe intersection: medium/minimal degrade to low, max to high,
+// unknown values normalize to "" (caller treats as unset). Shared by every
+// adapter so an owner-supplied level can never reach a wire that kills it.
+func NormalizeEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "low", "medium", "minimal":
+		return "low"
+	case "high":
+		return "high"
+	case "max":
+		// Allowed at the owner's explicit request, with eyes open: measured
+		// twice on the 0g router, glm-5.3 at max reasons past the router's
+		// ~600s stream kill even on a trivial prompt (78k chars of reasoning,
+		// zero reply). The CLI warns at selection; the platform passes the
+		// owner's choice through rather than second-guessing it.
+		return "max"
+	default:
+		return ""
+	}
+}
+
+// HeuristicOpenAIMaxTokens is the conservative output budget the name
+// heuristic assumes for OpenAI-format models when the catalog is unreachable.
+// Exported so config healers can recognize it as a machine-written value
+// (eligible for healing once the catalog is reachable again) rather than a
+// hand-set one.
+const HeuristicOpenAIMaxTokens = 8192
 
 // ResolveZG returns the routing decision for a model on 0g-compute.
 //
@@ -76,6 +178,13 @@ func ResolveZG(ctx context.Context, model string) Route {
 		if entry.MaxCompletionTokens > 0 {
 			r.MaxTokens = entry.MaxCompletionTokens
 		}
+		for _, p := range entry.SupportedParameters {
+			if p == "reasoning_effort" {
+				r.SupportsReasoningEffort = true
+				break
+			}
+		}
+		r.CatalogSourced = true
 		return r
 	}
 	// Fallback heuristic — keep boot working through a catalog outage.
@@ -93,7 +202,7 @@ func heuristicRoute(model string) Route {
 	if strings.HasPrefix(strings.ToLower(model), "claude") {
 		return anthropicRoute(200000, 64000)
 	}
-	return openAIRoute(128000, 8192)
+	return openAIRoute(128000, HeuristicOpenAIMaxTokens)
 }
 
 func routeForFormats(formats []string, model string) Route {
@@ -122,11 +231,17 @@ func routeForFormats(formats []string, model string) Route {
 }
 
 func openAIRoute(cw, mt int) Route {
-	return Route{Format: WireOpenAI, BaseURL: ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY", ContextWindow: cw, MaxTokens: mt}
+	return Route{
+		ModelFacts: ModelFacts{ContextWindow: cw, MaxTokens: mt},
+		Endpoint:   Endpoint{Format: WireOpenAI, BaseURL: ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"},
+	}
 }
 
 func anthropicRoute(cw, mt int) Route {
-	return Route{Format: WireAnthropic, BaseURL: ZGAnthropicBaseURL, EnvKey: "ANTHROPIC_API_KEY", ContextWindow: cw, MaxTokens: mt}
+	return Route{
+		ModelFacts: ModelFacts{ContextWindow: cw, MaxTokens: mt},
+		Endpoint:   Endpoint{Format: WireAnthropic, BaseURL: ZGAnthropicBaseURL, EnvKey: "ANTHROPIC_API_KEY"},
+	}
 }
 
 type zgCatalogEntry struct {
@@ -134,6 +249,7 @@ type zgCatalogEntry struct {
 	SupportedFormats    []string `json:"supported_formats"`
 	ContextLength       int      `json:"context_length"`
 	MaxCompletionTokens int      `json:"max_completion_tokens"`
+	SupportedParameters []string `json:"supported_parameters"`
 }
 
 func fetchZGCatalogEntry(ctx context.Context, model string) (zgCatalogEntry, bool) {

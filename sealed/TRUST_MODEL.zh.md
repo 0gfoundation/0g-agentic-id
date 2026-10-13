@@ -58,7 +58,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节 |
-| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到容器的临时 `container_pubkey`；与之配对的 `container_privkey` 在 TEE 内部生成，从不跨越任何边界。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
+| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:159-167`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:206-221`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
 任何对 sealed 的未来变更，只要可能跨越这条边界 —— 即使是间接的
 （例如把 priv 字节写日志、通过 debug endpoint 暴露、把它放进与
@@ -235,8 +235,13 @@ key。
 
 Sealed 容器启动时：
 
-1. 容器在自己的 TEE 内部生成一对临时 secp256k1 keypair
-   （`container_pubkey`、`container_privkey`）。
+1. 0g-Sandbox 封装层为这个容器生成一对临时 secp256k1 keypair
+   （`container_pubkey`、`container_privkey`），并把私钥那一半作为
+   `SANDBOX_SEAL_KEY` 环境变量注入。容器**不**生成它：Phase 0 只检查
+   注入进来的这把 key 派生出的压缩 `pubkey` 跟签名 attestation envelope
+   里的那个一致，不一致就 fail loud（`internal/config/config.go:159-167`）。
+   容器也不会自己独立得到那个 pubkey —— 它转发的就是 envelope 里带的那个
+   （`internal/provision/provision.go:58-65`）。
 2. 0g-Sandbox 观察容器启动、测量它的 `image_hash`，用自己
    TappRegistry 注册过的某把 node key 签出一个 attestation
    envelope：
@@ -275,11 +280,19 @@ hash"这件事落下来。补法是在 AgenticID 合约侧给 `validFrameworkHas
 对齐就行）—— 不需要、也不会把 sealed 迁进 TappRegistry。
 
 三道闸门必须全过。成功后，Attestor 用 **ECIES** 把
-`agent_seal_priv` 加密到 `container_pubkey`，返回密文；只有匹配
-的容器能用 `container_privkey`（从不离开容器 TEE）解密。解密后，
-`agent_seal_priv` 在容器整个生命周期里只活在 TEE 加密的 RAM 中 ——
+`agent_seal_priv` 加密到 `container_pubkey`，返回密文；只有
+`container_privkey` 能解开。解密后，`agent_seal_priv` 在容器整个生命
+周期里只活在 TEE 加密的 RAM 中 ——
 [根本不变量](#根本不变量owner-永远不持有-agent_seal_priv) 由此
-恢复。
+恢复 —— 并且在任何 agent 进程 spawn 之前，sealed 会把 seal key 清零、
+unset 掉环境变量（`config.ScrubProvisioningSecrets`）。
+
+这里要说准确，因为原先的措辞说过了头。`container_privkey` 确实不离开
+**这个**容器，但它也不是在这里诞生的：它由 sandbox 封装层注入（第 1
+步），所以造出它的那一方被假定没有留副本。这份信任不是 sealed 做的任何
+检查建立起来的 —— 它来自上面第一道闸门，也就是用户已经 ack 过的那个
+sandbox `app_id`。owner 的 settings document 走的是同一条下发路径、加密
+到同一个 pubkey，因此原封不动地继承这一跳的全部假设。
 
 Attestor 侧保存的绑定让重启可以跳过 5 分钟新鲜度窗口：同一个
 0g-Sandbox spawn 出的容器重启、提交相同的 `container_pubkey` 时，

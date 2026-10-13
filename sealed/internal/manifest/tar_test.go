@@ -123,7 +123,7 @@ func TestPackDir_EmptyDir(t *testing.T) {
 func TestPackDir_NonAsciiPathsAndContent(t *testing.T) {
 	tree := map[string]string{
 		"中文.md":         "用户文档\n",
-		"emoji-🦊.txt":    "fox content",
+		"emoji-🦊.txt":   "fox content",
 		"sub/日本語/x.txt": "kanji here",
 	}
 	dirA := buildTree(t, tree)

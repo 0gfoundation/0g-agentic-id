@@ -9,9 +9,11 @@ import (
 
 // ── openclaw.json merge I/O ─────────────────────────────────────────────────
 //
-// Multiple Restore calls + Start all write into the same openclaw.json.
-// Each writer owns specific top-level keys; we read-merge-write rather
-// than rewriting the whole file so dim writes don't clobber each other.
+// RenderSettings (inference sections) and Start (gateway subtree) both
+// write into the same openclaw.json, as does openclaw itself while it
+// runs. Each writer owns specific top-level keys; we read-merge-write
+// rather than rewriting the whole file so those writers don't clobber
+// each other.
 
 // loadOpenclawJSON parses ~/.openclaw/openclaw.json, returning an empty
 // map if the file doesn't exist.

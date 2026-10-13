@@ -26,8 +26,6 @@ func (a *Adapter) Restore(ctx context.Context, role string, plaintext []byte) er
 	switch role {
 	case "framework":
 		return a.restoreFramework(plaintext)
-	case "openclaw.json":
-		return a.restoreOpenclawJSON(plaintext)
 	case "workspace/":
 		return a.restoreWorkspace(plaintext)
 	case "workspace/skills/":

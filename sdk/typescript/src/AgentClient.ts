@@ -52,6 +52,19 @@ export interface ChatMessage {
   content: string;
 }
 
+/**
+ * Snapshot of one long-running task (a "response" in OpenAI Responses API
+ * terms) on the agent. Returned by {@link AgentClient.task} /
+ * {@link AgentClient.cancelTask}.
+ */
+export interface AgentTask {
+  id: string;
+  status: 'queued' | 'in_progress' | 'completed' | 'failed' | 'cancelled';
+  /** Assistant text produced so far (full text once completed). */
+  output_text: string;
+  error?: { message: string };
+}
+
 export interface ChatCompletion {
   choices: Array<{ message: { role: string; content: string } }>;
   [k: string]: unknown;
@@ -117,7 +130,46 @@ export interface AgentClient {
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
+    /** Per-message reasoning-effort override for thinking models. Only the
+     *  prime bridge honors it today (other frameworks' HTTP surfaces don't
+     *  take a per-request level — their default is set at deploy/reset via
+     *  `thinking`); unsupported bridges ignore it. */
+    thinking?: 'low' | 'high' | 'max';
+    /** Fires once with the server-side task id, as soon as the agent assigns
+     *  one. Only on the responses transport (see {@link AgentClient.task}):
+     *  save it and you can re-attach to this turn after a process restart via
+     *  {@link AgentClient.followTask}, or stop it via
+     *  {@link AgentClient.cancelTask}. */
+    onTask?: (id: string) => void;
   }): AsyncGenerator<string>;
+  /**
+   * Poll one task's snapshot (status + text so far). Present only when the
+   * agent declares a `kind: "responses"` route — the long-task surface where
+   * a turn is owned by a server-side id rather than an HTTP connection, so it
+   * survives dropped connections and proxy request-duration caps. On such
+   * agents `chat`/`chatStream` already ride this transport transparently
+   * (auto-resuming when the connection drops); these methods are for
+   * re-attaching later or from elsewhere.
+   */
+  task?(id: string): Promise<AgentTask>;
+  /**
+   * Re-attach to a running (or finished) task and stream its remaining
+   * output. `startingAfter` is the last event sequence number already seen
+   * (0 = from the beginning — the agent replays buffered events first, then
+   * follows live). Ends when the task completes; throws if it failed.
+   * Present under the same conditions as {@link task}.
+   */
+  followTask?(id: string, opts?: {
+    startingAfter?: number;
+    signal?: AbortSignal;
+    onActivity?: (label: string) => void;
+  }): AsyncGenerator<string>;
+  /**
+   * Stop one task by id — the responses-transport form of {@link interrupt}.
+   * Already-executed actions are not rolled back. Present under the same
+   * conditions as {@link task}.
+   */
+  cancelTask?(id: string): Promise<AgentTask>;
   /**
    * Stop the agent's CURRENT task — whoever started it. Esc semantics: the
    * turn stops issuing new tool calls / output; already-executed actions are
@@ -164,6 +216,8 @@ async function* iterSseChunks(
   const decoder = new TextDecoder();
   let buf = '';
 
+  try {
+
   function* parseFrame(frame: string): Generator<Record<string, unknown>> {
     // Named SSE events matter: hermes streams turn activity as
     // "event: hermes.tool.progress" frames on the same chat stream. Track the
@@ -204,6 +258,12 @@ async function* iterSseChunks(
     }
   }
   if (buf.trim()) yield* parseFrame(buf); // flush a trailing frame with no blank line
+  } finally {
+    // A consumer that breaks or throws out of the loop (e.g. the responses
+    // transport tearing down on a sequence gap) must not leave the HTTP
+    // connection dangling until GC.
+    try { await reader.cancel(); } catch { /* already closed */ }
+  }
 }
 
 /**
@@ -259,9 +319,18 @@ export function makeAgentClient(params: {
    *  as X-Client-Address so the TEE binds each proof to this redeemer (front-run
    *  protection). Omit for anonymous calls (proofs come back unredeemable). */
   clientAddress?: string;
+  /** Per-process client id for the agent's single-driver seat (occupancy.go):
+   *  ride it on every request so a displaced window is told with a 409 the
+   *  moment it next speaks. Absent = this client does not participate. */
+  instanceId?: string;
+  /** Stall threshold in ms for the responses transport: no bytes for this long
+   *  and the follow stream is torn down and resumed by sequence number.
+   *  Defaults to 90s (nine missed 10s keepalives). Exposed so tests can drive
+   *  the recovery in milliseconds; tune only with a reason. */
+  stallMs?: number;
 }): AgentClient {
   const base = params.base.replace(/\/$/, '');
-  const { services, routes, reauth, clientAddress } = params;
+  const { services, routes, reauth, clientAddress, instanceId } = params;
   const canAuth = !!(reauth || params.token);
 
   let cached: string | undefined = params.token;
@@ -285,6 +354,9 @@ export function makeAgentClient(params: {
       // set the header explicitly.
       if (clientAddress && !headers.has('X-Client-Address')) {
         headers.set('X-Client-Address', clientAddress);
+      }
+      if (instanceId && !headers.has('X-Client-Instance')) {
+        headers.set('X-Client-Instance', instanceId);
       }
       return fetch(url, { ...init, headers });
     };
@@ -436,6 +508,264 @@ export function makeAgentClient(params: {
             : 'chat: the stream ended without any output — the agent-side model call likely failed (see /agentlog)',
         );
       }
+    };
+  }
+
+  // ── Responses transport (the long-task surface) ──────────────────────────
+  //
+  // When the agent declares a `kind: "responses"` route (prime/dsh bridges
+  // natively; openclaw/hermes via the sealed proxy's synthesized layer), a
+  // turn is owned by a server-side response id, not by the HTTP connection —
+  // so it survives network drops and the sandbox preview proxy's request-
+  // duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
+  // REPLACED to ride it: same signatures, but a dropped connection now means
+  // "resume from the last sequence number", not "the task died". task/
+  // followTask/cancelTask expose the id-level surface for re-attaching later.
+  const responsesRoute = routes.find((r) => r.kind === 'responses');
+  if (responsesRoute && canAuth) {
+    const rPrefix = responsesRoute.prefix.replace(/\/$/, '');
+
+    const taskSnapshot = async (id: string): Promise<AgentTask> => {
+      const r = await doFetch(`${rPrefix}/${id}`);
+      if (!r.ok) throw new Error(`task: HTTP ${r.status}: ${await r.text()}`);
+      return (await r.json()) as AgentTask;
+    };
+
+    // Normalize activity labels across serving layers: hermes narrates its
+    // reasoning phase as tool_name "_thinking" many times a second — collapse
+    // to the throttled "thinking" label the callers already understand.
+    const wrapActivity = (onActivity?: (label: string) => void): ((label: string) => void) | undefined => {
+      if (!onActivity) return undefined;
+      let lastThinkingAt = 0;
+      return (label: string) => {
+        if (label === '_thinking' || label === 'thinking') {
+          const now = Date.now();
+          if (now - lastThinkingAt > 2000) { lastThinkingAt = now; onActivity('thinking'); }
+          return;
+        }
+        onActivity(label);
+      };
+    };
+
+    /**
+     * Follow one response to its terminal event, yielding text deltas. The
+     * task id is always known before this runs (chatStream submits first), so
+     * every attempt is a fresh GET
+     * {prefix}/{id}?stream=true&starting_after={seq} — every event carries a
+     * sequence_number, so nothing is duplicated or lost across reconnects.
+     * Only an explicit abort or a terminal event ends the loop; repeated
+     * failures (connection errors or barren attempts) give up with the id in
+     * the message so the caller can re-attach later.
+     */
+    // No bytes for this long means something between us and the agent has
+    // gone quiet: the bridges keepalive every 10s, so 90s of true silence is
+    // already pathological. Reconnecting then beats waiting out the runtime's
+    // own timeout (undici: 300s), and makes the SDK independent of it.
+    // Injectable so tests can exercise the recovery in milliseconds instead
+    // of waiting out the real threshold.
+    const STALL_MS = params.stallMs ?? 90_000;
+    // How often the watchdog checks. Derived from the threshold rather than
+    // fixed: a hardcoded interval silently coarsens the effective deadline
+    // (a 15s poll turned a 90s stall into a 105s recovery) and makes the
+    // guarantee untestable at small thresholds.
+    const STALL_POLL_MS = Math.max(50, Math.floor(STALL_MS / 6));
+    // Backoff between attempts, capped by the threshold as well as by the
+    // absolute ceiling: a fixed ladder dominates the give-up horizon whenever
+    // the threshold is small (at stallMs=150 it made the give-up path 24s of
+    // a 29s suite) and is the last constant not derived from the threshold.
+    const backoffFor = (n: number): number =>
+      Math.min(500 * 2 ** n, 8_000, Math.max(50, STALL_MS * 4));
+
+    const lostAgent = (id: string | undefined, why: string): Error =>
+      new Error(
+        `task ${id}: lost the agent while following (${why}) — ` +
+        `the task may still be running; re-attach with followTask("${id}")`,
+      );
+
+    async function* followResponse(args: {
+      id?: string;
+      startingAfter?: number;
+      signal?: AbortSignal;
+      onActivity?: (label: string) => void;
+    }): AsyncGenerator<string> {
+      const id = args.id;
+      let seq = args.startingAfter ?? 0;
+      let sawText = false;
+      let terminal: AgentTask | undefined;
+      let failures = 0;
+      const followedAt = Date.now(); // for the give-up message: total wait, not per-attempt
+      // Per-attempt controller: the stall watchdog aborts THIS attempt without
+      // touching the caller's signal (which means "stop the task").
+      let attempt: AbortController | undefined;
+      let lastByteAt = Date.now();
+
+      for (;;) {
+        // ONE lifecycle per attempt: the caller's abort link and the stall
+        // watchdog are installed before the fetch and torn down only when the
+        // attempt is over — headers arriving is not the end of an attempt.
+        // (Removing the abort link at the header boundary silently broke Esc
+        // mid-stream: the body phase had nothing connecting the caller's
+        // signal to this attempt. Review R1.)
+        attempt = new AbortController();
+        let onOuterAbort: (() => void) | undefined;
+        if (args.signal) {
+          if (args.signal.aborted) attempt.abort();
+          else {
+            onOuterAbort = () => attempt?.abort();
+            args.signal.addEventListener('abort', onOuterAbort, { once: true });
+          }
+        }
+        lastByteAt = Date.now();
+        const progressAt = { seq };
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastByteAt > STALL_MS) attempt?.abort();
+        }, STALL_POLL_MS);
+
+        try {
+          // ── open (or re-open) the follow stream ────────────────────────
+          let res: Response;
+          try {
+            const r = await doFetch(`${rPrefix}/${id}?stream=true&starting_after=${seq}`, { signal: attempt.signal });
+            if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+            res = r;
+            lastByteAt = Date.now();
+          } catch (e) {
+            if (args.signal?.aborted) throw e;
+            if (++failures > 5) throw lostAgent(id, (e as Error).message);
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
+            continue;
+          }
+          if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+            throw new Error('task: expected an SSE stream from the responses route');
+          }
+
+          // ── consume it ─────────────────────────────────────────────────
+          try {
+            // The comment callback counts keepalives as liveness — they are
+            // exactly what the bridges send during a quiet turn.
+            for await (const chunk of iterSseChunks(res.body, () => { lastByteAt = Date.now(); })) {
+              lastByteAt = Date.now();
+              const sn = (chunk as { sequence_number?: number }).sequence_number;
+              if (typeof sn === 'number') {
+                // Continuity guard: after a reconnect the replay may overlap
+                // what we already consumed — skip those. A FORWARD jump means
+                // the server dropped events for us (lagging-follower detach);
+                // don't consume past the hole — tear down and resume from the
+                // last good sequence, replaying the missing span.
+                if (sn <= seq) continue;
+                if (sn > seq + 1) throw new Error(`sequence gap: got ${sn} after ${seq}`);
+                seq = sn; failures = 0;
+              }
+              switch ((chunk as { type?: string }).type) {
+                case 'response.created':
+                  break; // the id is already known — we submitted before following
+
+                case 'response.output_text.delta': {
+                  const d = (chunk as { delta?: string }).delta;
+                  if (typeof d === 'string' && d) { sawText = true; yield d; }
+                  break;
+                }
+                case 'response.activity': {
+                  const label = (chunk as { label?: string }).label;
+                  if (args.onActivity && typeof label === 'string') args.onActivity(label);
+                  break;
+                }
+                case 'response.completed':
+                case 'response.failed': {
+                  terminal = (chunk as { response?: AgentTask }).response;
+                  break;
+                }
+              }
+              if (terminal) break;
+            }
+          } catch (e) {
+            if (args.signal?.aborted) throw e;
+            // Network cut mid-stream, or our own stall watchdog firing —
+            // either way the cure is the same: resume from the last sequence.
+          }
+
+          if (terminal) break;
+          if (args.signal?.aborted) {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            throw err;
+          }
+          // An attempt that delivered NO new event is barren. Real mute
+          // servers flush their headers and then say nothing, so those
+          // attempts never reach the connection-error budget above — count
+          // them here or the client reconnects at the stall cadence for ever
+          // (review R2: measured 33 reconnects in 6s before this).
+          if (seq === progressAt.seq) {
+            if (++failures > 5) {
+              throw lostAgent(id, `no events across ${failures} attempts over ${Math.round((Date.now() - followedAt) / 1000)}s`);
+            }
+            await new Promise((t) => setTimeout(t, backoffFor(failures)));
+          }
+          // reconnect via GET resume (the id is always known here)
+        } finally {
+          clearInterval(watchdog);
+          if (onOuterAbort && args.signal) args.signal.removeEventListener('abort', onOuterAbort);
+        }
+      }
+
+      if (terminal.status === 'failed') {
+        throw new Error(`chat: ${terminal.error?.message ?? 'task failed'}`);
+      }
+      if (terminal.status === 'cancelled') return; // owner stopped it — partial text already yielded
+      if (!sawText) {
+        // Deltas can fall past the agent's replay horizon on a very late
+        // re-attach; the terminal snapshot still carries the full text.
+        if (terminal.output_text) { yield terminal.output_text; return; }
+        throw new Error('chat: the task completed without any output — the agent-side model call likely failed (see /agentlog)');
+      }
+    }
+
+    client.chatStream = async function* (messages, opts) {
+      // SUBMIT and FOLLOW are deliberately two requests. With `stream: true`
+      // the submit IS the long-lived stream, which leaves one unresumable
+      // window: a failure before the id arrives cannot be re-attached, and
+      // the caller can only report a dead task. Submitting WITHOUT stream
+      // returns the id in milliseconds, so every long-lived byte after that
+      // travels on a GET we can always resume by id. One extra round trip
+      // buys the guarantee that a task is never lost to a dropped connection.
+      const payload: Record<string, unknown> = { input: messages };
+      if (opts?.model) payload.model = opts.model;
+      if (opts?.thinking) payload.reasoning = { effort: opts.thinking };
+      const r = await doFetch(rPrefix, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: opts?.signal,
+      });
+      if (!r.ok) throw new Error(`chat: HTTP ${r.status}: ${await r.text()}`);
+      const submitted = (await r.json()) as AgentTask;
+      if (!submitted?.id) throw new Error('chat: the agent accepted the task but returned no id');
+      opts?.onTask?.(submitted.id);
+      yield* followResponse({
+        id: submitted.id,
+        startingAfter: 0,
+        signal: opts?.signal,
+        onActivity: wrapActivity(opts?.onActivity),
+      });
+    };
+
+    client.chat = async (messages, opts) => {
+      let content = '';
+      for await (const delta of client.chatStream!(messages, opts)) content += delta;
+      return { choices: [{ message: { role: 'assistant', content } }] } as ChatCompletion;
+    };
+
+    client.task = taskSnapshot;
+    client.followTask = (id, opts) => followResponse({
+      id,
+      startingAfter: opts?.startingAfter ?? 0,
+      signal: opts?.signal,
+      onActivity: wrapActivity(opts?.onActivity),
+    });
+    client.cancelTask = async (id) => {
+      const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
+      if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${await r.text()}`);
+      return (await r.json()) as AgentTask;
     };
   }
 

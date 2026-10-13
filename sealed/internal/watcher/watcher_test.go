@@ -9,6 +9,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/platform"
+	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 )
 
@@ -21,7 +22,7 @@ type fakeAdapter struct {
 	evoErr  error
 }
 
-func (f *fakeAdapter) Name() string                            { return "fake" }
+func (f *fakeAdapter) Name() string { return "fake" }
 func (f *fakeAdapter) FrameworkFacts() platform.FrameworkFacts {
 	return platform.FrameworkFacts{Home: "~/.fake/", Tracked: []platform.PathNote{{Path: "~/.fake/state", Note: "fake"}}}
 }
@@ -41,6 +42,8 @@ func (f *fakeAdapter) LoadEntry(context.Context, string, string) ([]byte, error)
 func (f *fakeAdapter) RestoreEntry(context.Context, string, string, []byte) error {
 	return framework.ErrUnsupportedDim
 }
+func (f *fakeAdapter) RenderSettings(context.Context, settings.Resolved) error { return nil }
+
 func (f *fakeAdapter) Start(context.Context, framework.RuntimeContext) (framework.StartResult, error) {
 	return framework.StartResult{}, nil
 }

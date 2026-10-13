@@ -48,6 +48,37 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FileConfig {
   }
 }
 
+/**
+ * Secret-env sticky pins (issue #166): attestor URLs that have advertised
+ * `secret_env_scheme` at least once, so a later absence is refused as
+ * tampering instead of silently downgrading to a clear-text key — across
+ * CLI invocations, not just within one process. One small file so the
+ * existing config.json load/save semantics stay untouched.
+ */
+export function loadSecretEnvPins(env: NodeJS.ProcessEnv = process.env): Record<string, true> {
+  const file = join(configPaths(env).dir, 'secret-env-pins.json');
+  if (!existsSync(file)) return {};
+  try {
+    return JSON.parse(readFileSync(file, 'utf8')) as Record<string, true>;
+  } catch {
+    return {};
+  }
+}
+
+/** Record that `attestorUrl` advertises the scheme. Best-effort: a failed
+ *  write only costs persistence, never the call. */
+export function recordSecretEnvPin(attestorUrl: string, env: NodeJS.ProcessEnv = process.env): void {
+  try {
+    const { dir } = configPaths(env);
+    mkdirSync(dir, { recursive: true });
+    const pins = { ...loadSecretEnvPins(env), [attestorUrl]: true as const };
+    writeFileSync(join(dir, 'secret-env-pins.json'), `${JSON.stringify(pins, null, 2)}
+`, { mode: 0o644 });
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Merge a patch into config.json (creating the dir), 0644. */
 export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.env): void {
   const { dir, config } = configPaths(env);

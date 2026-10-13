@@ -9,16 +9,28 @@ package dsh
 //	skills/          agent-installed skills — the "user-dsh" rank-400 root in
 //	                 the skill-discovery table (docs/subsystems/skills.md),
 //	                 <name>/SKILL.md or <name>.md per skill (skills.go)
-//	settings.yaml    DSH's own hot-reloaded settings file; this adapter's
-//	                 durable home for the inference route pin, the same role
-//	                 hermes's config.yaml and prime's models.json play
-//	                 (settingsyaml.go)
+//	APPEND_SYSTEM.md the owner persona (persona.go)
 //
 // Deliberately NOT managed (never on chain):
 //
+//   - $DSH_HOME/settings.yaml — DSH's own hot-reloaded settings file. This
+//     adapter no longer writes, reads or tracks it: the inference pin comes
+//     from the owner's settings document and reaches the bridge as env
+//     (settings.go). Nothing regressed by dropping it — the bridge never
+//     mounted `dsh-settings-file`, so DSH itself never read the file either.
+//     An agent minted while the role existed still has one last use for it:
+//     HandleLegacy reads the pin out of the chain entry once at boot, and the
+//     platform persists it as that agent's settings document (settings.go).
+//
+//   - $DSH_HOME/AGENTS.md — the spine's workspace-context file. Nothing
+//     mounts the extra that reads it (the knob that would is refused, see
+//     settings.go), and no role carries it: an agent may write it, but it is
+//     read by nothing and survives nothing.
+//
 //   - Any session-persistence backend's output. This adapter's composition
-//     mounts NO session-persistence plugin: the bridge keeps one Agent
-//     object alive in process memory for the container's lifetime, so
+//     mounts no UPSTREAM session-persistence plugin; the bridge itself is the
+//     backend now (sessionstore.mjs, CONVERSATION.md) and its output is
+//     conversationPath() below — untracked for the same reason:
 //     `followup()` continuity does not depend on a durable session log —
 //     and DSH's own session log is append-only, growing on every turn, which
 //     would phantom-drift on every 30s tick if it were ever tracked.
@@ -37,8 +49,10 @@ package dsh
 //     names its own checkout path so its self-referential toolset can read
 //     and edit it), but doing so safely needs a promote/rollback primitive
 //     this codebase does not have yet (see the package doc). v1 tracks only
-//     the framework's DATA surface — persona, skills, the inference pin —
-//     the same surface openclaw and hermes track.
+//     the framework's DATA surface — the persona and the installed skills.
+//     The inference pin is NOT part of it: it is the owner's settings
+//     document, rendered into the bridge's environment at every Start
+//     (settings.go), and no role carries it.
 //
 // `dshHome` is a var (not const) so unit tests can redirect into
 // t.TempDir(). Production code never reassigns it.
@@ -58,8 +72,7 @@ func ensureDir(dir string) error {
 	return nil
 }
 
-func skillsDir() string        { return dshHome + "/skills" }
-func settingsYAMLPath() string { return dshHome + "/settings.yaml" }
+func skillsDir() string { return dshHome + "/skills" }
 
 // appendSystemPath holds the owner persona, injected by the bridge into
 // ctx.systemPrompt at boot (see spawn.go) — DSH has no native
@@ -74,3 +87,10 @@ func appendSystemPath() string { return dshHome + "/APPEND_SYSTEM.md" }
 // ctx.systemPrompt.section(). Deliberately OUTSIDE dshHome: per-boot platform
 // text must never be reachable by a tracked role.
 func agentDocPath() string { return "/run/seal-agentdoc.md" }
+
+// conversationPath is where the bridge persists this agent's ONE conversation
+// (CONVERSATION.md): the event log the session is re-seeded from on a process
+// restart. An untracked child of dshHome — this file is exactly the "session-
+// persistence backend's output" the header above classifies as deliberately
+// not chain-tracked; it lives and dies with the container.
+func conversationPath() string { return dshHome + "/owner-chat.session.jsonl" }

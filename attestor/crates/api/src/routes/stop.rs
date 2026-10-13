@@ -106,6 +106,9 @@ mod tests {
             standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
+            secret_env_enabled: false,
+            cli_latest: String::new(),
+            cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
@@ -136,6 +139,7 @@ mod tests {
             seal_id,
             owner: env.wallet_address,
             sandbox_envelope: env,
+            framework: None,
         }
     }
 
@@ -166,6 +170,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::NotStarted,
@@ -182,6 +187,11 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
             created_at: now,
             updated_at: now,
         };

@@ -69,3 +69,9 @@ test('readEnv: AGENTIC_* env vars win over the files; files remain the fallback'
   assert.equal(resolved.attestorUrl, 'https://env.example');
   assert.equal(resolved.privateKey, KEY);
 });
+
+test('SDK_VERSION stays in lockstep with package.json', async () => {
+  const { SDK_VERSION } = await import('../dist/constants.js');
+  const pkg = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(SDK_VERSION, pkg.version, 'bump src/constants.ts SDK_VERSION together with package.json');
+});

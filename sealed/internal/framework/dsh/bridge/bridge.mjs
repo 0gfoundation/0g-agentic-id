@@ -16,17 +16,22 @@
  * cannot alter what gets mounted at next boot. Deliberately NOT mounted
  * (each a decision, see the adapter's package doc):
  *
- *   session-persistence-*  — the append-only session log would phantom-drift
- *                            every watcher tick, and its format is pinned at
- *                            v0 with no compatibility promise. One Agent
- *                            object in process memory instead.
- *   settings-file          — its hot-reload layers settings.yaml OVER the
- *                            composition; mounting it would let an agent
- *                            edit of settings.yaml inject an arbitrary
- *                            baseURL route live. The tracked settings.yaml
- *                            role is read by the ADAPTER (readPin) and
- *                            reaches this bridge as env — DSH never reads
- *                            the file.
+ *   session-persistence-*  — the upstream plugin family is not mounted (its
+ *                            append-only log format is pinned v0 with no
+ *                            compatibility promise, and no concrete backend
+ *                            ships). The bridge implements the backend itself:
+ *                            sessionstore.mjs appends every committed session
+ *                            event and re-seeds the session on boot
+ *                            (CONVERSATION.md). One Agent object per process,
+ *                            durable through its event log.
+ *   settings-file          — its hot-reload layers $DSH_HOME/settings.yaml
+ *                            OVER the composition; mounting it would let an
+ *                            agent edit of that file inject an arbitrary
+ *                            baseURL route live. The inference pin reaches
+ *                            this bridge as SEAL_MODEL_* env, rendered from
+ *                            the owner's settings document before Start
+ *                            (the adapter's settings.go) — no file involved
+ *                            on either side.
  *   tool-cordis            — in-process tool definition; unaudited and
  *                            gone on restart (untrackable self-modification).
  *   sandbox stack          — privsep (kernel uid split) is the wall; DSH's
@@ -34,9 +39,18 @@
  *                            bwrap/Landlock, which slim TEE containers lack.
  *   web/*, e2b/*, subagent — capability tiers deferred to the preset menu
  *                            (phase 2); the agent has curl via bash.
- *   workspaceContext/jobs/goals (spine extras) — off; workspaceContext reads
- *                            ~/.dsh/AGENTS.md, which is an open phase-2
- *                            question for the tracked-role set.
+ *   goals (spine extra)    — off; no owner-facing surface for it yet.
+ *
+ * toolJobs / maxParallelToolCalls are OWNER knobs, not platform decisions:
+ * they arrive as SEAL_DSH_* env from the settings document's `framework`
+ * section and default to the values this bridge used to hardcode (off / 1).
+ *
+ * workspaceContext is NOT one of them and is pinned off here. It reads
+ * ~/.dsh/AGENTS.md into every turn's context, and that file is agent-writable
+ * and belongs to no chain-tracked role — an untracked channel into the system
+ * prompt is a platform-boundary decision, not a composition preference. The
+ * adapter refuses the knob (settings.go); tracking AGENTS.md as a role is
+ * what would make it offerable.
  *
  * Run: node bridge.mjs  (plain ESM; @deepseek-ai/* resolved via NODE_PATH)
  */
@@ -57,7 +71,8 @@ import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import * as TimeoutPolicy from '@deepseek-ai/dsh-tool-call-timeout-policy'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, decodeStorageRecord, interruptedTurnClosers, packChunkRuns } from '@deepseek-ai/dsh-session'
+import { appendEvent, loadSeed } from './sessionstore.mjs'
 
 import * as SealTools from './seal-tools.mjs'
 import * as SealGuard from './seal-guard.mjs'
@@ -67,10 +82,34 @@ const TOKEN = process.env.SEAL_BRIDGE_TOKEN || ''
 const AGENT_DOC = process.env.SEAL_AGENT_DOC || ''
 const PERSONA_PATH = process.env.SEAL_PERSONA_PATH || ''
 const DSH_HOME = process.env.DSH_HOME || '/root/.dsh'
+// Where the harness persists THIS agent's one conversation (CONVERSATION.md).
+// Set by the adapter to an untracked path under DSH_HOME; empty disables
+// persistence (in-memory session + the client-replay restoreTranscript path).
+const CONVERSATION_FILE = process.env.SEAL_CONVERSATION_FILE || ''
 const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
 const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
+// Router-catalog output budget, resolved by the adapter (settings.go). Only a
+// CATALOG-sourced value is ever passed: 0 means "let pi-ai default" rather
+// than a name-heuristic guess (8192), which would starve a reasoning model's
+// shared thinking+reply budget into permanently empty replies.
+const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
+// The reasoning bound, already resolved by the adapter (settings.Resolved's
+// Effort() folds the model's catalog support, the owner's level and the "low"
+// floor into one value; it is provider-independent, so a native provider gets
+// bounded too). Empty/absent = this model takes NO bound, and then nothing
+// reasoning-related is declared — the parameter is a hard 400 on a model that
+// rejects it. Not an optimization: an always-thinking model (glm-5.3) reasons
+// WITHOUT BOUND when the parameter is absent — measured 100k+ chars of
+// reasoning, zero reply, stream killed upstream; "low" converges in minutes.
+const MODEL_EFFORT = ['low', 'high', 'max'].includes(process.env.SEAL_MODEL_EFFORT) ? process.env.SEAL_MODEL_EFFORT : ''
+
+// Owner composition knobs (settings document `framework` section → adapter →
+// env). Defaults are the literals this bridge hardcoded before the section
+// existed, so an owner who sets nothing gets exactly the shipped composition.
+const TOOL_JOBS = process.env.SEAL_DSH_TOOL_JOBS === '1'
+const MAX_PARALLEL_TOOL_CALLS = Number(process.env.SEAL_DSH_MAX_PARALLEL_TOOL_CALLS || '1') || 1
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -78,12 +117,12 @@ if (!TOKEN) {
 }
 if (!PROVIDER || !MODEL_ID) {
   // Same stance as prime's resolveModel: substituting a model the owner never
-  // pinned must be an error, not a fallback.
-  console.error('bridge: SEAL_MODEL_PROVIDER and SEAL_MODEL_ID are required (the inference pin is on-chain identity)')
+  // picked must be an error, not a fallback.
+  console.error("bridge: SEAL_MODEL_PROVIDER and SEAL_MODEL_ID are required (the owner's settings name the model; the adapter renders them here)")
   process.exit(2)
 }
 
-const log = (...args) => console.log(`[bridge] ${args.join(' ')}`)
+const log = (...args) => console.log(`[${new Date().toISOString().slice(11, 23)}] [bridge] ${args.join(' ')}`)
 
 /**
  * Neutralize `{{` in owner/platform text. DSH's prompt renderer interpolates
@@ -109,17 +148,20 @@ async function boot() {
   const ctx = new Context()
 
   // Spine: session/tools/system-prompt/agent/agent-loop/skills/shell-env/
-  // tool-bash/llm seam + retry. Spine extras (jobs tools, goals, workspace
-  // context) are off — see the header. Persona goes into DSH's reserved
-  // order-0 persona slot; the platform doc is registered separately below so
-  // it renders AFTER tool guidance — platform mechanics are the final word.
+  // tool-bash/llm seam + retry. The workspace-context / jobs / parallelism
+  // extras are the owner's to set (see the header); goals stays off. Persona
+  // goes into DSH's reserved order-0 persona slot; the platform doc is
+  // registered separately below so it renders AFTER tool guidance — platform
+  // mechanics are the final word.
   const persona = depot(readOptional(PERSONA_PATH, 'persona'))
+  log(`composition: toolJobs=${TOOL_JOBS} maxParallelToolCalls=${MAX_PARALLEL_TOOL_CALLS} (workspaceContext pinned off)`)
   await ctx.plugin(Spine, {
     dshHome: DSH_HOME,
     persona,
+    // Pinned off, not owner-settable: see the header.
     workspaceContext: false,
-    toolJobs: false,
-    maxParallelToolCalls: 1,
+    toolJobs: TOOL_JOBS,
+    maxParallelToolCalls: MAX_PARALLEL_TOOL_CALLS,
     // The spine bundle unconditionally mounts a set of relational invariant
     // self-checks (scope/session/agent/agent-loop) meant for development. On
     // rc.1 the session/created dispatch trips the scope-carrier check; these
@@ -138,12 +180,23 @@ async function boot() {
   // Inference: one self-declared llm-pi-ai route for the resolved provider.
   // baseURL comes pre-resolved from the adapter (0g-compute → router /v1);
   // empty baseURL means a catalog provider pi-ai already knows.
+  log(`thinking level: ${MODEL_EFFORT || 'n/a (model takes no reasoning_effort)'}`)
   await ctx.plugin(PiAi, {
     providers: {
       [PROVIDER]: {
         apiKeyEnv: 'SEAL_MODEL_API_KEY',
         ...(MODEL_BASE_URL ? { api: MODEL_API, baseURL: MODEL_BASE_URL } : {}),
-        models: [{ id: MODEL_ID }],
+        // Bounded reasoning (see MODEL_EFFORT above): declare the level set
+        // the model accepts (keys = offered levels, values = wire spellings)
+        // so pi-ai marks it reasoning-capable, and default the profile to the
+        // resolved level. resolveReasoningLevel validates against this set, so
+        // an unsupported level fails loudly here instead of as an upstream 400.
+        ...(MODEL_EFFORT ? { reasoning: MODEL_EFFORT } : {}),
+        models: [{
+          id: MODEL_ID,
+          ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
+          ...(MODEL_EFFORT ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+        }],
       },
     },
   })
@@ -190,11 +243,29 @@ async function boot() {
     try { log(`agent/error: ${JSON.stringify(args).slice(0, 500)}`) } catch { log('agent/error (unserializable)') }
   })
 
+  // Restore the persisted conversation (CONVERSATION.md): decode the event
+  // log and hand it to create() as the seed — the SDK's documented replay
+  // path. No file / unusable file → fresh conversation, exactly as before.
+  const sdkCodecs = { decodeStorageRecord, interruptedTurnClosers, packChunkRuns }
+  const seed = CONVERSATION_FILE ? loadSeed(CONVERSATION_FILE, sdkCodecs, log) : null
+  if (seed && seed.length) storeRestored = true
   const handle = await ctx.agents.create({
     sessionId: SessionId('owner-chat'),
-    meta: { cwd: DSH_HOME },
+    meta: { cwd: DSH_HOME, ...(seed ? { seedLength: seed.length } : {}) },
+    ...(seed ? { seed } : {}),
     agentOptions: { provider: PROVIDER, model: MODEL_ID },
   })
+  if (CONVERSATION_FILE) {
+    // Persist every event committed AFTER the seed. The seq guard makes this
+    // robust whichever way create() treats seed publication: re-emitted seed
+    // events are skipped instead of double-written.
+    const seedMaxSeq = seed && seed.length ? (seed[seed.length - 1].seq ?? -1) : -1
+    ctx.on('session/event', (session, event) => {
+      if (session !== handle.agent.session) return
+      if (typeof event.seq === 'number' && event.seq <= seedMaxSeq) return
+      appendEvent(CONVERSATION_FILE, event, sdkCodecs, log)
+    })
+  }
   log(`agent ready (persona: ${persona.length} bytes, platform doc: ${doc ? `${doc.length} bytes` : 'ABSENT'})`)
   return { ctx, agent: handle.agent }
 }
@@ -274,6 +345,187 @@ async function runTurn(ctx, agent, text, onDelta, onActivity) {
   return full
 }
 
+// ── /v1/responses (OpenAI Responses API subset) ─────────────────────────────
+//
+// The long-task surface (verbatim port of the prime bridge's implementation).
+// chat/completions couples the TURN to one HTTP connection — fatal for agent
+// work that legitimately runs longer than any proxy allows a request to live
+// (0g-sandbox#122: ~300s on mainnet). The Responses shape decouples them:
+//
+//   POST /v1/responses {input, stream:true}   → SSE; first event carries id
+//   GET  /v1/responses/:id                    → poll {status, output_text}
+//   GET  /v1/responses/:id?stream=true&starting_after=N
+//                                             → replay events > N, then live
+//   POST /v1/responses/:id/cancel             → cancel the running turn
+//
+// Subset only: input as string or messages-style items (last user text wins,
+// same as handleChat — the agent is a stateful session, not a stateless
+// completion). Events carry sequence_number for resume. Responses are kept in
+// a bounded in-memory ring (survives disconnects, not bridge restarts — the
+// agent's own session state is the durable record).
+
+import { randomBytes } from 'node:crypto'
+
+const RESPONSES_MAX = 16
+const responses = new Map() // id -> record
+const responseOrder = []
+
+function newResponseRecord(text) {
+  const id = 'resp_' + randomBytes(12).toString('hex')
+  const rec = {
+    id,
+    status: 'queued', // queued | in_progress | completed | failed | cancelled
+    prompt: text.slice(0, 200),
+    events: [], // {seq, name, data}
+    seq: 0,
+    outputText: '',
+    error: null,
+    listeners: new Set(), // live followers: (evt) => void
+  }
+  responses.set(id, rec)
+  responseOrder.push(id)
+  while (responseOrder.length > RESPONSES_MAX) {
+    const old = responseOrder.shift()
+    responses.delete(old)
+  }
+  return rec
+}
+
+function pushResponseEvent(rec, name, data) {
+  const evt = { seq: ++rec.seq, name, data }
+  rec.events.push(evt)
+  // Bound memory: cap the retained delta log (~1MB of text per response).
+  if (rec.events.length > 4096) rec.events.splice(0, rec.events.length - 4096)
+  for (const l of rec.listeners) {
+    try { l(evt) } catch { /* dead follower */ }
+  }
+  return evt
+}
+
+function responseSnapshot(rec) {
+  return {
+    id: rec.id,
+    object: 'response',
+    status: rec.status,
+    output_text: rec.outputText,
+    ...(rec.error ? { error: { message: rec.error } } : {}),
+  }
+}
+
+/** Run one agent turn under a response record. The turn is owned by the
+ *  record, NOT by any HTTP connection — followers attach and detach freely. */
+function startResponseTurn(rec, text) {
+  rec.turn = serialize(async () => {
+    // A cancel can land while this task is still QUEUED behind another turn
+    // (the cancel path then only marks the status — agent.cancel() would hit
+    // the wrong, currently-running task). Honor it here instead of silently
+    // overwriting it and running a dead task (review B1).
+    if (rec.status === 'cancelled') {
+      pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
+      pushResponseEvent(rec, 'response.completed', { type: 'response.completed', response: responseSnapshot(rec) })
+      return
+    }
+    rec.status = 'in_progress'
+    pushResponseEvent(rec, 'response.created', { type: 'response.created', response: responseSnapshot(rec) })
+    try {
+      const { ctx, agent } = await getAgent()
+      const full = await runTurn(
+        ctx,
+        agent,
+        text,
+        (delta) => {
+          rec.outputText += delta
+          pushResponseEvent(rec, 'response.output_text.delta', {
+            type: 'response.output_text.delta',
+            delta,
+            sequence_number: rec.seq + 1,
+          })
+        },
+        (line) => {
+          log(`  ${line}`)
+          // Activity rides as a non-standard event so resumed followers
+          // see progress too; standard clients ignore unknown names.
+          pushResponseEvent(rec, 'response.activity', { type: 'response.activity', label: line })
+        },
+      )
+      if (rec.status !== 'cancelled') {
+        rec.outputText = full || rec.outputText
+        rec.status = 'completed'
+      }
+      pushResponseEvent(rec, 'response.completed', { type: 'response.completed', response: responseSnapshot(rec) })
+    } catch (err) {
+      rec.status = rec.status === 'cancelled' ? 'cancelled' : 'failed'
+      rec.error = String((err && err.message) || err)
+      pushResponseEvent(rec, 'response.failed', { type: 'response.failed', response: responseSnapshot(rec) })
+    }
+  })
+}
+
+/** SSE-stream a record to `res` from sequence > startingAfter: replay the
+ *  buffered events, then follow live until a terminal event. */
+function streamResponse(req, res, rec, startingAfter) {
+  res.writeHead(200, {
+    'content-type': 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  })
+  if (typeof res.flushHeaders === 'function') res.flushHeaders()
+  // Paired with the "accepted" line: accepted WITHOUT stream open means the
+  // failure is inside this bridge; both present means the bytes left here.
+  log(`responses: ${rec.id} stream open (from seq ${startingAfter})`)
+  let closed = false
+  const write = (evt) => {
+    if (closed || res.writableEnded || res.destroyed) return
+    try {
+      res.write(`id: ${evt.seq}\nevent: ${evt.name}\ndata: ${JSON.stringify({ ...evt.data, sequence_number: evt.seq })}\n\n`)
+    } catch { closed = true }
+  }
+  const isTerminal = (evt) => evt.name === 'response.completed' || evt.name === 'response.failed'
+  // Numbered keepalives: a client trace can then distinguish "never got a
+  // byte" from "got the first N then silence" — the two have different causes
+  // and used to be indistinguishable from the outside.
+  let beats = 0
+  const beat = setInterval(() => {
+    if (!closed && !res.writableEnded && !res.destroyed) { try { res.write(`: keepalive ${++beats}\n\n`) } catch { closed = true } }
+  }, 10_000)
+  const finish = () => {
+    clearInterval(beat)
+    rec.listeners.delete(follow)
+    if (!res.writableEnded && !res.destroyed) { try { res.end() } catch { /* raced */ } }
+  }
+  const follow = (evt) => { write(evt); if (isTerminal(evt)) finish() }
+  // Replay history strictly after the resume point.
+  let sawTerminal = false
+  for (const evt of rec.events) {
+    if (evt.seq <= startingAfter) continue
+    write(evt)
+    if (isTerminal(evt)) sawTerminal = true
+  }
+  if (sawTerminal || rec.status === 'completed' || rec.status === 'failed' || rec.status === 'cancelled') {
+    finish()
+    return
+  }
+  rec.listeners.add(follow)
+  res.on('close', () => { closed = true; finish() })
+}
+
+/** Extract the user text from a Responses `input` (string or items array). */
+function responseInputText(input) {
+  if (typeof input === 'string') return input
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const it = input[i]
+      if (!it || (it.role && it.role !== 'user')) continue
+      if (typeof it.content === 'string') return it.content
+      if (Array.isArray(it.content)) {
+        const t = it.content.filter((c) => c && typeof c.text === 'string').map((c) => c.text).join('\n')
+        if (t) return t
+      }
+    }
+  }
+  return ''
+}
+
 // ── OpenAI wire shapes (verbatim from the prime bridge) ─────────────────────
 
 const created = () => Math.floor(Date.now() / 1000)
@@ -312,6 +564,47 @@ function lastUserText(messages) {
     }
   }
   return ''
+}
+
+// ── session restore after a bridge restart ───────────────────────────────────
+//
+// The conversation lives in THIS process's memory (the session object), but a
+// configuration change restarts the harness (manager.Reload), and a fresh
+// process used to greet a mid-conversation owner with total amnesia (now the
+// NO-PERSISTENCE fallback only — with SEAL_CONVERSATION_FILE set the harness
+// restores its own history from disk and this replay is gated off): the
+// client resends the full transcript on every turn — it always has — yet the
+// bridge took only the last user line. On the FIRST turn of a fresh process,
+// if the request carries history, replay it as a framed transcript ahead of
+// the prompt. Meeting minutes, not native memory: tool-call internals are not
+// reconstructed, but the conversation continues instead of restarting.
+const RESTORE_CAP = 30_000; // chars kept, tail-first — the newest turns matter most
+let sessionSeeded = false; // flips when the first turn is dispatched
+let storeRestored = false // true when the persistent store seeded this boot
+
+function restoreTranscript(messages) {
+  // When the store SEEDED this boot, replaying the client's copy on top
+  // would double the history — but an empty/quarantined/archived store is
+  // exactly "disk could not cover it" (CONVERSATION.md invariant 6), and
+  // there the client's copy is the only continuity left.
+  if (storeRestored) return "";
+  if (sessionSeeded || !Array.isArray(messages)) return "";
+  let lastUser = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] && messages[i].role === "user") { lastUser = i; break; }
+  }
+  // History = everything before the final user message (that one IS the turn).
+  const prior = messages
+    .slice(0, lastUser === -1 ? messages.length : lastUser)
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({ role: m.role, text: lastUserText([{ role: "user", content: m.content }]) }))
+    .filter((m) => m.text.trim().length > 0);
+  if (!prior.length) return "";
+  let body = prior.map((m) => `${m.role}: ${m.text}`).join("\n\n");
+  let truncated = false;
+  if (body.length > RESTORE_CAP) { body = body.slice(-RESTORE_CAP); truncated = true; }
+  log(`session restore: replaying client transcript (${prior.length} msgs, ${body.length} chars${truncated ? ", oldest truncated" : ""})`);
+  return `[Context restore: this session was restarted mid-conversation. Prior transcript${truncated ? " (oldest part truncated)" : ""}:]\n\n${body}\n\n[End of prior transcript. Continue the conversation; do not re-answer old messages.]\n\n`;
 }
 
 // ── Request handling ────────────────────────────────────────────────────────
@@ -354,31 +647,24 @@ async function handleChat(req, res) {
   if (!text) {
     return sendJSON(res, 400, { error: { message: 'no user message in `messages`' } })
   }
+  const prompt = restoreTranscript(body.messages) + text
+  sessionSeeded = true
 
   const { ctx, agent } = await getAgent()
   const id = `chatcmpl-${created()}`
   const model = body.model || `${PROVIDER}/${MODEL_ID}`
 
-  // Interrupt: closing the HTTP connection is the OpenAI-conventional cancel
-  // signal (chat/completions has no cancel endpoint). When the client goes
-  // away mid-turn, stop the turn via DSH's native agent.cancel() — the abort
-  // propagates into every running tool and the in-flight LLM request, and the
-  // turn settles cleanly in the session. Two details matter:
-  //   - Guard on "MY turn is the active one": turns are serialized, so a
-  //     queued request's disconnect must not cancel someone else's turn.
-  //   - This also un-blocks the queue: without it, an abandoned long turn
-  //     stalls every request behind it.
-  let myTurnActive = false
+  // A dropped connection is NOT an interrupt. Networks blip, laptops sleep,
+  // and the sandbox preview proxy hard-caps request duration (~300s on
+  // mainnet, 0g-sandbox#122) — cancelling on disconnect made every long task
+  // die with its stream. Deliberate stops go through POST /v1/interrupt
+  // (the CLI's Esc calls it), so the turn RUNS TO COMPLETION here; the owner
+  // reattaches via /agentlog or a follow-up message (queued behind it).
   let disconnected = false
   const onGone = () => {
     if (disconnected) return
     disconnected = true
-    if (myTurnActive) {
-      log('client disconnected mid-turn — cancelling')
-      try { agent.cancel('client disconnected') } catch (err) {
-        log(`WARN agent.cancel: ${(err && err.message) || err}`)
-      }
-    }
+    log('client disconnected mid-turn — turn continues server-side (stop it explicitly via /v1/interrupt)')
   }
   res.on('close', () => { if (!res.writableEnded) onGone() })
 
@@ -393,10 +679,7 @@ async function handleChat(req, res) {
   const runMine = (onDelta, onActivity) =>
     serialize(() => {
       if (disconnected) return '' // client left while queued — skip, don't run
-      myTurnActive = true
-      return runTurn(ctx, agent, text, onDelta, onActivity).finally(() => {
-        myTurnActive = false
-      })
+      return runTurn(ctx, agent, prompt, onDelta, onActivity)
     })
 
   if (body.stream) {
@@ -479,6 +762,63 @@ const server = createServer((req, res) => {
       if (res.headersSent) return res.end()
       sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
     })
+  }
+
+  // ── /v1/responses — the long-task surface (see the module block above) ──
+  if (req.method === 'POST' && path === '/v1/responses') {
+    return (async () => {
+      const raw = await readBody(req)
+      let body
+      try { body = JSON.parse(raw || '{}') } catch { return sendJSON(res, 400, { error: { message: 'invalid JSON body' } }) }
+      const text = responseInputText(body.input)
+      if (!text) return sendJSON(res, 400, { error: { message: 'input is required (string or messages-style items)' } })
+      const prompt = (Array.isArray(body.input) ? restoreTranscript(body.input) : '') + text
+      sessionSeeded = true
+      const rec = newResponseRecord(text)
+      startResponseTurn(rec, prompt)
+      log(`responses: ${rec.id} accepted (${text.slice(0, 60)}…)`)
+      if (body.stream) return streamResponse(req, res, rec, 0)
+      // Non-stream (background-style): hand back the id immediately.
+      return sendJSON(res, 200, responseSnapshot(rec))
+    })().catch((err) => {
+      log(`ERROR ${err && err.stack ? err.stack : err}`)
+      if (!res.headersSent) sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
+    })
+  }
+  {
+    const m = path.match(/^\/v1\/responses\/(resp_[0-9a-f]+)(\/cancel)?$/)
+    if (m) {
+      const rec = responses.get(m[1])
+      if (!rec) return sendJSON(res, 404, { error: { message: `no such response ${m[1]} (the bridge keeps the last ${RESPONSES_MAX})` } })
+      if (req.method === 'POST' && m[2] === '/cancel') {
+        return (async () => {
+          // QUEUED: hasn't touched the agent — agent.cancel() would abort the
+          // wrong, currently-running task (review B1). Mark only; the
+          // turn-body guard no-ops it at dequeue.
+          if (rec.status === 'queued') {
+            rec.status = 'cancelled'
+            log(`responses: ${rec.id} cancelled while queued`)
+            return sendJSON(res, 200, responseSnapshot(rec))
+          }
+          if (rec.status === 'in_progress') {
+            rec.status = 'cancelled'
+            const { agent } = await getAgent()
+            try { agent.cancel('cancelled via /v1/responses') } catch { /* idle already */ }
+            log(`responses: ${rec.id} cancelled`)
+          }
+          return sendJSON(res, 200, responseSnapshot(rec))
+        })().catch((err) => sendJSON(res, 500, { error: { message: String((err && err.message) || err) } }))
+      }
+      if (req.method === 'GET' && !m[2]) {
+        const q = new URLSearchParams((req.url || '').split('?')[1] || '')
+        if (q.get('stream') === 'true') {
+          const after = Number(q.get('starting_after') || '0') || 0
+          return streamResponse(req, res, rec, after)
+        }
+        return sendJSON(res, 200, responseSnapshot(rec))
+      }
+      return sendJSON(res, 405, { error: { message: 'method not allowed' } })
+    }
   }
 
   // Owner's brake pedal: unconditionally cancel the CURRENT turn, whoever

@@ -58,6 +58,23 @@ pub async fn handle(
     // attacker-supplied field and was forgeable — see {lifecycle_auth}.
     authorize_lifecycle(&state, &d, &req.sandbox_envelope).await?;
 
+    // First-provision (action="create") may carry a framework, same contract
+    // as /reset: validate against the supported list and persist so a legacy
+    // mint-only row stops asking on later resets (review #154 N1). A resume
+    // (action="start") never changes harness — ignore the field there.
+    if action == "create" {
+        if let Some(fw) = &req.framework {
+            let supported = state.cfg.framework_names();
+            if !supported.iter().any(|n| n == fw) {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported framework {fw:?}; supported: {}",
+                    supported.join(", ")
+                )));
+            }
+            state.deployments.set_framework(req.seal_id, fw.clone()).await?;
+        }
+    }
+
     let payload = if action == "start" {
         JobPayload::SandboxStart {
             seal_id: req.seal_id,
@@ -125,6 +142,9 @@ mod tests {
             standard_clone_authorizer_addr: None,
             tee_data_verifier_addr: None,
             console_enabled: true,
+            secret_env_enabled: false,
+            cli_latest: String::new(),
+            cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
@@ -155,6 +175,7 @@ mod tests {
             seal_id,
             owner: env.wallet_address,
             sandbox_envelope: env,
+            framework: None,
         }
     }
 
@@ -187,6 +208,7 @@ mod tests {
             agent_uri: String::new(),
             agent_card: serde_json::Value::Object(Default::default()),
             i_data: Vec::new(),
+            framework: None,
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::NotStarted,
@@ -203,6 +225,11 @@ mod tests {
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
+            settings: None,
+            settings_last_good: None,
+            settings_version: 0,
+            settings_confirmed_version: 0,
+            settings_attempts: 0,
             created_at: now,
             updated_at: now,
         };
@@ -245,6 +272,7 @@ mod tests {
             seal_id,
             owner,
             sandbox_envelope: envelope_with_action(action),
+            framework: None,
         }
     }
 
