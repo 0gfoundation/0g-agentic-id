@@ -139,7 +139,8 @@ function mk(priv, cfg) {
   check('deployment row owner == B (indexer synced)', ownedByB, `ownedByB=${ownedByB}`);
 
   // ── reachable + identity preserved under B ────────────────────────────
-  const base = `http://${cfg.agent_serve_port}-${row.sandboxId}.${proxy}`;
+  // Row url first — correct scheme on 443-only production proxies (#128).
+  const base = row.url ?? `http://${cfg.agent_serve_port}-${row.sandboxId}.${proxy}`;
   const proofHeader = await hdr(base);
   check('/hello reachable + X-Agent-Proof under new owner', !!proofHeader, base);
   if (proofHeader) {
