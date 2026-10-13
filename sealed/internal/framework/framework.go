@@ -390,6 +390,10 @@ type RuntimeContext struct {
 	APIKey       string // inference provider API key from env (e.g. ANTHROPIC_API_KEY)
 	PublicURL    string // externally-reachable URL prefix for this sandbox; empty in local dev
 	SealSignSock string // unix socket path for agent-only sign endpoint (agentSeal identity)
+	// SecretProxyURL is the loopback egress proxy (http://127.0.0.1:<port>)
+	// through which the agent uses owner secrets by {{secret:NAME}} placeholder
+	// without seeing their values (SECRETS.md). Empty when unset.
+	SecretProxyURL string
 	AgentSeal    string // 0x-prefixed address derived from agent_seal_priv pubkey
 
 	// Chain bootstrap outputs (Phase 2). Populated by main.go from

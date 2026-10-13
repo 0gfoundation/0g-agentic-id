@@ -431,6 +431,22 @@ pub struct Deployment {
     #[serde(default, skip_serializing)]
     pub settings_attempts: i32,
 
+    /// Owner business secrets (SECRETS.md): the whole secrets document sealed
+    /// to this agent's agentSeal key. The attestor never decrypts it (unlike
+    /// settings, which it holds in cleartext and re-encrypts); it is stored
+    /// opaque and delivered as-is over /provision. None = none configured.
+    #[serde(default, skip_serializing)]
+    pub secrets_blob: Option<String>,
+    /// Cleartext index of secret name -> allowed hosts, so the owner can list
+    /// and validate without agentSeal (they never hold it and cannot read the
+    /// blob back). Values are NEVER stored here. None = none configured.
+    #[serde(default, skip_serializing)]
+    pub secrets_index: Option<serde_json::Value>,
+    /// Monotonic counter / CAS token for secrets writes (mirrors
+    /// settings_version). 0 = never configured. Cleared on transfer.
+    #[serde(default)]
+    pub secrets_version: i64,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -610,6 +626,9 @@ mod tests {
             settings_version: 0,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         }
@@ -894,6 +913,14 @@ pub struct ProvisionResponse {
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
+    /// The owner's secrets document, ALREADY sealed to this agent's agentSeal
+    /// key (SECRETS.md). Passed through verbatim — the attestor does NOT
+    /// encrypt it here (unlike `encrypted_settings`), because it never held
+    /// the plaintext. Base64 as stored. Omitted when none configured or no
+    /// sandbox is on record. Rides `/provision` so a resumed container gets
+    /// it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_secrets: Option<String>,
 }
 
 // ── /status ─────────────────────────────────────────────────────────────
@@ -960,6 +987,33 @@ pub struct SettingsWriteRequest {
     /// for readability. Unsigned, so it decides nothing — the route only
     /// refuses a request whose two copies disagree, which catches a client
     /// that built the body and the signature from different reads.
+    #[serde(default)]
+    pub base_version: Option<i64>,
+}
+
+/// Body of `POST /secrets` — the owner writing their business-secrets
+/// document (SECRETS.md). `blob` is the whole document ALREADY sealed to the
+/// agent's agentSeal key (base64) — the attestor stores it opaque and never
+/// decrypts it. `index` is the cleartext name->hosts map, stored so the owner
+/// can list/validate without agentSeal; it carries NO values. The signed
+/// `X-Auth-Message` digest binds `blob` (the sensitive half); `index` is
+/// derived from the same local edit, so a mismatch only fails the owner's own
+/// write. CAS on `base_version`.
+///
+/// No `Debug` derive: although `blob` is ciphertext, keep the whole owner
+/// document off every log line by construction.
+#[derive(Deserialize)]
+pub struct SecretsWriteRequest {
+    pub seal_id: SealId,
+    /// The agentSeal-sealed secrets document, base64. None clears the stored
+    /// secrets (an empty set) while still bumping the version.
+    #[serde(default)]
+    pub blob: Option<String>,
+    /// Cleartext { name: [hosts] }. None when clearing.
+    #[serde(default)]
+    pub index: Option<serde_json::Value>,
+    /// Same base version the signed message carries, echoed for readability;
+    /// unsigned, so it only has to agree with the signed copy.
     #[serde(default)]
     pub base_version: Option<i64>,
 }

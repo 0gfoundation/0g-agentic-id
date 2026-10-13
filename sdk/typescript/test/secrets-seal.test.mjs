@@ -1,0 +1,40 @@
+import { test } from 'node:test';
+import assert from 'node:assert';
+import { sealSecretsDocument } from '../dist/secretEnv.js';
+
+// A throwaway agentSeal pubkey (compressed secp256k1) and owner.
+const PUB = '0x02' + 'a'.repeat(64);
+const OWNER = '0x2ff0F380d85543e0Ab6D32eba80DA7F3dB332dcB';
+
+test('seals a valid named-secret map to base64', () => {
+  const blob = sealSecretsDocument(PUB, OWNER, { STRIPE: { value: 'sk_live_x', hosts: ['api.stripe.com'] } });
+  assert.match(blob, /^[A-Za-z0-9+/]+=*$/, 'base64');
+  assert.ok(blob.length > 40);
+});
+
+test('rejects a secret with no hosts (invariant 3)', () => {
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { X: { value: 'val123', hosts: [] } }), /at least one host/);
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { X: { value: 'val123', hosts: ['  '] } }), /at least one host/);
+});
+
+test('rejects empty value and bad names', () => {
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { X: { value: '', hosts: ['a.com'] } }), /empty value/);
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { 'a b': { value: 'val123', hosts: ['a.com'] } }), /invalid secret name/);
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { '{{x}}': { value: 'val123', hosts: ['a.com'] } }), /invalid secret name/);
+});
+
+import { secretsAuthMessage, SECRETS_DOMAIN } from '../dist/secretEnv.js';
+
+test('secretsAuthMessage: write ends with digest, read without; domain distinct', () => {
+  assert.equal(SECRETS_DOMAIN, 'AgenticID.Secrets.v1');
+  const seal = '0xABCDEF';
+  const write = secretsAuthMessage(seal, 1700, 3, 'deadbeef');
+  assert.equal(write, 'AgenticID.Secrets.v1:0xabcdef:1700:3:deadbeef');
+  const read = secretsAuthMessage(seal, 1700, 3);
+  assert.equal(read, 'AgenticID.Secrets.v1:0xabcdef:1700:3');
+  assert.ok(!write.startsWith('AgenticID.Settings'), 'distinct from settings domain');
+});
+
+test('rejects a value too short to redact (F3)', () => {
+  assert.throws(() => sealSecretsDocument(PUB, OWNER, { X: { value: 'sk1', hosts: ['a.com'] } }), /shorter than 6/);
+});

@@ -26,6 +26,7 @@ import {
   publicKeyToAddress,
   randomBytes,
   sealSecretEnv,
+  secretsAuthMessage,
   type SecretEnvMode,
 } from './secretEnv';
 
@@ -826,6 +827,75 @@ export class AttestorClient {
       throw new Error(`getSettings: /settings HTTP ${res.status} ${text}`);
     }
     return parseSettingsBody(await res.json());
+  }
+
+  /**
+   * `GET /secrets?seal_id=…` — list the owner secrets' names + hosts and the
+   * version to write against next (SECRETS.md). The sealed blob is never
+   * returned: the owner cannot decrypt it, and the index is all they need to
+   * manage the set. Owner-signed, read grammar (no digest).
+   */
+  async getSecrets(sealId: `0x${string}`): Promise<{ index: Record<string, string[]>; version: number }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const seal = sealId.toLowerCase() as `0x${string}`;
+    const message = secretsAuthMessage(seal, Math.floor(Date.now() / 1000), 0);
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.baseUrl()}/secrets?seal_id=${seal}`, {
+      headers: { 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 401) {
+        throw new Error(`getSecrets: rejected (HTTP 401) — ${account.address} is not agent ${seal}'s current on-chain owner. ${text}`);
+      }
+      throw new Error(`getSecrets: /secrets HTTP ${res.status} ${text}`);
+    }
+    const b = (await res.json()) as { index?: Record<string, string[]> | null; version?: number };
+    return { index: b.index ?? {}, version: Number(b.version ?? 0) };
+  }
+
+  /**
+   * `POST /secrets` — store the sealed secrets `blob` (already sealed to
+   * agentSeal) and its cleartext `index` (name → hosts). `blob`/`index` null
+   * clears the set (still bumping the version). Owner-signed, write grammar
+   * with the blob's sha256 bound in; `baseVersion` is the compare-and-swap
+   * term from {@link getSecrets} (0 for a first write). HTTP 409 on a stale
+   * base — re-read and retry against the new version.
+   */
+  async setSecrets(params: {
+    sealId: `0x${string}`;
+    blob: string | null;
+    index: Record<string, string[]> | null;
+    baseVersion: number;
+  }): Promise<{ version: number }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const seal = params.sealId.toLowerCase() as `0x${string}`;
+    const base = Number(params.baseVersion);
+    if (!Number.isSafeInteger(base) || base < 0) {
+      throw new Error(`setSecrets: baseVersion must be a non-negative integer (read it from getSecrets), got ${String(params.baseVersion)}`);
+    }
+    // Digest binds the blob (the sensitive half); a clear binds sha256("").
+    const message = secretsAuthMessage(seal, Math.floor(Date.now() / 1000), base, await sha256Hex(params.blob ?? ''));
+    const signature = await walletClient.signMessage({ account, message });
+    const res = await fetch(`${this.baseUrl()}/secrets`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-Auth-Message': message, 'X-Auth-Signature': signature },
+      body: JSON.stringify({ seal_id: seal, base_version: base, blob: params.blob, index: params.index }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      if (res.status === 401) {
+        throw new Error(`setSecrets: rejected (HTTP 401) — ${account.address} is not agent ${seal}'s current on-chain owner. ${text}`);
+      }
+      if (res.status === 409) {
+        throw new Error(`setSecrets: version conflict (HTTP 409) — another write landed first; re-read getSecrets and retry. ${text}`);
+      }
+      throw new Error(`setSecrets: /secrets HTTP ${res.status} ${text}`);
+    }
+    const b = (await res.json().catch(() => ({}))) as { version?: number };
+    return { version: Number(b.version ?? base + 1) };
   }
 
   /**

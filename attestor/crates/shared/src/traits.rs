@@ -475,6 +475,24 @@ pub trait DeploymentRepo: Send + Sync {
     /// the new document (first attempt) or the last one that worked.
     async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>>;
 
+    /// Write the owner's secrets: the opaque agentSeal-sealed blob plus the
+    /// cleartext name->hosts index, compare-and-swap on `secrets_version`
+    /// (mirrors `set_settings`). A stale `base_version` matches no row and
+    /// returns `None` with nothing written. Callers MUST have verified the
+    /// writer is the agent's current on-chain owner (`routes::secrets`).
+    async fn set_secrets(
+        &self,
+        seal_id: SealId,
+        blob: Option<String>,
+        index: Option<serde_json::Value>,
+        base_version: i64,
+    ) -> anyhow::Result<Option<i64>>;
+
+    /// Clear the owner's secrets (blob + index NULL, version reset to 0) on
+    /// transfer, so the previous owner's credentials never reach the new
+    /// owner's container. Unlike settings, secrets do NOT carry over.
+    async fn clear_secrets(&self, agent_id: AgentId) -> anyhow::Result<()>;
+
     /// Read-only: running deployments whose last heartbeat is older than
     /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller
     /// (the worker's reconcile sweep) can check each sandbox's real state and

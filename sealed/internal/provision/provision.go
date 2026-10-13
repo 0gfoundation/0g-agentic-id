@@ -45,6 +45,12 @@ type Result struct {
 	// container create, so a resumed container would come up with no
 	// configuration at all.
 	Settings []byte
+	// SecretsBlob is the owner's secrets document, base64, ALREADY sealed to
+	// this agent's agentSeal key by the SDK (not to the container pubkey like
+	// Settings). Passed through verbatim — the attestor never sees the
+	// plaintext and provision does not decrypt it; the secrets package opens it
+	// with agentSeal_priv after bootstrap. Empty when none configured.
+	SecretsBlob string
 }
 
 // FromAttestor calls attestorURL/provision with the sandbox's identity proof
@@ -80,6 +86,7 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	var out struct {
 		EncryptedAgentSealPriv string `json:"encrypted_agent_seal_priv"`
 		EncryptedSettings      string `json:"encrypted_settings"`
+		EncryptedSecrets       string `json:"encrypted_secrets"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		logger.Logf("FAIL provision: decode response: %v", err)
@@ -122,7 +129,10 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 			logger.Logf("OK   provisioned agent_seal_priv (%d bytes)", len(plaintext))
 		}
 	}
-	return Result{AgentSealPriv: plaintext, Settings: settingsBlob}
+	if out.EncryptedSecrets != "" {
+		logger.Logf("OK   provisioned owner secrets blob (%d chars, sealed to agentSeal)", len(out.EncryptedSecrets))
+	}
+	return Result{AgentSealPriv: plaintext, Settings: settingsBlob, SecretsBlob: out.EncryptedSecrets}
 }
 
 // fmt is referenced indirectly via fmt.Errorf elsewhere in this package once

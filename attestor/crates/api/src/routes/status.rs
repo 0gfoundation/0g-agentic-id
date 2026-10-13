@@ -354,6 +354,9 @@ mod tests {
             settings_version: 1,
             settings_confirmed_version: confirmed,
             settings_attempts: attempts,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         });

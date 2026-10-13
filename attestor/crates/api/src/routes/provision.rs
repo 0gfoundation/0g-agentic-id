@@ -314,9 +314,22 @@ pub async fn handle(
         }
     }
 
+    // Secrets: pass the stored blob through verbatim (already sealed to
+    // agentSeal; the attestor never decrypts it). Same ghost-container gating
+    // as settings — only served when a sandbox is on record. No last-good /
+    // attempt machinery: a bad secret merely fails to work, it cannot wedge
+    // boot, so there is nothing to roll back to.
+    let encrypted_secrets = match stored.as_ref() {
+        Some(d) if !d.sandbox_id.as_deref().map(str::is_empty).unwrap_or(true) => {
+            d.secrets_blob.clone()
+        }
+        _ => None,
+    };
+
     Ok(Json(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
         encrypted_settings,
+        encrypted_secrets,
     }))
 }
 
@@ -596,6 +609,9 @@ mod tests {
             settings_version,
             settings_confirmed_version: 0,
             settings_attempts: 0,
+            secrets_blob: None,
+            secrets_index: None,
+            secrets_version: 0,
             created_at: now,
             updated_at: now,
         });

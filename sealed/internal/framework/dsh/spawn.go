@@ -130,6 +130,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		AttestorURL:      rt.AttestorURL,
 		PublicURL:        rt.PublicURL,
 		SealSignSock:     rt.SealSignSock,
+		SecretProxyURL:   rt.SecretProxyURL,
 		Provider:         provider,
 		Model:            model,
 		ZGComputeRouted:  rendered.resolved.Endpoint != nil,
@@ -264,6 +265,9 @@ func (be bridgeEnv) environ(nodePath string) []string {
 	}
 	if be.rt.SealSignSock != "" {
 		env = append(env, "SEAL_SIGN_SOCK="+be.rt.SealSignSock)
+	}
+	if be.rt.SecretProxyURL != "" {
+		env = append(env, "SEAL_SECRET_PROXY="+be.rt.SecretProxyURL)
 	}
 	if be.rt.AgentSeal != "" {
 		env = append(env, "AGENT_SEAL="+be.rt.AgentSeal)
