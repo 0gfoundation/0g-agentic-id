@@ -30,6 +30,7 @@ export interface SavedProof {
     agentId: string; submitter: `0x${string}`; timestamp: string; deadline: string;
     taskHash: `0x${string}`; dataHashes: `0x${string}`[]; frameworkHash: `0x${string}`;
     signature: `0x${string}`;
+    validator?: `0x${string}`; // envelope diagnostics: lets `rate` tell a registry mismatch from a bad ticket
   };
   task: TaskReveal;
 }
@@ -77,6 +78,7 @@ export function saveProof(proof: ServeProof, task: TaskReveal, endpoint: string)
       dataHashes: proof.dataHashes,
       frameworkHash: proof.frameworkHash,
       signature: proof.signature,
+      ...(proof.validator ? { validator: proof.validator } : {}),
     },
     task,
   };
@@ -122,5 +124,6 @@ export function toServeProof(e: SavedProof): ServeProof {
     dataHashes: e.proof.dataHashes,
     frameworkHash: e.proof.frameworkHash,
     signature: e.proof.signature,
+    ...(e.proof.validator ? { validator: e.proof.validator } : {}),
   };
 }

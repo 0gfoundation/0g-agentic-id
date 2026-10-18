@@ -505,7 +505,7 @@ container's `:8080`.
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
-| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
+| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
 
 The agent's own `/settings` lever is deliberately asymmetric with the owner's:
 it validates, renders and restarts exactly like the owner path, but persists
@@ -521,12 +521,20 @@ it over what is in force, so the agent need not restate a pin it does not own.
 The sign socket is the critical trust boundary between sealed and the
 outside world (which is really the same-container agent process). The
 private key never leaves the sealed process; the agent hands the
-message to sign over the unix socket. The socket itself is just
-transport. **Refusal logic lives on the agent side, constrained by
-SOUL.md's refusal rules**: any sign request originating from external
-prompts must be refused, without relying on "describe what to sign in
-plain language" heuristics, which are easily fooled by identity
-phishing. See `internal/framework/openclaw/soulmd.go`.
+message to sign over the unix socket. The socket enforces one thing
+itself, its **signing-domain invariant**: it signs only `0x19 0x45`
+personal messages, `0x19 0x01` EIP-712 digests, and transactions it
+assembles from fields. It never signs a raw hash and never signs
+EIP-191 version `0x00` data. Serve-proofs are signed in that `0x00`
+domain, bound to the VerifiedFeedbackRegistry, so nothing the agent
+signs through the socket verifies as one (audit FIND-01;
+`internal/proxy/sign.go` header, pinned by `sign_test.go`). Within
+those shapes the socket is just transport. **Refusal logic lives on
+the agent side, constrained by SOUL.md's refusal rules**: any sign
+request originating from external prompts must be refused, without
+relying on "describe what to sign in plain language" heuristics,
+which are easily fooled by identity phishing. See
+`internal/framework/openclaw/soulmd.go`.
 
 ## 8. Configuration surface
 
@@ -547,6 +555,7 @@ The env surface:
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
 | `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
+| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
 | `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:51-54`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:163-170`) |

@@ -291,12 +291,20 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
 });
 const data = await response.json();                   // your normal response body
 // proof → { agentId: 33n, submitter: "0x…", timestamp: 1719_000_000n, deadline: 1719_003_600n,
-//           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…" } | null
+//           taskHash: "0x…", dataHashes: ["0x…"], frameworkHash: "0x…", signature: "0x…",
+//           validator: "0x…" } | null
+//   (validator = the VerifiedFeedbackRegistry the proof was signed for; diagnostics
+//    only — it is not part of the on-chain proof)
 // low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
-// 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData)
+// 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData).
+//    The signature is bound to addresses.verifiedFeedback (fromAttestor fills it).
 await ag.reputation.verifyProof(proof);
-// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, reasons: [] }
+// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true, reasons: [] }
+// registryMatches: false (signerMatches false too) = no VerifiedFeedbackRegistry is configured
+// ('no VerifiedFeedbackRegistry configured — cannot verify serve-proof') or the envelope names
+// another one ('proof signed for a different VerifiedFeedbackRegistry') — a configuration
+// mismatch, not necessarily a bad proof.
 
 // 3. submit feedback. Storage and trust are split across two contracts:
 // the entry itself goes to the OFFICIAL canonical ERC-8004 Reputation
@@ -308,9 +316,17 @@ await ag.reputation.verifyProof(proof);
 // attest rolls back the canonical write too, and feedbackTx === attestTx
 // (already mined). Otherwise: canonical write (mined inside the call, so the
 // assigned index can be read back) + attestFeedback (returned pending).
+// Because that canonical entry lands first, the sequential path checks the
+// proof gas-free beforehand (bound to addresses.verifiedFeedback, signer ==
+// on-chain agentSeal, submitter == you, you ≠ agentSeal) and throws with
+// nothing broadcast if it could never attest — a canonical write without its
+// mark would be an orphaned, unverified entry.
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
-// come from a different wallet than the one that owns `agentId`.
+// come from a different wallet than the one that owns `agentId`. Neither can
+// the agent's own agentSeal wallet (same error). Both are conformance guards,
+// not sybil resistance: a fresh wallet funded by the owner or the agent still
+// passes.
 const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // → { feedbackTx: "0x…" (mined), attestTx: "0x…" (pending), feedbackIndex: 2n }
 await ag.reputation.waitForTransaction(fb.attestTx);
@@ -352,7 +368,9 @@ await ag.reputation.isVerified(agentId, buyer, idx);            // → true
 // pass `task: { method, uri, reqBodyHash, respBodyHash, statusCode }` to
 // giveFeedback (the receipt materials of the rated interaction — bodies stay
 // private, only their hashes go on-chain) and the contract opens the proof's
-// taskHash commitment, recording the URI as a TEE-VERIFIED endpoint:
+// taskHash commitment, recording the URI as a TEE-VERIFIED endpoint.
+// statusCode must be an integer in 100..999: the registry hashes it as 3-digit
+// decimal and rejects anything else, so the SDK refuses it before broadcasting.
 await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);   // → "/hello" ("" if unrevealed)
 await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');  // trustless per-interface aggregate
 await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → all VERIFIED clients (empty → zero summary)
@@ -597,7 +615,7 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
   // hello → { agent, owner, public_url, message, services, routes }
-  // verification → { ok, signerMatches, notExpired, dataOnChain, reasons }
+  // verification → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
   ```
 
   The card carries two declared surfaces:
@@ -621,7 +639,9 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   in the other half: an `agentId` resolves the URL on chain (`tokenURI` → the
   AgentCard's serve `url`, no attestor); an `agentUrl` reads the agent's signed
   `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
-  is enough (owner ops still gated on `ag` having a key).
+  is enough (owner ops still gated on `ag` having a key). That needs the proof:
+  where the runtime has no `VERIFIED_FEEDBACK_ADDR`, `/hello` is unsigned, so
+  pass the `agentId` instead.
 
   **Multi-window clients: the single-driver seat.** The container admits ONE
   driving client at a time (WeChat login semantics — configuration is global,
@@ -750,8 +770,19 @@ and throwing on unsupported tx types rather than mis-signing. See
 Notes for in-container use: the adapter speaks `node:http` over the unix
 socket (global fetch can't), hence the node-only subpath; fund the
 agent's own wallet first (`topUpAgentSeal` — that's what evolution gas is
-for); and remember the sign socket is a fully general signer — the agent
-is the gatekeeper for what bytes it forwards (sealed/TRUST_MODEL.md).
+for); and remember the sign socket signs whatever personal_sign / typed-data /
+transaction payload the agent forwards — the agent is the gatekeeper for
+those bytes (sealed/TRUST_MODEL.md).
+
+One invariant is mechanical: the socket never offers raw-hash signing or
+EIP-191 version 0x00 signing. Its preimages are only `0x19 0x45`
+(personal_sign), `0x19 0x01` (typed data), or a transaction it encodes
+itself from fields, and `sealAccount()` exposes no `sign({ hash })`. Serve-proofs
+are signed over a `0x19 0x00` digest (see [Advanced](#advanced)), so an agent
+cannot forge serve-proof contents through the socket. It can still obtain
+**genuine** proofs by calling its own proxy (e.g. loopback `:8080`) with an
+`X-Client-Address` it controls. That is the documented sybil class, and the
+digest change does not close it.
 
 ## Addresses
 
@@ -763,40 +794,61 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G
 
 ## Notes
 
-- **Serve-proof binding.** On-chain attribution is `msg.sender` at the canonical `giveFeedback`, and `attestFeedback` requires the same wallet; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter. Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
+- **Serve-proof binding.** On-chain attribution is `msg.sender` at the canonical `giveFeedback`, and `attestFeedback` requires the same wallet; each proof also carries a `submitter` (the redeemer, echoed from the `X-Client-Address` request header) — the only address allowed to redeem it, so a proof can't be front-run by another submitter — and its signature is bound to exactly one VerifiedFeedbackRegistry (see [Advanced](#advanced)). Still treat proofs as sensitive regardless of transport — the serve scheme is deployment-specific (dev proxy is plain http; the hosted environment is https).
 - **0G receipt timing.** `waitForTransaction` is tuned for 0G (120s timeout + retries). If it still times out, the tx likely landed — confirm by reading state.
 - On-chain types: `value`/`summaryValue` are `int128` (bigint), `feedbackIndex` is `uint64` (bigint).
 
 ## Advanced
 
-Raw ABIs (`agenticIDAbi`, `reputationRegistryAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) are exported.
+Raw ABIs (`agenticIDAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`) are exported.
 
-**Serve-proof canonical digest** (for independent verifiers): the signature
-is the agentSeal's EIP-191 personal_sign over
+**Serve-proof canonical digest** (for independent verifiers): two hashes.
+The inner `proofHash` is
 `keccak256(abi.encode(block.chainid, identityRegistry /* verifyingContract */,
 submitter, agentId, timestamp, deadline, taskHash,
 keccak256(abi.encodePacked(dataHashes)), frameworkHash))` — deadline is
 timestamp + 3600. `chainId` + `verifyingContract` (the AgenticID address the
 reputation registry is anchored to) give cross-chain / cross-deployment
 separation, and `submitter` binds the proof to the single address allowed to
-redeem it. `buildServeProofMessageHash` is the TS implementation; the Go side
-lives in `sealed/internal/proxy/proxy.go`.
+redeem it. The agentSeal signs the EIP-191 **version 0x00** ("data with
+intended validator") digest of it:
+`keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, where `validator` is the
+VerifiedFeedbackRegistry **proxy** address as 20 raw bytes. On chain that is
+`MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(proofHash))`.
+It is **not** personal_sign: a personal_sign (`0x19 0x45`) signature over
+`proofHash` is rejected, and nothing falls back to it. `buildServeProofMessageHash` /
+`buildServeProofSigningHash` are the TS implementation; the Go side lives in
+`sealed/internal/proxy/`. `npm run test:kav` pins both hashes to the
+known-answer vectors the contracts and sealed also assert. The sealed proxy
+learns the validator from `VERIFIED_FEEDBACK_ADDR` (injected by the attestor)
+and echoes it as the envelope's `validator` field (diagnostics only, not part
+of the on-chain tuple); when that variable is unset, malformed or zero, it
+emits no `X-Agent-Proof` at all.
 
 To verify with the exported primitive, pass the domain explicitly —
-`verifyServeProofSignature(proof, expectedSigner, { chainId, verifyingContract })`
-(`submitter` is read from the proof). `BuildServeProofHashParams` (used by
-`buildServeProofMessageHash` / `signServeProof`) requires `chainId`,
-`verifyingContract`, and `submitter` alongside the service fields.
+`verifyServeProofSignature(proof, expectedSigner, { chainId, verifyingContract, validator })`.
+`submitter` is read from the proof; the proof's own `validator` field is not
+consulted, so pass the registry you will redeem at. A missing, malformed or zero
+`validator` returns `false`. `BuildServeProofHashParams` (used by
+`buildServeProofMessageHash`) requires `chainId`, `verifyingContract`, and
+`submitter` alongside the service fields; `BuildServeProofSigningHashParams`
+(used by `buildServeProofSigningHash` / `signServeProof`) adds `validator`.
 
-`signServeProof`'s callback receives the **already-EIP-191-wrapped** digest
-(the `buildServeProofSigningHash` output), so sign it raw — don't re-wrap:
+`signServeProof`'s callback receives the **final** `0x19 0x00` digest
+(the `buildServeProofSigningHash` output), so sign it raw — don't wrap it:
 
 ```ts
 // correct — raw sign of the final digest
-const signed = await signServeProof(proof, (hash) => account.sign({ hash }));
-// WRONG — account.signMessage({ message: { raw: hash } }) double-wraps EIP-191
-// and fails verifyServeProofSignature.
+const signed = await signServeProof({ ...fields, validator: verifiedFeedbackAddr }, (hash) => account.sign({ hash }));
+// WRONG — account.signMessage({ message: { raw: hash } }) produces the
+// personal_sign (0x19 0x45) form, which the registry rejects on purpose.
 ```
+
+**0.2.0 is a hard cut.** SDK 0.2.0 verifies only the version-0x00 digest,
+matching VerifiedFeedbackRegistry 1.2.0. Proofs from sealed images built
+before it (personal_sign) no longer verify, locally or on chain; a running
+agent picks up the new image only through an owner-signed reset.
+`signServeProof` and `verifyServeProofSignature` now require a `validator`.
 
 The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
 
@@ -817,7 +869,7 @@ Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealI
 
 The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/tasks` `/result [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
-Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` discards a ticket that fails verification on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — expiry, or data not on chain), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
 ### Diagnostics subcommands
 

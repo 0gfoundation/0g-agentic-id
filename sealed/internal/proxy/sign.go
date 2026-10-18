@@ -13,17 +13,40 @@
 //   - 127.0.0.1 binds are also exposed by Daytona in some configurations.
 //   - A unix socket is purely intra-container; fs permission is the ACL.
 //
-// Three endpoints:
+// Five routes (signSocketRoutes is the complete set; sign_test.go pins it):
 //
-//	POST /sign/personal_sign  EIP-191 — body {"message": str} or {"message_hex": "0x..."}
-//	POST /sign/typed_data     EIP-712 — body is the standard TypedData JSON
-//	POST /sign/transaction    raw RLP — body has chain_id, nonce, to, value, data,
-//	                                    gas_limit, max_fee_per_gas, max_priority_fee_per_gas
+//	POST     /sign/personal_sign  EIP-191 0x45 — body {"message": str} or {"message_hex": "0x..."}
+//	POST     /sign/typed_data     EIP-712 (EIP-191 0x01) — body is the standard TypedData JSON
+//	POST     /sign/transaction    raw RLP — body has chain_id, nonce, to, value, data,
+//	                                        gas_limit, max_fee_per_gas, max_priority_fee_per_gas
+//	GET/POST /services            agent service registry (services.go) — signs nothing
+//	POST     /settings            agent half of the settings channel (settings.go) — signs nothing
 //
-// Trust note: this is a fully general signer. If the agent forwards owner-
-// controlled bytes through one of these endpoints it can manufacture a
-// signature that looks like a legitimate serve-proof or contract claim. The
-// agent is the gatekeeper. See sealed/TRUST_MODEL.md.
+// SIGNING-DOMAIN INVARIANT. Every signature this socket produces is over one
+// of exactly three preimage shapes, each built here from the request:
+//
+//   - 0x19 0x45 ("\x19Ethereum Signed Message:\n<len>" ‖ msg)  — personal_sign
+//   - 0x19 0x01 ‖ domainSeparator ‖ structHash                — typed_data
+//   - a transaction signing payload (0x02 ‖ rlp(…) for EIP-1559, an RLP list
+//     ≥ 0xc0 for legacy), built from the request fields via
+//     types.LatestSignerForChainID                            — transaction
+//
+// It must NEVER offer raw-hash signing (sign an arbitrary caller-supplied
+// 32 bytes, eth_sign-style) or EIP-191 version 0x00 ("data with intended
+// validator") signing. ServeProofs live in the v0x00 domain, bound to the
+// VerifiedFeedbackRegistry (proxy.serveProofDigest), and on-chain redemption
+// never sees which channel a signature came from — so, with agent_seal_priv
+// itself out of the agent's reach, this socket's inability to reach that
+// domain is what stops the agent from forging ServeProof contents offline
+// (audit FIND-01). Adding either path, here or in an adapter that bridges
+// this socket, reopens it. (It does not stop the agent obtaining genuine
+// proofs by calling its own proxy — see TRUST_MODEL.md.)
+//
+// Trust note: within those three shapes this is a fully general signer. If
+// the agent forwards owner-controlled bytes through one of these endpoints it
+// can manufacture a personal_sign / EIP-712 claim or a transaction that looks
+// legitimate to whoever accepts that shape. The agent is the gatekeeper for
+// those. See sealed/TRUST_MODEL.md.
 
 package proxy
 
@@ -82,18 +105,45 @@ func (s *Server) ListenInternal(sockPath string) {
 	}
 	privsep.OwnPath(sockPath)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/sign/personal_sign", s.handleSignPersonalSign)
-	mux.HandleFunc("/sign/typed_data", s.handleSignTypedData)
-	mux.HandleFunc("/sign/transaction", s.handleSignTransaction)
-	mux.HandleFunc("/services", s.handleServices)
-	mux.HandleFunc("/settings", s.handleAgentSettings)
+	mux, paths := s.signSocketMux()
 
 	go func() {
-		logger.Logf("OK   sign socket listening at unix://%s "+
-			"(/sign/personal_sign | /sign/typed_data | /sign/transaction | /services)", sockPath)
+		logger.Logf("OK   sign socket listening at unix://%s (%s)", sockPath, strings.Join(paths, " | "))
 		_ = http.Serve(l, mux)
 	}()
+}
+
+// signRoute is one path on the agent-only sign socket.
+type signRoute struct {
+	path    string
+	handler http.HandlerFunc
+}
+
+// signSocketRoutes is the complete route set of the sign socket. Adding a
+// signing route is a protocol change: it must stay within the signing-domain
+// invariant in the file header (no raw-hash, no EIP-191 v0x00), and
+// sign_test.go pins this list so the change can't land silently.
+func (s *Server) signSocketRoutes() []signRoute {
+	return []signRoute{
+		{"/sign/personal_sign", s.handleSignPersonalSign},
+		{"/sign/typed_data", s.handleSignTypedData},
+		{"/sign/transaction", s.handleSignTransaction},
+		{"/services", s.handleServices},
+		{"/settings", s.handleAgentSettings},
+	}
+}
+
+// signSocketMux builds the sign socket's mux from signSocketRoutes and
+// returns the registered paths (for the startup log line).
+func (s *Server) signSocketMux() (*http.ServeMux, []string) {
+	mux := http.NewServeMux()
+	routes := s.signSocketRoutes()
+	paths := make([]string, 0, len(routes))
+	for _, rt := range routes {
+		mux.HandleFunc(rt.path, rt.handler)
+		paths = append(paths, rt.path)
+	}
+	return mux, paths
 }
 
 // signPriv returns (priv, agentSealAddr) or an error if state isn't armed

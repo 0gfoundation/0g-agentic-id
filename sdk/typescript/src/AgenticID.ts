@@ -670,6 +670,12 @@ export class AgentApi {
    * plus a structured verification. The whole "is this agent who it
    * claims, running what chain says" check, without hand-rolling the
    * fetch + parse + verify.
+   *
+   * The proof signature is bound to the VerifiedFeedbackRegistry, so the
+   * check needs `addresses.verifiedFeedback` (fromAttestor fills it from
+   * /config). Without it `verification.signerMatches` is false with the
+   * reason 'no VerifiedFeedbackRegistry configured — cannot verify
+   * serve-proof'.
    */
   async sayHi(agentUrl: string): Promise<{
     hello: {

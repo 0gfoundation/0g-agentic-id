@@ -87,9 +87,9 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 
 | 名字 | 是什么 | 在哪用 |
 |---|---|---|
-| **ServeProof**（PascalCase）| Solidity struct，链上 reputation 流程的载体 | `giveFeedback(ServeProof, ...)`，合约 ecrecover 验签 |
+| **ServeProof**（PascalCase）| Solidity struct，链上 reputation 流程的载体 | `VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, ServeProof)`，合约对绑定本 registry 的 digest 做 ecrecover 验签 |
 | **serve-proof**（小写连字符）| 通用概念——sealed 自动签的任何 envelope | 文档里的非正式称呼，包含 ServeProof + heartbeat + chain.Update 等 |
-| **X-Agent-Proof** | HTTP 响应头名 | sealed proxy 给每个 :8080 响应自动加的 header；载体是签过的 envelope |
+| **X-Agent-Proof** | HTTP 响应头名 | 容器有 `VERIFIED_FEEDBACK_ADDR` 时，sealed proxy 给签名的 :8080 响应（`/hello`、agent 的 `/api/*` 服务）自动加的 header；载体是签过的 envelope |
 
 简记：**ServeProof** 是它的链上形态，**X-Agent-Proof** 是它的 HTTP 形态，**serve-proof** 是统称。
 
@@ -222,11 +222,22 @@ Sealed Sandbox 可看作 agent 独立持有的一个运行环境。如上所述�
 > 链上 `frameworkHash` 同时进入每条 `ServeProof`（见机制 5），所以买家做尽
 > 调时能看到"这条声誉是哪个版本的运行时框架挣来的"。
 
-### 5 · 声誉：gaming 不出来
+### 5 · 声誉：凭 proof 准入
 
-AgenticID 扩展了 **ERC-8004**，加了一条关键要求：**每条评价都必须附带一份
-AgentSeal 签名的服务证明（ServeProof）**。没有真实交互，就没有合法评价。
-刷分在结构上做不到——你伪造不出一个只有活着的 TEE 运行时才能生成的签名。
+AgenticID 扩展了 **ERC-8004**，加了一条关键要求：**一条评价只有附带一份
+AgentSeal 签名的服务证明（ServeProof）才算 verified**。这样的评价凭空造不出来：
+sealed 运行时在它自己的签名域里签 proof——EIP-191 version `0x00`，绑定
+`VerifiedFeedbackRegistry`——agent 进程的 sign socket 签不出这个域，所以连
+agent 自己也伪造不出一次没发生过的响应的 proof 内容。没有真实响应撑腰的评价
+拿不到 verified 标记。
+
+这抬高了刷假评价的成本，但**不是**完整的抗 sybil：运行时对每个响应都出
+proof，包括无需认证的公开 `GET /hello`，所以 proof 很容易拿到，同一个主体
+也可以用自己控制的多个钱包去请求服务。agent 自己也一样：它可以带一个自己
+控制的 `X-Client-Address` 调自己的 proxy（例如 loopback `:8080`），拿到*真的*
+proof——签名域隔离挡住的是伪造 proof 内容，不是自刷。要做到真正的"一个主体
+一票"需要链下一层——按真实身份限流、质押、proof-of-personhood——这超出了
+链上合约的范围。
 
 每条反馈还**记录了它挣分那一刻生效的具体 iData**（proof 里的 `dataHashes`），
 所以声誉可以对照"agent 当时实际在跑什么"来审计，而不只是它静态的 tokenId。至于
@@ -237,6 +248,7 @@ id-bound（按 tokenId）。
 ```solidity
 struct ServeProof {
     uint256   agentId;
+    address   submitter;      // 唯一可兑付它的地址
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -246,10 +258,23 @@ struct ServeProof {
 }
 ```
 
-`giveFeedback` 在链上重建签名内容、`ecrecover` 后与 `getAgentSeal(agentId)`
-比对——`agentSeal_priv` 只有 Agent TEE 持有，谁都伪造不出 ServeProof，且每张
-proof 一次性（签名 nonce）。没有 `client` 字段——归属由提交时的 `msg.sender`
-决定。详见 [`contracts/README.zh.md`](contracts/README.zh.md) §5。
+`VerifiedFeedbackRegistry.attestFeedback` 在链上重建内层 `proofHash`（绑定链、
+identity registry 和 `submitter`），把它包成 EIP-191 version `0x00`、以 registry
+自己的 proxy 地址作 intended validator——`keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash)`
+——再 `ecrecover`，与 `getAgentSeal(agentId)` 比对。光靠密钥托管还做不到不可伪造：
+agent 进程与运行时同在 TEE 里，能让 sealed 的 sign socket 用 `agentSeal_priv`
+签名。真正堵住它的是签名域：socket 只签 `personal_sign`（`0x19 0x45`）、EIP-712
+（`0x19 0x01`）和它按字段自己组装的交易——从不签裸 hash，也从不签 version
+`0x00` 消息——所以谁都没法线下伪造 ServeProof 内容，agent 也不例外。
+（`VerifiedFeedbackRegistry` 1.2.0 之前，digest 是对 `proofHash` 的普通
+`personal_sign`，socket 照签不误——审计 FIND-01。已弃用的
+`AgenticIDReputationRegistry` 仍校验这个旧 digest，必须暂停。）只有 `submitter`
+能兑付一张 proof（`submitter == msg.sender`，条目归属于 `msg.sender`），每张
+proof 一次性（签名 nonce），且只在唯一一个 registry 上验得过。换到这个 digest
+是硬切换：早于它的 sealed 镜像签出的 proof 在 registry 升级后不再能验过，正在
+运行的 agent 只有经 owner 签名的 `/reset` 才会换到新镜像（上线步骤见
+[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) §7）。详见
+[`contracts/README.zh.md`](contracts/README.zh.md) §5。
 
 ### 6 · 转让 agent = 转让它的能力
 
@@ -364,8 +389,8 @@ attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`giveFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 138
-个 Foundry 测试（18 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
+`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 235
+个 Foundry 测试（25 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
 
@@ -415,9 +440,15 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
 - **ServeProof / X-Agent-Proof** —— 每条响应签名的 envelope 提供的 8
   条保证都是密码学绑定的、但成立条件分两组：**Group A 身份层 3 条**
   只要 priv 不出 TEE 就无条件成立、**Group B 内容层 5 条**还需要"签名
-  能力不被滥用"这一前提（由 agent 钢印兜底）；sealed sign socket 是
-  schema-agnostic 通用 signer，区分 framework-signed 与 agent-signed
-  这件事密码学上做不到；为什么内容真伪要靠链上声誉层而非密码学层
+  能力不被滥用"这一前提。对 serve-proof 本身这一前提是机械保证的：它签在
+  EIP-191 version `0x00` 下、绑定 `VerifiedFeedbackRegistry`，sealed sign
+  socket（只有 `personal_sign`、EIP-712 和 socket 自己组装的交易，没有裸
+  hash 签名）签不出这个域——所以 framework 签的 ServeProof 与 agent 能签的
+  任何东西在密码学上**可以**区分；socket 能签的其他东西（`chain.Update`、
+  agent 自己的声明）上它仍是 schema-agnostic 通用 signer，Group B 由 agent
+  钢印兜底。agent 仍能用自己控制的钱包调自己的 proxy 拿到真 proof，而且没有
+  哪张 proof 能说明响应*内容*是否正确；为什么内容真伪要靠链上声誉层而非
+  密码学层
 
 ---
 

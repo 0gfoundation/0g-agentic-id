@@ -4761,12 +4761,48 @@ function fireProbe(sealIdHex) {
 //   ⟳ Response body integrity — recomputed taskHash matches envelope.task_hash
 //   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
-// envelope = `{ agent_id, timestamp, deadline, task_hash, data_hashes[], framework_hash }`.
-// sig is EIP-191 over keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)) — the contract's ServeProof digest.
+// envelope = `{ agent_id, submitter, timestamp, deadline, task_hash,
+// data_hashes[], framework_hash, validator }` (`validator` is diagnostic only —
+// not part of the signed tuple). sig is over the ServeProof digest, see
+// serveProofSignedDigest.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+}
+
+// ServeProof signed digest — one of five copies of this consensus-critical
+// digest (VerifiedFeedbackRegistry, sealed proxy writeServeProof, SDK
+// ServeProof.ts, this, attestor/scripts/verify-agent.sh check 3b; see
+// AGENTS.md). Pinned by sdk/typescript/test/serveproof-copies.test.mjs, which
+// runs this function verbatim: validator 0x…B7 + the shared fixed tuple →
+// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b.
+// Inner proofHash = keccak256(abi.encode(chainId, identityRegistry,
+// submitter, agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)); the signed digest
+// is EIP-191 version 0x00 ("data with intended validator"):
+// keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash), validator = the
+// VerifiedFeedbackRegistry proxy. Recover it RAW (ethers.recoverAddress) —
+// verifyMessage would apply the personal_sign wrap, which the registry
+// rejects. chainId / identityRegistry come from /config, never the envelope.
+function serveProofSignedDigest(chainId, identityRegistry, validator, envelope) {
+  const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+  const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
+  const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
+    [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
+     BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+     envelope.task_hash, dhHash, envelope.framework_hash],
+  ));
+  return ethers.keccak256(ethers.concat(['0x1900', ethers.getAddress(validator), proofHash]));
+}
+
+// The configured ServeProof validator (/config verified_feedback_addr), or
+// null when this attestor advertises none (blank, malformed or zero) — the
+// containers then emit no proof, and any proof is unverifiable here.
+function configuredServeProofValidator(cfg) {
+  const v = cfg && cfg.verified_feedback_addr;
+  if (!v || !ethers.isAddress(v) || BigInt(v) === 0n) return null;
+  return v;
 }
 
 // Flatten an agent-declared JSON input_example into a URL query string
@@ -4981,25 +5017,49 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     paint('verifying', '', 'Verifying agent identity…', null, null, null);
     await sleep(550);
 
-    let envelope, recovered, sigInfo;
+    const short = a => `${String(a).slice(0,6)}…${String(a).slice(-4)}`;
+    let envelope, sig;
     try {
       const parts = proofHeader.split('.');
       if (parts.length !== 2) throw new Error('malformed X-Agent-Proof (expected sig.envelope)');
-      const [sig, envB64] = parts;
-      envelope = JSON.parse(b64urlDecode(envB64));
-      // Reconstruct the contract's signed digest: keccak256(abi.encode(agentId,
-      // timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
-      // frameworkHash)), then EIP-191 — matches AgenticIDReputationRegistry._verifyServeProof
-      // and the sealed proxy's writeServeProof.
-      const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
-      const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
-      const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-        ['uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
-        [BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
-         envelope.task_hash, dhHash, envelope.framework_hash],
-      ));
-      recovered = ethers.verifyMessage(ethers.getBytes(proofHash), sig);
-      sigInfo = { full: recovered, short: `${recovered.slice(0,6)}…${recovered.slice(-4)}` };
+      sig = parts[0];
+      envelope = JSON.parse(b64urlDecode(parts[1]));
+    } catch (e) {
+      setRow('identity', 'failed', `envelope: ${e.message || e}`);
+      skipRest();
+      paint('failed', '✗', 'Envelope error', null, null, null);
+      return;
+    }
+
+    // The digest binds chainId + identityRegistry + validator, all taken
+    // from /config. Without a configured registry the proof is
+    // unverifiable here — that is not an identity mismatch.
+    const cfgDomain = State.config || {};
+    const validator = configuredServeProofValidator(cfgDomain);
+    if (!validator || !cfgDomain.chain_id || !cfgDomain.agentic_id_addr) {
+      setRow('identity', 'skipped',
+        'unverifiable: this attestor advertises no VerifiedFeedbackRegistry (verified_feedback_addr)');
+      skipRest();
+      paint('warn', '⚠', 'Response received',
+        'Proof unverifiable — no VerifiedFeedbackRegistry configured on this attestor', null, humanMsg);
+      return;
+    }
+    // envelope.validator is diagnostic (not signed): a different one means
+    // the container was created for another registry deployment.
+    if (envelope.validator && String(envelope.validator).toLowerCase() !== validator.toLowerCase()) {
+      setRow('identity', 'failed',
+        `proof signed for a different registry: ${short(envelope.validator)} ≠ configured ${short(validator)}`);
+      skipRest();
+      paint('failed', '✗', 'Registry mismatch',
+        'Proof signed for a different registry', null, humanMsg);
+      return;
+    }
+
+    let recovered, sigInfo;
+    try {
+      const digest = serveProofSignedDigest(cfgDomain.chain_id, cfgDomain.agentic_id_addr, validator, envelope);
+      recovered = ethers.recoverAddress(digest, sig);
+      sigInfo = { full: recovered, short: short(recovered) };
     } catch (e) {
       setRow('identity', 'failed', `envelope: ${e.message || e}`);
       skipRest();
@@ -5008,10 +5068,12 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     }
 
     if (!expectedSealAddr || expectedSealAddr.toLowerCase() !== recovered.toLowerCase()) {
-      const want = expectedSealAddr
-        ? `${expectedSealAddr.slice(0,6)}…${expectedSealAddr.slice(-4)}`
-        : '(unknown)';
-      setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}`);
+      const want = expectedSealAddr ? short(expectedSealAddr) : '(unknown)';
+      // No envelope.validator → a pre-validator sealed image signing the
+      // legacy personal_sign digest; only an owner /reset onto a current
+      // image fixes it (no fallback verification — the registry has none).
+      const legacy = envelope.validator ? '' : ' (no validator in envelope — legacy sealed image? reset the agent)';
+      setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}${legacy}`);
       skipRest();
       paint('failed', '✗', 'Identity mismatch',
         'Recovered signer is not the on-chain agent_seal',

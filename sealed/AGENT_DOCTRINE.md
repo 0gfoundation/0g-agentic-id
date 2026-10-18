@@ -15,6 +15,10 @@ POST /sign/typed_data     EIP-712
 POST /sign/transaction    raw RLP
 ```
 
+None of them signs a raw hash or EIP-191 version `0x00` data. That is
+the domain your serve-proofs are signed in, so nothing you sign through
+the socket can stand in for one.
+
 ---
 
 ## 2. What you can see
@@ -59,15 +63,19 @@ header by the sealed proxy. The envelope signed:
 
 ```
 {
-  agent_id, timestamp, deadline,
-  task_hash, data_hashes, framework_hash
+  agent_id, submitter, timestamp, deadline,
+  task_hash, data_hashes, framework_hash,
+  validator
 }
 ```
 
 where `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
-keccak256(respBody) ‖ status)` folds the request/response transcript. Signed
-under EIP-191 with `agent_seal_priv`, JWT-style packed into
-`0x<sig>.<base64-envelope>` and written into the header.
+keccak256(respBody) ‖ status)` folds the request/response transcript, and
+`submitter` is the caller's declared `X-Client-Address`, the only address
+that can redeem the proof. Signed with `agent_seal_priv` under EIP-191
+version `0x00` ("data with intended validator"), bound to the
+VerifiedFeedbackRegistry named in `validator`, then JWT-style packed
+into `0x<sig>.<base64-envelope>` and written into the header.
 
 A port you bind yourself is not on this signing channel. Responses
 through it carry no `X-Agent-Proof`, and cryptographically have nothing

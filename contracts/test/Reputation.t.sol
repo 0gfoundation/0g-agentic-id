@@ -330,12 +330,12 @@ contract ReputationTest is AgenticIDTestBase {
 
     // ── Submitter binding / front-running ─────────────────────────────────────
 
-    /// @dev Cross-implementation known-answer vector. The ServeProof digest for a
-    ///      fixed input set must equal this exact constant here, in the sealed Go
-    ///      runtime (writeServeProof), and in the TypeScript SDK
-    ///      (buildServeProofMessageHash). The constant was generated from the SDK;
-    ///      if any implementation's field order or encoding drifts, its assertion
-    ///      against this value fails. Keep the three in lockstep.
+    /// @dev Inner-hash known-answer vector as the deprecated fork computes it
+    ///      (the fork signs the legacy personal_sign wrap of this hash). The
+    ///      cross-implementation anchor — this inner hash PLUS the
+    ///      registry-bound signed digest the sealed runtime and the SDK pin —
+    ///      is VerifiedFeedback.t.sol's test_serveProofDigest_knownAnswerVector;
+    ///      the inner constant here must stay equal to it.
     function test_serveProofDigest_knownAnswerVector() public pure {
         bytes32[] memory dataHashes = new bytes32[](2);
         dataHashes[0] = bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222));

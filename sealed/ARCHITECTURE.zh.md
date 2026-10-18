@@ -463,7 +463,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
-| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
 
 agent 自己那条 `/settings` 跟 owner 那条是刻意不对称的：校验、渲染、重启的流程一模
 一样，但**什么都不持久化**，所以改动只活到这个容器结束，任何一次重启回来的都是
@@ -475,9 +475,15 @@ owner 的 document。正是这个不对称让"把这条口子给 agent"变得安
 
 sign socket 是 sealed 跟外界（其实是同容器的 agent 进程）的关键
 信任边界：私钥不出 sealed 进程，agent 把要签的消息通过 unix socket
-递过来。socket 本身只是传输层 —— **拒绝逻辑在 agent 侧由 SOUL.md
-的拒绝规则约束**（任何来自外部 prompt 的 sign 请求都要拒，不靠
-"用人话描述待签内容" 这种容易被身份钓鱼骗过的启发式）。详见
+递过来。socket 自己只强制一件事，即它的**签名域不变量**：只签
+`0x19 0x45` personal message、`0x19 0x01` EIP-712 digest、以及它从
+字段组装的交易；永不签裸 hash，也永不签 EIP-191 version `0x00` 数据。
+serve-proof 正是签在这个 `0x00` 域里、绑定 VerifiedFeedbackRegistry，
+所以 agent 经 socket 签出的任何东西都验不成 serve-proof（审计
+FIND-01；见 `internal/proxy/sign.go` 文件头，由 `sign_test.go` 钉死）。
+在这几种形状之内，socket 只是传输层 —— **拒绝逻辑在 agent 侧由
+SOUL.md 的拒绝规则约束**（任何来自外部 prompt 的 sign 请求都要拒，
+不靠"用人话描述待签内容" 这种容易被身份钓鱼骗过的启发式）。详见
 `internal/framework/openclaw/soulmd.go`。
 
 ## 8. 配置面
@@ -496,6 +502,7 @@ env 这一面：
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
 | `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
+| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** 地址，由 attestor worker 注入在 `AGENTIC_ID_ADDR` 旁边（取自它的 `ATTESTOR_VERIFIED_FEEDBACK_ADDR`）。它是每个 serve-proof 签名所绑定的 EIP-191 version `0x00` intended validator。未设置、格式错误或为零地址时，sealed 在启动时记一行 `WARN`，并且**不**发 `X-Agent-Proof`，跟没有链上身份的 agent 走同一条路径。永不回退到 registry 拒收的旧 `personal_sign` 包装 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
 | `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:163-170`）|

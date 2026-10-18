@@ -25,9 +25,10 @@ import {
   encodeFunctionData,
   parseEventLogs,
 } from 'viem';
-import { canonicalReputationAbi, verifiedFeedbackAbi, feedbackBatcherAbi } from './abi';
+import { agenticIDAbi, canonicalReputationAbi, verifiedFeedbackAbi, feedbackBatcherAbi } from './abi';
 import { RECEIPT_WAIT } from './constants';
 import { type Ctx } from './context';
+import { verifyServeProofSignature } from './ServeProof';
 import type {
   ServeProof,
   GiveFeedbackParams,
@@ -42,6 +43,24 @@ import type {
 } from './types';
 
 const ZERO32 = ('0x' + '0'.repeat(64)) as `0x${string}`;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+/**
+ * FIND-02: the registry recomputes taskHash with the status code as decimal
+ * text, so it accepts only the fixed 3-digit width (100..999) and reverts
+ * anything else with VerifiedFeedbackInvalidTaskReveal. Refuse such a reveal
+ * before anything is broadcast — on the sequential path a late revert would
+ * leave an orphaned canonical entry behind.
+ */
+function assertTaskStatusCode(task: TaskReveal): void {
+  const s = task.statusCode;
+  if (!Number.isInteger(s) || s < 100 || s > 999) {
+    throw new Error(
+      `reputation: task.statusCode must be an integer HTTP status in 100..999 (got ${String(s)}) — ` +
+      'the VerifiedFeedbackRegistry rejects any other value (VerifiedFeedbackInvalidTaskReveal)',
+    );
+  }
+}
 
 /**
  * Internal client for the reputation pair (canonical ERC-8004 registry +
@@ -100,12 +119,18 @@ export class ReputationClient {
    *   mined on return.
    * - **Sequential (fallback)** — canonical write (mined in-call so the
    *   assigned index can be read), then attest. `attestTx` is returned
-   *   unmined — wait for it before reading `isVerified`. If the attest leg
-   *   fails, retry it later with `attestFeedback` (the proof is not consumed
-   *   by a reverted attempt).
+   *   unmined — wait for it before reading `isVerified`. Because the
+   *   canonical entry lands first, the proof is checked gas-free beforehand
+   *   and a proof that could never attest here is refused with nothing
+   *   broadcast (see `preflightServeProof`). If the attest leg still fails,
+   *   retry it later with `attestFeedback` (the proof is not consumed by a
+   *   reverted attempt).
    */
   async giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> {
     this.requireWallet();
+    // Before EITHER path broadcasts: covers the atomic batch and the
+    // sequential canonical write that precedes attestFeedbackWithTask.
+    if (params.task) assertTaskStatusCode(params.task);
 
     const batcher = this.ctx.addresses.feedbackBatcher;
     if (batcher && batcher !== '0x0000000000000000000000000000000000000000') {
@@ -115,6 +140,7 @@ export class ReputationClient {
       // was broadcast, so the sequential path is safe to take.
     }
 
+    await this.preflightServeProof(params.agentId, params.serveProof);
     const canonical = await this.canonical();
     const feedbackTx = await this.walletClient!.writeContract({
       address: canonical,
@@ -141,6 +167,60 @@ export class ReputationClient {
       ? await this.attestFeedbackWithTask(params.agentId, feedbackIndex, params.serveProof, params.task)
       : await this.attestFeedback(params.agentId, feedbackIndex, params.serveProof);
     return { feedbackTx, attestTx, feedbackIndex };
+  }
+
+  /**
+   * Sequential-path preflight. There the canonical entry is written (and
+   * mined) BEFORE the registry sees the proof, so a proof that can never
+   * attest would leave an orphaned, unverified canonical entry that no
+   * `attestFeedback` retry can rescue. Refuse, gas-free and before anything
+   * is broadcast, the permanent failures the 1.2.0 hard cut made common: a
+   * proof signed for another registry, a pre-upgrade sealed image's legacy
+   * personal_sign wrap (any signature that does not recover to the on-chain
+   * agentSeal under this registry's domain), and agentSeal self-feedback —
+   * plus the two free local checks, agent and submitter mismatch. Owner /
+   * operator self-feedback and an expired deadline are left to the registry.
+   * The atomic path needs none of this: a bad proof reverts the whole batch.
+   */
+  private async preflightServeProof(agentId: bigint, proof: ServeProof): Promise<void> {
+    const registry = this.verifiedFeedbackAddr;
+    const agenticID = this.ctx.addresses.agenticID;
+    const me = this.account!.address;
+    const refuse = (why: string): never => {
+      throw new Error(
+        `reputation: serve-proof cannot attest (${why}) — refused before the canonical write, nothing was broadcast`,
+      );
+    };
+    if (proof.agentId !== agentId) refuse(`proof is for agent ${proof.agentId}, not ${agentId}`);
+    if (proof.submitter.toLowerCase() !== me.toLowerCase()) {
+      refuse(`proof is bound to submitter ${proof.submitter}, not the connected wallet ${me}`);
+    }
+    if (proof.validator && proof.validator.toLowerCase() !== registry.toLowerCase()) {
+      refuse(`proof signed for a different VerifiedFeedbackRegistry (proof: ${proof.validator}, configured: ${registry})`);
+    }
+    const agentSeal = (await this.publicClient.readContract({
+      address: agenticID,
+      abi: agenticIDAbi,
+      functionName: 'getAgentSeal',
+      args: [agentId],
+    })) as Address;
+    if (agentSeal.toLowerCase() === me.toLowerCase()) {
+      refuse("the connected wallet is this agent's own agentSeal (VerifiedFeedbackSelfFeedback)");
+    }
+    const signerMatches =
+      agentSeal !== ZERO_ADDRESS &&
+      (await verifyServeProofSignature(proof, agentSeal, {
+        chainId: BigInt(this.chain.id),
+        verifyingContract: agenticID,
+        validator: registry,
+      }));
+    if (!signerMatches) {
+      refuse(
+        proof.validator
+          ? 'signature does not match the on-chain agentSeal'
+          : 'signature does not match the on-chain agentSeal; the proof names no validator — likely a pre-upgrade sealed image, which only an owner reset fixes',
+      );
+    }
   }
 
   /**
@@ -193,6 +273,8 @@ export class ReputationClient {
           params.endpoint ?? '',
           params.feedbackURI ?? '',
           params.feedbackHash ?? ('0x' + '0'.repeat(64) as `0x${string}`),
+          // Field by field: the proof's informational `validator` must never
+          // reach the on-chain tuple.
           {
             agentId: sp.agentId,
             submitter: sp.submitter,
@@ -203,6 +285,8 @@ export class ReputationClient {
             frameworkHash: sp.frameworkHash,
             signature: sp.signature,
           },
+          // No task: placeholder with an EMPTY method — FeedbackBatcher routes
+          // that to plain attestFeedback, so statusCode 0 is never checked.
           params.task ?? { method: '', uri: '', reqBodyHash: ZERO32, respBodyHash: ZERO32, statusCode: 0 },
         ],
       }),
@@ -213,7 +297,8 @@ export class ReputationClient {
     if (receipt.status !== 'success') {
       throw new Error(
         `atomic feedback batch reverted (tx ${txHash}) — nothing was written; ` +
-        'check the proof (expired deadline / wrong submitter / owner self-feedback)',
+        'check the proof (expired deadline / wrong submitter / owner or agentSeal self-feedback / ' +
+        'proof signed for a different registry or by a pre-upgrade sealed image)',
       );
     }
     const events = parseEventLogs({
@@ -274,6 +359,7 @@ export class ReputationClient {
     task: TaskReveal,
   ): Promise<WriteContractReturnType> {
     this.requireWallet();
+    assertTaskStatusCode(task);
     return this.walletClient!.writeContract({
       address: this.verifiedFeedbackAddr,
       abi: verifiedFeedbackAbi,

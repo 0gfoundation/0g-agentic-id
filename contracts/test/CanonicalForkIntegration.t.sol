@@ -153,9 +153,10 @@ contract CanonicalForkIntegrationTest is Test {
             block.timestamp, deadline, keccak256("fork-task"),
             keccak256(abi.encodePacked(dataHashes)), keccak256("fw")
         ));
+        // EIP-191 version 0x00, intended validator = the VF proxy.
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(
             sealWallet.privateKey,
-            keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", inner))
+            keccak256(abi.encodePacked(hex"1900", address(verifiedFeedback), inner))
         );
         ServeProof memory proof = ServeProof({
             agentId: agentId,

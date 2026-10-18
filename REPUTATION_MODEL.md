@@ -2,11 +2,14 @@
 
 Status: **design / north-star**. The simple first cut (`getDataBoundScore`, snapshot
 overlap) is designed but not yet in the SDK; the full model below is the target for
-the event-indexer phase. On-chain `getSummary` is **not** changed by any of this.
-Note it is **not** the ERC-8004 reference baseline: it returns a **sum + count**
-(the reference registry averages), so this fork's on-chain aggregation is its own
-— see `contracts/README.md` for the named divergences. This document builds only
-on `getSummary` staying fixed, not on it matching the reference.
+the event-indexer phase. The live on-chain reads are **not** changed by any of this:
+the canonical ERC-8004 Reputation Registry's `getSummary` (raw feedback, verified or
+not) and `VerifiedFeedbackRegistry.getVerifiedSummary` /
+`getVerifiedSummaryForEndpoint` (ServeProof-backed entries only — see
+`contracts/README.md`). This document builds only on those reads staying fixed.
+(The deprecated `AgenticIDReputationRegistry` fork's own `getSummary` is not one of
+them: that fork still accepts the legacy, agent-forgeable ServeProof digest — see
+Data sources.)
 
 ## Problem
 
@@ -31,10 +34,10 @@ re-rated" state honestly.
    (SDK / indexer); it's zero-gas, unlimited scale, and freely iterable. On-chain
    aggregation is only warranted when another contract must consume the score
    trustlessly — not our case today.
-2. **Don't touch `getSummary`.** It's the stable on-chain read this fork already
-   exposes (sum + count); keep it fixed so anything already reading it doesn't
-   break. It is **not** the ERC-8004 reference baseline (that averages), so this
-   is about our own stability, not cross-registry parity. This model is additive.
+2. **Don't touch the on-chain summaries.** The canonical registry's `getSummary`
+   and the VerifiedFeedbackRegistry's `getVerifiedSummary*` are the stable
+   on-chain reads; keep them fixed so anything already reading them doesn't
+   break. This model is additive.
 3. **General model, simple defaults.** The model is fully parameterized, but its
    default parameters (all weights equal) collapse it to a plain average. Complexity
    is opt-in.
@@ -126,12 +129,17 @@ Simple is the default; per-tag / per-role weighting is opt-in.
 - **Version chain**: reconstruct from the AgenticID contract's iData `Updated` / `EntryUpdated` events
   (each update = a new version + block time); the current version is
   `intelligentDatasOf(agentId)`.
-- **Review → version**: attach each feedback to the version live at its `giveFeedback`
-  block time (from `NewFeedback` / `FeedbackWithProof` events).
+- **Review → version**: attach each feedback to the version live at its block time —
+  the canonical ERC-8004 Reputation Registry's `NewFeedback` event (clients call its
+  `giveFeedback` directly). `VerifiedFeedbackRegistry`'s `FeedbackVerified` event marks
+  the entries backed by a ServeProof; for those, the proof's `dataHashes` (below) name
+  the serving version directly.
 - **Per-role dataHashes**: `intelligentDatasOf` gives `(role=dataDescription, dataHash)`
   for the current version; historical role↔hash mapping comes from the update events.
-- **Serve-data per review**: `getServeData(agentId, client, idx)` or the
-  `FeedbackWithProof(…, dataHashes, frameworkHash)` event.
+- **Serve-data per review**: `VerifiedFeedbackRegistry.getServeData(agentId, client, idx)`
+  or the `FeedbackVerified(…, dataHashes, frameworkHash, taskHash, uri)` event. (The
+  deprecated `AgenticIDReputationRegistry`'s `FeedbackWithProof` is not a source: it
+  still accepts the legacy, agent-forgeable ServeProof digest.)
 
 ## Attribution limits (important)
 

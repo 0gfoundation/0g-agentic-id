@@ -15,6 +15,10 @@ import {IAgenticID} from "./interfaces/IAgenticID.sol";
 import {NonceRegistryUpgradeable} from "./utils/NonceRegistryUpgradeable.sol";
 
 error VerifiedFeedbackNoAgentSeal();
+/// @dev The signature does not recover to the agent's agentSeal over the
+/// registry-bound digest (EIP-191 version 0x00, see `_serveProofDigest`). A
+/// proof signed under the pre-1.2.0 personal_sign wrap (an old sealed image)
+/// lands here too — there is no legacy fallback.
 error VerifiedFeedbackInvalidProofSignature();
 error VerifiedFeedbackNotPauser();
 /// @dev The outer `agentId` does not match the agent the ServeProof attests to
@@ -23,9 +27,10 @@ error VerifiedFeedbackProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
 /// @dev The proof was signed for a different redeemer — `proof.submitter` must
 /// equal the attestFeedback caller. Closes front-running / proof theft.
 error VerifiedFeedbackProofSubmitterMismatch(address submitter, address sender);
-/// @dev ERC-8004: the agent owner or an approved operator must not attest
-/// feedback on their own agent. Conformance guard, not sybil resistance (a
-/// determined owner can still self-rate from an unrelated second wallet).
+/// @dev ERC-8004: the agent owner, an approved operator, or the agent's own
+/// agentSeal must not attest feedback on their own agent. Conformance guard,
+/// not sybil resistance (a determined owner can still self-rate from an
+/// unrelated second wallet — including a fresh wallet the seal funds).
 error VerifiedFeedbackSelfFeedback(uint256 agentId, address submitter);
 /// @dev No canonical feedback entry exists at (agentId, msg.sender, feedbackIndex)
 /// — index 0, or beyond the client's last canonical index.
@@ -38,9 +43,11 @@ error VerifiedFeedbackNotVerified(uint256 agentId, address clientAddress, uint64
 error VerifiedFeedbackClientsRequired();
 /// @dev The revealed receipt materials don't hash to the proof's taskHash.
 error VerifiedFeedbackTaskMismatch(bytes32 expected, bytes32 actual);
-/// @dev Malformed task reveal: method outside the known HTTP set, or a URI
-/// not starting with '/'. Both checks close the concatenation ambiguity at
-/// the method‖uri boundary of the taskHash preimage.
+/// @dev Malformed task reveal: method outside the known HTTP set, a URI not
+/// starting with '/', or a statusCode outside 100..999. The first two close
+/// the concatenation ambiguity at the method‖uri boundary of the taskHash
+/// preimage; the fixed 3-digit status closes it at the respBodyHash‖status
+/// tail.
 error VerifiedFeedbackInvalidTaskReveal();
 /// @dev A summary summation exceeded int128 — unreachable given canonical's
 /// bounded writes (|value| ≤ 1e38 is still bounded after 18-decimal
@@ -56,16 +63,27 @@ error VerifiedFeedbackSummaryOverflow();
 ///         by a TEE-signed ServeProof, plus the proof's audit data
 ///         (dataHashes, frameworkHash).
 ///
-/// @dev The ServeProof digest is IDENTICAL to the one the (deprecated)
-///      AgenticIDReputationRegistry verifies — bound to (chainId,
-///      identityRegistry, submitter), NOT to this contract's address — so the
-///      sealed runtime and SDK signing paths are unchanged. Consequence: while
-///      both contracts are live on one deployment, a single proof can be
-///      redeemed once on EACH (their nonce stores are separate) — and the same
-///      generalizes to any extra VerifiedFeedbackRegistry instance anchored to
-///      the same pair, so readers should pin ONE registry address per
-///      deployment (DEPLOYMENT.md §6). Acceptable — the fork registry is
-///      deprecated and new stacks deploy only this one.
+/// @dev Since 1.2.0 the signed ServeProof digest is BOUND TO THIS REGISTRY:
+///      agentSeal signs keccak256(0x19 ‖ 0x00 ‖ address(this) ‖ proofHash)
+///      raw — EIP-191 version 0x00, "data with intended validator"
+///      (address(this) is the proxy under the beacon delegatecall). The inner
+///      proofHash is unchanged, still bound to (chainId, identityRegistry,
+///      submitter). Two consequences:
+///        - The sealed sign socket only produces personal_sign (0x19 0x45 …),
+///          typed_data (0x19 0x01 …) and socket-built transaction preimages,
+///          so the agent process cannot forge a ServeProof offline by asking
+///          its own socket to sign a chosen proofHash (audit FIND-01). This
+///          rests on a sealed-side invariant: the socket must never offer
+///          raw-hash or version-0x00 signing.
+///        - A proof redeems on exactly one registry. Neither the deprecated
+///          AgenticIDReputationRegistry (still on the legacy personal_sign
+///          wrap — it must be paused) nor a second VerifiedFeedbackRegistry
+///          instance anchored to the same pair recovers the seal from it
+///          (FIND-16). Readers still pin ONE registry address per deployment
+///          (DEPLOYMENT.md §6) — marks live per instance.
+///      Residual, not closed here: the agent can still obtain GENUINE proofs
+///      by calling its own proxy with a client address it controls — the
+///      documented sybil class (see the self-feedback guard).
 contract VerifiedFeedbackRegistry is
     IVerifiedFeedbackRegistry,
     OwnableUpgradeable,
@@ -76,7 +94,15 @@ contract VerifiedFeedbackRegistry is
 
     /// @notice Current implementation version. See contracts/UPGRADING.md for
     ///         the bump rules.
-    /// @dev 1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
+    /// @dev 1.2.0 — ServeProof hardening (beacon upgrade; storage and ABI
+    ///      unchanged, but consensus-critical — ships with new sealed images +
+    ///      SDK in one window): the signed digest becomes EIP-191 version 0x00
+    ///      bound to this registry (toDataWithIntendedValidatorHash(address(this),
+    ///      proofHash)); legacy personal_sign-wrapped proofs are rejected, no
+    ///      fallback (audit FIND-01 / FIND-16). attestFeedbackWithTask requires
+    ///      statusCode in 100..999 (FIND-02). The agent's own agentSeal may not
+    ///      attest (VerifiedFeedbackSelfFeedback).
+    ///      1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
     ///      recomputes the proof's taskHash from revealed receipt materials and
     ///      records the URI as the entry's TEE-verified endpoint; new views
     ///      getVerifiedEndpoint / getVerifiedSummaryForEndpoint; FeedbackVerified
@@ -84,10 +110,12 @@ contract VerifiedFeedbackRegistry is
     ///      `uri` field (mapping-stored struct — append-safe, old entries read "").
     ///      1.0.0 — initial: attest-only companion to the canonical ERC-8004
     ///      Reputation Registry, replacing the AgenticIDReputationRegistry fork.
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
 
-    /// @dev Same tag as the fork registry — the digest and nonce-key derivation
-    ///      are consensus-critical, shared with sealed/ and the SDK.
+    /// @dev Nonce-key tag — same keccak256(tag, agentId, signature) derivation
+    ///      as the fork registry (each registry keeps its own nonce store). The
+    ///      signed DIGEST is no longer shared with the fork since 1.2.0 (see
+    ///      `_serveProofDigest`).
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
@@ -206,11 +234,15 @@ contract VerifiedFeedbackRegistry is
         // materials exactly as the sealed proxy built it — keccak256(method ‖
         // uri ‖ reqBodyHash ‖ respBodyHash ‖ decimal statusCode). The hash is
         // inside the seal-signed digest, so a match proves the interaction hit
-        // `task.uri`. Method whitelist + leading '/' close the concatenation
-        // ambiguity at the method‖uri boundary.
+        // `task.uri`. encodePacked is ambiguous at both variable-width ends:
+        // method whitelist + leading '/' pin the method‖uri boundary, and a
+        // fixed 3-digit status pins the tail — a 1–2 digit status would let a
+        // reveal shift body-hash bytes into `uri` (FIND-02). 100..999 is what
+        // Go's net/http emits, so no genuine receipt is orphaned.
         if (!_isKnownMethod(task.method)) revert VerifiedFeedbackInvalidTaskReveal();
         bytes memory uriBytes = bytes(task.uri);
         if (uriBytes.length == 0 || uriBytes[0] != "/") revert VerifiedFeedbackInvalidTaskReveal();
+        if (task.statusCode < 100 || task.statusCode > 999) revert VerifiedFeedbackInvalidTaskReveal();
         bytes32 recomputed = keccak256(abi.encodePacked(
             bytes(task.method),
             uriBytes,
@@ -236,15 +268,17 @@ contract VerifiedFeedbackRegistry is
         // it). Require them to match — otherwise a valid proof for agent A
         // could mark entries on any other agent B.
         if (agentId != proof.agentId) revert VerifiedFeedbackProofAgentMismatch(agentId, proof.agentId);
-        _verifyServeProof(proof);
+        address agentSeal = _verifyServeProof(proof);
 
-        // ERC-8004 conformance: the attester must not be the agent owner or an
-        // approved operator. Conformance guard, NOT sybil resistance — the
-        // serve proof is obtainable from the unauthenticated /hello, so a
-        // determined owner can still self-rate from an unrelated second
-        // wallet. msg.sender == proof.submitter here (enforced above), so this
-        // checks the real redeemer.
-        if (_isOwnerOrApproved(agentId, msg.sender)) revert VerifiedFeedbackSelfFeedback(agentId, msg.sender);
+        // ERC-8004 conformance: the attester must not be the agent owner, an
+        // approved operator, or the agent's own agentSeal. Conformance guard,
+        // NOT sybil resistance — the serve proof is obtainable from the
+        // unauthenticated /hello, so a determined owner can still self-rate
+        // from an unrelated second wallet (and the agent from a fresh wallet
+        // its seal funds). msg.sender == proof.submitter here (enforced
+        // above), so this checks the real redeemer.
+        if (msg.sender == agentSeal || _isOwnerOrApproved(agentId, msg.sender))
+            revert VerifiedFeedbackSelfFeedback(agentId, msg.sender);
 
         VerifiedFeedbackStorage storage $ = _getVerifiedFeedbackStorage();
 
@@ -401,12 +435,13 @@ contract VerifiedFeedbackRegistry is
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /// @dev Verifies the ServeProof signature against the agent's agentSeal AND
-    ///      consumes the nonce (derived from signature bytes) via NonceRegistry.
-    ///      State-mutating despite the "verify" name — this is the single
-    ///      entrypoint that guarantees each ServeProof is redeemed at most once
-    ///      here. Digest and nonce-key derivation are byte-identical to the
-    ///      fork registry's (consensus-critical, shared with sealed/ and SDK).
-    function _verifyServeProof(ServeProof calldata proof) internal {
+    ///      consumes the nonce (derived from signature bytes) via NonceRegistry;
+    ///      returns the agentSeal. State-mutating despite the "verify" name —
+    ///      this is the single entrypoint that guarantees each ServeProof is
+    ///      redeemed at most once here. The nonce-key derivation matches the
+    ///      fork registry's; the signed digest does not since 1.2.0 (bound to
+    ///      this registry — `_serveProofDigest`).
+    function _verifyServeProof(ServeProof calldata proof) internal returns (address agentSeal) {
         // Only the address the proof was signed for may redeem it — the
         // front-running / theft guard. Checked before signature recovery so a
         // mismatched caller reverts cheaply.
@@ -414,15 +449,34 @@ contract VerifiedFeedbackRegistry is
             revert VerifiedFeedbackProofSubmitterMismatch(proof.submitter, msg.sender);
 
         address identityRegistry = _getVerifiedFeedbackStorage().identityRegistry;
-        address agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
+        agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
         if (agentSeal == address(0)) revert VerifiedFeedbackNoAgentSeal();
 
-        // Domain + submitter separation: block.chainid and the identity
-        // registry make the proof non-portable across chains and protocol
-        // deployments; `submitter` makes it non-transferable. Fixed-width
-        // words only, so abi.encode has no encoding ambiguity.
-        bytes32 proofHash = keccak256(abi.encode(
-            block.chainid,
+        // Registry binding: the validator is this proxy, so the digest is one
+        // the sign socket never produces and no other registry accepts.
+        bytes32 digest = _serveProofDigest(
+            address(this), _serveProofHash(block.chainid, identityRegistry, proof)
+        );
+        if (digest.recover(proof.signature) != agentSeal)
+            revert VerifiedFeedbackInvalidProofSignature();
+
+        // Replay protection: signature is unique per sealed payload.
+        bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, proof.agentId, proof.signature));
+        _checkAndMarkNonce(nonceKey, proof.deadline);
+    }
+
+    /// @dev The ServeProof's inner hash (unchanged by 1.2.0). Domain +
+    ///      submitter separation: chainId and the identity registry make the
+    ///      proof non-portable across chains and protocol deployments;
+    ///      `submitter` makes it non-transferable. Fixed-width words only, so
+    ///      abi.encode has no encoding ambiguity. Consensus-critical — the
+    ///      sealed proxy and the SDK compute it independently (cross-impl
+    ///      known-answer vector in test/VerifiedFeedback.t.sol).
+    function _serveProofHash(uint256 chainId, address identityRegistry, ServeProof calldata proof)
+        internal pure returns (bytes32)
+    {
+        return keccak256(abi.encode(
+            chainId,
             identityRegistry,
             proof.submitter,
             proof.agentId,
@@ -432,13 +486,17 @@ contract VerifiedFeedbackRegistry is
             keccak256(abi.encodePacked(proof.dataHashes)),
             proof.frameworkHash
         ));
-        bytes32 ethHash = MessageHashUtils.toEthSignedMessageHash(proofHash);
-        if (ethHash.recover(proof.signature) != agentSeal)
-            revert VerifiedFeedbackInvalidProofSignature();
+    }
 
-        // Replay protection: signature is unique per sealed payload.
-        bytes32 nonceKey = keccak256(abi.encode(_SERVEPROOF_TAG, proof.agentId, proof.signature));
-        _checkAndMarkNonce(nonceKey, proof.deadline);
+    /// @dev The digest agentSeal signs — RAW, with no further EIP-191 wrap:
+    ///      EIP-191 version 0x00 ("data with intended validator"),
+    ///      keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash), validator = the
+    ///      registry proxy. The 0x00 version byte separates it from every
+    ///      preimage the sealed sign socket signs (personal_sign 0x19 0x45,
+    ///      typed_data 0x19 0x01, socket-built transactions), so a
+    ///      personal_sign over the same proofHash does not verify (FIND-01).
+    function _serveProofDigest(address validator, bytes32 proofHash) internal pure returns (bytes32) {
+        return MessageHashUtils.toDataWithIntendedValidatorHash(validator, abi.encodePacked(proofHash));
     }
 
     /// @dev True if `addr` is the agent owner or an ERC-721 approved operator.

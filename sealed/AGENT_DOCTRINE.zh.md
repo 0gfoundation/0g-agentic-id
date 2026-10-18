@@ -14,6 +14,9 @@ POST /sign/typed_data     EIP-712
 POST /sign/transaction    raw RLP
 ```
 
+它们都不签裸 hash,也不签 EIP-191 version `0x00` 数据。那正是你的
+serve-proof 所签的域,所以你经 socket 签出的任何东西都替代不了它。
+
 ---
 
 ## 2. 你能看见什么
@@ -55,14 +58,18 @@ Envelope 签:
 
 ```
 {
-  agent_id, timestamp, deadline,
-  task_hash, data_hashes, framework_hash
+  agent_id, submitter, timestamp, deadline,
+  task_hash, data_hashes, framework_hash,
+  validator
 }
 ```
 
 其中 `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
-keccak256(respBody) ‖ status)` 把请求/响应 transcript 折进去。用
-`agent_seal_priv` 以 EIP-191 签名,JWT 风格打包成
+keccak256(respBody) ‖ status)` 把请求/响应 transcript 折进去;
+`submitter` 是调用方声明的 `X-Client-Address`,唯一能兑付这条 proof
+的地址。用 `agent_seal_priv` 以 EIP-191 version `0x00`("data with
+intended validator")签名,绑定 `validator` 指明的
+VerifiedFeedbackRegistry,再 JWT 风格打包成
 `0x<sig>.<base64-envelope>` 写进 header。
 
 自开的 port 不在签名通道上,响应没有 `X-Agent-Proof`,密码学上

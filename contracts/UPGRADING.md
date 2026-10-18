@@ -5,10 +5,15 @@ addresses, and each contract's current version + changelog live in
 [`DEPLOYMENT.md`](DEPLOYMENT.md)** — this doc only covers *how to version* and
 *how to upgrade*.
 
-Architecture: every contract sits behind `BeaconProxy + UpgradeableBeacon + Impl`;
-the three beacons are owned by a single `TimelockController`, so an upgrade is a
-two-step `schedule → wait → execute`. A beacon upgrade keeps the proxy address
-and storage unchanged.
+Architecture: every upgradeable contract (`AgenticID`, `TEEDataVerifier`,
+`VerifiedFeedbackRegistry`, `CloneGate`, plus the deprecated
+`AgenticIDReputationRegistry` where it still lives) sits behind
+`BeaconProxy + UpgradeableBeacon + Impl`. An environment's beacons — four on a
+fresh `Deploy.s.sol` stack, five on test/dev, which still carry the deprecated
+fork — are owned by a single `TimelockController`, so an upgrade is a two-step
+`schedule → wait → execute`. A beacon upgrade keeps the proxy address and
+storage unchanged. (`FeedbackBatcher` and `StandardCloneAuthorizer` are
+immutable — replaced by redeploying, see [`DEPLOYMENT.md`](DEPLOYMENT.md).)
 
 ## 1. Version scheme (`major.minor.patch`)
 
@@ -29,6 +34,17 @@ One-line test:
 Example: reputation dropping `ServeProof.client` (ABI change, storage-compatible,
 beacon upgrade) → `1.0.0 → 1.1.0` (minor).
 
+**Consensus-critical digests: still minor, but a same-window rollout.** A change
+to a digest that off-chain code must reproduce byte-for-byte — e.g. the
+ServeProof digest, which `VerifiedFeedbackRegistry` 1.2.0 moved from
+`personal_sign(proofHash)` to EIP-191 version 0x00 bound to the registry — is a
+**minor** bump when storage-compatible, even with the ABI unchanged. But it is
+not "integrators adapt at their leisure": every signer and verifier (sealed
+images, SDK, attestor console) must switch in the **same window** as the beacon
+upgrade, or every proof in flight stops verifying (a hard cut, unless the impl
+deliberately dual-accepts). Plan it as a coordinated rollout and write the
+steps into the `DEPLOYMENT.md` §7 entry — 1.2.0's is the template.
+
 ## 2. Minor/patch upgrade (in-place beacon upgrade, two-step)
 
 `TIMELOCK_DELAY=0` (dev) still follows the same steps as prod. For gas see
@@ -39,7 +55,7 @@ beacon upgrade) → `1.0.0 → 1.1.0` (minor).
 # Step 1: bump the source VERSION per §1 + update the impl's @dev changelog; forge test green.
 
 # Step 2: deploy the new impl
-forge create src/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry \
+forge create src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry \
   --rpc-url <RPC> --chain 16602 --private-key <PK> --legacy --gas-price 5000000000 --broadcast
 
 # Step 3: proposer schedules (BEACON is the beacon to upgrade, NOT the proxy)

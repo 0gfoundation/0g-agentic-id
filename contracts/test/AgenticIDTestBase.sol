@@ -94,10 +94,23 @@ abstract contract AgenticIDTestBase is Test {
         );
     }
 
-    /// @dev EIP-191 raw-32-byte variant used by ServeProof / setAgentWallet.
-    ///      Matches MessageHashUtils.toEthSignedMessageHash(bytes32).
+    /// @dev EIP-191 raw-32-byte (personal_sign) variant. Matches
+    ///      MessageHashUtils.toEthSignedMessageHash(bytes32). The deprecated
+    ///      fork registry's ServeProof format (Reputation / UpgradeReputation
+    ///      suites); against VerifiedFeedbackRegistry >= 1.2.0 it is the
+    ///      legacy / attacker format that must be rejected — exactly what the
+    ///      sealed sign socket's /sign/personal_sign returns for 32 bytes.
     function _eip191RawHash(bytes32 inner) internal pure returns (bytes32) {
         return keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", inner));
+    }
+
+    /// @dev EIP-191 version 0x00 ("data with intended validator") variant —
+    ///      the ServeProof digest since VerifiedFeedbackRegistry 1.2.0:
+    ///      keccak256(0x19 ‖ 0x00 ‖ validator ‖ inner), validator = the
+    ///      registry proxy. Spelled out byte-wise (not via MessageHashUtils)
+    ///      so the suites cross-check the contract's library call.
+    function _eip191ValidatorHash(address validator, bytes32 inner) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(hex"1900", validator, inner));
     }
 
     // ── Transfer proof builders ───────────────────────────────────────────────

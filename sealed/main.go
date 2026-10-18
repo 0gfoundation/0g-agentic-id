@@ -712,6 +712,9 @@ func startAgent(
 			ContractAddr: cfg.ContractAddr,
 			ChainID:      chainIDStr,
 			AttestorURL:  cfg.AttestorURL,
+			// Serve-proof validator (VerifiedFeedbackRegistry proxy); config
+			// already normalized it to "" when unusable.
+			VerifiedFeedbackAddr: cfg.VerifiedFeedbackAddr,
 
 			// Sealed runtime metadata.
 			SealedVersion: sealedVersion,

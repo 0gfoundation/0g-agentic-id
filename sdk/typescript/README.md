@@ -169,18 +169,20 @@ const agent = await ag.agent.connect(agentId);
 const { response, proof } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
-// proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature } | null
+// proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature,
+//           validator /* registry it was signed for — diagnostics, not on-chain */ } | null
 // low-level escape hatch: ag.reputation.capture(() => fetch(…))
 
-// 2. verify before spending gas
+// 2. verify before spending gas — the signature is bound to addresses.verifiedFeedback
+//    (fromAttestor fills it); registryMatches: false = none configured / a different one
 await ag.reputation.verifyProof(proof);
-// → { ok, signerMatches, notExpired, dataOnChain, reasons }
+// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
 //    is advertised) both land in ONE atomic type-4 tx; otherwise two sequential
-//    txs. An owner CANNOT attest feedback on their own agent (the verified
-//    registry rejects it).
+//    txs. An owner CANNOT attest feedback on their own agent, nor can the
+//    agent's own agentSeal (the verified registry rejects both).
 const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
 await ag.reputation.waitForTransaction(fb.attestTx);
@@ -203,7 +205,8 @@ await ag.reputation.getVerifiedIndexes(agentId, buyer);    // → [1n, …]
 await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
 // task-receipt opening: pass `task` (method/uri/body hashes/status of the rated
 // interaction) to giveFeedback and the contract verifies it against the proof's
-// taskHash, recording the URI as the entry's TEE-verified endpoint:
+// taskHash, recording the URI as the entry's TEE-verified endpoint
+// (statusCode: an integer in 100..999 — anything else is refused before broadcast):
 await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);            // → "/hello" ("" if unrevealed)
 await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');    // per-interface verified aggregate
 
@@ -296,11 +299,11 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
-- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec.
+- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, the last three taking the VerifiedFeedbackRegistry as `validator`) and the canonical digest spec (EIP-191 version 0x00, intended validator = the registry; 0.2.0 is a hard cut from personal_sign).
 - **[CLI](./GUIDE.md#cli-0g-agenticid)** `npx 0g-agenticid` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
 
-- **Serve-proof binding** — attribution is `msg.sender` at submission; each proof also names a `submitter` (the redeemer). Treat proofs as sensitive regardless of transport.
+- **Serve-proof binding** — attribution is `msg.sender` at submission; each proof also names a `submitter` (the redeemer) and is signed for exactly one VerifiedFeedbackRegistry. Treat proofs as sensitive regardless of transport.
 - **0G receipt timing** — `waitForTransaction` is tuned for 0G (120s + retries); if it times out the tx likely still landed — confirm by reading state.
 - **On-chain types** — `value`/`summaryValue` are `int128`, `feedbackIndex` is `uint64` (all bigint).

@@ -22,6 +22,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// `VERIFIED_FEEDBACK_ADDR` value for the container env. Unset → the key is
+/// STILL injected, empty: extra_env overrides the deployer-signed payload's
+/// env, so a blank keeps an owner-supplied validator from passing through,
+/// and sealed reads empty as "no validator" (no X-Agent-Proof, never a
+/// fallback to the legacy personal_sign wrap).
+fn validator_env(addr: Option<alloy::primitives::Address>) -> String {
+    addr.map(|a| format!("{a:#x}")).unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -86,6 +95,12 @@ async fn main() -> anyhow::Result<()> {
         // accepted. If construction fails the worker still boots; admin
         // calls just no-op and orphans fall back to sandbox runtime GC.
         let admin_signer = AdminSigner::from_priv(app_priv).ok();
+        if cfg.verified_feedback_addr.is_none() {
+            tracing::warn!(
+                "ATTESTOR_VERIFIED_FEEDBACK_ADDR unset: new containers get a blank \
+                 VERIFIED_FEEDBACK_ADDR and emit no X-Agent-Proof (no ServeProofs)"
+            );
+        }
         Arc::new(HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
@@ -98,6 +113,12 @@ async fn main() -> anyhow::Result<()> {
                 (
                     "AGENTIC_ID_ADDR".into(),
                     format!("{:#x}", cfg.agentic_id_addr),
+                ),
+                // ServeProof validator (VerifiedFeedbackRegistry proxy):
+                // sealed signs keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash).
+                (
+                    "VERIFIED_FEEDBACK_ADDR".into(),
+                    validator_env(cfg.verified_feedback_addr),
                 ),
             ],
             // Public-port allowlist (ATTESTOR_SANDBOX_PUBLIC_PORTS): when set,
@@ -389,5 +410,19 @@ async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
         Ok(Arc::new(MockKmsClient::from_hex(secret_hex)?))
     } else {
         Ok(Arc::new(TappKmsClient::connect(cfg).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validator_env;
+
+    #[test]
+    fn validator_env_is_lowercase_hex_or_blank() {
+        let vf: alloy::primitives::Address =
+            "0x00000000000000000000000000000000000000B7".parse().unwrap();
+        assert_eq!(validator_env(Some(vf)), "0x00000000000000000000000000000000000000b7");
+        // Blank, not omitted: the key must still override the payload env.
+        assert_eq!(validator_env(None), "");
     }
 }

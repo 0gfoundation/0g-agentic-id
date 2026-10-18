@@ -19,8 +19,11 @@
 // output, which is owner-private. /healthz and /log stay open.
 //
 // All signed responses (everything except /healthz, /log, /log/agent) carry an
-// X-Agent-Proof header packing both an EIP-191 signature and the canonical
-// envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
+// X-Agent-Proof header packing an agentSeal signature and the envelope JSON it
+// covers. The signature is EIP-191 version 0x00 bound to the
+// VerifiedFeedbackRegistry (see writeServeProof) — not a personal_sign, so
+// there is no verifyMessage-style check: verifiers rebuild the ServeProof hash
+// from the envelope plus their configured deployment and recover the digest.
 package proxy
 
 import (
@@ -42,6 +45,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/framework"
@@ -313,9 +317,9 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 //	  "ts":         <unix>
 //	}
 //
-// The X-Agent-Proof header signs (method, uri, req_body_hash, status,
-// resp_body_hash, data_hashes, ts) so verifiers can confirm the response
-// originated from this attested instance.
+// The X-Agent-Proof header signs a ServeProof (taskHash over method, uri,
+// req/resp body hashes and status; data_hashes; timestamp/deadline) so
+// verifiers can confirm the response originated from this attested instance.
 //
 // `services` is built from sealed's service registry (agent-registered
 // via POST /services) on each call — fresh per request, no caching. An
@@ -324,7 +328,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -372,7 +376,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -541,7 +545,7 @@ func (s *Server) resolveOwner(ctx context.Context, cached string) (string, bool)
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil || owner == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -578,7 +582,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -588,7 +592,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -753,7 +757,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(respBody)
 		return
 	}
-	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -880,20 +884,21 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 // ── Serve-proof signing ─────────────────────────────────────────────────────
 
 // serveProofDeadlineWindow is how long (seconds) a serve-proof stays
-// submittable on chain after issuance — the buyer must call giveFeedback
-// before it lapses.
+// submittable on chain after issuance — the buyer must redeem it
+// (VerifiedFeedbackRegistry.attestFeedback / attestFeedbackWithTask) before
+// it lapses.
 const serveProofDeadlineWindow = 3600
 
-// serveProof is the canonical envelope signed by agent_seal_priv and packed
-// into X-Agent-Proof. It mirrors the on-chain
-// AgenticIDReputationRegistry.ServeProof tuple (minus the signature, which
-// travels alongside in the header). It is bound to a single redeemer via
-// `submitter` — the address the client declared in the X-Client-Address
-// request header — so a copied proof can't be front-run or spent by anyone
-// else. The chain id and identity-registry address are also part of the
-// signed digest (cross-chain / cross-deployment separation) but are NOT
-// carried in the envelope: the contract derives them from block.chainid and
-// its own storage, and the SDK from its configured deployment.
+// serveProof is the envelope packed into X-Agent-Proof next to the agentSeal
+// signature. It mirrors the on-chain VerifiedFeedbackRegistry ServeProof tuple
+// (minus the signature, which travels alongside in the header). It is bound to
+// a single redeemer via `submitter` — the address the client declared in the
+// X-Client-Address request header — so a copied proof can't be front-run or
+// spent by anyone else. The chain id and identity-registry address are also
+// part of the signed digest (cross-chain / cross-deployment separation) but
+// are NOT carried in the envelope: the contract derives them from
+// block.chainid and its own storage, and the SDK from its configured
+// deployment.
 //
 //	agent_id       : on-chain token id (uint256 decimal string)
 //	submitter      : the only address allowed to redeem this proof (0x0 if the
@@ -906,6 +911,10 @@ const serveProofDeadlineWindow = 3600
 //	                 against AgenticID.intelligentDatasOf); dims not yet on chain
 //	                 are omitted
 //	framework_hash : the sealed image measurement (AgenticID Framework code)
+//	validator      : the VerifiedFeedbackRegistry (proxy) address the signature
+//	                 is bound to — diagnostics only, NOT a ServeProof tuple
+//	                 field. A verifier compares it with the registry it will
+//	                 redeem at; a mismatch means the proof can't verify there.
 type serveProof struct {
 	AgentID       string   `json:"agent_id"`
 	Submitter     string   `json:"submitter"`
@@ -914,6 +923,7 @@ type serveProof struct {
 	TaskHash      string   `json:"task_hash"`
 	DataHashes    []string `json:"data_hashes"`
 	FrameworkHash string   `json:"framework_hash"`
+	Validator     string   `json:"validator"`
 }
 
 // clientAddressHeader is the request header a client sets to declare the
@@ -925,22 +935,27 @@ const clientAddressHeader = "X-Client-Address"
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// The signature is over keccak256(abi.encode(chainId, identityRegistry,
-// submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)), wrapped EIP-191 —
-// exactly what AgenticIDReputationRegistry._verifyServeProof checks. chainId +
+// The signed digest is serveProofDigest(validator, serveProofHash(...)) —
+// exactly what VerifiedFeedbackRegistry._verifyServeProof checks. chainId +
 // identityRegistry give cross-chain / cross-deployment separation; submitter
-// (declared by the client in X-Client-Address) binds the proof to one redeemer.
+// (declared by the client in X-Client-Address) binds the proof to one
+// redeemer; validator (the registry proxy) binds the signature to the one
+// contract that redeems it, in a signing domain the sign socket never
+// produces (see sign.go).
 //
 // When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
-// empty, e.g. local dev without a chain), the body is written without a proof
-// header — a reputation proof would be meaningless.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr string) error {
+// empty, e.g. local dev without a chain), or no usable validator
+// (VERIFIED_FEEDBACK_ADDR unset, malformed or zero), the body is written
+// without a proof header — a reputation proof would be meaningless, and there
+// is deliberately no fallback to the legacy personal_sign wrap.
+func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
 	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
 	chainIDBig, chainOK := new(big.Int).SetString(chainID, 10)
 	fwBytes, fwErr := hexToBytes32(frameworkHash)
-	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 {
-		// No on-chain identity — serve the body without a serve-proof.
+	validatorAddr, validatorOK := parseValidator(validator)
+	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK {
+		// No on-chain identity (or nothing to bind the proof to) — serve the
+		// body without a serve-proof.
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(statusCode)
@@ -995,38 +1010,22 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 		TaskHash:      "0x" + hex.EncodeToString(taskHash),
 		DataHashes:    dhHex,
 		FrameworkHash: frameworkHash,
+		Validator:     "0x" + hex.EncodeToString(validatorAddr.Bytes()),
 	}
 	proofJSON, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal serve-proof: %w", err)
 	}
 
-	// abi.encode of (uint256 chainId, address identityRegistry, address submitter,
-	// uint256 agentId, uint256 timestamp, uint256 deadline, bytes32 taskHash,
-	// bytes32 dataHashesHash, bytes32 frameworkHash) — all static 32-byte words,
-	// so it's a plain concatenation.
-	encoded := bytes.Join([][]byte{
-		word256(chainIDBig),
-		addrWord(identityAddr),
-		submitterWord,
-		word256(agentIDBig),
-		word256(big.NewInt(now)),
-		word256(big.NewInt(deadline)),
-		taskHash,
-		crypto.Keccak256(packed),
-		fwBytes,
-	}, nil)
-	proofHash := crypto.Keccak256(encoded)
-
-	// EIP-191: keccak256("\x19Ethereum Signed Message:\n32" || proofHash),
-	// matching OpenZeppelin MessageHashUtils.toEthSignedMessageHash(bytes32).
-	ethHash := crypto.Keccak256([]byte("\x19Ethereum Signed Message:\n32"), proofHash)
+	proofHash := serveProofHash(chainIDBig, addrWord(identityAddr), submitterWord,
+		agentIDBig, now, deadline, taskHash, packed, fwBytes)
+	digest := serveProofDigest(validatorAddr, proofHash)
 
 	privKey, err := crypto.ToECDSA(priv)
 	if err != nil {
 		return fmt.Errorf("agent priv: %w", err)
 	}
-	sig, err := crypto.Sign(ethHash, privKey)
+	sig, err := crypto.Sign(digest, privKey)
 	if err != nil {
 		return fmt.Errorf("sign: %w", err)
 	}
@@ -1042,6 +1041,59 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	return nil
 }
 
+// serveProofHash is the inner ServeProof hash, keccak256(abi.encode(chainId,
+// identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)). Every field is a
+// static 32-byte word, so abi.encode is a plain concatenation. identityRegistry
+// and submitter are abi address words (addrWord); dataHashesPacked is
+// abi.encodePacked(bytes32[]) — the on-chain roots back to back.
+//
+// Consensus-critical: byte-identical to VerifiedFeedbackRegistry, the SDK
+// (sdk/typescript/src/ServeProof.ts), the attestor console's say-hi check and
+// attestor/scripts/verify-agent.sh check 3b (the five copies in AGENTS.md).
+func serveProofHash(chainID *big.Int, identityRegistry, submitter []byte, agentID *big.Int, timestamp, deadline int64, taskHash, dataHashesPacked, frameworkHash []byte) []byte {
+	return crypto.Keccak256(bytes.Join([][]byte{
+		word256(chainID),
+		identityRegistry,
+		submitter,
+		word256(agentID),
+		word256(big.NewInt(timestamp)),
+		word256(big.NewInt(deadline)),
+		taskHash,
+		crypto.Keccak256(dataHashesPacked),
+		frameworkHash,
+	}, nil))
+}
+
+// serveProofDigest is what agent_seal_priv actually signs (raw, no further
+// wrap): EIP-191 version 0x00, "data with intended validator",
+//
+//	keccak256(0x19 ‖ 0x00 ‖ validator (20 bytes) ‖ proofHash (32 bytes))
+//
+// matching OpenZeppelin MessageHashUtils.toDataWithIntendedValidatorHash(
+// address(this), abi.encodePacked(proofHash)) inside VerifiedFeedbackRegistry,
+// whose address(this) is its proxy. This is the FIND-01 fix: the sign socket
+// can only produce 0x19 0x45 (personal_sign), 0x19 0x01 (EIP-712) and
+// transaction preimages, so no signature the agent can request there is a
+// valid ServeProof signature. The legacy toEthSignedMessageHash wrap is
+// rejected on chain — never sign it here.
+func serveProofDigest(validator common.Address, proofHash []byte) []byte {
+	return crypto.Keccak256([]byte{0x19, 0x00}, validator.Bytes(), proofHash)
+}
+
+// parseValidator parses the VerifiedFeedbackRegistry (proxy) address a
+// serve-proof is bound to. Empty, malformed and the zero address all mean "no
+// validator": a proof bound to none would verify nowhere, and the caller takes
+// the no-proof path rather than falling back to any other wrap.
+func parseValidator(s string) (common.Address, bool) {
+	s = strings.TrimSpace(s)
+	if !common.IsHexAddress(s) {
+		return common.Address{}, false
+	}
+	a := common.HexToAddress(s)
+	return a, a != (common.Address{})
+}
+
 // word256 left-pads a non-negative big.Int to a 32-byte big-endian word.
 func word256(x *big.Int) []byte {
 	out := make([]byte, 32)
@@ -1050,14 +1102,18 @@ func word256(x *big.Int) []byte {
 }
 
 // addrWord left-pads a hex address (with or without "0x") into a 32-byte abi
-// word, matching Solidity's abi.encode(address). An empty or unparseable input
-// yields the zero word — the sentinel for "no redeemer declared".
+// word, matching Solidity's abi.encode(address). Anything that is not exactly
+// a 20-byte hex address — empty, malformed, or an over-long client-supplied
+// X-Client-Address — yields the zero word, the sentinel for "no redeemer
+// declared". (Parsing it as an integer instead panicked past 32 bytes and
+// signed a non-address word for 21–32-byte values, while the envelope echoed
+// only the low 20 bytes — an unredeemable proof.)
 func addrWord(hexAddr string) []byte {
-	v, ok := new(big.Int).SetString(strings.TrimPrefix(strings.TrimSpace(hexAddr), "0x"), 16)
-	if !ok {
-		v = big.NewInt(0)
+	out := make([]byte, 32)
+	if s := strings.TrimSpace(hexAddr); common.IsHexAddress(s) {
+		copy(out[12:], common.HexToAddress(s).Bytes())
 	}
-	return word256(v)
+	return out
 }
 
 // hexToBytes32 parses a "0x"-prefixed 32-byte hex string.

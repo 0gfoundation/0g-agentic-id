@@ -1,7 +1,8 @@
 /**
  * Proof-jar behavior pins (CLI rating tickets): expired entries pruned on
  * load, the per-(agent,wallet) cap enforced, burn-by-signature removes only
- * the spent ticket, and the bigint round-trip through JSON is lossless.
+ * the spent ticket, and the bigint round-trip through JSON is lossless
+ * (including the optional envelope `validator`).
  */
 
 import { test } from 'node:test';
@@ -89,4 +90,11 @@ test('removeProof burns exactly the spent ticket', () => {
   const left = listProofs(777n, WALLET);
   assert.equal(left.length, 1);
   assert.equal(left[0].proof.signature, keep.signature);
+});
+
+test('the envelope validator round-trips when present (rate tells registry mismatch from a bad ticket)', () => {
+  const p = { ...mkProof({ agentId: 555n }), validator: '0x0000000000000000000000000000000000000aaa' };
+  saveProof(p, TASK, 'http://a');
+  const [t] = listProofs(555n, WALLET);
+  assert.deepEqual(toServeProof(t), p);
 });

@@ -16,6 +16,10 @@ OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 \
 It deploys a fresh source, then runs verify-agent → agent-e2e →
 evolution-probe → lifecycle-e2e → transfer-live against it. The
 individual scripts below are the building blocks it calls.
+`VERIFIED_FEEDBACK_ADDR` must equal the attestor's `GET /config`
+`verified_feedback_addr`: that is the ServeProof validator its containers
+sign for, so any other registry rejects every proof (the script aborts
+on a mismatch before spending gas).
 
 Last verified on the -dev testnet: **3 consecutive full rounds green**
 (~13 min each), absorbing live 0G-Storage / KMS / indexer jitter without
@@ -101,7 +105,8 @@ API=http://<attestor>:8080
 # 1. preflight — health, config sanity, and the KMS self-check already
 #    passed if the binaries are up at all (they refuse to boot otherwise)
 curl -s $API/health                                    # "ok"
-curl -s $API/config | jq '{sandbox_snapshot, frameworks}'
+curl -s $API/config | jq '{sandbox_snapshot, frameworks, verified_feedback_addr}'
+# verified_feedback_addr null ⇒ containers emit no X-Agent-Proof (step 3 fails)
 
 # 2. deploy (snapshot is read from /config — never hardcode it)
 OWNER_PRIV=0x<funded key> API=$API bash scripts/e2e.sh # → PASS — phase=running
@@ -133,7 +138,9 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
 # indexer owner sync, and the post-transfer owner gate (old owner
 # rejected, new owner can recreate). Needs VERIFIED_FEEDBACK_ADDR = the
 # VerifiedFeedbackRegistry bound to this AgenticID (the canonical 8004
-# reputation registry is discovered from it). FEEDBACK_BATCHER_ADDR is
+# reputation registry is discovered from it) — the same address as /config
+# verified_feedback_addr, the validator the containers sign ServeProofs
+# for (a different one rejects every proof). FEEDBACK_BATCHER_ADDR is
 # optional: set → the feedback leg goes through the atomic EIP-7702 path;
 # unset → the script falls back to the attestor /config's advertised value,
 # and to the sequential two-tx flow when that is absent too.
@@ -182,8 +189,19 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
 2. **decrypt health** — the sealed bootstrap log has one `decrypted` per
    iData entry and zero `FAIL` lines;
 3. **serve-proof** — `/hello` returns 200 with an `X-Agent-Proof` header
-   whose payload names this agent. (Full signature recovery: paste the
-   agent URL into the console's say-hi verifier, or SDK `sayHi()`.)
+   whose envelope names this agent, and (with `cast`) the signature
+   recovers to the seal address over the EIP-191 version-0x00 digest bound
+   to `/config` `verified_feedback_addr` — the check the registry makes,
+   gas-free. An envelope `validator` other than that address fails as
+   "proof signed for a different registry"; no `validator` plus a failed
+   recovery means a sealed image from before the VerifiedFeedbackRegistry
+   1.2.0 cut (the owner must `/reset`). The console's say-hi verifier and
+   SDK `sayHi()` (0.2.0+) run the same recovery.
+
+`bash scripts/verify-agent.sh --kat` checks step 3's digest offline against
+the cross-implementation known-answer vector (`cast` + `jq` only, no attestor
+or agent); the SDK's `npm test` runs it, and the console's copy, from
+`test/serveproof-copies.test.mjs`.
 
 **4. recreate determinism** (the check that guards KMS key stability):
 reset the agent (console button, or SDK `reset({snapshot, apiKey})`),

@@ -80,7 +80,7 @@ export {
   signServeProof,
   verifyServeProofSignature,
 } from './ServeProof';
-export type { BuildServeProofHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
 
 // ── Types ──
 export type {

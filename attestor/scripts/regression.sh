@@ -11,7 +11,10 @@
 #                    fine — the checks don't exercise the model)
 #   VERIFIED_FEEDBACK_ADDR  VerifiedFeedbackRegistry bound to this AgenticID
 #                    (canonical 8004 reputation registry is discovered from
-#                    it); if unset, the feedback/lifecycle leg is skipped
+#                    it); if unset, the feedback/lifecycle leg is skipped.
+#                    Must equal /config verified_feedback_addr (the
+#                    validator containers sign ServeProofs for) — a mismatch
+#                    aborts before any gas is spent
 #   FEEDBACK_BATCHER_ADDR  optional EIP-7702 batcher for the atomic feedback
 #                    path; unset falls back to /config, then to two txs
 #   RUN_UNIT=1       also run the free T0 suites (cargo/go) first
@@ -48,6 +51,17 @@ step() { # step "name" cmd...
   if "$@"; then NAMES+=("$name"); RESULTS+=("PASS"); else NAMES+=("$name"); RESULTS+=("FAIL"); fi
 }
 skip() { NAMES+=("$1"); RESULTS+=("SKIP"); printf '\n── %s: SKIPPED (%s) ──\n' "$1" "$2"; }
+
+# ── ServeProof validator sanity (free) ───────────────────────────────
+# Containers sign ServeProofs for /config's verified_feedback_addr only; a
+# different registry would reject every proof the feedback leg submits.
+if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
+  CFG_VF=$(curl -fsS "$API/config" | jq -r '.verified_feedback_addr // empty')
+  if [ "$(echo "$CFG_VF" | tr '[:upper:]' '[:lower:]')" != "$(echo "$VERIFIED_FEEDBACK_ADDR" | tr '[:upper:]' '[:lower:]')" ]; then
+    echo "VERIFIED_FEEDBACK_ADDR=$VERIFIED_FEEDBACK_ADDR != /config verified_feedback_addr=${CFG_VF:-<unset>} — aborting"
+    exit 1
+  fi
+fi
 
 # ── SDK build (needed by the .cjs legs) ───────────────────────────────
 if [ ! -f "$SDK/dist/index.js" ]; then

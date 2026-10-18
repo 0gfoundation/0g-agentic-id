@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 209 tests / 22 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 235 tests / 25 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -252,14 +252,28 @@ struct ServeProof {
 }
 ```
 
-签名内容（域 + submitter 双重绑定：跨链/跨部署不可移植，跨钱包不可转让）：
+签名内容（域 + submitter + 注册表三重绑定：跨链/跨部署不可移植，跨钱包不可转让，只能在唯一一个注册表兑现）：
 ```
-inner = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
-                             agentId, timestamp, deadline, taskHash,
-                             keccak256(abi.encodePacked(dataHashes)),
-                             frameworkHash))
-signature = personal_sign(inner, agentSeal_priv)
+inner     = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
+                                 agentId, timestamp, deadline, taskHash,
+                                 keccak256(abi.encodePacked(dataHashes)),
+                                 frameworkHash))
+digest    = keccak256(0x19 ‖ 0x00 ‖ verifiedFeedbackRegistry ‖ inner)   // EIP-191 version 0x00
+signature = sign(digest, agentSeal_priv)                               // 直接签 digest——不再套一层 EIP-191
 ```
+
+`verifiedFeedbackRegistry` 是 `VerifiedFeedbackRegistry` 的 **proxy** 地址，即
+EIP-191 的 "intended validator"（链上实现：
+`MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`）。
+sealed 运行时从 `VERIFIED_FEEDBACK_ADDR` 得知该地址——由 attestor 在创建 sandbox
+时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入；未设置或非法 → 容器干脆不出
+proof。自 `VerifiedFeedbackRegistry` 1.2.0 起它取代旧的 `personal_sign(inner)`
+包装，旧格式一律**拒绝**——硬切换、无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
+该 digest 属于共识关键：五份副本各自独立实现——合约、`sealed/internal/proxy/`、
+SDK 的 `ServeProof.ts`、attestor 控制台的 say-hi 校验和
+`attestor/scripts/verify-agent.sh`（清单维护在根目录 [`AGENTS.md`](../AGENTS.md)）
+——并都钉同一组已知答案向量（`VerifiedFeedback.t.sol`
+`test_serveProofDigest_knownAnswerVector`）。
 
 ### 链上提交——client 两笔调用（SDK 打包成一步）
 
@@ -285,16 +299,31 @@ VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, serveProof);
 
 `attestFeedback` 校验的事：
 1. `agentId == proof.agentId`，且 `proof.submitter == msg.sender`（只有声明的 client 能兑——堵抢跑/盗用）
-2. 重建 `inner`，ecrecover 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名
-3. 调用者不是 agent owner 或被授权 operator（对照**本地** AgenticID 的 owner——canonical 注册表自己查不了，它眼里每个托管 token 的 owner 都是 AgenticID 合约）
+2. 重建 `inner`，按 `toDataWithIntendedValidatorHash(address(this), inner)` 包装（EIP-191 version 0x00，validator 为本注册表 proxy），ecrecover 该 digest 后和 `IAgenticID.getAgentSeal(agentId)` 比较 → 过签名。旧的 `personal_sign` 包装 proof 会 revert `VerifiedFeedbackInvalidProofSignature`
+3. 调用者不是 agent owner、被授权 operator，也不是该 agent 自己的 `agentSeal`（owner/operator 对照**本地** AgenticID 的 owner——canonical 注册表自己查不了，它眼里每个托管 token 的 owner 都是 AgenticID 合约）。这是 ERC-8004 合规检查，不是防 sybil——见下文残余风险
 4. canonical 条目 `(agentId, msg.sender, feedbackIndex)` 存在且尚无章
 5. 通过 NonceRegistry 登记 `key = keccak256("SERVEPROOF", agentId, signature)`，同时校验 `deadline`（每张 proof 只能兑一次）
 6. 存下 proof 的 `dataHashes` / `frameworkHash`，emit `FeedbackVerified`
 
-**防 sybil 的核心**：没有 agentSeal 就没有有效的 ServeProof，而 agentSeal_priv
-只有 Agent TEE 持有。canonical 注册表是 permissionless 的——谁都能往里写未验证
-的 feedback——但没有真实服务调用就拿不到验证章。在乎真伪的读方拿章的集合和
-canonical 条目做交集。
+**防 sybil 的核心**建立在两个前提上：只有 Agent TEE 持有 `agentSeal_priv`，
+**并且** TEE 内没有任何东西会按需签 ServeProof digest。第二条并不能由第一条推出——
+sealed 的 **sign socket**（`/sign/personal_sign`、`/sign/typed_data`、
+`/sign/transaction`）允许 agent 进程用 agentSeal 签名。它的原像只有
+`0x19 0x45…`（personal_sign）、`0x19 0x01…`（EIP-712），或由 socket 按字段自行
+构造的交易编码——从不签裸 hash，也从不签 EIP-191 version `0x00`。由于 digest 是
+`0x19 0x00 ‖ registry ‖ inner`，agent 无法离线伪造 ServeProof 内容。（1.2.0 之前
+digest 是 `personal_sign(inner)`，socket 对任意 32 字节消息都会签出它——审计
+FIND-01。）这条 socket 不变量是承重的：给 socket 加上裸 hash 或 version `0x00`
+签名能力，就会重新打开伪造口子。
+
+canonical 注册表是 permissionless 的——谁都能往里写未验证的 feedback——但验证章
+需要一张 TEE 真实签发的 proof。在乎真伪的读方拿章的集合和 canonical 条目做交集。
+
+**残余风险（上述机制不覆盖）**：agent——或其 owner——仍可以带着自己控制的
+`X-Client-Address` 向自己的 proxy（如 loopback `:8080`，或公开的 `/hello`）发
+请求，拿到*真实*的 proof，再从那个钱包兑现。owner / operator / agentSeal 防自评
+检查拦不住这种做法——一个新钱包（哪怕是 seal 出资的）就能通过。这是已文档化的
+sybil 类问题，所以 `getVerifiedSummary` 要求调用方显式给出信任的 client 列表。
 
 ### 其他操作
 
@@ -305,12 +334,17 @@ canonical 条目做交集。
 - `isVerified(agentId, client, idx)` —— 这条 canonical 条目有没有章？
 - `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` —— 枚举已验证集合
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` —— 聚合指定 client 的**已验证** canonical 条目（值实时从 canonical 读取；跳过 revoked；求和 + 计数，归一到固定 18 decimals；`clients` 必须非空——由调用方决定信谁）。仅限链下 `eth_call`。
-- `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag。
+- `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag。reveal 必须满足：method 在已知 HTTP 集合内、URI 以 `/` 开头、`statusCode` 在 **100..999**（恰好三位数——Go `net/http` 的输出范围），否则 revert `VerifiedFeedbackInvalidTaskReveal`。否则 packed 原像有歧义：一两位数的 status 能让 reveal 把正文哈希的字节挪进 URI，记下一个调用从未访问过的接口（审计 FIND-02，1.2.0 起强制）。
 - `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
 
-> **已废弃**：先前的私有分叉（`AgenticIDReputationRegistry`，proof 门禁的
-> `giveFeedback` + 自有 feedback 存储）被这套拆分取代。存量环境上它仍在运行、
-> 源码保留在仓库，但新部署只带 `VerifiedFeedbackRegistry`。
+> **已废弃——必须暂停**：先前的私有分叉（`AgenticIDReputationRegistry`，proof
+> 门禁的 `giveFeedback` + 自有 feedback 存储）被这套拆分取代。存量的 test 和 dev
+> 环境上它仍在运行（mainnet 从未部署）、源码保留在仓库，但新部署只带
+> `VerifiedFeedbackRegistry`。它仍按**旧的** `personal_sign(inner)` digest 验签——
+> agent 进程可经 sign socket 对任意 `inner` 拿到这种签名——所以它接受的 feedback
+> 可被伪造。其 pauser 必须在 `VerifiedFeedbackRegistry` 1.2.0 切换之前（或同时）
+> 对每个在线实例调用 `pause()`。1.2.0 的注册表绑定 proof 在它上面验不过，所以同一
+> 张 proof 不再能两边各兑一次。
 
 ---
 
@@ -463,13 +497,13 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 - **mint 对称性**：`register` 和 `registerWithSeal` 都 emit `ITransferred(0x0, to, agentId, entries[])`，indexer 对 mint 和 transfer 统一处理。
 - **dataKey 只在 TEE 内流动**：attestor 生成后丢弃、Agent TEE 持有、Oracle TEE 转让时短暂持有后丢弃。链上只见 sealedKey 密文。
 - **Oracle 加密 pubkey 在 TappRegistry**：通过 0g-Tapp 的 `TappRegistry` 合约（外部依赖、已上线）的 `getNode` / `getNodeList` 视图发布，不进 `TEEDataVerifier` 存储，保持 verifier 简洁。Agent TEE 转让时直接查 registry。
-- **8004 兼容在两条轴上都是 canonical 的**。身份托管绑定 canonical Identity Registry（0x8004… 单例），8004 身份工具原生看到 AgenticID agent。Feedback 由 client **直接提交到 canonical Reputation Registry**（per-client 归因原生、所有 8004 工具可读），本地 `VerifiedFeedbackRegistry` 叠加 TEE 层：给有 ServeProof 背书的 canonical 条目盖章并存审计数据。在乎真伪的读方做交集；不在乎的读方照常拿标准 8004 声誉。身份的无参 `register()` overload 仍**有意禁用**（注册必须携带 IntelligentData）。先前的私有声誉分叉（`AgenticIDReputationRegistry`）**已废弃**——存量环境仍在运行，新部署不再包含。目标 ERC-8004 修订版：**2026-01-25**。
+- **8004 兼容在两条轴上都是 canonical 的**。身份托管绑定 canonical Identity Registry（0x8004… 单例），8004 身份工具原生看到 AgenticID agent。Feedback 由 client **直接提交到 canonical Reputation Registry**（per-client 归因原生、所有 8004 工具可读），本地 `VerifiedFeedbackRegistry` 叠加 TEE 层：给有 ServeProof 背书的 canonical 条目盖章并存审计数据。在乎真伪的读方做交集；不在乎的读方照常拿标准 8004 声誉。身份的无参 `register()` overload 仍**有意禁用**（注册必须携带 IntelligentData）。先前的私有声誉分叉（`AgenticIDReputationRegistry`）**已废弃**——存量环境仍在运行，新部署不再包含；它仍接受旧的 ServeProof digest，必须暂停（§5）。目标 ERC-8004 修订版：**2026-01-25**。
 
 ---
 
 ## 9. 测试
 
-209 个 Foundry tests / 22 suites（207 通过，2 个 fork 测试未设 `FORK_RPC`
+235 个 Foundry tests / 25 suites（233 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -480,9 +514,9 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
-| `VerifiedFeedback.t.sol` | 27 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评 / 对着 canonical mock 的 verified summary |
-| `FeedbackBatcher.t.sol` | 6 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用 |
-| `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签 + revoke / appendResponse 全路径（含跨实现 digest 已知答案向量）|
+| `VerifiedFeedback.t.sol` | 36 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、agentSeal）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界与 status-0 错位切分伪造 / 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式）|
+| `FeedbackBatcher.t.sol` | 8 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用、已委托 EOA 仍能收 ETH / safeMint 的 NFT |
+| `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签（旧 personal_sign digest）+ revoke / appendResponse 全路径（含 inner hash 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
@@ -492,18 +526,24 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Upgradeable.t.sol` | 9 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
 | `CanonicalBinding.t.sol` | 9 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id |
 | `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
+| `UpgradeVerifiedFeedback.t.sol` | 3 | VerifiedFeedbackRegistry 经 Timelock 从 1.1.0 升到 1.2.0（升级前 impl = `test/mocks/` 里冻结的 1.1.0 源码）：章 / 审计数据 / 接口 / 配置 / nonce 均保留；切换后旧格式 proof 被拒、注册表绑定 proof 通过 |
+| `CloneGate.t.sol` | 20 | policy 模式克隆卫星合约：setCloneAuthorizer 门禁 / cloneFrom 正常路径 + 全部 revert（attestor、无/拒绝/自身 revert 的 authorizer、arity、sealId、暂停）/ 转让时按 owner-at-set 失效 / lineage |
+| `StandardCloneAuthorizer.t.sol` | 10 | 官方按买家开关的克隆 policy：仅卖家可 grant/revoke、按 agent 隔离、转让后 grant 失效且收回后复活、经 gate 克隆 |
+| `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
 | `StorageLayout.t.sol` | 2 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）|
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
 | `CanonicalForkIntegration.t.sol` | 2 | 对着线上 canonical 注册表 self-mint + verified-feedback attest（仅设了 `FORK_RPC` 才跑，否则跳过）|
 
-共享 scaffolding 在 `test/AgenticIDTestBase.sol`：两种 EIP-191 变体
-（hex-encoded 用于 transfer proof，raw-32-byte 用于 ServeProof / wallet sig）、
+共享 scaffolding 在 `test/AgenticIDTestBase.sol`：三种 EIP-191 变体
+（hex-encoded 用于 transfer proof；raw-32-byte `personal_sign` 用于已废弃分叉的
+ServeProof，也作为被拒的旧格式；version `0x00` intended-validator 用于
+`VerifiedFeedbackRegistry` 的 ServeProof）、
 proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写业务断言。
 
 
 ## 10. 进一步阅读
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** —— 部署 / 升级 / Etherscan verify 全套
-  runbook（11 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
+  runbook（15 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
   Galileo testnet 参考地址）。

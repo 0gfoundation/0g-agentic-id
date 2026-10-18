@@ -400,6 +400,10 @@ type RuntimeContext struct {
 	ContractAddr string // AgenticID (identity registry) address; signed into serve-proof domain
 	ChainID      string // chain id (decimal); signed into serve-proof domain separation
 	AttestorURL  string // attestor endpoint URL
+	// VerifiedFeedbackRegistry proxy address (VERIFIED_FEEDBACK_ADDR): the
+	// EIP-191 v0x00 intended validator every serve-proof signature is bound
+	// to. Empty when unset/unusable — the proxy then signs no serve-proofs.
+	VerifiedFeedbackAddr string
 	// There is deliberately no thinking level here. It used to ride this
 	// struct, arriving as SEAL_OWNER_THINKING in the sandbox env — and that
 	// is precisely why it had to leave: RuntimeContext is captured once at

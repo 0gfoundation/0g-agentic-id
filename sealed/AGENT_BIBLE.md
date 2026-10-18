@@ -103,6 +103,8 @@ Endpoints (all POST, all JSON):
   Body: `{chain_id, nonce, to, value, data, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, type}` (type defaults to `"dynamic"` for EIP-1559; use `"legacy"` with `gas_price` for legacy chains).
   Returns: `{"raw_tx", "tx_hash", "address", "signature"}`.
 
+These are the only three shapes the socket signs: an EIP-191 `0x19 0x45` personal message, an EIP-712 `0x19 0x01` digest, or a transaction it assembles from the fields. It has no raw-hash signing and no EIP-191 version `0x00` (intended-validator) signing, by design: that is the domain your serve-proofs are signed in, so nothing you sign here can stand in for one.
+
 Example (curl over unix socket):
 
     curl --unix-socket "$SEAL_SIGN_SOCK" \
@@ -114,7 +116,7 @@ Example (curl over unix socket):
 
 - A contract caller / verifier requires `msg.sender == AGENT_SEAL` or checks an EIP-712 signature against `AGENT_SEAL`.
 - You need an off-chain claim that a third party can verify came from a legitimate TEE runtime (not just "the agent says so").
-- Note: serve-proof headers on responses through `AGENT_PUBLIC_URL` are signed automatically by the runtime using agentSeal; you do not need to call these endpoints for that case.
+- Note: serve-proof headers on responses through `AGENT_PUBLIC_URL` are signed automatically by the runtime using agentSeal; you do not need to call these endpoints for that case, and they cannot produce one.
 
 ### What NOT to do with agentSeal
 
@@ -134,7 +136,7 @@ To read the value at runtime, run `printenv AGENT_PUBLIC_URL` with your framewor
 
 Service exposure is a runtime capability, not a framework feature, and registering through the runtime is the ONLY attributable way to serve external callers. You run the backend; the runtime fronts and signs it. You decide the rest — language, port, what it does — so this is the contract, not a script.
 
-**The contract:** run an HTTP server bound to loopback, then POST your service list to `$SEAL_SIGN_SOCK/services` (the signing socket). Each entry is `{ path, method, description, input_example, backend }`. The runtime routes `${AGENT_PUBLIC_URL}<path>` to your `backend`, signs every response with `X-Agent-Proof`, and lists the service in `/hello` — that IS discovery; there is no manifest file. (`/hello` is where callers see *what* you offer; `/api/...` is where they *call* it.)
+**The contract:** run an HTTP server bound to loopback, then POST your service list to `$SEAL_SIGN_SOCK/services` (the signing socket). Each entry is `{ path, method, description, input_example, backend }`. The runtime routes `${AGENT_PUBLIC_URL}<path>` to your `backend`, signs every response with `X-Agent-Proof` (when `VERIFIED_FEEDBACK_ADDR` is configured), and lists the service in `/hello` — that IS discovery; there is no manifest file. (`/hello` is where callers see *what* you offer; `/api/...` is where they *call* it.)
 
 **Facts you can't infer, so hold them:**
 
@@ -153,7 +155,7 @@ Before you rely on a service, exercise your backend directly, then confirm throu
 
 ### Trust contract
 
-Every response through `AGENT_PUBLIC_URL` is signed with an `X-Agent-Proof` header (an agentSeal EIP-191 signature over the canonical request/response envelope) — whether served by your registered backend or by the runtime itself. Verifiers reject responses without it. Direct users only to `AGENT_PUBLIC_URL`.
+Responses on the signed routes through `AGENT_PUBLIC_URL` — your registered `/api/*` services and the runtime's own endpoints such as `/hello` — carry an `X-Agent-Proof` header (an agentSeal signature under EIP-191 version `0x00`, bound to the VerifiedFeedbackRegistry, over a serve-proof that commits to the request/response transcript, your on-chain data hashes and the framework hash) whenever the runtime has a VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`). The framework's own chat/UI routes are never signed. Verifiers reject responses without it. Direct users only to `AGENT_PUBLIC_URL`.
 
 ### Persistent state
 

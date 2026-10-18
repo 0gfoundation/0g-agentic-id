@@ -1199,8 +1199,18 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Free pre-check before spending gas.
         const v = await ag.reputation.verifyProof(proof);
         if (!v.ok) {
-          removeProof(ticket.proof.signature);
-          out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+          // Burn only on a defect of the ticket itself (bad signature, expired,
+          // data not on chain). No registry configured / a different registry
+          // is this side's configuration: the ticket may still redeem once
+          // that is fixed, so keep it.
+          const ticketDefect = !v.notExpired || !v.dataOnChain || (v.registryMatches && !v.signerMatches);
+          if (ticketDefect) {
+            removeProof(ticket.proof.signature);
+            out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+          } else {
+            out(`serve-proof not verifiable in this environment (${v.reasons.join(', ')}) — ticket kept\n` +
+                `  → check the attestor's verified_feedback_addr / AGENTIC_VERIFIED_FEEDBACK_ADDR\n`);
+          }
           continue;
         }
 
@@ -1497,7 +1507,10 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
   } = {};
   try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
-  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  const proofLine = valid
+    ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
+    : '(no proof header)';
+  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
   if (body.services?.length) {
     out('services:\n');
