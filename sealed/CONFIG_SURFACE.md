@@ -282,7 +282,7 @@ flight could keep a valid signature while substituting a different document
 (`internal/proxy/settings.go:18`) — an unbounded read on an owner-facing route
 is an easy denial.
 
-The applier `main.go` registers (`main.go:709`) does three things in a fixed
+The applier `main.go` registers (`main.go:775`) does three things in a fixed
 order: swap the in-force document, render it, restart the framework process —
 **and roll the swap back if the render fails**, so a document that cannot be
 rendered never becomes the one the next crash-restart picks up. A document
@@ -322,7 +322,7 @@ itself into a state it will not boot from, which is how agent 3586004 bricked
 itself by hand-editing its framework config
 (`internal/proxy/settings.go:120-129`). If a render of the agent's document
 fails, `main.go` re-renders the owner's, so a rejected attempt cannot leave the
-framework half-configured (`main.go:726-734`).
+framework half-configured (`main.go:792-800`).
 
 ## 6. Where each framework reads it — `RenderSettings`
 
@@ -443,7 +443,7 @@ Every accepted change restarts the framework process. There is no ladder:
 
 - `manager.StartParams.PreStart` (`internal/manager/manager.go:122`) runs the
   render immediately before EVERY `adapter.Start` — the first one, a `Reload`,
-  and a crash-restart alike. `main.go:694` points it at
+  and a crash-restart alike. `main.go:760` points it at
   `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`.
 - Both push paths render and then call `manager.Reload`, which is Stop+Start.
 - `framework.Reloadable` is still declared and still consumed by nothing
@@ -565,9 +565,9 @@ always owed its own first attempt (`traits.rs` (`flip_stale_heartbeats`), `:467`
 
 An agent minted before the channel has its pin in a chain role no adapter
 declares any more. Bootstrap Phase C hands every chain entry whose role is
-outside `Roles()` to `HandleLegacy` (`main.go:572-581`), and the optional
+outside `Roles()` to `HandleLegacy` (`main.go:636-645`), and the optional
 `framework.LegacySettingsSeeder` (`framework.go:321`) is how an adapter hands
-what it recovered back to the platform. `main.go:598-609` consults the seeder
+what it recovered back to the platform. `main.go:662-675` consults the seeder
 **only** when the provisioned document names no model — so a real document
 always outranks a recovery — and persists what it gets with
 `report.SeedSettings` (`internal/report/report.go:86`).

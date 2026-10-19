@@ -14,7 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
-| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:115-118`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
+| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:116-119`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -22,14 +22,30 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 
 `main.go` 的 5 个 phase 严格按顺序走。某个 phase 失败**不会**把容器带下去：
 `runMainPipeline` 记日志、上报 attestor、然后返回，`:8080` 继续服务
-`/healthz` 和 `/log` 供诊断（`main.go:176-181`）。两个 listener —— 对外
+`/healthz` 和 `/log` 供诊断（`main.go:200-202`）。两个 listener —— 对外
 `:8080` mux 和 `/run/seal-sign.sock` unix socket —— 在 Phase 1 **之前**就已经
 起来了；在 `agent_seal_priv` 落进 `state.Agent` 之前，handler 一律回 503
-（`main.go:146-148`）。
+（`main.go:147-149`）。
+
+Phase 0 和 Phase 1 之间有一道闸：`provisionGate`（`main.go:177-198`）。
+`ATTESTOR_URL` 或链相关 env 没设（本地开发）时它跳过整条流水线；
+`privsep.Required` 失败时它**拒绝**流水线 —— sealed 不是 root，或者镜像里没有
+一个拥有自己非 root uid/gid 的 `agent` 账户 —— 所以 `agent_seal_priv` 永远不会
+被取进一个框架会以 sealed 的 uid 运行的容器。这种拒绝比某个 phase 失败更安静：
+只记日志（`/log` 里一行 `FAIL`，写明原因和修法）。attestor 那边收不到任何上报，
+因为 `/status` 要用的正是这次启动拒绝去取的那把密钥签名；改由 attestor 的
+provision 超时扫描兜底：sandbox 创建或重建后 `PROVISION_TIMEOUT`（5 分钟）内
+`/provision` 没来，这条部署就被判失败
+（`attestor/crates/worker/src/jobs.rs:21`、
+`attestor/crates/worker/src/main.rs:166-189`）。
 
 ```
 Phase 0  attest           解析环境、校验 SANDBOX_SEAL_KEY ↔ attestation.pubkey、
                           恢复 TEE signer (TEE_SIGNER_ADDRESS 校验若设了的话)
+                          ↓
+gate     privsep          privsep.Required：框架将以 `agent` 用户运行，否则记一行
+                          FAIL（原因 + 修法）就停 —— 没有密钥、不发 /status；
+                          由 attestor 的 provision 超时扫描判部署失败
                           ↓
 Phase 1  provision        POST /provision → 用同一把容器密钥 ECIES 解出响应里的
                           两份载荷：
@@ -95,7 +111,7 @@ attestor 只把它当不透明字节存和发 —— 不解析、不校验、不
 `Reload`、崩溃重启一视同仁（`internal/manager/manager.go:168`、`:209`、`:336`）。
 `main.go` 把它接到
 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`
-（`main.go:694-696`）。
+（`main.go:760-762`）。
 
 之所以做成 hook 而不是 `RuntimeContext` 上的一个字段：`RuntimeContext` 在首次
 `Start` 时被捕获一次、之后每次重启原样回放，所以搭在它上面的东西在容器整个生命期
@@ -433,7 +449,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 
 **settings 通道之前铸出来的 agent 怎么迁移。** 它们的 pin 落在一个已经没有 adapter
 声明的链上 role 里，所以 bootstrap 的 Phase C 把它交给 `HandleLegacy`
-（`main.go:572-581`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:321`）
+（`main.go:636-645`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:321`）
 是 adapter 把恢复出来的东西交还给平台的方式，平台再用 `report.SeedSettings` 在
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删

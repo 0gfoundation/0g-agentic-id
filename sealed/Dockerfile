@@ -47,7 +47,10 @@ FROM ${OPENCLAW_BASE}
 # sealed (root, PID 1) drops the agent process to it so the agent cannot
 # read sealed's memory or bootstrap env. Home stays /root — ownership of
 # the framework subtrees is handed over at spawn; the paths don't move.
-RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
+# Without a usable agent account sealed refuses to provision
+# (privsep.Required). Guarded with id -u so the line stays idempotent when
+# the base image already ships the user.
+RUN id -u agent >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
 
 # Pre-install a pinned openclaw version and warm up its "bundled runtime
 # deps" (the npm packages openclaw fetches the first time `gateway run`

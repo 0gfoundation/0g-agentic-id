@@ -655,14 +655,19 @@ exposed over the network** — sandbox owners cannot post to it directly
 from outside. The uid split also makes the key-exfiltration half of
 doctrine refusals 2/4 kernel-enforced: a de-privileged agent process
 cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read PID 1's
-bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`). The split
-is fail-closed: when it is unavailable (sealed not root, or the image
-lacks the `agent` user) sealed refuses to provision `agent_seal_priv`
-(`privsep.Required`), so no container that holds the key runs its
-framework with sealed's uid — the on-chain image whitelist pins hashes,
-not build contents, and cannot catch an image whose Dockerfile lost the
-`useradd`. This is
-analogous to how
+bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`).
+
+The uid split is fail-closed: when it is unavailable (sealed not root, or
+the image has no `agent` account with its own non-root uid and gid) sealed
+refuses to provision `agent_seal_priv` (`privsep.Required`) — the on-chain
+image whitelist pins hashes, not build contents, and cannot catch an image
+whose Dockerfile lost or broke that account. What the gate guarantees is
+deliberately narrow: in a container that holds the key, the framework never
+*runs* as sealed's uid. That is a necessary condition for the kernel wall
+above, not a complete proof of isolation — root-side handling of framework
+files and CLIs is a separate hardening area.
+
+Signing over the socket is analogous to how
 `eth_signTransaction` and
 `personal_sign` work in any wallet: the wallet attests *who signed*,
 not *that the content is correct*. agentSeal is no different; it just

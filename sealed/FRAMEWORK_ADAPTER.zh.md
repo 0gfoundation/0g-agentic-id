@@ -521,7 +521,7 @@ dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、
 (§5.4)——而可选的 `SeededSettings() (settings.Doc, bool)` 就是 adapter 把回收
 到的文档交还给平台的方式。`main.go` **只在**已存文档没有 model 时才问它,所以
 真正的 owner 文档永远压过回收来的那份;拿到后用 `report.SeedSettings` 持久化
-(`main.go:583-608`)。
+(`main.go:647-675`)。
 
 时机就是全部意义所在。uploader 会按 `Roles()` 重建链上条目表并整体替换提交,所以
 watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那之前 pin 没被读出来
@@ -812,11 +812,16 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    `images/sealed/` 这个通用镜像目标,在你的部署把它作为 base
    发布之后才落到实处。)
    实际构建线上镜像的那个 Dockerfile 必须创建 `agent` 用户
-   (`useradd --system --no-create-home --home-dir /root
-   --shell /usr/sbin/nologin agent`)并以 root 运行 sealed,你的
-   `Start` 必须经 `privsep.Drop` 起进程。没有这个用户,sealed 会拒绝
-   provision(`privsep.Required`),该镜像上的每次部署都会失败 —— 这是
-   有意的:白名单钉的是 hash,不是构建内容。
+   (`RUN id -u agent >/dev/null 2>&1 || useradd --system
+   --no-create-home --home-dir /root --shell /usr/sbin/nologin agent`;
+   `id -u` 这道判断让它在已带该用户的 base 上也幂等)并以 root 运行
+   sealed,你的 `Start` 必须经 `privsep.Drop` 起进程。没有可用的
+   `agent` 账户 —— 缺失,或映射到 uid/gid 0 —— sealed 会拒绝
+   provision(`privsep.Required`,它的错误写明原因和修法),该镜像上的
+   每次部署都会失败 —— 这是有意的:白名单钉的是 hash,不是构建内容。
+   这道闸只保证框架永远不以 sealed 的 uid 运行 —— 这是内核隔离墙的
+   必要条件,不是隔离的完整证明;root 一侧如何处理框架文件和框架 CLI
+   是另一块独立的加固领域。
 8. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
    attestor 把名字当不透明字符串(mint 前校验、写进无版本 binding、
    UI 里列出),除此之外零改动(本仓库 `attestor/`)。

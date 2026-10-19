@@ -6,12 +6,15 @@
 // it does not elevate sealed.
 //
 // Availability is probed once, lazily: the split engages only when sealed
-// runs as root AND the image ships the agent user (created in the image's
-// build Dockerfile). Without it every helper degrades to a no-op — but
-// sealed refuses to provision agent_seal_priv (Required, checked in main),
-// so a container that cannot keep the key from its framework never
-// receives it. Unit tests and local runs without an attestor never
-// provision, so they are unaffected.
+// runs as root AND the image ships an agent account with its own non-root
+// uid and gid (created in the image's build Dockerfile). Without it every
+// helper degrades to a no-op — but sealed then refuses to provision
+// agent_seal_priv (Required, checked in main), so in a container that holds
+// the key the framework never runs as sealed's uid. That is a necessary
+// condition for the kernel wall described below, not a complete proof of
+// isolation: how root-side code handles framework-owned files and framework
+// CLIs is a separate hardening area. Unit tests and local runs without an
+// attestor never provision, so they are unaffected.
 //
 // This turns the key-exfiltration half of the agent doctrine (refusals 2
 // and 4: shell → read sealed's memory / bootstrap secrets) from a
@@ -22,6 +25,7 @@
 package privsep
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -44,34 +48,81 @@ import (
 // agent user rather than the paths moving to a new home).
 const agentUsername = "agent"
 
+// agentUseradd is the Dockerfile line that creates the agent account, quoted
+// verbatim in Required's error when the image lacks it. The id -u guard
+// keeps it idempotent, so an image layered on a base that already has the
+// user still builds.
+const agentUseradd = "RUN id -u agent >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent"
+
 var (
 	lookupOnce  sync.Once
 	cred        *syscall.Credential
-	unavailable string // why cred is nil; set together with it
+	unavailable string // why cred is nil and what fixes it; set together with it
 )
 
 // credential resolves the agent user once. nil = split unavailable, with
-// the reason in unavailable.
+// the cause and its remediation in unavailable.
 func credential() *syscall.Credential {
 	lookupOnce.Do(func() {
-		if os.Geteuid() != 0 {
-			unavailable = fmt.Sprintf("not root (euid=%d)", os.Geteuid())
-		} else if u, err := user.Lookup(agentUsername); err != nil {
-			unavailable = fmt.Sprintf("no %q user in this image", agentUsername)
-		} else if uid, err1 := strconv.ParseUint(u.Uid, 10, 32); err1 != nil {
-			unavailable = fmt.Sprintf("unparsable uid %q for %q", u.Uid, agentUsername)
-		} else if gid, err2 := strconv.ParseUint(u.Gid, 10, 32); err2 != nil {
-			unavailable = fmt.Sprintf("unparsable gid %q for %q", u.Gid, agentUsername)
-		} else {
-			// Groups: empty slice (not nil) so setgroups(0) actually drops
-			// root's supplementary groups instead of inheriting them.
-			cred = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}
-			logger.Logf("privsep: framework subprocess will run as %s (uid=%d gid=%d)", agentUsername, uid, gid)
+		cred, unavailable = probe(os.Geteuid(), user.Lookup)
+		if cred != nil {
+			logger.Logf("privsep: framework subprocess will run as %s (uid=%d gid=%d)", agentUsername, cred.Uid, cred.Gid)
 			return
 		}
 		logger.Logf("privsep: unavailable — %s", unavailable)
 	})
 	return cred
+}
+
+// probe is credential's decision with sealed's euid and the account lookup
+// injected, so every cause is unit-testable. It returns either the
+// credential to drop the framework to, or why there is none followed by the
+// fix for that specific cause — an operator reading the refusal in /log
+// must not be sent to the Dockerfile when the problem is how sealed runs.
+func probe(euid int, lookup func(string) (*user.User, error)) (*syscall.Credential, string) {
+	if euid != 0 {
+		return nil, fmt.Sprintf("sealed runs as euid=%d, not root; run sealed as root so it can drop the framework to the %q user", euid, agentUsername)
+	}
+	u, err := lookup(agentUsername)
+	var unknown user.UnknownUserError
+	switch {
+	case errors.As(err, &unknown):
+		return nil, fmt.Sprintf("no %q user in this image; add to its Dockerfile: %s", agentUsername, agentUseradd)
+	case err != nil:
+		return nil, fmt.Sprintf("looking up the %q user: %v; fix the image's account database", agentUsername, err)
+	}
+	c, err := agentCredential(u.Uid, u.Gid, euid)
+	if err != nil {
+		return nil, fmt.Sprintf("%v; fix the image's %q account: it needs its own non-root uid and gid", err, agentUsername)
+	}
+	return c, ""
+}
+
+// agentCredential turns the agent account's uid/gid strings into the
+// credential the framework spawns with, refusing any account that would
+// not actually separate the framework from sealed: uid 0 or gid 0 (root's
+// identity under another name), or a uid equal to sealed's own euid. Pure,
+// so each rejection is unit-tested.
+func agentCredential(uidStr, gidStr string, selfEUID int) (*syscall.Credential, error) {
+	uid, err := strconv.ParseUint(uidStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("%q has unparsable uid %q", agentUsername, uidStr)
+	}
+	gid, err := strconv.ParseUint(gidStr, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("%q has unparsable gid %q", agentUsername, gidStr)
+	}
+	switch {
+	case uid == 0:
+		return nil, fmt.Errorf("%q maps to uid 0 (root)", agentUsername)
+	case gid == 0:
+		return nil, fmt.Errorf("%q maps to gid 0 (root's group)", agentUsername)
+	case selfEUID >= 0 && uid == uint64(selfEUID):
+		return nil, fmt.Errorf("%q maps to sealed's own uid %d", agentUsername, uid)
+	}
+	// Groups: empty slice (not nil) so setgroups(0) actually drops root's
+	// supplementary groups instead of inheriting them.
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}, nil
 }
 
 // Active reports whether the uid split is available in this container —
@@ -81,14 +132,17 @@ func Active() bool {
 }
 
 // Required returns nil when the framework subprocess will run as the agent
-// user, else an error naming why it cannot. sealed checks it before
-// provisioning and fails closed: without the split the framework would
-// share sealed's uid and could read agent_seal_priv out of this process,
-// and the doctrine injected into the agent states the kernel wall as fact
-// (platform/context.go) — so the key is never fetched into such a
-// container. Catches a mis-built image (an image whose build Dockerfile
-// lost the useradd) that the on-chain image whitelist, which pins hashes
-// rather than contents, cannot.
+// user, else an error naming the cause and the fix for it. sealed checks it
+// before provisioning and fails closed: without the split the framework
+// would share sealed's uid and could read agent_seal_priv out of this
+// process, and the doctrine injected into the agent states the kernel wall
+// as fact (platform/context.go). What the gate guarantees is deliberately
+// narrow — in a container that holds the key, the framework never runs as
+// sealed's uid. That is necessary for the wall, not sufficient for
+// isolation; root-side handling of framework files and CLIs is a separate
+// hardening area. It catches a mis-built image (a build Dockerfile that
+// lost or broke the agent account) that the on-chain image whitelist, which
+// pins hashes rather than contents, cannot.
 func Required() error {
 	if credential() == nil {
 		return fmt.Errorf("privsep unavailable: %s", unavailable)

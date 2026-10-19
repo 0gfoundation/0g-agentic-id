@@ -160,17 +160,8 @@ func main() {
 	// Phase 1+2+3: provision + bootstrap from chain + start agent.
 	// Each phase is best-effort; if any fails we report error to attestor
 	// and continue to serve /healthz, /log so operators can inspect.
-	if cfg.AttestorURL == "" {
-		logger.Logf("ATTESTOR_URL unset -- skipping provision / bootstrap / status")
-	} else if cfg.ChainRPC == "" || cfg.ContractAddr == "" || cfg.FallbackIndexer == "" {
-		logger.Logf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
-			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
-	} else if err := privsep.Required(); err != nil {
-		// Fail closed: never fetch agent_seal_priv into a container whose
-		// framework would share sealed's uid (it could read the key out of
-		// this process). /healthz and /log stay up for diagnosis; the
-		// attestor fails the deployment when /provision never arrives.
-		logger.Logf("FAIL %v -- refusing to provision; the image must create the %q user", err, "agent")
+	if skip := provisionGate(cfg, privsep.Required); skip != "" {
+		logger.Logf("%s", skip)
 	} else {
 		runMainPipeline(cfg, agent, sealedProxy)
 	}
@@ -181,6 +172,29 @@ func main() {
 
 	// Block forever -- HTTP server runs in its own goroutine.
 	select {}
+}
+
+// provisionGate decides whether this boot runs the provisioning pipeline
+// (runMainPipeline): "" to proceed, else the line main logs instead. The
+// privsep check runs last and fails closed — agent_seal_priv is never
+// fetched into a container whose framework would share sealed's uid (it
+// could read the key out of this process). Nothing reaches attestor on that
+// path, since /status is signed with the key this boot refuses to fetch: the
+// refusal (cause + fix, from privsep.Required) is visible only in /log, and
+// attestor's provision-timeout sweep fails the deployment when /provision
+// never arrives.
+func provisionGate(cfg *config.Bootstrap, privsepRequired func() error) string {
+	if cfg.AttestorURL == "" {
+		return "ATTESTOR_URL unset -- skipping provision / bootstrap / status"
+	}
+	if cfg.ChainRPC == "" || cfg.ContractAddr == "" || cfg.FallbackIndexer == "" {
+		return fmt.Sprintf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
+			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
+	}
+	if err := privsepRequired(); err != nil {
+		return "FAIL provision refused: " + err.Error()
+	}
+	return ""
 }
 
 // runMainPipeline encapsulates Phases 1-4. Errors are logged and reported

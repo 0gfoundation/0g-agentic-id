@@ -226,7 +226,7 @@ POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第�
 (`internal/proxy/settings.go:18`)—— 面向 owner 的路由上做无界读取是最容易的一种拒绝
 服务。
 
-`main.go` 注册的 applier(`main.go:709`)按固定顺序做三件事:换掉生效中的文档、渲染它、
+`main.go` 注册的 applier(`main.go:775`)按固定顺序做三件事:换掉生效中的文档、渲染它、
 重启框架进程 —— **并且渲染失败时把替换回滚**,这样一份渲染不出来的文档永远不会变成下次
 崩溃重启会捡起来的那份。校验不过的文档在任何东西被应用之前就被拒,所以**一次无法生效的
 推送不可能把 agent 搞下线**。
@@ -256,7 +256,7 @@ agent 问不到的部分不归它。
 (`"durable": false`)。钱和资产都是 owner 的。结构性的后果是
 **agent 没有能力把自己配置成起不来的状态**,而 agent 3586004 正是手工编辑框架配置把自己
 砖了的(`internal/proxy/settings.go:120-129`)。如果 agent 那份文档渲染失败,`main.go`
-会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:726-734`)。
+会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:792-800`)。
 
 ## 6. 各框架在哪读它 —— `RenderSettings`
 
@@ -353,7 +353,7 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 任何被接受的修改都会重启框架进程。没有阶梯:
 
 - `manager.StartParams.PreStart`(`internal/manager/manager.go:122`)在**每一次**
-  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go:694` 把它
+  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go:760` 把它
   指向 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`。
 - 两条推送路径都是先渲染再调 `manager.Reload`,而 Reload 就是 Stop+Start。
 - `framework.Reloadable` 依然只是声明、依然没有任何消费方
@@ -447,8 +447,8 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 在途的那一轮�
 
 在通道出现之前铸造的 agent,它的 pin 存在一个**已经没有任何 adapter 声明**的上链角色里。
 Bootstrap 的 Phase C 会把每一个角色在 `Roles()` 之外的链上条目交给 `HandleLegacy`
-(`main.go:572-581`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:321`)是
-adapter 把恢复出来的东西交还给平台的方式。`main.go:598-609` **仅在**下发的文档没有 model
+(`main.go:636-645`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:321`)是
+adapter 把恢复出来的东西交还给平台的方式。`main.go:662-675` **仅在**下发的文档没有 model
 时才去问 seeder —— 所以真实文档永远压过恢复 —— 并用 `report.SeedSettings`
 (`internal/report/report.go:86`)把拿到的东西持久化。
 

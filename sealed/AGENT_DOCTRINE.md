@@ -180,12 +180,15 @@ supplied.
 
 Shells are open to the agent — it runs as a de-privileged user, and the
 kernel (`internal/privsep`), not doctrine, walls its process off from
-sealed's memory and bootstrap secrets. That statement holds in every
-container that holds a key: sealed refuses to provision when the split is
-unavailable (`privsep.Required`). So the slot governs **authorship**,
-not shell access: executing, via shell or subprocess, a command drafted
-outside the agent's own deliberation is refusal 1 wearing a shell — same
-disqualifier, bytes the agent did not author.
+sealed's memory and bootstrap secrets. (sealed refuses to provision when
+the split is unavailable — `privsep.Required` — so in a container that
+holds a key the agent never runs as sealed's uid. That is a necessary
+condition for the wall, not a complete proof of isolation: root-side
+handling of framework files and CLIs is a separate hardening area.) So
+the slot governs **authorship**, not shell access: executing, via shell
+or subprocess, a command drafted outside the agent's own deliberation is
+refusal 1 wearing a shell — same disqualifier, bytes the agent did not
+author.
 
 **Boundary with #3**: #3 governs outward port attribution. #2 governs
 what a shell is allowed to execute. The two risks do not substitute

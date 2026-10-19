@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed uploads/downloads via the `0g-storage-client` CLI |
-| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, dsh (`main.go:115-118`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
+| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, dsh (`main.go:116-119`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -26,14 +26,32 @@ This document describes **the form actually running in current code** and **why 
 `main.go`'s 5 phases run strictly in order. A failing phase does **not** take
 the container down: `runMainPipeline` logs it, reports it to attestor and
 returns, so `:8080` keeps serving `/healthz` and `/log` for diagnosis
-(`main.go:176-181`). Both listeners — the public `:8080` mux and the
+(`main.go:200-202`). Both listeners — the public `:8080` mux and the
 `/run/seal-sign.sock` unix socket — are already up *before* Phase 1; their
 handlers answer 503 until `agent_seal_priv` reaches `state.Agent`
-(`main.go:146-148`).
+(`main.go:147-149`).
+
+Between Phase 0 and Phase 1 sits a gate, `provisionGate`
+(`main.go:177-198`). It skips the pipeline when `ATTESTOR_URL` or the chain
+env is unset (local dev), and **refuses** it when `privsep.Required` fails —
+sealed is not root, or the image has no `agent` account with its own non-root
+uid and gid — so `agent_seal_priv` is never fetched into a container whose
+framework would run as sealed's uid. The refusal is quieter than a failing
+phase: it is only logged (a `FAIL` line in `/log` naming the cause and its
+fix). Nothing reaches attestor, because `/status` is signed with the very key
+this boot declined to fetch; instead attestor's provision-timeout sweep fails
+the deployment once `/provision` has not arrived within `PROVISION_TIMEOUT`
+(5 min) of sandbox create or recreate
+(`attestor/crates/worker/src/jobs.rs:21`,
+`attestor/crates/worker/src/main.rs:166-189`).
 
 ```
 Phase 0  attest           parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pubkey,
                           recover TEE signer (TEE_SIGNER_ADDRESS check if set)
+                          ↓
+gate     privsep          privsep.Required: framework will run as the `agent` user,
+                          else log FAIL (cause + fix) and stop — no key, no /status;
+                          attestor's provision-timeout sweep fails the deploy
                           ↓
 Phase 1  provision        POST /provision → ECIES-decrypt, with the one container key,
                           both payloads the response carries:
@@ -107,7 +125,7 @@ covers only where it lands in the boot.
 the first one, a `Reload`, and a crash-restart alike
 (`internal/manager/manager.go:168`, `:209`, `:336`). `main.go` points it at
 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`
-(`main.go:694-696`).
+(`main.go:760-762`).
 
 It is a hook rather than a field on `RuntimeContext` because `RuntimeContext`
 is captured once at the initial `Start` and replayed verbatim on every
@@ -469,7 +487,7 @@ which the per-framework config files were obscuring.
 
 **Migration for agents minted before the settings channel.** Their pin sits in
 a chain role no adapter declares any more, so bootstrap Phase C hands it to
-`HandleLegacy` (`main.go:572-581`); the optional
+`HandleLegacy` (`main.go:636-645`); the optional
 `framework.LegacySettingsSeeder` (`framework.go:321`) is how an adapter hands
 what it recovered back to the platform, which persists it with
 `report.SeedSettings` before the watcher's first tick drops the stale role.

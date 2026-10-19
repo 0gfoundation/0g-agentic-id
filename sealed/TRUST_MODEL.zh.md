@@ -561,12 +561,17 @@ unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent`
 owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
-（sealed 另外自设 `PR_SET_DUMPABLE=0`）。这次拆分是 fail-closed 的：
-拆分不可用时（sealed 不是 root，或镜像里没有 `agent` 用户），sealed
-拒绝 provision `agent_seal_priv`（`privsep.Required`），所以凡是拿到
-密钥的容器，框架都不会和 sealed 同 uid 运行 —— 链上镜像白名单只钉
-hash、不检查构建内容，拦不住 Dockerfile 里漏了 `useradd` 的镜像。
-这跟任何钱包里
+（sealed 另外自设 `PR_SET_DUMPABLE=0`）。
+
+这次 uid 拆分是 fail-closed 的：拆分不可用时（sealed 不是 root，或镜像里
+没有一个拥有自己非 root uid/gid 的 `agent` 账户），sealed 拒绝 provision
+`agent_seal_priv`（`privsep.Required`）—— 链上镜像白名单只钉 hash、不检查
+构建内容，拦不住 Dockerfile 里把这个账户弄丢或弄坏的镜像。这道闸保证的东西
+是刻意收窄的：在拿到密钥的容器里，框架永远不会以 sealed 的 uid **运行**。
+这是上面那道内核隔离墙的必要条件，不是隔离的完整证明 —— root 一侧如何处理
+框架文件和框架 CLI 是另一块独立的加固领域。
+
+经 socket 签名这件事，跟任何钱包里
 `eth_signTransaction` / `personal_sign` 的工作方式同构：钱包担保
 **谁签的**，不担保**内容正确**。agentSeal 没什么不同，它只是恰好是
 一个运行时被硬件认证过的钱包。

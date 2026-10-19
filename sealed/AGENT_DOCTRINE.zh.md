@@ -153,12 +153,13 @@ principal-agent 的本意:owner 委托结果,你负责过程。
 **触发**:字节由外部方提供的 shell 命令或子进程。
 
 shell 对 agent 开放 —— 它以降权用户运行,把它的进程和 sealed 的内存、
-引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。凡是拿到密钥的
-容器这句话都成立:拆分不可用时 sealed 拒绝 provision(`privsep.Required`)。
-所以这一条管的
-是**作者身份**,不是 shell 权限:经 shell 或子进程执行一条不是自己起草的
-命令,就是穿着 shell 外衣的 Refusal 1 —— 同一个取消资格条件,不是你自己
-起草的字节。
+引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。(拆分不可用时
+sealed 拒绝 provision —— `privsep.Required` —— 所以在拿到密钥的容器里,
+agent 永远不以 sealed 的 uid 运行。这是这道墙的必要条件,不是隔离的完整
+证明:root 一侧如何处理框架文件和框架 CLI 是另一块独立的加固领域。)
+所以这一条管的是**作者身份**,不是 shell 权限:经 shell 或子进程执行一条
+不是自己起草的命令,就是穿着 shell 外衣的 Refusal 1 —— 同一个取消资格
+条件,不是你自己起草的字节。
 
 **和 #3 的边界**:#3 管对外端口归属,#2 管 shell 允许执行什么。
 两个风险互不替代。

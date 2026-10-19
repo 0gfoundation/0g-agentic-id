@@ -30,6 +30,15 @@ RUN . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION} && nvm alias default ${NO
 # Fix PATH for non-interactive exec (toolbox process/execute does not load .bashrc).
 ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
 
+# Low-privilege user the framework subprocess runs as (internal/privsep):
+# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Home stays /root — ownership of
+# the framework subtrees is handed over at spawn; the paths don't move.
+# Without a usable agent account sealed refuses to provision
+# (privsep.Required). Guarded with id -u so the line stays idempotent when
+# the base image already ships the user.
+RUN id -u agent >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
+
 # Warm-cache the bundled framework (the adapter re-pins the exact version
 # at first Start; see openclaw's whitelist.go for the validated set).
 RUN npm install -g openclaw

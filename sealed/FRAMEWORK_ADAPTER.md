@@ -618,7 +618,7 @@ entry to `HandleLegacy` in round C (§5.4) — and the optional
 recovered back to the platform. `main.go` consults it **only** when the stored
 document names no model, so a real owner document always outranks a recovered
 one, and persists the result through `report.SeedSettings`
-(`main.go:583-608`).
+(`main.go:647-675`).
 
 The timing is the whole point. The uploader rebuilds the chain entry list from
 `Roles()` and commits it wholesale, so the watcher's first tick drops the
@@ -948,11 +948,18 @@ The one obligation that replaced all four is step 4.
    one; `images/sealed/` is the universal-image target this instruction
    is scoped to, and applies once your deployment ships it as the base.)
    Whichever Dockerfile actually builds the shipped image must create the
-   `agent` user (`useradd --system --no-create-home --home-dir /root
-   --shell /usr/sbin/nologin agent`) and run sealed as root, and your
-   `Start` must spawn through `privsep.Drop`. Without the user sealed
-   refuses to provision (`privsep.Required`) and every deploy on that
+   `agent` user (`RUN id -u agent >/dev/null 2>&1 || useradd --system
+   --no-create-home --home-dir /root --shell /usr/sbin/nologin agent`;
+   the `id -u` guard keeps it idempotent over a base that already has
+   it) and run sealed as root, and your `Start` must spawn through
+   `privsep.Drop`. Without a usable `agent` account — missing, or mapped
+   to uid or gid 0 — sealed refuses to provision (`privsep.Required`,
+   whose error names the cause and the fix) and every deploy on that
    image fails — by design: the whitelist pins the hash, not the build.
+   The gate guarantees only that the framework never runs as sealed's
+   uid — a necessary condition for the kernel wall, not a complete proof
+   of isolation; root-side handling of framework files and CLIs is a
+   separate hardening area.
 8. Add your framework's name to attestor's supported-names list so
    deploys can select it — attestor treats the name as an opaque string
    (validated pre-mint, written into the version-less binding, listed in
