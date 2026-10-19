@@ -750,7 +750,7 @@ fallback.
 | `SealSignSock` | `/run/seal-sign.sock` | the agent-only sign endpoint (§8); tell your agent where it is |
 | `AgentSeal` | 0x address derived from `agent_seal_priv` | the agent's TEE identity address |
 | `AgentID`, `Owner`, `ChainRPC`, `ContractAddr`, `ChainID`, `AttestorURL` | chain bootstrap outputs | public on-chain facts, not secrets; inject into the agent's context so it can reason about its own identity |
-| `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
+| `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero, or its `getIdentityRegistry()` is not `AGENTIC_ID_ADDR` | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
 | `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
 
@@ -791,7 +791,8 @@ You get these for free; design your framework's surface assuming them:
   `submitter`, `timestamp`, `deadline`, `task_hash`, a `data_hashes` list
   of on-chain storage roots, `framework_hash`, and a diagnostics-only
   `validator`. It carries no `content_hash`, which stays internal to drift
-  detection. Without `VERIFIED_FEEDBACK_ADDR` no header is emitted. Your
+  detection. Without a usable `VERIFIED_FEEDBACK_ADDR` (set, and anchored to
+  `AGENTIC_ID_ADDR` on chain) no header is emitted. Your
   upstream serves plain HTTP on localhost.
 - **`GET /hello`** — signed self-introduction: agent identity, current
   `data_hashes`, `public_url`, and the agent-declared service list (built

@@ -440,7 +440,8 @@ digest    = keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)
 `personal_sign` 包装。`chainId` 和 `identityRegistry` 参与签名但不随 envelope
 携带(verifier 用自己部署的值)。`validator` 只为诊断而携带,它不是链上 tuple
 的字段;verifier 拿它跟自己要兑付的 registry 比对。没配 `VERIFIED_FEEDBACK_ADDR`
-的 runtime 根本不发 `X-Agent-Proof`。
+——或者配的地址其 `getIdentityRegistry()` 不是本容器的 `AGENTIC_ID_ADDR`(链连上后
+检查一次)——的 runtime 根本不发 `X-Agent-Proof`。
 
 请求/响应 transcript **折进 `task_hash`**,不再作为独立字段暴露:
 
@@ -604,7 +605,10 @@ VerifiedFeedbackRegistry 1.2.0、新的 sealed 镜像（读取
 `ATTESTOR_CLI_LATEST` 提示旧 CLI 升级）在同一个窗口上线。切 snapshot 之前，新镜像 hash 必须先在每个 AgenticID 上
 `addValidFrameworkHash`。正在运行的 agent 保持旧镜像和旧 env，直到
 owner 签名的 `/reset` 重建它；升级之后，旧镜像签出的 proof 不再能
-验过。已弃用的 `AgenticIDReputationRegistry` 没有改动，仍校验旧的
+验过。移除旧镜像 hash（`removeValidFrameworkHash`）要等到所有这类 agent 都
+reset 之后：attestor 每次 `/provision` 都会重查白名单，而 sealed 每次开机
+（resume、崩溃重启）都会调 `/provision`，所以没 reset 的容器下次开机就会
+provision 失败，直到它的 owner reset 为止。已弃用的 `AgenticIDReputationRegistry` 没有改动，仍校验旧的
 `personal_sign` digest，所以它的 pauser 必须在切换之前或切换时暂停它。
 在那之前，它对 FIND-01 式伪造仍然敞开。
 

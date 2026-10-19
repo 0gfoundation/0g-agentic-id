@@ -3,7 +3,7 @@
 > Give every AI agent a chain-anchored identity that spans its entire lifecycle and that anyone can independently verify.
 
 AgenticID is a protocol built on the **0G ecosystem**. It anchors an agent's
-functional data on chain, runs its code inside a TEE, and stamps every response
+functional data on chain, runs its code inside a TEE, and stamps its served responses
 with a key that exists only inside that TEE — turning "this agent is
 trustworthy" from a claim you take on faith into a property anyone can verify
 for themselves.
@@ -99,7 +99,7 @@ below; circle back here whenever you hit an unfamiliar term elsewhere.
 |---|---|---|
 | **ServeProof** (PascalCase) | Solidity struct, the carrier for the on-chain reputation flow | `VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, ServeProof)`, contract verifies via ecrecover over a registry-bound digest |
 | **serve-proof** (lowercase hyphenated) | The general concept: any envelope sealed signs automatically | Informal term in docs; covers ServeProof, heartbeat, chain.Update, etc. |
-| **X-Agent-Proof** | HTTP response header name | The header the sealed proxy auto-appends to signed :8080 responses (`/hello`, the agent's `/api/*` services) when the container has `VERIFIED_FEEDBACK_ADDR`; the payload is a signed envelope |
+| **X-Agent-Proof** | HTTP response header name | The header the sealed proxy auto-appends to signed :8080 responses (`/hello`, `/_seal/auth`, the agent's `/api/*` services) when the container has `VERIFIED_FEEDBACK_ADDR`; the payload is a signed envelope |
 
 Shorthand: **ServeProof** is its on-chain form, **X-Agent-Proof** is its HTTP form, and **serve-proof** is the umbrella.
 
@@ -142,7 +142,9 @@ discoverable and callable.
 The on-chain record isn't frozen. The agent can update its functional data
 autonomously. What the protocol guarantees is more precise: **you can always
 verify what iData the agent was running at the exact moment it served you.**
-Every response carries a signed proof of the current iData version. This
+Every signed response (`/hello`, `/_seal/auth`, the agent's `/api/*`
+services) carries a signed proof of the current iData version when the
+runtime has `VERIFIED_FEEDBACK_ADDR`. This
 isn't immutability — it's **verifiability at any point in time**, an
 audit-trail kind of trust.
 
@@ -189,8 +191,8 @@ specific TDX device), and accessible only inside a TEE.
 From this key material, AgenticID generates an **AgentSeal** for each
 agent — a key pair whose private key exists only inside the TEE runtime.
 The owner cannot get to it; no one outside the TEE can get to it. The agent
-uses AgentSeal to sign **the responses it serves** (its `/hello` and its
-`/api/*` services), and this signature proves the response came from an agent
+uses AgentSeal to sign **the responses it serves** (its `/hello`,
+`/_seal/auth` and its `/api/*` services), and this signature proves the response came from an agent
 running in a TEE, strictly following its on-chain record.
 
 AgenticID's backend Attestor is itself a Tapp application registered on

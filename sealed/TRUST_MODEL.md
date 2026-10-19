@@ -507,8 +507,9 @@ apply, and the registry rejects the legacy `personal_sign` wrap.
 `chainId` and `identityRegistry` are signed but not carried (the verifier
 supplies its own deployment's). `validator` is carried for diagnostics only.
 It is not a field of the on-chain tuple, and a verifier compares it with the
-registry it will redeem at. A runtime without `VERIFIED_FEEDBACK_ADDR`
-emits no `X-Agent-Proof` at all.
+registry it will redeem at. A runtime without `VERIFIED_FEEDBACK_ADDR` —
+or with one whose `getIdentityRegistry()` is not its `AGENTIC_ID_ADDR`,
+checked once the chain is dialled — emits no `X-Agent-Proof` at all.
 
 The request/response transcript is **committed via `task_hash`**, not
 exposed as separate fields:
@@ -714,7 +715,11 @@ one window. The new image hashes must be added with
 `addValidFrameworkHash` on each AgenticID before the attestor switches
 snapshots. A running agent keeps its old image and env until an
 owner-signed `/reset` recreates it, and proofs from old images stop
-verifying at the upgrade. The deprecated `AgenticIDReputationRegistry`
+verifying at the upgrade. Removing the old image hashes
+(`removeValidFrameworkHash`) waits until every such agent has been reset:
+the attestor re-checks the allowlist on every `/provision`, which sealed
+calls on every boot (resume, crash restart), so an un-reset container
+would fail to provision on its next boot until its owner resets it. The deprecated `AgenticIDReputationRegistry`
 is unchanged and still verifies the legacy `personal_sign` digest, so
 its pauser must pause it before or at the cut. Until then it stays open
 to FIND-01 forgeries.

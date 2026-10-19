@@ -42,9 +42,11 @@ const adversarial = [
 (async () => {
   const account = privateKeyToAccount(OWNER_PRIV);
   const ai = await AgenticID.fromAttestor(ATTESTOR_URL, { account });
-  // authenticate() is single-arg now (URL or agentId); it resolves the other
-  // half itself and returns an AgentClient with an eagerly-minted `.token`.
-  const cred = await ai.agent.authenticate(AGENT_URL);
+  // authenticate() takes the URL or the agentId and resolves the other half
+  // itself, returning an AgentClient with an eagerly-minted `.token`. The
+  // { agentId } hint covers a runtime whose /hello is unsigned (no
+  // VERIFIED_FEEDBACK_ADDR) and is still checked against the URL on chain.
+  const cred = await ai.agent.authenticate(AGENT_URL, { agentId: AGENT_ID });
   if (!cred.token) { console.error('authenticate: no token'); process.exit(2); }
 
   // Stream the completion (SSE). A NON-streaming request gets cut by the

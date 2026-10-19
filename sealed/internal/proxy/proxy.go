@@ -897,10 +897,52 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			resp.Header.Del("Access-Control-Allow-Headers")
 			resp.Header.Del("Access-Control-Expose-Headers")
 			// Upgrades are never signed; the header is runtime-owned.
-			resp.Header.Del(agentProofHeader)
+			dropAgentProof(resp.Header)
+			// A non-101 reply (the upstream refused the upgrade) is relayed
+			// as a normal body, and httputil.ReverseProxy forwards every
+			// upstream trailer after it — so the trailer copy is dropped
+			// too. Announced trailers are removed here; the transport fills
+			// resp.Trailer only at body EOF, so the body is wrapped to drop
+			// it again then (ReverseProxy copies trailers after that). A 101
+			// body must stay the transport's io.ReadWriteCloser, and carries
+			// no trailers.
+			if resp.StatusCode != http.StatusSwitchingProtocols {
+				dropAgentProof(resp.Trailer)
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp}
+			}
 			return nil
 		},
 	}
+}
+
+// dropAgentProof deletes every X-Agent-Proof key from h, whatever its case.
+func dropAgentProof(h http.Header) {
+	for k := range h {
+		if isAgentProofHeader(k) {
+			delete(h, k)
+		}
+	}
+}
+
+// trailerProofStripper drops X-Agent-Proof from resp.Trailer once the body
+// has been read to EOF (when the transport populates trailers) and on Close.
+type trailerProofStripper struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (b *trailerProofStripper) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		dropAgentProof(b.resp.Trailer)
+	}
+	return n, err
+}
+
+func (b *trailerProofStripper) Close() error {
+	err := b.ReadCloser.Close()
+	dropAgentProof(b.resp.Trailer)
+	return err
 }
 
 // ── Serve-proof signing ─────────────────────────────────────────────────────
@@ -954,8 +996,9 @@ const clientAddressHeader = "X-Client-Address"
 
 // agentProofHeader carries the serve-proof. It is runtime-owned: writeServeProof
 // is the only place that sets it, and every path relaying an upstream response
-// (buffered, streamed, WebSocket upgrade) drops an upstream-supplied copy, so a
-// backend cannot put a header of its own choosing under the runtime's name.
+// (buffered, streamed, WebSocket upgrade — header and trailer) drops an
+// upstream-supplied copy, so a backend cannot put a header of its own choosing
+// under the runtime's name.
 const agentProofHeader = "X-Agent-Proof"
 
 // isAgentProofHeader reports whether a response header key names
@@ -980,7 +1023,8 @@ func isAgentProofHeader(k string) bool {
 //
 // When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
 // empty, e.g. local dev without a chain), or no usable validator
-// (VERIFIED_FEEDBACK_ADDR unset, malformed or zero), the body is written
+// (VERIFIED_FEEDBACK_ADDR unset, malformed, zero, or not anchored to
+// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written
 // without a proof header — a reputation proof would be meaningless, and there
 // is deliberately no fallback to the legacy personal_sign wrap.
 func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {

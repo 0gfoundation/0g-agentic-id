@@ -186,16 +186,19 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
   node scripts/evolution-probe.cjs
 ```
 
-`verify-agent.sh` checks:
+`verify-agent.sh` (needs `curl`, `jq` and `cast`) checks:
 1. **identity tri-check** — attestor row == on-chain `getAgentSeal` ==
    the address the container was provisioned with;
 2. **decrypt health** — the sealed bootstrap log has one `decrypted` per
    iData entry and zero `FAIL` lines;
 3. **serve-proof** — `/hello` returns 200 with an `X-Agent-Proof` header
-   whose envelope names this agent, and (with `cast`) the signature
-   recovers to the seal address over the EIP-191 version-0x00 digest bound
-   to `/config` `verified_feedback_addr` — the check the registry makes,
-   gas-free. An envelope `validator` other than that address fails as
+   whose envelope names this agent; `/config` `verified_feedback_addr`'s
+   `getIdentityRegistry()` equals `/config` `agentic_id_addr`; and the
+   signature recovers to the seal address over the EIP-191 version-0x00
+   digest bound to that `verified_feedback_addr` — the signature check the
+   registry makes, gas-free. The anchoring and the recovery are skipped only
+   when `/config` has no `verified_feedback_addr`. An envelope `validator`
+   other than that address fails as
    "proof signed for a different registry"; no `validator` plus a failed
    recovery means a sealed image from before the VerifiedFeedbackRegistry
    1.2.0 cut (the owner must `/reset`). The console's say-hi verifier and

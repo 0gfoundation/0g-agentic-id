@@ -121,9 +121,11 @@ pub struct Config {
     /// sealed proxy signs keccak256(0x19 ‖ 0x00 ‖ this ‖ proofHash) (EIP-191
     /// version 0x00), so proofs redeem only at this address. None (unset,
     /// blank or the zero address) → /config serves null, the container gets a
-    /// blank value and emits no X-Agent-Proof. The attestor itself never calls
-    /// it. Parsed strictly: a non-empty value that is not an address fails
-    /// startup.
+    /// blank value and emits no X-Agent-Proof. The attestor never writes to
+    /// it; worker and api make one view call at startup
+    /// (`chain::check_verified_feedback_anchor`): its getIdentityRegistry()
+    /// must equal `agentic_id_addr`, else startup fails. Parsed strictly: a
+    /// non-empty value that is not an address fails startup.
     pub verified_feedback_addr: Option<Address>,
     /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
     /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its

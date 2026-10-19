@@ -313,7 +313,12 @@ const data = await response.json();                   // your normal response bo
 // low-level escape hatch (you build the whole request): ag.reputation.capture(() => fetch(…))
 
 // 2. verify before spending gas (signer == on-chain agentSeal, deadline, dataHashes ⊆ iData).
-//    The signature is bound to addresses.verifiedFeedback (fromAttestor fills it).
+//    The signature is bound to addresses.verifiedFeedback (fromAttestor fills it), and is
+//    checked as strictly as the registry does (65 bytes, v ∈ {27,28}, low s).
+//    `ok` also needs dataOnChain, which the registry does NOT check (it records the
+//    proof's dataHashes as the serving version): a proof from before the agent's latest
+//    state commit still redeems, so gate a rating on signerMatches && notExpired, as
+//    the CLI's `rate` does.
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true, reasons: [] }
 // registryMatches: false (signerMatches false too) = no VerifiedFeedbackRegistry is configured
@@ -337,7 +342,8 @@ await ag.reputation.verifyProof(proof);
 // orphaned, unverified entry. Refused: agent / submitter mismatch, a proof
 // bound to another registry, a deadline already past or within 60s of the
 // latest block, a signature that does not recover to the on-chain agentSeal
-// under addresses.verifiedFeedback, you being the agentSeal, the owner, the
+// under addresses.verifiedFeedback (or is an encoding the registry's OZ ECDSA
+// rejects: not 65 bytes, v ∉ {27,28}, high s), you being the agentSeal, the owner, the
 // approved address or an approved-for-all operator, and a proof already
 // redeemed (isNonceConsumed). NOT prevented: a paused registry, a deadline
 // beyond the registry's nonce retention, state changing between the check and
@@ -393,8 +399,18 @@ await ag.reputation.isVerified(agentId, buyer, idx);            // → true
 // taskHash commitment, recording the URI as a TEE-VERIFIED endpoint.
 // statusCode must be an integer in 100..999: the registry hashes it as 3-digit
 // decimal and rejects anything else, so the SDK refuses it before broadcasting.
+// `uri` is what the sealed proxy hashed: Go's r.URL.RequestURI() of the request
+// as it arrived — taskHashOf(task) recomputes the commitment, requestUriOf(target)
+// derives that uri from the request target you sent (a raw '|' or '^' in the path
+// comes out as %7C / %5E; a bare trailing '?' is kept), and requestUriCandidates(url)
+// lists the forms a fetch of `url` may have produced (Node's fetch drops a bare '?',
+// browsers keep it). An intermediary that rewrites the URI on the way (normalizing
+// percent-encoding, say) cannot be reproduced client-side: the reveal then does not
+// open the commitment — the CLI's `call` reports that ticket as NOT banked.
 await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);   // → "/hello" ("" if unrevealed)
-await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');  // trustless per-interface aggregate
+await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');  // per-interface aggregate of TEE-verified marks
+// (trustless only for marks from the environment's 1.2.0 upgrade block on — contracts/DEPLOYMENT.md §6;
+//  the views also count earlier marks, which carry no such guarantee: filter FeedbackVerified logs by block)
 await ag.reputation.getVerifiedSummary({ agentId });            // unscoped → all VERIFIED clients (empty → zero summary)
 await ag.reputation.getVerifiedClients(agentId);                // → [ "0x…", … ]  clients with ≥1 verified entry
 await ag.reputation.getVerifiedIndexes(agentId, buyer);         // → [ 1n, 2n ]
@@ -631,7 +647,8 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 
 - **`GET {agentUrl}/hello`** — public identity card: who I am, my owner, and
   the surface I expose. Buffered responses carry a signed `X-Agent-Proof`
-  (a streamed/SSE reply doesn't — a signature needs a complete body). Or
+  (a framework route's SSE stream doesn't — a signature needs a complete
+  body; an `/api/*` service's SSE is buffered, then signed). Or
   let the SDK do the fetch + proof check in one call:
 
   ```ts
@@ -739,7 +756,10 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 
 - **`authenticate` / `connect`** are opinionated shortcuts over `client()`:
   `ag.agent.authenticate(agentId)` mints the owner token up front (so a
-  non-owner fails right there, not at first chat) and requires a wallet;
+  non-owner fails right there, not at first chat) and requires a wallet —
+  with an `agentUrl` it takes the same `{ agentId }` hint as `client()`, under
+  the same checks, and without one an unsigned `/hello` is an error that says
+  so;
   `ag.agent.connect(agentId | agentUrl)` is an explicit **public** handle
   (never attaches a token) for a third party calling `/api/*` and capturing the
   proof:
@@ -826,7 +846,7 @@ The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G
 
 ## Advanced
 
-Raw ABIs (`agenticIDAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`) are exported.
+Raw ABIs (`agenticIDAbi`, `canonicalReputationAbi`, `verifiedFeedbackAbi`, `feedbackBatcherAbi`, `cloneGateAbi`, `standardCloneAuthorizerAbi`, `tappRegistryAbi`, `sandboxServingAbi`) and serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, and for the `taskHash` commitment `taskHashOf`, `requestUriOf`, `requestUriCandidates`) are exported.
 
 **Serve-proof canonical digest** (for independent verifiers): two hashes.
 The inner `proofHash` is
@@ -848,7 +868,8 @@ It is **not** personal_sign: a personal_sign (`0x19 0x45`) signature over
 known-answer vectors the contracts and sealed also assert. The sealed proxy
 learns the validator from `VERIFIED_FEEDBACK_ADDR` (injected by the attestor)
 and echoes it as the envelope's `validator` field (diagnostics only, not part
-of the on-chain tuple); when that variable is unset, malformed or zero, it
+of the on-chain tuple); when that variable is unset, malformed or zero — or
+the registry's `getIdentityRegistry()` is not the container's AgenticID — it
 emits no `X-Agent-Proof` at all.
 
 To verify with the exported primitive, pass the domain explicitly —
@@ -895,7 +916,7 @@ Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealI
 
 The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/tasks` `/result [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
-Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` discards a ticket that fails verification on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — expiry, or data not on chain), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
 ### Diagnostics subcommands
 

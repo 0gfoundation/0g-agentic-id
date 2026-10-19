@@ -38,7 +38,8 @@ pub struct ConfigResponse {
 
     // Protocol-domain siblings of agentic_id_addr, served so ONE URL
     // describes the whole environment (SDK bootstrap) — the attestor
-    // itself never calls the reputation contracts.
+    // never writes to the reputation contracts (its only call is the
+    // startup getIdentityRegistry() anchor check on verified_feedback_addr).
     /// DEPRECATED AgenticIDReputationRegistry fork. Still verifies the legacy
     /// personal_sign ServeProof digest, so it must be paused; clients use
     /// `verified_feedback_addr`.

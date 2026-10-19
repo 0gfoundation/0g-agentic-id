@@ -17,12 +17,13 @@ import * as readline from 'node:readline';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
-import { parseEther, keccak256, toBytes, hexToBytes, concat, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
+import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
+import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
-import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, type SavedProof } from '../proofs';
+import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
@@ -1144,7 +1145,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         try { pretty = JSON.stringify(JSON.parse(t.bodyText), null, 2); } catch { /* not JSON */ }
         out(pretty.length > 4096 ? `${pretty.slice(0, 4096)}\n… (${pretty.length} chars total)\n` : `${pretty}\n`);
         if (t.banked) out(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
-        else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript seen here\n');
+        else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript as sent from here ' +
+                              '(something between here and the agent re-encoded the request URI or a body)\n');
         else out('ticket  : NOT banked — no serve-proof on the response\n');
         continue;
       }
@@ -1200,9 +1202,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
         const proof = toServeProof(ticket);
 
-        // Free pre-check before spending gas.
+        // Free pre-check before spending gas, on the fields the registry
+        // checks (ticketRedeemable) — not on dataOnChain, which it doesn't.
         const v = await ag.reputation.verifyProof(proof);
-        if (!v.ok) {
+        if (!ticketRedeemable(v)) {
           // Burn only on a defect of the ticket itself; keep it when the
           // failure is this side's registry configuration (ticketDisposition).
           if (ticketDisposition(v) === 'burn') {
@@ -1213,6 +1216,10 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
                 `  → check the attestor's verified_feedback_addr / AGENTIC_VERIFIED_FEEDBACK_ADDR\n`);
           }
           continue;
+        }
+        if (!v.dataOnChain) {
+          out(`note: the agent has committed new state since this interaction (a dataHash in the ticket is no longer current) — ` +
+              `the ticket still redeems, and the rating records the version that served you\n`);
         }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
@@ -1389,15 +1396,6 @@ async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<st
   }
 }
 
-/** The sealed proxy's taskHash composition, recomputed client-side:
- *  keccak256(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status). */
-function taskHashOf(task: TaskReveal): `0x${string}` {
-  return keccak256(concat([
-    toBytes(task.method), toBytes(task.uri),
-    hexToBytes(task.reqBodyHash), hexToBytes(task.respBodyHash),
-    toBytes(String(task.statusCode)),
-  ]));
-}
 
 /** Call one of an agent's endpoints, capturing the serve-proof AND its
  *  task-receipt materials. With `clientAddr` the request declares
@@ -1431,15 +1429,18 @@ async function callAgentWithTicket(
   let task: TaskReveal | null = null;
   let banked = false;
   if (proof) {
-    const u = new URL(target);
-    const candidate: TaskReveal = {
-      method,
-      uri: u.pathname + u.search,
-      reqBodyHash: keccak256(bodyBytes),
-      respBodyHash: keccak256(raw),
-      statusCode: res.status,
-    };
-    if (taskHashOf(candidate) === proof.taskHash) task = candidate;
+    // The uri is Go's r.URL.RequestURI() of what was sent (requestUriCandidates
+    // covers the forms a client may put on the wire).
+    for (const uri of requestUriCandidates(target)) {
+      const candidate: TaskReveal = {
+        method,
+        uri,
+        reqBodyHash: keccak256(bodyBytes),
+        respBodyHash: keccak256(raw),
+        statusCode: res.status,
+      };
+      if (taskHashOf(candidate) === proof.taskHash) { task = candidate; break; }
+    }
     if (clientAddr && proof.submitter.toLowerCase() === clientAddr.toLowerCase() && task) {
       saveProof(proof, task, target);
       banked = true;

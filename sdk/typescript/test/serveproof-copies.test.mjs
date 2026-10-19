@@ -9,7 +9,10 @@
  *   VERBATIM: extracted from the page source and evaluated against the
  *   vendored ethers bundle the page itself loads;
  * - attestor/scripts/verify-agent.sh check 3b, through its offline `--kat`
- *   mode (skipped when cast or jq is not on PATH).
+ *   mode (skipped when cast or jq is not on PATH);
+ * - the console's taskHash uri derivation (goRequestURI /
+ *   serveProofRequestURIs), against sealed's requestURIForms table and
+ *   katTaskHashEdge, agreeing with the SDK's requestUriOf.
  *
  * Same known-answer vector as contracts, sealed and test/serveproof.test.mjs,
  * plus a cross-check against the SDK's production builder and a
@@ -26,6 +29,8 @@ import vm from 'node:vm';
 import { privateKeyToAccount } from 'viem/accounts';
 
 import { buildServeProofSigningHash, signServeProof } from '../dist/ServeProof.js';
+import { requestUriOf, requestUriCandidates } from '../dist/taskHash.js';
+import { KAT_TASK_HASH_EDGE, REQUEST_URI_FORMS, RESP } from './taskhash-vectors.mjs';
 
 const REPO = fileURLToPath(new URL('../../../', import.meta.url));
 const WEB = `${REPO}attestor/crates/api/web/`;
@@ -67,12 +72,16 @@ function extractFunction(src, name) {
 function loadConsole() {
   const html = readFileSync(`${WEB}index.html`, 'utf8');
   const ethers = createRequire(import.meta.url)(`${WEB}ethers.umd.min.js`);
-  const ctx = vm.createContext({ ethers });
+  const ctx = vm.createContext({ ethers, URL, TextEncoder });
   vm.runInContext(
-    ['serveProofSignedDigest', 'configuredServeProofValidator'].map((n) => extractFunction(html, n)).join('\n'),
+    ['serveProofSignedDigest', 'configuredServeProofValidator', 'goRequestURI', 'serveProofRequestURIs']
+      .map((n) => extractFunction(html, n)).join('\n'),
     ctx,
   );
-  return { ethers, digest: ctx.serveProofSignedDigest, validatorOf: ctx.configuredServeProofValidator };
+  return {
+    ethers, digest: ctx.serveProofSignedDigest, validatorOf: ctx.configuredServeProofValidator,
+    requestURI: ctx.goRequestURI, requestURIs: ctx.serveProofRequestURIs,
+  };
 }
 
 /** SDK builder params for an envelope (what ServeSession would parse). */
@@ -135,6 +144,26 @@ test('console configuredServeProofValidator: blank, malformed or zero → null',
   }
   assert.equal(validatorOf(null), null);
   assert.equal(validatorOf({ verified_feedback_addr: KAT_VALIDATOR }), KAT_VALIDATOR);
+});
+
+test("console goRequestURI matches Go's RequestURI on every sealed vector (and the SDK copy)", () => {
+  const { requestURI } = loadConsole();
+  for (const [wire, want] of REQUEST_URI_FORMS) {
+    assert.equal(requestURI(wire), want, wire);
+    assert.equal(requestUriOf(wire), want, `SDK ${wire}`);
+  }
+});
+
+test('console taskHash over its uri reproduces katTaskHashEdge; candidates agree with the SDK', () => {
+  const { ethers, requestURI, requestURIs } = loadConsole();
+  const task = ethers.keccak256(ethers.concat([
+    ethers.toUtf8Bytes('GET'), ethers.toUtf8Bytes(requestURI('/api/a|b?')),
+    ethers.keccak256('0x'), ethers.keccak256(ethers.toUtf8Bytes(RESP)), ethers.toUtf8Bytes('200'),
+  ]));
+  assert.equal(task, KAT_TASK_HASH_EDGE);
+  for (const url of ['http://h/hello', 'http://h/api/a|b?', 'http://h/api/x?q=1', 'http://h/api/x?#f']) {
+    assert.deepEqual([...requestURIs(url)], requestUriCandidates(url), url);
+  }
 });
 
 const haveCastJq = spawnSync('sh', ['-c', 'command -v cast && command -v jq'], { stdio: 'ignore' }).status === 0;

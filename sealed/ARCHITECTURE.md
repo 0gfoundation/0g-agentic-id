@@ -510,10 +510,13 @@ container's `:8080`.
 
 Exactly three surfaces are proof-signed: `/hello`, `/_seal/auth` and the
 agent-registered `/api/*` services — and only when `VERIFIED_FEEDBACK_ADDR`
-is usable (and the agent has an on-chain identity). Framework routes
-(`/v1/*`, `/v1/responses*`, any UI), WebSocket upgrades and streamed
-responses never carry an `X-Agent-Proof`; the proxy also drops one an
-upstream backend sets, so the header is always the runtime's own.
+is usable and anchored (its `getIdentityRegistry()` is `AGENTIC_ID_ADDR`,
+checked once the chain is dialled) and the agent has an on-chain identity.
+Framework routes (`/v1/*`, `/v1/responses*`, any UI) — their SSE streams
+included — and WebSocket upgrades never carry an `X-Agent-Proof`; an
+`/api/*` backend's SSE is buffered, then signed. The proxy also drops one an
+upstream backend sets, as a header or a trailer, so the header is always the
+runtime's own.
 
 The agent's own `/settings` lever is deliberately asymmetric with the owner's:
 it validates, renders and restarts exactly like the owner path, but persists
@@ -563,7 +566,7 @@ The env surface:
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
 | `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`) |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
-| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
+| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. Once the chain client has dialled, sealed also reads its `getIdentityRegistry()`: unless that is `AGENTIC_ID_ADDR` (no code, a revert or an unreadable result after retries count as not), it logs a `WARN` naming both addresses and takes the same no-proof path. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
 | `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:51-54`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:163-170`) |

@@ -133,7 +133,10 @@ Simple is the default; per-tag / per-role weighting is opt-in.
   the canonical ERC-8004 Reputation Registry's `NewFeedback` event (clients call its
   `giveFeedback` directly). `VerifiedFeedbackRegistry`'s `FeedbackVerified` event marks
   the entries backed by a ServeProof; for those, the proof's `dataHashes` (below) name
-  the serving version directly.
+  the serving version directly — for marks from the environment's 1.2.0 upgrade block
+  on (`contracts/DEPLOYMENT.md` §6). Earlier marks carry no FIND-01 / FIND-02
+  guarantee, so their `dataHashes` are not assured; drop `FeedbackVerified` logs below
+  that block (the on-chain views cannot).
 - **Per-role dataHashes**: `intelligentDatasOf` gives `(role=dataDescription, dataHash)`
   for the current version; historical role↔hash mapping comes from the update events.
 - **Serve-data per review**: `VerifiedFeedbackRegistry.getServeData(agentId, client, idx)`

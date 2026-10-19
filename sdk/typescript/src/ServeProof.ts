@@ -230,11 +230,17 @@ export async function signServeProof(
  * from the proof itself. The proof's own `validator` field is NOT consulted —
  * it is unsigned diagnostics; pass the registry you trust.
  *
+ * Exactly as strict as the registry (OZ 5.0.2 `ECDSA.recover`): the signature
+ * must be 65 bytes with `v` ∈ {27, 28} and a low `s` (≤ secp256k1n / 2).
+ * A high-`s` or `v` ∈ {0, 1} encoding of an otherwise genuine signature
+ * recovers the same signer off chain but reverts on chain, so it is `false`
+ * here too — never an `ok` that the registry then refuses.
+ *
  * @param proof - The complete ServeProof with signature
  * @param expectedSigner - The agentSeal address that should have signed
  * @param domain - The chainId + verifyingContract + validator the proof is bound to
  * @returns True if the signature is valid for the expected signer; false for a
- *   missing / malformed / zero validator
+ *   missing / malformed / zero validator or a non-canonical signature encoding
  */
 export async function verifyServeProofSignature(
   proof: ServeProofType,
@@ -244,6 +250,7 @@ export async function verifyServeProofSignature(
   // No usable validator → nothing to verify against. Never fall back to the
   // legacy personal_sign digest.
   if (!isUsableValidator(domain?.validator)) return false;
+  if (!isRegistryCanonicalSignature(proof.signature)) return false;
   const signingHash = buildServeProofSigningHash({
     chainId: domain.chainId,
     verifyingContract: domain.verifyingContract,
@@ -265,4 +272,19 @@ export async function verifyServeProofSignature(
     return false;
   }
   return recovered.toLowerCase() === expectedSigner.toLowerCase();
+}
+
+/** secp256k1n / 2 — OZ ECDSA rejects any `s` above it (signature malleability). */
+const SECP256K1N_HALF = BigInt('0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0');
+
+/**
+ * Whether `sig` is an encoding the VerifiedFeedbackRegistry accepts: 65 bytes
+ * (`r ‖ s ‖ v`), `v` ∈ {27, 28} (ecrecover yields no signer for anything else)
+ * and `s` ≤ secp256k1n / 2 (OZ `ECDSA.tryRecover` → `ECDSAInvalidSignatureS`).
+ */
+function isRegistryCanonicalSignature(sig: unknown): boolean {
+  if (typeof sig !== 'string' || !/^0x[0-9a-fA-F]{130}$/.test(sig)) return false;
+  const s = BigInt(`0x${sig.slice(66, 130)}`);
+  const v = parseInt(sig.slice(130, 132), 16);
+  return (v === 27 || v === 28) && s <= SECP256K1N_HALF;
 }

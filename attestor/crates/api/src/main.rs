@@ -58,6 +58,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
     )?;
+    // GET /config advertises this validator to every verifier; refuse to
+    // serve one that is not anchored to ATTESTOR_AGENTIC_ID_ADDR.
+    attestor_shared::chain::check_verified_feedback_anchor(
+        chain.as_ref(),
+        cfg.verified_feedback_addr,
+        cfg.agentic_id_addr,
+    )
+    .await?;
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let idempotency = PostgresIdempotencyStore::new(pool.clone());

@@ -54,9 +54,11 @@ serve-proof 所签的域,所以你经 socket 签出的任何东西都替代不�
 不可被覆盖。
 
 签名路由上的响应——`/hello`、`/_seal/auth` 和你注册的 `/api/*`
-服务——在 runtime 配置了 VerifiedFeedbackRegistry(`VERIFIED_FEEDBACK_ADDR`)
-时,**自动**被 sealed proxy 加上 `X-Agent-Proof` 头。framework 自己的
-chat/UI 路由、WebSocket upgrade 和流式响应一律不签。Envelope 签:
+服务——在 runtime 有 serve-proof validator(注入的 runtime snapshot 里的
+`serve-proof validator` 一行;那里是 `none` 就表示什么都不签)时,**自动**被
+sealed proxy 加上 `X-Agent-Proof` 头。framework 自己的 chat/UI 路由——包括它们的
+SSE 流——和 WebSocket upgrade 一律不签。你的 `/api/*` 响应总是先完整缓冲再签名,
+SSE 也一样,所以服务应当返回简短、独立的响应,而不是一条长流。Envelope 签:
 
 ```
 {

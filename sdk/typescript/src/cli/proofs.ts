@@ -115,17 +115,32 @@ export function removeProof(signature: `0x${string}`): void {
 }
 
 /**
- * What `rate` does with a ticket whose free pre-check (`verifyProof`) failed.
- * `'burn'` only on a defect of the ticket itself — expired, data not on
- * chain, or a signature that does not verify against the registry it names.
- * `'keep'` when the failure is this side's configuration (no registry
- * configured, or the ticket names a different one): the ticket may still
- * redeem once that is fixed.
+ * Whether the registry would redeem this ticket, judged on exactly what
+ * VerifiedFeedbackRegistry checks: not expired, and a signature that verifies
+ * against the registry configured here. `dataOnChain` is NOT one of them —
+ * the registry never compares a proof's dataHashes with the agent's current
+ * iData (it records them as the version that served), so a ticket whose
+ * agent has since committed new state still redeems. `rate` shows that case
+ * as an informational note, not a failure.
+ */
+export function ticketRedeemable(
+  v: Pick<ProofVerification, 'notExpired' | 'registryMatches' | 'signerMatches'>,
+): boolean {
+  return v.notExpired && v.registryMatches && v.signerMatches;
+}
+
+/**
+ * What `rate` does with a ticket that is not `ticketRedeemable`.
+ * `'burn'` only on a defect of the ticket itself — expired, or a signature
+ * that does not verify against the registry it names. `'keep'` when the
+ * failure is this side's configuration (no registry configured, or the
+ * ticket names a different one): the ticket may still redeem once that is
+ * fixed. `dataOnChain` never burns a ticket (see `ticketRedeemable`).
  */
 export function ticketDisposition(
-  v: Pick<ProofVerification, 'notExpired' | 'dataOnChain' | 'registryMatches' | 'signerMatches'>,
+  v: Pick<ProofVerification, 'notExpired' | 'registryMatches' | 'signerMatches'>,
 ): 'burn' | 'keep' {
-  const defect = !v.notExpired || !v.dataOnChain || (v.registryMatches && !v.signerMatches);
+  const defect = !v.notExpired || (v.registryMatches && !v.signerMatches);
   return defect ? 'burn' : 'keep';
 }
 

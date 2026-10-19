@@ -16,7 +16,7 @@ import { join } from 'node:path';
 // throwaway dir BEFORE importing so every test is hermetic.
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'jar-'));
 
-const { saveProof, listProofs, removeProof, toServeProof, ticketDisposition } = await import('../dist/cli/proofs.js');
+const { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable } = await import('../dist/cli/proofs.js');
 
 const WALLET = '0xC11e0000000000000000000000000000000000C1';
 const now = Math.floor(Date.now() / 1000);
@@ -105,14 +105,25 @@ test('rate burns a ticket only for its own defects, keeps it on a registry-confi
   const good = { notExpired: true, dataOnChain: true, registryMatches: true, signerMatches: true };
   const cases = [
     ['expired', { notExpired: false }, 'burn'],
-    ['data not on chain', { dataOnChain: false }, 'burn'],
+    // The registry never checks dataHashes against chain: an agent that has
+    // committed new state since the interaction leaves the ticket redeemable.
+    ['data not on chain', { dataOnChain: false }, 'keep'],
     ['signature mismatch under the matching registry', { signerMatches: false }, 'burn'],
     // registryMatches false ⇒ the signature was not checked (signerMatches false too)
     ['no registry configured / names a different registry', { registryMatches: false, signerMatches: false }, 'keep'],
     ['different registry AND expired', { registryMatches: false, signerMatches: false, notExpired: false }, 'burn'],
-    ['different registry AND data not on chain', { registryMatches: false, signerMatches: false, dataOnChain: false }, 'burn'],
+    ['different registry AND data not on chain', { registryMatches: false, signerMatches: false, dataOnChain: false }, 'keep'],
   ];
   for (const [name, over, want] of cases) {
     assert.equal(ticketDisposition({ ...good, ...over }), want, name);
   }
+});
+
+test('rate gates on what the registry checks — data not on chain alone does not block', () => {
+  const good = { notExpired: true, dataOnChain: true, registryMatches: true, signerMatches: true };
+  assert.equal(ticketRedeemable(good), true);
+  assert.equal(ticketRedeemable({ ...good, dataOnChain: false }), true, 'stale dataHashes still redeem');
+  assert.equal(ticketRedeemable({ ...good, notExpired: false }), false);
+  assert.equal(ticketRedeemable({ ...good, signerMatches: false }), false);
+  assert.equal(ticketRedeemable({ ...good, registryMatches: false, signerMatches: false }), false);
 });

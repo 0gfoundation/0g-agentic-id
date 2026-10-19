@@ -3,7 +3,7 @@
 > 给每一个 AI agent 一个贯穿其整个生命周期、可被任何人独立验证的链上身份。
 
 AgenticID 是构建在 **0G 生态**上的协议：把 agent 的功能数据锚定上链、在 TEE
-里运行其代码、用只存在于 TEE 内的密钥给每条响应盖章，让"这个 agent 可信"
+里运行其代码、用只存在于 TEE 内的密钥给它对外服务的响应盖章，让"这个 agent 可信"
 从一句需要盲信的声明，变成一条任何人都能自己验证的属性。
 
 ---
@@ -89,7 +89,7 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 |---|---|---|
 | **ServeProof**（PascalCase）| Solidity struct，链上 reputation 流程的载体 | `VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, ServeProof)`，合约对绑定本 registry 的 digest 做 ecrecover 验签 |
 | **serve-proof**（小写连字符）| 通用概念——sealed 自动签的任何 envelope | 文档里的非正式称呼，包含 ServeProof + heartbeat + chain.Update 等 |
-| **X-Agent-Proof** | HTTP 响应头名 | 容器有 `VERIFIED_FEEDBACK_ADDR` 时，sealed proxy 给签名的 :8080 响应（`/hello`、agent 的 `/api/*` 服务）自动加的 header；载体是签过的 envelope |
+| **X-Agent-Proof** | HTTP 响应头名 | 容器有 `VERIFIED_FEEDBACK_ADDR` 时，sealed proxy 给签名的 :8080 响应（`/hello`、`/_seal/auth`、agent 的 `/api/*` 服务）自动加的 header；载体是签过的 envelope |
 
 简记：**ServeProof** 是它的链上形态，**X-Agent-Proof** 是它的 HTTP 形态，**serve-proof** 是统称。
 
@@ -126,8 +126,9 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 被发现、可被调用。
 
 链上记录不是冻结的。agent 可以自动更新功能数据。协议保证的东西更精确：
-**你永远能验证 agent 为你服务的那一刻，跑的是什么样的 iData。** 每条响应都
-带一份对当前 iData 版本的签名证明。这不是不可变性，而是**任意时点的可验
+**你永远能验证 agent 为你服务的那一刻，跑的是什么样的 iData。** 运行时有
+`VERIFIED_FEEDBACK_ADDR` 时，每条签名响应（`/hello`、`/_seal/auth`、agent 的
+`/api/*` 服务）都带一份对当前 iData 版本的签名证明。这不是不可变性，而是**任意时点的可验
 证性**——审计追踪式的信任。
 
 > 在本仓库里，这套"演化即上链"由 `sealed` 运行时实现：watcher 每 30s 比对
@@ -163,7 +164,7 @@ attestation 值，并留下可追溯的日志。没有"悄悄改掉一个运行�
 
 从这份密钥材料，AgenticID 为每个 agent 生成一个 **AgentSeal**：一对密钥，
 私钥只存在于 TEE 运行时内。owner 拿不到，TEE 之外的任何人都拿不到。agent 用
-AgentSeal 给自己**对外服务的响应**（它的 `/hello` 和 `/api/*` 服务）签名——这个
+AgentSeal 给自己**对外服务的响应**（它的 `/hello`、`/_seal/auth` 和 `/api/*` 服务）签名——这个
 签名证明：响应来自一个跑在 TEE 里、且严格按链上记录运行的 agent。
 
 具体地说，AgenticID 的后端 Attestor 自己也是一个注册在 TappRegistry 上的

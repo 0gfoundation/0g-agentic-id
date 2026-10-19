@@ -90,6 +90,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
     )?;
+    // The validator every new container is handed must verify against this
+    // AgenticID — refuse to start rather than bake a wrong one fleet-wide.
+    attestor_shared::chain::check_verified_feedback_anchor(
+        chain.as_ref(),
+        cfg.verified_feedback_addr,
+        cfg.agentic_id_addr,
+    )
+    .await?;
     let storage: Arc<dyn StorageClient> = if cfg.mock_storage {
         tracing::info!("storage: using MockStorage (MOCK_STORAGE=true)");
         Arc::new(MockStorage::new(&cfg.storage_indexer))
