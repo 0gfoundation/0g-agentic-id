@@ -181,8 +181,8 @@ func main() {
 // could read the key out of this process). Nothing reaches attestor on that
 // path, since /status is signed with the key this boot refuses to fetch: the
 // refusal (cause + fix, from privsep.Required) is visible only in /log, and
-// attestor's provision-timeout sweep fails the deployment when /provision
-// never arrives.
+// attestor's provision-timeout sweep fails the container stage (deployment
+// phase offline) when /provision never arrives.
 func provisionGate(cfg *config.Bootstrap, privsepRequired func() error) string {
 	if cfg.AttestorURL == "" {
 		return "ATTESTOR_URL unset -- skipping provision / bootstrap / status"

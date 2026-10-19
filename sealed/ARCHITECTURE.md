@@ -39,11 +39,19 @@ uid and gid — so `agent_seal_priv` is never fetched into a container whose
 framework would run as sealed's uid. The refusal is quieter than a failing
 phase: it is only logged (a `FAIL` line in `/log` naming the cause and its
 fix). Nothing reaches attestor, because `/status` is signed with the very key
-this boot declined to fetch; instead attestor's provision-timeout sweep fails
-the deployment once `/provision` has not arrived within `PROVISION_TIMEOUT`
+this boot declined to fetch; instead attestor's provision-timeout sweep
+catches it once `/provision` has not arrived within `PROVISION_TIMEOUT`
 (5 min) of sandbox create or recreate
 (`attestor/crates/worker/src/jobs.rs:21`,
-`attestor/crates/worker/src/main.rs:166-189`).
+`attestor/crates/worker/src/main.rs:166-189`). The sweep flips
+`container_stage` to `Failed` (reason `provision timeout`), so the deployment
+shows as `offline`, not `failed`: `failed` means the deploy itself never
+completed (a storage or mint failure), while a container failure on a
+deployment whose storage and mint landed is `offline`
+(`attestor/crates/shared/src/types.rs` (`derive_phase`)). Bringing it back
+online on the same image only repeats the refusal. The remedy is a corrected
+image (the fix the `FAIL` line names), then a fresh create on it — bring
+online (`/start` with a `create` envelope) or `/reset`.
 
 ```
 Phase 0  attest           parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pubkey,
@@ -51,7 +59,7 @@ Phase 0  attest           parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pub
                           ↓
 gate     privsep          privsep.Required: framework will run as the `agent` user,
                           else log FAIL (cause + fix) and stop — no key, no /status;
-                          attestor's provision-timeout sweep fails the deploy
+                          attestor's provision-timeout sweep marks it `offline`
                           ↓
 Phase 1  provision        POST /provision → ECIES-decrypt, with the one container key,
                           both payloads the response carries:

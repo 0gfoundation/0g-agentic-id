@@ -818,7 +818,8 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    sealed,你的 `Start` 必须经 `privsep.Drop` 起进程。没有可用的
    `agent` 账户 —— 缺失,或映射到 uid/gid 0 —— sealed 会拒绝
    provision(`privsep.Required`,它的错误写明原因和修法),该镜像上的
-   每次部署都会失败 —— 这是有意的:白名单钉的是 hash,不是构建内容。
+   部署一个都上不了线(显示为 `offline`)—— 这是有意的:白名单钉的是
+   hash,不是构建内容。
    这道闸只保证框架永远不以 sealed 的 uid 运行 —— 这是内核隔离墙的
    必要条件,不是隔离的完整证明;root 一侧如何处理框架文件和框架 CLI
    是另一块独立的加固领域。

@@ -35,9 +35,15 @@ Phase 0 和 Phase 1 之间有一道闸：`provisionGate`（`main.go:177-198`）�
 只记日志（`/log` 里一行 `FAIL`，写明原因和修法）。attestor 那边收不到任何上报，
 因为 `/status` 要用的正是这次启动拒绝去取的那把密钥签名；改由 attestor 的
 provision 超时扫描兜底：sandbox 创建或重建后 `PROVISION_TIMEOUT`（5 分钟）内
-`/provision` 没来，这条部署就被判失败
+`/provision` 没来，扫描就会接手
 （`attestor/crates/worker/src/jobs.rs:21`、
-`attestor/crates/worker/src/main.rs:166-189`）。
+`attestor/crates/worker/src/main.rs:166-189`）。扫描把 `container_stage` 置为
+`Failed`（原因 `provision timeout`），于是这条部署显示为 `offline`，而不是
+`failed`：`failed` 指部署本身没走完（存储或 mint 失败），而存储和 mint 都已落地
+的部署出了容器故障，显示的是 `offline`
+（`attestor/crates/shared/src/types.rs`（`derive_phase`））。在同一个镜像上重新
+上线只会再被拒一次。补救是换一个修好的镜像（修法就是那行 `FAIL` 写的），再在它上面
+全新创建一次 —— 上线（`/start` 带 `create` 信封）或 `/reset`。
 
 ```
 Phase 0  attest           解析环境、校验 SANDBOX_SEAL_KEY ↔ attestation.pubkey、
@@ -45,7 +51,7 @@ Phase 0  attest           解析环境、校验 SANDBOX_SEAL_KEY ↔ attestation
                           ↓
 gate     privsep          privsep.Required：框架将以 `agent` 用户运行，否则记一行
                           FAIL（原因 + 修法）就停 —— 没有密钥、不发 /status；
-                          由 attestor 的 provision 超时扫描判部署失败
+                          由 attestor 的 provision 超时扫描把它标为 `offline`
                           ↓
 Phase 1  provision        POST /provision → 用同一把容器密钥 ECIES 解出响应里的
                           两份载荷：

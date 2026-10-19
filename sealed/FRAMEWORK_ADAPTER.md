@@ -954,8 +954,9 @@ The one obligation that replaced all four is step 4.
    it) and run sealed as root, and your `Start` must spawn through
    `privsep.Drop`. Without a usable `agent` account — missing, or mapped
    to uid or gid 0 — sealed refuses to provision (`privsep.Required`,
-   whose error names the cause and the fix) and every deploy on that
-   image fails — by design: the whitelist pins the hash, not the build.
+   whose error names the cause and the fix) and no deploy on that image
+   ever comes online (it shows as `offline`) — by design: the whitelist
+   pins the hash, not the build.
    The gate guarantees only that the framework never runs as sealed's
    uid — a necessary condition for the kernel wall, not a complete proof
    of isolation; root-side handling of framework files and CLIs is a
