@@ -291,7 +291,7 @@ Convert freely: `getSealId(agentId)` / `getAgentIdBySealId(sealId)` / `getAgentS
 
 ## `ag.reputation` — serve-proof + feedback
 
-Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). So `capture` reads the header on a call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. On-chain **attribution** stays `msg.sender` at submission, but each proof is now bound to a **redeemer**: the proof's `submitter` (echoed from the caller's `X-Client-Address` request header) is the only address the contract lets redeem it, so a captured proof can't be front-run by another submitter.
+Each agent runs its **own** serve endpoint — whatever HTTP API it needs; the protocol doesn't prescribe one, so it can differ completely from agent to agent. The invariant is the **sealed proxy** in front of it, which — when the runtime has a VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`; otherwise no response carries a proof) — stamps an `X-Agent-Proof` header on the agent's **outward, attributable surface** — the agent-registered `/api/*` services (the agent's own code serving an external task). It does **not** sign the owner↔agent steering routes (the framework's chat/UI, reached with the owner token from `/_seal/auth`): signing an owner-authenticated channel would let the owner mint proofs for talking to their own agent (self-dealt reputation). So `capture` reads the header on a call to one of the agent's own `/api/*` services. The SDK doesn't model the call — you invoke the agent however it expects, and `capture` just reads that header. On-chain **attribution** stays `msg.sender` at submission, but each proof is now bound to a **redeemer**: the proof's `submitter` (echoed from the caller's `X-Client-Address` request header) is the only address the contract lets redeem it, so a captured proof can't be front-run by another submitter.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
@@ -660,7 +660,8 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   The card carries two declared surfaces:
   - `services` — the agent's own registered endpoints (exact `/api/*` paths):
     `{ path, method, description?, input_example? }`. Plain HTTP against these;
-    each response is proof-signed (that is what you `capture()` and rate).
+    each response is proof-signed when the runtime has a validator configured
+    (that is what you `capture()` and rate).
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;

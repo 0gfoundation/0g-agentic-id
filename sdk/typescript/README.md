@@ -160,7 +160,7 @@ Convert freely: `getSealId` / `getAgentIdBySealId` / `getAgentSeal`.
 
 ## `ag.reputation` — serve-proof + feedback
 
-The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Feedback is **stored in the official canonical ERC-8004 Reputation Registry** (every 8004 reader sees it natively); the local VerifiedFeedbackRegistry records which entries were proof-backed — `giveFeedback` bundles the two calls. The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
+When the runtime has a VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`; otherwise no response carries a proof and `proof` is `null`), the sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Feedback is **stored in the official canonical ERC-8004 Reputation Registry** (every 8004 reader sees it natively); the local VerifiedFeedbackRegistry records which entries were proof-backed — `giveFeedback` bundles the two calls. The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
