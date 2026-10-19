@@ -404,6 +404,23 @@ export const agenticIDAbi = [
   },
   {
     type: 'function',
+    name: 'getApproved',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'isApprovedForAll',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'operator', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
     name: 'balanceOf',
     stateMutability: 'view',
     inputs: [{ name: 'owner', type: 'address' }],
@@ -884,6 +901,15 @@ export const verifiedFeedbackAbi = [
     stateMutability: 'view',
     inputs: [],
     outputs: [{ name: '', type: 'address' }],
+  },
+  // NonceRegistry view: a ServeProof's nonce key is
+  // keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, signature)).
+  {
+    type: 'function',
+    name: 'isNonceConsumed',
+    stateMutability: 'view',
+    inputs: [{ name: 'key', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'bool' }],
   },
 
   // ── Events ──

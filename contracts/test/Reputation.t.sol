@@ -331,7 +331,7 @@ contract ReputationTest is AgenticIDTestBase {
     // ── Submitter binding / front-running ─────────────────────────────────────
 
     /// @dev Inner-hash known-answer vector as the deprecated fork computes it
-    ///      (the fork signs the legacy personal_sign wrap of this hash). The
+    ///      (the fork verifies the legacy personal_sign wrap of this hash). The
     ///      cross-implementation anchor — this inner hash PLUS the
     ///      registry-bound signed digest the sealed runtime and the SDK pin —
     ///      is VerifiedFeedback.t.sol's test_serveProofDigest_knownAnswerVector;

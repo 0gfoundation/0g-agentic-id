@@ -640,6 +640,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 | `SealSignSock` | `/run/seal-sign.sock` | agent 专用签名端点(§8);告诉你的 agent 它在哪 |
 | `AgentSeal` | 从 `agent_seal_priv` 公钥派生的 0x 地址 | agent 的 TEE 身份地址 |
 | `AgentID`、`Owner`、`ChainRPC`、`ContractAddr`、`ChainID`、`AttestorURL` | 链上 bootstrap 输出 | 公开链上事实,不是秘密;注入 agent 的 context 让它能推理自己的身份 |
+| `VerifiedFeedbackAddr` | 来自 `VERIFIED_FEEDBACK_ADDR` 的 VerifiedFeedbackRegistry proxy 地址;未设置、格式错误或为零地址时为空 | serve-proof 的 validator(EIP-191 version `0x00`)。由 sealed 自己拿它签名——adapter 无需处理;为空 ⇒ 任何路由都不带 `X-Agent-Proof` |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
 | `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
 

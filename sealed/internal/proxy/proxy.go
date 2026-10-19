@@ -12,15 +12,23 @@
 //	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
 //	POST /_seal/claim   - take the single-driver seat (owner-signed)
 //	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
-//	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
+//	*    /              - reverse proxy (returns 503 until armed): agent-registered
+//	                      /api/* services (signed) and framework-declared routes
+//	                      (never signed); any other path 404s
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
 // X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
 // output, which is owner-private. /healthz and /log stay open.
 //
-// All signed responses (everything except /healthz, /log, /log/agent) carry an
-// X-Agent-Proof header packing an agentSeal signature and the envelope JSON it
-// covers. The signature is EIP-191 version 0x00 bound to the
+// Signed responses carry an X-Agent-Proof header packing an agentSeal
+// signature and the envelope JSON it covers. The signed set is exactly:
+// /hello, /_seal/auth and agent-registered /api/* services — and only when
+// VERIFIED_FEEDBACK_ADDR names a usable registry (and the agent has an
+// on-chain identity). Framework routes (chat/UI), WebSocket upgrades and
+// streamed (SSE) responses are never signed, nor is anything else. The
+// header is runtime-owned: an X-Agent-Proof set by an upstream backend is
+// dropped on every relay path, so the only one a client ever sees is the one
+// writeServeProof attached. The signature is EIP-191 version 0x00 bound to the
 // VerifiedFeedbackRegistry (see writeServeProof) — not a personal_sign, so
 // there is no verifyMessage-style check: verifiers rebuild the ServeProof hash
 // from the envelope plus their configured deployment and recover the digest.
@@ -72,7 +80,7 @@ type Server struct {
 	adapter      framework.Framework
 	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
 	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
-	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
 	// adapters that don't serve one natively.
@@ -101,6 +109,10 @@ type Server struct {
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
 	liveOwner OwnerResolver
+
+	// chainID is the chain the bootstrap client dialled (decimal), late-bound
+	// via SetChainID; it picks the explorer the HTML log pages link to.
+	chainID string
 }
 
 // OwnerResolver returns the agent's owner as of right now, by reading the
@@ -625,11 +637,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//   1. an agent-registered service (exact path) → its loopback backend,
 	//      always signed;
 	//   2. a framework-declared route (longest-prefix) → the framework
-	//      upstream, signed per Route.Signed;
-	//   3. otherwise, if the adapter declared any routes, 404 — an undeclared
-	//      path is NOT blind-forwarded (bounds the public + signing surface).
-	// Legacy fallback: an adapter that declares no routes keeps the old
-	// behaviour — forward every path to the upstream and sign every response.
+	//      upstream, never signed;
+	//   3. otherwise 404 — an undeclared path is NOT blind-forwarded (bounds
+	//      the public + signing surface), whether or not the adapter declared
+	//      any routes.
 	// Signing follows a proxy-owned invariant, NOT the adapter's declared
 	// Signed flag:
 	//   - agent-registered /api/* service → signed. The outward, attributable
@@ -723,8 +734,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Gated on frameworkRoute, NOT on Content-Type alone: only a
 	// framework-declared route (the owner↔agent steering channel — chat/UI) may
 	// go unsigned. An agent-registered /api/* service (the outward, attributable
-	// surface) and the legacy forward-all path must stay buffered + signed, so
-	// they never lose their X-Agent-Proof merely by emitting text/event-stream —
+	// surface) must stay buffered + signed, so it never loses its
+	// X-Agent-Proof merely by emitting text/event-stream —
 	// even if that means a long /api/* stream is buffered (and can still hit the
 	// idle cutoff; model such a service as short, discrete responses instead).
 	if shouldStreamRelay(frameworkRoute, resp) {
@@ -742,6 +753,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// Skip Access-Control-* (corsMiddleware already set ours; duplicates
 		// cause browsers to reject the response).
 		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		// X-Agent-Proof is runtime-owned: only writeServeProof attaches it.
+		if isAgentProofHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -775,9 +790,9 @@ func isEventStream(resp *http.Response) bool {
 // shouldStreamRelay decides whether a response is relayed as an unsigned stream
 // rather than buffered + signed. Only a framework-declared route (the
 // owner↔agent steering channel: chat/UI) may stream: it has no attribution
-// consumer, so an unsigned stream is fine. Agent-registered /api/* services and
-// the legacy forward-all path never stream here — they stay buffered + signed
-// so the attributable surface keeps its X-Agent-Proof even when it emits SSE.
+// consumer, so an unsigned stream is fine. Agent-registered /api/* services
+// never stream here — they stay buffered + signed so the attributable surface
+// keeps its X-Agent-Proof even when it emits SSE.
 func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
 	return frameworkRoute && isEventStream(resp)
 }
@@ -797,6 +812,11 @@ func streamRelay(w http.ResponseWriter, resp *http.Response) {
 		// corsMiddleware already set our Access-Control-*; duplicates make
 		// browsers reject the response.
 		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		// A stream is never signed, so an upstream X-Agent-Proof can only be
+		// one the runtime did not issue — drop it.
+		if isAgentProofHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -876,6 +896,8 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			resp.Header.Del("Access-Control-Allow-Methods")
 			resp.Header.Del("Access-Control-Allow-Headers")
 			resp.Header.Del("Access-Control-Expose-Headers")
+			// Upgrades are never signed; the header is runtime-owned.
+			resp.Header.Del(agentProofHeader)
 			return nil
 		},
 	}
@@ -930,6 +952,19 @@ type serveProof struct {
 // address that will redeem the serve-proof (bound into the signature).
 const clientAddressHeader = "X-Client-Address"
 
+// agentProofHeader carries the serve-proof. It is runtime-owned: writeServeProof
+// is the only place that sets it, and every path relaying an upstream response
+// (buffered, streamed, WebSocket upgrade) drops an upstream-supplied copy, so a
+// backend cannot put a header of its own choosing under the runtime's name.
+const agentProofHeader = "X-Agent-Proof"
+
+// isAgentProofHeader reports whether a response header key names
+// X-Agent-Proof. Keys from net/http are canonical already; the comparison is
+// case-insensitive anyway so a non-canonical map key cannot slip past.
+func isAgentProofHeader(k string) bool {
+	return strings.EqualFold(k, agentProofHeader)
+}
+
 // writeServeProof signs the contract-shaped envelope with agent_seal_priv and
 // emits a single header packing the signature and base64-url envelope JSON:
 //
@@ -955,7 +990,9 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	validatorAddr, validatorOK := parseValidator(validator)
 	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK {
 		// No on-chain identity (or nothing to bind the proof to) — serve the
-		// body without a serve-proof.
+		// body without a serve-proof, and without any X-Agent-Proof a caller
+		// may have left on w.
+		w.Header().Del(agentProofHeader)
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(statusCode)
@@ -1031,7 +1068,7 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	}
 	sig[64] += 27
 
-	w.Header().Set("X-Agent-Proof",
+	w.Header().Set(agentProofHeader,
 		"0x"+hex.EncodeToString(sig)+"."+base64.RawURLEncoding.EncodeToString(proofJSON))
 	w.Header().Del("Content-Length")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))

@@ -398,16 +398,40 @@ export class AgentApi {
    * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
+   *
+   * With an `agentUrl`, the agentId comes from `/hello`'s proof envelope — which
+   * is absent when the runtime signs nothing (no `VERIFIED_FEEDBACK_ADDR`).
+   * Callers that already know the id pass it as `opts.agentId`: it is used when
+   * `/hello` carries no proof, must equal the envelope's id when it does, and
+   * is bound to the URL on chain like a discovered id. An `ag` with a key that
+   * still ends up with no agentId gets a public handle and a console warning —
+   * never a silent downgrade.
    */
-  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string; agentId?: bigint }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
-    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
-    // this URL via chain before this handle could ever sign for it.
+    let agentId = fromUrl ? disc.agentId : idOrUrl;
+    if (fromUrl && opts?.agentId !== undefined) {
+      if (agentId !== undefined && agentId !== opts.agentId) {
+        throw new Error(
+          `client: ${base}/hello is signed as agent ${agentId}, not the expected agent ${opts.agentId} — refusing to connect`,
+        );
+      }
+      agentId = opts.agentId;
+    }
+    // #62: when the agentId came from the agent's (untrusted) /hello — or from
+    // the caller's hint — bind it to this URL via chain before this handle
+    // could ever sign for it.
     if (fromUrl && agentId !== undefined && this.hasAccount()) {
       await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    if (agentId === undefined && this.hasAccount()) {
+      console.warn(
+        `[agentic-sdk] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
+          'this handle has NO owner ops (chat/logs) although this AgenticID holds a key. ' +
+          'Pass { agentId } (or call client(agentId)) to connect as the owner.',
+      );
     }
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;

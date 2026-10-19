@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 235 tests / 25 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 236 tests / 25 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -275,9 +275,12 @@ signature = sign(digest, agentSeal_priv)                               // raw �
 the EIP-191 "intended validator" (on chain:
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`).
 The sealed runtime learns it from `VERIFIED_FEEDBACK_ADDR`, which the attestor
-injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`; unset or
-invalid → the container emits no proof at all. Since `VerifiedFeedbackRegistry`
-1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
+injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. If the
+container's `VERIFIED_FEEDBACK_ADDR` is unset, malformed or the zero address,
+it emits no `X-Agent-Proof` at all. On the attestor side, a blank or zero
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (so they emit
+no proof), and a non-address value fails attestor startup. Since
+`VerifiedFeedbackRegistry` 1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
 **rejected** — a hard cut with no fallback (rollout: [`DEPLOYMENT.md`](DEPLOYMENT.md) §7).
 The digest is consensus-critical: five copies implement it independently —
 the contract, `sealed/internal/proxy/`, the SDK's `ServeProof.ts`, the attestor
@@ -546,7 +549,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-235 Foundry tests across 25 suites (233 pass, 2 fork tests skip unless
+236 Foundry tests across 25 suites (234 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 

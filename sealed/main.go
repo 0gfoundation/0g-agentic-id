@@ -201,6 +201,12 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 		return
 	}
 
+	// The HTML log pages link hex tokens to this chain's explorer (none for
+	// a chain they don't know).
+	if res.client != nil && res.client.ChainID() != nil {
+		sealedProxy.SetChainID(res.client.ChainID().String())
+	}
+
 	// The owner's sealed secret env needs both agentSeal_priv (Phase 1) and
 	// the on-chain owner (Phase 2), so it opens here, before any adapter
 	// reads the inference key.

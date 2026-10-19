@@ -1,8 +1,9 @@
 /**
  * Proof-jar behavior pins (CLI rating tickets): expired entries pruned on
  * load, the per-(agent,wallet) cap enforced, burn-by-signature removes only
- * the spent ticket, and the bigint round-trip through JSON is lossless
- * (including the optional envelope `validator`).
+ * the spent ticket, the bigint round-trip through JSON is lossless
+ * (including the optional envelope `validator`), and `rate`'s burn-or-keep
+ * decision for a ticket that failed its free pre-check.
  */
 
 import { test } from 'node:test';
@@ -15,7 +16,7 @@ import { join } from 'node:path';
 // throwaway dir BEFORE importing so every test is hermetic.
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'jar-'));
 
-const { saveProof, listProofs, removeProof, toServeProof } = await import('../dist/cli/proofs.js');
+const { saveProof, listProofs, removeProof, toServeProof, ticketDisposition } = await import('../dist/cli/proofs.js');
 
 const WALLET = '0xC11e0000000000000000000000000000000000C1';
 const now = Math.floor(Date.now() / 1000);
@@ -97,4 +98,21 @@ test('the envelope validator round-trips when present (rate tells registry misma
   saveProof(p, TASK, 'http://a');
   const [t] = listProofs(555n, WALLET);
   assert.deepEqual(toServeProof(t), p);
+});
+
+test('rate burns a ticket only for its own defects, keeps it on a registry-config mismatch', () => {
+  // A ticket that verified in every respect, for overriding one field at a time.
+  const good = { notExpired: true, dataOnChain: true, registryMatches: true, signerMatches: true };
+  const cases = [
+    ['expired', { notExpired: false }, 'burn'],
+    ['data not on chain', { dataOnChain: false }, 'burn'],
+    ['signature mismatch under the matching registry', { signerMatches: false }, 'burn'],
+    // registryMatches false ⇒ the signature was not checked (signerMatches false too)
+    ['no registry configured / names a different registry', { registryMatches: false, signerMatches: false }, 'keep'],
+    ['different registry AND expired', { registryMatches: false, signerMatches: false, notExpired: false }, 'burn'],
+    ['different registry AND data not on chain', { registryMatches: false, signerMatches: false, dataOnChain: false }, 'burn'],
+  ];
+  for (const [name, over, want] of cases) {
+    assert.equal(ticketDisposition({ ...good, ...over }), want, name);
+  }
 });

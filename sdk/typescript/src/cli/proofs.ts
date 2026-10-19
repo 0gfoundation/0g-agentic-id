@@ -17,6 +17,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ServeProof, TaskReveal } from '../types';
+import type { ProofVerification } from '../ServeSession';
 import { configPaths } from './config';
 
 /** A saved ticket: the proof plus its receipt materials and provenance. */
@@ -111,6 +112,21 @@ export function listProofs(agentId: bigint, wallet: `0x${string}`, marginSeconds
 /** Burn ONE spent (or refused) ticket, identified by its unique signature. */
 export function removeProof(signature: `0x${string}`): void {
   writeJar(loadJar().filter((e) => e.proof.signature !== signature));
+}
+
+/**
+ * What `rate` does with a ticket whose free pre-check (`verifyProof`) failed.
+ * `'burn'` only on a defect of the ticket itself — expired, data not on
+ * chain, or a signature that does not verify against the registry it names.
+ * `'keep'` when the failure is this side's configuration (no registry
+ * configured, or the ticket names a different one): the ticket may still
+ * redeem once that is fixed.
+ */
+export function ticketDisposition(
+  v: Pick<ProofVerification, 'notExpired' | 'dataOnChain' | 'registryMatches' | 'signerMatches'>,
+): 'burn' | 'keep' {
+  const defect = !v.notExpired || !v.dataOnChain || (v.registryMatches && !v.signerMatches);
+  return defect ? 'burn' : 'keep';
 }
 
 /** Rehydrate the bigint fields for SDK submission. */

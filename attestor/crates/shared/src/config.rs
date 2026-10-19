@@ -119,10 +119,11 @@ pub struct Config {
     /// siblings, AND injected into every newly created container as
     /// `VERIFIED_FEEDBACK_ADDR`: it is the ServeProof validator, i.e. the
     /// sealed proxy signs keccak256(0x19 ‖ 0x00 ‖ this ‖ proofHash) (EIP-191
-    /// version 0x00), so proofs redeem only at this address. None → the
-    /// container gets a blank value and emits no X-Agent-Proof. The attestor
-    /// itself never calls it. Parsed strictly: a non-empty value that is not
-    /// an address fails startup.
+    /// version 0x00), so proofs redeem only at this address. None (unset,
+    /// blank or the zero address) → /config serves null, the container gets a
+    /// blank value and emits no X-Agent-Proof. The attestor itself never calls
+    /// it. Parsed strictly: a non-empty value that is not an address fails
+    /// startup.
     pub verified_feedback_addr: Option<Address>,
     /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
     /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
@@ -434,9 +435,11 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
-/// An optional address env var, parsed strictly: unset or blank → None, but
-/// a non-empty value that is not an address is a startup error (a typo must
-/// not silently read as "unset").
+/// An optional address env var, parsed strictly: unset, blank or the zero
+/// address → None, but a non-empty value that is not an address is a startup
+/// error (a typo must not silently read as "unset"). The zero address names
+/// no contract, so it is treated as "unset" rather than served and injected
+/// as if it were one.
 fn env_opt_addr(key: &str) -> anyhow::Result<Option<Address>> {
     parse_opt_addr(key, env_opt(key).as_deref())
 }
@@ -445,8 +448,8 @@ fn parse_opt_addr(key: &str, raw: Option<&str>) -> anyhow::Result<Option<Address
     match raw.map(str::trim) {
         None | Some("") => Ok(None),
         Some(s) => s
-            .parse()
-            .map(Some)
+            .parse::<Address>()
+            .map(|a| (a != Address::ZERO).then_some(a))
             .map_err(|e| anyhow::anyhow!("invalid {key}={s:?}: {e}")),
     }
 }
@@ -496,8 +499,15 @@ mod tests {
     #[test]
     fn opt_addr_blank_is_none_and_typo_is_an_error() {
         const K: &str = "ATTESTOR_VERIFIED_FEEDBACK_ADDR";
-        // .env.example ships it blank → unset, not an error.
-        for blank in [None, Some(""), Some("   ")] {
+        // .env.example ships it blank → unset, not an error. The zero address
+        // names no registry: also unset (the worker warns, /config serves null).
+        for blank in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0x0000000000000000000000000000000000000000"),
+            Some(" 0x0000000000000000000000000000000000000000 "),
+        ] {
             assert_eq!(parse_opt_addr(K, blank).unwrap(), None, "{blank:?}");
         }
         let a = parse_opt_addr(K, Some(" 0x00000000000000000000000000000000000000B7 "))

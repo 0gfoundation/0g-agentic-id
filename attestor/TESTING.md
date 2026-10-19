@@ -54,6 +54,8 @@ with exact remediation named, then passed after ack() + deposit().
 cd attestor && cargo test --workspace          # incl. KMS mock, fuse, seal_material
 cd sealed   && go test ./...                   # marker round-trip, adapter conformance
 cd contracts && forge test                     # on-chain invariants
+cd sdk/typescript && npm test                  # SDK flows; pins the console's + verify-agent.sh's
+                                               # ServeProof digest copies (that leg needs cast + jq)
 ```
 
 All free, no network, no env. This is the minimum bar for every commit.
@@ -112,7 +114,8 @@ curl -s $API/config | jq '{sandbox_snapshot, frameworks, verified_feedback_addr}
 OWNER_PRIV=0x<funded key> API=$API bash scripts/e2e.sh # → PASS — phase=running
 
 # 3. verify the identity chain + decrypt + serve-proof in one shot
-AGENT_ID=<decimal id printed by e2e> API=$API bash scripts/verify-agent.sh
+#    (owner-run: reads the owner-scoped deployment row with the same key)
+AGENT_ID=<decimal id printed by e2e> OWNER_PRIV=0x<same key> API=$API bash scripts/verify-agent.sh
 ```
 
 **3b. SDK coverage** (needs node ≥18; `cd sdk/typescript && npm ci && npm run build`):

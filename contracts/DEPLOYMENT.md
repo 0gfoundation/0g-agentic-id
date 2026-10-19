@@ -12,9 +12,12 @@ Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
 `AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
 Implementation**. All beacons are
 owned by one **TimelockController**; upgrades are two-phase
-`schedule → wait → execute`. `FeedbackBatcher` is the one non-upgradeable
-piece: stateless and privilege-free (an EIP-7702 delegate target), it is
-replaced by deploying a new one and re-delegating.
+`schedule → wait → execute`. `FeedbackBatcher` and `StandardCloneAuthorizer`
+are the non-upgradeable pieces (no proxy, no beacon). `FeedbackBatcher` is
+stateless and privilege-free (an EIP-7702 delegate target); it is replaced by
+deploying a new one and re-delegating. `StandardCloneAuthorizer` is immutable
+(the official stock clone policy); it is replaced by deploying a new one,
+which source owners opt into per agent via `CloneGate.setCloneAuthorizer`.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
 ERC-8004 Identity Registry** (binding semantics in §2).
@@ -130,8 +133,11 @@ Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
 Off-chain changes (ServeProof, VerifiedFeedbackRegistry 1.2.0) — these DO
 touch the `sealed` runtime: the sealed proxy signs the v0 digest bound to
 `VERIFIED_FEEDBACK_ADDR`, which the attestor worker injects at sandbox create
-from `ATTESTOR_VERIFIED_FEEDBACK_ADDR` (unset, malformed or zero → the
-container emits no `X-Agent-Proof`, never a legacy-format one), and adds a
+from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. On the attestor, a blank or zero
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (and
+`/config` serves none); a non-address value fails attestor startup. In the
+container, a `VERIFIED_FEEDBACK_ADDR` that is unset, malformed or zero → no
+`X-Agent-Proof` at all, never a legacy-format one. The 1.2.0 change also adds a
 diagnostic `validator` field to the `X-Agent-Proof` envelope (not part of the
 signed tuple). The SDK (0.2.0) and the attestor console verify the same
 digest. All of it ships in one window with the beacon upgrade (§7).
@@ -280,7 +286,7 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` | |
-| **VerifiedFeedback proxy** | `0xc0C902666078774435429d1fdEB5B1b17D95D583` | **1.1.0** (deployed 2026-09-07 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7 |
+| **VerifiedFeedback proxy** | `0xc0C902666078774435429d1fdEB5B1b17D95D583` | **1.1.0** (deployed 2026-09-07 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7; record its upgrade block here (pre-cut marks, §7) |
 | VerifiedFeedback impl | `0x8BD29e2eb59116214b1d932AC071a07173339c8F` | |
 | VerifiedFeedback beacon | `0x8A3E9C65c017CA21618639F48438413CB641abFa` | |
 | **CloneGate proxy** | `0xACcDcC5A6569AB25aA144ccCFdDB882fEaDaBb89` | **1.0.1** (deployed 2026-09-07 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor) |
@@ -317,7 +323,7 @@ owner `0x9C58…80Bb`.
 | ReputationRegistry proxy (DEPRECATED — **must be paused**: still verifies the legacy ServeProof digest; see §7 pending) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
-| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7 |
+| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7; record its upgrade block here (pre-cut marks, §7) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
 | CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — allow + deny paths exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
@@ -350,7 +356,7 @@ follow-ups before this carries real user value.**
 |---|---|
 | AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0) |
 | AgenticID impl / beacon | `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817` / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
-| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`; 1.2.0 pending — §7) |
+| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`; 1.2.0 pending — §7; record its upgrade block here — no pre-cut marks exist, §7) |
 | VerifiedFeedback impl / beacon | `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31` / `0x1C23A210806568bf0815c3289E56719325c36827` |
 | CloneGate proxy | `0x1d33086b367a9dF4b4f4d7A29b35fC1187380303` (1.0.1; allowlisted via addTrustedAttestor) |
 | CloneGate impl / beacon | `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29` / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
@@ -413,7 +419,14 @@ Changelog:
   revert `VerifiedFeedbackInvalidProofSignature` — no dual-accept window.
   (2) `attestFeedbackWithTask` requires `statusCode` in 100..999, else
   `VerifiedFeedbackInvalidTaskReveal`. (3) The agent's own agentSeal may not
-  attest (`VerifiedFeedbackSelfFeedback`). **Hard-cut rollout — one window.**
+  attest (`VerifiedFeedbackSelfFeedback`). **Pre-cut marks**: verification
+  marks attested before an environment's 1.2.0 upgrade block carry no
+  FIND-01 / FIND-02 guarantee — their recorded audit data (dataHashes,
+  frameworkHash) and verified endpoint are not assured to be authentic.
+  Record each environment's upgrade block (the block of the `ExecuteUpgrade`
+  transaction) in §6 so readers and indexers can drop `FeedbackVerified` logs
+  below it. Mainnet's VF proxy (§6.2m) has none to drop: it had emitted no
+  `FeedbackVerified` log as of 2026-10-19. **Hard-cut rollout — one window.**
   The ordering is a correctness dependency, not hygiene: old images' proofs
   stop verifying the moment the beacon lands, and new images' proofs verify
   nowhere before it does. Each step ends with a check — confirm it before
@@ -445,17 +458,19 @@ Changelog:
      CLIs). Check: `curl -s $API/config | jq '{verified_feedback_addr,
      cli_latest, sandbox_snapshot}'` shows `$VF`, `"0.2.0"` and the new
      snapshot; then deploy one fresh agent and run
-     `API=$API AGENT_ID=<id> bash attestor/scripts/verify-agent.sh` — check 3
-     must recover the seal over the version-0x00 digest.
+     `API=$API AGENT_ID=<id> OWNER_PRIV=<owner key of that fresh agent> bash attestor/scripts/verify-agent.sh`
+     — check 3 must recover the seal over the version-0x00 digest.
   5. Running agents keep their old image and env until an owner-signed
      `/reset` recreates the container on the new image with
      `VERIFIED_FEEDBACK_ADDR` set. Until then their proofs — like every proof
-     issued before the upgrade — stop verifying. Check, per agent:
-     `verify-agent.sh` check 3 fails with the old-image hint before the reset
-     and passes after it.
+     issued before the upgrade — stop verifying. Check, per agent — owner-run,
+     because `verify-agent.sh` reads the owner-scoped deployment row and so
+     needs that agent's owner key as `OWNER_PRIV`: check 3 fails with the
+     old-image hint before the reset and passes after it.
   Optionally `removeValidFrameworkHash` the pre-1.2.0 image hashes afterwards
   so no new deploy lands on an image whose proofs no longer verify. Record
-  the impl address, VERSION and dates in §6 / this entry when executed.
+  the impl address, VERSION, dates and the upgrade block in §6 / this entry
+  when executed.
 
 - **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
   `CloneGateArityMismatch` reports the sealedKeys length when that side

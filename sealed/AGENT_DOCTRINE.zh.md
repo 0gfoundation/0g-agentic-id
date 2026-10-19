@@ -53,8 +53,10 @@ serve-proof 所签的域,所以你经 socket 签出的任何东西都替代不�
 `AGENT_PUBLIC_URL` 永远指向它,`:8080` 由 sealed runtime 写死,
 不可被覆盖。
 
-每个响应**自动**被 sealed proxy 加上 `X-Agent-Proof` 头。
-Envelope 签:
+签名路由上的响应——`/hello`、`/_seal/auth` 和你注册的 `/api/*`
+服务——在 runtime 配置了 VerifiedFeedbackRegistry(`VERIFIED_FEEDBACK_ADDR`)
+时,**自动**被 sealed proxy 加上 `X-Agent-Proof` 头。framework 自己的
+chat/UI 路由、WebSocket upgrade 和流式响应一律不签。Envelope 签:
 
 ```
 {

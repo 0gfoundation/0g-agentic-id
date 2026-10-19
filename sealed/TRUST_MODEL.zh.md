@@ -569,7 +569,7 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
 |---|---|
 | `agent_seal_priv` 不出 TEE | 整套塌，连 Group A 都丢（攻击者线下任意伪造）|
 | **sign socket 永不签裸 hash 或 EIP-191 version `0x00`** | agent 线下伪造 serve-proof 内容（任意 `task_hash` / `data_hashes` / 时间戳 / `submitter`），并为它们铸出 VerifiedFeedbackRegistry 标记（FIND-01）。任何把 socket 桥接成 agent 工具的 adapter 同理 |
-| sealed proxy 控制响应 header | 现在影响很小。agent 写的 header 只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
+| sealed proxy 控制响应 header | 现在影响很小。proxy 在每条转发路径上都会丢掉上游 backend 设的 `X-Agent-Proof`，客户端看到的这个头总是 runtime 自己的。即便漏过一个，它也只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
 | **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
 `report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
@@ -628,8 +628,10 @@ socket 按不变量**永不**签的东西（`sealed/internal/proxy/sign.go`）�
 
 socket 的每个签名都落在 `0x19 0x45` personal message、`0x19 0x01`
 EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程内的
-签名都在这几种形状之外：`report.Status` 和 settings seed 是裸
-keccak256 digest，serve-proof 是 `0x00`，`chain.Update` 是普通交易。
+签名里，只有三种在这几种形状之外：`report.Status` 和 settings seed 是裸
+keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
+普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
+所以这条渠道靠的是钢印（见上面的承重墙表）。
 把 socket 桥接成 agent 工具的 adapter（例如 dsh 的 `seal_sign`）
 不得补上这两条缺失的路径。
 

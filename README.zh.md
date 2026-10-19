@@ -163,8 +163,8 @@ attestation 值，并留下可追溯的日志。没有"悄悄改掉一个运行�
 
 从这份密钥材料，AgenticID 为每个 agent 生成一个 **AgentSeal**：一对密钥，
 私钥只存在于 TEE 运行时内。owner 拿不到，TEE 之外的任何人都拿不到。agent 用
-AgentSeal 给自己产出的**每一条响应**签名——这个签名证明：响应来自一个跑在
-TEE 里、且严格按链上记录运行的 agent。
+AgentSeal 给自己**对外服务的响应**（它的 `/hello` 和 `/api/*` 服务）签名——这个
+签名证明：响应来自一个跑在 TEE 里、且严格按链上记录运行的 agent。
 
 具体地说，AgenticID 的后端 Attestor 自己也是一个注册在 TappRegistry 上的
 Tapp 应用。它的注册条目包含三样东西：
@@ -231,7 +231,7 @@ sealed 运行时在它自己的签名域里签 proof——EIP-191 version `0x00`
 agent 自己也伪造不出一次没发生过的响应的 proof 内容。没有真实响应撑腰的评价
 拿不到 verified 标记。
 
-这抬高了刷假评价的成本，但**不是**完整的抗 sybil：运行时对每个响应都出
+这抬高了刷假评价的成本，但**不是**完整的抗 sybil：运行时对每个签名响应都出
 proof，包括无需认证的公开 `GET /hello`，所以 proof 很容易拿到，同一个主体
 也可以用自己控制的多个钱包去请求服务。agent 自己也一样：它可以带一个自己
 控制的 `X-Client-Address` 调自己的 proxy（例如 loopback `:8080`），拿到*真的*
@@ -310,8 +310,9 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 - **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器并签其镜像
   哈希；保证 agent 按链上功能数据运行。
 - **Agent 运行时（`sealed`）** — 跑在 Sandbox 里、受 RA 后下发密钥的容器：把
-  链上加密 iData 还原成可运行 agent，持续把状态演化写回链上，给每条响应签
-  `X-Agent-Proof`。（Go，见 [`sealed/`](sealed/ARCHITECTURE.zh.md)）
+  链上加密 iData 还原成可运行 agent，持续把状态演化写回链上，给签名响应
+  （`/hello`、`/_seal/auth`、agent 注册的 `/api/*` 服务）签 `X-Agent-Proof`。
+  （Go，见 [`sealed/`](sealed/ARCHITECTURE.zh.md)）
 - **0g-kms** — 为 Tapp 生态提供具有容灾能力的硬件安全级密钥服务。
 
 ### 存储层
@@ -334,7 +335,7 @@ Attestor 验 0g-Sandbox 凭证 + 核对 validFrameworkHashes
 0g-Sandbox 确认授权 owner + 正确运行时代码
         │
         ▼
-agent 用 AgentSeal 给每条响应签名（X-Agent-Proof）
+agent 用 AgentSeal 给对外服务的响应签名（X-Agent-Proof）
         │
         ▼
 0g-compute attest 每一次推理
@@ -389,7 +390,7 @@ attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 235
+`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 236
 个 Foundry 测试（25 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
@@ -437,7 +438,7 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
   问题：换硬件能再派同一把 priv，链上绑定永远合法
 - **dataKey 转手** —— seller TEE → Oracle TEE → buyer TEE 之间**零信任
   原子交付**（Oracle 短暂持有 + 立即丢弃；链上一笔 tx 双签验）
-- **ServeProof / X-Agent-Proof** —— 每条响应签名的 envelope 提供的 8
+- **ServeProof / X-Agent-Proof** —— 每条签名响应的 envelope 提供的 8
   条保证都是密码学绑定的、但成立条件分两组：**Group A 身份层 3 条**
   只要 priv 不出 TEE 就无条件成立、**Group B 内容层 5 条**还需要"签名
   能力不被滥用"这一前提。对 serve-proof 本身这一前提是机械保证的：它签在

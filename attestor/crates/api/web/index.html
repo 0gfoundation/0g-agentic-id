@@ -5032,16 +5032,27 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     }
 
     // The digest binds chainId + identityRegistry + validator, all taken
-    // from /config. Without a configured registry the proof is
-    // unverifiable here — that is not an identity mismatch.
-    const cfgDomain = State.config || {};
-    const validator = configuredServeProofValidator(cfgDomain);
-    if (!validator || !cfgDomain.chain_id || !cfgDomain.agentic_id_addr) {
-      setRow('identity', 'skipped',
-        'unverifiable: this attestor advertises no VerifiedFeedbackRegistry (verified_feedback_addr)');
+    // from /config. Without a loaded /config, or one naming no registry, the
+    // proof is unverifiable here — that is not an identity mismatch.
+    if (!State.config) {
+      setRow('identity', 'skipped', 'unverifiable: /config not loaded (reload the page to retry)');
       skipRest();
       paint('warn', '⚠', 'Response received',
-        'Proof unverifiable — no VerifiedFeedbackRegistry configured on this attestor', null, humanMsg);
+        'Proof unverifiable — /config not loaded', null, humanMsg);
+      return;
+    }
+    const cfgDomain = State.config;
+    const validator = configuredServeProofValidator(cfgDomain);
+    if (!validator || !cfgDomain.chain_id || !cfgDomain.agentic_id_addr) {
+      const what = validator
+        ? '/config lacks chain_id / agentic_id_addr'
+        : 'this attestor advertises no VerifiedFeedbackRegistry (verified_feedback_addr)';
+      setRow('identity', 'skipped', `unverifiable: ${what}`);
+      skipRest();
+      paint('warn', '⚠', 'Response received',
+        validator
+          ? 'Proof unverifiable — /config is missing the chain domain'
+          : 'Proof unverifiable — no VerifiedFeedbackRegistry configured on this attestor', null, humanMsg);
       return;
     }
     // envelope.validator is diagnostic (not signed): a different one means

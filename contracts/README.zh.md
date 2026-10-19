@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 235 tests / 25 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 236 tests / 25 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -266,9 +266,12 @@ signature = sign(digest, agentSeal_priv)                               // 直接
 EIP-191 的 "intended validator"（链上实现：
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`）。
 sealed 运行时从 `VERIFIED_FEEDBACK_ADDR` 得知该地址——由 attestor 在创建 sandbox
-时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入；未设置或非法 → 容器干脆不出
-proof。自 `VerifiedFeedbackRegistry` 1.2.0 起它取代旧的 `personal_sign(inner)`
-包装，旧格式一律**拒绝**——硬切换、无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
+时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入。容器的 `VERIFIED_FEEDBACK_ADDR`
+未设置、格式错误或为零地址 → 容器干脆不出 `X-Agent-Proof`。attestor 一侧，
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` 留空或为零地址 → 容器拿到空值（因而不出
+proof）；填了但不是地址则 attestor 启动失败。自 `VerifiedFeedbackRegistry`
+1.2.0 起它取代旧的 `personal_sign(inner)` 包装，旧格式一律**拒绝**——硬切换、
+无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
 该 digest 属于共识关键：五份副本各自独立实现——合约、`sealed/internal/proxy/`、
 SDK 的 `ServeProof.ts`、attestor 控制台的 say-hi 校验和
 `attestor/scripts/verify-agent.sh`（清单维护在根目录 [`AGENTS.md`](../AGENTS.md)）
@@ -503,7 +506,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-235 个 Foundry tests / 25 suites（233 通过，2 个 fork 测试未设 `FORK_RPC`
+236 个 Foundry tests / 25 suites（234 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 

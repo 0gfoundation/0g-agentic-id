@@ -22,7 +22,7 @@ import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
 import { buildClient } from '../sdk';
-import { saveProof, listProofs, removeProof, toServeProof, type SavedProof } from '../proofs';
+import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
@@ -277,7 +277,11 @@ interface Session {
 async function connectSession(s: Session, url: string): Promise<void> {
   s.url = url;
   s.sandboxId = sbid(url);
-  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId });
+  // Pass the session's known agentId: the URL alone yields one only via
+  // /hello's proof envelope, which a container without VERIFIED_FEEDBACK_ADDR
+  // does not emit — and without it the handle would lose owner reauth.
+  const agentId = /^\d+$/.test(s.agentId) ? BigInt(s.agentId) : undefined;
+  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId, agentId });
   s.phase = 'running';
   // Take the single-driver seat (WeChat: the new login just wins; whoever
   // held it is told on their next message). Best-effort — a pre-seat
@@ -1199,12 +1203,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Free pre-check before spending gas.
         const v = await ag.reputation.verifyProof(proof);
         if (!v.ok) {
-          // Burn only on a defect of the ticket itself (bad signature, expired,
-          // data not on chain). No registry configured / a different registry
-          // is this side's configuration: the ticket may still redeem once
-          // that is fixed, so keep it.
-          const ticketDefect = !v.notExpired || !v.dataOnChain || (v.registryMatches && !v.signerMatches);
-          if (ticketDefect) {
+          // Burn only on a defect of the ticket itself; keep it when the
+          // failure is this side's registry configuration (ticketDisposition).
+          if (ticketDisposition(v) === 'burn') {
             removeProof(ticket.proof.signature);
             out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
           } else {

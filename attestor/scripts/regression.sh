@@ -17,7 +17,7 @@
 #                    aborts before any gas is spent
 #   FEEDBACK_BATCHER_ADDR  optional EIP-7702 batcher for the atomic feedback
 #                    path; unset falls back to /config, then to two txs
-#   RUN_UNIT=1       also run the free T0 suites (cargo/go) first
+#   RUN_UNIT=1       also run the free T0 suites (cargo/go/npm test) first
 #   SKIP_TRANSFER=1  skip the (slow, ~10 min) self-contained transfer-live leg
 #
 # Free negative checks always run. Every live leg spends testnet gas +
@@ -64,14 +64,18 @@ if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
 fi
 
 # ── SDK build (needed by the .cjs legs) ───────────────────────────────
-if [ ! -f "$SDK/dist/index.js" ]; then
-  echo "building SDK…"; (cd "$SDK" && npm ci --silent && npm run build --silent) || { echo "SDK build failed"; exit 1; }
-fi
+# Always rebuild: dist/ is not versioned with the source, and a stale one
+# (e.g. a 0.1.x build left from an older checkout) would drive every leg with
+# an outdated ServeProof scheme. Install deps only when they are missing.
+echo "building SDK…"
+(cd "$SDK" && { [ -d node_modules ] || npm ci --silent; } && npm run build --silent) || { echo "SDK build failed"; exit 1; }
 
 # ── T0 unit (optional, free) ──────────────────────────────────────────
 if [ "${RUN_UNIT:-0}" = "1" ]; then
   step "T0 attestor cargo test" bash -c "cd '$ROOT/attestor' && cargo test --workspace --quiet"
   step "T0 sealed go test"      bash -c "cd '$ROOT/sealed' && go test ./... >/dev/null"
+  # Also pins the console's and verify-agent.sh's ServeProof digest copies.
+  step "T0 sdk npm test"        bash -c "cd '$SDK' && npm test >/dev/null"
 fi
 
 # ── negative path (free) ──────────────────────────────────────────────

@@ -633,6 +633,40 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         );
     }
 
+    /// @dev The taskHash known-answer vector the sealed proxy pins by driving
+    ///      writeServeProof (sealed/internal/proxy/serveproof_test.go,
+    ///      katTaskHash): POST /api/x?q=1 (RequestURI, query included),
+    ///      request body {"q":"in"}, response body {"a":"out"}, status 201.
+    ///      Recomputed exactly as attestFeedbackWithTask does, then redeemed
+    ///      with a proof committing to the pinned constant — a receipt the
+    ///      runtime signs must open on chain.
+    bytes32 private constant SEALED_KAT_TASK_HASH =
+        0x6c37771076037daf6053adca6126264030e249e0c9a6fc0cc238c56509f842db;
+
+    function test_taskHash_sealedProxyVector_redeems() public {
+        TaskReveal memory task = TaskReveal({
+            method: "POST",
+            uri: "/api/x?q=1",
+            reqBodyHash: keccak256('{"q":"in"}'),
+            respBodyHash: keccak256('{"a":"out"}'),
+            statusCode: 201
+        });
+        bytes32 recomputed = keccak256(abi.encodePacked(
+            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash,
+            bytes(Strings.toString(uint256(task.statusCode)))
+        ));
+        assertEq(recomputed, SEALED_KAT_TASK_HASH, "taskHash drifted from the sealed proxy's pinned vector");
+
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, SEALED_KAT_TASK_HASH);
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, idx, proof, task);
+
+        assertTrue(registry.isVerified(agentId, client, idx), "verified");
+        assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "/api/x?q=1", "endpoint recorded verbatim");
+    }
+
     function _taskAndProof(uint256 agentId, address submitter, bytes32 dataHash, string memory uri)
         internal view returns (TaskReveal memory task, ServeProof memory proof)
     {

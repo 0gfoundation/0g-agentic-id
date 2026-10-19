@@ -58,8 +58,12 @@ You have only one externally bound port: **`:8080`**, listened by the
 sealed proxy. `AGENT_PUBLIC_URL` always points to it. `:8080` is
 hard-coded by the sealed runtime and not overridable.
 
-Every response is **automatically** stamped with an `X-Agent-Proof`
-header by the sealed proxy. The envelope signed:
+Responses on the signed routes — `/hello`, `/_seal/auth` and your
+registered `/api/*` services — are **automatically** stamped with an
+`X-Agent-Proof` header by the sealed proxy, whenever the runtime has a
+VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`). The
+framework's own chat/UI routes, WebSocket upgrades and streamed
+responses are never signed. The envelope signed:
 
 ```
 {
