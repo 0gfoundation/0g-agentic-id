@@ -199,6 +199,11 @@ func (s *Server) handleCompact(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), compactTimeout)
 	defer cancel()
 	note, err := apply(ctx)
+	if errors.Is(err, framework.ErrCompactUnsupported) {
+		logger.Logf("compact: unsupported: %v", err)
+		http.Error(w, "this framework does not support on-demand compaction ("+err.Error()+")", http.StatusNotImplemented)
+		return
+	}
 	if errors.Is(err, framework.ErrCompactRefused) {
 		logger.Logf("compact: refused: %v", err)
 		http.Error(w, "the framework did not compact and nothing changed; try again shortly ("+err.Error()+")", http.StatusConflict)

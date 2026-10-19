@@ -2063,7 +2063,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // The agent's own 500 ("compact failed: …") is a final outcome; only
           // a dropped connection or a gateway timeout leaves it unknown.
           const failed = msg.match(/^compactConversation: HTTP 500: (compact failed: [\s\S]*)$/);
-          if (/HTTP 501/.test(msg)) out(`this agent's framework${s.framework ? ` (${s.framework})` : ''} does not support /compact yet — /clear starts fresh instead\n`);
+          // A 501 that names a reason (an older framework version) shows it.
+          const why = msg.match(/^compactConversation: HTTP 501: [^(]*\(([\s\S]*)\)\s*$/)?.[1]?.split(': ').pop()?.trim();
+          if (/HTTP 501/.test(msg)) out(`this agent's framework${s.framework ? ` (${s.framework})` : ''} does not support /compact${why ? ` (${why})` : ' yet'} — /clear starts fresh instead\n`);
           else if (/HTTP 409/.test(msg)) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
           else if (failed) out(`${failed[1].trim()}\n`);
           else out(`compact failed: ${msg}\n(if the connection dropped, the agent may still be finishing it — /startuplog shows the outcome)\n`);

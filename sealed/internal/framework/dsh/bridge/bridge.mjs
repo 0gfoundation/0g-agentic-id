@@ -95,8 +95,8 @@ const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
 // value is ever passed: 0 means "let pi-ai default" rather than a
 // name-heuristic guess (8192), which would starve a reasoning model's shared
 // thinking+reply budget into permanently empty replies. Declared as the
-// model's maxTokens, pi-ai sends it as max_completion_tokens on every request,
-// which upstreams reserve against the conversation — hence the cap.
+// model's maxTokens, pi-ai sends it as max_completion_tokens on every request
+// — hence the cap (settings.go RequestMaxTokens says why).
 const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
 // The reasoning bound, already resolved by the adapter (settings.Resolved's
 // Effort() folds the model's catalog support, the owner's level and the "low"
@@ -127,12 +127,12 @@ const COMPACT_TIMEOUT_MS = 10 * 60 * 1000
 //     at effort=max: a 6.6K-token summary prompt took 3,477 output tokens, a
 //     33.9K-token one 5,239 (2,561 of them reasoning) — the need grows far
 //     slower than the history, and 16384 is 3x the larger.
-//   - Room to be accepted. compactNow keeps no tail, so the summary request
+//   - Room for the input. compactNow keeps no tail, so the summary request
 //     carries the system prompt, the tools and the whole history but its
-//     last node — a turn's input, give or take. Upstreams reserve the output
-//     cap against that input (settings.go RequestMaxTokens), so with a
-//     turn's full budget the summary would be refused at the same length the
-//     turns are, which is exactly when an owner reaches for /compact.
+//     last node — a turn's input, give or take — at the moment the history
+//     is longest. Wherever a server checks prompt + max_tokens against a
+//     limit, a smaller reservation leaves the summary more room than a turn
+//     has.
 const COMPACT_SUMMARY_MAX_TOKENS = 16384
 
 if (!TOKEN) {
@@ -227,10 +227,14 @@ async function boot() {
           // all four glm-5.3 providers, a developer-role instruction was
           // ignored and left out of prompt_tokens, while the same text as
           // "system" was obeyed — this agent ran without its persona and
-          // platform doc. openclaw and prime pin the same switch off. Only the
-          // openai-* protocols offer it (a native anthropic route carries the
-          // system prompt as its own field, and pi-ai refuses a compat switch
-          // the route's protocol does not take).
+          // platform doc. On long conversations it was also behind the HTTP
+          // 400 code 400001 rejections (settings.go RequestMaxTokens): zg
+          // compute confirmed (2026-10-19) that Tencent's and 0G's
+          // self-hosted backends do not support the role. openclaw and prime
+          // pin the same switch off. Only the openai-* protocols offer it (a
+          // native anthropic route carries the system prompt as its own
+          // field, and pi-ai refuses a compat switch the route's protocol
+          // does not take).
           ...(MODEL_BASE_URL && MODEL_API.startsWith('openai-') ? { compat: { supportsDeveloperRole: false } } : {}),
         }],
       },
@@ -254,11 +258,18 @@ async function boot() {
 
   // Loop hygiene + context headroom.
   await ctx.plugin(TokenMeter)
-  // The summary call's output cap (COMPACT_SUMMARY_MAX_TOKENS) — with no
+  // Summarize with the model this bridge runs. Unset, compaction-basic uses
+  // the session's LAST routed model, which after a model switch is one this
+  // restarted bridge no longer declares — measured offline: three turns on
+  // glm-5.3, restart on another model, /v1/compact → 500 'provider
+  // "0g-compute" has no configured model "glm-5.3"'.
+  // The summary call's output cap: COMPACT_SUMMARY_MAX_TOKENS — with no
   // catalog-sourced budget, the engine's default 8192 rather than a guess.
-  await ctx.plugin(BasicCompactionEngine, MODEL_MAX_TOKENS
-    ? { maxTokens: Math.min(MODEL_MAX_TOKENS, COMPACT_SUMMARY_MAX_TOKENS) }
-    : {})
+  await ctx.plugin(BasicCompactionEngine, {
+    summarizationProvider: PROVIDER,
+    summarizationModel: MODEL_ID,
+    ...(MODEL_MAX_TOKENS ? { maxTokens: Math.min(MODEL_MAX_TOKENS, COMPACT_SUMMARY_MAX_TOKENS) } : {}),
+  })
   await ctx.plugin(TimeoutPolicy)
 
   // Platform control points (ours).

@@ -200,13 +200,19 @@ const RequestOutputCeiling = 32768
 // catalog gate as PersistableMaxTokens).
 //
 // The catalog's max_completion_tokens is a CAPABILITY — the most one reply
-// may ever be — not a sensible value to request on every call. Frameworks
-// send the configured budget as max_tokens on every request, and upstreams
-// reserve it against the input: with glm-5.3's catalog 131072, the router's
-// upstreams were measured rejecting requests (HTTP 400, code 400001) once
-// prompt + max_tokens reached ~196,608 — i.e. at ~65K tokens of
-// conversation — while the same request body with a smaller max_tokens went
-// through. Capping the request budget keeps that headroom for the conversation.
+// may ever be — not a value to request on every call, which is how
+// frameworks send the configured budget. Where a server checks prompt +
+// max_tokens against the context window, the capability can take most of
+// it: the router lists deepseek-v3 at 147456 of a 163840 window, which
+// leaves 16,384 tokens for the conversation; capped, 131,072 (catalog,
+// 2026-10-19).
+//
+// Not the fix for the HTTP 400 code 400001 that long glm-5.3 conversations
+// hit in 2026-10. Those requests had prompt + max_tokens at ~196,608 or
+// more AND a "developer"-role system prompt; with it sent as "system", the
+// same requests went through (0 of 65 refused, 2026-10-16), and zg compute
+// confirmed (2026-10-19) that Tencent's and 0G's self-hosted backends do
+// not support the role. dsh now sends "system" (bridge.mjs).
 func (r Resolved) RequestMaxTokens() int {
 	mt := r.PersistableMaxTokens()
 	if mt > RequestOutputCeiling {

@@ -162,7 +162,7 @@ and degrades gracefully when absent):
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | the stateful responses door's upstream calls | the framework holds no server-side conversation keyed by a session identity (see `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door drops client-sent history: it sends the prior turns this returns, then only the client's current turn. Return none when your gateway replays its own session (openclaw) — a client's history on top would reach the model twice | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
-| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure | the route answers 501 — the framework cannot be asked to compact from outside |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version cannot compact on demand — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -475,9 +475,9 @@ Three accessors carry the gating you must not re-invent:
   per-request `max_tokens`: `PersistableMaxTokens()` capped at
   `settings.RequestOutputCeiling` (32768), same 0 for "write nothing". Use it,
   never the raw catalog value, for anything sent on every request: the
-  catalog's `max_completion_tokens` is a capability, and upstreams reserve the
-  requested budget against the conversation (glm-5.3's 131072 left ~65K tokens
-  of conversation before HTTP 400s — `CONFIG_SURFACE.md` §3.2). Like
+  catalog's `max_completion_tokens` is a capability, and wherever a server
+  checks prompt + budget against the context window it can take most of the
+  window (`CONFIG_SURFACE.md` §3.2). Like
   `Effort()`'s `("", false)`, 0 is "unknown", not "clear" — but a render that
   EDITS a file in place must still remove a budget it wrote for a different
   model, or a switch to a model with a lower output limit fails every request

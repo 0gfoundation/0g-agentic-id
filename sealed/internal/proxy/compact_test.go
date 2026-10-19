@@ -307,6 +307,20 @@ func TestCompact_TurnRefusedWhileCompacting(t *testing.T) {
 	}
 }
 
+// A framework that cannot compact as installed (an older version) answers
+// like an adapter without the capability: 501.
+func TestCompact_FrameworkUnsupportedIs501(t *testing.T) {
+	s, sign := occupancyServer(t)
+	s.SetCompact(func(context.Context) (string, error) {
+		return "", fmt.Errorf("x.CompactSession: %w: version 1.0 has no compaction", framework.ErrCompactUnsupported)
+	})
+	w := httptest.NewRecorder()
+	s.handleCompact(w, compactReq(t, sign, "0GSealCompact", "", 0))
+	if w.Code != http.StatusNotImplemented || !strings.Contains(w.Body.String(), "version 1.0") {
+		t.Fatalf("HTTP %d %q, want 501 carrying the reason", w.Code, w.Body.String())
+	}
+}
+
 // A framework's "not now" is a 409 the owner can retry, not a failure — and
 // it releases the slot like any other outcome.
 func TestCompact_FrameworkRefusalIs409(t *testing.T) {

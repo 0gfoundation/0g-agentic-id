@@ -18,10 +18,17 @@ import (
 // compactCLITimeout bounds one `openclaw sessions compact` run. The gateway's
 // summary is a model call — 73s measured on a 270K-token glm-5.3 session
 // (2026-10-19, openclaw 2026.7.1) — with headroom for a reasoning model on a
-// longer history. It stays under sealed's route deadline
-// (proxy.compactTimeout), so the owner sees openclaw's own error rather than
-// a killed process.
+// longer history. The deadlines nest so the layer that knows why is the one
+// that gives up: openclaw's own compaction timeout (rendered,
+// openclawCompactionTimeout = 10m) < the CLI's --timeout (11m) < this (12m)
+// < sealed's route deadline (proxy.compactTimeout, 15m).
 const compactCLITimeout = 12 * time.Minute
+
+// compactMinVersion is the first openclaw with a `sessions compact` CLI
+// command. 2026.5.6 and 2026.5.7 — still whitelisted — register only
+// `sessions cleanup` and `export-trajectory` (checked in their published
+// dist, 2026-10-19).
+const compactMinVersion = "2026.7.1"
 
 // compactCLIWaitDelay bounds how long the CLI's output pipes may outlive the
 // process once it has exited or been killed — the stopgap for any descendant
@@ -75,7 +82,7 @@ type compactResult struct {
 // session — the summary, then the kept tail — and the stateful door adds no
 // history of its own (conversation.go). The kept tail survives a MANUAL
 // compaction only because the render sets keepRecentTokens
-// (ensureCompactionKeepRecent): unset, openclaw rewrites the record to
+// (ensureCompactionDefaults): unset, openclaw rewrites the record to
 // replay from the summary alone, and the tail — never summarized — is lost.
 //
 // The gateway listens on a non-default port, so the CLI needs a URL override,
@@ -83,12 +90,36 @@ type compactResult struct {
 // credentials are intentionally not reused"). Both go in as
 // OPENCLAW_GATEWAY_URL / OPENCLAW_GATEWAY_TOKEN — the pairing the CLI asks
 // for — which also keeps the token out of argv.
+//
+// Two "not here / not now" answers come before the CLI runs:
+//   - an openclaw older than compactMinVersion has no `sessions compact`
+//     command at all → framework.ErrCompactUnsupported (501);
+//   - openclaw summarizes with the model the session LAST ran on
+//     (resolveSessionModelRef), not the pin: right after a model switch that
+//     is the old model — summarized with it, or failing as "Unknown model"
+//     once its provider is gone (measured offline). Until one turn has run on
+//     the new pin → framework.ErrCompactRefused (409), with what to do.
 func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 	a.mu.RLock()
 	token := a.authToken
+	version := ""
+	if a.cfg != nil {
+		version = a.cfg.framework.PackageVersion
+	}
+	rendered := a.rendered
 	a.mu.RUnlock()
 	if token == "" {
 		return "", fmt.Errorf("openclaw.CompactSession: gateway not started yet")
+	}
+	if version != "" && compareVersions(version, compactMinVersion) < 0 {
+		return "", fmt.Errorf("openclaw.CompactSession: %w: openclaw %s has no `sessions compact`; it arrives in %s", framework.ErrCompactUnsupported, version, compactMinVersion)
+	}
+	if rendered != nil && rendered.Model != "" {
+		lastProvider, lastModel := pinnedSessionModel(currentConversationKey())
+		pinProvider := clawProviderName(*rendered)
+		if lastModel != "" && (lastModel != rendered.Model || (lastProvider != "" && lastProvider != pinProvider)) {
+			return "", fmt.Errorf("openclaw.CompactSession: %w: the conversation last ran on %s/%s and openclaw summarizes with that model, not the new pin %s/%s — send one message first, then /compact", framework.ErrCompactRefused, lastProvider, lastModel, pinProvider, rendered.Model)
+		}
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -129,6 +160,9 @@ func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 		if isCompactRefusal(detail) {
 			return "", fmt.Errorf("openclaw.CompactSession: %w: %s", framework.ErrCompactRefused, detail)
 		}
+		if isNothingToCompact(detail) {
+			return "nothing to compact (" + detail + ")", nil
+		}
 		return "", fmt.Errorf("openclaw.CompactSession: %s", detail)
 	}
 	switch {
@@ -165,6 +199,15 @@ func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 func isCompactRefusal(detail string) bool {
 	return strings.Contains(detail, "is still active; try again") ||
 		strings.Contains(detail, "changed before compaction. Retry.")
+}
+
+// isNothingToCompact reports a manual compaction's "no work" answers — 2026.7.1
+// throws "Already compacted" when the session's last entry is a compaction
+// and "Nothing to compact (session too small)" when nothing can be prepared.
+// The CLI reports them as ok:false and exits 1 (measured: a /compact right
+// after another); for the owner they mean nothing to do, not a failure.
+func isNothingToCompact(detail string) bool {
+	return strings.Contains(detail, "Already compacted") || strings.Contains(detail, "Nothing to compact")
 }
 
 // decodeCLIJSON decodes the first JSON object in the CLI's stdout, tolerating

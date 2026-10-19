@@ -588,9 +588,11 @@ export class AgentApi {
    * {@link clearConversation}. No restart. The summary is a model call, so
    * this can take minutes; a connection dropped meanwhile does not abort it
    * (the outcome is also in the runtime log). Owner-signed (tag
-   * `0GSealCompact`, the clear grammar). A framework that cannot compact on
-   * demand answers 501; a second compaction while one runs, or a replayed
-   * signature, answers 409. Pass `instanceId` when the caller participates in
+   * `0GSealCompact`, the clear grammar). A framework — or framework version —
+   * that cannot compact on demand answers 501; a second compaction while one
+   * runs, a replayed signature, or a framework declining for now (busy;
+   * openclaw right after a model switch, until one turn has run on the new
+   * model) answers 409. Pass `instanceId` when the caller participates in
    * the single-driver seat: compaction is a driving action and is refused
    * (409) from a displaced window.
    */

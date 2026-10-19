@@ -86,13 +86,15 @@ adapter 在自己的包里用自己的方言作答。
   在新鲜度窗口内不能被重放(以签名的消息为键,换个写法或可塑变形的签名仍算同一
   请求);压缩和 synth 门上的一轮永不重叠——后到的那个被拒(答 409)——因为
   openclaw 的压缩会中止会话里正在运行的那一轮。框架自己的"现在不行"(已有压缩
-  在排队、会话仍忙)也答 409(`framework.ErrCompactRefused`),不算失败。压缩与
+  在排队、会话仍忙、openclaw 刚换完模型)也答 409(`framework.ErrCompactRefused`),
+  不算失败。压缩与
   请求解耦(连接断开不会中止它,结果写进日志)。
   dsh 让桥执行(`POST /v1/compact` → 组合里的 `compactNow`,排在正在跑的那一轮
-  之后,同一时间只挂一个;摘要调用的输出上限是 16384,低于一轮的 32768——它带着
-  约一轮的输入,而上游把这个上限从输入里预留出来);openclaw 对正在运行的网关执行
-  它自己的 `openclaw sessions compact <key>`,网关地址和 token 走环境变量。hermes
-  和 prime 暂时答 501。
+  之后,同一时间只挂一个;摘要由桥当前运行的模型来写,输出上限 16384,低于一轮的
+  32768——见 `CONFIG_SURFACE.zh.md` §3.2);openclaw 对正在运行的网关执行它自己的
+  `openclaw sessions compact <key>`,网关地址和 token 走环境变量(它的边界情况见
+  下方 openclaw 的坑)。两者在引擎认为没有可折叠的内容时都答"无可压缩"(200,不算
+  失败)。hermes 和 prime 暂时答 501。
 
 透明的 `/v1/chat/completions` 门**永远**不带会话 header、不用存储历史——在那扇门
 上做有状态会悄悄改变标准 OpenAI 客户端看到的行为。有状态是第二扇门,不是替换。
@@ -142,6 +144,17 @@ adapter 在自己的包里用自己的方言作答。
   时才保留这段尾部——不设的话,openclaw 会改写记录,让重放从摘要开始,而那段从未
   被总结的尾部就丢了(离线实测)——所以 render 会写入 openclaw 自己的默认值
   20000,除非 owner 的 overlay 另有指定。
+- openclaw 上的 `/compact` 还有四个边界情况(2026-10-19 离线发现)。
+  `sessions compact` 是 2026.7.1 才有的命令——白名单里的 2026.5.6/5.7 包都没有——
+  所以低于这个版本时 `CompactSession` 答 `ErrCompactUnsupported`(501)。openclaw
+  用会话**最后一次**用的模型写摘要,所以刚换完模型时压缩会被拒(409,"先发一条
+  消息"),直到新模型上跑过一轮。openclaw 的压缩期限默认 180 秒
+  (`EMBEDDED_COMPACTION_TIMEOUT_MS`),远在 sealed 自己的 11–15 分钟之内,所以
+  render 把 `agents.defaults.compaction.timeoutSeconds` 设为 600,除非 overlay 给了
+  正数(用一个每次摘要调用都在 200 秒后才回复的桩模型:默认设置下 180 秒时报
+  "Compaction timed out",设为 600 后完成,用时 402 秒)。
+  还有,openclaw 的 "Already compacted" / "Nothing to compact (session too small)"
+  在它的 CLI 里报的是失败,这里回成"无可压缩"。
 - openclaw 默认的会话策略是**按天**:每天 04:00(本地时间)之后的第一轮,会给同一个
   key 开一个新会话。在 2026.7.1 上离线实测(把会话的时间倒拨过边界):下一轮到达
   模型时之前的各轮一条都没有,前一天的 transcript 和 trajectory 成了孤儿——`/clear`
@@ -225,7 +238,9 @@ openclaw 2026.7.1 —— `sessions compact` 用 73 秒把一个 269,717 token �
 openclaw 的坑)。离线(桩模型)验证:dsh 桥在已有压缩挂起时拒绝第二个,摘要调用以
 16384 发出,报告引擎的真实原因(包括上游 400),摘要不会更小时答"无可压缩";设了
 `keepRecentTokens` 后,openclaw 压缩后的下一轮,模型收到的是摘要加六轮中的第 4–6
-轮,不设则只有摘要。
+轮,不设则只有摘要。换模型之后,dsh 的摘要调用发给了新模型(在桥指定摘要模型之前,
+同样的步骤会以 500 失败);`timeoutSeconds` 设为 600 后,openclaw 完成了一次摘要调用
+耗时 200 秒的压缩。
 
 每条存储路径都对照**从已 build 镜像抽出的真 SDK** 验证(prime SessionManager
 往返+轮转;dsh 追加→seed→`fromRestore`;hermes/openclaw 的 header 语义读自网关

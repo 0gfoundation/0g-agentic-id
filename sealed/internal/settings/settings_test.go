@@ -174,10 +174,9 @@ func TestCatalogOutageDoesNotDecide(t *testing.T) {
 }
 
 // The catalog's max_completion_tokens is a capability, not a per-request
-// budget: frameworks send the configured budget on every request and the
-// router's upstreams reserve it against the conversation (glm-5.3's 131072
-// left ~65K tokens of conversation before HTTP 400s). RequestMaxTokens caps
-// it; a smaller catalog budget passes through, a heuristic one stays unwritten.
+// budget: frameworks send the configured budget on every request.
+// RequestMaxTokens caps it; a smaller catalog budget passes through, a
+// heuristic one stays unwritten.
 func TestRequestMaxTokensCapsTheCatalogBudget(t *testing.T) {
 	cases := []struct {
 		name  string

@@ -133,19 +133,27 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 那次事故就是 `Resolved` 每次启动重算、且哪儿都不存的原因:**存下来的副本会过时,然后
 与算出来的值互相打架**(`settings.go:11-15`)。
 
-适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:210`):即
+适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:216`):即
 `PersistableMaxTokens()` 封顶到 `RequestOutputCeiling = 32768`(`settings.go:196`),
 同样以 `0` 表示"什么都别写"。目录里的 `max_completion_tokens` 是一种能力——单次回复
-最多能有多长——而不是每次请求该填的值:每个框架都会在每次请求里带上它配置的预算,上游
-会把这部分预留从对话可用的空间里扣掉。glm-5.3 的目录值是 131072,实测路由的上游在
-"prompt + 预算"达到约 196,608 时拒绝请求(HTTP 400,code `400001`)——也就是对话只有
-约 65K token 时——而同一份请求体只要预算更小就能通过(2026-10)。线上的字段:dsh 发
+最多能有多长——而不是每次请求该填的值,而每个框架都会在每次请求里带上它配置的预算。
+如果服务端按"prompt + 预算"对照上下文窗口做检查,这个能力值会占掉窗口的大半:路由
+目录里 deepseek-v3 的输出上限是 147456、窗口 163840,只给对话留 16,384 个 token;
+封顶后是 131,072(目录,2026-10-19)。32768 也是目录预算接进来之前 pi-ai 默认发的值,
+是实测最大单次输出(约 13.6K token,glm-5.3,effort=max)的两倍多。线上的字段:dsh 发
 `max_completion_tokens`,openclaw 和 hermes 发 `max_tokens`;prime-agent 的 SDK
 不管 models.json 写多少,都会压到 32000。还有一个调用压得更低:dsh 的压缩摘要
-(`/compact`)封顶 16384(`bridge.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`),因为它带着
-约一轮的输入——若给它一轮的预算,它会和那些轮次在同样的长度上被拒,而那恰恰是 owner
-要用它的时候;16384 是实测最大摘要的 3 倍(effort=max 下 33.9K token 的 prompt 产出
-5,239 个输出 token)。
+(`/compact`)封顶 16384(`bridge.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`):它在历史最长
+的时候带着约一轮的输入,所以凡是服务端按"prompt + 预算"对照某个上限做检查的地方,更小
+的预留都给它留出比一轮更多的空间;16384 是实测最大摘要的 3 倍(effort=max 下 33.9K
+token 的 prompt 产出 5,239 个输出 token)。
+
+2026-10 长对话里 glm-5.3 遇到的 HTTP 400(code `400001`)不是靠这个封顶修好的。那些
+请求的"prompt + 预算"都在约 196,608 及以上,**并且** dsh 的系统提示是用 `developer`
+角色的消息发的;把这段提示改成 `system` 后重放同一个请求,65 次全部通过(2026-10-16),
+zg compute 也确认(2026-10-19)腾讯和 0G 自部署的后端不支持这个角色。真正的修复是 dsh
+改发 `system`(`bridge.mjs`,`compat.supportsDeveloperRole: false`——openclaw 和
+prime 早已这样钉住)。
 
 ## 4. 文档存在哪,怎么到达容器
 
@@ -295,9 +303,9 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 
 | | 文档落到哪 | overlay 怎么处理 |
 |---|---|---|
-| openclaw(`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`agents.defaults.compaction.keepRecentTokens` 设为 openclaw 自己的默认值(20000),除非 overlay 给了正数——手动压缩只有在它被设置时才保留最近的尾部——`session.reset` 设为 `{mode: "idle"}`(永不过期),除非 overlay 自己设了——openclaw 默认每天开一个新会话(`CONVERSATION.zh.md`) |
+| openclaw(`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`agents.defaults.compaction.keepRecentTokens` 设为 openclaw 自己的默认值(20000),除非 overlay 给了正数——手动压缩只有在它被设置时才保留最近的尾部——`agents.defaults.compaction.timeoutSeconds` 同样设为 600,因为 openclaw 默认的 180 秒会把慢的 `/compact` 摘要截断;`session.reset` 设为 `{mode: "idle"}`(永不过期),除非 overlay 自己设了——openclaw 默认每天开一个新会话(`CONVERSATION.zh.md`) |
 | hermes(`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | 深合并,再把平台键写在上面:`model.{default,provider,base_url,api_key}`、`agent.reasoning_effort`,以及目录给出预算时的 `model.max_tokens`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint;`model.max_tokens` 在同一模型遇目录故障时保留,模型变了就删除(除非 overlay 自己设了它),否则换到输出上限更低的模型后每个请求都会失败 |
-| prime-agent(`prime/modelsjson.go:143`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
+| prime-agent(`prime/modelsjson.go:142`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
 | dsh(`dsh/settings.go:161`) | 只有桥进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
 
 dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-settings-file` 提供,

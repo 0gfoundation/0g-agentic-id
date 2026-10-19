@@ -162,22 +162,33 @@ stored copy goes stale and then fights the computed value
 (`settings.go:11-15`).
 
 What adapters actually hand their framework is `Resolved.RequestMaxTokens()`
-(`settings.go:210`): `PersistableMaxTokens()` capped at
+(`settings.go:216`): `PersistableMaxTokens()` capped at
 `RequestOutputCeiling = 32768` (`settings.go:196`), same `0` for "write
 nothing". The catalog's `max_completion_tokens` is a capability — the most one
-reply may ever be — not a per-request value: every framework sends its
-configured budget on every request, and upstreams reserve it against the
-conversation. With glm-5.3's catalog 131072, the router's upstreams were
-measured rejecting requests (HTTP 400, code `400001`) once prompt + budget
-reached ~196,608 — about 65K tokens of conversation — while the same request
-body with a smaller budget went through (2026-10). On the wire: dsh sends it as
-`max_completion_tokens`, openclaw and hermes as `max_tokens`; prime-agent's SDK
-clamps to 32000 whatever models.json says. One call sits lower still: dsh's
-compaction summary (`/compact`) is capped at 16384 (`bridge.mjs`
-`COMPACT_SUMMARY_MAX_TOKENS`), because it carries about a turn's input — with a
-turn's budget it would be refused at the same length the turns are, exactly
-when an owner reaches for it; 16384 is 3x the largest summary measured
-(5,239 output tokens for a 33.9K-token prompt at effort=max).
+reply may ever be — not a per-request value, and every framework sends its
+configured budget on every request. Where a server checks prompt + budget
+against the context window, the capability can take most of it: the router
+lists deepseek-v3 at 147456 of a 163840 window, which leaves 16,384 tokens for
+the conversation; capped, 131,072 (catalog, 2026-10-19). 32768 is also what
+pi-ai sent by default before the catalog budget was wired through, over twice
+the largest completion measured (~13.6K tokens, glm-5.3 at effort=max). On the
+wire: dsh sends it as `max_completion_tokens`, openclaw and hermes as
+`max_tokens`; prime-agent's SDK clamps to 32000 whatever models.json says. One
+call sits lower still: dsh's compaction summary (`/compact`) is capped at 16384
+(`bridge.mjs` `COMPACT_SUMMARY_MAX_TOKENS`): it carries about a turn's input
+at the moment the history is longest, so wherever a server checks prompt +
+budget against a limit, the smaller reservation leaves it more room than a
+turn has; 16384 is 3x the largest summary measured (5,239 output tokens for a
+33.9K-token prompt at effort=max).
+
+The cap is not what fixed the HTTP 400 code `400001` that long glm-5.3
+conversations hit in 2026-10. Those requests had prompt + budget at ~196,608
+or more AND dsh's system prompt in a `developer`-role message; replayed with
+that prompt as `system`, the same request went through 65 times out of 65
+(2026-10-16), and zg compute confirmed (2026-10-19) that Tencent's and 0G's
+self-hosted backends do not support the role. The fix is dsh sending `system`
+(`bridge.mjs`, `compat.supportsDeveloperRole: false` — openclaw and prime
+already pinned it).
 
 ## 4. Where the document lives, and how it reaches a container
 
@@ -371,9 +382,9 @@ instead of only at mint time.
 
 | | where the document lands | overlay handling |
 |---|---|---|
-| openclaw (`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it; `agents.defaults.compaction.keepRecentTokens` is set to openclaw's own default (20000) unless the overlay gives a positive value — a manual compaction keeps its recent tail only while it is set — and `session.reset` to `{mode: "idle"}` (never stale) unless the overlay sets one — openclaw's default starts a new session daily (`CONVERSATION.md`) |
+| openclaw (`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it; `agents.defaults.compaction.keepRecentTokens` is set to openclaw's own default (20000) unless the overlay gives a positive value — a manual compaction keeps its recent tail only while it is set — likewise `agents.defaults.compaction.timeoutSeconds` to 600, as openclaw's default 180s would cut a slow `/compact` summary short; and `session.reset` to `{mode: "idle"}` (never stale) unless the overlay sets one — openclaw's default starts a new session daily (`CONVERSATION.md`) |
 | hermes (`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | deep-merged, then the platform keys written over it: `model.{default,provider,base_url,api_key}`, `agent.reasoning_effort`, and `model.max_tokens` when the catalog gives the budget; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key; `model.max_tokens` is kept through an outage on the same model and removed when the model changes (unless the overlay sets it), or a switch to a model with a lower output limit fails every request |
-| prime-agent (`prime/modelsjson.go:143`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
+| prime-agent (`prime/modelsjson.go:142`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
 | dsh (`dsh/settings.go:161`) | the bridge process's environment only | a typed knob allowlist (`toolJobs`, `maxParallelToolCalls`); this framework has no config file to render into |
 
 dsh is the interesting case: DSH's own `settings.yaml` is served by

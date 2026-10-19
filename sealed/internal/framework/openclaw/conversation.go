@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
@@ -114,10 +115,14 @@ func (a *Adapter) ConversationHistory(context.Context) ([]framework.Conversation
 }
 
 // sessionEntry is the slice of openclaw's sessions.json this package needs:
-// the store is a map keyed by session key.
+// the store is a map keyed by session key. Model/ModelProvider are what the
+// session's last run used — and what openclaw summarizes with on a manual
+// compaction (resolveSessionModelRef).
 type sessionEntry struct {
-	SessionID   string `json:"sessionId"`
-	SessionFile string `json:"sessionFile"`
+	SessionID     string `json:"sessionId"`
+	SessionFile   string `json:"sessionFile"`
+	Model         string `json:"model"`
+	ModelProvider string `json:"modelProvider"`
 }
 
 // storeKeys are the sessions.json keys a pinned session key may be filed
@@ -149,43 +154,9 @@ var afterStoreRead = func() {}
 // swap in between), and nothing it says is used as a path — only a plain
 // file name survives, which os.Root removes without following.
 func sessionFilesForKey(root *os.Root, key string) ([]string, error) {
-	// A regular file only: a FIFO planted here would block the open forever.
-	fi, err := root.Lstat("sessions.json")
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
-	if err != nil {
+	entry, found, err := readSessionEntry(root, key)
+	if err != nil || !found {
 		return nil, err
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file (%v)", sessionsStorePath(), fi.Mode().Type())
-	}
-	f, err := root.Open("sessions.json")
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	raw, err := io.ReadAll(io.LimitReader(f, maxSessionsStore+1))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) > maxSessionsStore {
-		return nil, fmt.Errorf("%s is over %d bytes", sessionsStorePath(), maxSessionsStore)
-	}
-	var store map[string]sessionEntry
-	if err := json.Unmarshal(raw, &store); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", sessionsStorePath(), err)
-	}
-	var entry sessionEntry
-	found := false
-	for _, k := range storeKeys(key) {
-		if e, ok := store[k]; ok {
-			entry, found = e, true
-			break
-		}
-	}
-	if !found {
-		return nil, nil
 	}
 	var stems []string
 	if entry.SessionFile != "" {
@@ -213,6 +184,62 @@ func sessionFilesForKey(root *os.Root, key string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// readSessionEntry returns key's entry from the sessions.json in the directory
+// root is open on; found=false when there is no store or no entry. The store
+// is agent-writable: it is opened non-blocking and must be a regular file
+// AS OPENED — checked on the descriptor, since a path check before the open
+// can be raced by swapping a FIFO in, whose open would block a root thread
+// forever — and the read is size-capped.
+func readSessionEntry(root *os.Root, key string) (sessionEntry, bool, error) {
+	f, err := root.OpenFile("sessions.json", os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if os.IsNotExist(err) {
+		return sessionEntry{}, false, nil
+	}
+	if err != nil {
+		return sessionEntry{}, false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return sessionEntry{}, false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return sessionEntry{}, false, fmt.Errorf("%s is not a regular file (%v)", sessionsStorePath(), fi.Mode().Type())
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxSessionsStore+1))
+	if err != nil {
+		return sessionEntry{}, false, err
+	}
+	if len(raw) > maxSessionsStore {
+		return sessionEntry{}, false, fmt.Errorf("%s is over %d bytes", sessionsStorePath(), maxSessionsStore)
+	}
+	var store map[string]sessionEntry
+	if err := json.Unmarshal(raw, &store); err != nil {
+		return sessionEntry{}, false, fmt.Errorf("parse %s: %w", sessionsStorePath(), err)
+	}
+	for _, k := range storeKeys(key) {
+		if e, ok := store[k]; ok {
+			return e, true, nil
+		}
+	}
+	return sessionEntry{}, false, nil
+}
+
+// pinnedSessionModel returns the provider label and model of the pinned
+// session's last run, per sessions.json; empty when unknown.
+func pinnedSessionModel(key string) (provider, model string) {
+	root, err := os.OpenRoot(sessionsDir())
+	if err != nil {
+		return "", ""
+	}
+	defer root.Close()
+	e, found, err := readSessionEntry(root, key)
+	if err != nil || !found {
+		return "", ""
+	}
+	return e.ModelProvider, e.Model
 }
 
 // sessionFileName returns the base name of candidate when it sits DIRECTLY in

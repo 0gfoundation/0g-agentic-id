@@ -12,9 +12,9 @@
 package framework
 
 import (
-	"net/http"
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -381,6 +381,11 @@ type SessionCompactor interface {
 
 // ErrCompactRefused marks a CompactSession error as "not now", not "failed".
 var ErrCompactRefused = fmt.Errorf("framework: compaction refused for now")
+
+// ErrCompactUnsupported marks a CompactSession error as "this framework, as
+// installed, cannot compact on demand" (e.g. a version without the command):
+// the proxy answers it 501, as for an adapter without SessionCompactor.
+var ErrCompactUnsupported = fmt.Errorf("framework: on-demand compaction not supported by this framework version")
 
 // LegacySettingsSeeder is implemented by adapters that can recover an owner's
 // configuration from a chain role that predates the settings channel.

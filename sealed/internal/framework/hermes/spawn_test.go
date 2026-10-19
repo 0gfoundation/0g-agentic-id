@@ -578,8 +578,7 @@ func TestRenderRequestBudgetLifecycle(t *testing.T) {
 }
 
 // With a catalog-sourced budget hermes gets model.max_tokens, capped. Absent,
-// its custom-provider default (65536) goes out on every main-loop request and
-// is reserved against the conversation.
+// its custom-provider default (65536) goes out on every main-loop request.
 func TestRenderWritesCappedRequestBudget(t *testing.T) {
 	a := newTestAdapter(t)
 	s := routed("glm-5.3", "", inference.ModelFacts{MaxTokens: 131072, SupportsReasoningEffort: true, CatalogSourced: true})

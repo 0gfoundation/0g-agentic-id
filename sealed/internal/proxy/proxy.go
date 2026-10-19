@@ -93,7 +93,7 @@ type Server struct {
 	// stateful door: prior turns come from the framework's own store, the
 	// client's input supplies only the current turn.
 	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
-	applySession  SessionSettingsApplier
+	applySession        SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
 	seat occupantSeat

@@ -390,7 +390,14 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 	// as summary + the new message; set, as summary + turns 4–6 + the new
 	// message. The value is openclaw's own default, so automatic compaction
 	// is unchanged; a positive value already there (the owner's overlay) stands.
-	ensureCompactionKeepRecent(cfg)
+	//
+	// The same block's timeoutSeconds: openclaw gives any compaction 180s
+	// (EMBEDDED_COMPACTION_TIMEOUT_MS) and then fails it — measured offline,
+	// a summary call that took 200s failed "Compaction timed out" at 180.2s,
+	// whatever the CLI and sealed allow. A reasoning model summarizing a long
+	// history takes minutes, so the render allows openclawCompactionTimeout,
+	// inside the CLI's own deadline (compact.go).
+	ensureCompactionDefaults(cfg)
 
 	// The ONE conversation must not end on a clock. openclaw's default
 	// session policy is "daily": the first turn after 04:00 (local time)
@@ -429,9 +436,15 @@ func clawProviderName(s settings.Resolved) string {
 // compaction (DEFAULT_COMPACTION_SETTINGS.keepRecentTokens, 2026.7.1).
 const openclawKeepRecentTokens = 20000
 
-// ensureCompactionKeepRecent sets agents.defaults.compaction.keepRecentTokens
-// unless a positive number is already there.
-func ensureCompactionKeepRecent(cfg map[string]any) {
+// openclawCompactionTimeout bounds one compaction inside openclaw, in seconds:
+// 10 minutes, under the CLI's own deadline (compactCLITimeout − 1m = 11m).
+const openclawCompactionTimeout = 600
+
+// ensureCompactionDefaults sets agents.defaults.compaction.keepRecentTokens and
+// .timeoutSeconds, each unless a positive number is already there. All three
+// whitelisted openclaw versions accept both keys (their config schemas,
+// checked 2026-10-19).
+func ensureCompactionDefaults(cfg map[string]any) {
 	agents, _ := cfg["agents"].(map[string]any)
 	if agents == nil {
 		agents = map[string]any{}
@@ -447,14 +460,21 @@ func ensureCompactionKeepRecent(cfg map[string]any) {
 		compaction = map[string]any{}
 		defaults["compaction"] = compaction
 	}
-	v, present := compaction["keepRecentTokens"]
+	setPositiveDefault(compaction, "keepRecentTokens", openclawKeepRecentTokens)
+	setPositiveDefault(compaction, "timeoutSeconds", openclawCompactionTimeout)
+}
+
+// setPositiveDefault sets m[key] to def unless it already holds a positive
+// number; a present but invalid value is replaced, with a log line.
+func setPositiveDefault(m map[string]any, key string, def int) {
+	v, present := m[key]
 	if n, ok := v.(float64); ok && n > 0 {
 		return
 	}
 	if present {
-		logger.Logf("openclaw: agents.defaults.compaction.keepRecentTokens = %v is not a positive number — using openclaw's default %d", v, openclawKeepRecentTokens)
+		logger.Logf("openclaw: agents.defaults.compaction.%s = %v is not a positive number — using %d", key, v, def)
 	}
-	compaction["keepRecentTokens"] = openclawKeepRecentTokens
+	m[key] = def
 }
 
 // ensureSessionNeverResets sets session.reset to {mode:"idle"} — no idle

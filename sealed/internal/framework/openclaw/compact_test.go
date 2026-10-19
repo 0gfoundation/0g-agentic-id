@@ -212,6 +212,88 @@ func TestRenderSettings_SetsCompactionKeepRecentTokens(t *testing.T) {
 	}
 }
 
+// An openclaw without the `sessions compact` command (2026.5.x, still
+// whitelisted) answers "unsupported" — 501 at the proxy — and the CLI never runs.
+func TestCompactSession_OlderOpenclawIsUnsupported(t *testing.T) {
+	a := startedAdapter(t)
+	a.cfg = &config{framework: frameworkBinding{PackageVersion: "2026.5.7"}}
+	call := stubCompactCLI(t, "", nil)
+	_, err := a.CompactSession(context.Background())
+	if !errors.Is(err, framework.ErrCompactUnsupported) || !strings.Contains(err.Error(), "2026.5.7") {
+		t.Fatalf("err = %v; want ErrCompactUnsupported naming the version", err)
+	}
+	if call.args != nil {
+		t.Fatalf("the CLI must not run on an unsupported version: %v", call.args)
+	}
+}
+
+// openclaw summarizes with the model the session last ran on, so right after
+// a model switch the compaction is refused (409) until one turn has run on the
+// new pin — and goes ahead once it has.
+func TestCompactSession_RefusedUntilATurnRanOnTheNewModel(t *testing.T) {
+	a := startedAdapter(t)
+	s := routedSettings(inference.WireOpenAI, "other-model")
+	a.rendered = &s
+	key := currentConversationKey()
+	plantSession(t, "agent:main:"+key, sessionEntry{SessionID: "s1", Model: "glm-5.3", ModelProvider: "openai"}, nil)
+	call := stubCompactCLI(t, `{"ok":true,"compacted":true,"result":{"tokensBefore":10,"tokensAfter":2}}`, nil)
+
+	_, err := a.CompactSession(context.Background())
+	if !errors.Is(err, framework.ErrCompactRefused) || !strings.Contains(err.Error(), "send one message first") {
+		t.Fatalf("err = %v; want a refusal saying to send one message first", err)
+	}
+	if call.args != nil {
+		t.Fatalf("the CLI must not run against the old model: %v", call.args)
+	}
+
+	plantSession(t, "agent:main:"+key, sessionEntry{SessionID: "s1", Model: "other-model", ModelProvider: "openai"}, nil)
+	if _, err := a.CompactSession(context.Background()); err != nil {
+		t.Fatalf("after a turn on the new model: %v", err)
+	}
+	if call.args == nil {
+		t.Fatal("the CLI should run once the session is on the pinned model")
+	}
+}
+
+// openclaw's "no work" answers come back as ok:false from the CLI; for the
+// owner they are nothing to compact, not a failure.
+func TestCompactSession_NoWorkIsNothingToCompact(t *testing.T) {
+	for _, reason := range []string{"Already compacted", "Nothing to compact (session too small)"} {
+		a := startedAdapter(t)
+		stubCompactCLI(t, `{"ok":false,"compacted":false,"reason":"`+reason+`"}`, errors.New("exit status 1"))
+		note, err := a.CompactSession(context.Background())
+		if err != nil || !strings.Contains(note, "nothing to compact") || !strings.Contains(note, reason) {
+			t.Fatalf("%q: note=%q err=%v; want a nothing-to-compact note", reason, note, err)
+		}
+	}
+}
+
+// openclaw fails any compaction after 180s by default; the render allows
+// openclawCompactionTimeout, and an owner's positive value stands.
+func TestRenderSettings_SetsCompactionTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name, overlay string
+		want          int
+	}{
+		{"unset gets the platform's", "", openclawCompactionTimeout},
+		{"the overlay's value stands", `{"agents":{"defaults":{"compaction":{"timeoutSeconds":300}}}}`, 300},
+		{"an invalid value is replaced", `{"agents":{"defaults":{"compaction":{"timeoutSeconds":"10m"}}}}`, openclawCompactionTimeout},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			useTempHome(t)
+			s := routedSettings(inference.WireOpenAI, "glm-5.3")
+			if tc.overlay != "" {
+				s.Others = json.RawMessage(tc.overlay)
+			}
+			cfg := renderInto(t, s)
+			c := cfg["agents"].(map[string]any)["defaults"].(map[string]any)["compaction"].(map[string]any)
+			if v, _ := c["timeoutSeconds"].(float64); int(v) != tc.want {
+				t.Fatalf("timeoutSeconds = %v; want %d", c["timeoutSeconds"], tc.want)
+			}
+		})
+	}
+}
+
 // No JSON at all (CLI missing, crashed): the run error is what surfaces.
 func TestCompactSession_CLIFailure(t *testing.T) {
 	a := startedAdapter(t)

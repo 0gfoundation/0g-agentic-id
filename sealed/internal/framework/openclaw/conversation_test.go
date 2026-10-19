@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"seal-verify/internal/inference"
 )
 
@@ -300,4 +302,48 @@ func TestRenderSettings_SessionNeverResets(t *testing.T) {
 			t.Fatalf("session.reset = %v; want the overlay's daily/5", r)
 		}
 	})
+}
+
+// The store's type is checked on the descriptor as opened, not by a path
+// check before the open: an agent atomically swapping a FIFO in between must
+// not be able to block /clear (a root thread) forever.
+func TestClearSession_FIFOSwapRaceDoesNotHang(t *testing.T) {
+	redirectHome(t)
+	dir := sessionsDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sessions.json"), []byte(`{"agent:main:k":{"sessionId":"abc"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "other"), 0o644); err != nil {
+		t.Skipf("no FIFO support: %v", err)
+	}
+	swap := func() error {
+		return unix.Renameat2(unix.AT_FDCWD, filepath.Join(dir, "sessions.json"), unix.AT_FDCWD, filepath.Join(dir, "other"), unix.RENAME_EXCHANGE)
+	}
+	if err := swap(); err != nil {
+		t.Skipf("no RENAME_EXCHANGE here: %v", err)
+	}
+	stop := make(chan struct{})
+	go func() { // the hostile agent: swap the two names, forever
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = swap()
+			}
+		}
+	}()
+	defer close(stop)
+	for i := 0; i < 200; i++ {
+		done := make(chan struct{})
+		go func() { removeSessionFiles("k"); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("attempt %d: removeSessionFiles blocked on a FIFO swapped in", i)
+		}
+	}
 }

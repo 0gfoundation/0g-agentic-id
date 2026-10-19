@@ -137,7 +137,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
-| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败 | 该路由答 501——无法从外部让该框架压缩 |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本无法按需压缩时包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -412,12 +412,11 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 - `s.RequestMaxTokens() int` —— 配置成框架每次请求的 `max_tokens` 的预算:即
   `PersistableMaxTokens()` 封顶到 `settings.RequestOutputCeiling`(32768),同样以 0
   表示"什么都别写"。凡是每次请求都会发出去的东西,用它,别用目录原值:目录的
-  `max_completion_tokens` 是能力上限,而上游会把请求的预算从对话可用空间里预留出来
-  (glm-5.3 的 131072 只给对话留下约 65K token,之后就是 HTTP 400 —— 见
-  `CONFIG_SURFACE.zh.md` §3.2)。和 `Effort()` 的 `("", false)` 一样,0 是"不知道",
-  不是"清掉"——但**原地编辑**文件的 render 仍须删掉它为别的模型写下的预算,否则
-  换到输出上限更低的模型后每个请求都会失败(hermes `spawn.go`:同一模型遇目录
-  故障时保留,模型变了就删除)。
+  `max_completion_tokens` 是能力上限,凡是服务端按"prompt + 预算"对照上下文窗口
+  做检查的地方,它都可能占掉窗口的大半(见 `CONFIG_SURFACE.zh.md` §3.2)。和
+  `Effort()` 的 `("", false)` 一样,0 是"不知道",不是"清掉"——但**原地编辑**
+  文件的 render 仍须删掉它为别的模型写下的预算,否则换到输出上限更低的模型后
+  每个请求都会失败(hermes `spawn.go`:同一模型遇目录故障时保留,模型变了就删除)。
 
 #### 规则一 —— 幂等
 

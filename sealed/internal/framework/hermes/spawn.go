@@ -241,9 +241,9 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 		// model.max_tokens is the per-request output budget hermes sends as
 		// max_tokens (gateway/run.py reads it, over any provider's own cap).
 		// Absent, the custom provider profile's default applies — captured on
-		// the wire as 65536 on every main-loop request, reserved against the
-		// conversation. Like the reasoning bound below, the outcomes must not
-		// be collapsed:
+		// the wire as 65536 on every main-loop request (why that is capped:
+		// settings.RequestMaxTokens). Like the reasoning bound below, the
+		// outcomes must not be collapsed:
 		//   budget known (catalog)       write it, capped (RequestMaxTokens)
 		//   unknown, overlay names one   the owner's value stands
 		//   unknown, same model          leave it: a catalog outage must not

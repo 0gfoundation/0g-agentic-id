@@ -649,10 +649,11 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   // `ag.agent.clearConversation(base, agentId)` (CLI `/clear`) wipes it
   // without a reset; chain-tracked memory is untouched.
   // `ag.agent.compactConversation(base, agentId)` (CLI `/compact`) keeps it
-  // but has the framework summarize the older part now (dsh, openclaw; other
-  // frameworks answer 501). One model call — it can take minutes. HTTP 409 is
-  // "not now", nothing changed (a compaction or a turn already running, the
-  // framework busy, or a reused signature): retry later.
+  // but has the framework summarize the older part now (dsh, openclaw from
+  // 2026.7.1; other frameworks answer 501). One model call — it can take
+  // minutes. HTTP 409 is "not now", nothing changed (a compaction or a turn
+  // already running, the framework busy, or a reused signature: retry later;
+  // openclaw right after a model switch: send one message first).
 
   // Chat — present ONLY if the agent declares a chat route AND this ag has a
   // key. Streams under the hood (`stream: true`), so a long reasoning turn
