@@ -392,6 +392,18 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 	// is unchanged; a positive value already there (the owner's overlay) stands.
 	ensureCompactionKeepRecent(cfg)
 
+	// The ONE conversation must not end on a clock. openclaw's default
+	// session policy is "daily": the first turn after 04:00 (local time)
+	// starts a new session. Measured offline on 2026.7.1 by backdating a
+	// session past the boundary: the next turn reached the model with none
+	// of the earlier turns, and the old transcript was orphaned, out of
+	// /clear's reach. session.reset {mode:"idle"} with no idleMinutes never
+	// goes stale (reset-policy.ts: idle without a window sets no expiry), so
+	// the conversation ends only by /clear or a container recreate
+	// (CONVERSATION.md invariants 4–5). An owner's overlay that sets
+	// session.reset stands.
+	ensureSessionNeverResets(cfg)
+
 	if s.Endpoint != nil {
 		applyEndpointToConfig(cfg, clawProvider, s)
 	}
@@ -435,10 +447,28 @@ func ensureCompactionKeepRecent(cfg map[string]any) {
 		compaction = map[string]any{}
 		defaults["compaction"] = compaction
 	}
-	if v, ok := compaction["keepRecentTokens"].(float64); ok && v > 0 {
+	v, present := compaction["keepRecentTokens"]
+	if n, ok := v.(float64); ok && n > 0 {
 		return
 	}
+	if present {
+		logger.Logf("openclaw: agents.defaults.compaction.keepRecentTokens = %v is not a positive number — using openclaw's default %d", v, openclawKeepRecentTokens)
+	}
 	compaction["keepRecentTokens"] = openclawKeepRecentTokens
+}
+
+// ensureSessionNeverResets sets session.reset to {mode:"idle"} — no idle
+// window, so never stale — unless a reset policy is already there.
+func ensureSessionNeverResets(cfg map[string]any) {
+	session, _ := cfg["session"].(map[string]any)
+	if session == nil {
+		session = map[string]any{}
+		cfg["session"] = session
+	}
+	if _, set := session["reset"]; set {
+		return
+	}
+	session["reset"] = map[string]any{"mode": "idle"}
 }
 
 // setModelPrimary writes agents.defaults.model.primary WITHOUT replacing

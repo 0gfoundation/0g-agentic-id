@@ -25,7 +25,8 @@ import (
 // it kept verbatim. This file is openclaw's conversation encapsulation
 // (CONVERSATION.md §4): pin ONE session key so every stateful-door turn lands
 // in ONE session, and have the door send ONLY the current turn, because the
-// gateway brings the rest.
+// gateway brings the rest. It stays ONE session only because the render sets
+// session.reset (inference.go): openclaw's default starts a new one daily.
 //
 // Verified 2026-10-19 against 2026.7.1 (offline, stub model): a turn sent
 // alone reached the model with the earlier turns in front of it; a turn sent
@@ -53,6 +54,14 @@ import (
 // changes them is THIS file's maintenance burden.
 
 const sessionKeyHeader = "x-openclaw-session-key"
+
+// The ONE conversation, as the proxy sees it: these three switch the door to
+// "pin the session, send only the current turn" and route /clear here.
+var (
+	_ framework.ConversationSession = (*Adapter)(nil)
+	_ framework.ConversationHistory = (*Adapter)(nil)
+	_ framework.SessionClearer      = (*Adapter)(nil)
+)
 
 // openclawAgentID is the default agent id openclaw stores sessions under.
 const openclawAgentID = "main"
@@ -118,8 +127,13 @@ func storeKeys(key string) []string {
 	return []string{"agent:" + openclawAgentID + ":" + key, key}
 }
 
-// maxSessionsStore bounds the read of the agent-writable sessions.json.
-const maxSessionsStore = 64 << 20
+// maxSessionsStore bounds the read of the agent-writable sessions.json — and
+// with it the memory decoding it costs PID 1.
+const maxSessionsStore = 8 << 20
+
+// afterStoreRead runs between reading sessions.json and removing the files it
+// names. A var so a test can swap the directory in that window.
+var afterStoreRead = func() {}
 
 // sessionFilesForKey names the files openclaw keeps for one session key, as
 // plain names in the directory root is open on: the transcript, and the
@@ -135,10 +149,18 @@ const maxSessionsStore = 64 << 20
 // swap in between), and nothing it says is used as a path — only a plain
 // file name survives, which os.Root removes without following.
 func sessionFilesForKey(root *os.Root, key string) ([]string, error) {
-	f, err := root.Open("sessions.json")
+	// A regular file only: a FIFO planted here would block the open forever.
+	fi, err := root.Lstat("sessions.json")
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file (%v)", sessionsStorePath(), fi.Mode().Type())
+	}
+	f, err := root.Open("sessions.json")
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +256,7 @@ func removeSessionFiles(key string) {
 		logger.Logf("openclaw conversation: %v — superseded session files left in place", err)
 		return
 	}
+	afterStoreRead()
 	for _, n := range names {
 		if err := root.Remove(n); err != nil && !os.IsNotExist(err) {
 			logger.Logf("openclaw conversation: remove %s: %v", n, err)
@@ -257,10 +280,12 @@ func (a *Adapter) ClearSession(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("openclaw.ClearSession: %w", err)
 	}
-	// Delete outside the lock: at worst an in-flight turn on oldKey recreates
-	// a file (openclaw is still writing), leaving an ORPHAN — the key has
+	// Delete outside the lock. A turn still in flight on oldKey can recreate
+	// a file before the restart that follows stops the gateway — a trajectory
+	// rewritten that way is a full copy of the cleared conversation, left on
+	// the container's disk (never on chain) until a recreate. The key has
 	// already rotated, so the gateway serves the new key's session and never
-	// the orphan (audit #169 F4: leak, not resurrection).
+	// the orphan (audit #169 F4: a leftover, not a resurrection).
 	if oldKey != "" {
 		removeSessionFiles(oldKey)
 	}

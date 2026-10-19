@@ -69,8 +69,11 @@ type compactState struct {
 }
 
 // busy reports whether any turn on the synthesized responses door is queued
-// or running. The hub keeps the last synthMaxRecords turns, so a turn could
-// only be missed if that many newer turns were created while it ran.
+// or running. No turn can be created while handleCompact checks this and
+// claims the slot: both hold compact.mu, and admitSynthTurn is the only way a
+// turn record is made. The one blind spot is eviction — the hub keeps the
+// last synthMaxRecords turns, so a still-running turn is missed only if that
+// many newer turns were created while it ran.
 func (h *synthHub) busy() bool {
 	h.mu.Lock()
 	recs := make([]*synthRecord, 0, len(h.byID))

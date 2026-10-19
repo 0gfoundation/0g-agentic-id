@@ -149,7 +149,7 @@ only triggers it.
 | **prime** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` — the SDK appends every entry (messages, tool calls, compaction, thinking) and `open()` rebuilds context on restart. File `/root/.prime-conversation/owner-chat.jsonl`, outside `primeHome`, `privsep`-owned. Self-rotation at the latest compaction entry (header kept, compaction entry re-parented to root, older lines discarded); a corrupt file quarantines (`.corrupt-<ts>`) and a fresh one opens. Verified on the real SDK: rotation 9209B→729B with context rebuilt; torn tail tolerated. | delete file + leftovers, restart |
 | **hermes** | its own gateway, bound via `ConversationSession` | the gateway is already stateful over HTTP: `X-Hermes-Session-Id` (Bearer `API_SERVER_KEY`, already set) loads history from `~/.hermes/state.db`, body's last message is the turn. The adapter mints and persists ONE id (`~/.hermes/.seal-conversation-id`) and FOLLOWS the echoed id — compaction ends the parent session and continues on a child. Unsafe echoes (path-shaped, control chars) are never persisted. Invariant 7 note: the transcript store is hermes's own `state.db` — its store, its compaction; self-rotation does not apply to a file the harness owns. | mint a fresh id (old rows stay in hermes's db, unreferenced), restart |
 | **dsh** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam has no concrete subclass; `resume()` rejects). The bridge is the backend: every committed `session/event` of `owner-chat` appends via `packChunkRuns`; boot decodes (`decodeStorageRecord`) and seeds `ctx.agents.create({ seed, meta:{seedLength} })`; `interruptedTurnClosers` closes a mid-turn crash (closers appended, so the file balances); a seq guard skips re-emitted seed events. Rotation is necessarily cruder: a seed must be contiguous from seq 0, so the head cannot be cut — at the ceiling the store archives and the conversation restarts fresh, loudly. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). Verified on the real SDK: append→load→`Session.fromRestore` (create's validator) passes; crash repair balances. | remove the log + leftovers, restart |
-| **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) and its gateway REPLAYS the pinned session into every turn. The adapter pins ONE session key (`x-openclaw-session-key`, persisted at `~/.openclaw/.seal-conversation-key`) so all stateful-door turns land in ONE session, and has the door send only the current turn (`ConversationHistory` returns none — see the trap below). The private format coupling (`sessions.json` shape, file naming) is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7 (re-verified 2026-10-19, see the trap below): openclaw's compaction APPENDS a `compaction` record and keeps every message line — `truncateAfterCompaction`, which would rotate the file, is opt-in and off — so the harness does not bound the file here; open. | rotate the key + remove the superseded session's files — transcript and trajectory record (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
+| **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) and its gateway REPLAYS the pinned session into every turn — one session for good, because the render sets `session.reset` to a policy that never goes stale (openclaw's default starts a new session daily; see the trap below). The adapter pins ONE session key (`x-openclaw-session-key`, persisted at `~/.openclaw/.seal-conversation-key`) so all stateful-door turns land in ONE session, and has the door send only the current turn (`ConversationHistory` returns none — see the trap below). The private format coupling (`sessions.json` shape, file naming) is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7 (re-verified 2026-10-19, see the trap below): openclaw's compaction APPENDS a `compaction` record and keeps every message line — `truncateAfterCompaction`, which would rotate the file, is opt-in and off — so the harness does not bound the file here; open. | rotate the key + remove the superseded session's files — transcript and trajectory record (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
 
 Source-verified traps, recorded:
 
@@ -199,6 +199,24 @@ Source-verified traps, recorded:
   unset, openclaw rewrites the record so replay starts at the summary and the
   tail, never summarized, is lost (measured offline) — so the render sets
   openclaw's own default, 20000, unless the owner's overlay names one.
+- openclaw's default session policy is DAILY: the first turn after 04:00
+  (local time) starts a new session for the same key. Measured offline on
+  2026.7.1 by backdating a session past the boundary: the next turn reached
+  the model with none of the earlier turns, and the day-old transcript and
+  trajectory were orphaned — `/clear` follows only the key's current entry,
+  so they stayed on disk. Until now an openclaw agent's conversation
+  restarted this way at its first turn after each 04:00 (container local
+  time). The render now sets `session.reset` to
+  `{mode: "idle"}` with no `idleMinutes`, which never goes stale
+  (reset-policy: idle without a window sets no expiry; measured: the day-two
+  turn carried day one) — unless the owner's overlay sets `session.reset`.
+- What `/clear` still leaves on openclaw (the container's disk only, never
+  chain; gone with a recreate): the compaction summary openclaw keeps in its
+  own `sessions.json` entry for the old key (`compactionCheckpoints`, a store
+  sealed does not rewrite while the gateway runs); session files orphaned by
+  daily resets before the policy above; and a file an in-flight turn on the
+  old key recreates between the clear and the restart that follows — a
+  trajectory rewritten that way is a full copy of the cleared conversation.
 - hermes ROTATES the session id at compaction — a pinned id forks the
   conversation; the echo must be followed. It is followed by compare-and-swap
   on the id the turn was SENT with: synth does not serialize turns, so a turn

@@ -6,7 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
+	"time"
+
+	"seal-verify/internal/inference"
 )
 
 func redirectHome(t *testing.T) {
@@ -206,4 +210,94 @@ func TestClearSession_DoesNotFollowSymlinks(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(sessionsDir(), "sess-evil.jsonl")); !os.IsNotExist(err) {
 		t.Fatalf("the planted link itself should be gone: %v", err)
 	}
+}
+
+// The store is read and the files removed through ONE directory handle: an
+// agent swapping the sessions dir for a symlink between the read and the
+// delete cannot steer the delete into another directory — it still lands in
+// the directory whose store named the files.
+func TestClearSession_DeletesWhereTheStoreWasRead(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	files := plantRealSession(t, a.ConversationHeaders()[sessionKeyHeader])
+	decoy := t.TempDir()
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(decoy, f), []byte("not yours"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	moved := sessionsDir() + ".moved"
+	prev := afterStoreRead
+	afterStoreRead = func() {
+		if err := os.Rename(sessionsDir(), moved); err != nil {
+			t.Error(err)
+		}
+		if err := os.Symlink(decoy, sessionsDir()); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { afterStoreRead = prev })
+
+	if err := a.ClearSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(decoy, f)); err != nil {
+			t.Errorf("a file in the swapped-in directory was deleted: %s (%v)", f, err)
+		}
+		if _, err := os.Stat(filepath.Join(moved, f)); !os.IsNotExist(err) {
+			t.Errorf("%s should be gone from the directory the store was read in: %v", f, err)
+		}
+	}
+}
+
+// A FIFO planted as sessions.json must not hang /clear.
+func TestClearSession_FIFOStoreDoesNotHang(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	a.ConversationHeaders()
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(sessionsStorePath(), 0o644); err != nil {
+		t.Skipf("no FIFO support: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- a.ClearSession(context.Background()) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("clear must still succeed (key rotated): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ClearSession hung on a FIFO sessions.json")
+	}
+}
+
+// openclaw's default session policy starts a new session daily at 04:00,
+// silently ending the ONE conversation; the render sets a reset policy that
+// never goes stale ({mode:"idle"} with no window) — unless the owner's
+// overlay sets one.
+func TestRenderSettings_SessionNeverResets(t *testing.T) {
+	reset := func(cfg map[string]any) any {
+		session, _ := cfg["session"].(map[string]any)
+		return session["reset"]
+	}
+	t.Run("default", func(t *testing.T) {
+		useTempHome(t)
+		got := reset(renderInto(t, routedSettings(inference.WireOpenAI, "glm-5.3")))
+		r, _ := got.(map[string]any)
+		if r == nil || r["mode"] != "idle" || len(r) != 1 {
+			t.Fatalf("session.reset = %v; want {mode: idle} with no idleMinutes", got)
+		}
+	})
+	t.Run("the overlay's policy stands", func(t *testing.T) {
+		useTempHome(t)
+		s := routedSettings(inference.WireOpenAI, "glm-5.3")
+		s.Others = json.RawMessage(`{"session":{"reset":{"mode":"daily","atHour":5}}}`)
+		r, _ := reset(renderInto(t, s)).(map[string]any)
+		if r == nil || r["mode"] != "daily" || r["atHour"] != float64(5) {
+			t.Fatalf("session.reset = %v; want the overlay's daily/5", r)
+		}
+	})
 }

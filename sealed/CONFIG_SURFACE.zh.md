@@ -295,7 +295,7 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 
 | | 文档落到哪 | overlay 怎么处理 |
 |---|---|---|
-| openclaw(`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`agents.defaults.compaction.keepRecentTokens` 设为 openclaw 自己的默认值(20000),除非 overlay 给了正数——手动压缩只有在它被设置时才保留最近的尾部(`CONVERSATION.zh.md`) |
+| openclaw(`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`agents.defaults.compaction.keepRecentTokens` 设为 openclaw 自己的默认值(20000),除非 overlay 给了正数——手动压缩只有在它被设置时才保留最近的尾部——`session.reset` 设为 `{mode: "idle"}`(永不过期),除非 overlay 自己设了——openclaw 默认每天开一个新会话(`CONVERSATION.zh.md`) |
 | hermes(`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | 深合并,再把平台键写在上面:`model.{default,provider,base_url,api_key}`、`agent.reasoning_effort`,以及目录给出预算时的 `model.max_tokens`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint;`model.max_tokens` 在同一模型遇目录故障时保留,模型变了就删除(除非 overlay 自己设了它),否则换到输出上限更低的模型后每个请求都会失败 |
 | prime-agent(`prime/modelsjson.go:143`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
 | dsh(`dsh/settings.go:161`) | 只有桥进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
