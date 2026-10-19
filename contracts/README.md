@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 259 tests / 28 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 261 tests / 28 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -561,7 +561,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-259 Foundry tests across 28 suites (257 pass, 2 fork tests skip unless
+261 Foundry tests across 28 suites (259 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -592,7 +592,7 @@ longest business deadline window.
 | `Eip170Size.t.sol` | 1 | every deployed impl fits the EIP-170 runtime-size limit |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
 | `StorageLayout.t.sol` | 3 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal); OZ's `Ownable2Step` slot pinned and disjoint from all of ours |
-| `DeployScript.t.sol` | 6 | `Deploy.s.sol` governance: Timelock `minDelay` defaults to / requires ≥ 86400 on chain 16661, 0 elsewhere; no external Timelock admin on chain 16661, OWNER admin elsewhere; incremental deploys refuse a weak beacon-owner Timelock on mainnet |
+| `DeployScript.t.sol` | 8 | deploy-script governance (`script/MainnetGovernance.sol`), library-level and end to end. `Deploy.s.sol`: on chain 16661 Timelock `minDelay` defaults to / requires ≥ 86400, no external Timelock admin, and unusable or ambiguous PROPOSERS / EXECUTORS (empty, a `0x0` proposer, OWNER not a proposer, `0x0` mixed into named executors) revert before broadcast; elsewhere delay 0, OWNER admin, role sets unchecked. `DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`: on chain 16661 refuse a weak or code-less `TIMELOCK`, accept a ≥ 1-day one; any elsewhere |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
 | `CanonicalForkIntegration.t.sol` | 2 | self-mint + verified-feedback attest against the live canonical registries (runs only with `FORK_RPC` set; skips otherwise) |
 

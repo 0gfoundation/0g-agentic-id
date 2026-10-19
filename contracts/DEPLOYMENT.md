@@ -217,7 +217,8 @@ export OWNER=0x...
 export PAUSER=0x...
 export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
 # optional: TIMELOCK_DELAY (default 86400 on 0G mainnet 16661, where < 86400 reverts; 0 elsewhere),
-#           CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
+#           CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS (comma-separated; checked
+#           on 16661, see below), NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
   --priority-gas-price 2000000000 --gas-price 5000000000
@@ -232,12 +233,28 @@ itself, so role changes go through `schedule → minDelay → execute` like any
 upgrade; **elsewhere OWNER is admin**, as on the §6.1 / §6.2 Timelocks (with
 `minDelay` 0 the proposer could schedule + execute a role change back to back
 anyway, so dropping the admin there would add friction, not safety).
-`updateDelay` is self-only on every chain. The delay and admin rules live in
-`script/MainnetGovernance.sol` (covered by
-`test/DeployScript.t.sol`); the incremental `DeployVerifiedFeedback.s.sol` /
-`DeployCloneGate.s.sol` apply its other half — on chain 16661 they refuse a
-`TIMELOCK` (the new beacon's owner) that is not a TimelockController with
-`minDelay ≥ 86400`. The run prints all 15 addresses — record them in §6.
+`updateDelay` is self-only on every chain.
+
+With no admin, the constructor's role sets are permanent unless the Timelock
+itself changes them, which needs a working proposer and executor; an unusable
+set freezes every beacon for good. So on chain 16661 the script prints the
+parsed `PROPOSERS` / `EXECUTORS` and reverts before broadcasting unless
+`PROPOSERS` is non-empty, contains no `0x0` and includes `OWNER`, and
+`EXECUTORS` is non-empty and either exactly `[0x0]` (open execution) or only
+non-zero addresses. A set-but-empty `PROPOSERS=` / `EXECUTORS=` parses to an
+empty list, not the default — unset the variable to get the default.
+`OWNER` must be a proposer (extras are allowed) because the required
+post-deploy admin calls below prove right away that `OWNER` can sign; a
+proposer that is only used at the first upgrade could turn out to be
+unreachable months after the stack went live. Other chains skip these checks
+(`OWNER` is admin there and can grant a missing role directly).
+
+The delay, admin and role-set rules live in `script/MainnetGovernance.sol`
+(covered by `test/DeployScript.t.sol`); the incremental
+`DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol` apply its other half
+— on chain 16661 they refuse a `TIMELOCK` (the new beacon's owner) that is not
+a TimelockController with `minDelay ≥ 86400`. The run prints all 15 addresses
+— record them in §6.
 
 **Required post-deploy (fresh contract = empty allowlists):** the owner must
 `addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`),
@@ -509,11 +526,16 @@ Changelog:
   not consensus-critical and independent of the VerifiedFeedbackRegistry 1.2.0
   cut — deploy the two impls and `ScheduleUpgrade` / `ExecuteUpgrade` each
   beacon (UPGRADING.md §2; on mainnet the vault schedules and execution waits
-  ≥ 86400 s). Operational change afterwards: every ownership move is two txs —
-  the current owner proposes, then the NEW owner (e.g. a successor vault) calls
+  ≥ 86400 s). Execution is open, so any account can execute each op as soon
+  as it is ready. If the two ride along in the VerifiedFeedbackRegistry window
+  below, schedule them with that entry's step-3 `DELAY` (window start − now);
+  with plain `minDelay` they become executable before the window. Operational
+  change afterwards: every ownership move is two txs — the current owner
+  proposes, then the NEW owner (e.g. a successor vault) calls
   `acceptOwnership()`; a one-shot `transferOwnership` like the 2026-10-16
-  mainnet migration no longer completes on its own. Record impl addresses,
-  VERSION and dates in §6 / here when executed.
+  mainnet migration no longer completes on its own (pending proposals and how
+  to withdraw one: §8). Record impl addresses, VERSION and dates in §6 / here
+  when executed.
 
 - **VerifiedFeedbackRegistry 1.2.0 — PENDING (source only: not deployed on
   any environment, no impl address yet)** — ServeProof hardening (audit
@@ -555,9 +577,19 @@ Changelog:
      per hash: `cast call $AGENTIC_ID 'isValidFrameworkHash(bytes32)(bool)'
      <image hash> --rpc-url $RPC` → `true`.
   3. Deploy the 1.2.0 impl and beacon-upgrade each environment's VF proxy via
-     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). On mainnet the
-     Timelock's `minDelay` is 1 day, so schedule at least 86400 s before the
-     window; execute (open execution) at its start. Check:
+     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Execution is open
+     on mainnet and test (§6.2m / §6.1), so anyone can perform the cut the
+     moment the op is ready, and an op becomes ready `DELAY` seconds after the
+     schedule tx lands. On mainnet (`minDelay` 1 day) the vault therefore schedules with
+     `DELAY` = window start − now, in seconds and ≥ 86400 (`schedule` rejects
+     less, so fix the window at least a day ahead), not with plain `minDelay`:
+     scheduled earlier with 86400, the op would be ready, and executable by
+     anyone, before the window. Check after the schedule tx lands:
+     `getTimestamp(opId)` (UPGRADING.md "Mainnet Step 3") = the window start,
+     or slightly later by the vault's approval time. Execute at the window's
+     start. If the window slips, the vault (the canceller) calls
+     `cancel(opId)` before the op is ready and schedules again. On test / dev
+     (`minDelay` 0) schedule inside the window and execute right away. Check:
      `cast call $VF 'VERSION()(string)' --rpc-url $RPC` → `"1.2.0"`.
   4. In the same window: roll the attestor with
      `ATTESTOR_VERIFIED_FEEDBACK_ADDR` = that environment's VF proxy (§6) and
@@ -732,6 +764,16 @@ Changelog:
 - Testnet / dev (§6.1 / §6.2) deliberately keep an EOA owner and `minDelay` 0;
   none of the above applies there, except that **testnet keys must never be
   reused on mainnet**.
+- **Pending ownership transfers (every environment, from 1.2.0).** A
+  `transferOwnership(x)` on AgenticID / TEEDataVerifier /
+  VerifiedFeedbackRegistry stays pending, with no expiry, until `x` calls
+  `acceptOwnership()` or the owner calls `transferOwnership` again; the
+  current owner keeps full control meanwhile. A new call replaces the
+  candidate (the superseded one can no longer accept). To withdraw a proposal
+  — a wrong address, or a migration called off — the owner calls
+  `transferOwnership(address(0))`, which clears `pendingOwner()` (pinned in
+  `test/TwoStepOwnership.t.sol`). Read `pendingOwner()` after every
+  ownership move: a stale candidate can still accept until it is cleared.
 
 ### Tracked follow-ups (GitHub issues)
 

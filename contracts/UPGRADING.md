@@ -52,9 +52,23 @@ steps into the `DEPLOYMENT.md` §7 entry — 1.2.0's is the template.
 Same steps on every environment; only the Timelock's `minDelay` differs —
 0 on testnet / dev, **86400 (1 day) on mainnet** (DEPLOYMENT.md §6.2m). On
 mainnet the proposer is the Fordefi MPC vault, so Step 3's `schedule(beacon, 0,
-upgradeTo(newImpl), predecessor, salt, 86400)` — the call `ScheduleUpgrade`
+upgradeTo(newImpl), predecessor, salt, delay)` — the call `ScheduleUpgrade`
 makes — is submitted from the vault rather than with a local `--private-key`,
-and Step 4 (open execution: any account) can only succeed ≥ 1 day later.
+and Step 4 can only succeed once `delay` (≥ 86400) has passed.
+
+**Open execution: the ready time is the upgrade time.** The mainnet and test
+Timelocks have executor `address(0)` (DEPLOYMENT.md §6.2m / §6.1; the
+`Deploy.s.sol` default), so any account can execute an op from the moment it
+is ready — `delay` seconds after the schedule tx lands. An op scheduled with plain `minDelay` more than a day
+before its intended window is therefore executable, by anyone, before the
+window. When the upgrade must land at a set time (e.g. the
+VerifiedFeedbackRegistry 1.2.0 hard cut, DEPLOYMENT.md §7), schedule with
+`DELAY` = window start − now in seconds; on mainnet that must be ≥ 86400
+(`schedule` reverts below `minDelay`), so fix the window at least a day
+ahead. Until the op is executed, a canceller (on mainnet the vault) can
+`cancel(opId)` it — do so before it is ready if the window slips, then
+schedule again.
+
 `ScheduleUpgrade` logs the parameters and the opId but not the calldata the
 vault needs; build that with `cast` (see "Mainnet Step 3" below) or take the
 tx `input` from a dry run (`--sender <vault>`, no `--broadcast`:
@@ -71,20 +85,31 @@ forge create src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry \
 
 # Step 3: proposer schedules (BEACON is the beacon to upgrade, NOT the proxy)
 export TIMELOCK=0x... BEACON=0x... NEW_IMPL=0x<from step 2>
+export PREDECESSOR=$(cast hash-zero) SALT=$(cast hash-zero)   # full 32-byte hex; Step 4 reuses both
+# optional: export DELAY=<seconds> — default = the Timelock's minDelay; for a set window, window start - now
 forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> --chain 16602 \
   --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
 
 # Mainnet Step 3 (proposer = Fordefi vault): build the tx data, submit it from the vault
-#   to = $TIMELOCK, value = 0. PREDECESSOR / SALT are full 32-byte hex (0x00…00 = 64 zeros).
+#   to = $TIMELOCK, value = 0. PREDECESSOR / SALT as exported above (full 32-byte hex).
+#   DELAY: 86400 to allow execution as soon as possible; for a set window (unix ts
+#   WINDOW_START), the seconds until it — must be >= 86400. It counts from the block the
+#   vault tx lands in, so approval time only moves the ready time later, never earlier.
+export DELAY=$(( WINDOW_START - $(date +%s) ))   # or: export DELAY=86400
 cast calldata "schedule(address,uint256,bytes,bytes32,bytes32,uint256)" \
-  $BEACON 0 $(cast calldata "upgradeTo(address)" $NEW_IMPL) $PREDECESSOR $SALT 86400
+  $BEACON 0 $(cast calldata "upgradeTo(address)" $NEW_IMPL) $PREDECESSOR $SALT $DELAY
 # once the vault tx lands: the opId (same value ScheduleUpgrade would log) and its ready time
 OP=$(cast call $TIMELOCK "hashOperation(address,uint256,bytes,bytes32,bytes32)(bytes32)" \
   $BEACON 0 $(cast calldata "upgradeTo(address)" $NEW_IMPL) $PREDECESSOR $SALT --rpc-url https://evmrpc.0g.ai)
-cast call $TIMELOCK "getTimestamp(bytes32)(uint256)" $OP --rpc-url https://evmrpc.0g.ai   # 0 = not scheduled
+cast call $TIMELOCK "getTimestamp(bytes32)(uint256)" $OP --rpc-url https://evmrpc.0g.ai   # 0 = not scheduled;
+#   else the ready time: >= WINDOW_START, and anyone may execute from then on
+# window slipped? the vault cancels before the ready time (to = $TIMELOCK, value = 0), then re-schedules:
+cast calldata "cancel(bytes32)" $OP
 
 # Step 4: after the delay (1 day on mainnet; with delay=0, still poll isOperationReady), executor executes.
-#         TIMELOCK/BEACON/NEW_IMPL must byte-match Step 3.
+#         TIMELOCK/BEACON/NEW_IMPL/PREDECESSOR/SALT must byte-match Step 3 (same shell, or re-export
+#         the same values: the opId is their hash; unset PREDECESSOR/SALT default to 0x0). DELAY is not
+#         part of the opId.
 forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> --chain 16602 \
   --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
 ```
@@ -118,7 +143,9 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
 - [ ] On chain: `proxy.VERSION() == new version` and `beacon.implementation() == new impl`
 - [ ] Ownership moves after a 1.2.0 upgrade are two-step: the current owner
       calls `transferOwnership(new)`, then `new` calls `acceptOwnership()`
-      (check `owner()` / `pendingOwner()`)
+      (check `owner()` / `pendingOwner()`); a proposal stays pending until
+      accepted or replaced — withdraw one with `transferOwnership(address(0))`
+      (DEPLOYMENT.md §8)
 - [ ] `script/verify.sh <proxy>` re-verifies the new impl (see DEPLOYMENT §5)
 - [ ] `DEPLOYMENT.md`: update the impl address + VERSION in the relevant §6 env; append a §7 changelog entry
 - [ ] Upgrade both dev and test as needed to avoid version drift (current state in §6)

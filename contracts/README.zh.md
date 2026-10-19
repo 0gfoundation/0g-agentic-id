@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 259 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 261 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -517,7 +517,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-259 个 Foundry tests / 28 suites（257 通过，2 个 fork 测试未设 `FORK_RPC`
+261 个 Foundry tests / 28 suites（259 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -548,7 +548,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
 | `StorageLayout.t.sol` | 3 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）；OZ `Ownable2Step` 槽固定且与我们所有槽不相交 |
-| `DeployScript.t.sol` | 6 | `Deploy.s.sol` 治理规则：链 16661 上 Timelock `minDelay` 默认且至少 86400，其余链默认 0；链 16661 上 Timelock 无外部 admin，其余链 OWNER 为 admin；增量部署在 mainnet 上拒绝弱 Timelock 作 beacon owner |
+| `DeployScript.t.sol` | 8 | 部署脚本治理规则（`script/MainnetGovernance.sol`），库级 + 端到端。`Deploy.s.sol`：链 16661 上 Timelock `minDelay` 默认且至少 86400、无外部 admin，且不可用或有歧义的 PROPOSERS / EXECUTORS（为空、含 `0x0` proposer、OWNER 不是 proposer、`0x0` 与具名 executor 混用）在 broadcast 前 revert；其余链 delay 0、OWNER 为 admin、不检查角色集合。`DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`：链 16661 上拒绝弱或无代码的 `TIMELOCK`，接受 ≥ 1 天的；其余链不限 |
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
 | `CanonicalForkIntegration.t.sol` | 2 | 对着线上 canonical 注册表 self-mint + verified-feedback attest（仅设了 `FORK_RPC` 才跑，否则跳过）|
 

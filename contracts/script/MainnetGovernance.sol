@@ -8,8 +8,9 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///
 ///         0G mainnet (chain 16661) is strict: the TimelockController that owns
 ///         the beacons must have minDelay >= 1 day, so every beacon upgrade is
-///         publicly scheduled a day before it can execute, and a fresh Timelock
-///         gets no external admin (role changes take the same 1-day path).
+///         publicly scheduled a day before it can execute; a fresh Timelock
+///         gets no external admin (role changes take the same 1-day path), so
+///         its constructor role sets must be usable (requireMainnetTimelockRoles).
 ///         Every other chain (0G Galileo testnet, local) stays lightweight:
 ///         minDelay defaults to 0 and OWNER is the Timelock admin, as on the
 ///         existing testnet / dev Timelocks (DEPLOYMENT.md §6.1 / §6.2).
@@ -49,6 +50,49 @@ library MainnetGovernance {
     ///         to back anyway; dropping the admin there adds friction, not safety).
     function timelockAdmin(uint256 chainId, address owner) internal pure returns (address) {
         return chainId == ZG_MAINNET_CHAIN_ID ? address(0) : owner;
+    }
+
+    /// @notice Role sets for a fresh Timelock, checked before broadcast. On 0G
+    ///         mainnet the Timelock has no external admin (timelockAdmin), so the
+    ///         constructor's proposers / executors are the only accounts that
+    ///         can ever schedule / execute, including the role changes that
+    ///         would repair a bad set: an unusable set freezes every beacon for
+    ///         good. Rules on chain 16661:
+    ///         - proposers: non-empty, no address(0) (a role nobody can use),
+    ///           and OWNER among them. OWNER is the account the mandatory
+    ///           post-deploy admin calls (DEPLOYMENT.md §3) exercise right after
+    ///           the deploy, so a stack whose proposer can't sign is caught
+    ///           before anything depends on it; a proposer first used at the
+    ///           first upgrade could prove unreachable only then. Extra
+    ///           proposers are allowed.
+    ///         - executors: non-empty, and either exactly [address(0)] (open
+    ///           execution) or only non-zero accounts. address(0) next to named
+    ///           executors would still open execution to anyone, contradicting
+    ///           the restricted set the list suggests.
+    ///         No-op on other chains: OWNER is the Timelock admin there and can
+    ///         grant any missing role directly.
+    function requireMainnetTimelockRoles(
+        uint256 chainId,
+        address owner,
+        address[] memory proposers,
+        address[] memory executors
+    ) internal pure {
+        if (chainId != ZG_MAINNET_CHAIN_ID) return;
+        require(proposers.length != 0, "PROPOSERS is empty on 0G mainnet (chain 16661): nobody could schedule");
+        bool ownerProposes;
+        for (uint256 i; i < proposers.length; ++i) {
+            require(proposers[i] != address(0), "PROPOSERS contains address(0) on 0G mainnet (chain 16661)");
+            if (proposers[i] == owner) ownerProposes = true;
+        }
+        require(ownerProposes, "PROPOSERS must include OWNER on 0G mainnet (chain 16661)");
+        require(executors.length != 0, "EXECUTORS is empty on 0G mainnet (chain 16661): nobody could execute");
+        if (executors.length == 1 && executors[0] == address(0)) return; // open execution
+        for (uint256 i; i < executors.length; ++i) {
+            require(
+                executors[i] != address(0),
+                "EXECUTORS mixes address(0) with named executors on 0G mainnet (chain 16661): use exactly 0x0 or only non-zero addresses"
+            );
+        }
     }
 
     /// @notice Incremental deploys hand a new beacon to an EXISTING Timelock.

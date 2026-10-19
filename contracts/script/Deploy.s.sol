@@ -21,8 +21,9 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///         Environment variables:
 ///           OWNER             — owner of TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry
 ///                               (two-step Ownable; admin calls are direct, NOT timelocked).
-///                               Also the default Timelock proposer, and the Timelock admin
-///                               everywhere except 0G mainnet (see "Timelock admin" below).
+///                               Also the default Timelock proposer (on 0G mainnet it must be
+///                               one of PROPOSERS), and the Timelock admin everywhere except
+///                               0G mainnet (see "Timelock admin" below).
 ///           PAUSER            — address allowed to pause/unpause (not timelocked)
 ///           TEE_ORACLE        — signer address for TEEDataVerifier
 ///           TIMELOCK_DELAY    — Timelock minDelay in seconds. 0G mainnet (16661): default
@@ -33,6 +34,11 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///           EXECUTORS         — comma-separated; default [0x0] = open execution (anyone may
 ///                               execute a READY op — the delay is the protection, not the
 ///                               executor set)
+///                               A set-but-empty PROPOSERS= / EXECUTORS= parses to an EMPTY
+///                               list, not the default. On 0G mainnet (16661) the run reverts
+///                               before broadcast unless PROPOSERS is non-empty, has no 0x0 and
+///                               includes OWNER, and EXECUTORS is non-empty and either exactly
+///                               [0x0] or all non-zero (MainnetGovernance.requireMainnetTimelockRoles).
 ///           NFT_NAME          — ERC-721 name   (default "AgenticID")
 ///           NFT_SYMBOL        — ERC-721 symbol (default "AID")
 ///           MAX_PROOF_AGE     — nonce GC horizon in seconds (default 86400)
@@ -85,6 +91,10 @@ contract Deploy is Script {
     function run() external returns (Deployed memory d) {
         Config memory c = _readConfig();
         _printConfig(c);
+
+        // Fail fast on a Timelock that could never schedule or execute — on 0G
+        // mainnet it has no admin to repair its roles afterwards.
+        MainnetGovernance.requireMainnetTimelockRoles(block.chainid, c.owner, c.proposers, c.executors);
 
         // Fail fast if canonical points at the wrong contract (e.g. the testnet
         // address used on mainnet, which resolves to a different v0.0.1 contract).
@@ -208,6 +218,13 @@ contract Deploy is Script {
         address admin = MainnetGovernance.timelockAdmin(block.chainid, c.owner);
         if (admin == address(0)) console2.log("timelockAdmin:  none (self-administered)");
         else console2.log("timelockAdmin: ", admin);
+        if (c.proposers.length == 0) console2.log("proposers:      none");
+        for (uint256 i; i < c.proposers.length; ++i) console2.log("proposer:      ", c.proposers[i]);
+        if (c.executors.length == 0) console2.log("executors:      none");
+        for (uint256 i; i < c.executors.length; ++i) console2.log("executor:      ", c.executors[i]);
+        if (c.executors.length == 1 && c.executors[0] == address(0)) {
+            console2.log("                (0x0 = open execution: anyone may execute a ready op)");
+        }
         console2.log("maxProofAge:   ", c.maxProofAge);
         console2.log("canonical8004: ", c.canonical);
         console2.log("canonical8004Reputation: ", c.canonicalReputation);
