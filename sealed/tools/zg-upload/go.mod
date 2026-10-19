@@ -4,10 +4,13 @@ go 1.24.0
 
 // 0g-storage-client is pinned to upstream commit bb5675461a96 (main,
 // 2026-08-25). main.go mirrors that version's `upload --indexer` path
-// (cmd/upload.go, cmd/root.go); re-check the mapping when bumping it.
-// This is also the version of the `0g-storage-client` CLI (downloads) in
-// every sealed image: the storage-builder stages read it from this file
-// (`go list -m`) and `go install` the CLI at it, so the two move together.
+// (cmd/upload.go, cmd/root.go, common/blockchain/rpc.go); re-check the
+// mapping when bumping it -- TestCLISource_Unchanged fails until the new
+// versions of those files are recorded. This is also the version of the
+// `0g-storage-client` CLI (downloads) in every image that builds the
+// storage binaries (sealed/Dockerfile, images/{hermes,prime,dsh}): their
+// storage-builder stages read it from this file (`go list -m`) and
+// `go install` the CLI at it, so the two move together.
 require (
 	github.com/0gfoundation/0g-storage-client v1.4.4-testnet.0.20260825201704-bb5675461a96
 	github.com/ethereum/go-ethereum v1.15.11

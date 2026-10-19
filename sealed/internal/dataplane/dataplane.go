@@ -8,7 +8,7 @@
 // The uploader reuses SealDataKey, Encrypt and Upload for the symmetric
 // outbound flow. Download runs the `0g-storage-client` CLI; Upload runs the
 // zg-upload helper (sealed/tools/zg-upload), which takes the signing key on
-// stdin.
+// stdin (a socketpair, keyChannel).
 package dataplane
 
 import (
@@ -114,16 +114,20 @@ func NewDataKey() ([]byte, error) {
 }
 
 // uploadHelperPath is the storage-upload helper built from
-// sealed/tools/zg-upload; every sealed image installs it here, root-owned,
-// next to 0g-storage-client. It wraps the 0g-storage-client Go SDK with the
-// CLI's upload semantics, but reads the signing key from stdin: the CLI
-// accepts the key only as a --key argument, and process arguments are
-// readable by every local user via /proc/<pid>/cmdline.
+// sealed/tools/zg-upload. The images that build the storage binaries
+// (sealed/Dockerfile, images/{hermes,prime,dsh}) install it here,
+// root-owned, next to 0g-storage-client; the base images images/openclaw
+// and images/sealed carry neither binary, so an image built from one of
+// them alone fails every upload and download. The helper wraps the
+// 0g-storage-client Go SDK with the CLI's upload semantics, but reads the
+// signing key from stdin: the CLI accepts the key only as a --key argument,
+// and process arguments are readable by every local user via
+// /proc/<pid>/cmdline.
 //
 // Both storage binaries are run by absolute path, never looked up through
 // PATH: sealed runs as root, some images put a directory under $HOME first
-// on PATH, and the openclaw adapter hands $HOME to the agent user, so a PATH
-// lookup can resolve to a file that user controls. Vars so tests can point
+// on PATH, and the framework adapters hand $HOME to the agent user, so a
+// PATH lookup can resolve to a file that user controls. Vars so tests can point
 // them at stand-ins.
 var uploadHelperPath = "/usr/local/bin/zg-upload"
 
@@ -171,12 +175,15 @@ var rootLineRegexp = regexp.MustCompile(`root\s*=\s*(0x[0-9a-fA-F]{64})`)
 // same manifest.
 const perUploadTimeout = 90 * time.Second
 
-// uploadCommand builds the helper invocation for one blob. The signing key
-// is written to the helper's stdin and never appears in its argument list
-// or environment (an explicit one, helperEnv).
+// uploadCommand builds the helper invocation for one blob, and the channel
+// that carries the signing key to it: cmd.Stdin is one end of a socketpair
+// (keyChannel), and Upload writes the key to the other end once the helper
+// has started. The key never appears in the argument list or in the
+// environment (an explicit one, helperEnv).
 //
-// The endpoint URLs do travel in the argument list, so CHAIN_RPC_URL and
-// INDEXER_URL must not embed credentials (internal/config).
+// The endpoint URLs do travel in the argument list. CHAIN_RPC_URL and
+// INDEXER_URL are public anyway (internal/config) and must not embed
+// credentials.
 //
 // Flags match the `0g-storage-client upload` defaults except where pinned:
 //
@@ -187,9 +194,24 @@ const perUploadTimeout = 90 * time.Second
 //	--method random        avoid shard.Select empty-method bug
 //
 // Boolean flags use the --flag=value form; the helper rejects a separate
-// value word. Keep this list in sync with sealedArgs in
-// sealed/tools/zg-upload/main_test.go.
-func uploadCommand(ctx context.Context, file, indexerURL, rpcURL, signerPrivHex string) *exec.Cmd {
+// value word. The helper lives in another Go module, so the two sides are
+// checked against each other's source: TestUploadCommand_ArgsMatchHelperFlags
+// (here) checks these arguments against the flags the helper's parseFlags
+// defines, and the helper's TestParseFlags_SealedInvocation runs its real
+// parser on the literal arguments of the exec.CommandContext call below.
+// Keep that call's arguments string literals or the parameters file,
+// indexerURL and rpcURL.
+//
+// What this function and Upload guarantee -- the helper by its absolute
+// path, an explicit environment, the key only on the socketpair stdin, the
+// root read from stdout only -- is pinned by dataplane_test.go.
+// A change that routes this exec through another launcher keeps those
+// properties and ports those tests rather than dropping them.
+func uploadCommand(ctx context.Context, file, indexerURL, rpcURL, signerPrivHex string) (*exec.Cmd, *keyChannel, error) {
+	keys, err := newKeyChannel(signerPrivHex)
+	if err != nil {
+		return nil, nil, err
+	}
 	cmd := exec.CommandContext(ctx, uploadHelperPath,
 		"--file", file,
 		"--indexer", indexerURL,
@@ -201,8 +223,8 @@ func uploadCommand(ctx context.Context, file, indexerURL, rpcURL, signerPrivHex 
 		"--method", "random",
 	)
 	cmd.Env = helperEnv()
-	cmd.Stdin = strings.NewReader(strings.TrimPrefix(signerPrivHex, "0x") + "\n")
-	return cmd
+	cmd.Stdin = keys.remote
+	return cmd, keys, nil
 }
 
 // Upload pushes ciphertext to 0g-storage and returns the storage root
@@ -214,7 +236,8 @@ func uploadCommand(ctx context.Context, file, indexerURL, rpcURL, signerPrivHex 
 // in-process) so that any SDK panic, logrus.Fatal, or OOM stays
 // contained -- the sealed binary keeps serving /healthz + /log even when
 // the upload itself fails -- and so the SDK's go-ethereum version stays
-// out of sealed's module. The key is passed over stdin (uploadCommand).
+// out of sealed's module. The key is passed over stdin (uploadCommand,
+// keyChannel).
 func Upload(
 	ctx context.Context,
 	ciphertext []byte,
@@ -244,14 +267,29 @@ func Upload(
 		return [32]byte{}, fmt.Errorf("close tempfile: %w", err)
 	}
 
-	cmd := uploadCommand(uploadCtx, tmpPath, indexerURL, rpcURL, signerPrivHex)
+	cmd, keys, err := uploadCommand(uploadCtx, tmpPath, indexerURL, rpcURL, signerPrivHex)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	defer keys.Close()
 	// stdout carries only the result line; SDK logs and the final error
 	// line go to stderr.
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		return [32]byte{}, fmt.Errorf("upload cmd: %v", err)
+	}
+	keys.started()
+	sendErr := keys.send(uploadCtx)
+	// Wait even when the key could not be written: a helper that exited
+	// early (bad flags, say) explains itself on stderr, which says more
+	// than the write error.
+	if err := cmd.Wait(); err != nil {
 		return [32]byte{}, fmt.Errorf("upload cmd: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	if sendErr != nil {
+		return [32]byte{}, fmt.Errorf("upload cmd: write key: %v", sendErr)
 	}
 
 	m := rootLineRegexp.FindSubmatch(stdout.Bytes())

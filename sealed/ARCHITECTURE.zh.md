@@ -155,13 +155,14 @@ sealed/
 └── tools/zg-upload/              存储上传 helper：基于 0g-storage-client SDK 的独立 Go module
                                   （版本钉在它自己的 go.mod；镜像里负责下载的 CLI 也按同一版本构建）；从 stdin 读签名密钥。
                                   凡是构建 CLI 的镜像（Dockerfile、images/{hermes,prime,dsh}）都把它装在
-                                  /usr/local/bin/zg-upload，紧挨 0g-storage-client
+                                  /usr/local/bin/zg-upload，紧挨 0g-storage-client；基础镜像 images/openclaw
+                                  和 images/sealed 两个都不带
 ```
 
 ### 各包职责一句话
 
 - **chain**：所有链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）
-- **dataplane**：iData 加解密 + 0g-storage 传输；自己不发链上调用。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 跑 `0g-storage-client download`，`Upload` 跑 `zg-upload` helper、把 agent_seal 密钥写进它的 stdin（密钥从不出现在任何进程的参数或环境变量里），每个 blob 上限 90s。两个二进制都按 `/usr/local/bin` 下的绝对路径运行，从不经 `PATH` 查找
+- **dataplane**：iData 加解密 + 0g-storage 传输；自己不发链上调用。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 跑 `0g-storage-client download`，`Upload` 跑 `zg-upload` helper、把 agent_seal 密钥写进它的 stdin —— 一对 socketpair 的一端，而不是管道（密钥从不出现在任何进程的参数或环境变量里），每个 blob 上限 90s。两个二进制都按 `/usr/local/bin` 下的绝对路径运行，从不经 `PATH` 查找
 - **framework**：定义 `Framework` 接口（adapter 协议）+ `RuntimeContext` + `RoleSpec{Name, Shape}` + 共享类型如 `StartParams`、`StartResult`。**不依赖具体框架**
 - **settings**：`Doc`（provider / model / thinking / 一段不透明的 per-framework overlay）是 owner 的 document，也是唯一被持久化的那一半；`Resolved` 再加上平台在 Start 时算出来的部分 —— endpoint、输出预算、模型吃不吃 reasoning bound —— 哪儿都不存，因为存下来的副本会过期、然后跟算出来的值打架（`settings.go:10-15`）
 - **framework/openclaw**：参考 adapter 实现。又内部拆成 `restore.go`/`restore_paths.go`、`evolution.go`/`evolution_paths.go`、`spawn.go`、`ingest.go`（persona legacy）、`inference.go`（`RenderSettings`：owner 的 document → openclaw.json）、`disk.go`（openclaw.json read/write）、`whitelist.go`（npm 版本白名单）、`identitymd.go`/`soulmd.go`/`toolsmd.go`（IDENTITY/SOUL/TOOLS 三份 sealed-managed 平台段 + 共享 marker 工具）
@@ -499,9 +500,9 @@ env 这一面：
 | `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
 | `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
-| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链。不能内嵌凭据：它会作为命令行参数传给 `zg-upload` helper |
+| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，无需鉴权），并作为命令行参数传给 `zg-upload` helper；attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
-| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。不能内嵌凭据：它会作为命令行参数传给 `zg-upload` helper，并记进每个上传条目的链上 `dataDescription` |
+| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。它是公开的，所以不能内嵌凭据：它会记进每个上传条目的链上 `dataDescription`（attestor 在 mint 时也这样记），打进启动日志（`/log`、`/log.html`，无需鉴权），并作为命令行参数传给 `zg-upload` helper |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
 | `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:163-170`）|
 | `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |

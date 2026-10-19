@@ -5,8 +5,12 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -27,19 +31,73 @@ func testKeyAddress(t *testing.T) common.Address {
 	return crypto.PubkeyToAddress(priv.PublicKey)
 }
 
-// sealedArgs is the argument list sealed/internal/dataplane.uploadCommand
-// passes. Keep the two in sync.
-func sealedArgs(file string) []string {
-	return []string{
-		"--file", file,
-		"--indexer", "http://indexer.example:5678",
-		"--url", "http://rpc.example:8545",
-		"--expected-replica", "1",
-		"--skip-tx=true",
-		"--fast-mode=true",
-		"--full-trusted=true",
-		"--method", "random",
+// Stand-ins for uploadCommand's indexerURL and rpcURL parameters.
+const (
+	sealedIndexer = "http://indexer.example:5678"
+	sealedRPC     = "http://rpc.example:8545"
+)
+
+// sealedArgs returns the argument list sealed/internal/dataplane's
+// uploadCommand passes the helper. sealed is another Go module and cannot
+// be imported, so the list is read from that function's source: the
+// arguments of its exec.CommandContext call after the context and the
+// helper path, with the parameters file, indexerURL and rpcURL replaced by
+// file, sealedIndexer and sealedRPC. Any other kind of argument fails the
+// test rather than being guessed at.
+func sealedArgs(t testing.TB, file string) []string {
+	t.Helper()
+	const src = "../../internal/dataplane/dataplane.go"
+	f, err := parser.ParseFile(token.NewFileSet(), src, nil, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse %s: %v", src, err)
 	}
+	var call *ast.CallExpr
+	for _, d := range f.Decls {
+		fd, ok := d.(*ast.FuncDecl)
+		if !ok || fd.Name.Name != "uploadCommand" || fd.Body == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			c, ok := n.(*ast.CallExpr)
+			if !ok || call != nil {
+				return call == nil
+			}
+			if sel, ok := c.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "CommandContext" {
+				if x, ok := sel.X.(*ast.Ident); ok && x.Name == "exec" {
+					call = c
+					return false
+				}
+			}
+			return true
+		})
+	}
+	if call == nil {
+		t.Fatalf("no exec.CommandContext call in uploadCommand in %s; update sealedArgs", src)
+	}
+	if call.Ellipsis.IsValid() || len(call.Args) < 3 {
+		t.Fatalf("uploadCommand's exec.CommandContext call no longer lists its arguments literally; update sealedArgs")
+	}
+	params := map[string]string{"file": file, "indexerURL": sealedIndexer, "rpcURL": sealedRPC}
+	var args []string
+	for _, a := range call.Args[2:] {
+		switch v := a.(type) {
+		case *ast.BasicLit:
+			s, err := strconv.Unquote(v.Value)
+			if v.Kind != token.STRING || err != nil {
+				t.Fatalf("uploadCommand passes the non-string literal %s", v.Value)
+			}
+			args = append(args, s)
+		case *ast.Ident:
+			s, ok := params[v.Name]
+			if !ok {
+				t.Fatalf("uploadCommand passes %s; give it a stand-in in sealedArgs", v.Name)
+			}
+			args = append(args, s)
+		default:
+			t.Fatalf("uploadCommand passes a %T argument; keep them string literals or the parameters file, indexerURL, rpcURL", a)
+		}
+	}
+	return args
 }
 
 // ── readKey ────────────────────────────────────────────────────────────────
@@ -160,15 +218,22 @@ func TestParseFlags_DefaultsMatchCLI(t *testing.T) {
 	}
 }
 
+// TestParseFlags_SealedInvocation runs the helper's real flag parser on the
+// arguments sealed's uploadCommand actually passes (read from its source by
+// sealedArgs), so a change on either side that the helper would reject --
+// a flag it does not define, a separate value word after a boolean flag --
+// fails here. sealed's TestUploadCommand_ArgsMatchHelperFlags checks the
+// same pairing from the other module.
 func TestParseFlags_SealedInvocation(t *testing.T) {
-	o, err := parseFlags(sealedArgs("/tmp/blob.bin"), io.Discard)
+	args := sealedArgs(t, "/tmp/blob.bin")
+	o, err := parseFlags(args, io.Discard)
 	if err != nil {
-		t.Fatalf("parseFlags: %v", err)
+		t.Fatalf("parseFlags on the arguments sealed passes (%q): %v", args, err)
 	}
 	want := options{
 		file:            "/tmp/blob.bin",
-		indexer:         "http://indexer.example:5678",
-		url:             "http://rpc.example:8545",
+		indexer:         sealedIndexer,
+		url:             sealedRPC,
 		expectedReplica: 1,
 		skipTx:          true,
 		fastMode:        true,
@@ -181,7 +246,7 @@ func TestParseFlags_SealedInvocation(t *testing.T) {
 }
 
 func TestParseFlags_BooleanFalse(t *testing.T) {
-	args := append(sealedArgs("f"), "--skip-tx=false", "--fast-mode=false", "--full-trusted=false")
+	args := append(sealedArgs(t, "f"), "--skip-tx=false", "--fast-mode=false", "--full-trusted=false")
 	o, err := parseFlags(args, io.Discard)
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -193,9 +258,9 @@ func TestParseFlags_BooleanFalse(t *testing.T) {
 
 func TestParseFlags_RejectsKeyFlag(t *testing.T) {
 	for _, args := range [][]string{
-		append(sealedArgs("f"), "--key", testKeyHex),
-		append(sealedArgs("f"), "--key="+testKeyHex),
-		append(sealedArgs("f"), "-key", testKeyHex),
+		append(sealedArgs(t, "f"), "--key", testKeyHex),
+		append(sealedArgs(t, "f"), "--key="+testKeyHex),
+		append(sealedArgs(t, "f"), "-key", testKeyHex),
 	} {
 		var stderr bytes.Buffer
 		_, err := parseFlags(args, &stderr)
@@ -253,7 +318,7 @@ func TestParseFlags_Method(t *testing.T) {
 // ── SDK option mapping ─────────────────────────────────────────────────────
 
 func TestUploadOption_MatchesCLIMapping(t *testing.T) {
-	o, err := parseFlags(sealedArgs("f"), io.Discard)
+	o, err := parseFlags(sealedArgs(t, "f"), io.Discard)
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
@@ -326,7 +391,7 @@ func TestRun_SuccessPrintsOnlyTheRootLine(t *testing.T) {
 		return []common.Hash{root}, nil
 	}
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), sealedArgs("/tmp/x.bin"), strings.NewReader(testKeyHex+"\n"), &stdout, &stderr, stub)
+	code := run(context.Background(), sealedArgs(t, "/tmp/x.bin"), strings.NewReader(testKeyHex+"\n"), &stdout, &stderr, stub)
 	if code != exitOK {
 		t.Fatalf("exit %d, stderr %q", code, stderr.String())
 	}
@@ -346,7 +411,7 @@ func TestRun_UploadErrorIsLastStderrLine(t *testing.T) {
 		return nil, errors.New("failed to send transaction:\ninsufficient funds for gas * price + value")
 	}
 	var stdout, stderr bytes.Buffer
-	code := run(context.Background(), sealedArgs("f"), strings.NewReader(testKeyHex), &stdout, &stderr, stub)
+	code := run(context.Background(), sealedArgs(t, "f"), strings.NewReader(testKeyHex), &stdout, &stderr, stub)
 	if code != exitError {
 		t.Fatalf("exit %d, want %d", code, exitError)
 	}
@@ -368,11 +433,92 @@ func TestRun_RejectsMultipleRoots(t *testing.T) {
 		return []common.Hash{{1}, {2}}, nil
 	}
 	var stdout, stderr bytes.Buffer
-	if code := run(context.Background(), sealedArgs("f"), strings.NewReader(testKeyHex), &stdout, &stderr, stub); code != exitError {
+	if code := run(context.Background(), sealedArgs(t, "f"), strings.NewReader(testKeyHex), &stdout, &stderr, stub); code != exitError {
 		t.Fatalf("exit %d, want %d", code, exitError)
 	}
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+// stdinProbe is a stdin that counts reads and fails the test if one comes
+// before run hardened the process.
+type stdinProbe struct {
+	t        *testing.T
+	hardened *bool
+	r        io.Reader
+	reads    int
+}
+
+func (p *stdinProbe) Read(b []byte) (int, error) {
+	p.reads++
+	if !*p.hardened {
+		p.t.Error("stdin read before the process was hardened")
+	}
+	return p.r.Read(b)
+}
+
+// observeHarden replaces harden for the test: with fail nil it runs the
+// real hardenProcess and records that it did; otherwise it returns fail.
+func observeHarden(t *testing.T, fail error) *bool {
+	t.Helper()
+	hardened := new(bool)
+	prev := harden
+	harden = func() error {
+		if fail != nil {
+			return fail
+		}
+		if err := prev(); err != nil {
+			return err
+		}
+		*hardened = true
+		return nil
+	}
+	t.Cleanup(func() { harden = prev })
+	return hardened
+}
+
+// TestRun_HardensBeforeReadingStdin pins the order main relies on: run
+// hardens the process before it reads the key or uploads.
+func TestRun_HardensBeforeReadingStdin(t *testing.T) {
+	hardened := observeHarden(t, nil)
+	stdin := &stdinProbe{t: t, hardened: hardened, r: strings.NewReader(testKeyHex + "\n")}
+	uploaded := false
+	stub := func(context.Context, options, *ecdsa.PrivateKey) ([]common.Hash, error) {
+		if !*hardened {
+			t.Error("upload ran before the process was hardened")
+		}
+		uploaded = true
+		return []common.Hash{{1}}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), sealedArgs(t, "f"), stdin, &stdout, &stderr, stub); code != exitOK {
+		t.Fatalf("exit %d, stderr %q", code, stderr.String())
+	}
+	if stdin.reads == 0 || !uploaded {
+		t.Fatalf("reads %d, uploaded %v; want the key read and the upload run", stdin.reads, uploaded)
+	}
+}
+
+// TestRun_HardenFailureStopsBeforeStdin: if the process cannot be
+// hardened, run stops before it reads stdin.
+func TestRun_HardenFailureStopsBeforeStdin(t *testing.T) {
+	observeHarden(t, errors.New("operation not permitted"))
+	hardened := false
+	stdin := &stdinProbe{t: t, hardened: &hardened, r: strings.NewReader(testKeyHex + "\n")}
+	stub := func(context.Context, options, *ecdsa.PrivateKey) ([]common.Hash, error) {
+		t.Error("upload ran although hardening failed")
+		return nil, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), sealedArgs(t, "f"), stdin, &stdout, &stderr, stub); code != exitError {
+		t.Fatalf("exit %d, want %d", code, exitError)
+	}
+	if stdin.reads != 0 {
+		t.Fatalf("stdin read %d times after hardening failed", stdin.reads)
+	}
+	if got := strings.TrimRight(stderr.String(), "\n"); got != "zg-upload: set non-dumpable: operation not permitted" {
+		t.Fatalf("stderr = %q", got)
 	}
 }
 
@@ -386,10 +532,10 @@ func TestRun_BadKeyOrFlagsNeverUpload(t *testing.T) {
 		args  []string
 		stdin string
 	}{
-		{sealedArgs("f"), ""},
-		{sealedArgs("f"), "not a key"},
+		{sealedArgs(t, "f"), ""},
+		{sealedArgs(t, "f"), "not a key"},
 		{[]string{"--file", "f"}, testKeyHex},
-		{append(sealedArgs("f"), "--key", testKeyHex), testKeyHex},
+		{append(sealedArgs(t, "f"), "--key", testKeyHex), testKeyHex},
 	}
 	for _, c := range cases {
 		var stdout, stderr bytes.Buffer

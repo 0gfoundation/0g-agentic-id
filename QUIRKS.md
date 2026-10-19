@@ -129,16 +129,21 @@ required `--key` flag, and a process's arguments are readable by every local use
 (`/proc/<pid>/cmdline`). sealed therefore keeps the CLI for `download` (no key) but
 uploads through `zg-upload` (`sealed/tools/zg-upload`): a small helper that calls
 the client's Go SDK with the CLI's upload semantics and reads the hex key from
-stdin. It is a separate Go module because the SDK is built against go-ethereum
-v1.15.x while sealed's module is on v1.17.x, and so sealed's offline test runs
-never need the SDK's dependencies. The SDK version is pinned in the helper's
-`go.mod`; when bumping it, re-check `main.go` against that version's
-`cmd/upload.go`. That pin is also the CLI's: every image's `storage-builder`
-stage reads the version from the helper's `go.mod` (`go list -m`), `go install`s
-the CLI at it and builds the helper next to it, so the two always move together
-(and a rebuilt image no longer picks up whatever upstream `main` is). sealed runs
-both by absolute path (`/usr/local/bin/0g-storage-client`,
-`/usr/local/bin/zg-upload`), not through a `PATH` lookup.
+stdin. That stdin is one end of a socketpair, not a pipe: a pipe can be opened
+again through `/proc/<pid>/fd/0`, a socket cannot. It is a separate Go module
+because the SDK is built against go-ethereum v1.15.x while sealed's module is on
+v1.17.x, and so sealed's offline test runs never need the SDK's dependencies.
+The SDK version is pinned in the helper's `go.mod`; when bumping it, re-check
+`main.go` against that version's `cmd/upload.go` (the helper's
+`TestCLISource_Unchanged` fails until you do). That pin is also the CLI's: the
+`storage-builder` stage of every image that builds the storage binaries
+(`sealed/Dockerfile`, `images/{hermes,prime,dsh}`; the base images
+`images/openclaw` and `images/sealed` have none) reads the version from the
+helper's `go.mod` (`go list -m`), `go install`s the CLI at it and builds the
+helper next to it, so the two always move together (and a rebuilt image no
+longer picks up whatever upstream `main` is). sealed runs both by absolute path
+(`/usr/local/bin/0g-storage-client`, `/usr/local/bin/zg-upload`), not through a
+`PATH` lookup.
 
 ### 0g-sandbox billing rejects random keys
 

@@ -18,14 +18,30 @@
 // Boolean flags take the --flag=value form; a separate value word is
 // rejected rather than silently ending flag parsing.
 //
-// On Linux the helper first marks itself non-dumpable (PR_SET_DUMPABLE=0),
-// so other unprivileged processes, its own uid included, cannot read its
-// memory, environment or descriptors through /proc while it holds the key.
+// sealed connects stdin to one end of an AF_UNIX socketpair, not a pipe
+// (internal/dataplane keyChannel): a socket cannot be opened again through
+// /proc/<pid>/fd/0. Reading the key works the same on either.
+//
+// What keeps the key from the de-privileged agent is the uid split
+// (sealed's internal/privsep): the helper runs as root, like sealed, and
+// the agent as another uid that can read neither its memory and
+// environment nor its descriptors. That holds only as long as no root-side
+// code executes a binary the agent user can write; hardening sealed's
+// root-side execs against that lands separately.
+//
+// On Linux the helper also marks itself non-dumpable (PR_SET_DUMPABLE=0,
+// harden_linux.go) before it parses its arguments or reads stdin. That
+// covers only what happens after the call: from execve through Go runtime
+// and package initialisation the helper is dumpable, so against a process
+// of its own uid the flag is defence in depth, not a boundary.
 //
 // Flag defaults match `0g-storage-client upload`. Parameters that CLI
 // exposes but sealed never sets are fixed at the CLI's defaults
 // (uploadOption, providerOption), and the SDK calls mirror the CLI's
 // indexer upload path (cmd/upload.go at the pinned version in go.mod).
+// TestSDKUpload_WiresTheCLIPath pins what sdkUpload hands the SDK, and
+// TestCLISource_Unchanged fails when an SDK bump changes the CLI files this
+// was checked against.
 //
 // Output contract: on success stdout carries exactly one line,
 // "root = 0x<64 hex>", and the exit status is 0. SDK logs go to stderr. On
@@ -105,21 +121,26 @@ type options struct {
 // is the production implementation; tests substitute a stub.
 type uploadFunc func(ctx context.Context, o options, priv *ecdsa.PrivateKey) ([]common.Hash, error)
 
+// harden is the first thing run does. It is hardenProcess; a variable only
+// so tests can observe the order and fail it.
+var harden = hardenProcess
+
 func main() {
-	// First, before the key is read: become non-dumpable (harden_linux.go).
-	if err := hardenProcess(); err != nil {
-		fmt.Fprintf(os.Stderr, "zg-upload: set non-dumpable: %s\n", oneLine(err))
-		os.Exit(exitError)
-	}
 	logrus.SetOutput(os.Stderr)
 	logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, DisableColors: true})
 	logrus.SetLevel(logrus.InfoLevel)
 	os.Exit(run(context.Background(), os.Args[1:], os.Stdin, os.Stdout, os.Stderr, sdkUpload))
 }
 
-// run is main without the process globals: it parses args, reads the key
-// from stdin, uploads through up and writes the result line to stdout.
+// run is main without the process globals: it hardens the process, parses
+// args, reads the key from stdin, uploads through up and writes the result
+// line to stdout.
 func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, up uploadFunc) int {
+	// First, before the key is read: become non-dumpable (harden_linux.go).
+	if err := harden(); err != nil {
+		fmt.Fprintf(stderr, "zg-upload: set non-dumpable: %s\n", oneLine(err))
+		return exitError
+	}
 	o, err := parseFlags(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -290,14 +311,44 @@ func uploadOption(o options, submitter common.Address) transfer.UploadOption {
 	}
 }
 
-// sdkUpload performs the SDK calls of the CLI's --indexer upload path. The
-// signer is built from the parsed key rather than from a key string, so no
-// immutable copy of the hex key is created.
+// sdk holds the 0g-storage-client SDK client constructors sdkUpload uses.
+// storageSDK has the SDK's own; tests substitute recorders, so the wiring
+// below runs without a network.
+type sdk struct {
+	newWeb3    func(url string, opt web3go.ClientOption) (*web3go.Client, error)
+	newIndexer func(url string, opt indexer.IndexerClientOption) (splitUploader, error)
+}
+
+// splitUploader is the part of *indexer.Client that sdkUpload calls.
+type splitUploader interface {
+	SplitableUpload(ctx context.Context, w3Client *web3go.Client, data core.IterableData, option ...transfer.UploadOption) ([]common.Hash, []common.Hash, error)
+	Close()
+}
+
+var storageSDK = sdk{
+	newWeb3: web3go.NewClientWithOption,
+	newIndexer: func(url string, opt indexer.IndexerClientOption) (splitUploader, error) {
+		c, err := indexer.NewClient(url, opt)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
+	},
+}
+
+// sdkUpload performs the SDK calls of the CLI's --indexer upload path.
 func sdkUpload(ctx context.Context, o options, priv *ecdsa.PrivateKey) ([]common.Hash, error) {
+	return storageSDK.upload(ctx, o, priv)
+}
+
+// upload is sdkUpload over the constructors in s. The signer is built from
+// the parsed key rather than from a key string, so no immutable copy of the
+// hex key is created.
+func (s sdk) upload(ctx context.Context, o options, priv *ecdsa.PrivateKey) ([]common.Hash, error) {
 	signer := signers.NewPrivateKeySigner(priv)
 	clientOpt := web3go.ClientOption{Option: providerOption()}
 	clientOpt.WithSignerManager(signers.NewSignerManager([]interfaces.Signer{signer}))
-	w3client, err := web3go.NewClientWithOption(o.url, clientOpt)
+	w3client, err := s.newWeb3(o.url, clientOpt)
 	if err != nil {
 		return nil, fmt.Errorf("connect to fullnode: %w", err)
 	}
@@ -309,7 +360,7 @@ func sdkUpload(ctx context.Context, o options, priv *ecdsa.PrivateKey) ([]common
 	}
 	defer file.Close()
 
-	indexerClient, err := indexer.NewClient(o.indexer, indexer.IndexerClientOption{
+	indexerClient, err := s.newIndexer(o.indexer, indexer.IndexerClientOption{
 		ProviderOption: providerOption(),
 		LogOption:      zg_common.LogOption{Logger: logrus.StandardLogger()},
 		Routines:       runtime.GOMAXPROCS(0),

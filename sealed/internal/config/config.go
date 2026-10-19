@@ -18,12 +18,15 @@
 //	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
 //	                            framework binding (local dev); the binding is authoritative
 //
-// CHAIN_RPC_URL and INDEXER_URL must not embed credentials (an API token in
-// the URL's userinfo, path or query): sealed passes both to the storage
-// upload helper as command-line arguments, which every process in the
-// container can read through /proc/<pid>/cmdline, and INDEXER_URL is also
-// recorded in each uploaded entry's on-chain dataDescription. The attestor
-// forwards them from ATTESTOR_CHAIN_RPC and ATTESTOR_STORAGE_INDEXER.
+// CHAIN_RPC_URL and INDEXER_URL are public and must not embed credentials
+// (an API token in the URL's userinfo, path or query). sealed prints both in
+// its boot log, which the proxy serves without authentication at /log and
+// /log.html, and passes both to the storage-upload helper as command-line
+// arguments, which every process in the container can read through
+// /proc/<pid>/cmdline; INDEXER_URL is also recorded in each uploaded entry's
+// on-chain dataDescription. The attestor forwards them from
+// ATTESTOR_CHAIN_RPC (which it also serves in GET /config) and
+// ATTESTOR_STORAGE_INDEXER (which it also records on chain at mint).
 //
 // After provisioning succeeds, SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION /
 // API_KEY / SEAL_SECRET_ENV MUST be cleared from the environment to deny a malicious or
