@@ -25,16 +25,32 @@ import (
 // every stateful-door turn lands in ONE transcript, and read that transcript
 // back as the history for the next turn — so the client sends only the
 // current turn and a process restart resumes from openclaw's own store.
+// (That is the design; on 2026.7.1 the read-back finds nothing and the
+// gateway carries the history itself — see the re-verification note below.)
 //
 // The private-format coupling (version:3 JSONL, sessions.json shape) is
 // quarantined here, in openclaw's own package — the same kind of coupling
 // this adapter already has (it parses openclaw.json). An openclaw upgrade
 // that changes the transcript format is THIS file's maintenance burden.
 //
-// openclaw's own compaction REWRITES the persisted transcript (not
-// context-only), so invariant 7's self-rotation is satisfied by the harness
-// itself: the file openclaw keeps is the compacted view, and that is exactly
-// what we read back.
+// Re-verified 2026-10-19 against 2026.7.1 (offline, stub model, the files
+// openclaw itself wrote) — what actually holds there, which /_seal/compact
+// relies on:
+//   - sessions.json keys the session "agent:main:<key>", so the bare-key
+//     lookup below finds nothing and ConversationHistory returns no turns
+//     (0 as shipped; 4 with the bare key patched in). The conversation is
+//     carried by the gateway itself, which replays the pinned session into
+//     every turn — the client's messages[] is NOT all it sees.
+//   - compaction appends a `compaction` record and keeps every message line
+//     (`truncateAfterCompaction`, which would rotate the file, is opt-in and
+//     off), so invariant 7 is not met by the harness here. The gateway's
+//     replay honours the record — summary first, then the kept tail — which
+//     is why a compaction takes effect. A MANUAL compaction keeps that tail
+//     only while agents.defaults.compaction.keepRecentTokens is set, which
+//     the render does (inference.go): unset, openclaw rewrites the record to
+//     replay from the summary alone, and the tail is lost.
+// Making the lookup match would resend the full pre-compaction text on top
+// of the gateway's own context; reconcile the two before changing either.
 
 const sessionKeyHeader = "x-openclaw-session-key"
 

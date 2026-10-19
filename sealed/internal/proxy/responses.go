@@ -279,7 +279,11 @@ func (s *Server) handleSynthCreate(w http.ResponseWriter, r *http.Request, chatU
 		return
 	}
 
-	rec := s.synth.create()
+	rec, ok := s.admitSynthTurn()
+	if !ok {
+		writeSynthJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"message": "the conversation is being compacted; send this again once /compact finishes"}})
+		return
+	}
 	go s.runSynthTurn(rec, chatUpstream, token, body.Input, body.Model)
 	logger.Logf("responses: %s accepted (%.60s…)", rec.id, text)
 

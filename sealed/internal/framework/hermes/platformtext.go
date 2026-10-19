@@ -34,7 +34,7 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Note: "`~/.hermes/cron/` — scheduled jobs. Deliberately not persisted: migrating them across an owner transfer would keep the OLD owner's timers firing in the NEW owner's container"},
 			{Note: "`~/.hermes/state.db`, `sessions/`, `logs/` — conversation history and runtime state"},
 			{Note: "`.env` — secrets"},
-			{Note: "`~/.hermes/config.yaml` — your model wiring. Never reaches chain. At every boot the platform rewrites the five keys it owns (`model.default`, `model.provider`, `model.base_url`, `model.api_key`, `agent.reasoning_effort`) from your owner's settings, and re-applies whatever else those settings carry; your edits to those keys do not survive a restart, edits to the rest of the file do"},
+			{Note: "`~/.hermes/config.yaml` — your model wiring. Never reaches chain. At every boot the platform rewrites the keys it owns (`model.default`, `model.provider`, `model.base_url`, `model.api_key`, `agent.reasoning_effort`, and `model.max_tokens` whenever the model catalog gives your model's output budget) from your owner's settings, and re-applies whatever else those settings carry; your edits to those keys do not survive a restart, edits to the rest of the file do"},
 		},
 		DurableHints: []platform.DurableHint{
 			{Ask: "Remember this long-term", Place: "`memories/MEMORY.md` (or a new `.md` under `memories/`)"},

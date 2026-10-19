@@ -12,6 +12,7 @@
 //	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
 //	POST /_seal/claim   - take the single-driver seat (owner-signed)
 //	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
+//	POST /_seal/compact - compact the persisted conversation in place (owner-signed)
 //	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
@@ -77,6 +78,10 @@ type Server struct {
 	readSettings  SettingsReader
 	applySettings SettingsApplier
 	applyClear    ClearApplier
+
+	// compact backs POST /_seal/compact (compact.go): its applier plus the
+	// single-flight and replay guards, under their own lock.
+	compact compactState
 
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
@@ -245,6 +250,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
+	mux.HandleFunc("/_seal/compact", s.handleCompact)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {

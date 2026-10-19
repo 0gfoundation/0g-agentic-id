@@ -32,6 +32,8 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
 4. **容器重建清空——这是设计。**`reset` 即"重新开始";该留的早已蒸馏进链上记忆
    角色(MEMORY.md / memories/ / harness_state.json)。对话是工作上下文,不是资产。
 5. **`/clear`:不重建即清空。**owner 签名,settings 推送同一文法。开新对话,删文件。
+   它温和的兄弟 **`/compact`** 保留对话:由 harness 自己的压缩把较早的历史换成
+   摘要,不重启(§3,`framework.SessionCompactor`)。
 6. **客户端零存储。**`restoreTranscript()` 降级为"磁盘没兜住"的那些场景的尽力
    兜底:容器重建,以及**任何存储没恢复出内容的 boot**(全新、被隔离、被归档)——
    门禁按"这次 boot 真的从盘上恢复了"判定,不按"配置了持久化"判定。
@@ -44,7 +46,7 @@ settings 推送、每次 `/think` 都是 Stop+Start(`manager.Reload`),崩溃走�
 ## 3. 架构:通用 proxy + 各框架自己的封装
 
 所有框架专属的会话知识都住在各框架自己的封装里;共享 proxy 永不按框架名分支。
-proxy 的有状态门通过三个可选能力接口问 adapter——`RenderSettings` 模式——各
+proxy 的有状态门通过四个可选能力接口问 adapter——`RenderSettings` 模式——各
 adapter 在自己的包里用自己的方言作答。
 
 **与已批准设计的偏离(未关闭)。** 已批准的设计是:hermes 声明它网关自带的
@@ -60,7 +62,7 @@ adapter 在自己的包里用自己的方言作答。
 取消时的行为),再把 hermes/openclaw 改为直接转发过去,并删除 synth 以及它所需的
 补偿机制——hermes 的 id 文件及其比较交换(§4)、openclaw 读 transcript。
 
-三个能力接口:
+四个能力接口:
 
 - **`framework.ConversationSession`** —— adapter 命名把每次有状态上游调用绑定到
   该 agent 唯一对话的 header,并连同本轮发出时的 header 一起观察每个上游响应
@@ -74,10 +76,26 @@ adapter 在自己的包里用自己的方言作答。
   proxy 暴露一条 owner 签名的 `POST /_seal/clear`(tag `0GSealClear`,settings
   推送文法,占座门控),CLI 加 `/clear`;历史在客户端侧的 adapter 答 501,CLI
   只清本地回显。
+- **`framework.SessionCompactor`** —— 按需运行 harness **自己的**压缩:较早的
+  历史变成摘要,最新的部分原样保留(保留多少由 harness 决定:dsh 只留最新的一项,
+  openclaw 约 20K token),进程不重启。proxy 暴露一条 owner 签名的
+  `POST /_seal/compact`(tag `0GSealCompact`,clear 同一文法,占座门控),CLI 加
+  `/compact`。有三道 clear 不需要的闸:同一时间只跑一个压缩(第二个答 409);
+  一个签名请求只接受一次——压缩是一次模型调用、不幂等,所以不同于 clear,它
+  在新鲜度窗口内不能被重放(以签名的消息为键,换个写法或可塑变形的签名仍算同一
+  请求);压缩和 synth 门上的一轮永不重叠——后到的那个被拒(答 409)——因为
+  openclaw 的压缩会中止会话里正在运行的那一轮。框架自己的"现在不行"(已有压缩
+  在排队、会话仍忙)也答 409(`framework.ErrCompactRefused`),不算失败。压缩与
+  请求解耦(连接断开不会中止它,结果写进日志)。
+  dsh 让桥执行(`POST /v1/compact` → 组合里的 `compactNow`,排在正在跑的那一轮
+  之后,同一时间只挂一个;摘要调用的输出上限是 16384,低于一轮的 32768——它带着
+  约一轮的输入,而上游把这个上限从输入里预留出来);openclaw 对正在运行的网关执行
+  它自己的 `openclaw sessions compact <key>`,网关地址和 token 走环境变量。hermes
+  和 prime 暂时答 501。
 
 透明的 `/v1/chat/completions` 门**永远**不带会话 header、不用存储历史——在那扇门
 上做有状态会悄悄改变标准 OpenAI 客户端看到的行为。有状态是第二扇门,不是替换。
-压缩始终归 harness 自己;平台永不解析对话。
+压缩始终归 harness 自己;平台永不解析对话——`/compact` 只是触发它。
 
 ## 4. 各框架的答案(as built,对照 SDK 源码核实)
 
@@ -86,7 +104,7 @@ adapter 在自己的包里用自己的方言作答。
 | **prime** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` —— SDK 自己逐条追加(消息、工具调用、压缩、思考),重启 `open()` 重建上下文。文件 `/root/.prime-conversation/owner-chat.jsonl`,在 `primeHome` 外,`privsep` 交接属主。自轮转切在最近压缩条目(保留 header、压缩条目重挂根、丢弃更早行);损坏文件隔离(`.corrupt-<ts>`)后开新。真 SDK 验证:轮转 9209B→729B 且上下文可重建;断尾行可容忍。 | 删文件+残留,重启 |
 | **hermes** | 它自己的网关,经 `ConversationSession` 绑定 | 网关在 HTTP 上本就有状态:`X-Hermes-Session-Id`(Bearer `API_SERVER_KEY`,早已设置)让历史从 `~/.hermes/state.db` 读、body 最后一条为当前轮。adapter 铸造并持久化唯一 id(`~/.hermes/.seal-conversation-id`)并**跟随**回吐的 id——压缩会结束父会话、在子 id 上续。不安全回吐(路径形、控制字符)永不落盘。不变量 7 注:transcript 存储是 hermes 自己的 `state.db`——它的存储、它的压缩;自轮转不适用于 harness 自有的文件。 | 铸新 id(旧行留在 hermes 的 db,无引用),重启 |
 | **dsh** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | 无现成后端(`SessionPersistence` 接缝无具体子类;没它 `resume()` 拒绝)。桥即后端:`owner-chat` 会话每个已提交 `session/event` 经 `packChunkRuns` 追加;boot 时 `decodeStorageRecord` 解码后作 `ctx.agents.create({ seed, meta:{seedLength} })` 的种子;`interruptedTurnClosers` 闭合中途崩溃(closer 也落盘,文件自平衡);seq 守卫跳过重发的种子事件。轮转必然更粗:seed 必须从 seq 0 连续,砍不了头——到上限就归档、响亮地重开新对话。文件 `/root/.dsh/owner-chat.session.jsonl`(本就归为不追踪)。真 SDK 验证:追加→装载→`Session.fromRestore`(create 的校验器)通过;崩溃修复平衡。 | 删日志+残留,重启 |
-| **openclaw** | `ConversationSession` + `ConversationHistory`,在 adapter 包内 | openclaw 把每轮网关对话都落盘(`~/.openclaw/agents/main/sessions/<id>.jsonl`,`sessions.json` 存 key→session 映射)但它的 OpenAI 门从不回读。adapter 钉一个会话 key(`x-openclaw-session-key`,存 `~/.openclaw/.seal-conversation-key`)让有状态门的所有轮次落进同一份 transcript,并把它读回作历史(文本轮次;工具记录跳过——synth 门一贯记录的限制)。私有 `version:3` 格式耦合关在 openclaw 包内——和这个 adapter 已有的耦合同类(它本就解析 openclaw.json)。不变量 7:openclaw 自己的压缩会**重写**落盘 transcript,harness 自己封顶了文件。 | 轮换 key + 尽力删被替换的 transcript(openclaw 的 `sessions.json` 是它自己的存储——绝不从外部改写),重启 |
+| **openclaw** | `ConversationSession` + `ConversationHistory`,在 adapter 包内 | openclaw 把每轮网关对话都落盘(`~/.openclaw/agents/main/sessions/<id>.jsonl`,`sessions.json` 存 key→session 映射)但它的 OpenAI 门从不回读。adapter 钉一个会话 key(`x-openclaw-session-key`,存 `~/.openclaw/.seal-conversation-key`)让有状态门的所有轮次落进同一份 transcript,并把它读回作历史(文本轮次;工具记录跳过——synth 门一贯记录的限制)。私有 `version:3` 格式耦合关在 openclaw 包内——和这个 adapter 已有的耦合同类(它本就解析 openclaw.json)。不变量 7(2026-10-19 复核,见下方的坑):openclaw 的压缩是**追加**一条 `compaction` 记录、保留所有消息行——会轮转文件的 `truncateAfterCompaction` 需显式开启、默认关——所以这里 harness 并没有给文件封顶;待解决。 | 轮换 key + 尽力删被替换的 transcript(openclaw 的 `sessions.json` 是它自己的存储——绝不从外部改写),重启 |
 
 源码级的坑,记录在案:
 
@@ -105,6 +123,17 @@ adapter 在自己的包里用自己的方言作答。
   框架用户),所以它命名的 `sessionFile` 在 root 进程打开前必须被词法约束在
   sessionsDir() 内,且打开走 `os.OpenRoot`——词法检查拦不住目录**内部**栽的符号链接——否则对抗性 agent 可让 root 把任意文件读进它自己的上游请求
   (评审 #169)。
+- openclaw 2026.7.1 的 `sessions.json` 以 `agent:main:<key>` 为键(2026-10-19 离线
+  复核,用的是网关自己写出的文件):adapter 按裸 key 查不到,所以
+  `ConversationHistory` 读不出任何一轮(原样 0 轮,把裸 key 补进去后 4 轮),
+  `ClearSession` 也删不掉被替换的 transcript。对话仍能延续,是因为**网关**把钉住的
+  会话重放进每一轮——模型看到的不只是门发来的那一条——而且这个重放遵循压缩
+  (先摘要,再保留的尾部),`/compact` 正是因此生效。**手动**压缩只有在设置了
+  `agents.defaults.compaction.keepRecentTokens` 时才保留这段尾部——不设的话,
+  openclaw 会改写记录,让重放从摘要开始,而那段从未被总结的尾部就丢了(离线实测)——
+  所以 render 会写入 openclaw 自己的默认值 20000,除非 owner 的 overlay 另有指定。
+  待解决:让查找命中会在网关自己的上下文之上再发一遍压缩前的全文,所以回读和重放
+  必须一起理顺。
 - hermes 在压缩时**轮换**会话 id——钉死一个 id 会分叉对话;必须跟随回吐。
   跟随用的是对本轮**发出时** id 的比较交换:synth 不串行任务,一个跨过 `/clear`
   (或落在更新一轮的轮换之后)仍在飞的旧轮,否则会把旧 id 写回、让已清除的对话
@@ -119,7 +148,8 @@ adapter 在自己的包里用自己的方言作答。
 - **不做多 session、不做选择器、不做 `previous_response_id` 寻址**——不变量 2。
 - **平台不做压缩**——**模型上下文**由 harness 自己压(追加 `compaction` 条目、前移
   叶指针;文件保留旧条目,无破坏性丢失)。文件只在**两次轮转之间**涨;封装负责轮转
-  (不变量 7)。平台永不解析它。
+  (不变量 7;openclaw 尚未做到,见 §4)。平台永不解析它。`/compact` 不改变这一点:它只是让 harness 现在就跑
+  一次它自己的压缩。
 - **不做跨机器同步**——文件随容器;客户端零持有。想显示回滚条的客户端自留屏幕
   缓冲——UI,不是状态。
 
@@ -163,6 +193,16 @@ client(零历史)**发出——连续性只可能来自容器:
 3. ✅ hermes —— 会话 id 钉住 + 轮换跟随 + ClearSession
 4. ✅ openclaw —— 会话 key 钉住 + transcript 作历史 + ClearSession
 5. ✅ `/_seal/clear` + SDK `clearConversation` + CLI `/clear`
+
+之后新增:`/_seal/compact` + SDK `compactConversation` + CLI `/compact`,覆盖
+dsh 和 openclaw,用真实模型验证过(glm-5.3 经 0G 路由,2026-10-19):dsh —— 一段
+约 26.6K token 的历史被总结,下一轮靠摘要正确作答,压缩结果在桥重启后仍然有效;
+openclaw 2026.7.1 —— `sessions compact` 用 73 秒把一个 269,717 token 的会话压到
+3,559(那时还没设 `keepRecentTokens`,所以那次也丢掉了约 20K token 的尾部——见上面
+openclaw 的坑)。离线(桩模型)验证:dsh 桥在已有压缩挂起时拒绝第二个,摘要调用以
+16384 发出,报告引擎的真实原因(包括上游 400),摘要不会更小时答"无可压缩";设了
+`keepRecentTokens` 后,openclaw 压缩后的下一轮,模型收到的是摘要加六轮中的第 4–6
+轮,不设则只有摘要。
 
 每条存储路径都对照**从已 build 镜像抽出的真 SDK** 验证(prime SessionManager
 往返+轮转;dsh 追加→seed→`fromRestore`;hermes/openclaw 的 header 语义读自网关

@@ -40,7 +40,7 @@ vocabulary:
 |---|---|
 | `provider` | who serves the model. `inference.ZGComputeProvider` = `"0g-compute"` (`internal/inference/zgcompute.go:109`) means the PLATFORM supplies the endpoint; any other value names a framework built-in that wires itself |
 | `model` | the model id, spelled the way that provider spells it |
-| `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:52`) |
+| `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:56`) |
 | `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
 
 `framework` is opaque on purpose, and the opacity is load-bearing in three
@@ -60,12 +60,12 @@ safe only because the container never writes the document back. The one
 exception is the migration seed (§10), which carries a recovered pin and
 nothing else.
 
-**Validation is deliberately thin** (`Doc.Validate`, `settings.go:98`):
+**Validation is deliberately thin** (`Doc.Validate`, `settings.go:102`):
 
 - a blank `model` is the only fatal error, because two adapters hard-fail
   `Start` without a pin (`framework/prime/spawn.go:78`,
   `framework/dsh/spawn.go:77`) while the other two only warn and run modelless
-  (`framework/openclaw/spawn.go:63`, `framework/hermes/spawn.go:273`);
+  (`framework/openclaw/spawn.go:63`, `framework/hermes/spawn.go:298`);
 - `thinking` must be one of `Levels`, case-insensitively;
 - `framework` must be valid JSON, and nothing more.
 
@@ -77,17 +77,17 @@ check is advisory — a caller can skip the CLI, so the container-side one
 decides (`sdk/typescript/src/cli/commands/settings.ts`).
 
 An empty blob parses to an empty document, not an error: that is an agent
-nobody has configured yet, which is a legal state (`Parse`, `settings.go:71`).
+nobody has configured yet, which is a legal state (`Parse`, `settings.go:75`).
 
 **The inference credential is not in the document** — see §7.
 
 ## 3. What the platform computes, and never stores
 
-`settings.Resolved` (`settings.go:56`) is a `Doc` plus everything the platform
+`settings.Resolved` (`settings.go:60`) is a `Doc` plus everything the platform
 works out for it on this boot: `Facts`, `Endpoint`, `APIKey`. Adapters only
 ever see a `Resolved`; nothing persists one.
 
-`settings.Resolve(ctx, doc, apiKey)` (`settings.go:123`) calls
+`settings.Resolve(ctx, doc, apiKey)` (`settings.go:127`) calls
 `inference.Resolve(provider, model)` (`zgcompute.go:121`), and that is where
 the split which makes the whole channel work lives:
 
@@ -111,7 +111,7 @@ now still gets a bound, and there is a regression test for exactly that
 
 ### 3.1 `Effort()` has three outcomes and none may be collapsed
 
-`Resolved.Effort() (level string, decided bool)` (`settings.go:156`):
+`Resolved.Effort() (level string, decided bool)` (`settings.go:160`):
 
 ```
 ("high", true)   apply this level
@@ -148,7 +148,7 @@ passes the choice through rather than second-guessing it
 
 ### 3.2 `PersistableMaxTokens()`, and why nothing resolved is stored
 
-`Resolved.PersistableMaxTokens()` (`settings.go:180`) returns the catalog's
+`Resolved.PersistableMaxTokens()` (`settings.go:184`) returns the catalog's
 output budget, or `0` for "write nothing", gated on
 `ModelFacts.CatalogSourced`. The name heuristic's fallback is
 `inference.HeuristicOpenAIMaxTokens = 8192` (`zgcompute.go:160`); written to
@@ -160,6 +160,24 @@ replies — three ~6-minute turns with `textLen=0`, live on agent 404
 That incident is why `Resolved` is recomputed every boot and stored nowhere: a
 stored copy goes stale and then fights the computed value
 (`settings.go:11-15`).
+
+What adapters actually hand their framework is `Resolved.RequestMaxTokens()`
+(`settings.go:210`): `PersistableMaxTokens()` capped at
+`RequestOutputCeiling = 32768` (`settings.go:196`), same `0` for "write
+nothing". The catalog's `max_completion_tokens` is a capability — the most one
+reply may ever be — not a per-request value: every framework sends its
+configured budget on every request, and upstreams reserve it against the
+conversation. With glm-5.3's catalog 131072, the router's upstreams were
+measured rejecting requests (HTTP 400, code `400001`) once prompt + budget
+reached ~196,608 — about 65K tokens of conversation — while the same request
+body with a smaller budget went through (2026-10). On the wire: dsh sends it as
+`max_completion_tokens`, openclaw and hermes as `max_tokens`; prime-agent's SDK
+clamps to 32000 whatever models.json says. One call sits lower still: dsh's
+compaction summary (`/compact`) is capped at 16384 (`bridge.mjs`
+`COMPACT_SUMMARY_MAX_TOKENS`), because it carries about a turn's input — with a
+turn's budget it would be refused at the same length the turns are, exactly
+when an owner reaches for it; 16384 is 3x the largest summary measured
+(5,239 output tokens for a 33.9K-token prompt at effort=max).
 
 ## 4. Where the document lives, and how it reaches a container
 
@@ -278,7 +296,7 @@ The POST's signature is additionally bound to a `sha256` of the request body,
 carried as a fifth field of the signed message. Without it the signature
 attests only to WHO is calling, and anything able to alter the request in
 flight could keep a valid signature while substituting a different document
-(`internal/proxy/proxy.go:402-407`). The body is bounded at 256 KiB
+(`internal/proxy/proxy.go:439-442`). The body is bounded at 256 KiB
 (`internal/proxy/settings.go:18`) — an unbounded read on an owner-facing route
 is an easy denial.
 
@@ -353,9 +371,9 @@ instead of only at mint time.
 
 | | where the document lands | overlay handling |
 |---|---|---|
-| openclaw (`openclaw/inference.go:55`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it |
-| hermes (`hermes/spawn.go:174`) | `~/.hermes/config.yaml` | deep-merged, then five platform keys written over it: `model.{default,provider,base_url,api_key}` and `agent.reasoning_effort`; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key |
-| prime-agent (`prime/modelsjson.go:132`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
+| openclaw (`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it; `agents.defaults.compaction.keepRecentTokens` is set to openclaw's own default (20000) unless the overlay gives a positive value — a manual compaction keeps its recent tail only while it is set (`CONVERSATION.md`) |
+| hermes (`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | deep-merged, then the platform keys written over it: `model.{default,provider,base_url,api_key}`, `agent.reasoning_effort`, and `model.max_tokens` when the catalog gives the budget; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key; `model.max_tokens` is kept through an outage on the same model and removed when the model changes (unless the overlay sets it), or a switch to a model with a lower output limit fails every request |
+| prime-agent (`prime/modelsjson.go:143`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
 | dsh (`dsh/settings.go:161`) | the bridge process's environment only | a typed knob allowlist (`toolJobs`, `maxParallelToolCalls`); this framework has no config file to render into |
 
 dsh is the interesting case: DSH's own `settings.yaml` is served by
@@ -397,7 +415,7 @@ owner knob must not be able to make it (`dsh/settings.go:46-57`).
 
 ## 7. The credential
 
-The inference API key is `Resolved.APIKey` (`settings.go:66`): it arrives in
+The inference API key is `Resolved.APIKey` (`settings.go:70`): it arrives in
 the container's environment, is never part of `Doc`, and is persisted nowhere.
 Since #167 it can arrive sealed: when the attestor advertises
 `secret_env_scheme`, the SDK ships it as `SEAL_SECRET_ENV` — ECIES to the
@@ -414,7 +432,7 @@ what each framework's client actually reads:
 | | how the key reaches the framework |
 |---|---|
 | openclaw | by reference: the config holds `{source: env, id: <VAR>}`, so only the variable NAME is on disk; `spawn.go` exports the value |
-| hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:163-170`) |
+| hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:164-171`) |
 | prime-agent | by reference: `models.json` holds `apiKey: "SEAL_MODEL_API_KEY"` (`prime/modelsjson.go:63`); the bridge env holds the value |
 | dsh | the bridge env only — and deliberately NOT in the deterministic, logged `settingsEnv` slice, so the rendered environment can be compared and logged without handling a secret (`dsh/settings.go:181-187`) |
 
@@ -688,7 +706,7 @@ hermes's `approvals` and `terminal` left too, and not as collateral. They were
 labelled "agent self-tuning" but nothing in sealed ever wrote them, and inside
 an unattended TEE sandbox there is nobody for an approval policy to ask. They
 are owner knobs, so they now ride the opaque overlay like any other hermes key
-(`hermes/spawn.go:290-293`).
+(`hermes/spawn.go:330-333`).
 
 The test for what belongs on chain, which this whole change is an application
 of: **can it be re-supplied if lost?** Memory cannot be reconstructed; a model

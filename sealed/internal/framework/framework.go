@@ -359,6 +359,28 @@ type SessionClearer interface {
 	ClearSession(ctx context.Context) error
 }
 
+// SessionCompactor is implemented by adapters whose framework can compact the
+// agent's ONE persisted conversation on demand (CONVERSATION.md): the
+// framework's own compaction summarizes the older part of the history so later
+// requests carry less of it — the conversation continues, unlike ClearSession,
+// which discards it. CompactSession blocks until the framework reports the
+// outcome and returns a short owner-facing note on what happened, including
+// "nothing to compact". It does not restart the framework. Adapters that
+// cannot trigger compaction from outside simply don't implement this; the
+// proxy answers 501 for them.
+//
+// An error that wraps ErrCompactRefused means the framework did not compact —
+// it declined (another turn or compaction holds the session) or gave up
+// because the session changed under it — and the conversation is as it was;
+// the proxy answers it 409, so the owner retries instead of reading a
+// failure. Never wrap it once anything was committed.
+type SessionCompactor interface {
+	CompactSession(ctx context.Context) (string, error)
+}
+
+// ErrCompactRefused marks a CompactSession error as "not now", not "failed".
+var ErrCompactRefused = fmt.Errorf("framework: compaction refused for now")
+
 // LegacySettingsSeeder is implemented by adapters that can recover an owner's
 // configuration from a chain role that predates the settings channel.
 //

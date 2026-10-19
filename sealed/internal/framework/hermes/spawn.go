@@ -151,8 +151,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 //     forever (measured on glm-5.3: 100k+ chars of reasoning, zero reply,
 //     stream killed upstream). s.Effort() is provider-independent.
 //
-// The five keys this render owns are model.{default,provider,base_url,api_key}
-// and agent.reasoning_effort. The three that carry endpoint wiring
+// The keys this render owns are model.{default,provider,base_url,api_key}
+// and agent.reasoning_effort, plus model.max_tokens whenever the catalog
+// gives the model's budget. The three that carry endpoint wiring
 // (provider/base_url/api_key) are also CLEARED when the document stops
 // supplying them — a leftover value aims hermes at the previous boot's
 // endpoint, or hands it the previous boot's key. Everything else in the file
@@ -188,6 +189,10 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	effort, effortDecided := s.Effort()
 
 	if err := updateConfigYAML(func(cfg map[string]any) {
+		// Which model the on-disk model.max_tokens was written for — read
+		// before anything below touches the section.
+		budgetWrittenFor := modelIdentity(cfg)
+
 		// Owner's overlay FIRST, platform-owned keys over it. Ordering, not
 		// an exclusion list, is what stops an overlay from pinning a stale
 		// base_url or disabling the reasoning bound.
@@ -233,6 +238,26 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 			delete(m, "api_key")
 		}
 		cfg["model"] = m
+		// model.max_tokens is the per-request output budget hermes sends as
+		// max_tokens (gateway/run.py reads it, over any provider's own cap).
+		// Absent, the custom provider profile's default applies — captured on
+		// the wire as 65536 on every main-loop request, reserved against the
+		// conversation. Like the reasoning bound below, the outcomes must not
+		// be collapsed:
+		//   budget known (catalog)       write it, capped (RequestMaxTokens)
+		//   unknown, overlay names one   the owner's value stands
+		//   unknown, same model          leave it: a catalog outage must not
+		//                                drop the cap; a guess is never written
+		//   unknown, model changed       remove it: it is the previous model's
+		//                                budget, and a value above the new
+		//                                model's limit fails every request
+		switch mt := s.RequestMaxTokens(); {
+		case mt > 0:
+			m["max_tokens"] = mt
+		case overlayNamesMaxTokens(overlay):
+		case s.Facts.CatalogSourced || modelIdentity(cfg) != budgetWrittenFor:
+			delete(m, "max_tokens")
+		}
 
 		// agent.reasoning_effort is hermes's single chokepoint for reasoning
 		// depth (hermes_constants.resolve_reasoning_config: per-model override
@@ -279,6 +304,21 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	a.resolved = &s
 	a.mu.Unlock()
 	return nil
+}
+
+// modelIdentity names the model config.yaml's model section points at: the
+// model, the provider and the endpoint.
+func modelIdentity(cfg map[string]any) string {
+	m, _ := cfg["model"].(map[string]any)
+	return fmt.Sprintf("%v|%v|%v", m["default"], m["provider"], m["base_url"])
+}
+
+// overlayNamesMaxTokens reports whether the owner's overlay sets
+// model.max_tokens itself.
+func overlayNamesMaxTokens(overlay map[string]any) bool {
+	m, _ := overlay["model"].(map[string]any)
+	_, ok := m["max_tokens"]
+	return ok
 }
 
 // frameworkOverlay decodes the owner's opaque per-framework section as the

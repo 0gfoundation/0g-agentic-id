@@ -187,3 +187,30 @@ func (r Resolved) PersistableMaxTokens() int {
 	}
 	return r.Facts.MaxTokens
 }
+
+// RequestOutputCeiling bounds the per-request output budget the platform asks
+// frameworks to send. It is the value pi-ai sent by default before the catalog
+// budget was wired through, and it covers a reasoning model's shared
+// thinking+reply budget with room to spare (largest single completion measured
+// on glm-5.3 at effort=max during the 2026-10 investigation: ~13.6K tokens).
+const RequestOutputCeiling = 32768
+
+// RequestMaxTokens is the output budget an adapter should configure as the
+// framework's per-request max_tokens, or 0 for "configure nothing" (same
+// catalog gate as PersistableMaxTokens).
+//
+// The catalog's max_completion_tokens is a CAPABILITY — the most one reply
+// may ever be — not a sensible value to request on every call. Frameworks
+// send the configured budget as max_tokens on every request, and upstreams
+// reserve it against the input: with glm-5.3's catalog 131072, the router's
+// upstreams were measured rejecting requests (HTTP 400, code 400001) once
+// prompt + max_tokens reached ~196,608 — i.e. at ~65K tokens of
+// conversation — while the same request body with a smaller max_tokens went
+// through. Capping the request budget keeps that headroom for the conversation.
+func (r Resolved) RequestMaxTokens() int {
+	mt := r.PersistableMaxTokens()
+	if mt > RequestOutputCeiling {
+		return RequestOutputCeiling
+	}
+	return mt
+}

@@ -818,6 +818,12 @@ func startAgent(
 		})
 	}
 
+	// Compaction runs inside the live framework process — no restart, the
+	// conversation continues from the compacted history.
+	if compactor, ok := adapter.(framework.SessionCompactor); ok {
+		sealedProxy.SetCompact(compactor.CompactSession)
+	}
+
 	// Once the agent has spawned, give the framework a moment to apply its
 	// own defaults to whatever sections we didn't pre-populate (e.g. memory
 	// engine, session config, plugins on a fresh install). Then re-seed:

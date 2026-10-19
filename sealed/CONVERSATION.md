@@ -48,7 +48,10 @@ onboarding copy.
    memory roles (MEMORY.md / memories/ / harness_state.json). The conversation
    is working context, not an asset.
 5. **`/clear`: wipe it without a recreate.** Owner-signed, the settings-push
-   grammar. Fresh conversation; the file is deleted.
+   grammar. Fresh conversation; the file is deleted. Its gentler sibling
+   **`/compact`** keeps the conversation: the harness's own compaction
+   replaces the older history with a summary, no restart (§3,
+   `framework.SessionCompactor`).
 6. **The client stores nothing.** `restoreTranscript()` is demoted to a
    best-effort fallback for exactly the cases disk could not cover: a
    container recreate, AND any boot where the store restored nothing (fresh,
@@ -68,7 +71,7 @@ onboarding copy.
 
 All framework-specific conversation knowledge lives in each framework's own
 encapsulation; the shared proxy never branches on a framework name. The
-proxy's stateful door asks the adapter through three optional capabilities —
+proxy's stateful door asks the adapter through four optional capabilities —
 the `RenderSettings` pattern — and each adapter answers in its own dialect,
 inside its own package.
 
@@ -90,7 +93,7 @@ forward hermes/openclaw to them and delete synth together with the
 compensations it needs — the hermes id file and its compare-and-swap (§4),
 openclaw's transcript read.
 
-The three capabilities:
+The four capabilities:
 
 - **`framework.ConversationSession`** — the adapter names headers that bind
   each stateful upstream call to the agent's ONE conversation, and observes
@@ -108,11 +111,34 @@ The three capabilities:
   `POST /_seal/clear` (tag `0GSealClear`, the settings-push grammar,
   seat-gated) and the CLI gains `/clear`; adapters with client-held history
   answer 501 and the CLI clears its local echo only.
+- **`framework.SessionCompactor`** — run the harness's OWN compaction on
+  demand: the older history becomes a summary, the newest part stays verbatim
+  (how much is the harness's: dsh keeps only its newest item, openclaw ~20K
+  tokens), the process keeps running. The proxy exposes an owner-signed
+  `POST /_seal/compact` (tag `0GSealCompact`, the clear grammar, seat-gated)
+  and the CLI gains `/compact`. Three guards a clear does not need: one compaction at
+  a time (a second answers 409); a signed request is accepted once — a
+  compaction is a model call and not idempotent, so unlike a clear it must not
+  be replayable inside the freshness window (keyed on the signed message, so a
+  re-spelled or malleated signature is the same request); and a compaction and
+  a turn on the synthesized door never overlap — whichever comes second is
+  refused (409) — because openclaw's compaction aborts a running turn in the
+  session. A framework's own "not now" (another compaction pending, a session
+  still busy) is a 409 too (`framework.ErrCompactRefused`), not a failure. The
+  run is detached from the request (a dropped connection does not abort it;
+  the outcome is logged). dsh asks its bridge (`POST /v1/compact` → the
+  composition's `compactNow`, queued behind a running turn, one pending at a
+  time; the summary call's output cap is 16384, below a turn's 32768 — it
+  carries about a turn's input, and upstreams reserve the cap against that
+  input); openclaw runs its own `openclaw sessions compact <key>` against the
+  running gateway, with the gateway URL and token passed by env. hermes and
+  prime answer 501 for now.
 
 The transparent `/v1/chat/completions` door NEVER gets conversation headers or
 store history — statefulness there would silently change what standard OpenAI
 clients see. Statefulness is the second door, not a replacement. Compaction
-stays the harness's own; the platform never parses a conversation.
+stays the harness's own; the platform never parses a conversation — `/compact`
+only triggers it.
 
 ## 4. Per-framework answers (as built, verified against SDK source)
 
@@ -121,7 +147,7 @@ stays the harness's own; the platform never parses a conversation.
 | **prime** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` — the SDK appends every entry (messages, tool calls, compaction, thinking) and `open()` rebuilds context on restart. File `/root/.prime-conversation/owner-chat.jsonl`, outside `primeHome`, `privsep`-owned. Self-rotation at the latest compaction entry (header kept, compaction entry re-parented to root, older lines discarded); a corrupt file quarantines (`.corrupt-<ts>`) and a fresh one opens. Verified on the real SDK: rotation 9209B→729B with context rebuilt; torn tail tolerated. | delete file + leftovers, restart |
 | **hermes** | its own gateway, bound via `ConversationSession` | the gateway is already stateful over HTTP: `X-Hermes-Session-Id` (Bearer `API_SERVER_KEY`, already set) loads history from `~/.hermes/state.db`, body's last message is the turn. The adapter mints and persists ONE id (`~/.hermes/.seal-conversation-id`) and FOLLOWS the echoed id — compaction ends the parent session and continues on a child. Unsafe echoes (path-shaped, control chars) are never persisted. Invariant 7 note: the transcript store is hermes's own `state.db` — its store, its compaction; self-rotation does not apply to a file the harness owns. | mint a fresh id (old rows stay in hermes's db, unreferenced), restart |
 | **dsh** | `bridge.mjs` + `sessionstore.mjs` (native `/v1/responses`) | no backend ships (the `SessionPersistence` seam has no concrete subclass; `resume()` rejects). The bridge is the backend: every committed `session/event` of `owner-chat` appends via `packChunkRuns`; boot decodes (`decodeStorageRecord`) and seeds `ctx.agents.create({ seed, meta:{seedLength} })`; `interruptedTurnClosers` closes a mid-turn crash (closers appended, so the file balances); a seq guard skips re-emitted seed events. Rotation is necessarily cruder: a seed must be contiguous from seq 0, so the head cannot be cut — at the ceiling the store archives and the conversation restarts fresh, loudly. File `/root/.dsh/owner-chat.session.jsonl` (already classified untracked). Verified on the real SDK: append→load→`Session.fromRestore` (create's validator) passes; crash repair balances. | remove the log + leftovers, restart |
-| **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) but its OpenAI door never reads it back. The adapter pins ONE session key (`x-openclaw-session-key`, persisted at `~/.openclaw/.seal-conversation-key`) so all stateful-door turns land in ONE transcript, and reads that transcript back as history (text turns; tool records skipped — the synth door's documented limitation). The private `version:3` format coupling is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7: openclaw's own compaction REWRITES the persisted transcript, so the harness bounds the file itself. | rotate the key + best-effort remove the superseded transcript (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
+| **openclaw** | `ConversationSession` + `ConversationHistory`, in the adapter package | openclaw persists every gateway turn (`~/.openclaw/agents/main/sessions/<id>.jsonl`, `sessions.json` maps key→session) but its OpenAI door never reads it back. The adapter pins ONE session key (`x-openclaw-session-key`, persisted at `~/.openclaw/.seal-conversation-key`) so all stateful-door turns land in ONE transcript, and reads that transcript back as history (text turns; tool records skipped — the synth door's documented limitation). The private `version:3` format coupling is quarantined in the openclaw package — the same kind of coupling it already has (it parses openclaw.json). Invariant 7 (re-verified 2026-10-19, see the trap below): openclaw's compaction APPENDS a `compaction` record and keeps every message line — `truncateAfterCompaction`, which would rotate the file, is opt-in and off — so the harness does not bound the file here; open. | rotate the key + best-effort remove the superseded transcript (openclaw's `sessions.json` is its own store — never rewritten from outside), restart |
 
 Source-verified traps, recorded:
 
@@ -147,6 +173,22 @@ Source-verified traps, recorded:
   checks cannot stop a symlink planted inside the dir itself — otherwise an
   adversarial agent could read any root file into its own upstream request
   (review #169).
+- openclaw 2026.7.1 keys `sessions.json` as `agent:main:<key>` (re-verified
+  2026-10-19 offline, against files the gateway itself wrote): the adapter's
+  bare-key lookup finds nothing, so `ConversationHistory` returns no turns
+  (0 as shipped, 4 with the bare key patched in) and `ClearSession` cannot
+  remove the superseded transcript. The conversation still continues
+  because the GATEWAY replays the pinned session into every turn — the
+  door's single message is not all the model sees — and that replay honours
+  compaction (summary first, then the kept tail), which is what makes
+  `/compact` effective. A MANUAL compaction keeps that tail only while
+  `agents.defaults.compaction.keepRecentTokens` is set — unset, openclaw
+  rewrites the record so replay starts at the summary and the tail, never
+  summarized, is lost (measured offline) — so the render sets openclaw's own
+  default, 20000, unless the owner's overlay names one. Open: making the
+  lookup match would resend the whole pre-compaction text on top of the
+  gateway's own context, so the read-back
+  and the replay have to be reconciled together.
 - hermes ROTATES the session id at compaction — a pinned id forks the
   conversation; the echo must be followed. It is followed by compare-and-swap
   on the id the turn was SENT with: synth does not serialize turns, so a turn
@@ -168,7 +210,10 @@ Source-verified traps, recorded:
 - **No platform compaction** — the harness compacts the MODEL CONTEXT itself
   (append a `compaction` entry, move the leaf; the file keeps prior entries,
   so nothing is destructively lost). The file only grows *between rotations*;
-  the encapsulation rotates it (invariant 7). The platform never parses it.
+  the encapsulation rotates it (invariant 7; not yet for openclaw, §4). The
+  platform never parses it.
+  `/compact` does not change this: it only asks the harness to run its own
+  compaction now.
 - **No cross-machine sync** — the file is per-container; clients hold nothing.
   A client that wants to *display* scrollback keeps its own screen buffer —
   UI, not state.
@@ -221,6 +266,20 @@ Original checklist (all shipped):
 3. ✅ hermes — session-id pin + rotation follow + ClearSession
 4. ✅ openclaw — session-key pin + transcript-as-history + ClearSession
 5. ✅ `/_seal/clear` + SDK `clearConversation` + CLI `/clear`
+
+Added since: `/_seal/compact` + SDK `compactConversation` + CLI `/compact`
+for dsh and openclaw, verified against a real model (glm-5.3 via the 0G
+router, 2026-10-19): dsh — a 26.6K-token span summarized, the next turn
+answered from the summary, and the compaction survived a bridge restart;
+openclaw 2026.7.1 — `sessions compact` took a 269,717-token session to 3,559
+in 73s (before `keepRecentTokens` was set, so that run also dropped the
+~20K-token tail — see the openclaw trap above). Offline, with a stub model:
+the dsh bridge refuses a second compaction while one is pending, sends the
+summary call at 16384, reports the engine's actual cause (an upstream 400
+included) and answers "nothing to compact" when a summary would not be
+smaller; with `keepRecentTokens` set, openclaw's next turn after a
+compaction reaches the model as the summary plus turns 4–6 of six, without
+it as the summary alone.
 
 Every store path was verified against the REAL SDKs extracted from the built
 images (prime SessionManager round-trip + rotation; dsh append→seed→

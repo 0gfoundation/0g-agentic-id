@@ -162,6 +162,7 @@ and degrades gracefully when absent):
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | the stateful responses door's upstream calls | the framework holds no server-side conversation keyed by a session identity (see `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door replaces client-sent history with the harness's own store | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure | the route answers 501 — the framework cannot be asked to compact from outside |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -454,7 +455,7 @@ skipped the bound along with the endpoint wiring — hermes and dsh both did
 this (`inference/zgcompute.go:57-65`). Facts apply to every provider; only
 `Endpoint` is gated on routing.
 
-Two accessors carry the gating you must not re-invent:
+Three accessors carry the gating you must not re-invent:
 
 - `s.Effort() (level string, decided bool)` — **three outcomes, and
   collapsing any two is a live bug.** `("high", true)`: apply this level.
@@ -470,6 +471,18 @@ Two accessors carry the gating you must not re-invent:
   written to disk during an outage looks hand-set forever after and starves a
   reasoning model's shared thinking+reply budget (live on agent 404: three
   ~6-minute turns, `textLen=0` — `prime/modelsjson.go:28-36`).
+- `s.RequestMaxTokens() int` — the budget to configure as the framework's
+  per-request `max_tokens`: `PersistableMaxTokens()` capped at
+  `settings.RequestOutputCeiling` (32768), same 0 for "write nothing". Use it,
+  never the raw catalog value, for anything sent on every request: the
+  catalog's `max_completion_tokens` is a capability, and upstreams reserve the
+  requested budget against the conversation (glm-5.3's 131072 left ~65K tokens
+  of conversation before HTTP 400s — `CONFIG_SURFACE.md` §3.2). Like
+  `Effort()`'s `("", false)`, 0 is "unknown", not "clear" — but a render that
+  EDITS a file in place must still remove a budget it wrote for a different
+  model, or a switch to a model with a lower output limit fails every request
+  (hermes `spawn.go`: kept through an outage on the same model, removed when
+  the model changes).
 
 #### Rule 1 — idempotent
 
@@ -535,7 +548,7 @@ re-point inference (`hermes/spawn.go:51-58`).
    on disk rather than by env, because its `custom` provider declares
    `env_vars=()` and reads the key from nowhere else — injecting by env
    produced a live 401 from the router, hermes having dialled it keyless
-   (`hermes/spawn.go:163-170`). The platform writes that key every render,
+   (`hermes/spawn.go:164-171`). The platform writes that key every render,
    and **deletes** it when the document supplies none: without the delete, a
    boot that switches to a framework built-in keeps the previous boot's 0G
    router key on disk and hands it to whichever provider now owns the
@@ -634,7 +647,7 @@ best-effort — a failure is logged, the agent runs on the recovered pin either
 way, and the next boot retries.
 
 Exactly one adapter implements the interface today: dsh, for its retired
-`settings.yaml` role (`dsh/settings.go:280-332`). openclaw, hermes and prime
+`settings.yaml` role (`dsh/settings.go:283-335`). openclaw, hermes and prime
 do not, so a pre-channel agent on those three comes up on whatever document
 attestor already holds; prime's `HandleLegacy` says so in as many words and
 calls lifting those pins "the platform's job", not yet landed
@@ -819,7 +832,7 @@ into either an infinite re-upload loop or silent identity divergence.
 - [ ] `RenderSettings` is idempotent — the same `Resolved` rendered twice yields byte-identical output, including on a catalog-outage boot.
 - [ ] `RenderSettings` merges the owner's `framework` overlay FIRST and writes platform-owned keys over it; no platform value is defended by an exclusion list.
 - [ ] `RenderSettings` never returns an error for anything the owner or the agent wrote — it runs before every spawn, so an error there is an agent that will not boot.
-- [ ] A platform key is written only when the platform knows it: `Effort()`'s three outcomes stay three, and `PersistableMaxTokens() == 0` means write nothing rather than write a guess.
+- [ ] A platform key is written only when the platform knows it: `Effort()`'s three outcomes stay three, and `RequestMaxTokens() == 0` means write nothing rather than write a guess. The per-request output budget is `RequestMaxTokens()`, never the raw catalog value — and a file edited in place drops a budget written for a different model.
 - [ ] A per-boot credential, and any provider block the platform owns, cannot be supplied through the overlay.
 - [ ] `Start` takes the pin from what `RenderSettings` stashed, never by re-parsing the file it wrote.
 - [ ] Restore calls commute across roles and are idempotent per role.

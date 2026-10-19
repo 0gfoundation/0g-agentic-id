@@ -34,7 +34,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 |---|---|
 | `provider` | 谁来服务这个模型。`inference.ZGComputeProvider` = `"0g-compute"`(`internal/inference/zgcompute.go:109`)表示**由平台**提供 endpoint;其他任何取值都指向一个自带接线的框架内置 provider |
 | `model` | 模型 id,按该 provider 自己的拼法 |
-| `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:52`) |
+| `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:56`) |
 | `others` | 三个具名设置之外的一切:该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`)。曾名 `framework`,真机演练里 owner 的第一反应是"能选框架?"——而这恰恰是它做不到的事(框架绑定是 mint 时的身份),故改名 |
 
 `others` 的不透明是刻意的,而且同时在三处承重:平台不解析它,attestor 根本不知道它
@@ -48,11 +48,11 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 的就丢掉 —— 而这之所以安全,只因为**容器从不把文档写回去**。唯一的例外是迁移用的 seed
 (§10),它只带一个恢复出来的 pin。
 
-**校验刻意做得很薄**(`Doc.Validate`,`settings.go:98`):
+**校验刻意做得很薄**(`Doc.Validate`,`settings.go:102`):
 
 - `model` 为空是唯一的致命错误,因为有两家在缺 pin 时 `Start` 硬失败
   (`framework/prime/spawn.go:78`、`framework/dsh/spawn.go:77`),另两家只告警然后无模型
-  运行(`framework/openclaw/spawn.go:63`、`framework/hermes/spawn.go:273`);
+  运行(`framework/openclaw/spawn.go:63`、`framework/hermes/spawn.go:298`);
 - `thinking` 必须属于 `Levels`,大小写不敏感;
 - `others` 必须是合法 JSON,仅此而已。
 
@@ -62,16 +62,16 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 做决定的是容器这一侧(`sdk/typescript/src/cli/commands/settings.ts`)。
 
 空 blob 解析成空文档,不是错误:那是一个还没人配置过的 agent,是合法状态
-(`Parse`,`settings.go:71`)。
+(`Parse`,`settings.go:75`)。
 
 **推理凭据不在这份文档里** —— 见 §7。
 
 ## 3. 平台派生、且从不存储的东西
 
-`settings.Resolved`(`settings.go:56`)是 `Doc` 加上平台为这次启动算出来的一切:
+`settings.Resolved`(`settings.go:60`)是 `Doc` 加上平台为这次启动算出来的一切:
 `Facts`、`Endpoint`、`APIKey`。adapter 只看得到 `Resolved`;没有任何东西会把它存下来。
 
-`settings.Resolve(ctx, doc, apiKey)`(`settings.go:123`)调用
+`settings.Resolve(ctx, doc, apiKey)`(`settings.go:127`)调用
 `inference.Resolve(provider, model)`(`zgcompute.go:121`),整条通道能成立的那个拆分就
 在这里:
 
@@ -92,7 +92,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 ### 3.1 `Effort()` 有三种结果,任何两种都不能合并
 
-`Resolved.Effort() (level string, decided bool)`(`settings.go:156`):
+`Resolved.Effort() (level string, decided bool)`(`settings.go:160`):
 
 ```
 ("high", true)   施加这个档位
@@ -123,7 +123,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 ### 3.2 `PersistableMaxTokens()`,以及"解析结果一律不存"的由来
 
-`Resolved.PersistableMaxTokens()`(`settings.go:180`)返回目录给出的输出预算,或者 `0`
+`Resolved.PersistableMaxTokens()`(`settings.go:184`)返回目录给出的输出预算,或者 `0`
 表示"什么都别写",闸门是 `ModelFacts.CatalogSourced`。名字启发式的兜底值是
 `inference.HeuristicOpenAIMaxTokens = 8192`(`zgcompute.go:160`);在目录故障期间被写进
 磁盘,它此后看起来就永远像是手工设定的,把一个推理模型"思考+回复"的共享预算饿成永远
@@ -132,6 +132,20 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 那次事故就是 `Resolved` 每次启动重算、且哪儿都不存的原因:**存下来的副本会过时,然后
 与算出来的值互相打架**(`settings.go:11-15`)。
+
+适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:210`):即
+`PersistableMaxTokens()` 封顶到 `RequestOutputCeiling = 32768`(`settings.go:196`),
+同样以 `0` 表示"什么都别写"。目录里的 `max_completion_tokens` 是一种能力——单次回复
+最多能有多长——而不是每次请求该填的值:每个框架都会在每次请求里带上它配置的预算,上游
+会把这部分预留从对话可用的空间里扣掉。glm-5.3 的目录值是 131072,实测路由的上游在
+"prompt + 预算"达到约 196,608 时拒绝请求(HTTP 400,code `400001`)——也就是对话只有
+约 65K token 时——而同一份请求体只要预算更小就能通过(2026-10)。线上的字段:dsh 发
+`max_completion_tokens`,openclaw 和 hermes 发 `max_tokens`;prime-agent 的 SDK
+不管 models.json 写多少,都会压到 32000。还有一个调用压得更低:dsh 的压缩摘要
+(`/compact`)封顶 16384(`bridge.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`),因为它带着
+约一轮的输入——若给它一轮的预算,它会和那些轮次在同样的长度上被拒,而那恰恰是 owner
+要用它的时候;16384 是实测最大摘要的 3 倍(effort=max 下 33.9K token 的 prompt 产出
+5,239 个输出 token)。
 
 ## 4. 文档存在哪,怎么到达容器
 
@@ -222,7 +236,7 @@ SDK 抛 `SettingsConflictError`,并**刻意不重试** —— 盲目重放同一
 
 POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第五个字段。没有它,签名只证明
 **谁**在调用,任何能在途中改动请求的东西都可以保留一个有效签名却换掉文档
-(`internal/proxy/proxy.go:402-407`)。请求体上限 256 KiB
+(`internal/proxy/proxy.go:439-442`)。请求体上限 256 KiB
 (`internal/proxy/settings.go:18`)—— 面向 owner 的路由上做无界读取是最容易的一种拒绝
 服务。
 
@@ -281,9 +295,9 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 
 | | 文档落到哪 | overlay 怎么处理 |
 |---|---|---|
-| openclaw(`openclaw/inference.go:55`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它 |
-| hermes(`hermes/spawn.go:174`) | `~/.hermes/config.yaml` | 深合并,再把五个平台键写在上面:`model.{default,provider,base_url,api_key}` 与 `agent.reasoning_effort`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint |
-| prime-agent(`prime/modelsjson.go:132`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
+| openclaw(`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`agents.defaults.compaction.keepRecentTokens` 设为 openclaw 自己的默认值(20000),除非 overlay 给了正数——手动压缩只有在它被设置时才保留最近的尾部(`CONVERSATION.zh.md`) |
+| hermes(`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | 深合并,再把平台键写在上面:`model.{default,provider,base_url,api_key}`、`agent.reasoning_effort`,以及目录给出预算时的 `model.max_tokens`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint;`model.max_tokens` 在同一模型遇目录故障时保留,模型变了就删除(除非 overlay 自己设了它),否则换到输出上限更低的模型后每个请求都会失败 |
+| prime-agent(`prime/modelsjson.go:143`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
 | dsh(`dsh/settings.go:161`) | 只有桥进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
 
 dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-settings-file` 提供,
@@ -316,7 +330,7 @@ dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext
 
 ## 7. 凭据
 
-推理 API key 是 `Resolved.APIKey`(`settings.go:66`):它从容器环境到来,从不属于 `Doc`,
+推理 API key 是 `Resolved.APIKey`(`settings.go:70`):它从容器环境到来,从不属于 `Doc`,
 也不在任何地方持久化。自 #167 起它可以密文到达:attestor 声明 `secret_env_scheme` 时,
 SDK 把它装进 `SEAL_SECRET_ENV` —— 用 agentSeal 公钥 ECIES 加密、绑定 owner ——
 `main.go` 在 Phase 2 之后、任何 adapter 运行之前解开,所以两条路殊途同归到同一个
@@ -329,7 +343,7 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 | | 密钥怎么到达框架 |
 |---|---|
 | openclaw | 引用式:配置里放 `{source: env, id: <VAR>}`,盘上只有变量**名**;`spawn.go` 把值导给子进程 |
-| hermes | **明文写在盘上**的 `model.api_key` —— hermes 的 `custom` provider 声明了 `env_vars=()`,只从 `config.yaml` 读密钥;用 env 注入曾导致 router 线上 401,hermes 是裸着拨过去的(`hermes/spawn.go:163-170`) |
+| hermes | **明文写在盘上**的 `model.api_key` —— hermes 的 `custom` provider 声明了 `env_vars=()`,只从 `config.yaml` 读密钥;用 env 注入曾导致 router 线上 401,hermes 是裸着拨过去的(`hermes/spawn.go:164-171`) |
 | prime-agent | 引用式:`models.json` 里放 `apiKey: "SEAL_MODEL_API_KEY"`(`prime/modelsjson.go:63`),值在桥的 env 里 |
 | dsh | 只在桥的 env 里 —— 并且**刻意不放进**那个确定性、会被记录、每次启动重建的 `settingsEnv` 切片,这样渲染出来的环境可以被比较和记录而不必碰密钥(`dsh/settings.go:181-187`) |
 
@@ -542,7 +556,7 @@ mint 时副本的形状识别启发式,而重渲染把它要修的那份副本�
 hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它们曾被标注为
 "agent self-tuning",但 sealed 从未写过它们,而在无人值守的 TEE 沙盒里,审批策略**没有
 人可以问**。它们是 owner 的旋钮,所以现在像任何 hermes 键一样搭那份不透明 overlay
-(`hermes/spawn.go:290-293`)。
+(`hermes/spawn.go:330-333`)。
 
 判断什么该上链的判据 —— 这次改动就是它的一次应用:**丢了能不能重填。**记忆重建不出来,
 模型重选一次只要十秒。**分界线是这个不对称,不是"它算不算配置"。**

@@ -47,7 +47,7 @@ import (
 // actually know is not written, and it does not erase what is already on
 // disk either. Resolved.Effort()'s second return distinguishes "this model
 // takes no bound" (clear the key) from "the catalog was unreachable" (leave
-// the key); Resolved.PersistableMaxTokens() and ModelFacts.CatalogSourced
+// the key); Resolved.RequestMaxTokens() and ModelFacts.CatalogSourced
 // draw the same line for the output budget, the context window and the
 // reasoning flags. An outage boot must not be able to strip a bound from an
 // always-thinking model, nor shrink a 1M context window to a guessed 128k
@@ -380,6 +380,18 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 	diagnostics["stuckSessionAbortMs"] = 900_000
 	cfg["diagnostics"] = diagnostics
 
+	// A manual compaction (/_seal/compact → `sessions.compact`) must keep the
+	// recent tail. openclaw 2026.7.1 summarizes everything before its kept
+	// tail and then — unless agents.defaults.compaction.keepRecentTokens is
+	// SET — rewrites the compaction record so replay starts from the summary
+	// alone (hardenManualCompactionBoundary): the tail is neither summarized
+	// nor replayed, and the owner's latest turns silently vanish. Measured
+	// offline with six ~27K-char turns: unset, the next turn reached the model
+	// as summary + the new message; set, as summary + turns 4–6 + the new
+	// message. The value is openclaw's own default, so automatic compaction
+	// is unchanged; a positive value already there (the owner's overlay) stands.
+	ensureCompactionKeepRecent(cfg)
+
 	if s.Endpoint != nil {
 		applyEndpointToConfig(cfg, clawProvider, s)
 	}
@@ -399,6 +411,34 @@ func clawProviderName(s settings.Resolved) string {
 		return "anthropic"
 	}
 	return "openai"
+}
+
+// openclawKeepRecentTokens is openclaw's own default kept tail for
+// compaction (DEFAULT_COMPACTION_SETTINGS.keepRecentTokens, 2026.7.1).
+const openclawKeepRecentTokens = 20000
+
+// ensureCompactionKeepRecent sets agents.defaults.compaction.keepRecentTokens
+// unless a positive number is already there.
+func ensureCompactionKeepRecent(cfg map[string]any) {
+	agents, _ := cfg["agents"].(map[string]any)
+	if agents == nil {
+		agents = map[string]any{}
+		cfg["agents"] = agents
+	}
+	defaults, _ := agents["defaults"].(map[string]any)
+	if defaults == nil {
+		defaults = map[string]any{}
+		agents["defaults"] = defaults
+	}
+	compaction, _ := defaults["compaction"].(map[string]any)
+	if compaction == nil {
+		compaction = map[string]any{}
+		defaults["compaction"] = compaction
+	}
+	if v, ok := compaction["keepRecentTokens"].(float64); ok && v > 0 {
+		return
+	}
+	compaction["keepRecentTokens"] = openclawKeepRecentTokens
 }
 
 // setModelPrimary writes agents.defaults.model.primary WITHOUT replacing
@@ -566,15 +606,24 @@ func applyEndpointToConfig(cfg map[string]any, clawProvider string, s settings.R
 		modelDef["reasoning"] = s.Facts.SupportsReasoningEffort
 		compat["supportsReasoningEffort"] = s.Facts.SupportsReasoningEffort
 		// Output budget: only a CATALOG-sourced value may be written to disk
-		// (Resolved.PersistableMaxTokens enforces it). During an outage the
+		// (Resolved.RequestMaxTokens enforces it). During an outage the
 		// heuristic's 8192 would — with reasoning and the reply SHARING the
 		// budget — permanently starve replies. With the field absent openclaw
 		// sends no max_tokens at all and the model's own ceiling applies.
-		if mt := s.PersistableMaxTokens(); mt > 0 {
+		// openclaw sends maxTokens as max_tokens on EVERY request (captured on
+		// 2026.7.1), so this is the capped request budget, not the catalog's
+		// raw capability — see RequestMaxTokens for why.
+		if mt := s.RequestMaxTokens(); mt > 0 {
 			modelDef["maxTokens"] = mt
 		}
 	} else {
 		carryOver(prev, modelDef, "contextWindow", "maxTokens", "reasoning")
+		// A budget carried over from a render that predates the cap (the raw
+		// catalog 131072) must not survive an outage boot uncapped. prev comes
+		// from openclaw.json decoded into map[string]any, so it is a float64.
+		if mt, ok := modelDef["maxTokens"].(float64); ok && mt > settings.RequestOutputCeiling {
+			modelDef["maxTokens"] = settings.RequestOutputCeiling
+		}
 		prevCompat, _ := prev["compat"].(map[string]any)
 		carryOver(prevCompat, compat, "supportsReasoningEffort")
 		logger.Logf("openclaw: catalog silent on %q; keeping the model facts already on disk rather than writing heuristic ones", s.Model)

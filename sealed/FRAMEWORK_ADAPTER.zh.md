@@ -137,6 +137,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门用 harness 自己的存储替换客户端发的历史 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败 | 该路由答 501——无法从外部让该框架压缩 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -395,7 +396,7 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 一起被静默跳过——hermes 和 dsh 都犯过(`inference/zgcompute.go:57-65`)。Facts
 对每个 provider 都适用;只有 `Endpoint` 以"是否平台路由"为门。
 
-两个 accessor 封装了你不该自己重造的 gating:
+三个 accessor 封装了你不该自己重造的 gating:
 
 - `s.Effort() (level string, decided bool)` —— **三种结果,合并任意两种都是
   线上 bug。** `("high", true)`:照这个级别写。`("", true)`:**清掉**任何级别,
@@ -408,6 +409,15 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
   目录来源就返回 0,因为目录故障期间写进磁盘的启发式 8192 从此看起来像手工设定,
   会把推理模型"思考 + 回复"共享的预算长期饿死(agent 404 实测:三个约 6 分钟的
   回合,`textLen=0` —— `prime/modelsjson.go:28-36`)。
+- `s.RequestMaxTokens() int` —— 配置成框架每次请求的 `max_tokens` 的预算:即
+  `PersistableMaxTokens()` 封顶到 `settings.RequestOutputCeiling`(32768),同样以 0
+  表示"什么都别写"。凡是每次请求都会发出去的东西,用它,别用目录原值:目录的
+  `max_completion_tokens` 是能力上限,而上游会把请求的预算从对话可用空间里预留出来
+  (glm-5.3 的 131072 只给对话留下约 65K token,之后就是 HTTP 400 —— 见
+  `CONFIG_SURFACE.zh.md` §3.2)。和 `Effort()` 的 `("", false)` 一样,0 是"不知道",
+  不是"清掉"——但**原地编辑**文件的 render 仍须删掉它为别的模型写下的预算,否则
+  换到输出上限更低的模型后每个请求都会失败(hermes `spawn.go`:同一模型遇目录
+  故障时保留,模型变了就删除)。
 
 #### 规则一 —— 幂等
 
@@ -459,7 +469,7 @@ sealed 编出来、看上去像手工设定的数字
    是渲染自己会写的键;凡是渲染不写的键,就从 overlay 里丢掉并在日志里说明。
 2. **推理凭据。** hermes 把 key 写进磁盘上的 `model.api_key` 而不是走 env,因为
    它的 `custom` provider 声明 `env_vars=()`,只从这个键读 key——用 env 注入实测
-   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:163-170`)。
+   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:164-171`)。
    这个键由平台每次渲染写入,并且在文档没给凭据时**删除**:不删的话,一次切到
    框架内置 provider 的开机会把上一次的 0G router key 留在盘上,交给现在占着这
    一节的那个 provider。老的"采集路径上剥密钥"这道防线随 role 一起没了——已经
@@ -534,7 +544,7 @@ watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那
 无论如何跑在回收到的 pin 上,下次开机再试。
 
 今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role
-(`dsh/settings.go:280-332`)。openclaw、hermes、prime 都没实现,所以这三个上面
+(`dsh/settings.go:283-335`)。openclaw、hermes、prime 都没实现,所以这三个上面
 的"通道之前"的 agent 会用 attestor 已经存着的那份文档开机;prime 的
 `HandleLegacy` 把这件事写得明明白白,并称把这些 pin 抬进文档"是平台的活",尚未
 落地(`prime/persona.go:108-129`)。你的框架曾经有过链上追踪的 pin 就实现它;等
@@ -703,7 +713,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 - [ ] `RenderSettings` 幂等——同一份 `Resolved` 渲染两次字节相同,目录故障的开机也一样。
 - [ ] `RenderSettings` 先合并 owner 的 `framework` overlay,再把平台自有的键写在上面;没有任何平台值靠排除清单来守。
 - [ ] `RenderSettings` 对 owner 或 agent 写的任何东西都不返回错误——它在每次 spawn 前跑,报错就等于一个起不来的 agent。
-- [ ] 平台键只在平台真的知道时才写:`Effort()` 的三种结果保持三种,`PersistableMaxTokens() == 0` 意味着什么都不写,而不是写个猜测。
+- [ ] 平台键只在平台真的知道时才写:`Effort()` 的三种结果保持三种,`RequestMaxTokens() == 0` 意味着什么都不写,而不是写个猜测。每次请求的输出预算用 `RequestMaxTokens()`,绝不用目录原值——原地编辑的文件要删掉为别的模型写下的预算。
 - [ ] per-boot 凭据、以及平台自己拥有的 provider 块,都不能从 overlay 供给。
 - [ ] `Start` 从 `RenderSettings` 存下的东西取 pin,绝不重新解析它写出去的文件。
 - [ ] Restore 跨 role 可交换、单 role 幂等。
