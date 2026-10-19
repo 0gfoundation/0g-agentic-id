@@ -555,7 +555,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
 | `StorageLayout.t.sol` | 3 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）；OZ `Ownable2Step` 槽固定且与我们所有槽不相交 |
-| `DeployScript.t.sol` | 8 | 部署脚本治理规则（`script/MainnetGovernance.sol`），库级 + 端到端。`Deploy.s.sol`：链 16661 上 Timelock `minDelay` 默认且至少 86400、无外部 admin，且不可用或有歧义的 PROPOSERS / EXECUTORS（为空、含 `0x0` proposer、OWNER 不是 proposer、`0x0` 与具名 executor 混用）在 broadcast 前 revert；其余链 delay 0、OWNER 为 admin、不检查角色集合。`DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`：链 16661 上拒绝弱或无代码的 `TIMELOCK`，接受 ≥ 1 天的；其余链不限 |
+| `DeployScript.t.sol` | 8 | 部署脚本治理规则（`script/MainnetGovernance.sol`），库级 + 端到端。`Deploy.s.sol`：链 16661 上 Timelock `minDelay` 默认且至少 86400、无外部 admin，且不可用或有歧义的 PROPOSERS / EXECUTORS（为空、含 `0x0` proposer、OWNER 不是 proposer、`0x0` 与具名 executor 混用、具名 executor 里没有 OWNER）在 broadcast 前 revert；其余链 delay 0、OWNER 为 admin、不检查角色集合。`DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`：链 16661 上拒绝弱或无代码的 `TIMELOCK`，接受 ≥ 1 天的；其余链不限 |
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
 | `CanonicalForkIntegration.t.sol` | 2 | 对着线上 canonical 注册表 self-mint + verified-feedback attest（仅设了 `FORK_RPC` 才跑，否则跳过）|
 

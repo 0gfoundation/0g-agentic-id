@@ -243,13 +243,16 @@ set freezes every beacon for good. So on chain 16661 the script prints the
 parsed `PROPOSERS` / `EXECUTORS` and reverts before broadcasting unless
 `PROPOSERS` is non-empty, contains no `0x0` and includes `OWNER`, and
 `EXECUTORS` is non-empty and either exactly `[0x0]` (open execution) or only
-non-zero addresses. A set-but-empty `PROPOSERS=` / `EXECUTORS=` parses to an
-empty list, not the default — unset the variable to get the default.
-`OWNER` must be a proposer (extras are allowed) because the required
+non-zero addresses that include `OWNER`. A set-but-empty `PROPOSERS=` /
+`EXECUTORS=` parses to an empty list, not the default — unset the variable to
+get the default. `OWNER` must be a proposer, and a named executor unless
+execution is open (extras are allowed in both sets), because the required
 post-deploy admin calls below prove right away that `OWNER` can sign; a
-proposer that is only used at the first upgrade could turn out to be
-unreachable months after the stack went live. Other chains skip these checks
-(`OWNER` is admin there and can grant a missing role directly).
+proposer or named executor that is only used at the first upgrade could turn
+out to be unreachable months after the stack went live — and an unreachable
+executor set leaves even the repairing `grantRole` op unexecutable. Other
+chains skip these checks (`OWNER` is admin there and can grant a missing role
+directly).
 
 The delay, admin and role-set rules live in `script/MainnetGovernance.sol`
 (covered by `test/DeployScript.t.sol`); the incremental
@@ -325,8 +328,10 @@ verified once; re-run after each upgrade (already-verified ones skip). Browser
 >   `chain_id 16602`, `agentic_id_addr = 0x3449…`,
 >   `verified_feedback_addr = 0xc0c9…`. (Until mainnet launched, this set was
 >   what `agenticid.0g.ai` served — checked live 2026-07-30.)
-> - **dev** (§6.2, Galileo 16602) — AgenticID `0x5BB5…`, owner `0x9C58…`.
->   **This is what the dev-host attestor points at** (`ATTESTOR_AGENTIC_ID_ADDR`).
+> - **dev** (§6.2, Galileo 16602) — AgenticID `0x5BB5…`, owner `0x2AB7…`
+>   (moved from `0x9C58…` on 2026-10-19; the two Galileo sets no longer share
+>   a governance key). **This is what the dev-host attestor points at**
+>   (`ATTESTOR_AGENTIC_ID_ADDR`).
 >
 > Neither public attestor advertises `reputation_registry_addr`. §6.3 lists
 > superseded deploys (do not use), including the pre-canonical-binding
@@ -379,9 +384,17 @@ hard rule is that a testnet key is **never** reused on mainnet (§6.2m).
 ### 6.2 dev environment — 2026-06-17 (active)
 
 **The dev-host attestor points at this** (`ATTESTOR_AGENTIC_ID_ADDR = 0x5BB5…`),
-owner `0x9C58…80Bb`. Same deliberately lightweight governance as §6.1 (one EOA,
-`minDelay=0`; TEEDataVerifier `teeOracleAddress()` also `0x9C58…80Bb`,
-2026-10-19).
+owner `0x2AB7…a0B3`. Same deliberately lightweight governance as §6.1 (one EOA,
+`minDelay=0`, open execution), but a different EOA: as read on chain
+2026-10-19 (`owner()` / `pauser()` / `teeOracleAddress()` / `getMinDelay()` /
+`hasRole`), `0x2AB7…a0B3` is owner and pauser of AgenticID,
+VerifiedFeedbackRegistry, TEEDataVerifier and the deprecated
+ReputationRegistry, the TEEDataVerifier `teeOracleAddress()`, and the
+Timelock's proposer + canceller + admin (the Timelock is also its own admin;
+executor = `address(0)`). `0x9C58…80Bb` holds no dev role any more — it
+renounced every Timelock role in the same window (it remains §6.1's key).
+Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
+`OwnershipTransferred(0x9C58… → 0x2AB7…)` at block 60947194).
 
 | Contract | Address | VERSION |
 |---|---|---|
@@ -402,8 +415,8 @@ owner `0x9C58…80Bb`. Same deliberately lightweight governance as §6.1 (one EO
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x9C58…80Bb` (migrated 2026-10-12 from `0x7344…431b`) |
-| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`) |
+| owner / pauser (all contracts) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
 in this repo (they're attestor-deployment infra, configured via
@@ -580,7 +593,7 @@ Changelog:
      <image hash> --rpc-url $RPC` → `true`.
   3. Deploy the 1.2.0 impl and beacon-upgrade each environment's VF proxy via
      `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Execution is open
-     on mainnet and test (§6.2m / §6.1), so anyone can perform the cut the
+     on every environment (§6.2m / §6.1 / §6.2), so anyone can perform the cut the
      moment the op is ready, and an op becomes ready `DELAY` seconds after the
      schedule tx lands. On mainnet (`minDelay` 1 day) the vault therefore schedules with
      `DELAY` = window start − now, in seconds and ≥ 86400 (`schedule` rejects
@@ -588,8 +601,11 @@ Changelog:
      scheduled earlier with 86400, the op would be ready, and executable by
      anyone, before the window. Check after the schedule tx lands:
      `getTimestamp(opId)` (UPGRADING.md "Mainnet Step 3") = the window start,
-     or slightly later by the vault's approval time. Execute at the window's
-     start. If the window slips, the vault (the canceller) calls
+     or slightly later by the vault's approval time. Execute once block time
+     ≥ `getTimestamp(opId)` — at the window start, or as soon after it as the
+     op is ready (`ExecuteUpgrade` logs `op ready? false` and its simulated
+     `execute` reverts, broadcasting nothing, if run earlier) — and shift the
+     step-4 roll with it. If the window slips, the vault (the canceller) calls
      `cancel(opId)` before the op is ready and schedules again. On test / dev
      (`minDelay` 0) schedule inside the window and execute right away. Check:
      `cast call $VF 'VERSION()(string)' --rpc-url $RPC` → `"1.2.0"`.

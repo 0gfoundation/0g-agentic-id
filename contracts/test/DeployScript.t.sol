@@ -81,6 +81,8 @@ contract DeployScriptTest is Test {
     bytes internal constant EXECUTORS_MIXED = bytes(
         "EXECUTORS mixes address(0) with named executors on 0G mainnet (chain 16661): use exactly 0x0 or only non-zero addresses"
     );
+    bytes internal constant EXECUTORS_NO_OWNER =
+        bytes("EXECUTORS must be exactly 0x0 or include OWNER on 0G mainnet (chain 16661)");
     bytes internal constant WEAK_TIMELOCK = bytes("TIMELOCK minDelay below 86400 (1 day) on 0G mainnet (chain 16661)");
     bytes internal constant CODELESS_TIMELOCK = bytes("TIMELOCK has no code (0G mainnet needs a TimelockController)");
 
@@ -167,11 +169,17 @@ contract DeployScriptTest is Test {
         h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(address(0), other));
         vm.expectRevert(EXECUTORS_MIXED);
         h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(other, address(0)));
+        // Named executors must include OWNER (same reachability rule as proposers).
+        vm.expectRevert(EXECUTORS_NO_OWNER);
+        h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(other));
+        vm.expectRevert(EXECUTORS_NO_OWNER);
+        h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(other, makeAddr("keeper")));
 
-        // Accepted: OWNER (plus extras) proposing; open or all-named execution.
+        // Accepted: OWNER (plus extras) proposing; open execution, or named
+        // execution with OWNER (plus extras) among the executors.
         h.requireMainnetTimelockRoles(16661, owner, _list(owner), open);
         h.requireMainnetTimelockRoles(16661, owner, _list(other, owner), open);
-        h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(other));
+        h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(owner));
         h.requireMainnetTimelockRoles(16661, owner, _list(owner), _list(other, owner));
     }
 
@@ -295,15 +303,18 @@ contract DeployScriptTest is Test {
         _expectRolesRevert(script, otherStr, openStr, PROPOSERS_NO_OWNER);
         _expectRolesRevert(script, ownerStr, "", EXECUTORS_EMPTY);
         _expectRolesRevert(script, ownerStr, string.concat(openStr, ",", otherStr), EXECUTORS_MIXED);
-
-        // Accepted: an extra proposer and named executors only.
         address keeper = makeAddr("keeper");
-        _pinRoles(string.concat(ownerStr, ",", otherStr), string.concat(otherStr, ",", vm.toString(keeper)));
+        string memory keeperStr = vm.toString(keeper);
+        _expectRolesRevert(script, ownerStr, string.concat(otherStr, ",", keeperStr), EXECUTORS_NO_OWNER);
+
+        // Accepted: an extra proposer, and named executors that include OWNER.
+        _pinRoles(string.concat(ownerStr, ",", otherStr), string.concat(keeperStr, ",", ownerStr));
         TimelockController t = TimelockController(payable(script.run().timelock));
         assertTrue(t.hasRole(t.PROPOSER_ROLE(), owner), "OWNER proposes");
         assertTrue(t.hasRole(t.PROPOSER_ROLE(), other), "extra proposer");
-        assertTrue(t.hasRole(t.EXECUTOR_ROLE(), other), "named executor");
-        assertTrue(t.hasRole(t.EXECUTOR_ROLE(), keeper), "named executor");
+        assertTrue(t.hasRole(t.EXECUTOR_ROLE(), owner), "OWNER executes");
+        assertTrue(t.hasRole(t.EXECUTOR_ROLE(), keeper), "extra named executor");
+        assertFalse(t.hasRole(t.EXECUTOR_ROLE(), other), "proposer only");
         assertFalse(t.hasRole(t.EXECUTOR_ROLE(), address(0)), "execution not open");
 
         // 4. Incremental deploys onto the stack from leg 2.

@@ -56,9 +56,9 @@ upgradeTo(newImpl), predecessor, salt, delay)` — the call `ScheduleUpgrade`
 makes — is submitted from the vault rather than with a local `--private-key`,
 and Step 4 can only succeed once `delay` (≥ 86400) has passed.
 
-**Open execution: the ready time is the upgrade time.** The mainnet and test
-Timelocks have executor `address(0)` (DEPLOYMENT.md §6.2m / §6.1; the
-`Deploy.s.sol` default), so any account can execute an op from the moment it
+**Open execution: the ready time is the upgrade time.** The mainnet, test and
+dev Timelocks have executor `address(0)` (DEPLOYMENT.md §6.2m / §6.1 / §6.2;
+the `Deploy.s.sol` default), so any account can execute an op from the moment it
 is ready — `delay` seconds after the schedule tx lands. An op scheduled with plain `minDelay` more than a day
 before its intended window is therefore executable, by anyone, before the
 window. When the upgrade must land at a set time (e.g. the
@@ -76,18 +76,28 @@ tx `input` from a dry run (`--sender <vault>`, no `--broadcast`:
 [`../QUIRKS.md`](../QUIRKS.md) (forge 1.6 + 0G: use
 `--legacy --gas-price 5000000000 --slow`).
 
+The commands below carry no `--chain`: forge takes the chain id from
+`--rpc-url` (Galileo `https://evmrpc-testnet.0g.ai` → 16602, mainnet
+`https://evmrpc.0g.ai` → 16661) — the chain the transactions are signed for
+and, for `forge script`, the `broadcast/<script>/<chain id>/` directory they
+are logged under. A literal `--chain` only invites a mismatch when the block is copied to
+another environment — on `forge script` it would merely override
+`block.chainid` inside the local simulation (neither upgrade script reads it),
+so a copied `--chain 16602` against the mainnet RPC is misleading, not
+protective. Pick the environment with `--rpc-url` alone.
+
 ```bash
 # Step 1: bump the source VERSION per §1 + update the impl's @dev changelog; forge test green.
 
-# Step 2: deploy the new impl
+# Step 2: deploy the new impl (<RPC> picks the environment and so the chain id — no --chain, see above)
 forge create src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry \
-  --rpc-url <RPC> --chain 16602 --private-key <PK> --legacy --gas-price 5000000000 --broadcast
+  --rpc-url <RPC> --private-key <PK> --legacy --gas-price 5000000000 --broadcast
 
 # Step 3: proposer schedules (BEACON is the beacon to upgrade, NOT the proxy)
 export TIMELOCK=0x... BEACON=0x... NEW_IMPL=0x<from step 2>
 export PREDECESSOR=$(cast hash-zero) SALT=$(cast hash-zero)   # full 32-byte hex; Step 4 reuses both
 # optional: export DELAY=<seconds> — default = the Timelock's minDelay; for a set window, window start - now
-forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> --chain 16602 \
+forge script script/ScheduleUpgrade.s.sol --rpc-url <RPC> \
   --private-key <PROPOSER_PK> --legacy --gas-price 5000000000 --broadcast --slow
 
 # Mainnet Step 3 (proposer = Fordefi vault): build the tx data, submit it from the vault
@@ -107,10 +117,11 @@ cast call $TIMELOCK "getTimestamp(bytes32)(uint256)" $OP --rpc-url https://evmrp
 cast calldata "cancel(bytes32)" $OP
 
 # Step 4: after the delay (1 day on mainnet; with delay=0, still poll isOperationReady), executor executes.
+#         Same <RPC> as Step 3, no --chain (see above).
 #         TIMELOCK/BEACON/NEW_IMPL/PREDECESSOR/SALT must byte-match Step 3 (same shell, or re-export
 #         the same values: the opId is their hash; unset PREDECESSOR/SALT default to 0x0). DELAY is not
 #         part of the opId.
-forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> --chain 16602 \
+forge script script/ExecuteUpgrade.s.sol --rpc-url <RPC> \
   --private-key <EXECUTOR_PK> --legacy --gas-price 5000000000 --broadcast --slow
 ```
 

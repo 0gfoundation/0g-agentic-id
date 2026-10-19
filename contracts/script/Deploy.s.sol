@@ -22,8 +22,9 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///           OWNER             — owner of TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry
 ///                               (two-step Ownable; admin calls are direct, NOT timelocked).
 ///                               Also the default Timelock proposer (on 0G mainnet it must be
-///                               one of PROPOSERS), and the Timelock admin everywhere except
-///                               0G mainnet (see "Timelock admin" below).
+///                               one of PROPOSERS, and one of EXECUTORS unless execution is
+///                               open), and the Timelock admin everywhere except 0G mainnet
+///                               (see "Timelock admin" below).
 ///           PAUSER            — address allowed to pause/unpause (not timelocked)
 ///           TEE_ORACLE        — signer address for TEEDataVerifier
 ///           TIMELOCK_DELAY    — Timelock minDelay in seconds. 0G mainnet (16661): default
@@ -38,7 +39,9 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///                               list, not the default. On 0G mainnet (16661) the run reverts
 ///                               before broadcast unless PROPOSERS is non-empty, has no 0x0 and
 ///                               includes OWNER, and EXECUTORS is non-empty and either exactly
-///                               [0x0] or all non-zero (MainnetGovernance.requireMainnetTimelockRoles).
+///                               [0x0] or all non-zero and including OWNER — a named executor,
+///                               like a proposer, must be one the post-deploy owner calls prove
+///                               reachable (MainnetGovernance.requireMainnetTimelockRoles).
 ///           NFT_NAME          — ERC-721 name   (default "AgenticID")
 ///           NFT_SYMBOL        — ERC-721 symbol (default "AID")
 ///           MAX_PROOF_AGE     — nonce GC horizon in seconds (default 86400)

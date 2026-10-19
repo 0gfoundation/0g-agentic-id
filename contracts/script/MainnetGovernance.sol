@@ -66,9 +66,14 @@ library MainnetGovernance {
     ///           first upgrade could prove unreachable only then. Extra
     ///           proposers are allowed.
     ///         - executors: non-empty, and either exactly [address(0)] (open
-    ///           execution) or only non-zero accounts. address(0) next to named
-    ///           executors would still open execution to anyone, contradicting
-    ///           the restricted set the list suggests.
+    ///           execution) or only non-zero accounts with OWNER among them.
+    ///           address(0) next to named executors would still open execution
+    ///           to anyone, contradicting the restricted set the list suggests.
+    ///           OWNER must be a named executor for the same reason it must
+    ///           propose: a named executor is first used at the first upgrade,
+    ///           and one that proves unreachable then leaves ops nobody can
+    ///           execute — including the grantRole that would repair the set.
+    ///           Extra executors are allowed.
     ///         No-op on other chains: OWNER is the Timelock admin there and can
     ///         grant any missing role directly.
     function requireMainnetTimelockRoles(
@@ -87,12 +92,15 @@ library MainnetGovernance {
         require(ownerProposes, "PROPOSERS must include OWNER on 0G mainnet (chain 16661)");
         require(executors.length != 0, "EXECUTORS is empty on 0G mainnet (chain 16661): nobody could execute");
         if (executors.length == 1 && executors[0] == address(0)) return; // open execution
+        bool ownerExecutes;
         for (uint256 i; i < executors.length; ++i) {
             require(
                 executors[i] != address(0),
                 "EXECUTORS mixes address(0) with named executors on 0G mainnet (chain 16661): use exactly 0x0 or only non-zero addresses"
             );
+            if (executors[i] == owner) ownerExecutes = true;
         }
+        require(ownerExecutes, "EXECUTORS must be exactly 0x0 or include OWNER on 0G mainnet (chain 16661)");
     }
 
     /// @notice Incremental deploys hand a new beacon to an EXISTING Timelock.
