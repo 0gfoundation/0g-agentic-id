@@ -135,7 +135,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `SettleDelayer` | `SettleDelay()` | bootstrap 基线采集 | 保守的 5s 默认值 |
 | `LegacySettingsSeeder`(过渡性) | `SeededSettings()` | bootstrap,Phase C 的 `HandleLegacy` 轮之后 | settings 通道之前铸造的 agent 拿不回自己的 pin(§5.5 *迁移*) |
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
-| `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门用 harness 自己的存储替换客户端发的历史 | 客户端历史继续原样转发 |
+| `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
 | `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败 | 该路由答 501——无法从外部让该框架压缩 |
 

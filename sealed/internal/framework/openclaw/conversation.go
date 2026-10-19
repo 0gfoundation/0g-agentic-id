@@ -1,12 +1,12 @@
 package openclaw
 
 import (
-	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,40 +17,40 @@ import (
 	"seal-verify/internal/logger"
 )
 
-// openclaw persists every gateway turn to a per-session JSONL transcript
-// (~/.openclaw/agents/<id>/sessions/<sessionId>.jsonl, sessionKey→sessionId in
-// sessions.json) — but its OpenAI-compatible door never reads it back: the
-// client's messages[] is authoritative there. This file is openclaw's
-// conversation encapsulation (CONVERSATION.md §4): pin ONE session key so
-// every stateful-door turn lands in ONE transcript, and read that transcript
-// back as the history for the next turn — so the client sends only the
-// current turn and a process restart resumes from openclaw's own store.
-// (That is the design; on 2026.7.1 the read-back finds nothing and the
-// gateway carries the history itself — see the re-verification note below.)
+// openclaw keeps the agent's conversation itself. Every gateway turn is
+// persisted to a per-session JSONL transcript
+// (~/.openclaw/agents/main/sessions/<sessionId>.jsonl; sessions.json maps the
+// session key to it), and the gateway REPLAYS that session into every turn on
+// its OpenAI-compatible door — compaction-aware: the latest summary, then what
+// it kept verbatim. This file is openclaw's conversation encapsulation
+// (CONVERSATION.md §4): pin ONE session key so every stateful-door turn lands
+// in ONE session, and have the door send ONLY the current turn, because the
+// gateway brings the rest.
 //
-// The private-format coupling (version:3 JSONL, sessions.json shape) is
-// quarantined here, in openclaw's own package — the same kind of coupling
-// this adapter already has (it parses openclaw.json). An openclaw upgrade
-// that changes the transcript format is THIS file's maintenance burden.
+// Verified 2026-10-19 against 2026.7.1 (offline, stub model): a turn sent
+// alone reached the model with the earlier turns in front of it; a turn sent
+// WITH the client's history reached it with that history twice — the
+// gateway's replay, plus the client's copy folded into the new message as
+// "[Chat messages since your last reply - for context] …".
 //
-// Re-verified 2026-10-19 against 2026.7.1 (offline, stub model, the files
-// openclaw itself wrote) — what actually holds there, which /_seal/compact
-// relies on:
-//   - sessions.json keys the session "agent:main:<key>", so the bare-key
-//     lookup below finds nothing and ConversationHistory returns no turns
-//     (0 as shipped; 4 with the bare key patched in). The conversation is
-//     carried by the gateway itself, which replays the pinned session into
-//     every turn — the client's messages[] is NOT all it sees.
-//   - compaction appends a `compaction` record and keeps every message line
-//     (`truncateAfterCompaction`, which would rotate the file, is opt-in and
-//     off), so invariant 7 is not met by the harness here. The gateway's
-//     replay honours the record — summary first, then the kept tail — which
-//     is why a compaction takes effect. A MANUAL compaction keeps that tail
-//     only while agents.defaults.compaction.keepRecentTokens is set, which
-//     the render does (inference.go): unset, openclaw rewrites the record to
-//     replay from the summary alone, and the tail is lost.
-// Making the lookup match would resend the full pre-compaction text on top
-// of the gateway's own context; reconcile the two before changing either.
+// Until then this package also read the transcript back and sent it as
+// history (#169), on the belief that the door ignores its own store. That
+// read never matched anything on 2026.7.1 — sessions.json keys a session
+// "agent:main:<key>", not "<key>" — and it is gone: had it matched, the model
+// would have seen every earlier turn twice, and a compaction would have been
+// undone by the full pre-compaction text riding along.
+//
+// Compaction appends a `compaction` record and keeps every message line
+// (`truncateAfterCompaction`, which would rotate the file, is opt-in and off),
+// so invariant 7 is not met by the harness here. A MANUAL compaction keeps
+// its recent tail only while agents.defaults.compaction.keepRecentTokens is
+// set, which the render does (inference.go): unset, openclaw rewrites the
+// record to replay from the summary alone, and the tail is lost.
+//
+// The private-format coupling (sessions.json shape, file naming) is
+// quarantined here, in openclaw's own package — the same kind of coupling this
+// adapter already has (it parses openclaw.json). An openclaw upgrade that
+// changes them is THIS file's maintenance burden.
 
 const sessionKeyHeader = "x-openclaw-session-key"
 
@@ -85,7 +85,7 @@ func mintConversationKey() string {
 }
 
 // ConversationHeaders implements framework.ConversationSession: pin the one
-// session key, so openclaw files every stateful turn under ONE transcript.
+// session key, so openclaw files every stateful turn under ONE session.
 func (a *Adapter) ConversationHeaders() map[string]string {
 	return map[string]string{sessionKeyHeader: currentConversationKey()}
 }
@@ -94,6 +94,16 @@ func (a *Adapter) ConversationHeaders() map[string]string {
 // session keys do not rotate — nothing to follow.
 func (a *Adapter) ObserveConversation(map[string]string, http.Header) {}
 
+// ConversationHistory implements framework.ConversationHistory with NO prior
+// turns, on purpose: the gateway replays the pinned session itself, so the
+// door must forward only the current turn — exactly what a history hook with
+// nothing to prepend makes it do (proxy synthUpstreamMessages: the client's
+// history is dropped, its last user message kept). Without the hook the door
+// would forward the client's history, and the model would see it twice.
+func (a *Adapter) ConversationHistory(context.Context) ([]framework.ConversationTurn, error) {
+	return nil, nil
+}
+
 // sessionEntry is the slice of openclaw's sessions.json this package needs:
 // the store is a map keyed by session key.
 type sessionEntry struct {
@@ -101,167 +111,141 @@ type sessionEntry struct {
 	SessionFile string `json:"sessionFile"`
 }
 
-// transcriptPathForKey resolves the pinned key to its transcript file via
-// openclaw's own sessions.json. Empty when the key has no session yet (first
-// turn ever) — that is data, not an error.
+// storeKeys are the sessions.json keys a pinned session key may be filed
+// under: the gateway's canonical "agent:<agentId>:<key>" (2026.7.1), then the
+// bare key.
+func storeKeys(key string) []string {
+	return []string{"agent:" + openclawAgentID + ":" + key, key}
+}
+
+// maxSessionsStore bounds the read of the agent-writable sessions.json.
+const maxSessionsStore = 64 << 20
+
+// sessionFilesForKey names the files openclaw keeps for one session key, as
+// plain names in the directory root is open on: the transcript, and the
+// trajectory record and its pointer — the trajectory holds each turn's full
+// prompt and reply, so the conversation lives there too (openclaw caps it at
+// 10 MiB per session). Empty when the key has no session.
 //
 // SECURITY (review #169): sessions.json lives under openclawHome, the tree
-// privsep hands to the de-privileged framework user — i.e. the agent mind can
-// rewrite it. This function runs in the ROOT sealed process and what it reads
-// is piped into the next upstream request body, so a verbatim `sessionFile`
-// would let an adversarial agent point root at any file and read its bytes
-// back across the exact boundary privsep exists to hold. Every candidate is
-// therefore CONTAINED to sessionsDir(); a violation logs and degrades to
-// empty history, never fails the turn.
-func transcriptPathForKey(key string) (string, error) {
-	raw, err := os.ReadFile(sessionsStorePath())
+// privsep hands to the de-privileged framework user — the agent mind can
+// rewrite it, and swap any directory in it for a symlink — while the ROOT
+// sealed process deletes what it names. So the store is read through the
+// same os.Root the deletions go through (one directory, pinned at open: no
+// swap in between), and nothing it says is used as a path — only a plain
+// file name survives, which os.Root removes without following.
+func sessionFilesForKey(root *os.Root, key string) ([]string, error) {
+	f, err := root.Open("sessions.json")
 	if os.IsNotExist(err) {
-		return "", nil
+		return nil, nil
 	}
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxSessionsStore+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxSessionsStore {
+		return nil, fmt.Errorf("%s is over %d bytes", sessionsStorePath(), maxSessionsStore)
 	}
 	var store map[string]sessionEntry
 	if err := json.Unmarshal(raw, &store); err != nil {
-		return "", fmt.Errorf("parse %s: %w", sessionsStorePath(), err)
+		return nil, fmt.Errorf("parse %s: %w", sessionsStorePath(), err)
 	}
-	entry, ok := store[key]
-	if !ok {
-		return "", nil
-	}
-	if entry.SessionFile != "" {
-		if p := containedTranscriptPath(entry.SessionFile); p != "" {
-			return p, nil
+	var entry sessionEntry
+	found := false
+	for _, k := range storeKeys(key) {
+		if e, ok := store[k]; ok {
+			entry, found = e, true
+			break
 		}
-		logger.Logf("openclaw conversation: sessions.json names a transcript OUTSIDE %s (%q) — refusing it (agent-writable store; see conversation.go)", sessionsDir(), entry.SessionFile)
-		// fall through to the SessionID construction
 	}
-	if entry.SessionID == "" {
-		return "", nil
-	}
-	if strings.ContainsAny(entry.SessionID, "/\\") || strings.Contains(entry.SessionID, "..") {
-		logger.Logf("openclaw conversation: sessions.json sessionId %q is path-shaped — refusing it", entry.SessionID)
-		return "", nil
-	}
-	return filepath.Join(sessionsDir(), entry.SessionID+".jsonl"), nil
-}
-
-// containedTranscriptPath returns the cleaned path when it resolves INSIDE
-// sessionsDir(), else "".
-func containedTranscriptPath(candidate string) string {
-	p := filepath.Clean(candidate)
-	if !filepath.IsAbs(p) {
-		// The v3 store has been observed with absolute paths; a relative one
-		// would resolve against the sealed process's cwd — wrong either way.
-		p = filepath.Join(sessionsDir(), p)
-	}
-	rel, err := filepath.Rel(sessionsDir(), p)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	return p
-}
-
-// ConversationHistory implements framework.ConversationHistory: prior turns
-// from openclaw's own transcript. Transcript lines are
-// {type:"message", message:{role, content}} where content is a string or an
-// array of {type:"text", text} parts; everything else (header, tool records)
-// is skipped — the same TEXT-history limitation the synth door has always
-// documented.
-func (a *Adapter) ConversationHistory(_ context.Context) ([]framework.ConversationTurn, error) {
-	path, err := transcriptPathForKey(currentConversationKey())
-	if err != nil || path == "" {
-		return nil, err
-	}
-	// os.OpenRoot: kernel-level containment (review #169 hardening note).
-	// Lexical containment above cannot stop a symlink planted INSIDE
-	// sessionsDir — the tree is agent-writable, so a legit-named .jsonl could
-	// itself point at a root-only file and pass every string check. Root.Open
-	// refuses to follow anything that escapes the directory.
-	rel, err := filepath.Rel(sessionsDir(), path)
-	if err != nil {
-		return nil, err
-	}
-	dirRoot, err := os.OpenRoot(sessionsDir())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // no sessions dir yet — first turn ever
-		}
-		return nil, err
-	}
-	defer dirRoot.Close()
-	f, err := dirRoot.Open(rel)
-	if os.IsNotExist(err) {
-		return nil, nil // mapped but not yet written — first turn in flight
-	}
-	if err != nil {
-		logger.Logf("openclaw conversation: transcript open refused (%v) — degrading to empty history", err)
+	if !found {
 		return nil, nil
 	}
-	defer f.Close()
-
-	var turns []framework.ConversationTurn
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 256*1024), 8*1024*1024)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var rec struct {
-			Type    string `json:"type"`
-			Message struct {
-				Role    string          `json:"role"`
-				Content json.RawMessage `json:"content"`
-			} `json:"message"`
-		}
-		if err := json.Unmarshal(line, &rec); err != nil {
-			continue // torn tail or foreign record — skip, never fail the turn
-		}
-		if rec.Type != "message" || (rec.Message.Role != "user" && rec.Message.Role != "assistant") {
-			continue
-		}
-		if text := contentText(rec.Message.Content); text != "" {
-			turns = append(turns, framework.ConversationTurn{Role: rec.Message.Role, Text: text})
+	var stems []string
+	if entry.SessionFile != "" {
+		if name := sessionFileName(entry.SessionFile); name != "" {
+			stems = append(stems, strings.TrimSuffix(name, ".jsonl"))
+		} else {
+			logger.Logf("openclaw conversation: sessions.json names a transcript outside %s (%q) — ignoring it (agent-writable store; see conversation.go)", sessionsDir(), entry.SessionFile)
 		}
 	}
-	if err := sc.Err(); err != nil {
-		// A mid-file scanner failure (or a single line past the buffer cap)
-		// would otherwise truncate history with no trace — CONVERSATION.md
-		// promises loud degradation.
-		logger.Logf("openclaw conversation: transcript read stopped early (%v) — history truncated at %d turns", err, len(turns))
+	if entry.SessionID != "" {
+		if plainFileName(entry.SessionID) {
+			stems = append(stems, entry.SessionID)
+		} else {
+			logger.Logf("openclaw conversation: sessions.json sessionId %q is path-shaped — ignoring it", entry.SessionID)
+		}
 	}
-	return turns, nil
+	var names []string
+	seen := map[string]bool{}
+	for _, stem := range stems {
+		for _, n := range []string{stem + ".jsonl", stem + ".trajectory.jsonl", stem + ".trajectory-path.json"} {
+			if !seen[n] {
+				seen[n] = true
+				names = append(names, n)
+			}
+		}
+	}
+	return names, nil
 }
 
-// contentText flattens openclaw's message content (string, or an array of
-// typed parts) to its text.
-func contentText(raw json.RawMessage) string {
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		return s
+// sessionFileName returns the base name of candidate when it sits DIRECTLY in
+// sessionsDir() (the shape openclaw writes: an absolute path there), else "".
+func sessionFileName(candidate string) string {
+	p := filepath.Clean(candidate)
+	if !filepath.IsAbs(p) {
+		// A relative one would resolve against the sealed process's cwd —
+		// read it as relative to the sessions dir instead.
+		p = filepath.Join(sessionsDir(), p)
 	}
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
+	if filepath.Dir(p) != filepath.Clean(sessionsDir()) {
 		return ""
 	}
-	var b strings.Builder
-	for _, p := range parts {
-		if p.Type == "text" && p.Text != "" {
-			b.WriteString(p.Text)
+	if name := filepath.Base(p); plainFileName(name) {
+		return name
+	}
+	return ""
+}
+
+// plainFileName reports whether s can only ever name an entry in the current
+// directory.
+func plainFileName(s string) bool {
+	return s != "" && s != "." && s != ".." && !strings.ContainsAny(s, "/\\\x00")
+}
+
+// removeSessionFiles deletes the files of key's session from sessionsDir(),
+// best-effort and logged. A name that is a symlink is removed itself, never
+// followed.
+func removeSessionFiles(key string) {
+	root, err := os.OpenRoot(sessionsDir())
+	if err != nil {
+		if !os.IsNotExist(err) {
+			logger.Logf("openclaw conversation: open %s: %v — superseded session files left in place", sessionsDir(), err)
+		}
+		return
+	}
+	defer root.Close()
+	names, err := sessionFilesForKey(root, key)
+	if err != nil {
+		logger.Logf("openclaw conversation: %v — superseded session files left in place", err)
+		return
+	}
+	for _, n := range names {
+		if err := root.Remove(n); err != nil && !os.IsNotExist(err) {
+			logger.Logf("openclaw conversation: remove %s: %v", n, err)
 		}
 	}
-	return b.String()
 }
 
 // ClearSession implements framework.SessionClearer: mint a fresh session key
-// — the next turn starts an empty transcript. The superseded transcript file
-// is removed best-effort; the sessions.json entry is openclaw's own store and
-// is left for openclaw to manage (rewriting a live store it owns from outside
-// risks corrupting it mid-write).
+// — the next turn starts an empty session — and delete the superseded
+// session's files. The sessions.json entry is openclaw's own store and is left
+// for openclaw to manage (rewriting a live store it owns from outside risks
+// corrupting it mid-write).
 func (a *Adapter) ClearSession(_ context.Context) error {
 	convMu.Lock()
 	oldKey := ""
@@ -273,15 +257,12 @@ func (a *Adapter) ClearSession(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("openclaw.ClearSession: %w", err)
 	}
-	// Remove the superseded transcript outside the lock: at worst an in-flight
-	// turn on oldKey recreates it (openclaw is still appending), leaving an
-	// ORPHAN — the key has already rotated, so ConversationHistory reads the
-	// new key's file and never the orphan (audit #169 F4: leak, not
-	// resurrection). A stray orphan is swept on the next boot's rotation path.
+	// Delete outside the lock: at worst an in-flight turn on oldKey recreates
+	// a file (openclaw is still writing), leaving an ORPHAN — the key has
+	// already rotated, so the gateway serves the new key's session and never
+	// the orphan (audit #169 F4: leak, not resurrection).
 	if oldKey != "" {
-		if path, perr := transcriptPathForKey(oldKey); perr == nil && path != "" {
-			_ = os.Remove(path)
-		}
+		removeSessionFiles(oldKey)
 	}
 	return nil
 }

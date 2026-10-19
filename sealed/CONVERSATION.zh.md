@@ -60,7 +60,7 @@ adapter 在自己的包里用自己的方言作答。
 `x-openclaw-session-key`),但都没有实现 `starting_after` 续传。后续(独立 PR):
 先在真容器里验证两扇原生门(重启后能否延续、流格式与 CLI/SDK 是否兼容、断线和
 取消时的行为),再把 hermes/openclaw 改为直接转发过去,并删除 synth 以及它所需的
-补偿机制——hermes 的 id 文件及其比较交换(§4)、openclaw 读 transcript。
+补偿机制——hermes 的 id 文件及其比较交换(§4)、openclaw 的"只发当前轮"历史钩子。
 
 四个能力接口:
 
@@ -68,10 +68,11 @@ adapter 在自己的包里用自己的方言作答。
   该 agent 唯一对话的 header,并连同本轮发出时的 header 一起观察每个上游响应
   (hermes 在压缩时轮换会话 id;不跟随回吐会分叉对话,跟随了过期的回吐会让已
   清除的对话复活)。
-- **`framework.ConversationHistory`** —— 框架持久化了 transcript 但它自己的网关
-  从不回读(openclaw)时,adapter 从那份存储供给历史;有状态门随即忽略客户端发的
-  历史,只取客户端的当前轮。历史读取失败**响亮地**降级为客户端输入——坏存储
-  不能杀掉这一轮。
+- **`framework.ConversationHistory`** —— 有状态门忽略客户端发的历史,只取客户端的
+  当前轮,前面接上 adapter 返回的历史。网关自己会重放会话的框架返回空:openclaw
+  就是这样,在它的重放之上再叠客户端的历史,模型会看到两遍(实测,§4)。网关不重放
+  的框架则从 harness 自己的存储返回历史。历史读取失败**响亮地**降级为客户端
+  输入——坏存储不能杀掉这一轮。
 - **`framework.SessionClearer`** —— 清掉存储;main.go 在成功清除后重启进程。
   proxy 暴露一条 owner 签名的 `POST /_seal/clear`(tag `0GSealClear`,settings
   推送文法,占座门控),CLI 加 `/clear`;历史在客户端侧的 adapter 答 501,CLI
@@ -104,7 +105,7 @@ adapter 在自己的包里用自己的方言作答。
 | **prime** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | `createAgentSession({ …, sessionManager: SessionManager.open(SEAL_CONVERSATION_FILE) })` —— SDK 自己逐条追加(消息、工具调用、压缩、思考),重启 `open()` 重建上下文。文件 `/root/.prime-conversation/owner-chat.jsonl`,在 `primeHome` 外,`privsep` 交接属主。自轮转切在最近压缩条目(保留 header、压缩条目重挂根、丢弃更早行);损坏文件隔离(`.corrupt-<ts>`)后开新。真 SDK 验证:轮转 9209B→729B 且上下文可重建;断尾行可容忍。 | 删文件+残留,重启 |
 | **hermes** | 它自己的网关,经 `ConversationSession` 绑定 | 网关在 HTTP 上本就有状态:`X-Hermes-Session-Id`(Bearer `API_SERVER_KEY`,早已设置)让历史从 `~/.hermes/state.db` 读、body 最后一条为当前轮。adapter 铸造并持久化唯一 id(`~/.hermes/.seal-conversation-id`)并**跟随**回吐的 id——压缩会结束父会话、在子 id 上续。不安全回吐(路径形、控制字符)永不落盘。不变量 7 注:transcript 存储是 hermes 自己的 `state.db`——它的存储、它的压缩;自轮转不适用于 harness 自有的文件。 | 铸新 id(旧行留在 hermes 的 db,无引用),重启 |
 | **dsh** | `bridge.mjs` + `sessionstore.mjs`(原生 `/v1/responses`) | 无现成后端(`SessionPersistence` 接缝无具体子类;没它 `resume()` 拒绝)。桥即后端:`owner-chat` 会话每个已提交 `session/event` 经 `packChunkRuns` 追加;boot 时 `decodeStorageRecord` 解码后作 `ctx.agents.create({ seed, meta:{seedLength} })` 的种子;`interruptedTurnClosers` 闭合中途崩溃(closer 也落盘,文件自平衡);seq 守卫跳过重发的种子事件。轮转必然更粗:seed 必须从 seq 0 连续,砍不了头——到上限就归档、响亮地重开新对话。文件 `/root/.dsh/owner-chat.session.jsonl`(本就归为不追踪)。真 SDK 验证:追加→装载→`Session.fromRestore`(create 的校验器)通过;崩溃修复平衡。 | 删日志+残留,重启 |
-| **openclaw** | `ConversationSession` + `ConversationHistory`,在 adapter 包内 | openclaw 把每轮网关对话都落盘(`~/.openclaw/agents/main/sessions/<id>.jsonl`,`sessions.json` 存 key→session 映射)但它的 OpenAI 门从不回读。adapter 钉一个会话 key(`x-openclaw-session-key`,存 `~/.openclaw/.seal-conversation-key`)让有状态门的所有轮次落进同一份 transcript,并把它读回作历史(文本轮次;工具记录跳过——synth 门一贯记录的限制)。私有 `version:3` 格式耦合关在 openclaw 包内——和这个 adapter 已有的耦合同类(它本就解析 openclaw.json)。不变量 7(2026-10-19 复核,见下方的坑):openclaw 的压缩是**追加**一条 `compaction` 记录、保留所有消息行——会轮转文件的 `truncateAfterCompaction` 需显式开启、默认关——所以这里 harness 并没有给文件封顶;待解决。 | 轮换 key + 尽力删被替换的 transcript(openclaw 的 `sessions.json` 是它自己的存储——绝不从外部改写),重启 |
+| **openclaw** | `ConversationSession` + `ConversationHistory`,在 adapter 包内 | openclaw 把每轮网关对话都落盘(`~/.openclaw/agents/main/sessions/<id>.jsonl`,`sessions.json` 存 key→session 映射),它的网关会把钉住的会话**重放**进每一轮。adapter 钉一个会话 key(`x-openclaw-session-key`,存 `~/.openclaw/.seal-conversation-key`)让有状态门的所有轮次落进同一个会话,并让门只发当前轮(`ConversationHistory` 返回空——见下方的坑)。私有格式耦合(`sessions.json` 结构、文件命名)关在 openclaw 包内——和这个 adapter 已有的耦合同类(它本就解析 openclaw.json)。不变量 7(2026-10-19 复核,见下方的坑):openclaw 的压缩是**追加**一条 `compaction` 记录、保留所有消息行——会轮转文件的 `truncateAfterCompaction` 需显式开启、默认关——所以这里 harness 并没有给文件封顶;待解决。 | 轮换 key + 删掉被替换会话的文件——transcript 和 trajectory 记录(openclaw 的 `sessions.json` 是它自己的存储——绝不从外部改写),重启 |
 
 源码级的坑,记录在案:
 
@@ -120,20 +121,27 @@ adapter 在自己的包里用自己的方言作答。
   持久器收不到,**第二次重启**就撞连续性校验砖死(评审 #169 blocker,跨代实证)。
   `loadSeed` 预先把标记同时写入文件和返回的 seed,构造器便不再追加。
 - openclaw 的 `sessions.json` 是 **agent 可写的**(privsep 把 openclawHome 交给
-  框架用户),所以它命名的 `sessionFile` 在 root 进程打开前必须被词法约束在
-  sessionsDir() 内,且打开走 `os.OpenRoot`——词法检查拦不住目录**内部**栽的符号链接——否则对抗性 agent 可让 root 把任意文件读进它自己的上游请求
-  (评审 #169)。
-- openclaw 2026.7.1 的 `sessions.json` 以 `agent:main:<key>` 为键(2026-10-19 离线
-  复核,用的是网关自己写出的文件):adapter 按裸 key 查不到,所以
-  `ConversationHistory` 读不出任何一轮(原样 0 轮,把裸 key 补进去后 4 轮),
-  `ClearSession` 也删不掉被替换的 transcript。对话仍能延续,是因为**网关**把钉住的
-  会话重放进每一轮——模型看到的不只是门发来的那一条——而且这个重放遵循压缩
-  (先摘要,再保留的尾部),`/compact` 正是因此生效。**手动**压缩只有在设置了
-  `agents.defaults.compaction.keepRecentTokens` 时才保留这段尾部——不设的话,
-  openclaw 会改写记录,让重放从摘要开始,而那段从未被总结的尾部就丢了(离线实测)——
-  所以 render 会写入 openclaw 自己的默认值 20000,除非 owner 的 overlay 另有指定。
-  待解决:让查找命中会在网关自己的上下文之上再发一遍压缩前的全文,所以回读和重放
-  必须一起理顺。
+  框架用户),而 `/clear` 时 **root** 进程会删掉它命名的文件。所以它里面的内容一律
+  不当路径用——只保留直接位于 sessions 目录下的纯文件名——并且读这个存储、删这些
+  文件都经过**同一个**打开在该目录上的 `os.Root`:目录内部栽的符号链接只删链接
+  本身、绝不跟随,目录也没法在读和删之间被偷换(评审 #169 的收容,现在用在删除
+  路径上;它最初保护的那次读取已经删掉)。
+- openclaw 的网关会把钉住的会话**重放**进每一轮(2026-10-19 在 2026.7.1 上离线
+  验证):单独发出的一轮,到达模型时前面带着之前的各轮;**附带**客户端历史发出的
+  一轮,到达模型时那段历史出现了两遍——网关的重放,加上客户端那份被折进新消息,
+  写成 `[Chat messages since your last reply - for context] …`。所以门只能发当前
+  轮,`ConversationHistory` 返回空正是让它这么做。#169 让 adapter 把 transcript
+  读回来当历史发出去,依据是"门不读自己的存储";这次读取从没命中过——2026.7.1 在
+  `sessions.json` 里把会话记在 `agent:main:<key>` 下,而不是 `<key>`——所以它一直
+  是死代码,现已删除(假如它命中了,之前的每一轮都会到达模型两遍)。
+  `ClearSession` 也因同样的原因从没删掉过任何东西;现在它按 `agent:main:<key>`
+  (再退到裸 key)找到旧会话,删掉它的 transcript **和** trajectory 记录——每轮
+  完整的提示和回复,openclaw 每个会话封顶 10 MiB——已在网关写出的真实文件上验证,
+  网关在删除后能正常重启。这个重放遵循压缩(先摘要,再保留的尾部),`/compact` 正是
+  因此生效。**手动**压缩只有在设置了 `agents.defaults.compaction.keepRecentTokens`
+  时才保留这段尾部——不设的话,openclaw 会改写记录,让重放从摘要开始,而那段从未
+  被总结的尾部就丢了(离线实测)——所以 render 会写入 openclaw 自己的默认值
+  20000,除非 owner 的 overlay 另有指定。
 - hermes 在压缩时**轮换**会话 id——钉死一个 id 会分叉对话;必须跟随回吐。
   跟随用的是对本轮**发出时** id 的比较交换:synth 不串行任务,一个跨过 `/clear`
   (或落在更新一轮的轮换之后)仍在飞的旧轮,否则会把旧 id 写回、让已清除的对话
@@ -172,10 +180,11 @@ client(零历史)**发出——连续性只可能来自容器:
   两个存储。这次意外恰好把"对话 vs 记忆"的设计区分做了真机演示,是这条设计线
   最有力的证据。
 - 投毒 sessions.json 的收容**未能 live 执行**:agent 两次拒绝破坏自己的会话
-  存储,即使以 owner 名义的演练说明——这本身值得记录。收容依据单测(5 例词法 +
-  os.OpenRoot 符号链接),驱动同一代码路径。
+  存储,即使以 owner 名义的演练说明——这本身值得记录。收容依据单测(收容用例 +
+  符号链接测试,读取删除后改在删除路径上),驱动同一代码路径。
 - openclaw persist 时序:问第 N+1 轮时 transcript 已含第 N 轮(全新 client 的
-  同 boot 读回证明了回读路径)。
+  同 boot 连续性)。2026-10-19 复核:起作用的是网关自己的重放——回读在 2026.7.1
+  上从没命中过 key。
 - hermes 压缩轮换未在演练中触发(需要长对话);跟随逻辑有单测,回吐语义读自
   网关源码。
 
@@ -192,6 +201,8 @@ client(零历史)**发出——连续性只可能来自容器:
 2. ✅ dsh —— 桥事件日志后端 + seed 重建 + 崩溃修复 + ClearSession
 3. ✅ hermes —— 会话 id 钉住 + 轮换跟随 + ClearSession
 4. ✅ openclaw —— 会话 key 钉住 + transcript 作历史 + ClearSession
+   (2026-10-19:transcript 作历史已移除——网关自己重放会话;ClearSession 现在能
+   找到并删掉旧会话的文件)
 5. ✅ `/_seal/clear` + SDK `clearConversation` + CLI `/clear`
 
 之后新增:`/_seal/compact` + SDK `compactConversation` + CLI `/compact`,覆盖
@@ -209,7 +220,6 @@ openclaw 的坑)。离线(桩模型)验证:dsh 桥在已有压缩挂起时拒绝
 源码)。距离"真正完成"还欠:T2 真机演练——每个框架对话中杀进程 → 重启 → agent
 无客户端重放答出杀前信息;`/clear` → 答不出;容器重建 → 新对话、链上记忆完好
 ——这需要四个镜像重建。按 #169 评审:演练必须对**同一对话重启两次**(dsh 的 end-seed 洞只在第二次重启
-咬人——一次重启证明不了什么),并断言 openclaw 的历史读取被收容(投毒的
-`sessions.json` sessionFile 在日志中被拒、历史降级为空、该轮存活)。有一项 openclaw 专属检查只能在演练里做、静态定不了:
-问第 N+1 轮时 transcript 必须已含第 N 轮(按源码 openclaw 在 turn 管线内持久化,
-但若持久化滞后于响应,我们的回读就会比对话慢一轮)。
+咬人——一次重启证明不了什么),并断言 openclaw 的 `/clear` 删除被收容(投毒的
+`sessions.json` sessionFile 在日志中被忽略、sessions 目录之外什么都不碰、清除
+照样成功)。

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -15,54 +16,50 @@ func redirectHome(t *testing.T) {
 	t.Cleanup(func() { openclawHome = old })
 }
 
-// Write an openclaw-shaped store + transcript for the pinned key.
-func plantTranscript(t *testing.T, key string, lines []string) string {
+// plantSession writes an openclaw-shaped store entry under storeKey and the
+// named files (relative to sessionsDir) with their content.
+func plantSession(t *testing.T, storeKey string, entry sessionEntry, files map[string]string) {
 	t.Helper()
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	tp := filepath.Join(sessionsDir(), "sess-1.jsonl")
-	store := map[string]sessionEntry{key: {SessionID: "sess-1"}}
-	raw, _ := json.Marshal(store)
+	raw, _ := json.Marshal(map[string]sessionEntry{storeKey: entry})
 	if err := os.WriteFile(sessionsStorePath(), raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	body := ""
-	for _, l := range lines {
-		body += l + "\n"
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(sessionsDir(), name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.WriteFile(tp, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return tp
 }
 
-// The real v3 transcript shape: header line, then message records whose
-// content is a string OR an array of typed parts. Foreign records skip.
-func TestConversationHistory_ReadsOpenclawTranscript(t *testing.T) {
+// The shape openclaw 2026.7.1 writes: the session filed under
+// "agent:main:<key>", an absolute sessionFile, and a trajectory record plus
+// its pointer next to the transcript.
+func plantRealSession(t *testing.T, key string) []string {
+	t.Helper()
+	files := []string{"sess-1.jsonl", "sess-1.trajectory.jsonl", "sess-1.trajectory-path.json"}
+	plantSession(t, "agent:main:"+key,
+		sessionEntry{SessionID: "sess-1", SessionFile: filepath.Join(sessionsDir(), "sess-1.jsonl")},
+		map[string]string{
+			files[0]: `{"type":"message","id":"m1","message":{"role":"user","content":"codeword lychee42"}}` + "\n",
+			files[1]: `{"type":"prompt.submitted","data":"codeword lychee42"}` + "\n",
+			files[2]: `{"traceSchema":"openclaw-trajectory-pointer","schemaVersion":1,"sessionId":"sess-1"}`,
+		})
+	return files
+}
+
+// The gateway replays the pinned session itself, so the door must send only
+// the current turn: the hook returns no prior turns even with a transcript
+// full of them on disk.
+func TestConversationHistory_SendsOnlyTheCurrentTurn(t *testing.T) {
 	redirectHome(t)
 	a := &Adapter{}
-	key := a.ConversationHeaders()[sessionKeyHeader]
-	plantTranscript(t, key, []string{
-		`{"type":"session","version":3,"id":"sess-1","timestamp":"2026-09-29T00:00:00Z","cwd":"/root"}`,
-		`{"type":"message","id":"m1","message":{"role":"user","content":"codeword lychee42"}}`,
-		`{"type":"message","id":"m2","message":{"role":"assistant","content":[{"type":"text","text":"noted: "},{"type":"text","text":"lychee42"}],"usage":{"input":1}}}`,
-		`{"type":"custom","id":"m3"}`,
-		`{"type":"message","id":"m4","message":{"role":"toolResult","content":"skipped"}}`,
-		`{"type":"message","id":"m5","message":` /* torn crash tail */,
-	})
+	plantRealSession(t, a.ConversationHeaders()[sessionKeyHeader])
 	turns, err := a.ConversationHistory(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(turns) != 2 {
-		t.Fatalf("want 2 turns, got %d: %+v", len(turns), turns)
-	}
-	if turns[0].Role != "user" || turns[0].Text != "codeword lychee42" {
-		t.Fatalf("user turn wrong: %+v", turns[0])
-	}
-	if turns[1].Role != "assistant" || turns[1].Text != "noted: lychee42" {
-		t.Fatalf("assistant parts must flatten: %+v", turns[1])
+	if err != nil || turns != nil {
+		t.Fatalf("turns=%v err=%v; want nil/nil — prepending history would duplicate the gateway's replay", turns, err)
 	}
 }
 
@@ -87,94 +84,126 @@ func TestConversationKey_Stable(t *testing.T) {
 	}
 }
 
-// /clear rotates the key and removes the superseded transcript; openclaw's
-// own sessions.json is left alone (its store, its write cycle).
-func TestClearSession_RotatesKeyAndRemovesTranscript(t *testing.T) {
+// /clear rotates the key and deletes the superseded session's files — the
+// transcript AND the trajectory, which holds the same conversation — found
+// under the key openclaw actually files it by. Another session's files and
+// openclaw's own sessions.json are left alone.
+func TestClearSession_RemovesTheSupersededSessionFiles(t *testing.T) {
 	redirectHome(t)
 	a := &Adapter{}
 	key := a.ConversationHeaders()[sessionKeyHeader]
-	tp := plantTranscript(t, key, []string{`{"type":"session","version":3,"id":"sess-1"}`})
+	files := plantRealSession(t, key)
+	other := filepath.Join(sessionsDir(), "sess-other.jsonl")
+	if err := os.WriteFile(other, []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := a.ClearSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if got := a.ConversationHeaders()[sessionKeyHeader]; got == key {
 		t.Fatal("key must rotate on clear")
 	}
-	if _, err := os.Stat(tp); !os.IsNotExist(err) {
-		t.Fatalf("superseded transcript must be removed: %v", err)
+	for _, f := range files {
+		if _, err := os.Stat(filepath.Join(sessionsDir(), f)); !os.IsNotExist(err) {
+			t.Errorf("superseded %s must be removed: %v", f, err)
+		}
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Errorf("another session's file must survive: %v", err)
 	}
 	if _, err := os.Stat(sessionsStorePath()); err != nil {
-		t.Fatalf("openclaw's own store must be left alone: %v", err)
+		t.Errorf("openclaw's own store must be left alone: %v", err)
 	}
-	turns, err := a.ConversationHistory(context.Background())
-	if err != nil || len(turns) != 0 {
-		t.Fatalf("after clear the conversation is fresh: %v %v", turns, err)
+}
+
+// A store filed under the bare key (an openclaw that does not prefix it) is
+// found too.
+func TestClearSession_BareKeyStore(t *testing.T) {
+	redirectHome(t)
+	a := &Adapter{}
+	key := a.ConversationHeaders()[sessionKeyHeader]
+	plantSession(t, key, sessionEntry{SessionID: "sess-2"}, map[string]string{"sess-2.jsonl": "{}\n"})
+	if err := a.ClearSession(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(sessionsDir(), "sess-2.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("transcript under the bare key must be removed: %v", err)
 	}
 }
 
 // sessions.json is agent-writable (privsep hands openclawHome to the framework
-// user), so a sessionFile it names must never walk the root-running adapter
-// out of sessionsDir() — that read is piped into the next upstream body.
-func TestTranscriptPath_ContainsAgentWritableStore(t *testing.T) {
+// user) and the ROOT process deletes what it names, so only plain file names
+// directly inside the sessions dir survive — never a path.
+func TestSessionFiles_ContainsAgentWritableStore(t *testing.T) {
 	redirectHome(t)
-	a := &Adapter{}
-	key := a.ConversationHeaders()[sessionKeyHeader]
+	key := "k"
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		t.Fatal(err)
+	}
+	triple := func(stem string) []string {
+		return []string{stem + ".jsonl", stem + ".trajectory.jsonl", stem + ".trajectory-path.json"}
 	}
 	cases := []struct {
 		name  string
 		entry sessionEntry
-		want  string // "" = refused/empty
+		want  []string // nil = refused/empty
 	}{
-		{"absolute escape", sessionEntry{SessionFile: "/etc/shadow"}, ""},
-		{"dotdot escape", sessionEntry{SessionFile: sessionsDir() + "/../../../etc/shadow"}, ""},
-		{"path-shaped id", sessionEntry{SessionID: "../../etc/passwd"}, ""},
-		{"legit absolute", sessionEntry{SessionFile: sessionsDir() + "/ok.jsonl"}, sessionsDir() + "/ok.jsonl"},
-		{"legit id", sessionEntry{SessionID: "sess-9"}, sessionsDir() + "/sess-9.jsonl"},
+		{"absolute escape", sessionEntry{SessionFile: "/etc/shadow"}, nil},
+		{"dotdot escape", sessionEntry{SessionFile: sessionsDir() + "/../../../etc/shadow"}, nil},
+		{"subdirectory", sessionEntry{SessionFile: sessionsDir() + "/sub/x.jsonl"}, nil},
+		{"path-shaped id", sessionEntry{SessionID: "../../etc/passwd"}, nil},
+		{"backslash id", sessionEntry{SessionID: `a\b`}, nil},
+		{"dotdot id", sessionEntry{SessionID: ".."}, nil},
+		{"legit absolute", sessionEntry{SessionFile: sessionsDir() + "/ok.jsonl"}, triple("ok")},
+		{"legit id", sessionEntry{SessionID: "sess-9"}, triple("sess-9")},
+		{"both agree", sessionEntry{SessionID: "s", SessionFile: sessionsDir() + "/s.jsonl"}, triple("s")},
 	}
 	for _, c := range cases {
-		raw, _ := json.Marshal(map[string]sessionEntry{key: c.entry})
+		raw, _ := json.Marshal(map[string]sessionEntry{"agent:main:" + key: c.entry})
 		if err := os.WriteFile(sessionsStorePath(), raw, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		got, err := transcriptPathForKey(key)
+		root, err := os.OpenRoot(sessionsDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := sessionFilesForKey(root, key)
+		root.Close()
 		if err != nil {
 			t.Fatalf("%s: %v", c.name, err)
 		}
-		if got != c.want {
+		if !slices.Equal(got, c.want) {
 			t.Fatalf("%s: got %q want %q", c.name, got, c.want)
 		}
 	}
 }
 
-// Lexical containment cannot stop a symlink planted INSIDE the agent-writable
-// sessionsDir; os.OpenRoot must refuse to follow it out (review #169
-// hardening note). The turn degrades to empty history, never reads the target.
-func TestConversationHistory_RefusesSymlinkEscape(t *testing.T) {
+// A symlink planted INSIDE the agent-writable sessions dir under a legit name
+// is removed itself; what it points at is never touched.
+func TestClearSession_DoesNotFollowSymlinks(t *testing.T) {
 	redirectHome(t)
 	a := &Adapter{}
 	key := a.ConversationHeaders()[sessionKeyHeader]
 	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	secret := filepath.Join(t.TempDir(), "root-only.txt")
-	if err := os.WriteFile(secret, []byte(`{"type":"message","id":"x","message":{"role":"user","content":"EXFILTRATED"}}`), 0o600); err != nil {
+	victim := filepath.Join(t.TempDir(), "root-only.jsonl")
+	if err := os.WriteFile(victim, []byte("precious"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// A legit-named transcript that is actually a symlink out of the dir.
-	if err := os.Symlink(secret, filepath.Join(sessionsDir(), "sess-evil.jsonl")); err != nil {
+	if err := os.Symlink(victim, filepath.Join(sessionsDir(), "sess-evil.jsonl")); err != nil {
 		t.Skipf("no symlink support: %v", err)
 	}
-	raw, _ := json.Marshal(map[string]sessionEntry{key: {SessionID: "sess-evil"}})
-	if err := os.WriteFile(sessionsStorePath(), raw, 0o644); err != nil {
+	plantSession(t, "agent:main:"+key, sessionEntry{SessionID: "sess-evil"}, nil)
+
+	if err := a.ClearSession(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	turns, err := a.ConversationHistory(context.Background())
-	if err != nil {
-		t.Fatalf("must degrade, not error: %v", err)
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "precious" {
+		t.Fatalf("the symlink's target was touched: %q %v", b, err)
 	}
-	if len(turns) != 0 {
-		t.Fatalf("symlink escape was followed: %+v", turns)
+	if _, err := os.Lstat(filepath.Join(sessionsDir(), "sess-evil.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("the planted link itself should be gone: %v", err)
 	}
 }

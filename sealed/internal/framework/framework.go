@@ -337,13 +337,14 @@ type ConversationTurn struct {
 	Text string
 }
 
-// ConversationHistory is implemented by adapters whose framework PERSISTS a
-// transcript that its own gateway never reads back (openclaw: the OpenAI door
-// takes the client's messages[] as authoritative). The stateful responses
-// door calls this instead of trusting client-sent history: prior turns come
-// from the harness's own store, the client supplies only the current turn.
-// The private on-disk format knowledge stays HERE, in the framework's own
-// package — the caller never parses the store (CONVERSATION.md §3).
+// ConversationHistory is implemented by adapters whose stateful turns must
+// NOT carry the client's history. The stateful responses door then ignores
+// client-sent history: it sends the prior turns this returns, then only the
+// client's current turn. An adapter whose gateway replays its own session
+// returns none (openclaw: a client's history on top of that replay reaches
+// the model twice); one whose gateway does not would return the turns from
+// the harness's own store. Any on-disk format knowledge stays in the
+// framework's own package — the caller never parses a store (CONVERSATION.md §3).
 type ConversationHistory interface {
 	ConversationHistory(ctx context.Context) ([]ConversationTurn, error)
 }

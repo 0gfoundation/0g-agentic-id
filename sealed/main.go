@@ -788,9 +788,9 @@ func startAgent(
 	if cs, ok := adapter.(framework.ConversationSession); ok {
 		sealedProxy.SetConversationSession(cs.ConversationHeaders, cs.ObserveConversation)
 	}
-	// Frameworks that persist a transcript their own gateway never reads back
-	// (openclaw): the stateful door takes prior turns from that store and the
-	// client sends only the current turn.
+	// Frameworks whose stateful turns must not carry the client's history: the
+	// door sends the prior turns the adapter returns — none for openclaw,
+	// whose gateway replays its own session — then only the current turn.
 	if ch, ok := adapter.(framework.ConversationHistory); ok {
 		sealedProxy.SetConversationHistory(func(ctx context.Context) ([]proxy.ConversationTurn, error) {
 			turns, err := ch.ConversationHistory(ctx)
