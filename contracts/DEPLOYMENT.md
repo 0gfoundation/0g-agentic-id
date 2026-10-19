@@ -413,17 +413,28 @@ Changelog:
   revert `VerifiedFeedbackInvalidProofSignature` — no dual-accept window.
   (2) `attestFeedbackWithTask` requires `statusCode` in 100..999, else
   `VerifiedFeedbackInvalidTaskReveal`. (3) The agent's own agentSeal may not
-  attest (`VerifiedFeedbackSelfFeedback`). **Hard-cut rollout — one window:**
+  attest (`VerifiedFeedbackSelfFeedback`). **Hard-cut rollout — one window.**
+  The ordering is a correctness dependency, not hygiene: old images' proofs
+  stop verifying the moment the beacon lands, and new images' proofs verify
+  nowhere before it does. Each step ends with a check — confirm it before
+  moving on (`$RPC`, `$AGENTIC_ID`, `$VF`, `$API` = that environment's RPC,
+  AgenticID proxy, VF proxy and attestor URL, §6):
+  0. Pin the digest before touching anything:
+     `bash attestor/scripts/verify-agent.sh --kat` → `OK serveproof_digest KAT`.
   1. The pauser `pause()`s the deprecated fork proxies (test `0xeDe7…D196`,
      dev `0x884c…63d2`; mainnet has none) before or at the cut — they still
      accept the legacy digest, which any agent can produce through its sign
-     socket. Not yet done as of this entry.
+     socket. Not yet done as of this entry. Check:
+     `cast call <fork proxy> 'paused()(bool)' --rpc-url $RPC` → `true`.
   2. Build the new sealed images. For every new image hash the AgenticID
      owner calls `addValidFrameworkHash` on each environment's AgenticID (§3 —
      else `/provision` rejects the image) BEFORE the attestor switches
-     snapshots (`ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS`).
+     snapshots (`ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS`). Check,
+     per hash: `cast call $AGENTIC_ID 'isValidFrameworkHash(bytes32)(bool)'
+     <image hash> --rpc-url $RPC` → `true`.
   3. Deploy the 1.2.0 impl and beacon-upgrade each environment's VF proxy via
-     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2).
+     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Check:
+     `cast call $VF 'VERSION()(string)' --rpc-url $RPC` → `"1.2.0"`.
   4. In the same window: roll the attestor with
      `ATTESTOR_VERIFIED_FEEDBACK_ADDR` = that environment's VF proxy (§6) and
      the new snapshots, and release SDK 0.2.0. Set `ATTESTOR_CLI_LATEST=0.2.0`
@@ -431,11 +442,17 @@ Changelog:
      same attestor roll: a 0.1.x CLI/SDK checks every new-image proof against
      the legacy digest and reports a signature mismatch, and `/config`
      `cli_latest` drives the only in-band upgrade hint (printed by 0.1.7+
-     CLIs).
+     CLIs). Check: `curl -s $API/config | jq '{verified_feedback_addr,
+     cli_latest, sandbox_snapshot}'` shows `$VF`, `"0.2.0"` and the new
+     snapshot; then deploy one fresh agent and run
+     `API=$API AGENT_ID=<id> bash attestor/scripts/verify-agent.sh` — check 3
+     must recover the seal over the version-0x00 digest.
   5. Running agents keep their old image and env until an owner-signed
      `/reset` recreates the container on the new image with
      `VERIFIED_FEEDBACK_ADDR` set. Until then their proofs — like every proof
-     issued before the upgrade — stop verifying.
+     issued before the upgrade — stop verifying. Check, per agent:
+     `verify-agent.sh` check 3 fails with the old-image hint before the reset
+     and passes after it.
   Optionally `removeValidFrameworkHash` the pre-1.2.0 image hashes afterwards
   so no new deploy lands on an image whose proofs no longer verify. Record
   the impl address, VERSION and dates in §6 / this entry when executed.
