@@ -165,6 +165,12 @@ func main() {
 	} else if cfg.ChainRPC == "" || cfg.ContractAddr == "" || cfg.FallbackIndexer == "" {
 		logger.Logf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
 			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
+	} else if err := privsep.Required(); err != nil {
+		// Fail closed: never fetch agent_seal_priv into a container whose
+		// framework would share sealed's uid (it could read the key out of
+		// this process). /healthz and /log stay up for diagnosis; the
+		// attestor fails the deployment when /provision never arrives.
+		logger.Logf("FAIL %v -- refusing to provision; the image must create the %q user", err, "agent")
 	} else {
 		runMainPipeline(cfg, agent, sealedProxy)
 	}

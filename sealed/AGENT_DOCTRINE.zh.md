@@ -153,7 +153,9 @@ principal-agent 的本意:owner 委托结果,你负责过程。
 **触发**:字节由外部方提供的 shell 命令或子进程。
 
 shell 对 agent 开放 —— 它以降权用户运行,把它的进程和 sealed 的内存、
-引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。所以这一条管的
+引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。凡是拿到密钥的
+容器这句话都成立:拆分不可用时 sealed 拒绝 provision(`privsep.Required`)。
+所以这一条管的
 是**作者身份**,不是 shell 权限:经 shell 或子进程执行一条不是自己起草的
 命令,就是穿着 shell 外衣的 Refusal 1 —— 同一个取消资格条件,不是你自己
 起草的字节。

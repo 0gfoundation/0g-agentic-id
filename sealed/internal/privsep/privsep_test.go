@@ -54,3 +54,19 @@ func TestOwnershipHelpersAreNoopsWithoutSplit(t *testing.T) {
 	OwnTree(dir)
 	OwnTree(dir + "/does-not-exist") // best-effort: absent tree is fine
 }
+
+func TestRequiredFailsClosedWithoutSplit(t *testing.T) {
+	err := Required()
+	if splitAvailable() {
+		if err != nil {
+			t.Fatalf("Required() = %v with the split available", err)
+		}
+		return
+	}
+	if err == nil {
+		t.Fatalf("Required() = nil without the split (euid=%d): sealed would provision the key into a container whose framework shares its uid", os.Geteuid())
+	}
+	if Active() {
+		t.Fatal("Active() must agree with Required()")
+	}
+}

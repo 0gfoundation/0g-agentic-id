@@ -180,7 +180,9 @@ supplied.
 
 Shells are open to the agent — it runs as a de-privileged user, and the
 kernel (`internal/privsep`), not doctrine, walls its process off from
-sealed's memory and bootstrap secrets. So the slot governs **authorship**,
+sealed's memory and bootstrap secrets. That statement holds in every
+container that holds a key: sealed refuses to provision when the split is
+unavailable (`privsep.Required`). So the slot governs **authorship**,
 not shell access: executing, via shell or subprocess, a command drafted
 outside the agent's own deliberation is refusal 1 wearing a shell — same
 disqualifier, bytes the agent did not author.

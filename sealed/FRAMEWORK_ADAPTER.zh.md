@@ -811,6 +811,12 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    镜像(`images/openclaw/`),不是通用镜像;本条指令针对的是
    `images/sealed/` 这个通用镜像目标,在你的部署把它作为 base
    发布之后才落到实处。)
+   实际构建线上镜像的那个 Dockerfile 必须创建 `agent` 用户
+   (`useradd --system --no-create-home --home-dir /root
+   --shell /usr/sbin/nologin agent`)并以 root 运行 sealed,你的
+   `Start` 必须经 `privsep.Drop` 起进程。没有这个用户,sealed 会拒绝
+   provision(`privsep.Required`),该镜像上的每次部署都会失败 —— 这是
+   有意的:白名单钉的是 hash,不是构建内容。
 8. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
    attestor 把名字当不透明字符串(mint 前校验、写进无版本 binding、
    UI 里列出),除此之外零改动(本仓库 `attestor/`)。

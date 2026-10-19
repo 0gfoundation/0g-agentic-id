@@ -947,6 +947,12 @@ The one obligation that replaced all four is step 4.
    FROM the openclaw base image (`images/openclaw/`), not the universal
    one; `images/sealed/` is the universal-image target this instruction
    is scoped to, and applies once your deployment ships it as the base.)
+   Whichever Dockerfile actually builds the shipped image must create the
+   `agent` user (`useradd --system --no-create-home --home-dir /root
+   --shell /usr/sbin/nologin agent`) and run sealed as root, and your
+   `Start` must spawn through `privsep.Drop`. Without the user sealed
+   refuses to provision (`privsep.Required`) and every deploy on that
+   image fails — by design: the whitelist pins the hash, not the build.
 8. Add your framework's name to attestor's supported-names list so
    deploys can select it — attestor treats the name as an opaque string
    (validated pre-mint, written into the version-less binding, listed in

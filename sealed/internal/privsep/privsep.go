@@ -6,10 +6,12 @@
 // it does not elevate sealed.
 //
 // Availability is probed once, lazily: the split engages only when sealed
-// runs as root AND the image ships the agent user (created in
-// images/*/Dockerfile). Everywhere else — unit tests, local dev, a legacy
-// image — every function degrades to a logged no-op and the subprocess
-// spawns with sealed's own identity, exactly the pre-split behaviour.
+// runs as root AND the image ships the agent user (created in the image's
+// build Dockerfile). Without it every helper degrades to a no-op — but
+// sealed refuses to provision agent_seal_priv (Required, checked in main),
+// so a container that cannot keep the key from its framework never
+// receives it. Unit tests and local runs without an attestor never
+// provision, so they are unaffected.
 //
 // This turns the key-exfiltration half of the agent doctrine (refusals 2
 // and 4: shell → read sealed's memory / bootstrap secrets) from a
@@ -20,6 +22,7 @@
 package privsep
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -42,42 +45,55 @@ import (
 const agentUsername = "agent"
 
 var (
-	lookupOnce sync.Once
-	cred       *syscall.Credential
+	lookupOnce  sync.Once
+	cred        *syscall.Credential
+	unavailable string // why cred is nil; set together with it
 )
 
-// credential resolves the agent user once. nil = split unavailable.
+// credential resolves the agent user once. nil = split unavailable, with
+// the reason in unavailable.
 func credential() *syscall.Credential {
 	lookupOnce.Do(func() {
 		if os.Geteuid() != 0 {
-			logger.Logf("privsep: not root (euid=%d) — framework subprocess keeps current identity", os.Geteuid())
+			unavailable = fmt.Sprintf("not root (euid=%d)", os.Geteuid())
+		} else if u, err := user.Lookup(agentUsername); err != nil {
+			unavailable = fmt.Sprintf("no %q user in this image", agentUsername)
+		} else if uid, err1 := strconv.ParseUint(u.Uid, 10, 32); err1 != nil {
+			unavailable = fmt.Sprintf("unparsable uid %q for %q", u.Uid, agentUsername)
+		} else if gid, err2 := strconv.ParseUint(u.Gid, 10, 32); err2 != nil {
+			unavailable = fmt.Sprintf("unparsable gid %q for %q", u.Gid, agentUsername)
+		} else {
+			// Groups: empty slice (not nil) so setgroups(0) actually drops
+			// root's supplementary groups instead of inheriting them.
+			cred = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}
+			logger.Logf("privsep: framework subprocess will run as %s (uid=%d gid=%d)", agentUsername, uid, gid)
 			return
 		}
-		u, err := user.Lookup(agentUsername)
-		if err != nil {
-			logger.Logf("privsep: no %q user in this image — framework subprocess keeps root (legacy image?)", agentUsername)
-			return
-		}
-		uid, err1 := strconv.ParseUint(u.Uid, 10, 32)
-		gid, err2 := strconv.ParseUint(u.Gid, 10, 32)
-		if err1 != nil || err2 != nil {
-			logger.Logf("privsep: unparsable uid/gid for %q (%q/%q) — framework subprocess keeps root", agentUsername, u.Uid, u.Gid)
-			return
-		}
-		// Groups: empty slice (not nil) so setgroups(0) actually drops
-		// root's supplementary groups instead of inheriting them.
-		cred = &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}
-		logger.Logf("privsep: framework subprocess will run as %s (uid=%d gid=%d)", agentUsername, uid, gid)
+		logger.Logf("privsep: unavailable — %s", unavailable)
 	})
 	return cred
 }
 
 // Active reports whether the uid split is available in this container —
-// i.e. whether the framework subprocess will run de-privileged. Adapters
-// feed it into platform.RuntimeSnapshot so the injected doctrine can state
-// the container's real boundary (shell ban vs kernel-enforced isolation).
+// i.e. whether the framework subprocess will run de-privileged.
 func Active() bool {
 	return credential() != nil
+}
+
+// Required returns nil when the framework subprocess will run as the agent
+// user, else an error naming why it cannot. sealed checks it before
+// provisioning and fails closed: without the split the framework would
+// share sealed's uid and could read agent_seal_priv out of this process,
+// and the doctrine injected into the agent states the kernel wall as fact
+// (platform/context.go) — so the key is never fetched into such a
+// container. Catches a mis-built image (an image whose build Dockerfile
+// lost the useradd) that the on-chain image whitelist, which pins hashes
+// rather than contents, cannot.
+func Required() error {
+	if credential() == nil {
+		return fmt.Errorf("privsep unavailable: %s", unavailable)
+	}
+	return nil
 }
 
 // Drop configures cmd to spawn as the agent user. Returns false — leaving
@@ -133,8 +149,8 @@ func OwnTree(root string) {
 
 // HardenSelf makes the sealed process non-dumpable (PR_SET_DUMPABLE=0): even
 // a same-uid process can then neither ptrace it nor read its /proc/<pid>/mem
-// or environ. Defence in depth for images without the agent user, where the
-// framework subprocess still shares root with sealed. Call once at startup.
+// or environ. Defence in depth on top of the uid split (Required refuses to
+// provision without it). Call once at startup.
 func HardenSelf() {
 	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
 		logger.Logf("privsep: PR_SET_DUMPABLE=0: %v", err)
