@@ -49,6 +49,7 @@ with exact remediation named, then passed after ack() + deposit().
 ```bash
 cd attestor && cargo test --workspace          # incl. KMS mock, fuse, seal_material
 cd sealed   && go test ./...                   # marker round-trip, adapter conformance
+cd sealed/tools/zg-upload && go test ./...     # upload helper (own module; first run fetches its deps)
 cd contracts && forge test                     # on-chain invariants
 ```
 

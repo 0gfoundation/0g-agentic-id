@@ -57,6 +57,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
+| 存储上传 helper 只经 stdin 拿到它 | `dataplane.Upload` 按绝对路径（`/usr/local/bin/zg-upload`，各镜像里属主都是 root；从不经 `PATH` 查找）运行 `zg-upload` helper（`tools/zg-upload`），并把密钥写进它的 stdin。密钥从不出现在任何进程的参数列表里（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），也不进环境变量：helper 没有 `--key` flag，拿到的是一份显式环境（`PATH` 加代理 / CA bundle 设置），而不是 sealed 的环境。让 helper 的 stdin 管道、内存和环境落在 agent 够不着的地方的，是 uid 拆分（`internal/privsep`）：helper 跟 sealed 一样以 root 运行，框架则以 `agent` 用户运行。helper 还会在读 stdin 之前把自己设为不可 dump（`PR_SET_DUMPABLE=0`），跟 sealed 对自己做的一样（execve 会重置这个标志，sealed 的设置带不到子进程）；此后同 uid 的非特权进程也无法经 `/proc` 读取这些内容。由 `internal/dataplane/dataplane_test.go` 和 `tools/zg-upload` 的测试钉住 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节 |
 | provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:159-167`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:206-221`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 

@@ -55,6 +55,30 @@ func TestSeverityOf_GasExhaustedBareRevertIsWarning(t *testing.T) {
 	}
 }
 
+// helperFailure builds an upload error in the shape dataplane.Upload
+// returns for a failed zg-upload run: "upload cmd: <exit>: <stderr>", where
+// stderr is the storage SDK's logrus lines followed by the helper's single
+// final "zg-upload: upload: <error>" line.
+func helperFailure(cause string) error {
+	return errors.New("upload openclaw.json: upload cmd: exit status 1: " +
+		"time=\"2026-10-20T08:00:01Z\" level=info msg=\"Data prepared to upload\" chunks=3 segments=1\n" +
+		"time=\"2026-10-20T08:00:02Z\" level=info msg=\"Selecting nodes ...\"\n" +
+		"zg-upload: upload: Failed to submit log entry: Failed to send transaction to append log entry: " +
+		"failed to send transaction: " + cause)
+}
+
+func TestSeverityOf_HelperFailureShape(t *testing.T) {
+	for cause, want := range map[string]string{
+		"insufficient funds for gas * price + value": "warning",
+		"execution reverted; data: 0x":               "warning",
+		"nonce too low":                              "error",
+	} {
+		if got := severityOf(helperFailure(cause)); got != want {
+			t.Errorf("severityOf(helper failure %q) = %q; want %s", cause, got, want)
+		}
+	}
+}
+
 func TestSeverityOf_GenericErrorIsError(t *testing.T) {
 	// Unknown / system-level errors stay "error" so the 5-failure escalation
 	// still defends against silent system failures.
@@ -87,9 +111,21 @@ func TestSummarizeError_SingleLinePassthrough(t *testing.T) {
 	}
 }
 
+func TestSummarizeError_HelperFailureKeepsFinalLine(t *testing.T) {
+	// zg-upload ends a failed run with one "zg-upload: <error>" line after
+	// the SDK's log lines; that line is what the owner should see.
+	got := summarizeError(helperFailure("insufficient funds for gas * price + value"))
+	want := "zg-upload: upload: Failed to submit log entry: Failed to send transaction to append log entry: " +
+		"failed to send transaction: insufficient funds for gas * price + value"
+	if got != want {
+		t.Errorf("summarizeError(helper failure):\n got %q\n want %q", got, want)
+	}
+}
+
 func TestSummarizeError_MultilineKeepsLastNonEmpty(t *testing.T) {
-	// Mimics the 0g-storage CLI's multi-line output: many INFO/WARN
-	// lines, then the final FATA on terminal failure. We want the FATA.
+	// Legacy shape: the 0g-storage CLI's multi-line output (uploads ran
+	// through it before zg-upload): many INFO/WARN lines, then the final
+	// FATA on terminal failure. We want the FATA.
 	raw := "INFO[2026-05-15T02:18:36Z] Selecting nodes ...\n" +
 		"INFO[2026-05-15T02:18:38Z] submit with fee fee(neuron)=122934579848\n" +
 		"WARN[2026-05-15T02:18:39Z] Upload failed, retrying error=\"...\"\n" +

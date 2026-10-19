@@ -13,7 +13,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 |---|---|
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
-| 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
+| 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载、通过 `zg-upload` helper（`tools/zg-upload/`，同一 client 的 Go SDK）上传；签名密钥经 stdin 传给 helper，从不出现在进程参数里 |
 | agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:115-118`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
@@ -122,7 +122,8 @@ sealed/
 ├── internal/
 │   ├── config/                   env 解析、运行参数
 │   ├── chain/                    AgenticID 合约 view + tx 包装
-│   ├── dataplane/                ECIES 解 sealedKey + AES-GCM 解/加密 iData
+│   ├── dataplane/                ECIES 解 sealedKey + AES-GCM 解/加密 iData +
+│   │                             0g-storage Download（CLI）/ Upload（zg-upload helper）
 │   ├── provision/                /provision RA 请求 + 响应解封装
 │   ├── report/                   /status 上报到 attestor
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
@@ -150,13 +151,17 @@ sealed/
 ├── images/sealed/                sealed sandbox 镜像，node 版（openclaw；npm 安装只是热缓存）
 ├── images/hermes/                sealed sandbox 镜像，python/uv 版（hermes）
 ├── images/prime/                 sealed sandbox 镜像，node+python 版（prime-agent）
-└── images/dsh/                   sealed sandbox 镜像，dsh 版
+├── images/dsh/                   sealed sandbox 镜像，dsh 版
+└── tools/zg-upload/              存储上传 helper：基于 0g-storage-client SDK 的独立 Go module
+                                  （版本钉在它自己的 go.mod；镜像里负责下载的 CLI 也按同一版本构建）；从 stdin 读签名密钥。
+                                  凡是构建 CLI 的镜像（Dockerfile、images/{hermes,prime,dsh}）都把它装在
+                                  /usr/local/bin/zg-upload，紧挨 0g-storage-client
 ```
 
 ### 各包职责一句话
 
 - **chain**：所有链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）
-- **dataplane**：crypto-only，不碰链、不碰文件。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`
+- **dataplane**：iData 加解密 + 0g-storage 传输；自己不发链上调用。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 跑 `0g-storage-client download`，`Upload` 跑 `zg-upload` helper、把 agent_seal 密钥写进它的 stdin（密钥从不出现在任何进程的参数或环境变量里），每个 blob 上限 90s。两个二进制都按 `/usr/local/bin` 下的绝对路径运行，从不经 `PATH` 查找
 - **framework**：定义 `Framework` 接口（adapter 协议）+ `RuntimeContext` + `RoleSpec{Name, Shape}` + 共享类型如 `StartParams`、`StartResult`。**不依赖具体框架**
 - **settings**：`Doc`（provider / model / thinking / 一段不透明的 per-framework overlay）是 owner 的 document，也是唯一被持久化的那一半；`Resolved` 再加上平台在 Start 时算出来的部分 —— endpoint、输出预算、模型吃不吃 reasoning bound —— 哪儿都不存，因为存下来的副本会过期、然后跟算出来的值打架（`settings.go:10-15`）
 - **framework/openclaw**：参考 adapter 实现。又内部拆成 `restore.go`/`restore_paths.go`、`evolution.go`/`evolution_paths.go`、`spawn.go`、`ingest.go`（persona legacy）、`inference.go`（`RenderSettings`：owner 的 document → openclaw.json）、`disk.go`（openclaw.json read/write）、`whitelist.go`（npm 版本白名单）、`identitymd.go`/`soulmd.go`/`toolsmd.go`（IDENTITY/SOUL/TOOLS 三份 sealed-managed 平台段 + 共享 marker 工具）
@@ -494,9 +499,9 @@ env 这一面：
 | `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
 | `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
-| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
+| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链。不能内嵌凭据：它会作为命令行参数传给 `zg-upload` helper |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
-| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
+| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。不能内嵌凭据：它会作为命令行参数传给 `zg-upload` helper，并记进每个上传条目的链上 `dataDescription` |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
 | `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:163-170`）|
 | `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |

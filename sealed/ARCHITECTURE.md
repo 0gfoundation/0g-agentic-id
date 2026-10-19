@@ -16,7 +16,7 @@ External components it integrates with:
 |---|---|
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
-| 0G storage | The actual carrier for each iData's encrypted plaintext; sealed uploads/downloads via the `0g-storage-client` CLI |
+| 0G storage | The actual carrier for each iData's encrypted plaintext; sealed downloads via the `0g-storage-client` CLI and uploads via the `zg-upload` helper (`tools/zg-upload/`, the same client's Go SDK), which receives the signing key on stdin, never in process arguments |
 | the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, dsh (`main.go:115-118`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
@@ -138,7 +138,8 @@ sealed/
 ├── internal/
 │   ├── config/                   env parsing, runtime parameters
 │   ├── chain/                    AgenticID contract view + tx wrappers
-│   ├── dataplane/                ECIES-decrypt sealedKey + AES-GCM decrypt/encrypt iData
+│   ├── dataplane/                ECIES-decrypt sealedKey + AES-GCM decrypt/encrypt iData +
+│   │                             0g-storage Download (CLI) / Upload (zg-upload helper)
 │   ├── provision/                /provision RA request + response envelope unpacking
 │   ├── report/                   /status reporting to attestor
 │   ├── logger/                   structured logging (the shared writer logger.Logf, exposed by proxy as /log.html)
@@ -168,13 +169,17 @@ sealed/
 ├── images/sealed/                sealed sandbox image, node flavour (openclaw; npm installs are warm cache only)
 ├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
 ├── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
-└── images/dsh/                   sealed sandbox image, dsh flavour
+├── images/dsh/                   sealed sandbox image, dsh flavour
+└── tools/zg-upload/              storage-upload helper: its own Go module over the 0g-storage-client SDK
+                                  (pinned in its go.mod; the images build the download CLI at that same version);
+                                  reads the signing key from stdin. Installed at /usr/local/bin/zg-upload, next to
+                                  0g-storage-client, by every image that builds the CLI (Dockerfile, images/{hermes,prime,dsh})
 ```
 
 ### One-line per-package summary
 
 - **chain**: all chain views / txs funnel through here; outside code never gets an `*ethclient.Client`, only a semantic API (`WaitForMint` / `IntelligentDatasOf` / `Update` etc.)
-- **dataplane**: crypto-only, no chain calls, no file IO. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`
+- **dataplane**: iData crypto plus the 0g-storage transfers; no chain calls of its own. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`; `Download` runs `0g-storage-client download`, `Upload` runs the `zg-upload` helper and writes the agent_seal key to its stdin (the key never appears in a process's arguments or environment), with a 90s cap per blob. Both binaries are run by absolute path under `/usr/local/bin`, never looked up through `PATH`
 - **framework**: defines the `Framework` interface (adapter protocol) + `RuntimeContext` + `RoleSpec{Name, Shape}` + shared types like `StartParams`, `StartResult`. **Does not depend on any specific framework**
 - **settings**: `Doc` (provider / model / thinking / an opaque per-framework overlay) is the owner's document and the only persisted half; `Resolved` adds what the platform computes at Start — endpoint, output budget, whether the model takes a reasoning bound — and is persisted nowhere, because a stored copy goes stale and then fights the computed value (`settings.go:10-15`)
 - **framework/openclaw**: the reference adapter implementation. Internally split into `restore.go` / `restore_paths.go`, `evolution.go` / `evolution_paths.go`, `spawn.go`, `ingest.go` (persona legacy), `inference.go` (`RenderSettings`: the owner's document → openclaw.json), `disk.go` (openclaw.json read/write), `whitelist.go` (npm version allowlist), `identitymd.go` / `soulmd.go` / `toolsmd.go` (the IDENTITY/SOUL/TOOLS three sealed-managed platform sections + shared marker utilities)
@@ -545,9 +550,9 @@ The env surface:
 | `SANDBOX_SEAL_ATTESTATION` | sandbox-signed attestation JSON containing `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`; sealId is read from here, not a separate env |
 | `TEE_SIGNER_ADDRESS` | (optional, **usually unset in production**) if set, Phase 0 requires the address recovered from the attestation signature == this value, otherwise fail loud. The authoritative sandbox signer check is at the attestor `/provision` end (querying `TappRegistry.getNodeList(sandbox_app_id)`); this pin in sealed is only a dev / local-debug fail-early aid, not a security boundary |
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
-| `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives |
+| `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives. Must not embed a credential: it is passed to the `zg-upload` helper as a command-line argument |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
-| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
+| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty. Must not embed a credential: it is passed to the `zg-upload` helper as a command-line argument and recorded in each uploaded entry's on-chain `dataDescription` |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
 | `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:51-54`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:163-170`) |
 | `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. A value that does not open is logged as `FAIL` and ignored (`internal/secretenv`); if that leaves the agent with no key, its status stays `warning` with detail `secret_env_not_applied: <reason>` (a reason class such as `owner_mismatch`, never a value) instead of `running` |

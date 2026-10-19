@@ -22,13 +22,21 @@
 # --build-arg OPENCLAW_BASE=<aliyun tag> to build against the aliyun mirror.
 ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.0
 
-# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).
+# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data)
+# and the zg-upload helper (tools/zg-upload; used to upload drift). Both come
+# from the one 0g-storage-client version pinned in tools/zg-upload/go.mod: the
+# CLI is `go install`ed at that version (module checksums verified against the
+# Go checksum database), the helper is built over that version's Go SDK. The
+# signing key is passed to the helper over stdin, never in process arguments.
 FROM golang:1.24-alpine AS storage-builder
-RUN apk add --no-cache git
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/0gfoundation/0g-storage-client.git
-WORKDIR /src/0g-storage-client
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/0g-storage-client .
+WORKDIR /src/zg-upload
+COPY tools/zg-upload/go.mod tools/zg-upload/go.sum ./
+RUN go mod download
+RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) \
+ && test -n "$V" \
+ && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
+COPY tools/zg-upload/*.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/zg-upload .
 
 # Stage 2 — bootstrap binary.
 FROM golang:1.24-alpine AS bootstrap-builder
@@ -71,6 +79,7 @@ RUN npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
  && rm -f /root/.openclaw/openclaw.json /root/.openclaw/openclaw.json.bak
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
+COPY --from=storage-builder /out/zg-upload /usr/local/bin/zg-upload
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 
 # Bootstrap launches openclaw itself once it has decrypted the config — no

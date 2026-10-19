@@ -1,0 +1,327 @@
+package dataplane
+
+import (
+	"context"
+	"encoding/hex"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// Where every sealed image installs the storage binaries (the Dockerfiles'
+// COPY --from=storage-builder lines); sealed runs them from exactly here.
+const (
+	installedUploadHelper  = "/usr/local/bin/zg-upload"
+	installedStorageClient = "/usr/local/bin/0g-storage-client"
+)
+
+// Well-known test key; never used outside tests.
+const testSealPrivHex = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318"
+
+const (
+	testRoot  = "0x1111111111111111111111111111111111111111111111111111111111111111"
+	decoyRoot = "0x2222222222222222222222222222222222222222222222222222222222222222"
+)
+
+func assertNoKey(t *testing.T, what, s string) {
+	t.Helper()
+	if strings.Contains(strings.ToLower(s), testSealPrivHex) {
+		t.Fatalf("%s carries the signing key: %q", what, s)
+	}
+}
+
+// TestStorageBinaries_AbsolutePaths: sealed runs both storage binaries from
+// the absolute paths the images install them at, never through PATH.
+func TestStorageBinaries_AbsolutePaths(t *testing.T) {
+	if uploadHelperPath != installedUploadHelper {
+		t.Errorf("uploadHelperPath = %q, want %q", uploadHelperPath, installedUploadHelper)
+	}
+	if storageClientPath != installedStorageClient {
+		t.Errorf("storageClientPath = %q, want %q", storageClientPath, installedStorageClient)
+	}
+}
+
+// TestDockerfiles_InstallStorageBinaries checks every image that has a
+// storage-builder stage: it installs both binaries at the paths sealed runs,
+// and builds the CLI at the 0g-storage-client version pinned in the helper's
+// go.mod rather than from a floating clone.
+func TestDockerfiles_InstallStorageBinaries(t *testing.T) {
+	files, err := filepath.Glob("../../images/*/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files = append(files, "../../Dockerfile")
+	var checked []string
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		df := string(b)
+		if !strings.Contains(df, " AS storage-builder") {
+			continue
+		}
+		checked = append(checked, f)
+		for _, want := range []string{
+			"COPY --from=storage-builder /out/zg-upload " + installedUploadHelper + "\n",
+			"COPY --from=storage-builder /out/0g-storage-client " + installedStorageClient + "\n",
+			"COPY tools/zg-upload/go.mod tools/zg-upload/go.sum ./\n",
+			"go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client",
+			`go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"`,
+		} {
+			if !strings.Contains(df, want) {
+				t.Errorf("%s: missing %q", f, want)
+			}
+		}
+		if strings.Contains(df, "github.com/0gfoundation/0g-storage-client.git") {
+			t.Errorf("%s: builds 0g-storage-client from a git clone; build it at the helper's go.mod version", f)
+		}
+	}
+	if len(checked) < 4 {
+		t.Fatalf("checked %d Dockerfiles with a storage-builder stage (%q), want at least 4", len(checked), checked)
+	}
+}
+
+// TestUploadCommand_KeyOnlyOnStdin pins the invocation: the key is written
+// to stdin, and neither the argument list nor the (explicit) environment
+// carries it.
+func TestUploadCommand_KeyOnlyOnStdin(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-test-not-forwarded")
+	t.Setenv("HTTPS_PROXY", "http://proxy.test:3128")
+	for _, key := range []string{testSealPrivHex, "0x" + testSealPrivHex} {
+		cmd := uploadCommand(context.Background(), "/tmp/blob.bin", "http://indexer:5678", "http://rpc:8545", key)
+
+		if cmd.Path != installedUploadHelper || !filepath.IsAbs(cmd.Path) {
+			t.Fatalf("Path = %q, want the absolute %q", cmd.Path, installedUploadHelper)
+		}
+		if cmd.Err != nil {
+			t.Fatalf("Err = %v; an absolute path needs no lookup", cmd.Err)
+		}
+		wantArgs := []string{
+			installedUploadHelper,
+			"--file", "/tmp/blob.bin",
+			"--indexer", "http://indexer:5678",
+			"--url", "http://rpc:8545",
+			"--expected-replica", "1",
+			"--skip-tx=true",
+			"--fast-mode=true",
+			"--full-trusted=true",
+			"--method", "random",
+		}
+		if strings.Join(cmd.Args, "\x00") != strings.Join(wantArgs, "\x00") {
+			t.Fatalf("Args = %q\nwant  %q", cmd.Args, wantArgs)
+		}
+		for _, a := range cmd.Args {
+			assertNoKey(t, "argument", a)
+			if a == "--key" || strings.HasPrefix(a, "--key=") || a == "-key" || strings.HasPrefix(a, "-key=") {
+				t.Fatalf("Args carry a key flag: %q", cmd.Args)
+			}
+		}
+		if cmd.Env == nil {
+			t.Fatal("Env is nil: the helper would inherit sealed's whole environment")
+		}
+		wantEnv := []string{"PATH=" + helperPATH, "HTTPS_PROXY=http://proxy.test:3128"}
+		if strings.Join(cmd.Env, "\x00") != strings.Join(wantEnv, "\x00") {
+			t.Fatalf("Env = %q\nwant %q", cmd.Env, wantEnv)
+		}
+		for _, e := range cmd.Env {
+			assertNoKey(t, "environment entry", e)
+		}
+		if cmd.Stdin == nil {
+			t.Fatal("Stdin is nil; the key must be passed on stdin")
+		}
+		got, err := io.ReadAll(cmd.Stdin)
+		if err != nil {
+			t.Fatalf("read Stdin: %v", err)
+		}
+		if string(got) != testSealPrivHex+"\n" {
+			t.Fatalf("Stdin = %q, want the bare hex key and a newline", got)
+		}
+	}
+}
+
+// installFake writes an executable shell script into a fresh directory and
+// points *target (uploadHelperPath or storageClientPath) at it for the rest
+// of the test. It also puts a decoy of the same name first on PATH that
+// records any run, and fails the test if the decoy ran: sealed must run the
+// binary by its absolute path, never through a PATH lookup. Returns the
+// script's directory.
+func installFake(t *testing.T, target *string, script func(dir string) string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake binary is a POSIX shell script")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, filepath.Base(*target))
+	if err := os.WriteFile(path, []byte(script(dir)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := *target
+	*target = path
+	t.Cleanup(func() { *target = prev })
+
+	decoyDir := t.TempDir()
+	marker := filepath.Join(decoyDir, "ran")
+	decoy := "#!/bin/sh\n: > '" + marker + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(decoyDir, filepath.Base(prev)), []byte(decoy), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", decoyDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Cleanup(func() {
+		if _, err := os.Stat(marker); err == nil {
+			t.Errorf("the PATH decoy %s ran; sealed must run %s", filepath.Base(prev), path)
+		}
+	})
+	return dir
+}
+
+func installFakeHelper(t *testing.T, script func(dir string) string) string {
+	t.Helper()
+	return installFake(t, &uploadHelperPath, script)
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(b)
+}
+
+// TestUpload_KeyReachesHelperOnlyOverStdin runs Upload against a fake
+// helper that records what the child process actually received: its argv
+// (including the kernel's /proc view when available), its environment,
+// its stdin, and the blob behind --file.
+func TestUpload_KeyReachesHelperOnlyOverStdin(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-test-not-forwarded")
+	dir := installFakeHelper(t, func(dir string) string {
+		return `#!/bin/sh
+out='` + dir + `'
+printf '%s\n' "$@" > "$out/args"
+env > "$out/env"
+if [ -r /proc/$$/cmdline ]; then tr '\000' '\n' < /proc/$$/cmdline > "$out/cmdline"; fi
+cat > "$out/stdin"
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--file" ]; then cp "$2" "$out/blob"; fi
+  shift
+done
+echo 'level=info msg="Data merkle root calculated" root=` + decoyRoot + `' >&2
+echo 'root = ` + testRoot + `'
+`
+	})
+
+	blob := []byte("ciphertext bytes")
+	root, err := Upload(context.Background(), blob, "http://indexer:5678", "http://rpc:8545", "0x"+testSealPrivHex)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if got := "0x" + hex.EncodeToString(root[:]); got != testRoot {
+		t.Fatalf("root = %s, want %s (parsed from stdout, not the stderr log line)", got, testRoot)
+	}
+
+	args := readFile(t, filepath.Join(dir, "args"))
+	assertNoKey(t, "helper argv", args)
+	if !strings.Contains(args, "--indexer\nhttp://indexer:5678\n") || !strings.Contains(args, "--url\nhttp://rpc:8545\n") {
+		t.Fatalf("helper argv missing endpoints:\n%s", args)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "cmdline")); err == nil {
+		assertNoKey(t, "/proc/<pid>/cmdline", readFile(t, filepath.Join(dir, "cmdline")))
+	}
+	env := readFile(t, filepath.Join(dir, "env"))
+	assertNoKey(t, "helper environment", env)
+	if strings.Contains(env, "sk-test-not-forwarded") {
+		t.Fatalf("helper inherited sealed's environment:\n%s", env)
+	}
+	if got := readFile(t, filepath.Join(dir, "stdin")); got != testSealPrivHex+"\n" {
+		t.Fatalf("helper stdin = %q, want the hex key line", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "blob")); got != string(blob) {
+		t.Fatalf("helper --file content = %q, want %q", got, blob)
+	}
+}
+
+// TestUpload_HelperFailureKeepsLastLineAndOmitsKey checks the failure
+// surface: the helper's final stderr line stays the last line of the error
+// (what summarizeError shows the owner), and the key is not in the error.
+func TestUpload_HelperFailureKeepsLastLineAndOmitsKey(t *testing.T) {
+	installFakeHelper(t, func(string) string {
+		return `#!/bin/sh
+cat > /dev/null
+echo 'level=info msg="Selecting nodes ..."' >&2
+echo 'zg-upload: upload: insufficient funds for gas * price + value' >&2
+exit 1
+`
+	})
+	_, err := Upload(context.Background(), []byte("ct"), "http://indexer", "http://rpc", testSealPrivHex)
+	if err == nil {
+		t.Fatal("Upload succeeded against a failing helper")
+	}
+	msg := err.Error()
+	assertNoKey(t, "error", msg)
+	lines := strings.Split(msg, "\n")
+	if last := lines[len(lines)-1]; last != "zg-upload: upload: insufficient funds for gas * price + value" {
+		t.Fatalf("last error line = %q", last)
+	}
+}
+
+// TestUpload_RootOnlyFromStdout: a root-shaped string in the helper's logs
+// must not be taken as the result.
+func TestUpload_RootOnlyFromStdout(t *testing.T) {
+	installFakeHelper(t, func(string) string {
+		return `#!/bin/sh
+cat > /dev/null
+echo 'file uploaded, root = ` + decoyRoot + `' >&2
+exit 0
+`
+	})
+	_, err := Upload(context.Background(), []byte("ct"), "http://indexer", "http://rpc", testSealPrivHex)
+	if err == nil || !strings.Contains(err.Error(), "could not parse root") {
+		t.Fatalf("err = %v, want a parse failure", err)
+	}
+	assertNoKey(t, "error", err.Error())
+}
+
+func TestUpload_MissingHelper(t *testing.T) {
+	prev := uploadHelperPath
+	uploadHelperPath = filepath.Join(t.TempDir(), "zg-upload")
+	t.Cleanup(func() { uploadHelperPath = prev })
+	_, err := Upload(context.Background(), []byte("ct"), "http://indexer", "http://rpc", testSealPrivHex)
+	if err == nil || !strings.Contains(err.Error(), uploadHelperPath) {
+		t.Fatalf("err = %v, want it to name the missing helper", err)
+	}
+	assertNoKey(t, "error", err.Error())
+}
+
+// TestDownload_RunsCLIByAbsolutePath: the download CLI is run from
+// storageClientPath, not looked up through PATH.
+func TestDownload_RunsCLIByAbsolutePath(t *testing.T) {
+	dir := installFake(t, &storageClientPath, func(dir string) string {
+		return `#!/bin/sh
+printf '%s\n' "$@" > '` + dir + `/args'
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--file" ]; then printf 'plain' > "$2"; fi
+  shift
+done
+`
+	})
+	out := filepath.Join(t.TempDir(), "out.bin")
+	// Bounded: a failed first attempt would otherwise sit in Download's
+	// retry backoff.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := Download(ctx, testRoot, "http://indexer", out); err != nil {
+		t.Fatalf("Download: %v", err)
+	}
+	want := "download\n--root\n" + testRoot + "\n--file\n" + out + "\n--indexer\nhttp://indexer\n"
+	if got := readFile(t, filepath.Join(dir, "args")); got != want {
+		t.Fatalf("CLI args = %q, want %q", got, want)
+	}
+	if got := readFile(t, out); got != "plain" {
+		t.Fatalf("downloaded file = %q", got)
+	}
+}

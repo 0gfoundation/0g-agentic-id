@@ -35,6 +35,7 @@ docker run --rm -v "$PWD/..":/repo -v cargo-cache:/usr/local/cargo/registry \
 # sealed
 cd sealed && go test ./...
 go test ./internal/proxy -run TestServeProof       # one test
+cd tools/zg-upload && go test ./...                # upload helper: its own module (0g-storage-client SDK), outside sealed's ./...
 
 # sdk
 cd sdk/typescript && npm install && npm run typecheck && npm run build

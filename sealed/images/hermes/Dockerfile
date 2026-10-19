@@ -14,9 +14,9 @@
 # storage + router TLS), procps (adapter's orphan-gateway pkill sweep),
 # the hermes checkout + synced venv (warm cache — the adapter re-pins the
 # exact whitelisted tag at first Start; see hermes/whitelist.go), the
-# sealed bootstrap binary, and 0g-storage-client.
+# sealed bootstrap binary, 0g-storage-client and the zg-upload helper.
 #
-# Build context = sealed/ (for the bootstrap COPY):
+# Build context = sealed/ (for the bootstrap and zg-upload COPYs):
 #
 #   cd sealed && docker build -t 0g-sealed-hermes:0.1.0 -f images/hermes/Dockerfile .
 #
@@ -24,13 +24,21 @@
 # on-chain validFrameworkHashes whitelist or the attestor destroys the
 # container right after provision.
 
-# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).
+# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data)
+# and the zg-upload helper (tools/zg-upload; used to upload drift). Both come
+# from the one 0g-storage-client version pinned in tools/zg-upload/go.mod: the
+# CLI is `go install`ed at that version (module checksums verified against the
+# Go checksum database), the helper is built over that version's Go SDK. The
+# signing key is passed to the helper over stdin, never in process arguments.
 FROM golang:1.24-alpine AS storage-builder
-RUN apk add --no-cache git
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/0gfoundation/0g-storage-client.git
-WORKDIR /src/0g-storage-client
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/0g-storage-client .
+WORKDIR /src/zg-upload
+COPY tools/zg-upload/go.mod tools/zg-upload/go.sum ./
+RUN go mod download
+RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) \
+ && test -n "$V" \
+ && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
+COPY tools/zg-upload/*.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/zg-upload .
 
 # Stage 2 — sealed bootstrap binary.
 FROM golang:1.24-alpine AS bootstrap-builder
@@ -95,6 +103,7 @@ RUN hermes --version \
  && rm -f /root/.hermes/.env
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
+COPY --from=storage-builder /out/zg-upload /usr/local/bin/zg-upload
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 
 # Bootstrap runs as PID 1 and spawns `hermes gateway run` itself once it

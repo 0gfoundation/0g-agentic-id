@@ -108,7 +108,8 @@ func severityOf(err error) string {
 	// owner-recoverable condition as the funds-check above, just a
 	// different shape. Confirmed by reproducing byte-for-byte against a
 	// 0.0008 OG balance (fails) vs 0.0058 OG (succeeds) with the same
-	// 0g-storage-client build and params.
+	// 0g-storage-client build and params (then via its CLI; uploads now
+	// run through the same client's SDK in the zg-upload helper).
 	case strings.Contains(s, "execution reverted; data: 0x"):
 		return "warning"
 	// Future owner-recoverable patterns slot in here without changing
@@ -122,14 +123,16 @@ func severityOf(err error) string {
 }
 
 // summarizeError trims long multi-line error strings (in particular
-// 0g-storage CLI output that interleaves INFO / WARN / FATA lines)
-// down to the single most informative line. The full error is still
-// in the sealed log; this is what we hand to the attestor / UI.
+// upload-helper stderr, where the storage SDK's INFO / WARN log lines
+// precede the failure) down to the single most informative line. The
+// full error is still in the sealed log; this is what we hand to the
+// attestor / UI.
 //
 // Heuristic: pick the last non-empty line of the error string. The
-// 0g-storage CLI prints `FATA[...] Failed to upload file error="..."`
-// as the final line on terminal failure, which is exactly what owners
-// need to see.
+// zg-upload helper (sealed/tools/zg-upload) ends a failed run with a
+// single `zg-upload: <error>` line, which is exactly what owners need to
+// see. (The `0g-storage-client` CLI that uploads used to run through
+// ended the same way, with a final `FATA[...]` line.)
 func summarizeError(err error) string {
 	if err == nil {
 		return ""

@@ -8,13 +8,13 @@
 # Contents beyond debian-slim: node (SDK + sealed bridge), ca-certificates
 # (chain RPC + 0G storage + router TLS), git and procps (the adapter's orphan
 # sweep), the whitelisted @deepseek-ai/dsh-* packages installed globally, the
-# sealed bootstrap binary, and 0g-storage-client.
+# sealed bootstrap binary, 0g-storage-client and the zg-upload helper.
 #
 # The composition is authored in the bridge (embedded in the sealed binary),
 # NOT in a cordis.yml / profile / bundle on disk — so it rides the sealed image
 # hash and an agent editing $DSH_HOME cannot change what mounts next boot.
 #
-# Build context = sealed/ (for the bootstrap COPY):
+# Build context = sealed/ (for the bootstrap and zg-upload COPYs):
 #
 #   cd sealed && docker build -t 0g-sealed-dsh:0.1.0 -f images/dsh/Dockerfile .
 #
@@ -24,13 +24,21 @@
 # deploy MUST pass sealedImage explicitly — the default image carries no DSH
 # packages and the agent lands offline.
 
-# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).
+# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data)
+# and the zg-upload helper (tools/zg-upload; used to upload drift). Both come
+# from the one 0g-storage-client version pinned in tools/zg-upload/go.mod: the
+# CLI is `go install`ed at that version (module checksums verified against the
+# Go checksum database), the helper is built over that version's Go SDK. The
+# signing key is passed to the helper over stdin, never in process arguments.
 FROM golang:1.24-alpine AS storage-builder
-RUN apk add --no-cache git
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/0gfoundation/0g-storage-client.git
-WORKDIR /src/0g-storage-client
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/0g-storage-client .
+WORKDIR /src/zg-upload
+COPY tools/zg-upload/go.mod tools/zg-upload/go.sum ./
+RUN go mod download
+RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) \
+ && test -n "$V" \
+ && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
+COPY tools/zg-upload/*.go ./
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/zg-upload .
 
 # Stage 2 — sealed bootstrap binary (carries the embedded bridge + plugins).
 FROM golang:1.24-alpine AS bootstrap-builder
@@ -119,6 +127,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* /root/.npm
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
+COPY --from=storage-builder /out/zg-upload /usr/local/bin/zg-upload
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
 
 # Bootstrap runs as PID 1 and spawns the bridge once it has restored the
