@@ -13,19 +13,23 @@
  *   attestFeedbackWithTask;
  * - FIND-02: a task reveal whose statusCode is not an integer in 100..999 is
  *   refused BEFORE anything is broadcast, on every path;
- * - the proof's informational `validator` never reaches an ABI tuple;
+ * - the proof's informational `validator` is not forwarded: the sequential
+ *   attest tuple has exactly the eight on-chain fields, and the atomic
+ *   calldata is byte-identical with and without it;
  * - sequential path: a proof that cannot attest (another registry, the legacy
- *   personal_sign wrap, agentSeal self-feedback, agent / submitter mismatch)
- *   is refused BEFORE the canonical write; the atomic path is unchanged.
+ *   personal_sign wrap, agentSeal / owner / approved / operator
+ *   self-feedback, an expired or about-to-expire deadline, an already
+ *   redeemed nonce, agent / submitter mismatch) is refused BEFORE the
+ *   canonical write; the atomic path is unchanged.
  */
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeEventTopics, encodeAbiParameters, decodeFunctionData } from 'viem';
+import { encodeEventTopics, encodeAbiParameters } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
-import { ReputationClient } from '../dist/ReputationClient.js';
-import { verifiedFeedbackAbi, feedbackBatcherAbi } from '../dist/abi.js';
+import { ReputationClient, serveProofNonceKey } from '../dist/ReputationClient.js';
+import { verifiedFeedbackAbi } from '../dist/abi.js';
 import { buildServeProofMessageHash, signServeProof } from '../dist/ServeProof.js';
 
 const ME = '0x00000000000000000000000000000000000000C1';
@@ -38,11 +42,15 @@ const DESIGNATOR = ('0xef0100' + BATCHER.slice(2)).toLowerCase();
 
 // Fixed throwaway key (never funded) acting as agent 352's agentSeal.
 const SEAL = privateKeyToAccount(`0x${'5e'.repeat(32)}`);
+// Stubbed latest-block time; FIELDS' proof is issued just before it with the
+// sealed proxy's 1h window, so the sequential deadline preflight passes.
+const BLOCK_TS = 1_700_000_100n;
+const OWNER = '0x00000000000000000000000000000000000000E1';
 const FIELDS = {
   agentId: 352n,
   submitter: ME,
-  timestamp: 1n,
-  deadline: 2n,
+  timestamp: 1_700_000_000n,
+  deadline: 1_700_003_600n,
   taskHash: `0x${'11'.repeat(32)}`,
   dataHashes: [],
   frameworkHash: `0x${'22'.repeat(32)}`,
@@ -83,19 +91,29 @@ function feedbackVerifiedLog(feedbackIndex) {
 }
 
 /** Stub Ctx factory. `opts` shape:
- *  { code, authThrows, receiptLogs, batcher, agentSeal } */
+ *  { code, authThrows, receiptLogs, batcher, agentSeal, blockTs, owner,
+ *    approved, operatorFor, consumedKey } */
 function mkCtx(opts = {}) {
-  const calls = { writes: [], sends: [], authSigned: 0 };
+  const calls = { writes: [], sends: [], authSigned: 0, reads: [] };
   const ctx = {
     addresses: { agenticID: AGENTIC_ID, verifiedFeedback: VFR, feedbackBatcher: opts.batcher ?? BATCHER },
     account: { address: ME, type: 'local' },
     chain: { id: 16602 },
     publicClient: {
       getCode: async () => opts.code ?? '0x',
-      readContract: async ({ functionName }) => {
+      getBlock: async () => ({ timestamp: opts.blockTs ?? BLOCK_TS }),
+      readContract: async ({ functionName, args }) => {
+        calls.reads.push({ functionName, args });
         if (functionName === 'getCanonicalReputation') return CANONICAL;
         if (functionName === 'getLastIndex') return 7n;
         if (functionName === 'getAgentSeal') return opts.agentSeal ?? SEAL.address;
+        if (functionName === 'ownerOf') return opts.owner ?? OWNER;
+        if (functionName === 'getApproved') return opts.approved ?? '0x0000000000000000000000000000000000000000';
+        // operatorFor: the [owner, operator] pair that IS approved-for-all
+        if (functionName === 'isApprovedForAll') {
+          return !!opts.operatorFor && args[0] === opts.operatorFor[0] && args[1] === opts.operatorFor[1];
+        }
+        if (functionName === 'isNonceConsumed') return args[0] === opts.consumedKey;
         throw new Error(`unstubbed read: ${functionName}`);
       },
       waitForTransactionReceipt: async () => ({ status: 'success', logs: opts.receiptLogs ?? [] }),
@@ -208,7 +226,7 @@ test('FIND-02: in-range statusCodes (100, 200, 599, 999) pass', async () => {
   assert.equal(calls.sends.length, 1);
 });
 
-test('the proof\'s informational validator never reaches an ABI tuple', async () => {
+test('the proof\'s informational validator is not forwarded', async () => {
   const withValidator = { ...PROOF, validator: VFR };
   const tupleKeys = ['agentId', 'submitter', 'timestamp', 'deadline', 'taskHash', 'dataHashes', 'frameworkHash', 'signature'];
 
@@ -218,11 +236,14 @@ test('the proof\'s informational validator never reaches an ABI tuple', async ()
   const attest = seq.calls.writes.find((w) => w.functionName === 'attestFeedbackWithTask');
   assert.deepEqual(Object.keys(attest.args[2]), tupleKeys);
 
-  // atomic: the extra field does not disturb encoding — calldata decodes to the 8-field tuple
-  const atom = mkCtx({ code: DESIGNATOR, receiptLogs: [feedbackVerifiedLog(7n)] });
-  await new ReputationClient(atom.ctx).giveFeedback({ ...params, serveProof: withValidator });
-  const { args } = decodeFunctionData({ abi: feedbackBatcherAbi, data: atom.calls.sends[0].data });
-  assert.deepEqual(Object.keys(args[8]), tupleKeys);
+  // atomic: the type-4 calldata is byte-identical with and without the
+  // informational field — it changes nothing that is sent.
+  const sent = async (serveProof) => {
+    const atom = mkCtx({ code: DESIGNATOR, receiptLogs: [feedbackVerifiedLog(7n)] });
+    await new ReputationClient(atom.ctx).giveFeedback({ ...params, serveProof });
+    return atom.calls.sends[0].data;
+  };
+  assert.equal(await sent(withValidator), await sent(PROOF));
 });
 
 // Sequential path: the canonical entry would land before the registry sees the
@@ -246,6 +267,38 @@ test('sequential: a proof that cannot attest is refused before the canonical wri
     assert.equal(calls.writes.length, 0, `${name}: nothing may be written`);
     assert.equal(calls.sends.length, 0, name);
   }
+});
+
+test('sequential: deadline, owner/operator self-feedback and a redeemed nonce are refused before the canonical write', async () => {
+  const key = serveProofNonceKey(PROOF.agentId, PROOF.signature);
+  const cases = [
+    ['deadline passed', { blockTs: FIELDS.deadline + 1n }, /deadline .* has passed/],
+    ['deadline within the attest margin', { blockTs: FIELDS.deadline - 30n }, /too close to land the attest/],
+    ['caller owns the agent', { owner: ME }, /owns this agent/],
+    ['caller is the approved address', { approved: ME }, /approved address/],
+    ['caller is an approved-for-all operator of the owner', { operatorFor: [OWNER, ME] }, /approved operator/],
+    ['proof already redeemed (nonce consumed)', { consumedKey: key }, /already redeemed/],
+  ];
+  for (const [name, ctxOpts, re] of cases) {
+    const { ctx, calls } = mkCtx({ ...SEQUENTIAL, ...ctxOpts });
+    await assert.rejects(() => new ReputationClient(ctx).giveFeedback(params), re, name);
+    assert.equal(calls.writes.length, 0, `${name}: nothing may be written`);
+    assert.equal(calls.sends.length, 0, name);
+  }
+});
+
+test('the nonce key matches the registry derivation keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, signature))', async () => {
+  // Pinned with `cast keccak $(cast abi-encode "f(bytes32,uint256,bytes)" $(cast keccak SERVEPROOF) 352 0xab…ab)`;
+  // contracts/test/UpgradeVerifiedFeedback.t.sol reads isNonceConsumed with the same formula.
+  assert.equal(
+    serveProofNonceKey(352n, `0x${'ab'.repeat(65)}`),
+    '0x4e8d9900f3d815dd5acbf4dcbae90687866f22190b0f97847a702a4b3b7d38d8',
+  );
+  // and the preflight asks the registry about exactly this proof's key
+  const { ctx, calls } = mkCtx(SEQUENTIAL);
+  await new ReputationClient(ctx).giveFeedback(params);
+  const q = calls.reads.find((r) => r.functionName === 'isNonceConsumed');
+  assert.deepEqual(q.args, [serveProofNonceKey(PROOF.agentId, PROOF.signature)]);
 });
 
 test('sequential: a valid proof (with or without the echoed validator) passes the preflight', async () => {

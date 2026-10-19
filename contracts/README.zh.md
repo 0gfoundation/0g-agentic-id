@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 258 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 259 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -266,9 +266,12 @@ signature = sign(digest, agentSeal_priv)                               // 直接
 EIP-191 的 "intended validator"（链上实现：
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`）。
 sealed 运行时从 `VERIFIED_FEEDBACK_ADDR` 得知该地址——由 attestor 在创建 sandbox
-时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入；未设置或非法 → 容器干脆不出
-proof。自 `VerifiedFeedbackRegistry` 1.2.0 起它取代旧的 `personal_sign(inner)`
-包装，旧格式一律**拒绝**——硬切换、无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
+时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入。容器的 `VERIFIED_FEEDBACK_ADDR`
+未设置、格式错误或为零地址 → 容器干脆不出 `X-Agent-Proof`。attestor 一侧，
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` 留空或为零地址 → 容器拿到空值（因而不出
+proof）；填了但不是地址则 attestor 启动失败。自 `VerifiedFeedbackRegistry`
+1.2.0 起它取代旧的 `personal_sign(inner)` 包装，旧格式一律**拒绝**——硬切换、
+无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
 该 digest 属于共识关键：五份副本各自独立实现——合约、`sealed/internal/proxy/`、
 SDK 的 `ServeProof.ts`、attestor 控制台的 say-hi 校验和
 `attestor/scripts/verify-agent.sh`（清单维护在根目录 [`AGENTS.md`](../AGENTS.md)）
@@ -514,7 +517,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-258 个 Foundry tests / 28 suites（256 通过，2 个 fork 测试未设 `FORK_RPC`
+259 个 Foundry tests / 28 suites（257 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -525,7 +528,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
-| `VerifiedFeedback.t.sol` | 36 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、agentSeal）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界与 status-0 错位切分伪造 / 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式）|
+| `VerifiedFeedback.t.sol` | 37 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、agentSeal）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界与 status-0 错位切分伪造 / 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式），以及 sealed proxy 钉住的 taskHash 向量经 attestFeedbackWithTask 兑现 |
 | `FeedbackBatcher.t.sol` | 8 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用、已委托 EOA 仍能收 ETH / safeMint 的 NFT |
 | `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签（旧 personal_sign digest）+ revoke / appendResponse 全路径（含 inner hash 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |

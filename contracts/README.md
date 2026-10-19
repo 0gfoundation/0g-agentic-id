@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 258 tests / 28 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 259 tests / 28 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -275,9 +275,12 @@ signature = sign(digest, agentSeal_priv)                               // raw �
 the EIP-191 "intended validator" (on chain:
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`).
 The sealed runtime learns it from `VERIFIED_FEEDBACK_ADDR`, which the attestor
-injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`; unset or
-invalid → the container emits no proof at all. Since `VerifiedFeedbackRegistry`
-1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
+injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. If the
+container's `VERIFIED_FEEDBACK_ADDR` is unset, malformed or the zero address,
+it emits no `X-Agent-Proof` at all. On the attestor side, a blank or zero
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (so they emit
+no proof), and a non-address value fails attestor startup. Since
+`VerifiedFeedbackRegistry` 1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
 **rejected** — a hard cut with no fallback (rollout: [`DEPLOYMENT.md`](DEPLOYMENT.md) §7).
 The digest is consensus-critical: five copies implement it independently —
 the contract, `sealed/internal/proxy/`, the SDK's `ServeProof.ts`, the attestor
@@ -558,7 +561,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-258 Foundry tests across 28 suites (256 pass, 2 fork tests skip unless
+259 Foundry tests across 28 suites (257 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -569,7 +572,7 @@ longest business deadline window.
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
 | `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
-| `VerifiedFeedback.t.sol` | 36 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback (owner, operator, agentSeal) / verified summary against the canonical registry mock / task-receipt opening incl. the statusCode 100..999 bound and the status-0 shifted-split forgery / registry-bound digest: legacy personal_sign, EIP-712-wrapped and other-validator proofs rejected (and a registry-bound proof rejected by the deprecated fork), plus the cross-impl digest known-answer vector (inner + signed + legacy) |
+| `VerifiedFeedback.t.sol` | 37 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback (owner, operator, agentSeal) / verified summary against the canonical registry mock / task-receipt opening incl. the statusCode 100..999 bound and the status-0 shifted-split forgery / registry-bound digest: legacy personal_sign, EIP-712-wrapped and other-validator proofs rejected (and a registry-bound proof rejected by the deprecated fork), plus the cross-impl digest known-answer vector (inner + signed + legacy) and the sealed proxy's pinned taskHash vector redeemed via attestFeedbackWithTask |
 | `FeedbackBatcher.t.sol` | 8 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls, delegated EOA still receives ETH / safe-minted NFTs |
 | `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification (legacy personal_sign digest) + revoke / appendResponse, all paths (incl. the inner-hash known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |

@@ -317,10 +317,17 @@ await ag.reputation.verifyProof(proof);
 // (already mined). Otherwise: canonical write (mined inside the call, so the
 // assigned index can be read back) + attestFeedback (returned pending).
 // Because that canonical entry lands first, the sequential path checks the
-// proof gas-free beforehand (bound to addresses.verifiedFeedback, signer ==
-// on-chain agentSeal, submitter == you, you ≠ agentSeal) and throws with
-// nothing broadcast if it could never attest — a canonical write without its
-// mark would be an orphaned, unverified entry.
+// proof gas-free beforehand and throws with nothing broadcast on the known
+// permanent failures — a canonical write without its mark would be an
+// orphaned, unverified entry. Refused: agent / submitter mismatch, a proof
+// bound to another registry, a deadline already past or within 60s of the
+// latest block, a signature that does not recover to the on-chain agentSeal
+// under addresses.verifiedFeedback, you being the agentSeal, the owner, the
+// approved address or an approved-for-all operator, and a proof already
+// redeemed (isNonceConsumed). NOT prevented: a paused registry, a deadline
+// beyond the registry's nonce retention, state changing between the check and
+// the attest, and non-proof tx failures (gas, RPC) — the proof stays
+// unconsumed, so retry with attestFeedback where that can help.
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
 // come from a different wallet than the one that owns `agentId`. Neither can
@@ -641,7 +648,11 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   `/hello`, whose `X-Agent-Proof` envelope carries the agentId — so a URL alone
   is enough (owner ops still gated on `ag` having a key). That needs the proof:
   where the runtime has no `VERIFIED_FEEDBACK_ADDR`, `/hello` is unsigned, so
-  pass the `agentId` instead.
+  pass the `agentId` instead — or keep the URL and add the id as a hint,
+  `client(agentUrl, { agentId })`: it is used when `/hello` carries no proof,
+  must match the envelope's id when it does, and is bound to the URL on chain
+  like a discovered id. An `ag` with a key that still ends up with no agentId
+  gets a public handle and a console warning, never a silent downgrade.
 
   **Multi-window clients: the single-driver seat.** The container admits ONE
   driving client at a time (WeChat login semantics — configuration is global,

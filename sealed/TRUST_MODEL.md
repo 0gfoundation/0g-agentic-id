@@ -669,7 +669,7 @@ That marks out the **load-bearing wall**:
 |---|---|
 | `agent_seal_priv` stays inside TEE | Whole thing collapses, Group A goes with it (attacker forges arbitrary signatures offline) |
 | **Sign socket never signs raw hashes or EIP-191 version `0x00`** | The agent forges serve-proof contents offline (any `task_hash` / `data_hashes` / timestamps / `submitter`) and mints VerifiedFeedbackRegistry marks for them (FIND-01). The same holds for any adapter that bridges the socket into an agent tool |
-| sealed proxy controls response headers | Little, now. A header the agent wrote could carry only socket-domain signatures, which don't verify as serve-proofs, or a genuine proof lifted from another response, whose `task_hash` won't match this one |
+| sealed proxy controls response headers | Little, now. The proxy drops any `X-Agent-Proof` an upstream backend sets, on every relay path, so the header a client sees is the runtime's own. Even one that got through could carry only socket-domain signatures, which don't verify as serve-proofs, or a genuine proof lifted from another response, whose `task_hash` won't match this one |
 | **Agent doctrine** | Group B fails on what the socket *can* sign: `chain.Update` (an `update` tx via `/sign/transaction`) and any personal_sign / EIP-712 claim the agent issues. The serve-proof's Group B still holds mechanically, and Group A holds on every channel |
 
 `report.Status` and the settings seed are not on that list. sealed signs
@@ -739,11 +739,14 @@ What the socket **never** signs, by invariant (`sealed/internal/proxy/sign.go`):
 
 Every socket signature is over a `0x19 0x45` personal message, a
 `0x19 0x01` EIP-712 digest, or a transaction the socket assembles from
-fields. sealed's own in-process signatures sit outside those shapes:
-`report.Status` and the settings seed are raw keccak256 digests, the
-serve-proof is `0x00`, and `chain.Update` is an ordinary transaction.
-An adapter that bridges the socket into an agent tool (for example dsh's
-`seal_sign`) must not add either missing path.
+fields. Of sealed's own in-process signatures, only three sit outside
+those shapes: `report.Status` and the settings seed are raw keccak256
+digests, and the serve-proof is `0x00`. `chain.Update` does not: it is an
+ordinary transaction, the same shape `/sign/transaction` produces, so the
+signing domain does not separate the two — which is why that channel
+relies on doctrine (the load-bearing-wall table above). An adapter that
+bridges the socket into an agent tool (for example dsh's `seal_sign`)
+must not add either missing path.
 
 The unix socket is bound 0600 and owned by the low-privilege `agent`
 user the framework subprocess runs as (`internal/privsep`), and **never

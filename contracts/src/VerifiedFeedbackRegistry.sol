@@ -108,6 +108,11 @@ contract VerifiedFeedbackRegistry is
     ///      acceptOwnership — adds pendingOwner / acceptOwnership +
     ///      OwnershipTransferStarted, the only ABI additions; the pending owner
     ///      lives in OZ's ERC-7201 namespace, so no existing storage moves.
+    ///      Marks attested before an environment's 1.2.0 upgrade block carry
+    ///      no FIND-01 / FIND-02 guarantee: their recorded audit data and
+    ///      verified endpoint are not assured to be authentic. That block is
+    ///      recorded per environment in contracts/DEPLOYMENT.md §6; readers and
+    ///      indexers should drop FeedbackVerified logs below it.
     ///      1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
     ///      recomputes the proof's taskHash from revealed receipt materials and
     ///      records the URI as the entry's TEE-verified endpoint; new views

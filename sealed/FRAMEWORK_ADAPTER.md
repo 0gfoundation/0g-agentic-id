@@ -750,6 +750,7 @@ fallback.
 | `SealSignSock` | `/run/seal-sign.sock` | the agent-only sign endpoint (§8); tell your agent where it is |
 | `AgentSeal` | 0x address derived from `agent_seal_priv` | the agent's TEE identity address |
 | `AgentID`, `Owner`, `ChainRPC`, `ContractAddr`, `ChainID`, `AttestorURL` | chain bootstrap outputs | public on-chain facts, not secrets; inject into the agent's context so it can reason about its own identity |
+| `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
 | `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
 

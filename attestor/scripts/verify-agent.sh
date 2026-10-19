@@ -9,22 +9,33 @@
 #      derived from a different master fails ECIES with "message
 #      authentication failed")
 #   3. serve-proof: /hello returns 200 + X-Agent-Proof, its envelope names
-#      this agent, and (with cast) the signature recovers to the seal addr
-#      over the EIP-191 version-0x00 ServeProof digest bound to /config's
+#      this agent, and the signature recovers to the seal addr over the
+#      EIP-191 version-0x00 ServeProof digest bound to /config's
 #      verified_feedback_addr — the same check VerifiedFeedbackRegistry
 #      makes, gas-free, so a validator / image skew shows up here first
 #
+# Owner-run: the deployment row's sandbox_id / agent_seal_addr are
+# owner-tier fields, so this needs THAT agent's owner key.
+#
 # Usage:
-#   API=http://sandbox.example:8080 AGENT_ID=61 scripts/verify-agent.sh
+#   API=http://sandbox.example:8080 AGENT_ID=61 OWNER_PRIV=0x<owner key> scripts/verify-agent.sh
 #   scripts/verify-agent.sh --kat   # offline: pin check 3b's digest to the
 #                                   # cross-impl known-answer vector (cast + jq)
 #
+# Requires: curl, jq, and cast (foundry) — cast signs the owner-scoped
+# request and does the chain read and the signature recovery.
+#
 # Env:
-#   API       attestor base URL            (default http://localhost:8080)
-#   AGENT_ID  on-chain agentId to verify   (required)
-#   RPC       chain RPC for the getAgentSeal cross-check; skipped if cast
-#             is unavailable                (default: /config's chain_rpc)
+#   API         attestor base URL            (default http://localhost:8080)
+#   AGENT_ID    on-chain agentId to verify   (required)
+#   OWNER_PRIV  that agent's owner private key (required) — signs the
+#               owner-scoped /deployments request
+#   RPC         chain RPC for the getAgentSeal cross-check
+#               (default: /config's chain_rpc)
 set -euo pipefail
+
+command -v cast >/dev/null 2>&1 || { echo "verify-agent: cast (foundry) is required"; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "verify-agent: jq is required"; exit 1; }
 
 # serveproof_digest CHAIN_ID IDENTITY_REGISTRY VALIDATOR ENVELOPE_JSON prints
 # the ServeProof signed digest for an X-Agent-Proof envelope — what agent_seal
@@ -101,13 +112,9 @@ say "row: phase=$PHASE seal_addr=$DB_ADDR sandbox=$SANDBOX"
 [ -n "$SANDBOX" ] || { bad "no sandbox_id on the row"; exit 1; }
 
 # ── 1a. chain: getAgentSeal must equal the row ──────────────────────────
-if command -v cast >/dev/null 2>&1; then
-  CHAIN_ADDR=$(cast call --rpc-url "$RPC" "$CONTRACT" "getAgentSeal(uint256)(address)" "$AGENT_ID" | tr '[:upper:]' '[:lower:]')
-  if [ "$CHAIN_ADDR" = "$DB_ADDR" ]; then ok "chain getAgentSeal == attestor row ($CHAIN_ADDR)"
-  else bad "chain getAgentSeal=$CHAIN_ADDR != row=$DB_ADDR"; fi
-else
-  say "SKIP chain cross-check (cast not installed)"
-fi
+CHAIN_ADDR=$(cast call --rpc-url "$RPC" "$CONTRACT" "getAgentSeal(uint256)(address)" "$AGENT_ID" | tr '[:upper:]' '[:lower:]')
+if [ "$CHAIN_ADDR" = "$DB_ADDR" ]; then ok "chain getAgentSeal == attestor row ($CHAIN_ADDR)"
+else bad "chain getAgentSeal=$CHAIN_ADDR != row=$DB_ADDR"; fi
 
 # ── 1b + 2. sealed bootstrap log: provisioned addr + decrypt health ─────
 LOG_URL="http://${SERVE_PORT}-${SANDBOX}.${PROXY}/log.html"
@@ -166,9 +173,7 @@ if [ -n "$PROOF" ]; then
   E_VAL=$(printf '%s' "$ENV_JSON" | jq -r '.validator // empty' 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
   if [ "$E_AGENT" = "$AGENT_ID" ]; then ok "proof envelope agent_id == $AGENT_ID"
   else bad "proof envelope agent_id='$E_AGENT' != $AGENT_ID"; fi
-  if ! command -v cast >/dev/null 2>&1; then
-    say "SKIP ServeProof signature recovery (cast not installed)"
-  elif [ -z "$VF" ]; then
+  if [ -z "$VF" ]; then
     say "SKIP ServeProof signature recovery (/config has no verified_feedback_addr — unverifiable)"
   elif [ -n "$E_VAL" ] && [ "$E_VAL" != "$VF" ]; then
     bad "proof signed for a different registry: envelope validator=$E_VAL != /config verified_feedback_addr=$VF"
@@ -176,11 +181,14 @@ if [ -n "$PROOF" ]; then
     DIGEST=$(serveproof_digest "$CHAIN_ID" "$CONTRACT" "$VF" "$ENV_JSON") || DIGEST=""
     if [ -z "$DIGEST" ]; then
       bad "ServeProof digest: could not rebuild from envelope ($ENV_JSON)"
-    elif cast wallet verify --no-hash --address "$DB_ADDR" "$DIGEST" "$SIG" >/dev/null 2>&1; then
+    elif VERIFY_ERR=$(cast wallet verify --no-hash --address "$DB_ADDR" "$DIGEST" "$SIG" 2>&1 >/dev/null); then
       ok "ServeProof signature recovers to seal addr (validator $VF)"
-    else
+    elif printf '%s' "$VERIFY_ERR" | grep -q "did not sign this message"; then
       hint=""; [ -n "$E_VAL" ] || hint=" (envelope has no validator — legacy sealed image? owner must /reset)"
       bad "ServeProof signature does not recover to seal addr $DB_ADDR$hint"
+    else
+      # Not a plain mismatch (malformed signature, cast usage error, …).
+      bad "ServeProof signature check errored: $VERIFY_ERR"
     fi
   fi
 fi

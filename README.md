@@ -189,9 +189,9 @@ specific TDX device), and accessible only inside a TEE.
 From this key material, AgenticID generates an **AgentSeal** for each
 agent — a key pair whose private key exists only inside the TEE runtime.
 The owner cannot get to it; no one outside the TEE can get to it. The agent
-uses AgentSeal to sign **every response** it produces, and this signature
-proves the response came from an agent running in a TEE, strictly following
-its on-chain record.
+uses AgentSeal to sign **the responses it serves** (its `/hello` and its
+`/api/*` services), and this signature proves the response came from an agent
+running in a TEE, strictly following its on-chain record.
 
 AgenticID's backend Attestor is itself a Tapp application registered on
 TappRegistry. Its registration entry contains three things:
@@ -281,8 +281,8 @@ never happened. A review that was never backed by a real response gets no
 verification mark.
 
 This raises the cost of fake reviews but is **not** full sybil resistance:
-the runtime issues a proof on every response, including the unauthenticated
-public `GET /hello`, so proofs are cheaply obtainable, and one entity can
+the runtime issues a proof on every signed response, including the
+unauthenticated public `GET /hello`, so proofs are cheaply obtainable, and one entity can
 request service from many wallets it controls. That includes the agent
 itself: it can call its own proxy (e.g. loopback `:8080`) with an
 `X-Client-Address` it controls and get *genuine* proofs — signing-domain
@@ -377,7 +377,8 @@ chain from on-chain registration to each signed response.
 - **Agent runtime (`sealed`)** — the container running inside Sandbox that
   receives the key after RA. It restores encrypted iData from chain into a
   runnable agent, continuously writes state evolution back on chain, and
-  signs `X-Agent-Proof` on every response. (Go, see
+  signs `X-Agent-Proof` on its signed responses (`/hello`, `/_seal/auth`,
+  agent-registered `/api/*` services). (Go, see
   [`sealed/`](sealed/ARCHITECTURE.md))
 - **0g-kms** — provides hardware-security-grade key services with disaster
   recovery for the Tapp ecosystem.
@@ -403,7 +404,7 @@ Attestor validates 0g-Sandbox credentials + checks validFrameworkHashes
 0g-Sandbox confirms authorized owner + correct runtime code
         │
         ▼
-agent signs every response with AgentSeal (X-Agent-Proof)
+agent signs its served responses with AgentSeal (X-Agent-Proof)
         │
         ▼
 0g-compute attests every inference
@@ -469,7 +470,7 @@ protocol), ERC-8004 (identity registration and reputation), AgenticID
 NonceRegistry (unified replay protection), along with their extension
 points and dependencies. Walks through the three main flows (`register`,
 `attestFeedback`, `iTransferFrom`) with their on-chain logic and ecrecover
-validation, plus 258 Foundry tests across 28 suites and full deploy, upgrade,
+validation, plus 259 Foundry tests across 28 suites and full deploy, upgrade,
 and Etherscan-verify scripts.
 
 **[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**

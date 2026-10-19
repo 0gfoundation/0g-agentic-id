@@ -18,7 +18,7 @@ Guidance for AI coding agents working in this repository. (Claude Code loads thi
 ```bash
 # contracts — submodules first, once:
 git submodule update --init --recursive
-cd contracts && forge build && forge test          # 258 tests / 28 suites; 2 fork tests skip unless FORK_RPC is set
+cd contracts && forge build && forge test          # 259 tests / 28 suites; 2 fork tests skip unless FORK_RPC is set
 forge test --match-contract TransferFlow           # one suite
 forge test --match-test test_iCloneFrom_succeeds   # one test
 
@@ -36,8 +36,9 @@ docker run --rm -v "$PWD/..":/repo -v cargo-cache:/usr/local/cargo/registry \
 cd sealed && go test ./...
 go test ./internal/proxy -run TestServeProof       # one test
 
-# sdk
-cd sdk/typescript && npm install && npm run typecheck && npm run build
+# sdk — `npm test` builds, then runs test/*.test.mjs (it also pins the console's and
+# verify-agent.sh's ServeProof digest copies); `npm run test:kav` is the cross-impl vector
+cd sdk/typescript && npm install && npm run typecheck && npm test
 
 # live regression (costs gas + sandbox billing; drives every e2e leg against a deployed env)
 OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 VERIFIED_FEEDBACK_ADDR=0x<registry> \
@@ -50,7 +51,7 @@ There is no CI — run the relevant suite(s) locally before pushing. `attestor/T
 
 **Deploy flow** (attestor): `POST /deploy` → preflight (trust-root ack + prepaid sandbox balance ≥ 0.1 OG, HTTP 402 with named remediation) → async jobs drive three parallel *stages* recorded per deployment row: `storage_stage` (iData → 0g storage), `mint_stage` (registerWithSeal on chain), `container_stage` (sandbox create → TEE attestation → `/provision` hands the container its `agent_seal_priv`). `derive_phase()` in `attestor/crates/shared/src/types.rs` folds the stages into the single `phase` every UI/SDK consumer sees (`deploying/running/stopped/offline/failed`).
 
-**Runtime** (sealed): boots in 5 strict phases (attest → provision → chain bootstrap → framework restore → status report). Everything framework-specific sits behind the `framework.Framework` adapter interface (`sealed/internal/framework/framework.go`); four adapters ship — openclaw, hermes, prime-agent, dsh — and `FRAMEWORK_ADAPTER.md` is the contract for adding another. Each framework has its own sealed image (`sealed/images/*`), advertised per framework by the attestor's `GET /config` `frameworks[]`; the SDK resolves the image from an explicit `sealedImage`/`framework` argument, else from the agent's deployment-row framework (refusing when the row is unreadable). The container still does not validate that the binding's framework matches the image it booted on — a wrong explicit `sealedImage` fails at framework start, not before. A 30s watcher diffs each role's canonical plaintext against the chain snapshot and uploads drift (uploader → 0g storage → signed `update` tx). The proxy signs `/hello` and agent-registered `/api/*` responses with an `X-Agent-Proof` ServeProof header bound to the VerifiedFeedbackRegistry — only when the agent has a chain identity and `VERIFIED_FEEDBACK_ADDR` is usable (see below); framework-declared routes (chat/UI) are never signed.
+**Runtime** (sealed): boots in 5 strict phases (attest → provision → chain bootstrap → framework restore → status report). Everything framework-specific sits behind the `framework.Framework` adapter interface (`sealed/internal/framework/framework.go`); four adapters ship — openclaw, hermes, prime-agent, dsh — and `FRAMEWORK_ADAPTER.md` is the contract for adding another. Each framework has its own sealed image (`sealed/images/*`), advertised per framework by the attestor's `GET /config` `frameworks[]`; the SDK resolves the image from an explicit `sealedImage`/`framework` argument, else from the agent's deployment-row framework (refusing when the row is unreadable). The container still does not validate that the binding's framework matches the image it booted on — a wrong explicit `sealedImage` fails at framework start, not before. A 30s watcher diffs each role's canonical plaintext against the chain snapshot and uploads drift (uploader → 0g storage → signed `update` tx). The proxy signs `/hello`, `/_seal/auth` and agent-registered `/api/*` responses with an `X-Agent-Proof` ServeProof header bound to the VerifiedFeedbackRegistry — only when the agent has a chain identity and `VERIFIED_FEEDBACK_ADDR` is usable (see below); framework-declared routes (chat/UI), WebSocket upgrades and streamed responses are never signed, and an `X-Agent-Proof` set by an upstream backend is dropped (the header is runtime-owned).
 
 **Authorization model** (cross-cutting, easy to get wrong):
 - Owner-initiated lifecycle calls (`/stop`, `/start`, `/reset`, `/retry`-with-envelope) carry a *sandbox envelope*: a canonical JSON `{action, expires_at, nonce, payload, resource_id}` — **field order must match exactly**, it's verbatim-relayed and EIP-191-verified — signed by the owner wallet. The attestor verifies the signer against the **live on-chain owner** (`authorize_lifecycle` in `attestor/crates/api/src/routes/lifecycle_auth.rs`); never gate on the unsigned `req.owner` field, that pattern is forgeable and was deliberately removed.

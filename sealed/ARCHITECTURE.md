@@ -501,11 +501,19 @@ container's `:8080`.
 | `/hello` | verifier, attestor, ops | returns the agent's identity + `data_hashes` of currentSnapshot (the serve-proof envelope travels in the `X-Agent-Proof` header) |
 | `/_seal/auth` | **owner's wallet** | owner signs `0GSealAuth:{sealId}:{ts}` with EIP-191; sealed verifies the signer == on-chain owner and returns the framework gateway credential `{token}` (the chat-API bearer) |
 | `/_seal/settings` | **owner's wallet** | `GET` returns the document in force; `POST` replaces it, re-renders and restarts the framework process. Both owner-signed against the **live** on-chain owner; the `POST` signature is additionally bound to a sha256 of the request body, so anything able to alter the request in flight can't keep a valid signature while substituting a different document. The hot path — it exists so changing a model or a thinking level stops needing a container rebuild. Not durable: attestor still holds the owner's document, and the next boot restores it (`internal/proxy/settings.go:40-53`) |
-| `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth, responses proof-signed); every undeclared path 404s — there is no catch-all relay |
+| `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
+| `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
+
+Exactly three surfaces are proof-signed: `/hello`, `/_seal/auth` and the
+agent-registered `/api/*` services — and only when `VERIFIED_FEEDBACK_ADDR`
+is usable (and the agent has an on-chain identity). Framework routes
+(`/v1/*`, `/v1/responses*`, any UI), WebSocket upgrades and streamed
+responses never carry an `X-Agent-Proof`; the proxy also drops one an
+upstream backend sets, so the header is always the runtime's own.
 
 The agent's own `/settings` lever is deliberately asymmetric with the owner's:
 it validates, renders and restarts exactly like the owner path, but persists

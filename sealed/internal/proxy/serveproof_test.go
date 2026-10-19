@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -31,7 +32,57 @@ const (
 	// wrap, which a personal_sign over katProofHash produces and the registry
 	// now rejects.
 	katLegacyDigest = "6286d77e85057c51844833e65baab36380e73b1f8a5ec91cbdf23de60e077dcf"
+	// keccak256("POST" ‖ "/api/x?q=1" ‖ keccak256(`{"q":"in"}`) ‖
+	// keccak256(`{"a":"out"}`) ‖ "201") — the taskHash preimage that
+	// attestFeedbackWithTask recomputes from a reveal. Also pinned (and
+	// redeemed) in contracts/test/VerifiedFeedback.t.sol.
+	katTaskHash = "6c37771076037daf6053adca6126264030e249e0c9a6fc0cc238c56509f842db"
 )
+
+// The fixed receipt materials behind katTaskHash.
+const (
+	katTaskMethod = "POST"
+	katTaskURI    = "/api/x?q=1"
+	katTaskReq    = `{"q":"in"}`
+	katTaskResp   = `{"a":"out"}`
+	katTaskStatus = 201
+)
+
+// TestWriteServeProof_TaskHashKnownAnswer pins the taskHash the runtime signs
+// to the preimage VerifiedFeedbackRegistry.attestFeedbackWithTask rebuilds —
+// abi.encodePacked(method, uri, keccak256(reqBody), keccak256(respBody),
+// decimal statusCode), i.e. a plain concatenation — both against an
+// independent rebuild here and against the cross-implementation constant.
+// Drift in field order, the URI form (RequestURI, query included) or the
+// status encoding would orphan every receipt-opened attest.
+func TestWriteServeProof_TaskHashKnownAnswer(t *testing.T) {
+	priv, _ := crypto.GenerateKey()
+	reqBody, respBody := []byte(katTaskReq), []byte(katTaskResp)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(katTaskMethod, katTaskURI, strings.NewReader(katTaskReq))
+	if err := writeServeProof(rec, req, crypto.FromECDSA(priv), reqBody, respBody, nil, katTaskStatus,
+		"30", "0x"+strings.Repeat("11", 32), "16602", "0x00000000000000000000000000000000000000A9", testValidator); err != nil {
+		t.Fatalf("writeServeProof: %v", err)
+	}
+	if rec.Code != katTaskStatus || rec.Body.String() != katTaskResp {
+		t.Fatalf("got %d %q, want %d %q", rec.Code, rec.Body.String(), katTaskStatus, katTaskResp)
+	}
+	_, env := decodeProofHeader(t, rec.Header().Get("X-Agent-Proof"))
+
+	var preimage []byte
+	preimage = append(preimage, katTaskMethod...)
+	preimage = append(preimage, katTaskURI...)
+	preimage = append(preimage, crypto.Keccak256(reqBody)...)
+	preimage = append(preimage, crypto.Keccak256(respBody)...)
+	preimage = append(preimage, strconv.Itoa(katTaskStatus)...)
+	if want := "0x" + hex.EncodeToString(crypto.Keccak256(preimage)); env.TaskHash != want {
+		t.Fatalf("task_hash = %s, want the independently rebuilt %s", env.TaskHash, want)
+	}
+	if env.TaskHash != "0x"+katTaskHash {
+		t.Fatalf("task_hash drifted from the cross-impl vector:\n got  %s\n want 0x%s", env.TaskHash, katTaskHash)
+	}
+}
 
 // Rebuild the contract's signed digest from the envelope — independently of
 // serveProofHash / serveProofDigest, which the KAT below pins — and recover
