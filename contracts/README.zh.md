@@ -517,7 +517,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + 自定义模式、delegate、签名/nonce/deadline/pubkey 全面攻击面 |
 | `Clone.t.sol` | 9 | iCloneFrom + 源保留 + 新 token 无 seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` 清 agentWallet / authorizedUsers，保留 seal/data/URI/metadata |
-| `VerifiedFeedback.t.sol` | 36 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、agentSeal）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界与 status-0 错位切分伪造 / 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式）|
+| `VerifiedFeedback.t.sol` | 37 | attestFeedback ServeProof 验签 / canonical 条目绑定 / 防自评（owner、operator、agentSeal）/ 对着 canonical mock 的 verified summary / task-receipt 开箱，含 statusCode 100..999 边界与 status-0 错位切分伪造 / 注册表绑定 digest：旧 personal_sign、EIP-712 包装、其他 validator 的 proof 均被拒（且注册表绑定 proof 在已废弃分叉上被拒），外加跨实现 digest 已知答案向量（inner + 签名 digest + 旧格式），以及 sealed proxy 钉住的 taskHash 向量经 attestFeedbackWithTask 兑现 |
 | `FeedbackBatcher.t.sol` | 8 | EIP-7702 委托批处理（7702 cheatcode）：原子写+盖章、坏 proof 回滚、自调门禁 vs 直调/外人调用、已委托 EOA 仍能收 ETH / safeMint 的 NFT |
 | `Reputation.t.sol` | 24 | 已废弃分叉：giveFeedback ServeProof 验签（旧 personal_sign digest）+ revoke / appendResponse 全路径（含 inner hash 已知答案向量）|
 | `DataStorage.t.sol` | 13 | update / updateAt + 空 / 越界 / 非 owner |
