@@ -39,6 +39,34 @@ contract StorageLayoutTest is Test {
             0x70c420e34ba808fea9cb59170b4cd5f9b7bcf6408241b0008bcba5d7b854d100);
     }
 
+    /// @dev The OZ namespaces behind the 1.2.0 Ownable → Ownable2Step swap
+    ///      (AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry). The owner
+    ///      stays in OZ's Ownable slot; Ownable2Step adds exactly one slot of
+    ///      its own (pendingOwner), distinct from every 0g namespace above —
+    ///      which is why the swap is beacon-upgrade-safe for live proxies.
+    function test_ownable2StepNamespaceIsDisjoint() public pure {
+        bytes32 ownable = _erc7201("openzeppelin.storage.Ownable");
+        bytes32 twoStep = _erc7201("openzeppelin.storage.Ownable2Step");
+        assertEq(ownable, 0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300);
+        assertEq(twoStep, 0x237e158222e3e6968b72b9db0d8043aacf074ad9f650f0d1606b4d82ee432c00);
+        string[13] memory ours = [
+            "0g.storage.AgenticID", "0g.storage.ERC8004CanonicalBound",
+            "0g.storage.ERC7857Cloneable", "0g.storage.ERC7857Authorize",
+            "0g.storage.ERC7857IDataStorage", "0g.storage.NonceRegistry",
+            "0g.storage.TEEDataVerifier", "0g.storage.AgenticIDReputationRegistry",
+            "0g.storage.ERC7857", "0g.storage.VerifiedFeedbackRegistry",
+            "0g.storage.CloneGate", "openzeppelin.storage.Ownable",
+            "0g.storage.BaseDataVerifier"
+        ];
+        for (uint256 i = 0; i < ours.length; i++) {
+            assertTrue(_erc7201(ours[i]) != twoStep, ours[i]);
+        }
+        assertTrue(
+            twoStep != 0x2a6e9d47b6f4c10d00c1ba6c2a83e5a99f9ffd6b1a85ca0f0b97a3c3c3a27c00,
+            "BaseDataVerifier literal slot"
+        );
+    }
+
     /// @dev BaseDataVerifier's slot is a fixed literal, not the ERC-7201
     ///      derivation. Pinned so the (intentional) mismatch can't drift
     ///      silently — the constant differs from the derived value, and the

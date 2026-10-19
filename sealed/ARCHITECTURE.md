@@ -553,7 +553,7 @@ The env surface:
 | `SANDBOX_SEAL_ATTESTATION` | sandbox-signed attestation JSON containing `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`; sealId is read from here, not a separate env |
 | `TEE_SIGNER_ADDRESS` | (optional, **usually unset in production**) if set, Phase 0 requires the address recovered from the attestation signature == this value, otherwise fail loud. The authoritative sandbox signer check is at the attestor `/provision` end (querying `TappRegistry.getNodeList(sandbox_app_id)`); this pin in sealed is only a dev / local-debug fail-early aid, not a security boundary |
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
-| `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives |
+| `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`) |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |

@@ -53,7 +53,7 @@ git submodule update --init --recursive
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 235 tests / 25 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试（当前 258 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -134,7 +134,7 @@ AgenticID
   ├── ERC7857IDataStorageUpgradeable             (IntelligentData[])
   ├── ERC7857AuthorizeUpgradeable                (authorizedUsers[])
   ├── ERC7857CloneableUpgradeable                (iCloneFrom)
-  └── OwnableUpgradeable                          (owner / attestor 管理)
+  └── Ownable2StepUpgradeable                     (两步 owner / attestor 管理)
 ```
 
 ERC-721 同时经 8004 和 7857 两条路径进来，C3 把它收敛成单实例：一个 agent =
@@ -492,6 +492,17 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
   通过 read-through / write-forward 暴露同一个身份。生态里的 8004 工具读
   canonical 注册表时原生看到 AgenticID agent；可转让的 owner 活在本地
   AgenticID token 上。
+- **治理：owner 直接调用且两步转移，升级走 Timelock**。AgenticID、
+  TEEDataVerifier、VerifiedFeedbackRegistry 均为 `Ownable2Step`（1.2.0，审计
+  FIND-16）：`transferOwnership(x)` 只设置 `pendingOwner`（事件
+  `OwnershipTransferStarted`），`x` 调 `acceptOwnership()` 后 ownership 才转移。
+  owner 专属的管理操作——attestor 白名单、framework hash 白名单、
+  `setVerifier` / `setTeeOracleAddress`、`setPauser`、`setMaxProofAge`——都是
+  直接调用，不走 timelock；只有 beacon 升级经过 Timelock（mainnet `minDelay`
+  1 天，testnet / dev 为 0）。这两个替换 setter 拒绝 `address(0)`
+  （`AgenticIDZeroAddress` / `TEEDataVerifierZeroAddress`），并 emit
+  `VerifierUpdated` / `TeeOracleUpdated`（旧值、新值），与 `PauserUpdated` 一致
+  （FIND-12）。各环境的角色持有者见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §1 / §6。
 - **agentSeal / sealId：set-once 永久绑定**。一个 agentId 的 seal 只能设一次，转让也不清除。换硬件时 attestor 给新 Agent TEE provision 同一个 `agentSeal_priv` 即可。
 - **转让按 seal 分叉**。seal 绑定 agent 走标准 `transferFrom` 只转 ownership（数据始终锁在 TEE）；无 seal agent 走 proof 门禁的 `iTransferFrom`（dataKey 重加密给买家）。`iCloneFrom` 仅限无 seal。
 - **mint 对称性**：`register` 和 `registerWithSeal` 都 emit `ITransferred(0x0, to, agentId, entries[])`，indexer 对 mint 和 transfer 统一处理。
@@ -503,7 +514,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 
 ## 9. 测试
 
-235 个 Foundry tests / 25 suites（233 通过，2 个 fork 测试未设 `FORK_RPC`
+258 个 Foundry tests / 28 suites（256 通过，2 个 fork 测试未设 `FORK_RPC`
 时跳过），`forge test` 全绿。覆盖每个 `external` / `public` 函数和每条文档化
 的 error 路径。
 
@@ -521,17 +532,20 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `Authorize.t.sol` | 9 | 授权增删查清 + 重复 / 零址 / 非 owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + 过期 / 重放 / 非 owner / unset |
 | `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + 覆写 / nonexistent |
-| `VerifierAdmin.t.sol` | 7 | oracle 轮换 / pause（pauser 角色）/ maxProofAge / onlyOwner |
-| `AgenticIDAdmin.t.sol` | 7 | attestor 增删 / frameworkHash / setVerifier / onlyOwner |
+| `VerifierAdmin.t.sol` | 9 | oracle 轮换（拒绝零地址、`TeeOracleUpdated`）/ pause（pauser 角色）/ maxProofAge / onlyOwner |
+| `AgenticIDAdmin.t.sol` | 9 | attestor 增删 / frameworkHash / setVerifier（拒绝零地址、`VerifierUpdated`）/ onlyOwner |
+| `TwoStepOwnership.t.sol` | 6 | AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry：提议后 owner 不变、只有 pending owner 能接受、接受后权限转移；再次提议覆盖、`address(0)` 取消 |
 | `Upgradeable.t.sol` | 9 | Timelock 升级 beacon（非 Timelock 拒绝 / 延时前拒绝 / 延时后成功+state 保留）+ pauser 角色（非 pauser 拒绝 / 暂停阻断写路径 / view 正常 / 解锁 / setPauser 轮换）|
 | `CanonicalBinding.t.sol` | 9 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id |
 | `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
-| `UpgradeVerifiedFeedback.t.sol` | 3 | VerifiedFeedbackRegistry 经 Timelock 从 1.1.0 升到 1.2.0（升级前 impl = `test/mocks/` 里冻结的 1.1.0 源码）：章 / 审计数据 / 接口 / 配置 / nonce 均保留；切换后旧格式 proof 被拒、注册表绑定 proof 通过 |
+| `UpgradeVerifiedFeedback.t.sol` | 4 | VerifiedFeedbackRegistry 经 Timelock 从 1.1.0 升到 1.2.0（升级前 impl = `test/mocks/` 里冻结的 1.1.0 源码）：章 / 审计数据 / 接口 / 配置 / nonce 均保留；切换后旧格式 proof 被拒、注册表绑定 proof 通过；owner 保留，之后为两步转移 |
+| `UpgradeGovernance.t.sol` | 5 | AgenticID + TEEDataVerifier 从冻结的 1.1.0 源码经 1 天 Timelock（仿 mainnet 的延时、owner 作 proposer、开放执行）升到 1.2.0：seal 绑定 / iData / URI / metadata / 白名单 / verifier / oracle / nonce 均保留；升级后两步 ownership 与零地址校验生效 |
 | `CloneGate.t.sol` | 20 | policy 模式克隆卫星合约：setCloneAuthorizer 门禁 / cloneFrom 正常路径 + 全部 revert（attestor、无/拒绝/自身 revert 的 authorizer、arity、sealId、暂停）/ 转让时按 owner-at-set 失效 / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | 官方按买家开关的克隆 policy：仅卖家可 grant/revoke、按 agent 隔离、转让后 grant 失效且收回后复活、经 gate 克隆 |
 | `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |
 | `InitializerGuard.t.sol` | 3 | proxy + impl 都不可 reinit |
-| `StorageLayout.t.sol` | 2 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）|
+| `StorageLayout.t.sol` | 3 | 每个 ERC-7201 槽常量与其 namespace 推导一致（+ BaseDataVerifier 有意为之的字面量）；OZ `Ownable2Step` 槽固定且与我们所有槽不相交 |
+| `DeployScript.t.sol` | 6 | `Deploy.s.sol` 治理规则：链 16661 上 Timelock `minDelay` 默认且至少 86400，其余链默认 0；链 16661 上 Timelock 无外部 admin，其余链 OWNER 为 admin；增量部署在 mainnet 上拒绝弱 Timelock 作 beacon owner |
 | `ERC165.t.sol` | 2 | 9 个声明接口正、`0xffffffff` / unknown 负 |
 | `CanonicalForkIntegration.t.sol` | 2 | 对着线上 canonical 注册表 self-mint + verified-feedback attest（仅设了 `FORK_RPC` 才跑，否则跳过）|
 
@@ -546,4 +560,4 @@ proxy 部署、proof / mint helpers。新增 suite 通常只需要继承 + 写�
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** —— 部署 / 升级 / Etherscan verify 全套
   runbook（15 合约一次部署、Timelock 两阶段升级、`verify.sh` 工作原理、0g
-  Galileo testnet 参考地址）。
+  Galileo testnet 与 0G mainnet 参考地址 + 各环境治理）。

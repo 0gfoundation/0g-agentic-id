@@ -35,6 +35,7 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ```ts
 import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
 
+// 0G mainnet; for the Galileo testnet use 'https://agenticid-testnet.0g.ai'
 const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only
 });

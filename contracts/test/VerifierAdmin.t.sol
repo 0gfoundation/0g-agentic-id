@@ -4,7 +4,11 @@ pragma solidity ^0.8.24;
 import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {TEEDataVerifierInvalidSignature} from "../src/verifiers/TEEDataVerifier.sol";
+import {
+    TEEDataVerifier,
+    TEEDataVerifierInvalidSignature,
+    TEEDataVerifierZeroAddress
+} from "../src/verifiers/TEEDataVerifier.sol";
 import {DataVerifierNotPauser} from "../src/verifiers/BaseDataVerifier.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
@@ -64,6 +68,26 @@ contract VerifierAdminTest is AgenticIDTestBase {
         vm.prank(sellerWallet.addr);
         agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, agentId, proofsNew);
         assertEq(agenticId.ownerOf(agentId), buyerWallet.addr, "transfer after rotation works");
+    }
+
+    /// @dev FIND-12: no signature recovers to address(0), so a zero oracle
+    ///      would make every ownership proof fail — 1.2.0 refuses it and the
+    ///      current oracle stays active.
+    function test_setTeeOracleAddress_revertsOnZeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(TEEDataVerifierZeroAddress.selector);
+        verifier.setTeeOracleAddress(address(0));
+        assertEq(verifier.teeOracleAddress(), oracleAddr, "oracle unchanged");
+    }
+
+    /// @dev FIND-12: the rotation is observable on chain — old and new address.
+    function test_setTeeOracleAddress_emitsTeeOracleUpdated() public {
+        address newOracle = makeAddr("rotated-oracle");
+        vm.expectEmit(true, true, false, false, address(verifier));
+        emit TEEDataVerifier.TeeOracleUpdated(oracleAddr, newOracle);
+        vm.prank(owner);
+        verifier.setTeeOracleAddress(newOracle);
+        assertEq(verifier.teeOracleAddress(), newOracle, "oracle rotated");
     }
 
     function test_setTeeOracleAddress_revertsWhenNotOwner() public {

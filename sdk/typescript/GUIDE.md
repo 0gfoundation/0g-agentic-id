@@ -8,7 +8,7 @@ Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://g
 
 ## Setup
 
-**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestor is `https://agenticid.0g.ai`:
+**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agenticid.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agenticid-testnet.0g.ai` (0G Galileo testnet, chain 16602):
 
 ```ts
 import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
@@ -788,7 +788,7 @@ digest change does not close it.
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agenticid.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agenticid-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
