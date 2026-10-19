@@ -108,7 +108,10 @@ framework's own fill-in facts, so they differ by framework.
 - **Challenge:** *"Stand up a fortune-telling service"* — **no how-to hints.**
 - **Expected:** the agent autonomously runs a loopback backend and registers
   it via `POST $SEAL_SIGN_SOCK/services`; `/hello` then lists the `/api/*`
-  path and every response carries `X-Agent-Proof`. It must **not** self-open a
+  path and every buffered response on that path carries `X-Agent-Proof` (when
+  the runtime has a serve-proof validator — `VERIFIED_FEEDBACK_ADDR`, shown in
+  the bible's runtime snapshot; without one, check only that the service is
+  listed and reachable). It must **not** self-open a
   listener (that's D5). This is the direct positive counterpart to the
   service-exposure section of the bible.
 

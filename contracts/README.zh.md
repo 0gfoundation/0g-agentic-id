@@ -267,9 +267,11 @@ EIP-191 的 "intended validator"（链上实现：
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`）。
 sealed 运行时从 `VERIFIED_FEEDBACK_ADDR` 得知该地址——由 attestor 在创建 sandbox
 时依据 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 注入。容器的 `VERIFIED_FEEDBACK_ADDR`
-未设置、格式错误或为零地址 → 容器干脆不出 `X-Agent-Proof`。attestor 一侧，
+未设置、格式错误或为零地址——或者它的 `getIdentityRegistry()` 不是容器的
+`AGENTIC_ID_ADDR`——→ 容器干脆不出 `X-Agent-Proof`。attestor 一侧，
 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` 留空或为零地址 → 容器拿到空值（因而不出
-proof）；填了但不是地址则 attestor 启动失败。自 `VerifiedFeedbackRegistry`
+proof）；填了但不是地址、或其 `getIdentityRegistry()` 不是
+`ATTESTOR_AGENTIC_ID_ADDR`，则 attestor 启动失败。自 `VerifiedFeedbackRegistry`
 1.2.0 起它取代旧的 `personal_sign(inner)` 包装，旧格式一律**拒绝**——硬切换、
 无回退（上线步骤见 [`DEPLOYMENT.md`](DEPLOYMENT.md) §7）。
 该 digest 属于共识关键：五份副本各自独立实现——合约、`sealed/internal/proxy/`、
@@ -321,6 +323,10 @@ FIND-01。）这条 socket 不变量是承重的：给 socket 加上裸 hash 或
 
 canonical 注册表是 permissionless 的——谁都能往里写未验证的 feedback——但验证章
 需要一张 TEE 真实签发的 proof。在乎真伪的读方拿章的集合和 canonical 条目做交集。
+这一点从该环境的 1.2.0 升级区块起成立（记录在 [`DEPLOYMENT.md`](DEPLOYMENT.md)
+§6）：此前的章没有 FIND-01 / FIND-02 保证，而链上 view（`isVerified`、
+`getServeData`、`getVerifiedSummary*`）无法排除它们——要按区块过滤
+`FeedbackVerified` 日志。
 
 **残余风险（上述机制不覆盖）**：agent——或其 owner——仍可以带着自己控制的
 `X-Client-Address` 向自己的 proxy（如 loopback `:8080`，或公开的 `/hello`）发
@@ -339,6 +345,7 @@ sybil 类问题，所以 `getVerifiedSummary` 要求调用方显式给出信任�
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` —— 聚合指定 client 的**已验证** canonical 条目（值实时从 canonical 读取；跳过 revoked；求和 + 计数，归一到固定 18 decimals；`clients` 必须非空——由调用方决定信谁）。仅限链下 `eth_call`。
 - `attestFeedbackWithTask(…, TaskReveal)` —— 额外开箱 proof 的 taskHash 承诺（方法 / 路径 / 正文**哈希** / 状态码——正文本身不上链）：合约重算哈希比对,把路径记为该条目的 **TEE 验证接口**。`getVerifiedEndpoint` 读回;`getVerifiedSummaryForEndpoint(agentId, clients[], uri)` 按接口聚合,不依赖 client 自报的 tag。reveal 必须满足：method 在已知 HTTP 集合内、URI 以 `/` 开头、`statusCode` 在 **100..999**（恰好三位数——Go `net/http` 的输出范围），否则 revert `VerifiedFeedbackInvalidTaskReveal`。否则 packed 原像有歧义：一两位数的 status 能让 reveal 把正文哈希的字节挪进 URI，记下一个调用从未访问过的接口（审计 FIND-02，1.2.0 起强制）。
 - `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
+- 上述所有 view 也会计入该环境 1.2.0 升级区块（`DEPLOYMENT.md` §6）之前的章，而这些章没有 FIND-01 / FIND-02 保证（审计数据和验证接口都不可信）。view 不带区块过滤；只要切换后章的读方，按区块过滤 `FeedbackVerified` 日志。
 
 > **已废弃——必须暂停**：先前的私有分叉（`AgenticIDReputationRegistry`，proof
 > 门禁的 `giveFeedback` + 自有 feedback 存储）被这套拆分取代。存量的 test 和 dev

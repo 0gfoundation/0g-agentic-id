@@ -8,7 +8,8 @@
  * - signServeProof → verifyServeProofSignature round-trips with a validator;
  * - NEGATIVE: a personal_sign (0x19 0x45) or EIP-712 (0x19 0x01) signature
  *   over the same proofHash — what the sealed sign socket can produce — does
- *   NOT verify; neither does a wrong, zero, missing or malformed validator;
+ *   NOT verify; neither does a wrong, zero, missing or malformed validator,
+ *   nor an encoding the registry rejects (high s, v ∈ {0,1}, not 65 bytes);
  * - ServeSession.verifyProof reports distinct reasons for "no registry
  *   configured", "proof signed for a different registry" and a bad signature,
  *   and parses the envelope's `validator` field.
@@ -155,6 +156,38 @@ test('NEGATIVE: wrong / zero / missing / malformed validator → false (no fallb
     await verifyServeProofSignature(asProof(p, legacy), seal.address, { chainId: DOMAIN.chainId, verifyingContract: AGENTIC_ID }),
     false,
   );
+});
+
+// secp256k1 group order n.
+const SECP256K1N = BigInt('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141');
+
+test('NEGATIVE: non-canonical encodings the registry rejects (high s, v ∈ {0,1}, wrong length) → false', async () => {
+  const p = proofParams();
+  const proof = await signServeProof(p, (hash) => seal.sign({ hash }));
+  const sig = proof.signature;
+  const r = sig.slice(2, 66);
+  const s = BigInt(`0x${sig.slice(66, 130)}`);
+  const v = parseInt(sig.slice(130, 132), 16);
+  assert.ok(v === 27 || v === 28, 'signer emits v ∈ {27,28}');
+
+  // High-s twin: (r, n − s, v flipped) recovers the same signer under viem…
+  const highS = `0x${r}${(SECP256K1N - s).toString(16).padStart(64, '0')}${(v === 27 ? 28 : 27).toString(16)}`;
+  const digest = buildServeProofSigningHash(p);
+  assert.equal(await recoverAddress({ hash: digest, signature: highS }), seal.address, 'sanity: viem accepts high s');
+  // …but OZ ECDSA reverts on it, so it must not verify.
+  assert.equal(await verifyServeProofSignature({ ...proof, signature: highS }, seal.address, DOMAIN), false);
+
+  // v − 27 ∈ {0,1}: ecrecover returns no signer on chain.
+  const vRaw = `${sig.slice(0, 130)}${(v - 27).toString(16).padStart(2, '0')}`;
+  assert.equal(await recoverAddress({ hash: digest, signature: vRaw }), seal.address, 'sanity: viem accepts v ∈ {0,1}');
+  assert.equal(await verifyServeProofSignature({ ...proof, signature: vRaw }, seal.address, DOMAIN), false);
+
+  // Not 65 bytes.
+  assert.equal(await verifyServeProofSignature({ ...proof, signature: sig.slice(0, 130) }, seal.address, DOMAIN), false);
+  assert.equal(await verifyServeProofSignature({ ...proof, signature: `${sig}00` }, seal.address, DOMAIN), false);
+
+  // The canonical original still verifies.
+  assert.equal(await verifyServeProofSignature(proof, seal.address, DOMAIN), true);
 });
 
 // ── ServeSession.verifyProof ──

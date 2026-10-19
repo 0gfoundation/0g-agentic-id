@@ -61,9 +61,12 @@ hard-coded by the sealed runtime and not overridable.
 Responses on the signed routes — `/hello`, `/_seal/auth` and your
 registered `/api/*` services — are **automatically** stamped with an
 `X-Agent-Proof` header by the sealed proxy, whenever the runtime has a
-VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`). The
-framework's own chat/UI routes, WebSocket upgrades and streamed
-responses are never signed. The envelope signed:
+serve-proof validator (the `serve-proof validator` row of your injected
+runtime snapshot; `none` there means nothing is signed). The framework's
+own chat/UI routes — their SSE streams included — and WebSocket upgrades
+are never signed. Your `/api/*` responses are always buffered to
+completion and then signed, SSE included, so a service should return
+short, discrete responses rather than a long stream. The envelope signed:
 
 ```
 {

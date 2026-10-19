@@ -135,8 +135,10 @@ touch the `sealed` runtime: the sealed proxy signs the v0 digest bound to
 `VERIFIED_FEEDBACK_ADDR`, which the attestor worker injects at sandbox create
 from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. On the attestor, a blank or zero
 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (and
-`/config` serves none); a non-address value fails attestor startup. In the
-container, a `VERIFIED_FEEDBACK_ADDR` that is unset, malformed or zero → no
+`/config` serves none); a non-address value, or one whose
+`getIdentityRegistry()` is not `ATTESTOR_AGENTIC_ID_ADDR`, fails attestor
+startup (worker and api). In the container, a `VERIFIED_FEEDBACK_ADDR` that is
+unset, malformed or zero, or not anchored to its `AGENTIC_ID_ADDR`, → no
 `X-Agent-Proof` at all, never a legacy-format one. The 1.2.0 change also adds a
 diagnostic `validator` field to the `X-Agent-Proof` envelope (not part of the
 signed tuple). The SDK (0.2.0) and the attestor console verify the same
@@ -451,15 +453,24 @@ Changelog:
   4. In the same window: roll the attestor with
      `ATTESTOR_VERIFIED_FEEDBACK_ADDR` = that environment's VF proxy (§6) and
      the new snapshots, and release SDK 0.2.0. Set `ATTESTOR_CLI_LATEST=0.2.0`
-     (optionally `ATTESTOR_CLI_NOTES` naming the ServeProof hard cut) in the
-     same attestor roll: a 0.1.x CLI/SDK checks every new-image proof against
-     the legacy digest and reports a signature mismatch, and `/config`
-     `cli_latest` drives the only in-band upgrade hint (printed by 0.1.7+
-     CLIs). Check: `curl -s $API/config | jq '{verified_feedback_addr,
-     cli_latest, sandbox_snapshot}'` shows `$VF`, `"0.2.0"` and the new
-     snapshot; then deploy one fresh agent and run
+     (optionally `ATTESTOR_CLI_NOTES` naming the ServeProof hard cut and
+     telling users to upgrade before they rate) in the same attestor roll: a
+     0.1.x CLI/SDK checks every new-image proof against the legacy digest and
+     reports a signature mismatch — and a 0.1.x CLI's `rate` then deletes
+     that ticket from its `proofs.json`, so a not-yet-upgraded user loses
+     every genuine new-image ticket they try to rate. Users must upgrade to
+     0.2.0 before rating; `/config` `cli_latest` drives the only in-band
+     upgrade hint (printed by 0.1.7+ CLIs). Check: `cast call $VF
+     'getIdentityRegistry()(address)' --rpc-url $RPC` → `$AGENTIC_ID` (the
+     worker and api refuse to start otherwise); `curl -s $API/config | jq
+     '{verified_feedback_addr, cli_latest, sandbox_snapshot, frameworks}'`
+     shows `$VF`, `"0.2.0"`, the new snapshot, and a new image for every
+     `frameworks[]` entry (each one's hash allowlisted in step 2 — every
+     framework image embeds sealed); then deploy one fresh agent per
+     advertised framework (`frameworks[].name`) and run, for each,
      `API=$API AGENT_ID=<id> OWNER_PRIV=<owner key of that fresh agent> bash attestor/scripts/verify-agent.sh`
-     — check 3 must recover the seal over the version-0x00 digest.
+     — check 3 must recover the seal over the version-0x00 digest (check 3b
+     also asserts the anchoring above).
   5. Running agents keep their old image and env until an owner-signed
      `/reset` recreates the container on the new image with
      `VERIFIED_FEEDBACK_ADDR` set. Until then their proofs — like every proof
@@ -467,8 +478,14 @@ Changelog:
      because `verify-agent.sh` reads the owner-scoped deployment row and so
      needs that agent's owner key as `OWNER_PRIV`: check 3 fails with the
      old-image hint before the reset and passes after it.
-  Optionally `removeValidFrameworkHash` the pre-1.2.0 image hashes afterwards
-  so no new deploy lands on an image whose proofs no longer verify. Record
+  Only once every pre-1.2.0 agent has been reset — no deployment row still
+  runs a pre-1.2.0 image — optionally `removeValidFrameworkHash` those image
+  hashes, so no new deploy lands on an image whose proofs no longer verify.
+  Not before: the attestor re-checks the allowlist on every `/provision`, and
+  sealed calls `/provision` on every boot (sandbox resume, crash restart), so
+  an un-reset container whose hash was removed fails `/provision` on its next
+  boot — it gets no `agent_seal_priv` and its container stage is marked
+  failed — until its owner signs a `/reset`. Record
   the impl address, VERSION, dates and the upgrade block in §6 / this entry
   when executed.
 

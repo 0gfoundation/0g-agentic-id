@@ -128,12 +128,57 @@ func TestHandleProxy_ServiceSignedCarriesOnlyGenuineProof(t *testing.T) {
 
 // The WebSocket relay strips the header from the upgrade response too.
 func TestWSReverseProxy_DropsUpstreamProof(t *testing.T) {
-	resp := &http.Response{Header: http.Header{"X-Agent-Proof": {upstreamProof}}}
+	resp := &http.Response{StatusCode: http.StatusSwitchingProtocols,
+		Header: http.Header{"X-Agent-Proof": {upstreamProof}, "x-agent-proof": {upstreamProof}}}
 	if err := wsReverseProxy("http://127.0.0.1:1").ModifyResponse(resp); err != nil {
 		t.Fatalf("ModifyResponse: %v", err)
 	}
-	if v := resp.Header.Get("X-Agent-Proof"); v != "" {
-		t.Fatalf("upgrade response keeps X-Agent-Proof %q", v)
+	if h := proofHeaders(&httptest.ResponseRecorder{HeaderMap: resp.Header}); len(h) != 0 {
+		t.Fatalf("upgrade response keeps X-Agent-Proof %q", h)
+	}
+}
+
+// A WebSocket upgrade the upstream refuses (non-101, chunked body) is relayed
+// as a normal response, trailers included. An upstream X-Agent-Proof trailer —
+// announced or not — must not reach the client; other trailers still do.
+func TestWSReverseProxy_DropsUpstreamProofTrailer(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "X-Agent-Proof, X-Other")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "no upgrade")
+		w.(http.Flusher).Flush() // force chunked encoding
+		w.Header().Set("X-Agent-Proof", upstreamProof)
+		w.Header().Set("X-Other", "kept")
+		w.Header().Set(http.TrailerPrefix+"x-agent-proof", upstreamProof) // unannounced
+	}))
+	t.Cleanup(backend.Close)
+	s, _ := armedProxy(t, backend.URL, testValidator)
+	front := httptest.NewServer(http.HandlerFunc(s.handleProxy))
+	t.Cleanup(front.Close)
+
+	for path, method := range map[string]string{"/api/x": http.MethodPost, "/v1/ws": http.MethodGet} {
+		req, _ := http.NewRequest(method, front.URL+path, nil)
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "websocket")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest || string(body) != "no upgrade" {
+			t.Fatalf("%s: got %d %q", path, resp.StatusCode, body)
+		}
+		for _, h := range []http.Header{resp.Header, resp.Trailer} {
+			for k, vs := range h {
+				if isAgentProofHeader(k) || strings.Contains(strings.ToLower(strings.Join(vs, ",")), "x-agent-proof") {
+					t.Fatalf("%s: relayed %s: %q", path, k, vs)
+				}
+			}
+		}
+		if got := resp.Trailer.Get("X-Other"); got != "kept" {
+			t.Fatalf("%s: X-Other trailer = %q, want kept (trailers must still relay)", path, got)
+		}
 	}
 }
 

@@ -9,10 +9,14 @@
 #      derived from a different master fails ECIES with "message
 #      authentication failed")
 #   3. serve-proof: /hello returns 200 + X-Agent-Proof, its envelope names
-#      this agent, and the signature recovers to the seal addr over the
-#      EIP-191 version-0x00 ServeProof digest bound to /config's
-#      verified_feedback_addr — the same check VerifiedFeedbackRegistry
-#      makes, gas-free, so a validator / image skew shows up here first
+#      this agent, /config's verified_feedback_addr is anchored to its
+#      agentic_id_addr (getIdentityRegistry()), and the signature recovers
+#      to the seal addr over the EIP-191 version-0x00 ServeProof digest
+#      bound to that verified_feedback_addr — the signature check
+#      VerifiedFeedbackRegistry makes, gas-free, so a validator / image skew
+#      shows up here first. Both addresses come from the same /config, so
+#      the anchoring assertion is what ties the recovery to a registry that
+#      redeems for this AgenticID
 #
 # Owner-run: the deployment row's sandbox_id / agent_seal_addr are
 # owner-tier fields, so this needs THAT agent's owner key.
@@ -162,6 +166,19 @@ elif [ -n "$HELLO_AGENT" ]; then
 fi
 
 # ── 3b. ServeProof signature recovery (what the registry checks) ────────
+# The validator must verify against THIS AgenticID: /config serves both
+# addresses, so a wrong verified_feedback_addr (a VF impl / beacon, another
+# environment's proxy) would otherwise pass the recovery below while the
+# registry refuses every proof.
+CONTRACT_LC=$(printf '%s' "$CONTRACT" | tr '[:upper:]' '[:lower:]')
+if [ -n "$VF" ]; then
+  VF_ID=$(cast call --rpc-url "$RPC" "$VF" 'getIdentityRegistry()(address)' 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
+  if [ "$VF_ID" = "$CONTRACT_LC" ]; then
+    ok "verified_feedback_addr $VF anchored: getIdentityRegistry() == agentic_id_addr"
+  else
+    bad "verified_feedback_addr $VF: getIdentityRegistry()='${VF_ID:-<unreadable>}' != agentic_id_addr $CONTRACT_LC (not this AgenticID's registry proxy — its proofs will not redeem)"
+  fi
+fi
 # digest = serveproof_digest (top of file); the signature is over the digest
 # RAW (cast --no-hash).
 if [ -n "$PROOF" ]; then

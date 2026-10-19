@@ -212,7 +212,9 @@ export class ReputationClient {
    *     of the latest block's timestamp;
    *   - a signature that does not recover to the on-chain agentSeal under
    *     this registry's domain (signed for another registry, a pre-upgrade
-   *     image's legacy personal_sign wrap, an agent with no seal);
+   *     image's legacy personal_sign wrap, an agent with no seal), or an
+   *     encoding the registry's OZ ECDSA rejects (not 65 bytes, v ∉ {27,28},
+   *     high s);
    *   - self-feedback: the connected wallet is the agentSeal, the agent's
    *     owner, its `getApproved` address, or an `isApprovedForAll` operator;
    *   - a proof already redeemed here (`isNonceConsumed`).

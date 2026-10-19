@@ -17,7 +17,9 @@
 //	VERIFIED_FEEDBACK_ADDR      (optional) VerifiedFeedbackRegistry proxy address — the
 //	                            EIP-191 v0x00 intended validator every serve-proof is
 //	                            bound to. Unset, malformed or zero ⇒ no X-Agent-Proof
-//	                            is emitted (never a legacy-wrap fallback)
+//	                            is emitted (never a legacy-wrap fallback); so too when
+//	                            its getIdentityRegistry() is not AGENTIC_ID_ADDR
+//	                            (main.anchorValidator, checked once the chain is dialled)
 //	INDEXER_URL                 (optional) 0g-storage indexer fallback URL
 //	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
 //	                            framework binding (local dev); the binding is authoritative
@@ -60,7 +62,8 @@ type Bootstrap struct {
 	// (VERIFIED_FEEDBACK_ADDR, injected by the attestor worker next to
 	// AGENTIC_ID_ADDR), checksummed — or "" when unset, malformed or the
 	// zero address, in which case the proxy signs no serve-proofs. See
-	// verifiedFeedbackAddr.
+	// verifiedFeedbackAddr. main.anchorValidator also resets it to "" when
+	// the registry is not anchored to AGENTIC_ID_ADDR on chain.
 	VerifiedFeedbackAddr string
 
 	// SecretEnv is the raw SEAL_SECRET_ENV value: ciphertext only. It can
@@ -146,7 +149,9 @@ func Load() (*Bootstrap, error) {
 //
 // Logs exactly once (here, at boot) so an unusable value is visible in /log
 // without a line per request. Never fatal — a missing validator costs the
-// agent its proofs, not its liveness.
+// agent its proofs, not its liveness. This is a format check only: whether
+// the address is a VerifiedFeedbackRegistry anchored to AGENTIC_ID_ADDR is
+// checked on chain once the client has dialled (main.anchorValidator).
 func verifiedFeedbackAddr(raw string) string {
 	v := strings.TrimSpace(raw)
 	if v == "" {
@@ -162,7 +167,7 @@ func verifiedFeedbackAddr(raw string) string {
 		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR is the zero address -- serve-proofs disabled (no X-Agent-Proof)")
 		return ""
 	}
-	logger.Logf("OK   serve-proof validator (VERIFIED_FEEDBACK_ADDR): %s", addr.Hex())
+	logger.Logf("OK   serve-proof validator (VERIFIED_FEEDBACK_ADDR) well-formed: %s (on-chain anchor checked at bootstrap)", addr.Hex())
 	return addr.Hex()
 }
 

@@ -262,12 +262,12 @@ type SettleDelayer interface {
 // The proxy forwards a request to the framework upstream ONLY if its path
 // matches a declared route (longest-prefix wins); every other path 404s
 // instead of being blind-forwarded. This bounds the framework's public
-// surface — and, via Signed, the serve-proof signing surface — to what the
-// adapter deliberately declares, so a framework upgrade can't silently widen
-// either. Routes are trusted input: only the audited, in-tree adapter code
-// constructs them (contrast agent-registered /api/* services in
-// proxy/services.go, which are untrusted runtime input and always exact-match
-// + signed).
+// surface to what the adapter deliberately declares, so a framework upgrade
+// can't silently widen it. Framework routes are never signed (a proxy-owned
+// invariant, whatever Signed says). Routes are trusted input: only the
+// audited, in-tree adapter code constructs them (contrast agent-registered
+// /api/* services in proxy/services.go, which are untrusted runtime input and
+// always exact-match + signed).
 type Route struct {
 	// Prefix is the public path prefix this route claims, e.g. "/" (a
 	// framework that owns the root, like a dashboard SPA) or "/v1/" (a
@@ -281,9 +281,10 @@ type Route struct {
 	// route: "token-fragment" (append #token=… and open in a browser),
 	// "bearer" (Authorization: Bearer …), or "none".
 	Auth string
-	// Signed selects whether responses on this route carry an X-Agent-Proof
-	// serve-proof. True for attributable API responses; false for static UI
-	// assets, which shouldn't bear the agent's on-chain signature.
+	// Signed is ignored by the proxy: framework routes are never signed
+	// (proxy-owned invariant — see proxy.handleProxy; signing them would let
+	// the owner mint serve-proofs for their own steering channel). Declare
+	// false; it is surfaced in /hello as-is.
 	Signed bool
 	// Backend is the loopback upstream this route forwards to, e.g.
 	// "http://127.0.0.1:9119". Empty = the adapter's single StartResult
@@ -299,10 +300,10 @@ type Route struct {
 }
 
 // RouteProvider is implemented by adapters that declare their public HTTP
-// surface to the proxy. When an adapter implements it, the proxy routes only
-// declared prefixes (404ing the rest) and signs per Route.Signed. Adapters
-// that don't implement it fall back to legacy behaviour: every path is
-// forwarded to the upstream and every response is signed.
+// surface to the proxy. The proxy forwards only declared prefixes (404ing the
+// rest) and never signs them. An adapter that doesn't implement it exposes no
+// framework routes: every framework path 404s (there is no forward-all
+// fallback).
 type RouteProvider interface {
 	FrameworkRoutes() []Route
 }
@@ -402,7 +403,8 @@ type RuntimeContext struct {
 	AttestorURL  string // attestor endpoint URL
 	// VerifiedFeedbackRegistry proxy address (VERIFIED_FEEDBACK_ADDR): the
 	// EIP-191 v0x00 intended validator every serve-proof signature is bound
-	// to. Empty when unset/unusable — the proxy then signs no serve-proofs.
+	// to. Empty when unset/unusable or not anchored to ContractAddr on chain
+	// (main.anchorValidator) — the proxy then signs no serve-proofs.
 	VerifiedFeedbackAddr string
 	// There is deliberately no thinking level here. It used to ride this
 	// struct, arriving as SEAL_OWNER_THINKING in the sandbox env — and that

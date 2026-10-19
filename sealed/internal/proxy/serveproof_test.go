@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"math/big"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -19,9 +20,14 @@ import (
 // testValidator stands in for the VerifiedFeedbackRegistry proxy address.
 const testValidator = "0x00000000000000000000000000000000000000B7"
 
-// Cross-implementation known-answer vectors. The same constants are asserted
-// in contracts/test and sdk/typescript/scripts/serveproof-kav.cjs; the inputs
-// are the fixed tuple in TestServeProofDigest_KnownAnswerVector.
+// Cross-implementation known-answer vectors. katProofHash / katV0Digest /
+// katLegacyDigest are also asserted in contracts/test,
+// sdk/typescript/scripts/serveproof-kav.cjs and the SDK's
+// test/serveproof*.test.mjs (inputs: the fixed tuple in
+// TestServeProofDigest_KnownAnswerVector); katTaskHash in
+// contracts/test/VerifiedFeedback.t.sol and sdk/typescript/test/taskhash.test.mjs;
+// katTaskHashEdge and the requestURIForms table in that SDK test and in the
+// attestor console's copy (test/serveproof-copies.test.mjs).
 const (
 	// keccak256(abi.encode(...)) — the inner ServeProof hash, unchanged by the
 	// FIND-01 fix.
@@ -38,6 +44,62 @@ const (
 	// redeemed) in contracts/test/VerifiedFeedback.t.sol.
 	katTaskHash = "6c37771076037daf6053adca6126264030e249e0c9a6fc0cc238c56509f842db"
 )
+
+// keccak256("GET" ‖ "/api/a%7Cb?" ‖ keccak256("") ‖ keccak256(`{"a":"out"}`) ‖
+// "200") — a request sent as "/api/a|b?": Go re-escapes the '|' WHATWG URLs
+// leave raw and keeps the bare trailing '?' (RequestURI with ForceQuery).
+const katTaskHashEdge = "9e00c178e74e6acfb1c048af8be9a47f3d91adf60a02982ce15810ff452fc81b"
+
+// requestURIForms maps a request target as sent on the wire to the
+// r.URL.RequestURI() the proxy hashes. Mirrored verbatim by the SDK's
+// requestUriOf and the console's goRequestURI.
+var requestURIForms = [][2]string{
+	{"/api/x?q=1", "/api/x?q=1"},
+	{"/api/x?", "/api/x?"},
+	{"/api/a|b", "/api/a%7Cb"},
+	{"/api/a^b?x=|^", "/api/a%5Eb?x=|^"},
+	{"/api/a|b?", "/api/a%7Cb?"},
+	{"/api/a%2Fb|c", "/api/a/b%7Cc"},
+	{"/api/a%7cb", "/api/a%7cb"},
+	{"/api/a%41|", "/api/aA%7C"},
+	{"/api/%C3%A9", "/api/%C3%A9"},
+	{"/api/%C3%A9|", "/api/%C3%A9%7C"},
+	{"/api/[x]!'()*,;=:@$&+", "/api/[x]!'()*,;=:@$&+"},
+	{"/api/[x]|", "/api/%5Bx%5D%7C"},
+	{"/api/a??b", "/api/a??b"},
+}
+
+// TestWriteServeProof_RequestURIForms pins the uri the taskHash commits to —
+// Go's RequestURI of the received target — for the forms a client-side copy
+// must reproduce, and katTaskHashEdge for one of them.
+func TestWriteServeProof_RequestURIForms(t *testing.T) {
+	priv, _ := crypto.GenerateKey()
+	respBody := []byte(katTaskResp)
+	for _, f := range requestURIForms {
+		req := httptest.NewRequest(http.MethodGet, f[0], nil)
+		if got := req.URL.RequestURI(); got != f[1] {
+			t.Fatalf("RequestURI(%q) = %q, want %q", f[0], got, f[1])
+		}
+		rec := httptest.NewRecorder()
+		if err := writeServeProof(rec, req, crypto.FromECDSA(priv), nil, respBody, nil, http.StatusOK,
+			"30", "0x"+strings.Repeat("11", 32), "16602", "0x00000000000000000000000000000000000000A9", testValidator); err != nil {
+			t.Fatalf("writeServeProof(%q): %v", f[0], err)
+		}
+		_, env := decodeProofHeader(t, rec.Header().Get("X-Agent-Proof"))
+		var preimage []byte
+		preimage = append(preimage, http.MethodGet...)
+		preimage = append(preimage, f[1]...)
+		preimage = append(preimage, crypto.Keccak256(nil)...)
+		preimage = append(preimage, crypto.Keccak256(respBody)...)
+		preimage = append(preimage, "200"...)
+		if want := "0x" + hex.EncodeToString(crypto.Keccak256(preimage)); env.TaskHash != want {
+			t.Fatalf("%q: task_hash = %s, want %s (uri %q)", f[0], env.TaskHash, want, f[1])
+		}
+		if f[0] == "/api/a|b?" && env.TaskHash != "0x"+katTaskHashEdge {
+			t.Fatalf("task_hash drifted from katTaskHashEdge:\n got  %s\n want 0x%s", env.TaskHash, katTaskHashEdge)
+		}
+	}
+}
 
 // The fixed receipt materials behind katTaskHash.
 const (

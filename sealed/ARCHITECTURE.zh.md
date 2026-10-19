@@ -467,10 +467,12 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名；永不签裸 hash，也永不签 EIP-191 version `0x00` —— serve-proof 所在的域，见下）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
 
 带 proof 签名的只有三处:`/hello`、`/_seal/auth` 和 agent 注册的 `/api/*`
-服务——而且只在 `VERIFIED_FEEDBACK_ADDR` 可用(且 agent 有链上身份)时。
-framework 路由(`/v1/*`、`/v1/responses*`、任何 UI)、WebSocket upgrade 和
-流式响应永远不带 `X-Agent-Proof`;上游 backend 自己设的这个头也会被 proxy
-丢掉,所以该头永远出自 runtime 本身。
+服务——而且只在 `VERIFIED_FEEDBACK_ADDR` 可用且锚定(它的 `getIdentityRegistry()`
+就是 `AGENTIC_ID_ADDR`,链连上后检查一次)、且 agent 有链上身份时。framework
+路由(`/v1/*`、`/v1/responses*`、任何 UI)——包括它们的 SSE 流——和 WebSocket
+upgrade 永远不带 `X-Agent-Proof`;`/api/*` backend 发的 SSE 先缓冲再签名。上游
+backend 自己设的这个头(无论作为 header 还是 trailer)也会被 proxy 丢掉,所以该头
+永远出自 runtime 本身。
 
 agent 自己那条 `/settings` 跟 owner 那条是刻意不对称的：校验、渲染、重启的流程一模
 一样，但**什么都不持久化**，所以改动只活到这个容器结束，任何一次重启回来的都是
@@ -509,7 +511,7 @@ env 这一面：
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
 | `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
-| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** 地址，由 attestor worker 注入在 `AGENTIC_ID_ADDR` 旁边（取自它的 `ATTESTOR_VERIFIED_FEEDBACK_ADDR`）。它是每个 serve-proof 签名所绑定的 EIP-191 version `0x00` intended validator。未设置、格式错误或为零地址时，sealed 在启动时记一行 `WARN`，并且**不**发 `X-Agent-Proof`，跟没有链上身份的 agent 走同一条路径。永不回退到 registry 拒收的旧 `personal_sign` 包装 |
+| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** 地址，由 attestor worker 注入在 `AGENTIC_ID_ADDR` 旁边（取自它的 `ATTESTOR_VERIFIED_FEEDBACK_ADDR`）。它是每个 serve-proof 签名所绑定的 EIP-191 version `0x00` intended validator。未设置、格式错误或为零地址时，sealed 在启动时记一行 `WARN`，并且**不**发 `X-Agent-Proof`，跟没有链上身份的 agent 走同一条路径。链客户端连上之后，sealed 还会读它的 `getIdentityRegistry()`：结果不是 `AGENTIC_ID_ADDR`（没有代码、revert、重试后仍读不出都算不是）就记一行点名两个地址的 `WARN`，走同一条不出 proof 的路径。永不回退到 registry 拒收的旧 `personal_sign` 包装 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
 | `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:163-170`）|

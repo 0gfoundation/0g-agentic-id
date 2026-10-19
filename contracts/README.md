@@ -276,10 +276,12 @@ the EIP-191 "intended validator" (on chain:
 `MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`).
 The sealed runtime learns it from `VERIFIED_FEEDBACK_ADDR`, which the attestor
 injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. If the
-container's `VERIFIED_FEEDBACK_ADDR` is unset, malformed or the zero address,
-it emits no `X-Agent-Proof` at all. On the attestor side, a blank or zero
+container's `VERIFIED_FEEDBACK_ADDR` is unset, malformed or the zero address —
+or its `getIdentityRegistry()` is not the container's `AGENTIC_ID_ADDR` — it
+emits no `X-Agent-Proof` at all. On the attestor side, a blank or zero
 `ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (so they emit
-no proof), and a non-address value fails attestor startup. Since
+no proof), and a non-address value, or one whose `getIdentityRegistry()` is not
+`ATTESTOR_AGENTIC_ID_ADDR`, fails attestor startup. Since
 `VerifiedFeedbackRegistry` 1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
 **rejected** — a hard cut with no fallback (rollout: [`DEPLOYMENT.md`](DEPLOYMENT.md) §7).
 The digest is consensus-critical: five copies implement it independently —
@@ -336,7 +338,12 @@ socket would reopen the forgery.
 
 The canonical registry is permissionless — anyone can write unverified feedback
 there — but a verification mark needs a genuine TEE-issued proof. Readers that
-care about authenticity intersect canonical entries with the marks.
+care about authenticity intersect canonical entries with the marks. That holds
+from an environment's 1.2.0 upgrade block on (recorded in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) §6): marks from before it carry no FIND-01 /
+FIND-02 guarantee, and the on-chain views (`isVerified`, `getServeData`,
+`getVerifiedSummary*`) cannot exclude them — filter `FeedbackVerified` logs by
+block instead.
 
 **Residual (not closed by the above):** the agent — or its owner — can still
 obtain *genuine* proofs by sending requests to its own proxy (e.g. loopback
@@ -357,6 +364,7 @@ explicit list of trusted clients.
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` — aggregate the given clients' **verified** canonical entries (values read live from the canonical registry; revoked skipped; sum + count, normalized to fixed 18 decimals; `clients` must be non-empty — the caller picks whom to trust). Off-chain `eth_call` only.
 - `attestFeedbackWithTask(…, TaskReveal)` — additionally opens the proof's taskHash commitment (method / uri / body **hashes** / status — bodies stay private): the contract recomputes the hash and records the URI as the entry's **TEE-verified endpoint**. `getVerifiedEndpoint` reads it back; `getVerifiedSummaryForEndpoint(agentId, clients[], uri)` aggregates per interface without trusting client-declared tags. The reveal is rejected (`VerifiedFeedbackInvalidTaskReveal`) unless the method is in the known HTTP set, the URI starts with `/`, and `statusCode` is in **100..999** (exactly three digits — the range Go's `net/http` emits). The packed preimage is otherwise ambiguous: a 1–2 digit status would let a reveal shift body-hash bytes into the URI and record an endpoint the call never hit (audit FIND-02, enforced since 1.2.0).
 - `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
+- Every view above counts marks from before the environment's 1.2.0 upgrade block (`DEPLOYMENT.md` §6) as well, and those carry no FIND-01 / FIND-02 guarantee (audit data and verified endpoint not assured). The views take no block filter; a reader that needs only post-cut marks filters `FeedbackVerified` logs by block.
 
 > **Deprecated — must be paused:** the previous private fork
 > (`AgenticIDReputationRegistry`, proof-gated `giveFeedback` with its own
