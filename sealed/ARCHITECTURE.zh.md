@@ -457,7 +457,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 |---|---|---|
 | `/healthz` | sandbox proxy / 运维 | 流动性探测，返回 200 + 一行 status |
 | `/hello` | verifier、attestor、运维 | 返回 agent 身份 + currentSnapshot 的 `data_hashes`（serve-proof envelope 走 `X-Agent-Proof` 头）|
-| `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回 framework gateway 凭据 `{token}`(chat API 的 bearer) |
+| `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回 framework gateway 凭据 `{token}`(chat API 的 bearer)和一个 owner session `{seal_session, seal_session_exp}`(1 小时,用进程内随机 key 做 HMAC,容器重启即失效)。以 `X-Seal-Session` 发送时,session 仅在 `/log/agent(.html)` 和 `/_seal/clear` 上代替一次新签名——每次使用仍实时校验链上 owner,转让后立即失效;settings 和 claim 绑定 body digest,仍只认签名(`internal/proxy/session.go`) |
 | `/_seal/settings` | **owner 钱包** | `GET` 返回当前生效的 document；`POST` 换掉它、重渲染、重启 framework 进程。两者都要 owner 签名，且比对的是**链上实时** owner；`POST` 的签名还额外绑定 body 的 sha256 —— 否则签名只证明"谁在调用"，中途能改请求的人就能保着有效签名替换掉 document。这是热路径：换 model、换 thinking level 不用再重建容器。不持久：owner 的 document 仍在 attestor 手里，下次开机恢复回去（`internal/proxy/settings.go:40-53`）|
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权、响应带 proof 签名);未声明的路径一律 404——没有 catch-all 转发 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |

@@ -60,7 +60,7 @@ func (s *Server) handleClear(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sum := sha256.Sum256(body)
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealClear", sealID, owner, hex.EncodeToString(sum[:])); !ok {
+	if !s.verifyOwner(w, r, "0GSealClear", sealID, owner, hex.EncodeToString(sum[:])) {
 		return
 	}
 

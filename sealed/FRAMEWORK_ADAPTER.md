@@ -683,7 +683,9 @@ address against the on-chain owner, ±300s window) and only then calls
 verified owner control-plane access — openclaw returns just
 `{"token": …}` (the chat-API bearer; the dashboard route was removed). Return an error if Start
 hasn't provisioned credentials yet (proxy turns it into a 503). Never do
-your own auth here; the caller has already done it.
+your own auth here; the caller has already done it. The proxy adds its own
+`seal_session`/`seal_session_exp` fields to whatever you return (owner
+session, `internal/proxy/session.go`), so don't use those keys.
 
 ## 6. Lifecycle timeline (when each method fires)
 

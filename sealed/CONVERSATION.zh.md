@@ -72,7 +72,7 @@ adapter 在自己的包里用自己的方言作答。
   不能杀掉这一轮。
 - **`framework.SessionClearer`** —— 清掉存储;main.go 在成功清除后重启进程。
   proxy 暴露一条 owner 签名的 `POST /_seal/clear`(tag `0GSealClear`,settings
-  推送文法,占座门控),CLI 加 `/clear`;历史在客户端侧的 adapter 答 501,CLI
+  推送文法,占座门控;body 不使用,所以也接受 `/_seal/auth` 发的 owner session 代替签名),CLI 加 `/clear`;历史在客户端侧的 adapter 答 501,CLI
   只清本地回显。
 
 透明的 `/v1/chat/completions` 门**永远**不带会话 header、不用存储历史——在那扇门

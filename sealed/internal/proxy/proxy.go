@@ -9,14 +9,16 @@
 //	GET  /log/agent.html - same log, color-coded HTML view (owner-only)
 //	GET  /hello         - signed A2A self-introduction (returns 503 until armed)
 //	POST /_seal/auth    - owner-only flow returning the framework auth token
+//	                      and an owner session token (session.go)
 //	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
 //	POST /_seal/claim   - take the single-driver seat (owner-signed)
 //	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
 //	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
-// X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
-// output, which is owner-private. /healthz and /log stay open.
+// X-Auth-Signature, tag "0GSealLog") or an owner session (X-Seal-Session,
+// session.go) — it exposes the agent's own process output, which is
+// owner-private. /healthz and /log stay open.
 //
 // All signed responses (everything except /healthz, /log, /log/agent) carry an
 // X-Agent-Proof header packing both an EIP-191 signature and the canonical
@@ -97,6 +99,10 @@ type Server struct {
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
 	liveOwner OwnerResolver
+
+	// Owner session HMAC key (session.go), generated on first use.
+	sessionOnce sync.Once
+	sessionKey  []byte
 }
 
 // OwnerResolver returns the agent's owner as of right now, by reading the
@@ -283,7 +289,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
 	}
-	if _, ok := s.verifyOwnerSig(w, r, "0GSealLog", sealID, owner, ""); !ok {
+	if !s.verifyOwner(w, r, "0GSealLog", sealID, owner, "") {
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -571,6 +577,13 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		envelope["payload"] = payload
 	}
 	envelope["ts"] = now
+	// One signature buys a session for the owner-only reads and clear
+	// (session.go). Minted for the LIVE owner the signature just matched; if
+	// that second lookup fails the session is simply omitted and the client
+	// keeps signing per request.
+	if live, ok := s.resolveOwner(r.Context(), owner); ok {
+		envelope["seal_session"], envelope["seal_session_exp"] = s.mintSession(sealID, live, now)
+	}
 
 	body, err := json.Marshal(envelope)
 	if err != nil {

@@ -106,7 +106,8 @@ The three capabilities:
 - **`framework.SessionClearer`** — wipe the store; main.go restarts the
   process after a successful clear. The proxy exposes one owner-signed
   `POST /_seal/clear` (tag `0GSealClear`, the settings-push grammar,
-  seat-gated) and the CLI gains `/clear`; adapters with client-held history
+  seat-gated; an owner session from `/_seal/auth` is accepted in place of
+  the signature, since the body is unused) and the CLI gains `/clear`; adapters with client-held history
   answer 501 and the CLI clears its local echo only.
 
 The transparent `/v1/chat/completions` door NEVER gets conversation headers or

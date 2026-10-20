@@ -576,7 +576,9 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 ±300s 时间窗),验证通过才调 `AuthResponse(ctx)`。你返回一个可 JSON
 编码的载荷,授予已验证的 owner 控制面访问权——openclaw 只返回
 `{"token": …}`(chat API 的 bearer;dashboard route 已移除)。Start 还没准备好凭据时
-返回错误(proxy 会转成 503)。绝不要在这里自己做鉴权;调用方已经做完了。
+返回错误(proxy 会转成 503)。绝不要在这里自己做鉴权;调用方已经做完了。proxy 会在你返回的载荷里
+追加自己的 `seal_session`/`seal_session_exp` 字段(owner session,`internal/proxy/session.go`),
+所以别用这两个 key。
 
 ## 6. 生命周期时间线(每个方法何时被调)
 
