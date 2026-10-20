@@ -20,15 +20,15 @@ import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/ut
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
+import {IERC7857DataVerifierV1_1_0 as IERC7857DataVerifier} from "./v1_1_0/IERC7857DataVerifierV1_1_0.sol";
 import {
-    IERC7857DataVerifier,
     OracleType,
     AccessProof,
     OwnershipProof,
     TransferValidityProof,
     TransferValidityProofOutput
 } from "../../src/interfaces/IERC7857DataVerifier.sol";
-import {NonceRegistryUpgradeable} from "../../src/utils/NonceRegistryUpgradeable.sol";
+import {NonceRegistryUpgradeableV1_1_0 as NonceRegistryUpgradeable} from "./v1_1_0/NonceRegistryUpgradeableV1_1_0.sol";
 
 /// @notice The access proof signature is invalid (zero address recovered).
 error DataVerifierInvalidAccessProof();

@@ -313,7 +313,10 @@ app-scoped KMS key 就无法伪造 (`container_pubkey`, `mac`) 这一对。
 - **Per-agent 一次写入**：一旦 `agentSeal[agentId]` 非零，就再也
   不能被改写。写入时拒绝零值，所以首次写入即是终局写入。
 - **`sealId` 全局唯一**：`sealId → agentId` 的映射在所有 agent
-  之间一对一。两个 agent 不能共享一把 seal。
+  之间一对一，所以两个 agent 不能共享一个 sealId。自 AgenticID 1.2.0
+  起 agentSeal 地址也唯一，但只覆盖这次升级之后绑定的 seal（更早的
+  不在记录里；attestor 每次都从新的 sealId 派生 seal，CloneGate 也会
+  拒绝复用源 agent 自身 seal 的克隆）。
 - **跨 transfer 持续存在**：`iTransferFrom` 清空 `agentWallet` 和
   `authorizedUsers`（per-owner 的状态），但保留 `agentSeal` /
   `sealId` 不动。agent 的 TEE-attested 身份比任何一次 owner 变更
@@ -373,17 +376,21 @@ TEE，期间一刻都不能在任何 TEE 之外以明文出现 —— 否则新 
 `iTransferFrom` 通过同一笔交易里携带的两段密码学证明强制这件事：
 
 - **AccessProof** —— 买方签
-  `keccak256(chainId || erc7857 || dataHash || buyer_targetPubkey || nonce || deadline)`
-  （`erc7857` 是 AgenticID token 合约地址；这两个前缀是**必须的**，
-  用于对跨链 / 跨合约重放做域分隔），
+  `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, buyer_targetPubkey, nonce, deadline))`
+  （按字对齐、带长度前缀的 `abi.encode`，不是字节拼接；`erc7857` 是
+  AgenticID token 合约地址，`tokenId` / `from` 是被卖的 token 及其卖家，
+  `isClone` 是动作；这五个都是**必须的**：前两个对跨链 / 跨合约重放做
+  域分隔，其余几个自 TEEDataVerifier 1.2.0 起把 proof 绑定到这个 token
+  和这个动作，声明了相同 `dataHash` 的仿冒 token 无法兑现它，转让 proof
+  也不能被拿去兑现克隆），
   声明"我想要把这份数据 seal 到我的 pubkey"。recover 出来的签名者
   必须等于 `to`（或一个注册过的 delegate）。
 - **OwnershipProof** —— Oracle TEE 用卖方的 `agent_seal_priv` 解
   现有的 `sealedKey`，把同一份明文 `dataKey` 用 `buyer_targetPubkey`
   重新 ECIES 加密，并签：
-  `keccak256(chainId || erc7857 || dataHash || sealedKey_new ||
-  buyer_targetPubkey || nonce || deadline)`（同样必须带
-  `chainId || erc7857` 前缀）。recover 出来的签名者必须等于链上注册过的
+  `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone,
+  dataHash, sealedKey_new, buyer_targetPubkey, nonce, deadline))`（同样必须
+  带这组前缀）。recover 出来的签名者必须等于链上注册过的
   `teeOracleAddress`。
 
 Oracle TEE 对 `dataKey` 是**无状态**的：解密、重新加密、签
@@ -595,8 +602,8 @@ loopback `:8080` 上的 `/hello` 或它自己的 `/api/*` 服务），带一个�
 注资的钱包。这些 proof 对那次交互是如实的，因为每个字段都是 sealed
 从真实请求里算出来的，但"client"就是 agent 自己。这跟 owner 用第二
 个钱包经 `/hello` 给自己打分是同一类 sybil 问题。
-VerifiedFeedbackRegistry 拒绝 owner、approved operator 或 agentSeal
-本身作为兑付方。这是 ERC-8004 合规，不是抗 sybil：一个由 seal 注资的
+VerifiedFeedbackRegistry 拒绝 owner、approved operator、该 agent 的
+收款钱包（1.2.0 起）或 agentSeal 本身作为兑付方。这是 ERC-8004 合规，不是抗 sybil：一个由 seal 注资的
 新钱包照样能过。只能由声誉加权去吸收。
 
 **切换。** `0x00` 绑定是硬切换，不双收、不回退。

@@ -11,12 +11,20 @@ import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {CanonicalIdentityRegistryMock} from "./mocks/CanonicalIdentityRegistryMock.sol";
 import {AgenticIDV1_1_0} from "./mocks/AgenticIDV1_1_0.sol";
 import {TEEDataVerifierV1_1_0} from "./mocks/TEEDataVerifierV1_1_0.sol";
-import {AgenticID, AgenticIDZeroAddress, AgenticIDSealIdTaken} from "../src/AgenticID.sol";
-import {TEEDataVerifier, TEEDataVerifierZeroAddress} from "../src/verifiers/TEEDataVerifier.sol";
+import {AgenticID, AgenticIDZeroAddress, AgenticIDSealIdTaken, AgenticIDAgentSealTaken} from "../src/AgenticID.sol";
+import {
+    TEEDataVerifier,
+    TEEDataVerifierZeroAddress,
+    TEEDataVerifierInvalidSignature
+} from "../src/verifiers/TEEDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import {CloneGate, CloneGateSourceSealReused} from "../src/CloneGate.sol";
+import {ICloneAuthorizer} from "../src/interfaces/ICloneAuthorizer.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {
     AccessProof,
+    OracleType,
     OwnershipProof,
     TransferValidityProof
 } from "../src/interfaces/IERC7857DataVerifier.sol";
@@ -35,7 +43,10 @@ import {
 ///           - every pre-upgrade value survives (the Ownable2Step swap only
 ///             adds OZ's namespaced pendingOwner slot, which starts at zero);
 ///           - the owner survives, and ownership is two-step afterwards;
-///           - the FIND-12 setter guards are live through the existing proxy.
+///           - the FIND-12 setter guards are live through the existing proxy;
+///           - transfer proofs become token-bound (FIND-05), which changes
+///             the AgenticID → verifier call, so the two impls must land in
+///             the same window: either one alone breaks non-seal transfers.
 contract UpgradeGovernanceTest is AgenticIDTestBase {
     TimelockController internal timelock;
     UpgradeableBeacon internal agenticIdBeacon;
@@ -128,10 +139,51 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         );
 
         (soldId, soldHash) = _selfMintData(seller.addr, 0);
-        _sell(soldId, soldHash, seller.addr, buyer, "ap-1", "op-1");
+        _sellV1_1_0(soldId, soldHash, seller.addr, buyer, "ap-1", "op-1");
     }
 
-    /// @dev Proof-gated iTransferFrom of a non-seal agent to `to`.
+    /// @dev Proof-gated iTransferFrom under the 1.1.0 impls: the 1.1.0 proof
+    ///      preimages, abi.encode(chainId, erc7857, <fields>) — no tokenId /
+    ///      from.
+    function _sellV1_1_0(
+        uint256 agentId,
+        bytes32 dataHash,
+        address from,
+        Vm.Wallet memory to,
+        bytes memory apNonce,
+        bytes memory opNonce
+    ) internal {
+        vm.prank(from);
+        agenticId.iTransferFrom(from, to.addr, agentId, _proofsV1_1_0(dataHash, to, apNonce, opNonce));
+    }
+
+    function _proofsV1_1_0(bytes32 dataHash, Vm.Wallet memory to, bytes memory apNonce, bytes memory opNonce)
+        internal view returns (TransferValidityProof[] memory proofs)
+    {
+        uint256 deadline = block.timestamp + 1 hours;
+        bytes memory toPubkey = _pubkey(to);
+        bytes32 apInner = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash, bytes(""), apNonce, deadline
+        ));
+        bytes32 opInner = keccak256(abi.encode(
+            block.chainid, address(agenticId), dataHash, SEALED_KEY_NEW, toPubkey, opNonce, deadline
+        ));
+        proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({
+            accessProof: AccessProof({
+                dataHash: dataHash, targetPubkey: "", nonce: apNonce, deadline: deadline,
+                proof: _sign(to.privateKey, _eip191HexHash(apInner))
+            }),
+            ownershipProof: OwnershipProof({
+                oracleType: OracleType.TEE, dataHash: dataHash, sealedKey: SEALED_KEY_NEW,
+                targetPubkey: toPubkey, nonce: opNonce, deadline: deadline,
+                proof: _sign(oraclePk, _eip191HexHash(opInner))
+            })
+        });
+    }
+
+    /// @dev Proof-gated iTransferFrom of a non-seal agent to `to` (1.2.0
+    ///      token-bound proofs).
     function _sell(
         uint256 agentId,
         bytes32 dataHash,
@@ -141,16 +193,18 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         bytes memory opNonce
     ) internal {
         uint256 deadline = block.timestamp + 1 hours;
-        AccessProof memory ap = _mkAccessProof(dataHash, "", apNonce, deadline, to.privateKey);
-        OwnershipProof memory op = _mkOwnershipProof(dataHash, SEALED_KEY_NEW, _pubkey(to), opNonce, deadline);
+        AccessProof memory ap = _mkAccessProof(agentId, from, dataHash, "", apNonce, deadline, to.privateKey);
+        OwnershipProof memory op = _mkOwnershipProof(agentId, from, dataHash, SEALED_KEY_NEW, _pubkey(to), opNonce, deadline);
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
         vm.prank(from);
         agenticId.iTransferFrom(from, to.addr, agentId, proofs);
     }
 
-    /// @dev The verifier's nonce key for a proof nonce (BaseDataVerifier:
-    ///      keccak256(abi.encode(tag, msg.sender = AgenticID, nonce))).
+    /// @dev The 1.1.0 verifier's nonce key for a proof nonce
+    ///      (keccak256(abi.encode(tag, msg.sender = AgenticID, nonce)); 1.2.0
+    ///      adds the signer to the access key — FIND-06 — and the tokenId to
+    ///      the ownership key).
     function _nonceKey(string memory tag, bytes memory nonce) internal view returns (bytes32) {
         return keccak256(abi.encode(keccak256(bytes(tag)), address(agenticId), nonce));
     }
@@ -230,6 +284,10 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         );
         assertEq(nextId, soldId + 1, "canonical counter continues");
         assertEq(agenticId.getAgentSeal(nextId), address(0xAB), "new seal bound");
+        // ...and a seal address bound after the upgrade cannot be bound again (FIND-08).
+        vm.prank(attestor);
+        vm.expectRevert(abi.encodeWithSelector(AgenticIDAgentSealTaken.selector, address(0xAB)));
+        agenticId.registerWithSeal(agentOwner, "", none, more, keys, address(0xAB), bytes32(uint256(SEAL_ID) + 2));
     }
 
     function test_agenticID_upgrade_ownershipBecomesTwoStep() public {
@@ -293,6 +351,9 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
 
         _upgrade(verifierBeacon, address(new TEEDataVerifier()));
         assertEq(verifier.VERSION(), "1.2.0", "post-upgrade VERSION");
+        // Token-bound proofs change the AgenticID → verifier call: AgenticID
+        // ships in the same window.
+        _upgrade(agenticIdBeacon, address(new AgenticID()));
 
         assertEq(verifier.owner(), owner, "owner preserved");
         assertEq(verifier.pendingOwner(), address(0), "no pending owner after upgrade");
@@ -303,10 +364,38 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertTrue(verifier.isNonceConsumed(opKey), "ownership nonce store preserved");
         assertEq(verifier.nonceConsumedAt(apKey), apAt, "nonce timestamp preserved");
 
-        // The upgraded verifier still verifies (proof encoding unchanged):
-        // the buyer resells to the original seller with fresh proofs.
+        // 1.1.0-format proofs (no tokenId / from) no longer verify...
+        TransferValidityProof[] memory legacy = _proofsV1_1_0(soldHash, seller, "ap-legacy", "op-legacy");
+        vm.prank(buyer.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iTransferFrom(buyer.addr, seller.addr, soldId, legacy);
+        // ...token-bound ones do: the buyer resells to the original seller.
         _sell(soldId, soldHash, buyer.addr, seller, "ap-2", "op-2");
         assertEq(agenticId.ownerOf(soldId), seller.addr, "post-upgrade transfer verified");
+    }
+
+    /// @dev The rollout constraint behind "same window": with only one of the
+    ///      two impls upgraded, the AgenticID → verifier call has no matching
+    ///      entrypoint and every non-seal transfer reverts (none happen today:
+    ///      no oracle signs ownership proofs yet).
+    function test_verifierAndAgenticID_mustUpgradeTogether() public {
+        uint256 snap = vm.snapshotState();
+
+        // No matching selector and no fallback: an empty revert, bubbled up.
+        _upgrade(verifierBeacon, address(new TEEDataVerifier()));
+        TransferValidityProof[] memory legacy = _proofsV1_1_0(soldHash, seller, "ap-v", "op-v");
+        vm.prank(buyer.addr);
+        vm.expectRevert(bytes(""));
+        agenticId.iTransferFrom(buyer.addr, seller.addr, soldId, legacy);
+
+        vm.revertToState(snap);
+        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        vm.expectRevert(bytes(""));
+        _sell(soldId, soldHash, buyer.addr, seller, "ap-a", "op-a");
+
+        _upgrade(verifierBeacon, address(new TEEDataVerifier()));
+        _sell(soldId, soldHash, buyer.addr, seller, "ap-a", "op-a");
+        assertEq(agenticId.ownerOf(soldId), seller.addr, "both upgraded: transfer verifies");
     }
 
     function test_verifier_upgrade_ownershipBecomesTwoStepAndClosesZeroOracle() public {
@@ -336,5 +425,43 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         vm.prank(newOwner);
         verifier.acceptOwnership();
         assertEq(verifier.owner(), newOwner, "owner moves on accept");
+    }
+
+    /// @dev FIND-08 on the deployed state. AgenticID 1.2.0 tracks only seals
+    ///      bound after its upgrade, so a pre-upgrade seal is not refused by
+    ///      registerWithSeal itself (the documented limit — the attestor
+    ///      derives every seal from a fresh sealId). CloneGate 1.1.0 still
+    ///      refuses that seal for a clone of its own source.
+    function test_legacySeal_cloneGateRejectsItAsTheCloneSeal() public {
+        _upgrade(agenticIdBeacon, address(new AgenticID()));
+        CloneGate gate = CloneGate(address(new ERC1967Proxy(
+            address(new CloneGate()), abi.encodeCall(CloneGate.initialize, (address(agenticId)))
+        )));
+        vm.prank(owner);
+        agenticId.addTrustedAttestor(address(gate));
+        AllowAllAuthorizer allow = new AllowAllAuthorizer();
+        vm.prank(agentOwner);
+        gate.setCloneAuthorizer(sealedId, address(allow));
+
+        bytes32[] memory hashes = new bytes32[](1);
+        hashes[0] = sealedHash;
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = SEALED_KEY_NEW;
+        vm.prank(attestor);
+        vm.expectRevert(abi.encodeWithSelector(CloneGateSourceSealReused.selector, SEAL_ADDR));
+        gate.cloneFrom(sealedId, buyer.addr, hashes, keys, SEAL_ADDR, bytes32(uint256(SEAL_ID) + 9), buyer.addr, "");
+
+        // A fresh seal clones fine.
+        vm.prank(attestor);
+        uint256 cloneId = gate.cloneFrom(
+            sealedId, buyer.addr, hashes, keys, address(0xC10E), bytes32(uint256(SEAL_ID) + 9), buyer.addr, ""
+        );
+        assertEq(agenticId.getAgentSeal(cloneId), address(0xC10E), "clone bound to its own seal");
+    }
+}
+
+contract AllowAllAuthorizer is ICloneAuthorizer {
+    function canClone(uint256, address, address, bytes calldata) external pure returns (bool) {
+        return true;
     }
 }

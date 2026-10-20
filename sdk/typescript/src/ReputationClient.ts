@@ -89,6 +89,29 @@ function assertTaskStatusCode(task: TaskReveal): void {
 }
 
 /**
+ * FIND-04: the registry only marks entries with |value| ≤ 1e9 and at most 18
+ * decimals (VerifiedFeedbackValueOutOfRange) — summaries skip anything else.
+ * Refuse such a value before anything is broadcast: on the sequential path the
+ * canonical entry would land and then never verify.
+ */
+export const MAX_ABS_FEEDBACK_VALUE = 1_000_000_000n;
+
+function assertFeedbackValueInRange(value: bigint, valueDecimals: number): void {
+  if (!Number.isInteger(valueDecimals) || valueDecimals < 0 || valueDecimals > 18) {
+    throw new Error(
+      `reputation: valueDecimals must be an integer in 0..18 (got ${String(valueDecimals)}) — ` +
+      'the VerifiedFeedbackRegistry rejects any other value (VerifiedFeedbackValueOutOfRange)',
+    );
+  }
+  if (value > MAX_ABS_FEEDBACK_VALUE || value < -MAX_ABS_FEEDBACK_VALUE) {
+    throw new Error(
+      `reputation: |value| must be at most ${MAX_ABS_FEEDBACK_VALUE} (got ${value}) — ` +
+      'the VerifiedFeedbackRegistry rejects larger values (VerifiedFeedbackValueOutOfRange)',
+    );
+  }
+}
+
+/**
  * Internal client for the reputation pair (canonical ERC-8004 registry +
  * VerifiedFeedbackRegistry). Consumers use the `AgenticID` facade's
  * `reputation` namespace, not this directly.
@@ -149,9 +172,11 @@ export class ReputationClient {
    *   canonical entry lands first, the proof is checked gas-free beforehand
    *   and the known permanent attest failures are refused with nothing
    *   broadcast: agent / submitter mismatch, another registry, a deadline
-   *   past or within 60s, a signature not recovering to the on-chain
-   *   agentSeal, self-feedback (agentSeal / owner / approved / operator) and
-   *   an already-redeemed proof. Not covered: a paused registry, a deadline
+   *   past or within 60s, a zero or after-deadline timestamp, a signature not
+   *   recovering to the on-chain agentSeal, self-feedback (agentSeal / owner
+   *   / approved / operator / payment wallet) and an already-redeemed proof.
+   *   On both paths a value outside |value| ≤ 1e9 / 0..18 decimals is
+   *   refused up front ({@link MAX_ABS_FEEDBACK_VALUE}). Not covered: a paused registry, a deadline
    *   beyond the nonce retention, state changing before the attest, non-proof
    *   tx failures. If the attest leg still fails, retry it later with
    *   `attestFeedback` (the proof is not consumed by a reverted attempt).
@@ -161,6 +186,7 @@ export class ReputationClient {
     // Before EITHER path broadcasts: covers the atomic batch and the
     // sequential canonical write that precedes attestFeedbackWithTask.
     if (params.task) assertTaskStatusCode(params.task);
+    assertFeedbackValueInRange(params.value, params.valueDecimals ?? 0);
 
     const batcher = this.ctx.addresses.feedbackBatcher;
     if (batcher && batcher !== '0x0000000000000000000000000000000000000000') {
@@ -209,14 +235,16 @@ export class ReputationClient {
    *     (the proof is bound to another wallet) — local checks;
    *   - a proof whose envelope names another VerifiedFeedbackRegistry;
    *   - a deadline already past, or within {@link ATTEST_DEADLINE_MARGIN_S}
-   *     of the latest block's timestamp;
+   *     of the latest block's timestamp; a zero timestamp or one after the
+   *     deadline (VerifiedFeedbackInvalidProofTimestamp);
    *   - a signature that does not recover to the on-chain agentSeal under
    *     this registry's domain (signed for another registry, a pre-upgrade
    *     image's legacy personal_sign wrap, an agent with no seal), or an
    *     encoding the registry's OZ ECDSA rejects (not 65 bytes, v ∉ {27,28},
    *     high s);
    *   - self-feedback: the connected wallet is the agentSeal, the agent's
-   *     owner, its `getApproved` address, or an `isApprovedForAll` operator;
+   *     owner, its `getApproved` address, an `isApprovedForAll` operator, or
+   *     the agent's payment wallet (`getAgentWallet`);
    *   - a proof already redeemed here (`isNonceConsumed`).
    * NOT prevented — these can still leave the canonical entry unverified: a
    * paused registry, a deadline beyond the registry's nonce retention
@@ -242,6 +270,9 @@ export class ReputationClient {
     }
     if (proof.validator && proof.validator.toLowerCase() !== registry.toLowerCase()) {
       refuse(`proof signed for a different VerifiedFeedbackRegistry (proof: ${proof.validator}, configured: ${registry})`);
+    }
+    if (proof.timestamp === 0n || proof.timestamp > proof.deadline) {
+      refuse(`proof timestamp ${proof.timestamp} is zero or after its deadline ${proof.deadline} (VerifiedFeedbackInvalidProofTimestamp)`);
     }
     // NonceExpired is checked against the attest block's timestamp, which is
     // later than the latest one by at least the canonical write's mining.
@@ -284,19 +315,25 @@ export class ReputationClient {
     if (owner.toLowerCase() === me.toLowerCase()) {
       refuse("the connected wallet owns this agent (VerifiedFeedbackSelfFeedback)");
     }
-    const [approved, operator] = await Promise.all([
+    const [approved, operator, paymentWallet] = await Promise.all([
       this.publicClient.readContract({
         address: agenticID, abi: agenticIDAbi, functionName: 'getApproved', args: [agentId],
       }) as Promise<Address>,
       this.publicClient.readContract({
         address: agenticID, abi: agenticIDAbi, functionName: 'isApprovedForAll', args: [owner, me],
       }) as Promise<boolean>,
+      this.publicClient.readContract({
+        address: agenticID, abi: agenticIDAbi, functionName: 'getAgentWallet', args: [agentId],
+      }) as Promise<Address>,
     ]);
     if (approved.toLowerCase() === me.toLowerCase()) {
       refuse("the connected wallet is this agent's approved address (VerifiedFeedbackSelfFeedback)");
     }
     if (operator) {
       refuse("the connected wallet is an approved operator of this agent's owner (VerifiedFeedbackSelfFeedback)");
+    }
+    if (paymentWallet.toLowerCase() === me.toLowerCase()) {
+      refuse("the connected wallet is this agent's payment wallet (VerifiedFeedbackSelfFeedback)");
     }
     const consumed = (await this.publicClient.readContract({
       address: registry,
@@ -382,7 +419,8 @@ export class ReputationClient {
     if (receipt.status !== 'success') {
       throw new Error(
         `atomic feedback batch reverted (tx ${txHash}) — nothing was written; ` +
-        'check the proof (expired deadline / wrong submitter / owner or agentSeal self-feedback / ' +
+        'check the proof (expired deadline / timestamp after deadline / wrong submitter / ' +
+        'self-feedback by the owner, an approved operator, the payment wallet or the agentSeal / ' +
         'proof signed for a different registry or by a pre-upgrade sealed image)',
       );
     }
@@ -668,7 +706,8 @@ export class ReputationClient {
 
   /**
    * Summary over VERIFIED canonical feedback only (values read live from the
-   * canonical registry; revoked entries skipped). Empty `clientAddresses`
+   * canonical registry; revoked entries and pre-1.2.0 marks outside
+   * |value| ≤ 1e9 / 18 decimals skipped). Empty `clientAddresses`
    * defaults to all verified clients (the contract itself requires a
    * non-empty set); no verified clients yet → empty summary.
    */
@@ -702,15 +741,19 @@ export class ReputationClient {
   }
 
   /**
-   * Summary over verified entries whose TEE-verified endpoint equals `uri`.
-   * Empty `clientAddresses` defaults to all verified clients; none yet →
-   * empty summary.
+   * Summary over verified entries whose TEE-verified endpoint equals `uri`
+   * (non-empty). Empty `clientAddresses` defaults to all verified clients;
+   * none yet → empty summary.
    */
   async getVerifiedSummaryForEndpoint(
     agentId: bigint,
     uri: string,
     clientAddresses?: Address[],
   ): Promise<FeedbackSummary> {
+    // The registry reverts on "" (VerifiedFeedbackEndpointRequired): entries
+    // attested without a task reveal store "", so it would match exactly the
+    // unproven ones.
+    if (uri === '') throw new Error('reputation: getVerifiedSummaryForEndpoint needs a non-empty uri');
     let clients = clientAddresses ?? [];
     if (clients.length === 0) {
       clients = await this.getVerifiedClients(agentId);

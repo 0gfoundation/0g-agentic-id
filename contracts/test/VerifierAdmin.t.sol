@@ -10,6 +10,8 @@ import {
     TEEDataVerifierZeroAddress
 } from "../src/verifiers/TEEDataVerifier.sol";
 import {DataVerifierNotPauser} from "../src/verifiers/BaseDataVerifier.sol";
+import {NonceMaxAgeDecrease, NonceMaxAgeOutOfRange} from "../src/utils/NonceRegistryUpgradeable.sol";
+import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {
@@ -45,10 +47,10 @@ contract VerifierAdminTest is AgenticIDTestBase {
 
         // Sig by OLD oracle must now fail.
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory opOld = _mkOwnershipProofSignedBy(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-old"), deadline, oraclePk
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-old"), deadline, oraclePk
         );
         TransferValidityProof[] memory proofsOld = new TransferValidityProof[](1);
         proofsOld[0] = TransferValidityProof({accessProof: ap, ownershipProof: opOld});
@@ -60,7 +62,7 @@ contract VerifierAdminTest is AgenticIDTestBase {
         // Sig by NEW oracle must succeed (with fresh ap nonce — the old ap was never
         // consumed, so we can reuse it as long as the ownership proof is fresh).
         OwnershipProof memory opNew = _mkOwnershipProofSignedBy(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-new"), deadline, newOraclePk
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-new"), deadline, newOraclePk
         );
         TransferValidityProof[] memory proofsNew = new TransferValidityProof[](1);
         proofsNew[0] = TransferValidityProof({accessProof: ap, ownershipProof: opNew});
@@ -112,10 +114,10 @@ contract VerifierAdminTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
@@ -137,10 +139,10 @@ contract VerifierAdminTest is AgenticIDTestBase {
         uint256 deadline = block.timestamp + 1 hours;
 
         AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
+            agentId, sellerWallet.addr, dataHash, "", bytes("ap"), deadline, buyerWallet.privateKey
         );
         OwnershipProof memory op = _mkOwnershipProof(
-            dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op"), deadline
+            agentId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op"), deadline
         );
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
@@ -172,5 +174,25 @@ contract VerifierAdminTest is AgenticIDTestBase {
             )
         );
         verifier.setMaxProofAge(2 days);
+    }
+
+    // ── maxProofAge bounds (1.2.0: FIND-07) ──────────────────────────────────
+
+    function test_setMaxProofAge_revertsOnDecrease() public {
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeDecrease.selector, MAX_PROOF_AGE, MAX_PROOF_AGE - 1));
+        verifier.setMaxProofAge(MAX_PROOF_AGE - 1);
+    }
+
+    /// @dev 0 rejected every proof not expiring in the current second; a value
+    ///      near 2^256 overflowed `now + maxAge` and halted every verification.
+    function test_initialize_rejectsOutOfRangeMaxProofAge() public {
+        address impl = address(new TEEDataVerifier());
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, uint256(0)));
+        new ERC1967Proxy(impl, abi.encodeCall(TEEDataVerifier.initialize, (owner, pauser, oracleAddr, 0)));
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, type(uint256).max));
+        new ERC1967Proxy(
+            impl, abi.encodeCall(TEEDataVerifier.initialize, (owner, pauser, oracleAddr, type(uint256).max))
+        );
     }
 }

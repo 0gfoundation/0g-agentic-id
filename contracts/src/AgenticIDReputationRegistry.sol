@@ -56,7 +56,13 @@ contract AgenticIDReputationRegistry is
     /// @notice Current implementation version. See contracts/UPGRADING.md for the
     ///         bump rules (major = storage-incompatible/redeploy; minor = ABI/behavior
     ///         change via a beacon upgrade; patch = compatible fix).
-    /// @dev 1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
+    /// @dev 1.3.0 — source only, never to be deployed (this fork is deprecated
+    ///      and must be paused): bumped because the shared
+    ///      NonceRegistryUpgradeable changed under it — setMaxProofAge is now
+    ///      raise-only within [2 hours, 365 days] and emits NonceMaxAgeUpdated,
+    ///      and initialize checks the same range (audit FIND-07). The deployed
+    ///      1.2.0 instances keep the unrestricted setter.
+    ///      1.2.0 — audit security fixes (beacon upgrade): giveFeedback requires
     ///      `agentId == proof.agentId`, bounds `value`/`valueDecimals` so one entry
     ///      can't brick getSummary, rejects (via NonceRegistry) a proof whose
     ///      deadline outlives the nonce retention, aligns the read surface to
@@ -73,7 +79,7 @@ contract AgenticIDReputationRegistry is
     ///      attribution is now `msg.sender` at giveFeedback (signed digest + giveFeedback
     ///      ABI changed).
     ///      1.0.0 — initial (client-bound ServeProof).
-    string public constant VERSION = "1.2.0";
+    string public constant VERSION = "1.3.0";
 
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
 

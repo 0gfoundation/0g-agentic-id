@@ -34,14 +34,29 @@ changes — **the version scheme + upgrade procedure are in
 on chain after redeploying the impl + upgrading the beacon.**
 
 Pausing is independent of upgrades: each contract has a `pauser` role (**not** via
-the Timelock); `pause()` takes effect immediately and blocks every `whenNotPaused`
-write path (`register` / `setAgentWallet` / `iTransferFrom` / `giveFeedback` …);
-views are unaffected. `owner` can `setPauser` at any time.
+the Timelock); `pause()` takes effect immediately; views are unaffected. On
+AgenticID it blocks mints (incl. `CloneGate.cloneFrom`, which mints through
+`registerWithSeal`), transfers (incl. `iTransferFrom` / `iCloneFrom`), iData
+`update` / `updateAt`, usage grants, `setAccessDelegate` and — since 1.2.0 —
+`setAgentURI` / `setMetadata` / `setAgentWallet` (audit FIND-11; on 1.1.0 those
+three, including a trusted attestor's URI rewrite, stay open while paused, so
+there the lever for a compromised attestor is `removeTrustedAttestor`). Left
+open on purpose: actions that only take a privilege away — `unsetAgentWallet`,
+and since 1.2.0 `revokeAuthorization` / `clearAuthorizedUsers` — and ERC-721
+`approve` / `setApprovalForAll` (a grant there only unlocks transfers, which are
+paused). On VerifiedFeedbackRegistry it blocks the attest calls; on
+TEEDataVerifier, `verifyTransferValidity`. `owner` can `setPauser` at any time.
+Since 1.2.0 a pause can also catch an attestor deploy between its mint and its
+agent-card write (`setAgentURI`): that agent ends up minted with no URI while
+its deployment row still looks healthy. After unpausing, check `tokenURI` of
+agents minted around the pause; `/retry` re-runs the URI write when the
+container is still healthy (otherwise it needs the owner's sandbox envelope and
+recreates the sandbox).
 
 | Role | Identity | Timelock-protected |
 |---|---|---|
 | Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
-| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | attestor allowlist / framework-hash whitelist / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` | no — direct calls, effective immediately |
+| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | attestor allowlist / framework-hash whitelist / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` (raise-only within 2 hours–365 days in TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; the deployed fork stays unrestricted) | no — direct calls, effective immediately |
 | Pauser | emergency switch | no (emergency path can't be delayed) |
 
 **Governance split (deliberate).** Privileged admin calls are **direct owner
@@ -111,15 +126,29 @@ reused on mainnet**.
 ### 2.2 Proof domain separation (security)
 
 TEE-signed **transfer** proofs bind `chainId` + the calling token contract (else a
-proof minted for one deployment replays against another). Off-chain transfer
-signers must mirror these exactly:
+proof minted for one deployment replays against another) and, since
+TEEDataVerifier 1.2.0, the token being moved, its owner and the action.
+Off-chain transfer signers must mirror these exactly:
 
 | Proof | Signer (off-chain) | Preimage (pre-EIP-191) |
 |---|---|---|
-| **AccessProof** | buyer wallet | `keccak256(abi.encodePacked(chainId, erc7857, dataHash, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
-| **OwnershipProof** | oracle TEE | `keccak256(abi.encodePacked(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
+| **AccessProof** | buyer wallet | `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
+| **OwnershipProof** | oracle TEE | `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, sealedKey, targetPubkey, nonce, deadline))` then hex-encoded EIP-191 |
 
-`erc7857` = the AgenticID contract address (the token contract calling the verifier).
+`erc7857` = the AgenticID contract address (the token contract calling the
+verifier); `tokenId` / `from` = the token being transferred or cloned and its
+current owner; `isClone` = `false` for `iTransferFrom`, `true` for
+`iCloneFrom`. Without the token binding (1.1.0) a proof pair verified on any
+token that merely declared the same dataHash — `register` is permissionless —
+so a copied pair could move a look-alike instead (audit FIND-05); without the
+action, a buyer's transfer proofs could be redeemed as a clone, leaving the
+original with the seller. `abi.encode`, not `encodePacked`, since 1.1.0
+(adjacent dynamic fields). Known-answer vectors:
+`test_accessProofDigest_knownAnswerVector` /
+`test_ownershipProofDigest_knownAnswerVector` in `test/TransferFlow.t.sol`.
+Since 1.2.0 access-proof nonces are keyed per signer (audit FIND-06) and
+ownership-proof nonces per token, so neither an unrelated buyer nor an oracle
+proof for another token can collide with or burn a pending transfer's nonce.
 
 **ServeProof is envelope-domain-separated, submitter-bound and
 registry-bound.** Inner hash (since reputation registry 1.2.0, #86):
@@ -146,8 +175,10 @@ per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS derivation,
 agentic-id#38), so the same agentId on another deployment resolves to a
 different agentSeal regardless.
 
-Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
-`chainId ‖ erc7857`; the `sealed` runtime is unchanged.
+Off-chain changes (transfer proofs only): Oracle TEE + buyer signer prepend
+`chainId, erc7857, tokenId, from, isClone` (all `abi.encode`d). No such signer exists yet — the oracle
+is unbuilt and the SDK does not build transfer proofs — so there is nothing to
+migrate; the `sealed` runtime is unchanged.
 
 Off-chain changes (ServeProof, VerifiedFeedbackRegistry 1.2.0) — these DO
 touch the `sealed` runtime: the sealed proxy signs the v0 digest bound to
@@ -220,7 +251,8 @@ export PAUSER=0x...
 export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
 # optional: TIMELOCK_DELAY (default 86400 on 0G mainnet 16661, where < 86400 reverts; 0 elsewhere),
 #           CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS (comma-separated; checked
-#           on 16661, see below), NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
+#           on 16661, see below), NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE (default 86400;
+#           must be within 7200–31536000 or initialize reverts NonceMaxAgeOutOfRange)
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
   --priority-gas-price 2000000000 --gas-price 5000000000
@@ -509,9 +541,11 @@ beacon upgrade and was verified post-upgrade — see changelog; mainnet
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
-> The source is at AgenticID **1.2.0**, TEEDataVerifier **1.2.0** and
-> VerifiedFeedbackRegistry **1.2.0**, which no environment runs yet — see the
-> pending changelog entries. Policy-mode cloning (issue #133) shipped as the
+> The source is at AgenticID **1.2.0**, TEEDataVerifier **1.2.0**,
+> VerifiedFeedbackRegistry **1.2.0** and CloneGate **1.1.0**, which no
+> environment runs yet — see the pending changelog entries. The deprecated
+> fork's source reads **1.3.0** only because a shared base changed under it;
+> it is never to be deployed. Policy-mode cloning (issue #133) shipped as the
 > **CloneGate satellite** (1.0.1 on dev) — AgenticID stayed 1.1.0 for it (see
 > the changelog entry for why: EIP-170).
 
@@ -519,8 +553,11 @@ Changelog:
 
 - **AgenticID 1.2.0 + TEEDataVerifier 1.2.0 — PENDING (source only: not
   deployed on any environment, no impl addresses yet)** — governance hardening
-  (audit FIND-12 / FIND-16). Minor per UPGRADING.md: beacon upgrade, no
-  existing storage moves, ABI additions only. (1) Two-step ownership: both
+  (audit FIND-12 / FIND-16) and the audit's Low fixes (FIND-05 / 06 / 07 / 08
+  / 11 / 14, item 4). Minor per UPGRADING.md: beacon upgrade, no existing
+  storage moves (AgenticID appends one mapping); AgenticID's ABI only gains
+  entries, TEEDataVerifier's `verifyTransferValidity` changes signature. (1)
+  Two-step ownership: both
   switch from `OwnableUpgradeable` to `Ownable2StepUpgradeable` (TEEDataVerifier
   via `BaseDataVerifier`) — adds `pendingOwner()` / `acceptOwnership()` +
   `OwnershipTransferStarted`; `transferOwnership` only proposes. The pending
@@ -529,18 +566,53 @@ Changelog:
   OZ's Ownable slot. (2) `AgenticID.setVerifier` and
   `TEEDataVerifier.setTeeOracleAddress` revert on `address(0)`
   (`AgenticIDZeroAddress` / `TEEDataVerifierZeroAddress`) and emit
-  `VerifierUpdated` / `TeeOracleUpdated` (previous, new). Initializers are
-  unchanged. (3) EIP-170: Ownable2Step + the guard cost ~400 B against the
-  1.1.0 impl's 9 B headroom; folding `register` / `registerWithSeal` into one
-  shared internal mint body (same checks, order and events) pays for it —
-  AgenticID measures **24,440 / 24,576** runtime bytes (`forge build
-  --sizes`), TEEDataVerifier 5,925. (The PR #145 "AgenticID 1.2.0" below
+  `VerifierUpdated` / `TeeOracleUpdated` (previous, new). (3) EIP-170:
+  Ownable2Step + the guard cost ~400 B against the 1.1.0 impl's 9 B headroom;
+  folding `register` / `registerWithSeal` into one shared internal mint body
+  (same checks, order and events) pays for it, and one shared owner check
+  (`_requireAgentOwner`, same error and arguments) pays for item 4 —
+  AgenticID measures **24,517 / 24,576** runtime bytes (`forge build
+  --sizes`), TEEDataVerifier 6,252. (4) Audit Lows: transfer / clone proofs
+  are token- and action-bound — both preimages gain `tokenId, from, isClone`
+  after `chainId, erc7857` (§2.2) and `verifyTransferValidity(tokenId, from,
+  isClone, proofs)` takes them from AgenticID's `_proofCheck` (`isClone` read
+  from `msg.sig` — a constant argument made the optimizer inline the body
+  twice, past EIP-170), so a copied proof pair no longer moves a look-alike
+  token declaring the same dataHash, and transfer proofs can't be redeemed as
+  a clone (FIND-05); access-proof nonces are keyed per signer (FIND-06) and
+  ownership-proof nonces per token; `setMaxProofAge` only raises, within
+  2 hours–365 days (twice the ServeProof window, for TEE clock skew), emitting
+  `NonceMaxAgeUpdated`, and `initialize` checks the same range (FIND-07 —
+  lowering it reopened consumed proofs to replay); `registerWithSeal` refuses
+  an agentSeal address already bound to another agent
+  (`AgenticIDAgentSealTaken`; new `agentSealBound` mapping appended to
+  AgenticID's namespaced struct) (FIND-08). Seals bound before the upgrade are
+  not in that set and no backfill fits the 59 B left under EIP-170, so the
+  guarantee covers seals bound from the upgrade on; the attestor derives every
+  seal from a fresh random sealId, and CloneGate 1.1.0 refuses a clone reusing
+  its source's seal whatever its age (`test_legacySeal_cloneGateRejectsItAsTheCloneSeal`);
+  `setAgentURI` / `setMetadata` / `setAgentWallet` revert while paused and
+  `revokeAuthorization` / `clearAuthorizedUsers` no longer do (FIND-11, §1);
+  `getMetadata` / `getAgentWallet` revert `ERC721NonexistentToken` for an
+  agentId with no local token, like `tokenURI` (FIND-14). The frozen 1.1.0
+  test fixtures now import frozen copies of their base contracts
+  (`test/mocks/v1_1_0/`), so these base changes leave them byte-identical to
+  the deployed 1.1.0. (The PR #145 "AgenticID 1.2.0" below
   never reached chain; this is a different build.) `test/UpgradeGovernance.t.sol`
   upgrades both from frozen copies of the deployed 1.1.0 source through a
   1-day Timelock and checks state survival + the new behavior. **Rollout:**
-  not consensus-critical and independent of the VerifiedFeedbackRegistry 1.2.0
-  cut — deploy the two impls and `ScheduleUpgrade` / `ExecuteUpgrade` each
-  beacon (UPGRADING.md §2; on mainnet the vault schedules and execution waits
+  independent of the VerifiedFeedbackRegistry 1.2.0 cut, but the two beacons
+  move together: with only one of them upgraded the AgenticID → verifier call
+  has no matching entrypoint, so every non-seal `iTransferFrom` /
+  `iCloneFrom` reverts until the other lands
+  (`test_verifierAndAgenticID_mustUpgradeTogether`) — none run today, as no
+  oracle signs ownership proofs, and the new proof format has no signer to
+  migrate. Schedule both with the same `DELAY` and execute them in the same
+  block — or as one `scheduleBatch` / `executeBatch` operation, which makes
+  the pair atomic (with open execution anyone can otherwise execute just one;
+  the gap fails closed).
+  Deploy the two impls and `ScheduleUpgrade` / `ExecuteUpgrade` each beacon
+  (UPGRADING.md §2; on mainnet the vault schedules and execution waits
   ≥ 86400 s). Execution is open, so any account can execute each op as soon
   as it is ready. If the two ride along in the VerifiedFeedbackRegistry window
   below, schedule them with that entry's step-3 `DELAY` (window start − now);
@@ -554,9 +626,10 @@ Changelog:
 
 - **VerifiedFeedbackRegistry 1.2.0 — PENDING (source only: not deployed on
   any environment, no impl address yet)** — ServeProof hardening (audit
-  FIND-01 / FIND-02 / FIND-16). Minor per UPGRADING.md: beacon upgrade,
-  storage unchanged, ABI gains only the two-step-ownership surface of (4), but
-  the signed digest changes. (1) agentSeal
+  FIND-01 / FIND-02 / FIND-16) and the audit's Low fixes on this contract
+  (item 5). Minor per UPGRADING.md: beacon upgrade, storage unchanged, ABI
+  gains only the two-step-ownership surface of (4) plus the errors and the
+  `NonceMaxAgeUpdated` event of (5), but the signed digest changes. (1) agentSeal
   signs `keccak256(0x19 ‖ 0x00 ‖ VF proxy ‖ proofHash)` raw (EIP-191 version
   0x00, §2.2) instead of `personal_sign(proofHash)`; legacy-format proofs
   revert `VerifiedFeedbackInvalidProofSignature` — no dual-accept window.
@@ -565,7 +638,21 @@ Changelog:
   attest (`VerifiedFeedbackSelfFeedback`). (4) Ownership becomes two-step
   (`Ownable2StepUpgradeable`, same as AgenticID / TEEDataVerifier 1.2.0 above):
   `pendingOwner()` / `acceptOwnership()` added, `transferOwnership` only
-  proposes. **Pre-cut marks**: verification marks attested before an
+  proposes. (5) Audit Lows: an entry with |value| > 1e9 or more than 18
+  decimals cannot be attested (`VerifiedFeedbackValueOutOfRange` — the fork's
+  write-time bound; the canonical registry allows up to 1e38) and both
+  summaries skip such marks from before the cut, so one extreme entry no
+  longer makes every summary over its client revert (FIND-04);
+  `getVerifiedSummaryForEndpoint` rejects an empty `uri`
+  (`VerifiedFeedbackEndpointRequired` — it matched exactly the unrevealed
+  entries, FIND-09); the agent's payment wallet (`getAgentWallet`) counts as
+  self-feedback (FIND-13); a proof with timestamp 0 or after its deadline
+  reverts `VerifiedFeedbackInvalidProofTimestamp`, and the stored
+  dataHashes / frameworkHash are documented as claimed by the seal-signed
+  proof, not checked against iData or the framework allowlist (FIND-15);
+  `setMaxProofAge` is raise-only within 2 hours–365 days (FIND-07, shared
+  `NonceRegistryUpgradeable`). SDK 0.2.0 refuses the new cases before
+  broadcasting. None of these touch the signed digest. **Pre-cut marks**: verification marks attested before an
   environment's 1.2.0 upgrade block carry no FIND-01 / FIND-02 guarantee —
   their recorded audit data (dataHashes, frameworkHash) and verified endpoint
   are not assured to be authentic. Record each environment's upgrade block
@@ -648,6 +735,21 @@ Changelog:
   the impl address, VERSION, dates and the upgrade block in §6 / this entry
   when executed.
 
+- **AgenticIDReputationRegistry (deprecated fork) 1.3.0 — source only, never
+  to be deployed.** Bumped because the shared `NonceRegistryUpgradeable`
+  changed under it (FIND-07: raise-only `setMaxProofAge` within
+  2 hours–365 days, range-checked `initialize`, `NonceMaxAgeUpdated`). The
+  deployed 1.2.0 instances keep the unrestricted setter; they must be paused
+  (VerifiedFeedbackRegistry 1.2.0 entry, step 1), not upgraded.
+- **CloneGate 1.1.0 — PENDING (source only: not deployed on any
+  environment)** — `cloneFrom` rejects a `newAgentSeal` equal to the
+  source's agentSeal (`CloneGateSourceSealReused`; audit FIND-08). AgenticID
+  1.2.0 refuses any reused seal address, but only tracks seals bound after
+  its own upgrade — this check also covers older sources. Minor per
+  UPGRADING.md (new revert + error, no storage change); independent of the
+  other upgrades — the attestor always derives a fresh seal per clone, so
+  nothing it sends changes behavior. Record impl addresses, VERSION and dates
+  in §6 / here when executed.
 - **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
   `CloneGateArityMismatch` reports the sealedKeys length when that side
   mismatches (was always dataHashes.length; review F5). Diagnostic-only.
@@ -762,10 +864,10 @@ Changelog:
 
 ## 8. Notes / follow-ups
 
-- AgenticID still inherits `NonceRegistryUpgradeable` (exposes `setMaxProofAge` /
-  `cleanExpiredNonces`) for storage-layout/admin-surface stability, but it's
-  vestigial on AgenticID since `setAgentWallet` forwards to the canonical contract;
-  removable in a future cleanup.
+- AgenticID no longer inherits `NonceRegistryUpgradeable` (dropped once
+  `setAgentWallet` started forwarding to the canonical contract, which uses a
+  deadline and no nonce); the transfer verifier and the reputation registries
+  keep their own.
 - The suite uses `CanonicalIdentityRegistryMock`; `CanonicalForkIntegration.t.sol`
   runs against the real registry when `FORK_RPC` is set.
 - **Mainnet checklist** (state of §6.2m as read on chain 2026-10-19):
