@@ -164,8 +164,9 @@ sealed/
 │   ├── uploader/                 drift → 0g-storage upload + signed chain.Update
 │   ├── watcher/                  30s tick running EvolutionFor, triggers uploader.Apply
 │   └── proxy/                    :8080 reverse proxy + signing + log pages
+├── Dockerfile                    the openclaw sealed image that ships (0g-sealed): the bootstrap binary on the images/openclaw/ base
 ├── images/openclaw/              openclaw base-image build scripts (independent artifact, layered separately from the sealed bootstrap image)
-├── images/sealed/                sealed sandbox image, node flavour (openclaw; npm installs are warm cache only)
+├── images/sealed/                universal node image (npm installs are warm cache only); builds no image that ships — openclaw's is Dockerfile above
 ├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
 ├── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
 └── images/dsh/                   sealed sandbox image, dsh flavour
