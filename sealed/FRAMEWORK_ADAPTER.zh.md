@@ -137,7 +137,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
-| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本无法按需压缩时包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本缺少你的 adapter 用来触发压缩的东西时(openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令),包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -185,7 +185,7 @@ sealed 的五个组件各自通过一个窄切面消费它:
   锚在链上,等于把 mint 时的副本还给一个配置早就变过的 agent——这正是
   mint 之后发布的每个修复(有界推理、目录预算、watchdog 余量、模型 idle
   超时)统统止步于 mint 时那份副本的原因
-  (`openclaw/inference.go:14-30`)。改成每次 spawn 从文档渲染这个文件,
+  (`openclaw/inference.go:15-31`)。改成每次 spawn 从文档渲染这个文件,
   同一个修复就能在下一次 Start 到达每个 agent。
 - **`framework` role 是协议保留的。** 每个 adapter 必须把它声明为
   `Leaf`,plaintext 是 binding JSON:
@@ -413,10 +413,12 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
   `PersistableMaxTokens()` 封顶到 `settings.RequestOutputCeiling`(32768),同样以 0
   表示"什么都别写"。凡是每次请求都会发出去的东西,用它,别用目录原值:目录的
   `max_completion_tokens` 是能力上限,凡是服务端按"prompt + 预算"对照上下文窗口
-  做检查的地方,它都可能占掉窗口的大半(见 `CONFIG_SURFACE.zh.md` §3.2)。和
-  `Effort()` 的 `("", false)` 一样,0 是"不知道",不是"清掉"——但**原地编辑**
-  文件的 render 仍须删掉它为别的模型写下的预算,否则换到输出上限更低的模型后
-  每个请求都会失败(hermes `spawn.go`:同一模型遇目录故障时保留,模型变了就删除)。
+  做检查的地方,它都可能占掉窗口的大半(见 `CONFIG_SURFACE.zh.md` §3.2)。0 有两种
+  含义,靠 `s.Facts.CatalogSourced` 区分:目录没连上——和 `Effort()` 的
+  `("", false)` 一样,是"不知道",不是"清掉"——或者目录回答了、但这个模型没有预算,
+  那就没有什么要保留的。**原地编辑**文件的 render 还须删掉它为别的模型写下的预算,
+  否则换到输出上限更低的模型后每个请求都会失败(hermes `spawn.go`:同一模型遇目录
+  故障时保留,模型变了或目录没给预算时删除)。
 
 #### 规则一 —— 幂等
 
@@ -468,7 +470,7 @@ sealed 编出来、看上去像手工设定的数字
    是渲染自己会写的键;凡是渲染不写的键,就从 overlay 里丢掉并在日志里说明。
 2. **推理凭据。** hermes 把 key 写进磁盘上的 `model.api_key` 而不是走 env,因为
    它的 `custom` provider 声明 `env_vars=()`,只从这个键读 key——用 env 注入实测
-   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:164-171`)。
+   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:165-172`)。
    这个键由平台每次渲染写入,并且在文档没给凭据时**删除**:不删的话,一次切到
    框架内置 provider 的开机会把上一次的 0G router key 留在盘上,交给现在占着这
    一节的那个 provider。老的"采集路径上剥密钥"这道防线随 role 一起没了——已经
@@ -543,7 +545,7 @@ watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那
 无论如何跑在回收到的 pin 上,下次开机再试。
 
 今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role
-(`dsh/settings.go:283-335`)。openclaw、hermes、prime 都没实现,所以这三个上面
+(`dsh/settings.go:286-338`)。openclaw、hermes、prime 都没实现,所以这三个上面
 的"通道之前"的 agent 会用 attestor 已经存着的那份文档开机;prime 的
 `HandleLegacy` 把这件事写得明明白白,并称把这些 pin 抬进文档"是平台的活",尚未
 落地(`prime/persona.go:108-129`)。你的框架曾经有过链上追踪的 pin 就实现它;等

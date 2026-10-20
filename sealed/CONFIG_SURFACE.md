@@ -65,7 +65,7 @@ nothing else.
 - a blank `model` is the only fatal error, because two adapters hard-fail
   `Start` without a pin (`framework/prime/spawn.go:78`,
   `framework/dsh/spawn.go:77`) while the other two only warn and run modelless
-  (`framework/openclaw/spawn.go:63`, `framework/hermes/spawn.go:298`);
+  (`framework/openclaw/spawn.go:63`, `framework/hermes/spawn.go:338`);
 - `thinking` must be one of `Levels`, case-insensitively;
 - `framework` must be valid JSON, and nothing more.
 
@@ -175,9 +175,10 @@ the largest completion measured (~13.6K tokens, glm-5.3 at effort=max). On the
 wire: dsh sends it as `max_completion_tokens`, openclaw and hermes as
 `max_tokens`; prime-agent's SDK clamps to 32000 whatever models.json says. One
 call sits lower still: dsh's compaction summary (`/compact`) is capped at 16384
-(`bridge.mjs` `COMPACT_SUMMARY_MAX_TOKENS`): it carries about a turn's input
+(`bridge.mjs` `COMPACT_SUMMARY_MAX_TOKENS`; with no catalog budget, the
+engine's own 8192): it carries about a turn's input
 at the moment the history is longest, so wherever a server checks prompt +
-budget against a limit, the smaller reservation leaves it more room than a
+budget against a limit, the smaller budget leaves it more room than a
 turn has; 16384 is 3x the largest summary measured (5,239 output tokens for a
 33.9K-token prompt at effort=max).
 
@@ -307,7 +308,7 @@ The POST's signature is additionally bound to a `sha256` of the request body,
 carried as a fifth field of the signed message. Without it the signature
 attests only to WHO is calling, and anything able to alter the request in
 flight could keep a valid signature while substituting a different document
-(`internal/proxy/proxy.go:439-442`). The body is bounded at 256 KiB
+(`internal/proxy/proxy.go:446-449`). The body is bounded at 256 KiB
 (`internal/proxy/settings.go:18`) — an unbounded read on an owner-facing route
 is an easy denial.
 
@@ -382,9 +383,9 @@ instead of only at mint time.
 
 | | where the document lands | overlay handling |
 |---|---|---|
-| openclaw (`openclaw/inference.go:60`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it; `agents.defaults.compaction.keepRecentTokens` is set to openclaw's own default (20000) unless the overlay gives a positive value — a manual compaction keeps its recent tail only while it is set — likewise `agents.defaults.compaction.timeoutSeconds` to 600, as openclaw's default 180s would cut a slow `/compact` summary short; and `session.reset` to `{mode: "idle"}` (never stale) unless the overlay sets one — openclaw's default starts a new session daily (`CONVERSATION.md`) |
-| hermes (`hermes/spawn.go:175`) | `~/.hermes/config.yaml` | deep-merged, then the platform keys written over it: `model.{default,provider,base_url,api_key}`, `agent.reasoning_effort`, and `model.max_tokens` when the catalog gives the budget; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key; `model.max_tokens` is kept through an outage on the same model and removed when the model changes (unless the overlay sets it), or a switch to a model with a lower output limit fails every request |
-| prime-agent (`prime/modelsjson.go:142`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
+| openclaw (`openclaw/inference.go:61`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it. On openclaw 2026.7.1 and later (the versions with `/compact`), three `agents.defaults.compaction` keys: `keepRecentTokens` is set to openclaw's own default (20000) — a manual compaction keeps its recent tail only while it is set — and `timeoutSeconds` to 600, as openclaw's default 180s would cut a slow `/compact` summary short, each unless openclaw.json already holds a positive whole number there (the owner's overlay, or an edit on disk); for a routed pin, `model` is set to the pin, so a compaction right after a model switch summarizes with the new model, unless the overlay names one. `session.reset` is set to `{mode: "idle"}` (never stale) unless openclaw.json already holds one (the overlay's, or an edit on disk) — openclaw's default starts a new session daily (`CONVERSATION.md`) |
+| hermes (`hermes/spawn.go:176`) | `~/.hermes/config.yaml` | deep-merged, then the platform keys written over it: `model.{default,provider,base_url,api_key}`, `agent.reasoning_effort`, and `model.max_tokens` when the catalog gives the budget; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key; `model.max_tokens` is kept through an outage on the same model and removed when the model changes (unless the overlay sets it), or a switch to a model with a lower output limit fails every request |
+| prime-agent (`prime/modelsjson.go:144`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
 | dsh (`dsh/settings.go:161`) | the bridge process's environment only | a typed knob allowlist (`toolJobs`, `maxParallelToolCalls`); this framework has no config file to render into |
 
 dsh is the interesting case: DSH's own `settings.yaml` is served by
@@ -398,7 +399,7 @@ still unmounted (`dsh/settings.go:15-34`).
 Three details worth carrying, because each is a scar:
 
 - **openclaw repairs a corrupt config instead of dying on it**
-  (`openclaw/inference.go:101`). A parse error used to be terminal and
+  (`openclaw/inference.go:105`). A parse error used to be terminal and
   self-perpetuating: `Start` refuses to run without a successful render, and
   nothing repaired the file. The chain-tracked role used to do that repair
   incidentally, by rewriting the file wholesale from chain every boot; now
@@ -410,7 +411,7 @@ Three details worth carrying, because each is a scar:
   pin. openclaw additionally deep-**copies** overlay values in: aliasing let
   the platform's own keys be written through maps shared with the recorded
   overlay, so the next boot's "withdraw removed overlay keys" pass withdrew
-  the platform's own reasoning bound (`openclaw/inference.go:149-156`).
+  the platform's own reasoning bound (`openclaw/inference.go:153-160`).
 - **An overlay must never be able to take the boot down.** dsh's `parseKnobs`
   is best-effort for every way an overlay can be wrong — wrong type, out of
   range, not an object at all — because `RenderSettings` runs from `PreStart`
@@ -443,7 +444,7 @@ what each framework's client actually reads:
 | | how the key reaches the framework |
 |---|---|
 | openclaw | by reference: the config holds `{source: env, id: <VAR>}`, so only the variable NAME is on disk; `spawn.go` exports the value |
-| hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:164-171`) |
+| hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:165-172`) |
 | prime-agent | by reference: `models.json` holds `apiKey: "SEAL_MODEL_API_KEY"` (`prime/modelsjson.go:63`); the bridge env holds the value |
 | dsh | the bridge env only — and deliberately NOT in the deterministic, logged `settingsEnv` slice, so the rendered environment can be compared and logged without handling a secret (`dsh/settings.go:181-187`) |
 
@@ -500,7 +501,7 @@ The prime bridge still reads an environment variable *named*
 bridge's own contract, and the bridge ships inside the sealed binary; only the
 SOURCE of the value changed, from the deploy-time sandbox env to the owner's
 document via `Resolved.Effort()` (`prime/spawn.go:245-257`, `:376`). prime's
-per-turn override (`bridge.mjs:365`) is unchanged, and is still the only
+per-turn override (`bridge.mjs:446`) is unchanged, and is still the only
 genuinely hot configuration change in the system.
 
 ### 8.1 The single-driver seat
@@ -595,7 +596,7 @@ always owed its own first attempt (`traits.rs` (`flip_stale_heartbeats`), `:467`
 An agent minted before the channel has its pin in a chain role no adapter
 declares any more. Bootstrap Phase C hands every chain entry whose role is
 outside `Roles()` to `HandleLegacy` (`main.go:572-581`), and the optional
-`framework.LegacySettingsSeeder` (`framework.go:321`) is how an adapter hands
+`framework.LegacySettingsSeeder` (`framework.go:403`) is how an adapter hands
 what it recovered back to the platform. `main.go:598-609` consults the seeder
 **only** when the provisioned document names no model — so a real document
 always outranks a recovery — and persists what it gets with
@@ -711,13 +712,13 @@ to capture and nothing to retrofit; an agent editing one of those files is
 simply overwritten at the next render — no gate, no revert, no watcher.
 `healOpenclawConfig` in particular was a shape-recognition heuristic for
 repairing a mint-time copy, and re-rendering removed the copy it existed to
-repair (`openclaw/inference.go:18-30`).
+repair (`openclaw/inference.go:19-31`).
 
 hermes's `approvals` and `terminal` left too, and not as collateral. They were
 labelled "agent self-tuning" but nothing in sealed ever wrote them, and inside
 an unattended TEE sandbox there is nobody for an approval policy to ask. They
 are owner knobs, so they now ride the opaque overlay like any other hermes key
-(`hermes/spawn.go:330-333`).
+(`hermes/spawn.go:370-373`).
 
 The test for what belongs on chain, which this whole change is an application
 of: **can it be re-supplied if lost?** Memory cannot be reconstructed; a model

@@ -110,7 +110,7 @@ bound。（prime 的 bridge 仍然**收到**一个同名 env var —— 那是 b
 每次 spawn 都重渲染还白捡一个老办法给不了的性质：配置文件会自愈。那些字节归平台
 所有，所以被 agent 写坏的文件会在下一次 Start 时重建，而不是让 agent 一直起不来、
 非得有人 reset 容器
-（`internal/framework/openclaw/inference.go:83-101`）。
+（`internal/framework/openclaw/inference.go:87-105`）。
 
 ## 2. 包结构
 
@@ -342,7 +342,7 @@ model 选择十秒钟就能重挑一次。是这个不对称性、而不是"它�
 - **链上跟踪配置文件等于给派生产物下锚。** 每次开机都从 mint 时的副本还原，所以
   agent 铸出来之后才发的修复 —— bounded reasoning、按 catalog 来的输出预算、模型
   idle timeout —— 永远到不了那个 agent。改成每次 Start 从 owner 的 document 渲染，
-  修复下一次开机就落地（`internal/framework/openclaw/inference.go:18-30`）。
+  修复下一次开机就落地（`internal/framework/openclaw/inference.go:19-31`）。
 - **不再捕获，就没有什么要脱敏、也没有什么要补。** 各 adapter 的 config-key
   allowlist、两份 `stripSecrets`、`healOpenclawConfig` 和 `backfillMaxTokens` 全部
   直接删掉。它们的存在要么是为了让"捕获配置文件"这件事安全，要么是为了修补已经被
@@ -433,18 +433,18 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 
 **settings 通道之前铸出来的 agent 怎么迁移。** 它们的 pin 落在一个已经没有 adapter
 声明的链上 role 里，所以 bootstrap 的 Phase C 把它交给 `HandleLegacy`
-（`main.go:572-581`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:321`）
+（`main.go:572-581`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:403`）
 是 adapter 把恢复出来的东西交还给平台的方式，平台再用 `report.SeedSettings` 在
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删
 掉 —— 到那时 pin 还没被读出来存下，它就没了，而 prime 和 dsh 没有 pin 都会 hard-fail
-`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:363`），另外三个
+`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:366`），另外三个
 把自己退役的 role 当未知 legacy role 记一条日志就忽略。见
 [CONFIG_SURFACE.zh.md](CONFIG_SURFACE.zh.md) §10。
 
 设计取舍：
 
-- **openclaw.json 是渲染产物，不是被捕获的资产**：`RenderSettings` 先合并 owner 那段不透明 overlay，再把平台自己的键写在上面，openclaw 自己的记账键（`logging`/`wizard`/`discovery`/`push`/`cli`）原样留着 —— 它是在改这个文件，不是重新生成。因为已经没人对这个文件算 hash，当年为了不让那些键被当成 phantom drift 而存在的 config-key allowlist 也一并删了。文件坏了会被挪走并在下一次渲染时重建，这就是渲染自愈的由来（`inference.go:83-101`）。
+- **openclaw.json 是渲染产物，不是被捕获的资产**：`RenderSettings` 先合并 owner 那段不透明 overlay，再把平台自己的键写在上面，openclaw 自己的记账键（`logging`/`wizard`/`discovery`/`push`/`cli`）原样留着 —— 它是在改这个文件，不是重新生成。因为已经没人对这个文件算 hash，当年为了不让那些键被当成 phantom drift 而存在的 config-key allowlist 也一并删了。文件坏了会被挪走并在下一次渲染时重建，这就是渲染自愈的由来（`inference.go:87-105`）。
 - **三文件平台注入 + 通用 strip**：spawn 时往 `IDENTITY.md`（身份事实）/`SOUL.md`（拒绝规则）/`TOOLS.md`（sign 端点 + public URL）各注入一段被 `<!-- 0g-platform-injected:start/end -->` marker 包裹的平台段，分摊三种关切。文件分布对齐 openclaw 的 `CODEX_BOOTSTRAP_CONTEXT_ORDER`（SOUL=10 > IDENTITY=20 > TOOLS=40，数字越小越优先）。算 hash 和 LoadEntry 时 `stripPlatformInjection` 会从 **任何** workspace 根级 .md 里砍掉 marker 段，让 ContentHash 跟具体 sandbox 实例无关、未来加新平台文件不用动 evolution 代码。
 - **framework binding 实时 probe**：`evoFramework` 跑 `openclaw --version` 拿真实版本号覆盖到 `cfg.framework.PackageVersion` 上 —— Reconcile 触发 npm 升级后，下个 watcher tick 自然会把新版本号写上链。
 - **空 md defense**：`workspaceRequiredMDs` 列了 7 个根级必备 md（SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY/DREAMS），manifest 没列就 touch 一个空文件，避免 openclaw 自动生成几 KB 的 template；空文件不进 manifest，所以 round-trip 稳定。
@@ -461,7 +461,7 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/_seal/settings` | **owner 钱包** | `GET` 返回当前生效的 document；`POST` 换掉它、重渲染、重启 framework 进程。两者都要 owner 签名，且比对的是**链上实时** owner；`POST` 的签名还额外绑定 body 的 sha256 —— 否则签名只证明"谁在调用"，中途能改请求的人就能保着有效签名替换掉 document。这是热路径：换 model、换 thinking level 不用再重建容器。不持久：owner 的 document 仍在 attestor 手里，下次开机恢复回去（`internal/proxy/settings.go:40-53`）|
 | `/_seal/claim` | **owner 钱包** | 占单驾驶座（tag `0GSealClaim`，与设置推送一样绑定 body 摘要）；被挤下的客户端实例下一次驾驶请求得到 409。只在 proxy 内存里——重启即清空座位（`internal/proxy/occupancy.go`） |
 | `/_seal/clear` | **owner 钱包** | 清掉 agent 唯一的持久化对话并重启框架进程（tag `0GSealClear`，占座门控）；框架不在服务端保留历史时答 501（`CONVERSATION.zh.md`） |
-| `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；无法从外部让该框架（或其已安装的版本）压缩时答 501（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
+| `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权、响应带 proof 签名);未声明的路径一律 404——没有 catch-all 转发 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
@@ -501,7 +501,7 @@ env 这一面：
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
-| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:164-171`）|
+| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:57-60`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:165-172`）|
 | `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
 

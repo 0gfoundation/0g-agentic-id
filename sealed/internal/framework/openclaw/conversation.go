@@ -115,14 +115,10 @@ func (a *Adapter) ConversationHistory(context.Context) ([]framework.Conversation
 }
 
 // sessionEntry is the slice of openclaw's sessions.json this package needs:
-// the store is a map keyed by session key. Model/ModelProvider are what the
-// session's last run used — and what openclaw summarizes with on a manual
-// compaction (resolveSessionModelRef).
+// the store is a map keyed by session key.
 type sessionEntry struct {
-	SessionID     string `json:"sessionId"`
-	SessionFile   string `json:"sessionFile"`
-	Model         string `json:"model"`
-	ModelProvider string `json:"modelProvider"`
+	SessionID   string `json:"sessionId"`
+	SessionFile string `json:"sessionFile"`
 }
 
 // storeKeys are the sessions.json keys a pinned session key may be filed
@@ -225,21 +221,6 @@ func readSessionEntry(root *os.Root, key string) (sessionEntry, bool, error) {
 		}
 	}
 	return sessionEntry{}, false, nil
-}
-
-// pinnedSessionModel returns the provider label and model of the pinned
-// session's last run, per sessions.json; empty when unknown.
-func pinnedSessionModel(key string) (provider, model string) {
-	root, err := os.OpenRoot(sessionsDir())
-	if err != nil {
-		return "", ""
-	}
-	defer root.Close()
-	e, found, err := readSessionEntry(root, key)
-	if err != nil || !found {
-		return "", ""
-	}
-	return e.ModelProvider, e.Model
 }
 
 // sessionFileName returns the base name of candidate when it sits DIRECTLY in

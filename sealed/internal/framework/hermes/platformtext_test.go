@@ -73,7 +73,8 @@ func TestEvoSoulMDNoMarkerNoOp(t *testing.T) {
 // The agent ACTS on FrameworkFacts text, so the config.yaml note has to match
 // what RenderSettings does. It used to say the file is "rendered from your
 // owner's settings at every boot, so edits to it do not survive a restart" —
-// false: the render rewrites five keys and leaves the rest of the file alone,
+// false: the render rewrites the keys it owns (five, and model.max_tokens
+// when the catalog gives a budget) and leaves the rest of the file alone,
 // so the agent was being told its own edits there are futile when most of
 // them are not. This pins both halves of the corrected claim.
 func TestConfigYAMLNoteMatchesWhatTheRenderDoes(t *testing.T) {
@@ -91,7 +92,7 @@ func TestConfigYAMLNoteMatchesWhatTheRenderDoes(t *testing.T) {
 	// Half one: the keys the render really owns are named.
 	for _, key := range []string{
 		"model.default", "model.provider", "model.base_url", "model.api_key",
-		"agent.reasoning_effort",
+		"agent.reasoning_effort", "model.max_tokens",
 	} {
 		if !strings.Contains(note, key) {
 			t.Errorf("config.yaml note does not name platform-owned key %q:\n%s", key, note)

@@ -126,7 +126,7 @@ Re-rendering on every spawn buys a second property the old arrangement could
 not have: the config file is self-repairing. The platform owns those bytes, so
 a file the agent corrupted is rebuilt at the next start instead of leaving the
 agent unable to boot until someone resets the container
-(`internal/framework/openclaw/inference.go:83-101`).
+(`internal/framework/openclaw/inference.go:87-105`).
 
 ## 2. Package structure
 
@@ -375,7 +375,7 @@ Three consequences, and they are the reason the change was worth making:
   bounded reasoning, catalog-sourced output budgets, the model idle timeout —
   never reached that agent. Rendering the file from the owner's document at
   every Start means the fix lands on the next boot
-  (`internal/framework/openclaw/inference.go:18-30`).
+  (`internal/framework/openclaw/inference.go:19-31`).
 - **Nothing is captured, so nothing needs sanitising or retrofitting.** The
   per-adapter config-key allowlists, both `stripSecrets` implementations,
   `healOpenclawConfig` and `backfillMaxTokens` are deleted outright. Each
@@ -470,20 +470,20 @@ which the per-framework config files were obscuring.
 **Migration for agents minted before the settings channel.** Their pin sits in
 a chain role no adapter declares any more, so bootstrap Phase C hands it to
 `HandleLegacy` (`main.go:572-581`); the optional
-`framework.LegacySettingsSeeder` (`framework.go:321`) is how an adapter hands
+`framework.LegacySettingsSeeder` (`framework.go:403`) is how an adapter hands
 what it recovered back to the platform, which persists it with
 `report.SeedSettings` before the watcher's first tick drops the stale role.
 The ordering is load-bearing: the uploader rebuilds the entry list from
 `Roles()` and commits it wholesale, so the first drift commit removes the
 undeclared role — if the pin has not been read out and persisted by then, it
 is gone, and prime and dsh both hard-fail `Start` without one. Coverage is
-partial today: only dsh implements the seeder (`dsh/settings.go:363`); the
+partial today: only dsh implements the seeder (`dsh/settings.go:366`); the
 other three log their retired role as unknown and ignore it. See
 [CONFIG_SURFACE.md](CONFIG_SURFACE.md) §10.
 
 Design trade-offs:
 
-- **openclaw.json is a render output, not a captured artifact**: `RenderSettings` merges the owner's opaque overlay, writes the platform-owned keys over it, and leaves openclaw's own bookkeeping (`logging` / `wizard` / `discovery` / `push` / `cli`) standing — it edits the file rather than regenerating it. Because nothing hashes the file any more, the old config-key allowlist that existed to keep those keys from registering as phantom drift is deleted with it. A corrupt file is set aside and rebuilt on the next render, which is what makes the render self-repairing (`inference.go:83-101`).
+- **openclaw.json is a render output, not a captured artifact**: `RenderSettings` merges the owner's opaque overlay, writes the platform-owned keys over it, and leaves openclaw's own bookkeeping (`logging` / `wizard` / `discovery` / `push` / `cli`) standing — it edits the file rather than regenerating it. Because nothing hashes the file any more, the old config-key allowlist that existed to keep those keys from registering as phantom drift is deleted with it. A corrupt file is set aside and rebuilt on the next render, which is what makes the render self-repairing (`inference.go:87-105`).
 - **Three-file platform injection + shared strip**: at spawn time, a platform section wrapped in `<!-- 0g-platform-injected:start/end -->` markers is injected into each of `IDENTITY.md` (identity facts), `SOUL.md` (refusal rules), and `TOOLS.md` (sign endpoints + public URL), splitting the three concerns. The file distribution aligns with openclaw's `CODEX_BOOTSTRAP_CONTEXT_ORDER` (SOUL=10 > IDENTITY=20 > TOOLS=40; lower numbers have higher priority). When computing hashes and in LoadEntry, `stripPlatformInjection` removes the marker section from **any** workspace root-level .md, so ContentHash is independent of any specific sandbox instance, and adding future platform files doesn't require touching evolution code.
 - **Live-probed framework binding**: `evoFramework` runs `openclaw --version` to get the real version and writes it onto `cfg.framework.PackageVersion`. After Reconcile triggers an npm upgrade, the next watcher tick naturally writes the new version on chain.
 - **Empty md defense**: `workspaceRequiredMDs` lists 7 root-level required mds (SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY/DREAMS); if a manifest doesn't list one, touch an empty file rather than letting openclaw auto-generate a multi-KB template. Empty files aren't in the manifest, so round-trip is stable.
@@ -503,7 +503,7 @@ container's `:8080`.
 | `/_seal/settings` | **owner's wallet** | `GET` returns the document in force; `POST` replaces it, re-renders and restarts the framework process. Both owner-signed against the **live** on-chain owner; the `POST` signature is additionally bound to a sha256 of the request body, so anything able to alter the request in flight can't keep a valid signature while substituting a different document. The hot path — it exists so changing a model or a thinking level stops needing a container rebuild. Not durable: attestor still holds the owner's document, and the next boot restores it (`internal/proxy/settings.go:40-53`) |
 | `/_seal/claim` | **owner's wallet** | take the single-driver seat (tag `0GSealClaim`, body-digest-bound like the settings push); the displaced client instance gets 409 on its next driving request. Proxy memory only — a restart clears the seat (`internal/proxy/occupancy.go`) |
 | `/_seal/clear` | **owner's wallet** | wipe the agent's ONE persisted conversation and restart the framework process (tag `0GSealClear`, seat-gated); 501 when the framework keeps no server-side history (`CONVERSATION.md`) |
-| `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the framework, or its installed version, cannot be asked from outside (`internal/proxy/compact.go`, `CONVERSATION.md`) |
+| `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth, responses proof-signed); every undeclared path 404s — there is no catch-all relay |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
@@ -552,7 +552,7 @@ The env surface:
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
-| `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:51-54`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:164-171`) |
+| `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:57-60`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:165-172`) |
 | `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. A value that does not open is logged as `FAIL` and ignored (`internal/secretenv`); if that leaves the agent with no key, its status stays `warning` with detail `secret_env_not_applied: <reason>` (a reason class such as `owner_mismatch`, never a value) instead of `running` |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | used to build `AGENT_PUBLIC_URL`, in the form `http://8080-<sandbox_id>.<proxy_domain>`; the agent's own exposed port is hard-coded `:8080` by sealed proxy |
 

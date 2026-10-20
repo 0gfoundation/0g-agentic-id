@@ -141,6 +141,26 @@ Rule: write the probe as a package-level `var probeXxx = func(...)` and
 stub it to return `""` in tests. New adapters copy openclaw's
 `probeOpenclawVersion` pattern.
 
+### The 0G router's self-hosted glm-5.3 backends do not take the `developer` role
+
+Measured 2026-10-15/16 against all four glm-5.3 providers behind
+`router-api.0g.ai`: an instruction sent as a `developer`-role message was not
+followed and its text did not count in `prompt_tokens` (the same text as
+`system` was followed and counted), and once `prompt + max_tokens` reached
+~196,608 a request carrying a `developer` message was refused with HTTP 400
+code `400001` ("rejected by an internal MaaS component"); replayed with the
+prompt as `system`, the same request went through 65 times out of 65. zg
+compute confirmed (2026-10-19) that Tencent's and 0G's self-hosted backends do
+not support the role, and is changing the broker to map `developer` →
+`system` for every client.
+
+Workaround, per adapter that speaks the OpenAI dialect to the router: tell the
+framework the model has no `developer` role, so its system prompt goes out as
+`system` — dsh `compat.supportsDeveloperRole: false` (`dsh/bridge/bridge.mjs`),
+openclaw `supportsDeveloperRole: false` in the rendered model `compat`
+(`openclaw/inference.go`), prime the same flag in `models.json`
+(`prime/modelsjson.go`). The flags stay correct after the broker change.
+
 ### Marker injection/strip must be lossless — don't reintroduce newline normalization
 
 The historical `platform.UpsertMarkedSection` "ensured a blank line

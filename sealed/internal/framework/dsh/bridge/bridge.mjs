@@ -131,8 +131,7 @@ const COMPACT_TIMEOUT_MS = 10 * 60 * 1000
 //     carries the system prompt, the tools and the whole history but its
 //     last node — a turn's input, give or take — at the moment the history
 //     is longest. Wherever a server checks prompt + max_tokens against a
-//     limit, a smaller reservation leaves the summary more room than a turn
-//     has.
+//     limit, a smaller budget leaves the summary more room than a turn has.
 const COMPACT_SUMMARY_MAX_TOKENS = 16384
 
 if (!TOKEN) {
@@ -344,6 +343,35 @@ function serialize(fn) {
   const run = tail.then(fn, fn)
   tail = run.then(() => undefined, () => undefined)
   return run
+}
+
+// compaction-basic's words (0.1.1-rc.2) for a summary that would not shrink
+// what it replaces: on the error it throws, and on the failed attempt's
+// `compaction/end` event.
+const SUMMARY_NOT_SMALLER = 'summary is not smaller than the shadowed content'
+
+// What /v1/compact answers when nothing has been said since the last one.
+const NOTHING_SAID_SINCE = Symbol('nothing said since the last compaction')
+
+// True when the latest compaction committed — or found the history already
+// shorter than its summary — and no turn has started since. Another one would
+// only pay for a model call that summarizes the summary again (losing
+// detail), or fails the same way (measured offline: a /compact right after
+// another made a second summary call either way). Read from the session's own
+// log, so it holds across a restart: a restored session is its stored log plus
+// a seed marker. Any other failed attempt (an upstream error, a timeout) does
+// not count; a retry may succeed.
+function nothingSaidSinceLastCompact(session) {
+  const events = session.events
+  for (let i = events.length - 1; i >= 0; i--) {
+    const { type, data } = events[i]
+    if (type === 'turn/start' || type === 'turn/end') return false
+    if (type === 'compaction/end') {
+      const error = data && typeof data.error === 'string' ? data.error : ''
+      if (error === '' || error.startsWith(SUMMARY_NOT_SMALLER)) return true
+    }
+  }
+  return false
 }
 
 /**
@@ -907,7 +935,9 @@ const server = createServer((req, res) => {
   // One at a time, whichever door asked: sealed's single flight ends when the
   // adapter stops waiting, but a compaction queued here behind a long turn
   // outlives that, and a retry would queue a second one that summarizes the
-  // first one's summary. So a request while one is pending is a 409 "busy".
+  // first one's summary. So a request while one is pending is a 409 "busy",
+  // and one that arrives after it, with nothing said in between, is "nothing
+  // to compact" without a model call (nothingSaidSinceLastCompact).
   if (req.method === 'POST' && path === '/v1/compact') {
     if (compactPending) {
       return sendJSON(res, 409, { error: { message: 'a compaction is already queued or running', code: 'busy' } })
@@ -917,8 +947,13 @@ const server = createServer((req, res) => {
       try {
         const result = await serialize(async () => {
           const { ctx, agent } = await getAgent()
+          if (nothingSaidSinceLastCompact(agent.session)) return NOTHING_SAID_SINCE
           return ctx.compaction.compactNow(agent, AbortSignal.timeout(COMPACT_TIMEOUT_MS))
         })
+        if (result === NOTHING_SAID_SINCE) {
+          log('compact: nothing to compact (nothing said since the last /compact)')
+          return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: nothing has been said since the last /compact' })
+        }
         if (!result) {
           log('compact: nothing to compact')
           return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: no older history that can be summarized yet' })
@@ -955,7 +990,7 @@ const server = createServer((req, res) => {
         // A summary no smaller than what it would replace (compaction-basic
         // 0.1.1-rc.2 wording) is not a failure: what is left is already as
         // short as it gets — typically a /compact right after another one.
-        if (code === 'summary' && cause.startsWith('summary is not smaller than the shadowed content')) {
+        if (code === 'summary' && cause.startsWith(SUMMARY_NOT_SMALLER)) {
           log(`compact: nothing to compact (${cause})`)
           return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: the history left is already shorter than a summary of it would be' })
         }

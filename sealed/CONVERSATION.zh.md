@@ -82,19 +82,23 @@ adapter 在自己的包里用自己的方言作答。
   openclaw 约 20K token),进程不重启。proxy 暴露一条 owner 签名的
   `POST /_seal/compact`(tag `0GSealCompact`,clear 同一文法,占座门控),CLI 加
   `/compact`。有三道 clear 不需要的闸:同一时间只跑一个压缩(第二个答 409);
-  一个签名请求只接受一次——压缩是一次模型调用、不幂等,所以不同于 clear,它
+  一个签名请求只接受一次——压缩要做一次或多次模型调用、不幂等,所以不同于 clear,它
   在新鲜度窗口内不能被重放(以签名的消息为键,换个写法或可塑变形的签名仍算同一
   请求);压缩和 synth 门上的一轮永不重叠——后到的那个被拒(答 409)——因为
   openclaw 的压缩会中止会话里正在运行的那一轮。框架自己的"现在不行"(已有压缩
-  在排队、会话仍忙、openclaw 刚换完模型)也答 409(`framework.ErrCompactRefused`),
-  不算失败。压缩与
-  请求解耦(连接断开不会中止它,结果写进日志)。
+  在排队、会话仍忙)也答 409(`framework.ErrCompactRefused`),不算失败。压缩与
+  请求解耦:连接断开不会中止它,结果写进日志。这一点有实际意义:长的摘要会比客户端
+  等得更久——Node 的 fetch 等 300 秒没有回应就放弃——所以 CLI 把"没等到回应"报成
+  "仍在压缩,看 /startuplog",而不是失败。
   dsh 让桥执行(`POST /v1/compact` → 组合里的 `compactNow`,排在正在跑的那一轮
   之后,同一时间只挂一个;摘要由桥当前运行的模型来写,输出上限 16384,低于一轮的
-  32768——见 `CONFIG_SURFACE.zh.md` §3.2);openclaw 对正在运行的网关执行它自己的
+  32768——目录没给预算时用引擎自己的 8192,见 `CONFIG_SURFACE.zh.md` §3.2);
+  openclaw 对正在运行的网关执行它自己的
   `openclaw sessions compact <key>`,网关地址和 token 走环境变量(它的边界情况见
   下方 openclaw 的坑)。两者在引擎认为没有可折叠的内容时都答"无可压缩"(200,不算
-  失败)。hermes 和 prime 暂时答 501。
+  失败)。上次 `/compact` 之后还没聊过时,dsh 桥也直接答"无可压缩",不调用模型:
+  离线实测,紧接着再按一次、或重启后马上按,都会再做一次摘要调用,把摘要再压一遍。
+  hermes 和 prime 暂时答 501。
 
 透明的 `/v1/chat/completions` 门**永远**不带会话 header、不用存储历史——在那扇门
 上做有状态会悄悄改变标准 OpenAI 客户端看到的行为。有状态是第二扇门,不是替换。
@@ -143,15 +147,24 @@ adapter 在自己的包里用自己的方言作答。
   因此生效。**手动**压缩只有在设置了 `agents.defaults.compaction.keepRecentTokens`
   时才保留这段尾部——不设的话,openclaw 会改写记录,让重放从摘要开始,而那段从未
   被总结的尾部就丢了(离线实测)——所以 render 会写入 openclaw 自己的默认值
-  20000,除非 owner 的 overlay 另有指定。
-- openclaw 上的 `/compact` 还有四个边界情况(2026-10-19 离线发现)。
-  `sessions compact` 是 2026.7.1 才有的命令——白名单里的 2026.5.6/5.7 包都没有——
-  所以低于这个版本时 `CompactSession` 答 `ErrCompactUnsupported`(501)。openclaw
-  用会话**最后一次**用的模型写摘要,所以刚换完模型时压缩会被拒(409,"先发一条
-  消息"),直到新模型上跑过一轮。openclaw 的压缩期限默认 180 秒
+  20000,除非 openclaw.json 里那里已经是一个正整数(owner 的 overlay,或磁盘上的
+  修改)。
+- openclaw 上的 `/compact` 还有三个边界情况(2026-10-19 离线发现)。
+  `sessions compact` 是 2026.7.1 才有的命令。白名单里的 2026.5.6/5.7 有网关的
+  `sessions.compact` RPC,但没有 adapter 调用的那条 CLI 命令,所以低于 2026.7.1 时
+  `CompactSession` 答 `ErrCompactUnsupported`(501),render 也不写下面这些压缩
+  配置:在那些版本上它们只会改变自动压缩(2026.5.x 给压缩 900 秒,不是 180 秒)。
+  openclaw 用会话**最后一次**用的模型写摘要,除非 `agents.defaults.compaction.model`
+  指定了一个。离线实测:刚换完模型就 `/compact`,摘要用的是旧模型;换模型同时换了
+  接口格式时,直接报 "Unknown model"。所以对走路由的 pin,render 在那里写上这个
+  pin(实测:两种格式下摘要都发给了新模型),除非 owner 的 overlay 指定了模型。
+  框架自带 provider 的 pin 交给 openclaw 自己处理——它可能是 openclaw 会解析的
+  别名(anthropic/sonnet → claude-sonnet-5),而指定模型这一做法只对走路由的 pin
+  验证过——所以在那里,刚换完模型时的 `/compact` 仍可能用旧模型、或因旧模型失败,
+  直到新模型上跑过一轮。openclaw 的压缩期限默认 180 秒
   (`EMBEDDED_COMPACTION_TIMEOUT_MS`),远在 sealed 自己的 11–15 分钟之内,所以
-  render 把 `agents.defaults.compaction.timeoutSeconds` 设为 600,除非 overlay 给了
-  正数(用一个每次摘要调用都在 200 秒后才回复的桩模型:默认设置下 180 秒时报
+  render 把 `agents.defaults.compaction.timeoutSeconds` 设为 600,除非那里已经是
+  一个正整数(用一个每次摘要调用都在 200 秒后才回复的桩模型:默认设置下 180 秒时报
   "Compaction timed out",设为 600 后完成,用时 402 秒)。
   还有,openclaw 的 "Already compacted" / "Nothing to compact (session too small)"
   在它的 CLI 里报的是失败,这里回成"无可压缩"。
@@ -239,8 +252,12 @@ openclaw 的坑)。离线(桩模型)验证:dsh 桥在已有压缩挂起时拒绝
 16384 发出,报告引擎的真实原因(包括上游 400),摘要不会更小时答"无可压缩";设了
 `keepRecentTokens` 后,openclaw 压缩后的下一轮,模型收到的是摘要加六轮中的第 4–6
 轮,不设则只有摘要。换模型之后,dsh 的摘要调用发给了新模型(在桥指定摘要模型之前,
-同样的步骤会以 500 失败);`timeoutSeconds` 设为 600 后,openclaw 完成了一次摘要调用
-耗时 200 秒的压缩。
+同样的步骤会以 500 失败);openclaw 也一样,用的是 render 自己生成的配置,覆盖了
+openai 格式内换模型和换到 anthropic 两种情况(不设 `compaction.model` 时:分别是
+旧模型,和 "Unknown model");`timeoutSeconds` 设为 600 后,openclaw 完成了一次
+摘要调用耗时 200 秒的压缩。dsh 在一次 `/compact` 之后、或重启后马上再按
+`/compact`,现在答"无可压缩",不调用模型(以前:每次都多一次摘要调用,把摘要
+再压一遍)。
 
 每条存储路径都对照**从已 build 镜像抽出的真 SDK** 验证(prime SessionManager
 往返+轮转;dsh 追加→seed→`fromRestore`;hermes/openclaw 的 header 语义读自网关

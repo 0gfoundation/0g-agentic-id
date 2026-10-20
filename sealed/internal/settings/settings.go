@@ -209,10 +209,10 @@ const RequestOutputCeiling = 32768
 //
 // Not the fix for the HTTP 400 code 400001 that long glm-5.3 conversations
 // hit in 2026-10. Those requests had prompt + max_tokens at ~196,608 or
-// more AND a "developer"-role system prompt; with it sent as "system", the
-// same requests went through (0 of 65 refused, 2026-10-16), and zg compute
-// confirmed (2026-10-19) that Tencent's and 0G's self-hosted backends do
-// not support the role. dsh now sends "system" (bridge.mjs).
+// more AND a "developer"-role system prompt; replayed with it as "system",
+// the same request went through 65 times out of 65 (2026-10-16), and zg
+// compute confirmed (2026-10-19) that Tencent's and 0G's self-hosted
+// backends do not support the role. dsh now sends "system" (bridge.mjs).
 func (r Resolved) RequestMaxTokens() int {
 	mt := r.PersistableMaxTokens()
 	if mt > RequestOutputCeiling {

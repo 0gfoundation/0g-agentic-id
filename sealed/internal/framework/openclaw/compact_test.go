@@ -14,6 +14,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
+	"seal-verify/internal/settings"
 )
 
 var _ framework.SessionCompactor = (*Adapter)(nil)
@@ -179,12 +180,6 @@ func TestCompactSession_ChangedAfterCompletionIsAFailure(t *testing.T) {
 // openclaw's own default whenever nothing else has — and leaves an owner's
 // positive value, and its siblings, alone.
 func TestRenderSettings_SetsCompactionKeepRecentTokens(t *testing.T) {
-	compaction := func(cfg map[string]any) map[string]any {
-		agents, _ := cfg["agents"].(map[string]any)
-		defaults, _ := agents["defaults"].(map[string]any)
-		c, _ := defaults["compaction"].(map[string]any)
-		return c
-	}
 	for _, tc := range []struct {
 		name, overlay string
 		want          int
@@ -192,6 +187,9 @@ func TestRenderSettings_SetsCompactionKeepRecentTokens(t *testing.T) {
 		{"unset gets openclaw's default", "", openclawKeepRecentTokens},
 		{"the overlay's value stands", `{"agents":{"defaults":{"compaction":{"keepRecentTokens":8000,"reserveTokens":4000}}}}`, 8000},
 		{"a non-positive value is replaced", `{"agents":{"defaults":{"compaction":{"keepRecentTokens":0}}}}`, openclawKeepRecentTokens},
+		// openclaw's schema takes integers only; a fraction would get the
+		// whole overlay withdrawn (ensureConfigAcceptable).
+		{"a fraction is replaced", `{"agents":{"defaults":{"compaction":{"keepRecentTokens":8000.5}}}}`, openclawKeepRecentTokens},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			useTempHome(t)
@@ -199,7 +197,7 @@ func TestRenderSettings_SetsCompactionKeepRecentTokens(t *testing.T) {
 			if tc.overlay != "" {
 				s.Others = json.RawMessage(tc.overlay)
 			}
-			c := compaction(renderInto(t, s))
+			c := compactionBlock(renderInto(t, s))
 			if v, _ := c["keepRecentTokens"].(float64); int(v) != tc.want {
 				t.Fatalf("keepRecentTokens = %v; want %d", c["keepRecentTokens"], tc.want)
 			}
@@ -227,31 +225,91 @@ func TestCompactSession_OlderOpenclawIsUnsupported(t *testing.T) {
 	}
 }
 
-// openclaw summarizes with the model the session last ran on, so right after
-// a model switch the compaction is refused (409) until one turn has run on the
-// new pin — and goes ahead once it has.
-func TestCompactSession_RefusedUntilATurnRanOnTheNewModel(t *testing.T) {
+// /compact does not second-guess the session's recorded model: openclaw files
+// a built-in provider's alias under the resolved name (anthropic/sonnet →
+// claude-sonnet-5), so comparing it with the pin refused such an owner
+// forever. The summary's model is the render's job (setCompactionModel).
+func TestCompactSession_RunsWhateverTheSessionLastRanOn(t *testing.T) {
 	a := startedAdapter(t)
-	s := routedSettings(inference.WireOpenAI, "other-model")
-	a.rendered = &s
-	key := currentConversationKey()
-	plantSession(t, "agent:main:"+key, sessionEntry{SessionID: "s1", Model: "glm-5.3", ModelProvider: "openai"}, nil)
+	a.rendered = &settings.Resolved{Doc: settings.Doc{Provider: "anthropic", Model: "sonnet"}}
+	if err := os.MkdirAll(sessionsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := `{"agent:main:` + currentConversationKey() + `":{"sessionId":"s1","model":"claude-sonnet-5","modelProvider":"anthropic"}}`
+	if err := os.WriteFile(sessionsStorePath(), []byte(store), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	call := stubCompactCLI(t, `{"ok":true,"compacted":true,"result":{"tokensBefore":10,"tokensAfter":2}}`, nil)
-
-	_, err := a.CompactSession(context.Background())
-	if !errors.Is(err, framework.ErrCompactRefused) || !strings.Contains(err.Error(), "send one message first") {
-		t.Fatalf("err = %v; want a refusal saying to send one message first", err)
-	}
-	if call.args != nil {
-		t.Fatalf("the CLI must not run against the old model: %v", call.args)
-	}
-
-	plantSession(t, "agent:main:"+key, sessionEntry{SessionID: "s1", Model: "other-model", ModelProvider: "openai"}, nil)
 	if _, err := a.CompactSession(context.Background()); err != nil {
-		t.Fatalf("after a turn on the new model: %v", err)
+		t.Fatal(err)
 	}
 	if call.args == nil {
-		t.Fatal("the CLI should run once the session is on the pinned model")
+		t.Fatal("the CLI did not run")
+	}
+}
+
+// compactionBlock reads agents.defaults.compaction back out of a rendered
+// config; nil when absent.
+func compactionBlock(cfg map[string]any) map[string]any {
+	agents, _ := cfg["agents"].(map[string]any)
+	defaults, _ := agents["defaults"].(map[string]any)
+	c, _ := defaults["compaction"].(map[string]any)
+	return c
+}
+
+// The summary is written with the pin: a routed pin is named as the render
+// files it, a built-in provider's is left to openclaw (and a routed leftover
+// removed), an owner's overlay value stands until the overlay drops it, and a
+// document with no provider leaves the key as it is.
+func TestRenderSettings_NamesTheCompactionModel(t *testing.T) {
+	useTempHome(t)
+	model := func(cfg map[string]any) any { return compactionBlock(cfg)["model"] }
+	withOverlay := func(s settings.Resolved, overlay string) settings.Resolved {
+		s.Others = json.RawMessage(overlay)
+		return s
+	}
+	for _, step := range []struct {
+		name string
+		s    settings.Resolved
+		want any
+	}{
+		{"routed openai", routedSettings(inference.WireOpenAI, "glm-5.3"), "openai/glm-5.3"},
+		{"routed anthropic", routedSettings(inference.WireAnthropic, "claude-sonnet-5"), "anthropic/claude-sonnet-5"},
+		{"built-in provider", settings.Resolved{Doc: settings.Doc{Provider: "anthropic", Model: "sonnet"}}, nil},
+		{"the overlay names one", withOverlay(routedSettings(inference.WireOpenAI, "glm-5.3"), `{"agents":{"defaults":{"compaction":{"model":"openai/cheap"}}}}`), "openai/cheap"},
+		{"the overlay drops it", routedSettings(inference.WireOpenAI, "glm-5.3"), "openai/glm-5.3"},
+		{"no provider", settings.Resolved{Doc: settings.Doc{Model: "other-model"}}, "openai/glm-5.3"},
+	} {
+		if got := model(renderInto(t, step.s)); got != step.want {
+			t.Fatalf("%s: compaction.model = %v; want %v", step.name, got, step.want)
+		}
+	}
+}
+
+// An openclaw without `sessions compact` gets none of the compaction keys:
+// they would only change its automatic compaction (2026.5.x allows 900s, not
+// 180s). An overlay's own compaction keys still pass through.
+func TestRenderSettings_OlderOpenclawGetsNoCompactionKeys(t *testing.T) {
+	useTempHome(t)
+	a := New()
+	a.cfg = &config{framework: frameworkBinding{PackageVersion: "2026.5.7"}}
+	s := routedSettings(inference.WireOpenAI, "glm-5.3")
+	s.Others = json.RawMessage(`{"agents":{"defaults":{"compaction":{"reserveTokens":4000}}}}`)
+	if err := a.RenderSettings(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadOpenclawJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := compactionBlock(cfg)
+	for _, k := range []string{"keepRecentTokens", "timeoutSeconds", "model"} {
+		if v, set := c[k]; set {
+			t.Errorf("compaction.%s = %v on 2026.5.7; want it absent", k, v)
+		}
+	}
+	if v, _ := c["reserveTokens"].(float64); v != 4000 {
+		t.Errorf("the overlay's reserveTokens was lost: %v", c)
 	}
 }
 
@@ -278,6 +336,7 @@ func TestRenderSettings_SetsCompactionTimeout(t *testing.T) {
 		{"unset gets the platform's", "", openclawCompactionTimeout},
 		{"the overlay's value stands", `{"agents":{"defaults":{"compaction":{"timeoutSeconds":300}}}}`, 300},
 		{"an invalid value is replaced", `{"agents":{"defaults":{"compaction":{"timeoutSeconds":"10m"}}}}`, openclawCompactionTimeout},
+		{"a fraction is replaced", `{"agents":{"defaults":{"compaction":{"timeoutSeconds":300.5}}}}`, openclawCompactionTimeout},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			useTempHome(t)

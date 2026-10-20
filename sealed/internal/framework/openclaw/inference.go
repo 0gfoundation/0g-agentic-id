@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"reflect"
@@ -65,6 +66,9 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	mergeInto(cfg, overlay)
 
 	applySettingsToConfig(cfg, s)
+	if hasCompactCLI(a.packageVersion()) {
+		applyCompactionConfig(cfg, s, overlay)
+	}
 
 	if err := saveOpenclawJSON(cfg); err != nil {
 		return err
@@ -380,25 +384,6 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 	diagnostics["stuckSessionAbortMs"] = 900_000
 	cfg["diagnostics"] = diagnostics
 
-	// A manual compaction (/_seal/compact → `sessions.compact`) must keep the
-	// recent tail. openclaw 2026.7.1 summarizes everything before its kept
-	// tail and then — unless agents.defaults.compaction.keepRecentTokens is
-	// SET — rewrites the compaction record so replay starts from the summary
-	// alone (hardenManualCompactionBoundary): the tail is neither summarized
-	// nor replayed, and the owner's latest turns silently vanish. Measured
-	// offline with six ~27K-char turns: unset, the next turn reached the model
-	// as summary + the new message; set, as summary + turns 4–6 + the new
-	// message. The value is openclaw's own default, so automatic compaction
-	// is unchanged; a positive value already there (the owner's overlay) stands.
-	//
-	// The same block's timeoutSeconds: openclaw gives any compaction 180s
-	// (EMBEDDED_COMPACTION_TIMEOUT_MS) and then fails it — measured offline,
-	// a summary call that took 200s failed "Compaction timed out" at 180.2s,
-	// whatever the CLI and sealed allow. A reasoning model summarizing a long
-	// history takes minutes, so the render allows openclawCompactionTimeout,
-	// inside the CLI's own deadline (compact.go).
-	ensureCompactionDefaults(cfg)
-
 	// The ONE conversation must not end on a clock. openclaw's default
 	// session policy is "daily": the first turn after 04:00 (local time)
 	// starts a new session. Measured offline on 2026.7.1 by backdating a
@@ -440,11 +425,37 @@ const openclawKeepRecentTokens = 20000
 // 10 minutes, under the CLI's own deadline (compactCLITimeout − 1m = 11m).
 const openclawCompactionTimeout = 600
 
-// ensureCompactionDefaults sets agents.defaults.compaction.keepRecentTokens and
-// .timeoutSeconds, each unless a positive number is already there. All three
-// whitelisted openclaw versions accept both keys (their config schemas,
-// checked 2026-10-19).
-func ensureCompactionDefaults(cfg map[string]any) {
+// applyCompactionConfig writes the part of agents.defaults.compaction that the
+// owner's /compact depends on. RenderSettings calls it only for an openclaw
+// with `sessions compact` (hasCompactCLI). An older one refuses /compact
+// before anything runs, and there these keys would only change its automatic
+// compaction: 2026.5.6/5.7 give a compaction 900s by default, which the
+// timeout below would shorten.
+//
+// keepRecentTokens: a manual compaction (/_seal/compact → `sessions.compact`)
+// must keep the recent tail. openclaw 2026.7.1 summarizes everything before
+// its kept tail and then — unless keepRecentTokens is SET — rewrites the
+// compaction record so replay starts from the summary alone
+// (hardenManualCompactionBoundary): the tail is neither summarized nor
+// replayed, and the owner's latest turns silently vanish. Measured offline
+// with six ~27K-char turns: unset, the next turn reached the model as summary
+// + the new message; set, as summary + turns 4–6 + the new message. The value
+// is openclaw's own default, so automatic compaction is unchanged.
+//
+// timeoutSeconds: openclaw gives any compaction 180s
+// (EMBEDDED_COMPACTION_TIMEOUT_MS) and then fails it — measured offline, a
+// summary call that took 200s failed "Compaction timed out" at 180.2s,
+// whatever the CLI and sealed allow. A reasoning model summarizing a long
+// history takes minutes, so the render allows openclawCompactionTimeout,
+// inside the CLI's own deadline (compact.go).
+//
+// Either value stands when openclaw.json already holds a positive whole
+// number (the owner's overlay, or an edit on disk). Anything else is
+// replaced: openclaw's schema takes only positive integers, and a config it
+// rejects costs the owner the whole overlay (ensureConfigAcceptable).
+//
+// model: see setCompactionModel.
+func applyCompactionConfig(cfg map[string]any, s settings.Resolved, overlay map[string]any) {
 	agents, _ := cfg["agents"].(map[string]any)
 	if agents == nil {
 		agents = map[string]any{}
@@ -460,21 +471,65 @@ func ensureCompactionDefaults(cfg map[string]any) {
 		compaction = map[string]any{}
 		defaults["compaction"] = compaction
 	}
-	setPositiveDefault(compaction, "keepRecentTokens", openclawKeepRecentTokens)
-	setPositiveDefault(compaction, "timeoutSeconds", openclawCompactionTimeout)
+	setPositiveIntDefault(compaction, "keepRecentTokens", openclawKeepRecentTokens)
+	setPositiveIntDefault(compaction, "timeoutSeconds", openclawCompactionTimeout)
+	setCompactionModel(compaction, s, overlay)
 }
 
-// setPositiveDefault sets m[key] to def unless it already holds a positive
-// number; a present but invalid value is replaced, with a log line.
-func setPositiveDefault(m map[string]any, key string, def int) {
+// maxJSONSafeInt is the largest whole number a JSON reader in JavaScript
+// holds exactly (Number.MAX_SAFE_INTEGER).
+const maxJSONSafeInt = 1<<53 - 1
+
+// setPositiveIntDefault sets m[key] to def unless it already holds a positive
+// whole number; anything else present is replaced, with a log line.
+func setPositiveIntDefault(m map[string]any, key string, def int) {
 	v, present := m[key]
-	if n, ok := v.(float64); ok && n > 0 {
-		return
+	switch n := v.(type) {
+	case float64:
+		if n >= 1 && n <= maxJSONSafeInt && n == math.Trunc(n) {
+			return
+		}
+	case int:
+		if n >= 1 {
+			return
+		}
 	}
 	if present {
-		logger.Logf("openclaw: agents.defaults.compaction.%s = %v is not a positive number — using %d", key, v, def)
+		logger.Logf("openclaw: agents.defaults.compaction.%s = %v is not a positive whole number — using %d", key, v, def)
 	}
 	m[key] = def
+}
+
+// setCompactionModel names the model a compaction summarizes with.
+//
+// openclaw summarizes with the model the session LAST ran on unless
+// agents.defaults.compaction.model names one (resolveEmbeddedCompactionTarget,
+// 2026.7.1). Right after a model switch the last model is the old one: the
+// summary is written with it, or fails as "Unknown model" once its provider
+// entry is gone (measured offline). So for a routed pin the render names the
+// pin itself, as "<label>/<model>" — the label and id it files the model under
+// in models.providers (applyEndpointToConfig), which is where openclaw looks it
+// up.
+//
+// A built-in provider's pin is left to openclaw, and a value a routed pin left
+// behind is removed. Such a pin may be an alias that openclaw resolves for
+// turns (anthropic/sonnet → claude-sonnet-5, parseModelRef), and naming the
+// model here was verified for routed pins only. A document with no provider
+// leaves the pin on disk as it is (applySettingsToConfig), and this key with
+// it. An owner's overlay that names a model stands.
+func setCompactionModel(compaction map[string]any, s settings.Resolved, overlay map[string]any) {
+	ovAgents, _ := overlay["agents"].(map[string]any)
+	ovDefaults, _ := ovAgents["defaults"].(map[string]any)
+	ovCompaction, _ := ovDefaults["compaction"].(map[string]any)
+	if _, owner := ovCompaction["model"]; owner {
+		return
+	}
+	switch {
+	case s.Endpoint != nil && s.Model != "":
+		compaction["model"] = clawProviderName(s) + "/" + s.Model
+	case s.Provider != "":
+		delete(compaction, "model")
+	}
 }
 
 // ensureSessionNeverResets sets session.reset to {mode:"idle"} — no idle

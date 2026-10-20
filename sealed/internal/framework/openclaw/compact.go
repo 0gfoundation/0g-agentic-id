@@ -16,12 +16,13 @@ import (
 )
 
 // compactCLITimeout bounds one `openclaw sessions compact` run. The gateway's
-// summary is a model call — 73s measured on a 270K-token glm-5.3 session
-// (2026-10-19, openclaw 2026.7.1) — with headroom for a reasoning model on a
-// longer history. The deadlines nest so the layer that knows why is the one
-// that gives up: openclaw's own compaction timeout (rendered,
-// openclawCompactionTimeout = 10m) < the CLI's --timeout (11m) < this (12m)
-// < sealed's route deadline (proxy.compactTimeout, 15m).
+// summary takes one or more model calls (two in an offline run that split a
+// turn) — 73s measured on a 270K-token glm-5.3 session (2026-10-19, openclaw
+// 2026.7.1) — with headroom for a reasoning model on a longer history. The
+// deadlines nest so the layer that knows why is the one that gives up:
+// openclaw's own compaction timeout (rendered, openclawCompactionTimeout =
+// 10m) < the CLI's --timeout (11m) < this (12m) < sealed's route deadline
+// (proxy.compactTimeout, 15m).
 const compactCLITimeout = 12 * time.Minute
 
 // compactMinVersion is the first openclaw with a `sessions compact` CLI
@@ -29,6 +30,23 @@ const compactCLITimeout = 12 * time.Minute
 // `sessions cleanup` and `export-trajectory` (checked in their published
 // dist, 2026-10-19).
 const compactMinVersion = "2026.7.1"
+
+// hasCompactCLI reports whether openclaw version has `sessions compact`. An
+// unknown version (no framework binding restored) counts as having it: Start
+// installs whitelistMax then.
+func hasCompactCLI(version string) bool {
+	return version == "" || compareVersions(version, compactMinVersion) >= 0
+}
+
+// packageVersion is the openclaw version this adapter installs and runs.
+func (a *Adapter) packageVersion() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.cfg == nil {
+		return ""
+	}
+	return a.cfg.framework.PackageVersion
+}
 
 // compactCLIWaitDelay bounds how long the CLI's output pipes may outlive the
 // process once it has exited or been killed — the stopgap for any descendant
@@ -91,35 +109,20 @@ type compactResult struct {
 // OPENCLAW_GATEWAY_URL / OPENCLAW_GATEWAY_TOKEN — the pairing the CLI asks
 // for — which also keeps the token out of argv.
 //
-// Two "not here / not now" answers come before the CLI runs:
-//   - an openclaw older than compactMinVersion has no `sessions compact`
-//     command at all → framework.ErrCompactUnsupported (501);
-//   - openclaw summarizes with the model the session LAST ran on
-//     (resolveSessionModelRef), not the pin: right after a model switch that
-//     is the old model — summarized with it, or failing as "Unknown model"
-//     once its provider is gone (measured offline). Until one turn has run on
-//     the new pin → framework.ErrCompactRefused (409), with what to do.
+// The summary is written with the pinned model, not the one the session last
+// ran on, for a routed pin: the render names it (setCompactionModel).
+//
+// An openclaw older than compactMinVersion has no `sessions compact` command
+// at all → framework.ErrCompactUnsupported (501), before the CLI runs.
 func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 	a.mu.RLock()
 	token := a.authToken
-	version := ""
-	if a.cfg != nil {
-		version = a.cfg.framework.PackageVersion
-	}
-	rendered := a.rendered
 	a.mu.RUnlock()
 	if token == "" {
 		return "", fmt.Errorf("openclaw.CompactSession: gateway not started yet")
 	}
-	if version != "" && compareVersions(version, compactMinVersion) < 0 {
+	if version := a.packageVersion(); !hasCompactCLI(version) {
 		return "", fmt.Errorf("openclaw.CompactSession: %w: openclaw %s has no `sessions compact`; it arrives in %s", framework.ErrCompactUnsupported, version, compactMinVersion)
-	}
-	if rendered != nil && rendered.Model != "" {
-		lastProvider, lastModel := pinnedSessionModel(currentConversationKey())
-		pinProvider := clawProviderName(*rendered)
-		if lastModel != "" && (lastModel != rendered.Model || (lastProvider != "" && lastProvider != pinProvider)) {
-			return "", fmt.Errorf("openclaw.CompactSession: %w: the conversation last ran on %s/%s and openclaw summarizes with that model, not the new pin %s/%s — send one message first, then /compact", framework.ErrCompactRefused, lastProvider, lastModel, pinProvider, rendered.Model)
-		}
 	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),

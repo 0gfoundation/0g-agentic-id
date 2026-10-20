@@ -8,10 +8,11 @@
 //
 // Three guards /_seal/clear does not need:
 //
-//   - Single flight. A compaction makes a model call and can take minutes; a
-//     second request while one runs is answered 409 rather than queued.
+//   - Single flight. A compaction makes one or more model calls and can take
+//     minutes; a second request while one runs is answered 409 rather than
+//     queued.
 //   - Replay. The signed message carries no nonce, and unlike a clear a
-//     compaction is NOT idempotent — every run is another model call and
+//     compaction is NOT idempotent — every run is more model calls and
 //     another round of summarizing what is left — so a signed message is
 //     accepted once: a repeat inside the freshness window is refused (409).
 //   - No live turn. openclaw's compaction aborts a running turn in the

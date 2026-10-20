@@ -74,10 +74,11 @@ const apiKeyEnvRef = "SEAL_MODEL_API_KEY"
 type modelEntry struct {
 	ID string `json:"id"`
 	// MaxTokens is the model's OUTPUT budget per call (the SDK sends it as
-	// max_tokens). Filled from Resolved.RequestMaxTokens (the router catalog's
-	// max_completion_tokens, capped — the raw capability is not a per-call
-	// value, see settings.RequestMaxTokens); omitted — SDK default 16384 —
-	// for a budget the catalog did not supply.
+	// max_completion_tokens to the router: its detectCompat picks max_tokens
+	// only for a few named hosts). Filled from Resolved.RequestMaxTokens (the
+	// router catalog's max_completion_tokens, capped — the raw capability is
+	// not a per-call value, see settings.RequestMaxTokens); omitted — SDK
+	// default 16384 — for a budget the catalog did not supply.
 	MaxTokens int `json:"maxTokens,omitempty"`
 	// Reasoning marks the model as a thinking model. Required for the SDK to
 	// send reasoning_effort at all (its gate is reasoning && compat

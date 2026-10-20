@@ -162,7 +162,7 @@ and degrades gracefully when absent):
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | the stateful responses door's upstream calls | the framework holds no server-side conversation keyed by a session identity (see `CONVERSATION.md`) |
 | `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door drops client-sent history: it sends the prior turns this returns, then only the client's current turn. Return none when your gateway replays its own session (openclaw) — a client's history on top would reach the model twice | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
-| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version cannot compact on demand — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version lacks what your adapter uses to trigger compaction (openclaw before 2026.7.1 has no `sessions compact` CLI command) — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -215,7 +215,7 @@ Conventions and rules:
   agent whose configuration has since changed, which is how every fix
   shipped after mint — bounded reasoning, catalog budgets, the watchdog
   headroom, the model idle timeout — stopped at the mint-time copy
-  (`openclaw/inference.go:14-30`). Rendering the file from the document on
+  (`openclaw/inference.go:15-31`). Rendering the file from the document on
   every spawn makes the same fix reach every agent on its next Start.
 - **The `framework` role is protocol-reserved.** Every adapter must
   declare it as a `Leaf` whose plaintext is the binding JSON:
@@ -477,12 +477,14 @@ Three accessors carry the gating you must not re-invent:
   never the raw catalog value, for anything sent on every request: the
   catalog's `max_completion_tokens` is a capability, and wherever a server
   checks prompt + budget against the context window it can take most of the
-  window (`CONFIG_SURFACE.md` §3.2). Like
-  `Effort()`'s `("", false)`, 0 is "unknown", not "clear" — but a render that
-  EDITS a file in place must still remove a budget it wrote for a different
-  model, or a switch to a model with a lower output limit fails every request
-  (hermes `spawn.go`: kept through an outage on the same model, removed when
-  the model changes).
+  window (`CONFIG_SURFACE.md` §3.2). A 0 has two readings, told apart by
+  `s.Facts.CatalogSourced`: the catalog was unreachable — like `Effort()`'s
+  `("", false)`, "unknown", not "clear" — or it answered with no budget for
+  this model, and there is nothing to keep. A render that EDITS a file in
+  place must also remove a budget it wrote for a different model, or a switch
+  to a model with a lower output limit fails every request (hermes
+  `spawn.go`: kept through an outage on the same model, removed when the
+  model changes or the catalog gives none).
 
 #### Rule 1 — idempotent
 
@@ -548,7 +550,7 @@ re-point inference (`hermes/spawn.go:51-58`).
    on disk rather than by env, because its `custom` provider declares
    `env_vars=()` and reads the key from nowhere else — injecting by env
    produced a live 401 from the router, hermes having dialled it keyless
-   (`hermes/spawn.go:164-171`). The platform writes that key every render,
+   (`hermes/spawn.go:165-172`). The platform writes that key every render,
    and **deletes** it when the document supplies none: without the delete, a
    boot that switches to a framework built-in keeps the previous boot's 0G
    router key on disk and hands it to whichever provider now owns the
@@ -647,7 +649,7 @@ best-effort — a failure is logged, the agent runs on the recovered pin either
 way, and the next boot retries.
 
 Exactly one adapter implements the interface today: dsh, for its retired
-`settings.yaml` role (`dsh/settings.go:283-335`). openclaw, hermes and prime
+`settings.yaml` role (`dsh/settings.go:286-338`). openclaw, hermes and prime
 do not, so a pre-channel agent on those three comes up on whatever document
 attestor already holds; prime's `HandleLegacy` says so in as many words and
 calls lifting those pins "the platform's job", not yet landed

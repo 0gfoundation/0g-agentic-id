@@ -90,8 +90,9 @@ type Server struct {
 	conversationHeaders func() map[string]string
 	observeConversation func(sent map[string]string, resp http.Header)
 	// conversationHistory, when set, replaces CLIENT-sent history on the
-	// stateful door: prior turns come from the framework's own store, the
-	// client's input supplies only the current turn.
+	// stateful door: prior turns come from the adapter (none when the harness
+	// replays its own session), the client's input supplies only the current
+	// turn.
 	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
 	applySession        SessionSettingsApplier
 

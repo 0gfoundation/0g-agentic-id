@@ -585,16 +585,19 @@ export class AgentApi {
    * newest part verbatim (how much is the framework's: openclaw ~20K tokens,
    * dsh only its newest item), so later requests carry less of it while the
    * conversation goes on — the middle ground between doing nothing and
-   * {@link clearConversation}. No restart. The summary is a model call, so
-   * this can take minutes; a connection dropped meanwhile does not abort it
-   * (the outcome is also in the runtime log). Owner-signed (tag
-   * `0GSealCompact`, the clear grammar). A framework — or framework version —
-   * that cannot compact on demand answers 501; a second compaction while one
-   * runs, a replayed signature, or a framework declining for now (busy;
-   * openclaw right after a model switch, until one turn has run on the new
-   * model) answers 409. Pass `instanceId` when the caller participates in
-   * the single-driver seat: compaction is a driving action and is refused
-   * (409) from a displaced window.
+   * {@link clearConversation}. No restart. The summary takes one or more
+   * model calls, so this can take minutes — longer than Node's fetch waits
+   * for an answer (300s). A connection dropped or timed out meanwhile does not
+   * abort it; the outcome is in the runtime log. Nothing to compact —
+   * including nothing said since the last compaction — is a 200 whose note
+   * says so. Owner-signed (tag `0GSealCompact`, the clear grammar). A
+   * framework, or a framework version, that cannot compact on demand answers
+   * 501: openclaw before 2026.7.1 has no `sessions compact` CLI command, which
+   * the adapter drives. A second compaction while one runs, a replayed
+   * signature, or a framework declining for now (busy) answers 409. Pass
+   * `instanceId` when the caller participates in the single-driver seat:
+   * compaction is a driving action and is refused (409) from a displaced
+   * window.
    */
   async compactConversation(base: string, agentId: bigint, instanceId?: string): Promise<{ note?: string }> {
     const { walletClient, account } = requireWallet(this.ctx);

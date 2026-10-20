@@ -120,23 +120,31 @@ The four capabilities:
   `POST /_seal/compact` (tag `0GSealCompact`, the clear grammar, seat-gated)
   and the CLI gains `/compact`. Three guards a clear does not need: one compaction at
   a time (a second answers 409); a signed request is accepted once — a
-  compaction is a model call and not idempotent, so unlike a clear it must not
+  compaction makes one or more model calls and is not idempotent, so unlike a
+  clear it must not
   be replayable inside the freshness window (keyed on the signed message, so a
   re-spelled or malleated signature is the same request); and a compaction and
   a turn on the synthesized door never overlap — whichever comes second is
   refused (409) — because openclaw's compaction aborts a running turn in the
   session. A framework's own "not now" (another compaction pending, a session
-  still busy, openclaw right after a model switch) is a 409 too
-  (`framework.ErrCompactRefused`), not a failure. The
-  run is detached from the request (a dropped connection does not abort it;
-  the outcome is logged). dsh asks its bridge (`POST /v1/compact` → the
+  still busy) is a 409 too (`framework.ErrCompactRefused`), not a failure. The
+  run is detached from the request: a dropped connection does not abort it,
+  and the outcome is logged. That matters because a long summary outlasts the
+  client — Node's fetch gives up after 300s without an answer — so the CLI
+  reports no answer as "still compacting, see /startuplog", not as a failure.
+  dsh asks its bridge (`POST /v1/compact` → the
   composition's `compactNow`, queued behind a running turn, one pending at a
   time; the summary is written by the model the bridge runs, at an output cap
-  of 16384, below a turn's 32768 — `CONFIG_SURFACE.md` §3.2); openclaw runs
+  of 16384, below a turn's 32768 — the engine's own 8192 when the catalog
+  gives no budget, `CONFIG_SURFACE.md` §3.2); openclaw runs
   its own `openclaw sessions compact <key>` against the running gateway, with
   the gateway URL and token passed by env (its edges: the openclaw traps
   below). Either answers "nothing to compact" (200, not a failure) when its
-  engine finds nothing to fold. hermes and prime answer 501 for now.
+  engine finds nothing to fold. The dsh bridge also answers it, without a
+  model call, when nothing has been said since the last `/compact`: offline,
+  a second `/compact` right after one, or right after a restart, made another
+  summary call and summarized the summary again. hermes and prime answer 501
+  for now.
 
 The transparent `/v1/chat/completions` door NEVER gets conversation headers or
 store history — statefulness there would silently change what standard OpenAI
@@ -200,21 +208,32 @@ Source-verified traps, recorded:
   that tail only while `agents.defaults.compaction.keepRecentTokens` is set —
   unset, openclaw rewrites the record so replay starts at the summary and the
   tail, never summarized, is lost (measured offline) — so the render sets
-  openclaw's own default, 20000, unless the owner's overlay names one.
-- `/compact` on openclaw has four more edges (found offline, 2026-10-19).
-  `sessions compact` arrived in 2026.7.1 — the whitelisted 2026.5.6/5.7
-  packages do not have it — so below that version `CompactSession` answers
-  `ErrCompactUnsupported` (501). openclaw writes the summary with the
-  session's LAST model, so right after a model switch the compaction is
-  refused (409, "send one message first") until a turn has run on the new
-  model. openclaw's compaction deadline defaults to 180s
+  openclaw's own default, 20000, unless openclaw.json already holds a positive
+  whole number there (the owner's overlay, or an edit on disk).
+- `/compact` on openclaw has three more edges (found offline, 2026-10-19).
+  `sessions compact` arrived in 2026.7.1. The whitelisted 2026.5.6/5.7 have
+  the gateway's `sessions.compact` RPC but not the CLI command the adapter
+  drives, so below 2026.7.1 `CompactSession` answers `ErrCompactUnsupported`
+  (501), and the render writes none of the compaction keys below: there they
+  would only change automatic compaction (2026.5.x allows it 900s, not
+  180s). openclaw writes the summary with the session's LAST model unless
+  `agents.defaults.compaction.model` names one. Measured offline, a
+  `/compact` right after a model switch summarized with the old model, or
+  failed "Unknown model" when the switch changed the wire dialect. So for a
+  routed pin the render names the pin there (measured: the summary went to
+  the new model, on either dialect), unless the owner's overlay names a
+  model. A built-in provider's pin is left to openclaw — it may be an alias
+  openclaw resolves (anthropic/sonnet → claude-sonnet-5), and naming the
+  model was verified for routed pins only — so there a `/compact` right
+  after a switch can still use, or fail on, the old model until one turn has
+  run on the new one. openclaw's compaction deadline defaults to 180s
   (`EMBEDDED_COMPACTION_TIMEOUT_MS`), well inside sealed's own 11–15
   minutes, so the render sets `agents.defaults.compaction.timeoutSeconds` to
-  600 unless the overlay gives a positive value (a stub model answering each
-  summary call after 200s: "Compaction timed out" at 180s by default,
-  completed in 402s at 600). And openclaw's "Already compacted" / "Nothing
-  to compact (session too small)", which its CLI reports as failures, come
-  back as "nothing to compact".
+  600 unless a positive whole number is already there (a stub model
+  answering each summary call after 200s: "Compaction timed out" at 180s by
+  default, completed in 402s at 600). And openclaw's "Already compacted" /
+  "Nothing to compact (session too small)", which its CLI reports as
+  failures, come back as "nothing to compact".
 - openclaw's default session policy is DAILY: the first turn after 04:00
   (local time) starts a new session for the same key. Measured offline on
   2026.7.1 by backdating a session past the boundary: the next turn reached
@@ -330,8 +349,13 @@ smaller; with `keepRecentTokens` set, openclaw's next turn after a
 compaction reaches the model as the summary plus turns 4–6 of six, without
 it as the summary alone. After a model switch, dsh's summary call went to the
 new model (before the bridge named its summarization model, the same
-sequence failed with a 500); openclaw completed a compaction whose summary
-call took 200s once `timeoutSeconds` was 600.
+sequence failed with a 500), and so did openclaw's, on a config produced by
+the render itself, for a switch within the openai dialect and one to
+anthropic (without `compaction.model`: the old model, and "Unknown model");
+openclaw completed a compaction whose summary call took 200s once
+`timeoutSeconds` was 600. A dsh `/compact` right after another, or right
+after a restart, now answers "nothing to compact" with no model call (before:
+one more summary call each, which summarized the summary again).
 
 Every store path was verified against the REAL SDKs extracted from the built
 images (prime SessionManager round-trip + rotation; dsh append→seed→

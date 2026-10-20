@@ -1861,8 +1861,8 @@ const L2_HELP_FULL = `session commands
                           history becomes a summary, the newest part stays
                           as it is (openclaw ~20K tokens, dsh its newest
                           item), and the conversation goes on (unlike
-                          /clear). One model call; can take minutes.
-                          dsh and openclaw agents
+                          /clear). One or more model calls; can take
+                          minutes. dsh, and openclaw 2026.7.1 or later
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -2049,26 +2049,36 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       if (line === '/compact') {
         // Compact the agent's persisted conversation in place: older history
         // becomes a summary, the newest part stays verbatim, and the
-        // conversation goes on (unlike /clear). The summary is a model call —
-        // minutes on a long history — and the agent finishes it even if this
-        // connection drops; the runtime log has the outcome. The local echo
-        // is left alone: the server-side history is the one compacted.
+        // conversation goes on (unlike /clear). The summary takes one or more
+        // model calls — minutes on a long history — and the agent finishes it
+        // even if this connection drops; the runtime log has the outcome. The
+        // local echo is left alone: the server-side history is the one
+        // compacted.
         if (!s.url) { out(`agent is ${s.phase} — nothing to compact\n`); continue; }
-        out('compacting the conversation (one model call; can take a few minutes)…\n');
+        out('compacting the conversation (one or more model calls; can take a few minutes)…\n');
         try {
           const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
           out(`${r.note ?? 'conversation compacted'}\n`);
         } catch (e) {
           const msg = (e as Error).message;
-          // The agent's own 500 ("compact failed: …") is a final outcome; only
-          // a dropped connection or a gateway timeout leaves it unknown.
+          const status = Number(msg.match(/^compactConversation: HTTP (\d+):/)?.[1] ?? 0);
+          const cause = (e as { cause?: { code?: string } }).cause?.code ?? '';
+          // The agent's own 500 ("compact failed: …") is a final outcome.
           const failed = msg.match(/^compactConversation: HTTP 500: (compact failed: [\s\S]*)$/);
           // A 501 that names a reason (an older framework version) shows it.
           const why = msg.match(/^compactConversation: HTTP 501: [^(]*\(([\s\S]*)\)\s*$/)?.[1]?.split(': ').pop()?.trim();
-          if (/HTTP 501/.test(msg)) out(`this agent's framework${s.framework ? ` (${s.framework})` : ''} does not support /compact${why ? ` (${why})` : ' yet'} — /clear starts fresh instead\n`);
-          else if (/HTTP 409/.test(msg)) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
+          // Sent, but no answer: this side gave up waiting (Node's fetch, after
+          // 300s: UND_ERR_HEADERS_TIMEOUT), the connection dropped, or a
+          // gateway on the way gave up (the agent's own route never answers
+          // 502/504). The agent goes on compacting regardless — unlike a
+          // connection that never opened, where nothing started.
+          const unanswered = status === 502 || status === 504 ||
+            ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'ECONNRESET'].includes(cause);
+          if (status === 501) out(`this agent's framework${s.framework ? ` (${s.framework})` : ''} does not support /compact${why ? ` (${why})` : ' yet'} — /clear starts fresh instead\n`);
+          else if (status === 409) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
           else if (failed) out(`${failed[1].trim()}\n`);
-          else out(`compact failed: ${msg}\n(if the connection dropped, the agent may still be finishing it — /startuplog shows the outcome)\n`);
+          else if (unanswered) out(`no answer yet (${status ? `HTTP ${status} from a gateway on the way` : cause}); the agent may still be compacting — /startuplog shows the outcome (a "compact:" line). Wait for it before sending /compact again.\n`);
+          else out(`compact failed: ${msg}${cause ? ` (${cause})` : ''}\n`);
         }
         continue;
       }
