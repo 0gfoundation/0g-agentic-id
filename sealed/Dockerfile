@@ -17,10 +17,10 @@
 # The base image (OPENCLAW_BASE below) is built separately from
 # sealed/images/openclaw/ — its Dockerfile builds the local tag
 # `openclaw-sandbox:1.1.0`, and the registry tag is applied when pushing.
-# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.0, whose
-# base layers are byte-identical to the aliyun eliza/0g-sealed:openclaw-1.1.0
-# it replaces (#130). You only need to rebuild the base when bumping node /
-# openclaw versions.
+# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.0. It is
+# the same image as the aliyun eliza/0g-sandbox:openclaw-1.1.0 it replaces
+# (#130; same image ID and digest on the build host, 2026-10-20). You only
+# need to rebuild the base when bumping node / openclaw versions.
 
 # Global build arg (declared before the first FROM so the stage-3 FROM can
 # reference it): the openclaw base registry. GCP by default — reachable from
