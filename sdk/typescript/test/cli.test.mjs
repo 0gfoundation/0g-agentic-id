@@ -62,6 +62,17 @@ test('parseAgentRef: 0x…64-hex → sealId', () => {
   assert.deepEqual(parseAgentRef(seal), { kind: 'sealId', sealId: seal });
 });
 
+test('parseAgentRef: 0x…40-hex → agentSeal (lowercased)', () => {
+  const seal = '0xAABBCCDDeeff00112233445566778899aabbccdd';
+  assert.deepEqual(parseAgentRef(seal), { kind: 'agentSeal', address: seal.toLowerCase() });
+});
+
+test('parseAgentRef: 40-hex beats sealPrefix classification (agentSeal wins, commands fall back)', () => {
+  const forty = `0x${'cd'.repeat(20)}`;
+  const ref = parseAgentRef(forty);
+  assert.equal(ref.kind, 'agentSeal'); // never classified as a plain prefix
+});
+
 test('parseAgentRef: garbage / short hex / missing → BAD_AGENT_REF', () => {
   for (const bad of ['xyz', '0x1234', '', undefined, '33n', '-1']) {
     assert.throws(() => parseAgentRef(bad), (e) => e instanceof CliError && e.code === 'BAD_AGENT_REF');

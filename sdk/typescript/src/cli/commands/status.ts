@@ -3,8 +3,9 @@
  * @description `0g-agenticid status <agent>` — one agent's full picture
  * (spec v0.03 §3.2): all three coordinates (agentId / sealId / agentSeal),
  * phase, url, and the FOLDED failure reason. `<agent>` is a decimal agentId
- * or a 0x… sealId; the command resolves the other coordinates from chain +
- * the attestor listing.
+ * or a 0x… sealId (64-hex) or agentSeal address (40-hex, resolved via
+ * listing + chain — no on-chain reverse map exists); the command resolves
+ * the other coordinates from chain + the attestor listing.
  *
  * Failure folding: the public /deployments listing withholds failure reasons
  * (owner-only since #64). When phase=failed and a wallet is configured, this
@@ -60,6 +61,38 @@ export async function run(ctx: CommandContext): Promise<void> {
       );
     }
     ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
+  }
+
+  // An agentSeal address (0x…40 hex, the TEE identity `status` itself prints)
+  // has no on-chain reverse map, so it resolves by scanning the listing and
+  // chain-reading each minted agent's seal until the address matches. No hit
+  // → fall back to seal-prefix semantics (a 40-hex input is also a legal
+  // prefix of a 64-hex sealId) before giving up.
+  if (ref.kind === 'agentSeal') {
+    const want = ref.address.toLowerCase();
+    const rows = await ag.agent.listDeployments();
+    let hit: (typeof rows)[number] | undefined;
+    for (const r of rows) {
+      if (r.agentId == null) continue; // unminted rows have no agentSeal yet
+      try {
+        const s = await ag.agent.getAgentSeal(r.agentId);
+        if (s.toLowerCase() === want) { hit = r; break; }
+      } catch { /* unreadable seal — skip this row */ }
+    }
+    if (hit) {
+      ref = { kind: 'sealId', sealId: hit.sealId as Hash };
+    } else {
+      note(`no agent's seal is ${ref.address} — trying it as a sealId prefix`);
+      const hits = rows.filter((r) => r.sealId?.toLowerCase().startsWith(want.slice(2)));
+      if (hits.length !== 1) {
+        throw new CliError(
+          'AGENT_NOT_FOUND',
+          `no agent matching agentSeal ${ref.address} on this attestor`,
+          { remedy: '0g-agenticid list   # to discover existing agents' },
+        );
+      }
+      ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
+    }
   }
 
   // — resolve the coordinate pair (either direction) —
