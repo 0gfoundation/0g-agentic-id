@@ -21,6 +21,12 @@ function shortSeal(s: string): string {
   return `${s.slice(0, 12)}…${s.slice(-6)}`; // same 0x+10-hex…6 form as the REPL list (review F-D)
 }
 
+/** 0xa932…9330 — human-mode display form of a 42-char owner address. */
+function shortOwner(s: string | null | undefined): string {
+  if (!s) return '—';
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
+}
+
 /** The deployment phases derive_phase() can produce — the valid --phase values. */
 const PHASES = ['deploying', 'running', 'stopped', 'offline', 'failed'];
 
@@ -51,11 +57,11 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
   const cell = (v: unknown, w: number): string =>
     (v === null || v === undefined ? '—' : String(v)).padEnd(w);
-  print(`${'AGENTID'.padEnd(9)}${'SEALID'.padEnd(19)}${'PHASE'.padEnd(11)}${'NAME'.padEnd(18)}URL`);
+  print(`${'AGENTID'.padEnd(9)}${'SEALID'.padEnd(19)}${'PHASE'.padEnd(11)}${'NAME'.padEnd(18)}${'OWNER'.padEnd(14)}URL`);
   for (const r of rows) {
     print(
       `${cell(r.agentId, 9)}${cell(shortSeal(r.sealId), 19)}${cell(r.phase, 11)}` +
-        `${cell(r.name, 18)}${r.url ?? '—'}`,
+        `${cell(r.name, 18)}${cell(shortOwner(r.owner), 14)}${r.url ?? '—'}`,
     );
   }
   print('');
