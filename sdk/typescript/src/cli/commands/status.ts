@@ -19,6 +19,7 @@ import { buildClient } from '../sdk';
 import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef } from '../ref';
+import { normalizeAgentSealRef } from '../refresolve';
 import type { CommandContext } from '../types';
 
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
@@ -64,35 +65,11 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
 
   // An agentSeal address (0x…40 hex, the TEE identity `status` itself prints)
-  // has no on-chain reverse map, so it resolves by scanning the listing and
-  // chain-reading each minted agent's seal until the address matches. No hit
-  // → fall back to seal-prefix semantics (a 40-hex input is also a legal
-  // prefix of a 64-hex sealId) before giving up.
+  // has no on-chain reverse map — resolution scans the listing + chain, then
+  // falls back to seal-prefix semantics (see refresolve.ts).
   if (ref.kind === 'agentSeal') {
-    const want = ref.address.toLowerCase();
-    const rows = await ag.agent.listDeployments();
-    let hit: (typeof rows)[number] | undefined;
-    for (const r of rows) {
-      if (r.agentId == null) continue; // unminted rows have no agentSeal yet
-      try {
-        const s = await ag.agent.getAgentSeal(r.agentId);
-        if (s.toLowerCase() === want) { hit = r; break; }
-      } catch { /* unreadable seal — skip this row */ }
-    }
-    if (hit) {
-      ref = { kind: 'sealId', sealId: hit.sealId as Hash };
-    } else {
-      note(`no agent's seal is ${ref.address} — trying it as a sealId prefix`);
-      const hits = rows.filter((r) => r.sealId?.toLowerCase().startsWith(want.slice(2)));
-      if (hits.length !== 1) {
-        throw new CliError(
-          'AGENT_NOT_FOUND',
-          `no agent matching agentSeal ${ref.address} on this attestor`,
-          { remedy: '0g-agenticid list   # to discover existing agents' },
-        );
-      }
-      ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
-    }
+    note(`resolving agentSeal ${ref.address} against the listing (no reverse map — one chain read per minted agent)`);
+    ref = await normalizeAgentSealRef(ag, ref, ctx.positionals[0] ?? ref.address);
   }
 
   // — resolve the coordinate pair (either direction) —

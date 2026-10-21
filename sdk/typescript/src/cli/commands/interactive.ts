@@ -27,6 +27,7 @@ import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
+import { normalizeAgentSealRef } from '../refresolve';
 import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
@@ -536,7 +537,8 @@ export async function run(ctx: CommandContext): Promise<void> {
 /** Resolve an agent ref to this wallet's deployment row (owner listing —
  *  lifecycle verbs need sandboxId, which the public listing withholds). */
 async function myRow(ag: AgenticID, refInput: string): Promise<{ sealId: `0x${string}`; agentId: string; phase: string; sandboxId?: string; framework?: string | null }> {
-  const ref = parseAgentRef(refInput);
+  let ref = parseAgentRef(refInput);
+  if (ref.kind === 'agentSeal') ref = await normalizeAgentSealRef(ag, ref, refInput);
   const rows = await ag.agent.listMyDeployments();
   rememberAgentIds(rows);
   const row = pickRow(ref, refInput, rows);
@@ -1086,7 +1088,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // Public inspection of ANY agent (yours or not) — no wallet needed.
         if (!args[0]) { out('usage: hello <agentId|sealId>\n'); continue; }
         const ag = await clientFor(ctx, false);
-        const ref = parseAgentRef(args[0]);
+        let ref = parseAgentRef(args[0]);
+        if (ref.kind === 'agentSeal') ref = await normalizeAgentSealRef(ag, ref, args[0]);
         const rows = await ag.agent.listDeployments();
         rememberAgentIds(rows);
         const row = pickRow(ref, args[0], rows);
@@ -1445,9 +1448,10 @@ async function helloWithTicket(
   return callAgentWithTicket(ag, url, '/hello', 'GET', undefined, clientAddr);
 }
 
-/** Public-listing row for an agentId/sealId(/unique-prefix) reference, or undefined. */
+/** Public-listing row for an agentId/sealId/agentSeal(/unique-prefix) reference, or undefined. */
 async function findAgentRow(ag: AgenticID, refInput: string): Promise<Awaited<ReturnType<AgenticID['agent']['listDeployments']>>[number] | undefined> {
-  const ref = parseAgentRef(refInput);
+  let ref = parseAgentRef(refInput);
+  if (ref.kind === 'agentSeal') ref = await normalizeAgentSealRef(ag, ref, refInput);
   const rows = await ag.agent.listDeployments();
   return pickRow(ref, refInput, rows);
 }
@@ -1726,7 +1730,8 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
 }
 
 async function attach(ag: AgenticID, attestorUrl: string, refInput: string, ask: (q: string) => Promise<string>): Promise<Session> {
-  const ref = parseAgentRef(refInput);
+  let ref = parseAgentRef(refInput);
+  if (ref.kind === 'agentSeal') ref = await normalizeAgentSealRef(ag, ref, refInput);
   const rows = await ag.agent.listDeployments();
   const row = pickRow(ref, refInput, rows as { agentId?: unknown; sealId?: string }[]) as
     { sealId: `0x${string}`; agentId?: unknown; phase?: string; url?: string; name?: string | null; framework?: string | null } | undefined;

@@ -24,14 +24,20 @@ import { buildClient } from '../sdk';
 import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
+import { normalizeAgentSealRef } from '../refresolve';
 import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
 
 const ZERO_HASH = `0x${'0'.repeat(64)}` as Hash;
 
-/** agentId | sealId | unique sealId prefix → the sealId the attestor keys on. */
+/** agentId | sealId | agentSeal | unique sealId prefix → the sealId the attestor keys on. */
 async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): Promise<Hash> {
+  // agentSeal first: it needs listing + chain reads (no reverse map), and a
+  // 40-hex input is also a legal prefix — refresolve tries the seal match
+  // before falling back to prefix semantics. Everything after this line only
+  // sees the three original kinds.
+  if (ref.kind === 'agentSeal') ref = await normalizeAgentSealRef(ag, ref, raw);
   if (ref.kind === 'sealId') return ref.sealId;
   if (ref.kind === 'sealPrefix') {
     const hits = (await ag.agent.listDeployments()).filter((r) =>
