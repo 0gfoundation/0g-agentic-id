@@ -14,19 +14,46 @@ import {CloneGate} from "../src/CloneGate.sol";
 import {StandardCloneAuthorizer} from "../src/StandardCloneAuthorizer.sol";
 import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 import {TEEDataVerifier} from "../src/verifiers/TEEDataVerifier.sol";
+import {MainnetGovernance} from "./MainnetGovernance.sol";
 
 /// @notice Deploy AgenticID stack behind BeaconProxy + TimelockController.
 ///
 ///         Environment variables:
-///           OWNER             — EOA/multisig receiving TimelockController admin role
+///           OWNER             — owner of TEEDataVerifier / AgenticID / VerifiedFeedbackRegistry
+///                               (two-step Ownable; admin calls are direct, NOT timelocked).
+///                               Also the default Timelock proposer (on 0G mainnet it must be
+///                               one of PROPOSERS, and one of EXECUTORS unless execution is
+///                               open), and the Timelock admin everywhere except 0G mainnet
+///                               (see "Timelock admin" below).
 ///           PAUSER            — address allowed to pause/unpause (not timelocked)
 ///           TEE_ORACLE        — signer address for TEEDataVerifier
-///           TIMELOCK_DELAY    — seconds (dev: 0, prod: e.g. 172800 = 2 days)
-///           PROPOSERS         — comma-separated addresses (defaults to OWNER)
-///           EXECUTORS         — comma-separated addresses; pass 0x0 for open execution
+///           TIMELOCK_DELAY    — Timelock minDelay in seconds. 0G mainnet (16661): default
+///                               86400 (1 day) and any override below 86400 reverts. Every
+///                               other chain: default 0 (testnet / dev stay lightweight).
+///           PROPOSERS         — comma-separated; default [OWNER]. OZ also makes every
+///                               proposer a CANCELLER.
+///           EXECUTORS         — comma-separated; default [0x0] = open execution (anyone may
+///                               execute a READY op — the delay is the protection, not the
+///                               executor set)
+///                               A set-but-empty PROPOSERS= / EXECUTORS= parses to an EMPTY
+///                               list, not the default. On 0G mainnet (16661) the run reverts
+///                               before broadcast unless PROPOSERS is non-empty, has no 0x0 and
+///                               includes OWNER, and EXECUTORS is non-empty and either exactly
+///                               [0x0] or all non-zero and including OWNER — a named executor,
+///                               like a proposer, must be one the post-deploy owner calls prove
+///                               reachable (MainnetGovernance.requireMainnetTimelockRoles).
 ///           NFT_NAME          — ERC-721 name   (default "AgenticID")
 ///           NFT_SYMBOL        — ERC-721 symbol (default "AID")
 ///           MAX_PROOF_AGE     — nonce GC horizon in seconds (default 86400)
+///           CANONICAL_8004 / CANONICAL_8004_REPUTATION — override the chainId defaults
+///
+///         Timelock admin (MainnetGovernance.timelockAdmin): on 0G mainnet (16661) none —
+///         the constructor's optional `admin` is address(0); OZ TimelockController always
+///         grants DEFAULT_ADMIN_ROLE to itself, so role changes must themselves go through
+///         schedule → minDelay → execute. Every other chain: OWNER, as on the existing
+///         testnet / dev Timelocks (role changes stay one direct grantRole). updateDelay is
+///         self-only on every chain. Nothing in this script needs an admin during setup —
+///         proposers and executors are granted by the constructor.
 contract Deploy is Script {
     struct Config {
         address   owner;
@@ -68,6 +95,10 @@ contract Deploy is Script {
         Config memory c = _readConfig();
         _printConfig(c);
 
+        // Fail fast on a Timelock that could never schedule or execute — on 0G
+        // mainnet it has no admin to repair its roles afterwards.
+        MainnetGovernance.requireMainnetTimelockRoles(block.chainid, c.owner, c.proposers, c.executors);
+
         // Fail fast if canonical points at the wrong contract (e.g. the testnet
         // address used on mainnet, which resolves to a different v0.0.1 contract).
         require(
@@ -85,9 +116,10 @@ contract Deploy is Script {
 
         vm.startBroadcast();
 
-        // 1. Timelock — owner of every beacon.
+        // 1. Timelock — owner of every beacon. Admin: none on 0G mainnet (the
+        //    Timelock self-administers), OWNER elsewhere (see the header).
         TimelockController timelock = new TimelockController(
-            c.timelockDelay, c.proposers, c.executors, c.owner
+            c.timelockDelay, c.proposers, c.executors, MainnetGovernance.timelockAdmin(block.chainid, c.owner)
         );
         d.timelock = address(timelock);
 
@@ -160,7 +192,9 @@ contract Deploy is Script {
         c.owner         = vm.envAddress("OWNER");
         c.pauser        = vm.envAddress("PAUSER");
         c.teeOracle     = vm.envAddress("TEE_ORACLE");
-        c.timelockDelay = vm.envOr("TIMELOCK_DELAY", uint256(0));
+        c.timelockDelay = MainnetGovernance.timelockDelay(
+            block.chainid, vm.envExists("TIMELOCK_DELAY"), vm.envOr("TIMELOCK_DELAY", uint256(0))
+        );
         c.nftName       = vm.envOr("NFT_NAME", string("AgenticID"));
         c.nftSymbol     = vm.envOr("NFT_SYMBOL", string("AID"));
         c.maxProofAge   = vm.envOr("MAX_PROOF_AGE", uint256(86400));
@@ -178,12 +212,22 @@ contract Deploy is Script {
         c.executors = vm.envOr("EXECUTORS", ",", defaultExecutors);
     }
 
-    function _printConfig(Config memory c) internal pure {
+    function _printConfig(Config memory c) internal view {
         console2.log("=== Deploy Config ===");
         console2.log("owner:         ", c.owner);
         console2.log("pauser:        ", c.pauser);
         console2.log("teeOracle:     ", c.teeOracle);
         console2.log("timelockDelay: ", c.timelockDelay);
+        address admin = MainnetGovernance.timelockAdmin(block.chainid, c.owner);
+        if (admin == address(0)) console2.log("timelockAdmin:  none (self-administered)");
+        else console2.log("timelockAdmin: ", admin);
+        if (c.proposers.length == 0) console2.log("proposers:      none");
+        for (uint256 i; i < c.proposers.length; ++i) console2.log("proposer:      ", c.proposers[i]);
+        if (c.executors.length == 0) console2.log("executors:      none");
+        for (uint256 i; i < c.executors.length; ++i) console2.log("executor:      ", c.executors[i]);
+        if (c.executors.length == 1 && c.executors[0] == address(0)) {
+            console2.log("                (0x0 = open execution: anyone may execute a ready op)");
+        }
         console2.log("maxProofAge:   ", c.maxProofAge);
         console2.log("canonical8004: ", c.canonical);
         console2.log("canonical8004Reputation: ", c.canonicalReputation);

@@ -40,9 +40,28 @@ views are unaffected. `owner` can `setPauser` at any time.
 
 | Role | Identity | Timelock-protected |
 |---|---|---|
-| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo` | — |
-| Owner (`OwnableUpgradeable`) | attestor allowlist / verifier swap / pauser rotation | no (takes effect immediately) |
+| Timelock | owner of every beacon; the only caller of `beacon.upgradeTo`. `minDelay` 1 day on mainnet (`Deploy.s.sol` enforces ≥ 86400 on chain 16661), 0 on testnet / dev | — |
+| Owner (`Ownable2StepUpgradeable` from AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0; `OwnableUpgradeable` before, and on the deprecated fork) | attestor allowlist / framework-hash whitelist / verifier + TEE-oracle swap / pauser rotation / `setMaxProofAge` | no — direct calls, effective immediately |
 | Pauser | emergency switch | no (emergency path can't be delayed) |
+
+**Governance split (deliberate).** Privileged admin calls are **direct owner
+calls** — on mainnet the owner is a Fordefi MPC vault (§6.2m) — with no
+Timelock and no separate guardian role; only beacon upgrades go through the
+Timelock. From 1.2.0 the owner surface is hardened (audit FIND-12 / FIND-16):
+ownership is two-step — `transferOwnership(x)` only records `pendingOwner = x`
+(`OwnershipTransferStarted`), and ownership moves when `x` itself calls
+`acceptOwnership()`, so a mistyped or unreachable address can't strand the
+admin surface; `setVerifier` / `setTeeOracleAddress` revert on `address(0)`
+(`AgenticIDZeroAddress` / `TEEDataVerifierZeroAddress`) and emit
+`VerifierUpdated` / `TeeOracleUpdated` (old, new), as `setPauser` already
+emits `PauserUpdated`. `renounceOwnership()` deliberately stays OZ's one-step
+version on all three (unchanged from 1.1.0; FIND-16 covers transfer only): it
+can't hand ownership to anyone, so it doesn't bypass the two-step transfer,
+but one mistaken owner call would permanently freeze every owner-only control
+above — on mainnet the vault's approval policy (§8) is what guards it.
+Testnet / dev deliberately stay lightweight (EOA owner,
+`minDelay` 0, §6.1 / §6.2); the one hard rule is that **no testnet key is ever
+reused on mainnet**.
 
 ## 2. ERC-8004 binding + proof domain separation
 
@@ -199,15 +218,48 @@ defaults):
 export OWNER=0x...
 export PAUSER=0x...
 export TEE_ORACLE=0x...           # oracle signing address generated in the TEE
-export TIMELOCK_DELAY=172800      # prod ≥ 2 days; dev may be 0
-# optional: CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS, NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
+# optional: TIMELOCK_DELAY (default 86400 on 0G mainnet 16661, where < 86400 reverts; 0 elsewhere),
+#           CANONICAL_8004, CANONICAL_8004_REPUTATION, PROPOSERS/EXECUTORS (comma-separated; checked
+#           on 16661, see below), NFT_NAME/NFT_SYMBOL, MAX_PROOF_AGE
 forge script script/Deploy.s.sol \
   --rpc-url <RPC> --private-key <PK> --broadcast \
   --priority-gas-price 2000000000 --gas-price 5000000000
 ```
 
-`PROPOSERS`/`EXECUTORS` default to proposers=[OWNER], executors=[0x0] (open
-execution). The run prints all 15 addresses — record them in §6.
+Timelock defaults: proposers = [OWNER] (OZ also makes every proposer a
+canceller), executors = [0x0] (open execution — anyone may execute an op once
+its delay has passed; the delay is the protection, not the executor set).
+Timelock admin: **on chain 16661 none** — the script passes `admin =
+address(0)`, and OZ `TimelockController` always grants `DEFAULT_ADMIN_ROLE` to
+itself, so role changes go through `schedule → minDelay → execute` like any
+upgrade; **elsewhere OWNER is admin**, as on the §6.1 / §6.2 Timelocks (with
+`minDelay` 0 the proposer could schedule + execute a role change back to back
+anyway, so dropping the admin there would add friction, not safety).
+`updateDelay` is self-only on every chain.
+
+With no admin, the constructor's role sets are permanent unless the Timelock
+itself changes them, which needs a working proposer and executor; an unusable
+set freezes every beacon for good. So on chain 16661 the script prints the
+parsed `PROPOSERS` / `EXECUTORS` and reverts before broadcasting unless
+`PROPOSERS` is non-empty, contains no `0x0` and includes `OWNER`, and
+`EXECUTORS` is non-empty and either exactly `[0x0]` (open execution) or only
+non-zero addresses that include `OWNER`. A set-but-empty `PROPOSERS=` /
+`EXECUTORS=` parses to an empty list, not the default — unset the variable to
+get the default. `OWNER` must be a proposer, and a named executor unless
+execution is open (extras are allowed in both sets), because the required
+post-deploy admin calls below prove right away that `OWNER` can sign; a
+proposer or named executor that is only used at the first upgrade could turn
+out to be unreachable months after the stack went live — and an unreachable
+executor set leaves even the repairing `grantRole` op unexecutable. Other
+chains skip these checks (`OWNER` is admin there and can grant a missing role
+directly).
+
+The delay, admin and role-set rules live in `script/MainnetGovernance.sol`
+(covered by `test/DeployScript.t.sol`); the incremental
+`DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol` apply its other half
+— on chain 16661 they refuse a `TIMELOCK` (the new beacon's owner) that is not
+a TimelockController with `minDelay ≥ 86400`. The run prints all 15 addresses
+— record them in §6.
 
 **Required post-deploy (fresh contract = empty allowlists):** the owner must
 `addTrustedAttestor(<attestor>)` (else mint reverts `AgenticIDNotTrustedAttestor`),
@@ -224,9 +276,12 @@ proxy address/storage unchanged); major (storage-incompatible) means redeploy +
 migrate. The upgrade mechanism is generic across every beacon-proxied contract,
 covered by `test/Upgradeable.t.sol` (AgenticID + TEEDataVerifier),
 `test/UpgradeReputation.t.sol` (the deprecated fork, incl. storage survival +
-post-upgrade behavior) and `test/UpgradeVerifiedFeedback.t.sol`
-(VerifiedFeedbackRegistry 1.1.0 → 1.2.0: storage survival + the ServeProof
-format cut).
+post-upgrade behavior), `test/UpgradeVerifiedFeedback.t.sol`
+(VerifiedFeedbackRegistry 1.1.0 → 1.2.0: storage survival, the ServeProof
+format cut, two-step ownership) and `test/UpgradeGovernance.t.sol`
+(AgenticID + TEEDataVerifier 1.1.0 → 1.2.0 from frozen copies of the deployed
+1.1.0 source, through a mainnet-shaped 1-day Timelock: state survival,
+two-step ownership, the zero-address setter guards).
 
 ## 5. Verify
 
@@ -251,7 +306,7 @@ constructor args from creation/runtime bytecode; `forge verify-contract` without
 verified once; re-run after each upgrade (already-verified ones skip). Browser
 "Read as Proxy" needs proxy+beacon+impl all verified to expand the business ABI.
 
-## 6. Deployment records (0G Galileo testnet, chain 16602)
+## 6. Deployment records (0G Galileo testnet 16602; 0G mainnet 16661 in §6.2m)
 
 > Deployment log — append, don't overwrite. `broadcast/Deploy.s.sol/16602/run-latest.json`
 > is the truth for the most recent deploy. Addresses/wiring below were
@@ -262,14 +317,24 @@ verified once; re-run after each upgrade (already-verified ones skip). Browser
 > ReputationRegistry 1.2.0 / TEEDataVerifier 1.1.0) on **2026-08-10** — both
 > verified post-upgrade (see §7).
 >
-> **Two canonical-bound environments run in parallel** — pick the set by env:
-> - **test** (§6.1) — AgenticID `0x3449…`, owner `0xea69…`. **This is what the
->   production attestor (`agenticid.0g.ai`) uses**: its `GET /config` serves
->   `agentic_id_addr = 0x3449…` (checked live 2026-07-30).
-> - **dev** (§6.2) — AgenticID `0x5BB5…`, owner `0x2AB7…a0B3`. **This is what the
->   dev-host attestor points at** (`ATTESTOR_AGENTIC_ID_ADDR`).
+> **Three canonical-bound environments run in parallel** — pick the set by env
+> (attestor `/config` values as of 2026-10-19):
+> - **mainnet** (§6.2m, chain 16661) — AgenticID `0x92F6…`. **This is what the
+>   production attestor (`agenticid.0g.ai`) serves**: `GET /config` →
+>   `chain_id 16661`, `agentic_id_addr = 0x92f6…`,
+>   `verified_feedback_addr = 0x6663…`.
+> - **test** (§6.1, Galileo 16602) — AgenticID `0x3449…`, owner `0x9C58…`.
+>   **Served by the testnet attestor (`agenticid-testnet.0g.ai`)**:
+>   `chain_id 16602`, `agentic_id_addr = 0x3449…`,
+>   `verified_feedback_addr = 0xc0c9…`. (Until mainnet launched, this set was
+>   what `agenticid.0g.ai` served — checked live 2026-07-30.)
+> - **dev** (§6.2, Galileo 16602) — AgenticID `0x5BB5…`, owner `0x2AB7…`
+>   (moved from `0x9C58…` on 2026-10-19; the two Galileo sets no longer share
+>   a governance key). **This is what the dev-host attestor points at**
+>   (`ATTESTOR_AGENTIC_ID_ADDR`).
 >
-> §6.3 lists superseded deploys (do not use), including the pre-canonical-binding
+> Neither public attestor advertises `reputation_registry_addr`. §6.3 lists
+> superseded deploys (do not use), including the pre-canonical-binding
 > self-implemented ones.
 
 ### 6.1 test environment — 2026-06-18 (active)
@@ -300,22 +365,36 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | Canonical ERC-8004 | `0x8004A818BFB912233c491871b3d84c89A494BD9e` | v2.0.0 |
 | TappRegistry (attestor infra, external) | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` | from attestor `GET /config` |
 | SandboxServing (attestor infra, external) | `0x3490B9053AC46F7Bf71A1ceBffcB2be2C1405b41` | from attestor `GET /config` |
-| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xea69…1837`); Timelock proposer + canceller + admin also = `0x9C58…80Bb` (fully migrated). `0xea69…1837` remains the oracle/deployer of record |
+| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xea69…1837`); Timelock proposer + canceller + admin also = `0x9C58…80Bb` (fully migrated); TEEDataVerifier `teeOracleAddress()` also reads `0x9C58…80Bb` (2026-10-19). `0xea69…1837` remains the deployer of record |
 
 TappRegistry / SandboxServing are attestor-deployment infrastructure (external
 contracts the attestor is configured with, **not** deployed by this repo's
-`Deploy.s.sol`); the addresses above are what the production attestor's
-`GET https://agenticid.0g.ai/config` serves (`tapp_registry_addr` /
-`sandbox_serving_addr`, checked live 2026-07-30). Together with the three
+`Deploy.s.sol`); the addresses above are what `GET https://agenticid.0g.ai/config`
+served (`tapp_registry_addr` / `sandbox_serving_addr`, checked live
+2026-07-30) while that host still fronted this set. Today the testnet
+attestor (`agenticid-testnet.0g.ai`) fronts it — re-checked 2026-10-19 on
+`agenticid-testnet.0g.ai/config`: unchanged. Together with the three
 proxies above they form the five-address `ContractAddresses` set the SDK needs.
 
-**Governance is testnet-only:** owner=pauser=oracle=deployer EOA, `timelockDelay=0`,
-open execution. Mainnet needs a real multisig + non-zero delay + a real TEE oracle.
+**Governance is deliberately lightweight (testnet):** owner = pauser = TEE
+oracle = one EOA, `minDelay=0`, the same EOA as Timelock
+proposer/canceller/admin, open execution. That is a choice, not a gap — the
+hard rule is that a testnet key is **never** reused on mainnet (§6.2m).
 
 ### 6.2 dev environment — 2026-06-17 (active)
 
 **The dev-host attestor points at this** (`ATTESTOR_AGENTIC_ID_ADDR = 0x5BB5…`),
-owner `0x2AB7…a0B3`; TEEDataVerifier `teeOracleAddress()` is the same address.
+owner `0x2AB7…a0B3`. Same deliberately lightweight governance as §6.1 (one EOA,
+`minDelay=0`, open execution), but a different EOA: as read on chain
+2026-10-19 (`owner()` / `pauser()` / `teeOracleAddress()` / `getMinDelay()` /
+`hasRole`), `0x2AB7…a0B3` is owner and pauser of AgenticID,
+VerifiedFeedbackRegistry, TEEDataVerifier and the deprecated
+ReputationRegistry, the TEEDataVerifier `teeOracleAddress()`, and the
+Timelock's proposer + canceller + admin (the Timelock is also its own admin;
+executor = `address(0)`). `0x9C58…80Bb` holds no dev role any more — it
+renounced every Timelock role in the same window (it remains §6.1's key).
+Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
+`OwnershipTransferred(0x9C58… → 0x2AB7…)` at block 60947194).
 
 | Contract | Address | VERSION |
 |---|---|---|
@@ -336,8 +415,8 @@ owner `0x2AB7…a0B3`; TEEDataVerifier `teeOracleAddress()` is the same address.
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x2AB7…a0B3` (migrated 2026-10-19 from `0x9C58…80Bb`, which renounced all three); executor open, `minDelay` 0; owns the five beacons |
-| owner / pauser (all contracts) | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (itself migrated 2026-10-12 from `0x7344…431b`, itself 2026-09-07 from `0xB831…CEd7`, deployer/oracle history); also the TEEDataVerifier TEE oracle |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the five beacons |
+| owner / pauser (all contracts) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
 in this repo (they're attestor-deployment infra, configured via
@@ -347,16 +426,38 @@ from the dev-host attestor's `GET /config` (`tapp_registry_addr` /
 
 ### 6.2m mainnet environment — 2026-09-09 (0G mainnet, chain 16661)
 
-Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). Governance
-mirrors testnet: owner / pauser / proposer / TEE-oracle = `0x8760…621d`
-(from `0x7344…431b` on 2026-10-04),
-Timelock `minDelay=0`, open execution. **The mainnet checklist (§8) is NOT
-yet satisfied — multisig owner, non-zero delay, and a real TEE oracle are
-follow-ups before this carries real user value.**
+Full stack via `Deploy.s.sol` (RPC `https://evmrpc.0g.ai`). **The production
+attestor `agenticid.0g.ai` serves this set** (§6 header).
+
+**Governance — as read on chain 2026-10-19** (`owner()` / `pauser()` /
+`teeOracleAddress()` / `getMinDelay()` / `hasRole`, plus the Timelock's
+`RoleGranted` / `RoleRevoked` / `MinDelayChange` logs):
+
+- **Owner** of AgenticID, VerifiedFeedbackRegistry and TEEDataVerifier,
+  **pauser** of all three, and the TEEDataVerifier **TEE oracle** =
+  `0xc0603224dE8c3B910a4487368E476e19dC6127cF`, a **Fordefi MPC vault**
+  (`cast codesize` = 0 — an MPC address looks like an EOA on chain). Admin
+  calls are direct vault calls, not timelocked (§1).
+- **Timelock** `0x399a…0cF7`: `minDelay = 86400` (1 day; raised from 0 on
+  2026-10-16); PROPOSER + CANCELLER = the vault; EXECUTOR = `address(0)` (open
+  execution). All four beacons are owned by the Timelock.
+- **Timelock `DEFAULT_ADMIN_ROLE`** = the Timelock itself **and the vault**:
+  `0x8760…621d` granted it to the vault in the 2026-10-16 migration and the
+  vault has not renounced it (this stack predates `Deploy.s.sol`'s mainnet
+  `admin = address(0)`). An admin can re-assign Timelock roles instantly
+  (no 1-day notice); it cannot shorten `minDelay` or execute early —
+  `updateDelay` is self-only. Follow-up in §8.
+- History: deployed by `0x7344…431b` (2026-09-09) → `0x8760…621d`
+  (2026-10-04) → the vault (2026-10-16; ownership, pauser, oracle and
+  Timelock roles in one window; `0x7344…` and `0x8760…` renounced every
+  Timelock role).
+
+Rule: testnet / dev keys (§6.1 / §6.2) are never reused here. §8 tracks
+which mainnet-checklist items are satisfied and which remain.
 
 | Contract | Address |
 |---|---|
-| AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0) |
+| AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0; 1.2.0 pending — §7) |
 | AgenticID impl / beacon | `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817` / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
 | VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`; 1.2.0 pending — §7; record its upgrade block here — no pre-cut marks exist, §7) |
 | VerifiedFeedback impl / beacon | `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31` / `0x1C23A210806568bf0815c3289E56719325c36827` |
@@ -364,11 +465,13 @@ follow-ups before this carries real user value.**
 | CloneGate impl / beacon | `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29` / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
 | StandardCloneAuthorizer | `0xEa7C23874a7530C9dd42c6C2CDAa52Eab0E19FF9` |
 | FeedbackBatcher (no beacon) | `0x8FbB46AeDc21e1f5CD853d014F47642Fa65d80B8` (v4) |
-| TEEDataVerifier proxy | `0x6867b17d0092E8d497D1b5110484138285E4D1B2` (1.1.0) |
+| TEEDataVerifier proxy | `0x6867b17d0092E8d497D1b5110484138285E4D1B2` (1.1.0; 1.2.0 pending — §7) |
 | TEEDataVerifier impl / beacon | `0x6D82f34CD671E4593A7E3BCDa253B23a2722403a` / `0xf74242B94dc958c3973Eb3e6219435c5956563fC` |
-| TimelockController | `0x399ab112B03104f20524Df0f9a4A2F0C199A0cF7` |
+| TimelockController | `0x399ab112B03104f20524Df0f9a4A2F0C199A0cF7` (`minDelay` 86400; proposer + canceller + admin = the vault, admin also self; open execution) |
 | Canonical ERC-8004 identity / reputation | `0x8004A169…a432` / `0x8004BAa1…9b63` (v2.0.0, pre-existing) |
-| owner / pauser / proposer / TEE-oracle | `0x87605Ec8E10Eb373C1d070e15E5d78FAC4D7621d` |
+| TappRegistry (attestor infra, external) | `0x54874F536301c993922Dd95097e3902e7FBfe612` (from `agenticid.0g.ai` `GET /config` `tapp_registry_addr`, 2026-10-19) |
+| SandboxServing (attestor infra, external) | `0x650C16a491ad52dB6b7f3053bCaD650cb43d2206` (from `agenticid.0g.ai` `GET /config` `sandbox_serving_addr`, 2026-10-19) |
+| owner / pauser / proposer / canceller / TEE-oracle | `0xc0603224dE8c3B910a4487368E476e19dC6127cF` (Fordefi MPC vault; since 2026-10-16, superseding `0x8760…621d`) |
 
 ### 6.3 Superseded / do not use
 
@@ -393,42 +496,83 @@ follow-ups before this carries real user value.**
 
 Current impl versions (dev verified on chain 2026-07-03; test matched that
 check except ReputationRegistry, which reached 1.1.0 via the **2026-07-22**
-beacon upgrade and was verified post-upgrade — see changelog):
+beacon upgrade and was verified post-upgrade — see changelog; mainnet
+`VERSION()` read on chain 2026-10-19):
 
-| Contract | dev VERSION | test VERSION |
-|---|---|---|
-| AgenticID | **1.1.0** | **1.1.0** |
-| TEEDataVerifier | **1.1.0** | **1.1.0** |
-| AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** |
-| VerifiedFeedbackRegistry | **1.1.0** | **1.1.0** (2026-09-07) |
-| CloneGate | **1.0.1** | **1.0.1** (2026-09-07) |
+| Contract | dev VERSION | test VERSION | mainnet VERSION |
+|---|---|---|---|
+| AgenticID | **1.1.0** | **1.1.0** | **1.1.0** |
+| TEEDataVerifier | **1.1.0** | **1.1.0** | **1.1.0** |
+| AgenticIDReputationRegistry (deprecated) | **1.2.0** | **1.2.0** | — (not deployed) |
+| VerifiedFeedbackRegistry | **1.1.0** | **1.1.0** (2026-09-07) | **1.1.0** |
+| CloneGate | **1.0.1** | **1.0.1** (2026-09-07) | **1.0.1** |
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
-> The source is at VerifiedFeedbackRegistry **1.2.0**, which no environment
-> runs yet (mainnet §6.2m is also on 1.1.0) — see the pending changelog entry.
-> Policy-mode cloning (issue #133) ships as the **CloneGate satellite** (1.0.1
-> on dev) — AgenticID stays 1.1.0 (see the changelog entry for why: EIP-170).
+> The source is at AgenticID **1.2.0**, TEEDataVerifier **1.2.0** and
+> VerifiedFeedbackRegistry **1.2.0**, which no environment runs yet — see the
+> pending changelog entries. Policy-mode cloning (issue #133) shipped as the
+> **CloneGate satellite** (1.0.1 on dev) — AgenticID stayed 1.1.0 for it (see
+> the changelog entry for why: EIP-170).
 
 Changelog:
+
+- **AgenticID 1.2.0 + TEEDataVerifier 1.2.0 — PENDING (source only: not
+  deployed on any environment, no impl addresses yet)** — governance hardening
+  (audit FIND-12 / FIND-16). Minor per UPGRADING.md: beacon upgrade, no
+  existing storage moves, ABI additions only. (1) Two-step ownership: both
+  switch from `OwnableUpgradeable` to `Ownable2StepUpgradeable` (TEEDataVerifier
+  via `BaseDataVerifier`) — adds `pendingOwner()` / `acceptOwnership()` +
+  `OwnershipTransferStarted`; `transferOwnership` only proposes. The pending
+  owner lives in OZ's ERC-7201 namespace `openzeppelin.storage.Ownable2Step`,
+  disjoint from every slot in use (`StorageLayout.t.sol`); the owner stays in
+  OZ's Ownable slot. (2) `AgenticID.setVerifier` and
+  `TEEDataVerifier.setTeeOracleAddress` revert on `address(0)`
+  (`AgenticIDZeroAddress` / `TEEDataVerifierZeroAddress`) and emit
+  `VerifierUpdated` / `TeeOracleUpdated` (previous, new). Initializers are
+  unchanged. (3) EIP-170: Ownable2Step + the guard cost ~400 B against the
+  1.1.0 impl's 9 B headroom; folding `register` / `registerWithSeal` into one
+  shared internal mint body (same checks, order and events) pays for it —
+  AgenticID measures **24,440 / 24,576** runtime bytes (`forge build
+  --sizes`), TEEDataVerifier 5,925. (The PR #145 "AgenticID 1.2.0" below
+  never reached chain; this is a different build.) `test/UpgradeGovernance.t.sol`
+  upgrades both from frozen copies of the deployed 1.1.0 source through a
+  1-day Timelock and checks state survival + the new behavior. **Rollout:**
+  not consensus-critical and independent of the VerifiedFeedbackRegistry 1.2.0
+  cut — deploy the two impls and `ScheduleUpgrade` / `ExecuteUpgrade` each
+  beacon (UPGRADING.md §2; on mainnet the vault schedules and execution waits
+  ≥ 86400 s). Execution is open, so any account can execute each op as soon
+  as it is ready. If the two ride along in the VerifiedFeedbackRegistry window
+  below, schedule them with that entry's step-3 `DELAY` (window start − now);
+  with plain `minDelay` they become executable before the window. Operational
+  change afterwards: every ownership move is two txs — the current owner
+  proposes, then the NEW owner (e.g. a successor vault) calls
+  `acceptOwnership()`; a one-shot `transferOwnership` like the 2026-10-16
+  mainnet migration no longer completes on its own (pending proposals and how
+  to withdraw one: §8). Record impl addresses, VERSION and dates in §6 / here
+  when executed.
 
 - **VerifiedFeedbackRegistry 1.2.0 — PENDING (source only: not deployed on
   any environment, no impl address yet)** — ServeProof hardening (audit
   FIND-01 / FIND-02 / FIND-16). Minor per UPGRADING.md: beacon upgrade,
-  storage and ABI unchanged, but the signed digest changes. (1) agentSeal
+  storage unchanged, ABI gains only the two-step-ownership surface of (4), but
+  the signed digest changes. (1) agentSeal
   signs `keccak256(0x19 ‖ 0x00 ‖ VF proxy ‖ proofHash)` raw (EIP-191 version
   0x00, §2.2) instead of `personal_sign(proofHash)`; legacy-format proofs
   revert `VerifiedFeedbackInvalidProofSignature` — no dual-accept window.
   (2) `attestFeedbackWithTask` requires `statusCode` in 100..999, else
   `VerifiedFeedbackInvalidTaskReveal`. (3) The agent's own agentSeal may not
-  attest (`VerifiedFeedbackSelfFeedback`). **Pre-cut marks**: verification
-  marks attested before an environment's 1.2.0 upgrade block carry no
-  FIND-01 / FIND-02 guarantee — their recorded audit data (dataHashes,
-  frameworkHash) and verified endpoint are not assured to be authentic.
-  Record each environment's upgrade block (the block of the `ExecuteUpgrade`
-  transaction) in §6 so readers and indexers can drop `FeedbackVerified` logs
-  below it. Mainnet's VF proxy (§6.2m) has none to drop: it had emitted no
-  `FeedbackVerified` log as of 2026-10-19. **Hard-cut rollout — one window.**
+  attest (`VerifiedFeedbackSelfFeedback`). (4) Ownership becomes two-step
+  (`Ownable2StepUpgradeable`, same as AgenticID / TEEDataVerifier 1.2.0 above):
+  `pendingOwner()` / `acceptOwnership()` added, `transferOwnership` only
+  proposes. **Pre-cut marks**: verification marks attested before an
+  environment's 1.2.0 upgrade block carry no FIND-01 / FIND-02 guarantee —
+  their recorded audit data (dataHashes, frameworkHash) and verified endpoint
+  are not assured to be authentic. Record each environment's upgrade block
+  (the block of the `ExecuteUpgrade` transaction) in §6 so readers and
+  indexers can drop `FeedbackVerified` logs below it. Mainnet's VF proxy
+  (§6.2m) has none to drop: it had emitted no `FeedbackVerified` log as of
+  2026-10-19. **Hard-cut rollout — one window.**
   The ordering is a correctness dependency, not hygiene: old images' proofs
   stop verifying the moment the beacon lands, and new images' proofs verify
   nowhere before it does. Each step ends with a check — confirm it before
@@ -448,7 +592,22 @@ Changelog:
      per hash: `cast call $AGENTIC_ID 'isValidFrameworkHash(bytes32)(bool)'
      <image hash> --rpc-url $RPC` → `true`.
   3. Deploy the 1.2.0 impl and beacon-upgrade each environment's VF proxy via
-     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Check:
+     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Execution is open
+     on every environment (§6.2m / §6.1 / §6.2), so anyone can perform the cut the
+     moment the op is ready, and an op becomes ready `DELAY` seconds after the
+     schedule tx lands. On mainnet (`minDelay` 1 day) the vault therefore schedules with
+     `DELAY` = window start − now, in seconds and ≥ 86400 (`schedule` rejects
+     less, so fix the window at least a day ahead), not with plain `minDelay`:
+     scheduled earlier with 86400, the op would be ready, and executable by
+     anyone, before the window. Check after the schedule tx lands:
+     `getTimestamp(opId)` (UPGRADING.md "Mainnet Step 3") = the window start,
+     or slightly later by the vault's approval time. Execute once block time
+     ≥ `getTimestamp(opId)` — at the window start, or as soon after it as the
+     op is ready (`ExecuteUpgrade` logs `op ready? false` and its simulated
+     `execute` reverts, broadcasting nothing, if run earlier) — and shift the
+     step-4 roll with it. If the window slips, the vault (the canceller) calls
+     `cancel(opId)` before the op is ready and schedules again. On test / dev
+     (`minDelay` 0) schedule inside the window and execute right away. Check:
      `cast call $VF 'VERSION()(string)' --rpc-url $RPC` → `"1.2.0"`.
   4. In the same window: roll the attestor with
      `ATTESTOR_VERIFIED_FEEDBACK_ADDR` = that environment's VF proxy (§6) and
@@ -550,8 +709,9 @@ Changelog:
   TEEDataVerifier `0x7d6201de6f8508840d7c04596860286ad8faa34a9209c09cfcb3c1513fa81077`.
   Post-upgrade verified on chain: proxy `VERSION()` reads 1.1.0 / 1.2.0 / 1.1.0
   and each `beacon.implementation()` matches the impl above; explorer verification
-  idempotent (all impl/beacon/proxy already verified). **Note:** test is the env
-  the production attestor (`agenticid.0g.ai`) uses; the serve-proof digest changed
+  idempotent (all impl/beacon/proxy already verified). **Note:** test was then
+  the env the production attestor (`agenticid.0g.ai`) used (it serves mainnet
+  §6.2m today); the serve-proof digest changed
   (#86), so the production sealed image + SDK must move to the #103 build in the
   same window, or running agents' ServeProofs fail `giveFeedback` verification
   until updated.
@@ -608,8 +768,45 @@ Changelog:
   removable in a future cleanup.
 - The suite uses `CanonicalIdentityRegistryMock`; `CanonicalForkIntegration.t.sol`
   runs against the real registry when `FORK_RPC` is set.
-- **Mainnet checklist:** `TEE_ORACLE` = real TEE signer; `TIMELOCK_DELAY` ≥ 2 days;
-  `OWNER`/`PAUSER`/`PROPOSERS`/`EXECUTORS` = multisig.
+- **Mainnet checklist** (state of §6.2m as read on chain 2026-10-19):
+  - **Done — owner / pauser / proposer / canceller moved to the Fordefi MPC
+    vault `0xc060…27cF`** instead of the multisig this list originally asked
+    for: no single private key; whether a transaction needs more than one
+    approver is a vault-policy setting, see Recommended below (owner decision:
+    admin calls stay direct vault calls, no Timelock or guardian in front of
+    them).
+  - **Done — upgrade delay:** Timelock `minDelay` 86400 (1 day, the chosen floor
+    rather than the earlier "≥ 2 days"); `Deploy.s.sol` now defaults to and
+    enforces ≥ 86400 on chain 16661. Executors stay open (`address(0)`) by
+    design — the delay is the protection.
+  - **Open — renounce the vault's Timelock `DEFAULT_ADMIN_ROLE`:** the vault
+    calls `renounceRole(DEFAULT_ADMIN_ROLE, vault)` on `0x399a…0cF7`
+    (direct, no delay) so role changes also take the 1-day path, matching
+    what `Deploy.s.sol` now produces for fresh mainnet stacks.
+  - **Open — real TEE oracle:** `teeOracleAddress()` is currently the vault, not
+    a TEE-held signer; rotate with `setTeeOracleAddress` (1.2.0 rejects zero
+    and emits `TeeOracleUpdated`).
+  - **Open — AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry 1.2.0:**
+    two-step ownership + setter guards (§7 pending).
+  - **Recommended (not verifiable from chain):** a Fordefi approval policy
+    that requires a human quorum for any vault transaction targeting the
+    governance contracts (AgenticID / VerifiedFeedbackRegistry /
+    TEEDataVerifier proxies, the Timelock) — with no Timelock in front of
+    admin calls, the vault policy IS the admin control. That includes the
+    one-step `renounceOwnership()` (§1), which no contract blocks.
+- Testnet / dev (§6.1 / §6.2) deliberately keep an EOA owner and `minDelay` 0;
+  none of the above applies there, except that **testnet keys must never be
+  reused on mainnet**.
+- **Pending ownership transfers (every environment, from 1.2.0).** A
+  `transferOwnership(x)` on AgenticID / TEEDataVerifier /
+  VerifiedFeedbackRegistry stays pending, with no expiry, until `x` calls
+  `acceptOwnership()` or the owner calls `transferOwnership` again; the
+  current owner keeps full control meanwhile. A new call replaces the
+  candidate (the superseded one can no longer accept). To withdraw a proposal
+  — a wrong address, or a migration called off — the owner calls
+  `transferOwnership(address(0))`, which clears `pendingOwner()` (pinned in
+  `test/TwoStepOwnership.t.sol`). Read `pendingOwner()` after every
+  ownership move: a stale candidate can still accept until it is cleared.
 
 ### Tracked follow-ups (GitHub issues)
 

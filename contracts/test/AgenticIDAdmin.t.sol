@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticIDNotTrustedAttestor} from "../src/AgenticID.sol";
+import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDZeroAddress} from "../src/AgenticID.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
@@ -99,5 +99,24 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
             )
         );
         agenticId.setVerifier(address(0xDEAD));
+    }
+
+    /// @dev FIND-12: a zero verifier would brick every proof-gated
+    ///      iTransferFrom / iCloneFrom (the call into address(0) fails), so
+    ///      1.2.0 refuses it outright and the old verifier stays in place.
+    function test_setVerifier_revertsOnZeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(AgenticIDZeroAddress.selector);
+        agenticId.setVerifier(address(0));
+        assertEq(address(agenticId.verifier()), address(verifier), "verifier unchanged");
+    }
+
+    /// @dev FIND-12: the swap is observable on chain — old and new address.
+    function test_setVerifier_emitsVerifierUpdated() public {
+        address newVerifier = address(0xDEAD);
+        vm.expectEmit(true, true, false, false, address(agenticId));
+        emit AgenticID.VerifierUpdated(address(verifier), newVerifier);
+        vm.prank(owner);
+        agenticId.setVerifier(newVerifier);
     }
 }

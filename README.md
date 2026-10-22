@@ -459,8 +459,9 @@ protocol: `ag.agent` (deploy / clone / transfer, reads, agent-seal gas
 top-up), `ag.reputation` (capture a TEE-signed serve-proof, verify it,
 submit/read on-chain feedback), plus top-level trust-root ack and
 prepaid sandbox deposit. Hides the contract set and the attestor HTTP
-API behind one config object; every snippet in it runs against the
-live testnet deployment.
+API behind one config object; every snippet in it runs against a live
+deployment — `https://agenticid.0g.ai` (as written) is 0G mainnet; point it at
+`https://agenticid-testnet.0g.ai` for the Galileo testnet.
 
 **[`contracts/README.md`](contracts/README.md) — the contract layer**
 
@@ -471,7 +472,7 @@ protocol), ERC-8004 (identity registration and reputation), AgenticID
 NonceRegistry (unified replay protection), along with their extension
 points and dependencies. Walks through the three main flows (`register`,
 `attestFeedback`, `iTransferFrom`) with their on-chain logic and ecrecover
-validation, plus 236 Foundry tests across 25 suites and full deploy, upgrade,
+validation, plus 261 Foundry tests across 28 suites and full deploy, upgrade,
 and Etherscan-verify scripts.
 
 **[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**

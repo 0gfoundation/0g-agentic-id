@@ -8,7 +8,7 @@ Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://g
 
 ## Setup
 
-**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestor is `https://agenticid.0g.ai`:
+**Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agenticid.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agenticid-testnet.0g.ai` (0G Galileo testnet, chain 16602):
 
 ```ts
 import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
@@ -34,7 +34,7 @@ still exists for hand-picked addresses — audit tooling, or reading a
 chain with no attestor running — and `overrides` lets you pin any single
 address without giving up the bootstrap.)
 
-Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client, and the RPC defaults to the 0G Galileo testnet, so it's optional.
+Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client. `rpcUrl` and `chain` both default to the 0G Galileo testnet, so they're optional there; for mainnet pass both (below).
 
 ```ts
 import { AgenticID, type ContractAddresses } from '@0gfoundation/0g-agenticid-sdk';
@@ -59,9 +59,24 @@ const ag = new AgenticID({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
   attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments/listMyDeployments)
-  // rpcUrl optional — defaults to the 0G Galileo testnet RPC
+  // rpcUrl / chain optional — both default to the 0G Galileo testnet (16602)
 });
 ```
+
+**Mainnet by hand.** `rpcUrl` and `chain` default independently to Galileo (`https://evmrpc-testnet.0g.ai` / `ZERO_G_TESTNET`, chain 16602). For the 0G mainnet set (`contracts/DEPLOYMENT.md` §6.2m, chain 16661) pass **both**: `rpcUrl` picks the node, `chain` the chain id every write is signed for — mainnet addresses with the default chain sign every tx for 16602, so writes fail.
+
+```ts
+import { AgenticID, ZERO_G_MAINNET } from '@0gfoundation/0g-agenticid-sdk';
+
+const main = new AgenticID({
+  addresses,                       // the §6.2m set
+  account: process.env.PRIVATE_KEY as `0x${string}`,
+  rpcUrl: 'https://evmrpc.0g.ai',
+  chain: ZERO_G_MAINNET,
+});
+```
+
+Or skip the hand wiring: `AgenticID.fromAttestor('https://agenticid.0g.ai', …)` takes the addresses, RPC and chain from the attestor's `/config`.
 
 **What you pass grows with what you do** — three tiers:
 
@@ -76,7 +91,7 @@ const ag = new AgenticID({
 `AgenticIDConfig` full shape: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
 
 - **`account`** — a private key or a viem `Account`. That alone enables writes; the SDK builds the signing (wallet) client for you.
-- **`walletClient`** (advanced) — supply your own signer instead of handing over a key, e.g. a browser wallet where MetaMask does the signing and the key never enters your code. `ZERO_G_TESTNET` and `RPC_URL` are exported to help build one.
+- **`walletClient`** (advanced) — supply your own signer instead of handing over a key, e.g. a browser wallet where MetaMask does the signing and the key never enters your code. `ZERO_G_TESTNET` / `ZERO_G_MAINNET` and `RPC_URL` (the testnet RPC) are exported to help build one.
 
 The snippets below assume these bindings:
 
@@ -827,7 +842,7 @@ digest change does not close it.
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel on the same chain (0G Galileo Testnet, `chainId 16602`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agenticid.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agenticid-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 

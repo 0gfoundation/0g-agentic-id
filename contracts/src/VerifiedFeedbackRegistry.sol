@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
@@ -86,7 +86,7 @@ error VerifiedFeedbackSummaryOverflow();
 ///      documented sybil class (see the self-feedback guard).
 contract VerifiedFeedbackRegistry is
     IVerifiedFeedbackRegistry,
-    OwnableUpgradeable,
+    Ownable2StepUpgradeable,
     PausableUpgradeable,
     NonceRegistryUpgradeable
 {
@@ -94,19 +94,25 @@ contract VerifiedFeedbackRegistry is
 
     /// @notice Current implementation version. See contracts/UPGRADING.md for
     ///         the bump rules.
-    /// @dev 1.2.0 — ServeProof hardening (beacon upgrade; storage and ABI
-    ///      unchanged, but consensus-critical — ships with new sealed images +
-    ///      SDK in one window): the signed digest becomes EIP-191 version 0x00
+    /// @dev 1.2.0 — ServeProof hardening (beacon upgrade; storage unchanged,
+    ///      ABI only gains the two-step-ownership surface below, but
+    ///      consensus-critical — ships with new sealed images + SDK in one
+    ///      window): the signed digest becomes EIP-191 version 0x00
     ///      bound to this registry (toDataWithIntendedValidatorHash(address(this),
     ///      proofHash)); legacy personal_sign-wrapped proofs are rejected, no
     ///      fallback (audit FIND-01 / FIND-16). attestFeedbackWithTask requires
     ///      statusCode in 100..999 (FIND-02). The agent's own agentSeal may not
-    ///      attest (VerifiedFeedbackSelfFeedback). Marks attested before an
-    ///      environment's 1.2.0 upgrade block carry no FIND-01 / FIND-02
-    ///      guarantee: their recorded audit data and verified endpoint are not
-    ///      assured to be authentic. That block is recorded per environment in
-    ///      contracts/DEPLOYMENT.md §6; readers and indexers should drop
-    ///      FeedbackVerified logs below it.
+    ///      attest (VerifiedFeedbackSelfFeedback). Ownership becomes two-step
+    ///      (FIND-16 governance hardening; Ownable2StepUpgradeable):
+    ///      transferOwnership only proposes and the new owner must
+    ///      acceptOwnership — adds pendingOwner / acceptOwnership +
+    ///      OwnershipTransferStarted, the only ABI additions; the pending owner
+    ///      lives in OZ's ERC-7201 namespace, so no existing storage moves.
+    ///      Marks attested before an environment's 1.2.0 upgrade block carry
+    ///      no FIND-01 / FIND-02 guarantee: their recorded audit data and
+    ///      verified endpoint are not assured to be authentic. That block is
+    ///      recorded per environment in contracts/DEPLOYMENT.md §6; readers and
+    ///      indexers should drop FeedbackVerified logs below it.
     ///      1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
     ///      recomputes the proof's taskHash from revealed receipt materials and
     ///      records the URI as the entry's TEE-verified endpoint; new views

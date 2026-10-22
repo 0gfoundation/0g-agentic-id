@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 
 import {IAgenticID} from "./interfaces/IAgenticID.sol";
 import {IERC8004IdentityRegistry, MetadataEntry} from "./interfaces/IERC8004IdentityRegistry.sol";
@@ -36,6 +36,9 @@ error AgenticIDUseRegisterWithData();
 
 /// @notice Caller is not the pauser.
 error AgenticIDNotPauser();
+
+/// @notice An owner setter was given the zero address (setVerifier).
+error AgenticIDZeroAddress();
 
 /// @notice update / updateAt was called by an address that is not
 ///         the agent's bound agentSeal. Once a seal is bound, iData
@@ -86,6 +89,14 @@ error AgenticIDCannotCloneSealedAgent(uint256 agentId);
 ///      this contract custodies the canonical token and assigns agentId from the
 ///      canonical global counter (see {ERC8004CanonicalBoundUpgradeable}).
 ///
+///      Ownership is two-step (Ownable2StepUpgradeable, since 1.2.0): the
+///      owner proposes with transferOwnership and the new owner must
+///      acceptOwnership, so a mistyped address can't strand the admin
+///      surface. Owner calls are direct (not timelocked); only beacon
+///      upgrades go through the Timelock. The bytecode sits a little over
+///      100 B under EIP-170 (test/Eip170Size.t.sol) — measure
+///      `forge build --sizes` on any change.
+///
 ///      agentSeal / sealId are one-time bindings per agentId and persist across
 ///      transfers. _update only needs to exist for diamond disambiguation:
 ///        AgenticID (no-op)
@@ -98,7 +109,7 @@ contract AgenticID is
     ERC7857IDataStorageUpgradeable,
     ERC7857AuthorizeUpgradeable,
     ERC7857CloneableUpgradeable,
-    OwnableUpgradeable
+    Ownable2StepUpgradeable
 {
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -119,7 +130,20 @@ contract AgenticID is
     }
 
     /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
+    /// @dev 1.2.0 — governance hardening (beacon upgrade; audit FIND-12 /
+    ///      FIND-16): ownership becomes two-step (Ownable2StepUpgradeable —
+    ///      transferOwnership only proposes, the new owner must
+    ///      acceptOwnership; adds pendingOwner / acceptOwnership +
+    ///      OwnershipTransferStarted, pending owner kept in OZ's ERC-7201
+    ///      namespace, so no existing storage moves); setVerifier rejects
+    ///      address(0) (AgenticIDZeroAddress) and emits VerifierUpdated. ABI
+    ///      additions only. EIP-170: Ownable2Step + the setter guard cost
+    ///      ~400 B against 9 B of 1.1.0 headroom; folding register /
+    ///      registerWithSeal into the shared _mintWithData (same checks, same
+    ///      order, same events) pays for it. (The PR #145 "1.2.0" never
+    ///      reached chain — its impl exceeded EIP-170; this is a different
+    ///      build.)
+    ///      1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
     ///      sealed keys before the receiver callback and iTransferFrom/iCloneFrom
     ///      are nonReentrant, so a re-entrant receiver can't desync ownership from
     ///      the stored keys; the external setAgentSeal entrypoint is removed (a
@@ -127,9 +151,10 @@ contract AgenticID is
     ///      function) + new reentrancy-guard storage (ERC-7201 namespaced, no
     ///      collision); no existing storage layout change.
     ///      1.0.0 — initial.
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
+    event VerifierUpdated(address indexed previousVerifier, address indexed newVerifier);
 
     // keccak256(abi.encode(uint256(keccak256("0g.storage.AgenticID")) - 1)) & ~bytes32(uint256(0xff))
     bytes32 private constant AgenticIDStorageLocation =
@@ -412,13 +437,7 @@ contract AgenticID is
         IntelligentData[] calldata intelligentDatas,
         bytes[] calldata sealedKeys
     ) external whenNotPaused returns (uint256 agentId) {
-        if (intelligentDatas.length == 0) revert ERC7857EmptyData();
-        if (intelligentDatas.length != sealedKeys.length) {
-            revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
-        }
-        agentId = _mintAgent(msg.sender, agentURI);
-        _setMetadataBatch(agentId, metadata);
-        _updateData(agentId, intelligentDatas, sealedKeys);
+        agentId = _mintWithData(msg.sender, agentURI, metadata, intelligentDatas, sealedKeys);
         _emitMintedKeys(agentId, msg.sender, intelligentDatas, sealedKeys);
     }
 
@@ -442,6 +461,21 @@ contract AgenticID is
     ) external whenNotPaused returns (uint256 agentId) {
         if (!_getAgenticIDStorage().trustedAttestors[msg.sender]) revert AgenticIDNotTrustedAttestor();
 
+        agentId = _mintWithData(to, agentURI, metadata, intelligentDatas, sealedKeys);
+        _setAgentSeal(agentId, agentSeal_, sealId);
+        _emitMintedKeys(agentId, to, intelligentDatas, sealedKeys);
+    }
+
+    /// @dev Shared body of register / registerWithSeal: validate the iData /
+    ///      sealedKeys arity, mint, write metadata, store the iData. One copy
+    ///      instead of two is what keeps 1.2.0 under EIP-170.
+    function _mintWithData(
+        address to,
+        string calldata agentURI,
+        MetadataEntry[] calldata metadata,
+        IntelligentData[] calldata intelligentDatas,
+        bytes[] calldata sealedKeys
+    ) private returns (uint256 agentId) {
         if (intelligentDatas.length == 0) revert ERC7857EmptyData();
         if (intelligentDatas.length != sealedKeys.length) {
             revert ERC7857SealedKeyArityMismatch(intelligentDatas.length, sealedKeys.length);
@@ -449,8 +483,6 @@ contract AgenticID is
         agentId = _mintAgent(to, agentURI);
         _setMetadataBatch(agentId, metadata);
         _updateData(agentId, intelligentDatas, sealedKeys);
-        _setAgentSeal(agentId, agentSeal_, sealId);
-        _emitMintedKeys(agentId, to, intelligentDatas, sealedKeys);
     }
 
     // ── Mint sealed-key emission ──────────────────────────────────────────────
@@ -463,8 +495,9 @@ contract AgenticID is
         IntelligentData[] calldata iDatas,
         bytes[] calldata sealedKeys
     ) internal {
-        // Arity is checked by the public callers (register / registerWithSeal)
-        // before reaching here, using ERC7857SealedKeyArityMismatch.
+        // Arity is checked in _mintWithData (shared by register /
+        // registerWithSeal) before reaching here, using
+        // ERC7857SealedKeyArityMismatch.
         SealedKeyEntry[] memory entries = new SealedKeyEntry[](iDatas.length);
         for (uint256 i = 0; i < iDatas.length; i++) {
             entries[i] = SealedKeyEntry({
@@ -583,6 +616,8 @@ contract AgenticID is
     // ── Admin ─────────────────────────────────────────────────────────────────
 
     function setVerifier(address newVerifier) external onlyOwner {
+        if (newVerifier == address(0)) revert AgenticIDZeroAddress();
+        emit VerifierUpdated(address(verifier()), newVerifier);
         _setVerifier(newVerifier);
     }
 

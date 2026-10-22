@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable2StepUpgradeable} from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
@@ -35,9 +35,15 @@ error DataVerifierNotPauser();
 ///
 ///         Subclasses implement `_verifyOwnershipProof` for their specific oracle
 ///         (TEE, ZKP, etc.) and call `__BaseDataVerifier_init` in their initializer.
+///
+/// @dev Ownership is two-step (Ownable2StepUpgradeable; TEEDataVerifier 1.2.0+):
+///      transferOwnership proposes, the new owner calls acceptOwnership. The
+///      pending owner lives in OZ's ERC-7201 namespace
+///      (openzeppelin.storage.Ownable2Step), so the swap from OwnableUpgradeable
+///      moves no existing storage.
 abstract contract BaseDataVerifier is
     IERC7857DataVerifier,
-    OwnableUpgradeable,
+    Ownable2StepUpgradeable,
     PausableUpgradeable,
     ReentrancyGuardUpgradeable,
     NonceRegistryUpgradeable
