@@ -221,10 +221,11 @@ func TestRenderOverlayAppliedButLoses(t *testing.T) {
 	}
 }
 
-// TestRenderNoPersistedBudget: hermes writes no output budget into
-// config.yaml at all, and a non-catalog-sourced one must never start being
-// written — a heuristic guess (8192) written during a catalog outage looks
-// hand-set forever after and starves a reasoning model's shared budget.
+// TestRenderNoPersistedBudget: hermes gets model.max_tokens only when the
+// budget is catalog-sourced (TestRenderWritesCappedRequestBudget); a
+// non-catalog-sourced one must never be written — a heuristic guess (8192)
+// written during a catalog outage looks hand-set forever after and starves a
+// reasoning model's shared budget.
 func TestRenderNoPersistedBudget(t *testing.T) {
 	a := newTestAdapter(t)
 	s := routed("glm-5.3", "", inference.ModelFacts{
@@ -508,5 +509,83 @@ func TestGatewayEnvTakesCredentialFromSettings(t *testing.T) {
 		if strings.HasPrefix(e, "ANTHROPIC_API_KEY=") {
 			t.Errorf("credential-less boot still set %q", e)
 		}
+	}
+}
+
+// The budget's lifecycle across renders: a value the platform wrote for one
+// model must not outlive a switch to a model it knows nothing about (above
+// the new model's limit, every request fails), while the same model keeps it
+// through a catalog outage, and the owner's overlay value stands whenever the
+// platform has none.
+func TestRenderRequestBudgetLifecycle(t *testing.T) {
+	known := inference.ModelFacts{MaxTokens: 131072, SupportsReasoningEffort: true, CatalogSourced: true}
+	unknown := inference.ModelFacts{MaxTokens: inference.HeuristicOpenAIMaxTokens} // outage or unlisted
+	render := func(t *testing.T, a *Adapter, s settings.Resolved) {
+		t.Helper()
+		if err := a.RenderSettings(context.Background(), s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	builtin := func(model string, others string) settings.Resolved {
+		s := settings.Resolved{Doc: settings.Doc{Provider: "openai", Model: model}, Facts: unknown}
+		if others != "" {
+			s.Others = json.RawMessage(others)
+		}
+		return s
+	}
+
+	t.Run("same model through an outage keeps it", func(t *testing.T) {
+		a := newTestAdapter(t)
+		render(t, a, routed("glm-5.3", "", known))
+		render(t, a, routed("glm-5.3", "", unknown))
+		if got := modelSection(t)["max_tokens"]; got != settings.RequestOutputCeiling {
+			t.Errorf("model.max_tokens = %v, want the last known %d", got, settings.RequestOutputCeiling)
+		}
+	})
+	t.Run("switch to an unlisted built-in drops it", func(t *testing.T) {
+		a := newTestAdapter(t)
+		render(t, a, routed("glm-5.3", "", known))
+		render(t, a, builtin("gpt-4o", ""))
+		if v, set := modelSection(t)["max_tokens"]; set {
+			t.Errorf("previous model's budget survived the switch: max_tokens = %v", v)
+		}
+	})
+	t.Run("model switch during an outage drops it", func(t *testing.T) {
+		a := newTestAdapter(t)
+		render(t, a, routed("glm-5.3", "", known))
+		render(t, a, routed("0gm-1.0-35b-a3b", "", unknown))
+		if v, set := modelSection(t)["max_tokens"]; set {
+			t.Errorf("previous model's budget survived the switch: max_tokens = %v", v)
+		}
+	})
+	t.Run("the overlay's value stands when the budget is unknown", func(t *testing.T) {
+		a := newTestAdapter(t)
+		render(t, a, routed("glm-5.3", "", known))
+		render(t, a, builtin("gpt-4o", `{"model":{"max_tokens":4096}}`))
+		if got := modelSection(t)["max_tokens"]; got != 4096 {
+			t.Errorf("model.max_tokens = %v (%T), want the overlay's 4096", got, got)
+		}
+	})
+	t.Run("a known budget is written over the overlay", func(t *testing.T) {
+		a := newTestAdapter(t)
+		s := routed("glm-5.3", "", known)
+		s.Others = json.RawMessage(`{"model":{"max_tokens":131072}}`)
+		render(t, a, s)
+		if got := modelSection(t)["max_tokens"]; got != settings.RequestOutputCeiling {
+			t.Errorf("model.max_tokens = %v, want the capped %d", got, settings.RequestOutputCeiling)
+		}
+	})
+}
+
+// With a catalog-sourced budget hermes gets model.max_tokens, capped. Absent,
+// its custom-provider default (65536) goes out on every main-loop request.
+func TestRenderWritesCappedRequestBudget(t *testing.T) {
+	a := newTestAdapter(t)
+	s := routed("glm-5.3", "", inference.ModelFacts{MaxTokens: 131072, SupportsReasoningEffort: true, CatalogSourced: true})
+	if err := a.RenderSettings(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	if got := modelSection(t)["max_tokens"]; got != settings.RequestOutputCeiling {
+		t.Errorf("model.max_tokens = %v (%T), want %d", got, got, settings.RequestOutputCeiling)
 	}
 }

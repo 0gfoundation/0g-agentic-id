@@ -2,9 +2,13 @@ package platform
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
+
+	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 // Marker-injection delivery mechanism, shared by every framework adapter.
@@ -51,8 +55,20 @@ const (
 // lines of their own — StripInjected only recognizes line-anchored
 // markers (see below), so the writer must uphold that shape.
 func UpsertMarkedSection(path, body string) error {
-	existing, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
+	// path sits in an agent-writable tree: read and write it through
+	// internal/privsep. An entry the read rules refuse (a link, a FIFO, a
+	// socket, a device, a directory, a foreign hard link) counts as empty,
+	// and the write below then replaces it with a regular file — the link's
+	// target is never read or written, and a directory is removed first. A
+	// file over its size limit is an error: it is the agent's content,
+	// which this rewrite must not drop.
+	existing, err := privsep.ReadFile(path, privsep.LimitTracked)
+	switch {
+	case err == nil, errors.Is(err, fs.ErrNotExist):
+	case errors.Is(err, privsep.ErrUnsafePath):
+		logger.Logf("platform: %s is not a regular file (%v); rewriting it as one", path, err)
+		existing = nil
+	default:
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 	cleaned := StripInjected(existing)
@@ -72,35 +88,16 @@ func UpsertMarkedSection(path, body string) error {
 		out = append(out, []byte(section)...)
 	}
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := privsep.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	// Write via a same-directory temp file + rename so a failure mid-write
-	// (disk full, killed process) cannot truncate or corrupt the existing
-	// file — the rename is the only step that can observably change it, and
-	// it either fully succeeds or leaves the original untouched.
-	tmp, err := os.CreateTemp(dir, ".markers-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp for %s: %w", path, err)
-	}
-	tmpPath := tmp.Name()
-	if _, err := tmp.Write(out); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("write temp for %s: %w", path, err)
-	}
-	if err := tmp.Chmod(0o644); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("chmod temp for %s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("close temp for %s: %w", path, err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename temp to %s: %w", path, err)
+	// privsep.WriteFile writes a same-directory temp file and renames it
+	// over path, so a failure mid-write (disk full, killed process) cannot
+	// truncate or corrupt the existing file — the rename is the only step
+	// that can observably change it, and it either fully succeeds or leaves
+	// the original untouched.
+	if err := privsep.WriteFile(path, out, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
 }

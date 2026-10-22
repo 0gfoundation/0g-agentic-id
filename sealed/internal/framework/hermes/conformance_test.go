@@ -13,6 +13,7 @@ import (
 
 func newTestAdapter(t *testing.T) *Adapter {
 	hermesHome = t.TempDir()
+	isolateState(t)
 	oldProbe := probeHermesVersion
 	probeHermesVersion = func(context.Context) string { return "" }
 	t.Cleanup(func() { probeHermesVersion = oldProbe })

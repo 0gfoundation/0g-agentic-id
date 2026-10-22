@@ -465,6 +465,99 @@ func TestApply_Manifest_IncrementalOnlyChangedEntryReuploads(t *testing.T) {
 	}
 }
 
+// A held entry (manifest.Held: over its size limit) keeps its committed
+// version while every other entry of the role keeps committing; one that
+// was never committed is left out; and a role whose only drift is a held
+// entry standing for exactly what is committed sends no transaction.
+func TestApply_Manifest_HeldEntryKeepsItsCommittedVersion(t *testing.T) {
+	const role = "workspace/skills/"
+	h := newHarness(t, []framework.RoleSpec{{Name: role, Shape: framework.DirectoryManifest}})
+	h.stubManifestRole(t, role, map[string][]byte{"big/": []byte("big-v1"), "other/": []byte("other-v1")})
+	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
+		t.Fatalf("Apply v1: %v", err)
+	}
+	committedV1 := h.committedManifest(t, role)
+	bigV1 := *committedV1.EntryByPath("big/")
+
+	// big/ grows past its limit (held), other/ changes, new/ appears, and
+	// huge/ is over its limit without ever having been committed.
+	h.stubManifestRole(t, role, map[string][]byte{"other/": []byte("other-v2"), "new/": []byte("new-v1")})
+	held := func(m *manifest.Manifest) []byte {
+		m.Entries = append(m.Entries, manifest.Held("big/", manifest.EntryDir), manifest.Held("huge/", manifest.EntryDir))
+		b, err := m.Marshal()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	m, _ := manifest.Unmarshal(h.adapter.evo[role])
+	h.adapter.evo[role] = held(m)
+	loads := len(h.adapter.loadLog)
+	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
+		t.Fatalf("Apply with a held entry: %v", err)
+	}
+	for _, l := range h.adapter.loadLog[loads:] {
+		if l == role+":big/" || l == role+":huge/" {
+			t.Errorf("LoadEntry ran for held entry %s", l)
+		}
+	}
+	committed := h.committedManifest(t, role)
+	var paths []string
+	for _, e := range committed.Entries {
+		paths = append(paths, e.Path)
+	}
+	if fmt.Sprint(paths) != "[big/ new/ other/]" {
+		t.Fatalf("committed entries = %v, want big/ (kept), new/ and other/", paths)
+	}
+	if got := *committed.EntryByPath("big/"); got != bigV1 {
+		t.Fatalf("held big/ committed as %+v, want its committed version %+v", got, bigV1)
+	}
+	if got := committed.EntryByPath("other/"); got.ContentHash != manifest.HashHex([]byte("other-v2")) {
+		t.Fatalf("other/ = %+v, want v2 committed", got)
+	}
+
+	// Same disk again: in sync, nothing sent.
+	updates, uploads := h.chain.updateCount, h.storage.uploadCount
+	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
+		t.Fatal(err)
+	}
+	// After a restart the chain snapshot is the committed manifest's own
+	// form, so the held plaintext drifts from it once; resolving it gives
+	// exactly what is committed, which sends nothing and is recorded.
+	strippedPT, err := manifest.StripStoragePtrs(h.decryptRole(t, role))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(strippedPT)
+	onChain := h.findRoleOnChain(t, role)
+	h.state.RecordChainUpload(role, hex.EncodeToString(sum[:]), "0x"+hex.EncodeToString(onChain.DataHash[:]))
+	if err := h.up.Apply(context.Background(), h.plaintexts()); err != nil {
+		t.Fatal(err)
+	}
+	if h.chain.updateCount != updates || h.storage.uploadCount != uploads {
+		t.Fatalf("a held entry equal to its committed version sent %d tx and %d uploads", h.chain.updateCount-updates, h.storage.uploadCount-uploads)
+	}
+	ptSum := sha256.Sum256(h.adapter.evo[role])
+	if got := h.state.ChainEntry(role).ContentHash; got != hex.EncodeToString(ptSum[:]) {
+		t.Fatalf("chain snapshot = %s, want the held plaintext recorded as in sync", got)
+	}
+}
+
+// committedManifest decrypts and parses the manifest role's blob on chain.
+func (h *uploadHarness) committedManifest(t *testing.T, role string) *manifest.Manifest {
+	t.Helper()
+	m, err := manifest.Unmarshal(h.decryptRole(t, role))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func (h *uploadHarness) decryptRole(t *testing.T, role string) []byte {
+	t.Helper()
+	return decryptViaTestKey(t, h, h.findRoleOnChain(t, role))
+}
+
 // chainSnapshot moves forward after Apply succeeds: RecordChainUpload
 // installs sha256(plaintext) so next tick sees in-sync. This is what
 // makes "failed Apply re-tries automatically" work — chainSnapshot only
@@ -521,4 +614,28 @@ func decryptViaTestKey(t *testing.T, h *uploadHarness, e chain.IntelligentData) 
 		t.Fatalf("decrypt: %v", err)
 	}
 	return pt
+}
+
+// TestNew_StorageSignsWithTheAgentSealKey: the production storage backend
+// hands dataplane.Upload the parsed agent_seal key itself, alongside the
+// deployment's endpoints.
+func TestNew_StorageSignsWithTheAgentSealKey(t *testing.T) {
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := New(&mockAdapter{}, state.New(), nil, big.NewInt(1), crypto.FromECDSA(priv), "http://rpc", "http://indexer")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ds, ok := up.storage.(*dataplaneStorage)
+	if !ok {
+		t.Fatalf("storage is a %T, want *dataplaneStorage", up.storage)
+	}
+	if ds.signer == nil || !ds.signer.Equal(priv) {
+		t.Fatal("the storage signer is not the agent_seal key")
+	}
+	if ds.rpcURL != "http://rpc" || ds.indexerURL != "http://indexer" {
+		t.Fatalf("endpoints = rpc %q, indexer %q", ds.rpcURL, ds.indexerURL)
+	}
 }

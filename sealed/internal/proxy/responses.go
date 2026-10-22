@@ -279,7 +279,11 @@ func (s *Server) handleSynthCreate(w http.ResponseWriter, r *http.Request, chatU
 		return
 	}
 
-	rec := s.synth.create()
+	rec, ok := s.admitSynthTurn()
+	if !ok {
+		writeSynthJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"message": "the conversation is being compacted; send this again once /compact finishes"}})
+		return
+	}
 	go s.runSynthTurn(rec, chatUpstream, token, body.Input, body.Model)
 	logger.Logf("responses: %s accepted (%.60s…)", rec.id, text)
 
@@ -592,10 +596,11 @@ func synthBearerOK(r *http.Request, token string) bool {
 
 // synthUpstreamMessages assembles what goes upstream. Default: the client's
 // input verbatim (full history — see synthInputMessages). When the adapter
-// provides framework.ConversationHistory, prior turns come from the
-// HARNESS'S OWN STORE instead and the client's input supplies only the
-// current turn (its last user message) — the client stores nothing
-// (CONVERSATION.md invariant 6). A history-read failure degrades to the
+// provides framework.ConversationHistory, prior turns come from the adapter
+// instead — the harness's own store, or none when the harness replays its
+// own session (openclaw) — and the client's input supplies only the current
+// turn (its last user message): the client stores nothing (CONVERSATION.md
+// invariant 6). A history-read failure degrades to the
 // client's input, loudly: a broken store must not kill the turn, but
 // silently answering without context would gaslight the owner.
 func (s *Server) synthUpstreamMessages(ctx context.Context, input json.RawMessage) []map[string]any {

@@ -68,6 +68,13 @@ type Watcher struct {
 
 	stopCh chan struct{}
 	once   sync.Once
+
+	// lastErr is the EvolutionFor error last logged per role. A role can
+	// fail the same way on every tick for as long as its cause lasts (a
+	// leaf role's file over its size limit keeps the role at its committed
+	// version until the agent shrinks it), so the error is logged when it
+	// first appears or changes, and its clearing is logged once.
+	lastErr map[string]string
 }
 
 // New constructs a Watcher. cfg is normalized to defaults internally.
@@ -78,6 +85,7 @@ func New(adapter framework.Framework, agent *state.Agent, cfg Config) *Watcher {
 		agent:   agent,
 		cfg:     cfg,
 		stopCh:  make(chan struct{}),
+		lastErr: map[string]string{},
 	}
 }
 
@@ -143,8 +151,16 @@ func (w *Watcher) tick(ctx context.Context) {
 			if errors.Is(err, framework.ErrUnsupportedDim) {
 				continue
 			}
-			logger.Logf("watcher: EvolutionFor[%s] error: %v", dim, err)
+			// The role is left out of this tick: its committed version stands.
+			if msg := err.Error(); w.lastErr[dim] != msg {
+				w.lastErr[dim] = msg
+				logger.Logf("watcher: EvolutionFor[%s] error (role kept at its committed version until this clears): %v", dim, err)
+			}
 			continue
+		}
+		if _, failed := w.lastErr[dim]; failed {
+			delete(w.lastErr, dim)
+			logger.Logf("watcher: EvolutionFor[%s] recovered", dim)
 		}
 		hash := sha256Hex(bytes)
 		drifted := w.agent.UpdateCurrentSnapshot(dim, hash)

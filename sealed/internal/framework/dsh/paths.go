@@ -59,14 +59,27 @@ package dsh
 
 import (
 	"fmt"
-	"os"
+
+	"seal-verify/internal/privsep"
 )
 
 var dshHome = "/root/.dsh"
 
-// ensureDir creates a managed directory (and parents) if absent.
+// ensureDir creates a managed directory (and parents) if absent, without
+// following links (internal/privsep).
 func ensureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := privsep.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// ensureRoleDir makes dir, inside dshHome, a real directory: Restore is
+// authoritative over the shape of the role directories, so a link or file
+// the agent left where one belongs is replaced (privsep.EnsureDir), never
+// followed, and cannot keep the agent from booting.
+func ensureRoleDir(dir string) error {
+	if err := privsep.EnsureDir(dshHome, dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	return nil
