@@ -62,9 +62,10 @@ How the implementation maintains this:
 |---|---|
 | Host can't read container memory | TDX hardware memory encryption + attestation |
 | Disk persistence is encrypted at rest | `agent_seal_priv` is never written to disk in plaintext; provisioned to memory only |
-| Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME`, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
-| No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes |
-| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go:159-167`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in an envelope signed by a TappRegistry-registered sandbox node key. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:206-221`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
+| Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME` — the agent's own home, `/home/agent` —, `OPENCLAW_STATE_DIR` and `OPENCLAW_HOME` — the framework tree's absolute path and its parent, not secret —, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
+| Storage uploads keep it in-process | `dataplane.Upload` uploads through the 0g-storage-client Go SDK inside sealed (`internal/dataplane/upload.go`) and builds the SDK's transaction signer from the key sealed already holds, so the key is never handed to a child process — not in an argument list (`/proc/<pid>/cmdline` is readable by every local user, the de-privileged agent included), an environment, a descriptor or a file. The blob goes to the SDK from memory (no temp file). Once its upload has ended (abandoned at the 90s deadline, say), the SDK can no longer sign or send a transaction with the key: that signer refuses, and so does the fullnode client, on every provider retry; only a send already on the wire at that moment can still reach the node, as one could when the CLI was killed at the deadline. The cost is footprint and fault isolation. The SDK links some 360 more non-standard packages into this process (most of them go-ethereum's node stack; details in `QUIRKS.md`), and through them the standard library's `net/http/pprof` and `expvar` (see the next row); `TestLinkedPackages_Reviewed` pins both the non-standard packages and the standard-library packages they import directly. And an upload now shares sealed's process: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (PID 1), and with it the container and the agent, where it used to end one CLI run (`runBounded` recovers only the goroutine that calls the SDK; see `QUIRKS.md`). The pinned SDK also leaves a goroutine blocked for good behind each submission of a blob over 2 MiB that reverts or whose receipt query fails, which a CLI run took with it when it exited; `Upload` caps how many can pile up (`QUIRKS.md`). The 0g-storage-client CLI is still run, through `privsep.RootCommand` (resolved only in root-only `PATH` directories), for downloads, which involve no key; the images that build it install it at `/usr/local/bin` (`Dockerfile`, `images/{hermes,prime,dsh,sealed}`; the base image `images/openclaw` carries none). Pinned by the `internal/dataplane` tests: `Upload` starts no child process (a source check that nothing on the upload path names a process-starting API, `internal/privsep`'s command builders included; and the root-side guard lists no binary for `Upload`), the dependencies whose source names a process-starting API are a reviewed set, the SDK wiring matches the CLI's, and signing and sending stop with the upload |
+| No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes. Nor are profiles or process variables served: the `/debug/pprof/*` and `/debug/vars` routes that linked libraries (`net/http/pprof`, `expvar`) register on `http.DefaultServeMux` at init are dropped at start, by replacing that mux (`defaultmux.go`) |
+| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go:180-188`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in an envelope signed by a TappRegistry-registered sandbox node key. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:227-243`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
 Any future change to sealed that risks crossing this boundary, even
 indirectly (logging priv bytes, exposing them via a debug endpoint,
@@ -280,7 +281,7 @@ When a Sealed container boots:
    the private half as the `SANDBOX_SEAL_KEY` env var. The container does
    **not** generate it: Phase 0 only checks that the injected key derives
    the compressed `pubkey` inside the signed attestation envelope, and
-   fails loud on a mismatch (`internal/config/config.go:159-167`). The
+   fails loud on a mismatch (`internal/config/config.go:180-188`). The
    container never learns the pubkey independently either — it forwards
    the one the envelope carries (`internal/provision/provision.go:58-65`).
 2. 0g-Sandbox observes the container's startup, measures its
@@ -655,8 +656,231 @@ exposed over the network** — sandbox owners cannot post to it directly
 from outside. The uid split also makes the key-exfiltration half of
 doctrine refusals 2/4 kernel-enforced: a de-privileged agent process
 cannot ptrace sealed, read `/proc/<sealed pid>/mem`, or read PID 1's
-bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`). This is
-analogous to how
+bootstrap environment (sealed also sets `PR_SET_DUMPABLE=0`). sealed
+also sets `no_new_privs` on itself, which every process it starts inherits:
+an exec in the agent's processes never grants privileges, so a setuid-root
+binary in the image (`su`, `mount`, `passwd`, ...) runs with the agent's
+uid, and the split does not depend on each such binary being free of a
+local privilege escalation (`privsep.HardenSelf`; `Required` refuses until
+it is set).
+
+The uid split is fail-closed: when it is unavailable (sealed not root, or
+the image has no `agent` account with its own non-root uid and gid) sealed
+refuses to provision `agent_seal_priv` (`privsep.Required`) — the on-chain
+image whitelist pins hashes, not build contents, and cannot catch an image
+whose Dockerfile lost or broke that account. What the gate guarantees is
+deliberately narrow: in a container that holds the key, the framework never
+*runs* as sealed's uid. The gate also requires root's home to be root-only
+and the agent's own home to be in place (`privsep.SecureHome` and
+`privsep.PrepareAgentHome`, below).
+
+Because the agent process is untrusted input to everything sealed does as
+root afterwards, root-side handling of agent-writable paths follows four
+invariants (`internal/privsep`):
+
+- **Homes.** `/root` stays `root:root 0711` with no POSIX ACL, enforced at
+  boot (`SecureHome`, run by `privsep.Harden`; a default ACL left on it
+  would hand what root later creates there to whoever it names). The agent
+  has a home of its own,
+  `/home/agent` (`agent:agent 0700`, created at boot by `PrepareAgentHome`;
+  neither it nor `/home` may be a link): it is `HOME` for everything the
+  agent runs and the default working directory of `AgentCommand`, so tool
+  caches and configuration (`~/.npm`, `~/.cache`, `~/.config`, `~/.local`,
+  `~/.gitconfig`, ...) and the agent's own files live there. (The prime and
+  dsh bridges deliberately start in their framework tree instead, so
+  relative paths of the tools they run resolve inside that tree.)
+  `Required` refuses until both homes are in place. Inside `/root` the
+  agent owns only its framework trees (`OwnTree`; for prime also
+  `/root/.prime-conversation` and the per-session harness directory
+  `/root/.prime-session`), each linked into its home (`~/.openclaw`,
+  `~/.hermes`, `~/.dsh`, `~/.prime/agent`; `LinkAgentHome`) so the paths it
+  is told about keep working. Each framework is also given its tree's
+  absolute path in its environment (`OPENCLAW_STATE_DIR`, `HERMES_HOME`,
+  `DSH_HOME`, `PRIME_AGENT_CODING_AGENT_DIR`; openclaw also gets
+  `OPENCLAW_HOME=/root`, from which it derives its default workspace and,
+  in 2026.5.x, its exec approvals file — QUIRKS.md), so a link the agent
+  removes or replaces never points the framework's config, state or
+  workspace at another tree, and sealed's own code uses the absolute
+  `/root/...` paths and never resolves those links. The link is not only
+  the agent's convenience, though: a few openclaw plugins take their
+  default locations from `HOME` and reach the tree through it —
+  memory-wiki's default vault, which the render therefore sets to an
+  absolute path in the tree when the plugin is enabled without one, and
+  the file-transfer audit log, which has no setting (QUIRKS.md); a link
+  the agent removed or replaced only moves those, within what the agent
+  can write anyway. (openclaw core expands `~` — in its config's
+  path-valued keys, in its media tools' paths — from `OPENCLAW_HOME` too,
+  so there `~/x` names `/root/x`, where the agent can create nothing
+  outside its tree; only its read/write/edit tools, the programs the agent
+  runs and those plugin defaults take `~` from `HOME`. The render rewrites
+  the owner's `~/x` and `/root/x` agent paths into the agent's home, and
+  the agent doc says to use absolute paths.) Their
+  names sit in root-owned directories — `/root` itself, or a directory
+  between it and a tree declared deeper inside it (prime's `/root/.prime`),
+  which is root's — so the agent can change what is inside these trees but
+  cannot replace the trees themselves.
+  It never owns root's home, `/`, an ancestor of a PATH directory or of
+  sealed's executable, or anything inside sealed's state directory or the
+  package directory of a binary sealed runs (`guardHandover`). Without
+  write access to `/root` itself the agent cannot plant configuration
+  (`~/.npmrc`, `~/.gitconfig`) or replace toolchains that root's commands
+  pick up from root's home. A container an earlier sealed ran — one that
+  let the agent own `/root` — can still hold entries the agent made there;
+  at boot, after securing `/root` and preparing the agent's home, sealed
+  moves every entry directly in `/root` that another uid could have
+  changed (not root's, writable by others or a group not root's, or
+  carrying a POSIX ACL that lets another uid write it or, on a directory,
+  what root later creates in it), except the framework trees adapters
+  declare (`DeclareTree`), into the agent's home (`ReclaimHome`) — or, for
+  an entry an adapter declares a new place for inside one of its trees
+  (`DeclareRelocation`: prime's legacy session artifacts), there. A
+  directory that only leads to a tree declared deeper inside `/root`
+  (prime's `/root/.prime`) is not moved, which would take the tree along:
+  it is made `root:root 0755` without an ACL, and what else it holds is
+  reclaimed the same way. `Required` refuses to provision while an entry
+  could not be moved or made root's.
+- **Exec.** Root runs no framework CLI: version probes are static reads, and
+  CLIs that read agent-writable state run as the agent (`AgentCommand`),
+  with a deadline and a bound on the output kept (`BoundedOutput`).
+  Toolchain commands that must write root-owned prefixes (npm, git, uv,
+  0g-storage-client) go through `RootCommand`, which resolves binaries only
+  in PATH directories owned by root and writable by nobody else, checks the
+  binary the same way, and gives it an environment sealed fixes: `PATH`
+  (the trusted directories), `HOME=/root` and a root-only `TMPDIR`. The
+  only values taken from sealed's own environment — the container's, which
+  the owner's signed deploy request sets — are proxy endpoints
+  (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, either case). Package registry
+  and index URLs and CA bundle locations are deliberately not passed: the
+  first would let the deploy environment choose the package whose install
+  scripts root runs, the second would name files root's toolchains open by
+  path, possibly inside an agent tree; both come from the image only (its
+  trust store and its toolchains' root-owned configuration). sealed's own
+  process runs as root with that same environment, and the same rule
+  applies to it: at boot, before its first TLS connection (chain RPC, the
+  attestor, the storage indexer, the inference router), it keeps
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` only when they name root-only files,
+  and removes them otherwise (`ScrubTrustEnv`), so the CAs it trusts come
+  from the image; and before its first log line, which is what makes Go
+  read the time zone `TZ` names (a blocking, link-following read), it keeps
+  `TZ` only when it names, or with `TZ` unset `/etc/localtime` is, a
+  root-only zone file Go can load, and sets `TZ=UTC` otherwise
+  (`ScrubTimeEnv`; a zone that loads also keeps Go from falling back to
+  `$GOROOT/lib/time/zoneinfo.zip`). Those, and the proxy endpoints, are the
+  deploy-set variables sealed's own process reads; `ZONEINFO` is read only
+  by `time.LoadLocation`, which sealed does not call. Proxy endpoints apply to sealed's own clients too: a proxy
+  sees which hosts are contacted, but cannot read or alter a TLS connection
+  (an endpoint configured as plain `http` has no such protection, with or
+  without a proxy). The provisioning reply is encrypted to the container's
+  key either way. A root
+  command runs in `/`, or in a directory `RootDir` has checked is
+  root-only, and its callers add to its environment only literal values
+  that name no path, or the values of a helper the root-side guard lists
+  with its reason (`rootEnvHelpers`: openclaw's `installEnv`). The
+  openclaw install also points the package's own install script at a
+  root-only directory (`OPENCLAW_HOME`) and turns off its plugin-registry
+  migration, so a root-run install writes nothing in the agent's tree.
+- **Files.** Every root read, write, chown, chmod, rename or removal inside
+  an agent tree goes through the privsep fs helpers: no link is followed at
+  any path component, and reads open only regular files (the leaf is
+  checked through an `O_PATH` descriptor first, so a FIFO, socket or device
+  is never opened), and never wait on a lease the file's owner holds
+  (`F_SETLEASE`): the open is non-blocking and fails at once with
+  `ErrBusy`. Where taking that for an absent file would lose or replace
+  state, it is not: for a tracked role it is transient (the watcher skips
+  the role for this pass, and the boot seed keeps it at its committed
+  version); an earlier sealed's conversation id or key is migrated on a
+  later turn rather than replaced; and a config render or the prime
+  harness-state restore sets the file aside before writing a fresh one,
+  as it does with a file that does not parse. Elsewhere it degrades only
+  what that read was for, as any unreadable agent file does (a turn's
+  history, the reasoning flags an outage boot would carry over from
+  prime's `models.json`) — nothing the agent could not do by editing the
+  file.
+  `ReadFile` and
+  `ReadTail` are size-bounded; callers of
+  `Open` bound what they read themselves (the openclaw transcript read keeps
+  its last 16 MiB). Writes replace the entry with a fresh regular file
+  instead of opening it, whatever is there: a link is replaced, not
+  followed, and a directory is removed first. Restore is likewise
+  authoritative over the shape of the directories it manages: a link or
+  file the agent left where a role directory belongs is replaced
+  (`EnsureDir`), never followed, so it cannot keep the agent from booting.
+  Content over its size limit is not skipped, which would commit state
+  without it, and it does not hold up anything else either: a manifest
+  entry over its limit — a file over 64 MiB, or a directory entry whose
+  archive would exceed 256 MiB (what sealed, which holds an archive in
+  memory while it commits it, packs; restore still accepts the 4 GiB
+  earlier versions could commit) — is held
+  (`manifest.Held`): that entry keeps its committed version (or, if it was
+  never committed, stays off chain) until it is back under the limit,
+  while every other entry of the role keeps committing. A leaf role over
+  its limit keeps its committed version. Earlier sealed versions committed
+  files of any size, so an agent can come back from chain with such a
+  file; the agent doc states the limit. sealed's own files
+  (overlay record, conversation identities, framework logs, the bootstrap
+  log, and the scratch directories storage downloads and uploads are
+  staged in) live in `framework.StateDir` (`/var/lib/sealed`, root-only),
+  never in the shared `/tmp`.
+- **Processes.** Root-side work does not depend on the agent being stopped:
+  the fs helpers are safe against concurrent changes, and root-run installs
+  touch no agent-writable path. `Stop` therefore ends only the framework's own
+  leftover processes (`privsep.Sweep`, which runs `pkill` as the agent user
+  and so cannot signal root's processes); other processes the agent started,
+  such as a backend it registered over the sign socket, survive a framework
+  restart.
+
+The structural tests in `internal/framework` (`rootside_guard_test.go`)
+scan every non-test source file of the module and fail, outside
+`internal/privsep`, on any reference — a call, or a function used as a
+value — to a path-taking function of `os`, `io/ioutil`, `syscall` or
+`golang.org/x/sys/unix` (for the last two, a set derived from their
+sources: every function with a string parameter except a short list that
+takes none as a path, plus the raw syscall entry points), a `filepath`
+walk, glob or link resolution, an `os/exec` function, a unix-socket listen
+or a `net/http` file server, except the call sites listed in
+`allowedDirectCalls`, each counted and each on a root-only path, and on
+any reference to `golang.org/x/sys/execabs` (`os/exec` under another
+name), `net/http/cgi` (whose handler runs a binary) or `plugin.Open`. They also
+fail on code outside privsep that constructs an `exec.Cmd`,
+`syscall.SysProcAttr`, `syscall.Credential` or `os.ProcAttr` (a literal,
+`new`, or a variable, field or parameter of that type); that references a
+command's `SysProcAttr` or `Credential` at all, for reading or writing
+(`AgentCommand`'s privilege drop lives in `cmd.SysProcAttr.Credential`,
+and each command gets its own copy of it); that assigns a command's
+`Path`, `Args` or `ExtraFiles`, or a working directory outside the agent
+spawns (a root command's goes through `RootDir`); that takes the address
+of a command's `Path`, `Args`, `ExtraFiles`, `Env` or `Dir`, or uses its
+`Args`, `Env` or `ExtraFiles` as a value other than in
+`x.F = append(x.F, ...)` (a copy shares the command's array, so a write
+through either would go unseen); that hands a command to anything but the
+module's own code taking it as a command — a function outside the module
+(a reflection-based decoder such as `json.Unmarshal` sets its fields), an
+interface, a function value; that uses `unsafe`, or `reflect` beyond
+`reflect.DeepEqual`. These rules see types: every package is type-checked
+against the real `os/exec`, so a field is a command's wherever the command
+came from (a helper's result, a struct field) and whatever the file
+imports, and only a receiver the check cannot type is judged by the
+field's name; `TestRootSideGuardFlagsEveryForbiddenShape` runs them over
+planted code, one forbidden shape each. They also fail on a dot-import of a
+package they inspect; on a `RootCommand` outside the functions and
+binaries they pin, or used as a value; on a framework spawn or CLI not
+started through `AgentCommand`; on an adapter that does not link its tree
+into the agent's home, does not declare the trees it hands over
+(`DeclareTree`) or does not sweep in `Stop`; and on a `main` that no
+longer runs `privsep.Harden` after registering the adapters and before the
+provisioning gate, or that logs before it. They are static checks: they pin how the code is
+written, not what a binary does at run time. The tests that exercise the
+boundary itself (privilege drops, chowns, sweeps) need root and are run as
+described in `AGENTS.md`.
+
+**Uploads keep the key in-process.** The `0g-storage-client upload` CLI
+takes the key only as its `--key` argument, which `/proc` shows to every uid
+in the container. So `dataplane.Upload` does not run it: it uploads through
+the client's Go SDK inside sealed (`internal/dataplane/upload.go`; the table
+above), and the key-isolation claim holds during uploads too. Downloads
+still run the CLI, through `privsep.RootCommand`, and carry no key.
+
+Signing over the socket is analogous to how
 `eth_signTransaction` and
 `personal_sign` work in any wallet: the wallet attests *who signed*,
 not *that the content is correct*. agentSeal is no different; it just

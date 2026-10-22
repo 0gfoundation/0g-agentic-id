@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -506,5 +507,18 @@ func TestHandleLegacy_SettingsYAML_PickIsDeterministic(t *testing.T) {
 		if doc.Provider != "0g-compute" || doc.Model != "glm-5.3" {
 			t.Fatalf("run %d recovered %+v; the pick must not depend on map order", i, doc)
 		}
+	}
+}
+
+// The bridge declares SEAL_MODEL_MAX_TOKENS as the model's maxTokens, which
+// pi-ai sends as max_completion_tokens on every request. glm-5.3's catalog
+// budget (131072) must reach it capped, not raw.
+func TestRenderSettings_CatalogBudgetIsCappedForTheBridge(t *testing.T) {
+	m := reasoningModel("glm-5.3")
+	m["max_completion_tokens"] = 131072
+	catalogServer(t, m)
+	env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"})
+	if got, want := env["SEAL_MODEL_MAX_TOKENS"], strconv.Itoa(settings.RequestOutputCeiling); got != want {
+		t.Errorf("SEAL_MODEL_MAX_TOKENS = %q, want %q (catalog 131072, capped)", got, want)
 	}
 }

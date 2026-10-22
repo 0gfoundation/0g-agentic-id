@@ -5,8 +5,10 @@
 //  2. UnsealDataKey(sealedKey, agentSealPriv) -> data_key
 //  3. Decrypt(ciphertext, data_key) -> plaintext
 //
-// Phase 4 (uploader) will reuse SealDataKey and Encrypt for the symmetric
-// outbound flow.
+// The uploader reuses SealDataKey, Encrypt and Upload for the symmetric
+// outbound flow. Download runs the `0g-storage-client` CLI (no key
+// involved); Upload runs in-process through the same client's Go SDK
+// (upload.go), so the signing key never leaves sealed.
 package dataplane
 
 import (
@@ -14,17 +16,16 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"encoding/hex"
 	"fmt"
-	"os"
-	"os/exec"
-	"regexp"
+	"io"
+	"path/filepath"
 	"strings"
 	"time"
 
 	eciesgo "github.com/ecies/go/v2"
 
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 const downloadAttempts = 10
@@ -110,103 +111,57 @@ func NewDataKey() ([]byte, error) {
 	return k, nil
 }
 
-// rootLineRegexp matches the CLI's success line: "file uploaded, root = 0x..."
-// Logged by /root/go/pkg/mod/github.com/0gfoundation/0g-storage-client/cmd/upload.go.
-var rootLineRegexp = regexp.MustCompile(`root\s*=\s*(0x[0-9a-fA-F]{64})`)
-
-// perUploadTimeout bounds a single `0g-storage-client upload` invocation.
-// 90s is generous for testnet conditions (typical successful uploads
-// land in ~10s) while still tight enough to surface a genuinely hung
-// CLI. The cap lives here — not on the surrounding Apply — so the cost
-// of one slow blob doesn't eat the budget of the other entries in the
-// same manifest.
-const perUploadTimeout = 90 * time.Second
-
-// Upload pushes ciphertext to 0g-storage and returns the storage root
-// hash. The root is what gets recorded as IntelligentData.dataHash on
-// chain. signerPrivHex is the hex-encoded (with or without 0x prefix)
-// agent_seal_priv -- it signs the storage submission tx and pays gas.
-//
-// Runs the `0g-storage-client upload` CLI in a subprocess (rather than the
-// Go SDK in-process) so that any SDK panic, logrus.Fatal, or OOM stays
-// contained -- the sealed binary keeps serving /healthz + /log even when
-// the upload itself fails. Matches the Download path, which has always
-// shelled out to the same binary.
-func Upload(
-	ctx context.Context,
-	ciphertext []byte,
-	indexerURL string,
-	rpcURL string,
-	signerPrivHex string,
-) ([32]byte, error) {
-	signerPrivHex = strings.TrimPrefix(signerPrivHex, "0x")
-
-	// Per-blob deadline. Inherits the caller's ctx so an Apply-level
-	// cancel still propagates, but caps this single subprocess at
-	// perUploadTimeout so a stuck CLI is bounded even when the parent
-	// context is effectively unbounded (uploader.Apply runs without a
-	// top-level timeout since sealed/main.go's drift loop).
-	uploadCtx, cancel := context.WithTimeout(ctx, perUploadTimeout)
-	defer cancel()
-
-	tmp, err := os.CreateTemp("", "0g-upload-*.bin")
+// Download fetches a blob from 0g-storage by content root hash and returns
+// its bytes. The CLI writes to a path (and a "<path>.download" partial next
+// to it), so the blob is staged in a fresh root-only scratch directory
+// (privsep.TempDir) — no other uid can create, replace or read a name in it
+// while the CLI runs — read back without following links, and the directory
+// removed. Every root-side download (bootstrap and the uploader) goes
+// through here.
+func Download(ctx context.Context, root, indexer string) ([]byte, error) {
+	dir, err := privsep.TempDir("download-")
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("create tempfile: %w", err)
+		return nil, fmt.Errorf("download scratch dir: %w", err)
 	}
-	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmp.Write(ciphertext); err != nil {
-		tmp.Close()
-		return [32]byte{}, fmt.Errorf("write tempfile: %w", err)
+	defer removeScratch(dir)
+	outPath := filepath.Join(dir, "blob.bin")
+	if err := downloadTo(ctx, root, indexer, outPath); err != nil {
+		return nil, err
 	}
-	if err := tmp.Close(); err != nil {
-		return [32]byte{}, fmt.Errorf("close tempfile: %w", err)
-	}
-
-	// Flags match cmd/upload.go defaults except where pinned:
-	//   --expected-replica 1   small payload, single replica is fine
-	//   --skip-tx              skip flow tx submission if already submitted
-	//   --fast-mode            small-file fast path (CLI default true)
-	//   --full-trusted         use trusted nodes (CLI default true)
-	//   --method random        avoid shard.Select empty-method bug
-	cmd := exec.CommandContext(uploadCtx, "0g-storage-client", "upload",
-		"--file", tmpPath,
-		"--indexer", indexerURL,
-		"--url", rpcURL,
-		"--key", signerPrivHex,
-		"--expected-replica", "1",
-		"--skip-tx", "true",
-		"--fast-mode", "true",
-		"--full-trusted", "true",
-		"--method", "random",
-	)
-	out, err := cmd.CombinedOutput()
+	f, err := privsep.Open(outPath)
 	if err != nil {
-		return [32]byte{}, fmt.Errorf("upload cmd: %v: %s", err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("read downloaded blob: %w", err)
 	}
-
-	m := rootLineRegexp.FindSubmatch(out)
-	if len(m) < 2 {
-		return [32]byte{}, fmt.Errorf("could not parse root from CLI output: %s", strings.TrimSpace(string(out)))
+	defer f.Close()
+	body, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read downloaded blob: %w", err)
 	}
-	rootHex := strings.TrimPrefix(string(m[1]), "0x")
-	rootBytes, err := hex.DecodeString(rootHex)
-	if err != nil || len(rootBytes) != 32 {
-		return [32]byte{}, fmt.Errorf("invalid root hex %q: %v", rootHex, err)
-	}
-	var root [32]byte
-	copy(root[:], rootBytes)
-	logger.Logf("0g-storage upload OK: root=0x%s size=%dB", rootHex, len(ciphertext))
-	return root, nil
+	return body, nil
 }
 
-// Download fetches a file from 0g-storage by content root hash, writing to
-// outPath. Implements exponential backoff (1s, 2s, 4s, ..., capped 60s) for
-// up to 10 attempts.
+// removeScratch removes a scratch directory made by privsep.TempDir.
+func removeScratch(dir string) {
+	if err := privsep.RemoveAll(dir); err != nil {
+		logger.Logf("dataplane: removing scratch %s: %v", dir, err)
+	}
+}
+
+// downloadTo runs the CLI download into outPath with exponential backoff
+// (1s, 2s, 4s, ..., capped 60s) for up to 10 attempts.
+//
+// The 0g-storage-client CLI is what sealed runs for downloads only (no key
+// involved; uploads run in-process, upload.go). The images that build it
+// (sealed/Dockerfile, images/{hermes,prime,dsh,sealed}) install it at
+// /usr/local/bin, root-owned, at the SDK version pinned in sealed/go.mod;
+// the base image images/openclaw does not carry it, so an image built from
+// it alone fails every download. It runs through
+// privsep.RootCommand, which resolves it only in root-only PATH directories
+// and gives it a fixed environment.
 //
 // The 0g-storage-client binary refuses to overwrite existing files, so any
 // leftover at outPath from a previous failed attempt is removed first.
-func Download(ctx context.Context, root, indexer, outPath string) error {
+func downloadTo(ctx context.Context, root, indexer, outPath string) error {
 	var lastErr error
 	for i := 0; i < downloadAttempts; i++ {
 		if i > 0 {
@@ -220,9 +175,12 @@ func Download(ctx context.Context, root, indexer, outPath string) error {
 			case <-time.After(time.Duration(delay) * time.Second):
 			}
 		}
-		_ = os.Remove(outPath)
-		cmd := exec.CommandContext(ctx, "0g-storage-client", "download",
+		_ = privsep.Remove(outPath)
+		cmd, err := privsep.RootCommand(ctx, "0g-storage-client", "download",
 			"--root", root, "--file", outPath, "--indexer", indexer)
+		if err != nil {
+			return fmt.Errorf("download cmd: %w", err)
+		}
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			return nil

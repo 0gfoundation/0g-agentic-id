@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/platform"
 )
@@ -73,7 +74,8 @@ func TestEvoSoulMDNoMarkerNoOp(t *testing.T) {
 // The agent ACTS on FrameworkFacts text, so the config.yaml note has to match
 // what RenderSettings does. It used to say the file is "rendered from your
 // owner's settings at every boot, so edits to it do not survive a restart" —
-// false: the render rewrites five keys and leaves the rest of the file alone,
+// false: the render rewrites the keys it owns (five, and model.max_tokens
+// when the catalog gives a budget) and leaves the rest of the file alone,
 // so the agent was being told its own edits there are futile when most of
 // them are not. This pins both halves of the corrected claim.
 func TestConfigYAMLNoteMatchesWhatTheRenderDoes(t *testing.T) {
@@ -91,7 +93,7 @@ func TestConfigYAMLNoteMatchesWhatTheRenderDoes(t *testing.T) {
 	// Half one: the keys the render really owns are named.
 	for _, key := range []string{
 		"model.default", "model.provider", "model.base_url", "model.api_key",
-		"agent.reasoning_effort",
+		"agent.reasoning_effort", "model.max_tokens",
 	} {
 		if !strings.Contains(note, key) {
 			t.Errorf("config.yaml note does not name platform-owned key %q:\n%s", key, note)
@@ -111,5 +113,26 @@ func TestConfigYAMLNoteMatchesWhatTheRenderDoes(t *testing.T) {
 	}
 	if got := modelSection(t)["temperature"]; got != 0.3 {
 		t.Errorf("note promises unnamed keys survive, but model.temperature was dropped: %v", got)
+	}
+}
+
+// hermes attaches a MEDIA: file to a reply only when it is not under a
+// denylisted prefix — /root among them — unless that prefix is the running
+// user's HOME, with its cache directories allowlisted ahead of the denylist
+// (validate_media_delivery_path, gateway/platforms/base.py). The gateway
+// runs with the agent's own HOME and the tree under /root, so a file the
+// agent writes elsewhere under ~/.hermes is not delivered: the agent doc
+// must say where deliverable files go (QUIRKS.md).
+func TestMediaDeliveryNoteMatchesTheHomes(t *testing.T) {
+	for _, kv := range gatewayEnv("", "", "k", framework.RuntimeContext{}) {
+		if strings.HasPrefix(kv, "HERMES_MEDIA_ALLOW_DIRS=") {
+			t.Fatalf("gateway env sets %s: an allowed root is checked before the denylist, so the tree's credential files would become deliverable", kv)
+		}
+	}
+	note := strings.Join(New().FrameworkFacts().Notes, "\n")
+	for _, want := range []string{"MEDIA:", "/home/agent", "/tmp", "~/.hermes/cache/images/", "/root"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("FrameworkFacts().Notes say nothing of %q: %q", want, note)
+		}
 	}
 }

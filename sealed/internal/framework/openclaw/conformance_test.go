@@ -14,6 +14,7 @@ import (
 // adapter's whitelistMax.
 func TestFrameworkBindingEmptyVersionResolvesToWhitelistMax(t *testing.T) {
 	openclawHome = t.TempDir()
+	isolateState(t)
 	oldProbe := probeOpenclawVersion
 	probeOpenclawVersion = func(context.Context) string { return "" }
 	t.Cleanup(func() { probeOpenclawVersion = oldProbe })
@@ -41,6 +42,7 @@ func TestConformance(t *testing.T) {
 	conformance.Run(t, conformance.Config{
 		New: func(t *testing.T) framework.Framework {
 			openclawHome = t.TempDir()
+			isolateState(t)
 			// Stub the CLI probe: a real openclaw on the dev machine's
 			// PATH would override the binding's package_version and make
 			// round-trips environment-dependent.

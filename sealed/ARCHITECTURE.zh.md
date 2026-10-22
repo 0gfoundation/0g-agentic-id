@@ -13,7 +13,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 |---|---|
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
-| 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 上传下载 |
+| 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载，通过同一 client 的 Go SDK 在进程内上传（`internal/dataplane/upload.go`），签名密钥从不离开 sealed |
 | agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:115-118`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
@@ -22,14 +22,47 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 
 `main.go` 的 5 个 phase 严格按顺序走。某个 phase 失败**不会**把容器带下去：
 `runMainPipeline` 记日志、上报 attestor、然后返回，`:8080` 继续服务
-`/healthz` 和 `/log` 供诊断（`main.go:176-181`）。两个 listener —— 对外
+`/healthz` 和 `/log` 供诊断（`main.go:209-211`）。两个 listener —— 对外
 `:8080` mux 和 `/run/seal-sign.sock` unix socket —— 在 Phase 1 **之前**就已经
 起来了；在 `agent_seal_priv` 落进 `state.Agent` 之前，handler 一律回 503
-（`main.go:146-148`）。
+（`main.go:156-158`）。
+
+Phase 0 和 Phase 1 之间有一道闸：`provisionGate`（`main.go:186-207`）。
+`ATTESTOR_URL` 或链相关 env 没设（本地开发）时它跳过整条流水线；
+`privsep.Required` 失败时它**拒绝**流水线 —— sealed 不是 root，或者镜像里没有
+一个拥有自己非 root uid/gid 的 `agent` 账户，或者 `/root` 无法被收紧为不带
+POSIX ACL 的 `root:root 0711`（`privsep.SecureHome`），或者 agent 自己的家目录
+`/home/agent` 无法创建（`privsep.PrepareAgentHome`），或者 `/root` 里仍有可能被
+其他 uid 改过的条目（早先让 agent 拥有 `/root` 的 sealed 留下的）而无法移走或
+改为 root 所有（`privsep.ReclaimHome`），或者无法给 sealed 设置 `no_new_privs`（它启动的每个
+进程都会继承；`privsep.HardenSelf`；这四步都在启动时由 `privsep.Harden` 执行，
+全部成功之前 `Required` 一律拒绝）—— 所以
+`agent_seal_priv` 永远不会被取进一个框架会以 sealed 的 uid 运行、或能替换 root
+从其家目录运行之物的容器。这种拒绝比某个 phase 失败更安静：
+只记日志（`/log` 里一行 `FAIL`，写明原因和修法）。attestor 那边收不到任何上报，
+因为 `/status` 要用的正是这次启动拒绝去取的那把密钥签名；改由 attestor 的
+provision 超时扫描兜底：sandbox 创建或重建后 `PROVISION_TIMEOUT`（5 分钟）内
+`/provision` 没来，扫描就会接手
+（`attestor/crates/worker/src/jobs.rs:21`、
+`attestor/crates/worker/src/main.rs:166-189`）。扫描把 `container_stage` 置为
+`Failed`（原因 `provision timeout`），于是这条部署显示为 `offline`，而不是
+`failed`：`failed` 指部署本身没走完（存储或 mint 失败），而存储和 mint 都已落地
+的部署出了容器故障，显示的是 `offline`
+（`attestor/crates/shared/src/types.rs`（`derive_phase`））。在同一个镜像上重新
+上线只会再被拒一次。补救是换一个修好的镜像（修法就是那行 `FAIL` 写的），再在它上面
+全新创建一次 —— 上线（`/start` 带 `create` 信封）或 `/reset`。
 
 ```
 Phase 0  attest           解析环境、校验 SANDBOX_SEAL_KEY ↔ attestation.pubkey、
                           恢复 TEE signer (TEE_SIGNER_ADDRESS 校验若设了的话)
+                          ↓
+gate     privsep          privsep.Required：框架将以 `agent` 用户运行、/root 仅
+                          root 可写（SecureHome）且没有其他 uid 能改的条目
+                          （ReclaimHome）、/home/agent 已就位
+                          （PrepareAgentHome）、no_new_privs 已设置
+                          （HardenSelf），否则记一行 FAIL（原因 + 修法）
+                          就停 —— 没有密钥、不发 /status；
+                          由 attestor 的 provision 超时扫描把它标为 `offline`
                           ↓
 Phase 1  provision        POST /provision → 用同一把容器密钥 ECIES 解出响应里的
                           两份载荷：
@@ -95,7 +128,7 @@ attestor 只把它当不透明字节存和发 —— 不解析、不校验、不
 `Reload`、崩溃重启一视同仁（`internal/manager/manager.go:168`、`:209`、`:336`）。
 `main.go` 把它接到
 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`
-（`main.go:694-696`）。
+（`main.go:762-764`）。
 
 之所以做成 hook 而不是 `RuntimeContext` 上的一个字段：`RuntimeContext` 在首次
 `Start` 时被捕获一次、之后每次重启原样回放，所以搭在它上面的东西在容器整个生命期
@@ -105,12 +138,12 @@ thinking level 就这么翻过车，它当年正是搭 `RuntimeContext.OwnerThin
 字段了；level 住在 settings document 里，`settings.Resolve` 在每次渲染时重算这个
 bound。（prime 的 bridge 仍然**收到**一个同名 env var —— 那是 bridge 自己的契约
 —— 但变的只是值的来源，从 deploy envelope 变成了 document：
-`internal/framework/prime/spawn.go:362-376`。）
+`internal/framework/prime/spawn.go:492-505`。）
 
 每次 spawn 都重渲染还白捡一个老办法给不了的性质：配置文件会自愈。那些字节归平台
 所有，所以被 agent 写坏的文件会在下一次 Start 时重建，而不是让 agent 一直起不来、
 非得有人 reset 容器
-（`internal/framework/openclaw/inference.go:83-101`）。
+（`internal/framework/openclaw/inference.go:95-138`）。
 
 ## 2. 包结构
 
@@ -119,10 +152,13 @@ sealed/
 ├── main.go                       入口；编排上面 5 个 phase + heartbeat + handleDrift
 ├── status.go                     runtimeStatus 单点真源（running/warning/error）+
 │                                 severityOf 错误分类器；handleDrift + heartbeat 都读它
+├── defaultmux.go                 init 时替换 http.DefaultServeMux，丢掉被链接进来的库
+│                                 在上面注册的 /debug 路由
 ├── internal/
 │   ├── config/                   env 解析、运行参数
 │   ├── chain/                    AgenticID 合约 view + tx 包装
-│   ├── dataplane/                ECIES 解 sealedKey + AES-GCM 解/加密 iData
+│   ├── dataplane/                ECIES 解 sealedKey + AES-GCM 解/加密 iData +
+│   │                             0g-storage Download（CLI）/ Upload（进程内 Go SDK）
 │   ├── provision/                /provision RA 请求 + 响应解封装
 │   ├── report/                   /status 上报到 attestor
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
@@ -155,8 +191,8 @@ sealed/
 
 ### 各包职责一句话
 
-- **chain**：所有链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）
-- **dataplane**：crypto-only，不碰链、不碰文件。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`
+- **chain**：所有 AgenticID 链 view / tx 在这里收口，外面拿不到 `*ethclient.Client`，只能拿语义 API（`WaitForMint` / `IntelligentDatasOf` / `Update` 等）。唯一在别处发出的交易是 0G 存储的 flow 提交，由 `dataplane.Upload` 通过存储 SDK 发出
+- **dataplane**：iData 加解密 + 0g-storage 传输；不调用 AgenticID。`UnsealDataKey(sealed, priv) → dataKey`、`Decrypt(ct, key)`、`Encrypt(pt, key)`；`Download` 经 `privsep.RootCommand` 跑 `0g-storage-client download`（只在仅 root 可写的 `PATH` 目录中解析；由 `Dockerfile` 和 `images/{hermes,prime,dsh,sealed}` 按 `go.mod` 里钉住的 SDK 版本安装到 `/usr/local/bin`），输出写进仅 root 可访问的临时目录；`Upload` 通过同一 client 的 Go SDK 在进程内上传，并自己提交 0G 存储的 flow 交易（SDK 连 `CHAIN_RPC_URL`），用 sealed 持有的 agent_seal 密钥签名 —— 不起子进程、不写临时文件 —— 每个 blob 上限 90s。上传与 sealed 共用进程，因此没有隔离：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（见 `QUIRKS.md`）
 - **framework**：定义 `Framework` 接口（adapter 协议）+ `RuntimeContext` + `RoleSpec{Name, Shape}` + 共享类型如 `StartParams`、`StartResult`。**不依赖具体框架**
 - **settings**：`Doc`（provider / model / thinking / 一段不透明的 per-framework overlay）是 owner 的 document，也是唯一被持久化的那一半；`Resolved` 再加上平台在 Start 时算出来的部分 —— endpoint、输出预算、模型吃不吃 reasoning bound —— 哪儿都不存，因为存下来的副本会过期、然后跟算出来的值打架（`settings.go:10-15`）
 - **framework/openclaw**：参考 adapter 实现。又内部拆成 `restore.go`/`restore_paths.go`、`evolution.go`/`evolution_paths.go`、`spawn.go`、`ingest.go`（persona legacy）、`inference.go`（`RenderSettings`：owner 的 document → openclaw.json）、`disk.go`（openclaw.json read/write）、`whitelist.go`（npm 版本白名单）、`identitymd.go`/`soulmd.go`/`toolsmd.go`（IDENTITY/SOUL/TOOLS 三份 sealed-managed 平台段 + 共享 marker 工具）
@@ -233,7 +269,7 @@ type Framework interface {
 平台为这次开机算出来的部分 —— 把它放到那个框架自己读配置的地方：openclaw 和
 hermes 是配置文件，prime 和 dsh 是 bridge 进程的环境变量。（prime 还会额外渲染一份
 `models.json` —— 那是产物，不是 role：它用的 SDK 没有 0G router 的内置 provider，
-而且没有任何环境变量能把内置 provider 重定向到别的端点，`prime/modelsjson.go:38-48`。）
+而且没有任何环境变量能把内置 provider 重定向到别的端点，`prime/modelsjson.go:47-55`。）
 这是整条配置通道里唯一没法共用的一段，因为只有 adapter 知道自己的方言。平台依赖
 它的两条规则（`framework.go:159-180`）：
 
@@ -342,7 +378,7 @@ model 选择十秒钟就能重挑一次。是这个不对称性、而不是"它�
 - **链上跟踪配置文件等于给派生产物下锚。** 每次开机都从 mint 时的副本还原，所以
   agent 铸出来之后才发的修复 —— bounded reasoning、按 catalog 来的输出预算、模型
   idle timeout —— 永远到不了那个 agent。改成每次 Start 从 owner 的 document 渲染，
-  修复下一次开机就落地（`internal/framework/openclaw/inference.go:18-30`）。
+  修复下一次开机就落地（`internal/framework/openclaw/inference.go:28-44`）。
 - **不再捕获，就没有什么要脱敏、也没有什么要补。** 各 adapter 的 config-key
   allowlist、两份 `stripSecrets`、`healOpenclawConfig` 和 `backfillMaxTokens` 全部
   直接删掉。它们的存在要么是为了让"捕获配置文件"这件事安全，要么是为了修补已经被
@@ -391,13 +427,13 @@ internal/framework/openclaw/
 ├── config.go            in-memory state（只保留 framework binding 3 字段，其余走盘）
 ├── restore.go           dispatch；framework leaf 的 Restore
 ├── restore_paths.go     workspace/* 的 Restore 实现 + LoadEntry/RestoreEntry
-├── evolution.go         dispatch；framework leaf 的 EvolutionFor（probe `openclaw --version`）
+├── evolution.go         dispatch；framework leaf 的 EvolutionFor（静态版本探测）
 ├── evolution_paths.go   workspace/* 的 EvolutionFor 实现 + 平台注入 strip
 ├── ingest.go            HandleLegacy[persona]：把老 mint-only persona 翻成新 auth/agents 字段
 ├── inference.go         RenderSettings：owner 的 settings document → openclaw.json（先 owner
 │                        overlay、平台键写在上面）+ applied-overlay 记录 + 坏文件重建
 ├── spawn.go             writeRuntimeSections + upsert IDENTITY/SOUL/TOOLS sealed 段 +
-│                        spawn `openclaw gateway run` + version probe
+│                        spawn `openclaw gateway run`（以 agent 用户）+ 静态版本探测
 ├── disk.go              ~/.openclaw/openclaw.json 读写（现在是渲染目标，不是 role）
 ├── identitymd.go        IDENTITY.md 的 sealed 段：agentSeal 身份事实 + 信任链
 ├── soulmd.go            SOUL.md sealed 段的投递层（只做 marker I/O——主权宣言 /
@@ -409,7 +445,7 @@ internal/framework/openclaw/
 └── paths.go             写死的 /root/.openclaw/* 路径常量（var 只为让测试重定向）
 ```
 
-**4 个 declared role**（`openclaw.go:146`）：
+**4 个 declared role**（`openclaw.go:164`）：
 
 | Name | Shape | EvolutionFor 内容 |
 |---|---|---|
@@ -423,30 +459,30 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 
 | Adapter | declared roles | 退役的 config role |
 |---|---|---|
-| openclaw（`openclaw.go:146`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
-| hermes（`hermes.go:121`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
-| prime-agent（`prime.go:135`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
-| dsh（`dsh.go:145`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
+| openclaw（`openclaw.go:164`） | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `openclaw.json` |
+| hermes（`hermes.go:143`） | `framework`、`SOUL.md`、`memories/`、`skills/` | `config.yaml` |
+| prime-agent（`prime.go:162`） | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `models.json` |
+| dsh（`dsh.go:153`） | `framework`、`APPEND_SYSTEM.md`、`skills/` | `settings.yaml` |
 
 四个都收敛成同一个形状 —— *binding + persona + memory + skills* —— 这个形状以前被
 各框架的配置文件挡住了。
 
 **settings 通道之前铸出来的 agent 怎么迁移。** 它们的 pin 落在一个已经没有 adapter
 声明的链上 role 里，所以 bootstrap 的 Phase C 把它交给 `HandleLegacy`
-（`main.go:572-581`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:321`）
+（`main.go:638-647`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:403`）
 是 adapter 把恢复出来的东西交还给平台的方式，平台再用 `report.SeedSettings` 在
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删
 掉 —— 到那时 pin 还没被读出来存下，它就没了，而 prime 和 dsh 没有 pin 都会 hard-fail
-`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:325`），另外三个
+`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:366`），另外三个
 把自己退役的 role 当未知 legacy role 记一条日志就忽略。见
 [CONFIG_SURFACE.zh.md](CONFIG_SURFACE.zh.md) §10。
 
 设计取舍：
 
-- **openclaw.json 是渲染产物，不是被捕获的资产**：`RenderSettings` 先合并 owner 那段不透明 overlay，再把平台自己的键写在上面，openclaw 自己的记账键（`logging`/`wizard`/`discovery`/`push`/`cli`）原样留着 —— 它是在改这个文件，不是重新生成。因为已经没人对这个文件算 hash，当年为了不让那些键被当成 phantom drift 而存在的 config-key allowlist 也一并删了。文件坏了会被挪走并在下一次渲染时重建，这就是渲染自愈的由来（`inference.go:83-101`）。
+- **openclaw.json 是渲染产物，不是被捕获的资产**：`RenderSettings` 先合并 owner 那段不透明 overlay，再把平台自己的键写在上面，openclaw 自己的记账键（`logging`/`wizard`/`discovery`/`push`/`cli`）原样留着 —— 它是在改这个文件，不是重新生成。因为已经没人对这个文件算 hash，当年为了不让那些键被当成 phantom drift 而存在的 config-key allowlist 也一并删了。文件坏了会被挪走并在下一次渲染时重建，这就是渲染自愈的由来（`inference.go:95-138`）。
 - **三文件平台注入 + 通用 strip**：spawn 时往 `IDENTITY.md`（身份事实）/`SOUL.md`（拒绝规则）/`TOOLS.md`（sign 端点 + public URL）各注入一段被 `<!-- 0g-platform-injected:start/end -->` marker 包裹的平台段，分摊三种关切。文件分布对齐 openclaw 的 `CODEX_BOOTSTRAP_CONTEXT_ORDER`（SOUL=10 > IDENTITY=20 > TOOLS=40，数字越小越优先）。算 hash 和 LoadEntry 时 `stripPlatformInjection` 会从 **任何** workspace 根级 .md 里砍掉 marker 段，让 ContentHash 跟具体 sandbox 实例无关、未来加新平台文件不用动 evolution 代码。
-- **framework binding 实时 probe**：`evoFramework` 跑 `openclaw --version` 拿真实版本号覆盖到 `cfg.framework.PackageVersion` 上 —— Reconcile 触发 npm 升级后，下个 watcher tick 自然会把新版本号写上链。
+- **framework binding 实时 probe**：`evoFramework` 静态读取已安装版本 —— 经可信 PATH 解析 `openclaw`，再从最近的 name 为 `openclaw` 的 `package.json` 读 `version`（root 不运行框架 CLI）—— 覆盖到 `cfg.framework.PackageVersion` 上 —— Reconcile 触发 npm 升级后，下个 watcher tick 自然会把新版本号写上链。
 - **空 md defense**：`workspaceRequiredMDs` 列了 7 个根级必备 md（SOUL/IDENTITY/USER/AGENTS/TOOLS/MEMORY/DREAMS），manifest 没列就 touch 一个空文件，避免 openclaw 自动生成几 KB 的 template；空文件不进 manifest，所以 round-trip 稳定。
 
 ## 7. 运行时入口
@@ -459,6 +495,9 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/hello` | verifier、attestor、运维 | 返回 agent 身份 + currentSnapshot 的 `data_hashes`（serve-proof envelope 走 `X-Agent-Proof` 头）|
 | `/_seal/auth` | **owner 钱包** | owner 用 EIP-191 签 `0GSealAuth:{sealId}:{ts}`，sealed 验签 == on-chain owner 后返回 framework gateway 凭据 `{token}`(chat API 的 bearer) |
 | `/_seal/settings` | **owner 钱包** | `GET` 返回当前生效的 document；`POST` 换掉它、重渲染、重启 framework 进程。两者都要 owner 签名，且比对的是**链上实时** owner；`POST` 的签名还额外绑定 body 的 sha256 —— 否则签名只证明"谁在调用"，中途能改请求的人就能保着有效签名替换掉 document。这是热路径：换 model、换 thinking level 不用再重建容器。不持久：owner 的 document 仍在 attestor 手里，下次开机恢复回去（`internal/proxy/settings.go:40-53`）|
+| `/_seal/claim` | **owner 钱包** | 占单驾驶座（tag `0GSealClaim`，与设置推送一样绑定 body 摘要）；被挤下的客户端实例下一次驾驶请求得到 409。只在 proxy 内存里——重启即清空座位（`internal/proxy/occupancy.go`） |
+| `/_seal/clear` | **owner 钱包** | 清掉 agent 唯一的持久化对话并重启框架进程（tag `0GSealClear`，占座门控）；框架不在服务端保留历史时答 501（`CONVERSATION.zh.md`） |
+| `/_seal/compact` | **owner 钱包** | 立刻对这份对话运行框架自己的压缩，不重启（tag `0GSealCompact`，占座门控）：同一时间只跑一个、一条签名消息只接受一次、与 synth 门上的一轮永不重叠——每种拒绝都答 409；adapter 无法触发框架的压缩时答 501——没实现 `SessionCompactor`，或已安装的版本缺少它要调用的东西（openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令）（`internal/proxy/compact.go`、`CONVERSATION.zh.md`） |
 | `/v1/*` | 用户、owner | framework chat API，反代到 gateway(bearer 鉴权、响应带 proof 签名);未声明的路径一律 404——没有 catch-all 转发 |
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
@@ -494,11 +533,11 @@ env 这一面：
 | `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
 | `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
-| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链 |
+| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，无需鉴权），attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
-| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback |
+| `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。它是公开的，所以不能内嵌凭据：它会记进每个上传条目的链上 `dataDescription`（attestor 在 mint 时也这样记），打进启动日志（`/log`、`/log.html`，无需鉴权），并作为命令行参数传给负责下载的 `0g-storage-client` CLI |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
-| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:51-54`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:163-170`）|
+| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:65-68`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:166-173`）|
 | `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
 

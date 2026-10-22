@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"seal-verify/internal/privsep"
 )
 
 // The harness-state canonicalization is this adapter's identity anchor; every
@@ -80,6 +82,74 @@ func TestCanonicalizeHarness_PreservesLargeNumbers(t *testing.T) {
 	}
 	if want := `"ts":1754870400000`; !contains(string(got), want) {
 		t.Errorf("large int mangled: got %s, want it to contain %s", got, want)
+	}
+}
+
+// A harness state file Restore cannot read (over the read limit, or not
+// parsing) still holds the local refinements log: it is set aside, with
+// its bytes, rather than written over by the restored state.
+func TestRestoreHarnessState_SetsAnUnreadableFileAside(t *testing.T) {
+	prevHome := primeHome
+	t.Cleanup(func() { primeHome = prevHome })
+	for name, plant := range map[string]func(t *testing.T){
+		"over the limit": func(t *testing.T) {
+			if err := os.WriteFile(harnessStatePath(), []byte(`{"refinements":[{"n":1}]}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Truncate(harnessStatePath(), privsep.LimitTracked+1); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"not parsing": func(t *testing.T) {
+			if err := os.WriteFile(harnessStatePath(), []byte(`{"refinements":[{"n":1}]`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+	} {
+		// What already sits at the set-aside name: nothing, an earlier copy
+		// (which the rename simply replaces), or a directory with something
+		// in it, which blocks the rename until it is cleared.
+		for occupant, occupy := range map[string]func(t *testing.T, aside string){
+			"free": func(*testing.T, string) {},
+			"an earlier copy": func(t *testing.T, aside string) {
+				if err := os.WriteFile(aside, []byte(`{"refinements":[{"n":0}]}`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			"a directory": func(t *testing.T, aside string) {
+				if err := os.MkdirAll(filepath.Join(aside, "sub"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(aside, "sub", "x"), []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		} {
+			t.Run(name+", set-aside name holds "+occupant, func(t *testing.T) {
+				primeHome = t.TempDir()
+				if err := os.MkdirAll(harnessStateDir(), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				plant(t)
+				occupy(t, harnessStatePath()+".unread")
+				before, err := os.Stat(harnessStatePath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				a := &Adapter{}
+				if err := a.restoreHarnessState([]byte(`{"entries":{"memory":{"new":{"id":"new","scope":"global"}}},"schema":1}`)); err != nil {
+					t.Fatalf("restoreHarnessState: %v", err)
+				}
+				aside, err := os.Lstat(harnessStatePath() + ".unread")
+				if err != nil || !aside.Mode().IsRegular() || aside.Size() != before.Size() {
+					t.Fatalf("the unreadable file was not set aside whole: %v, %v", aside, err)
+				}
+				onDisk, err := os.ReadFile(harnessStatePath())
+				if err != nil || !strings.Contains(string(onDisk), `"new"`) {
+					t.Fatalf("restored state = %q, %v", onDisk, err)
+				}
+			})
+		}
 	}
 }
 

@@ -85,8 +85,8 @@ func TestRenderSettings_AnthropicWire(t *testing.T) {
 	if _, hasCompat := modelDef["compat"]; hasCompat {
 		t.Error("anthropic wire must not carry the openai compat block")
 	}
-	if modelDef["contextWindow"] != float64(1000000) || modelDef["maxTokens"] != float64(131072) {
-		t.Errorf("catalog limits not applied: %v", modelDef)
+	if modelDef["contextWindow"] != float64(1000000) || modelDef["maxTokens"] != float64(settings.RequestOutputCeiling) {
+		t.Errorf("catalog limits not applied (maxTokens is the catalog budget capped at %d): %v", settings.RequestOutputCeiling, modelDef)
 	}
 }
 
@@ -150,8 +150,8 @@ func TestRenderSettings_CarriesTheFormerHealFixes(t *testing.T) {
 	if modelDef["compat"].(map[string]any)["supportsReasoningEffort"] != true {
 		t.Error("compat.supportsReasoningEffort must follow the catalog")
 	}
-	if mt, _ := modelDef["maxTokens"].(float64); int(mt) != 131072 {
-		t.Errorf("maxTokens = %v; want the catalog value", modelDef["maxTokens"])
+	if mt, _ := modelDef["maxTokens"].(float64); int(mt) != settings.RequestOutputCeiling {
+		t.Errorf("maxTokens = %v; want the catalog value capped at %d", modelDef["maxTokens"], settings.RequestOutputCeiling)
 	}
 	ms, _ := cfg["diagnostics"].(map[string]any)["stuckSessionAbortMs"].(float64)
 	if int(ms) != 900_000 {
@@ -399,7 +399,7 @@ func TestEnsureConfigAcceptable_JunkOverlayIsWithdrawnNotFatal(t *testing.T) {
 	prev := validateOpenclawConfig
 	defer func() { validateOpenclawConfig = prev }()
 	calls := 0
-	validateOpenclawConfig = func() error {
+	validateOpenclawConfig = func(context.Context) error {
 		calls++
 		cfg, err := loadOpenclawJSON()
 		if err != nil {
@@ -441,7 +441,7 @@ func TestEnsureConfigAcceptable_PlatformBugFailsLoudly(t *testing.T) {
 	}
 	prev := validateOpenclawConfig
 	defer func() { validateOpenclawConfig = prev }()
-	validateOpenclawConfig = func() error { return fmt.Errorf("<root>: Invalid input") }
+	validateOpenclawConfig = func(context.Context) error { return fmt.Errorf("<root>: Invalid input") }
 
 	err := a.ensureConfigAcceptable(context.Background())
 	if err == nil {

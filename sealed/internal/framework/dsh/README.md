@@ -81,8 +81,8 @@ in the log, and the other knobs still apply (`settings.go`).
 
 `workspaceContext` was in this table and is **refused**. It mounts the spine's
 workspace-context extra, which reads `~/.dsh/AGENTS.md` into every turn's
-system context — and that file is agent-writable (privsep hands the home to the
-agent user, which has bash and `fs-local`) and belongs to no role, so nothing
+system context — and that file is agent-writable (privsep hands `$DSH_HOME` to
+the agent user, which has bash and `fs-local`) and belongs to no role, so nothing
 restores it, commits it, or lets a verifier see it. An owner knob must not be
 able to open an untracked channel into the system prompt; that is a
 platform-boundary change. Making `~/.dsh/AGENTS.md` a tracked role is the work
