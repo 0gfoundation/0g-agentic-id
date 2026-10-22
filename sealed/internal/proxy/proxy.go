@@ -12,6 +12,7 @@
 //	GET/POST /_seal/settings - owner's configuration document (read / hot-apply)
 //	POST /_seal/claim   - take the single-driver seat (owner-signed)
 //	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
+//	POST /_seal/compact - compact the persisted conversation in place (owner-signed)
 //	*    /              - reverse proxy (returns 503 until armed): agent-registered
 //	                      /api/* services (signed) and framework-declared routes
 //	                      (never signed); any other path 404s
@@ -46,7 +47,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,6 +58,7 @@ import (
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/report"
 	"seal-verify/internal/state"
 )
@@ -90,6 +91,10 @@ type Server struct {
 	applySettings SettingsApplier
 	applyClear    ClearApplier
 
+	// compact backs POST /_seal/compact (compact.go): its applier plus the
+	// single-flight and replay guards, under their own lock.
+	compact compactState
+
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
 	// server-side. Applied ONLY to the synthesized responses door's upstream
@@ -97,10 +102,11 @@ type Server struct {
 	conversationHeaders func() map[string]string
 	observeConversation func(sent map[string]string, resp http.Header)
 	// conversationHistory, when set, replaces CLIENT-sent history on the
-	// stateful door: prior turns come from the framework's own store, the
-	// client's input supplies only the current turn.
+	// stateful door: prior turns come from the adapter (none when the harness
+	// replays its own session), the client's input supplies only the current
+	// turn.
 	conversationHistory func(ctx context.Context) ([]ConversationTurn, error)
-	applySession  SessionSettingsApplier
+	applySession        SessionSettingsApplier
 
 	// seat is the single active owner client (see occupancy.go).
 	seat occupantSeat
@@ -246,6 +252,19 @@ func (s *Server) getAgentLogPath() string {
 	return s.agentLogPath
 }
 
+// agentLogTailBytes bounds what /log/agent and /log/agent.html read: the
+// framework process appends to its log for the container's life, so only
+// the most recent part is served.
+const agentLogTailBytes int64 = 8 << 20
+
+// readAgentLog reads the tail of the framework process's log. The file sits
+// in sealed's root-only state directory, but its contents are written by the
+// agent process, so the read is bounded and does not follow links
+// (privsep.ReadTail).
+func readAgentLog(path string) ([]byte, error) {
+	return privsep.ReadTail(path, agentLogTailBytes)
+}
+
 // Listen starts an HTTP server on :8080 in a goroutine. Errors are logged
 // but never crash the process — bootstrap doesn't want a stray ListenAndServe
 // failure to mask the actual fatal error.
@@ -261,6 +280,7 @@ func (s *Server) Listen() {
 	mux.HandleFunc("/_seal/settings", s.handleSettings)
 	mux.HandleFunc("/_seal/claim", s.handleClaim)
 	mux.HandleFunc("/_seal/clear", s.handleClear)
+	mux.HandleFunc("/_seal/compact", s.handleCompact)
 	mux.HandleFunc("/", s.handleProxy)
 
 	go func() {
@@ -308,7 +328,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "agent log not available: framework adapter not resolved yet or no subprocess log path\n")
 		return
 	}
-	body, err := os.ReadFile(logPath)
+	body, err := readAgentLog(logPath)
 	if err != nil {
 		fmt.Fprintf(w, "agent log not available: %v\n", err)
 		return

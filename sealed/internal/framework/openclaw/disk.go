@@ -2,9 +2,12 @@ package openclaw
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
+
+	"seal-verify/internal/privsep"
 )
 
 // ── openclaw.json merge I/O ─────────────────────────────────────────────────
@@ -16,10 +19,13 @@ import (
 // each other.
 
 // loadOpenclawJSON parses ~/.openclaw/openclaw.json, returning an empty
-// map if the file doesn't exist.
+// map if the file doesn't exist. The file is agent-writable, so it is read
+// through internal/privsep: a link or other non-regular entry there is an
+// error, which RenderSettings answers by setting the entry aside and
+// rebuilding the file (loadConfigForRender).
 func loadOpenclawJSON() (map[string]any, error) {
-	data, err := os.ReadFile(openclawJSONPath())
-	if os.IsNotExist(err) {
+	data, err := privsep.ReadFile(openclawJSONPath(), privsep.LimitConfig)
+	if errors.Is(err, fs.ErrNotExist) {
 		return map[string]any{}, nil
 	}
 	if err != nil {
@@ -41,14 +47,14 @@ func loadOpenclawJSON() (map[string]any, error) {
 // saveOpenclawJSON writes ~/.openclaw/openclaw.json with stable indent.
 // Creates the home dir when missing.
 func saveOpenclawJSON(cfg map[string]any) error {
-	if err := os.MkdirAll(openclawHome, 0o755); err != nil {
+	if err := privsep.MkdirAll(openclawHome, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", openclawHome, err)
 	}
 	out, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal openclaw.json: %w", err)
 	}
-	if err := os.WriteFile(openclawJSONPath(), out, 0o600); err != nil {
+	if err := privsep.WriteFile(openclawJSONPath(), out, 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", openclawJSONPath(), err)
 	}
 	return nil
@@ -147,10 +153,10 @@ func setAgentsDefaults(cfg map[string]any, subKey string, raw json.RawMessage) e
 // ── workspace file I/O ─────────────────────────────────────────────────────
 
 func writeWorkspaceFile(path, content string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := privsep.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
 	}
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	if err := privsep.WriteFile(path, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 	return nil
@@ -159,7 +165,7 @@ func writeWorkspaceFile(path, content string) error {
 // readWorkspaceFile returns "" if the file is missing — agent may not
 // have created it yet, or it was never seeded.
 func readWorkspaceFile(path string) string {
-	data, err := os.ReadFile(path)
+	data, err := privsep.ReadFile(path, privsep.LimitTracked)
 	if err != nil {
 		return ""
 	}

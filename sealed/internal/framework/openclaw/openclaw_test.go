@@ -249,6 +249,7 @@ func useTempHome(t *testing.T) {
 	prev := openclawHome
 	openclawHome = t.TempDir()
 	t.Cleanup(func() { openclawHome = prev })
+	isolateState(t)
 }
 
 func TestAdapter_RestoreFramework_RejectsBadSchemaVersion(t *testing.T) {

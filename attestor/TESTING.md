@@ -52,13 +52,23 @@ with exact remediation named, then passed after ack() + deposit().
 
 ```bash
 cd attestor && cargo test --workspace          # incl. KMS mock, fuse, seal_material
-cd sealed   && go test ./...                   # marker round-trip, adapter conformance
+cd sealed   && go test ./...                   # marker round-trip, adapter conformance, storage upload wiring (Linux only)
 cd contracts && forge test                     # on-chain invariants
 cd sdk/typescript && npm test                  # SDK flows; pins the console's + verify-agent.sh's
                                                # ServeProof digest copies (that leg needs cast + jq)
 ```
 
 All free, no network, no env. This is the minimum bar for every commit.
+
+sealed builds and tests only on Linux: its privsep package uses Linux-only
+system calls, and on macOS the module stops at one compile error that says
+so. On a non-Linux machine, run its suite in the golang container whose
+command is in `AGENTS.md`. Its privsep security tests (the agent's privilege
+drop, chowns to a foreign uid, the process sweep, root-only fixtures) also
+need root: run as anyone else they skip, and `go test` still reports `ok`.
+Run them as root in that container, once without and once with the image's
+`agent` account (`useradd --system agent`), with `SEALED_PRIVSEP_TESTS=1`,
+which turns a skipped key branch into a failure.
 
 ## T1 — local stack, all mocks
 

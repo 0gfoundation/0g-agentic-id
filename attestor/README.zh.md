@@ -147,7 +147,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | env | 含义 |
 |---|---|
-| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G 链 RPC + chainId |
+| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G 链 RPC + chainId。RPC URL 是公开的（`GET /config` 会返回它，agent 的启动日志也会打印它），所以不能内嵌凭据；见 `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | 绑定该 AgenticID 的 VerifiedFeedbackRegistry **proxy**。在 `GET /config` 公布，并作为 ServeProof validator 以 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器。留空或为零地址 ⇒ `/config` 不公布该地址，容器拿到空值，因而不发 `X-Agent-Proof`；填了但不是地址则启动失败，其 `getIdentityRegistry()` 不是 `ATTESTOR_AGENTIC_ID_ADDR` 也启动失败（worker 和 api 启动时各读一次）。容器 env 只在创建时写入，改值需要逐个重建 agent（owner 签名的 `/reset`）|
 | `ATTESTOR_CANONICAL_8004_ADDR` | 官方 ERC-8004 IdentityRegistry（可选；按 chainId 自动选——主网 `0x8004A169…`、测试网 `0x8004A818…`）|
@@ -183,7 +183,7 @@ cargo run -p attestor-indexer# 第三个终端
 
 | env | 含义 |
 |---|---|
-| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL（dataKey 加密包上传目标）|
+| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL（dataKey 加密包上传目标）。它是公开的（记进每个 iData 条目的链上 `dataDescription`，agent 的启动日志也会打印它），所以不能内嵌凭据；见 `.env.example` |
 | `MOCK_STORAGE` | `true` 用 keccak256 替代真 merkle root，不上传；`false` 走真 SDK（attestor TEE EOA 需要 0G testnet gas）|
 
 ### 数据库 / 进程

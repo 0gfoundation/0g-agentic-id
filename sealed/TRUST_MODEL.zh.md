@@ -59,9 +59,10 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 |---|---|
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
-| openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节 |
-| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:159-167`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:206-221`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
+| openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,dsh,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
+| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:180-188`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
 任何对 sealed 的未来变更，只要可能跨越这条边界 —— 即使是间接的
 （例如把 priv 字节写日志、通过 debug endpoint 暴露、把它放进与
@@ -242,7 +243,7 @@ Sealed 容器启动时：
    （`container_pubkey`、`container_privkey`），并把私钥那一半作为
    `SANDBOX_SEAL_KEY` 环境变量注入。容器**不**生成它：Phase 0 只检查
    注入进来的这把 key 派生出的压缩 `pubkey` 跟签名 attestation envelope
-   里的那个一致，不一致就 fail loud（`internal/config/config.go:159-167`）。
+   里的那个一致，不一致就 fail loud（`internal/config/config.go:180-188`）。
    容器也不会自己独立得到那个 pubkey —— 它转发的就是 envelope 里带的那个
    （`internal/provision/provision.go:58-65`）。
 2. 0g-Sandbox 观察容器启动、测量它的 `image_hash`，用自己
@@ -644,7 +645,175 @@ unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent`
 owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
-（sealed 另外自设 `PR_SET_DUMPABLE=0`）。这跟任何钱包里
+（sealed 另外自设 `PR_SET_DUMPABLE=0`）。sealed 还给自己设置
+`no_new_privs`，它启动的每个进程都会继承：agent 的进程里任何 exec 都不会
+获得权限，所以镜像里的 setuid-root 二进制（`su`、`mount`、`passwd` 等）
+以 agent 的 uid 运行，uid 拆分也就不依赖这些二进制个个都没有本地提权漏洞
+（`privsep.HardenSelf`；设置成功之前 `Required` 一律拒绝）。
+
+这次 uid 拆分是 fail-closed 的：拆分不可用时（sealed 不是 root，或镜像里
+没有一个拥有自己非 root uid/gid 的 `agent` 账户），sealed 拒绝 provision
+`agent_seal_priv`（`privsep.Required`）—— 链上镜像白名单只钉 hash、不检查
+构建内容，拦不住 Dockerfile 里把这个账户弄丢或弄坏的镜像。这道闸保证的东西
+是刻意收窄的：在拿到密钥的容器里，框架永远不会以 sealed 的 uid **运行**。
+这道闸同时要求 root 的家目录只归 root 所有、agent 自己的家目录已经就位
+（`privsep.SecureHome` 与 `privsep.PrepareAgentHome`，见下）。
+
+agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所以 root 一侧
+对 agent 可写路径的处理遵循四条不变式（`internal/privsep`）：
+
+- **家目录。** `/root` 保持 `root:root 0711` 且不带 POSIX ACL，在启动时强制
+  （`SecureHome`，由 `privsep.Harden` 执行；留在它上面的 default ACL 会把 root
+  之后在那里创建的东西交给 ACL 点名的人）。agent 有自己的家目录
+  `/home/agent`（`agent:agent 0700`，启动时由 `PrepareAgentHome` 创建；它和
+  `/home` 都不能是链接）：它是 agent 运行的一切进程的 `HOME`，也是
+  `AgentCommand` 的默认工作目录，所以工具缓存与配置（`~/.npm`、`~/.cache`、
+  `~/.config`、`~/.local`、`~/.gitconfig` 等）以及 agent 自己的文件都在那里。
+  （prime 和 dsh 的 bridge 有意从各自的框架目录树启动，所以它们运行的工具
+  的相对路径落在那棵树里。）两个家目录都就位之前 `Required` 一律拒绝
+  provision。在 `/root` 里 agent 只拥有它的框架目录树（`OwnTree`；prime 另有
+  `/root/.prime-conversation` 和每会话 harness 目录 `/root/.prime-session`），
+  每棵都链接进它的家目录（`~/.openclaw`、`~/.hermes`、`~/.dsh`、
+  `~/.prime/agent`；`LinkAgentHome`），所以告诉它的那些路径照样可用。每个
+  框架还会在环境变量里拿到自己目录树的绝对路径（`OPENCLAW_STATE_DIR`、
+  `HERMES_HOME`、`DSH_HOME`、`PRIME_AGENT_CODING_AGENT_DIR`；openclaw 另外
+  拿到 `OPENCLAW_HOME=/root`，它从中推导默认 workspace，2026.5.x 还从中推导
+  exec approvals 文件 —— 见 QUIRKS.md），所以 agent 删掉或替换链接，也不会
+  让框架的配置、状态或 workspace 指向另一棵树；sealed 自己的代码使用
+  `/root/...` 绝对路径，从不解析这些链接。不过这个链接不只是给 agent 的
+  便利：openclaw 的少数插件从 `HOME` 取默认位置，经它到达目录树 ——
+  memory-wiki 的默认 vault（所以插件启用而没有设 vault 路径时，渲染会把它设成
+  目录树里的绝对路径），以及没有配置项的 file-transfer 审计日志（见
+  QUIRKS.md）；agent 删掉或替换链接，只会挪动这些，而且仍在 agent 本来就能写
+  的范围里。（openclaw 核心展开的 `~` —— 配置里取路径值的键中的、它的媒体
+  工具路径里的 —— 也取自 `OPENCLAW_HOME`，所以那里的 `~/x` 指 `/root/x`，而
+  agent 在它的目录树之外什么都建不了；只有它的 read/write/edit 工具、agent
+  运行的程序和上面那些插件默认位置从 `HOME` 取 `~`。渲染会把属主给的 `~/x`
+  和 `/root/x` agent 路径改写到 agent 的家目录，agent 文档也让它在那里用
+  绝对路径。）
+  这些目录树的名字位于 root 所有的目录里 —— `/root` 本身，或位于它和一棵声明
+  在更深处的目录树之间、归 root 所有的目录（prime 的 `/root/.prime`）——
+  所以 agent 能改动树里的内容，却替换不了树本身。agent 绝不拥有 root 的家目录、`/`、
+  任何 PATH 目录或 sealed 自身可执行文件的祖先目录，也不拥有 sealed 状态目录
+  里、或 sealed 所运行二进制的包目录里的任何东西（`guardHandover`）。对
+  `/root` 本身没有写权限，agent 就无法放置 root 的命令会从 root 家目录读取的
+  配置（`~/.npmrc`、`~/.gitconfig`），也无法替换那里的工具链。早先的 sealed
+  曾让 agent 拥有 `/root`，由它运行过的容器里仍可能留着 agent 在那里建的
+  条目；启动时，在加固 `/root` 并准备好 agent 家目录之后，sealed 把 `/root`
+  下每个可能被其他 uid 改过的直接条目（不归 root 所有，他人或非 root 的组
+  可写，或带有让其他 uid 能写它 —— 对目录而言，能写 root 之后在其中创建的
+  东西 —— 的 POSIX ACL）—— adapter 声明的框架目录树（`DeclareTree`）除外 ——
+  移进 agent 的家目录（`ReclaimHome`）；adapter 为其在自己目录树里声明了新
+  位置的条目（`DeclareRelocation`：prime 旧布局下的 session artifacts）则移到
+  那里。只是通向一棵声明在 `/root` 更深处的目录树的目录（prime 的
+  `/root/.prime`）不会被移走（那样会把树一起带走）：它被改为
+  `root:root 0755` 且不带 ACL，里面的其他东西按同样的规则收回。只要还有条目
+  移不走或改不成 root 所有，`Required` 就拒绝 provision。
+- **执行。** root 不运行任何框架 CLI：版本探测改为静态读取，读取 agent
+  可写状态的 CLI 以 agent 身份运行（`AgentCommand`），并有截止时间、只保留
+  有限的输出（`BoundedOutput`）。必须写 root 所有前缀的工具链命令（npm、git、
+  uv、0g-storage-client）走 `RootCommand`：只在由 root 所有且他人不可写的
+  PATH 目录里解析二进制，同样检查二进制本身，并使用由 sealed 固定的环境变量：
+  `PATH`（可信目录）、`HOME=/root` 和仅 root 可访问的 `TMPDIR`。唯一取自
+  sealed 自身环境的值 —— 也就是容器的环境，由 owner 签名的部署请求设定 ——
+  是代理端点（`HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`，大小写皆可）。包
+  registry / index URL 和 CA 证书位置有意不传：前者会让部署环境决定 root
+  运行哪个包的安装脚本，后者指向 root 的工具链按路径打开的文件，而那可能在
+  agent 目录树里；两者都只来自镜像（它的信任库和工具链归 root 所有的配置）。
+  sealed 自己的进程以 root 身份、在同一个环境里运行，同样的规则也适用于它：
+  启动时、在它的第一个 TLS 连接（链 RPC、attestor、存储 indexer、推理
+  router）之前，只有当 `SSL_CERT_FILE` 和 `SSL_CERT_DIR` 指向仅 root 可写的
+  文件时才保留它们，否则将其移除（`ScrubTrustEnv`），所以它信任的 CA 来自
+  镜像；在它的第一行日志之前（正是这行日志让 Go 读取 `TZ` 指向的时区文件，
+  而那是阻塞、跟随链接的读取），只有当 `TZ` 指向（或 `TZ` 未设置时
+  `/etc/localtime` 是）Go 能加载的、仅 root 可写的时区文件时才保留它，否则
+  设为 `TZ=UTC`（`ScrubTimeEnv`；能加载的时区也让 Go 不会退而去读
+  `$GOROOT/lib/time/zoneinfo.zip`）。这些变量和代理端点，就是 sealed 自己的
+  进程会读取的、由部署设定的变量；`ZONEINFO` 只有 `time.LoadLocation` 才读，
+  而 sealed 不调用它。代理端点同样作用于 sealed 自己的客户端：代理能看到连接了哪些主机，
+  但读不了也改不了 TLS 连接（配置成明文 `http` 的端点没有这层保护，有没有
+  代理都一样）。provision 的回复无论如何都加密给容器的密钥。
+  root 命令在 `/` 运行，或在经 `RootDir` 检查为仅 root 可访问的目录里运行，
+  调用方只往它的环境里追加不含路径的字面值，或 root 侧守卫测试列出并写明理由
+  的辅助函数给出的值（`rootEnvHelpers`：openclaw 的 `installEnv`）。openclaw 的安装还会把包自带的安装脚本指向
+  一个仅 root 可访问的目录（`OPENCLAW_HOME`）并关闭它的 plugin registry
+  迁移，所以以 root 运行的安装不会在 agent 的目录树里写任何东西。
+- **文件。** root 在 agent 目录树里的每一次读、写、chown、chmod、改名、删除
+  都经过 privsep 的 fs 辅助函数：任何路径分量都不跟随链接，读取只打开普通
+  文件（先经 `O_PATH` 描述符检查末端，所以 FIFO、socket、设备从不会被打开），
+  也从不等待文件属主持有的 lease（`F_SETLEASE`）：打开是非阻塞的，遇到
+  lease 立即以 `ErrBusy` 失败。凡是把它当成文件不存在会丢掉或换掉状态的
+  地方，都不这样当：对被追踪的 role 而言它是暂时性的（watcher 在这一轮跳过
+  该 role，启动时的 seed 让它保持已提交的版本）；早先 sealed 的对话 id 或
+  key 留到之后的某一轮再迁移，而不是被换掉；配置渲染和 prime 的 harness 状态
+  恢复会先把文件挪到一旁，再写一份新的，和处理解析不了的文件一样。在其他
+  地方，它只影响那次读取本来的用途，和任何读不了的 agent 文件一样（某一轮的
+  历史、断网启动时会从 prime 的 `models.json` 沿用的 reasoning 标记）——
+  这些 agent 改文件本来就能做到。
+  `ReadFile` 和 `ReadTail` 有大小上限；`Open` 的调用方自己限定读取量
+  （openclaw 读对话记录只保留最后 16 MiB）。写入以全新的普通文件替换目标项、
+  从不打开它，不管那里是什么：链接被替换而不是被跟随，目录先被删除。恢复
+  （restore）同样对它管理的目录形状说了算：agent 在 role 目录的位置留下的
+  链接或文件会被替换（`EnsureDir`），从不跟随，所以它没法让 agent 起不来。
+  超过大小上限的内容不会被跳过（那样会提交一份缺了它的状态），也不会拖住
+  别的东西：超过上限的 manifest 条目 —— 大于 64 MiB 的文件，或归档会超过
+  256 MiB 的目录条目（sealed 提交归档时要把它整个放在内存里，所以只打包到
+  这么大；恢复仍接受早先版本可能提交的 4 GiB）—— 被保持（`manifest.Held`）：在它回到上限
+  以内之前，这个条目保持已提交的版本（如果从未提交过，就留在链下），而该
+  role 的其他条目照常提交。超过上限的 leaf role 保持已提交的版本。早先的
+  sealed 版本提交任意大小的文件，所以 agent 可能从链上带着这样的文件恢复；
+  agent 文档里写明了这个上限。sealed 自己
+  的文件（overlay 记录、对话标识、框架日志、bootstrap 日志，以及存储下载和
+  上传用的暂存目录）放在 `framework.StateDir`（`/var/lib/sealed`，仅 root
+  可访问），绝不放在共享的 `/tmp`。
+- **进程。** root 侧工作不依赖 agent 已停止：fs 辅助函数在并发修改下依然
+  安全，以 root 运行的安装也不碰任何 agent 可写路径。所以 `Stop` 只结束框架
+  自己残留的进程（`privsep.Sweep`，以 agent 用户身份运行 `pkill`，因此发不出
+  信号给 root 的进程）；agent 启动的其他进程，比如它经 sign socket 注册的
+  后端，在框架重启后继续运行。
+
+`internal/framework` 里的结构性测试（`rootside_guard_test.go`）扫描模块里
+所有非测试源文件，在 `internal/privsep` 之外出现以下任何一项都会失败：对
+`os`、`io/ioutil`、`syscall`、`golang.org/x/sys/unix` 中接受路径的函数（后两者
+是从其源码推导出的集合：除少数不把字符串当路径的函数外，所有带字符串参数的
+函数，再加上原始 syscall 入口）、
+`filepath` 的遍历 / glob / 链接解析、`os/exec` 的函数、unix socket 监听或
+`net/http` 文件服务的任何引用（调用，或把函数当作值使用）—— `allowedDirectCalls`
+里逐个计数、且只作用于仅 root 可访问路径的调用点除外；对
+`golang.org/x/sys/execabs`（换了名字的 `os/exec`）、`net/http/cgi`（它的
+handler 会运行一个二进制）或 `plugin.Open` 的任何引用；构造 `exec.Cmd`、
+`syscall.SysProcAttr`、`syscall.Credential` 或 `os.ProcAttr`（字面量、`new`，
+或该类型的变量、字段、参数）；以任何方式（读或写）引用命令的 `SysProcAttr`
+或 `Credential`（`AgentCommand` 的降权放在 `cmd.SysProcAttr.Credential` 里，
+每个命令拿到各自的一份）；给命令的 `Path`、`Args`、`ExtraFiles` 赋值，或在
+agent 进程的 spawn 之外设工作目录（root 命令的工作目录经 `RootDir` 设定）；
+取命令的 `Path`、`Args`、`ExtraFiles`、`Env` 或 `Dir` 的地址，或在
+`x.F = append(x.F, ...)` 之外把它的 `Args`、`Env`、`ExtraFiles` 当作值使用
+（副本与命令共用底层数组，经由任何一方的写入都看不见）；把命令交给本模块里
+把它当作命令接收的代码之外的任何东西 —— 模块之外的函数（`json.Unmarshal`
+这类基于反射的解码器会设置它的字段）、接口、函数值；使用 `unsafe`，或
+`reflect.DeepEqual` 之外的 `reflect`。这些规则看类型：每个包都对照真正的
+`os/exec` 做类型检查，所以无论命令从哪里来（辅助函数的返回值、结构体字段）、
+文件导入了什么，字段是不是命令的都看得出来，只有类型检查定不了类型的接收者
+才按字段名判断；`TestRootSideGuardFlagsEveryForbiddenShape` 用预置的代码
+（每种禁止的写法一份）跑这些规则。此外还有：
+点导入（dot-import）它们检查的包；在它们钉住的函数和二进制之外调用
+`RootCommand`，或把它当作值使用；不经
+`AgentCommand` 启动框架进程或框架 CLI；adapter 没有把目录树链接进 agent 的
+家目录、没有声明它交出的目录树（`DeclareTree`），或 `Stop` 里不做 sweep；
+`main` 不再在注册完 adapter 之后、provision 闸之前执行 `privsep.Harden`，
+或在它之前写日志。
+这些是静态检查：钉住的是代码怎么写，而不是二进制运行时
+做了什么。真正验证这条边界本身的测试（降权、chown、sweep）需要 root，运行
+方式见 `AGENTS.md`。
+
+**上传时密钥留在进程内。** `0g-storage-client upload` 这个 CLI 只接受
+`--key` 参数形式的密钥，而 `/proc` 会把进程参数暴露给容器内的每个 uid。所以
+`dataplane.Upload` 不运行它，而是在 sealed 进程内通过该客户端的 Go SDK 上传
+（`internal/dataplane/upload.go`；见上表），上传期间密钥隔离结论同样成立。
+下载仍运行这个 CLI，经由 `privsep.RootCommand`，且不涉及密钥。
+
+经 socket 签名这件事，跟任何钱包里
 `eth_signTransaction` / `personal_sign` 的工作方式同构：钱包担保
 **谁签的**，不担保**内容正确**。agentSeal 没什么不同，它只是恰好是
 一个运行时被硬件认证过的钱包。

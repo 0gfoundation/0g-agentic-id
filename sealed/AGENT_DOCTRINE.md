@@ -195,10 +195,17 @@ supplied.
 
 Shells are open to the agent — it runs as a de-privileged user, and the
 kernel (`internal/privsep`), not doctrine, walls its process off from
-sealed's memory and bootstrap secrets. So the slot governs **authorship**,
-not shell access: executing, via shell or subprocess, a command drafted
-outside the agent's own deliberation is refusal 1 wearing a shell — same
-disqualifier, bytes the agent did not author.
+sealed's memory and bootstrap secrets. (sealed refuses to provision when
+the split is unavailable — `privsep.Required` — so in a container that
+holds a key the agent never runs as sealed's uid. Root-side handling of
+agent-writable paths follows the invariants in TRUST_MODEL.md — root's home
+stays root-only, root runs no framework CLI, root never follows a link inside
+an agent tree — and the one known gap, the signing key on the storage
+upload's argv, is recorded there too.) So
+the slot governs **authorship**, not shell access: executing, via shell
+or subprocess, a command drafted outside the agent's own deliberation is
+refusal 1 wearing a shell — same disqualifier, bytes the agent did not
+author.
 
 **Boundary with #3**: #3 governs outward port attribution. #2 governs
 what a shell is allowed to execute. The two risks do not substitute

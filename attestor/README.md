@@ -159,7 +159,7 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId |
+| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId. The RPC URL is public (served in `GET /config` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID contract address |
 | `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** bound to that AgenticID. Served on `GET /config` and injected into every new container as `VERIFIED_FEEDBACK_ADDR`, the ServeProof validator. Blank or the zero address ⇒ `/config` serves none and containers get an empty value, so they emit no `X-Agent-Proof`; a non-address value fails startup, and so does one whose `getIdentityRegistry()` is not `ATTESTOR_AGENTIC_ID_ADDR` (worker and api read it once at startup). Container env is set only at create, so a change needs each agent recreated (owner-signed `/reset`) |
 | `ATTESTOR_CANONICAL_8004_ADDR` | Canonical ERC-8004 IdentityRegistry (optional; auto-derived from chainId — mainnet `0x8004A169…`, testnet `0x8004A818…`) |
@@ -195,7 +195,7 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads) |
+| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads). Public (recorded on chain in each iData entry's `dataDescription` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (attestor's TEE EOA needs 0G testnet gas) |
 
 ### Database / process

@@ -70,6 +70,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -135,6 +136,9 @@ func New() *Adapter {
 		},
 	}
 	framework.Register(frameworkName, a)
+	// The tree spawnBridge hands to the agent user (privsep.DeclareTree:
+	// Harden leaves it in root's home although the agent owns it).
+	privsep.DeclareTree(dshHome)
 	return a
 }
 
@@ -234,7 +238,7 @@ func (a *Adapter) restoreManifestDir(plaintext []byte) error {
 		}
 		count = len(m.Entries)
 	}
-	if err := ensureDir(skillsDir()); err != nil {
+	if err := ensureRoleDir(skillsDir()); err != nil {
 		return fmt.Errorf("dsh.Restore[skills/]: %w", err)
 	}
 	logger.Logf("dsh.Restore[skills/]: parsed manifest (%d entries)", count)

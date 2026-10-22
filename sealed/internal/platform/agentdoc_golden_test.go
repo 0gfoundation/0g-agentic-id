@@ -48,6 +48,9 @@ func bibleTemplate() string {
 		DurableHints: []DurableHint{
 			{Ask: "(owner request, e.g. \"remember this\")", Place: "(where it goes, e.g. `memories/NOTES.md`)"},
 		},
+		Notes: []string{
+			"(framework-specific working rule that is not about tracking, e.g. how the framework resolves `~` — list each; leave empty if none)",
+		},
 		VersionScheme: "(release scheme, e.g. semver releases / CalVer tags)",
 		Versions:      []string{"(whitelisted version — list each)"},
 		VersionMax:    "(whitelist max)",

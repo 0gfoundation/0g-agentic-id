@@ -266,7 +266,7 @@ verified once; re-run after each upgrade (already-verified ones skip). Browser
 > - **test** (§6.1) — AgenticID `0x3449…`, owner `0xea69…`. **This is what the
 >   production attestor (`agenticid.0g.ai`) uses**: its `GET /config` serves
 >   `agentic_id_addr = 0x3449…` (checked live 2026-07-30).
-> - **dev** (§6.2) — AgenticID `0x5BB5…`, owner `0xB831…`. **This is what the
+> - **dev** (§6.2) — AgenticID `0x5BB5…`, owner `0x2AB7…a0B3`. **This is what the
 >   dev-host attestor points at** (`ATTESTOR_AGENTIC_ID_ADDR`).
 >
 > §6.3 lists superseded deploys (do not use), including the pre-canonical-binding
@@ -315,7 +315,7 @@ open execution. Mainnet needs a real multisig + non-zero delay + a real TEE orac
 ### 6.2 dev environment — 2026-06-17 (active)
 
 **The dev-host attestor points at this** (`ATTESTOR_AGENTIC_ID_ADDR = 0x5BB5…`),
-owner `0x9C58…80Bb`.
+owner `0x2AB7…a0B3`; TEEDataVerifier `teeOracleAddress()` is the same address.
 
 | Contract | Address | VERSION |
 |---|---|---|
@@ -336,8 +336,8 @@ owner `0x9C58…80Bb`.
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x9C58…80Bb` (migrated 2026-10-12 from `0x7344…431b`) |
-| owner / pauser (all contracts) | `0x9C58F839451EBf3e7f82442bC48E4088746380Bb` | migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | proposer + canceller + admin = `0x2AB7…a0B3` (migrated 2026-10-19 from `0x9C58…80Bb`, which renounced all three); executor open, `minDelay` 0; owns the five beacons |
+| owner / pauser (all contracts) | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (itself migrated 2026-10-12 from `0x7344…431b`, itself 2026-09-07 from `0xB831…CEd7`, deployer/oracle history); also the TEEDataVerifier TEE oracle |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded
 in this repo (they're attestor-deployment infra, configured via
