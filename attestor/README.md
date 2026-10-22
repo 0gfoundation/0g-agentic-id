@@ -158,7 +158,7 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId |
+| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId. The RPC URL is public (served in `GET /config` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID contract address |
 | `ATTESTOR_CANONICAL_8004_ADDR` | Canonical ERC-8004 IdentityRegistry (optional; auto-derived from chainId — mainnet `0x8004A169…`, testnet `0x8004A818…`) |
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry contract address |
@@ -193,7 +193,7 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads) |
+| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads). Public (recorded on chain in each iData entry's `dataDescription` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (attestor's TEE EOA needs 0G testnet gas) |
 
 ### Database / process

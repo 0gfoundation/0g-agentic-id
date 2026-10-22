@@ -12,9 +12,9 @@
 package framework
 
 import (
-	"net/http"
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
@@ -337,13 +337,14 @@ type ConversationTurn struct {
 	Text string
 }
 
-// ConversationHistory is implemented by adapters whose framework PERSISTS a
-// transcript that its own gateway never reads back (openclaw: the OpenAI door
-// takes the client's messages[] as authoritative). The stateful responses
-// door calls this instead of trusting client-sent history: prior turns come
-// from the harness's own store, the client supplies only the current turn.
-// The private on-disk format knowledge stays HERE, in the framework's own
-// package — the caller never parses the store (CONVERSATION.md §3).
+// ConversationHistory is implemented by adapters whose stateful turns must
+// NOT carry the client's history. The stateful responses door then ignores
+// client-sent history: it sends the prior turns this returns, then only the
+// client's current turn. An adapter whose gateway replays its own session
+// returns none (openclaw: a client's history on top of that replay reaches
+// the model twice); one whose gateway does not would return the turns from
+// the harness's own store. Any on-disk format knowledge stays in the
+// framework's own package — the caller never parses a store (CONVERSATION.md §3).
 type ConversationHistory interface {
 	ConversationHistory(ctx context.Context) ([]ConversationTurn, error)
 }
@@ -358,6 +359,34 @@ type ConversationHistory interface {
 type SessionClearer interface {
 	ClearSession(ctx context.Context) error
 }
+
+// SessionCompactor is implemented by adapters whose framework can compact the
+// agent's ONE persisted conversation on demand (CONVERSATION.md): the
+// framework's own compaction summarizes the older part of the history so later
+// requests carry less of it — the conversation continues, unlike ClearSession,
+// which discards it. CompactSession blocks until the framework reports the
+// outcome and returns a short owner-facing note on what happened, including
+// "nothing to compact". It does not restart the framework. Adapters that
+// cannot trigger compaction from outside simply don't implement this; the
+// proxy answers 501 for them.
+//
+// An error that wraps ErrCompactRefused means the framework did not compact —
+// it declined (another turn or compaction holds the session) or gave up
+// because the session changed under it — and the conversation is as it was;
+// the proxy answers it 409, so the owner retries instead of reading a
+// failure. Never wrap it once anything was committed.
+type SessionCompactor interface {
+	CompactSession(ctx context.Context) (string, error)
+}
+
+// ErrCompactRefused marks a CompactSession error as "not now", not "failed".
+var ErrCompactRefused = fmt.Errorf("framework: compaction refused for now")
+
+// ErrCompactUnsupported marks a CompactSession error as "the adapter cannot
+// trigger compaction on the installed framework version" (e.g. one without
+// the CLI command the adapter drives): the proxy answers it 501, as for an
+// adapter without SessionCompactor.
+var ErrCompactUnsupported = fmt.Errorf("framework: on-demand compaction not supported by this framework version")
 
 // LegacySettingsSeeder is implemented by adapters that can recover an owner's
 // configuration from a chain role that predates the settings channel.

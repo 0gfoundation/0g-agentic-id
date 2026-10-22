@@ -2,8 +2,11 @@ package openclaw
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
+
+	"seal-verify/internal/privsep"
 )
 
 // IDENTITY.md sealed-managed injection.
@@ -51,8 +54,14 @@ func upsertIdentityMD(path, identitySection string) error {
 // safe insertion point outside our marker block. Idempotent: if a
 // heading already exists, leaves the file alone.
 func ensureIdentityHeader(path string) error {
-	existing, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
+	// Agent-writable file: an entry the privsep read rules refuse (a link, a
+	// FIFO) counts as empty and is replaced with a regular file below.
+	existing, err := privsep.ReadFile(path, privsep.LimitTracked)
+	switch {
+	case err == nil, errors.Is(err, fs.ErrNotExist):
+	case errors.Is(err, privsep.ErrUnsafePath):
+		existing = nil
+	default:
 		return fmt.Errorf("read %s: %w", path, err)
 	}
 	cleaned := stripPlatformInjection(existing)
@@ -80,7 +89,7 @@ func ensureIdentityHeader(path string) error {
 			buf = append(buf, '\n')
 		}
 	}
-	if err := os.WriteFile(path, buf, 0o644); err != nil {
+	if err := privsep.WriteFile(path, buf, 0o644); err != nil {
 		return fmt.Errorf("seed IDENTITY.md header: %w", err)
 	}
 	return nil

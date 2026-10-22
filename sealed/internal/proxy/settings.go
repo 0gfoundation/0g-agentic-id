@@ -55,8 +55,8 @@ type ConversationTurn struct {
 }
 
 // SetConversationHistory wires framework.ConversationHistory into the
-// stateful door: history from the harness's own store, current turn from the
-// client.
+// stateful door: prior turns from the adapter (none when the harness replays
+// its own session), current turn from the client.
 func (s *Server) SetConversationHistory(fn func(ctx context.Context) ([]ConversationTurn, error)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

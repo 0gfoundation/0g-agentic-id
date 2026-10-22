@@ -90,10 +90,13 @@ const PROVIDER = process.env.SEAL_MODEL_PROVIDER || ''
 const MODEL_ID = process.env.SEAL_MODEL_ID || ''
 const MODEL_BASE_URL = process.env.SEAL_MODEL_BASE_URL || ''
 const MODEL_API = process.env.SEAL_MODEL_API || 'openai-completions'
-// Router-catalog output budget, resolved by the adapter (settings.go). Only a
-// CATALOG-sourced value is ever passed: 0 means "let pi-ai default" rather
-// than a name-heuristic guess (8192), which would starve a reasoning model's
-// shared thinking+reply budget into permanently empty replies.
+// Per-request output budget, resolved by the adapter (settings.go
+// RequestMaxTokens: the catalog budget capped at 32768). Only a CATALOG-sourced
+// value is ever passed: 0 means "let pi-ai default" rather than a
+// name-heuristic guess (8192), which would starve a reasoning model's shared
+// thinking+reply budget into permanently empty replies. Declared as the
+// model's maxTokens, pi-ai sends it as max_completion_tokens on every request
+// — hence the cap (settings.go RequestMaxTokens says why).
 const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
 // The reasoning bound, already resolved by the adapter (settings.Resolved's
 // Effort() folds the model's catalog support, the owner's level and the "low"
@@ -110,6 +113,26 @@ const MODEL_EFFORT = ['low', 'high', 'max'].includes(process.env.SEAL_MODEL_EFFO
 // existed, so an owner who sets nothing gets exactly the shipped composition.
 const TOOL_JOBS = process.env.SEAL_DSH_TOOL_JOBS === '1'
 const MAX_PARALLEL_TOOL_CALLS = Number(process.env.SEAL_DSH_MAX_PARALLEL_TOOL_CALLS || '1') || 1
+
+// Bound on one owner-initiated compaction once it starts (POST /v1/compact):
+// the summary is a model call, and a reasoning model takes minutes on a long
+// history. Kept under the adapter's and sealed's own deadlines so the bridge
+// is the one that gives up and says why.
+const COMPACT_TIMEOUT_MS = 10 * 60 * 1000
+
+// Output cap for a compaction's summary call — deliberately BELOW a turn's
+// MODEL_MAX_TOKENS, on both sides of a trade-off:
+//   - Room to finish. The cap covers a reasoning model's thinking too, and a
+//     summary cut off at the cap is a failed compaction. Measured on glm-5.3
+//     at effort=max: a 6.6K-token summary prompt took 3,477 output tokens, a
+//     33.9K-token one 5,239 (2,561 of them reasoning) — the need grows far
+//     slower than the history, and 16384 is 3x the larger.
+//   - Room for the input. compactNow keeps no tail, so the summary request
+//     carries the system prompt, the tools and the whole history but its
+//     last node — a turn's input, give or take — at the moment the history
+//     is longest. Wherever a server checks prompt + max_tokens against a
+//     limit, a smaller budget leaves the summary more room than a turn has.
+const COMPACT_SUMMARY_MAX_TOKENS = 16384
 
 if (!TOKEN) {
   console.error('bridge: SEAL_BRIDGE_TOKEN is required (it gates /v1/*)')
@@ -196,6 +219,22 @@ async function boot() {
           id: MODEL_ID,
           ...(MODEL_MAX_TOKENS ? { maxTokens: MODEL_MAX_TOKENS } : {}),
           ...(MODEL_EFFORT ? { reasoningEfforts: { low: 'low', high: 'high', max: 'max' } } : {}),
+          // System prompt as role "system", never "developer". pi-ai sends a
+          // reasoning model's system prompt as "developer" on any non-catalog
+          // OpenAI-protocol endpoint unless told otherwise, and through the 0G
+          // router a "developer" message never reaches the model: measured on
+          // all four glm-5.3 providers, a developer-role instruction was
+          // ignored and left out of prompt_tokens, while the same text as
+          // "system" was obeyed — this agent ran without its persona and
+          // platform doc. On long conversations it was also behind the HTTP
+          // 400 code 400001 rejections (settings.go RequestMaxTokens): zg
+          // compute confirmed (2026-10-19) that Tencent's and 0G's
+          // self-hosted backends do not support the role. openclaw and prime
+          // pin the same switch off. Only the openai-* protocols offer it (a
+          // native anthropic route carries the system prompt as its own
+          // field, and pi-ai refuses a compat switch the route's protocol
+          // does not take).
+          ...(MODEL_BASE_URL && MODEL_API.startsWith('openai-') ? { compat: { supportsDeveloperRole: false } } : {}),
         }],
       },
     },
@@ -218,7 +257,18 @@ async function boot() {
 
   // Loop hygiene + context headroom.
   await ctx.plugin(TokenMeter)
-  await ctx.plugin(BasicCompactionEngine)
+  // Summarize with the model this bridge runs. Unset, compaction-basic uses
+  // the session's LAST routed model, which after a model switch is one this
+  // restarted bridge no longer declares — measured offline: three turns on
+  // glm-5.3, restart on another model, /v1/compact → 500 'provider
+  // "0g-compute" has no configured model "glm-5.3"'.
+  // The summary call's output cap: COMPACT_SUMMARY_MAX_TOKENS — with no
+  // catalog-sourced budget, the engine's default 8192 rather than a guess.
+  await ctx.plugin(BasicCompactionEngine, {
+    summarizationProvider: PROVIDER,
+    summarizationModel: MODEL_ID,
+    ...(MODEL_MAX_TOKENS ? { maxTokens: Math.min(MODEL_MAX_TOKENS, COMPACT_SUMMARY_MAX_TOKENS) } : {}),
+  })
   await ctx.plugin(TimeoutPolicy)
 
   // Platform control points (ours).
@@ -287,10 +337,41 @@ function getAgent() {
 // Interleaving two turns onto one session would corrupt both.
 
 let tail = Promise.resolve()
+// True while an owner-initiated compaction is queued or running (/v1/compact).
+let compactPending = false
 function serialize(fn) {
   const run = tail.then(fn, fn)
   tail = run.then(() => undefined, () => undefined)
   return run
+}
+
+// compaction-basic's words (0.1.1-rc.2) for a summary that would not shrink
+// what it replaces: on the error it throws, and on the failed attempt's
+// `compaction/end` event.
+const SUMMARY_NOT_SMALLER = 'summary is not smaller than the shadowed content'
+
+// What /v1/compact answers when nothing has been said since the last one.
+const NOTHING_SAID_SINCE = Symbol('nothing said since the last compaction')
+
+// True when the latest compaction committed — or found the history already
+// shorter than its summary — and no turn has started since. Another one would
+// only pay for a model call that summarizes the summary again (losing
+// detail), or fails the same way (measured offline: a /compact right after
+// another made a second summary call either way). Read from the session's own
+// log, so it holds across a restart: a restored session is its stored log plus
+// a seed marker. Any other failed attempt (an upstream error, a timeout) does
+// not count; a retry may succeed.
+function nothingSaidSinceLastCompact(session) {
+  const events = session.events
+  for (let i = events.length - 1; i >= 0; i--) {
+    const { type, data } = events[i]
+    if (type === 'turn/start' || type === 'turn/end') return false
+    if (type === 'compaction/end') {
+      const error = data && typeof data.error === 'string' ? data.error : ''
+      if (error === '' || error.startsWith(SUMMARY_NOT_SMALLER)) return true
+    }
+  }
+  return false
 }
 
 /**
@@ -837,6 +918,89 @@ const server = createServer((req, res) => {
         return sendJSON(res, 200, { ok: true, aborted: true })
       } catch (err) {
         return sendJSON(res, 500, { error: { message: String((err && err.message) || err) } })
+      }
+    })()
+  }
+
+  // Owner-initiated compaction (sealed's /_seal/compact → the adapter → here;
+  // the owner's bearer route reaches it too, like /v1/interrupt). The
+  // composition's own compaction engine replaces the history with a summary,
+  // all but its newest item (compactNow keeps no tail beyond that, plus
+  // whatever keeps a tool call with its result) — the conversation goes on,
+  // unlike /clear. compactNow needs an idle agent, so
+  // this queues behind a running turn instead of failing against it; the
+  // summary is a model call and can take minutes, bounded by
+  // COMPACT_TIMEOUT_MS once it starts.
+  //
+  // One at a time, whichever door asked: sealed's single flight ends when the
+  // adapter stops waiting, but a compaction queued here behind a long turn
+  // outlives that, and a retry would queue a second one that summarizes the
+  // first one's summary. So a request while one is pending is a 409 "busy",
+  // and one that arrives after it, with nothing said in between, is "nothing
+  // to compact" without a model call (nothingSaidSinceLastCompact).
+  if (req.method === 'POST' && path === '/v1/compact') {
+    if (compactPending) {
+      return sendJSON(res, 409, { error: { message: 'a compaction is already queued or running', code: 'busy' } })
+    }
+    compactPending = true
+    return (async () => {
+      try {
+        const result = await serialize(async () => {
+          const { ctx, agent } = await getAgent()
+          if (nothingSaidSinceLastCompact(agent.session)) return NOTHING_SAID_SINCE
+          return ctx.compaction.compactNow(agent, AbortSignal.timeout(COMPACT_TIMEOUT_MS))
+        })
+        if (result === NOTHING_SAID_SINCE) {
+          log('compact: nothing to compact (nothing said since the last /compact)')
+          return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: nothing has been said since the last /compact' })
+        }
+        if (!result) {
+          log('compact: nothing to compact')
+          return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: no older history that can be summarized yet' })
+        }
+        const items = Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs.length : 0
+        const tokens = Number(result.shadowedTokenCount) || 0
+        log(`compact: ${items} history items (~${tokens} tokens) replaced by a summary`)
+        return sendJSON(res, 200, {
+          ok: true,
+          compacted: true,
+          shadowedItems: items,
+          shadowedTokens: tokens,
+          note: `compacted: ${items} history items (~${tokens} tokens) replaced by a summary; only the newest part is kept as is`,
+        })
+      } catch (err) {
+        // ManualCompactionError carries a stable class (compaction-basic
+        // 0.1.1-rc.2): busy (never started) and changed (the session moved
+        // under the summary, nothing committed) mean "try again"; summary and
+        // cancelled are failures that leave the conversation as it was;
+        // commit may have left it partly applied; persistence is thrown only
+        // AFTER a successful commit, when the durability flush failed. The
+        // class message is generic — "summary" reads "could not produce a
+        // smaller summary" whether the model call was refused upstream, came
+        // back empty, or produced a summary no smaller than its span — so the
+        // reason is the cause's.
+        const code = err && typeof err.code === 'string' ? err.code : ''
+        const cause = err && err.cause && err.cause.message ? String(err.cause.message) : ''
+        // Compacted, just not durably: reporting "failed" would invite a
+        // retry that compacts a second time.
+        if (code === 'persistence') {
+          log(`compact: compacted, but the durability checkpoint failed${cause ? ` (${cause})` : ''}`)
+          return sendJSON(res, 200, { ok: true, compacted: true, note: `compacted, but saving it failed${cause ? ` (${cause})` : ''}: the compaction holds for now and may be lost if the agent restarts` })
+        }
+        // A summary no smaller than what it would replace (compaction-basic
+        // 0.1.1-rc.2 wording) is not a failure: what is left is already as
+        // short as it gets — typically a /compact right after another one.
+        if (code === 'summary' && cause.startsWith(SUMMARY_NOT_SMALLER)) {
+          log(`compact: nothing to compact (${cause})`)
+          return sendJSON(res, 200, { ok: true, compacted: false, note: 'nothing to compact: the history left is already shorter than a summary of it would be' })
+        }
+        const message = String((err && err.message) || err) + (cause ? ` (${cause})` : '')
+        log(`compact FAILED${code ? ` (${code})` : ''}: ${message}`)
+        return sendJSON(res, code === 'busy' || code === 'changed' ? 409 : 500, {
+          error: { message, ...(code ? { code } : {}) },
+        })
+      } finally {
+        compactPending = false
       }
     })()
   }

@@ -131,8 +131,10 @@ func TestRenderSettings_CatalogOutageKeepsFactsOnDisk(t *testing.T) {
 	if cw, _ := def["contextWindow"].(float64); int(cw) != 1000000 {
 		t.Errorf("contextWindow = %v; want the catalog value kept, not the heuristic's 128000", def["contextWindow"])
 	}
-	if mt, _ := def["maxTokens"].(float64); int(mt) != 131072 {
-		t.Errorf("maxTokens = %v; want the catalog budget kept", def["maxTokens"])
+	// healthyEntry carries a pre-cap render's raw catalog 131072: the outage
+	// keeps it, but never uncapped — openclaw sends maxTokens on every request.
+	if mt, _ := def["maxTokens"].(float64); int(mt) != settings.RequestOutputCeiling {
+		t.Errorf("maxTokens = %v; want the on-disk budget kept but capped at %d", def["maxTokens"], settings.RequestOutputCeiling)
 	}
 	if def["reasoning"] != true {
 		t.Errorf("reasoning = %v; want the catalog value kept — an outage saying false disables thinking", def["reasoning"])
@@ -222,8 +224,8 @@ func TestRenderSettings_CatalogSourcedHealsPoisonedEntry(t *testing.T) {
 	cfg := renderInto(t, routedSettings(inference.WireOpenAI, "glm-5.3"))
 	def := firstModelDef(t, providerEntry(t, cfg, "openai"))
 
-	if mt, _ := def["maxTokens"].(float64); int(mt) != 131072 {
-		t.Errorf("maxTokens = %v; want the poisoned 8192 replaced by the catalog budget", def["maxTokens"])
+	if mt, _ := def["maxTokens"].(float64); int(mt) != settings.RequestOutputCeiling {
+		t.Errorf("maxTokens = %v; want the poisoned 8192 replaced by the capped catalog budget (%d)", def["maxTokens"], settings.RequestOutputCeiling)
 	}
 	if cw, _ := def["contextWindow"].(float64); int(cw) != 1000000 {
 		t.Errorf("contextWindow = %v; want the catalog value", def["contextWindow"])

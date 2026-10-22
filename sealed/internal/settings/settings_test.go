@@ -172,3 +172,25 @@ func TestCatalogOutageDoesNotDecide(t *testing.T) {
 		t.Fatalf("Effort() = (%q,%v), want the owner's level honoured despite the outage", lvl, decided)
 	}
 }
+
+// The catalog's max_completion_tokens is a capability, not a per-request
+// budget: frameworks send the configured budget on every request.
+// RequestMaxTokens caps it; a smaller catalog budget passes through, a
+// heuristic one stays unwritten.
+func TestRequestMaxTokensCapsTheCatalogBudget(t *testing.T) {
+	cases := []struct {
+		name  string
+		facts inference.ModelFacts
+		want  int
+	}{
+		{"catalog above the ceiling", inference.ModelFacts{MaxTokens: 131072, CatalogSourced: true}, RequestOutputCeiling},
+		{"catalog below the ceiling", inference.ModelFacts{MaxTokens: 16384, CatalogSourced: true}, 16384},
+		{"catalog silent on the budget", inference.ModelFacts{CatalogSourced: true}, 0},
+		{"heuristic guess", inference.ModelFacts{MaxTokens: inference.HeuristicOpenAIMaxTokens}, 0},
+	}
+	for _, c := range cases {
+		if got := (Resolved{Facts: c.facts}).RequestMaxTokens(); got != c.want {
+			t.Errorf("%s: RequestMaxTokens() = %d, want %d", c.name, got, c.want)
+		}
+	}
+}

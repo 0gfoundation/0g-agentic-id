@@ -742,3 +742,40 @@ func TestHandleLegacy_ModelsJSON_IsIdempotent(t *testing.T) {
 		t.Errorf("recovery has a side effect on disk: %v", entries)
 	}
 }
+
+// models.json's maxTokens is the per-call budget the SDK sends, so glm-5.3's
+// catalog 131072 is written capped.
+func TestRenderSettings_RequestBudgetIsCapped(t *testing.T) {
+	prev := primeHome
+	primeHome = t.TempDir()
+	t.Cleanup(func() { primeHome = prev })
+	if err := ensureDir(primeHome); err != nil {
+		t.Fatal(err)
+	}
+	s := settings.Resolved{
+		Doc:      settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Thinking: "high"},
+		Facts:    inference.ModelFacts{MaxTokens: 131072, SupportsReasoningEffort: true, CatalogSourced: true},
+		Endpoint: &inference.Endpoint{Format: inference.WireOpenAI, BaseURL: inference.ZGOpenAIBaseURL, EnvKey: "OPENAI_API_KEY"},
+	}
+	if err := New().RenderSettings(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(modelsJSONPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Providers map[string]struct {
+			Models []struct {
+				MaxTokens int `json:"maxTokens"`
+			} `json:"models"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse rendered models.json: %v\n%s", err, raw)
+	}
+	p := cfg.Providers[inference.ZGComputeProvider]
+	if len(p.Models) == 0 || p.Models[0].MaxTokens != settings.RequestOutputCeiling {
+		t.Errorf("maxTokens not capped at %d: %s", settings.RequestOutputCeiling, raw)
+	}
+}

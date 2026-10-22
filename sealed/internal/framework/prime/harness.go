@@ -3,8 +3,12 @@ package prime
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
+
+	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 )
 
 // The Continual Harness state file — this adapter's identity anchor and the
@@ -140,8 +144,12 @@ func isGlobalEntry(entry map[string]any) bool {
 // plaintext. A missing file — the framework has not written one yet — is "no
 // content", same as an all-local state.
 func (a *Adapter) evoHarnessState() ([]byte, error) {
-	content, err := os.ReadFile(harnessStatePath())
-	if os.IsNotExist(err) {
+	// Agent-writable file: read through internal/privsep; an entry the read
+	// rules refuse (a link, a FIFO) counts as absent. A file over its size
+	// limit is an error, so the anchored state stays as committed instead
+	// of being erased.
+	content, err := privsep.ReadFile(harnessStatePath(), privsep.LimitTracked)
+	if errors.Is(err, fs.ErrNotExist) || privsep.Refused(harnessStatePath(), err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -165,8 +173,8 @@ func (a *Adapter) evoHarnessState() ([]byte, error) {
 // finds a well-formed state file and the absent-on-chain invariant still holds
 // (evoHarnessState normalizes an entry-less state back to nil).
 func (a *Adapter) restoreHarnessState(plaintext []byte) error {
-	if err := os.MkdirAll(harnessStateDir(), 0o755); err != nil {
-		return fmt.Errorf("prime.Restore[harness_state.json]: mkdir %s: %w", harnessStateDir(), err)
+	if err := ensureRoleDir(harnessStateDir()); err != nil {
+		return fmt.Errorf("prime.Restore[harness_state.json]: %w", err)
 	}
 
 	next := rawHarness{
@@ -200,18 +208,57 @@ func (a *Adapter) restoreHarnessState(plaintext []byte) error {
 	// Carry the existing refinements log across untouched: it is deliberately
 	// not on chain, but wiping it on every boot would destroy the local audit
 	// trail of how this agent got here.
-	if existing, err := os.ReadFile(harnessStatePath()); err == nil {
-		if prev, perr := decodeHarness(existing); perr == nil && len(prev.Refinements) > 0 {
+	existing, err := privsep.ReadFile(harnessStatePath(), privsep.LimitTracked)
+	switch {
+	case err == nil && len(bytes.TrimSpace(existing)) == 0:
+		// Empty: nothing to carry.
+	case err == nil:
+		prev, perr := decodeHarness(existing)
+		if perr != nil {
+			setAsideHarnessState(perr)
+			break
+		}
+		if len(prev.Refinements) > 0 {
 			next.Refinements = prev.Refinements
 		}
+	case errors.Is(err, fs.ErrNotExist) || privsep.Refused(harnessStatePath(), err):
+		// Nothing to carry: no file, or an entry the read rules refuse (a
+		// link, a FIFO), which the write below replaces without touching
+		// what it points at.
+	default:
+		// A file that is there but cannot be read now — leased by its
+		// owner (privsep.ErrBusy), or over the read limit — still holds
+		// the log: it is set aside, not written over.
+		setAsideHarnessState(err)
 	}
 
 	b, err := json.Marshal(&next)
 	if err != nil {
 		return fmt.Errorf("prime.Restore[harness_state.json]: marshal: %w", err)
 	}
-	if err := os.WriteFile(harnessStatePath(), b, 0o644); err != nil {
+	if err := privsep.WriteFile(harnessStatePath(), b, 0o644); err != nil {
 		return fmt.Errorf("prime.Restore[harness_state.json]: write: %w", err)
 	}
 	return nil
+}
+
+// setAsideHarnessState moves a harness state file restore cannot read to
+// harnessStatePath()+".unread" (the latest such copy; the rename follows no
+// link), so the local refinements log it holds is kept rather than
+// overwritten by the restored state.
+func setAsideHarnessState(why error) {
+	aside := harnessStatePath() + ".unread"
+	err := privsep.Rename(harnessStatePath(), aside)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// A directory at the name blocks the rename (a file there is simply
+		// replaced): the name holds only the latest copy.
+		if rerr := privsep.RemoveAll(aside); rerr == nil {
+			err = privsep.Rename(harnessStatePath(), aside)
+		}
+	}
+	if err != nil {
+		logger.Logf("prime: %s cannot be read (%v) and could not be set aside (%v); its local refinements log is not carried over", harnessStatePath(), why, err)
+		return
+	}
+	logger.Logf("prime: %s cannot be read (%v); moved to %s, with its local refinements log, before restoring", harnessStatePath(), why, aside)
 }
