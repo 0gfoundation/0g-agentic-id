@@ -365,7 +365,11 @@ invariants:
   never be rewritten. Zero values are rejected at write time, so the
   initial set is also the final one.
 - **`sealId` global uniqueness**: the `sealId → agentId` mapping is
-  one-to-one across all agents. Two agents cannot share a seal.
+  one-to-one across all agents, so two agents cannot share a sealId.
+  Since AgenticID 1.2.0 the agentSeal address is unique too, for seals
+  bound from that upgrade on (older ones are not tracked; the attestor
+  derives each seal from a fresh sealId, and CloneGate refuses a clone
+  that reuses its source's seal).
 - **Persistence across transfer**: `iTransferFrom` clears `agentWallet`
   and `authorizedUsers` (per-owner state) but leaves `agentSeal` and
   `sealId` untouched. The agent's TEE-attested identity outlives any
@@ -435,19 +439,24 @@ gets only a hollow NFT, not a working agent.
 `iTransferFrom` enforces this via two cryptographic proofs that both
 land in the same transaction:
 
-- **AccessProof**: buyer signs `keccak256(chainId || erc7857 || dataHash
-  || buyer_targetPubkey || nonce || deadline)` (where `erc7857` is the
-  AgenticID token contract address — both prefixes are mandatory,
-  domain-separating the proof against cross-chain / cross-contract
-  replay), declaring "I want this data sealed to my
-  pubkey." The recovered signer must equal `to` (or a registered
+- **AccessProof**: buyer signs `keccak256(abi.encode(chainId, erc7857,
+  tokenId, from, isClone, dataHash, buyer_targetPubkey, nonce, deadline))`
+  (word-aligned and length-prefixed `abi.encode`, not a byte
+  concatenation; `erc7857` is the AgenticID token contract address,
+  `tokenId` / `from` the token being sold and its seller, `isClone` the
+  action — all five are mandatory: the first two domain-separate the
+  proof against cross-chain / cross-contract replay, the rest, since
+  TEEDataVerifier 1.2.0, bind it to this token and this action so a
+  look-alike declaring the same `dataHash` cannot redeem it and a
+  transfer proof cannot be redeemed as a clone), declaring "I want this
+  data sealed to my pubkey." The recovered signer must equal `to` (or a registered
   delegate).
 - **OwnershipProof**: Oracle TEE decrypts the existing `sealedKey`
   under the seller's `agent_seal_priv`, re-encrypts the same plaintext
   `dataKey` under `buyer_targetPubkey` (ECIES), and signs
-  `keccak256(chainId || erc7857 || dataHash || sealedKey_new ||
-  buyer_targetPubkey || nonce || deadline)` (same mandatory
-  `chainId || erc7857` prefix). The recovered signer must equal the
+  `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone,
+  dataHash, sealedKey_new, buyer_targetPubkey, nonce, deadline))` (same
+  mandatory prefix). The recovered signer must equal the
   on-chain-registered `teeOracleAddress`.
 
 The Oracle TEE is **stateless** with respect to `dataKey`. It decrypts,
@@ -703,8 +712,8 @@ controls, such as a wallet it generated and funded through
 because sealed composed every field from a real request, but the
 "client" is the agent. This is the same sybil class as an owner
 self-rating from a second wallet via `/hello`. VerifiedFeedbackRegistry
-rejects a redeemer that is the owner, an approved operator, or the
-agentSeal itself. That is ERC-8004 conformance, not sybil resistance: a
+rejects a redeemer that is the owner, an approved operator, the agent's
+payment wallet (since 1.2.0), or the agentSeal itself. That is ERC-8004 conformance, not sybil resistance: a
 fresh wallet funded by the seal still passes. Reputation weighting has
 to absorb it.
 

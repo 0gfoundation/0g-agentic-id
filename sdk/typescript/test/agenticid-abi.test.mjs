@@ -39,7 +39,7 @@ import { fileURLToPath } from 'node:url';
 
 import { agenticIDAbi } from '../dist/abi.js';
 
-const VENDORED_SHA256 = 'd89704b0d4459836df9b63e4808c21f23bd0094865a3ef166bcc6eb1deb16615';
+const VENDORED_SHA256 = '8571cda8c80b13eabb6a84887663b987ffaaf37e7dd0d33c85c3da49a1c0bec0';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const raw = readFileSync(join(here, 'assets', 'AgenticID.json'));

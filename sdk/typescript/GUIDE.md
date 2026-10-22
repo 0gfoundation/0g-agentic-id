@@ -341,20 +341,23 @@ await ag.reputation.verifyProof(proof);
 // permanent failures — a canonical write without its mark would be an
 // orphaned, unverified entry. Refused: agent / submitter mismatch, a proof
 // bound to another registry, a deadline already past or within 60s of the
-// latest block, a signature that does not recover to the on-chain agentSeal
-// under addresses.verifiedFeedback (or is an encoding the registry's OZ ECDSA
-// rejects: not 65 bytes, v ∉ {27,28}, high s), you being the agentSeal, the owner, the
-// approved address or an approved-for-all operator, and a proof already
-// redeemed (isNonceConsumed). NOT prevented: a paused registry, a deadline
+// latest block, a proof timestamp of 0 or after its deadline, a signature that
+// does not recover to the on-chain agentSeal under addresses.verifiedFeedback
+// (or is an encoding the registry's OZ ECDSA rejects: not 65 bytes,
+// v ∉ {27,28}, high s), you being the agentSeal, the owner, the approved
+// address, an approved-for-all operator or the agent's payment wallet, and a
+// proof already redeemed (isNonceConsumed). On BOTH paths a value outside
+// |value| ≤ 1e9 or 0..18 decimals is refused before anything is signed
+// (MAX_ABS_FEEDBACK_VALUE) — the registry marks nothing outside that bound. NOT prevented: a paused registry, a deadline
 // beyond the registry's nonce retention, state changing between the check and
 // the attest, and non-proof tx failures (gas, RPC) — the proof stays
 // unconsumed, so retry with attestFeedback where that can help.
 // NOTE: an agent's OWNER cannot attest feedback on their own agent — the
 // verified registry rejects it (VerifiedFeedbackSelfFeedback). Feedback must
 // come from a different wallet than the one that owns `agentId`. Neither can
-// the agent's own agentSeal wallet (same error). Both are conformance guards,
-// not sybil resistance: a fresh wallet funded by the owner or the agent still
-// passes.
+// the agent's own agentSeal wallet or its payment wallet (getAgentWallet; same
+// error). These are conformance guards, not sybil resistance: a fresh wallet
+// funded by the owner or the agent still passes.
 const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // → { feedbackTx: "0x…" (mined), attestTx: "0x…" (pending), feedbackIndex: 2n }
 await ag.reputation.waitForTransaction(fb.attestTx);

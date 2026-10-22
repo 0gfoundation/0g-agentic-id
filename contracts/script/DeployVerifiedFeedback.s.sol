@@ -24,7 +24,7 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///           OWNER                     — owner (two-step Ownable; setPauser / setMaxProofAge,
 ///                                       direct calls, not timelocked)
 ///           PAUSER                    — pause / unpause role
-///           MAX_PROOF_AGE             — nonce GC horizon in seconds (default 86400)
+///           MAX_PROOF_AGE             — nonce GC horizon in seconds (default 86400; 7200..31536000)
 ///           CANONICAL_8004_REPUTATION — override the chainId default
 contract DeployVerifiedFeedback is Script {
     function run() external returns (address impl, address beacon, address proxy, address batcher) {

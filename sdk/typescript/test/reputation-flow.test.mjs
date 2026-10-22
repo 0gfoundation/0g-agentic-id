@@ -109,6 +109,7 @@ function mkCtx(opts = {}) {
         if (functionName === 'getAgentSeal') return opts.agentSeal ?? SEAL.address;
         if (functionName === 'ownerOf') return opts.owner ?? OWNER;
         if (functionName === 'getApproved') return opts.approved ?? '0x0000000000000000000000000000000000000000';
+        if (functionName === 'getAgentWallet') return opts.agentWallet ?? '0x0000000000000000000000000000000000000000';
         // operatorFor: the [owner, operator] pair that IS approved-for-all
         if (functionName === 'isApprovedForAll') {
           return !!opts.operatorFor && args[0] === opts.operatorFor[0] && args[1] === opts.operatorFor[1];
@@ -269,7 +270,7 @@ test('sequential: a proof that cannot attest is refused before the canonical wri
   }
 });
 
-test('sequential: deadline, owner/operator self-feedback and a redeemed nonce are refused before the canonical write', async () => {
+test('sequential: deadline, owner/operator/payment-wallet self-feedback and a redeemed nonce are refused before the canonical write', async () => {
   const key = serveProofNonceKey(PROOF.agentId, PROOF.signature);
   const cases = [
     ['deadline passed', { blockTs: FIELDS.deadline + 1n }, /deadline .* has passed/],
@@ -277,6 +278,7 @@ test('sequential: deadline, owner/operator self-feedback and a redeemed nonce ar
     ['caller owns the agent', { owner: ME }, /owns this agent/],
     ['caller is the approved address', { approved: ME }, /approved address/],
     ['caller is an approved-for-all operator of the owner', { operatorFor: [OWNER, ME] }, /approved operator/],
+    ['caller is the agent\'s payment wallet (FIND-13)', { agentWallet: ME }, /payment wallet/],
     ['proof already redeemed (nonce consumed)', { consumedKey: key }, /already redeemed/],
   ];
   for (const [name, ctxOpts, re] of cases) {
@@ -285,6 +287,52 @@ test('sequential: deadline, owner/operator self-feedback and a redeemed nonce ar
     assert.equal(calls.writes.length, 0, `${name}: nothing may be written`);
     assert.equal(calls.sends.length, 0, name);
   }
+});
+
+test('sequential: a zero or after-deadline proof timestamp is refused before the canonical write (FIND-15)', async () => {
+  for (const timestamp of [0n, FIELDS.deadline + 1n]) {
+    const { ctx, calls } = mkCtx(SEQUENTIAL);
+    await assert.rejects(
+      () => new ReputationClient(ctx).giveFeedback({ ...params, serveProof: { ...PROOF, timestamp } }),
+      /zero or after its deadline/,
+      `timestamp ${timestamp}`,
+    );
+    assert.equal(calls.writes.length, 0, `timestamp ${timestamp}: nothing may be written`);
+  }
+});
+
+// FIND-04: the registry marks only |value| <= 1e9 with at most 18 decimals.
+const BAD_VALUES = [
+  { value: 1_000_000_001n }, { value: -1_000_000_001n }, { value: 10n ** 38n },
+  { value: 1n, valueDecimals: 19 }, { value: 1n, valueDecimals: -1 }, { value: 1n, valueDecimals: 1.5 },
+];
+
+test('FIND-04: an out-of-range value is refused before any broadcast (sequential and atomic)', async () => {
+  for (const bad of BAD_VALUES) {
+    for (const ctxOpts of [SEQUENTIAL, { code: DESIGNATOR, receiptLogs: [feedbackVerifiedLog(7n)] }]) {
+      const { ctx, calls } = mkCtx(ctxOpts);
+      await assert.rejects(
+        () => new ReputationClient(ctx).giveFeedback({ ...params, ...bad }),
+        /VerifiedFeedbackValueOutOfRange/,
+        JSON.stringify(bad, (_, v) => (typeof v === 'bigint' ? `${v}` : v)),
+      );
+      assert.equal(calls.writes.length + calls.sends.length + calls.authSigned, 0, 'nothing broadcast or signed');
+    }
+  }
+});
+
+test('FIND-04: the bound itself passes (±1e9, 0 and 18 decimals)', async () => {
+  for (const ok of [{ value: 1_000_000_000n }, { value: -1_000_000_000n, valueDecimals: 18 }]) {
+    const { ctx, calls } = mkCtx(SEQUENTIAL);
+    await new ReputationClient(ctx).giveFeedback({ ...params, ...ok });
+    assert.deepEqual(calls.writes.map((w) => w.functionName), ['giveFeedback', 'attestFeedback']);
+  }
+});
+
+test('FIND-09: getVerifiedSummaryForEndpoint refuses an empty uri without a read', async () => {
+  const { ctx, calls } = mkCtx();
+  await assert.rejects(() => new ReputationClient(ctx).getVerifiedSummaryForEndpoint(352n, ''), /non-empty uri/);
+  assert.equal(calls.reads.length, 0);
 });
 
 test('the nonce key matches the registry derivation keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, signature))', async () => {

@@ -44,7 +44,7 @@ import {MainnetGovernance} from "./MainnetGovernance.sol";
 ///                               reachable (MainnetGovernance.requireMainnetTimelockRoles).
 ///           NFT_NAME          — ERC-721 name   (default "AgenticID")
 ///           NFT_SYMBOL        — ERC-721 symbol (default "AID")
-///           MAX_PROOF_AGE     — nonce GC horizon in seconds (default 86400)
+///           MAX_PROOF_AGE     — nonce GC horizon in seconds (default 86400; 7200..31536000)
 ///           CANONICAL_8004 / CANONICAL_8004_REPUTATION — override the chainId defaults
 ///
 ///         Timelock admin (MainnetGovernance.timelockAdmin): on 0G mainnet (16661) none —

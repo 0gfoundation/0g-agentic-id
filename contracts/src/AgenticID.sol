@@ -26,6 +26,11 @@ error AgenticIDSealIdTaken(bytes32 sealId, uint256 existingAgentId);
 /// @notice The agent already has an agentSeal set. Seals are one-time bindings.
 error AgenticIDSealAlreadySet(uint256 agentId);
 
+/// @notice The agentSeal address is already bound to another agent. One seal
+///         per agent: a shared seal could update both agents' iData and sign
+///         ServeProofs for both (audit FIND-08).
+error AgenticIDAgentSealTaken(address agentSeal);
+
 /// @notice agentSeal or sealId is the zero value. Both must be non-zero.
 error AgenticIDZeroSeal();
 
@@ -93,8 +98,8 @@ error AgenticIDCannotCloneSealedAgent(uint256 agentId);
 ///      owner proposes with transferOwnership and the new owner must
 ///      acceptOwnership, so a mistyped address can't strand the admin
 ///      surface. Owner calls are direct (not timelocked); only beacon
-///      upgrades go through the Timelock. The bytecode sits a little over
-///      100 B under EIP-170 (test/Eip170Size.t.sol) — measure
+///      upgrades go through the Timelock. The bytecode sits about 60 B
+///      under EIP-170 (test/Eip170Size.t.sol) — measure
 ///      `forge build --sizes` on any change.
 ///
 ///      agentSeal / sealId are one-time bindings per agentId and persist across
@@ -127,6 +132,11 @@ contract AgenticID is
         // is ambiguous between "unbound" and "bound to agent 0", so uniqueness
         // and existence checks key off this flag instead of the zero sentinel.
         mapping(bytes32 => bool)    sealIdBound;
+        // Every agentSeal address bound since 1.2.0 (appended field — append-
+        // safe in this namespaced struct). Seals bound before the upgrade are
+        // not in the set; the attestor derives each seal from a fresh sealId,
+        // so those are distinct by construction.
+        mapping(address => bool)    agentSealBound;
     }
 
     /// @notice Current implementation version. Bump on every upgrade.
@@ -142,7 +152,19 @@ contract AgenticID is
     ///      registerWithSeal into the shared _mintWithData (same checks, same
     ///      order, same events) pays for it. (The PR #145 "1.2.0" never
     ///      reached chain — its impl exceeded EIP-170; this is a different
-    ///      build.)
+    ///      build.) Audit Low fixes in the same build: transfer / clone
+    ///      proofs are token- and action-bound — _proofCheck passes (tokenId,
+    ///      from, isClone) to verifyTransferValidity, isClone read from
+    ///      msg.sig, whose selector changes, so this impl and
+    ///      TEEDataVerifier 1.2.0 must land in the same window (FIND-05); a
+    ///      bound agentSeal address cannot be bound to a second agent
+    ///      (AgenticIDAgentSealTaken; appended `agentSealBound` mapping —
+    ///      seals bound before the upgrade are not in it, FIND-08);
+    ///      setAgentURI / setMetadata / setAgentWallet revert while paused and
+    ///      revokeAuthorization / clearAuthorizedUsers no longer do (FIND-11);
+    ///      getMetadata / getAgentWallet revert for an agentId with no local
+    ///      token (FIND-14). One shared owner check (_requireAgentOwner) pays
+    ///      for these under EIP-170.
     ///      1.1.0 — audit security fixes (beacon upgrade): iTransferFrom writes
     ///      sealed keys before the receiver callback and iTransferFrom/iCloneFrom
     ///      are nonReentrant, so a re-entrant receiver can't desync ownership from
@@ -263,6 +285,13 @@ contract AgenticID is
         returns (string memory)
     {
         return super.tokenURI(tokenId);
+    }
+
+    /// @dev setAgentURI / setMetadata / setAgentWallet are blocked while
+    ///      paused, so a pause also freezes a compromised attestor's URI
+    ///      rewrites (audit FIND-11).
+    function _beforeCanonicalWrite() internal view override {
+        _requireNotPaused();
     }
 
     /// @dev Allow trusted attestors to set the URI in addition to the token
@@ -533,10 +562,15 @@ contract AgenticID is
         // is a valid (third-party) agent on the canonical registry.
         if ($.sealIdBound[sealId]) revert AgenticIDSealIdTaken(sealId, $.sealIdToAgentId[sealId]);
 
+        // The seal address must be fresh too — one seal, one agent. Never
+        // cleared: seals are lifetime bindings, so a used address stays used.
+        if ($.agentSealBound[agentSeal_]) revert AgenticIDAgentSealTaken(agentSeal_);
+
         $.agentSeals[agentId]      = agentSeal_;
         $.agentIdToSealId[agentId] = sealId;
         $.sealIdToAgentId[sealId]  = agentId;
         $.sealIdBound[sealId]      = true;
+        $.agentSealBound[agentSeal_] = true;
 
         emit AgentSealSet(agentId, agentSeal_, sealId);
     }

@@ -27,10 +27,11 @@ error VerifiedFeedbackProofAgentMismatch(uint256 agentId, uint256 proofAgentId);
 /// @dev The proof was signed for a different redeemer — `proof.submitter` must
 /// equal the attestFeedback caller. Closes front-running / proof theft.
 error VerifiedFeedbackProofSubmitterMismatch(address submitter, address sender);
-/// @dev ERC-8004: the agent owner, an approved operator, or the agent's own
-/// agentSeal must not attest feedback on their own agent. Conformance guard,
-/// not sybil resistance (a determined owner can still self-rate from an
-/// unrelated second wallet — including a fresh wallet the seal funds).
+/// @dev ERC-8004: the agent owner, an approved operator, the agent's payment
+/// wallet (getAgentWallet), or the agent's own agentSeal must not attest
+/// feedback on their own agent. Conformance guard, not sybil resistance (a
+/// determined owner can still self-rate from an unrelated second wallet —
+/// including a fresh wallet the seal funds).
 error VerifiedFeedbackSelfFeedback(uint256 agentId, address submitter);
 /// @dev No canonical feedback entry exists at (agentId, msg.sender, feedbackIndex)
 /// — index 0, or beyond the client's last canonical index.
@@ -49,11 +50,22 @@ error VerifiedFeedbackTaskMismatch(bytes32 expected, bytes32 actual);
 /// preimage; the fixed 3-digit status closes it at the respBodyHash‖status
 /// tail.
 error VerifiedFeedbackInvalidTaskReveal();
-/// @dev A summary summation exceeded int128 — unreachable given canonical's
-/// bounded writes (|value| ≤ 1e38 is still bounded after 18-decimal
-/// normalization only for ≤ 18-decimal values; the guard keeps a would-be
-/// silent truncation a clean revert).
+/// @dev A summary summation exceeded int128. Unreachable: summaries count only
+/// entries with |value| ≤ MAX_ABS_VALUE and ≤ 18 decimals (each ≤ 1e27 after
+/// normalization), so overflow would take ~1.7e11 entries in one eth_call. The
+/// guard keeps a would-be silent truncation a clean revert.
 error VerifiedFeedbackSummaryOverflow();
+/// @dev The canonical entry's value is outside ±MAX_ABS_VALUE or its decimals
+/// exceed 18 — such an entry cannot earn a verification mark (audit FIND-04;
+/// the fork registry enforced the same bound at write time).
+error VerifiedFeedbackValueOutOfRange(int128 value, uint8 valueDecimals);
+/// @dev getVerifiedSummaryForEndpoint needs a non-empty `uri`: entries attested
+/// without a task reveal store "", so an empty filter would count exactly the
+/// entries whose endpoint is unproven (audit FIND-09).
+error VerifiedFeedbackEndpointRequired();
+/// @dev The ServeProof's timestamp is zero or later than its deadline (audit
+/// FIND-15). The sealed runtime always signs timestamp = now, deadline = now + 1h.
+error VerifiedFeedbackInvalidProofTimestamp();
 
 /// @title Verified Feedback Registry
 /// @notice TEE-verification layer over the official ERC-8004 Reputation
@@ -95,8 +107,8 @@ contract VerifiedFeedbackRegistry is
     /// @notice Current implementation version. See contracts/UPGRADING.md for
     ///         the bump rules.
     /// @dev 1.2.0 — ServeProof hardening (beacon upgrade; storage unchanged,
-    ///      ABI only gains the two-step-ownership surface below, but
-    ///      consensus-critical — ships with new sealed images + SDK in one
+    ///      ABI gains only the two-step-ownership surface below plus new
+    ///      errors and NonceMaxAgeUpdated, but consensus-critical — ships with new sealed images + SDK in one
     ///      window): the signed digest becomes EIP-191 version 0x00
     ///      bound to this registry (toDataWithIntendedValidatorHash(address(this),
     ///      proofHash)); legacy personal_sign-wrapped proofs are rejected, no
@@ -106,13 +118,23 @@ contract VerifiedFeedbackRegistry is
     ///      (FIND-16 governance hardening; Ownable2StepUpgradeable):
     ///      transferOwnership only proposes and the new owner must
     ///      acceptOwnership — adds pendingOwner / acceptOwnership +
-    ///      OwnershipTransferStarted, the only ABI additions; the pending owner
+    ///      OwnershipTransferStarted; the pending owner
     ///      lives in OZ's ERC-7201 namespace, so no existing storage moves.
     ///      Marks attested before an environment's 1.2.0 upgrade block carry
     ///      no FIND-01 / FIND-02 guarantee: their recorded audit data and
     ///      verified endpoint are not assured to be authentic. That block is
     ///      recorded per environment in contracts/DEPLOYMENT.md §6; readers and
-    ///      indexers should drop FeedbackVerified logs below it.
+    ///      indexers should drop FeedbackVerified logs below it. Audit Low
+    ///      fixes in the same build: an entry with |value| > 1e9 or > 18
+    ///      decimals cannot be attested (VerifiedFeedbackValueOutOfRange) and
+    ///      both summaries skip such pre-upgrade marks, so one extreme entry
+    ///      no longer makes every summary revert (FIND-04);
+    ///      getVerifiedSummaryForEndpoint rejects an empty uri (FIND-09); the
+    ///      agent's payment wallet counts as self-feedback (FIND-13); a proof
+    ///      with timestamp 0 or after its deadline is rejected
+    ///      (VerifiedFeedbackInvalidProofTimestamp; dataHashes / frameworkHash
+    ///      stay claimed, not checked — FIND-15); setMaxProofAge is
+    ///      raise-only within [2 hours, 365 days] (FIND-07).
     ///      1.1.0 — task-receipt opening (beacon upgrade): attestFeedbackWithTask
     ///      recomputes the proof's taskHash from revealed receipt materials and
     ///      records the URI as the entry's TEE-verified endpoint; new views
@@ -128,6 +150,14 @@ contract VerifiedFeedbackRegistry is
     ///      signed DIGEST is no longer shared with the fork since 1.2.0 (see
     ///      `_serveProofDigest`).
     bytes32 private constant _SERVEPROOF_TAG = keccak256("SERVEPROOF");
+
+    /// @dev Per-entry bound on |value| (raw, before decimal normalization) —
+    ///      the deprecated fork registry's write-time bound. Entries outside it
+    ///      (or with > 18 decimals) are not attestable and summaries skip them,
+    ///      so one extreme entry can no longer make every summary revert
+    ///      (audit FIND-04). The canonical registry itself allows |value| up to
+    ///      1e38, which normalizes past int128.
+    int128 private constant MAX_ABS_VALUE = 1e9;
 
     event PauserUpdated(address indexed previousPauser, address indexed newPauser);
 
@@ -292,14 +322,20 @@ contract VerifiedFeedbackRegistry is
             revert VerifiedFeedbackSelfFeedback(agentId, msg.sender);
 
         VerifiedFeedbackStorage storage $ = _getVerifiedFeedbackStorage();
+        ICanonicalReputationRegistry canonical_ = ICanonicalReputationRegistry($.canonicalReputation);
 
         // The canonical entry must exist AND belong to the caller — canonical
         // attribution is msg.sender there too, so (agentId, msg.sender,
         // feedbackIndex) names exactly the entry the caller submitted.
-        uint64 lastIndex = ICanonicalReputationRegistry($.canonicalReputation).getLastIndex(agentId, msg.sender);
+        uint64 lastIndex = canonical_.getLastIndex(agentId, msg.sender);
         if (feedbackIndex == 0 || feedbackIndex > lastIndex) {
             revert VerifiedFeedbackNoSuchEntry(agentId, msg.sender, feedbackIndex, lastIndex);
         }
+
+        // Only in-range values earn a mark — the same bound the summaries
+        // apply (FIND-04).
+        (int128 value, uint8 valueDecimals, , , ) = canonical_.readFeedback(agentId, msg.sender, feedbackIndex);
+        if (!_valueInRange(value, valueDecimals)) revert VerifiedFeedbackValueOutOfRange(value, valueDecimals);
 
         // One mark per entry. Distinct from the nonce (which is per proof):
         // two different proofs must not stack marks on one entry either.
@@ -370,13 +406,15 @@ contract VerifiedFeedbackRegistry is
     /// @dev Same shape and caveats as getVerifiedSummary, additionally
     ///      filtering to entries whose TEE-verified endpoint equals `uri`
     ///      (entries attested without a task reveal never match — their
-    ///      endpoint is unproven). Off-chain eth_call only.
+    ///      endpoint is unproven, and an empty `uri` reverts
+    ///      VerifiedFeedbackEndpointRequired). Off-chain eth_call only.
     function getVerifiedSummaryForEndpoint(
         uint256 agentId,
         address[] calldata clientAddresses,
         string calldata uri
     ) external view returns (uint64 count, int128 summaryValue, uint8 summaryValueDecimals) {
         if (clientAddresses.length == 0) revert VerifiedFeedbackClientsRequired();
+        if (bytes(uri).length == 0) revert VerifiedFeedbackEndpointRequired();
         VerifiedFeedbackStorage storage $ = _getVerifiedFeedbackStorage();
         ICanonicalReputationRegistry canonical_ = ICanonicalReputationRegistry($.canonicalReputation);
         bytes32 uriHash = keccak256(bytes(uri));
@@ -390,7 +428,7 @@ contract VerifiedFeedbackRegistry is
                 if (keccak256(bytes($.verified[agentId][client][indexes[j]].uri)) != uriHash) continue;
                 (int128 value, uint8 valueDecimals, , , bool revoked) =
                     canonical_.readFeedback(agentId, client, indexes[j]);
-                if (revoked) continue;
+                if (revoked || !_valueInRange(value, valueDecimals)) continue;
                 count++;
                 acc += _normalizeTo18(value, valueDecimals);
             }
@@ -424,7 +462,7 @@ contract VerifiedFeedbackRegistry is
             for (uint256 j = 0; j < indexes.length; j++) {
                 (int128 value, uint8 valueDecimals, string memory t1, string memory t2, bool revoked) =
                     canonical_.readFeedback(agentId, client, indexes[j]);
-                if (revoked) continue;
+                if (revoked || !_valueInRange(value, valueDecimals)) continue;
                 if (!_tagMatches(t1, tag1)) continue;
                 if (!_tagMatches(t2, tag2)) continue;
                 count++;
@@ -458,6 +496,7 @@ contract VerifiedFeedbackRegistry is
         // mismatched caller reverts cheaply.
         if (proof.submitter != msg.sender)
             revert VerifiedFeedbackProofSubmitterMismatch(proof.submitter, msg.sender);
+        if (proof.timestamp == 0 || proof.timestamp > proof.deadline) revert VerifiedFeedbackInvalidProofTimestamp();
 
         address identityRegistry = _getVerifiedFeedbackStorage().identityRegistry;
         agentSeal = IAgenticID(identityRegistry).getAgentSeal(proof.agentId);
@@ -510,17 +549,27 @@ contract VerifiedFeedbackRegistry is
         return MessageHashUtils.toDataWithIntendedValidatorHash(validator, abi.encodePacked(proofHash));
     }
 
-    /// @dev True if `addr` is the agent owner or an ERC-721 approved operator.
-    ///      Checked against the LOCAL AgenticID owner — the canonical registry
-    ///      cannot enforce this itself (it sees the AgenticID contract as the
-    ///      owner of every custody-bound token). The agent is known to exist
-    ///      here (its seal signed a verified proof), so ownerOf does not revert.
+    /// @dev True if `addr` is the agent owner, an ERC-721 approved operator,
+    ///      or the agent's payment wallet — an owner-set address, so the most
+    ///      obvious second wallet for self-rating (audit FIND-13). Checked
+    ///      against the LOCAL AgenticID owner — the canonical registry cannot
+    ///      enforce this itself (it sees the AgenticID contract as the owner of
+    ///      every custody-bound token). The agent is known to exist here (its
+    ///      seal signed a verified proof), so ownerOf / getAgentWallet do not
+    ///      revert.
     function _isOwnerOrApproved(uint256 agentId, address addr) private view returns (bool) {
         IAgenticID id = IAgenticID(_getVerifiedFeedbackStorage().identityRegistry);
         address owner = id.ownerOf(agentId);
         return addr == owner
             || id.getApproved(agentId) == addr
-            || id.isApprovedForAll(owner, addr);
+            || id.isApprovedForAll(owner, addr)
+            || id.getAgentWallet(agentId) == addr;
+    }
+
+    /// @dev The attest / summary bound: |value| ≤ MAX_ABS_VALUE and at most
+    ///      18 decimals (FIND-04).
+    function _valueInRange(int128 value, uint8 valueDecimals) private pure returns (bool) {
+        return valueDecimals <= 18 && value >= -MAX_ABS_VALUE && value <= MAX_ABS_VALUE;
     }
 
     /// @dev Empty filter = wildcard (matches any stored value).

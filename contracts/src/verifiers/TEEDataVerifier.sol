@@ -36,7 +36,16 @@ contract TEEDataVerifier is BaseDataVerifier {
     ///      owner must acceptOwnership; pending owner in OZ's ERC-7201
     ///      namespace, no existing storage moves); setTeeOracleAddress rejects
     ///      address(0) (TEEDataVerifierZeroAddress) and emits TeeOracleUpdated.
-    ///      ABI additions only; proof encoding unchanged.
+    ///      Audit Low fixes in the same build: both proof preimages gain
+    ///      (tokenId, from, isClone) right after (chainId, erc7857), and
+    ///      verifyTransferValidity takes them as arguments — a new selector,
+    ///      so AgenticID 1.2.0 must land in the same window, and 1.1.0-format
+    ///      proofs stop verifying (FIND-05; consensus-critical for the
+    ///      off-repo buyer and oracle signers — none sign today). The access
+    ///      nonce key adds the recovered signer (FIND-06) and the ownership
+    ///      nonce key the tokenId (storage keys only).
+    ///      setMaxProofAge only raises, within [2 hours, 365 days], and emits
+    ///      NonceMaxAgeUpdated; initialize enforces the same range (FIND-07).
     ///      1.1.0 — proof preimages switch from abi.encodePacked to abi.encode
     ///      (access + ownership). Adjacent dynamic fields (targetPubkey, nonce,
     ///      sealedKey) were packed without length boundaries, so a signature over
@@ -104,7 +113,10 @@ contract TEEDataVerifier is BaseDataVerifier {
     // ── Ownership proof ───────────────────────────────────────────────────────
 
     /// @dev Signed message:
-    ///      keccak256(abi.encode(chainId, erc7857, dataHash, sealedKey, targetPubkey, nonce, deadline)).
+    ///      keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, sealedKey, targetPubkey, nonce, deadline)).
+    ///      `tokenId` / `from` / `isClone` bind the oracle's re-seal to the
+    ///      token being moved, its owner and the action (audit FIND-05, same
+    ///      as the access proof).
     ///      Uses abi.encode, NOT encodePacked: sealedKey, targetPubkey and nonce are
     ///      three adjacent dynamic-length fields, so packing them lets a re-split of
     ///      the same bytes make the stored sealedKey differ from the blob actually
@@ -114,11 +126,14 @@ contract TEEDataVerifier is BaseDataVerifier {
     ///      domain-separate the oracle's OwnershipProof against cross-chain /
     ///      cross-contract replay. NOTE: the off-chain oracle signer MUST match this
     ///      encoding exactly.
-    function _verifyOwnershipProof(OwnershipProof calldata op, address erc7857) internal override {
+    function _verifyOwnershipProof(
+        OwnershipProof calldata op, address erc7857, uint256 tokenId, address from, bool isClone
+    ) internal override {
         if (op.oracleType != OracleType.TEE) revert TEEDataVerifierWrongOracleType();
 
         bytes32 inner = keccak256(abi.encode(
-            block.chainid, erc7857, op.dataHash, op.sealedKey, op.targetPubkey, op.nonce, op.deadline
+            block.chainid, erc7857, tokenId, from, isClone,
+            op.dataHash, op.sealedKey, op.targetPubkey, op.nonce, op.deadline
         ));
         address signer = _eip191Hash(inner).recover(op.proof);
 

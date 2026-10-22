@@ -10,6 +10,8 @@ import {IERC7857Cloneable} from "../src/interfaces/IERC7857Cloneable.sol";
 import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {DataVerifierDataHashMismatch} from "../src/verifiers/BaseDataVerifier.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
+import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
+import {TEEDataVerifierInvalidSignature} from "../src/verifiers/TEEDataVerifier.sol";
 import {
     AccessProof,
     OwnershipProof,
@@ -27,7 +29,8 @@ contract CloneTest is AgenticIDTestBase {
         buyerWallet = vm.createWallet("buyer");
     }
 
-    function _buildCloneProofs(bytes32 dataHash, bytes memory nonceSuffix)
+    /// @dev Proofs for cloning `srcId` out of sellerWallet (the source owner).
+    function _buildCloneProofs(uint256 srcId, bytes32 dataHash, bytes memory nonceSuffix)
         internal
         view
         returns (TransferValidityProof[] memory proofs)
@@ -35,14 +38,18 @@ contract CloneTest is AgenticIDTestBase {
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
 
-        AccessProof memory ap = _mkAccessProof(
+        AccessProof memory ap = _mkCloneAccessProof(
+            srcId,
+            sellerWallet.addr,
             dataHash,
             "",
             abi.encodePacked("ap-", nonceSuffix),
             deadline,
             buyerWallet.privateKey
         );
-        OwnershipProof memory op = _mkOwnershipProof(
+        OwnershipProof memory op = _mkCloneOwnershipProof(
+            srcId,
+            sellerWallet.addr,
             dataHash,
             SEALED_KEY_NEW,
             buyerPubkey,
@@ -57,7 +64,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_succeeds() public {
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-1");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-1");
 
         vm.prank(sellerWallet.addr);
         uint256 newId = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
@@ -73,7 +80,7 @@ contract CloneTest is AgenticIDTestBase {
         // Clone is only allowed for non-seal sources (seal-bound clone reverts —
         // see test_iCloneFrom_sealBoundSource_reverts). Source data is preserved.
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-src");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-src");
 
         vm.prank(sellerWallet.addr);
         agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
@@ -88,7 +95,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_sealBoundSource_reverts() public {
         (uint256 srcId, bytes32 dataHash) = _mintWithSeal(sellerWallet.addr);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-sb");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-sb");
 
         vm.prank(sellerWallet.addr);
         vm.expectRevert(
@@ -101,7 +108,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_newTokenInheritsData() public {
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-data");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-data");
 
         vm.prank(sellerWallet.addr);
         uint256 newId = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
@@ -115,7 +122,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_newTokenHasNoSeal() public {
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-seal");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-seal");
 
         vm.prank(sellerWallet.addr);
         uint256 newId = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
@@ -128,7 +135,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_emitsCloned() public {
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-evt");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-evt");
 
         vm.recordLogs();
         vm.prank(sellerWallet.addr);
@@ -162,11 +169,11 @@ contract CloneTest is AgenticIDTestBase {
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
 
-        AccessProof memory ap = _mkAccessProof(
-            dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
+        AccessProof memory ap = _mkCloneAccessProof(
+            srcId, sellerWallet.addr, dataHash, "", bytes("ap-nonce"), deadline, buyerWallet.privateKey
         );
-        OwnershipProof memory op = _mkOwnershipProof(
-            keccak256("wrong-hash"), SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
+        OwnershipProof memory op = _mkCloneOwnershipProof(
+            srcId, sellerWallet.addr, keccak256("wrong-hash"), SEALED_KEY_NEW, buyerPubkey, bytes("op-nonce"), deadline
         );
 
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
@@ -191,7 +198,7 @@ contract CloneTest is AgenticIDTestBase {
         (uint256 id1, bytes32 dh1) = _selfMintData(sellerWallet.addr, 0);
         assertEq(id1, 0, "first register mints canonical id 0");
 
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dh1, "counter");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(id1, dh1, "counter");
         vm.prank(sellerWallet.addr);
         uint256 id2 = agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, id1, proofs);
         assertEq(id2, 1, "clone must take next sequential tokenId");
@@ -206,7 +213,7 @@ contract CloneTest is AgenticIDTestBase {
 
     function test_iCloneFrom_revertsWhenFromDoesNotOwnSource() public {
         (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
-        TransferValidityProof[] memory proofs = _buildCloneProofs(dataHash, "clone-bad-from");
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "clone-bad-from");
 
         address stranger = address(0xDEADBEEF);
 
@@ -215,5 +222,49 @@ contract CloneTest is AgenticIDTestBase {
             abi.encodeWithSelector(IERC721Errors.ERC721InvalidSender.selector, stranger)
         );
         agenticId.iCloneFrom(stranger, buyerWallet.addr, srcId, proofs);
+    }
+
+    // ── Token binding (1.2.0: FIND-05) ────────────────────────────────────────
+
+    /// @dev A buyer's transfer proofs cannot be redeemed as a clone (which
+    ///      would hand the buyer a copy while the seller keeps the original).
+    function test_iCloneFrom_rejectsTransferProofs() public {
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        uint256 deadline = block.timestamp + 1 hours;
+        TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
+        proofs[0] = TransferValidityProof({
+            accessProof: _mkAccessProof(
+                srcId, sellerWallet.addr, dataHash, "", "ap-t", deadline, buyerWallet.privateKey
+            ),
+            ownershipProof: _mkOwnershipProof(
+                srcId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, _pubkey(buyerWallet), "op-t", deadline
+            )
+        });
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
+
+        // Control: the same proofs complete the sale.
+        vm.prank(sellerWallet.addr);
+        agenticId.iTransferFrom(sellerWallet.addr, buyerWallet.addr, srcId, proofs);
+        assertEq(agenticId.ownerOf(srcId), buyerWallet.addr, "transfer proofs transfer");
+    }
+
+    /// @dev Clone proofs are bound to the source token: a look-alike that
+    ///      declares the same dataHash cannot redeem them.
+    function test_iCloneFrom_lookalikeCannotRedeemSourceProofs() public {
+        (uint256 srcId, bytes32 dataHash) = _selfMintData(sellerWallet.addr, 0);
+        TransferValidityProof[] memory proofs = _buildCloneProofs(srcId, dataHash, "bound");
+
+        IntelligentData[] memory datas = new IntelligentData[](1);
+        datas[0] = IntelligentData({dataDescription: "d", dataHash: dataHash});
+        bytes[] memory keys = new bytes[](1);
+        keys[0] = SEALED_KEY_ORIGINAL;
+        vm.prank(sellerWallet.addr);
+        uint256 lookalike = agenticId.register("", new MetadataEntry[](0), datas, keys);
+
+        vm.prank(sellerWallet.addr);
+        vm.expectRevert(TEEDataVerifierInvalidSignature.selector);
+        agenticId.iCloneFrom(sellerWallet.addr, buyerWallet.addr, lookalike, proofs);
     }
 }

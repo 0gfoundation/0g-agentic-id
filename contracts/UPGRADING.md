@@ -33,14 +33,18 @@ One-line test:
 
 Example: reputation dropping `ServeProof.client` (ABI change, storage-compatible,
 beacon upgrade) → `1.0.0 → 1.1.0` (minor). Likewise AgenticID / TEEDataVerifier
-`1.1.0 → 1.2.0` (`Ownable` → `Ownable2Step` + zero-address setter guards: ABI
-additions and new reverts, no existing storage moved) is minor.
+`1.1.0 → 1.2.0` (`Ownable` → `Ownable2Step`, zero-address setter guards, the
+audit's Low fixes — new reverts, a changed `verifyTransferValidity` signature,
+one mapping appended to AgenticID's namespaced struct, no existing storage
+moved) is minor.
 
 **Consensus-critical digests: still minor, but a same-window rollout.** A change
 to a digest that off-chain code must reproduce byte-for-byte — e.g. the
 ServeProof digest, which `VerifiedFeedbackRegistry` 1.2.0 moved from
-`personal_sign(proofHash)` to EIP-191 version 0x00 bound to the registry — is a
-**minor** bump when storage-compatible, even with the ABI unchanged. But it is
+`personal_sign(proofHash)` to EIP-191 version 0x00 bound to the registry, or the
+transfer-proof preimages, which TEEDataVerifier 1.2.0 extends with
+`tokenId, from, isClone` — is a **minor** bump when storage-compatible, even
+with the ABI unchanged. But it is
 not "integrators adapt at their leisure": every signer and verifier (sealed
 images, SDK, attestor console) must switch in the **same window** as the beacon
 upgrade, or every proof in flight stops verifying (a hard cut, unless the impl
@@ -147,9 +151,11 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
 - [ ] A changed base contract keeps its state in an ERC-7201 namespace, pinned
       in `test/StorageLayout.t.sol` (e.g. 1.2.0's `Ownable2Step` adds only
       `openzeppelin.storage.Ownable2Step`), and an upgrade test runs from a
-      frozen copy of the deployed source (`test/mocks/*V1_1_0.sol`)
+      frozen copy of the deployed source (`test/mocks/*V1_1_0.sol`, whose
+      base contracts are frozen too, in `test/mocks/v1_1_0/` — change a src
+      base and the fixture must not move)
 - [ ] `forge build --sizes`: AgenticID stays under EIP-170 (`Eip170Size.t.sol`;
-      1.2.0 sits at 24,440 / 24,576 bytes)
+      1.2.0 sits at 24,517 / 24,576 bytes)
 - [ ] `forge test` green
 - [ ] On chain: `proxy.VERSION() == new version` and `beacon.implementation() == new impl`
 - [ ] Ownership moves after a 1.2.0 upgrade are two-step: the current owner
