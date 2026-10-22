@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -16,11 +17,11 @@ func TestSeverityOf_NilIsRunning(t *testing.T) {
 }
 
 func TestSeverityOf_InsufficientFundsIsWarning(t *testing.T) {
-	// The 0g-storage CLI raises "Failed to submit log entry: Failed to send
-	// transaction to append log entry: failed to send transaction:
+	// The 0g-storage client raises "Failed to submit log entry: Failed to
+	// send transaction to append log entry: failed to send transaction:
 	// insufficient funds for transfer" — the substring "insufficient funds"
 	// is the stable signal.
-	err := errors.New("upload openclaw.json: upload cmd: exit status 1: " +
+	err := errors.New("upload openclaw.json: 0g-storage upload: " +
 		"Failed to submit log entry: insufficient funds for transfer")
 	if got := severityOf(err); got != "warning" {
 		t.Errorf("severityOf(insufficient funds err) = %q; want warning", got)
@@ -52,6 +53,29 @@ func TestSeverityOf_GasExhaustedBareRevertIsWarning(t *testing.T) {
 		"failed to send transaction: execution reverted; data: 0x")
 	if got := severityOf(err); got != "warning" {
 		t.Errorf("severityOf(gas-exhausted bare revert) = %q; want warning", got)
+	}
+}
+
+// uploadFailure builds an upload error in the shape the uploader returns
+// for a failed blob: the role, then dataplane.Upload's single line
+// "0g-storage upload: <cause>", where the cause is the storage SDK's error
+// flattened onto that line.
+func uploadFailure(cause string) error {
+	return fmt.Errorf("upload openclaw.json: %w", errors.New("0g-storage upload: "+
+		"Failed to submit log entry: Failed to send transaction to append log entry: "+
+		"failed to send transaction: "+cause))
+}
+
+func TestSeverityOf_UploadFailureShape(t *testing.T) {
+	for cause, want := range map[string]string{
+		"insufficient funds for gas * price + value": "warning",
+		"execution reverted; data: 0x":               "warning",
+		"nonce too low":                              "error",
+		"context deadline exceeded":                  "error",
+	} {
+		if got := severityOf(uploadFailure(cause)); got != want {
+			t.Errorf("severityOf(upload failure %q) = %q; want %s", cause, got, want)
+		}
 	}
 }
 
@@ -87,9 +111,22 @@ func TestSummarizeError_SingleLinePassthrough(t *testing.T) {
 	}
 }
 
+func TestSummarizeError_UploadFailureIsWhole(t *testing.T) {
+	// An upload error is one line naming the role and the SDK's cause; the
+	// owner sees all of it.
+	err := uploadFailure("insufficient funds for gas * price + value")
+	want := "upload openclaw.json: 0g-storage upload: Failed to submit log entry: " +
+		"Failed to send transaction to append log entry: failed to send transaction: " +
+		"insufficient funds for gas * price + value"
+	if got := summarizeError(err); got != want {
+		t.Errorf("summarizeError(upload failure):\n got %q\n want %q", got, want)
+	}
+}
+
 func TestSummarizeError_MultilineKeepsLastNonEmpty(t *testing.T) {
-	// Mimics the 0g-storage CLI's multi-line output: many INFO/WARN
-	// lines, then the final FATA on terminal failure. We want the FATA.
+	// Legacy shape: the 0g-storage CLI's multi-line output (uploads ran
+	// through it before they moved in-process): many INFO/WARN lines, then
+	// the final FATA on terminal failure. We want the FATA.
 	raw := "INFO[2026-05-15T02:18:36Z] Selecting nodes ...\n" +
 		"INFO[2026-05-15T02:18:38Z] submit with fee fee(neuron)=122934579848\n" +
 		"WARN[2026-05-15T02:18:39Z] Upload failed, retrying error=\"...\"\n" +

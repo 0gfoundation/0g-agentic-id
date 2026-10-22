@@ -3,18 +3,34 @@ package openclaw
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 )
 
 // This file implements the path-driven Restore + LoadEntry + RestoreEntry
 // for the role set declared by Adapter.Roles(). Counterpart to
 // evolution_paths.go (read path).
+//
+// Every disk access goes through internal/privsep (the workspace is
+// agent-writable), and every entry path is checked to be a single segment
+// (manifest.ValidEntryPath) before it is joined under the role directory.
+//
+// Restore is authoritative over the shape of the role directories: the
+// agent may have put a link or a file where one of them belongs, and that
+// must not keep the agent from booting. ensureRoleDir (privsep.EnsureDir)
+// replaces whatever non-directory sits at a role directory or above it
+// inside openclawHome, never following it; a directory entry's own name is
+// cleared by privsep.RemoveAll, which removes a link there itself.
+
+// ensureRoleDir makes dir, inside openclawHome, a real directory.
+func ensureRoleDir(dir string) error {
+	return privsep.EnsureDir(openclawHome, dir, 0o755)
+}
 
 // ── Restore: role="workspace/" ──────────────────────────────────────────────
 
@@ -48,7 +64,7 @@ func (a *Adapter) restoreWorkspace(plaintext []byte) error {
 		}
 	}
 
-	if err := os.MkdirAll(workspaceDir(), 0o755); err != nil {
+	if err := ensureRoleDir(workspaceDir()); err != nil {
 		return fmt.Errorf("openclaw.Restore[workspace/]: mkdir %s: %w", workspaceDir(), err)
 	}
 
@@ -58,10 +74,10 @@ func (a *Adapter) restoreWorkspace(plaintext []byte) error {
 			continue // RestoreEntry will write the real content
 		}
 		path := filepath.Join(workspaceDir(), md)
-		if _, err := os.Stat(path); err == nil {
+		if _, err := privsep.Lstat(path); err == nil {
 			continue // already exists from previous boot — leave alone
 		}
-		if err := os.WriteFile(path, nil, 0o644); err != nil {
+		if err := privsep.WriteFile(path, nil, 0o644); err != nil {
 			return fmt.Errorf("openclaw.Restore[workspace/]: touch %s: %w", path, err)
 		}
 		touched++
@@ -101,7 +117,7 @@ func (a *Adapter) restoreManifestDir(plaintext []byte, rootDir, label string) er
 		}
 		entryCount = len(m.Entries)
 	}
-	if err := os.MkdirAll(rootDir, 0o755); err != nil {
+	if err := ensureRoleDir(rootDir); err != nil {
 		return fmt.Errorf("openclaw.Restore[%s]: mkdir %s: %w", label, rootDir, err)
 	}
 	logger.Logf("openclaw.Restore[%s]: parsed manifest (%d entries)", label, entryCount)
@@ -115,6 +131,9 @@ func (a *Adapter) restoreManifestDir(plaintext []byte, rootDir, label string) er
 // otherwise round-trip (LoadEntry → RestoreEntry → next EvolutionFor)
 // produces a different content_hash and the watcher reports phantom drift.
 func (a *Adapter) LoadEntry(ctx context.Context, role, path string) ([]byte, error) {
+	if err := manifest.ValidEntryPath(path); err != nil {
+		return nil, fmt.Errorf("openclaw.LoadEntry[%s]: %w", role, err)
+	}
 	switch role {
 	case "workspace/":
 		return a.loadEntryWorkspace(path)
@@ -131,7 +150,7 @@ func (a *Adapter) loadEntryWorkspace(path string) ([]byte, error) {
 		return nil, fmt.Errorf("openclaw.LoadEntry[workspace/]: dir entries not supported (got %q)", path)
 	}
 	full := filepath.Join(workspaceDir(), path)
-	content, err := os.ReadFile(full)
+	content, err := privsep.ReadFile(full, privsep.LimitTracked)
 	if err != nil {
 		return nil, fmt.Errorf("openclaw.LoadEntry[workspace/]: read %s: %w", full, err)
 	}
@@ -149,7 +168,7 @@ func (a *Adapter) loadEntryWorkspaceSkills(path string) ([]byte, error) {
 		return nil, fmt.Errorf("openclaw.LoadEntry[workspace/skills/]: only dir entries supported (got %q)", path)
 	}
 	slug := strings.TrimSuffix(path, "/")
-	if slug == "" || strings.ContainsRune(slug, '/') {
+	if manifest.ValidEntryPath(path) != nil {
 		return nil, fmt.Errorf("openclaw.LoadEntry[workspace/skills/]: invalid slug %q", path)
 	}
 	dir := filepath.Join(workspaceDir(), "skills", slug)
@@ -161,7 +180,7 @@ func (a *Adapter) loadEntryWorkspaceCanvas(path string) ([]byte, error) {
 	if strings.HasSuffix(path, "/") {
 		return manifest.PackDir(full)
 	}
-	return os.ReadFile(full)
+	return privsep.ReadFile(full, privsep.LimitTracked)
 }
 
 // ── RestoreEntry ────────────────────────────────────────────────────────────
@@ -170,6 +189,9 @@ func (a *Adapter) loadEntryWorkspaceCanvas(path string) ([]byte, error) {
 // Inverse of LoadEntry. Creates parent dirs as needed (order-independent
 // with Restore — caller can call RestoreEntry before or after Restore).
 func (a *Adapter) RestoreEntry(ctx context.Context, role, path string, plaintext []byte) error {
+	if err := manifest.ValidEntryPath(path); err != nil {
+		return fmt.Errorf("openclaw.RestoreEntry[%s]: %w", role, err)
+	}
 	switch role {
 	case "workspace/":
 		return a.restoreEntryWorkspace(path, plaintext)
@@ -185,11 +207,11 @@ func (a *Adapter) restoreEntryWorkspace(path string, plaintext []byte) error {
 	if strings.HasSuffix(path, "/") {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/]: dir entries not supported (got %q)", path)
 	}
-	if err := os.MkdirAll(workspaceDir(), 0o755); err != nil {
+	if err := ensureRoleDir(workspaceDir()); err != nil {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/]: mkdir: %w", err)
 	}
 	full := filepath.Join(workspaceDir(), path)
-	if err := os.WriteFile(full, plaintext, 0o644); err != nil {
+	if err := privsep.WriteFile(full, plaintext, 0o644); err != nil {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/]: write %s: %w", full, err)
 	}
 	return nil
@@ -200,31 +222,34 @@ func (a *Adapter) restoreEntryWorkspaceSkills(path string, plaintext []byte) err
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/skills/]: only dir entries supported (got %q)", path)
 	}
 	slug := strings.TrimSuffix(path, "/")
-	if slug == "" || strings.ContainsRune(slug, '/') {
+	if manifest.ValidEntryPath(path) != nil {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/skills/]: invalid slug %q", path)
+	}
+	if err := ensureRoleDir(workspaceDir() + "/skills"); err != nil {
+		return fmt.Errorf("openclaw.RestoreEntry[workspace/skills/]: %w", err)
 	}
 	dst := filepath.Join(workspaceDir(), "skills", slug)
 	// Clean any prior content at this slug so deletions inside the tarball
 	// are honoured (UnpackDir overwrites files but doesn't remove stale ones).
-	if err := os.RemoveAll(dst); err != nil {
+	if err := privsep.RemoveAll(dst); err != nil {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/skills/]: clean %s: %w", dst, err)
 	}
 	return manifest.UnpackDir(plaintext, dst)
 }
 
 func (a *Adapter) restoreEntryWorkspaceCanvas(path string, plaintext []byte) error {
+	if err := ensureRoleDir(workspaceDir() + "/canvas"); err != nil {
+		return fmt.Errorf("openclaw.RestoreEntry[workspace/canvas/]: %w", err)
+	}
 	if strings.HasSuffix(path, "/") {
 		dst := filepath.Join(workspaceDir(), "canvas", strings.TrimSuffix(path, "/"))
-		if err := os.RemoveAll(dst); err != nil {
+		if err := privsep.RemoveAll(dst); err != nil {
 			return fmt.Errorf("openclaw.RestoreEntry[workspace/canvas/]: clean %s: %w", dst, err)
 		}
 		return manifest.UnpackDir(plaintext, dst)
 	}
 	full := filepath.Join(workspaceDir(), "canvas", path)
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
-		return fmt.Errorf("openclaw.RestoreEntry[workspace/canvas/]: mkdir parent of %s: %w", full, err)
-	}
-	if err := os.WriteFile(full, plaintext, 0o644); err != nil {
+	if err := privsep.WriteFile(full, plaintext, 0o644); err != nil {
 		return fmt.Errorf("openclaw.RestoreEntry[workspace/canvas/]: write %s: %w", full, err)
 	}
 	return nil

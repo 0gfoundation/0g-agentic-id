@@ -447,7 +447,7 @@ Migration: 2026-10-19 07:54–08:01 UTC, blocks 60946923–60947793 (AgenticID
 | TEEDataVerifier proxy | `0x5e5BD9bB230cA70d813FeC9166a2b4F5b5Da75c7` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0xD4304fD6640047Df1183F54c31f113999a83AC66` | |
-| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`) |
+| TimelockController | `0x9715F9ffEa7d01552657CE9C6B115Ee6B32aA696` | `minDelay` 0; proposer + canceller + admin = `0x2AB7…a0B3` (admin also self; open execution) — migrated 2026-10-19 from `0x9C58…80Bb`, which renounced its roles (itself migrated 2026-10-12 from `0x7344…431b`); owns the five beacons |
 | owner / pauser (all contracts) + TEE oracle | `0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3` | migrated 2026-10-19 from `0x9C58…80Bb` (AgenticID `OwnershipTransferred` at block 60947194; window blocks 60946923–60947793), which was migrated 2026-10-12 from `0x7344…431b` (itself migrated 2026-09-07 from `0xB831…CEd7`, deployer/oracle history). TEEDataVerifier `teeOracleAddress()` = `0x2AB7…a0B3` too (2026-10-19) |
 
 The dev environment's TappRegistry / SandboxServing addresses are not recorded

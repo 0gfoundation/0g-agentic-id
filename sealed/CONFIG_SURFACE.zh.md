@@ -34,7 +34,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 |---|---|
 | `provider` | 谁来服务这个模型。`inference.ZGComputeProvider` = `"0g-compute"`(`internal/inference/zgcompute.go:109`)表示**由平台**提供 endpoint;其他任何取值都指向一个自带接线的框架内置 provider |
 | `model` | 模型 id,按该 provider 自己的拼法 |
-| `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:52`) |
+| `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:56`) |
 | `others` | 三个具名设置之外的一切:该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`)。曾名 `framework`,真机演练里 owner 的第一反应是"能选框架?"——而这恰恰是它做不到的事(框架绑定是 mint 时的身份),故改名 |
 
 `others` 的不透明是刻意的,而且同时在三处承重:平台不解析它,attestor 根本不知道它
@@ -48,11 +48,11 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 的就丢掉 —— 而这之所以安全,只因为**容器从不把文档写回去**。唯一的例外是迁移用的 seed
 (§10),它只带一个恢复出来的 pin。
 
-**校验刻意做得很薄**(`Doc.Validate`,`settings.go:98`):
+**校验刻意做得很薄**(`Doc.Validate`,`settings.go:102`):
 
 - `model` 为空是唯一的致命错误,因为有两家在缺 pin 时 `Start` 硬失败
-  (`framework/prime/spawn.go:78`、`framework/dsh/spawn.go:77`),另两家只告警然后无模型
-  运行(`framework/openclaw/spawn.go:63`、`framework/hermes/spawn.go:273`);
+  (`framework/prime/spawn.go:81`、`framework/dsh/spawn.go:78`),另两家只告警然后无模型
+  运行(`framework/openclaw/spawn.go:65`、`framework/hermes/spawn.go:300`);
 - `thinking` 必须属于 `Levels`,大小写不敏感;
 - `others` 必须是合法 JSON,仅此而已。
 
@@ -62,16 +62,16 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 做决定的是容器这一侧(`sdk/typescript/src/cli/commands/settings.ts`)。
 
 空 blob 解析成空文档,不是错误:那是一个还没人配置过的 agent,是合法状态
-(`Parse`,`settings.go:71`)。
+(`Parse`,`settings.go:75`)。
 
 **推理凭据不在这份文档里** —— 见 §7。
 
 ## 3. 平台派生、且从不存储的东西
 
-`settings.Resolved`(`settings.go:56`)是 `Doc` 加上平台为这次启动算出来的一切:
+`settings.Resolved`(`settings.go:60`)是 `Doc` 加上平台为这次启动算出来的一切:
 `Facts`、`Endpoint`、`APIKey`。adapter 只看得到 `Resolved`;没有任何东西会把它存下来。
 
-`settings.Resolve(ctx, doc, apiKey)`(`settings.go:123`)调用
+`settings.Resolve(ctx, doc, apiKey)`(`settings.go:127`)调用
 `inference.Resolve(provider, model)`(`zgcompute.go:121`),整条通道能成立的那个拆分就
 在这里:
 
@@ -92,7 +92,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 ### 3.1 `Effort()` 有三种结果,任何两种都不能合并
 
-`Resolved.Effort() (level string, decided bool)`(`settings.go:156`):
+`Resolved.Effort() (level string, decided bool)`(`settings.go:160`):
 
 ```
 ("high", true)   施加这个档位
@@ -123,15 +123,38 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 ### 3.2 `PersistableMaxTokens()`,以及"解析结果一律不存"的由来
 
-`Resolved.PersistableMaxTokens()`(`settings.go:180`)返回目录给出的输出预算,或者 `0`
+`Resolved.PersistableMaxTokens()`(`settings.go:184`)返回目录给出的输出预算,或者 `0`
 表示"什么都别写",闸门是 `ModelFacts.CatalogSourced`。名字启发式的兜底值是
 `inference.HeuristicOpenAIMaxTokens = 8192`(`zgcompute.go:160`);在目录故障期间被写进
 磁盘,它此后看起来就永远像是手工设定的,把一个推理模型"思考+回复"的共享预算饿成永远
 空的回复 —— agent 404 线上实测,三次约 6 分钟的对话,`textLen=0`
-(`framework/prime/modelsjson.go:28-36`)。
+(`framework/prime/modelsjson.go:37-45`)。
 
 那次事故就是 `Resolved` 每次启动重算、且哪儿都不存的原因:**存下来的副本会过时,然后
 与算出来的值互相打架**(`settings.go:11-15`)。
+
+适配器真正交给框架的是 `Resolved.RequestMaxTokens()`(`settings.go:216`):即
+`PersistableMaxTokens()` 封顶到 `RequestOutputCeiling = 32768`(`settings.go:196`),
+同样以 `0` 表示"什么都别写"。目录里的 `max_completion_tokens` 是一种能力——单次回复
+最多能有多长——而不是每次请求该填的值,而每个框架都会在每次请求里带上它配置的预算。
+如果服务端按"prompt + 预算"对照上下文窗口做检查,这个能力值会占掉窗口的大半:路由
+目录里 deepseek-v3 的输出上限是 147456、窗口 163840,只给对话留 16,384 个 token;
+封顶后是 131,072(目录,2026-10-19)。32768 也是目录预算接进来之前 pi-ai 默认发的值,
+是实测最大单次输出(约 13.6K token,glm-5.3,effort=max)的两倍多。线上的字段:dsh 发
+`max_completion_tokens`,openclaw 和 hermes 发 `max_tokens`;prime-agent 的 SDK
+不管 models.json 写多少,都会压到 32000。还有一个调用压得更低:dsh 的压缩摘要
+(`/compact`)封顶 16384(`bridge.mjs` 的 `COMPACT_SUMMARY_MAX_TOKENS`;目录没给
+预算时用引擎自己的 8192):它在历史最长
+的时候带着约一轮的输入,所以凡是服务端按"prompt + 预算"对照某个上限做检查的地方,更小
+的预算都给它留出比一轮更多的空间;16384 是实测最大摘要的 3 倍(effort=max 下 33.9K
+token 的 prompt 产出 5,239 个输出 token)。
+
+2026-10 长对话里 glm-5.3 遇到的 HTTP 400(code `400001`)不是靠这个封顶修好的。那些
+请求的"prompt + 预算"都在约 196,608 及以上,**并且** dsh 的系统提示是用 `developer`
+角色的消息发的;把这段提示改成 `system` 后重放同一个请求,65 次全部通过(2026-10-16),
+zg compute 也确认(2026-10-19)腾讯和 0G 自部署的后端不支持这个角色。真正的修复是 dsh
+改发 `system`(`bridge.mjs`,`compat.supportsDeveloperRole: false`——openclaw 和
+prime 早已这样钉住)。
 
 ## 4. 文档存在哪,怎么到达容器
 
@@ -160,7 +183,7 @@ create 时的 env,现在不再如此(`sdk/typescript/src/AttestorClient.ts` 的 
 `GET /deployment/:seal_id` 不带它,`/deployments` 的 owner 层也刻意省略它
 (`routes/deployments.rs` (`OwnerDeployment`)),而 `GET /settings` 需要 owner 签名(§5)。这一点重要,
 因为不透明的 `others` 段是 owner 自由撰写的文本 —— **owner 粘进去的字面密钥没有任何
-东西会剥掉**(`framework/prime/modelsjson.go:53-59`)。
+东西会剥掉**(`framework/prime/modelsjson.go:62-68`)。
 
 **解密失败的 settings blob 会被记录并丢弃,而不是致命错误**
 (`internal/provision/provision.go:53-56`)。**无配置也能开机,好过拒绝开机。**
@@ -222,11 +245,11 @@ SDK 抛 `SettingsConflictError`,并**刻意不重试** —— 盲目重放同一
 
 POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第五个字段。没有它,签名只证明
 **谁**在调用,任何能在途中改动请求的东西都可以保留一个有效签名却换掉文档
-(`internal/proxy/proxy.go:402-407`)。请求体上限 256 KiB
+(`internal/proxy/proxy.go:446-449`)。请求体上限 256 KiB
 (`internal/proxy/settings.go:18`)—— 面向 owner 的路由上做无界读取是最容易的一种拒绝
 服务。
 
-`main.go` 注册的 applier(`main.go:709`)按固定顺序做三件事:换掉生效中的文档、渲染它、
+`main.go` 注册的 applier(`main.go:777`)按固定顺序做三件事:换掉生效中的文档、渲染它、
 重启框架进程 —— **并且渲染失败时把替换回滚**,这样一份渲染不出来的文档永远不会变成下次
 崩溃重启会捡起来的那份。校验不过的文档在任何东西被应用之前就被拒,所以**一次无法生效的
 推送不可能把 agent 搞下线**。
@@ -239,7 +262,7 @@ POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第�
 `POST $SEAL_SIGN_SOCK/settings` 搭的是 agent 本来就在用的那个 socket(注册对外服务、
 获取 agentSeal 签名)。它只在容器内部通过 0600 的 unix socket 可达,所以 agent 进程是
 唯一可能的调用者,也就不涉及任何签名 —— **socket 本身就是凭据**
-(`internal/proxy/sign.go:90`、`internal/proxy/settings.go:148`)。
+(`internal/proxy/sign.go:94`、`internal/proxy/settings.go:148`)。
 
 agent 只能改 **`thinking`,别的都不行**。处理器对 body 做严格的单字段解码
 (`DisallowUnknownFields`),带任何其它键就以 403 拒绝,并在错误里点名 owner 通道 ——
@@ -256,7 +279,7 @@ agent 问不到的部分不归它。
 (`"durable": false`)。钱和资产都是 owner 的。结构性的后果是
 **agent 没有能力把自己配置成起不来的状态**,而 agent 3586004 正是手工编辑框架配置把自己
 砖了的(`internal/proxy/settings.go:120-129`)。如果 agent 那份文档渲染失败,`main.go`
-会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:726-734`)。
+会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:794-802`)。
 
 ## 6. 各框架在哪读它 —— `RenderSettings`
 
@@ -281,9 +304,9 @@ RenderSettings(ctx context.Context, s settings.Resolved) error
 
 | | 文档落到哪 | overlay 怎么处理 |
 |---|---|---|
-| openclaw(`openclaw/inference.go:55`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它 |
-| hermes(`hermes/spawn.go:174`) | `~/.hermes/config.yaml` | 深合并,再把五个平台键写在上面:`model.{default,provider,base_url,api_key}` 与 `agent.reasoning_effort`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint |
-| prime-agent(`prime/modelsjson.go:132`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
+| openclaw(`openclaw/inference.go:69`) | `~/.openclaw/openclaw.json` | 顶层深合并;`gateway` 被丢弃 —— 它携带首次 Start 写入的每次启动凭据,顺序保护不了它;`~/.openclaw` 之外的 `~/x` agent workspace 或 `agentDir` 渲染为 `/home/agent/x` —— openclaw 在那里从 `OPENCLAW_HOME=/root` 展开 `~`(`homeRelativeOverlayPaths`;见 QUIRKS.md)。在 openclaw 2026.7.1 及以上(有 `/compact` 的版本)写三个 `agents.defaults.compaction` 键:`keepRecentTokens` 设为 openclaw 自己的默认值(20000)——手动压缩只有在它被设置时才保留最近的尾部——`timeoutSeconds` 设为 600,因为 openclaw 默认的 180 秒会把慢的 `/compact` 摘要截断,两者都是除非 openclaw.json 里那里已经是一个正整数(owner 的 overlay,或磁盘上的修改);对走路由的 pin,`model` 设为这个 pin,让换模型后马上做的压缩用新模型写摘要,除非 overlay 指定了模型。`session.reset` 设为 `{mode: "idle"}`(永不过期),除非 openclaw.json 里已经有一个(overlay 的,或磁盘上的修改)——openclaw 默认每天开一个新会话(`CONVERSATION.zh.md`) |
+| hermes(`hermes/spawn.go:177`) | `~/.hermes/config.yaml` | 深合并,再把平台键写在上面:`model.{default,provider,base_url,api_key}`、`agent.reasoning_effort`,以及目录给出预算时的 `model.max_tokens`;文档不再提供时,三个接线键会被**清除**,否则 hermes 会继续拿上一次启动的 key 去拨上一次启动的 endpoint;`model.max_tokens` 在同一模型遇目录故障时保留,模型变了就删除(除非 overlay 自己设了它),否则换到输出上限更低的模型后每个请求都会失败 |
+| prime-agent(`prime/modelsjson.go:144`) | `~/.prime/agent/models.json` **以及**桥的环境 | 泛型 JSON 合并,平台键在**两条路径上都**覆盖其上;框架内置 provider 且没有 overlay 时干脆不写文件,并删掉遗留的旧文件 |
 | dsh(`dsh/settings.go:161`) | 只有桥进程的环境 | 一份有类型的旋钮白名单(`toolJobs`、`maxParallelToolCalls`);这个框架根本没有配置文件可渲染 |
 
 dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-settings-file` 提供,
@@ -294,7 +317,7 @@ dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-se
 
 有三处细节值得带着走,每一处都是一道疤:
 
-- **openclaw 会修复损坏的配置,而不是死在上面**(`openclaw/inference.go:101`)。解析错误
+- **openclaw 会修复损坏的配置,而不是死在上面**(`openclaw/inference.go:115`)。解析错误
   过去是终局且自我延续的:`Start` 在渲染不成功时拒绝运行,而没有任何东西会在下次开机
   修好那个文件。过去那个上链角色顺带做了这件修复 —— 每次开机从链上整份重写;既然现在
   渲染拥有这个文件,修复也归渲染。读不出来的字节被挪到
@@ -303,7 +326,7 @@ dsh 是有意思的一个:DSH 自己的 `settings.yaml` 由 `@deepseek-ai/dsh-se
   曾让一个只带 `model: {temperature: 0.2}` 的 overlay 替换掉整个 `model` 段、把 pin 抹空。
   openclaw 还额外把 overlay 的值**深拷贝**进来:别名共享曾让平台自己的键透过与"已应用
   overlay 记录"共享的 map 被写入,于是下次开机那轮"撤回已删除的 overlay 键"把平台自己
-  的推理上界撤掉了(`openclaw/inference.go:149-156`)。
+  的推理上界撤掉了(`openclaw/inference.go:357-364`)。
 - **overlay 绝不能有能力把开机搞挂。**dsh 的 `parseKnobs` 对 overlay 出错的每一种方式都
   尽力而为 —— 类型不对、越界、根本不是对象 —— 因为 `RenderSettings` 是从 `PreStart` 在
   **每一次** spawn 前跑的,所以这里报错不是"一次被拒的推送",而是**一个起不来的 agent**,
@@ -316,7 +339,7 @@ dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext
 
 ## 7. 凭据
 
-推理 API key 是 `Resolved.APIKey`(`settings.go:66`):它从容器环境到来,从不属于 `Doc`,
+推理 API key 是 `Resolved.APIKey`(`settings.go:70`):它从容器环境到来,从不属于 `Doc`,
 也不在任何地方持久化。自 #167 起它可以密文到达:attestor 声明 `secret_env_scheme` 时,
 SDK 把它装进 `SEAL_SECRET_ENV` —— 用 agentSeal 公钥 ECIES 加密、绑定 owner ——
 `main.go` 在 Phase 2 之后、任何 adapter 运行之前解开,所以两条路殊途同归到同一个
@@ -329,8 +352,8 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 | | 密钥怎么到达框架 |
 |---|---|
 | openclaw | 引用式:配置里放 `{source: env, id: <VAR>}`,盘上只有变量**名**;`spawn.go` 把值导给子进程 |
-| hermes | **明文写在盘上**的 `model.api_key` —— hermes 的 `custom` provider 声明了 `env_vars=()`,只从 `config.yaml` 读密钥;用 env 注入曾导致 router 线上 401,hermes 是裸着拨过去的(`hermes/spawn.go:163-170`) |
-| prime-agent | 引用式:`models.json` 里放 `apiKey: "SEAL_MODEL_API_KEY"`(`prime/modelsjson.go:63`),值在桥的 env 里 |
+| hermes | **明文写在盘上**的 `model.api_key` —— hermes 的 `custom` provider 声明了 `env_vars=()`,只从 `config.yaml` 读密钥;用 env 注入曾导致 router 线上 401,hermes 是裸着拨过去的(`hermes/spawn.go:165-172`) |
+| prime-agent | 引用式:`models.json` 里放 `apiKey: "SEAL_MODEL_API_KEY"`(`prime/modelsjson.go:72`),值在桥的 env 里 |
 | dsh | 只在桥的 env 里 —— 并且**刻意不放进**那个确定性、会被记录、每次启动重建的 `settingsEnv` 切片,这样渲染出来的环境可以被比较和记录而不必碰密钥(`dsh/settings.go:181-187`) |
 
 `config.yaml` 还是上链角色的时候,hermes 把密钥写盘需要在捕获路径上加一道
@@ -353,11 +376,11 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 任何被接受的修改都会重启框架进程。没有阶梯:
 
 - `manager.StartParams.PreStart`(`internal/manager/manager.go:122`)在**每一次**
-  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go:694` 把它
+  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go:762` 把它
   指向 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`。
 - 两条推送路径都是先渲染再调 `manager.Reload`,而 Reload 就是 Stop+Start。
 - `framework.Reloadable` 依然只是声明、依然没有任何消费方
-  (`framework.go:210`、`prime/prime.go:360`)。
+  (`framework.go:211`、`prime/prime.go:387`)。
 - sealed 永远不自行触发容器重建:那要花钱,是 owner 的决定。
 
 **为什么用 `PreStart` 而不是 `RuntimeContext`。**`RuntimeContext` 在首次 `Start` 时被捕获,
@@ -374,7 +397,7 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 prime 的桥仍然读一个**名叫** `SEAL_OWNER_THINKING` 的环境变量
 (`prime/bridge/bridge.mjs:64`)。那个名字是桥自己的契约,而桥是随 sealed 二进制一起发布
 的;变的只是**值的来源** —— 从部署时的沙盒 env 变成 owner 的文档,经由 `Resolved.Effort()`
-(`prime/spawn.go:245-257`、`:376`)。prime 的逐条消息覆盖(`bridge.mjs:365`)没有变,
+(`prime/spawn.go:348-360`、`:509`)。prime 的逐条消息覆盖(`prime/bridge/bridge.mjs:931`)没有变,
 它仍然是全系统唯一真正"热"的配置变更。
 
 ### 8.1 单驾驶座
@@ -447,8 +470,8 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 在途的那一轮�
 
 在通道出现之前铸造的 agent,它的 pin 存在一个**已经没有任何 adapter 声明**的上链角色里。
 Bootstrap 的 Phase C 会把每一个角色在 `Roles()` 之外的链上条目交给 `HandleLegacy`
-(`main.go:572-581`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:321`)是
-adapter 把恢复出来的东西交还给平台的方式。`main.go:598-609` **仅在**下发的文档没有 model
+(`main.go:638-647`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:403`)是
+adapter 把恢复出来的东西交还给平台的方式。`main.go:664-677` **仅在**下发的文档没有 model
 时才去问 seeder —— 所以真实文档永远压过恢复 —— 并用 `report.SeedSettings`
 (`internal/report/report.go:86`)把拿到的东西持久化。
 
@@ -524,10 +547,10 @@ attestor 已存的文档。
 
 | | 之前的角色 | 现在的角色 |
 |---|---|---|
-| openclaw | `framework`、`openclaw.json`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/`(`openclaw/openclaw.go:146`) |
-| hermes | `framework`、`config.yaml`、`SOUL.md`、`memories/`、`skills/` | `framework`、`SOUL.md`、`memories/`、`skills/`(`hermes/hermes.go:121`) |
-| prime-agent | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`models.json`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/`(`prime/prime.go:135`) |
-| dsh | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`dsh/dsh.go:145`) |
+| openclaw | `framework`、`openclaw.json`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/`(`openclaw/openclaw.go:164`) |
+| hermes | `framework`、`config.yaml`、`SOUL.md`、`memories/`、`skills/` | `framework`、`SOUL.md`、`memories/`、`skills/`(`hermes/hermes.go:143`) |
+| prime-agent | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`models.json`、`skills/` | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/`(`prime/prime.go:162`) |
+| dsh | `framework`、`APPEND_SYSTEM.md`、`settings.yaml`、`skills/` | `framework`、`APPEND_SYSTEM.md`、`skills/`(`dsh/dsh.go:153`) |
 
 **没有任何配置角色。**四家统一收敛成「读法 + 人格 + 记忆 + 技能」—— 这个共性以前被各家
 形状各异的配置文件盖住了。
@@ -537,12 +560,12 @@ attestor 已存的文档。
 所以**没有东西可捕获,也没有东西需要补救**;agent 去编辑这些文件,下次渲染直接覆盖 ——
 不需要闸门、不需要回滚、不需要巡检。`healOpenclawConfig` 尤其如此:它是一套用来修复
 mint 时副本的形状识别启发式,而重渲染把它要修的那份副本一起取消了
-(`openclaw/inference.go:18-30`)。
+(`openclaw/inference.go:28-44`)。
 
 hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它们曾被标注为
 "agent self-tuning",但 sealed 从未写过它们,而在无人值守的 TEE 沙盒里,审批策略**没有
 人可以问**。它们是 owner 的旋钮,所以现在像任何 hermes 键一样搭那份不透明 overlay
-(`hermes/spawn.go:290-293`)。
+(`hermes/spawn.go:372-375`)。
 
 判断什么该上链的判据 —— 这次改动就是它的一次应用:**丢了能不能重填。**记忆重建不出来,
 模型重选一次只要十秒。**分界线是这个不对称,不是"它算不算配置"。**
@@ -593,5 +616,5 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
   直说这个机制:**写进记忆的东西会随资产转让。**这是可观测性事实,不是行为指令。
 - **owner 的不透明 overlay 是未经扫描的自由文本。**owner 把字面密钥粘进 `others`,
   它就进了一个普通 JSONB 列,在 prime 上还会进到容器里的一个文件
-  (`prime/modelsjson.go:53-59`)。没有东西剥它;唯一的保护是那个列和那个文件都既不公开
+  (`prime/modelsjson.go:62-68`)。没有东西剥它;唯一的保护是那个列和那个文件都既不公开
   也不上链(§4)。

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"html"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 
@@ -93,7 +92,7 @@ func (s *Server) handleAgentLogHTML(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{"agent log not available: framework adapter not resolved yet or no subprocess log path"}, explorer))
 		return
 	}
-	body, err := os.ReadFile(logPath)
+	body, err := readAgentLog(logPath)
 	if err != nil {
 		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{fmt.Sprintf("agent log not available: %v", err)}, explorer))
 		return

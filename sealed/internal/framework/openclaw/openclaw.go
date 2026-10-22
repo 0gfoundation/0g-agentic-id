@@ -33,13 +33,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -53,7 +53,7 @@ const (
 	// spawn.go), so it is not counted here — this budget is purely the
 	// post-spawn gateway cold start (node load + gateway init). 120s was
 	// occasionally too tight on a loaded sandbox host; 180s gives headroom.
-	// On timeout, Start surfaces the tail of /tmp/openclaw.log so a startup
+	// On timeout, Start surfaces the tail of the gateway's log so a startup
 	// crash is legible instead of a blind "not listening" timeout.
 	startTimeout = 180 * time.Second
 )
@@ -111,6 +111,9 @@ type Adapter struct {
 func New() *Adapter {
 	a := &Adapter{}
 	framework.Register("openclaw", a)
+	// The tree Start hands to the agent user (privsep.DeclareTree: Harden
+	// leaves it in root's home although the agent owns it).
+	privsep.DeclareTree(openclawHome)
 	return a
 }
 
@@ -121,7 +124,7 @@ func (a *Adapter) Name() string { return "openclaw" }
 
 // SubprocessLogPath implements framework.SubprocessLogProvider. spawn.go
 // pipes the gateway's stdout/stderr here; proxy serves it on /log/agent.
-func (a *Adapter) SubprocessLogPath() string { return "/tmp/openclaw.log" }
+func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName) }
 
 // SettleDelay implements framework.SettleDelayer. openclaw rewrites
 // openclaw.json once on first boot (memory engine, session config, plugin
@@ -129,13 +132,13 @@ func (a *Adapter) SubprocessLogPath() string { return "/tmp/openclaw.log" }
 // baseline is captured.
 func (a *Adapter) SettleDelay() time.Duration { return 5 * time.Second }
 
-// Version probes the installed openclaw CLI. Best-effort; returns "" on error.
+// Version reports the installed openclaw version (a static read, see
+// probeOpenclawVersion). Best-effort.
 func (a *Adapter) Version(ctx context.Context) (string, error) {
-	out, err := exec.CommandContext(ctx, "openclaw", "--version").Output()
-	if err != nil {
-		return "", err
+	if v := probeOpenclawVersion(ctx); v != "" {
+		return v, nil
 	}
-	return strings.TrimSpace(string(out)), nil
+	return "", fmt.Errorf("openclaw: no installed version found")
 }
 
 // Roles returns the path-driven role set this adapter declares
@@ -249,15 +252,19 @@ func (a *Adapter) FrameworkRoutes() []framework.Route {
 }
 
 // Stop SIGTERMs the tracked process, waits up to gracefulTimeout, then
-// SIGKILLs. Afterwards SIGKILLs any leftover `openclaw gateway run`
-// processes — openclaw 5.x's self-restart fork-execs a child gateway we
-// don't track via a.cmd, and a leftover child holding :3284 would race
-// the next Start.
+// SIGKILLs. Afterwards — on every path, including a cancelled ctx — it
+// SIGKILLs any leftover gateway process (privsep.Sweep, which runs pkill as
+// the agent user, so it reaches only agent processes): openclaw 5.x's
+// self-restart fork-execs a child gateway we don't track via a.cmd, and a
+// leftover child holding :3284 would race the next Start. Other processes
+// the agent started, such as a backend it registered over the sign socket,
+// keep running.
 func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error {
 	a.mu.Lock()
 	cmd := a.cmd
 	a.cmd = nil
 	a.mu.Unlock()
+	defer privsep.Sweep(gatewaySweepPattern)
 
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Signal(os.Interrupt)
@@ -274,26 +281,28 @@ func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error
 			return ctx.Err()
 		}
 	}
-
-	sweepOrphanGateways()
 	return nil
 }
 
-// sweepOrphanGateways SIGKILLs any `openclaw gateway run` process. Used by
-// Stop to clean up children left behind by openclaw's internal self-restart.
-// pkill exit 1 = "no process matched" which is the happy-path; only louder
-// errors get logged.
-func sweepOrphanGateways() {
-	out, err := exec.Command("pkill", "-9", "-f", "openclaw gateway run").CombinedOutput()
-	if err == nil {
-		logger.Logf("openclaw: swept orphan gateway processes")
-		return
-	}
-	if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-		return // none matched, nothing to do
-	}
-	logger.Logf("openclaw: pkill orphan sweep failed: %v: %s", err, strings.TrimSpace(string(out)))
-}
+// gatewaySweepPattern matches the gateway's command line as it actually
+// is, for privsep.Sweep (pkill -f, an extended regular expression), at
+// every stage of its life. AgentCommand execs the resolved entry script, so
+// the kernel starts the gateway as `node …/openclaw/openclaw.mjs gateway
+// run …`; openclaw's entry point then retitles every openclaw process to
+// the bare `openclaw` (process.title) at once, and only the gateway loop,
+// once it is up, retitles it `openclaw-gateway`. A gateway still starting
+// (installing a plugin, say) — the one Start spawned, or a child that
+// replaced it (a self-restart spawns it detached, in its own session) —
+// reads `openclaw` and nothing more, so the pattern matches that bare title
+// too. The agent's own openclaw CLIs carry the same title, so a Stop also
+// ends any that are running then; they are short-lived and talk to the
+// gateway being stopped. A pattern naming the PATH link (`openclaw gateway
+// run`) matches none of these. Every alternative is anchored to the start
+// of the command line or of a path component, so a process whose command
+// line merely mentions the name (a script or log file the agent called
+// openclaw-gateway-proxy.js, an argument) is not swept: Stop ends the
+// framework's own processes only.
+const gatewaySweepPattern = `^openclaw(-gateway)?( |$)|(^|/)openclaw(\.mjs)? gateway run`
 
 // Liveness reports nil if the openclaw gateway is accepting TCP connections.
 func (a *Adapter) Liveness(ctx context.Context) error {
@@ -324,6 +333,10 @@ func (a *Adapter) Readiness(ctx context.Context) error { return a.Liveness(ctx) 
 //
 // iData chain sync (uploader.Push for framework dim) is the caller's
 // responsibility, separate from reconciliation.
+//
+// It runs while the gateway is up. The root-run install is confined to
+// root-owned paths (installOpenclaw's environment keeps openclaw's install
+// script out of the agent's tree), so it needs no quiescent agent.
 func (a *Adapter) ReconcileFramework(ctx context.Context) error {
 	target := whitelistMax()
 	if target == "" {

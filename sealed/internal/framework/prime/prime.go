@@ -51,6 +51,7 @@ import (
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -122,6 +123,16 @@ func New() *Adapter {
 		},
 	}
 	framework.Register(frameworkName, a)
+	// The trees spawnBridge hands to the agent user (privsep.DeclareTree:
+	// Harden leaves them in root's home although the agent owns them).
+	for _, tree := range handedOverTrees() {
+		privsep.DeclareTree(tree)
+	}
+	// The session artifacts an earlier sealed's layout left in root's home
+	// go with the conversation (migrateConversation), to where the SDK now
+	// looks for them, rather than into the agent's home with the rest of
+	// what that sealed let the agent leave there.
+	privsep.DeclareRelocation(legacySessionArtifactsDir(), sessionArtifactsDir())
 	return a
 }
 
@@ -247,7 +258,7 @@ func (a *Adapter) restoreManifestDir(plaintext []byte) error {
 		}
 		count = len(m.Entries)
 	}
-	if err := ensureDir(skillsDir()); err != nil {
+	if err := ensureRoleDir(skillsDir()); err != nil {
 		return fmt.Errorf("prime.Restore[skills/]: %w", err)
 	}
 	logger.Logf("prime.Restore[skills/]: parsed manifest (%d entries)", count)

@@ -40,8 +40,9 @@ const (
 	// Same mechanism the prime bridge relies on.
 	bridgeScriptDir = "/usr/local/lib/seal-dsh-bridge"
 
-	// agentLogPath receives the bridge's stdout/stderr, served on /log/agent.
-	agentLogPath = "/tmp/dsh-agent.log"
+	// logName names the bridge's stdout/stderr log under
+	// framework.StateDir/log, served on /log/agent.
+	logName = "dsh-agent"
 
 	// startTimeout bounds the wait for the bridge to bind. First boot composes
 	// the whole plugin tree and the first model resolution.
@@ -136,7 +137,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		ZGComputeRouted:     rendered.resolved.Endpoint != nil,
 		BootTime:            time.Now(),
 	})
-	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
+	if err := privsep.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its
 		// identity or the sign-refusal doctrine. Fail rather than degrade.
 		return framework.StartResult{}, fmt.Errorf("dsh.Start: write agent doc %s: %w", agentDocPath(), err)
@@ -184,7 +185,7 @@ func verifyInstalled(version string) error {
 	// Read package.json directly: the global node_modules is not on Node's
 	// default resolution path and the package's exports map need not expose
 	// ./package.json.
-	raw, err := os.ReadFile(filepath.Join(root, versionPackage, "package.json"))
+	raw, err := privsep.ReadFile(filepath.Join(root, versionPackage, "package.json"), privsep.LimitConfig)
 	if err != nil {
 		return fmt.Errorf("%s is not installed in this image (expected %s): %w — a dsh binding needs the dsh image; check the deploy's sealedImage", versionPackage, want, err)
 	}
@@ -201,6 +202,8 @@ func verifyInstalled(version string) error {
 
 // materializeBridge writes the embedded bridge + platform plugins to disk.
 // Rewritten on every Start so a sealed upgrade always ships its own bridge.
+// The directory's parent is root-owned, so what is written here stays
+// root's and read-only to the agent.
 func materializeBridge() error {
 	if err := ensureDir(bridgeScriptDir); err != nil {
 		return err
@@ -210,7 +213,7 @@ func materializeBridge() error {
 		if err != nil {
 			return fmt.Errorf("read embedded %s: %w", name, err)
 		}
-		if err := os.WriteFile(filepath.Join(bridgeScriptDir, name), src, 0o644); err != nil {
+		if err := privsep.WriteFile(filepath.Join(bridgeScriptDir, name), src, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
@@ -240,7 +243,10 @@ type bridgeEnv struct {
 func (be bridgeEnv) environ(nodePath string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		// The agent's own home (privsep.AgentHome): its tools' caches and
+		// config go there. DSH_HOME names the framework tree explicitly;
+		// ~/.dsh links to the same tree for the paths the agent is told.
+		"HOME=" + privsep.AgentHome(),
 		"NODE_PATH=" + nodePath, // belt for any CJS child; ESM resolves by ancestor walk
 		"DSH_HOME=" + dshHome,
 		fmt.Sprintf("SEAL_BRIDGE_PORT=%d", bridgePort),
@@ -273,9 +279,9 @@ func (be bridgeEnv) environ(nodePath string) []string {
 }
 
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
-	logFile, err := os.OpenFile(agentLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	logFile, err := framework.OpenLog(logName)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", agentLogPath, err)
+		return nil, fmt.Errorf("open %s: %w", framework.LogPath(logName), err)
 	}
 
 	nodePath, err := npmGlobalRoot()
@@ -284,20 +290,26 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command("node", bridgeScriptPath())
+	// Run the bridge (and every tool subprocess it spawns) as the low-privilege
+	// agent user when the image provides one (a plain spawn otherwise —
+	// internal/privsep). Background, not Start's ctx: the bridge outlives the
+	// call that spawned it; Stop ends it.
+	cmd, err := privsep.AgentCommand(context.Background(), "node", bridgeScriptPath())
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("start bridge: %w", err)
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Dir = dshHome
 	cmd.Env = be.environ(nodePath)
 
-	// Run the bridge (and every tool subprocess it spawns) as the low-privilege
-	// agent user when the image provides one (no-op otherwise — internal/privsep).
-	// Restore wrote the home as root, so hand it over now; $HOME must also accept
-	// new dotfiles. bridgeScriptDir stays root-owned read-only, which is fine.
-	if privsep.Drop(cmd) {
-		privsep.OwnPath(os.Getenv("HOME"))
-		privsep.OwnTree(dshHome)
-	}
+	// Restore wrote $DSH_HOME as root, so hand it over now, and link it into
+	// the agent's own home as ~/.dsh; root's home stays root's
+	// (privsep.SecureHome). bridgeScriptDir stays root-owned read-only,
+	// which is fine.
+	privsep.OwnTree(dshHome)
+	privsep.LinkAgentHome(".dsh", dshHome)
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -307,9 +319,15 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// npmGlobalRoot resolves the global node_modules path.
+// npmGlobalRoot resolves the global node_modules path. A toolchain query,
+// run through privsep.RootCommand (root-only PATH resolution, fixed
+// environment).
 func npmGlobalRoot() (string, error) {
-	out, err := exec.Command("npm", "root", "-g").Output()
+	cmd, err := privsep.RootCommand(context.Background(), "npm", "root", "-g")
+	if err != nil {
+		return "", fmt.Errorf("npm root -g: %w", err)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("npm root -g: %w", err)
 	}
@@ -352,32 +370,32 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 	}
 }
 
-// Stop terminates the bridge: SIGTERM, wait, SIGKILL, then sweep strays.
+// Stop terminates the bridge: SIGTERM, wait, SIGKILL — then SIGKILLs any
+// stray process whose command line names the bridge script (privsep.Sweep,
+// which runs pkill as the agent user, so it reaches only agent processes),
+// so the next Start gets a clean port.
 func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error {
 	a.mu.Lock()
 	cmd := a.cmd
 	a.cmd = nil
 	a.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	_ = cmd.Process.Signal(os.Interrupt)
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(os.Interrupt)
 
-	done := make(chan struct{})
-	go func() {
-		_, _ = cmd.Process.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(gracefulTimeout):
-		_ = cmd.Process.Kill()
+		done := make(chan struct{})
+		go func() {
+			_, _ = cmd.Process.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(gracefulTimeout):
+			_ = cmd.Process.Kill()
+		}
 	}
 
-	// A tool subprocess the bridge spawned can outlive it; sweep any stray so
-	// the next Start gets a clean port.
-	_ = exec.Command("pkill", "-f", bridgeScriptPath()).Run()
+	privsep.Sweep(bridgeScriptPath())
 	return nil
 }
 
@@ -437,7 +455,7 @@ func (a *Adapter) MonitorExit(onExit func(err error)) {
 
 // SubprocessLogPath implements framework.SubprocessLogProvider: the bridge log
 // is what /log/agent serves.
-func (a *Adapter) SubprocessLogPath() string { return agentLogPath }
+func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName) }
 
 // FrameworkRoutes declares the one public surface: the OpenAI-shaped chat API.
 func (a *Adapter) FrameworkRoutes() []framework.Route {

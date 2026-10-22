@@ -617,6 +617,48 @@ export class AgentApi {
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
+  /**
+   * Compact the agent's ONE persisted conversation in place: the framework's
+   * own compaction replaces the older history with a summary and keeps the
+   * newest part verbatim (how much is the framework's: openclaw ~20K tokens,
+   * dsh only its newest item), so later requests carry less of it while the
+   * conversation goes on — the middle ground between doing nothing and
+   * {@link clearConversation}. No restart. The summary takes one or more
+   * model calls, so this can take minutes — longer than Node's fetch waits
+   * for an answer (300s). A connection dropped or timed out meanwhile does not
+   * abort it; the outcome is in the runtime log. Nothing to compact —
+   * including nothing said since the last compaction — is a 200 whose note
+   * says so. Owner-signed (tag `0GSealCompact`, the clear grammar). A
+   * framework, or a framework version, that cannot compact on demand answers
+   * 501: openclaw before 2026.7.1 has no `sessions compact` CLI command, which
+   * the adapter drives. A second compaction while one runs, a replayed
+   * signature, or a framework declining for now (busy) answers 409. Pass
+   * `instanceId` when the caller participates in the single-driver seat:
+   * compaction is a driving action and is refused (409) from a displaced
+   * window.
+   */
+  async compactConversation(base: string, agentId: bigint, instanceId?: string): Promise<{ note?: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = '{}';
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealCompact:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/compact`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'application/json',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body,
+    });
+    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
   private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);

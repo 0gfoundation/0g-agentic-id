@@ -187,3 +187,36 @@ func (r Resolved) PersistableMaxTokens() int {
 	}
 	return r.Facts.MaxTokens
 }
+
+// RequestOutputCeiling bounds the per-request output budget the platform asks
+// frameworks to send. It is the value pi-ai sent by default before the catalog
+// budget was wired through, and it covers a reasoning model's shared
+// thinking+reply budget with room to spare (largest single completion measured
+// on glm-5.3 at effort=max during the 2026-10 investigation: ~13.6K tokens).
+const RequestOutputCeiling = 32768
+
+// RequestMaxTokens is the output budget an adapter should configure as the
+// framework's per-request max_tokens, or 0 for "configure nothing" (same
+// catalog gate as PersistableMaxTokens).
+//
+// The catalog's max_completion_tokens is a CAPABILITY — the most one reply
+// may ever be — not a value to request on every call, which is how
+// frameworks send the configured budget. Where a server checks prompt +
+// max_tokens against the context window, the capability can take most of
+// it: the router lists deepseek-v3 at 147456 of a 163840 window, which
+// leaves 16,384 tokens for the conversation; capped, 131,072 (catalog,
+// 2026-10-19).
+//
+// Not the fix for the HTTP 400 code 400001 that long glm-5.3 conversations
+// hit in 2026-10. Those requests had prompt + max_tokens at ~196,608 or
+// more AND a "developer"-role system prompt; replayed with it as "system",
+// the same request went through 65 times out of 65 (2026-10-16), and zg
+// compute confirmed (2026-10-19) that Tencent's and 0G's self-hosted
+// backends do not support the role. dsh now sends "system" (bridge.mjs).
+func (r Resolved) RequestMaxTokens() int {
+	mt := r.PersistableMaxTokens()
+	if mt > RequestOutputCeiling {
+		return RequestOutputCeiling
+	}
+	return mt
+}

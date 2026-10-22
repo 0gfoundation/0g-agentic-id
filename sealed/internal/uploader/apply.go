@@ -163,8 +163,15 @@ func (u *Uploader) Apply(ctx context.Context, plaintexts map[string][]byte) erro
 		}
 	}
 
-	// Skip the tx if computed state equals current chain state.
+	// Skip the tx if computed state equals current chain state. A role that
+	// drifted only in form (a manifest whose held entries resolve to exactly
+	// what is committed: pushManifest then returns the chain entry itself)
+	// is still recorded, so its new plaintext hash counts as in sync and the
+	// next tick does not resolve it again.
 	if entriesEqual(newEntries, chainEntries) {
+		for _, o := range outcomes {
+			u.agent.RecordChainUpload(o.role, o.contentHash, o.dataHash)
+		}
 		return nil
 	}
 

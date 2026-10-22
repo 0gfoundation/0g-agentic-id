@@ -1,13 +1,15 @@
 package prime
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 )
 
 // role="skills/" — the agent's installed Python skill packages.
@@ -41,8 +43,8 @@ import (
 func (a *Adapter) evoSkills() ([]byte, error) {
 	m := manifest.New()
 
-	entries, err := os.ReadDir(skillsDir())
-	if os.IsNotExist(err) {
+	entries, err := privsep.ReadDir(skillsDir())
+	if errors.Is(err, fs.ErrNotExist) {
 		return m.Marshal()
 	}
 	if err != nil {
@@ -51,7 +53,7 @@ func (a *Adapter) evoSkills() ([]byte, error) {
 
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || !manifest.Carries(skillsDir(), e.Name()) {
 			continue
 		}
 		names = append(names, e.Name())
@@ -59,17 +61,15 @@ func (a *Adapter) evoSkills() ([]byte, error) {
 	sort.Strings(names)
 
 	for _, name := range names {
-		sub := filepath.Join(skillsDir(), name)
-		tarBytes, err := manifest.PackDir(sub)
+		// A skill whose archive is over its limit is held (its committed
+		// version is kept) without holding the other skills.
+		entry, ok, err := manifest.DirEntryOf(filepath.Join(skillsDir(), name), name)
 		if err != nil {
-			return nil, fmt.Errorf("prime evoSkills: pack %s: %w", sub, err)
+			return nil, fmt.Errorf("prime evoSkills: %w", err)
 		}
-		m.Entries = append(m.Entries, manifest.Entry{
-			Path:        name + "/",
-			Kind:        manifest.EntryDir,
-			ContentHash: manifest.HashHex(tarBytes),
-			Size:        len(tarBytes),
-		})
+		if ok {
+			m.Entries = append(m.Entries, entry)
+		}
 	}
 	return m.Marshal()
 }
@@ -87,10 +87,13 @@ func (a *Adapter) restoreEntrySkills(path string, plaintext []byte) error {
 	if err != nil {
 		return fmt.Errorf("prime.RestoreEntry[skills/]: %w", err)
 	}
+	if err := ensureRoleDir(skillsDir()); err != nil {
+		return fmt.Errorf("prime.RestoreEntry[skills/]: %w", err)
+	}
 	dst := filepath.Join(skillsDir(), slug)
 	// Clean any prior content so deletions inside the tarball are honoured
 	// (UnpackDir overwrites files but does not remove stale ones).
-	if err := os.RemoveAll(dst); err != nil {
+	if err := privsep.RemoveAll(dst); err != nil {
 		return fmt.Errorf("prime.RestoreEntry[skills/]: clean %s: %w", dst, err)
 	}
 	return manifest.UnpackDir(plaintext, dst)
@@ -102,9 +105,8 @@ func skillSlug(path string) (string, error) {
 	if !strings.HasSuffix(path, "/") {
 		return "", fmt.Errorf("only dir entries supported (got %q)", path)
 	}
-	slug := strings.TrimSuffix(path, "/")
-	if slug == "" || strings.ContainsRune(slug, '/') || slug == "." || slug == ".." {
-		return "", fmt.Errorf("invalid slug %q", path)
+	if err := manifest.ValidEntryPath(path); err != nil {
+		return "", fmt.Errorf("invalid slug %q: %w", path, err)
 	}
-	return slug, nil
+	return strings.TrimSuffix(path, "/"), nil
 }
