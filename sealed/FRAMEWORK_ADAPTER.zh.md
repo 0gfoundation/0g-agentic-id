@@ -83,7 +83,10 @@ sealed 的五个组件各自通过一个窄切面消费它:
   版本;框架 shim 或 bridge 如果有,`go:embed` 在 sealed 二进制里、Start
   时落盘(已下线的 claudecode bridge 和 prime-agent 的 HTTP bridge 都是这
   个模式),这样它的度量跟着 sealed 镜像哈希走。接入一个我们已有生态的新
-  框架不需要新镜像,顶多加一行热缓存;新生态则需要。
+  框架不需要新镜像,顶多加一行热缓存;新生态则需要。这是设计意图;今天实际发布
+  的并非如此:openclaw 跑在 `sealed/Dockerfile` 上(FROM `images/openclaw/`
+  base),同样是 node 的 dsh 有自己的 `images/dsh/`,`images/sealed/` 不构建任何
+  实际发布的镜像。
 
 - **owner 的配置从头到尾归 core,只剩最后一步归你。** attestor 把 owner 的
   settings 文档当不透明 blob 存着,并在 `/provision` 响应里下发——用 ECIES
@@ -1066,7 +1069,9 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
 17. 按框架分镜像被一个通用镜像取代(`images/sealed/`):框架安装是
     热缓存、claudecode bridge `go:embed` 进二进制、attestor allowlist
     只挂一个 hash。净效果:attestor 完全框架无关——它对框架的全部
-    知识只剩一张不透明名字清单。
+    知识只剩一张不透明名字清单。(此后 hermes、prime、dsh 各自发布了自己的
+    镜像,openclaw 从 `sealed/Dockerfile` 发布;`images/sealed/` 不构建任何实际
+    发布的镜像。)
 18. 第 12 条毛边被生态解决:0g-compute 上线了 Anthropic 兼容端点
     (含 Claude 系模型),claudecode 现在把
     `persona.inference.provider = "0g-compute"` 经 `settings.json` 的
