@@ -182,8 +182,9 @@ sealed/
 │   ├── uploader/                 drift → 0g-storage upload + 签名 chain.Update
 │   ├── watcher/                  30s tick 跑 EvolutionFor、触发 uploader.Apply
 │   └── proxy/                    :8080 反向代理 + 签名 + 日志页
+├── Dockerfile                    实际发布的 openclaw sealed 镜像（0g-sealed）：images/openclaw/ base 上加 bootstrap 二进制
 ├── images/openclaw/              openclaw base 镜像构建脚本（独立产物，跟 sealed bootstrap 镜像分层）
-├── images/sealed/                sealed sandbox 镜像，node 版（openclaw；npm 安装只是热缓存）
+├── images/sealed/                通用 node 镜像（npm 安装只是热缓存）；不构建任何实际发布的镜像——openclaw 的是上面的 Dockerfile
 ├── images/hermes/                sealed sandbox 镜像，python/uv 版（hermes）
 ├── images/prime/                 sealed sandbox 镜像，node+python 版（prime-agent）
 └── images/dsh/                   sealed sandbox 镜像，dsh 版

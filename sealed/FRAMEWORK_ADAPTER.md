@@ -100,7 +100,10 @@ components hold only the interface (or a narrow subset of it) and need
   prime-agent HTTP bridge both work this way), so its measurement rides the
   sealed image hash. Supporting a new framework in an ecosystem we already
   carry does not require a new image, just (optionally) one more warm-cache
-  line; a new ecosystem does.
+  line; a new ecosystem does. That is the design intent; what ships today
+  differs: openclaw runs on `sealed/Dockerfile` (FROM the
+  `images/openclaw/` base), dsh, also node, has its own `images/dsh/`, and
+  `images/sealed/` builds no image that ships.
 
 - **The owner's configuration is core-owned end to end but the last
   step.** attestor stores the owner's settings document as an opaque blob
@@ -1292,7 +1295,9 @@ parts of it:
     claudecode bridge is `go:embed`ded, and the attestor allowlist
     carries a single hash. Net effect: attestor is fully
     framework-agnostic — its only remaining framework knowledge is a
-    list of opaque names.
+    list of opaque names. (Since then hermes, prime and dsh have shipped
+    images of their own, and openclaw ships from `sealed/Dockerfile`;
+    `images/sealed/` builds no image that ships.)
 18. Finding 12 resolved by the ecosystem: 0g-compute shipped an
     Anthropic-compatible endpoint (with Claude models), so claudecode
     now routes `persona.inference.provider = "0g-compute"` through the
