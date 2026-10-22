@@ -549,7 +549,7 @@ env 这一面：
 | `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
 | `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
-| `CHAIN_RPC_URL` | 0G testnet RPC，AgenticID 合约所在链。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，无需鉴权），attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
+| `CHAIN_RPC_URL` | AgenticID 合约所在 0G 链的 RPC——由 attestor worker 注入其自身的 `ATTESTOR_CHAIN_RPC`（`agenticid.0g.ai` 为 mainnet，`agenticid-testnet.0g.ai` 为 Galileo testnet）。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，无需鉴权），attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** 地址，由 attestor worker 注入在 `AGENTIC_ID_ADDR` 旁边（取自它的 `ATTESTOR_VERIFIED_FEEDBACK_ADDR`）。它是每个 serve-proof 签名所绑定的 EIP-191 version `0x00` intended validator。未设置、格式错误或为零地址时，sealed 在启动时记一行 `WARN`，并且**不**发 `X-Agent-Proof`，跟没有链上身份的 agent 走同一条路径。链客户端连上之后，sealed 还会读它的 `getIdentityRegistry()`：结果不是 `AGENTIC_ID_ADDR`（没有代码、revert、重试后仍读不出都算不是）就记一行点名两个地址的 `WARN`，走同一条不出 proof 的路径。永不回退到 registry 拒收的旧 `personal_sign` 包装 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。它是公开的，所以不能内嵌凭据：它会记进每个上传条目的链上 `dataDescription`（attestor 在 mint 时也这样记），打进启动日志（`/log`、`/log.html`，无需鉴权），并作为命令行参数传给负责下载的 `0g-storage-client` CLI |

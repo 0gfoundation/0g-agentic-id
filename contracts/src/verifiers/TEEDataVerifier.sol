@@ -13,6 +13,9 @@ error TEEDataVerifierInvalidSignature();
 /// @notice The ownership proof oracleType is not TEE.
 error TEEDataVerifierWrongOracleType();
 
+/// @notice setTeeOracleAddress was given the zero address.
+error TEEDataVerifierZeroAddress();
+
 /// @title TEEDataVerifier
 /// @notice Verifies ERC-7857 transfer validity proofs using a TEE oracle backend.
 ///
@@ -27,7 +30,14 @@ contract TEEDataVerifier is BaseDataVerifier {
     using ECDSA for bytes32;
 
     /// @notice Current implementation version. Bump on every upgrade.
-    /// @dev 1.1.0 — proof preimages switch from abi.encodePacked to abi.encode
+    /// @dev 1.2.0 — governance hardening (beacon upgrade; audit FIND-12 /
+    ///      FIND-16): ownership becomes two-step (BaseDataVerifier moves to
+    ///      Ownable2StepUpgradeable — transferOwnership only proposes, the new
+    ///      owner must acceptOwnership; pending owner in OZ's ERC-7201
+    ///      namespace, no existing storage moves); setTeeOracleAddress rejects
+    ///      address(0) (TEEDataVerifierZeroAddress) and emits TeeOracleUpdated.
+    ///      ABI additions only; proof encoding unchanged.
+    ///      1.1.0 — proof preimages switch from abi.encodePacked to abi.encode
     ///      (access + ownership). Adjacent dynamic fields (targetPubkey, nonce,
     ///      sealedKey) were packed without length boundaries, so a signature over
     ///      one field split verified for another — a re-split could seal the data
@@ -35,7 +45,9 @@ contract TEEDataVerifier is BaseDataVerifier {
     ///      each dynamic value makes the boundary part of the signed digest.
     ///      Off-chain signers (out of this repo) MUST match the new encoding.
     ///      1.0.0 — initial (packed preimages).
-    string public constant VERSION = "1.1.0";
+    string public constant VERSION = "1.2.0";
+
+    event TeeOracleUpdated(address indexed previousOracle, address indexed newOracle);
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -61,7 +73,8 @@ contract TEEDataVerifier is BaseDataVerifier {
 
     // ── Initializer ───────────────────────────────────────────────────────────
 
-    /// @param owner_            Contract owner (config: oracle address, maxProofAge). Timelock in prod.
+    /// @param owner_            Contract owner (config: oracle address, maxProofAge, pauser).
+    ///                          Direct calls, not timelocked — only beacon upgrades are.
     /// @param pauser_           Pauser (immediate pause/unpause). Not timelocked.
     /// @param teeOracleAddress_ Ethereum address corresponding to the TEE oracle's signing key.
     /// @param maxProofAge_      Maximum age (seconds) before a used nonce record can be deleted.
@@ -77,8 +90,15 @@ contract TEEDataVerifier is BaseDataVerifier {
 
     // ── Admin ─────────────────────────────────────────────────────────────────
 
+    /// @notice Rotate the TEE oracle signing address. Takes effect for every
+    ///         subsequent proof. Zero is rejected: no signature recovers to
+    ///         it, so every proof-gated iTransferFrom / iCloneFrom would revert
+    ///         until the next rotation.
     function setTeeOracleAddress(address newAddress) external onlyOwner {
-        _getTEEDataVerifierStorage().teeOracleAddress = newAddress;
+        if (newAddress == address(0)) revert TEEDataVerifierZeroAddress();
+        TEEDataVerifierStorage storage $ = _getTEEDataVerifierStorage();
+        emit TeeOracleUpdated($.teeOracleAddress, newAddress);
+        $.teeOracleAddress = newAddress;
     }
 
     // ── Ownership proof ───────────────────────────────────────────────────────

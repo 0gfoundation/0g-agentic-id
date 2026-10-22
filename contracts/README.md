@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 236 tests / 25 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 261 tests / 28 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -138,7 +138,7 @@ AgenticID
   ├── ERC7857IDataStorageUpgradeable             (IntelligentData[])
   ├── ERC7857AuthorizeUpgradeable                (authorizedUsers[])
   ├── ERC7857CloneableUpgradeable                (iCloneFrom)
-  └── OwnableUpgradeable                          (owner / attestor management)
+  └── Ownable2StepUpgradeable                     (two-step owner / attestor management)
 ```
 
 ERC-721 arrives via both the 8004 and 7857 paths; C3 collapses it to a single
@@ -546,6 +546,18 @@ longest business deadline window.
     `ownerOf`), must resolve a 0G agent's owner through the AgenticID contract, not the
     canonical singleton. The canonical singleton is shared and cannot be changed to
     report otherwise.
+- **Governance: direct two-step owner, Timelocked upgrades.** AgenticID,
+  TEEDataVerifier and VerifiedFeedbackRegistry are `Ownable2Step` (1.2.0, audit
+  FIND-16): `transferOwnership(x)` only sets `pendingOwner` (event
+  `OwnershipTransferStarted`), and ownership moves when `x` calls
+  `acceptOwnership()`. Owner-only admin — attestor allowlist, framework-hash
+  whitelist, `setVerifier` / `setTeeOracleAddress`, `setPauser`,
+  `setMaxProofAge` — is a direct call, not timelocked; only beacon upgrades go
+  through the Timelock (1-day `minDelay` on mainnet, 0 on testnet / dev).
+  The swap setters refuse `address(0)` (`AgenticIDZeroAddress` /
+  `TEEDataVerifierZeroAddress`) and emit `VerifierUpdated` / `TeeOracleUpdated`
+  (old, new), like `PauserUpdated` (FIND-12). Who holds each role per
+  environment: [`DEPLOYMENT.md`](DEPLOYMENT.md) §1 / §6.
 - **agentSeal / sealId: set-once, permanently bound.** An agentId's seal is set once and is not cleared on transfer. When the hardware changes, the attestor provisions the same `agentSeal_priv` to the new Agent TEE.
 - **Transfer splits on seal.** Seal-bound agents transfer ownership-only via standard `transferFrom` (data stays TEE-locked); non-seal agents transfer via proof-gated `iTransferFrom` (re-encrypts dataKey to the buyer). `iCloneFrom` is non-seal-only.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
@@ -557,7 +569,7 @@ longest business deadline window.
 
 ## 9. Tests
 
-236 Foundry tests across 25 suites (234 pass, 2 fork tests skip unless
+261 Foundry tests across 28 suites (259 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -575,17 +587,20 @@ longest business deadline window.
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
 | `AgentURIAndMetadata.t.sol` | 9 | setAgentURI / setMetadata + overwrite / nonexistent |
-| `VerifierAdmin.t.sol` | 7 | oracle rotation / pause (pauser role) / maxProofAge / onlyOwner |
-| `AgenticIDAdmin.t.sol` | 7 | attestor add/remove / frameworkHash / setVerifier / onlyOwner |
+| `VerifierAdmin.t.sol` | 9 | oracle rotation (zero rejected, `TeeOracleUpdated`) / pause (pauser role) / maxProofAge / onlyOwner |
+| `AgenticIDAdmin.t.sol` | 9 | attestor add/remove / frameworkHash / setVerifier (zero rejected, `VerifierUpdated`) / onlyOwner |
+| `TwoStepOwnership.t.sol` | 6 | AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry: propose leaves the owner in place, only the pending owner accepts, rights move on accept; re-proposal replaces, `address(0)` cancels |
 | `Upgradeable.t.sol` | 9 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
 | `CanonicalBinding.t.sol` | 9 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id |
 | `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
-| `UpgradeVerifiedFeedback.t.sol` | 3 | VerifiedFeedbackRegistry 1.1.0 → 1.2.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive; legacy-format proofs rejected after the cut, registry-bound accepted |
+| `UpgradeVerifiedFeedback.t.sol` | 4 | VerifiedFeedbackRegistry 1.1.0 → 1.2.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive; legacy-format proofs rejected after the cut, registry-bound accepted; owner preserved and two-step afterwards |
+| `UpgradeGovernance.t.sol` | 5 | AgenticID + TEEDataVerifier 1.1.0 → 1.2.0 from frozen 1.1.0 sources through a 1-day Timelock (mainnet's delay, owner-proposer, open execution): seal bindings / iData / URI / metadata / allowlists / verifier / oracle / nonces survive; two-step ownership and zero-address guards live after the upgrade |
 | `CloneGate.t.sol` | 20 | policy-mode cloning satellite: setCloneAuthorizer gating / cloneFrom happy path + every revert (attestor, no/denying/reverting authorizer, arity, sealId, paused) / owner-at-set invalidation on transfer / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | stock per-buyer clone policy: seller-only grant/revoke, per-agent scoping, grant dies on transfer and revives on re-acquire, clone through the gate |
 | `Eip170Size.t.sol` | 1 | every deployed impl fits the EIP-170 runtime-size limit |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
-| `StorageLayout.t.sol` | 2 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal) |
+| `StorageLayout.t.sol` | 3 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal); OZ's `Ownable2Step` slot pinned and disjoint from all of ours |
+| `DeployScript.t.sol` | 8 | deploy-script governance (`script/MainnetGovernance.sol`), library-level and end to end. `Deploy.s.sol`: on chain 16661 Timelock `minDelay` defaults to / requires ≥ 86400, no external Timelock admin, and unusable or ambiguous PROPOSERS / EXECUTORS (empty, a `0x0` proposer, OWNER not a proposer, `0x0` mixed into named executors, named executors without OWNER) revert before broadcast; elsewhere delay 0, OWNER admin, role sets unchecked. `DeployVerifiedFeedback.s.sol` / `DeployCloneGate.s.sol`: on chain 16661 refuse a weak or code-less `TIMELOCK`, accept a ≥ 1-day one; any elsewhere |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
 | `CanonicalForkIntegration.t.sol` | 2 | self-mint + verified-feedback attest against the live canonical registries (runs only with `FORK_RPC` set; skips otherwise) |
 
@@ -600,4 +615,5 @@ inherits this base and adds the business assertions.
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
   runbook (15 contracts in a single deploy, Timelock two-stage upgrade, how
-  `verify.sh` works, 0g Galileo testnet reference addresses).
+  `verify.sh` works, 0g Galileo testnet and 0G mainnet reference addresses +
+  per-environment governance).
