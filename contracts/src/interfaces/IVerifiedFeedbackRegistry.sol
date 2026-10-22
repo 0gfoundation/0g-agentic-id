@@ -52,7 +52,9 @@ interface IVerifiedFeedbackRegistry {
     /// @notice A canonical feedback entry passed ServeProof verification.
     /// @dev (agentId, clientAddress, feedbackIndex) identifies the entry in the
     ///      canonical ERC-8004 Reputation Registry. dataHashes/frameworkHash
-    ///      are the audit data carried by the proof (signed by agentSeal);
+    ///      are the audit data carried by the proof: CLAIMED by the agent's
+    ///      runtime and signed by agentSeal, not checked on chain against the
+    ///      agent's iData or the framework allowlist (see {getServeData});
     ///      taskHash is the TEE-signed interaction receipt (see {TaskReveal}).
     ///      `uri` is non-empty only when the receipt was opened and verified
     ///      on-chain (attestFeedbackWithTask) — the TEE-verified endpoint.
@@ -72,16 +74,18 @@ interface IVerifiedFeedbackRegistry {
     ///         `agentId` as backed by a TEE-signed ServeProof.
     /// @dev Verifies (in order): agentId matches proof.agentId;
     ///      proof.submitter == msg.sender (before signature recovery, so a
-    ///      mismatched caller reverts cheaply); the ServeProof signature
+    ///      mismatched caller reverts cheaply); 0 < proof.timestamp ≤
+    ///      proof.deadline; the ServeProof signature
     ///      against the agentSeal registered in the identity registry (inner
     ///      hash bound to this chain + identity registry + submitter, signed
     ///      as EIP-191 version 0x00 with THIS registry as the intended
     ///      validator — keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash); legacy
     ///      personal_sign-wrapped proofs are rejected); the proof's nonce
     ///      (consumed — one proof attests at most one entry); the caller is
-    ///      not the agent owner, an approved operator, or the agent's
-    ///      agentSeal; the canonical entry exists for msg.sender; the entry
-    ///      is not already verified.
+    ///      not the agent owner, an approved operator, the agent's payment
+    ///      wallet, or the agent's agentSeal; the canonical entry exists for
+    ///      msg.sender and its value is in range (|value| ≤ 1e9, ≤ 18
+    ///      decimals); the entry is not already verified.
     function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof) external;
 
     /// @notice Like {attestFeedback}, additionally opening the proof's
@@ -108,7 +112,12 @@ interface IVerifiedFeedbackRegistry {
         external view returns (bool);
 
     /// @notice Serve-proof audit data stored for a verified entry.
-    /// @dev Buyer due-diligence: compare dataHashes against
+    /// @dev Both fields are as CLAIMED in the seal-signed ServeProof — the
+    ///      registry checks the signature, not the content: dataHashes is not
+    ///      compared with the agent's on-chain iData and frameworkHash is not
+    ///      checked against AgenticID's framework allowlist (audit FIND-15).
+    ///      Their weight is that only the agent's TEE runtime holds agentSeal.
+    ///      Buyer due-diligence: compare dataHashes against
     ///      intelligentDatasOf(agentId) to see whether the agent's data changed
     ///      since this reputation was earned. Reverts if the entry is unverified.
     function getServeData(uint256 agentId, address clientAddress, uint64 feedbackIndex)
@@ -128,9 +137,10 @@ interface IVerifiedFeedbackRegistry {
 
     /// @notice Aggregate the given clients' verified entries whose TEE-verified
     ///         endpoint equals `uri` (values read live from the canonical
-    ///         registry; revoked skipped; sum + count, 18 decimals).
-    ///         `clientAddresses` must be non-empty — same trust stance as
-    ///         getVerifiedSummary. Off-chain eth_call only.
+    ///         registry; revoked and out-of-range entries skipped; sum +
+    ///         count, 18 decimals). `clientAddresses` and `uri` must be
+    ///         non-empty — same trust stance as getVerifiedSummary. Off-chain
+    ///         eth_call only.
     function getVerifiedSummaryForEndpoint(
         uint256 agentId,
         address[] calldata clientAddresses,
@@ -139,7 +149,8 @@ interface IVerifiedFeedbackRegistry {
 
     /// @notice Aggregate the given clients' VERIFIED canonical feedback,
     ///         reading values live from the canonical registry (revoked entries
-    ///         skipped, empty tag = wildcard). `clientAddresses` must be
+    ///         and entries outside |value| ≤ 1e9 / ≤ 18 decimals skipped — the
+    ///         latter can only be marks from before 1.2.0; empty tag = wildcard). `clientAddresses` must be
     ///         non-empty — the caller picks whom to trust, mirroring ERC-8004
     ///         getSummary (verification proves a service call happened, not
     ///         that the client is unrelated to the owner).

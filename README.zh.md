@@ -392,7 +392,7 @@ attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 261
+`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 290
 个 Foundry 测试（28 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**

@@ -130,6 +130,11 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
 
     // ── Proof validation ──────────────────────────────────────────────────────
 
+    /// @dev The verifier also checks which action the proofs were signed for:
+    ///      iTransferFrom, or any other proof-gated entrypoint (iCloneFrom) as a
+    ///      clone. Read from msg.sig rather than passed in — a constant
+    ///      argument made the optimizer inline this body into both callers,
+    ///      which AgenticID's EIP-170 headroom can't afford.
     function _proofCheck(
         address from,
         address to,
@@ -141,7 +146,9 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         if (proofs.length == 0) revert ERC7857InvalidProof();
 
         ERC7857Storage storage $ = _getERC7857Storage();
-        TransferValidityProofOutput[] memory proofOutput = $.verifier.verifyTransferValidity(proofs);
+        TransferValidityProofOutput[] memory proofOutput = $.verifier.verifyTransferValidity(
+            tokenId, from, msg.sig != IERC7857.iTransferFrom.selector, proofs
+        );
 
         IntelligentData[] memory datas = _intelligentDatasOf(tokenId);
         if (proofOutput.length != datas.length) revert ERC7857InvalidProof();

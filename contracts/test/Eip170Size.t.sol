@@ -10,9 +10,9 @@ import {Test} from "forge-std/Test.sol";
 ///         (numbered 1.2.0 at the time, 26,722 bytes) went green although its
 ///         deploy would revert on chain. That build was never deployed anywhere and
 ///         was superseded by the CloneGate satellite; it is NOT the current
-///         AgenticID 1.2.0 source (governance hardening, 24,440 bytes —
-///         DEPLOYMENT.md §7). This test makes the limit a suite failure instead
-///         of a deploy-time surprise. (Second occurrence; the first was fixed
+///         AgenticID 1.2.0 source (governance hardening + audit Low fixes,
+///         24,517 bytes — DEPLOYMENT.md §7). This test makes the limit a suite
+///         failure instead of a deploy-time surprise. (Second occurrence; the first was fixed
 ///         in eeec9ab.)
 contract Eip170SizeTest is Test {
     uint256 internal constant EIP170_LIMIT = 24576;

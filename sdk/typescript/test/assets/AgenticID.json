@@ -2162,6 +2162,17 @@
   },
   {
     "type": "error",
+    "name": "AgenticIDAgentSealTaken",
+    "inputs": [
+      {
+        "name": "agentSeal",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "AgenticIDCannotCloneSealedAgent",
     "inputs": [
       {

@@ -6,7 +6,8 @@ pragma solidity ^0.8.20;
 // environment runs: test/dev since the 2026-08 audit batch, mainnet since
 // 2026-09-09), taken verbatim from git 5e9ab03:contracts/src/AgenticID.sol
 // (unchanged through a417c65). Only the import paths and the contract name
-// differ; the inherited bases are imported live from src/ (unchanged by 1.2.0).
+// differ; the inherited bases are frozen 1.1.0 copies in ./v1_1_0/ (src/
+// changed them in 1.2.0).
 // Its runtime bytecode, CBOR metadata stripped, is identical to the mainnet
 // impl 0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817 (24,567 B; compared
 // 2026-10-19). UpgradeGovernance.t.sol uses it as the pre-upgrade beacon
@@ -23,11 +24,11 @@ import {TransferValidityProof} from "../../src/interfaces/IERC7857DataVerifier.s
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {IERC721} from "@openzeppelin/contracts/interfaces/IERC721.sol";
 import {ERC721Upgradeable} from "@openzeppelin/contracts-upgradeable/token/ERC721/ERC721Upgradeable.sol";
-import {ERC7857Upgradeable} from "../../src/ERC7857Upgradeable.sol";
-import {ERC8004CanonicalBoundUpgradeable} from "../../src/ERC8004CanonicalBoundUpgradeable.sol";
-import {ERC7857IDataStorageUpgradeable} from "../../src/extensions/ERC7857IDataStorageUpgradeable.sol";
-import {ERC7857AuthorizeUpgradeable} from "../../src/extensions/ERC7857AuthorizeUpgradeable.sol";
-import {ERC7857CloneableUpgradeable} from "../../src/extensions/ERC7857CloneableUpgradeable.sol";
+import {ERC7857UpgradeableV1_1_0 as ERC7857Upgradeable} from "./v1_1_0/ERC7857UpgradeableV1_1_0.sol";
+import {ERC8004CanonicalBoundUpgradeableV1_1_0 as ERC8004CanonicalBoundUpgradeable} from "./v1_1_0/ERC8004CanonicalBoundUpgradeableV1_1_0.sol";
+import {ERC7857IDataStorageUpgradeableV1_1_0 as ERC7857IDataStorageUpgradeable} from "./v1_1_0/ERC7857IDataStorageUpgradeableV1_1_0.sol";
+import {ERC7857AuthorizeUpgradeableV1_1_0 as ERC7857AuthorizeUpgradeable} from "./v1_1_0/ERC7857AuthorizeUpgradeableV1_1_0.sol";
+import {ERC7857CloneableUpgradeableV1_1_0 as ERC7857CloneableUpgradeable} from "./v1_1_0/ERC7857CloneableUpgradeableV1_1_0.sol";
 
 /// @notice Caller is not a trusted attestor.
 error AgenticIDNotTrustedAttestor();

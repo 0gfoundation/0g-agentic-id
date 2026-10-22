@@ -12,7 +12,8 @@ import {CanonicalReputationRegistryMock} from "./mocks/CanonicalReputationRegist
 import {VerifiedFeedbackRegistryV1_1_0} from "./mocks/VerifiedFeedbackRegistryV1_1_0.sol";
 import {
     VerifiedFeedbackRegistry,
-    VerifiedFeedbackInvalidProofSignature
+    VerifiedFeedbackInvalidProofSignature,
+    VerifiedFeedbackSummaryOverflow
 } from "../src/VerifiedFeedbackRegistry.sol";
 import {TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
@@ -251,5 +252,34 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
         vm.prank(client);
         registry.attestFeedback(agentId, i3, _proof(agentId, dataHash, keccak256("task-3"), true));
         assertTrue(registry.isVerified(agentId, client, i3), "registry-bound proof accepted post-upgrade");
+    }
+
+    /// @dev FIND-04 on the deployed state: 1.1.0 marks an entry at the
+    ///      canonical registry's ceiling (1e38, 0 decimals), after which every
+    ///      summary that includes the client reverts. 1.2.0 skips such
+    ///      pre-upgrade marks instead, and counts the rest.
+    function test_upgrade_summarySkipsPreUpgradeOutOfRangeMark() public {
+        (uint256 agentId, bytes32 dataHash) = _mintSealAgent();
+        uint64 normal = _canonicalFeedback(agentId); // 90
+        vm.prank(client);
+        canonicalRep.giveFeedback(agentId, 1e38, 0, "quality", "", "ep", "", bytes32(0));
+        uint64 extreme = canonicalRep.getLastIndex(agentId, client);
+
+        vm.startPrank(client);
+        registry.attestFeedback(agentId, normal, _proof(agentId, dataHash, keccak256("t-normal"), false));
+        registry.attestFeedback(agentId, extreme, _proof(agentId, dataHash, keccak256("t-extreme"), false));
+        vm.stopPrank();
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        vm.expectRevert(VerifiedFeedbackSummaryOverflow.selector);
+        registry.getVerifiedSummary(agentId, cs, "", "");
+
+        _upgradeBeacon(address(new VerifiedFeedbackRegistry()));
+
+        assertTrue(registry.isVerified(agentId, client, extreme), "the old mark itself survives");
+        (uint64 count, int128 sum, ) = registry.getVerifiedSummary(agentId, cs, "", "");
+        assertEq(count, 1, "out-of-range mark skipped");
+        assertEq(sum, int128(90e18), "only the in-range entry is summed");
     }
 }
