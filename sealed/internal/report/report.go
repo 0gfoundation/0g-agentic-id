@@ -17,10 +17,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/logger"
 )
 
@@ -48,7 +48,11 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 		"agent_seal_signature": "0x" + hex.EncodeToString(sig),
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("FAIL status: attestor identity: %v", err)
+		return
+	}
 	resp, err := client.Post(attestorURL+"/status", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("FAIL status: POST error: %v", err)
@@ -108,7 +112,11 @@ func SeedSettings(attestorURL string, agentSealPriv []byte, sealID string, doc [
 		"agent_seal_signature": "0x" + hex.EncodeToString(sig),
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("warn: settings seed: attestor identity: %v", err)
+		return
+	}
 	resp, err := client.Post(attestorURL+"/settings/seed", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("warn: settings seed: POST error: %v", err)

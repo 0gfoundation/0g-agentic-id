@@ -1,5 +1,13 @@
 # AgenticID 信任模型
 
+attestor HTTP 请求（`/provision`、`/status`、`/settings/seed`）统一使用
+`internal/attestorhttp`。生产创建流程覆盖注入 `ATTESTOR_TLS_DESCRIPTOR`，只包含
+公开的 Scan URL/SPKI 信任锚，以及固定的 appId、chain、registry、注册 epoch、
+app signer 和现有业务 URL。runtime 独立向已 pin 的 Scan 刷新 app TLS pin；
+身份过期或不匹配时停止业务请求，不挂载 tapp socket。只有 mock 部署会明确注入
+`ATTESTOR_ALLOW_UNPINNED_DEV=true` 以绕过校验。
+见 [应用身份迁移](../attestor/APP_IDENTITY.zh.md)。
+
 一个 agent 的身份如何在密码学上锚定到一段经过远程认证的代码上，每条
 `serve-proof` 实际证明了什么、又刻意不证明什么，以及声誉系统如何补
 上这道缝。

@@ -12,11 +12,11 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	eciesgo "github.com/ecies/go/v2"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/logger"
 )
 
@@ -64,7 +64,11 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 		"sandbox_signature": a.Signature,
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("FAIL provision: attestor identity: %v", err)
+		return Result{}
+	}
 	resp, err := client.Post(attestorURL+"/provision", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("FAIL provision: POST error: %v", err)

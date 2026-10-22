@@ -41,6 +41,8 @@ anyhow.workspace = true
 tracing.workspace = true
 dotenvy.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
+x509-parser.workspace = true
 base64.workspace = true
 
 # tapp-server gRPC (GetAppSecretKey, GetSecretResource)

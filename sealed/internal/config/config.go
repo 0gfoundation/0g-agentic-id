@@ -12,6 +12,9 @@
 //	                            agentSeal key; opened after provisioning, wins over API_KEY
 //	                            (internal/secretenv, issue #166)
 //	ATTESTOR_URL                (optional) provisioning endpoint root URL
+//	ATTESTOR_TLS_DESCRIPTOR     public Scan anchor + immutable attestor app scope,
+//	                            injected by attestor; required when ATTESTOR_URL is set
+//	ATTESTOR_ALLOW_UNPINNED_DEV  explicit development-only bypass ("true")
 //	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //	AGENTIC_ID_ADDR             (optional) AgenticID contract address
 //	INDEXER_URL                 (optional) 0g-storage indexer fallback URL

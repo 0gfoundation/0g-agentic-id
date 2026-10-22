@@ -16,14 +16,16 @@
 
 use crate::traits::StorageClient;
 use crate::types::StorageUploadResult;
-use alloy::primitives::{B256, TxHash};
+use alloy::primitives::{TxHash, B256};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 
 use ethers::middleware::SignerMiddleware;
+use ethers::providers::Middleware;
 use ethers::providers::{Http, Provider};
 use ethers::signers::{LocalWallet, Signer};
+use ethers::types::{BlockId, BlockNumber};
 use zg_storage_client::cmd::upload::{FinalityRequirement, UploadOption};
 use zg_storage_client::core::in_mem::DataInMemory;
 use zg_storage_client::indexer::client::IndexerClient;
@@ -34,6 +36,7 @@ pub struct ZgStorage {
     w3_client: Web3Client,
     indexer: IndexerClient,
     indexer_url: String,
+    submit_pool: sqlx::PgPool,
 }
 
 impl ZgStorage {
@@ -42,6 +45,7 @@ impl ZgStorage {
         chain_id: u64,
         priv_key: [u8; 32],
         indexer_url: String,
+        submit_pool: sqlx::PgPool,
     ) -> Result<Self> {
         let provider = Provider::<Http>::try_from(chain_rpc)
             .with_context(|| format!("invalid ATTESTOR_CHAIN_RPC: {chain_rpc}"))?;
@@ -56,6 +60,7 @@ impl ZgStorage {
             w3_client,
             indexer,
             indexer_url,
+            submit_pool,
         })
     }
 }
@@ -71,6 +76,37 @@ impl StorageClient for ZgStorage {
     }
 
     async fn upload(&self, data: Vec<u8>) -> Result<StorageUploadResult> {
+        // The SDK reads a latest nonce internally. Hold the SAME distributed
+        // lock as business writes, and drain earlier pending transactions
+        // before entering the SDK. The SDK waits until its own tx is packed.
+        let mut nonce_lock = self.submit_pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "attestor-sender:{}",
+                hex::encode(self.w3_client.address().as_bytes())
+            ))
+            .execute(&mut *nonce_lock)
+            .await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let address = self.w3_client.address();
+            let latest = self
+                .w3_client
+                .get_transaction_count(address, Some(BlockId::Number(BlockNumber::Latest)))
+                .await?;
+            let pending = self
+                .w3_client
+                .get_transaction_count(address, Some(BlockId::Number(BlockNumber::Pending)))
+                .await?;
+            if latest == pending {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "storage signer still has pending transactions"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
         let size = data.len() as u64;
         let mem = Arc::new(DataInMemory::new(data)?);
         // Compute root first — cheap, gives us the on-chain data_hash even
@@ -122,11 +158,13 @@ impl StorageClient for ZgStorage {
                     }
                     // Surface the full cause chain (not just the "indexer
                     // upload" context) so a non-race failure is diagnosable.
-                    return Err(e).with_context(|| format!("indexer upload (after {attempt} attempts)"));
+                    return Err(e)
+                        .with_context(|| format!("indexer upload (after {attempt} attempts)"));
                 }
             }
         };
 
+        nonce_lock.commit().await?;
         Ok(StorageUploadResult {
             root_hash: B256::from_slice(root_h256.as_bytes()),
             submit_tx_hash: TxHash::from_slice(tx_h256.as_bytes()),
@@ -140,7 +178,10 @@ impl StorageClient for ZgStorage {
         // (FinalityRequirement::TransactionPacked above). For the attestor's
         // current pipeline that's the confirmation we care about. If we
         // later need on-chain finality, we can poll the receipt here.
-        tracing::info!(?tx_hash, "zg storage: confirmation already implicit in upload()");
+        tracing::info!(
+            ?tx_hash,
+            "zg storage: confirmation already implicit in upload()"
+        );
         Ok(())
     }
 }

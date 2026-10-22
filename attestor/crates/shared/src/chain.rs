@@ -171,6 +171,7 @@ where
     // across submit (sub-second), NOT the receipt wait, so txs still pipeline.
     // tokio Mutex (not std) because the guard is held across an `.await`.
     submit_lock: tokio::sync::Mutex<()>,
+    submit_pool: sqlx::PgPool,
     _t: PhantomData<T>,
 }
 
@@ -187,6 +188,7 @@ where
         max_fee_gwei: u64,
         tapp_registry: Option<(Address, String)>,
         clone_gate: Option<Address>,
+        submit_pool: sqlx::PgPool,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
@@ -197,6 +199,7 @@ where
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             tapp_registry,
             submit_lock: tokio::sync::Mutex::new(()),
+            submit_pool,
             _t: PhantomData,
         })
     }
@@ -227,6 +230,7 @@ pub fn connect_http(
     max_fee_gwei: u64,
     tapp_registry: Option<(Address, String)>,
     clone_gate: Option<Address>,
+    submit_pool: sqlx::PgPool,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
@@ -248,6 +252,7 @@ pub fn connect_http(
         max_fee_gwei,
         tapp_registry,
         clone_gate,
+        submit_pool,
     );
     Ok(chain)
 }
@@ -297,11 +302,7 @@ where
             .with_input(call_data);
 
         // Estimate gas limit, add 20% safety margin.
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -319,10 +320,23 @@ where
         // held through the receipt wait, so mints still pipeline into mempool.
         let pending = {
             let _guard = self.submit_lock.lock().await;
-            self.provider
+            // One stable signer is shared by API and workers. Serialize the
+            // pending-nonce read and broadcast across those processes too.
+            let mut nonce_lock = self.submit_pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!(
+                    "attestor-sender:{}",
+                    hex::encode(self.sender.as_slice())
+                ))
+                .execute(&mut *nonce_lock)
+                .await?;
+            let pending = self
+                .provider
                 .send_transaction(tx)
                 .await
-                .map_err(decode_err)?
+                .map_err(decode_err)?;
+            nonce_lock.commit().await?;
+            pending
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
@@ -437,11 +451,7 @@ where
             .with_to(gate)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -456,10 +466,23 @@ where
 
         let pending = {
             let _guard = self.submit_lock.lock().await;
-            self.provider
+            // One stable signer is shared by API and workers. Serialize the
+            // pending-nonce read and broadcast across those processes too.
+            let mut nonce_lock = self.submit_pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!(
+                    "attestor-sender:{}",
+                    hex::encode(self.sender.as_slice())
+                ))
+                .execute(&mut *nonce_lock)
+                .await?;
+            let pending = self
+                .provider
                 .send_transaction(tx)
                 .await
-                .map_err(decode_err)?
+                .map_err(decode_err)?;
+            nonce_lock.commit().await?;
+            pending
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
@@ -533,11 +556,7 @@ where
         Ok(c.sealedKeysOf(agent_id).call().await?._0)
     }
 
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash> {
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
         let call_data = AgenticID::setAgentURICall {
             agentId: agent_id,
             newURI: uri,
@@ -549,11 +568,7 @@ where
             .with_to(self.contract_addr)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -567,10 +582,23 @@ where
 
         let pending = {
             let _guard = self.submit_lock.lock().await;
-            self.provider
+            // One stable signer is shared by API and workers. Serialize the
+            // pending-nonce read and broadcast across those processes too.
+            let mut nonce_lock = self.submit_pool.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!(
+                    "attestor-sender:{}",
+                    hex::encode(self.sender.as_slice())
+                ))
+                .execute(&mut *nonce_lock)
+                .await?;
+            let pending = self
+                .provider
                 .send_transaction(tx)
                 .await
-                .map_err(decode_err)?
+                .map_err(decode_err)?;
+            nonce_lock.commit().await?;
+            pending
         };
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");

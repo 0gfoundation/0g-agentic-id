@@ -79,8 +79,8 @@ pub struct Config {
     /// `tapp_ip`/`tapp_port`, which are then ignored. Mount the socket into
     /// the container to use it, keeping the TEE-key/KMS RPCs off any TCP port.
     pub tapp_socket: Option<String>,
-    /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
-    /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
+    /// App identifier registered in TappRegistry. Shared by `GetAppSigner`
+    /// (stable business EOA) and `GetSecretResource` (encryption secrets). Required when
     /// either `mock_tee=false` or `mock_kms=false`. Also surfaced to the
     /// frontend as the "attestor" slot in the trust-roots ack modal.
     pub app_id: Option<String>,
@@ -274,7 +274,7 @@ impl Config {
 
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,
 
-            sandbox_endpoint: env("ATTESTOR_SANDBOX_ENDPOINT")?,
+            sandbox_endpoint: env_opt("ATTESTOR_SANDBOX_ENDPOINT").unwrap_or_default(),
             mock_sandbox: env_opt("MOCK_SANDBOX")
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(true),

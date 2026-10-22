@@ -25,8 +25,8 @@ Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 worker 可以共享；job payload 和 provision 绑定 MAC 用的是 KMS
 **app-scoped** key，同一个 Tapp app 的任何节点都解得开；agentSeal
 由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
-本地没有密钥状态。多节点**尚未实际跑过**——还差三件事：每个节点的
-TEE EOA 进 `AgenticID.trustedAttestors`（并养 gas）、Postgres 从
+本地没有密钥状态。多节点**尚未实际跑过**——生产使用共享 KMS 稳定 app signer、
+绑定实例的 AgenticID 授权与 gas；Postgres 从
 per-host compose 里抽出来共享、以及 **indexer 保持单实例**（链上
 checkpoint 是单写者，两个 indexer 会重复消费事件）。归属
 node-federation 工作流。
@@ -158,7 +158,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_APP_ID` | attestor 自己在 TappRegistry 注册的 appId |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | 信任的另外两个 Tapp app（trust-roots ack 用）|
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（拿 TEE EOA key + KMS 派生 key：app-scoped 及带 `material` 的 per-seal）；docker 里通过 `host.docker.internal` 解到宿主 |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（加密 KMS key；生产签名与身份发现要求本地 socket）；docker 里通过 `host.docker.internal` 解到宿主 |
 | `MOCK_TEE` / `MOCK_KMS` | dev mock 开关 |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | `MOCK_TEE=true` 时必填；私钥需推得出地址（启动校验）|
 | `MOCK_APP_SECRET` | `MOCK_KMS=true` 时必填，32 字节 hex；三个 binary 必须读到**同一个值**否则派生分叉 |
@@ -167,9 +167,9 @@ cargo run -p attestor-indexer# 第三个终端
 
 | env | 含义 |
 |---|---|
-| `ATTESTOR_SANDBOX_PROVIDER_ADDR` | sandbox provider EOA（在 SandboxServing 上注册过）|
+| `ATTESTOR_SANDBOX_PROVIDER_ADDR` | 仅开发覆盖（`MOCK_TEE=true`）；生产按 sandbox appId 发现 app_signer |
 | `ATTESTOR_SANDBOX_SERVING_ADDR` | SandboxServing 合约地址（前端 deploy gate 查 owner 余额 ≥ 0.1 OG 用）|
-| `ATTESTOR_SANDBOX_ENDPOINT` | 0g-sandbox HTTP endpoint |
+| `ATTESTOR_SANDBOX_ENDPOINT` | Dev-only locator; production uses the authorized on-chain HTTPS URL |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | 实例化新 agent 用的 sealed runtime snapshot 名（升 image 时改这里）|
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
@@ -182,7 +182,7 @@ cargo run -p attestor-indexer# 第三个终端
 | env | 含义 |
 |---|---|
 | `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL（dataKey 加密包上传目标）|
-| `MOCK_STORAGE` | `true` 用 keccak256 替代真 merkle root，不上传；`false` 走真 SDK（attestor TEE EOA 需要 0G testnet gas）|
+| `MOCK_STORAGE` | `true` 用 keccak256 替代真 merkle root，不上传；`false` 走真 SDK（稳定 app signer 需要 0G testnet gas）|
 
 ### 数据库 / 进程
 
@@ -226,3 +226,5 @@ Postgres / chain / sandbox 依赖，单测从 6s 起。
 完整回归流程（本地全 mock、testnet 实测、故障速查表）见
 [TESTING.md](TESTING.md)——`scripts/e2e.sh` 负责部署，
 `scripts/verify-agent.sh` 负责验证。
+
+稳定应用身份、生产合约迁移与 TEE TLS 部署见 [APP_IDENTITY.zh.md](APP_IDENTITY.zh.md)。

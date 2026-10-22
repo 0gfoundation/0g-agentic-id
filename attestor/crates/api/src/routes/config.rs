@@ -79,7 +79,11 @@ pub struct ConfigResponse {
 }
 
 fn none_if_empty(s: &str) -> Option<String> {
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// The advertised secret-env scheme, if the operator enabled it.
@@ -87,8 +91,20 @@ fn secret_env_scheme(enabled: bool) -> Option<&'static str> {
     enabled.then_some(attestor_shared::config::SECRET_ENV_SCHEME)
 }
 
-pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
-    Json(ConfigResponse {
+pub async fn handle(
+    State(state): State<AppState>,
+) -> Result<Json<ConfigResponse>, (axum::http::StatusCode, String)> {
+    let connection = state.sandbox.service_identity().await.map_err(|_| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "sandbox identity lookup unavailable".to_string(),
+        )
+    })?;
+    let (provider, endpoint) = connection.map(|(p, url)| (Some(p), Some(url))).unwrap_or((
+        state.cfg.sandbox_provider_addr,
+        Some(state.cfg.sandbox_endpoint.clone()),
+    ));
+    Ok(Json(ConfigResponse {
         sandbox_proxy_addr: state.cfg.sandbox_proxy_addr.clone(),
         agent_serve_port: state.cfg.agent_serve_port,
         agent_serve_path: state.cfg.agent_serve_path.clone(),
@@ -102,14 +118,8 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         attestor_app_id: state.cfg.app_id.clone(),
         kms_app_id: state.cfg.kms_app_id.clone(),
         sandbox_app_id: state.cfg.sandbox_app_id.clone(),
-        sandbox_provider_addr: state
-            .cfg
-            .sandbox_provider_addr
-            .map(|a| format!("{:#x}", a)),
-        sandbox_serving_addr: state
-            .cfg
-            .sandbox_serving_addr
-            .map(|a| format!("{:#x}", a)),
+        sandbox_provider_addr: provider.map(|a| format!("{:#x}", a)),
+        sandbox_serving_addr: state.cfg.sandbox_serving_addr.map(|a| format!("{:#x}", a)),
         sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
         reputation_registry_addr: state
             .cfg
@@ -119,19 +129,13 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .cfg
             .verified_feedback_addr
             .map(|a| format!("{:#x}", a)),
-        feedback_batcher_addr: state
-            .cfg
-            .feedback_batcher_addr
-            .map(|a| format!("{:#x}", a)),
-        clone_gate_addr: state
-            .cfg
-            .clone_gate_addr
-            .map(|a| format!("{:#x}", a)),
+        feedback_batcher_addr: state.cfg.feedback_batcher_addr.map(|a| format!("{:#x}", a)),
+        clone_gate_addr: state.cfg.clone_gate_addr.map(|a| format!("{:#x}", a)),
         standard_clone_authorizer_addr: state
             .cfg
             .standard_clone_authorizer_addr
             .map(|a| format!("{:#x}", a)),
-        sandbox_endpoint: Some(state.cfg.sandbox_endpoint.clone()).filter(|s| !s.is_empty()),
+        sandbox_endpoint: endpoint.filter(|s| !s.is_empty()),
         tee_data_verifier_addr: state
             .cfg
             .tee_data_verifier_addr
@@ -141,7 +145,7 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         attestor_version: env!("CARGO_PKG_VERSION"),
         cli_latest: none_if_empty(&state.cfg.cli_latest),
         cli_notes: none_if_empty(&state.cfg.cli_notes),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -207,7 +211,13 @@ mod tests {
         // stale value.
         let unset = serde_json::to_value(sample("", "")).unwrap();
         assert_eq!(unset["attestor_version"], "9.9.9");
-        assert!(unset.get("cli_latest").is_none(), "cli_latest must be absent when unset");
-        assert!(unset.get("cli_notes").is_none(), "cli_notes must be absent when unset");
+        assert!(
+            unset.get("cli_latest").is_none(),
+            "cli_latest must be absent when unset"
+        );
+        assert!(
+            unset.get("cli_notes").is_none(),
+            "cli_notes must be absent when unset"
+        );
     }
 }

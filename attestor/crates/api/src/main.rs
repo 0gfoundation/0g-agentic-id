@@ -24,15 +24,33 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let cfg = Config::from_env()?;
+    let mut cfg = Config::from_env()?;
     tracing::info!(rpc = %cfg.chain_rpc, bind = %cfg.bind, "attestor-api starting");
 
     let pool = repo::connect(&cfg.db_url).await?;
 
     // Attestor EOA key. MOCK_TEE=true uses env vars; false goes over local
-    // gRPC to tapp-server's GetAppSecretKey.
+    // gRPC to tapp-server's GetAppSigner.
     let tee = build_tee_provider(&cfg).await?;
     let app_priv = tee.app_private_key().await?;
+    let app_signer = AdminSigner::from_priv(app_priv)?;
+    let attestor_identity = if cfg.mock_tee {
+        None
+    } else {
+        let identity =
+            attestor_shared::identity::AttestorDiscovery::new(&cfg, app_signer.address());
+        identity.snapshot().await?;
+        Some(identity)
+    };
+    let discovery = if !cfg.mock_tee && !cfg.mock_sandbox {
+        let discovery = attestor_shared::identity::SandboxDiscovery::new(&cfg)?;
+        let snapshot = discovery.snapshot().await?;
+        cfg.sandbox_provider_addr = Some(snapshot.provider);
+        cfg.sandbox_endpoint = snapshot.base_url.clone();
+        Some(discovery)
+    } else {
+        None
+    };
 
     // KMS master (app-scoped 32B secret). All three binaries must resolve
     // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value
@@ -57,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_max_fee_gwei,
         cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
+        pool.clone(),
     )?;
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
@@ -68,12 +87,12 @@ async fn main() -> anyhow::Result<()> {
     // failed container during /provision rejection). `create / start /
     // stop` calls all live in the worker, so the mock here would also
     // be fine for those — but using the same client matches worker's
-    // config so admin_delete signs with the same TEE EOA address.
+    // config so admin_delete signs with the same stable app signer.
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         Arc::new(MockSandbox)
     } else {
         let admin_signer = AdminSigner::from_priv(app_priv).ok();
-        Arc::new(HttpSandbox::new(
+        let client = HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
             // api never spawns containers, so extra_env / public_ports are
@@ -82,7 +101,15 @@ async fn main() -> anyhow::Result<()> {
             Vec::new(),
             admin_signer,
             cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
-        ))
+        );
+        let client = match &discovery {
+            Some(d) => client.with_discovery(d.clone()),
+            None => client,
+        };
+        Arc::new(match &attestor_identity {
+            Some(identity) => client.with_attestor_identity(identity.clone()),
+            None => client,
+        })
     };
 
     let state = AppState {
@@ -121,7 +148,9 @@ async fn build_tee_provider(cfg: &Config) -> anyhow::Result<Arc<dyn TeeKeyProvid
             .mock_app_eth_address
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("MOCK_TEE=true but MOCK_APP_ETH_ADDRESS not set"))?;
-        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(priv_hex, addr_hex)?))
+        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(
+            priv_hex, addr_hex,
+        )?))
     } else {
         Ok(Arc::new(TappTeeKeyProvider::connect(cfg).await?))
     }
