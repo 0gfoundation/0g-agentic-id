@@ -38,7 +38,7 @@ FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sandbox:base-ubu
 # ships an older node in its nvm, so install the pinned version here
 # instead of relying on the base (same bump the openclaw image line took
 # via base-ubuntu22-node24).
-ARG NODE_VERSION=24.15.0
+ARG NODE_VERSION=24.22.1
 ENV NVM_DIR=/root/.nvm
 RUN . "$NVM_DIR/nvm.sh" && nvm install ${NODE_VERSION} && nvm alias default ${NODE_VERSION}
 

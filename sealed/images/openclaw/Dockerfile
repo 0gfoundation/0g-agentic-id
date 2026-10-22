@@ -3,7 +3,7 @@
 # (rebuild the base first when NODE_VERSION changes — the ARG here only fixes PATH)
 FROM eliza-registry-vpc.ap-southeast-1.cr.aliyuncs.com/eliza/0g-sealed:base-ubuntu22-node24
 
-ARG NODE_VERSION=24.15.0
+ARG NODE_VERSION=24.22.1
 
 # Fix PATH for non-interactive exec (toolbox process/execute does not load .bashrc).
 ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
