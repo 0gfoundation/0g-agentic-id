@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -120,8 +119,20 @@ func main() {
 
 	// agent_seal_priv lives only in this process's memory: make it
 	// non-dumpable before anything else runs, so no sibling process can
-	// ptrace it or read /proc/<pid>/mem even if it shares our uid.
-	privsep.HardenSelf()
+	// ptrace it or read /proc/<pid>/mem even if it shares our uid. With the
+	// uid split, root's home is also made root-only here — the agent may
+	// traverse it to reach the framework trees handed to it, but must not
+	// create, rename or replace anything directly inside it, since root runs
+	// toolchains from there — and anything an earlier sealed let the agent
+	// leave in it is moved out (the adapters registered above have declared
+	// their own trees, which stay). Enforced rather than trusted to the base
+	// image: privsep.Required (the provision gate below) refuses until that
+	// has succeeded, so a boot that skips this call is never provisioned.
+	// It also checks sealed's own time zone and CA locations
+	// (privsep.ScrubTimeEnv, privsep.ScrubTrustEnv) before the first TLS
+	// connection and before its first log line, which is what first reads
+	// the time zone: nothing may log before this call.
+	privsep.Harden()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()
@@ -160,11 +171,8 @@ func main() {
 	// Phase 1+2+3: provision + bootstrap from chain + start agent.
 	// Each phase is best-effort; if any fails we report error to attestor
 	// and continue to serve /healthz, /log so operators can inspect.
-	if cfg.AttestorURL == "" {
-		logger.Logf("ATTESTOR_URL unset -- skipping provision / bootstrap / status")
-	} else if cfg.ChainRPC == "" || cfg.ContractAddr == "" || cfg.FallbackIndexer == "" {
-		logger.Logf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
-			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
+	if skip := provisionGate(cfg, privsep.Required); skip != "" {
+		logger.Logf("%s", skip)
 	} else {
 		runMainPipeline(cfg, agent, sealedProxy)
 	}
@@ -175,6 +183,29 @@ func main() {
 
 	// Block forever -- HTTP server runs in its own goroutine.
 	select {}
+}
+
+// provisionGate decides whether this boot runs the provisioning pipeline
+// (runMainPipeline): "" to proceed, else the line main logs instead. The
+// privsep check runs last and fails closed — agent_seal_priv is never
+// fetched into a container whose framework would share sealed's uid (it
+// could read the key out of this process). Nothing reaches attestor on that
+// path, since /status is signed with the key this boot refuses to fetch: the
+// refusal (cause + fix, from privsep.Required) is visible only in /log, and
+// attestor's provision-timeout sweep fails the container stage (deployment
+// phase offline) when /provision never arrives.
+func provisionGate(cfg *config.Bootstrap, privsepRequired func() error) string {
+	if cfg.AttestorURL == "" {
+		return "ATTESTOR_URL unset -- skipping provision / bootstrap / status"
+	}
+	if cfg.ChainRPC == "" || cfg.ContractAddr == "" || cfg.FallbackIndexer == "" {
+		return fmt.Sprintf("missing required env (CHAIN_RPC_URL=%q AGENTIC_ID_ADDR=%q INDEXER_URL=%q) -- skipping provision / bootstrap / status",
+			cfg.ChainRPC, cfg.ContractAddr, cfg.FallbackIndexer)
+	}
+	if err := privsepRequired(); err != nil {
+		return "FAIL provision refused: " + err.Error()
+	}
+	return ""
 }
 
 // runMainPipeline encapsulates Phases 1-4. Errors are logged and reported
@@ -447,8 +478,8 @@ func chainBootstrap(rpcURL, contractHex, sealIDHex string, agentSealPriv []byte,
 }
 
 // decryptEntry resolves dataDescription -> indexer + role, downloads the
-// ciphertext, ECIES-unseals the data_key, AES-GCM decrypts the body, and
-// removes the temp file before any agent process spawns.
+// ciphertext (dataplane.Download stages it in a root-only scratch directory
+// and removes it), ECIES-unseals the data_key and AES-GCM decrypts the body.
 func decryptEntry(ctx context.Context, idx int, d chain.IntelligentData, sealedKey, agentSealPriv []byte, fallbackIndexer string) (decryptedEntry, bool) {
 	tag := fmt.Sprintf("[%d]", idx)
 	dataHashHex := "0x" + hex.EncodeToString(d.DataHash[:])
@@ -468,16 +499,9 @@ func decryptEntry(ctx context.Context, idx int, d chain.IntelligentData, sealedK
 	}
 	logger.Logf("bootstrap%s data=%s role=%q indexer=%s", tag, dataHashHex, desc.Role, indexer)
 
-	outPath := fmt.Sprintf("/tmp/idata-%s.bin", hex.EncodeToString(d.DataHash[:]))
-	if err := dataplane.Download(ctx, dataHashHex, indexer, outPath); err != nil {
-		logger.Logf("FAIL bootstrap%s download: %v", tag, err)
-		return decryptedEntry{}, false
-	}
-	defer removeFile(outPath)
-
-	blob, err := readFile(outPath)
+	blob, err := dataplane.Download(ctx, dataHashHex, indexer)
 	if err != nil {
-		logger.Logf("FAIL bootstrap%s read downloaded file: %v", tag, err)
+		logger.Logf("FAIL bootstrap%s download: %v", tag, err)
 		return decryptedEntry{}, false
 	}
 
@@ -788,9 +812,9 @@ func startAgent(
 	if cs, ok := adapter.(framework.ConversationSession); ok {
 		sealedProxy.SetConversationSession(cs.ConversationHeaders, cs.ObserveConversation)
 	}
-	// Frameworks that persist a transcript their own gateway never reads back
-	// (openclaw): the stateful door takes prior turns from that store and the
-	// client sends only the current turn.
+	// Frameworks whose stateful turns must not carry the client's history: the
+	// door sends the prior turns the adapter returns — none for openclaw,
+	// whose gateway replays its own session — then only the current turn.
 	if ch, ok := adapter.(framework.ConversationHistory); ok {
 		sealedProxy.SetConversationHistory(func(ctx context.Context) ([]proxy.ConversationTurn, error) {
 			turns, err := ch.ConversationHistory(ctx)
@@ -816,6 +840,12 @@ func startAgent(
 			logger.Logf("conversation cleared by owner; framework restarted fresh")
 			return nil
 		})
+	}
+
+	// Compaction runs inside the live framework process — no restart, the
+	// conversation continues from the compacted history.
+	if compactor, ok := adapter.(framework.SessionCompactor); ok {
+		sealedProxy.SetCompact(compactor.CompactSession)
 	}
 
 	// Once the agent has spawned, give the framework a moment to apply its
@@ -984,7 +1014,7 @@ func handleDrift(
 	}
 
 	// No top-level Apply timeout — dataplane.Upload enforces a per-blob
-	// 90s deadline so a hung CLI invocation is still bounded, but Apply
+	// 90s deadline so a hung upload is still bounded, but Apply
 	// itself runs as long as needed. Capping Apply at 2 min used to kill
 	// the last entry whenever a manifest had many blobs (10s/entry × 11
 	// entries hit the budget mid-way), and a failed Apply means no
@@ -1054,6 +1084,28 @@ func seedCurrentSnapshots(ctx context.Context, adapter framework.Framework, agen
 			if errors.Is(err, framework.ErrUnsupportedDim) {
 				continue
 			}
+			if errors.Is(err, privsep.ErrTooLarge) {
+				// A leaf role's file over its size limit (which an older
+				// sealed could commit, and restore now writes back): the
+				// role keeps its committed version, as the watcher does,
+				// rather than failing the boot. (A manifest role holds such
+				// an entry by itself, manifest.Held, and does not fail.)
+				logger.Logf("seed: EvolutionFor[%s]: %v; the role keeps its committed version until the file is back under the limit", r.Name, err)
+				agent.UpdateCurrentSnapshot(r.Name, agent.ChainEntry(r.Name).ContentHash)
+				continue
+			}
+			if errors.Is(err, privsep.ErrBusy) {
+				// A tracked file whose owner — an agent process, by the
+				// time phase 2 runs — holds a lease on it: the read is
+				// refused for now, which says nothing about the content.
+				// The role keeps its committed version, as the watcher
+				// keeps it for a pass, and the watcher reads it again on
+				// its next tick; failing here would take the agent offline
+				// over a lease its own process holds.
+				logger.Logf("seed: EvolutionFor[%s]: %v; the role keeps its committed version until the file can be read", r.Name, err)
+				agent.UpdateCurrentSnapshot(r.Name, agent.ChainEntry(r.Name).ContentHash)
+				continue
+			}
 			return fmt.Errorf("EvolutionFor[%s] (seed): %w", r.Name, err)
 		}
 		agent.UpdateCurrentSnapshot(r.Name, sha256Hex(bytes))
@@ -1067,9 +1119,6 @@ func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
-
-func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
-func removeFile(path string)               { _ = os.Remove(path) }
 
 // findEntry returns the entry with the matching role, or nil if absent.
 // Caller is expected to have validated presence beforehand.
@@ -1112,14 +1161,9 @@ func restoreManifestEntries(
 		if rootHex == "" {
 			return fmt.Errorf("entry %q has empty storage_ptr.root_hash", entry.Path)
 		}
-		outPath := fmt.Sprintf("/tmp/idata-entry-%s.bin", sha256Hex([]byte(role+"/"+entry.Path)))
-		if err := dataplane.Download(ctx, rootHex, indexer, outPath); err != nil {
-			return fmt.Errorf("download entry %q: %w", entry.Path, err)
-		}
-		ct, err := readFile(outPath)
-		removeFile(outPath)
+		ct, err := dataplane.Download(ctx, rootHex, indexer)
 		if err != nil {
-			return fmt.Errorf("read entry %q ciphertext: %w", entry.Path, err)
+			return fmt.Errorf("download entry %q: %w", entry.Path, err)
 		}
 		pt, err := dataplane.Decrypt(ct, dataKey)
 		if err != nil {

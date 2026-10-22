@@ -24,13 +24,20 @@
 # deploy MUST pass sealedImage explicitly — the default image carries no DSH
 # packages and the agent lands offline.
 
-# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data).
+# Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data;
+# uploads run inside the bootstrap binary, through the same client's Go SDK).
+# The CLI is `go install`ed at the SDK version pinned in go.mod (module
+# checksums verified against the Go checksum database), so the two always
+# move together. A `replace` of the module in go.mod would split them (this
+# would install upstream's CLI while sealed links the replacement), so the
+# stage refuses to build with one.
 FROM golang:1.24-alpine AS storage-builder
-RUN apk add --no-cache git
 WORKDIR /src
-RUN git clone --depth 1 https://github.com/0gfoundation/0g-storage-client.git
-WORKDIR /src/0g-storage-client
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/0g-storage-client .
+COPY go.mod go.sum ./
+RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) \
+ && test -n "$V" \
+ && test -z "$(go list -m -f '{{if .Replace}}replaced{{end}}' github.com/0gfoundation/0g-storage-client)" \
+ && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
 
 # Stage 2 — sealed bootstrap binary (carries the embedded bridge + plugins).
 FROM golang:1.24-alpine AS bootstrap-builder
@@ -49,18 +56,39 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
-# sealed (root, PID 1) drops the agent process to it so the agent cannot read
-# sealed's memory or bootstrap env. Home stays /root — ownership of the
-# framework subtrees is handed over at spawn; the paths don't move.
-RUN useradd --system --no-create-home --home-dir /root --shell /usr/sbin/nologin agent
+# sealed (root, PID 1) drops the agent process to it so the agent cannot
+# read sealed's memory or bootstrap env. Its home is /home/agent, which
+# sealed creates at boot (agent:agent 0700, privsep.PrepareAgentHome) and
+# which is HOME for everything the agent runs, so its tools' caches and
+# config go there. The bridge, and every tool process it runs, starts in
+# the framework tree (/root/.dsh) instead, so relative paths in their
+# output land there, not in /home/agent (internal/framework/dsh/spawn.go
+# explains why). /root stays root's: sealed makes it root:root 0711 at
+# boot (privsep.SecureHome) and hands the agent only its framework tree
+# inside it (privsep.OwnTree), linked into /home/agent
+# (privsep.LinkAgentHome) so the ~/.<framework> paths keep working. The
+# agent cannot create, rename or replace anything directly in /root,
+# including the toolchain configuration root uses from there; on a reused
+# container, what an earlier sealed (which let the agent own /root) left
+# there is moved into /home/agent at boot (privsep.ReclaimHome). Without a
+# usable agent account sealed refuses to provision (privsep.Required).
+RUN useradd --system --no-create-home --home-dir /home/agent --shell /usr/sbin/nologin agent
 
 ENV HOME=/root
 
 # Node from the official tarball (debian's node is too old for the SDK).
 ARG NODE_VERSION=24.15.0
+#
+# --no-same-owner: the release tarball records its build user's uid/gid
+# (1001), and GNU tar run as root restores it by default — onto
+# /usr/local/bin and /usr/local/lib as well, since they are directory
+# entries of the archive. sealed resolves every command it runs, as root
+# (RootCommand) or as the agent (AgentCommand, Sweep), only in PATH
+# directories owned by root and writable by nobody else (privsep.LookPath),
+# so the toolchain must be root-owned (checked at the end of this file).
 RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
       -o /tmp/node.tar.xz \
- && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 \
+ && tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner \
  && rm /tmp/node.tar.xz \
  && node --version && npm --version
 
@@ -120,6 +148,25 @@ RUN apt-get update \
 
 COPY --from=storage-builder /out/0g-storage-client /usr/local/bin/0g-storage-client
 COPY --from=bootstrap-builder /app/bootstrap /bootstrap
+
+# sealed resolves every command it runs by name — as root (RootCommand) and
+# as the agent (AgentCommand, Sweep) alike — only through PATH directories
+# whose whole resolved path is owned by root and writable by nobody else,
+# and the resolved binary must be root-owned too (privsep.LookPath; the boot
+# log lists PATH entries it rejected). Fail the build, rather than the first
+# boot, when that does not hold for a command sealed needs here.
+RUN for c in npm node pkill 0g-storage-client; do \
+      w="$(command -v "$c")" || { echo "$c: not on PATH" >&2; exit 1; }; \
+      for p in "$(readlink -f "$w")" "$(readlink -f "$(dirname "$w")")"; do \
+        while :; do \
+          o="$(stat -c '%u %a' "$p")"; \
+          if [ "${o% *}" != 0 ] || [ $(( 0${o#* } & 022 )) -ne 0 ]; then \
+            echo "$p (uid ${o% *}, mode ${o#* }) is not root-only: privsep.LookPath will not resolve $c" >&2; exit 1; \
+          fi; \
+          [ "$p" = / ] && break; p="$(dirname "$p")"; \
+        done; \
+      done; \
+    done
 
 # Bootstrap runs as PID 1 and spawns the bridge once it has restored the
 # agent's iData. ENTRYPOINT is REQUIRED on a standalone (non-0g-sandbox-base)

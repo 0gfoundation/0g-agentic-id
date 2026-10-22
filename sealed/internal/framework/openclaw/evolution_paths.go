@@ -1,14 +1,26 @@
 package openclaw
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 )
+
+// The workspace is agent-writable, so every read here goes through
+// internal/privsep: only directories and regular files are considered, a
+// link is never followed, and an entry the read rules refuse (a link, a
+// special file, a foreign hard link) is skipped with one log line per path
+// rather than failing the whole role. An entry over its size limit is
+// different: it is the agent's data, so it is held (manifest.Held, through
+// manifest.FileEntryOf / DirEntryOf) and keeps its committed version, while
+// the role's other entries keep committing. Every entry name goes through
+// manifest.Carries, so what is emitted is what manifest.Unmarshal keeps.
 
 // This file implements EvolutionFor for the path-driven role set (§16).
 // The dispatch case-table lives in evolution.go's EvolutionFor; the per-
@@ -27,8 +39,8 @@ import (
 func (a *Adapter) evoWorkspace() ([]byte, error) {
 	m := manifest.New()
 
-	entries, err := os.ReadDir(workspaceDir())
-	if os.IsNotExist(err) {
+	entries, err := privsep.ReadDir(workspaceDir())
+	if errors.Is(err, fs.ErrNotExist) {
 		return m.Marshal()
 	}
 	if err != nil {
@@ -36,16 +48,11 @@ func (a *Adapter) evoWorkspace() ([]byte, error) {
 	}
 
 	for _, e := range entries {
-		if e.IsDir() {
-			continue
+		if !e.IsRegular() {
+			continue // directories have their own roles; links and special files are never tracked
 		}
-		if !strings.HasSuffix(e.Name(), ".md") {
+		if !strings.HasSuffix(e.Name(), ".md") || !manifest.Carries(workspaceDir(), e.Name()) {
 			continue
-		}
-		full := filepath.Join(workspaceDir(), e.Name())
-		content, err := os.ReadFile(full)
-		if err != nil {
-			return nil, fmt.Errorf("openclaw evoWorkspace: read %s: %w", full, err)
 		}
 		// Strip any sealed-injected platform section (marker-delimited)
 		// before hashing. spawn-time upserts re-add it after Restore, so
@@ -54,21 +61,19 @@ func (a *Adapter) evoWorkspace() ([]byte, error) {
 		// no-op on those). Running unconditionally on every workspace md
 		// is the future-proof shape: any new sealed-injected file picks
 		// up the strip without further wiring.
-		content = stripPlatformInjection(content)
+		entry, ok, err := manifest.FileEntryOf(filepath.Join(workspaceDir(), e.Name()), e.Name(), stripPlatformInjection)
+		if err != nil {
+			return nil, fmt.Errorf("openclaw evoWorkspace: %w", err)
+		}
 		// Empty md is not tracked — Restore's template-defense touch
 		// creates zero-byte files for required md names, and openclaw
 		// 5.x writes empty placeholders for some on first boot. Treating
 		// them as "no content = no entry" keeps the manifest stable
 		// across the defense-touch step (round-trip property).
-		if len(content) == 0 {
+		if !ok || (!entry.IsHeld() && entry.Size == 0) {
 			continue
 		}
-		m.Entries = append(m.Entries, manifest.Entry{
-			Path:        e.Name(),
-			Kind:        manifest.EntryFile,
-			ContentHash: manifest.HashHex(content),
-			Size:        len(content),
-		})
+		m.Entries = append(m.Entries, entry)
 	}
 	// Marshal sorts entries by Path, so iteration order here doesn't matter.
 	return m.Marshal()
@@ -102,8 +107,8 @@ func (a *Adapter) evoWorkspaceCanvas() ([]byte, error) {
 	dir := workspaceDir() + "/canvas"
 	m := manifest.New()
 
-	entries, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
+	entries, err := privsep.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
 		return m.Marshal()
 	}
 	if err != nil {
@@ -111,29 +116,25 @@ func (a *Adapter) evoWorkspaceCanvas() ([]byte, error) {
 	}
 
 	for _, e := range entries {
+		if !manifest.Carries(dir, e.Name()) {
+			continue
+		}
 		full := filepath.Join(dir, e.Name())
-		if e.IsDir() {
-			tarBytes, err := manifest.PackDir(full)
-			if err != nil {
-				return nil, fmt.Errorf("openclaw evoWorkspaceCanvas: pack %s: %w", full, err)
-			}
-			m.Entries = append(m.Entries, manifest.Entry{
-				Path:        e.Name() + "/",
-				Kind:        manifest.EntryDir,
-				ContentHash: manifest.HashHex(tarBytes),
-				Size:        len(tarBytes),
-			})
-		} else {
-			content, err := os.ReadFile(full)
-			if err != nil {
-				return nil, fmt.Errorf("openclaw evoWorkspaceCanvas: read %s: %w", full, err)
-			}
-			m.Entries = append(m.Entries, manifest.Entry{
-				Path:        e.Name(),
-				Kind:        manifest.EntryFile,
-				ContentHash: manifest.HashHex(content),
-				Size:        len(content),
-			})
+		var (
+			entry manifest.Entry
+			ok    bool
+		)
+		switch {
+		case e.IsDir():
+			entry, ok, err = manifest.DirEntryOf(full, e.Name())
+		case e.IsRegular():
+			entry, ok, err = manifest.FileEntryOf(full, e.Name(), nil)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("openclaw evoWorkspaceCanvas: %w", err)
+		}
+		if ok {
+			m.Entries = append(m.Entries, entry)
 		}
 	}
 	return m.Marshal()
@@ -151,8 +152,8 @@ func (a *Adapter) evoWorkspaceCanvas() ([]byte, error) {
 func (a *Adapter) evoSubdirManifest(root string) ([]byte, error) {
 	m := manifest.New()
 
-	entries, err := os.ReadDir(root)
-	if os.IsNotExist(err) {
+	entries, err := privsep.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
 		return m.Marshal()
 	}
 	if err != nil {
@@ -161,7 +162,7 @@ func (a *Adapter) evoSubdirManifest(root string) ([]byte, error) {
 
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || !manifest.Carries(root, e.Name()) {
 			continue
 		}
 		names = append(names, e.Name())
@@ -169,17 +170,13 @@ func (a *Adapter) evoSubdirManifest(root string) ([]byte, error) {
 	sort.Strings(names)
 
 	for _, name := range names {
-		sub := filepath.Join(root, name)
-		tarBytes, err := manifest.PackDir(sub)
+		entry, ok, err := manifest.DirEntryOf(filepath.Join(root, name), name)
 		if err != nil {
-			return nil, fmt.Errorf("openclaw evoSubdirManifest: pack %s: %w", sub, err)
+			return nil, fmt.Errorf("openclaw evoSubdirManifest: %w", err)
 		}
-		m.Entries = append(m.Entries, manifest.Entry{
-			Path:        name + "/",
-			Kind:        manifest.EntryDir,
-			ContentHash: manifest.HashHex(tarBytes),
-			Size:        len(tarBytes),
-		})
+		if ok {
+			m.Entries = append(m.Entries, entry)
+		}
 	}
 	return m.Marshal()
 }

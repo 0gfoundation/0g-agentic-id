@@ -1,6 +1,7 @@
 package uploader
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 
 	"seal-verify/internal/chain"
 	"seal-verify/internal/dataplane"
+	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
 )
 
@@ -49,6 +51,8 @@ func (u *Uploader) pushManifest(
 		}
 	}
 
+	resolveHeld(role, newManifest, oldManifest)
+
 	reused, fresh := 0, 0
 	for i := range newManifest.Entries {
 		e := &newManifest.Entries[i]
@@ -85,6 +89,14 @@ func (u *Uploader) pushManifest(
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("marshal filled manifest for %s: %w", role, err)
 	}
+	// Nothing changed on chain's side (the drift was only a held entry
+	// standing for its committed version): keep the committed manifest blob
+	// rather than upload an identical one and send a transaction for it.
+	if oldManifest != nil && fresh == 0 {
+		if prior, err := oldManifest.Marshal(); err == nil && bytes.Equal(prior, filled) {
+			return *oldEntry, nil
+		}
+	}
 	mCT, err := dataplane.Encrypt(filled, dataKey)
 	if err != nil {
 		return chain.IntelligentData{}, fmt.Errorf("encrypt manifest for %s: %w", role, err)
@@ -110,6 +122,29 @@ func (u *Uploader) pushManifest(
 		DataDescription: string(descJSON),
 		DataHash:        mRoot,
 	}, nil
+}
+
+// resolveHeld replaces each held entry of m (manifest.Held: an entry over
+// its size limit, whose committed version is to be kept) with the entry for
+// the same path in old, the manifest committed on chain. A held entry with
+// no committed version is left out — there is nothing on chain to keep, and
+// it is committed once it is back under the limit — and logged once.
+func resolveHeld(role string, m, old *manifest.Manifest) {
+	kept := m.Entries[:0]
+	for _, e := range m.Entries {
+		if !e.IsHeld() {
+			kept = append(kept, e)
+			continue
+		}
+		if old != nil {
+			if prior := old.EntryByPath(e.Path); prior != nil && !prior.IsHeld() {
+				kept = append(kept, *prior)
+				continue
+			}
+		}
+		logger.Once("uploader.held-new:"+role+e.Path, "uploader: %s entry %q is over its size limit and was never committed; it is left out until it is back under the limit", role, e.Path)
+	}
+	m.Entries = kept
 }
 
 // fetchOldManifest downloads the prior manifest blob referenced by

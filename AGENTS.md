@@ -32,9 +32,17 @@ docker run --rm -v "$PWD/..":/repo -v cargo-cache:/usr/local/cargo/registry \
   -e CARGO_TARGET_DIR=/tmp/target -e PROTOC=/usr/bin/protoc -w /repo/attestor rust:1.85 \
   bash -c "apt-get update -qq && apt-get install -y -qq cmake protobuf-compiler >/dev/null && cargo test --workspace"
 
-# sealed
+# sealed — Linux only: internal/privsep uses Linux system calls (O_PATH,
+# renameat2, ...), so on macOS the module does not build ("undefined:
+# sealedBuildsAndTestsOnlyOnLinux_..."); run it in the container below.
 cd sealed && go test ./...
 go test ./internal/proxy -run TestServeProof       # one test
+# The privsep security tests (privilege drop, chown, sweep, root-only fixtures)
+# also need root; run as anyone else they skip and the run still says ok. Run
+# them in a container, as root, both without and with the image's agent
+# account; SEALED_PRIVSEP_TESTS=1 turns any skip of a key branch into a failure:
+docker run --rm -v "$PWD":/src -w /src golang:1.24 \
+  sh -c 'SEALED_PRIVSEP_TESTS=1 go test ./... && useradd --system agent && SEALED_PRIVSEP_TESTS=1 go test -count=1 ./...'
 
 # sdk
 cd sdk/typescript && npm install && npm run typecheck && npm run build

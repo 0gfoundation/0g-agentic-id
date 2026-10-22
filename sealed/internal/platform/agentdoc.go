@@ -1,7 +1,11 @@
 package platform
 
 import (
+	"fmt"
 	"strings"
+
+	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 )
 
 // The agent doc — the "bible" — is ONE shared template. platform owns every
@@ -54,6 +58,12 @@ type FrameworkFacts struct {
 	// DurableHints answer "owner asks X → put it at Y". The template appends
 	// the universal "just for this conversation → ephemeral" line.
 	DurableHints []DurableHint
+
+	// Notes are framework-specific working rules that are not about whether
+	// a path is tracked (how the framework resolves `~`, where it will or
+	// will not pick a file up from). Rendered as a list of their own; empty
+	// omits it.
+	Notes []string
 
 	// VersionScheme names the release series, e.g. "releases" or
 	// "hermes release tags (CalVer)". Empty defaults to "releases".
@@ -111,7 +121,18 @@ func RenderFrameworkFacts(f FrameworkFacts) string {
 	}
 	b.WriteString("- \"Just for this conversation\" → anywhere off the tracked paths; it's ephemeral by default\n\n")
 
-	b.WriteString("**Cost:** each chain update consumes gas paid by agentSeal. If agentSeal's balance is too low, drift is detected but the convergence transaction fails — the file stays on disk but hasn't reached chain yet, so it would NOT survive a transfer. If the owner is asking about durability and you can see the warning state (`status: warning`) referencing low balance, tell them to top up before relying on the data being persisted.\n")
+	if len(f.Notes) > 0 {
+		b.WriteString("**Framework notes:**\n\n")
+		for _, n := range f.Notes {
+			b.WriteString("- " + n + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("**Cost:** each chain update consumes gas paid by agentSeal. If agentSeal's balance is too low, drift is detected but the convergence transaction fails — the file stays on disk but hasn't reached chain yet, so it would NOT survive a transfer. If the owner is asking about durability and you can see the warning state (`status: warning`) referencing low balance, tell them to top up before relying on the data being persisted.\n\n")
+
+	b.WriteString(fmt.Sprintf("**Size limit:** a tracked file sealed as an entry of its own (a file directly in a tracked directory, such as a workspace or memory file, or a single-file path such as a persona file) that is larger than %d MiB, or a tracked subdirectory sealed as one entry (one skill's directory, say) holding more than %d MiB in total, is not sealed: its last committed version stays on chain, and changes to it are not persisted until it is back under the limit (one never committed is not persisted at all until then). A file inside such a subdirectory has no limit of its own; it counts toward that subdirectory's %d MiB. Everything else on the tracked paths keeps being sealed. Keep large binaries, models and datasets off the tracked paths, or fetch them at runtime; if the owner relies on such a file surviving a transfer, tell them it will not.\n",
+		privsep.LimitTracked>>20, manifest.ArchiveLimit()>>20, manifest.ArchiveLimit()>>20))
 
 	// ── Framework constraints ─────────────────────────────────────────────
 	if len(f.Versions) > 0 {

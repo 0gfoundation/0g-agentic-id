@@ -30,11 +30,12 @@ package proxy
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -56,11 +57,14 @@ func (s *Server) ListenInternal(sockPath string) {
 		logger.Logf("sign socket: path empty, skipping")
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
+	// The socket's directory, the stale entry and the mode are handled
+	// without following links (privsep fs helpers), like every other path
+	// root touches.
+	if err := privsep.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
 		logger.Logf("FAIL sign socket: mkdir %s: %v", filepath.Dir(sockPath), err)
 		return
 	}
-	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+	if err := privsep.Remove(sockPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		logger.Logf("FAIL sign socket: remove stale %s: %v", sockPath, err)
 		return
 	}
@@ -74,10 +78,10 @@ func (s *Server) ListenInternal(sockPath string) {
 	// its key — hand the file to that user, 0600 keeps everyone else out
 	// (sealed is root and unaffected). Without the split (dev, legacy
 	// image) OwnPath is a no-op and 0600 matches the single-uid reality.
-	if err := os.Chmod(sockPath, 0o600); err != nil {
+	if err := privsep.Chmod(sockPath, 0o600); err != nil {
 		logger.Logf("FAIL sign socket: chmod %s: %v", sockPath, err)
 		l.Close()
-		os.Remove(sockPath)
+		_ = privsep.Remove(sockPath)
 		return
 	}
 	privsep.OwnPath(sockPath)

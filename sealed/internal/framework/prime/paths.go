@@ -41,14 +41,27 @@ package prime
 
 import (
 	"fmt"
-	"os"
+
+	"seal-verify/internal/privsep"
 )
 
 var primeHome = "/root/.prime/agent"
 
-// ensureDir creates a managed directory (and parents) if absent.
+// ensureDir creates a managed directory (and parents) if absent, without
+// following links (internal/privsep).
 func ensureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := privsep.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", dir, err)
+	}
+	return nil
+}
+
+// ensureRoleDir makes dir, inside primeHome, a real directory: Restore is
+// authoritative over the shape of the role directories, so a link or file
+// the agent left where one belongs is replaced (privsep.EnsureDir), never
+// followed, and cannot keep the agent from booting.
+func ensureRoleDir(dir string) error {
+	if err := privsep.EnsureDir(primeHome, dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
 	return nil
@@ -74,7 +87,8 @@ func modelsJSONPath() string { return primeHome + "/models.json" }
 // It sits inside primeHome but under none of the tracked paths — a venv is
 // reproducible from the pinned version, so tracking it would put 330MB of
 // derivable content on chain per agent.
-func kernelVenvPython() string { return primeHome + "/kernel-venv/bin/python" }
+func kernelVenvPython() string { return kernelVenvDir() + "/bin/python" }
+func kernelVenvDir() string    { return primeHome + "/kernel-venv" }
 
 // sessionStateDir is the explicit home for the framework's per-session
 // ("local") harness state, exported to the framework as RLM_SESSION_DIR.
@@ -85,13 +99,21 @@ func kernelVenvPython() string { return primeHome + "/kernel-venv/bin/python" }
 // without this the agent's first memory write fails. Worse, harness.py's own
 // comment warns that a fall-through lands local writes in the GLOBAL agent-dir
 // file, which is the one this adapter tracks: mid-task drafts would go on chain.
-// Pinning local state under /tmp keeps them off chain BY CONSTRUCTION rather
-// than by the framework happening to resolve the way we want.
+// Pinning local state outside primeHome keeps them off chain BY CONSTRUCTION
+// rather than by the framework happening to resolve the way we want.
 //
 // Outside primeHome, so no tracked role can reach it. If the SDK sets its own
 // RLM_SESSION_DIR per session, ours is simply overridden — that is the
 // framework doing the same job, and this stays a floor for when it does not.
-func sessionStateDir() string { return "/tmp/prime-session" }
+// Start creates it and hands it to the agent user, since the kernel that
+// writes it runs as that user; root never reads it back. It sits directly
+// in root's home (root:root 0711) rather than in the shared /tmp, so the
+// agent can use it but cannot remove or replace its name. On the writable
+// layer, like /tmp: it survives a process restart and goes with a
+// container recreate.
+//
+// A var so tests can redirect it; production code never reassigns it.
+var sessionStateDir = func() string { return "/root/.prime-session" }
 
 // agentDocPath is where Start writes the assembled agent doc (platform
 // mechanics + this adapter's FrameworkFacts) for the HTTP bridge to inject
@@ -105,9 +127,47 @@ func agentDocPath() string { return "/run/seal-agentdoc.md" }
 // (CONVERSATION.md). Deliberately OUTSIDE primeHome — a sibling dir, not under
 // any tracked role — so the watcher never commits it and a transfer never
 // conveys it (off-chain by construction). It is NOT sessionStateDir: that is
-// harness memory/notes pinned under /tmp; this is the message transcript. On
+// harness memory/notes; this is the message transcript. On
 // the writable layer, so it survives a process restart (settings push, crash)
 // and is cleared by a container recreate — which is exactly the intended
 // lifetime.
-func conversationDir() string  { return "/root/.prime-conversation" }
-func conversationPath() string { return conversationDir() + "/owner-chat.jsonl" }
+//
+// The file sits one level below conversationDir, in conversationSessionDir,
+// because the SDK keeps each session's artifacts NEXT TO the session's
+// directory (dirname(sessionDir)/session-artifacts/<id>): with the file
+// directly in conversationDir that resolved to root's home, which the agent
+// cannot write. One level down it resolves to
+// conversationDir/session-artifacts, inside the tree handed to the agent and
+// still off chain. An earlier sealed kept the file directly in
+// conversationDir; migrateConversation moves it.
+//
+// conversationDir is a var so tests can redirect it; production code never
+// reassigns it.
+var conversationDir = func() string { return "/root/.prime-conversation" }
+
+// handedOverTrees are the trees spawnBridge hands to the agent user
+// (privsep.OwnTree) and New declares (privsep.DeclareTree), listed once so
+// the two cannot drift apart:
+//
+//   - primeHome, the framework tree;
+//   - sessionStateDir, where harness.py (in the agent's kernel) creates
+//     its local state; root never reads it back;
+//   - conversationDir as a whole, not only the session directory in it:
+//     the bridge appends to the conversation there, and the SDK creates
+//     each session's artifacts next to the session directory
+//     (dirname(sessionDir)/session-artifacts/<id>), so the agent must be
+//     able to create entries in conversationDir itself, or every turn
+//     fails (TestHandedOverTreesCoverWhereTheAgentWrites).
+//
+// Each lives outside primeHome except the first, so none of the other two
+// is reachable by a tracked role.
+func handedOverTrees() []string {
+	return []string{primeHome, sessionStateDir(), conversationDir()}
+}
+
+func conversationSessionDir() string { return conversationDir() + "/session" }
+func conversationPath() string       { return conversationSessionDir() + "/" + conversationFile }
+
+// conversationFile is the conversation's file name, in conversationSessionDir
+// (and, before, directly in conversationDir).
+const conversationFile = "owner-chat.jsonl"
