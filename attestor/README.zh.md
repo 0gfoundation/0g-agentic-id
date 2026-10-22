@@ -114,7 +114,7 @@ cargo run -p attestor-indexer# 第三个终端
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
 | `POST /provision` | 容器换 `agentSeal_priv`，外加 owner 的配置文档（`encrypted_settings`，ECIES 给同一个容器公钥）。走这条而不是 sandbox env：**每次启动**（含 resume）都会调它。推送后的第一次启动拿新文档；反复重启却始终没确认的，改发上一次能跑起来的那份。文档这一半额外要求行上有 sandbox 记录（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）；密钥那一半不加这道闸，因为谁能拿密钥由 attestation 决定 | sandbox TEE 签名 + TappRegistry 节点验证 + `validFrameworkHashes` 白名单 |
-| `POST /status` | sealed 心跳 / 状态汇报。`running` 把这次启动真正拿到的那个 settings 版本提升为 last-known-good——按版本号记账，只提升一次，重复心跳不会给没人启动过的文档背书。`error` 不动文档：它在每次失败心跳都会来，在那里回滚会导致 agent 不健康时反而改不了配置 | agentSeal EIP-191 |
+| `POST /status` | sealed 心跳 / 状态汇报。`running` 把这次启动真正拿到的那个 settings 版本提升为 last-known-good——按版本号记账，只提升一次，重复心跳不会给没人启动过的文档背书。`error` 不动文档：它在每次失败心跳都会来，在那里回滚会导致 agent 不健康时反而改不了配置 | agentSeal 对 `StatusReport:0x<sealId>:<status>:<error_detail>` 的签名——裸 keccak256，无 EIP-191 前缀 |
 | `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
 
 ### 读 / 实时
@@ -132,7 +132,8 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 合约 | 用途 |
 |---|---|
-| **AgenticID** | NFT mint、iData 注册、ServeProof 验证、`validFrameworkHashes` 白名单 |
+| **AgenticID** | NFT mint、iData 注册、`validFrameworkHashes` 白名单 |
+| **VerifiedFeedbackRegistry** | 验证 ServeProof——agentSeal 的 EIP-191 version 0x00 签名 `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`，validator = 本 proxy——并在官方 ERC-8004 reputation registry 之上记录 TEE 标记。attestor 从不写它：只在 `GET /config` 公布地址，并作为 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器（`ATTESTOR_VERIFIED_FEEDBACK_ADDR`）；唯一的读取在 worker / api 启动时——`getIdentityRegistry()` 必须等于 `ATTESTOR_AGENTIC_ID_ADDR`，否则启动失败 |
 | **TappRegistry** | attestor / 0g-kms / 0g-sandbox-provider 三个 Tapp app 的代码身份 + 节点签名注册表；`/provision` 走 `getNodeList` 验 sandbox signer |
 | **SandboxServing** | sandbox 预付费余额 + voucher 结算；前端 deploy gate 要求 owner 余额 ≥ 0.1 OG |
 
@@ -148,6 +149,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G 链 RPC + chainId。RPC URL 是公开的（`GET /config` 会返回它，agent 的启动日志也会打印它），所以不能内嵌凭据；见 `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID 合约地址 |
+| `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | 绑定该 AgenticID 的 VerifiedFeedbackRegistry **proxy**。在 `GET /config` 公布，并作为 ServeProof validator 以 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器。留空或为零地址 ⇒ `/config` 不公布该地址，容器拿到空值，因而不发 `X-Agent-Proof`；填了但不是地址则启动失败，其 `getIdentityRegistry()` 不是 `ATTESTOR_AGENTIC_ID_ADDR` 也启动失败（worker 和 api 启动时各读一次）。容器 env 只在创建时写入，改值需要逐个重建 agent（owner 签名的 `/reset`）|
 | `ATTESTOR_CANONICAL_8004_ADDR` | 官方 ERC-8004 IdentityRegistry（可选；按 chainId 自动选——主网 `0x8004A169…`、测试网 `0x8004A818…`）|
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry 合约地址 |
 | `ATTESTOR_PRIORITY_FEE_GWEI` / `ATTESTOR_MAX_FEE_GWEI` | EIP-1559 gas 上下界（0G testnet `priority` 最低 2）|

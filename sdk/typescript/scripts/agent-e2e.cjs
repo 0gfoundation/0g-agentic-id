@@ -24,7 +24,7 @@
 //   OWNER_PRIV=0x… ATTESTOR_URL=http://… AGENT_URL=http://… \
 //   SEAL_ID=0x… AGENT_ID=51 API_KEY=sk-… node scripts/agent-e2e.cjs
 'use strict';
-const { AgenticID, parseServeProofHeader, verifyServeProofSignature } = require('../dist/index.js');
+const { AgenticID, parseServeProofHeader } = require('../dist/index.js');
 const { execSync } = require('child_process');
 
 // Fetch /hello via curl and return {hello, proofHeader}. The SDK's
@@ -68,7 +68,9 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
     addresses: {
       agenticID: cfg.agentic_id_addr,
       teeDataVerifier: ZERO,
-      verifiedFeedback: ZERO,
+      // The serve-proof signature is bound to this registry (EIP-191 v0x00
+      // intended validator) — without it verifyProof cannot check anything.
+      verifiedFeedback: cfg.verified_feedback_addr ?? ZERO,
       tappRegistry: cfg.tapp_registry_addr,
       sandboxServing: cfg.sandbox_serving_addr ?? ZERO,
     },
@@ -81,10 +83,14 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   const proof = hi.proofHeader ? parseServeProofHeader(hi.proofHeader) : null;
   check('SDK parses serve-proof header', !!proof, proof ? `agentId=${proof.agentId}` : 'parse failed');
   // verifyProof recomputes the domain-bound digest (chainId + identity
-  // registry) itself and checks the recovered signer against the on-chain
-  // agentSeal — the low-level verifyServeProofSignature now needs that domain.
-  const sigOk = proof ? (await ai.reputation.verifyProof(proof)).signerMatches : false;
-  check('serve-proof signature verifies (signer == agentSeal)', sigOk === true);
+  // registry + VerifiedFeedbackRegistry validator from /config) itself and
+  // checks the recovered signer against the on-chain agentSeal.
+  const v1 = proof ? await ai.reputation.verifyProof(proof) : null;
+  check('serve-proof signature verifies (signer == agentSeal)', v1?.signerMatches === true,
+    v1 && !v1.signerMatches ? v1.reasons.join('; ') : undefined);
+  check('proof envelope names the configured VerifiedFeedbackRegistry',
+    !!proof?.validator && proof.validator.toLowerCase() === String(cfg.verified_feedback_addr).toLowerCase(),
+    `envelope=${proof?.validator} config=${cfg.verified_feedback_addr}`);
 
   // ── data tracking + binding-persistence invariant ─────────────────────
   const before = await ai.agent.intelligentDatasOf(AGENT_ID);
@@ -121,8 +127,9 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
   // the refreshed URL — and via the domain-aware verifyProof (see above).
   const hi2 = curlHello(resetUrl);
   const proof2 = hi2.proofHeader ? parseServeProofHeader(hi2.proofHeader) : null;
-  const sig2Ok = proof2 ? (await ai.reputation.verifyProof(proof2)).signerMatches : false;
-  check('serve-proof still verifies after reset', sig2Ok === true);
+  const v2 = proof2 ? await ai.reputation.verifyProof(proof2) : null;
+  check('serve-proof still verifies after reset', v2?.signerMatches === true,
+    v2 && !v2.signerMatches ? v2.reasons.join('; ') : undefined);
   check('same agentSeal address after reset', hi2.hello.agent === hi.hello.agent,
     `${hi.hello.agent} → ${hi2.hello.agent}`);
 

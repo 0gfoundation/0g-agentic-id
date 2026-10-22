@@ -17,8 +17,11 @@ X 怎么办"之前，先把这篇读一遍。
 - `serve-proof` 签出的 8 条 envelope 断言**都是**由
   `agent_seal_priv` 密码学绑定的；但成立条件不一样：**Group A（身份
   层 3 条）**只要 priv 不出 TEE 就无条件成立，**Group B（内容层 5
-  条）**额外需要"签名能力不被 agent 滥用"这一前提，靠 **agent 钢印**
-  兜底 —— 见正文 [承重墙](#这-8-条保证的承重墙是-agent-钢印)。
+  条）**额外需要"签名能力不被 agent 滥用"这一前提。对 serve-proof
+  本身，这个前提是**机械保证**的：它签在 agent 的 sign socket 签不出
+  的域里（EIP-191 version `0x00`，绑定 VerifiedFeedbackRegistry）；
+  agent 的其他签名则靠 **agent 钢印**兜底 —— 见正文
+  [承重墙](#这-8-条保证的承重墙是签名域隔离加-agent-钢印)。
 - `serve-proof` **不**证明响应**内容正确**、agent **自主**、或者
   owner 没有通过 prompt **操纵**过 agent。
 - 内容层的信任被委托给一个链上的**声誉系统**：行为不当的 agent 会
@@ -411,24 +414,48 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 ```json
 {
   "agent_id":       "42",
+  "submitter":      "0x<唯一可兑付它的地址：调用方的 X-Client-Address，未声明则为 0x0>",
   "timestamp":      1778580000,
   "deadline":       1778583600,
   "task_hash":      "0x<对请求/响应 transcript 的 keccak256>",
   "data_hashes":    ["0x<iData root>", "..."],
-  "framework_hash": "0x<sealed 镜像度量>"
+  "framework_hash": "0x<sealed 镜像度量>",
+  "validator":      "0x<签名所绑定的 VerifiedFeedbackRegistry proxy>"
 }
 ```
 
-由 `agent_seal_priv` 用 EIP-191 签名(65 字节签名与 envelope 一起放在
-`X-Agent-Proof` header 里)。请求/响应 transcript **折进 `task_hash`**,不再作为
-独立字段暴露:
+65 字节签名与 envelope 一起放在 `X-Agent-Proof` header 里
+(`0x<sig>.<base64url envelope>`)。`agent_seal_priv` 对 `digest` 做裸签:
+
+```
+proofHash = keccak256(abi.encode(chainId, identityRegistry, submitter, agent_id,
+                                 timestamp, deadline, task_hash,
+                                 keccak256(abi.encodePacked(data_hashes)), framework_hash))
+digest    = keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)
+```
+
+`digest` 是 EIP-191 version `0x00`("data with intended validator"),validator
+是 VerifiedFeedbackRegistry proxy —— 链上即 OpenZeppelin
+`toDataWithIntendedValidatorHash(address(this), …)`。它**不是** `personal_sign`
+(`0x19 0x45`)digest:`verifyMessage` 一类的校验不适用,registry 也拒收旧的
+`personal_sign` 包装。`chainId` 和 `identityRegistry` 参与签名但不随 envelope
+携带(verifier 用自己部署的值)。`validator` 只为诊断而携带,它不是链上 tuple
+的字段;verifier 拿它跟自己要兑付的 registry 比对。没配 `VERIFIED_FEEDBACK_ADDR`
+——或者配的地址其 `getIdentityRegistry()` 不是本容器的 `AGENTIC_ID_ADDR`(链连上后
+检查一次)——的 runtime 根本不发 `X-Agent-Proof`。
+
+请求/响应 transcript **折进 `task_hash`**,不再作为独立字段暴露:
 
 ```
 task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody) ‖ status)
 ```
 
-这就是链上 `ServeProof` 的形状(无 client;归属由 `giveFeedback` 时的 `msg.sender`
-决定,靠签名 nonce 保证一次性)。
+`status` 是十进制 HTTP 状态码,永远是三位;`attestFeedbackWithTask` 拒收
+100–999 之外的值,所以拼接无法错位。
+
+这就是链上 `ServeProof` 的形状。只有 `submitter` 能兑付它(作为
+`VerifiedFeedbackRegistry.attestFeedback` / `attestFeedbackWithTask` 的
+`msg.sender`),签名 nonce 保证一次性。
 
 配合 TEE attestation 链（image_hash → 开源构建），验证这条签名能
 拿到以下**强、密码学**保证：
@@ -470,7 +497,7 @@ adapter 补上 `package_version` 后本地副本对不上,而同样被跳过,直
 
 ---
 
-## 这 8 条保证的承重墙是 agent 钢印
+## 这 8 条保证的承重墙是签名域隔离加 agent 钢印
 
 上一节那张表的 8 条**都是** `agent_seal_priv` 用密码学手段签出来的
 断言。但成立条件不一样，分两组：
@@ -504,7 +531,7 @@ adapter 补上 `package_version` 后本地副本对不上,而同样被跳过,直
 
 所以 Group B 在 Group A 的基础上**多一个前提：签名能力没有被滥用**
 （agent 没拿 sign socket 自己捏 framework schema 的 envelope）。
-这一点不是签名机制能保证的，因为 sealed 的 sign socket 是一个
+在它的三个签名端点之内，sealed 的 sign socket 是一个
 **schema-agnostic 的通用 signer**：
 
 ```
@@ -512,38 +539,79 @@ POST unix:///run/seal-sign.sock/sign/personal_sign  { message: <任意字节> }
       → 返回 sig，sealed 不检查 message 长什么样
 ```
 
-也就是说，agent（LLM 驱动的 openclaw 子进程）完全可以自己拼一份
-长得跟 serve-proof envelope 一模一样的 JSON、走 sign socket 签出来。
-Verifier 拿到那份 `(envelope, sig)`，**在密码学上无法区分**它是
-sealed 的 watcher 自己组装签的、还是 agent 自己捏的。
+所以 agent（LLM 驱动的框架子进程）完全可以拼出长得跟 serve-proof
+一模一样的字节 —— 哪怕就是那 32 字节的 `proofHash` 本身 —— 拿去
+签。但它拿回来的签名，原像永远是 socket 自己构造的三种形状之一：
+`0x19 0x45`（personal_sign）、`0x19 0x01`（EIP-712）、或交易签名
+payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
+签名**，由 `sealed/internal/proxy/sign_test.go` 钉死。
 
-"签名能力不被滥用"这件事撑住 Group B 的方式有两条：
+因此"签名能力不被滥用"以两种不同方式成立：
 
-1. **通道隔离**（仅 `X-Agent-Proof`）：`X-Agent-Proof` header 由
-   sealed proxy 在响应路径上自己写入，agent 没法覆盖 HTTP header。
-   verifier 只要规定"只信响应 header 里的 X-Agent-Proof，body 里
-   出现的 envelope sig 不算"，这一条通道上的 Group B 就靠**机械
-   保证**而非靠 agent 自律守住。
-2. **agent 钢印**（其余 framework envelope 全靠它）：agent 自身
-   被 system prompt 注入了拒签规则 —— 不签外部传进来的字节、不
-   主动组装 framework schema 的 envelope。见
-   [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md) §4.1 Refusal 1。
+1. **签名域隔离**（serve-proof）：serve-proof 签在 EIP-191 version
+   `0x00` 下，绑定 VerifiedFeedbackRegistry。socket 到不了这个域，
+   所以 agent 从 socket 拿到的任何签名，链上链下都验不成 serve-proof。
+   这是**机械保证**，也是唯一能覆盖链上兑付的保护：registry 只看到
+   `(proof, signature)`，永远不知道签名来自哪条通道。本文旧版把功劳
+   记在**通道隔离**上（`X-Agent-Proof` header 由 proxy 而非 agent
+   写入）。通道隔离只对读实时响应的 verifier 有用，从来护不住兑付。
+   VerifiedFeedbackRegistry 1.2.0 之前，serve-proof 就是对 `proofHash`
+   的一个普通 `personal_sign`，agent 可以线下通过 `/sign/personal_sign`
+   伪造（审计 FIND-01）。
+2. **agent 钢印**（socket *能*签的一切）：agent 自身被 system prompt
+   注入了拒签规则 —— 不签外部传进来的字节、不主动组装 framework
+   schema 的 envelope。见 [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md)
+   §4.1 Refusal 1。最要紧的 framework 渠道是 `chain.Update`：链上
+   门槛是 `msg.sender == agentSeal`，而 `/sign/transaction` 会签
+   agent 自己拼的 `update`。
 
 这就划出了承重墙：
 
 | 部件 | 它倒了会怎样 |
 |---|---|
 | `agent_seal_priv` 不出 TEE | 整套塌，连 Group A 都丢（攻击者线下任意伪造）|
-| sealed proxy 控制响应 header | `X-Agent-Proof` 那条通道上的 Group B 失去机械保护，回退到靠 agent 钢印；`report.Status` / `chain.Update` 本来就不靠 header 通道，不受影响 |
-| **agent 钢印** | `report.Status` / `chain.Update` 等渠道的 Group B 失效（agent 滥用 sign socket 拼伪 envelope）；`X-Agent-Proof` 仍靠通道隔离机械守住；Group A 在所有渠道上仍成立 |
+| **sign socket 永不签裸 hash 或 EIP-191 version `0x00`** | agent 线下伪造 serve-proof 内容（任意 `task_hash` / `data_hashes` / 时间戳 / `submitter`），并为它们铸出 VerifiedFeedbackRegistry 标记（FIND-01）。任何把 socket 桥接成 agent 工具的 adapter 同理 |
+| sealed proxy 控制响应 header | 现在影响很小。proxy 在每条转发路径上都会丢掉上游 backend 设的 `X-Agent-Proof`，客户端看到的这个头总是 runtime 自己的。即便漏过一个，它也只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
+| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
-也就是说，**agent 守不住 ⇒ Group B 在没有通道隔离的渠道上
-（`report.Status` / `chain.Update`）失效，但 Group A 全程不掉**。
-priv 没漏、TEE 没破，verifier 仍然能验出"这条断言由合法 TEE 内的
-`agent_seal_priv` 签出"，只是断言的内容层语义不再对应现实，要靠链
-上声誉补。这不是个 bug，是这套 trust model 主动接受的 ceiling：在
-跑 LLM 的 agent 上，没有比"信 agent 不滥用 sign socket + 用声誉补
-漏"更强的方案。
+`report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
+`StatusReport:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
+永不签裸 hash，所以 agent 没法通过它伪造这两者。本表旧版把
+`report.Status` 列为可经 socket 伪造，这是错的。
+
+也就是说，**agent 守不住 ⇒ Group B 在 socket 能签的东西上
+（`chain.Update`、agent 自己的声明）失效，但 serve-proof 的 Group B
+和整个 Group A 不掉**。priv 没漏、TEE 没破，verifier 仍然能验出
+"这条断言由合法 TEE 内的 `agent_seal_priv` 签出"，只是那些渠道上
+断言的内容层语义不再对应现实，要靠链上声誉补。serve-proof 展示了
+能做到时更强的方案：把 framework 的签名放进 socket 到不了的域。
+agent 按设计共享同一能力的地方，目前没有这种隔离 —— 它自己的交易里
+就包括对 AgenticID 的 `update`。那里的 ceiling 仍是"信 agent 不滥用
+sign socket + 用声誉补漏"。
+
+**签名域隔离没有堵上的东西。** agent 没法*伪造* serve-proof 内容，
+但仍能拿到*真的* serve-proof。它可以向自己的 proxy 发请求（例如
+loopback `:8080` 上的 `/hello` 或它自己的 `/api/*` 服务），带一个它
+控制的 `X-Client-Address`，比如它自己生成、经 `/sign/transaction`
+注资的钱包。这些 proof 对那次交互是如实的，因为每个字段都是 sealed
+从真实请求里算出来的，但"client"就是 agent 自己。这跟 owner 用第二
+个钱包经 `/hello` 给自己打分是同一类 sybil 问题。
+VerifiedFeedbackRegistry 拒绝 owner、approved operator 或 agentSeal
+本身作为兑付方。这是 ERC-8004 合规，不是抗 sybil：一个由 seal 注资的
+新钱包照样能过。只能由声誉加权去吸收。
+
+**切换。** `0x00` 绑定是硬切换，不双收、不回退。
+VerifiedFeedbackRegistry 1.2.0、新的 sealed 镜像（读取
+`VERIFIED_FEEDBACK_ADDR`）、注入该变量的 attestor、SDK 0.2.0（通过
+`ATTESTOR_CLI_LATEST` 提示旧 CLI 升级）在同一个窗口上线。切 snapshot 之前，新镜像 hash 必须先在每个 AgenticID 上
+`addValidFrameworkHash`。正在运行的 agent 保持旧镜像和旧 env，直到
+owner 签名的 `/reset` 重建它；升级之后，旧镜像签出的 proof 不再能
+验过。移除旧镜像 hash（`removeValidFrameworkHash`）要等到所有这类 agent 都
+reset 之后：attestor 每次 `/provision` 都会重查白名单，而 sealed 每次开机
+（resume、崩溃重启）都会调 `/provision`，所以没 reset 的容器下次开机就会
+provision 失败，直到它的 owner reset 为止。已弃用的 `AgenticIDReputationRegistry` 没有改动，仍校验旧的
+`personal_sign` digest，所以它的 pauser 必须在切换之前或切换时暂停它。
+在那之前，它对 FIND-01 式伪造仍然敞开。
 
 ### `agent_seal_priv` 还会被用来签什么
 
@@ -556,6 +624,21 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 发布跟 TEE-attested 身份绑定的链下声明
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
+
+socket 按不变量**永不**签的东西（`sealed/internal/proxy/sign.go`）：
+
+- 调用方给的裸 32 字节 hash（没有 `eth_sign` 一类的端点）
+- EIP-191 version `0x00`（"data with intended validator"）数据，
+  即 serve-proof 所在的域
+
+socket 的每个签名都落在 `0x19 0x45` personal message、`0x19 0x01`
+EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程内的
+签名里，只有三种在这几种形状之外：`report.Status` 和 settings seed 是裸
+keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
+普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
+所以这条渠道靠的是钢印（见上面的承重墙表）。
+把 socket 桥接成 agent 工具的 adapter（例如 dsh 的 `seal_sign`）
+不得补上这两条缺失的路径。
 
 unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
 （`internal/privsep`），并且**永不暴露到网络上** —— sandbox
@@ -827,9 +910,10 @@ peer-agent 消息、传感器数据）自驱完成任务，对 owner 指导的�
 
 如果 sealed 没法证明内容正确，谁能？
 
-**链上声誉系统。** 一个单独的合约（`AgenticIDReputationRegistry`）
-随时间累积关于每个 agent 行为的结构化信号。verifier 在决定对一条
-`serve-proof` 的内容下多大权重之前，**先**查声誉。
+**链上声誉系统。** 关于每个 agent 的反馈累积在 canonical ERC-8004
+reputation registry 里；`VerifiedFeedbackRegistry` 给那些作者兑付过
+serve-proof 的条目打标记，表示背后有一次 TEE 验证过的交互。verifier
+在决定对一条 `serve-proof` 的内容下多大权重之前，**先**查声誉。
 
 声誉信号来自：
 
@@ -867,15 +951,16 @@ sealed 是公证人 / CA / signer-binding。声誉是品牌 / 历史行为这一
 1. **验证 serve-proof** —— 给你上面 1-8 条形式保证。任意一项不通过，
    **直接拒绝响应**；sealed / TEE / 链这一侧出问题了。
 
-2. **查声誉** —— proof 形式上有效之后，从
-   `AgenticIDReputationRegistry` 取这个 agent 的声誉分。用这个分
-   决定对响应内容下多大权重。
+2. **查声誉** —— proof 形式上有效之后，从 canonical ERC-8004
+   reputation registry 读这个 agent 的反馈，并与
+   `VerifiedFeedbackRegistry` 的标记取交集（`isVerified` /
+   `getVerifiedSummary`）。用它决定对响应内容下多大权重。
 
 来自低声誉 agent 的形式有效 proof，**在内容层依然可疑**。别把
 "proof 验过"等同于"内容是真的"。
 
 > 看到现象不对、想知道是哪一层出锅、该不该算 sealed bug，对照
-> [`QUIRKS.md` 故障定位表](../QUIRKS.md#故障定位serve-proof--sealed-运行时)。
+> [`QUIRKS.md` 故障定位表](../QUIRKS.md#fault-localization-serve-proof--sealed-runtime)。
 
 ---
 

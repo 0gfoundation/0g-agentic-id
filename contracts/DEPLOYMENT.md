@@ -8,18 +8,24 @@
 ## 1. Architecture
 
 Every upgradeable contract (`AgenticID` / `TEEDataVerifier` /
-`VerifiedFeedbackRegistry` / the deprecated `AgenticIDReputationRegistry`)
-uses **BeaconProxy + UpgradeableBeacon + Implementation**. All beacons are
+`VerifiedFeedbackRegistry` / `CloneGate` / the deprecated
+`AgenticIDReputationRegistry`) uses **BeaconProxy + UpgradeableBeacon +
+Implementation**. All beacons are
 owned by one **TimelockController**; upgrades are two-phase
-`schedule → wait → execute`. `FeedbackBatcher` is the one non-upgradeable
-piece: stateless and privilege-free (an EIP-7702 delegate target), it is
-replaced by deploying a new one and re-delegating.
+`schedule → wait → execute`. `FeedbackBatcher` and `StandardCloneAuthorizer`
+are the non-upgradeable pieces (no proxy, no beacon). `FeedbackBatcher` is
+stateless and privilege-free (an EIP-7702 delegate target); it is replaced by
+deploying a new one and re-delegating. `StandardCloneAuthorizer` is immutable
+(the official stock clone policy); it is replaced by deploying a new one,
+which source owners opt into per agent via `CloneGate.setCloneAuthorizer`.
 
 `AgenticID` no longer reimplements ERC-8004 — it **custody-binds to the official
 ERC-8004 Identity Registry** (binding semantics in §2).
 Reputation is split (§2.1): feedback lives in the canonical ERC-8004
 Reputation Registry; `VerifiedFeedbackRegistry` stamps TEE verification marks
-(ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated.
+(ServeProof, §2.2). The `AgenticIDReputationRegistry` fork is deprecated and
+must be paused — it still verifies the legacy, agent-forgeable ServeProof
+digest (§2.2).
 
 Each contract has a `string public constant VERSION`, bumped whenever the impl
 changes — **the version scheme + upgrade procedure are in
@@ -66,13 +72,17 @@ views are unaffected. `owner` can `setPauser` at any time.
   chosen by chainId, override with `CANONICAL_8004_REPUTATION`); the local
   `VerifiedFeedbackRegistry` anchors to it and stores only ServeProof
   verification marks. The `AgenticIDReputationRegistry` fork is deprecated
-  (live on existing environments, absent from fresh deploys).
+  (live on the existing test/dev environments, absent from fresh deploys) and
+  must be paused by the VerifiedFeedbackRegistry 1.2.0 cut (§2.2, §7).
   Deploy `VerifiedFeedbackRegistry` through `Deploy.s.sol` only — the script's
   fail-fast checks (`getVersion`, `getIdentityRegistry() == canonical`) are
   what validate the anchoring; `initialize` itself only zero-checks the
-  addresses. And treat the §6 proxy address as **the** registry: any second
-  instance anchored to the same pair could redeem the same proofs
-  independently, so readers must pin one aggregator address per deployment.
+  addresses. And treat the §6 proxy address as **the** registry: marks live
+  per instance, so readers pin one aggregator address per deployment. (Before
+  1.2.0 a second instance anchored to the same pair could also redeem the same
+  proofs independently. From 1.2.0 the signed digest is bound to the
+  registry proxy (§2.2), so a proof redeems at exactly one instance — and
+  never at both this registry and the fork.)
 - **setAgentWallet is the official 4-arg form** (no nonce): signed by `newWallet`
   over `AgentWalletSet(uint256 agentId,address newWallet,address owner,uint256 deadline)`
   under domain `"ERC8004IdentityRegistry"/"1"`, `owner` = the AgenticID contract,
@@ -92,19 +102,47 @@ signers must mirror these exactly:
 
 `erc7857` = the AgenticID contract address (the token contract calling the verifier).
 
-**ServeProof is envelope-domain-separated and submitter-bound** (since
-reputation registry 1.2.0): signed digest =
-`keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`,
+**ServeProof is envelope-domain-separated, submitter-bound and
+registry-bound.** Inner hash (since reputation registry 1.2.0, #86):
+`proofHash = keccak256(abi.encode(chainId, identityRegistry, submitter, agentId, timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)), frameworkHash))`,
 where `identityRegistry` = the AgenticID proxy and `submitter` = the only wallet
-allowed to redeem the proof (`== msg.sender` at redemption). Consumed by
-`VerifiedFeedbackRegistry.attestFeedback` (and the deprecated fork registry's
-`giveFeedback`). The **key layer** adds defense in depth: agentSeal is derived
+allowed to redeem the proof (`== msg.sender` at redemption). Signed digest
+(since `VerifiedFeedbackRegistry` 1.2.0): EIP-191 version 0x00,
+`keccak256(0x19 ‖ 0x00 ‖ verifiedFeedbackRegistry ‖ proofHash)`, signed **raw**,
+where `verifiedFeedbackRegistry` = the VerifiedFeedbackRegistry **proxy**
+(`toDataWithIntendedValidatorHash(address(this), …)` on chain). Consumed by
+`VerifiedFeedbackRegistry.attestFeedback` / `attestFeedbackWithTask`; the
+legacy `personal_sign(proofHash)` wrap is rejected — hard cut, no fallback.
+The version byte is the security property: the sealed sign socket only signs
+`0x19 0x45…` (personal_sign), `0x19 0x01…` (typed_data) or transaction
+encodings it builds itself, so the agent process cannot forge ServeProof
+contents offline (audit FIND-01 — under the legacy wrap, `/sign/personal_sign`
+over a 32-byte proofHash WAS a valid proof). That makes "the socket never
+offers raw-hash or version-0x00 signing" a load-bearing invariant. Residual,
+not closed: the agent can still obtain genuine proofs from its own proxy with
+an `X-Client-Address` it controls — the documented sybil class. The deprecated
+fork registry's `giveFeedback` still verifies the legacy wrap and must be
+paused (§6, §7). The **key layer** adds defense in depth: agentSeal is derived
 per `(chainId, agenticID, sealId)` (**live** since the per-seal KMS derivation,
 agentic-id#38), so the same agentId on another deployment resolves to a
 different agentSeal regardless.
 
 Off-chain changes (transfer proofs only): Oracle TEE + buyer SDK prepend
 `chainId ‖ erc7857`; the `sealed` runtime is unchanged.
+
+Off-chain changes (ServeProof, VerifiedFeedbackRegistry 1.2.0) — these DO
+touch the `sealed` runtime: the sealed proxy signs the v0 digest bound to
+`VERIFIED_FEEDBACK_ADDR`, which the attestor worker injects at sandbox create
+from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. On the attestor, a blank or zero
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (and
+`/config` serves none); a non-address value, or one whose
+`getIdentityRegistry()` is not `ATTESTOR_AGENTIC_ID_ADDR`, fails attestor
+startup (worker and api). In the container, a `VERIFIED_FEEDBACK_ADDR` that is
+unset, malformed or zero, or not anchored to its `AGENTIC_ID_ADDR`, → no
+`X-Agent-Proof` at all, never a legacy-format one. The 1.2.0 change also adds a
+diagnostic `validator` field to the `X-Agent-Proof` envelope (not part of the
+signed tuple). The SDK (0.2.0) and the attestor console verify the same
+digest. All of it ships in one window with the beacon upgrade (§7).
 
 ### 2.3 agentSeal derivation (attestor — DONE, off-chain)
 
@@ -183,10 +221,12 @@ validFrameworkHashes`).
 **Upgrade procedure + version scheme are in [`UPGRADING.md`](UPGRADING.md):**
 minor/patch go through the two-phase beacon upgrade (`schedule → wait → execute`,
 proxy address/storage unchanged); major (storage-incompatible) means redeploy +
-migrate. The upgrade mechanism is generic across all three contracts, covered by
-`test/Upgradeable.t.sol` (AgenticID + TEEDataVerifier) and
-`test/UpgradeReputation.t.sol` (reputation, incl. storage survival + post-upgrade
-behavior).
+migrate. The upgrade mechanism is generic across every beacon-proxied contract,
+covered by `test/Upgradeable.t.sol` (AgenticID + TEEDataVerifier),
+`test/UpgradeReputation.t.sol` (the deprecated fork, incl. storage survival +
+post-upgrade behavior) and `test/UpgradeVerifiedFeedback.t.sol`
+(VerifiedFeedbackRegistry 1.1.0 → 1.2.0: storage survival + the ServeProof
+format cut).
 
 ## 5. Verify
 
@@ -242,13 +282,13 @@ auto-selected by chainId; deploy-time `getVersion() == "2.0.0"` check passed.
 | **AgenticID proxy** | `0x34493302287308f565CF3409DAAdEDF4C8895648` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
 | AgenticID impl | `0x99484dd890Ce0A507949af703544098Aa9312F70` | |
 | AgenticID beacon | `0x201E35B8566EDC26057348D8419Bc8cBCa609c0E` | |
-| **ReputationRegistry proxy** | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.2.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
+| **ReputationRegistry proxy** (DEPRECATED — **must be paused**: still verifies the legacy ServeProof digest; see §7 pending) | `0xeDe70197313d0b603612dfC9801162D1aDA3D196` | 1.2.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0x309AfEca706659e415FCb0CcF53B25F18859BB99` | |
 | **TEEDataVerifier proxy** | `0x9D48FCce51b4B39fcB6e4Bd0840F75A987Cef980` | 1.1.0 (audit batch — beacon-upgraded 2026-08-10, see §7) |
 | TEEDataVerifier impl | `0x2509aE421410f266189F1DB1D57361BE9651AF20` | |
 | TEEDataVerifier beacon | `0x6AD0a30c8d9142F8eDCA196e61164f6d671b227b` | |
-| **VerifiedFeedback proxy** | `0xc0C902666078774435429d1fdEB5B1b17D95D583` | **1.1.0** (deployed 2026-09-07 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
+| **VerifiedFeedback proxy** | `0xc0C902666078774435429d1fdEB5B1b17D95D583` | **1.1.0** (deployed 2026-09-07 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7; record its upgrade block here (pre-cut marks, §7) |
 | VerifiedFeedback impl | `0x8BD29e2eb59116214b1d932AC071a07173339c8F` | |
 | VerifiedFeedback beacon | `0x8A3E9C65c017CA21618639F48438413CB641abFa` | |
 | **CloneGate proxy** | `0xACcDcC5A6569AB25aA144ccCFdDB882fEaDaBb89` | **1.0.1** (deployed 2026-09-07 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor) |
@@ -282,10 +322,10 @@ owner `0x2AB7…a0B3`; TEEDataVerifier `teeOracleAddress()` is the same address.
 | AgenticID proxy | `0x5BB50987521A3fb7Da6Cd6aCC0ad1061D975B24A` | **1.1.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | AgenticID impl | `0x99484dd890Ce0A507949af703544098Aa9312F70` | |
 | AgenticID beacon | `0x2c60DAF0c41A9FABB8Be1F452F1DD6AE0266F431` | |
-| ReputationRegistry proxy (DEPRECATED — see VerifiedFeedback) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
+| ReputationRegistry proxy (DEPRECATED — **must be paused**: still verifies the legacy ServeProof digest; see §7 pending) | `0x884c2809888Bfd789919331eA1fB2DA9C31363d2` | **1.2.0** (audit; beacon-upgraded 2026-08-06, §7) |
 | ReputationRegistry impl | `0x2580630Ddce3b1836C8f5FF8D93134CdDd8661f3` | |
 | ReputationRegistry beacon | `0xd85172b48E824D8168E95f9D70E33091e5e1f9e2` | |
-| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`) |
+| VerifiedFeedback proxy | `0x729De5ddF7bA026Bfa1F055a1726558a4772C7E0` | **1.1.0** (task-receipt opening; beacon-upgraded 2026-08-28. 1.0.0 deployed 2026-08-27 via `DeployVerifiedFeedback.s.sol`; anchors canonical reputation `0x8004B663…8713`). 1.2.0 pending — §7; record its upgrade block here (pre-cut marks, §7) |
 | VerifiedFeedback impl | `0x6d785265d1C6c97C245988e50478605760D9b021` | (1.0.0 impl: `0x471C5a09…13cfbd`) |
 | VerifiedFeedback beacon | `0x9bBFCeB3e27837163a1E010E044296Da0DC34a0C` | |
 | CloneGate proxy | `0x1d4306e405bbcA5ab282C5104E7882aE6d122570` | **1.0.1** (1.0.0 deployed 2026-08-28 via `DeployCloneGate.s.sol`; allowlisted via addTrustedAttestor; policy-mode clone live-verified — allow + deny paths exact. 1.0.1 upgraded 2026-08-29 — arity diagnostic fix; storage intact, deny + arity paths re-probed live) |
@@ -318,7 +358,7 @@ follow-ups before this carries real user value.**
 |---|---|
 | AgenticID proxy | `0x92F66386092883f738032c472424255362A2CC6d` (1.1.0) |
 | AgenticID impl / beacon | `0xAa63e6B6260402F9f0bFA9Fe4Df749d44C588817` / `0x882FCD3c3B7b32EB53B11886B024cf656456F21C` |
-| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`) |
+| VerifiedFeedback proxy | `0x666391a61f3980bF942CE8C3CC8DfD7f2F7b2f4C` (1.1.0; anchors canonical rep `0x8004BAa1…9b63`; 1.2.0 pending — §7; record its upgrade block here — no pre-cut marks exist, §7) |
 | VerifiedFeedback impl / beacon | `0x2943075CcC8123Ce31c1f7c8950Ac4371144FD31` / `0x1C23A210806568bf0815c3289E56719325c36827` |
 | CloneGate proxy | `0x1d33086b367a9dF4b4f4d7A29b35fC1187380303` (1.0.1; allowlisted via addTrustedAttestor) |
 | CloneGate impl / beacon | `0xfb7617A73eDc3C0a20B36e5744bb4fbED70A4E29` / `0x941fAb5f87799F7EA60427a216A6386207CEc186` |
@@ -365,10 +405,89 @@ beacon upgrade and was verified post-upgrade — see changelog):
 
 > dev and test are at parity on the audit batch: dev upgraded **2026-08-06**,
 > test upgraded **2026-08-10** (see changelog). Both read 1.1.0 / 1.2.0 / 1.1.0.
+> The source is at VerifiedFeedbackRegistry **1.2.0**, which no environment
+> runs yet (mainnet §6.2m is also on 1.1.0) — see the pending changelog entry.
 > Policy-mode cloning (issue #133) ships as the **CloneGate satellite** (1.0.1
 > on dev) — AgenticID stays 1.1.0 (see the changelog entry for why: EIP-170).
 
 Changelog:
+
+- **VerifiedFeedbackRegistry 1.2.0 — PENDING (source only: not deployed on
+  any environment, no impl address yet)** — ServeProof hardening (audit
+  FIND-01 / FIND-02 / FIND-16). Minor per UPGRADING.md: beacon upgrade,
+  storage and ABI unchanged, but the signed digest changes. (1) agentSeal
+  signs `keccak256(0x19 ‖ 0x00 ‖ VF proxy ‖ proofHash)` raw (EIP-191 version
+  0x00, §2.2) instead of `personal_sign(proofHash)`; legacy-format proofs
+  revert `VerifiedFeedbackInvalidProofSignature` — no dual-accept window.
+  (2) `attestFeedbackWithTask` requires `statusCode` in 100..999, else
+  `VerifiedFeedbackInvalidTaskReveal`. (3) The agent's own agentSeal may not
+  attest (`VerifiedFeedbackSelfFeedback`). **Pre-cut marks**: verification
+  marks attested before an environment's 1.2.0 upgrade block carry no
+  FIND-01 / FIND-02 guarantee — their recorded audit data (dataHashes,
+  frameworkHash) and verified endpoint are not assured to be authentic.
+  Record each environment's upgrade block (the block of the `ExecuteUpgrade`
+  transaction) in §6 so readers and indexers can drop `FeedbackVerified` logs
+  below it. Mainnet's VF proxy (§6.2m) has none to drop: it had emitted no
+  `FeedbackVerified` log as of 2026-10-19. **Hard-cut rollout — one window.**
+  The ordering is a correctness dependency, not hygiene: old images' proofs
+  stop verifying the moment the beacon lands, and new images' proofs verify
+  nowhere before it does. Each step ends with a check — confirm it before
+  moving on (`$RPC`, `$AGENTIC_ID`, `$VF`, `$API` = that environment's RPC,
+  AgenticID proxy, VF proxy and attestor URL, §6):
+  0. Pin the digest before touching anything:
+     `bash attestor/scripts/verify-agent.sh --kat` → `OK serveproof_digest KAT`.
+  1. The pauser `pause()`s the deprecated fork proxies (test `0xeDe7…D196`,
+     dev `0x884c…63d2`; mainnet has none) before or at the cut — they still
+     accept the legacy digest, which any agent can produce through its sign
+     socket. Not yet done as of this entry. Check:
+     `cast call <fork proxy> 'paused()(bool)' --rpc-url $RPC` → `true`.
+  2. Build the new sealed images. For every new image hash the AgenticID
+     owner calls `addValidFrameworkHash` on each environment's AgenticID (§3 —
+     else `/provision` rejects the image) BEFORE the attestor switches
+     snapshots (`ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS`). Check,
+     per hash: `cast call $AGENTIC_ID 'isValidFrameworkHash(bytes32)(bool)'
+     <image hash> --rpc-url $RPC` → `true`.
+  3. Deploy the 1.2.0 impl and beacon-upgrade each environment's VF proxy via
+     `ScheduleUpgrade` / `ExecuteUpgrade` (UPGRADING.md §2). Check:
+     `cast call $VF 'VERSION()(string)' --rpc-url $RPC` → `"1.2.0"`.
+  4. In the same window: roll the attestor with
+     `ATTESTOR_VERIFIED_FEEDBACK_ADDR` = that environment's VF proxy (§6) and
+     the new snapshots, and release SDK 0.2.0. Set `ATTESTOR_CLI_LATEST=0.2.0`
+     (optionally `ATTESTOR_CLI_NOTES` naming the ServeProof hard cut and
+     telling users to upgrade before they rate) in the same attestor roll: a
+     0.1.x CLI/SDK checks every new-image proof against the legacy digest and
+     reports a signature mismatch — and a 0.1.x CLI's `rate` then deletes
+     that ticket from its `proofs.json`, so a not-yet-upgraded user loses
+     every genuine new-image ticket they try to rate. Users must upgrade to
+     0.2.0 before rating; `/config` `cli_latest` drives the only in-band
+     upgrade hint (printed by 0.1.7+ CLIs). Check: `cast call $VF
+     'getIdentityRegistry()(address)' --rpc-url $RPC` → `$AGENTIC_ID` (the
+     worker and api refuse to start otherwise); `curl -s $API/config | jq
+     '{verified_feedback_addr, cli_latest, sandbox_snapshot, frameworks}'`
+     shows `$VF`, `"0.2.0"`, the new snapshot, and a new image for every
+     `frameworks[]` entry (each one's hash allowlisted in step 2 — every
+     framework image embeds sealed); then deploy one fresh agent per
+     advertised framework (`frameworks[].name`) and run, for each,
+     `API=$API AGENT_ID=<id> OWNER_PRIV=<owner key of that fresh agent> bash attestor/scripts/verify-agent.sh`
+     — check 3 must recover the seal over the version-0x00 digest (check 3b
+     also asserts the anchoring above).
+  5. Running agents keep their old image and env until an owner-signed
+     `/reset` recreates the container on the new image with
+     `VERIFIED_FEEDBACK_ADDR` set. Until then their proofs — like every proof
+     issued before the upgrade — stop verifying. Check, per agent — owner-run,
+     because `verify-agent.sh` reads the owner-scoped deployment row and so
+     needs that agent's owner key as `OWNER_PRIV`: check 3 fails with the
+     old-image hint before the reset and passes after it.
+  Only once every pre-1.2.0 agent has been reset — no deployment row still
+  runs a pre-1.2.0 image — optionally `removeValidFrameworkHash` those image
+  hashes, so no new deploy lands on an image whose proofs no longer verify.
+  Not before: the attestor re-checks the allowlist on every `/provision`, and
+  sealed calls `/provision` on every boot (sandbox resume, crash restart), so
+  an un-reset container whose hash was removed fails `/provision` on its next
+  boot — it gets no `agent_seal_priv` and its container stage is marked
+  failed — until its owner signs a `/reset`. Record
+  the impl address, VERSION, dates and the upgrade block in §6 / this entry
+  when executed.
 
 - **CloneGate 1.0.1, dev beacon-upgraded 2026-08-29** —
   `CloneGateArityMismatch` reports the sealedKeys length when that side

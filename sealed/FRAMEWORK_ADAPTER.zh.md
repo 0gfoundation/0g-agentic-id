@@ -656,6 +656,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 | `SealSignSock` | `/run/seal-sign.sock` | agent 专用签名端点(§8);告诉你的 agent 它在哪 |
 | `AgentSeal` | 从 `agent_seal_priv` 公钥派生的 0x 地址 | agent 的 TEE 身份地址 |
 | `AgentID`、`Owner`、`ChainRPC`、`ContractAddr`、`ChainID`、`AttestorURL` | 链上 bootstrap 输出 | 公开链上事实,不是秘密;注入 agent 的 context 让它能推理自己的身份 |
+| `VerifiedFeedbackAddr` | 来自 `VERIFIED_FEEDBACK_ADDR` 的 VerifiedFeedbackRegistry proxy 地址;未设置、格式错误或为零地址,或其 `getIdentityRegistry()` 不是 `AGENTIC_ID_ADDR` 时为空 | serve-proof 的 validator(EIP-191 version `0x00`)。由 sealed 自己拿它签名——adapter 无需处理;为空 ⇒ 任何路由都不带 `X-Agent-Proof` |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
 | `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
 
@@ -682,21 +683,34 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 
 这些是白送的;设计你的框架的对外表面时按它们的存在来假设:
 
-- **`:8080` 签名反向代理** ——每个响应(健康/日志端点除外)都带
-  `X-Agent-Proof` 头:`agent_seal_priv` 对 canonical envelope 的
-  EIP-191 签名,envelope 含每个 role 的 `content_hash` + `data_hash`。
-  你的上游只需在 localhost 上提供明文 HTTP;WebSocket 升级不签名直通。
+- **`:8080` 签名反向代理** ——签名路由上的响应(runtime 自己的端点如
+  `/hello`,以及 agent 注册的 `/api/*` 服务)都带 `X-Agent-Proof` 头:
+  `agent_seal_priv` 以 EIP-191 version `0x00` 对 ServeProof 的签名,
+  绑定 VerifiedFeedbackRegistry(`VERIFIED_FEEDBACK_ADDR`)。你的框架
+  声明的路由(chat/UI)、健康/日志端点和 WebSocket 升级都不签名。
+  envelope 是扁平的:`agent_id`、`submitter`、`timestamp`、`deadline`、
+  `task_hash`、一个由链上存储 root 组成的 `data_hashes` 列表、
+  `framework_hash`,以及仅供诊断的 `validator`。它不带 `content_hash`,那个只留在内部做 drift 检测。
+  没有可用的 `VERIFIED_FEEDBACK_ADDR`(已设置、且在链上锚定到 `AGENTIC_ID_ADDR`)
+  时不发这个头。你的上游只需在
+  localhost 上提供明文 HTTP。
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
   `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
   注册过)agent 自声明的服务列表。
 - **`POST /_seal/auth`** ——§5.7 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是
-  靠它以 AgentSeal 身份签名而永远不持有私钥。socket 本身只是传输——
-  *拒签政策活在 agent 的教义里*(见
-  [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));你的 adapter 应该
-  装一套等价于 openclaw SOUL 规则的东西,让来自外部 prompt 的签名
-  请求被拒绝。
+  靠它以 AgentSeal 身份签名而永远不持有私钥。socket 自己只强制一条
+  不变量:只签 `0x19 0x45` personal message、`0x19 0x01` EIP-712
+  digest 和它从字段组装的交易,永不签裸 hash 或 EIP-191 version
+  `0x00` 数据(serve-proof 所在的域;见
+  [TRUST_MODEL.zh.md](TRUST_MODEL.zh.md))。除此之外,*拒签政策活在
+  agent 的教义里*(见 [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));
+  你的 adapter 应该装一套等价于 openclaw SOUL 规则的东西,让来自外部
+  prompt 的签名请求被拒绝。如果你的 adapter 把 socket 桥接成 agent
+  工具(像 dsh 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
+  能加裸 hash 或 `0x00` 签名路径。任何一条都会让 agent 能伪造
+  serve-proof。
 - **`/log`、`/log.html`、`/log/agent`(`.html`)** ——bootstrap 和
   子进程的实时日志。把框架的 stdout/stderr 落到文件并实现
   `framework.SubprocessLogProvider`,子进程日志页就会点亮

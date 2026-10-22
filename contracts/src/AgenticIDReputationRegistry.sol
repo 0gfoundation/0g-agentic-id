@@ -37,8 +37,14 @@ error ReputationProofSubmitterMismatch(address submitter, address sender);
 error ReputationSelfFeedback(uint256 agentId, address submitter);
 
 /// @title AgenticID Reputation Registry
-/// @notice Stores feedback for AgenticID agents, requiring a TEE-signed ServeProof
-///         on every submission to prevent sybil attacks.
+/// @notice DEPRECATED — superseded by VerifiedFeedbackRegistry (feedback lives
+///         in the canonical ERC-8004 Reputation Registry; VerifiedFeedbackRegistry
+///         records the TEE marks). Stores feedback for AgenticID agents,
+///         requiring a ServeProof on every submission. It still verifies the
+///         legacy personal_sign ServeProof digest, which VerifiedFeedbackRegistry
+///         1.2.0 no longer accepts, so the feedback it records carries none of
+///         that release's guarantees: every deployed instance must be paused
+///         (pauser) — see contracts/DEPLOYMENT.md §7.
 contract AgenticIDReputationRegistry is
     IAgenticIDReputationRegistry,
     OwnableUpgradeable,

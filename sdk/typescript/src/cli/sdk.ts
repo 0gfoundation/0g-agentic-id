@@ -34,7 +34,9 @@ export async function buildClient(env: CliEnv, opts: { withWallet?: boolean } = 
       : undefined;
   try {
     // Address overrides for environments whose attestor /config doesn't (yet)
-    // advertise the reputation pair — explicit env wins over discovery.
+    // advertise the reputation pair — explicit env wins over discovery. The
+    // registry must equal the one the sealed proxy signs serve-proofs for
+    // (EIP-191 v0x00 intended validator), or every proof fails verification.
     const vf = process.env.AGENTIC_VERIFIED_FEEDBACK_ADDR?.trim();
     const fbb = process.env.AGENTIC_FEEDBACK_BATCHER_ADDR?.trim();
     const overrides = {

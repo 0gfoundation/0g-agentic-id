@@ -54,7 +54,7 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 209 tests / 22 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full test suite (currently 236 tests / 25 suites; 2 fork tests skip without FORK_RPC)
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -259,15 +259,36 @@ struct ServeProof {
 }
 ```
 
-Signed payload (domain- and submitter-bound: non-portable across chains and
-protocol deployments, non-transferable across wallets):
+Signed payload (domain-, submitter- and registry-bound: non-portable across
+chains and protocol deployments, non-transferable across wallets, redeemable at
+exactly one registry):
 ```
-inner = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
-                             agentId, timestamp, deadline, taskHash,
-                             keccak256(abi.encodePacked(dataHashes)),
-                             frameworkHash))
-signature = personal_sign(inner, agentSeal_priv)
+inner     = keccak256(abi.encode(block.chainid, identityRegistry, submitter,
+                                 agentId, timestamp, deadline, taskHash,
+                                 keccak256(abi.encodePacked(dataHashes)),
+                                 frameworkHash))
+digest    = keccak256(0x19 ‖ 0x00 ‖ verifiedFeedbackRegistry ‖ inner)   // EIP-191 version 0x00
+signature = sign(digest, agentSeal_priv)                               // raw — no further EIP-191 wrap
 ```
+
+`verifiedFeedbackRegistry` is the `VerifiedFeedbackRegistry` **proxy** address,
+the EIP-191 "intended validator" (on chain:
+`MessageHashUtils.toDataWithIntendedValidatorHash(address(this), abi.encodePacked(inner))`).
+The sealed runtime learns it from `VERIFIED_FEEDBACK_ADDR`, which the attestor
+injects at sandbox create from `ATTESTOR_VERIFIED_FEEDBACK_ADDR`. If the
+container's `VERIFIED_FEEDBACK_ADDR` is unset, malformed or the zero address —
+or its `getIdentityRegistry()` is not the container's `AGENTIC_ID_ADDR` — it
+emits no `X-Agent-Proof` at all. On the attestor side, a blank or zero
+`ATTESTOR_VERIFIED_FEEDBACK_ADDR` gives containers an empty value (so they emit
+no proof), and a non-address value, or one whose `getIdentityRegistry()` is not
+`ATTESTOR_AGENTIC_ID_ADDR`, fails attestor startup. Since
+`VerifiedFeedbackRegistry` 1.2.0 this replaces the legacy `personal_sign(inner)` wrap, which is now
+**rejected** — a hard cut with no fallback (rollout: [`DEPLOYMENT.md`](DEPLOYMENT.md) §7).
+The digest is consensus-critical: five copies implement it independently —
+the contract, `sealed/internal/proxy/`, the SDK's `ServeProof.ts`, the attestor
+console's say-hi check and `attestor/scripts/verify-agent.sh` (the list is kept
+in the root [`AGENTS.md`](../AGENTS.md)) — and all pin one known-answer vector
+(`VerifiedFeedback.t.sol` `test_serveProofDigest_knownAnswerVector`).
 
 ### On-chain submission — two calls by the client (SDK bundles them)
 
@@ -296,17 +317,41 @@ VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, serveProof);
 
 What `attestFeedback` verifies:
 1. `agentId == proof.agentId`, and `proof.submitter == msg.sender` (only the declared client may redeem — closes front-running/theft).
-2. Reconstructs `inner`, ecrecovers it, and compares against `IAgenticID.getAgentSeal(agentId)`.
-3. The caller is not the agent owner or an approved operator (checked against the **local** AgenticID owner — the canonical registry can't enforce this itself, it sees the AgenticID contract as every custody-bound token's owner).
+2. Reconstructs `inner`, wraps it as `toDataWithIntendedValidatorHash(address(this), inner)` (EIP-191 version 0x00, this registry's proxy as validator), ecrecovers that digest, and compares against `IAgenticID.getAgentSeal(agentId)`. A legacy `personal_sign`-wrapped proof reverts `VerifiedFeedbackInvalidProofSignature`.
+3. The caller is not the agent owner, an approved operator, or the agent's own `agentSeal` (owner/operator checked against the **local** AgenticID owner — the canonical registry can't enforce this itself, it sees the AgenticID contract as every custody-bound token's owner). ERC-8004 conformance, not sybil resistance — see the residual below.
 4. The canonical entry `(agentId, msg.sender, feedbackIndex)` exists and carries no mark yet.
 5. Registers `key = keccak256("SERVEPROOF", agentId, signature)` in NonceRegistry and validates `deadline` (each proof redeemable once).
 6. Stores the proof's `dataHashes` / `frameworkHash` and emits `FeedbackVerified`.
 
-**The sybil-resistance core**: no agentSeal means no valid ServeProof, and only
-the Agent TEE holds `agentSeal_priv`. The canonical registry is permissionless —
-anyone can write unverified feedback there — but nobody can obtain a
-verification mark without a real service call. Readers that care about
-authenticity intersect canonical entries with the marks.
+**The sybil-resistance core** rests on two preconditions: only the Agent TEE
+holds `agentSeal_priv`, **and** nothing in the TEE signs the ServeProof digest
+on request. The second is not implied by the first — the sealed **sign socket**
+(`/sign/personal_sign`, `/sign/typed_data`, `/sign/transaction`) lets the agent
+process sign with agentSeal. Its preimages are only `0x19 0x45…`
+(personal_sign), `0x19 0x01…` (EIP-712) or a transaction encoding the socket
+builds from fields — never a raw hash, never EIP-191 version `0x00`. Because the
+digest is `0x19 0x00 ‖ registry ‖ inner`, the agent cannot forge ServeProof
+contents offline. (Before 1.2.0 the digest was `personal_sign(inner)`, which
+the socket produced for any 32-byte message — audit FIND-01.) This socket
+invariant is load-bearing: adding raw-hash or version-`0x00` signing to the
+socket would reopen the forgery.
+
+The canonical registry is permissionless — anyone can write unverified feedback
+there — but a verification mark needs a genuine TEE-issued proof. Readers that
+care about authenticity intersect canonical entries with the marks. That holds
+from an environment's 1.2.0 upgrade block on (recorded in
+[`DEPLOYMENT.md`](DEPLOYMENT.md) §6): marks from before it carry no FIND-01 /
+FIND-02 guarantee, and the on-chain views (`isVerified`, `getServeData`,
+`getVerifiedSummary*`) cannot exclude them — filter `FeedbackVerified` logs by
+block instead.
+
+**Residual (not closed by the above):** the agent — or its owner — can still
+obtain *genuine* proofs by sending requests to its own proxy (e.g. loopback
+`:8080`, or the public `/hello`) with an `X-Client-Address` it controls, then
+redeem them from that wallet. The owner / operator / agentSeal self-feedback
+guard does not stop this — a fresh wallet (even one the seal funds) passes it.
+This is the documented sybil class, which is why `getVerifiedSummary` takes an
+explicit list of trusted clients.
 
 ### Other operations
 
@@ -317,13 +362,20 @@ authenticity intersect canonical entries with the marks.
 - `isVerified(agentId, client, idx)` — does this canonical entry carry a mark?
 - `getVerifiedIndexes(agentId, client)` / `getVerifiedClients(agentId)` — enumerate the verified set.
 - `getVerifiedSummary(agentId, clients[], tag1, tag2)` — aggregate the given clients' **verified** canonical entries (values read live from the canonical registry; revoked skipped; sum + count, normalized to fixed 18 decimals; `clients` must be non-empty — the caller picks whom to trust). Off-chain `eth_call` only.
-- `attestFeedbackWithTask(…, TaskReveal)` — additionally opens the proof's taskHash commitment (method / uri / body **hashes** / status — bodies stay private): the contract recomputes the hash and records the URI as the entry's **TEE-verified endpoint**. `getVerifiedEndpoint` reads it back; `getVerifiedSummaryForEndpoint(agentId, clients[], uri)` aggregates per interface without trusting client-declared tags.
+- `attestFeedbackWithTask(…, TaskReveal)` — additionally opens the proof's taskHash commitment (method / uri / body **hashes** / status — bodies stay private): the contract recomputes the hash and records the URI as the entry's **TEE-verified endpoint**. `getVerifiedEndpoint` reads it back; `getVerifiedSummaryForEndpoint(agentId, clients[], uri)` aggregates per interface without trusting client-declared tags. The reveal is rejected (`VerifiedFeedbackInvalidTaskReveal`) unless the method is in the known HTTP set, the URI starts with `/`, and `statusCode` is in **100..999** (exactly three digits — the range Go's `net/http` emits). The packed preimage is otherwise ambiguous: a 1–2 digit status would let a reveal shift body-hash bytes into the URI and record an endpoint the call never hit (audit FIND-02, enforced since 1.2.0).
 - `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
+- Every view above counts marks from before the environment's 1.2.0 upgrade block (`DEPLOYMENT.md` §6) as well, and those carry no FIND-01 / FIND-02 guarantee (audit data and verified endpoint not assured). The views take no block filter; a reader that needs only post-cut marks filters `FeedbackVerified` logs by block.
 
-> **Deprecated:** the previous private fork (`AgenticIDReputationRegistry`,
-> proof-gated `giveFeedback` with its own feedback store) is replaced by this
-> split. It remains deployed on existing environments and its source stays in
-> the repo, but fresh deploys ship `VerifiedFeedbackRegistry` only.
+> **Deprecated — must be paused:** the previous private fork
+> (`AgenticIDReputationRegistry`, proof-gated `giveFeedback` with its own
+> feedback store) is replaced by this split. It remains deployed on the
+> existing test and dev environments (mainnet never had one) and its source
+> stays in the repo, but fresh deploys ship `VerifiedFeedbackRegistry` only.
+> It still verifies the **legacy** `personal_sign(inner)` digest — which the
+> agent process can obtain for any `inner` from its sign socket — so feedback
+> it accepts is forgeable. Its pauser must `pause()` each live instance before
+> (or at) the `VerifiedFeedbackRegistry` 1.2.0 cut. Registry-bound 1.2.0 proofs
+> do not verify on it, so one proof can no longer be redeemed on both.
 
 ---
 
@@ -499,13 +551,13 @@ longest business deadline window.
 - **mint symmetry**: both `register` and `registerWithSeal` emit `ITransferred(0x0, to, agentId, entries[])`, so the indexer handles mint and transfer uniformly.
 - **dataKey flows only between TEEs**: the attestor generates and discards it; the Agent TEE holds it; the Oracle TEE holds it briefly during transfer and discards it. Only the ciphertext (sealedKey) appears on chain.
 - **Oracle encryption pubkey lives in TappRegistry**: it is published via 0g-Tapp's `TappRegistry` contract (an external dependency, already deployed) through its `getNode` / `getNodeList` views. It does not live in `TEEDataVerifier` storage, which keeps the verifier clean. The Agent TEE queries the registry directly during a transfer.
-- **8004 compatibility is canonical on both axes.** Identity is bound by custody to the canonical ERC-8004 Identity Registry (the 0x8004… singleton), so 8004 identity tooling and scanners see AgenticID agents natively. Feedback is submitted by clients **directly to the canonical Reputation Registry** (native per-client attribution, readable by every 8004 tool), and the local `VerifiedFeedbackRegistry` adds the TEE layer: a mark per canonical entry that was backed by a ServeProof, plus the proof's audit data. Readers that care about authenticity intersect the two; readers that don't still get standard 8004 reputation. The parameterless identity `register()` overloads remain **deliberately disabled** (registration must carry IntelligentData). The previous private reputation fork (`AgenticIDReputationRegistry`) is **deprecated** — live on existing environments, absent from fresh deploys. Targeted ERC-8004 revision: **2026-01-25**.
+- **8004 compatibility is canonical on both axes.** Identity is bound by custody to the canonical ERC-8004 Identity Registry (the 0x8004… singleton), so 8004 identity tooling and scanners see AgenticID agents natively. Feedback is submitted by clients **directly to the canonical Reputation Registry** (native per-client attribution, readable by every 8004 tool), and the local `VerifiedFeedbackRegistry` adds the TEE layer: a mark per canonical entry that was backed by a ServeProof, plus the proof's audit data. Readers that care about authenticity intersect the two; readers that don't still get standard 8004 reputation. The parameterless identity `register()` overloads remain **deliberately disabled** (registration must carry IntelligentData). The previous private reputation fork (`AgenticIDReputationRegistry`) is **deprecated** — live on existing environments, absent from fresh deploys; it still accepts the legacy ServeProof digest and must be paused (§5). Targeted ERC-8004 revision: **2026-01-25**.
 
 ---
 
 ## 9. Tests
 
-209 Foundry tests across 22 suites (207 pass, 2 fork tests skip unless
+236 Foundry tests across 25 suites (234 pass, 2 fork tests skip unless
 `FORK_RPC` is set), all green under `forge test`. Coverage spans every
 `external` / `public` function and every documented error path.
 
@@ -516,9 +568,9 @@ longest business deadline window.
 | `TransferFlow.t.sol` | 23 | iTransferFrom eth + custom modes, delegate, signatures / nonce / deadline / pubkey full attack surface |
 | `Clone.t.sol` | 9 | iCloneFrom + source preserved + new token has no seal + Cloned vs ITransferred |
 | `TransferHook.t.sol` | 4 | `_update` clears agentWallet / authorizedUsers, retains seal / data / URI / metadata |
-| `VerifiedFeedback.t.sol` | 27 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback / verified summary against the canonical registry mock |
-| `FeedbackBatcher.t.sol` | 6 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls |
-| `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification + revoke / appendResponse, all paths (incl. the cross-impl digest known-answer vector) |
+| `VerifiedFeedback.t.sol` | 37 | attestFeedback ServeProof verification / canonical-entry binding / self-feedback (owner, operator, agentSeal) / verified summary against the canonical registry mock / task-receipt opening incl. the statusCode 100..999 bound and the status-0 shifted-split forgery / registry-bound digest: legacy personal_sign, EIP-712-wrapped and other-validator proofs rejected (and a registry-bound proof rejected by the deprecated fork), plus the cross-impl digest known-answer vector (inner + signed + legacy) and the sealed proxy's pinned taskHash vector redeemed via attestFeedbackWithTask |
+| `FeedbackBatcher.t.sol` | 8 | EIP-7702 delegated batch (7702 cheatcodes): atomic write+attest, bad-proof rollback, self-call guard vs direct/outsider calls, delegated EOA still receives ETH / safe-minted NFTs |
+| `Reputation.t.sol` | 24 | deprecated fork: giveFeedback ServeProof verification (legacy personal_sign digest) + revoke / appendResponse, all paths (incl. the inner-hash known-answer vector) |
 | `DataStorage.t.sol` | 13 | update / updateAt + empty / out-of-range / non-owner |
 | `Authorize.t.sol` | 9 | add/remove/query/clear authorization + duplicate / zero address / non-owner |
 | `AgentWallet.t.sol` | 8 | setAgentWallet EIP-712 + expired / replay / non-owner / unset |
@@ -528,19 +580,24 @@ longest business deadline window.
 | `Upgradeable.t.sol` | 9 | Timelock-upgraded beacon (non-Timelock rejected / before-delay rejected / after-delay succeeds + state retained) + pauser role (non-pauser rejected / pause blocks write paths / view still works / unpause / setPauser rotation) |
 | `CanonicalBinding.t.sol` | 9 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id |
 | `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
+| `UpgradeVerifiedFeedback.t.sol` | 3 | VerifiedFeedbackRegistry 1.1.0 → 1.2.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive; legacy-format proofs rejected after the cut, registry-bound accepted |
+| `CloneGate.t.sol` | 20 | policy-mode cloning satellite: setCloneAuthorizer gating / cloneFrom happy path + every revert (attestor, no/denying/reverting authorizer, arity, sealId, paused) / owner-at-set invalidation on transfer / lineage |
+| `StandardCloneAuthorizer.t.sol` | 10 | stock per-buyer clone policy: seller-only grant/revoke, per-agent scoping, grant dies on transfer and revives on re-acquire, clone through the gate |
+| `Eip170Size.t.sol` | 1 | every deployed impl fits the EIP-170 runtime-size limit |
 | `InitializerGuard.t.sol` | 3 | Neither proxy nor impl can re-init |
 | `StorageLayout.t.sol` | 2 | every ERC-7201 slot constant matches its namespace derivation (+ the intentional BaseDataVerifier literal) |
 | `ERC165.t.sol` | 2 | 9 declared interfaces accepted, `0xffffffff` / unknown rejected |
 | `CanonicalForkIntegration.t.sol` | 2 | self-mint + verified-feedback attest against the live canonical registries (runs only with `FORK_RPC` set; skips otherwise) |
 
-Shared scaffolding lives in `test/AgenticIDTestBase.sol`: two EIP-191 variants
-(hex-encoded for transfer proof, raw 32-byte for ServeProof and wallet sig),
-proxy deployment, and helpers for proofs and mints. A new suite usually just
+Shared scaffolding lives in `test/AgenticIDTestBase.sol`: three EIP-191 variants
+(hex-encoded for transfer proofs; raw 32-byte `personal_sign` for the deprecated
+fork's ServeProof and as the rejected legacy format; version `0x00`
+intended-validator for `VerifiedFeedbackRegistry` ServeProofs), proxy deployment, and helpers for proofs and mints. A new suite usually just
 inherits this base and adds the business assertions.
 
 
 ## 10. Further reading
 
 - **[`DEPLOYMENT.md`](DEPLOYMENT.md)** — full deploy / upgrade / Etherscan-verify
-  runbook (11 contracts in a single deploy, Timelock two-stage upgrade, how
+  runbook (15 contracts in a single deploy, Timelock two-stage upgrade, how
   `verify.sh` works, 0g Galileo testnet reference addresses).

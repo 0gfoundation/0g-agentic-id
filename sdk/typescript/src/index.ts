@@ -80,7 +80,8 @@ export {
   signServeProof,
   verifyServeProofSignature,
 } from './ServeProof';
-export type { BuildServeProofHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
 export type {

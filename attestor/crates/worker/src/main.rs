@@ -22,6 +22,36 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// `VERIFIED_FEEDBACK_ADDR` value for the container env. Unset → the key is
+/// STILL injected, empty: extra_env overrides the deployer-signed payload's
+/// env, so a blank keeps an owner-supplied validator from passing through,
+/// and sealed reads empty as "no validator" (no X-Agent-Proof, never a
+/// fallback to the legacy personal_sign wrap).
+fn validator_env(addr: Option<alloy::primitives::Address>) -> String {
+    addr.map(|a| format!("{a:#x}")).unwrap_or_default()
+}
+
+/// Attestor-injected container env: the container's view of chain / storage /
+/// contract config comes from us, not the deployer's payload. Same trust
+/// boundary as ATTESTOR_URL. Every key is always present (extra_env overrides
+/// the payload env, so an absent key would let a payload value through).
+fn container_extra_env(cfg: &Config) -> Vec<(String, String)> {
+    vec![
+        ("CHAIN_RPC_URL".into(), cfg.chain_rpc.clone()),
+        ("INDEXER_URL".into(), cfg.storage_indexer.clone()),
+        (
+            "AGENTIC_ID_ADDR".into(),
+            format!("{:#x}", cfg.agentic_id_addr),
+        ),
+        // ServeProof validator (VerifiedFeedbackRegistry proxy):
+        // sealed signs keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash).
+        (
+            "VERIFIED_FEEDBACK_ADDR".into(),
+            validator_env(cfg.verified_feedback_addr),
+        ),
+    ]
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
@@ -60,6 +90,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
     )?;
+    // The validator every new container is handed must verify against this
+    // AgenticID — refuse to start rather than bake a wrong one fleet-wide.
+    attestor_shared::chain::check_verified_feedback_anchor(
+        chain.as_ref(),
+        cfg.verified_feedback_addr,
+        cfg.agentic_id_addr,
+    )
+    .await?;
     let storage: Arc<dyn StorageClient> = if cfg.mock_storage {
         tracing::info!("storage: using MockStorage (MOCK_STORAGE=true)");
         Arc::new(MockStorage::new(&cfg.storage_indexer))
@@ -86,20 +124,16 @@ async fn main() -> anyhow::Result<()> {
         // accepted. If construction fails the worker still boots; admin
         // calls just no-op and orphans fall back to sandbox runtime GC.
         let admin_signer = AdminSigner::from_priv(app_priv).ok();
+        if cfg.verified_feedback_addr.is_none() {
+            tracing::warn!(
+                "ATTESTOR_VERIFIED_FEEDBACK_ADDR unset: new containers get a blank \
+                 VERIFIED_FEEDBACK_ADDR and emit no X-Agent-Proof (no ServeProofs)"
+            );
+        }
         Arc::new(HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
-            // Attestor-injected env: container's view of chain / storage /
-            // contract config comes from us, not the deployer's payload.
-            // Same trust boundary as ATTESTOR_URL.
-            vec![
-                ("CHAIN_RPC_URL".into(), cfg.chain_rpc.clone()),
-                ("INDEXER_URL".into(), cfg.storage_indexer.clone()),
-                (
-                    "AGENTIC_ID_ADDR".into(),
-                    format!("{:#x}", cfg.agentic_id_addr),
-                ),
-            ],
+            container_extra_env(&cfg),
             // Public-port allowlist (ATTESTOR_SANDBOX_PUBLIC_PORTS): when set,
             // create bodies carry `publicPorts` so only the agent-serving
             // port is publicly reachable. Empty = all-ports-public (default).
@@ -389,5 +423,105 @@ async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
         Ok(Arc::new(MockKmsClient::from_hex(secret_hex)?))
     } else {
         Ok(Arc::new(TappKmsClient::connect(cfg).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{container_extra_env, validator_env};
+    use alloy::primitives::Address;
+    use attestor_shared::Config;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn validator_env_is_lowercase_hex_or_blank() {
+        let vf: alloy::primitives::Address =
+            "0x00000000000000000000000000000000000000B7".parse().unwrap();
+        assert_eq!(validator_env(Some(vf)), "0x00000000000000000000000000000000000000b7");
+        // Blank, not omitted: the key must still override the payload env.
+        assert_eq!(validator_env(None), "");
+    }
+
+    fn test_config() -> Config {
+        Config {
+            chain_rpc: "http://rpc.local:8545".into(),
+            chain_id: 16602,
+            agentic_id_addr: "0x00000000000000000000000000000000000000A9".parse().unwrap(),
+            canonical_addr: Address::ZERO,
+            tapp_registry_addr: Address::ZERO,
+            storage_indexer: "http://indexer.local".into(),
+            sandbox_endpoint: "http://localhost:0".into(),
+            mock_sandbox: true,
+            attestor_public_url: String::new(),
+            db_url: String::new(),
+            bind: "0.0.0.0:0".into(),
+            job_retention_seconds: 3600,
+            mock_tee: true,
+            mock_app_private_key: None,
+            mock_app_eth_address: None,
+            mock_kms: true,
+            mock_app_secret: None,
+            mock_storage: true,
+            tapp_ip: "127.0.0.1".into(),
+            tapp_port: 0,
+            app_id: None,
+            kms_app_id: None,
+            sandbox_app_id: None,
+            sandbox_provider_addr: None,
+            sandbox_serving_addr: None,
+            reputation_registry_addr: None,
+            verified_feedback_addr: None,
+            feedback_batcher_addr: None,
+            clone_gate_addr: None,
+            standard_clone_authorizer_addr: None,
+            tee_data_verifier_addr: None,
+            console_enabled: true,
+            secret_env_enabled: false,
+            cli_latest: String::new(),
+            cli_notes: String::new(),
+            sandbox_snapshot: "0g-test-sealed".into(),
+            sandbox_public_ports: vec![],
+            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            tapp_socket: None,
+            chain_priority_fee_gwei: 2,
+            chain_max_fee_gwei: 10,
+            indexer_start_block: None,
+            oss_key_prefix: "test".into(),
+            sandbox_proxy_addr: "h.local:80".into(),
+            agent_serve_port: 8080,
+            agent_serve_path: "/hello".into(),
+            agent_dashboard_port: 8080,
+            agent_dashboard_path: "/dashboard".into(),
+        }
+    }
+
+    fn env_map(cfg: &Config) -> BTreeMap<String, String> {
+        let env = container_extra_env(cfg);
+        let map: BTreeMap<_, _> = env.iter().cloned().collect();
+        assert_eq!(map.len(), env.len(), "duplicate key in container env: {env:?}");
+        map
+    }
+
+    #[test]
+    fn container_env_always_carries_every_key() {
+        // No registry configured: VERIFIED_FEEDBACK_ADDR is still injected,
+        // blank, so a deployer-supplied value cannot pass through.
+        let env = env_map(&test_config());
+        let keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["AGENTIC_ID_ADDR", "CHAIN_RPC_URL", "INDEXER_URL", "VERIFIED_FEEDBACK_ADDR"]
+        );
+        assert_eq!(env["VERIFIED_FEEDBACK_ADDR"], "");
+        assert_eq!(env["AGENTIC_ID_ADDR"], "0x00000000000000000000000000000000000000a9");
+        assert_eq!(env["CHAIN_RPC_URL"], "http://rpc.local:8545");
+        assert_eq!(env["INDEXER_URL"], "http://indexer.local");
+
+        // Registry configured: lowercase 0x-hex.
+        let mut cfg = test_config();
+        cfg.verified_feedback_addr = Some("0x00000000000000000000000000000000000000B7".parse().unwrap());
+        let env = env_map(&cfg);
+        assert_eq!(env["VERIFIED_FEEDBACK_ADDR"], "0x00000000000000000000000000000000000000b7");
+        assert_eq!(env.len(), 4);
     }
 }

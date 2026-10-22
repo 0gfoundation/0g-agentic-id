@@ -14,6 +14,12 @@
 //	ATTESTOR_URL                (optional) provisioning endpoint root URL
 //	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //	AGENTIC_ID_ADDR             (optional) AgenticID contract address
+//	VERIFIED_FEEDBACK_ADDR      (optional) VerifiedFeedbackRegistry proxy address — the
+//	                            EIP-191 v0x00 intended validator every serve-proof is
+//	                            bound to. Unset, malformed or zero ⇒ no X-Agent-Proof
+//	                            is emitted (never a legacy-wrap fallback); so too when
+//	                            its getIdentityRegistry() is not AGENTIC_ID_ADDR
+//	                            (main.anchorValidator, checked once the chain is dialled)
 //	INDEXER_URL                 (optional) 0g-storage indexer fallback URL
 //	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
 //	                            framework binding (local dev); the binding is authoritative
@@ -62,6 +68,14 @@ type Bootstrap struct {
 	ChainRPC        string
 	ContractAddr    string
 	FallbackIndexer string
+
+	// VerifiedFeedbackAddr is the VerifiedFeedbackRegistry proxy address
+	// (VERIFIED_FEEDBACK_ADDR, injected by the attestor worker next to
+	// AGENTIC_ID_ADDR), checksummed — or "" when unset, malformed or the
+	// zero address, in which case the proxy signs no serve-proofs. See
+	// verifiedFeedbackAddr. main.anchorValidator also resets it to "" when
+	// the registry is not anchored to AGENTIC_ID_ADDR on chain.
+	VerifiedFeedbackAddr string
 
 	// SecretEnv is the raw SEAL_SECRET_ENV value: ciphertext only. It can
 	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
@@ -121,18 +135,51 @@ func Load() (*Bootstrap, error) {
 	}
 
 	return &Bootstrap{
-		SealKeyBytes:    keyBytes,
-		Attestation:     a,
-		TEESigner:       teeSignerPtr,
-		APIKey:          os.Getenv("API_KEY"),
-		SecretEnv:       os.Getenv("SEAL_SECRET_ENV"),
-		AttestorURL:     os.Getenv("ATTESTOR_URL"),
-		ChainRPC:        os.Getenv("CHAIN_RPC_URL"),
-		ContractAddr:    os.Getenv("AGENTIC_ID_ADDR"),
-		FallbackIndexer: os.Getenv("INDEXER_URL"),
-		Framework:       strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
-		PublicURL:       composePublicURL(),
+		SealKeyBytes:         keyBytes,
+		Attestation:          a,
+		TEESigner:            teeSignerPtr,
+		APIKey:               os.Getenv("API_KEY"),
+		SecretEnv:            os.Getenv("SEAL_SECRET_ENV"),
+		AttestorURL:          os.Getenv("ATTESTOR_URL"),
+		ChainRPC:             os.Getenv("CHAIN_RPC_URL"),
+		ContractAddr:         os.Getenv("AGENTIC_ID_ADDR"),
+		VerifiedFeedbackAddr: verifiedFeedbackAddr(os.Getenv("VERIFIED_FEEDBACK_ADDR")),
+		FallbackIndexer:      os.Getenv("INDEXER_URL"),
+		Framework:            strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
+		PublicURL:            composePublicURL(),
 	}, nil
+}
+
+// verifiedFeedbackAddr validates VERIFIED_FEEDBACK_ADDR, the
+// VerifiedFeedbackRegistry proxy that every serve-proof signature is bound to
+// (EIP-191 version 0x00 intended validator — see proxy.serveProofDigest).
+// Returns the checksummed address, or "" when the value is unset, not a hex
+// address, or the zero address. "" disables serve-proofs entirely: the proxy
+// takes the same no-proof path as an agent without a chain identity, and
+// never falls back to the legacy personal_sign wrap the registry rejects.
+//
+// Logs exactly once (here, at boot) so an unusable value is visible in /log
+// without a line per request. Never fatal — a missing validator costs the
+// agent its proofs, not its liveness. This is a format check only: whether
+// the address is a VerifiedFeedbackRegistry anchored to AGENTIC_ID_ADDR is
+// checked on chain once the client has dialled (main.anchorValidator).
+func verifiedFeedbackAddr(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR unset -- serve-proofs disabled (no X-Agent-Proof)")
+		return ""
+	}
+	if !common.IsHexAddress(v) {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR=%q is not a hex address -- serve-proofs disabled (no X-Agent-Proof)", raw)
+		return ""
+	}
+	addr := common.HexToAddress(v)
+	if addr == (common.Address{}) {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR is the zero address -- serve-proofs disabled (no X-Agent-Proof)")
+		return ""
+	}
+	logger.Logf("OK   serve-proof validator (VERIFIED_FEEDBACK_ADDR) well-formed: %s (on-chain anchor checked at bootstrap)", addr.Hex())
+	return addr.Hex()
 }
 
 // composePublicURL builds the externally-reachable URL prefix from the two

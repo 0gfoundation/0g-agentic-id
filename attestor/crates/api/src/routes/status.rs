@@ -26,8 +26,9 @@ pub async fn handle(
         .await?
         .ok_or_else(|| ApiError::not_found("unknown seal_id"))?;
 
-    // Agent authenticity: verify EIP-191 signature over the canonical
-    // status payload AND that every outer field matches what was signed.
+    // Agent authenticity: verify the agentSeal signature over the canonical
+    // "StatusReport:…" string — raw keccak256, NO EIP-191 prefix — which is
+    // rebuilt from the outer fields, so every field must match what was signed.
     // Signer must equal the on-record `agent_seal_addr` — blocks
     // forgery by anyone without the container's TEE private key.
     verify_status_signature(&report, d.agent_seal_addr, state.crypto.as_ref())

@@ -29,6 +29,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/chain"
@@ -225,7 +226,19 @@ func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *pro
 	logger.Logf("--- Bootstrap from AgenticID %s (rpc %s, fallback indexer %s) ---",
 		cfg.ContractAddr, cfg.ChainRPC, cfg.FallbackIndexer)
 
-	res, err := chainBootstrap(cfg.ChainRPC, cfg.ContractAddr, cfg.Attestation.SealID, agentSealPriv, cfg.FallbackIndexer)
+	onDial := func(ctx context.Context, c *chain.Client) {
+		// The HTML log pages link hex tokens to this chain's explorer (none
+		// for a chain they don't know). Recorded as soon as the client has
+		// dialled, so a later bootstrap failure still renders linked.
+		if c.ChainID() != nil {
+			sealedProxy.SetChainID(c.ChainID().String())
+		}
+		// Never sign for a validator that does not verify against this
+		// container's AgenticID: unanchored ⇒ "" ⇒ the no-proof path.
+		cfg.VerifiedFeedbackAddr = anchorValidator(ctx, c.IdentityRegistryOf, c.ContractAddr(),
+			cfg.VerifiedFeedbackAddr, validatorAnchorAttempts, validatorAnchorBackoff)
+	}
+	res, err := chainBootstrap(cfg.ChainRPC, cfg.ContractAddr, cfg.Attestation.SealID, agentSealPriv, cfg.FallbackIndexer, onDial)
 	if err != nil {
 		logger.Logf("FAIL bootstrap: %v", err)
 		report.Status(cfg.AttestorURL, agentSealPriv, cfg.Attestation.SealID, "error", "bootstrap: "+err.Error())
@@ -385,6 +398,56 @@ func resolveAdapter(entries []decryptedEntry, envName string) (manager.Adapter, 
 	return adapter, nil
 }
 
+// validatorAnchorAttempts / validatorAnchorBackoff bound the
+// getIdentityRegistry() read in anchorValidator, so one transient RPC error
+// does not cost the container its serve-proofs.
+const (
+	validatorAnchorAttempts = 3
+	validatorAnchorBackoff  = 2 * time.Second
+)
+
+// anchorValidator checks that the serve-proof validator (VERIFIED_FEEDBACK_ADDR,
+// already format-checked by config) is a VerifiedFeedbackRegistry whose
+// getIdentityRegistry() is this container's AgenticID. It returns validator
+// when anchored and "" otherwise — "" is the same no-proof path as an unset
+// VERIFIED_FEEDBACK_ADDR, so the runtime never signs proofs that no
+// registry bound to this AgenticID would accept (a pasted impl/beacon
+// address, another environment's registry). A read error is retried
+// attempts times, backoff apart; a definite mismatch is not.
+func anchorValidator(ctx context.Context, read func(context.Context, common.Address) (common.Address, error),
+	identity common.Address, validator string, attempts int, backoff time.Duration) string {
+	if validator == "" {
+		return ""
+	}
+	v := common.HexToAddress(validator)
+	var lastErr error
+attempt:
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				break attempt
+			case <-time.After(backoff):
+			}
+		}
+		got, err := read(ctx, v)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if got != identity {
+			logger.Logf("WARN serve-proof validator %s is anchored to AgenticID %s, not AGENTIC_ID_ADDR %s -- serve-proofs disabled (no X-Agent-Proof)",
+				v.Hex(), got.Hex(), identity.Hex())
+			return ""
+		}
+		logger.Logf("OK   serve-proof validator %s anchored to AGENTIC_ID_ADDR %s (getIdentityRegistry)", v.Hex(), identity.Hex())
+		return validator
+	}
+	logger.Logf("WARN serve-proof validator %s: getIdentityRegistry() unreadable (%v) -- not anchored to AGENTIC_ID_ADDR %s, serve-proofs disabled (no X-Agent-Proof)",
+		v.Hex(), lastErr, identity.Hex())
+	return ""
+}
+
 // chainBootstrapResult bundles the outputs of Phase 2.
 //
 // client is intentionally NOT closed by chainBootstrap — the uploader
@@ -399,14 +462,18 @@ type chainBootstrapResult struct {
 
 // chainBootstrap executes Phase 2 (mint observation, intelligentDatasOf,
 // sealedKey scan, per-entry download + decrypt). Returns nil + error on
-// any unrecoverable failure.
-func chainBootstrap(rpcURL, contractHex, sealIDHex string, agentSealPriv []byte, fallbackIndexer string) (*chainBootstrapResult, error) {
+// any unrecoverable failure. onDial (may be nil) runs once the chain client
+// has dialled, before any later step can fail.
+func chainBootstrap(rpcURL, contractHex, sealIDHex string, agentSealPriv []byte, fallbackIndexer string, onDial func(context.Context, *chain.Client)) (*chainBootstrapResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), bootstrapTimeout)
 	defer cancel()
 
 	c, err := chain.Dial(ctx, rpcURL, contractHex)
 	if err != nil {
 		return nil, err
+	}
+	if onDial != nil {
+		onDial(ctx, c)
 	}
 	// NOTE: client lifetime intentionally extends past this function so
 	// the uploader can reuse it. The bootstrap process never exits cleanly,
@@ -736,6 +803,9 @@ func startAgent(
 			ContractAddr: cfg.ContractAddr,
 			ChainID:      chainIDStr,
 			AttestorURL:  cfg.AttestorURL,
+			// Serve-proof validator (VerifiedFeedbackRegistry proxy); config
+			// already normalized it to "" when unusable.
+			VerifiedFeedbackAddr: cfg.VerifiedFeedbackAddr,
 
 			// Sealed runtime metadata.
 			SealedVersion: sealedVersion,

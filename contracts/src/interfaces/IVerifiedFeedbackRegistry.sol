@@ -10,7 +10,8 @@ import {ServeProof} from "./IAgenticIDReputationRegistry.sol";
 ///         so revealing these five values (bodies stay private — only their
 ///         hashes appear) lets the contract verify WHICH endpoint the
 ///         interaction hit, upgrading the client-declared endpoint/tag to a
-///         TEE-verified fact.
+///         TEE-verified fact. A malformed reveal (see the field docs) reverts
+///         VerifiedFeedbackInvalidTaskReveal before the recompute.
 struct TaskReveal {
     /// @dev HTTP method — must be one of the known set (GET/POST/PUT/PATCH/
     ///      DELETE/HEAD/OPTIONS). The whitelist closes the concatenation
@@ -20,6 +21,10 @@ struct TaskReveal {
     string  uri;
     bytes32 reqBodyHash;
     bytes32 respBodyHash;
+    /// @dev HTTP status — must be in 100..999 (exactly three decimal digits;
+    ///      the range Go's net/http emits). The fixed width closes the
+    ///      concatenation ambiguity at the respBodyHash‖status tail: a 1–2
+    ///      digit status would let a reveal shift body-hash bytes into `uri`.
     uint16  statusCode;
 }
 
@@ -68,11 +73,15 @@ interface IVerifiedFeedbackRegistry {
     /// @dev Verifies (in order): agentId matches proof.agentId;
     ///      proof.submitter == msg.sender (before signature recovery, so a
     ///      mismatched caller reverts cheaply); the ServeProof signature
-    ///      against the agentSeal registered in the identity registry (digest
-    ///      bound to this chain + identity registry + submitter); the proof's
-    ///      nonce (consumed — one proof attests at most one entry); the caller
-    ///      is not the agent owner or an approved operator; the canonical
-    ///      entry exists for msg.sender; the entry is not already verified.
+    ///      against the agentSeal registered in the identity registry (inner
+    ///      hash bound to this chain + identity registry + submitter, signed
+    ///      as EIP-191 version 0x00 with THIS registry as the intended
+    ///      validator — keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash); legacy
+    ///      personal_sign-wrapped proofs are rejected); the proof's nonce
+    ///      (consumed — one proof attests at most one entry); the caller is
+    ///      not the agent owner, an approved operator, or the agent's
+    ///      agentSeal; the canonical entry exists for msg.sender; the entry
+    ///      is not already verified.
     function attestFeedback(uint256 agentId, uint64 feedbackIndex, ServeProof calldata proof) external;
 
     /// @notice Like {attestFeedback}, additionally opening the proof's
@@ -80,6 +89,10 @@ interface IVerifiedFeedbackRegistry {
     ///         revealed receipt materials and, on match, records `task.uri`
     ///         as the TEE-verified endpoint of this entry — enabling
     ///         trustless per-endpoint aggregation (getVerifiedSummaryForEndpoint).
+    /// @dev Reverts VerifiedFeedbackInvalidTaskReveal when the method is
+    ///      outside the known set, the uri lacks a leading '/', or statusCode
+    ///      is outside 100..999; VerifiedFeedbackTaskMismatch when the
+    ///      recomputed hash differs from proof.taskHash.
     function attestFeedbackWithTask(
         uint256 agentId,
         uint64 feedbackIndex,
