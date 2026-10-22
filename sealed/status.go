@@ -108,7 +108,8 @@ func severityOf(err error) string {
 	// owner-recoverable condition as the funds-check above, just a
 	// different shape. Confirmed by reproducing byte-for-byte against a
 	// 0.0008 OG balance (fails) vs 0.0058 OG (succeeds) with the same
-	// 0g-storage-client build and params.
+	// 0g-storage-client build and params (then via its CLI; uploads now
+	// run through the same client's SDK, inside sealed).
 	case strings.Contains(s, "execution reverted; data: 0x"):
 		return "warning"
 	// Future owner-recoverable patterns slot in here without changing
@@ -121,15 +122,16 @@ func severityOf(err error) string {
 	}
 }
 
-// summarizeError trims long multi-line error strings (in particular
-// 0g-storage CLI output that interleaves INFO / WARN / FATA lines)
-// down to the single most informative line. The full error is still
-// in the sealed log; this is what we hand to the attestor / UI.
+// summarizeError trims long multi-line error strings down to the single
+// most informative line. The full error is still in the sealed log; this
+// is what we hand to the attestor / UI.
 //
-// Heuristic: pick the last non-empty line of the error string. The
-// 0g-storage CLI prints `FATA[...] Failed to upload file error="..."`
-// as the final line on terminal failure, which is exactly what owners
-// need to see.
+// Heuristic: pick the last non-empty line of the error string. Storage
+// upload errors (dataplane.Upload) are already one line, "0g-storage
+// upload: <cause>" with the SDK's cause flattened onto it, so they pass
+// through whole; the SDK's own log lines go to the sealed log instead.
+// Multi-line errors end with their cause, as the `0g-storage-client` CLI's
+// output did when uploads ran through it (a final `FATA[...]` line).
 func summarizeError(err error) string {
 	if err == nil {
 		return ""

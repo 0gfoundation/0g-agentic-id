@@ -32,9 +32,19 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			// every edit here is overwritten — only the platform-owned keys
 			// are. What is unconditionally true is that nothing in this file
 			// reaches chain, so none of it survives a container reset.
-			{Path: "~/.openclaw/openclaw.json", Note: "re-rendered from the owner's settings at every boot: the provider/model pin, the reasoning bound, the endpoint wiring and the watchdog headroom are rewritten from there, so your edits to THOSE keys are replaced on the next start. Other keys you set here are merged and kept — but this file never reaches chain, so nothing in it survives a container reset. Durable configuration belongs in the owner's settings document, not here"},
+			{Path: "~/.openclaw/openclaw.json", Note: "re-rendered from the owner's settings at every boot: the provider/model pin, the reasoning bound, the endpoint wiring and the watchdog headroom (`diagnostics.stuckSessionAbortMs`, on openclaw versions whose config has it; it is removed on the others) are rewritten from there, so your edits to THOSE keys are replaced on the next start. Other keys you set here are merged and kept — but this file never reaches chain, so nothing in it survives a container reset. Durable configuration belongs in the owner's settings document, not here. In this file openclaw expands a leading `~` to `/root`, not to your home `/home/agent`, and nothing can be created in `/root` outside `~/.openclaw/`: write paths here (a workspace, a log file, an allowlist pattern) as absolute `/home/agent/...` paths, or as `~/.openclaw/...`"},
 			{Note: "Any subdirectory of `workspace/` that isn't `skills/` or `canvas/` — e.g. `workspace/memory/`, `workspace/tmp/`, `workspace/cache/`. Use `MEMORY.md` (top-level) for memory you want to keep, not a `memory/` directory"},
 			{Note: "Non-`.md` files directly under `workspace/`"},
+		},
+		// How openclaw resolves "~" and where it reads files from: QUIRKS.md.
+		// openclaw core expands "~" from OPENCLAW_HOME (/root) everywhere
+		// but its read/write/edit tools and the programs exec runs, which
+		// use HOME; a few bundled plugins take their default locations from
+		// HOME, through the ~/.openclaw link.
+		Notes: []string{
+			"`~` in the paths you hand openclaw's media tools (`image`, `pdf`, `image_generate`, `music_generate`, `video_generate`) is `/root`, as in `openclaw.json`; only your shell, the programs you run and the read/write/edit tools take `~` to be `/home/agent`. Give the media tools absolute paths",
+			"openclaw reads environment files from `~/.openclaw/.env` (inside its tree), not from `~/.config/openclaw/gateway.env` in your home: put variables the gateway should load there",
+			"Keep the `~/.openclaw` link in your home in place: a few openclaw plugins find their files through it rather than through openclaw's own settings (memory-wiki's default vault, the file-transfer audit log). If you enable memory-wiki yourself, give it an absolute vault path inside the tree (`plugins.entries.memory-wiki.config.vault.path`, e.g. `/root/.openclaw/wiki/main`; the platform fills that one in at the next start when none is set): openclaw 2026.7.1 refuses to append to a vault it reaches through the link",
 		},
 		DurableHints: []platform.DurableHint{
 			{Ask: "Remember this for me long-term", Place: "write to `MEMORY.md` or create a new top-level `.md` in `workspace/`"},

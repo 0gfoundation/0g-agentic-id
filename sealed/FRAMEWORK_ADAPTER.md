@@ -160,8 +160,9 @@ and degrades gracefully when absent):
 | `SettleDelayer` | `SettleDelay()` | bootstrap baseline capture | conservative 5s default |
 | `LegacySettingsSeeder` *(transitional)* | `SeededSettings()` | bootstrap, right after the Phase C `HandleLegacy` round | an agent minted before the settings channel keeps no pin (§5.5, *Migration*) |
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | the stateful responses door's upstream calls | the framework holds no server-side conversation keyed by a session identity (see `CONVERSATION.md`) |
-| `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door replaces client-sent history with the harness's own store | client-sent history keeps being forwarded verbatim |
+| `ConversationHistory` | `ConversationHistory(ctx)` | the stateful responses door drops client-sent history: it sends the prior turns this returns, then only the client's current turn. Return none when your gateway replays its own session (openclaw) — a client's history on top would reach the model twice | client-sent history keeps being forwarded verbatim |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear` (owner-signed) + CLI `/clear`, followed by a process restart | the route answers 501 — history is client-held, nothing server-side to clear |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact` (owner-signed, single-flight, replay-refused, never overlapping a synthesized-door turn) + CLI `/compact`: run the framework's OWN compaction now, no restart; the note is shown to the owner. Wrap `framework.ErrCompactRefused` when the framework declines for now (busy, changed) — the owner gets a 409 to retry, not a failure; wrap `framework.ErrCompactUnsupported` when the installed framework version lacks what your adapter uses to trigger compaction (openclaw before 2026.7.1 has no `sessions compact` CLI command) — a 501, as without the interface | the route answers 501 — the framework cannot be asked to compact from outside |
 
 Declare compile-time assertions for everything you implement
 (`var _ framework.VersionReconciler = (*Adapter)(nil)`) — silent non-implementation of an optional
@@ -203,10 +204,10 @@ Conventions and rules:
 
   | Adapter | Roles | Config file, and where it comes from |
   |---|---|---|
-  | openclaw (`openclaw.go:146`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
-  | hermes (`hermes.go:121`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
-  | prime-agent (`prime.go:135`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
-  | dsh (`dsh.go:145`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the bridge's process environment |
+  | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `~/.openclaw/openclaw.json`, re-rendered every spawn |
+  | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `~/.hermes/config.yaml`, re-rendered every spawn |
+  | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `~/.prime/agent/models.json`, re-rendered every spawn |
+  | dsh (`dsh.go:153`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | none — the bridge's process environment |
 
   `openclaw.json`, `config.yaml`, `models.json` and `settings.yaml` were all
   roles until the owner's settings document became the pin's durable home.
@@ -214,7 +215,7 @@ Conventions and rules:
   agent whose configuration has since changed, which is how every fix
   shipped after mint — bounded reasoning, catalog budgets, the watchdog
   headroom, the model idle timeout — stopped at the mint-time copy
-  (`openclaw/inference.go:14-30`). Rendering the file from the document on
+  (`openclaw/inference.go:28-44`). Rendering the file from the document on
   every spawn makes the same fix reach every agent on its next Start.
 - **The `framework` role is protocol-reserved.** Every adapter must
   declare it as a `Leaf` whose plaintext is the binding JSON:
@@ -324,8 +325,10 @@ Grouped by pipeline stage. "Caller" refers to the table in §2.
 ### 5.1 Identity: `Name`, `Version`
 
 `Name()` is the static adapter id, and must equal the `name` field in the
-`framework` binding JSON. `Version(ctx)` is a best-effort runtime probe
-(may exec a CLI); see §2.2 for its current (un)wiring.
+`framework` binding JSON. `Version(ctx)` is a best-effort probe of the
+installed version: a static read (a `package.json`, a version file in the
+checkout), never a framework CLI run, because sealed runs as root and root
+runs no framework CLI (step 7 of §11); see §2.2 for its current (un)wiring.
 
 ### 5.2 Restore direction: `Restore`, `RestoreEntry`
 
@@ -412,7 +415,7 @@ configuration from it before every spawn, so anything an ingestion writes is
 overwritten moments later. Keeping a copy would only create a second source of
 truth, and the stale one wins on exactly the boots where the document is
 empty. prime and dsh therefore log the seed's pin and do not apply it
-(`prime/persona.go:108-129`, `dsh/persona.go:118-130`); openclaw and hermes
+(`prime/persona.go:114-135`, `dsh/persona.go:123-135`); openclaw and hermes
 still write it, which now matters only for an agent whose document carries no
 model (`hermes/ingest.go:51-55`). If your framework can't honour part of a
 seed, log it and keep your default rather than writing config your framework
@@ -454,7 +457,7 @@ skipped the bound along with the endpoint wiring — hermes and dsh both did
 this (`inference/zgcompute.go:57-65`). Facts apply to every provider; only
 `Endpoint` is gated on routing.
 
-Two accessors carry the gating you must not re-invent:
+Three accessors carry the gating you must not re-invent:
 
 - `s.Effort() (level string, decided bool)` — **three outcomes, and
   collapsing any two is a live bug.** `("high", true)`: apply this level.
@@ -469,7 +472,21 @@ Two accessors carry the gating you must not re-invent:
   whenever the facts are not catalog-sourced, because a heuristic 8192
   written to disk during an outage looks hand-set forever after and starves a
   reasoning model's shared thinking+reply budget (live on agent 404: three
-  ~6-minute turns, `textLen=0` — `prime/modelsjson.go:28-36`).
+  ~6-minute turns, `textLen=0` — `prime/modelsjson.go:37-46`).
+- `s.RequestMaxTokens() int` — the budget to configure as the framework's
+  per-request `max_tokens`: `PersistableMaxTokens()` capped at
+  `settings.RequestOutputCeiling` (32768), same 0 for "write nothing". Use it,
+  never the raw catalog value, for anything sent on every request: the
+  catalog's `max_completion_tokens` is a capability, and wherever a server
+  checks prompt + budget against the context window it can take most of the
+  window (`CONFIG_SURFACE.md` §3.2). A 0 has two readings, told apart by
+  `s.Facts.CatalogSourced`: the catalog was unreachable — like `Effort()`'s
+  `("", false)`, "unknown", not "clear" — or it answered with no budget for
+  this model, and there is nothing to keep. A render that EDITS a file in
+  place must also remove a budget it wrote for a different model, or a switch
+  to a model with a lower output limit fails every request (hermes
+  `spawn.go`: kept through an outage on the same model, removed when the
+  model changes or the catalog gives none).
 
 #### Rule 1 — idempotent
 
@@ -518,7 +535,7 @@ you rendered, not from the file you wrote.** hermes's `Start` takes
 provider/model from the `Resolved` its render stashed and hard-fails if no
 render has run, because `config.yaml` stopped being a chain-tracked role and
 is now an artifact of this method — reading it back would let an agent edit
-re-point inference (`hermes/spawn.go:51-58`).
+re-point inference (`hermes/spawn.go:53-60`).
 
 #### Three things that must never come out of the owner's overlay
 
@@ -535,7 +552,7 @@ re-point inference (`hermes/spawn.go:51-58`).
    on disk rather than by env, because its `custom` provider declares
    `env_vars=()` and reads the key from nowhere else — injecting by env
    produced a live 401 from the router, hermes having dialled it keyless
-   (`hermes/spawn.go:163-170`). The platform writes that key every render,
+   (`hermes/spawn.go:165-172`). The platform writes that key every render,
    and **deletes** it when the document supplies none: without the delete, a
    boot that switches to a framework built-in keeps the previous boot's 0G
    router key on disk and hands it to whichever provider now owns the
@@ -618,7 +635,7 @@ entry to `HandleLegacy` in round C (§5.4) — and the optional
 recovered back to the platform. `main.go` consults it **only** when the stored
 document names no model, so a real owner document always outranks a recovered
 one, and persists the result through `report.SeedSettings`
-(`main.go:583-608`).
+(`main.go:649-677`).
 
 The timing is the whole point. The uploader rebuilds the chain entry list from
 `Roles()` and commits it wholesale, so the watcher's first tick drops the
@@ -634,11 +651,11 @@ best-effort — a failure is logged, the agent runs on the recovered pin either
 way, and the next boot retries.
 
 Exactly one adapter implements the interface today: dsh, for its retired
-`settings.yaml` role (`dsh/settings.go:280-332`). openclaw, hermes and prime
+`settings.yaml` role (`dsh/settings.go:286-338`). openclaw, hermes and prime
 do not, so a pre-channel agent on those three comes up on whatever document
 attestor already holds; prime's `HandleLegacy` says so in as many words and
 calls lifting those pins "the platform's job", not yet landed
-(`prime/persona.go:108-129`). Implement it if your framework ever had a
+(`prime/persona.go:114-135`). Implement it if your framework ever had a
 chain-tracked pin; delete it once no live agent carries the old role.
 
 ### 5.6 Process lifecycle: `Start`, `Stop`, `Liveness`, `Readiness`, `MonitorExit`
@@ -767,7 +784,7 @@ tree populates or reads them any more: `APIKey`, `Provider`, `Model`,
 `ZGComputeRouted` and `OwnerThinking` are declared in the struct but dead.
 Take the credential and the pin from `settings.Resolved` instead — reading
 `RuntimeContext.APIKey` is the defect that dialled a platform-routed endpoint
-keyless and 401'd live (`openclaw/spawn.go:253-259`, `dsh/spawn.go:222-225`).
+keyless and 401'd live (`openclaw/spawn.go:335-342`, `dsh/spawn.go:225-228`).
 
 What to *do* with the rest is adapter policy, but the openclaw adapter is
 the reference: it injects marker-wrapped sections into the agent's
@@ -836,7 +853,7 @@ into either an infinite re-upload loop or silent identity divergence.
 - [ ] `RenderSettings` is idempotent — the same `Resolved` rendered twice yields byte-identical output, including on a catalog-outage boot.
 - [ ] `RenderSettings` merges the owner's `framework` overlay FIRST and writes platform-owned keys over it; no platform value is defended by an exclusion list.
 - [ ] `RenderSettings` never returns an error for anything the owner or the agent wrote — it runs before every spawn, so an error there is an agent that will not boot.
-- [ ] A platform key is written only when the platform knows it: `Effort()`'s three outcomes stay three, and `PersistableMaxTokens() == 0` means write nothing rather than write a guess.
+- [ ] A platform key is written only when the platform knows it: `Effort()`'s three outcomes stay three, and `RequestMaxTokens() == 0` means write nothing rather than write a guess. The per-request output budget is `RequestMaxTokens()`, never the raw catalog value — and a file edited in place drops a budget written for a different model.
 - [ ] A per-boot credential, and any provider block the platform owns, cannot be supplied through the overlay.
 - [ ] `Start` takes the pin from what `RenderSettings` stashed, never by re-parsing the file it wrote.
 - [ ] Restore calls commute across roles and are idempotent per role.
@@ -878,9 +895,10 @@ its process half exists — the prime-agent port was built in that order.
 
 Two hard-won rules the suite enforces structurally:
 
-- **Stub external probes.** Any CLI probe inside `EvolutionFor` must be a
-  swappable package var — a real `claude`/`openclaw` binary on the test
-  machine's PATH otherwise leaks into round-trip results.
+- **Stub external probes.** Any external probe inside `EvolutionFor` (the
+  static version read) must be a swappable package var — a real
+  `openclaw`/`hermes` installation on the test machine otherwise leaks into
+  round-trip results.
 - **Fixtures must be canonical bytes.** Leaf fixtures are compared
   byte-identically against `EvolutionFor` output, so write them in your
   adapter's canonical encoding (compact JSON, sorted keys).
@@ -964,6 +982,156 @@ The one obligation that replaced all four is step 4.
    FROM the openclaw base image (`images/openclaw/`), not the universal
    one; `images/sealed/` is the universal-image target this instruction
    is scoped to, and applies once your deployment ships it as the base.)
+   Whichever Dockerfile actually builds the shipped image must create the
+   `agent` user (`RUN if id -u agent >/dev/null 2>&1; then usermod --home
+   /home/agent agent; else useradd --system --no-create-home --home-dir
+   /home/agent --shell /usr/sbin/nologin agent; fi`; over a base that
+   already has the user it points the account's home at `/home/agent`
+   instead, which tools that read the home from the account database
+   rather than `HOME` — ssh, git over ssh — rely on, and sealed logs a
+   mismatch at boot; sealed creates `/home/agent` itself) and run sealed as
+   root, and your `Start` must spawn through `privsep.AgentCommand` (which
+   applies `privsep.Drop`). Without a usable `agent` account — missing, or
+   mapped to uid or gid 0 — or with a root home sealed cannot make
+   root-only, or an agent home it cannot create, sealed refuses to
+   provision (`privsep.Required`, whose error names the cause and the fix)
+   and no deploy on that image ever comes online (it shows as `offline`) —
+   by design: the whitelist pins the
+   hash, not the build. The image must also keep its toolchain root-owned:
+   every command sealed resolves by name — as root through `RootCommand`
+   (npm, git, uv, 0g-storage-client) and as the agent through
+   `AgentCommand` and `Sweep` (your framework CLI, node, pkill) — must sit
+   in a PATH directory whose whole resolved path is owned by root and
+   writable by nobody else, and the binary itself must be root-owned.
+   Release tarballs and nvm restore their build uid when extracted as
+   root, so the shipped Dockerfiles extract with `tar --no-same-owner` or
+   `chown -h 0:0` the toolchain trees, then fail the build if a needed
+   command does not qualify (see QUIRKS.md). Otherwise `Start` fails with
+   `not found in a root-only PATH directory`, `Sweep` degrades to a log
+   line, and the boot log lists the PATH entries rejected
+   (`privsep: PATH entry not used ...`). The agent process is untrusted
+   input to everything your adapter does as root, so the adapter contract
+   adds:
+   - **Never hand over `$HOME`; link your tree into the agent's home.**
+     The agent has its own home, `/home/agent`, which is `HOME` for
+     everything it runs and the default working directory of
+     `AgentCommand` (a spawn may set another directory the agent owns as
+     `Dir`, as the prime and dsh bridges do with their framework tree);
+     `/root` stays `root:root 0711`. Call `privsep.OwnTree` on your
+     framework trees only (it refuses `/`, root's home, any ancestor of a
+     PATH directory or sealed's executable, and anything inside sealed's
+     state directory or the package directory of a binary sealed runs),
+     then `privsep.LinkAgentHome(".<framework>", <your tree>)` so the
+     `~/...` paths your `FrameworkFacts` tell the agent still name that
+     tree, and declare every tree you hand over in your `New`
+     (`privsep.DeclareTree`): at boot, sealed moves out of `/root` anything
+     another uid could have changed there (by owner, mode or POSIX ACL),
+     except the declared trees (an entry your framework used to keep
+     directly in `/root` and now expects inside a declared tree can be
+     moved there instead, `privsep.DeclareRelocation`, as prime does for
+     its session artifacts); a directory between `/root` and a tree you
+     declare deeper inside it (prime's `/root/.prime`, above
+     `/root/.prime/agent`) stays, but is made root's. Put
+     `HOME=` + `privsep.AgentHome()` in your spawn environment, and name
+     the tree there too, through whatever variables your framework takes
+     its home or state directory from (`HERMES_HOME`, `DSH_HOME`,
+     `PRIME_AGENT_CODING_AGENT_DIR`; for openclaw both `OPENCLAW_STATE_DIR`
+     and `OPENCLAW_HOME`), set to absolute paths under `/root`, so no path
+     your framework derives runs through `HOME`; check that for every
+     whitelisted version (openclaw 2026.5.x takes its exec approvals file
+     from `OPENCLAW_HOME`, 2026.7.1 from `OPENCLAW_STATE_DIR`; QUIRKS.md),
+     and check the framework's plugins too, which may take a default
+     location from `HOME` whatever these variables say (openclaw's
+     memory-wiki vault and file-transfer audit log, through the
+     `~/.openclaw` link): pin such a location in the rendered config where
+     it has a key, and tell the agent where it has none. Check, too, what
+     else such a variable moves: openclaw core expands `~` — in its
+     config's path-valued keys, in the paths its media tools are given —
+     from `OPENCLAW_HOME`, so `~/x` there names `/root/x`, where the agent
+     can create nothing outside its tree; its render rewrites the owner's
+     `~/x` and `/root/x` agent paths into the agent's home, and its
+     `FrameworkFacts` tell the agent to use absolute paths there
+     (QUIRKS.md).
+     Pin a path in the rendered config only when no variable reaches it:
+     a config key can mean more than the one path (openclaw's
+     `agents.defaults.workspace` is also every other agent's base
+     directory). The link is the
+     agent's convenience, and a framework that reached its state only
+     through it would follow wherever the agent pointed it (openclaw also
+     refuses its exec tool under a symlinked path, and its
+     guarded appends under a symlinked workspace; QUIRKS.md). sealed's own
+     code keeps using the absolute paths and never resolves the link.
+   - **Spawn with `AgentCommand`; root execs only through `RootCommand`,
+     and never a framework CLI.** A CLI that reads agent-writable state
+     (a config validator, an import probe) runs as the agent, from a
+     context with a deadline, through `privsep.BoundedOutput`; a version
+     probe is a static read; only toolchain commands that must write
+     root-owned prefixes run as root, through `RootCommand`, and their
+     environment must keep them out of your framework tree (openclaw's
+     install sets `OPENCLAW_HOME` to a root-only directory for exactly
+     that); what you append to a root command's environment is a fixed
+     value naming no agent-writable path, and its working directory is set
+     only through `privsep.RootDir`, which refuses a directory that is not
+     root-only. Do not build or alter a command's identity outside privsep:
+     no `exec.Cmd`, `SysProcAttr` or `Credential` value, no reference to a
+     command's `SysProcAttr` or `Credential`, no assignment to its `Path`,
+     `Args` or `ExtraFiles`, no pointer to any of these or to its `Env` or
+     `Dir`, no copy of its `Args`, `Env` or `ExtraFiles` slice (which
+     shares the command's array), and no `unsafe` or `reflect` (beyond
+     `reflect.DeepEqual`) to reach them another way. Hand a command only
+     to the module's own code that takes it as a command — never to a
+     function outside the module (a reflection-based decoder such as
+     `json.Unmarshal` sets its fields), an interface or a function value.
+     The structural tests check all of this by type: every package is
+     type-checked against `os/exec`, so a field is a command's wherever the
+     command came from and whatever the file imports
+     (`rootside_types_test.go`; `TestRootSideGuardFlagsEveryForbiddenShape`
+     runs the rules over planted code).
+   - **All framework-tree file access goes through the privsep fs
+     helpers** (`ReadFile`, `ReadDir`, `Lstat`, `Open`, `WriteFile`,
+     `WriteFileFrom`, `MkdirAll`, `EnsureDir`, `Remove`, `RemoveAll`,
+     `Rename`); skip entries `privsep.Refused` reports (a link, a special
+     file, a foreign hard link — for a leaf role, read that as absent).
+     Build manifest entries with `manifest.DirEntryOf` and
+     `manifest.FileEntryOf`: they apply those rules and hold an entry over
+     its size limit (`manifest.Held`), so that entry keeps its committed
+     version while the rest of the role keeps committing; in a leaf role,
+     return `privsep.ErrTooLarge` as an error so the role keeps its
+     committed version. A read refused with `privsep.ErrBusy` (the file's
+     owner holds a lease on it) is never an absent file: return it as an
+     error too, and the role is skipped for that pass (at boot it keeps its
+     committed version). Create the role directories `Restore` and
+     `RestoreEntry` write into with `privsep.EnsureDir(<your tree>, dir)`,
+     which replaces a link or file the agent left where one belongs
+     instead of failing the boot. Run every entry name you emit through
+     `manifest.Carries` and check entry paths you are given with
+     `manifest.ValidEntryPath`.
+     sealed's own bookkeeping goes in `framework.StateDir` (`StatePath`,
+     `ReadState`/`WriteState`), logs via `framework.OpenLog`. The
+     structural tests in `internal/framework/rootside_guard_test.go` fail
+     on a direct path-based use of `os`, `syscall`/`unix` (every function
+     of theirs with a string parameter, bar a short list, and the raw
+     syscall entry points), `filepath` walks, `os/exec` functions (or
+     `golang.org/x/sys/execabs`, `net/http/cgi` or `plugin.Open`), the
+     command-field uses above, unix-socket listens or `net/http` file
+     servers outside
+     `internal/privsep` — except the call sites listed in
+     `allowedDirectCalls`, each counted and each with the reason its path
+     is root-only — and pin which functions may call `RootCommand` (with
+     which binaries), which must start their process through
+     `AgentCommand`, which must link their tree, and that every tree
+     handed over is declared: a new spawn, toolchain call or exception is
+     added there, with its reason.
+   - **`Stop` calls `privsep.Sweep(<pattern>)` on every path** (a `defer`
+     covers the cancelled-context one), which SIGKILLs leftovers of your
+     framework process as the agent user (so it cannot reach root's
+     processes). The pattern is matched by `pkill -f` against the command
+     line your process actually has: an interpreter script runs as
+     `<interpreter> <resolved script path> ...`, and a framework may
+     retitle itself (openclaw names every process `openclaw` as it starts,
+     and its gateway `openclaw-gateway` once up). Do not
+     end every agent process: backends the agent registered over the sign
+     socket outlive a framework restart.
 8. Add your framework's name to attestor's supported-names list so
    deploys can select it — attestor treats the name as an opaque string
    (validated pre-mint, written into the version-less binding, listed in
@@ -980,7 +1148,10 @@ The one obligation that replaced all four is step 4.
     drift) and renders them identically for every framework; you return a
     `platform.FrameworkFacts` struct filling only what differs by framework:
     `Home`, `Tracked`/`Untracked` paths (each with a note), `DurableHints`,
-    the version whitelist + `ReconcileHow` command, and — only if one of your
+    `Notes` (working rules that are not about tracking — how your framework
+    resolves `~`, where it will or will not pick a file up; rendered as a
+    list of their own, so they do not read as untracked paths), the version
+    whitelist + `ReconcileHow` command, and — only if one of your
     TRACKED roles is a key-filtered file — `ConfigFile` + `ConfigKeys`, which
     render the "considers only these top-level keys" paragraph. Prime's
     `harness_state.json` is the last user of that pair; openclaw, hermes and
@@ -1292,7 +1463,7 @@ watcher, so the port is worth recording.
     the wire at all. That file is no longer a chain role: `RenderSettings`
     rebuilds it from the owner's document before every spawn, and writes it
     only when the platform actually routes the model
-    (`prime/modelsjson.go:15-60`).
+    (`prime/modelsjson.go:19-60`).
 
 **A mistake worth recording — check which artifact carries which half.**
 The first version of this port installed the framework from npm

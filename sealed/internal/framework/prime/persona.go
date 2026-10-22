@@ -3,11 +3,13 @@ package prime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"strings"
 
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -30,9 +32,13 @@ import (
 
 // evoAppendSystem returns the persona file's bytes verbatim. Missing or empty
 // file → nil, matching Defaults so an absent persona produces no chain entry.
+//
+// The file is agent-writable: read through internal/privsep, and an entry
+// the read rules refuse (a link, a FIFO) counts as absent. A file over its
+// size limit is an error, so the committed persona stays.
 func (a *Adapter) evoAppendSystem() ([]byte, error) {
-	content, err := os.ReadFile(appendSystemPath())
-	if os.IsNotExist(err) {
+	content, err := privsep.ReadFile(appendSystemPath(), privsep.LimitTracked)
+	if errors.Is(err, fs.ErrNotExist) || privsep.Refused(appendSystemPath(), err) {
 		return nil, nil
 	}
 	if err != nil {
@@ -49,19 +55,19 @@ func (a *Adapter) evoAppendSystem() ([]byte, error) {
 // edits) and touches an empty one otherwise, so the framework never appends a
 // stock template that would land on chain as first-boot drift.
 func (a *Adapter) restoreAppendSystem(plaintext []byte) error {
-	if err := os.MkdirAll(primeHome, 0o755); err != nil {
+	if err := privsep.MkdirAll(primeHome, 0o755); err != nil {
 		return fmt.Errorf("prime.Restore[APPEND_SYSTEM.md]: mkdir %s: %w", primeHome, err)
 	}
 	if len(plaintext) == 0 {
-		if _, err := os.Stat(appendSystemPath()); err == nil {
+		if _, err := privsep.Lstat(appendSystemPath()); err == nil {
 			return nil
 		}
-		if err := os.WriteFile(appendSystemPath(), nil, 0o644); err != nil {
+		if err := privsep.WriteFile(appendSystemPath(), nil, 0o644); err != nil {
 			return fmt.Errorf("prime.Restore[APPEND_SYSTEM.md]: touch: %w", err)
 		}
 		return nil
 	}
-	if err := os.WriteFile(appendSystemPath(), plaintext, 0o644); err != nil {
+	if err := privsep.WriteFile(appendSystemPath(), plaintext, 0o644); err != nil {
 		return fmt.Errorf("prime.Restore[APPEND_SYSTEM.md]: write: %w", err)
 	}
 	logger.Logf("prime.Restore[APPEND_SYSTEM.md]: %d bytes", len(plaintext))

@@ -310,10 +310,10 @@ func TestSynthInputText(t *testing.T) {
 	}
 }
 
-// With framework.ConversationHistory wired (openclaw), the stateful door
-// takes prior turns from the HARNESS'S OWN STORE and the client's input
-// supplies only the current turn — client-sent history is deliberately
-// ignored (it would double or fork what the store already holds).
+// With framework.ConversationHistory wired, the stateful door takes prior
+// turns from the HARNESS'S OWN STORE and the client's input supplies only the
+// current turn — client-sent history is deliberately ignored (it would double
+// or fork what the store already holds).
 func TestSynthResponses_StoreHistoryReplacesClientHistory(t *testing.T) {
 	var gotMessages atomic.Value
 	up := chatUpstreamCounting(t, 1, 0, nil, &gotMessages)
@@ -358,6 +358,48 @@ func TestSynthResponses_StoreHistoryReplacesClientHistory(t *testing.T) {
 	}
 	if strings.Contains(got, "client stale one") {
 		t.Fatalf("client-sent history must be ignored when the store supplies it: %s", got)
+	}
+}
+
+// A hook with no prior turns (openclaw: its gateway replays the pinned
+// session itself) makes the door send ONLY the current turn — the client's
+// history on top of the gateway's replay would reach the model twice.
+func TestSynthResponses_EmptyHistorySendsOnlyTheCurrentTurn(t *testing.T) {
+	var gotMessages atomic.Value
+	up := chatUpstreamCounting(t, 1, 0, nil, &gotMessages)
+	s := &Server{synth: newSynthHub(), adapter: &synthFakeAdapter{token: "tok"}}
+	s.SetConversationHistory(func(context.Context) ([]ConversationTurn, error) { return nil, nil })
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.handleSynthResponses(w, r, up.URL)
+	}))
+	t.Cleanup(ts.Close)
+
+	input := `[{"role":"user","content":"client copy one"},{"role":"assistant","content":"client copy reply"},{"role":"user","content":"current turn"}]`
+	resp, err := synthPost(t, ts.URL+"/v1/responses", "tok", `{"input":`+input+`}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snap map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&snap)
+	resp.Body.Close()
+	id := snap["id"].(string)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st := synthGetJSON(t, ts.URL+"/v1/responses/"+id)
+		if st["status"] == "completed" || st["status"] == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("never finished")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	got, _ := gotMessages.Load().(string)
+	if !strings.Contains(got, "current turn") {
+		t.Fatalf("upstream missing the current turn: %s", got)
+	}
+	if strings.Contains(got, "client copy") {
+		t.Fatalf("client-sent history must not be forwarded: %s", got)
 	}
 }
 

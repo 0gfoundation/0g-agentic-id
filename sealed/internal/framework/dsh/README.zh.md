@@ -71,7 +71,7 @@ spine 的选项;默认值就是桥原来写死的那几个,所以什么都不填
 
 `workspaceContext` 原来在这张表里,现在是**拒绝**的。它会挂上 spine 的
 workspace-context 扩展,把 `~/.dsh/AGENTS.md` 读进每一轮的系统上下文 —— 而这个
-文件 agent 自己写得动(privsep 把家目录交给 agent 用户,它有 bash 和
+文件 agent 自己写得动(privsep 把 `$DSH_HOME` 交给 agent 用户,它有 bash 和
 `fs-local`),又不属于任何 role:没人恢复它、没人上链、验证方也看不见它。
 owner 的一个开关不该能捅开一条"不上链、agent 可写"的系统提示词通道,这是平台
 边界的事。要让它回来成为一个选项,先得把 `~/.dsh/AGENTS.md` 做成上链 role(还

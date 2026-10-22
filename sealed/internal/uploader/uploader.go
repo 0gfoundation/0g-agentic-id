@@ -116,7 +116,7 @@ type Uploader struct {
 }
 
 // New constructs a production Uploader wired to a concrete chain.Client
-// and the dataplane CLI-shelling storage backend. Returns an error if
+// and the dataplane storage backend. Returns an error if
 // agent_seal_priv can't be parsed (would block every Push otherwise).
 func New(
 	adapter Adapter,
@@ -132,9 +132,9 @@ func New(
 	}
 	pub := crypto.CompressPubkey(&priv.PublicKey)
 	storage := &dataplaneStorage{
-		indexerURL:    indexerURL,
-		rpcURL:        rpcURL,
-		signerPrivHex: hex.EncodeToString(agentSealPriv),
+		indexerURL: indexerURL,
+		rpcURL:     rpcURL,
+		signer:     priv,
 	}
 	return newWith(adapter, agent, chainClient, storage, tokenID, agentSealPriv, pub, indexerURL), nil
 }

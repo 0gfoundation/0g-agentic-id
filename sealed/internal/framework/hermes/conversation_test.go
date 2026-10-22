@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"os"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func redirectHome(t *testing.T) {
@@ -12,6 +14,7 @@ func redirectHome(t *testing.T) {
 	old := hermesHome
 	hermesHome = t.TempDir()
 	t.Cleanup(func() { hermesHome = old })
+	isolateState(t)
 }
 
 // One id, minted once, stable across calls — the "one conversation per agent"
@@ -115,5 +118,67 @@ func TestClearSession_MintsAFreshIdentity(t *testing.T) {
 	}
 	if _, err := os.Stat(conversationIDPath()); err != nil {
 		t.Fatalf("id file must persist: %v", err)
+	}
+}
+
+// A container upgraded in place keeps its conversation: the id an earlier
+// sealed kept in the hermes home is taken over once (and the old file
+// retired), and an unusable one is ignored.
+func TestConversationID_TakesOverTheEarlierSealedsID(t *testing.T) {
+	redirectHome(t)
+	legacy := legacyConversationIDPath()
+	if err := os.WriteFile(legacy, []byte("20260701_120000_abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := &Adapter{}
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != "20260701_120000_abcdef" {
+		t.Fatalf("id = %q, want the earlier sealed's", got)
+	}
+	if _, err := os.Lstat(legacy); !os.IsNotExist(err) {
+		t.Fatalf("the earlier id file was not retired: %v", err)
+	}
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != "20260701_120000_abcdef" {
+		t.Fatalf("id after the move = %q", got)
+	}
+
+	redirectHome(t)
+	if err := os.WriteFile(legacyConversationIDPath(), []byte("../../etc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.ConversationHeaders()[sessionIDHeader]; got == "" || got == "../../etc" {
+		t.Fatalf("id = %q, want a freshly minted one", got)
+	}
+}
+
+// An earlier sealed's id that cannot be read for now — its owner holds a
+// lease on the file — is not taken for absent: the turn gets a fresh id
+// that is not persisted, and once the lease is gone the earlier id is
+// taken over after all, so the conversation does not fork for good.
+func TestConversationID_LeasedEarlierIDIsNotForgotten(t *testing.T) {
+	redirectHome(t)
+	legacy := legacyConversationIDPath()
+	if err := os.WriteFile(legacy, []byte("20260701_120000_abcdef\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	holder, err := unix.Open(legacy, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(holder)
+	if _, err := unix.FcntlInt(uintptr(holder), unix.F_SETLEASE, unix.F_WRLCK); err != nil {
+		skipOrFail(t, "cannot take a lease on %s here: %v", legacy, err)
+	}
+	a := &Adapter{}
+	if got := a.ConversationHeaders()[sessionIDHeader]; got == "" || got == "20260701_120000_abcdef" {
+		t.Fatalf("id while leased = %q, want a fresh one", got)
+	}
+	if _, err := os.Lstat(conversationIDPath()); !os.IsNotExist(err) {
+		t.Fatalf("an id was persisted while the earlier one could not be read: %v", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(holder), unix.F_SETLEASE, unix.F_UNLCK); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.ConversationHeaders()[sessionIDHeader]; got != "20260701_120000_abcdef" {
+		t.Fatalf("id once the lease is gone = %q, want the earlier sealed's", got)
 	}
 }

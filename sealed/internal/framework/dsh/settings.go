@@ -168,7 +168,7 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 
 	level, decided := s.Effort()
 	logger.Logf("dsh: rendered settings provider=%s model=%s effort=%q(decided=%t) routed=%v maxTokens=%d knobs=%+v",
-		s.Provider, s.Model, level, decided, s.Endpoint != nil, s.PersistableMaxTokens(), knobs)
+		s.Provider, s.Model, level, decided, s.Endpoint != nil, s.RequestMaxTokens(), knobs)
 	return nil
 }
 
@@ -247,9 +247,12 @@ func settingsEnv(s settings.Resolved, k dshKnobs) []string {
 
 	// Only a catalog-sourced budget reaches the bridge (review P1): the name
 	// heuristic's guess (8192) starves a reasoning model's shared
-	// thinking+reply budget, and PersistableMaxTokens is 0 for it. With no
+	// thinking+reply budget, and RequestMaxTokens is 0 for it. With no
 	// variable the bridge omits maxTokens and pi-ai's own default applies.
-	if mt := s.PersistableMaxTokens(); mt > 0 {
+	// The bridge declares this as the model's maxTokens, which pi-ai sends as
+	// max_completion_tokens on EVERY request — so it is the capped request
+	// budget, never the catalog's raw capability (see RequestMaxTokens).
+	if mt := s.RequestMaxTokens(); mt > 0 {
 		env["SEAL_MODEL_MAX_TOKENS"] = strconv.Itoa(mt)
 	}
 
