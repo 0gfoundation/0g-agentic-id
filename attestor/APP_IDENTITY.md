@@ -8,6 +8,14 @@ per-agent agentSeal. Fund the stable signer for business and storage transaction
 API/worker broadcasts use a Postgres advisory transaction lock shared by signer; storage
 uploads take that same lock and wait for preceding pending transactions to be packed.
 Every replica must use the same database. The indexer still only reads and derives seals.
+Nonce coordination has bounded waits: RPC connections time out after 5 seconds and
+requests after 30 seconds; a business submission has a 120-second total budget,
+including pool/lock acquisition and broadcast. PostgreSQL lock waits are capped
+at 30 seconds. Storage has a 750-second total budget, including up to 120 seconds
+to drain preceding pending transactions and 600 seconds for the SDK upload and
+its retries. Cancellation releases the transaction-scoped lock. A timeout after
+submission starts reports an unknown outcome and is never automatically resent;
+check transaction/contract or storage state before retrying.
 
 Production requires `ATTESTOR_TAPP_SOCKET`, `ATTESTOR_APP_ID`,
 `ATTESTOR_SANDBOX_APP_ID`, `ATTESTOR_TAPP_REGISTRY_ADDR`,

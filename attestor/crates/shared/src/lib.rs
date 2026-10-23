@@ -14,6 +14,7 @@ pub mod identity;
 pub mod jobs;
 pub mod kms;
 pub mod mocks;
+pub mod nonce_submit;
 pub mod oss;
 pub mod pinned_tls;
 pub mod repo;

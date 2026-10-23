@@ -236,11 +236,13 @@ pub fn connect_http(
     let sender = signer.address();
     let wallet = EthereumWallet::from(signer);
     let url: reqwest::Url = rpc_url.parse()?;
+    let transport = rpc_http_transport(url, crate::nonce_submit::RPC_TIMEOUT)?;
+    let is_local = transport.guess_local();
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
         .filler(NonceFiller::<PendingNonceManager>::default())
         .wallet(wallet)
-        .on_http(url);
+        .on_client(alloy::rpc::client::RpcClient::new(transport, is_local));
     // Startup marker so a live process proves which build/strategy is running
     // (a missing line means the binary predates the #54 fix — stale image).
     tracing::info!(sender = %sender, "chain client ready — mint nonce = pending-read + submit_lock (#54)");
@@ -255,6 +257,17 @@ pub fn connect_http(
         submit_pool,
     );
     Ok(chain)
+}
+
+fn rpc_http_transport(
+    url: reqwest::Url,
+    timeout: std::time::Duration,
+) -> anyhow::Result<alloy::transports::http::Http<reqwest::Client>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(crate::nonce_submit::CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()?;
+    Ok(alloy::transports::http::Http::with_client(client, url))
 }
 
 #[async_trait]
@@ -318,26 +331,17 @@ where
         // Serialize the nonce-read→submit window (see `submit_lock`). Guard is
         // released as soon as the tx is broadcast (pending nonce bumped), not
         // held through the receipt wait, so mints still pipeline into mempool.
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            // One stable signer is shared by API and workers. Serialize the
-            // pending-nonce read and broadcast across those processes too.
-            let mut nonce_lock = self.submit_pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!(
-                    "attestor-sender:{}",
-                    hex::encode(self.sender.as_slice())
-                ))
-                .execute(&mut *nonce_lock)
-                .await?;
-            let pending = self
-                .provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?;
-            nonce_lock.commit().await?;
-            pending
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "registerWithSeal",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -464,26 +468,17 @@ where
             "alloy: sending cloneFrom (policy-gated mint)"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            // One stable signer is shared by API and workers. Serialize the
-            // pending-nonce read and broadcast across those processes too.
-            let mut nonce_lock = self.submit_pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!(
-                    "attestor-sender:{}",
-                    hex::encode(self.sender.as_slice())
-                ))
-                .execute(&mut *nonce_lock)
-                .await?;
-            let pending = self
-                .provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?;
-            nonce_lock.commit().await?;
-            pending
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "cloneFrom",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
         Ok(tx_hash)
@@ -580,26 +575,17 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            // One stable signer is shared by API and workers. Serialize the
-            // pending-nonce read and broadcast across those processes too.
-            let mut nonce_lock = self.submit_pool.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-                .bind(format!(
-                    "attestor-sender:{}",
-                    hex::encode(self.sender.as_slice())
-                ))
-                .execute(&mut *nonce_lock)
-                .await?;
-            let pending = self
-                .provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?;
-            nonce_lock.commit().await?;
-            pending
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "setAgentURI",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)
@@ -618,6 +604,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_deadline_bounds_a_real_silent_http_peer() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let transport = rpc_http_transport(url, Duration::from_millis(50)).unwrap();
+        let provider = alloy::providers::RootProvider::<_, Ethereum>::new(
+            alloy::rpc::client::RpcClient::new(transport, true),
+        );
+        let request = tokio::spawn(async move { provider.get_block_number().await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(300), request).await;
+        server.abort();
+        assert!(result
+            .expect("Alloy RPC ignored the HTTP request deadline")
+            .unwrap()
+            .is_err());
+    }
 
     /// `0x042a85a4` == selector of `AgenticIDNotTrustedAttestor()`.
     /// This is the exact error we saw in production (attestor EOA not

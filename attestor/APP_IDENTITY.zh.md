@@ -7,6 +7,11 @@ sandbox provider 地址。它与节点 signer（`GetAppSecretKey`）、空 mater
 API/worker 广播交易时使用按 signer 共享的 Postgres advisory transaction lock；存储
 上传使用同一锁，并等待此前 pending 交易打包。所有副本必须使用同一数据库。
 Indexer 仍只读取链与派生 agentSeal。
+Nonce 协调具有明确期限：RPC 连接 5 秒、单请求 30 秒；业务提交总预算为 120 秒，
+包含连接池/锁获取和广播。PostgreSQL 等锁最多 30 秒。存储总预算为 750 秒，
+其中等待此前 pending 交易最多 120 秒，SDK 上传及其重试最多 600 秒。
+取消会释放事务级锁。提交开始后超时会报告结果未知，不自动重发；重试前应先核对
+交易/合约或存储状态。
 
 生产必须设置 `ATTESTOR_TAPP_SOCKET`、`ATTESTOR_APP_ID`、
 `ATTESTOR_SANDBOX_APP_ID`、`ATTESTOR_TAPP_REGISTRY_ADDR`、
