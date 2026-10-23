@@ -24,9 +24,10 @@ authorized app/provider. A single-flight cache refreshes and repeats chain autho
 before its expiry. Each request signs against and connects with the same snapshot.
 `GET /config` refreshes that snapshot too, preserving existing SDK field names.
 
-API and worker initialize `GetAppSigner` once, then wait for their own identity and
-AgenticID instance authorization, followed by sandbox identity, chain authorization and
-pinned `/api/info`. This bootstrap has one 180-second budget, including the initial
+API and worker initialize `GetAppSigner` once, then concurrently check their own identity
+and AgenticID instance authorization alongside sandbox identity, chain authorization and
+pinned `/api/info`. After both checks finish, both leases must still have more than five
+seconds remaining. This bootstrap has one 180-second budget, including the initial
 key fetch; every readiness attempt is bounded by that deadline and retried after two
 seconds. A stale Scan observation or a pending operator binding therefore need not
 restart the process. Invalid static configuration is rejected before key acquisition;

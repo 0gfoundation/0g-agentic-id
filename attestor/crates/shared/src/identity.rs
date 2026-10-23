@@ -66,6 +66,29 @@ where
     }
 }
 
+/// Start both lookups together, then check both leases against the same final
+/// time. Neither side's result may expire while waiting for the other side.
+async fn ready_snapshots<A, S>(
+    attestor: A,
+    sandbox: S,
+) -> anyhow::Result<(
+    Option<AttestorTlsDescriptor>,
+    Option<Arc<SandboxConnection>>,
+)>
+where
+    A: Future<Output = anyhow::Result<Option<AttestorTlsDescriptor>>>,
+    S: Future<Output = anyhow::Result<Option<Arc<SandboxConnection>>>>,
+{
+    let (attestor, sandbox) = tokio::try_join!(attestor, sandbox)?;
+    let now = chrono::Utc::now().timestamp();
+    anyhow::ensure!(
+        attestor.as_ref().is_none_or(|a| a.expires_at > now + 5)
+            && sandbox.as_ref().is_none_or(|s| s.expires_at > now + 5),
+        "identity expired before startup readiness completed"
+    );
+    Ok((attestor, sandbox))
+}
+
 #[derive(Clone)]
 pub struct StartupIdentities {
     pub app_private_key: [u8; 32],
@@ -107,21 +130,21 @@ pub async fn initialize_for_startup(
             })
         },
         |identities: StartupIdentities| async move {
-            let attestor = match &identities.attestor {
-                Some(identity) => Some(identity.snapshot().await?),
-                None => None,
-            };
-            let sandbox = match &identities.sandbox {
-                Some(identity) => Some(identity.snapshot().await?),
-                None => None,
-            };
-            // The second lookup can outlast the first identity's lease.
-            let now = chrono::Utc::now().timestamp();
-            anyhow::ensure!(
-                attestor.as_ref().is_none_or(|a| a.expires_at > now + 5)
-                    && sandbox.as_ref().is_none_or(|s| s.expires_at > now + 5),
-                "identity expired before startup readiness completed"
-            );
+            let (_, sandbox) = ready_snapshots(
+                async {
+                    match &identities.attestor {
+                        Some(identity) => Ok(Some(identity.snapshot().await?)),
+                        None => Ok(None),
+                    }
+                },
+                async {
+                    match &identities.sandbox {
+                        Some(identity) => Ok(Some(identity.snapshot().await?)),
+                        None => Ok(None),
+                    }
+                },
+            )
+            .await?;
             Ok(sandbox)
         },
     )
@@ -549,6 +572,68 @@ mod tests {
     use crate::tee::TeeKeyProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tapp_grpc::proto::{ResolveAppIdentityResponse, ResolvedAppNodeIdentity};
+
+    #[tokio::test]
+    async fn startup_snapshot_lookups_both_start_before_either_is_released() {
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let first = gate.clone();
+        let second = gate.clone();
+        let (ready, _) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                ready_snapshots(
+                    async move {
+                        first.wait().await;
+                        Ok(None)
+                    },
+                    async move {
+                        second.wait().await;
+                        Ok(None)
+                    },
+                ),
+                gate.wait(),
+            )
+        })
+        .await
+        .expect("both lookups must start concurrently before the barrier opens");
+        assert!(ready.is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_snapshots_require_both_final_leases_to_exceed_the_margin() {
+        let expires_at = chrono::Utc::now().timestamp() + 5;
+        let attestor = AttestorTlsDescriptor {
+            version: 1,
+            chain_id: 1,
+            registry_address: String::new(),
+            app_id: "app".into(),
+            registered_at: 1,
+            app_signer: String::new(),
+            url: String::new(),
+            scan_url: String::new(),
+            scan_public_key: String::new(),
+            tls_spki_sha256: vec![],
+            checked_at: expires_at - 60,
+            expires_at,
+        };
+        let sandbox = Arc::new(SandboxConnection {
+            provider: Address::ZERO,
+            base_url: String::new(),
+            registered_at: 1,
+            expires_at,
+            http: reqwest::Client::new(),
+        });
+        for (attestor, sandbox) in [(Some(attestor), None), (None, Some(sandbox))] {
+            let result = ready_snapshots(async { Ok(attestor) }, async { Ok(sandbox) }).await;
+            match result {
+                Err(error) => assert!(error
+                    .to_string()
+                    .contains("identity expired before startup")),
+                Ok(_) => {
+                    panic!("neither side may return a lease at or below the five-second margin")
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn startup_wait_retries_until_observation_is_ready() {

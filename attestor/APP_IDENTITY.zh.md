@@ -22,8 +22,9 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 使用同一 snapshot 绑定签名中的 provider 和 HTTP 连接。`GET /config` 同样刷新 snapshot，
 保持原 SDK 字段名。
 
-API 和 worker 只初始化一次 `GetAppSigner`，随后等待自身身份、AgenticID 实例授权，
-再验证 sandbox 身份、链上授权及 pinned `/api/info`。这一启动流程共用 180 秒预算，
+API 和 worker 只初始化一次 `GetAppSigner`，随后并发验证自身身份和 AgenticID 实例授权，
+以及 sandbox 身份、链上授权及 pinned `/api/info`。两边查询均完成后，统一检查两边的
+lease 都还剩五秒以上。这一启动流程共用 180 秒预算，
 包含首次拿 key；每次就绪查询都受同一 deadline 限制，失败后间隔两秒重试。因此 Scan
 缓存尚未观察到新身份，或 operator 还在完成绑定时，不必立即重启进程。静态配置错误
 在拿 key 前拒绝；超时则启动失败，不使用过期身份、未授权 key 或手配地址回退。
