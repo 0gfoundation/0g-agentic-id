@@ -89,7 +89,7 @@ func newFixture(t *testing.T) *fixture {
 			case "expired":
 				v.ExpiresAt = now - 1
 			case "unverified":
-				v.IdentitiesVerified = false
+				v.IdentitiesVerified = boolValue(false)
 			case "pubkey":
 				v.Status.Attested.Identities[1].PublicKey = f.nodeIdentity.PublicKey
 			case "tls":
@@ -115,8 +115,10 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
+func boolValue(value bool) *bool { return &value }
+
 func (f *fixture) verdict() verdict {
-	v := verdict{AppID: f.descriptor.AppID, Signer: f.node, Verified: true, IdentitiesVerified: true, CheckedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 60, ImageEnv: "prod"}
+	v := verdict{AppID: f.descriptor.AppID, Signer: f.node, Verified: true, IdentitiesVerified: boolValue(true), CheckedAt: time.Now().Unix(), ExpiresAt: time.Now().Unix() + 60, ImageEnv: "prod"}
 	v.Scope.ChainID = f.descriptor.ChainID
 	v.Scope.Registry = f.descriptor.RegistryAddress
 	v.Scope.AppID = v.AppID
@@ -254,5 +256,226 @@ func TestScanPrefixesAndAppIDsPreserveEscaping(t *testing.T) {
 		if got := r.endpoint("apps", "a/b?x"); got != expected {
 			t.Fatalf("URL = %s, want %s", got, expected)
 		}
+	}
+}
+
+// This fixture exercises parsed Scan verdicts without a listener or a real TEE.
+func serviceNodeFixture(t *testing.T, nodeByte, tlsByte byte) *fixture {
+	t.Helper()
+	nodeKey, err := crypto.ToECDSA(append(make([]byte, 31), nodeByte))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appKey, err := crypto.ToECDSA(append(make([]byte, 31), 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := elliptic.P256().ScalarBaseMult([]byte{tlsByte})
+	spki, err := x509.MarshalPKIXPublicKey(&ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pin := sha256.Sum256(spki)
+	f := &fixture{node: crypto.PubkeyToAddress(nodeKey.PublicKey).Hex()}
+	f.descriptor = Descriptor{ChainID: 16602, RegistryAddress: testRegistry, AppID: "app", RegisteredAt: 100,
+		AppSigner: crypto.PubkeyToAddress(appKey.PublicKey).Hex(), TLSPins: []string{hex.EncodeToString(pin[:])}}
+	f.nodeIdentity = identity{Role: "node_signer", Algorithm: "ecdsa-secp256k1", Source: "local", Derivation: "tapp-app-signer-v1", Encoding: "sec1-compressed", PublicKey: "0x" + hex.EncodeToString(crypto.CompressPubkey(&nodeKey.PublicKey))}
+	f.appIdentity = identity{Role: "app_signer", Algorithm: "ecdsa-secp256k1", Source: "kms", Derivation: "raw-scalar-v1", Encoding: "sec1-compressed", PublicKey: "0x" + hex.EncodeToString(crypto.CompressPubkey(&appKey.PublicKey)),
+		KeyRef: &commitment{Scheme: "poseidon-bn254-4-v1", Material: "70726f7669646572", Commitment: "0x" + strings.Repeat("01", 32)}}
+	f.tlsIdentity = identity{Role: "tls", Algorithm: "ecdsa-p256", Source: "local", Derivation: "tapp-tls-v1-sha256", Encoding: "sec1-compressed", PublicKey: "0x" + hex.EncodeToString(elliptic.MarshalCompressed(elliptic.P256(), x, y))}
+	return f
+}
+
+func tlsOnlyVerdict(f *fixture) verdict {
+	v := f.verdict()
+	v.Status.Attested.AppSigner = ""
+	v.Status.Attested.Identities = []identity{f.nodeIdentity, f.tlsIdentity}
+	v.Status.Attested.Commitments = nil
+	v.CheckedAt -= 100
+	v.Status.CheckedAt = v.CheckedAt
+	v.ExpiresAt = time.Now().Unix() + 10
+	return v
+}
+
+func nodeOnlyVerdict(f *fixture) verdict {
+	v := tlsOnlyVerdict(f)
+	v.Status.Attested.TLS = ""
+	v.Status.Attested.Identities = []identity{f.nodeIdentity}
+	return v
+}
+
+func legacyPendingVerdict(f *fixture) verdict {
+	v := tlsOnlyVerdict(f)
+	v.IdentitiesVerified = boolValue(false)
+	v.Status.Attested.Identities = []identity{}
+	v.Status.Attested.Commitments = []commitment{}
+	return v
+}
+
+func TestLegacyPendingNodeDoesNotContributeServicePinsOrLease(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	nodes := newServiceNodes()
+	// The legacy TLS fingerprint can remain diagnostic data. It is never used.
+	raw, err := json.Marshal(legacyPendingVerdict(standby))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pending verdict
+	if err := json.Unmarshal(raw, &pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, pending); err != nil {
+		t.Fatal(err)
+	}
+	pending.Status.Attested.TLS = ""
+	if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, pending); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nodes.result(time.Now().Unix()); err == nil {
+		t.Fatal("a legacy pending observation authenticated a service")
+	}
+	v := ready.verdict()
+	if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, v); err != nil {
+		t.Fatal(err)
+	}
+	pins, expires, err := nodes.result(time.Now().Unix())
+	if err != nil || len(pins) != 1 || pins[0] != ready.descriptor.TLSPins[0] || expires != v.ExpiresAt {
+		t.Fatalf("legacy pending contributed a service pin or lease: %v %d %v", pins, expires, err)
+	}
+}
+
+func TestLegacyPendingNodeDoesNotHideErrorsOrLeakedMetadata(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	for name, mutate := range map[string]func(*verdict){
+		"identity error":         func(v *verdict) { message := "bad typed key"; v.Status.Attested.IdentitiesError = &message },
+		"empty identity error":   func(v *verdict) { message := ""; v.Status.Attested.IdentitiesError = &message },
+		"leaked identities":      func(v *verdict) { v.Status.Attested.Identities = []identity{standby.nodeIdentity} },
+		"leaked commitments":     func(v *verdict) { v.Status.Attested.Commitments = []commitment{*standby.appIdentity.KeyRef} },
+		"leaked app signer":      func(v *verdict) { v.Status.Attested.AppSigner = ready.descriptor.AppSigner },
+		"missing identities":     func(v *verdict) { v.Status.Attested.Identities = nil },
+		"missing commitments":    func(v *verdict) { v.Status.Attested.Commitments = nil },
+		"missing verified flag":  func(v *verdict) { v.IdentitiesVerified = nil },
+		"invalid diagnostic TLS": func(v *verdict) { v.Status.Attested.TLS = "bad" },
+		"verifier fault":         func(v *verdict) { v.Status.VerifierFault = true },
+		"wrong scope":            func(v *verdict) { v.Scope.ChainID++ },
+		"expired":                func(v *verdict) { v.ExpiresAt = time.Now().Unix() - 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			nodes := newServiceNodes()
+			if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, ready.verdict()); err != nil {
+				t.Fatal(err)
+			}
+			v := legacyPendingVerdict(standby)
+			mutate(&v)
+			if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, v); err == nil {
+				t.Fatal("legacy pending hid errors or leaked metadata")
+			}
+		})
+	}
+}
+
+func TestNodeOnlyStandbyDoesNotContributeServicePinsOrLease(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	nodes := newServiceNodes()
+	if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, nodeOnlyVerdict(standby)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nodes.result(time.Now().Unix()); err == nil {
+		t.Fatal("a node identity alone authenticated a service")
+	}
+	v := ready.verdict()
+	if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, v); err != nil {
+		t.Fatal(err)
+	}
+	pins, expires, err := nodes.result(time.Now().Unix())
+	if err != nil || len(pins) != 1 || pins[0] != ready.descriptor.TLSPins[0] || expires != v.ExpiresAt {
+		t.Fatalf("standby contributed a service pin or lease: %v %d %v", pins, expires, err)
+	}
+}
+
+func TestNodeOnlyStandbyDoesNotHideInvalidDeclarations(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	for name, mutate := range map[string]func(*verdict){
+		"TLS role without hash": func(v *verdict) {
+			v.Status.Attested.Identities = append(v.Status.Attested.Identities, standby.tlsIdentity)
+		},
+		"TLS hash without role": func(v *verdict) { v.Status.Attested.TLS = "0x" + standby.descriptor.TLSPins[0] },
+		"invalid TLS hash":      func(v *verdict) { v.Status.Attested.TLS = "bad" },
+		"invalid node key":      func(v *verdict) { v.Status.Attested.Identities[0].PublicKey = "0x00" },
+		"missing node role":     func(v *verdict) { v.Status.Attested.Identities = nil },
+		"invalid commitment": func(v *verdict) {
+			v.Status.Attested.Commitments = []commitment{{Scheme: "poseidon-bn254-4-v1", Material: "", Commitment: "0xffff"}}
+		},
+		"unverified metadata": func(v *verdict) { v.IdentitiesVerified = boolValue(false) },
+		"verifier fault":      func(v *verdict) { v.Status.VerifierFault = true },
+		"malformed negative":  func(v *verdict) { v.Verified = false },
+		"invalid signer":      func(v *verdict) { v.Status.Attested.AppSigner = "invalid" },
+		"wrong epoch":         func(v *verdict) { v.Scope.Epoch++ },
+		"expired":             func(v *verdict) { v.ExpiresAt = time.Now().Unix() - 1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			nodes := newServiceNodes()
+			if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, ready.verdict()); err != nil {
+				t.Fatal(err)
+			}
+			v := nodeOnlyVerdict(standby)
+			mutate(&v)
+			if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, v); err == nil {
+				t.Fatal("standby hid invalid or conflicting typed metadata")
+			}
+		})
+	}
+}
+
+func TestTLSOnlyStandbyDoesNotContributeServicePinsOrLease(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	nodes := newServiceNodes()
+	if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, tlsOnlyVerdict(standby)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := nodes.result(time.Now().Unix()); err == nil {
+		t.Fatal("TLS alone authenticated a service signer")
+	}
+	v := ready.verdict()
+	if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, v); err != nil {
+		t.Fatal(err)
+	}
+	pins, expires, err := nodes.result(time.Now().Unix())
+	if err != nil || len(pins) != 1 || pins[0] != ready.descriptor.TLSPins[0] || expires != v.ExpiresAt {
+		t.Fatalf("standby contributed a service pin or lease: %v %d %v", pins, expires, err)
+	}
+}
+
+func TestTLSOnlyStandbyDoesNotHideInvalidDeclarations(t *testing.T) {
+	ready := serviceNodeFixture(t, 1, 1)
+	standby := serviceNodeFixture(t, 3, 2)
+	for name, mutate := range map[string]func(*verdict){
+		"invalid signer":     func(v *verdict) { v.Status.Attested.AppSigner = "invalid" },
+		"conflicting signer": func(v *verdict) { v.Status.Attested.AppSigner = standby.node },
+		"hidden signer role": func(v *verdict) {
+			v.Status.Attested.Identities = append(v.Status.Attested.Identities, standby.appIdentity)
+		},
+		"expired":     func(v *verdict) { v.ExpiresAt = time.Now().Unix() - 1 },
+		"wrong scope": func(v *verdict) { v.Scope.ChainID++ },
+		"dev image":   func(v *verdict) { v.ImageEnv = "dev" },
+		"bad pin":     func(v *verdict) { v.Status.Attested.TLS = "bad" },
+		"bad key":     func(v *verdict) { v.Status.Attested.Identities[1].PublicKey = "0x00" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			nodes := newServiceNodes()
+			if err := nodes.add(ready.descriptor, ready.descriptor.AppID, ready.node, ready.verdict()); err != nil {
+				t.Fatal(err)
+			}
+			v := tlsOnlyVerdict(standby)
+			mutate(&v)
+			if err := nodes.add(ready.descriptor, standby.descriptor.AppID, standby.node, v); err == nil {
+				t.Fatal("standby hid an invalid or conflicting declaration")
+			}
+		})
 	}
 }

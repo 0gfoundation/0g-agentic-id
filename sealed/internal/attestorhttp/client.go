@@ -267,7 +267,7 @@ type verdict struct {
 	AppID              string `json:"app_id"`
 	Signer             string `json:"signer"`
 	Verified           bool   `json:"verified"`
-	IdentitiesVerified bool   `json:"identities_verified"`
+	IdentitiesVerified *bool  `json:"identities_verified"`
 	CheckedAt          int64  `json:"checked_at"`
 	ExpiresAt          int64  `json:"expires_at"`
 	Reason             string `json:"reason"`
@@ -286,16 +286,17 @@ type verdict struct {
 		VerifierFault bool            `json:"verifier_fault"`
 		Error         json.RawMessage `json:"error"`
 		Attested      struct {
-			Signer      string       `json:"attested_signer"`
-			SignerOK    bool         `json:"signer_ok"`
-			Fresh       bool         `json:"fresh"`
-			Replay      bool         `json:"runtime_replay_ok"`
-			Debug       *bool        `json:"td_debug"`
-			TCB         string       `json:"tcb_status"`
-			TLS         string       `json:"tls_public_key"`
-			AppSigner   string       `json:"app_signer"`
-			Identities  []identity   `json:"identities"`
-			Commitments []commitment `json:"key_commitments"`
+			Signer          string       `json:"attested_signer"`
+			SignerOK        bool         `json:"signer_ok"`
+			Fresh           bool         `json:"fresh"`
+			Replay          bool         `json:"runtime_replay_ok"`
+			Debug           *bool        `json:"td_debug"`
+			TCB             string       `json:"tcb_status"`
+			TLS             string       `json:"tls_public_key"`
+			AppSigner       string       `json:"app_signer"`
+			Identities      []identity   `json:"identities"`
+			Commitments     []commitment `json:"key_commitments"`
+			IdentitiesError *string      `json:"identities_error"`
 		} `json:"attested"`
 	} `json:"status"`
 }
@@ -315,9 +316,7 @@ func (r *resolver) resolve(ctx context.Context) ([]string, int64, error) {
 	if app.AppID != r.descriptor.AppID || len(app.Signers) == 0 || len(app.Signers) > 64 {
 		return nil, 0, fmt.Errorf("invalid current app nodes")
 	}
-	pins, seen, materials := []string{}, make(map[string]bool), make(map[string]commitment)
-	kmsRoles := make(map[string]identity)
-	expiry := int64(0)
+	nodes := newServiceNodes()
 	for _, signer := range app.Signers {
 		if !nonzeroAddress(signer) {
 			return nil, 0, fmt.Errorf("invalid current node signer")
@@ -326,52 +325,91 @@ func (r *resolver) resolve(ctx context.Context) ([]string, int64, error) {
 		if err := r.request(ctx, http.MethodPost, r.endpoint("verify"), map[string]string{"app_id": app.AppID, "signer": signer}, &v); err != nil {
 			return nil, 0, err
 		}
-		if v.AppID != app.AppID || !sameAddress(v.Signer, signer) || v.Scope.ChainID != r.descriptor.ChainID ||
-			!sameAddress(v.Scope.Registry, r.descriptor.RegistryAddress) || v.Scope.AppID != app.AppID || v.Scope.Epoch != r.descriptor.RegisteredAt ||
-			v.Status.AppID != app.AppID || !sameAddress(v.Status.Signer, signer) || v.Status.VerifierFault || !fresh(v.Status.CheckedAt) {
-			return nil, 0, fmt.Errorf("Scan verdict scope, instance or node mismatch")
-		}
-		if !v.Verified {
-			if v.Reason == "" {
-				return nil, 0, fmt.Errorf("invalid negative Scan verdict")
-			}
-			continue
-		}
-		a := v.Status.Attested
-		if !v.IdentitiesVerified || v.Reason != "" || string(v.Status.Error) != "null" || v.ImageEnv != "prod" ||
-			v.Status.Epoch != r.descriptor.RegisteredAt || v.CheckedAt != v.Status.CheckedAt || v.ExpiresAt <= time.Now().Unix() || v.ExpiresAt > v.CheckedAt+300 ||
-			!a.SignerOK || !sameAddress(a.Signer, signer) || !a.Fresh || !a.Replay || a.Debug == nil || *a.Debug || a.TCB == "" || strings.EqualFold(a.TCB, "Revoked") ||
-			!sameAddress(a.AppSigner, r.descriptor.AppSigner) || !validPin(a.TLS) {
-			return nil, 0, fmt.Errorf("Scan did not verify the expected production app identity")
-		}
-		if err := validateKeys(a.Identities, a.Commitments, signer, a.AppSigner, a.TLS); err != nil {
+		if err := nodes.add(r.descriptor, app.AppID, signer, v); err != nil {
 			return nil, 0, err
-		}
-		if err := consistentKMSIdentities(kmsRoles, a.Identities); err != nil {
-			return nil, 0, err
-		}
-		for _, c := range a.Commitments {
-			if old, ok := materials[c.Material]; ok && old != c {
-				return nil, 0, fmt.Errorf("nodes disagree about KMS commitment")
-			}
-			materials[c.Material] = c
-		}
-		pin := strings.TrimPrefix(a.TLS, "0x")
-		if !seen[pin] {
-			pins, seen[pin] = append(pins, pin), true
-		}
-		if expiry == 0 || v.ExpiresAt < expiry {
-			expiry = v.ExpiresAt
 		}
 	}
 	after, err := r.health(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
-	if after.Block < before.Block || len(pins) == 0 || expiry <= time.Now().Unix() {
+	if after.Block < before.Block {
 		return nil, 0, fmt.Errorf("Scan identity expired or scope regressed")
 	}
-	return pins, expiry, nil
+	return nodes.result(time.Now().Unix())
+}
+
+type serviceNodes struct {
+	pins      []string
+	seen      map[string]bool
+	materials map[string]commitment
+	kmsRoles  map[string]identity
+	expiresAt int64
+}
+
+func newServiceNodes() *serviceNodes {
+	return &serviceNodes{seen: make(map[string]bool), materials: make(map[string]commitment), kmsRoles: make(map[string]identity)}
+}
+
+func (nodes *serviceNodes) result(now int64) ([]string, int64, error) {
+	if len(nodes.pins) == 0 || nodes.expiresAt <= now {
+		return nil, 0, fmt.Errorf("Scan has no current node with a ready service identity")
+	}
+	return nodes.pins, nodes.expiresAt, nil
+}
+
+func (nodes *serviceNodes) add(d Descriptor, appID, signer string, v verdict) error {
+	if v.AppID != appID || !sameAddress(v.Signer, signer) || v.Scope.ChainID != d.ChainID ||
+		!sameAddress(v.Scope.Registry, d.RegistryAddress) || v.Scope.AppID != appID || v.Scope.Epoch != d.RegisteredAt ||
+		v.Status.AppID != appID || !sameAddress(v.Status.Signer, signer) || v.Status.VerifierFault || !fresh(v.Status.CheckedAt) {
+		return fmt.Errorf("Scan verdict scope, instance or node mismatch")
+	}
+	if !v.Verified {
+		if v.Reason == "" {
+			return fmt.Errorf("invalid negative Scan verdict")
+		}
+		return nil
+	}
+	a := v.Status.Attested
+	if v.IdentitiesVerified == nil || a.IdentitiesError != nil || v.Reason != "" || string(v.Status.Error) != "null" || v.ImageEnv != "prod" ||
+		v.Status.Epoch != d.RegisteredAt || v.CheckedAt != v.Status.CheckedAt || v.ExpiresAt <= time.Now().Unix() || v.ExpiresAt > v.CheckedAt+300 ||
+		!a.SignerOK || !sameAddress(a.Signer, signer) || !a.Fresh || !a.Replay || a.Debug == nil || *a.Debug || a.TCB == "" || strings.EqualFold(a.TCB, "Revoked") ||
+		(a.AppSigner != "" && !sameAddress(a.AppSigner, d.AppSigner)) || (a.TLS != "" && !validPin(a.TLS)) {
+		return fmt.Errorf("Scan did not verify the expected production app identity")
+	}
+	if !*v.IdentitiesVerified {
+		// Scan strips unverified typed metadata from legacy-schema observations.
+		// Only that explicit empty shape is pending; leaked claims remain fatal.
+		if a.Identities == nil || a.Commitments == nil || len(a.Identities) != 0 || len(a.Commitments) != 0 || a.AppSigner != "" {
+			return fmt.Errorf("unverified Scan response contains invalid or leaked typed metadata")
+		}
+		return nil
+	}
+	if err := validateKeys(a.Identities, a.Commitments, signer, a.AppSigner, a.TLS); err != nil {
+		return err
+	}
+	if err := consistentKMSIdentities(nodes.kmsRoles, a.Identities); err != nil {
+		return err
+	}
+	for _, c := range a.Commitments {
+		if old, ok := nodes.materials[c.Material]; ok && old != c {
+			return fmt.Errorf("nodes disagree about KMS commitment")
+		}
+		nodes.materials[c.Material] = c
+	}
+	// A node-only or TLS-only standby is not an authenticated business-service node.
+	// Keep validating its claims above, without accepting its pin or lease.
+	if a.AppSigner == "" || a.TLS == "" {
+		return nil
+	}
+	pin := strings.TrimPrefix(a.TLS, "0x")
+	if !nodes.seen[pin] {
+		nodes.pins, nodes.seen[pin] = append(nodes.pins, pin), true
+	}
+	if nodes.expiresAt == 0 || v.ExpiresAt < nodes.expiresAt {
+		nodes.expiresAt = v.ExpiresAt
+	}
+	return nil
 }
 
 func consistentKMSIdentities(seen map[string]identity, ids []identity) error {
@@ -455,7 +493,7 @@ func validateKeys(ids []identity, refs []commitment, node, app, tlsHash string) 
 			return fmt.Errorf("unsupported identity role")
 		}
 	}
-	if !roles["node_signer"] || !roles["app_signer"] || !roles["tls"] {
+	if !roles["node_signer"] || (tlsHash != "" && !roles["tls"]) || (app != "" && !roles["app_signer"]) {
 		return fmt.Errorf("incomplete typed app identity")
 	}
 	return nil

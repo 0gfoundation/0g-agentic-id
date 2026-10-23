@@ -22,6 +22,13 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 使用同一 snapshot 绑定签名中的 provider 和 HTTP 连接。`GET /config` 同样刷新 snapshot，
 保持原 SDK 字段名。
 
+仅有 node identity，或已有合法 TLS metadata、尚未获取 `app_signer` 的 current 节点可保留为 standby，
+但不贡献服务 TLS pins，也不决定服务 lease；至少一个 current 节点必须具备完整服务身份。
+非法 metadata 仍会导致发现失败，所有已声明的非空 app signer 必须一致；runtime 还会
+核对其固定的预期 signer。
+对于其他验证均通过的旧 schema 节点，只有 Scan 未报告身份错误，且明确清空 typed
+identities、commitments 和 app signer 时，才视为 pending。
+
 API 和 worker 只初始化一次 `GetAppSigner`，随后并发验证自身身份和 AgenticID 实例授权，
 以及 sandbox 身份、链上授权及 pinned `/api/info`。两边查询均完成后，统一检查两边的
 lease 都还剩五秒以上。这一启动流程共用 180 秒预算，

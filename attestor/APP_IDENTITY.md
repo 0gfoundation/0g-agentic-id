@@ -24,6 +24,14 @@ authorized app/provider. A single-flight cache refreshes and repeats chain autho
 before its expiry. Each request signs against and connects with the same snapshot.
 `GET /config` refreshes that snapshot too, preserving existing SDK field names.
 
+A current node with only its node identity, or valid TLS metadata without
+`app_signer`, can remain a standby. It contributes neither service TLS pins nor the service lease;
+at least one current node must have a complete service identity. Invalid metadata
+still fails discovery, and every nonempty app signer must agree with the other
+declared signers (and with the runtime's fixed expected signer).
+An otherwise verified legacy-schema node is also pending only when Scan reports
+no identity error and explicitly clears its typed identities, commitments and app signer.
+
 API and worker initialize `GetAppSigner` once, then concurrently check their own identity
 and AgenticID instance authorization alongside sandbox identity, chain authorization and
 pinned `/api/info`. After both checks finish, both leases must still have more than five

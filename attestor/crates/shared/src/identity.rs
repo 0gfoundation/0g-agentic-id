@@ -447,15 +447,6 @@ fn validate_resolved(
             node.image_env == "prod",
             "production identity requires a production TEE image"
         );
-        let current: Address = node
-            .app_signer
-            .parse()
-            .map_err(|_| anyhow::anyhow!("app has no stable app_signer"))?;
-        anyhow::ensure!(
-            current != Address::ZERO && signer.is_none_or(|s| s == current),
-            "nodes disagree on app_signer"
-        );
-        signer = Some(current);
         let pin = node
             .tls_spki_sha256
             .strip_prefix("0x")
@@ -464,12 +455,27 @@ fn validate_resolved(
             pin.len() == 64 && hex::decode(pin).is_ok(),
             "app has no valid TLS SPKI pin"
         );
+        // A current standby can have acquired TLS before its stable signer.
+        // Validate its observation, but do not route service traffic to it.
+        if node.app_signer.is_empty() {
+            continue;
+        }
+        let current: Address = node
+            .app_signer
+            .parse()
+            .map_err(|_| anyhow::anyhow!("app has no valid stable app_signer"))?;
+        anyhow::ensure!(
+            current != Address::ZERO && signer.is_none_or(|s| s == current),
+            "nodes disagree on app_signer"
+        );
+        signer = Some(current);
         pins.push(pin.to_ascii_lowercase());
         expires = expires.min(node.expires_at);
     }
     pins.sort();
     pins.dedup();
-    Ok((signer.unwrap(), pins, expires))
+    let signer = signer.ok_or_else(|| anyhow::anyhow!("app has no ready stable app_signer"))?;
+    Ok((signer, pins, expires))
 }
 
 pub fn validate_https_locator(locator: &str) -> anyhow::Result<()> {
@@ -559,6 +565,7 @@ async fn attestor_descriptor(
         checked_at: identity
             .nodes
             .iter()
+            .filter(|node| !node.app_signer.is_empty())
             .map(|node| node.checked_at)
             .min()
             .unwrap(),
@@ -755,6 +762,45 @@ mod tests {
         assert_eq!(signer, Address::repeat_byte(3));
         assert_eq!(pins.len(), 2);
         assert_eq!(expiry, 1_200);
+    }
+    #[test]
+    fn tls_only_standby_does_not_contribute_service_pins_or_expiry() {
+        let mut r = response();
+        let mut standby = r.nodes[0].clone();
+        standby.node_signer = format!("{:#x}", Address::repeat_byte(4));
+        standby.app_signer.clear();
+        standby.tls_spki_sha256 = "cd".repeat(32);
+        standby.checked_at = 800;
+        standby.expires_at = 1_050;
+        r.nodes.insert(0, standby.clone());
+        let (signer, pins, expiry) = check(&r).unwrap();
+        assert_eq!(signer, Address::repeat_byte(3));
+        assert_eq!(pins, vec!["ab".repeat(32)]);
+        assert_eq!(expiry, 1_300);
+
+        r.nodes = vec![standby];
+        assert!(
+            check(&r).is_err(),
+            "TLS alone cannot authenticate a service signer"
+        );
+    }
+    #[test]
+    fn tls_only_standby_does_not_hide_invalid_or_conflicting_nodes() {
+        let mutations: [fn(&mut ResolvedAppNodeIdentity); 5] = [
+            |n| n.app_signer = "invalid".into(),
+            |n| n.app_signer = format!("{:#x}", Address::repeat_byte(9)),
+            |n| n.expires_at = 1_000,
+            |n| n.image_env = "dev".into(),
+            |n| n.tls_spki_sha256 = "bad".into(),
+        ];
+        for mutate in mutations {
+            let mut r = response();
+            let mut standby = r.nodes[0].clone();
+            standby.app_signer.clear();
+            mutate(&mut standby);
+            r.nodes.push(standby);
+            assert!(check(&r).is_err());
+        }
     }
     #[test]
     fn rejects_missing_conflicting_stale_or_wrong_scope_identities() {
