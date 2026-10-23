@@ -35,7 +35,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -127,6 +127,20 @@ export function compareVersions(a: string, b: string): number {
 export function hostOf(url?: string): string {
   if (!url) return 'unset';
   try { return new URL(url).hostname; } catch { return url.slice(0, 24); }
+}
+
+/**
+ * The task bare `/cancel` targets: the newest one still in flight. Statuses
+ * arrive live from the agent (the way /tasks fetches them); "unknown"
+ * (evicted or agent restarted) counts as not in flight — cancelling an
+ * unknown record would claim to stop something nobody can see. Exported for
+ * the tests: this is the re-attach story's decision core.
+ */
+export function cancelTarget(rows: { id: string; status: string }[]): { id: string } | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].status === 'queued' || rows[i].status === 'in_progress') return rows[i];
+  }
+  return null;
 }
 
 let knownAgentIds: string[] = [];
@@ -1828,7 +1842,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1868,6 +1882,12 @@ const L2_HELP_FULL = `session commands
                           survives dropped connections and keeps running
   /result [id]            re-attach to a task (default: latest): prints a
                           finished one, follows a running one live
+  /cancel [id]            stop a task (default: newest in flight) — the brake
+                          that works after a re-attach: Esc only cancels a
+                          turn THIS connection started, so after a dropped
+                          connection /cancel is the way to stop an orphaned
+                          task. A queued one is marked cancelled; a running
+                          one is stopped server-side
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
@@ -2165,7 +2185,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // (followTask starts at sequence 0), so don't pre-print the snapshot.
         // Esc here stops WATCHING only (the deliberate stop stays on the chat
         // turn's Esc / the task's cancel).
-        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task)\nagent> `);
+        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; /cancel stops it)\nagent> `);
         const ac = new AbortController();
         irq.streaming = ac;
         try {
@@ -2173,11 +2193,51 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out('\n');
         } catch (e) {
           out(ac.signal.aborted
-            ? '\n(stopped watching — the task continues; /result re-attaches, Esc during a chat turn cancels)\n'
+            ? '\n(stopped watching — the task continues; /result re-attaches, /cancel stops it)\n'
             : `\n(${(e as Error).message})\n`);
         } finally {
           irq.streaming = null;
         }
+        continue;
+      }
+      if (line === '/cancel' || line.startsWith('/cancel ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset before cancelling\n`); continue; }
+        // The re-attach gap: Esc only cancels a turn THIS connection started
+        // (s.currentTask); after a dropped connection the id is gone while the
+        // turn keeps running server-side (on the responses transport that
+        // survival is the feature). /cancel is the explicit brake: by id, or
+        // the newest in-flight task this session knows.
+        let id = line.split(/\s+/)[1];
+        if (!id && s.client?.task) {
+          if (!s.tasks?.length) { out('no task id given and none started from this session — /cancel <id>, or /tasks to list\n'); continue; }
+          const rows = await Promise.all(s.tasks.map(async (t) => {
+            const snap = await s.client!.task!(t.id).catch(() => null);
+            return { id: t.id, status: snap?.status ?? 'unknown' };
+          }));
+          const target = cancelTarget(rows);
+          if (!target) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
+          id = target.id;
+        }
+        if (id && s.client?.cancelTask) {
+          try {
+            const t = await s.client.cancelTask(id);
+            out(`⏹ cancel ${id} — ${t.status}\n`);
+          } catch (e) { out(`(cancel failed: ${(e as Error).message})\n`); }
+          continue;
+        }
+        if (id && !s.client?.cancelTask) {
+          // An id was asked for but this image has no task-level cancel: do
+          // NOT silently interrupt "whatever is running" instead — the id
+          // named a task, and openclaw/hermes turns die with the connection
+          // anyway, so there is nothing orphaned to brake here.
+          out('(this agent image has no task-level cancel — the bridge interrupt stops the current turn; on agents without the task surface turns stop when the connection drops)\n');
+          continue;
+        }
+        // Bare /cancel on an image without the task surface: same brake as
+        // Esc at the idle prompt.
+        if (!s.client?.interrupt) { out('(this agent image has no cancel path — /stop stops the whole container)\n'); continue; }
+        const r = await s.client.interrupt().catch((e) => { out(`(interrupt failed: ${(e as Error).message})\n`); return null; });
+        if (r) out(r.aborted ? '⏹ stopped the running task\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
         continue;
       }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
@@ -2296,7 +2356,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
-            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
+            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''}; /cancel ${s.currentTask ?? '<id>'} stops it)`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -2311,7 +2371,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // running through disconnects (only /v1/interrupt stops work), so
           // this is a lost window, not a failed task — say so instead of
           // crying failure, and route the user to the reattach paths.
-          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Follow it with /agentlog; send a message later to get results, or Esc/${'/'}reset to stop it)${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
+          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Re-attach with /result; follow it with /agentlog; /cancel to stop it)${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
           messages.push({ role: 'assistant', content: `${reply} [connection dropped mid-turn — task continued server-side]` });
           break;
         } else {
