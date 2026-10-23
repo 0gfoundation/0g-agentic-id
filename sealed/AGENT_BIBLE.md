@@ -134,7 +134,7 @@ To read the value at runtime, run `printenv AGENT_PUBLIC_URL` with your framewor
 
 Service exposure is a runtime capability, not a framework feature, and registering through the runtime is the ONLY attributable way to serve external callers. You run the backend; the runtime fronts and signs it. You decide the rest — language, port, what it does — so this is the contract, not a script.
 
-**The contract:** run an HTTP server bound to loopback, then POST your service list to `$SEAL_SIGN_SOCK/services` (the signing socket). Each entry is `{ path, method, description, input_example, backend }`. The runtime routes `${AGENT_PUBLIC_URL}<path>` to your `backend`, signs every response with `X-Agent-Proof`, and lists the service in `/hello` — that IS discovery; there is no manifest file. (`/hello` is where callers see *what* you offer; `/api/...` is where they *call* it.)
+**The contract:** run an HTTP server bound to loopback, then POST your service list to `$SEAL_SIGN_SOCK/services` (the signing socket). Each entry is `{ path, method, description, input_example, backend, transport? }`. The runtime routes `${AGENT_PUBLIC_URL}<path>` to your `backend`, signs every response with `X-Agent-Proof`, and lists the service in `/hello` — that IS discovery; there is no manifest file. (`/hello` is where callers see *what* you offer; `/api/...` is where they *call* it.)
 
 **Facts you can't infer, so hold them:**
 
@@ -143,6 +143,7 @@ Service exposure is a runtime capability, not a framework feature, and registeri
 - Your backend receives the **full registered path** (`/api/foo`, not `/`) — the runtime does not strip the prefix. Implement your handler at the path you registered.
 - POST is **overwrite**: send the complete list each time; `GET /services` reads it back. Registration is runtime state — re-register on boot; it's lost on rebuild. For capability that survives rebuild / transfer, package it under one of your framework's chain-tracked paths (see the injected persistent-state notes) and register its handler.
 - `input_example`, when set, must be valid JSON; the deploy console feeds it to a copy-ready `curl`, so a wrong one misleads callers.
+- `transport: "mcp"` marks the service as an MCP server endpoint: the backend speaks MCP streamable HTTP (JSON-RPC over POST), so an MCP-capable client can mount `${AGENT_PUBLIC_URL}<path>` as an MCP server and your tools become its tools — with every response still carrying `X-Agent-Proof`, the trust attribution a random MCP server cannot offer. MCP routes must be POST (the one-method-per-path pin; a stateless server — no server-initiated pushes — is the supported shape). Omit `transport` for a plain HTTP endpoint; any other value is rejected at registration.
 
 **Two hard limits (from the sovereignty rules):**
 
