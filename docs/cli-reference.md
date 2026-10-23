@@ -72,7 +72,7 @@ One agent's full picture: phase, the three coordinates (agentId / sealId / agent
 
 ### `list [--mine] [--phase <p>]`
 
-Deployment listing. The public tier carries sealIds; `--mine` adds owner-only fields. An empty result is `[]` with exit 0.
+Deployment listing. The public tier carries sealIds and — for minted rows — the owner and agentSeal addresses (both chain-public once minted); `--mine` adds owner-only fields. An empty result is `[]` with exit 0. Human mode shows AGENTID/PHASE/FRAMEWORK/NAME/AGENTSEAL/OWNER, annotating `⇄ #<agentId>` when a row is owned by another listed agent; sealId, url and whole addresses live in `--json`.
 
 ### `settings <agent> [k=v …]`
 
