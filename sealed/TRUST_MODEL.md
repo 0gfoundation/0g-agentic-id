@@ -643,7 +643,11 @@ abuse the sign socket + patch the rest through reputation."
 Beyond the framework auto-signatures (`report.Status` / `chain.Update` /
 `X-Agent-Proof` above), the agent itself can request signatures over
 the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
-`/sign/transaction`) so it can participate as a first-class Web3 actor:
+`/sign/transaction`) so it can participate as a first-class Web3 actor.
+In the DSH composition the socket is reachable only through the native
+tools (`seal_sign`, `seal_sign_typed_data`, `seal_sign_transaction` —
+one per endpoint, every call a structured session-log record); the
+other frameworks reach it however their own composition allows:
 
 - Call contracts that check `msg.sender == agent_seal_addr`
 - Emit off-chain claims tied to its TEE-attested identity
