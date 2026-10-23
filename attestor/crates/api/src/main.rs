@@ -32,25 +32,11 @@ async fn main() -> anyhow::Result<()> {
     // Attestor EOA key. MOCK_TEE=true uses env vars; false goes over local
     // gRPC to tapp-server's GetAppSigner.
     let tee = build_tee_provider(&cfg).await?;
-    let app_priv = tee.app_private_key().await?;
-    let app_signer = AdminSigner::from_priv(app_priv)?;
-    let attestor_identity = if cfg.mock_tee {
-        None
-    } else {
-        let identity =
-            attestor_shared::identity::AttestorDiscovery::new(&cfg, app_signer.address());
-        identity.snapshot().await?;
-        Some(identity)
-    };
-    let discovery = if !cfg.mock_tee && !cfg.mock_sandbox {
-        let discovery = attestor_shared::identity::SandboxDiscovery::new(&cfg)?;
-        let snapshot = discovery.snapshot().await?;
-        cfg.sandbox_provider_addr = Some(snapshot.provider);
-        cfg.sandbox_endpoint = snapshot.base_url.clone();
-        Some(discovery)
-    } else {
-        None
-    };
+    let identities =
+        attestor_shared::identity::initialize_for_startup(&mut cfg, tee.as_ref()).await?;
+    let app_priv = identities.app_private_key;
+    let attestor_identity = identities.attestor;
+    let discovery = identities.sandbox;
 
     // KMS master (app-scoped 32B secret). All three binaries must resolve
     // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value

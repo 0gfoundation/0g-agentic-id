@@ -6,8 +6,157 @@ use alloy::{
     providers::ProviderBuilder,
     sol,
 };
-use std::sync::Arc;
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
+
+pub const STARTUP_IDENTITY_TIMEOUT: Duration = Duration::from_secs(180);
+const STARTUP_IDENTITY_RETRY: Duration = Duration::from_secs(2);
+
+/// Initialize key material once, then wait for observations and authorization.
+/// The one deadline bounds initialization and every readiness attempt, including
+/// an RPC that accepts a connection but never returns.
+async fn initialize_then_wait<S, T, I, IFut, C, CFut>(
+    timeout: Duration,
+    retry_interval: Duration,
+    initialize: I,
+    mut check: C,
+) -> anyhow::Result<(S, T)>
+where
+    S: Clone,
+    I: FnOnce() -> IFut,
+    IFut: Future<Output = anyhow::Result<S>>,
+    C: FnMut(S) -> CFut,
+    CFut: Future<Output = anyhow::Result<T>>,
+{
+    anyhow::ensure!(
+        !timeout.is_zero() && !retry_interval.is_zero(),
+        "invalid identity startup wait durations"
+    );
+    let deadline = tokio::time::Instant::now() + timeout;
+    let state = tokio::time::timeout_at(deadline, initialize())
+        .await
+        .map_err(|_| anyhow::anyhow!("identity startup timed out during key initialization"))??;
+    let mut attempt = 0u32;
+    let mut last_error = "identity readiness was not observed".to_string();
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "identity startup timed out after {}s: {}",
+                timeout.as_secs_f64(),
+                last_error
+            );
+        }
+        attempt += 1;
+        match tokio::time::timeout_at(deadline, check(state.clone())).await {
+            Ok(Ok(ready)) if tokio::time::Instant::now() < deadline => return Ok((state, ready)),
+            Ok(Ok(_)) | Err(_) => {
+                anyhow::bail!(
+                    "identity startup timed out after {}s: {}",
+                    timeout.as_secs_f64(),
+                    last_error
+                );
+            }
+            Ok(Err(error)) => {
+                last_error = format!("{error:#}");
+                tracing::warn!(attempt, error = %last_error, "application identities not ready; waiting before startup");
+            }
+        }
+        let next = (tokio::time::Instant::now() + retry_interval).min(deadline);
+        tokio::time::sleep_until(next).await;
+    }
+}
+
+#[derive(Clone)]
+pub struct StartupIdentities {
+    pub app_private_key: [u8; 32],
+    pub attestor: Option<Arc<AttestorDiscovery>>,
+    pub sandbox: Option<Arc<SandboxDiscovery>>,
+}
+
+/// Both binaries share the same bootstrap order. No key fetch occurs inside the
+/// readiness retry, and no mock/manual endpoint is used after a production error.
+pub async fn initialize_for_startup(
+    cfg: &mut Config,
+    key_provider: &dyn crate::tee::TeeKeyProvider,
+) -> anyhow::Result<StartupIdentities> {
+    if !cfg.mock_tee {
+        validate_attestor_config(cfg)?;
+        if !cfg.mock_sandbox {
+            // Validate static sandbox discovery settings before acquiring any key.
+            SandboxDiscovery::new(cfg)?;
+        }
+    }
+    let (identities, connection) = initialize_then_wait(
+        STARTUP_IDENTITY_TIMEOUT,
+        STARTUP_IDENTITY_RETRY,
+        || async {
+            let app_private_key = key_provider.app_private_key().await?;
+            let signer = crate::sandbox::AdminSigner::from_priv(app_private_key)?.address();
+            Ok(StartupIdentities {
+                app_private_key,
+                attestor: if cfg.mock_tee {
+                    None
+                } else {
+                    Some(AttestorDiscovery::new(cfg, signer)?)
+                },
+                sandbox: if cfg.mock_tee || cfg.mock_sandbox {
+                    None
+                } else {
+                    Some(SandboxDiscovery::new(cfg)?)
+                },
+            })
+        },
+        |identities: StartupIdentities| async move {
+            let attestor = match &identities.attestor {
+                Some(identity) => Some(identity.snapshot().await?),
+                None => None,
+            };
+            let sandbox = match &identities.sandbox {
+                Some(identity) => Some(identity.snapshot().await?),
+                None => None,
+            };
+            // The second lookup can outlast the first identity's lease.
+            let now = chrono::Utc::now().timestamp();
+            anyhow::ensure!(
+                attestor.as_ref().is_none_or(|a| a.expires_at > now + 5)
+                    && sandbox.as_ref().is_none_or(|s| s.expires_at > now + 5),
+                "identity expired before startup readiness completed"
+            );
+            Ok(sandbox)
+        },
+    )
+    .await?;
+    if let Some(snapshot) = connection {
+        cfg.sandbox_provider_addr = Some(snapshot.provider);
+        cfg.sandbox_endpoint = snapshot.base_url.clone();
+    }
+    Ok(identities)
+}
+
+fn validate_attestor_config(cfg: &Config) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        cfg.tapp_socket
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty()),
+        "production identity resolution requires ATTESTOR_TAPP_SOCKET"
+    );
+    anyhow::ensure!(
+        cfg.app_id.as_deref().is_some_and(|s| !s.trim().is_empty()),
+        "ATTESTOR_APP_ID is required"
+    );
+    anyhow::ensure!(
+        cfg.chain_id != 0
+            && cfg.tapp_registry_addr != Address::ZERO
+            && cfg.agentic_id_addr != Address::ZERO,
+        "chain scope, TappRegistry and AgenticID are required"
+    );
+    let rpc = reqwest::Url::parse(&cfg.chain_rpc)?;
+    anyhow::ensure!(
+        matches!(rpc.scheme(), "http" | "https") && rpc.host_str().is_some(),
+        "ATTESTOR_CHAIN_RPC must be an HTTP(S) RPC URL"
+    );
+    validate_https_locator(&cfg.attestor_public_url)
+}
 
 sol! {
     #[sol(rpc)]
@@ -71,12 +220,17 @@ pub struct AttestorDiscovery {
 }
 
 impl AttestorDiscovery {
-    pub fn new(cfg: &Config, signer: Address) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(cfg: &Config, signer: Address) -> anyhow::Result<Arc<Self>> {
+        validate_attestor_config(cfg)?;
+        anyhow::ensure!(
+            signer != Address::ZERO,
+            "attestor app signer must not be zero"
+        );
+        Ok(Arc::new(Self {
             cfg: cfg.clone(),
             signer,
             cached: Mutex::new(None),
-        })
+        }))
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<AttestorTlsDescriptor> {
@@ -108,11 +262,14 @@ impl SandboxDiscovery {
             "production identity resolution requires ATTESTOR_TAPP_SOCKET"
         );
         anyhow::ensure!(
-            cfg.sandbox_app_id.as_deref().is_some_and(|s| !s.is_empty()),
+            cfg.sandbox_app_id
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
             "ATTESTOR_SANDBOX_APP_ID is required"
         );
         anyhow::ensure!(
-            cfg.sandbox_serving_addr.is_some() && cfg.tapp_registry_addr != Address::ZERO,
+            cfg.sandbox_serving_addr.is_some_and(|a| a != Address::ZERO)
+                && cfg.tapp_registry_addr != Address::ZERO,
             "SandboxServing and TappRegistry are required"
         );
         Ok(Arc::new(Self {
@@ -389,7 +546,96 @@ async fn attestor_descriptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tee::TeeKeyProvider;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tapp_grpc::proto::{ResolveAppIdentityResponse, ResolvedAppNodeIdentity};
+
+    #[tokio::test]
+    async fn startup_wait_retries_until_observation_is_ready() {
+        let mut attempts = 0;
+        let (state, ready) = initialize_then_wait(
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+            || async { Ok(7u8) },
+            |state| {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt < 3 {
+                        anyhow::bail!("Scan cache has not observed TLS yet");
+                    }
+                    Ok(state + 1)
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((state, ready, attempts), (7, 8, 3));
+    }
+
+    #[tokio::test]
+    async fn startup_wait_bounds_an_unresponsive_readiness_rpc() {
+        let error = initialize_then_wait(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || async { Ok(()) },
+            |()| std::future::pending::<anyhow::Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("identity startup timed out"));
+    }
+
+    struct CountingKeyProvider(AtomicUsize);
+    #[async_trait::async_trait]
+    impl TeeKeyProvider for CountingKeyProvider {
+        async fn app_private_key(&self) -> anyhow::Result<[u8; 32]> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok([1; 32])
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_wait_initializes_key_provider_only_once() {
+        let provider = CountingKeyProvider(AtomicUsize::new(0));
+        let mut attempts = 0;
+        let (key, ()) = initialize_then_wait(
+            Duration::from_secs(2),
+            Duration::from_millis(1),
+            || provider.app_private_key(),
+            |key| {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    assert_eq!(key, [1; 32]);
+                    if attempt < 3 {
+                        anyhow::bail!("business authorization is not ready");
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(key, [1; 32]);
+        assert_eq!(attempts, 3);
+        assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn startup_wait_also_bounds_unresponsive_key_initialization() {
+        let error = initialize_then_wait(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || std::future::pending::<anyhow::Result<()>>(),
+            |()| async { Ok(()) },
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out during key initialization"));
+    }
     fn response() -> ResolveAppIdentityResponse {
         ResolveAppIdentityResponse {
             success: true,

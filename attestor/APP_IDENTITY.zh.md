@@ -22,6 +22,13 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 使用同一 snapshot 绑定签名中的 provider 和 HTTP 连接。`GET /config` 同样刷新 snapshot，
 保持原 SDK 字段名。
 
+API 和 worker 只初始化一次 `GetAppSigner`，随后等待自身身份、AgenticID 实例授权，
+再验证 sandbox 身份、链上授权及 pinned `/api/info`。这一启动流程共用 180 秒预算，
+包含首次拿 key；每次就绪查询都受同一 deadline 限制，失败后间隔两秒重试。因此 Scan
+缓存尚未观察到新身份，或 operator 还在完成绑定时，不必立即重启进程。静态配置错误
+在拿 key 前拒绝；超时则启动失败，不使用过期身份、未授权 key 或手配地址回退。
+只有两方身份都就绪后才开放 HTTP、消费任务。显式 mock 模式继续跳过生产身份发现。
+
 ## AgenticID 1.2 合约迁移
 
 沿用 beacon/timelock 升级流程。Owner 随后：
@@ -52,6 +59,12 @@ registry 查询失败或 app owner 改变都会让绑定失效；新实例必须
 Scan 身份。nginx 在 TEE 内终止 TLS，再代理私有 API。
 普通 HTTP 端口仅绑定 loopback。tapp TLS key 改变后重新运行 tls-init 并重建 nginx。
 生产应在受测量 compose 中固定 tls-init/nginx image digest。
+
+首次部署时，先注册节点并启动 app，使其能请求并度量 TLS key 和 app signer。通过已验证
+evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 sandbox KMS service
+注册，启动等待即可继续。这些查询认证的是类型化 key acquisition 事件，不要求成功的
+`start_app` reconciliation，也不要求 attestor HTTP API 已监听。保留 TLS-init 完成依赖，
+不要反过来让 tapp 的 app 启动依赖 API 业务就绪。
 
 创建 sandbox 时，在所有其他环境变量之后强制覆盖 `ATTESTOR_TLS_DESCRIPTOR`、
 `ATTESTOR_URL` 和 `ATTESTOR_ALLOW_UNPINNED_DEV`。生产仅传递公开 scope、app 实例、

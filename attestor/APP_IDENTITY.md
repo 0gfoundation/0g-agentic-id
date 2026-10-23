@@ -24,6 +24,16 @@ authorized app/provider. A single-flight cache refreshes and repeats chain autho
 before its expiry. Each request signs against and connects with the same snapshot.
 `GET /config` refreshes that snapshot too, preserving existing SDK field names.
 
+API and worker initialize `GetAppSigner` once, then wait for their own identity and
+AgenticID instance authorization, followed by sandbox identity, chain authorization and
+pinned `/api/info`. This bootstrap has one 180-second budget, including the initial
+key fetch; every readiness attempt is bounded by that deadline and retried after two
+seconds. A stale Scan observation or a pending operator binding therefore need not
+restart the process. Invalid static configuration is rejected before key acquisition;
+timeout fails startup, with no expired identity, unauthorized key or manual-address
+fallback. HTTP serving and job consumption start only after both identities are ready.
+Explicit mock mode skips production identity discovery as before.
+
 ## AgenticID 1.2 contract migration
 
 Upgrade through the existing beacon/timelock procedure. The owner then:
@@ -59,6 +69,14 @@ API/worker wait for TLS-init before resolving their own Scan identity. nginx ter
 TLS inside the TEE and proxies to the private API. The plain API port
 is bound only to loopback. Refresh/recreate tls-init and nginx whenever tapp's TLS key
 changes. Pin the tls-init/nginx image digests in the production compose measurement.
+
+For a first deployment, register the node and start the app so it can request and
+measure its TLS key and app signer. Read the public app signer from verified evidence
+or Scan, complete the AgenticID binding above and the sandbox KMS service registration,
+and let the bounded startup wait finish. These observations authenticate typed key
+acquisition events; they do not require a successful `start_app` reconciliation or an
+already-listening attestor HTTP API. Keep the TLS-init completion dependency, without
+making tapp's app startup depend on API business readiness.
 
 Sandbox creation overrides `ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_URL` and
 `ATTESTOR_ALLOW_UNPINNED_DEV` after all other environment fields. Production supplies

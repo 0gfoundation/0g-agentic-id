@@ -34,25 +34,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Attestor EOA key (mock env or local tapp GetAppSigner).
     let tee = build_tee_provider(&cfg).await?;
-    let app_priv = tee.app_private_key().await?;
-    let app_signer = AdminSigner::from_priv(app_priv)?;
-    let attestor_identity = if cfg.mock_tee {
-        None
-    } else {
-        let identity =
-            attestor_shared::identity::AttestorDiscovery::new(&cfg, app_signer.address());
-        identity.snapshot().await?;
-        Some(identity)
-    };
-    let discovery = if !cfg.mock_tee && !cfg.mock_sandbox {
-        let discovery = attestor_shared::identity::SandboxDiscovery::new(&cfg)?;
-        let snapshot = discovery.snapshot().await?;
-        cfg.sandbox_provider_addr = Some(snapshot.provider);
-        cfg.sandbox_endpoint = snapshot.base_url.clone();
-        Some(discovery)
-    } else {
-        None
-    };
+    let identities =
+        attestor_shared::identity::initialize_for_startup(&mut cfg, tee.as_ref()).await?;
+    let app_priv = identities.app_private_key;
+    let attestor_identity = identities.attestor;
+    let discovery = identities.sandbox;
 
     // Resolve app-scoped key from KMS (same source as api).
     let kms = build_kms_client(&cfg).await?;
