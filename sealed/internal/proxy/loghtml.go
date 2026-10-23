@@ -4,17 +4,48 @@ import (
 	"fmt"
 	"html"
 	"net/http"
-	"os"
 	"regexp"
 	"strings"
 
 	"seal-verify/internal/logger"
 )
 
-// explorerBase is the 0G Galileo testnet block explorer; the rest of the
-// stack (dashboard, user UI) uses the same host. Hard-coded for v0 since
-// sealed runs a single chain; promote to env when we support multi-chain.
-const explorerBase = "https://chainscan-galileo.0g.ai"
+// explorerFor maps a chain id (decimal string) to its block explorer's base
+// URL. The same sealed image runs on more than one chain, so the host is
+// chosen at runtime from the chain the bootstrap client dialled. Only the 0G
+// chains this stack deploys to are known; any other id — or none yet, before
+// the chain client has dialled — yields "" and the log renders hex tokens as
+// plain text rather than linking to a guessed host.
+func explorerFor(chainID string) string {
+	switch strings.TrimSpace(chainID) {
+	case "16661": // 0G mainnet
+		return "https://chainscan.0g.ai"
+	case "16602": // 0G Galileo testnet
+		return "https://chainscan-galileo.0g.ai"
+	}
+	return ""
+}
+
+// SetChainID records the chain the bootstrap client dialled (decimal string),
+// which picks the explorer the HTML log pages link to. Late-bound like
+// SetAdapter: the pages are served before Phase 2 knows the chain.
+func (s *Server) SetChainID(chainID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chainID = chainID
+}
+
+// explorerBase is the explorer for this runtime's chain: the dialled chain id
+// if SetChainID ran, else the armed agent's serve-proof domain, else none.
+func (s *Server) explorerBase() string {
+	s.mu.RLock()
+	id := s.chainID
+	s.mu.RUnlock()
+	if id == "" && s.agent != nil {
+		id, _, _ = s.agent.ProofDomain()
+	}
+	return explorerFor(id)
+}
 
 // hexLine carries the parsed shape of one log entry for HTML rendering:
 // timestamp pulled out, body classified by leading tag, hex tokens turned
@@ -28,7 +59,8 @@ type hexLine struct {
 var tsPrefix = regexp.MustCompile(`^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]\s+`)
 
 // txHash matches 0x + 64 hex (block / tx / data hashes / storage roots).
-// addrHash matches 0x + 40 hex (eth addresses). Both link to chainscan.
+// addrHash matches 0x + 40 hex (eth addresses). Both link to the chain's
+// explorer when one is known (explorerFor).
 var txHashRe = regexp.MustCompile(`0x[0-9a-fA-F]{64}`)
 var addrHashRe = regexp.MustCompile(`\b0x[0-9a-fA-F]{40}\b`)
 
@@ -37,7 +69,7 @@ var addrHashRe = regexp.MustCompile(`\b0x[0-9a-fA-F]{40}\b`)
 // a dimmed column so they don't compete with the event content.
 func (s *Server) handleLogHTML(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, renderLogHTML("sealed bootstrap log", logger.Lines()))
+	fmt.Fprint(w, renderLogHTML("sealed bootstrap log", logger.Lines(), s.explorerBase()))
 }
 
 func (s *Server) handleAgentLogHTML(w http.ResponseWriter, r *http.Request) {
@@ -54,18 +86,19 @@ func (s *Server) handleAgentLogHTML(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	explorer := s.explorerBase()
 	logPath := s.getAgentLogPath()
 	if logPath == "" {
-		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{"agent log not available: framework adapter not resolved yet or no subprocess log path"}))
+		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{"agent log not available: framework adapter not resolved yet or no subprocess log path"}, explorer))
 		return
 	}
-	body, err := os.ReadFile(logPath)
+	body, err := readAgentLog(logPath)
 	if err != nil {
-		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{fmt.Sprintf("agent log not available: %v", err)}))
+		fmt.Fprint(w, renderLogHTML("agent log (unavailable)", []string{fmt.Sprintf("agent log not available: %v", err)}, explorer))
 		return
 	}
 	lines := strings.Split(strings.TrimRight(string(body), "\n"), "\n")
-	fmt.Fprint(w, renderLogHTML("agent log", lines))
+	fmt.Fprint(w, renderLogHTML("agent log", lines, explorer))
 }
 
 // parseLine splits the leading timestamp prefix from the rest and picks
@@ -83,11 +116,15 @@ func parseLine(line string) hexLine {
 }
 
 // linkifyHex turns 64-hex (tx/dataHash) and 40-hex (address) tokens into
-// explorer links. Display text is truncated to 0x<head6>...<tail4> so the
-// log stays readable; full hex stays in the href + title attribute so
+// links under explorerBase. Display text is truncated to 0x<head6>...<tail4>
+// so the log stays readable; full hex stays in the href + title attribute so
 // click-to-copy / hover still surfaces it. Operates on already-escaped
-// HTML, hence the manual rebuild rather than naive html.EscapeString.
-func linkifyHex(escaped string) string {
+// HTML, hence the manual rebuild rather than naive html.EscapeString. An
+// empty explorerBase (unknown chain) leaves the text untouched.
+func linkifyHex(escaped, explorerBase string) string {
+	if explorerBase == "" {
+		return escaped
+	}
 	escaped = txHashRe.ReplaceAllStringFunc(escaped, func(h string) string {
 		short := h[:8] + "..." + h[len(h)-4:]
 		return fmt.Sprintf(`<a class="hex" href="%s/tx/%s" target="_blank" rel="noopener" title="%s">%s</a>`, explorerBase, h, h, short)
@@ -104,7 +141,7 @@ func linkifyHex(escaped string) string {
 // and the user pulls updates with the header "Refresh" button. A 3s
 // meta-refresh used to make the page unreadable — the constant reload, plus
 // a forced jump to the bottom, defeated any attempt to scroll back up.
-func renderLogHTML(title string, lines []string) string {
+func renderLogHTML(title string, lines []string, explorerBase string) string {
 	var b strings.Builder
 	b.Grow(len(lines)*120 + 1024)
 	b.WriteString(`<!doctype html><html><head><meta charset="utf-8">`)
@@ -126,7 +163,7 @@ func renderLogHTML(title string, lines []string) string {
 		b.WriteString(html.EscapeString(l.ts))
 		b.WriteString(`</span>`)
 		b.WriteString(`<span class="body">`)
-		b.WriteString(linkifyHex(html.EscapeString(l.body)))
+		b.WriteString(linkifyHex(html.EscapeString(l.body), explorerBase))
 		b.WriteString(`</span></div>`)
 	}
 	b.WriteString(`</div>`)

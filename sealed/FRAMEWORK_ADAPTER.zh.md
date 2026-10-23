@@ -83,7 +83,10 @@ sealed 的五个组件各自通过一个窄切面消费它:
   版本;框架 shim 或 bridge 如果有,`go:embed` 在 sealed 二进制里、Start
   时落盘(已下线的 claudecode bridge 和 prime-agent 的 HTTP bridge 都是这
   个模式),这样它的度量跟着 sealed 镜像哈希走。接入一个我们已有生态的新
-  框架不需要新镜像,顶多加一行热缓存;新生态则需要。
+  框架不需要新镜像,顶多加一行热缓存;新生态则需要。这是设计意图;今天实际发布
+  的并非如此:openclaw 跑在 `sealed/Dockerfile` 上(FROM `images/openclaw/`
+  base),同样是 node 的 dsh 有自己的 `images/dsh/`,`images/sealed/` 不构建任何
+  实际发布的镜像。
 
 - **owner 的配置从头到尾归 core,只剩最后一步归你。** attestor 把 owner 的
   settings 文档当不透明 blob 存着,并在 `/provision` 响应里下发——用 ECIES
@@ -135,8 +138,9 @@ sealed 的五个组件各自通过一个窄切面消费它:
 | `SettleDelayer` | `SettleDelay()` | bootstrap 基线采集 | 保守的 5s 默认值 |
 | `LegacySettingsSeeder`(过渡性) | `SeededSettings()` | bootstrap,Phase C 的 `HandleLegacy` 轮之后 | settings 通道之前铸造的 agent 拿不回自己的 pin(§5.5 *迁移*) |
 | `ConversationSession` | `ConversationHeaders()` / `ObserveConversation(h)` | 有状态 responses 门的上游调用 | 框架没有按会话身份持有服务端对话(见 `CONVERSATION.md`) |
-| `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门用 harness 自己的存储替换客户端发的历史 | 客户端历史继续原样转发 |
+| `ConversationHistory` | `ConversationHistory(ctx)` | 有状态 responses 门丢掉客户端发的历史:先发这里返回的历史,再只发客户端的当前轮。网关自己会重放会话时返回空(openclaw)——再叠客户端的历史,模型会看到两遍 | 客户端历史继续原样转发 |
 | `SessionClearer` | `ClearSession(ctx)` | `POST /_seal/clear`(owner 签名)+ CLI `/clear`,随后进程重启 | 该路由答 501——历史在客户端侧,服务端无可清 |
+| `SessionCompactor` | `CompactSession(ctx) (note string, err error)` | `POST /_seal/compact`(owner 签名、同一时间只跑一个、拒绝重放、与 synth 门上的一轮永不重叠)+ CLI `/compact`:立刻运行框架**自己的**压缩,不重启;note 展示给 owner。框架暂时拒绝(忙、会话已变)时包装 `framework.ErrCompactRefused`——owner 收到可重试的 409,而不是失败;已安装的框架版本缺少你的 adapter 用来触发压缩的东西时(openclaw 2026.7.1 之前没有 `sessions compact` 这条 CLI 命令),包装 `framework.ErrCompactUnsupported`——答 501,和没实现这个接口一样 | 该路由答 501——无法从外部让该框架压缩 |
 
 实现了哪个就写哪个的编译期断言(`var _ framework.VersionReconciler = (*Adapter)(nil)`)——可选接口
 悄悄没实现 = 功能悄悄关闭。
@@ -174,17 +178,17 @@ sealed 的五个组件各自通过一个窄切面消费它:
 
   | Adapter | Roles | 配置文件,以及它从哪来 |
   |---|---|---|
-  | openclaw(`openclaw.go:146`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
-  | hermes(`hermes.go:121`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
-  | prime-agent(`prime.go:135`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
-  | dsh(`dsh.go:145`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——桥进程的环境变量 |
+  | openclaw(`openclaw.go:164`) | `framework`、`workspace/`、`workspace/skills/`、`workspace/canvas/` | `~/.openclaw/openclaw.json`,每次 spawn 重新渲染 |
+  | hermes(`hermes.go:143`) | `framework`、`SOUL.md`、`memories/`、`skills/` | `~/.hermes/config.yaml`,每次 spawn 重新渲染 |
+  | prime-agent(`prime.go:162`) | `framework`、`harness_state.json`、`APPEND_SYSTEM.md`、`skills/` | `~/.prime/agent/models.json`,每次 spawn 重新渲染 |
+  | dsh(`dsh.go:153`) | `framework`、`APPEND_SYSTEM.md`、`skills/` | 没有——桥进程的环境变量 |
 
   `openclaw.json`、`config.yaml`、`models.json`、`settings.yaml` 曾经都是
   role,直到 owner 的 settings 文档成为推理 pin 的持久归宿。把一个派生产物
   锚在链上,等于把 mint 时的副本还给一个配置早就变过的 agent——这正是
   mint 之后发布的每个修复(有界推理、目录预算、watchdog 余量、模型 idle
   超时)统统止步于 mint 时那份副本的原因
-  (`openclaw/inference.go:14-30`)。改成每次 spawn 从文档渲染这个文件,
+  (`openclaw/inference.go:28-44`)。改成每次 spawn 从文档渲染这个文件,
   同一个修复就能在下一次 Start 到达每个 agent。
 - **`framework` role 是协议保留的。** 每个 adapter 必须把它声明为
   `Leaf`,plaintext 是 binding JSON:
@@ -285,8 +289,10 @@ uploader 负责填指针(`content_hash` 没变的条目复用旧指针),填好�
 ### 5.1 身份:`Name`、`Version`
 
 `Name()` 是静态 adapter id,必须等于 `framework` binding JSON 里的
-`name` 字段。`Version(ctx)` 是 best-effort 运行时探测(可以 exec
-CLI);当前(未)接线状态见 §2.2。
+`name` 字段。`Version(ctx)` 是对已安装版本的 best-effort 探测:静态读取
+(一个 `package.json`、checkout 里的版本文件),绝不运行框架 CLI,因为
+sealed 以 root 运行而 root 不运行任何框架 CLI(§11 第 7 步);当前(未)
+接线状态见 §2.2。
 
 ### 5.2 恢复方向:`Restore`、`RestoreEntry`
 
@@ -360,7 +366,7 @@ hermes → `SOUL.md`,prime 和 dsh → `APPEND_SYSTEM.md`)。忽略 `persona`
 settings 文档(§5.5),`RenderSettings` 会在每次 spawn 前从它重建框架配置,
 所以摄入写下去的东西过一会就被覆盖。留一份副本只会制造第二个真相源,而且
 恰恰在文档为空的那些开机上,陈旧的那份会赢。所以 prime 和 dsh 只把种子里的
-pin 记进日志、不落盘(`prime/persona.go:108-129`、`dsh/persona.go:118-130`);
+pin 记进日志、不落盘(`prime/persona.go:114-135`、`dsh/persona.go:123-135`);
 openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent 有意义
 (`hermes/ingest.go:51-55`)。框架无法兑现种子的某部分时,记日志、保留自己
 的默认值,不要写下框架解析不了的配置。
@@ -395,7 +401,7 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 一起被静默跳过——hermes 和 dsh 都犯过(`inference/zgcompute.go:57-65`)。Facts
 对每个 provider 都适用;只有 `Endpoint` 以"是否平台路由"为门。
 
-两个 accessor 封装了你不该自己重造的 gating:
+三个 accessor 封装了你不该自己重造的 gating:
 
 - `s.Effort() (level string, decided bool)` —— **三种结果,合并任意两种都是
   线上 bug。** `("high", true)`:照这个级别写。`("", true)`:**清掉**任何级别,
@@ -407,7 +413,17 @@ reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 - `s.PersistableMaxTokens() int` —— 返回 0 表示"什么都别写"。只要 facts 不是
   目录来源就返回 0,因为目录故障期间写进磁盘的启发式 8192 从此看起来像手工设定,
   会把推理模型"思考 + 回复"共享的预算长期饿死(agent 404 实测:三个约 6 分钟的
-  回合,`textLen=0` —— `prime/modelsjson.go:28-36`)。
+  回合,`textLen=0` —— `prime/modelsjson.go:37-46`)。
+- `s.RequestMaxTokens() int` —— 配置成框架每次请求的 `max_tokens` 的预算:即
+  `PersistableMaxTokens()` 封顶到 `settings.RequestOutputCeiling`(32768),同样以 0
+  表示"什么都别写"。凡是每次请求都会发出去的东西,用它,别用目录原值:目录的
+  `max_completion_tokens` 是能力上限,凡是服务端按"prompt + 预算"对照上下文窗口
+  做检查的地方,它都可能占掉窗口的大半(见 `CONFIG_SURFACE.zh.md` §3.2)。0 有两种
+  含义,靠 `s.Facts.CatalogSourced` 区分:目录没连上——和 `Effort()` 的
+  `("", false)` 一样,是"不知道",不是"清掉"——或者目录回答了、但这个模型没有预算,
+  那就没有什么要保留的。**原地编辑**文件的 render 还须删掉它为别的模型写下的预算,
+  否则换到输出上限更低的模型后每个请求都会失败(hermes `spawn.go`:同一模型遇目录
+  故障时保留,模型变了或目录没给预算时删除)。
 
 #### 规则一 —— 幂等
 
@@ -447,7 +463,7 @@ sealed 编出来、看上去像手工设定的数字
 拥有这些字节还有一个后果:**pin 要从你渲染出来的东西里读回,而不是从你写出去的
 那个文件里读。** hermes 的 `Start` 从渲染时存下的 `Resolved` 取 provider/model,
 没渲染过就硬失败——因为 `config.yaml` 已经不是链上追踪的 role、而是这个方法的
-产物,再读回来等于让 agent 改一下文件就能重定向推理(`hermes/spawn.go:51-58`)。
+产物,再读回来等于让 agent 改一下文件就能重定向推理(`hermes/spawn.go:53-60`)。
 
 #### 三样东西绝不能从 owner 的 overlay 里来
 
@@ -459,7 +475,7 @@ sealed 编出来、看上去像手工设定的数字
    是渲染自己会写的键;凡是渲染不写的键,就从 overlay 里丢掉并在日志里说明。
 2. **推理凭据。** hermes 把 key 写进磁盘上的 `model.api_key` 而不是走 env,因为
    它的 `custom` provider 声明 `env_vars=()`,只从这个键读 key——用 env 注入实测
-   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:163-170`)。
+   会拿到 router 的 401,hermes 是空着 key 去拨的(`hermes/spawn.go:165-172`)。
    这个键由平台每次渲染写入,并且在文档没给凭据时**删除**:不删的话,一次切到
    框架内置 provider 的开机会把上一次的 0G router key 留在盘上,交给现在占着这
    一节的那个 provider。老的"采集路径上剥密钥"这道防线随 role 一起没了——已经
@@ -521,7 +537,7 @@ dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、
 (§5.4)——而可选的 `SeededSettings() (settings.Doc, bool)` 就是 adapter 把回收
 到的文档交还给平台的方式。`main.go` **只在**已存文档没有 model 时才问它,所以
 真正的 owner 文档永远压过回收来的那份;拿到后用 `report.SeedSettings` 持久化
-(`main.go:583-608`)。
+(`main.go:649-677`)。
 
 时机就是全部意义所在。uploader 会按 `Roles()` 重建链上条目表并整体替换提交,所以
 watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那之前 pin 没被读出来
@@ -534,10 +550,10 @@ watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那
 无论如何跑在回收到的 pin 上,下次开机再试。
 
 今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role
-(`dsh/settings.go:280-332`)。openclaw、hermes、prime 都没实现,所以这三个上面
+(`dsh/settings.go:286-338`)。openclaw、hermes、prime 都没实现,所以这三个上面
 的"通道之前"的 agent 会用 attestor 已经存着的那份文档开机;prime 的
 `HandleLegacy` 把这件事写得明明白白,并称把这些 pin 抬进文档"是平台的活",尚未
-落地(`prime/persona.go:108-129`)。你的框架曾经有过链上追踪的 pin 就实现它;等
+落地(`prime/persona.go:114-135`)。你的框架曾经有过链上追踪的 pin 就实现它;等
 到线上不再有 agent 带着旧 role,就删掉。
 
 ### 5.6 进程生命周期:`Start`、`Stop`、`Liveness`、`Readiness`、`MonitorExit`
@@ -640,6 +656,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 | `SealSignSock` | `/run/seal-sign.sock` | agent 专用签名端点(§8);告诉你的 agent 它在哪 |
 | `AgentSeal` | 从 `agent_seal_priv` 公钥派生的 0x 地址 | agent 的 TEE 身份地址 |
 | `AgentID`、`Owner`、`ChainRPC`、`ContractAddr`、`ChainID`、`AttestorURL` | 链上 bootstrap 输出 | 公开链上事实,不是秘密;注入 agent 的 context 让它能推理自己的身份 |
+| `VerifiedFeedbackAddr` | 来自 `VERIFIED_FEEDBACK_ADDR` 的 VerifiedFeedbackRegistry proxy 地址;未设置、格式错误或为零地址,或其 `getIdentityRegistry()` 不是 `AGENTIC_ID_ADDR` 时为空 | serve-proof 的 validator(EIP-191 version `0x00`)。由 sealed 自己拿它签名——adapter 无需处理;为空 ⇒ 任何路由都不带 `X-Agent-Proof` |
 | `SealedVersion` | sealed 二进制的 git hash | 用于 proof/元数据表面 |
 | `FrameworkHash` | sealed 镜像的 `"0x"+sha256` | 签进 serve-proof 的 AgenticID Framework code hash |
 
@@ -653,7 +670,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
 `Provider`、`Model`、`ZGComputeRouted`、`OwnerThinking` 还在结构里,但都是死的。
 凭据和 pin 一律从 `settings.Resolved` 取——读 `RuntimeContext.APIKey` 正是那个
 "平台路由的 endpoint 被空着 key 拨出去、线上 401"的缺陷
-(`openclaw/spawn.go:253-259`、`dsh/spawn.go:222-225`)。
+(`openclaw/spawn.go:335-342`、`dsh/spawn.go:225-228`)。
 
 剩下的拿来做什么是 adapter 的策略,但 openclaw adapter 是参考实现:它往
 agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY)、
@@ -666,21 +683,34 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 
 这些是白送的;设计你的框架的对外表面时按它们的存在来假设:
 
-- **`:8080` 签名反向代理** ——每个响应(健康/日志端点除外)都带
-  `X-Agent-Proof` 头:`agent_seal_priv` 对 canonical envelope 的
-  EIP-191 签名,envelope 含每个 role 的 `content_hash` + `data_hash`。
-  你的上游只需在 localhost 上提供明文 HTTP;WebSocket 升级不签名直通。
+- **`:8080` 签名反向代理** ——签名路由上的响应(runtime 自己的端点如
+  `/hello`,以及 agent 注册的 `/api/*` 服务)都带 `X-Agent-Proof` 头:
+  `agent_seal_priv` 以 EIP-191 version `0x00` 对 ServeProof 的签名,
+  绑定 VerifiedFeedbackRegistry(`VERIFIED_FEEDBACK_ADDR`)。你的框架
+  声明的路由(chat/UI)、健康/日志端点和 WebSocket 升级都不签名。
+  envelope 是扁平的:`agent_id`、`submitter`、`timestamp`、`deadline`、
+  `task_hash`、一个由链上存储 root 组成的 `data_hashes` 列表、
+  `framework_hash`,以及仅供诊断的 `validator`。它不带 `content_hash`,那个只留在内部做 drift 检测。
+  没有可用的 `VERIFIED_FEEDBACK_ADDR`(已设置、且在链上锚定到 `AGENTIC_ID_ADDR`)
+  时不发这个头。你的上游只需在
+  localhost 上提供明文 HTTP。
 - **`GET /hello`** ——签名的自我介绍:agent 身份、当前 `data_hashes`、
   `public_url`,以及(如果 agent 通过 `POST $SEAL_SIGN_SOCK/services`
   注册过)agent 自声明的服务列表。
 - **`POST /_seal/auth`** ——§5.7 的 owner 鉴权流程。
 - **`unix:///run/seal-sign.sock`** ——`POST /sign/personal_sign`、
   `/sign/typed_data`、`/sign/transaction`;仅容器内可达。agent 就是
-  靠它以 AgentSeal 身份签名而永远不持有私钥。socket 本身只是传输——
-  *拒签政策活在 agent 的教义里*(见
-  [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));你的 adapter 应该
-  装一套等价于 openclaw SOUL 规则的东西,让来自外部 prompt 的签名
-  请求被拒绝。
+  靠它以 AgentSeal 身份签名而永远不持有私钥。socket 自己只强制一条
+  不变量:只签 `0x19 0x45` personal message、`0x19 0x01` EIP-712
+  digest 和它从字段组装的交易,永不签裸 hash 或 EIP-191 version
+  `0x00` 数据(serve-proof 所在的域;见
+  [TRUST_MODEL.zh.md](TRUST_MODEL.zh.md))。除此之外,*拒签政策活在
+  agent 的教义里*(见 [AGENT_DOCTRINE.zh.md](AGENT_DOCTRINE.zh.md));
+  你的 adapter 应该装一套等价于 openclaw SOUL 规则的东西,让来自外部
+  prompt 的签名请求被拒绝。如果你的 adapter 把 socket 桥接成 agent
+  工具(像 dsh 的 `seal_sign` 那样),它只能转发到这几个端点,**绝不**
+  能加裸 hash 或 `0x00` 签名路径。任何一条都会让 agent 能伪造
+  serve-proof。
 - **`/log`、`/log.html`、`/log/agent`(`.html`)** ——bootstrap 和
   子进程的实时日志。把框架的 stdout/stderr 落到文件并实现
   `framework.SubprocessLogProvider`,子进程日志页就会点亮
@@ -703,7 +733,7 @@ agent 的 context 文件里注入 marker 包裹的段——身份事实(IDENTITY
 - [ ] `RenderSettings` 幂等——同一份 `Resolved` 渲染两次字节相同,目录故障的开机也一样。
 - [ ] `RenderSettings` 先合并 owner 的 `framework` overlay,再把平台自有的键写在上面;没有任何平台值靠排除清单来守。
 - [ ] `RenderSettings` 对 owner 或 agent 写的任何东西都不返回错误——它在每次 spawn 前跑,报错就等于一个起不来的 agent。
-- [ ] 平台键只在平台真的知道时才写:`Effort()` 的三种结果保持三种,`PersistableMaxTokens() == 0` 意味着什么都不写,而不是写个猜测。
+- [ ] 平台键只在平台真的知道时才写:`Effort()` 的三种结果保持三种,`RequestMaxTokens() == 0` 意味着什么都不写,而不是写个猜测。每次请求的输出预算用 `RequestMaxTokens()`,绝不用目录原值——原地编辑的文件要删掉为别的模型写下的预算。
 - [ ] per-boot 凭据、以及平台自己拥有的 provider 块,都不能从 overlay 供给。
 - [ ] `Start` 从 `RenderSettings` 存下的东西取 pin,绝不重新解析它写出去的文件。
 - [ ] Restore 跨 role 可交换、单 role 幂等。
@@ -739,9 +769,9 @@ func TestConformance(t *testing.T) {
 
 套件结构性强制的两条血泪规则:
 
-- **stub 掉外部探测。** `EvolutionFor` 里的任何 CLI 探测必须是可替换
-  的包级 var——否则测试机 PATH 上真实存在的 `claude`/`openclaw` 会
-  漏进 round-trip 结果。
+- **stub 掉外部探测。** `EvolutionFor` 里的任何外部探测(静态版本读取)
+  必须是可替换的包级 var——否则测试机上真实安装的 `openclaw`/`hermes`
+  会漏进 round-trip 结果。
 - **fixture 必须是 canonical 字节。** leaf fixture 与 `EvolutionFor`
   输出做字节级比较,所以要按你的 adapter 的 canonical 编码写(紧凑
   JSON、键排序)。
@@ -811,6 +841,119 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
    镜像(`images/openclaw/`),不是通用镜像;本条指令针对的是
    `images/sealed/` 这个通用镜像目标,在你的部署把它作为 base
    发布之后才落到实处。)
+   实际构建线上镜像的那个 Dockerfile 必须创建 `agent` 用户
+   (`RUN if id -u agent >/dev/null 2>&1; then usermod --home /home/agent
+   agent; else useradd --system --no-create-home --home-dir /home/agent
+   --shell /usr/sbin/nologin agent; fi`;在已带该用户的 base 上,它改为把该账户的
+   家目录指向 `/home/agent` —— 从账户数据库而不是 `HOME` 取家目录的工具(ssh、
+   走 ssh 的 git)依赖这一点,不一致时 sealed 会在启动时记一条日志;`/home/agent`
+   由 sealed 自己创建)并以 root 运行 sealed,你的 `Start` 必须经
+   `privsep.AgentCommand`(内部会应用 `privsep.Drop`)起进程。没有可用的
+   `agent` 账户 —— 缺失,或映射到 uid/gid 0 —— 或 sealed 无法把 root 家目录
+   收紧为仅 root 可写、无法创建 agent 的家目录时,sealed 会拒绝 provision
+   (`privsep.Required`,它的错误写明原因和修法),该镜像上的部署一个都上不了线(显示为 `offline`)
+   —— 这是有意的:白名单钉的是 hash,不是构建内容。镜像还必须保持工具链归
+   root 所有:sealed 按名字解析的每个命令 —— 以 root 经 `RootCommand` 运行的
+   (npm、git、uv、0g-storage-client),以及以 agent 经 `AgentCommand` 和
+   `Sweep` 运行的(你的框架 CLI、node、pkill)—— 都必须位于整条解析后路径
+   都归 root 所有、且他人不可写的 PATH 目录里,二进制本身也必须归 root 所有。
+   release tarball 和 nvm 以 root 解压时会还原它们构建时的 uid,所以随仓库的
+   Dockerfile 用 `tar --no-same-owner` 解压,或对工具链目录树做
+   `chown -h 0:0`,然后在某个所需命令不满足条件时让构建失败(见 QUIRKS.md)。
+   否则 `Start` 会以 `not found in a root-only PATH directory` 失败,`Sweep`
+   退化成一行日志,启动日志里会列出被拒绝的 PATH 条目
+   (`privsep: PATH entry not used ...`)。agent 进程是你的 adapter 以 root 身份
+   所做一切的不可信输入,所以 adapter 契约还要求:
+   - **绝不移交 `$HOME`;把你的目录树链接进 agent 的家目录。** agent 有自己
+     的家目录 `/home/agent`,它是 agent 运行的一切进程的 `HOME`,也是
+     `AgentCommand` 的默认工作目录(spawn 可以把另一个 agent 拥有的目录设为
+     `Dir`,prime 和 dsh 的 bridge 就设成各自的框架目录树);`/root` 保持
+     `root:root 0711`。只对你的框架目录树调用 `privsep.OwnTree`(它会拒绝
+     `/`、root 家目录、任何 PATH 目录或 sealed 可执行文件的祖先目录,以及
+     sealed 状态目录里、或 sealed 所运行二进制的包目录里的任何东西),再调用
+     `privsep.LinkAgentHome(".<框架>", <你的目录树>)`,让你的 `FrameworkFacts`
+     告诉 agent 的 `~/...` 路径仍然指向那棵树;并在你的 `New` 里声明你交出的
+     每棵目录树(`privsep.DeclareTree`):启动时 sealed 会把 `/root` 里可能被
+     其他 uid 改过的东西(按属主、权限位或 POSIX ACL 判断)移走,只有声明过的
+     目录树除外(框架以前直接放在 `/root` 里、现在要放进某棵声明过的目录树的
+     条目,可以改为移到那里,`privsep.DeclareRelocation`,prime 的 session
+     artifacts 就是这样);位于 `/root` 和一棵声明在更深处的目录树之间的目录
+     (prime 的 `/root/.prime`,在 `/root/.prime/agent` 之上)留在原处,但会被
+     改为 root 所有。在 spawn 环境里放
+     `HOME=` + `privsep.AgentHome()`,并且也在那里点名这棵树:用你的框架取家
+     目录或状态目录的那些变量(`HERMES_HOME`、`DSH_HOME`、
+     `PRIME_AGENT_CODING_AGENT_DIR`;openclaw 则是 `OPENCLAW_STATE_DIR` 和
+     `OPENCLAW_HOME` 两个),设为 `/root` 下的绝对路径,让框架推导的任何路径都
+     不经过 `HOME`;对白名单里的每个版本都要核实(openclaw 2026.5.x 从
+     `OPENCLAW_HOME` 推导 exec approvals 文件,2026.7.1 从
+     `OPENCLAW_STATE_DIR`;见 QUIRKS.md),也要核实框架的插件:它们可能不管
+     这些变量,从 `HOME` 取默认位置(openclaw 的 memory-wiki vault 和
+     file-transfer 审计日志,经 `~/.openclaw` 链接):有配置键的,把这个位置
+     钉进渲染出的配置;没有的,告诉 agent。还要核实这样的变量另外改变了什么:
+     openclaw 核心展开的 `~` —— 配置里取路径值的键中的、它的媒体工具收到的
+     路径里的 —— 取自 `OPENCLAW_HOME`,所以那里的 `~/x` 指 `/root/x`,而 agent
+     在它的目录树之外什么都建不了;它的渲染会把属主给的 `~/x` 和 `/root/x`
+     agent 路径改写到 agent 的家目录,它的 `FrameworkFacts` 也告诉 agent 在那里
+     用绝对路径(见 QUIRKS.md)。只有没有变量能管到的路径才钉进渲染
+     出的配置:一个配置键可能不只代表一条路径(openclaw 的
+     `agents.defaults.workspace` 同时是其他所有 agent 的基准目录)。链接只是给
+     agent 的便利,只靠它找到状态的框架会跟着 agent 把它指向的地方走(openclaw
+     还会在路径经过符号链接时拒绝运行它的 exec 工具,在 workspace 经符号链接
+     时拒绝它受保护的追加写,见 QUIRKS.md)。sealed 自己
+     的代码继续使用绝对路径,从不解析这个链接。
+   - **用 `AgentCommand` 起进程;root 只通过 `RootCommand` 执行命令,且
+     绝不运行框架 CLI。** 读取 agent 可写状态的 CLI(配置校验、import
+     探测)以 agent 身份运行,用带截止时间的 context,经
+     `privsep.BoundedOutput` 收集输出;版本探测是静态读取;只有必须写 root
+     所有前缀的工具链命令才以 root 运行,且经 `RootCommand`,并且它们的环境
+     变量必须让它们碰不到你的框架目录树(openclaw 的安装正是为此把
+     `OPENCLAW_HOME` 设为一个仅 root 可访问的目录);你往 root 命令环境里
+     追加的只能是固定值,且不指向任何 agent 可写的路径,它的工作目录只能经
+     `privsep.RootDir` 设定 —— 不是仅 root 可访问的目录会被拒绝。不要在
+     privsep 之外构造或改动命令的身份:不构造 `exec.Cmd`、`SysProcAttr` 或
+     `Credential` 值,不引用命令的 `SysProcAttr` 或 `Credential`,不给它的
+     `Path`、`Args`、`ExtraFiles` 赋值,不取这些字段或它的 `Env`、`Dir` 的
+     指针,不复制它的 `Args`、`Env`、`ExtraFiles` 切片(副本与命令共用底层
+     数组),也不用 `unsafe` 或 `reflect`(`reflect.DeepEqual` 除外)从别的
+     途径碰到它们。命令只交给本模块里把它当作命令接收的代码 —— 绝不交给
+     模块之外的函数(`json.Unmarshal` 这类基于反射的解码器会设置它的字段)、
+     接口或函数值。结构测试按类型检查以上全部:每个包都对照 `os/exec` 做类型
+     检查,所以无论命令从哪里来、文件导入了什么,字段是不是命令的都看得出来
+     (`rootside_types_test.go`;`TestRootSideGuardFlagsEveryForbiddenShape`
+     用预置的代码跑这些规则)。
+   - **框架目录树里的所有文件访问都经 privsep 的 fs 辅助函数**
+     (`ReadFile`、`ReadDir`、`Lstat`、`Open`、`WriteFile`、`WriteFileFrom`、
+     `MkdirAll`、`EnsureDir`、`Remove`、`RemoveAll`、`Rename`);跳过
+     `privsep.Refused` 报告的条目(链接、特殊文件、属于他人的硬链接 —— 对
+     leaf role 视为不存在)。用 `manifest.DirEntryOf` 和 `manifest.FileEntryOf`
+     构造 manifest 条目:它们套用这些规则,并把超过大小上限的条目保持住
+     (`manifest.Held`),让这个条目保持已提交的版本,而该 role 的其余部分照常
+     提交;在 leaf role 里,把 `privsep.ErrTooLarge` 作为错误返回,让该 role
+     保持已提交的版本。以 `privsep.ErrBusy` 被拒的读取(文件属主持有它的
+     lease)绝不等于文件不存在:同样作为错误返回,该 role 就跳过这一轮(启动时
+     保持已提交的版本)。`Restore` 和 `RestoreEntry` 写入的 role 目录用
+     `privsep.EnsureDir(<你的目录树>, dir)` 创建,它会替换 agent 在那里留下的
+     链接或文件,而不是让启动失败。你产出的每个条目名都经 `manifest.Carries`,
+     收到的条目路径用 `manifest.ValidEntryPath` 检查。sealed 自己的记账放在
+     `framework.StateDir`(`StatePath`、`ReadState`/`WriteState`),日志用
+     `framework.OpenLog`。`internal/framework/rootside_guard_test.go` 里的
+     结构性测试会在 `internal/privsep` 之外直接、基于路径地使用 `os`、
+     `syscall`/`unix`(它们所有带字符串参数的函数 —— 少数几个除外 —— 以及
+     原始 syscall 入口)、`filepath` 遍历、`os/exec` 函数(或
+     `golang.org/x/sys/execabs`、`net/http/cgi`、`plugin.Open`)、上面那些
+     命令字段的用法、unix socket 监听或 `net/http` 文件服务时失败 ——
+     `allowedDirectCalls` 里逐个计数、各自写明
+     其路径为何仅 root 可访问的调用点除外 —— 并钉住哪些函数可以调用
+     `RootCommand`(以及可运行哪些二进制)、哪些必须经 `AgentCommand` 起
+     进程、哪些必须链接目录树,以及交出的每棵目录树都已声明:新增的 spawn、
+     工具链调用或例外要连同理由一起加进去。
+   - **`Stop` 在每条路径上都调用 `privsep.Sweep(<模式>)`**(用 `defer` 覆盖
+     context 被取消的那条),它以 agent 用户身份 SIGKILL 你框架进程的残留
+     (因此碰不到 root 的进程)。这个模式由 `pkill -f` 匹配你的进程**实际**的
+     命令行:解释器脚本以 `<解释器> <解析后的脚本路径> ...` 运行,框架还可能
+     给自己改名(openclaw 启动时把每个进程都改名为 `openclaw`,gateway 起来
+     之后再改为 `openclaw-gateway`)。不要结束所有
+     agent 进程:agent 经 sign socket 注册的后端在框架重启后继续存在。
 8. 把你的框架名加进 attestor 的支持名单,部署时才能选中它——
    attestor 把名字当不透明字符串(mint 前校验、写进无版本 binding、
    UI 里列出),除此之外零改动(本仓库 `attestor/`)。
@@ -824,7 +967,9 @@ conformance 之外,再补 adapter 特有的测试:注入剥除 round-trip(注入
     `platform.RenderFrameworkFacts` 持有全部平台机制文字(sealing、gas、版本
     回正、配置 drift),对每个框架逐字一致地渲染;你只返回一个
     `platform.FrameworkFacts` 结构,填因框架而异的部分:`Home`、`Tracked`/
-    `Untracked` 路径(每条带一句说明)、`DurableHints`、版本白名单 +
+    `Untracked` 路径(每条带一句说明)、`DurableHints`、`Notes`(与追踪无关的
+    工作规则——你的框架怎样展开 `~`、它会或不会从哪里读取文件;单独渲染成一个
+    列表,所以不会读成未追踪路径)、版本白名单 +
     `ReconcileHow` 命令,以及——仅当你某个**被追踪** role 本身是按键过滤的
     文件时——`ConfigFile` + `ConfigKeys`,它们渲染出"只看这几个顶层键"那段。
     prime 的 `harness_state.json` 是这一对最后的用户;openclaw、hermes、dsh
@@ -938,7 +1083,9 @@ dashboard),严格按本文档的契约实现,坏什么修什么。发现按严�
 17. 按框架分镜像被一个通用镜像取代(`images/sealed/`):框架安装是
     热缓存、claudecode bridge `go:embed` 进二进制、attestor allowlist
     只挂一个 hash。净效果:attestor 完全框架无关——它对框架的全部
-    知识只剩一张不透明名字清单。
+    知识只剩一张不透明名字清单。(此后 hermes、prime、dsh 各自发布了自己的
+    镜像,openclaw 从 `sealed/Dockerfile` 发布;`images/sealed/` 不构建任何实际
+    发布的镜像。)
 18. 第 12 条毛边被生态解决:0g-compute 上线了 Anthropic 兼容端点
     (含 Claude 系模型),claudecode 现在把
     `persona.inference.provider = "0g-compute"` 经 `settings.json` 的
@@ -1069,7 +1216,7 @@ Prime Agent(Prime Intellect)是一个自我改进的 RLM harness:它在**任务
     的 provider,`models.json` 的 provider 条目是唯一途径,而且那条目还带着
     让 SDK 能把 `reasoning_effort` 发上线的标志位。这个文件已经不是链上
     role:`RenderSettings` 在每次 spawn 前从 owner 的文档重建它,而且只在
-    平台真的路由这个模型时才写(`prime/modelsjson.go:15-60`)。
+    平台真的路由这个模型时才写(`prime/modelsjson.go:19-60`)。
 
 **一个值得记下来的错误 —— 先确认哪个产物装着哪一半。**
 这次移植的第一版是从 npm 装框架的(`@earendil-works/pi-coding-agent`),理由是

@@ -33,7 +33,7 @@ sol!(
     #[sol(rpc)]
     #[derive(Debug)]
     AgenticID,
-    "../../../contracts/out/AgenticID.sol/AgenticID.json"
+    concat!(env!("OUT_DIR"), "/AgenticID.abi.json")
 );
 
 // TappRegistry — minimal inline interface (not a JSON-ABI import, to keep
@@ -82,6 +82,93 @@ sol!(
         event ClonedFrom(uint256 indexed sourceAgentId, uint256 indexed newAgentId, address indexed to, address caller);
     }
 );
+
+// VerifiedFeedbackRegistry — only the anchor read the startup check makes
+// (`check_verified_feedback_anchor`). The attestor never writes to it.
+sol!(
+    #[sol(rpc)]
+    interface IVerifiedFeedbackAnchor {
+        function getIdentityRegistry() external view returns (address);
+    }
+);
+
+/// Attempts for the startup `getIdentityRegistry()` read; a definite
+/// mismatch is not retried.
+const ANCHOR_READ_ATTEMPTS: u32 = 3;
+
+/// Why `ATTESTOR_VERIFIED_FEEDBACK_ADDR` was refused at startup.
+#[derive(Debug, thiserror::Error)]
+pub enum VerifiedFeedbackAnchorError {
+    #[error(
+        "ATTESTOR_VERIFIED_FEEDBACK_ADDR {registry:#x} is not a readable VerifiedFeedbackRegistry \
+         proxy (getIdentityRegistry() failed: {reason}); set it to the proxy bound to \
+         ATTESTOR_AGENTIC_ID_ADDR {agentic_id:#x}, or leave it blank"
+    )]
+    Unreadable {
+        registry: Address,
+        agentic_id: Address,
+        reason: String,
+    },
+    #[error(
+        "ATTESTOR_VERIFIED_FEEDBACK_ADDR {registry:#x} is anchored to AgenticID {anchored:#x}, \
+         not ATTESTOR_AGENTIC_ID_ADDR {agentic_id:#x}: containers would sign ServeProofs that \
+         no registry for this AgenticID redeems"
+    )]
+    Mismatch {
+        registry: Address,
+        anchored: Address,
+        agentic_id: Address,
+    },
+}
+
+/// Startup guard for `ATTESTOR_VERIFIED_FEEDBACK_ADDR` (worker and api): the
+/// configured VerifiedFeedbackRegistry must report `getIdentityRegistry() ==
+/// ATTESTOR_AGENTIC_ID_ADDR`. The address is injected into every new
+/// container as its ServeProof validator and served on `GET /config`, and
+/// every off-chain verifier takes both addresses from that same /config, so a
+/// pasted impl/beacon address or another environment's proxy would otherwise
+/// pass every check but the registry's own. `None` (unset) skips the check.
+/// A read error is retried a few times before it fails startup.
+pub async fn check_verified_feedback_anchor(
+    chain: &dyn ChainClient,
+    verified_feedback: Option<Address>,
+    agentic_id: Address,
+) -> Result<(), VerifiedFeedbackAnchorError> {
+    let Some(registry) = verified_feedback else {
+        return Ok(());
+    };
+    let mut reason = String::new();
+    for attempt in 1..=ANCHOR_READ_ATTEMPTS {
+        match chain.identity_registry_of(registry).await {
+            Ok(anchored) if anchored == agentic_id => {
+                tracing::info!(
+                    registry = %format!("{registry:#x}"),
+                    "VerifiedFeedbackRegistry anchored to ATTESTOR_AGENTIC_ID_ADDR"
+                );
+                return Ok(());
+            }
+            Ok(anchored) => {
+                return Err(VerifiedFeedbackAnchorError::Mismatch {
+                    registry,
+                    anchored,
+                    agentic_id,
+                })
+            }
+            Err(e) => {
+                reason = format!("{e:#}");
+                if attempt < ANCHOR_READ_ATTEMPTS {
+                    tracing::warn!(attempt, error = %reason, "getIdentityRegistry() read failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(VerifiedFeedbackAnchorError::Unreadable {
+        registry,
+        agentic_id,
+        reason,
+    })
+}
 
 /// Wall-time bound for the authorizer pre-check eth_call. A hostile or
 /// looping authorizer must not pin an attestor worker thread indefinitely;
@@ -494,6 +581,15 @@ where
         Ok(c.isTrustedAttestor(addr).call().await?._0)
     }
 
+    async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
+        let code = self.provider.get_code_at(registry).await?;
+        if code.is_empty() {
+            anyhow::bail!("no contract code at {registry:#x}");
+        }
+        let r = IVerifiedFeedbackAnchor::new(registry, self.provider.clone());
+        Ok(r.getIdentityRegistry().call().await?._0)
+    }
+
     async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
         let (registry_addr, app_id) = self
             .tapp_registry
@@ -682,5 +778,63 @@ mod tests {
     fn decode_returns_none_for_unknown_selector() {
         let err = r#"execution reverted, data: "0xdeadbeef""#;
         assert!(decode_revert_data_in_error(err).is_none());
+    }
+
+    // ── check_verified_feedback_anchor ─────────────────────────────────
+
+    use crate::mocks::MockChain;
+
+    const AGENTIC_ID: Address = Address::repeat_byte(0xa9);
+    const VF: Address = Address::repeat_byte(0xb7);
+
+    #[tokio::test]
+    async fn anchor_check_skipped_when_unset() {
+        // The mock would fail the read — unset never reaches it.
+        let chain = MockChain::new();
+        check_verified_feedback_anchor(&chain, None, AGENTIC_ID)
+            .await
+            .expect("unset validator skips the check");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_passes_when_anchored() {
+        let chain = MockChain::new();
+        chain.set_identity_registry(Some(AGENTIC_ID));
+        check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect("anchored registry passes");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_rejects_other_identity_registry() {
+        let chain = MockChain::new();
+        let other = Address::repeat_byte(0xc3);
+        chain.set_identity_registry(Some(other));
+        let err = check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect_err("a registry bound to another AgenticID must fail startup");
+        assert!(
+            matches!(err, VerifiedFeedbackAnchorError::Mismatch { anchored, .. } if anchored == other),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("ATTESTOR_VERIFIED_FEEDBACK_ADDR"), "{msg}");
+        assert!(msg.contains(&format!("{AGENTIC_ID:#x}")), "{msg}");
+        assert!(msg.contains(&format!("{other:#x}")), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn anchor_check_rejects_unreadable_registry() {
+        // No code / revert / RPC down: refused after the retries (~1.5s of
+        // backoff).
+        let chain = MockChain::new();
+        let err = check_verified_feedback_anchor(&chain, Some(VF), AGENTIC_ID)
+            .await
+            .expect_err("an unreadable registry must fail startup");
+        assert!(
+            matches!(err, VerifiedFeedbackAnchorError::Unreadable { .. }),
+            "got {err:?}"
+        );
+        assert!(err.to_string().contains("getIdentityRegistry()"), "{err}");
     }
 }

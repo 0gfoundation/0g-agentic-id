@@ -18,9 +18,6 @@ package hermes
 //                               it holds this boot's inference credential
 //   - .env, auth.json           secrets
 //   - state.db / *.db           conversation history + runtime task state
-//   - .seal-conversation-id     the platform's pinned session identity
-//                               (conversation.go, CONVERSATION.md) — ours,
-//                               container-lifetime, never tracked
 //   - sessions/, logs/, bin/,   ephemeral / cache / process bookkeeping
 //     image_cache/, gateway.*
 //   - cron/                     scheduled behaviour is owner-scoped, not
@@ -29,6 +26,10 @@ package hermes
 //                               jobs running in the NEW owner's container —
 //                               a standing-backdoor vector. Deliberate
 //                               decision (2026-07), not an omission.
+//
+// The platform's pinned session identity (conversation.go, CONVERSATION.md)
+// is sealed's own bookkeeping and lives in framework.StateDir, outside this
+// tree, which is handed to the agent user.
 //
 // `hermesHome` is a var (not const) so unit tests can redirect into
 // t.TempDir(). Production code never reassigns it.

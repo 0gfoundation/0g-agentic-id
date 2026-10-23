@@ -42,6 +42,20 @@ import type {
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
+/**
+ * The agentId for a URL-form handle (`client` / `authenticate`): the one
+ * `/hello`'s X-Agent-Proof envelope carries, or the caller's hint when the
+ * envelope is absent. A hint that contradicts a signed `/hello` is refused.
+ * The caller still binds the result to the URL on chain (#62).
+ */
+function urlAgentId(op: string, base: string, discovered: bigint | undefined, hint: bigint | undefined): bigint | undefined {
+  if (hint === undefined) return discovered;
+  if (discovered !== undefined && discovered !== hint) {
+    throw new Error(`${op}: ${base}/hello is signed as agent ${discovered}, not the expected agent ${hint} — refusing to connect`);
+  }
+  return hint;
+}
+
 function assertSealBound(seal: Address, op: string): void {
   if (seal === ZERO) {
     throw new Error(`${op}: non-seal-bound agents are not supported yet (would go through iTransferFrom/iCloneFrom)`);
@@ -398,16 +412,32 @@ export class AgentApi {
    * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
+   *
+   * With an `agentUrl`, the agentId comes from `/hello`'s proof envelope — which
+   * is absent when the runtime signs nothing (no `VERIFIED_FEEDBACK_ADDR`).
+   * Callers that already know the id pass it as `opts.agentId`: it is used when
+   * `/hello` carries no proof, must equal the envelope's id when it does, and
+   * is bound to the URL on chain like a discovered id. An `ag` with a key that
+   * still ends up with no agentId gets a public handle and a console warning —
+   * never a silent downgrade.
    */
-  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string; agentId?: bigint }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
-    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
-    // this URL via chain before this handle could ever sign for it.
+    const agentId = fromUrl ? urlAgentId('client', base, disc.agentId, opts?.agentId) : idOrUrl;
+    // #62: when the agentId came from the agent's (untrusted) /hello — or from
+    // the caller's hint — bind it to this URL via chain before this handle
+    // could ever sign for it.
     if (fromUrl && agentId !== undefined && this.hasAccount()) {
       await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    if (agentId === undefined && this.hasAccount()) {
+      console.warn(
+        `[agentic-sdk] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
+          'this handle has NO owner ops (chat/logs) although this AgenticID holds a key. ' +
+          'Pass { agentId } (or call client(agentId)) to connect as the owner.',
+      );
     }
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
@@ -419,15 +449,23 @@ export class AgentApi {
    * Owner handshake, eager: like {@link client} on an `ag` with a key, but
    * mints the token up front so a non-owner fails HERE, not at first chat.
    * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   *
+   * With an `agentUrl`, `opts.agentId` works as in {@link client}: used when
+   * `/hello` carries no proof (runtime without `VERIFIED_FEEDBACK_ADDR`),
+   * must equal the envelope's id when it does, and is bound to the URL on
+   * chain before anything is signed.
    */
-  async authenticate(idOrUrl: bigint | string): Promise<AgentClient> {
+  async authenticate(idOrUrl: bigint | string, opts?: { agentId?: bigint }): Promise<AgentClient> {
     requireWallet(this.ctx);
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    const agentId = fromUrl ? urlAgentId('authenticate', base, disc.agentId, opts?.agentId) : idOrUrl;
     if (agentId === undefined) {
-      throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
+      throw new Error(
+        `authenticate: ${base}/hello carried no X-Agent-Proof (the runtime has no VERIFIED_FEEDBACK_ADDR, ` +
+          'or the agent is not provisioned yet), so its agentId is unknown — pass { agentId } or call authenticate(agentId)',
+      );
     }
     // #62: reject a lying /hello (URL claims someone else's agentId) before signing.
     if (fromUrl) await this.assertAgentIdBoundToUrl(agentId, base);
@@ -579,6 +617,48 @@ export class AgentApi {
     return (await r.json().catch(() => ({}))) as { note?: string };
   }
 
+  /**
+   * Compact the agent's ONE persisted conversation in place: the framework's
+   * own compaction replaces the older history with a summary and keeps the
+   * newest part verbatim (how much is the framework's: openclaw ~20K tokens,
+   * dsh only its newest item), so later requests carry less of it while the
+   * conversation goes on — the middle ground between doing nothing and
+   * {@link clearConversation}. No restart. The summary takes one or more
+   * model calls, so this can take minutes — longer than Node's fetch waits
+   * for an answer (300s). A connection dropped or timed out meanwhile does not
+   * abort it; the outcome is in the runtime log. Nothing to compact —
+   * including nothing said since the last compaction — is a 200 whose note
+   * says so. Owner-signed (tag `0GSealCompact`, the clear grammar). A
+   * framework, or a framework version, that cannot compact on demand answers
+   * 501: openclaw before 2026.7.1 has no `sessions compact` CLI command, which
+   * the adapter drives. A second compaction while one runs, a replayed
+   * signature, or a framework declining for now (busy) answers 409. Pass
+   * `instanceId` when the caller participates in the single-driver seat:
+   * compaction is a driving action and is refused (409) from a displaced
+   * window.
+   */
+  async compactConversation(base: string, agentId: bigint, instanceId?: string): Promise<{ note?: string }> {
+    const { walletClient, account } = requireWallet(this.ctx);
+    const sealId = await this.id.getSealId(agentId);
+    const body = '{}';
+    const digest = await sha256Hex(body);
+    const audience = new URL(base).origin;
+    const message = `0GSealCompact:${sealId}:${Math.floor(Date.now() / 1000)}:${digest}:${audience}`;
+    const signature = await walletClient.signMessage({ account, message });
+    const r = await fetch(`${base}/_seal/compact`, {
+      method: 'POST',
+      headers: {
+        'X-Auth-Message': message,
+        'X-Auth-Signature': signature,
+        'content-type': 'application/json',
+        ...(instanceId ? { 'X-Client-Instance': instanceId } : {}),
+      },
+      body,
+    });
+    if (!r.ok) throw new Error(`compactConversation: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json().catch(() => ({}))) as { note?: string };
+  }
+
   /** Sign `0GSealAuth` (audience-bound) and exchange it at `{base}/_seal/auth` for a token. */
   private async mintToken(base: string, agentId: bigint): Promise<string> {
     const { message, signature } = await this.signOwner('0GSealAuth', base, agentId);
@@ -670,6 +750,12 @@ export class AgentApi {
    * plus a structured verification. The whole "is this agent who it
    * claims, running what chain says" check, without hand-rolling the
    * fetch + parse + verify.
+   *
+   * The proof signature is bound to the VerifiedFeedbackRegistry, so the
+   * check needs `addresses.verifiedFeedback` (fromAttestor fills it from
+   * /config). Without it `verification.signerMatches` is false with the
+   * reason 'no VerifiedFeedbackRegistry configured — cannot verify
+   * serve-proof'.
    */
   async sayHi(agentUrl: string): Promise<{
     hello: {

@@ -571,7 +571,7 @@ async fn attestor_descriptor(
     let auth = AttestorAuthorization::new(cfg.agentic_id_addr, &provider);
     anyhow::ensure!(
         auth.instanceBoundAttestorsRequired().call().await?._0,
-        "AgenticID requires the 1.2 instance-bound attestor migration"
+        "AgenticID requires the instance-bound attestor migration"
     );
     let binding = auth.trustedAttestorAppBinding(signer).call().await?;
     anyhow::ensure!(

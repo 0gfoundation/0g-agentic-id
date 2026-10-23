@@ -266,6 +266,33 @@ where
     }
 }
 
+/// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
+/// create body's `env`, creating the object if the payload has none. Always
+/// OVERRIDES a same-named key from the deployer-signed payload — including
+/// with an empty value, which is how an unset attestor setting (e.g. a blank
+/// `VERIFIED_FEEDBACK_ADDR`) still blocks a payload-supplied one. Pulled out
+/// of `create()` so the override is unit-testable without an HTTP round-trip.
+fn apply_attestor_env(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    attestor_public_url: &str,
+    extra_env: &[(String, String)],
+) -> anyhow::Result<()> {
+    let env_val = obj
+        .entry("env".to_string())
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    let env_obj = env_val.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
+    })?;
+    env_obj.insert(
+        "ATTESTOR_URL".into(),
+        serde_json::Value::String(attestor_public_url.to_string()),
+    );
+    for (k, v) in extra_env {
+        env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    Ok(())
+}
+
 pub struct HttpSandbox {
     base_url: String,
     /// Public URL that containers use to reach this attestor. Injected into
@@ -405,7 +432,9 @@ impl SandboxClient for HttpSandbox {
         //     channel), so the container never trusts user-supplied env.
         //   - `env.ATTESTOR_URL`: runtime config for the container —
         //     where to call `/provision` and `/status`. Not sensitive,
-        //     fine to ride the plain env channel.
+        //     fine to ride the plain env channel. Same for `extra_env`
+        //     (chain / storage / contract config, incl. the ServeProof
+        //     validator `VERIFIED_FEEDBACK_ADDR`) — see `apply_attestor_env`.
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("sandbox create: base64 decode: {e}"))?;
@@ -430,19 +459,11 @@ impl SandboxClient for HttpSandbox {
         // all-ports-public, safe against providers still on stock Daytona).
         apply_public_ports(obj, &self.public_ports);
 
-        let env_val = obj
-            .entry("env".to_string())
-            .or_insert_with(|| serde_json::Value::Object(Default::default()));
-        let env_obj = env_val.as_object_mut().ok_or_else(|| {
-            anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
-        })?;
-        env_obj.insert(
-            "ATTESTOR_URL".into(),
-            serde_json::Value::String(self.attestor_public_url.clone()),
-        );
-        for (k, v) in &self.extra_env {
-            env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
-        }
+        apply_attestor_env(obj, &self.attestor_public_url, &self.extra_env)?;
+        // apply_attestor_env creates and validates this object. Overlay the
+        // authenticated descriptor last so payload/extra env cannot replace it.
+        let env_obj = obj.get_mut("env").and_then(serde_json::Value::as_object_mut)
+            .expect("apply_attestor_env validated env");
         let attestor_identity = self.attestor_tls_identity().await?;
         apply_attestor_identity(
             env_obj,
@@ -1036,6 +1057,60 @@ mod tests {
         obj.insert("publicPorts".into(), serde_json::json!([9090]));
         apply_public_ports(&mut obj, &[8080]);
         assert_eq!(obj.get("publicPorts"), Some(&serde_json::json!([9090])));
+    }
+
+    #[test]
+    fn attestor_env_overrides_payload_env_including_blank() {
+        // The deployer signs the payload, so its env is untrusted for the
+        // keys the attestor owns: a smuggled ServeProof validator (or chain
+        // config) must be overwritten — by an EMPTY value too, which is what
+        // the worker injects for VERIFIED_FEEDBACK_ADDR when the attestor
+        // has none configured (sealed then emits no X-Agent-Proof).
+        let mut obj = serde_json::json!({
+            "snapshot": "img",
+            "env": {
+                "API_KEY": "sk-owner",
+                "ATTESTOR_URL": "http://evil",
+                "AGENTIC_ID_ADDR": "0xbad",
+                "VERIFIED_FEEDBACK_ADDR": "0x00000000000000000000000000000000000000ee",
+            },
+        });
+        let extra = vec![
+            ("AGENTIC_ID_ADDR".to_string(), "0xa9".to_string()),
+            ("VERIFIED_FEEDBACK_ADDR".to_string(), String::new()),
+        ];
+        apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &extra).unwrap();
+        let env = &obj["env"];
+        assert_eq!(env["ATTESTOR_URL"], "http://attestor");
+        assert_eq!(env["AGENTIC_ID_ADDR"], "0xa9");
+        assert_eq!(env["VERIFIED_FEEDBACK_ADDR"], "", "blank must still override");
+        // Keys the attestor does not own pass through untouched.
+        assert_eq!(env["API_KEY"], "sk-owner");
+
+        // Configured value overrides likewise.
+        let extra = vec![(
+            "VERIFIED_FEEDBACK_ADDR".to_string(),
+            "0x00000000000000000000000000000000000000b7".to_string(),
+        )];
+        apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &extra).unwrap();
+        assert_eq!(
+            obj["env"]["VERIFIED_FEEDBACK_ADDR"],
+            "0x00000000000000000000000000000000000000b7"
+        );
+    }
+
+    #[test]
+    fn attestor_env_creates_env_object_and_rejects_non_object() {
+        let mut obj = serde_json::Map::new();
+        let extra = vec![("VERIFIED_FEEDBACK_ADDR".to_string(), String::new())];
+        apply_attestor_env(&mut obj, "http://attestor", &extra).unwrap();
+        assert_eq!(obj["env"]["ATTESTOR_URL"], "http://attestor");
+        assert_eq!(obj["env"]["VERIFIED_FEEDBACK_ADDR"], "");
+
+        let mut obj = serde_json::Map::new();
+        obj.insert("env".into(), serde_json::json!("K=V"));
+        let err = apply_attestor_env(&mut obj, "http://attestor", &extra).unwrap_err();
+        assert!(err.to_string().contains("env must be a JSON object"), "got: {err}");
     }
 
     #[test]

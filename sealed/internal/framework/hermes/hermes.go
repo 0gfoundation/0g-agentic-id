@@ -44,13 +44,13 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"strings"
 	"sync"
 	"time"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/manifest"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -105,6 +105,9 @@ type Adapter struct {
 func New() *Adapter {
 	a := &Adapter{}
 	framework.Register("hermes", a)
+	// The tree spawnGateway hands to the agent user (privsep.DeclareTree:
+	// Harden leaves it in root's home although the agent owns it).
+	privsep.DeclareTree(hermesHome)
 	return a
 }
 
@@ -115,7 +118,7 @@ func (a *Adapter) Name() string { return "hermes" }
 
 // SubprocessLogPath implements framework.SubprocessLogProvider. spawn.go
 // pipes the gateway's stdout/stderr here; proxy serves it on /log/agent.
-func (a *Adapter) SubprocessLogPath() string { return "/tmp/hermes.log" }
+func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName) }
 
 // SettleDelay implements framework.SettleDelayer. Hermes's first boot
 // seeds bundled skills into ~/.hermes/skills/; 10s lets those writes land
@@ -123,7 +126,8 @@ func (a *Adapter) SubprocessLogPath() string { return "/tmp/hermes.log" }
 // network bound).
 func (a *Adapter) SettleDelay() time.Duration { return 10 * time.Second }
 
-// Version probes the installed hermes CLI. Best-effort; "" on error.
+// Version reports the checked-out hermes release (a static read, see
+// probeHermesVersion). Best-effort.
 func (a *Adapter) Version(ctx context.Context) (string, error) {
 	v := probeHermesVersion(ctx)
 	if v == "" {
@@ -219,8 +223,10 @@ func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
 }
 
 // Stop SIGTERMs the gateway process, waits up to gracefulTimeout, then
-// SIGKILLs. Afterwards sweeps any leftover `hermes gateway run` process so
-// a stale child can't hold :8642 against the next Start.
+// SIGKILLs. Afterwards it SIGKILLs any leftover `hermes gateway run`
+// process (privsep.Sweep, which runs pkill as the agent user, so it reaches
+// only agent processes) so a stale child can't hold :8642 against the next
+// Start. Other processes the agent started keep running.
 func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error {
 	a.mu.Lock()
 	cmd := a.cmd
@@ -228,7 +234,7 @@ func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error
 	a.mu.Unlock()
 
 	err := stopProc(ctx, cmd, gracefulTimeout)
-	sweepOrphans()
+	privsep.Sweep("hermes gateway run")
 	return err
 }
 
@@ -252,22 +258,6 @@ func stopProc(ctx context.Context, cmd *exec.Cmd, graceful time.Duration) error 
 		_ = cmd.Process.Kill()
 		<-done
 		return ctx.Err()
-	}
-}
-
-// sweepOrphans SIGKILLs any leftover hermes gateway process.
-// pkill exit 1 = "no process matched", the happy path.
-func sweepOrphans() {
-	for _, pat := range []string{"hermes gateway run"} {
-		out, err := exec.Command("pkill", "-9", "-f", pat).CombinedOutput()
-		if err == nil {
-			logger.Logf("hermes: swept orphan %q processes", pat)
-			continue
-		}
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			continue // none matched
-		}
-		logger.Logf("hermes: pkill %q sweep failed: %v: %s", pat, err, strings.TrimSpace(string(out)))
 	}
 }
 

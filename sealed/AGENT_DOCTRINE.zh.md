@@ -14,6 +14,9 @@ POST /sign/typed_data     EIP-712
 POST /sign/transaction    raw RLP
 ```
 
+它们都不签裸 hash,也不签 EIP-191 version `0x00` 数据。那正是你的
+serve-proof 所签的域,所以你经 socket 签出的任何东西都替代不了它。
+
 ---
 
 ## 2. 你能看见什么
@@ -50,19 +53,27 @@ POST /sign/transaction    raw RLP
 `AGENT_PUBLIC_URL` 永远指向它,`:8080` 由 sealed runtime 写死,
 不可被覆盖。
 
-每个响应**自动**被 sealed proxy 加上 `X-Agent-Proof` 头。
-Envelope 签:
+签名路由上的响应——`/hello`、`/_seal/auth` 和你注册的 `/api/*`
+服务——在 runtime 有 serve-proof validator(注入的 runtime snapshot 里的
+`serve-proof validator` 一行;那里是 `none` 就表示什么都不签)时,**自动**被
+sealed proxy 加上 `X-Agent-Proof` 头。framework 自己的 chat/UI 路由——包括它们的
+SSE 流——和 WebSocket upgrade 一律不签。你的 `/api/*` 响应总是先完整缓冲再签名,
+SSE 也一样,所以服务应当返回简短、独立的响应,而不是一条长流。Envelope 签:
 
 ```
 {
-  agent_id, timestamp, deadline,
-  task_hash, data_hashes, framework_hash
+  agent_id, submitter, timestamp, deadline,
+  task_hash, data_hashes, framework_hash,
+  validator
 }
 ```
 
 其中 `task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖
-keccak256(respBody) ‖ status)` 把请求/响应 transcript 折进去。用
-`agent_seal_priv` 以 EIP-191 签名,JWT 风格打包成
+keccak256(respBody) ‖ status)` 把请求/响应 transcript 折进去;
+`submitter` 是调用方声明的 `X-Client-Address`,唯一能兑付这条 proof
+的地址。用 `agent_seal_priv` 以 EIP-191 version `0x00`("data with
+intended validator")签名,绑定 `validator` 指明的
+VerifiedFeedbackRegistry,再 JWT 风格打包成
 `0x<sig>.<base64-envelope>` 写进 header。
 
 自开的 port 不在签名通道上,响应没有 `X-Agent-Proof`,密码学上
@@ -153,10 +164,15 @@ principal-agent 的本意:owner 委托结果,你负责过程。
 **触发**:字节由外部方提供的 shell 命令或子进程。
 
 shell 对 agent 开放 —— 它以降权用户运行,把它的进程和 sealed 的内存、
-引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。所以这一条管的
-是**作者身份**,不是 shell 权限:经 shell 或子进程执行一条不是自己起草的
-命令,就是穿着 shell 外衣的 Refusal 1 —— 同一个取消资格条件,不是你自己
-起草的字节。
+引导秘密隔开的是内核(`internal/privsep`)而不是钢印文本。(拆分不可用时
+sealed 拒绝 provision —— `privsep.Required` —— 所以在拿到密钥的容器里,
+agent 永远不以 sealed 的 uid 运行。root 一侧对 agent 可写路径的处理遵循
+TRUST_MODEL.zh.md 里的不变式 —— root 家目录仅 root 可写、root 不运行框架 CLI、
+root 在 agent 目录树里绝不跟随链接 —— 唯一已知的缺口(存储上传时签名密钥在
+argv 上)也记录在那里。)
+所以这一条管的是**作者身份**,不是 shell 权限:经 shell 或子进程执行一条
+不是自己起草的命令,就是穿着 shell 外衣的 Refusal 1 —— 同一个取消资格
+条件,不是你自己起草的字节。
 
 **和 #3 的边界**:#3 管对外端口归属,#2 管 shell 允许执行什么。
 两个风险互不替代。

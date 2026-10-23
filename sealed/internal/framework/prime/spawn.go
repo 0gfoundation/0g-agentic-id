@@ -6,7 +6,9 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -49,8 +51,9 @@ const (
 	// framework outside that measurement.
 	releasePackage = "prime-agent"
 
-	// agentLogPath receives the bridge's stdout/stderr, served on /log/agent.
-	agentLogPath = "/tmp/prime-agent.log"
+	// logName names the bridge's stdout/stderr log under
+	// framework.StateDir/log, served on /log/agent.
+	logName = "prime-agent"
 
 	// startTimeout bounds the wait for the bridge to bind. First boot may
 	// include a global npm install against a cold cache.
@@ -99,11 +102,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := materializeBridge(); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
-	if err := ensureDir(sessionStateDir()); err != nil {
-		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
-	}
-	// The bridge's SessionManager.open() needs the parent dir to exist.
-	if err := ensureDir(conversationDir()); err != nil {
+	if err := prepareConversation(); err != nil {
 		return framework.StartResult{}, fmt.Errorf("prime.Start: %w", err)
 	}
 
@@ -111,23 +110,24 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// bridge injects it as a virtual context file at session creation. No
 	// markers, no stripping, and nothing for the agent's harness API to delete.
 	pc := platform.Build(platform.RuntimeSnapshot{
-		SealedVersion:    rt.SealedVersion,
-		FrameworkVersion: version,
-		WhitelistMax:     whitelistMax(),
-		AgentSeal:        rt.AgentSeal,
-		AgentID:          rt.AgentID,
-		Owner:            rt.Owner,
-		ChainRPC:         rt.ChainRPC,
-		ContractAddr:     rt.ContractAddr,
-		AttestorURL:      rt.AttestorURL,
-		PublicURL:        rt.PublicURL,
-		SealSignSock:     rt.SealSignSock,
-		Provider:         provider,
-		Model:            model,
-		ZGComputeRouted:  cfg.Endpoint != nil,
-		BootTime:         time.Now(),
+		SealedVersion:       rt.SealedVersion,
+		FrameworkVersion:    version,
+		WhitelistMax:        whitelistMax(),
+		AgentSeal:           rt.AgentSeal,
+		AgentID:             rt.AgentID,
+		Owner:               rt.Owner,
+		ChainRPC:            rt.ChainRPC,
+		ContractAddr:        rt.ContractAddr,
+		ServeProofValidator: rt.VerifiedFeedbackAddr,
+		AttestorURL:         rt.AttestorURL,
+		PublicURL:           rt.PublicURL,
+		SealSignSock:        rt.SealSignSock,
+		Provider:            provider,
+		Model:               model,
+		ZGComputeRouted:     cfg.Endpoint != nil,
+		BootTime:            time.Now(),
 	})
-	if err := os.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
+	if err := privsep.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its
 		// own identity or the sign-refusal doctrine. Fail rather than degrade.
 		return framework.StartResult{}, fmt.Errorf("prime.Start: write agent doc %s: %w", agentDocPath(), err)
@@ -174,7 +174,7 @@ func verifyInstalled(ctx context.Context, version string) error {
 	// require("prime-agent/package.json") fails twice over — the global
 	// node_modules is not on node's default resolution path, and the package's
 	// `exports` map does not expose ./package.json.
-	raw, err := os.ReadFile(filepath.Join(pkgDir, "package.json"))
+	raw, err := privsep.ReadFile(filepath.Join(pkgDir, "package.json"), privsep.LimitConfig)
 	if err != nil {
 		return fmt.Errorf("%s is not installed in this image (expected %s): %w — a prime-agent binding needs the prime-agent image; check the deploy's sealedImage", releasePackage, want, err)
 	}
@@ -194,17 +194,121 @@ func verifyInstalled(ctx context.Context, version string) error {
 	// sources ship inside the release tarball, so that check passes on an image
 	// where the kernel venv was never provisioned. An agent there looks perfectly
 	// healthy and never persists a thing.
-	if out, err := exec.CommandContext(ctx, kernelVenvPython(), "-c", "import ipykernel, rlm.harness").CombinedOutput(); err != nil {
-		return fmt.Errorf("kernel venv at %s cannot import ipykernel + rlm.harness: %w: %s — the image's kernel bootstrap did not complete, so the harness state would never be written",
-			kernelVenvPython(), err, strings.TrimSpace(string(out)))
+	//
+	// The venv sits inside primeHome, a tree handed to the agent user, so the
+	// probe runs as that user (privsep.AgentCommand) — never as root — and,
+	// since what it imports is agent-writable, with a deadline and a bound
+	// on the output kept.
+	if err := probeKernelVenv(ctx, kernelVenvPython()); err != nil {
+		return fmt.Errorf("kernel venv at %s cannot import ipykernel + rlm.harness: %w — the image's kernel bootstrap did not complete, so the harness state would never be written",
+			kernelVenvPython(), err)
 	}
 
 	logger.Logf("prime: %s@%s present with a working kernel venv (binding resolved to %s)", releasePackage, meta.Version, want)
 	return nil
 }
 
+// probeKernelVenv runs `python -c "import ipykernel, rlm.harness"` as the
+// agent user (privsep.AgentCommand), within probeTimeout of ctx, keeping
+// the last probeOutputMax bytes of its output for the error.
+func probeKernelVenv(ctx context.Context, python string) error {
+	pctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	probe, err := privsep.AgentCommand(pctx, python, "-c", "import ipykernel, rlm.harness")
+	if err != nil {
+		return fmt.Errorf("kernel venv probe: %w", err)
+	}
+	if out, err := privsep.BoundedOutput(probe, probeOutputMax); err != nil {
+		if pctx.Err() != nil {
+			err = fmt.Errorf("%w (did not finish within %s)", err, probeTimeout)
+		}
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// probeTimeout bounds the kernel venv import probe. A var so tests can
+// shorten it; production code never reassigns it.
+var probeTimeout = 2 * time.Minute
+
+// probeOutputMax is how much of the probe's output is kept (the tail).
+const probeOutputMax = 64 << 10
+
+// prepareConversation is everything Start does to the conversation store
+// before the bridge starts: the bridge's SessionManager.open() needs the
+// conversation's directory to exist (prepareSessionDirs), and a
+// conversation an earlier sealed kept one level up moves into it
+// (migrateConversation), next to its session artifacts, which ReclaimHome
+// relocated at boot (legacySessionArtifactsDir). One function, so a test
+// pins both steps and their order (TestStartPreparesTheConversation).
+func prepareConversation() error {
+	if err := prepareSessionDirs(); err != nil {
+		return err
+	}
+	migrateConversation()
+	return nil
+}
+
+// prepareSessionDirs makes the directories Start hands the agent outside
+// primeHome: sessionStateDir (the harness's per-session state) and
+// conversationSessionDir (the conversation). Something else may sit at
+// either name — the conversation directory above the session directory is
+// the agent's — so a link, a file or anything else that is not a directory
+// is replaced (privsep.EnsureDir: the entry itself, never what it points
+// at), and the agent cannot keep the bridge from starting.
+func prepareSessionDirs() error {
+	for _, d := range []struct{ base, dir string }{
+		{filepath.Dir(sessionStateDir()), sessionStateDir()},
+		{conversationDir(), conversationSessionDir()},
+	} {
+		if err := privsep.EnsureDir(d.base, d.dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", d.dir, err)
+		}
+	}
+	return nil
+}
+
+// migrateConversation moves a conversation an earlier sealed kept directly
+// in conversationDir into conversationSessionDir, together with its rotated
+// and quarantined siblings (owner-chat.jsonl.*), so it survives the move to
+// the nested layout. Only regular files move; nothing already at the
+// destination is replaced (the new layout wins); the move follows no link
+// (privsep.RenameNoReplace). The tree is the agent's, so a failure is
+// logged and leaves the file where it was — the bridge then starts a fresh
+// conversation, the same outcome as a container recreate.
+func migrateConversation() {
+	oldDir, newDir := conversationDir(), conversationSessionDir()
+	ents, err := privsep.ReadDir(oldDir)
+	if err != nil {
+		return
+	}
+	moved := 0
+	for _, e := range ents {
+		name := e.Name()
+		if !e.IsRegular() || (name != conversationFile && !strings.HasPrefix(name, conversationFile+".")) {
+			continue
+		}
+		// The agent decides how many such names exist, and this runs on
+		// every Start: each one is reported once per process.
+		err := privsep.RenameNoReplace(filepath.Join(oldDir, name), filepath.Join(newDir, name))
+		switch {
+		case err == nil:
+			moved++
+		case errors.Is(err, fs.ErrExist):
+			logger.Once("prime.migrate:"+name, "prime: %s already has %s; leaving the earlier copy in %s", newDir, name, oldDir)
+		default:
+			logger.Once("prime.migrate:"+name, "prime: moving %s into %s: %v", name, newDir, err)
+		}
+	}
+	if moved > 0 {
+		logger.Logf("prime: moved %d conversation file(s) from %s to %s", moved, oldDir, newDir)
+	}
+}
+
 // materializeBridge writes the embedded bridge script to disk. Rewritten on
-// every Start so a sealed upgrade always ships its own bridge.
+// every Start so a sealed upgrade always ships its own bridge. The
+// directory's parent is root-owned, so what is written here stays root's
+// and read-only to the agent.
 func materializeBridge() error {
 	if err := ensureDir(bridgeScriptDir); err != nil {
 		return err
@@ -215,7 +319,7 @@ func materializeBridge() error {
 			return fmt.Errorf("read embedded bridge %s: %w", name, err)
 		}
 		dst := filepath.Join(bridgeScriptDir, name)
-		if err := os.WriteFile(dst, src, 0o644); err != nil {
+		if err := privsep.WriteFile(dst, src, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dst, err)
 		}
 	}
@@ -286,9 +390,9 @@ func bridgeEnvFor(cfg settings.Resolved, token string, rt framework.RuntimeConte
 // otherwise be readable from inside the agent process via `env` or
 // /proc/self/environ. Same rule as the openclaw and hermes adapters.
 func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
-	logFile, err := os.OpenFile(agentLogPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	logFile, err := framework.OpenLog(logName)
 	if err != nil {
-		return nil, fmt.Errorf("open %s: %w", agentLogPath, err)
+		return nil, fmt.Errorf("open %s: %w", framework.LogPath(logName), err)
 	}
 
 	// The bridge imports `prime-agent` by bare specifier. That resolves because
@@ -303,28 +407,33 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		return nil, err
 	}
 
-	cmd := exec.Command("node", bridgeScriptPath())
+	// Run the bridge (and the IPython kernel it spawns) as the low-privilege
+	// agent user when the image provides one (a plain spawn otherwise — see
+	// internal/privsep). Background, not Start's ctx: the bridge outlives
+	// the call that spawned it; Stop ends it.
+	cmd, err := privsep.AgentCommand(context.Background(), "node", bridgeScriptPath())
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("start bridge: %w", err)
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	// The agent's own working directory: keep it inside the framework home so
 	// cwd-relative discovery (project skills, context files) stays within the
-	// paths this adapter manages.
+	// paths this adapter manages. The tree is the agent's (handed over
+	// below), so this is a directory it owns.
 	cmd.Dir = primeHome
 	cmd.Env = be.environ(nodePath)
 
-	// Run the bridge (and the IPython kernel it spawns) as the low-privilege
-	// agent user when the image provides one (no-op otherwise — see
-	// internal/privsep). Restore wrote the home as root, so hand it over
-	// now; $HOME itself must also accept new dotfiles. sessionStateDir is
-	// under /tmp (world-writable), no handover needed.
-	if privsep.Drop(cmd) {
-		privsep.OwnPath(os.Getenv("HOME"))
-		privsep.OwnTree(primeHome)
-		// The conversation store is OUTSIDE primeHome (off-chain by
-		// construction) and ensureDir created it as root — without this the
-		// de-privileged bridge EACCESes on its very first append.
-		privsep.OwnTree(conversationDir())
+	// Restore and Start wrote these trees as root, so hand them over now
+	// (handedOverTrees: the framework home, the per-session harness state,
+	// the whole conversation directory), and link the framework home into
+	// the agent's own home: the SDK and the agent doc know it as
+	// ~/.prime/agent. Root's home stays root's (privsep.SecureHome).
+	for _, tree := range handedOverTrees() {
+		privsep.OwnTree(tree)
 	}
+	privsep.LinkAgentHome(".prime/agent", primeHome)
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
@@ -341,9 +450,14 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 func (be bridgeEnv) environ(nodePath string) []string {
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		// The agent's own home (privsep.AgentHome): tool caches and config,
+		// and the IPython/matplotlib state of the kernel, go there.
+		"HOME=" + privsep.AgentHome(),
 		"NODE_PATH=" + nodePath,
+		// The framework's own directories, named explicitly rather than
+		// derived from HOME (~/.prime/agent links to the same tree).
 		"PRIME_AGENT_CODING_AGENT_DIR=" + primeHome,
+		"PRIME_AGENT_KERNEL_VENV=" + kernelVenvDir(),
 		// Read by harness.py inside the IPython kernel, which the SDK spawns as
 		// a child of this bridge and which therefore inherits this env. See
 		// sessionStateDir for why leaving it unset is not an option.
@@ -405,9 +519,14 @@ func (be bridgeEnv) environ(nodePath string) []string {
 }
 
 // npmGlobalRoot resolves the global node_modules path so the bridge can import
-// the SDK it was installed with.
+// the SDK it was installed with. A toolchain query, run through
+// privsep.RootCommand (root-only PATH resolution, fixed environment).
 func npmGlobalRoot() (string, error) {
-	out, err := exec.Command("npm", "root", "-g").Output()
+	cmd, err := privsep.RootCommand(context.Background(), "npm", "root", "-g")
+	if err != nil {
+		return "", fmt.Errorf("npm root -g: %w", err)
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("npm root -g: %w", err)
 	}
@@ -455,33 +574,32 @@ func waitForListen(ctx context.Context, addr string, timeout time.Duration) erro
 	}
 }
 
-// Stop terminates the bridge: SIGTERM, wait, SIGKILL.
+// Stop terminates the bridge: SIGTERM, wait, SIGKILL — then SIGKILLs any
+// stray process whose command line names the bridge script (privsep.Sweep,
+// which runs pkill as the agent user, so it reaches only agent processes),
+// so the next Start gets a clean port.
 func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error {
 	a.mu.Lock()
 	cmd := a.cmd
 	a.cmd = nil
 	a.mu.Unlock()
 
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	_ = cmd.Process.Signal(os.Interrupt)
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Signal(os.Interrupt)
 
-	done := make(chan struct{})
-	go func() {
-		_, _ = cmd.Process.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(gracefulTimeout):
-		_ = cmd.Process.Kill()
+		done := make(chan struct{})
+		go func() {
+			_, _ = cmd.Process.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(gracefulTimeout):
+			_ = cmd.Process.Kill()
+		}
 	}
 
-	// The bridge hosts the agent in-process, but an IPython kernel it spawned
-	// can outlive it and hold state; sweep any stray child so the next Start
-	// gets a clean port and kernel.
-	_ = exec.Command("pkill", "-f", bridgeScriptPath()).Run()
+	privsep.Sweep(bridgeScriptPath())
 	return nil
 }
 
@@ -543,4 +661,4 @@ func (a *Adapter) MonitorExit(onExit func(err error)) {
 
 // SubprocessLogPath implements framework.SubprocessLogProvider: the bridge log
 // is what /log/agent serves.
-func (a *Adapter) SubprocessLogPath() string { return agentLogPath }
+func (a *Adapter) SubprocessLogPath() string { return framework.LogPath(logName) }

@@ -9,6 +9,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -70,8 +72,8 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 			return framework.StartResult{}, err
 		}
 	} else {
-		if _, err := exec.Command("hermes", "--version").Output(); err != nil {
-			return framework.StartResult{}, fmt.Errorf("hermes binary missing on restart: %w", err)
+		if err := checkoutPresent(); err != nil {
+			return framework.StartResult{}, err
 		}
 		logger.Logf("hermes restart: skipping install (framework already pinned)")
 	}
@@ -83,21 +85,22 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// v1 gap — how to expose a service (register at $SEAL_SIGN_SOCK/services).
 	// Marker-delimited; evoSoulMD strips it so only the persona reaches chain.
 	pc := platform.Build(platform.RuntimeSnapshot{
-		SealedVersion:    rt.SealedVersion,
-		FrameworkVersion: probeHermesVersion(ctx),
-		WhitelistMax:     whitelistMax(),
-		AgentSeal:        rt.AgentSeal,
-		AgentID:          rt.AgentID,
-		Owner:            rt.Owner,
-		ChainRPC:         rt.ChainRPC,
-		ContractAddr:     rt.ContractAddr,
-		AttestorURL:      rt.AttestorURL,
-		PublicURL:        rt.PublicURL,
-		SealSignSock:     rt.SealSignSock,
-		Provider:         provider,
-		Model:            model,
-		ZGComputeRouted:  rs.Endpoint != nil,
-		BootTime:         time.Now(),
+		SealedVersion:       rt.SealedVersion,
+		FrameworkVersion:    probeHermesVersion(ctx),
+		WhitelistMax:        whitelistMax(),
+		AgentSeal:           rt.AgentSeal,
+		AgentID:             rt.AgentID,
+		Owner:               rt.Owner,
+		ChainRPC:            rt.ChainRPC,
+		ContractAddr:        rt.ContractAddr,
+		ServeProofValidator: rt.VerifiedFeedbackAddr,
+		AttestorURL:         rt.AttestorURL,
+		PublicURL:           rt.PublicURL,
+		SealSignSock:        rt.SealSignSock,
+		Provider:            provider,
+		Model:               model,
+		ZGComputeRouted:     rs.Endpoint != nil,
+		BootTime:            time.Now(),
 	})
 	if err := upsertSoulMD(pc, a.FrameworkFacts()); err != nil {
 		logger.Logf("warn: inject platform context into SOUL.md: %v", err)
@@ -151,8 +154,9 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 //     forever (measured on glm-5.3: 100k+ chars of reasoning, zero reply,
 //     stream killed upstream). s.Effort() is provider-independent.
 //
-// The five keys this render owns are model.{default,provider,base_url,api_key}
-// and agent.reasoning_effort. The three that carry endpoint wiring
+// The keys this render owns are model.{default,provider,base_url,api_key}
+// and agent.reasoning_effort, plus model.max_tokens whenever the catalog
+// gives the model's budget. The three that carry endpoint wiring
 // (provider/base_url/api_key) are also CLEARED when the document stops
 // supplying them — a leftover value aims hermes at the previous boot's
 // endpoint, or hands it the previous boot's key. Everything else in the file
@@ -188,6 +192,10 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	effort, effortDecided := s.Effort()
 
 	if err := updateConfigYAML(func(cfg map[string]any) {
+		// Which model the on-disk model.max_tokens was written for — read
+		// before anything below touches the section.
+		budgetWrittenFor := modelIdentity(cfg)
+
 		// Owner's overlay FIRST, platform-owned keys over it. Ordering, not
 		// an exclusion list, is what stops an overlay from pinning a stale
 		// base_url or disabling the reasoning bound.
@@ -233,6 +241,26 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 			delete(m, "api_key")
 		}
 		cfg["model"] = m
+		// model.max_tokens is the per-request output budget hermes sends as
+		// max_tokens (gateway/run.py reads it, over any provider's own cap).
+		// Absent, the custom provider profile's default applies — captured on
+		// the wire as 65536 on every main-loop request (why that is capped:
+		// settings.RequestMaxTokens). Like the reasoning bound below, the
+		// outcomes must not be collapsed:
+		//   budget known (catalog)       write it, capped (RequestMaxTokens)
+		//   unknown, overlay names one   the owner's value stands
+		//   unknown, same model          leave it: a catalog outage must not
+		//                                drop the cap; a guess is never written
+		//   unknown, model changed       remove it: it is the previous model's
+		//                                budget, and a value above the new
+		//                                model's limit fails every request
+		switch mt := s.RequestMaxTokens(); {
+		case mt > 0:
+			m["max_tokens"] = mt
+		case overlayNamesMaxTokens(overlay):
+		case s.Facts.CatalogSourced || modelIdentity(cfg) != budgetWrittenFor:
+			delete(m, "max_tokens")
+		}
 
 		// agent.reasoning_effort is hermes's single chokepoint for reasoning
 		// depth (hermes_constants.resolve_reasoning_config: per-model override
@@ -279,6 +307,21 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	a.resolved = &s
 	a.mu.Unlock()
 	return nil
+}
+
+// modelIdentity names the model config.yaml's model section points at: the
+// model, the provider and the endpoint.
+func modelIdentity(cfg map[string]any) string {
+	m, _ := cfg["model"].(map[string]any)
+	return fmt.Sprintf("%v|%v|%v", m["default"], m["provider"], m["base_url"])
+}
+
+// overlayNamesMaxTokens reports whether the owner's overlay sets
+// model.max_tokens itself.
+func overlayNamesMaxTokens(overlay map[string]any) bool {
+	m, _ := overlay["model"].(map[string]any)
+	_, ok := m["max_tokens"]
+	return ok
 }
 
 // frameworkOverlay decodes the owner's opaque per-framework section as the
@@ -357,86 +400,145 @@ var uvSyncArgs = []string{"sync", "--locked", "--extra", "sms"}
 // this IS its version-pinning mechanism (`hermes update` is just a
 // friendlier `git pull` + sync). `uv sync --locked` hash-verifies against
 // uv.lock, so the dependency tree is pinned by the same tag.
+//
+// The checkout is root-owned, so git and uv run as root — through
+// privsep.RootCommand (root-only PATH resolution, fixed environment), in
+// the checkout directory (privsep.RootDir, which refuses one another uid
+// could write: git and uv read their configuration from it), with git's
+// credential prompt disabled.
 func installHermes(tag string) error {
-	if _, err := os.Stat(hermesInstallDir); err != nil {
+	if _, err := privsep.Lstat(hermesInstallDir); err != nil {
 		return fmt.Errorf("hermes checkout missing at %s (not baked into this image?): %w", hermesInstallDir, err)
 	}
+	// run takes RootCommand's result directly, so every call site names its
+	// toolchain binary as a literal (TestRootRunsOnlyPinnedToolchainCommands
+	// pins which binaries root runs).
+	run := func(cmd *exec.Cmd, err error) ([]byte, error) {
+		if err != nil {
+			return nil, err
+		}
+		if err := privsep.RootDir(cmd, hermesInstallDir); err != nil {
+			return nil, err
+		}
+		cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0")
+		return cmd.CombinedOutput()
+	}
+	ctx := context.Background()
 	if v := strings.TrimSpace(tag); v != "" {
 		logger.Logf("pinning hermes to %s...", v)
-		if out, err := exec.Command("git", "-C", hermesInstallDir, "checkout", "--quiet", v).CombinedOutput(); err != nil {
+		if out, err := run(privsep.RootCommand(ctx, "git", "-C", hermesInstallDir, "checkout", "--quiet", v)); err != nil {
 			// Tag may postdate the baked checkout: fetch tags once and retry.
-			logger.Logf("hermes: local checkout lacks %s, fetching tags: %s", v, strings.TrimSpace(string(out)))
-			if out, err := exec.Command("git", "-C", hermesInstallDir, "fetch", "--tags", "--quiet", "origin").CombinedOutput(); err != nil {
+			logger.Logf("hermes: local checkout lacks %s, fetching tags: %v %s", v, err, strings.TrimSpace(string(out)))
+			if out, err := run(privsep.RootCommand(ctx, "git", "-C", hermesInstallDir, "fetch", "--tags", "--quiet", "origin")); err != nil {
 				return fmt.Errorf("git fetch --tags: %v: %s", err, strings.TrimSpace(string(out)))
 			}
-			if out, err := exec.Command("git", "-C", hermesInstallDir, "checkout", "--quiet", v).CombinedOutput(); err != nil {
+			if out, err := run(privsep.RootCommand(ctx, "git", "-C", hermesInstallDir, "checkout", "--quiet", v)); err != nil {
 				return fmt.Errorf("git checkout %s: %v: %s", v, err, strings.TrimSpace(string(out)))
 			}
 		}
 	}
 	logger.Logf("uv %s (fast against the baked cache)...", strings.Join(uvSyncArgs, " "))
-	sync := exec.Command("uv", uvSyncArgs...)
-	sync.Dir = hermesInstallDir
-	if out, err := sync.CombinedOutput(); err != nil {
+	if out, err := run(privsep.RootCommand(ctx, "uv", uvSyncArgs...)); err != nil {
 		return fmt.Errorf("uv %s: %v: %s", strings.Join(uvSyncArgs, " "), err, tail(string(out), 400))
 	}
-	if out, err := exec.Command("hermes", "--version").Output(); err == nil {
-		logger.Logf("OK   installed: %s", firstLine(string(out)))
+	if v := probeHermesVersion(context.Background()); v != "" {
+		logger.Logf("OK   installed: hermes %s", v)
 	}
 	return nil
 }
 
-// probeHermesVersion returns the CalVer release tag from `hermes
-// --version`. CLI output double-names the release: "Hermes Agent v0.19.0
-// (2026.7.20) · upstream 8fc27820" — the parenthesized token is the git
-// tag minus its "v" (the "v0.19.0" is a marketing name with NO
-// corresponding tag), so this returns "v2026.7.20". Empty on probe error
-// or unrecognized output — empty keeps the binding's value, which is
-// strictly safer than returning the un-checkout-able semantic name (that
-// would wedge the watcher in a permanent drift↔reconcile loop).
+// probeHermesVersion returns the CalVer release tag of the checked-out
+// hermes, e.g. "v2026.7.20", or "" when the checkout is missing or
+// unrecognized — empty keeps the binding's value.
+//
+// A static read, not `hermes --version`: root runs no framework CLI, and
+// EvolutionFor("framework") calls this on every watcher tick. It reads
+// __release_date__ from hermes_cli/__init__.py in the root-owned checkout —
+// the value `hermes --version` prints in parentheses ("Hermes Agent v0.19.0
+// (2026.7.20)"), which is the git tag minus its "v". The semantic
+// __version__ ("0.19.0") is a marketing name with NO corresponding tag, and
+// returning it would wedge the watcher in a permanent drift↔reconcile loop.
 //
 // Package var, not func: EvolutionFor("framework") layers this live probe
-// over the restored binding, so tests must stub it (a real hermes on the
-// dev machine's PATH would make round-trips environment-dependent).
+// over the restored binding, so tests must stub it (a real hermes checkout
+// on the dev machine would make round-trips environment-dependent).
 var probeHermesVersion = func(ctx context.Context) string {
-	out, err := exec.CommandContext(ctx, "hermes", "--version").Output()
+	raw, err := privsep.ReadFile(hermesVersionFile(), privsep.LimitConfig)
 	if err != nil {
 		return ""
 	}
-	for _, f := range strings.Fields(firstLine(string(out))) {
-		inner := strings.TrimSuffix(strings.TrimPrefix(f, "("), ")")
-		if inner != f && inner != "" && inner[0] >= '0' && inner[0] <= '9' && strings.Contains(inner, ".") {
-			return "v" + inner
-		}
-	}
-	return ""
+	return parseReleaseDate(raw)
 }
 
-func spawnGateway(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.RuntimeContext) (*exec.Cmd, error) {
-	logFile, err := os.OpenFile("/tmp/hermes.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("open hermes.log: %w", err)
+// checkoutPresent is the restart check: the checkout must still be there.
+// A static check, not `hermes --version`, because root runs no framework
+// CLI. Presence, not the version parse: a release whose __init__.py the
+// parser does not recognize must restart just as it booted (the first
+// Start and evoFramework treat an unparsed version as benign too).
+func checkoutPresent() error {
+	if _, err := privsep.Lstat(hermesVersionFile()); err != nil {
+		return fmt.Errorf("hermes checkout missing or unreadable on restart (%s): %w", hermesInstallDir, err)
 	}
-	cmd := exec.Command("hermes", "gateway", "run")
+	return nil
+}
+
+// hermesVersionFile is the checkout file the version is read from; its
+// presence is what a restart checks.
+func hermesVersionFile() string {
+	return filepath.Join(hermesInstallDir, "hermes_cli", "__init__.py")
+}
+
+var releaseDateRE = regexp.MustCompile(`(?m)^__release_date__\s*=\s*["']([^"']+)["']`)
+
+// parseReleaseDate extracts __release_date__ and returns it as a tag ("v" +
+// value), or "" when absent or not CalVer-shaped.
+func parseReleaseDate(src []byte) string {
+	m := releaseDateRE.FindSubmatch(src)
+	if m == nil {
+		return ""
+	}
+	v := strings.TrimSpace(string(m[1]))
+	if v == "" || v[0] < '0' || v[0] > '9' || !strings.Contains(v, ".") {
+		return ""
+	}
+	return "v" + v
+}
+
+// logName names the gateway's log under framework.StateDir/log.
+const logName = "hermes"
+
+func spawnGateway(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.RuntimeContext) (*exec.Cmd, error) {
+	logFile, err := framework.OpenLog(logName)
+	if err != nil {
+		return nil, fmt.Errorf("open hermes log: %w", err)
+	}
+	// Run the framework as the low-privilege agent user when the image
+	// provides one (a plain spawn otherwise — see internal/privsep).
+	// Background, not Start's ctx: the gateway outlives the call that
+	// spawned it; Stop ends it.
+	cmd, err := privsep.AgentCommand(context.Background(), "hermes", "gateway", "run")
+	if err != nil {
+		logFile.Close()
+		return nil, fmt.Errorf("start hermes gateway: %w", err)
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = gatewayEnv(apiKeyEnv, inferenceKey, apiServerKey, rt)
 
-	// Run the framework as the low-privilege agent user when the image
-	// provides one (no-op otherwise — see internal/privsep). Restore wrote
-	// the home as root, so hand it over now; $HOME itself must also accept
-	// new dotfiles. The checkout under hermesInstallDir stays root-owned
-	// read-only, which is fine (python skips __pycache__ writes silently).
-	if privsep.Drop(cmd) {
-		privsep.OwnPath(os.Getenv("HOME"))
-		privsep.OwnTree(hermesHome)
-	}
+	// Restore wrote the home as root; hand the framework tree over now, and
+	// link it into the agent's own home so ~/.hermes (the path the agent is
+	// told about) still names it. Root's home stays root's
+	// (privsep.SecureHome). The checkout under hermesInstallDir stays
+	// root-owned read-only, which is fine (python skips __pycache__ writes
+	// silently).
+	privsep.OwnTree(hermesHome)
+	privsep.LinkAgentHome(".hermes", hermesHome)
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
 		return nil, fmt.Errorf("start hermes gateway: %w", err)
 	}
-	logger.Logf("OK   hermes gateway spawned, pid=%d (log: /tmp/hermes.log)", cmd.Process.Pid)
+	logger.Logf("OK   hermes gateway spawned, pid=%d (log: %s)", cmd.Process.Pid, framework.LogPath(logName))
 	return cmd, nil
 }
 
@@ -462,9 +564,17 @@ func gatewayEnv(apiKeyEnv, inferenceKey, apiServerKey string, rt framework.Runti
 	// API_SERVER_KEY check is (hermes api_server.py says as much), and it
 	// still runs after CORS, so `*` opens the browser-origin gate without
 	// weakening auth (verified: wrong key → 401 even with Origin + `*`).
+	//
+	// HOME is the agent's own home (privsep.AgentHome): its tools' caches
+	// and config go there, and it is hermes's default working directory —
+	// the terminal tool, relative paths in the file tools and execute_code
+	// start there unless the owner's overlay sets terminal.cwd, which this
+	// environment leaves to config.yaml. HERMES_HOME names the framework
+	// tree explicitly, so hermes does not depend on the ~/.hermes link.
 	envWhitelist := []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		"HOME=" + privsep.AgentHome(),
+		"HERMES_HOME=" + hermesHome,
 		"API_SERVER_ENABLED=true",
 		"API_SERVER_KEY=" + apiServerKey,
 		"API_SERVER_CORS_ORIGINS=*",

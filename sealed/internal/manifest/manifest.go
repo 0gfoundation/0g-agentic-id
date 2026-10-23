@@ -19,6 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
+	"unicode/utf8"
+
+	"seal-verify/internal/logger"
 )
 
 // SchemaVersion is the manifest plaintext schema version. Bumped only
@@ -106,9 +110,50 @@ func (m *Manifest) Marshal() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// ValidEntryPath reports whether p is a well-formed entry path: exactly one
+// path segment, optionally followed by "/" (a dir entry). RestoreEntry joins
+// the path under the role's directory, so anything that could name a
+// different directory — "", ".", "..", a "/" inside the segment, a NUL — is
+// refused. So is a name that is not valid UTF-8: a manifest is JSON, which
+// carries only UTF-8 strings, and encoding/json would rewrite the invalid
+// bytes as U+FFFD, naming a file that does not exist. Every other byte is an
+// ordinary file-name byte on Linux (a backslash included) and is accepted,
+// so any UTF-8 name a directory listing returns is a valid entry path.
+func ValidEntryPath(p string) error {
+	seg := strings.TrimSuffix(p, "/")
+	switch {
+	case seg == "", seg == ".", seg == "..":
+		return fmt.Errorf("manifest: invalid entry path %q", p)
+	case strings.ContainsAny(seg, "/\x00"):
+		return fmt.Errorf("manifest: entry path %q is not a single path segment", p)
+	case !utf8.ValidString(seg):
+		return fmt.Errorf("manifest: entry path %q is not valid UTF-8, which a manifest (JSON) cannot carry", p)
+	}
+	return nil
+}
+
+// Carries reports whether the directory entry name, found in dir, can be
+// carried as a manifest entry (ValidEntryPath of name, or of name+"/" for a
+// directory — the two agree). Every producer checks the names it lists
+// through here, so what a producer emits is exactly what Unmarshal keeps and
+// what the uploader can load back by its path; a name that cannot be
+// carried is skipped and logged once, and the rest of the role keeps
+// committing.
+func Carries(dir, name string) bool {
+	if err := ValidEntryPath(name); err != nil {
+		logger.Once("manifest.carries:"+dir+"/"+name, "manifest: not tracking %q in %s: %v", name, dir, err)
+		return false
+	}
+	return true
+}
+
 // Unmarshal parses plaintext bytes into a Manifest. Validates schema
 // version and kind so a wildly different blob shape can't be mistakenly
-// treated as a manifest.
+// treated as a manifest. Manifests arrive from chain, where an agent's own
+// commits (or an older sealed) put them, so an entry whose path is not a
+// valid entry path (ValidEntryPath) is dropped with one log line rather
+// than failing the whole manifest: every other entry still restores, and
+// the next commit no longer carries the dropped one.
 func Unmarshal(b []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -121,9 +166,15 @@ func Unmarshal(b []byte) (*Manifest, error) {
 	if m.Kind != KindLabel {
 		return nil, fmt.Errorf("manifest: unexpected kind: %q (expected %q)", m.Kind, KindLabel)
 	}
-	if m.Entries == nil {
-		m.Entries = []Entry{}
+	kept := make([]Entry, 0, len(m.Entries))
+	for _, e := range m.Entries {
+		if err := ValidEntryPath(e.Path); err != nil {
+			logger.Once("manifest.unmarshal:"+e.Path, "manifest: dropping entry: %v", err)
+			continue
+		}
+		kept = append(kept, e)
 	}
+	m.Entries = kept
 	return &m, nil
 }
 
@@ -162,6 +213,24 @@ func (m *Manifest) EntryByPath(path string) *Entry {
 	}
 	return nil
 }
+
+// heldHash is the ContentHash of a held entry (Held). It is not a hex
+// digest, so no entry built from content carries it.
+const heldHash = "held"
+
+// Held is the entry a producer emits for path when the entry's content is
+// over its size limit: it stands for "keep the committed version of this
+// entry". It appears only in the drift form EvolutionFor returns, never on
+// chain: the uploader replaces it with the entry for path in the manifest
+// committed on chain, or leaves it out when that manifest has none
+// (uploader.pushManifest). Holding one entry rather than failing the role
+// keeps every other entry of the role committing.
+func Held(path string, kind EntryKind) Entry {
+	return Entry{Path: path, Kind: kind, ContentHash: heldHash}
+}
+
+// IsHeld reports whether e is a Held entry.
+func (e Entry) IsHeld() bool { return e.ContentHash == heldHash }
 
 // HashHex returns the 0x-prefixed hex sha256 of b. Same algorithm used
 // for both Entry.ContentHash and iData.dataHash so the formats round-trip.

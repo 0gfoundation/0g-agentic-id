@@ -113,9 +113,19 @@ pub struct Config {
     /// full environment from one URL — the attestor itself never calls it.
     /// New SDKs use `verified_feedback_addr` instead.
     pub reputation_registry_addr: Option<Address>,
-    /// VerifiedFeedbackRegistry bound to this AgenticID (TEE marks over the
-    /// canonical ERC-8004 reputation registry, which SDKs discover FROM it
-    /// via getCanonicalReputation). Same /config-discovery-only purpose.
+    /// VerifiedFeedbackRegistry PROXY bound to this AgenticID (TEE marks over
+    /// the canonical ERC-8004 reputation registry, which SDKs discover FROM
+    /// it via getCanonicalReputation). Served on GET /config like its
+    /// siblings, AND injected into every newly created container as
+    /// `VERIFIED_FEEDBACK_ADDR`: it is the ServeProof validator, i.e. the
+    /// sealed proxy signs keccak256(0x19 ‖ 0x00 ‖ this ‖ proofHash) (EIP-191
+    /// version 0x00), so proofs redeem only at this address. None (unset,
+    /// blank or the zero address) → /config serves null, the container gets a
+    /// blank value and emits no X-Agent-Proof. The attestor never writes to
+    /// it; worker and api make one view call at startup
+    /// (`chain::check_verified_feedback_anchor`): its getIdentityRegistry()
+    /// must equal `agentic_id_addr`, else startup fails. Parsed strictly: a
+    /// non-empty value that is not an address fails startup.
     pub verified_feedback_addr: Option<Address>,
     /// FeedbackBatcher — EIP-7702 delegate making the SDK's feedback flow
     /// atomic. Advertise ONLY on 7702-enabled chains: the SDK treats its
@@ -313,8 +323,10 @@ impl Config {
                 .and_then(|s| s.parse().ok()),
             reputation_registry_addr: env_opt("ATTESTOR_REPUTATION_ADDR")
                 .and_then(|s| s.parse().ok()),
-            verified_feedback_addr: env_opt("ATTESTOR_VERIFIED_FEEDBACK_ADDR")
-                .and_then(|s| s.parse().ok()),
+            // Strict, unlike its discovery-only siblings: this one becomes the
+            // containers' ServeProof validator, so a typo must fail startup
+            // rather than silently turn proofs off fleet-wide.
+            verified_feedback_addr: env_opt_addr("ATTESTOR_VERIFIED_FEEDBACK_ADDR")?,
             feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
                 .and_then(|s| s.parse().ok()),
             clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
@@ -425,6 +437,25 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+/// An optional address env var, parsed strictly: unset, blank or the zero
+/// address → None, but a non-empty value that is not an address is a startup
+/// error (a typo must not silently read as "unset"). The zero address names
+/// no contract, so it is treated as "unset" rather than served and injected
+/// as if it were one.
+fn env_opt_addr(key: &str) -> anyhow::Result<Option<Address>> {
+    parse_opt_addr(key, env_opt(key).as_deref())
+}
+
+fn parse_opt_addr(key: &str, raw: Option<&str>) -> anyhow::Result<Option<Address>> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => s
+            .parse::<Address>()
+            .map(|a| (a != Address::ZERO).then_some(a))
+            .map_err(|e| anyhow::anyhow!("invalid {key}={s:?}: {e}")),
+    }
+}
+
 /// Parse the `ATTESTOR_FRAMEWORKS` value: a comma list of `name[:image]`
 /// entries. `image` omitted → `None` (caller falls back to sandbox_snapshot).
 /// Empty / `None` → `[openclaw]` (an empty list would reject every deploy).
@@ -465,6 +496,31 @@ mod tests {
             assert!(!parse_opt_in(Some(off)), "{off:?} must not enable");
         }
         assert!(!parse_opt_in(None), "unset must not enable");
+    }
+
+    #[test]
+    fn opt_addr_blank_is_none_and_typo_is_an_error() {
+        const K: &str = "ATTESTOR_VERIFIED_FEEDBACK_ADDR";
+        // .env.example ships it blank → unset, not an error. The zero address
+        // names no registry: also unset (the worker warns, /config serves null).
+        for blank in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("0x0000000000000000000000000000000000000000"),
+            Some(" 0x0000000000000000000000000000000000000000 "),
+        ] {
+            assert_eq!(parse_opt_addr(K, blank).unwrap(), None, "{blank:?}");
+        }
+        let a = parse_opt_addr(K, Some(" 0x00000000000000000000000000000000000000B7 "))
+            .unwrap()
+            .expect("valid address");
+        assert_eq!(format!("{a:#x}"), "0x00000000000000000000000000000000000000b7");
+        // A typo must fail startup, not silently disable ServeProofs.
+        for bad in ["0x1234", "not-an-address", "0x00000000000000000000000000000000000000ZZ"] {
+            let err = parse_opt_addr(K, Some(bad)).unwrap_err().to_string();
+            assert!(err.contains(K), "error must name the var: {err}");
+        }
     }
 
     #[test]

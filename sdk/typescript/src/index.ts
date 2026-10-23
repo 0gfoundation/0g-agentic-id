@@ -38,7 +38,7 @@ export type { AgenticIDConfig } from './context';
 export { SandboxClient } from './SandboxClient';
 export { AgenticIDClient } from './AgenticIDClient';
 export type { IntelligentDataResult } from './AgenticIDClient';
-export { ReputationClient } from './ReputationClient';
+export { ReputationClient, MAX_ABS_FEEDBACK_VALUE } from './ReputationClient';
 export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
@@ -80,7 +80,8 @@ export {
   signServeProof,
   verifyServeProofSignature,
 } from './ServeProof';
-export type { BuildServeProofHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
 export type {

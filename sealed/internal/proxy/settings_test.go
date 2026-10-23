@@ -21,7 +21,7 @@ import (
 func settingsServer(t *testing.T, owner string) (*Server, *settings.Doc) {
 	t.Helper()
 	ag := state.New()
-	ag.Set([]byte{1}, "http://127.0.0.1:1", "deadbeef", owner, "1", "0x00", "1", "0x00")
+	ag.Set([]byte{1}, "http://127.0.0.1:1", "deadbeef", owner, "1", "0x00", "1", "0x00", "")
 	s := &Server{agent: ag}
 	cur := settings.Doc{Provider: "0g-compute", Model: "glm-5.2", Thinking: "low"}
 	applied := &settings.Doc{}

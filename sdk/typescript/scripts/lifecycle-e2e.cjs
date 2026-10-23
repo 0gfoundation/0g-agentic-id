@@ -86,6 +86,14 @@ function mkClient(privKey, cfg) {
 
 (async () => {
   const cfg = await (await fetch(ATTESTOR_URL + '/config')).json();
+  // The sealed proxy signs serve-proofs for the registry the attestor injects
+  // (VERIFIED_FEEDBACK_ADDR ← ATTESTOR_VERIFIED_FEEDBACK_ADDR, advertised as
+  // /config verified_feedback_addr). A different VERIFIED_FEEDBACK_ADDR here
+  // would make every attest revert — fail fast instead of spending gas.
+  if (String(cfg.verified_feedback_addr ?? '').toLowerCase() !== VERIFIED_FEEDBACK_ADDR.toLowerCase()) {
+    console.error(`VERIFIED_FEEDBACK_ADDR=${VERIFIED_FEEDBACK_ADDR} != attestor /config verified_feedback_addr=${cfg.verified_feedback_addr}`);
+    process.exit(2);
+  }
   const A = mkClient(OWNER_PRIV, cfg);
   const ownerA = privateKeyToAccount(OWNER_PRIV).address;
 
@@ -177,6 +185,9 @@ function mkClient(privKey, cfg) {
   check('live ServeProof captured from /hello', !!header);
   const proof = A.reputation.parseServeProofHeader(header);
   check('proof names the source agent', proof.agentId === AGENT_ID, `proof.agentId=${proof.agentId}`);
+  // Free local pre-check (v0x00 digest bound to VERIFIED_FEEDBACK_ADDR) before spending gas.
+  const pre = await B.reputation.verifyProof(proof);
+  check('proof passes the local verifyProof pre-check', pre.ok, pre.ok ? undefined : pre.reasons.join('; '));
 
   const readAll = () => B.reputation.readAllFeedback({
     agentId: AGENT_ID, clientAddresses: [], tag1: '', tag2: '', includeRevoked: false,

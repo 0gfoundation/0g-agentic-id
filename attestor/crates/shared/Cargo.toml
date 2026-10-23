@@ -61,3 +61,4 @@ ethers = "2.0"
 
 [build-dependencies]
 tonic-build.workspace = true
+serde_json.workspace = true

@@ -27,8 +27,11 @@ X 怎么办"之前，先把这篇读一遍。
 - `serve-proof` 签出的 8 条 envelope 断言**都是**由
   `agent_seal_priv` 密码学绑定的；但成立条件不一样：**Group A（身份
   层 3 条）**只要 priv 不出 TEE 就无条件成立，**Group B（内容层 5
-  条）**额外需要"签名能力不被 agent 滥用"这一前提，靠 **agent 钢印**
-  兜底 —— 见正文 [承重墙](#这-8-条保证的承重墙是-agent-钢印)。
+  条）**额外需要"签名能力不被 agent 滥用"这一前提。对 serve-proof
+  本身，这个前提是**机械保证**的：它签在 agent 的 sign socket 签不出
+  的域里（EIP-191 version `0x00`，绑定 VerifiedFeedbackRegistry）；
+  agent 的其他签名则靠 **agent 钢印**兜底 —— 见正文
+  [承重墙](#这-8-条保证的承重墙是签名域隔离加-agent-钢印)。
 - `serve-proof` **不**证明响应**内容正确**、agent **自主**、或者
   owner 没有通过 prompt **操纵**过 agent。
 - 内容层的信任被委托给一个链上的**声誉系统**：行为不当的 agent 会
@@ -66,9 +69,10 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 |---|---|
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
-| openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节 |
-| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:159-167`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:206-221`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
+| openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,dsh,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
+| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:180-188`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
 任何对 sealed 的未来变更，只要可能跨越这条边界 —— 即使是间接的
 （例如把 priv 字节写日志、通过 debug endpoint 暴露、把它放进与
@@ -249,7 +253,7 @@ Sealed 容器启动时：
    （`container_pubkey`、`container_privkey`），并把私钥那一半作为
    `SANDBOX_SEAL_KEY` 环境变量注入。容器**不**生成它：Phase 0 只检查
    注入进来的这把 key 派生出的压缩 `pubkey` 跟签名 attestation envelope
-   里的那个一致，不一致就 fail loud（`internal/config/config.go:159-167`）。
+   里的那个一致，不一致就 fail loud（`internal/config/config.go:180-188`）。
    容器也不会自己独立得到那个 pubkey —— 它转发的就是 envelope 里带的那个
    （`internal/provision/provision.go:58-65`）。
 2. 0g-Sandbox 观察容器启动、测量它的 `image_hash`，用自己
@@ -320,7 +324,10 @@ app-scoped KMS key 就无法伪造 (`container_pubkey`, `mac`) 这一对。
 - **Per-agent 一次写入**：一旦 `agentSeal[agentId]` 非零，就再也
   不能被改写。写入时拒绝零值，所以首次写入即是终局写入。
 - **`sealId` 全局唯一**：`sealId → agentId` 的映射在所有 agent
-  之间一对一。两个 agent 不能共享一把 seal。
+  之间一对一，所以两个 agent 不能共享一个 sealId。自 AgenticID 1.2.0
+  起 agentSeal 地址也唯一，但只覆盖这次升级之后绑定的 seal（更早的
+  不在记录里；attestor 每次都从新的 sealId 派生 seal，CloneGate 也会
+  拒绝复用源 agent 自身 seal 的克隆）。
 - **跨 transfer 持续存在**：`iTransferFrom` 清空 `agentWallet` 和
   `authorizedUsers`（per-owner 的状态），但保留 `agentSeal` /
   `sealId` 不动。agent 的 TEE-attested 身份比任何一次 owner 变更
@@ -380,17 +387,21 @@ TEE，期间一刻都不能在任何 TEE 之外以明文出现 —— 否则新 
 `iTransferFrom` 通过同一笔交易里携带的两段密码学证明强制这件事：
 
 - **AccessProof** —— 买方签
-  `keccak256(chainId || erc7857 || dataHash || buyer_targetPubkey || nonce || deadline)`
-  （`erc7857` 是 AgenticID token 合约地址；这两个前缀是**必须的**，
-  用于对跨链 / 跨合约重放做域分隔），
+  `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone, dataHash, buyer_targetPubkey, nonce, deadline))`
+  （按字对齐、带长度前缀的 `abi.encode`，不是字节拼接；`erc7857` 是
+  AgenticID token 合约地址，`tokenId` / `from` 是被卖的 token 及其卖家，
+  `isClone` 是动作；这五个都是**必须的**：前两个对跨链 / 跨合约重放做
+  域分隔，其余几个自 TEEDataVerifier 1.2.0 起把 proof 绑定到这个 token
+  和这个动作，声明了相同 `dataHash` 的仿冒 token 无法兑现它，转让 proof
+  也不能被拿去兑现克隆），
   声明"我想要把这份数据 seal 到我的 pubkey"。recover 出来的签名者
   必须等于 `to`（或一个注册过的 delegate）。
 - **OwnershipProof** —— Oracle TEE 用卖方的 `agent_seal_priv` 解
   现有的 `sealedKey`，把同一份明文 `dataKey` 用 `buyer_targetPubkey`
   重新 ECIES 加密，并签：
-  `keccak256(chainId || erc7857 || dataHash || sealedKey_new ||
-  buyer_targetPubkey || nonce || deadline)`（同样必须带
-  `chainId || erc7857` 前缀）。recover 出来的签名者必须等于链上注册过的
+  `keccak256(abi.encode(chainId, erc7857, tokenId, from, isClone,
+  dataHash, sealedKey_new, buyer_targetPubkey, nonce, deadline))`（同样必须
+  带这组前缀）。recover 出来的签名者必须等于链上注册过的
   `teeOracleAddress`。
 
 Oracle TEE 对 `dataKey` 是**无状态**的：解密、重新加密、签
@@ -420,24 +431,48 @@ TappRegistry 流程（审计形状一致，只是角色不同）。
 ```json
 {
   "agent_id":       "42",
+  "submitter":      "0x<唯一可兑付它的地址：调用方的 X-Client-Address，未声明则为 0x0>",
   "timestamp":      1778580000,
   "deadline":       1778583600,
   "task_hash":      "0x<对请求/响应 transcript 的 keccak256>",
   "data_hashes":    ["0x<iData root>", "..."],
-  "framework_hash": "0x<sealed 镜像度量>"
+  "framework_hash": "0x<sealed 镜像度量>",
+  "validator":      "0x<签名所绑定的 VerifiedFeedbackRegistry proxy>"
 }
 ```
 
-由 `agent_seal_priv` 用 EIP-191 签名(65 字节签名与 envelope 一起放在
-`X-Agent-Proof` header 里)。请求/响应 transcript **折进 `task_hash`**,不再作为
-独立字段暴露:
+65 字节签名与 envelope 一起放在 `X-Agent-Proof` header 里
+(`0x<sig>.<base64url envelope>`)。`agent_seal_priv` 对 `digest` 做裸签:
+
+```
+proofHash = keccak256(abi.encode(chainId, identityRegistry, submitter, agent_id,
+                                 timestamp, deadline, task_hash,
+                                 keccak256(abi.encodePacked(data_hashes)), framework_hash))
+digest    = keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)
+```
+
+`digest` 是 EIP-191 version `0x00`("data with intended validator"),validator
+是 VerifiedFeedbackRegistry proxy —— 链上即 OpenZeppelin
+`toDataWithIntendedValidatorHash(address(this), …)`。它**不是** `personal_sign`
+(`0x19 0x45`)digest:`verifyMessage` 一类的校验不适用,registry 也拒收旧的
+`personal_sign` 包装。`chainId` 和 `identityRegistry` 参与签名但不随 envelope
+携带(verifier 用自己部署的值)。`validator` 只为诊断而携带,它不是链上 tuple
+的字段;verifier 拿它跟自己要兑付的 registry 比对。没配 `VERIFIED_FEEDBACK_ADDR`
+——或者配的地址其 `getIdentityRegistry()` 不是本容器的 `AGENTIC_ID_ADDR`(链连上后
+检查一次)——的 runtime 根本不发 `X-Agent-Proof`。
+
+请求/响应 transcript **折进 `task_hash`**,不再作为独立字段暴露:
 
 ```
 task_hash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody) ‖ status)
 ```
 
-这就是链上 `ServeProof` 的形状(无 client;归属由 `giveFeedback` 时的 `msg.sender`
-决定,靠签名 nonce 保证一次性)。
+`status` 是十进制 HTTP 状态码,永远是三位;`attestFeedbackWithTask` 拒收
+100–999 之外的值,所以拼接无法错位。
+
+这就是链上 `ServeProof` 的形状。只有 `submitter` 能兑付它(作为
+`VerifiedFeedbackRegistry.attestFeedback` / `attestFeedbackWithTask` 的
+`msg.sender`),签名 nonce 保证一次性。
 
 配合 TEE attestation 链（image_hash → 开源构建），验证这条签名能
 拿到以下**强、密码学**保证：
@@ -479,7 +514,7 @@ adapter 补上 `package_version` 后本地副本对不上,而同样被跳过,直
 
 ---
 
-## 这 8 条保证的承重墙是 agent 钢印
+## 这 8 条保证的承重墙是签名域隔离加 agent 钢印
 
 上一节那张表的 8 条**都是** `agent_seal_priv` 用密码学手段签出来的
 断言。但成立条件不一样，分两组：
@@ -513,7 +548,7 @@ adapter 补上 `package_version` 后本地副本对不上,而同样被跳过,直
 
 所以 Group B 在 Group A 的基础上**多一个前提：签名能力没有被滥用**
 （agent 没拿 sign socket 自己捏 framework schema 的 envelope）。
-这一点不是签名机制能保证的，因为 sealed 的 sign socket 是一个
+在它的三个签名端点之内，sealed 的 sign socket 是一个
 **schema-agnostic 的通用 signer**：
 
 ```
@@ -521,38 +556,79 @@ POST unix:///run/seal-sign.sock/sign/personal_sign  { message: <任意字节> }
       → 返回 sig，sealed 不检查 message 长什么样
 ```
 
-也就是说，agent（LLM 驱动的 openclaw 子进程）完全可以自己拼一份
-长得跟 serve-proof envelope 一模一样的 JSON、走 sign socket 签出来。
-Verifier 拿到那份 `(envelope, sig)`，**在密码学上无法区分**它是
-sealed 的 watcher 自己组装签的、还是 agent 自己捏的。
+所以 agent（LLM 驱动的框架子进程）完全可以拼出长得跟 serve-proof
+一模一样的字节 —— 哪怕就是那 32 字节的 `proofHash` 本身 —— 拿去
+签。但它拿回来的签名，原像永远是 socket 自己构造的三种形状之一：
+`0x19 0x45`（personal_sign）、`0x19 0x01`（EIP-712）、或交易签名
+payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
+签名**，由 `sealed/internal/proxy/sign_test.go` 钉死。
 
-"签名能力不被滥用"这件事撑住 Group B 的方式有两条：
+因此"签名能力不被滥用"以两种不同方式成立：
 
-1. **通道隔离**（仅 `X-Agent-Proof`）：`X-Agent-Proof` header 由
-   sealed proxy 在响应路径上自己写入，agent 没法覆盖 HTTP header。
-   verifier 只要规定"只信响应 header 里的 X-Agent-Proof，body 里
-   出现的 envelope sig 不算"，这一条通道上的 Group B 就靠**机械
-   保证**而非靠 agent 自律守住。
-2. **agent 钢印**（其余 framework envelope 全靠它）：agent 自身
-   被 system prompt 注入了拒签规则 —— 不签外部传进来的字节、不
-   主动组装 framework schema 的 envelope。见
-   [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md) §4.1 Refusal 1。
+1. **签名域隔离**（serve-proof）：serve-proof 签在 EIP-191 version
+   `0x00` 下，绑定 VerifiedFeedbackRegistry。socket 到不了这个域，
+   所以 agent 从 socket 拿到的任何签名，链上链下都验不成 serve-proof。
+   这是**机械保证**，也是唯一能覆盖链上兑付的保护：registry 只看到
+   `(proof, signature)`，永远不知道签名来自哪条通道。本文旧版把功劳
+   记在**通道隔离**上（`X-Agent-Proof` header 由 proxy 而非 agent
+   写入）。通道隔离只对读实时响应的 verifier 有用，从来护不住兑付。
+   VerifiedFeedbackRegistry 1.2.0 之前，serve-proof 就是对 `proofHash`
+   的一个普通 `personal_sign`，agent 可以线下通过 `/sign/personal_sign`
+   伪造（审计 FIND-01）。
+2. **agent 钢印**（socket *能*签的一切）：agent 自身被 system prompt
+   注入了拒签规则 —— 不签外部传进来的字节、不主动组装 framework
+   schema 的 envelope。见 [`AGENT_DOCTRINE.zh.md`](AGENT_DOCTRINE.zh.md)
+   §4.1 Refusal 1。最要紧的 framework 渠道是 `chain.Update`：链上
+   门槛是 `msg.sender == agentSeal`，而 `/sign/transaction` 会签
+   agent 自己拼的 `update`。
 
 这就划出了承重墙：
 
 | 部件 | 它倒了会怎样 |
 |---|---|
 | `agent_seal_priv` 不出 TEE | 整套塌，连 Group A 都丢（攻击者线下任意伪造）|
-| sealed proxy 控制响应 header | `X-Agent-Proof` 那条通道上的 Group B 失去机械保护，回退到靠 agent 钢印；`report.Status` / `chain.Update` 本来就不靠 header 通道，不受影响 |
-| **agent 钢印** | `report.Status` / `chain.Update` 等渠道的 Group B 失效（agent 滥用 sign socket 拼伪 envelope）；`X-Agent-Proof` 仍靠通道隔离机械守住；Group A 在所有渠道上仍成立 |
+| **sign socket 永不签裸 hash 或 EIP-191 version `0x00`** | agent 线下伪造 serve-proof 内容（任意 `task_hash` / `data_hashes` / 时间戳 / `submitter`），并为它们铸出 VerifiedFeedbackRegistry 标记（FIND-01）。任何把 socket 桥接成 agent 工具的 adapter 同理 |
+| sealed proxy 控制响应 header | 现在影响很小。proxy 在每条转发路径上都会丢掉上游 backend 设的 `X-Agent-Proof`，客户端看到的这个头总是 runtime 自己的。即便漏过一个，它也只能带 socket 域的签名（验不成 serve-proof），或从别的响应里搬来的真 proof（`task_hash` 对不上这条响应）|
+| **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
-也就是说，**agent 守不住 ⇒ Group B 在没有通道隔离的渠道上
-（`report.Status` / `chain.Update`）失效，但 Group A 全程不掉**。
-priv 没漏、TEE 没破，verifier 仍然能验出"这条断言由合法 TEE 内的
-`agent_seal_priv` 签出"，只是断言的内容层语义不再对应现实，要靠链
-上声誉补。这不是个 bug，是这套 trust model 主动接受的 ceiling：在
-跑 LLM 的 agent 上，没有比"信 agent 不滥用 sign socket + 用声誉补
-漏"更强的方案。
+`report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
+`StatusReport:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
+永不签裸 hash，所以 agent 没法通过它伪造这两者。本表旧版把
+`report.Status` 列为可经 socket 伪造，这是错的。
+
+也就是说，**agent 守不住 ⇒ Group B 在 socket 能签的东西上
+（`chain.Update`、agent 自己的声明）失效，但 serve-proof 的 Group B
+和整个 Group A 不掉**。priv 没漏、TEE 没破，verifier 仍然能验出
+"这条断言由合法 TEE 内的 `agent_seal_priv` 签出"，只是那些渠道上
+断言的内容层语义不再对应现实，要靠链上声誉补。serve-proof 展示了
+能做到时更强的方案：把 framework 的签名放进 socket 到不了的域。
+agent 按设计共享同一能力的地方，目前没有这种隔离 —— 它自己的交易里
+就包括对 AgenticID 的 `update`。那里的 ceiling 仍是"信 agent 不滥用
+sign socket + 用声誉补漏"。
+
+**签名域隔离没有堵上的东西。** agent 没法*伪造* serve-proof 内容，
+但仍能拿到*真的* serve-proof。它可以向自己的 proxy 发请求（例如
+loopback `:8080` 上的 `/hello` 或它自己的 `/api/*` 服务），带一个它
+控制的 `X-Client-Address`，比如它自己生成、经 `/sign/transaction`
+注资的钱包。这些 proof 对那次交互是如实的，因为每个字段都是 sealed
+从真实请求里算出来的，但"client"就是 agent 自己。这跟 owner 用第二
+个钱包经 `/hello` 给自己打分是同一类 sybil 问题。
+VerifiedFeedbackRegistry 拒绝 owner、approved operator、该 agent 的
+收款钱包（1.2.0 起）或 agentSeal 本身作为兑付方。这是 ERC-8004 合规，不是抗 sybil：一个由 seal 注资的
+新钱包照样能过。只能由声誉加权去吸收。
+
+**切换。** `0x00` 绑定是硬切换，不双收、不回退。
+VerifiedFeedbackRegistry 1.2.0、新的 sealed 镜像（读取
+`VERIFIED_FEEDBACK_ADDR`）、注入该变量的 attestor、SDK 0.2.0（通过
+`ATTESTOR_CLI_LATEST` 提示旧 CLI 升级）在同一个窗口上线。切 snapshot 之前，新镜像 hash 必须先在每个 AgenticID 上
+`addValidFrameworkHash`。正在运行的 agent 保持旧镜像和旧 env，直到
+owner 签名的 `/reset` 重建它；升级之后，旧镜像签出的 proof 不再能
+验过。移除旧镜像 hash（`removeValidFrameworkHash`）要等到所有这类 agent 都
+reset 之后：attestor 每次 `/provision` 都会重查白名单，而 sealed 每次开机
+（resume、崩溃重启）都会调 `/provision`，所以没 reset 的容器下次开机就会
+provision 失败，直到它的 owner reset 为止。已弃用的 `AgenticIDReputationRegistry` 没有改动，仍校验旧的
+`personal_sign` digest，所以它的 pauser 必须在切换之前或切换时暂停它。
+在那之前，它对 FIND-01 式伪造仍然敞开。
 
 ### `agent_seal_priv` 还会被用来签什么
 
@@ -566,12 +642,195 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
+socket 按不变量**永不**签的东西（`sealed/internal/proxy/sign.go`）：
+
+- 调用方给的裸 32 字节 hash（没有 `eth_sign` 一类的端点）
+- EIP-191 version `0x00`（"data with intended validator"）数据，
+  即 serve-proof 所在的域
+
+socket 的每个签名都落在 `0x19 0x45` personal message、`0x19 0x01`
+EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程内的
+签名里，只有三种在这几种形状之外：`report.Status` 和 settings seed 是裸
+keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
+普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
+所以这条渠道靠的是钢印（见上面的承重墙表）。
+把 socket 桥接成 agent 工具的 adapter（例如 dsh 的 `seal_sign`）
+不得补上这两条缺失的路径。
+
 unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
 （`internal/privsep`），并且**永不暴露到网络上** —— sandbox
 owner 没法从外面直接 post。这次 uid 拆分同时把 doctrine 第 2/4 条里
 "偷钥匙"的那一半变成内核强制：降权后的 agent 进程无法 ptrace
 sealed、读不了 `/proc/<sealed pid>/mem`、也读不了 PID 1 的引导环境变量
-（sealed 另外自设 `PR_SET_DUMPABLE=0`）。这跟任何钱包里
+（sealed 另外自设 `PR_SET_DUMPABLE=0`）。sealed 还给自己设置
+`no_new_privs`，它启动的每个进程都会继承：agent 的进程里任何 exec 都不会
+获得权限，所以镜像里的 setuid-root 二进制（`su`、`mount`、`passwd` 等）
+以 agent 的 uid 运行，uid 拆分也就不依赖这些二进制个个都没有本地提权漏洞
+（`privsep.HardenSelf`；设置成功之前 `Required` 一律拒绝）。
+
+这次 uid 拆分是 fail-closed 的：拆分不可用时（sealed 不是 root，或镜像里
+没有一个拥有自己非 root uid/gid 的 `agent` 账户），sealed 拒绝 provision
+`agent_seal_priv`（`privsep.Required`）—— 链上镜像白名单只钉 hash、不检查
+构建内容，拦不住 Dockerfile 里把这个账户弄丢或弄坏的镜像。这道闸保证的东西
+是刻意收窄的：在拿到密钥的容器里，框架永远不会以 sealed 的 uid **运行**。
+这道闸同时要求 root 的家目录只归 root 所有、agent 自己的家目录已经就位
+（`privsep.SecureHome` 与 `privsep.PrepareAgentHome`，见下）。
+
+agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所以 root 一侧
+对 agent 可写路径的处理遵循四条不变式（`internal/privsep`）：
+
+- **家目录。** `/root` 保持 `root:root 0711` 且不带 POSIX ACL，在启动时强制
+  （`SecureHome`，由 `privsep.Harden` 执行；留在它上面的 default ACL 会把 root
+  之后在那里创建的东西交给 ACL 点名的人）。agent 有自己的家目录
+  `/home/agent`（`agent:agent 0700`，启动时由 `PrepareAgentHome` 创建；它和
+  `/home` 都不能是链接）：它是 agent 运行的一切进程的 `HOME`，也是
+  `AgentCommand` 的默认工作目录，所以工具缓存与配置（`~/.npm`、`~/.cache`、
+  `~/.config`、`~/.local`、`~/.gitconfig` 等）以及 agent 自己的文件都在那里。
+  （prime 和 dsh 的 bridge 有意从各自的框架目录树启动，所以它们运行的工具
+  的相对路径落在那棵树里。）两个家目录都就位之前 `Required` 一律拒绝
+  provision。在 `/root` 里 agent 只拥有它的框架目录树（`OwnTree`；prime 另有
+  `/root/.prime-conversation` 和每会话 harness 目录 `/root/.prime-session`），
+  每棵都链接进它的家目录（`~/.openclaw`、`~/.hermes`、`~/.dsh`、
+  `~/.prime/agent`；`LinkAgentHome`），所以告诉它的那些路径照样可用。每个
+  框架还会在环境变量里拿到自己目录树的绝对路径（`OPENCLAW_STATE_DIR`、
+  `HERMES_HOME`、`DSH_HOME`、`PRIME_AGENT_CODING_AGENT_DIR`；openclaw 另外
+  拿到 `OPENCLAW_HOME=/root`，它从中推导默认 workspace，2026.5.x 还从中推导
+  exec approvals 文件 —— 见 QUIRKS.md），所以 agent 删掉或替换链接，也不会
+  让框架的配置、状态或 workspace 指向另一棵树；sealed 自己的代码使用
+  `/root/...` 绝对路径，从不解析这些链接。不过这个链接不只是给 agent 的
+  便利：openclaw 的少数插件从 `HOME` 取默认位置，经它到达目录树 ——
+  memory-wiki 的默认 vault（所以插件启用而没有设 vault 路径时，渲染会把它设成
+  目录树里的绝对路径），以及没有配置项的 file-transfer 审计日志（见
+  QUIRKS.md）；agent 删掉或替换链接，只会挪动这些，而且仍在 agent 本来就能写
+  的范围里。（openclaw 核心展开的 `~` —— 配置里取路径值的键中的、它的媒体
+  工具路径里的 —— 也取自 `OPENCLAW_HOME`，所以那里的 `~/x` 指 `/root/x`，而
+  agent 在它的目录树之外什么都建不了；只有它的 read/write/edit 工具、agent
+  运行的程序和上面那些插件默认位置从 `HOME` 取 `~`。渲染会把属主给的 `~/x`
+  和 `/root/x` agent 路径改写到 agent 的家目录，agent 文档也让它在那里用
+  绝对路径。）
+  这些目录树的名字位于 root 所有的目录里 —— `/root` 本身，或位于它和一棵声明
+  在更深处的目录树之间、归 root 所有的目录（prime 的 `/root/.prime`）——
+  所以 agent 能改动树里的内容，却替换不了树本身。agent 绝不拥有 root 的家目录、`/`、
+  任何 PATH 目录或 sealed 自身可执行文件的祖先目录，也不拥有 sealed 状态目录
+  里、或 sealed 所运行二进制的包目录里的任何东西（`guardHandover`）。对
+  `/root` 本身没有写权限，agent 就无法放置 root 的命令会从 root 家目录读取的
+  配置（`~/.npmrc`、`~/.gitconfig`），也无法替换那里的工具链。早先的 sealed
+  曾让 agent 拥有 `/root`，由它运行过的容器里仍可能留着 agent 在那里建的
+  条目；启动时，在加固 `/root` 并准备好 agent 家目录之后，sealed 把 `/root`
+  下每个可能被其他 uid 改过的直接条目（不归 root 所有，他人或非 root 的组
+  可写，或带有让其他 uid 能写它 —— 对目录而言，能写 root 之后在其中创建的
+  东西 —— 的 POSIX ACL）—— adapter 声明的框架目录树（`DeclareTree`）除外 ——
+  移进 agent 的家目录（`ReclaimHome`）；adapter 为其在自己目录树里声明了新
+  位置的条目（`DeclareRelocation`：prime 旧布局下的 session artifacts）则移到
+  那里。只是通向一棵声明在 `/root` 更深处的目录树的目录（prime 的
+  `/root/.prime`）不会被移走（那样会把树一起带走）：它被改为
+  `root:root 0755` 且不带 ACL，里面的其他东西按同样的规则收回。只要还有条目
+  移不走或改不成 root 所有，`Required` 就拒绝 provision。
+- **执行。** root 不运行任何框架 CLI：版本探测改为静态读取，读取 agent
+  可写状态的 CLI 以 agent 身份运行（`AgentCommand`），并有截止时间、只保留
+  有限的输出（`BoundedOutput`）。必须写 root 所有前缀的工具链命令（npm、git、
+  uv、0g-storage-client）走 `RootCommand`：只在由 root 所有且他人不可写的
+  PATH 目录里解析二进制，同样检查二进制本身，并使用由 sealed 固定的环境变量：
+  `PATH`（可信目录）、`HOME=/root` 和仅 root 可访问的 `TMPDIR`。唯一取自
+  sealed 自身环境的值 —— 也就是容器的环境，由 owner 签名的部署请求设定 ——
+  是代理端点（`HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY`，大小写皆可）。包
+  registry / index URL 和 CA 证书位置有意不传：前者会让部署环境决定 root
+  运行哪个包的安装脚本，后者指向 root 的工具链按路径打开的文件，而那可能在
+  agent 目录树里；两者都只来自镜像（它的信任库和工具链归 root 所有的配置）。
+  sealed 自己的进程以 root 身份、在同一个环境里运行，同样的规则也适用于它：
+  启动时、在它的第一个 TLS 连接（链 RPC、attestor、存储 indexer、推理
+  router）之前，只有当 `SSL_CERT_FILE` 和 `SSL_CERT_DIR` 指向仅 root 可写的
+  文件时才保留它们，否则将其移除（`ScrubTrustEnv`），所以它信任的 CA 来自
+  镜像；在它的第一行日志之前（正是这行日志让 Go 读取 `TZ` 指向的时区文件，
+  而那是阻塞、跟随链接的读取），只有当 `TZ` 指向（或 `TZ` 未设置时
+  `/etc/localtime` 是）Go 能加载的、仅 root 可写的时区文件时才保留它，否则
+  设为 `TZ=UTC`（`ScrubTimeEnv`；能加载的时区也让 Go 不会退而去读
+  `$GOROOT/lib/time/zoneinfo.zip`）。这些变量和代理端点，就是 sealed 自己的
+  进程会读取的、由部署设定的变量；`ZONEINFO` 只有 `time.LoadLocation` 才读，
+  而 sealed 不调用它。代理端点同样作用于 sealed 自己的客户端：代理能看到连接了哪些主机，
+  但读不了也改不了 TLS 连接（配置成明文 `http` 的端点没有这层保护，有没有
+  代理都一样）。provision 的回复无论如何都加密给容器的密钥。
+  root 命令在 `/` 运行，或在经 `RootDir` 检查为仅 root 可访问的目录里运行，
+  调用方只往它的环境里追加不含路径的字面值，或 root 侧守卫测试列出并写明理由
+  的辅助函数给出的值（`rootEnvHelpers`：openclaw 的 `installEnv`）。openclaw 的安装还会把包自带的安装脚本指向
+  一个仅 root 可访问的目录（`OPENCLAW_HOME`）并关闭它的 plugin registry
+  迁移，所以以 root 运行的安装不会在 agent 的目录树里写任何东西。
+- **文件。** root 在 agent 目录树里的每一次读、写、chown、chmod、改名、删除
+  都经过 privsep 的 fs 辅助函数：任何路径分量都不跟随链接，读取只打开普通
+  文件（先经 `O_PATH` 描述符检查末端，所以 FIFO、socket、设备从不会被打开），
+  也从不等待文件属主持有的 lease（`F_SETLEASE`）：打开是非阻塞的，遇到
+  lease 立即以 `ErrBusy` 失败。凡是把它当成文件不存在会丢掉或换掉状态的
+  地方，都不这样当：对被追踪的 role 而言它是暂时性的（watcher 在这一轮跳过
+  该 role，启动时的 seed 让它保持已提交的版本）；早先 sealed 的对话 id 或
+  key 留到之后的某一轮再迁移，而不是被换掉；配置渲染和 prime 的 harness 状态
+  恢复会先把文件挪到一旁，再写一份新的，和处理解析不了的文件一样。在其他
+  地方，它只影响那次读取本来的用途，和任何读不了的 agent 文件一样（某一轮的
+  历史、断网启动时会从 prime 的 `models.json` 沿用的 reasoning 标记）——
+  这些 agent 改文件本来就能做到。
+  `ReadFile` 和 `ReadTail` 有大小上限；`Open` 的调用方自己限定读取量
+  （openclaw 读对话记录只保留最后 16 MiB）。写入以全新的普通文件替换目标项、
+  从不打开它，不管那里是什么：链接被替换而不是被跟随，目录先被删除。恢复
+  （restore）同样对它管理的目录形状说了算：agent 在 role 目录的位置留下的
+  链接或文件会被替换（`EnsureDir`），从不跟随，所以它没法让 agent 起不来。
+  超过大小上限的内容不会被跳过（那样会提交一份缺了它的状态），也不会拖住
+  别的东西：超过上限的 manifest 条目 —— 大于 64 MiB 的文件，或归档会超过
+  256 MiB 的目录条目（sealed 提交归档时要把它整个放在内存里，所以只打包到
+  这么大；恢复仍接受早先版本可能提交的 4 GiB）—— 被保持（`manifest.Held`）：在它回到上限
+  以内之前，这个条目保持已提交的版本（如果从未提交过，就留在链下），而该
+  role 的其他条目照常提交。超过上限的 leaf role 保持已提交的版本。早先的
+  sealed 版本提交任意大小的文件，所以 agent 可能从链上带着这样的文件恢复；
+  agent 文档里写明了这个上限。sealed 自己
+  的文件（overlay 记录、对话标识、框架日志、bootstrap 日志，以及存储下载和
+  上传用的暂存目录）放在 `framework.StateDir`（`/var/lib/sealed`，仅 root
+  可访问），绝不放在共享的 `/tmp`。
+- **进程。** root 侧工作不依赖 agent 已停止：fs 辅助函数在并发修改下依然
+  安全，以 root 运行的安装也不碰任何 agent 可写路径。所以 `Stop` 只结束框架
+  自己残留的进程（`privsep.Sweep`，以 agent 用户身份运行 `pkill`，因此发不出
+  信号给 root 的进程）；agent 启动的其他进程，比如它经 sign socket 注册的
+  后端，在框架重启后继续运行。
+
+`internal/framework` 里的结构性测试（`rootside_guard_test.go`）扫描模块里
+所有非测试源文件，在 `internal/privsep` 之外出现以下任何一项都会失败：对
+`os`、`io/ioutil`、`syscall`、`golang.org/x/sys/unix` 中接受路径的函数（后两者
+是从其源码推导出的集合：除少数不把字符串当路径的函数外，所有带字符串参数的
+函数，再加上原始 syscall 入口）、
+`filepath` 的遍历 / glob / 链接解析、`os/exec` 的函数、unix socket 监听或
+`net/http` 文件服务的任何引用（调用，或把函数当作值使用）—— `allowedDirectCalls`
+里逐个计数、且只作用于仅 root 可访问路径的调用点除外；对
+`golang.org/x/sys/execabs`（换了名字的 `os/exec`）、`net/http/cgi`（它的
+handler 会运行一个二进制）或 `plugin.Open` 的任何引用；构造 `exec.Cmd`、
+`syscall.SysProcAttr`、`syscall.Credential` 或 `os.ProcAttr`（字面量、`new`，
+或该类型的变量、字段、参数）；以任何方式（读或写）引用命令的 `SysProcAttr`
+或 `Credential`（`AgentCommand` 的降权放在 `cmd.SysProcAttr.Credential` 里，
+每个命令拿到各自的一份）；给命令的 `Path`、`Args`、`ExtraFiles` 赋值，或在
+agent 进程的 spawn 之外设工作目录（root 命令的工作目录经 `RootDir` 设定）；
+取命令的 `Path`、`Args`、`ExtraFiles`、`Env` 或 `Dir` 的地址，或在
+`x.F = append(x.F, ...)` 之外把它的 `Args`、`Env`、`ExtraFiles` 当作值使用
+（副本与命令共用底层数组，经由任何一方的写入都看不见）；把命令交给本模块里
+把它当作命令接收的代码之外的任何东西 —— 模块之外的函数（`json.Unmarshal`
+这类基于反射的解码器会设置它的字段）、接口、函数值；使用 `unsafe`，或
+`reflect.DeepEqual` 之外的 `reflect`。这些规则看类型：每个包都对照真正的
+`os/exec` 做类型检查，所以无论命令从哪里来（辅助函数的返回值、结构体字段）、
+文件导入了什么，字段是不是命令的都看得出来，只有类型检查定不了类型的接收者
+才按字段名判断；`TestRootSideGuardFlagsEveryForbiddenShape` 用预置的代码
+（每种禁止的写法一份）跑这些规则。此外还有：
+点导入（dot-import）它们检查的包；在它们钉住的函数和二进制之外调用
+`RootCommand`，或把它当作值使用；不经
+`AgentCommand` 启动框架进程或框架 CLI；adapter 没有把目录树链接进 agent 的
+家目录、没有声明它交出的目录树（`DeclareTree`），或 `Stop` 里不做 sweep；
+`main` 不再在注册完 adapter 之后、provision 闸之前执行 `privsep.Harden`，
+或在它之前写日志。
+这些是静态检查：钉住的是代码怎么写，而不是二进制运行时
+做了什么。真正验证这条边界本身的测试（降权、chown、sweep）需要 root，运行
+方式见 `AGENTS.md`。
+
+**上传时密钥留在进程内。** `0g-storage-client upload` 这个 CLI 只接受
+`--key` 参数形式的密钥，而 `/proc` 会把进程参数暴露给容器内的每个 uid。所以
+`dataplane.Upload` 不运行它，而是在 sealed 进程内通过该客户端的 Go SDK 上传
+（`internal/dataplane/upload.go`；见上表），上传期间密钥隔离结论同样成立。
+下载仍运行这个 CLI，经由 `privsep.RootCommand`，且不涉及密钥。
+
+经 socket 签名这件事，跟任何钱包里
 `eth_signTransaction` / `personal_sign` 的工作方式同构：钱包担保
 **谁签的**，不担保**内容正确**。agentSeal 没什么不同，它只是恰好是
 一个运行时被硬件认证过的钱包。
@@ -668,9 +927,10 @@ peer-agent 消息、传感器数据）自驱完成任务，对 owner 指导的�
 
 如果 sealed 没法证明内容正确，谁能？
 
-**链上声誉系统。** 一个单独的合约（`AgenticIDReputationRegistry`）
-随时间累积关于每个 agent 行为的结构化信号。verifier 在决定对一条
-`serve-proof` 的内容下多大权重之前，**先**查声誉。
+**链上声誉系统。** 关于每个 agent 的反馈累积在 canonical ERC-8004
+reputation registry 里；`VerifiedFeedbackRegistry` 给那些作者兑付过
+serve-proof 的条目打标记，表示背后有一次 TEE 验证过的交互。verifier
+在决定对一条 `serve-proof` 的内容下多大权重之前，**先**查声誉。
 
 声誉信号来自：
 
@@ -708,15 +968,16 @@ sealed 是公证人 / CA / signer-binding。声誉是品牌 / 历史行为这一
 1. **验证 serve-proof** —— 给你上面 1-8 条形式保证。任意一项不通过，
    **直接拒绝响应**；sealed / TEE / 链这一侧出问题了。
 
-2. **查声誉** —— proof 形式上有效之后，从
-   `AgenticIDReputationRegistry` 取这个 agent 的声誉分。用这个分
-   决定对响应内容下多大权重。
+2. **查声誉** —— proof 形式上有效之后，从 canonical ERC-8004
+   reputation registry 读这个 agent 的反馈，并与
+   `VerifiedFeedbackRegistry` 的标记取交集（`isVerified` /
+   `getVerifiedSummary`）。用它决定对响应内容下多大权重。
 
 来自低声誉 agent 的形式有效 proof，**在内容层依然可疑**。别把
 "proof 验过"等同于"内容是真的"。
 
 > 看到现象不对、想知道是哪一层出锅、该不该算 sealed bug，对照
-> [`QUIRKS.md` 故障定位表](../QUIRKS.md#故障定位serve-proof--sealed-运行时)。
+> [`QUIRKS.md` 故障定位表](../QUIRKS.md#fault-localization-serve-proof--sealed-runtime)。
 
 ---
 

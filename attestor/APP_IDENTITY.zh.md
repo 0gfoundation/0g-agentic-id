@@ -57,9 +57,12 @@ deadline 内等待另一边查询结束后再重试，避免取消 Scan 已接�
 在拿 key 前拒绝；超时则启动失败，不使用过期身份、未授权 key 或手配地址回退。
 只有两方身份都就绪后才开放 HTTP、消费任务。显式 mock 模式继续跳过生产身份发现。
 
-## AgenticID 1.2 合约迁移
+## AgenticID 1.3 合约迁移
 
-沿用 beacon/timelock 升级流程。Owner 随后：
+AgenticID 链接无状态的 `AttestorAppBindingLib`；库没有 owner 或独立配置，绑定状态
+仍留在 proxy。使用固定的合约工具链部署并链接库和实现，再沿用 beacon/timelock
+升级流程。库代码变更同样需要新的链接后实现并走原升级流程，无需迁移状态。
+部署和验证约束见 [`contracts/UPGRADING.md`](../contracts/UPGRADING.md)。Owner 随后：
 
 1. 查询当前 app 注册实例与稳定 service signer。
 2. 调用 `bindTrustedAttestorApp(signer, registry, appId, registeredAt)`。
@@ -68,7 +71,9 @@ deadline 内等待另一边查询结束后再重试，避免取消 Scan 已接�
 4. 调用单向开启的 `requireInstanceBoundAttestors()`。
 5. 移除废弃的旧地址白名单项。
 
-存储字段追加在原 ERC-7201 namespace。步骤 4 之前保留旧白名单兼容，但生产 API/worker
+AgenticID 1.3.0 保留 1.2.0 的治理与 proof 规则。新字段追加在原 ERC-7201 namespace
+已有的 `agentSealBound` mapping 之后，保留它的槽位和终身 seal 地址绑定。
+步骤 4 之前保留旧白名单兼容，但生产 API/worker
 拒绝在旧模式启动。步骤 4 之后，仅添加地址不会产生权限，必须有有效实例绑定。
 所有 trusted-attestor 检查（包括 URI 写入）统一使用这一规则。注销、注册 epoch 改变、
 registry 查询失败或 app owner 改变都会让绑定失效；新实例必须由 owner 明确授权，

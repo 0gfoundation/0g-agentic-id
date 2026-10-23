@@ -99,6 +99,12 @@ pub trait ChainClient: Send + Sync {
     /// from current data and resubmit).
     async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash>;
 
+    /// VerifiedFeedbackRegistry `getIdentityRegistry()` on `registry` — the
+    /// AgenticID that registry verifies ServeProofs against. Read once at
+    /// startup (`chain::check_verified_feedback_anchor`). An address with no
+    /// code, or a call that reverts, is an `Err`.
+    async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address>;
+
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
     /// AgentCard URL after OSS upload without going through the owner.

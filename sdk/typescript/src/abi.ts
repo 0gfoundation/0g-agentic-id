@@ -404,6 +404,23 @@ export const agenticIDAbi = [
   },
   {
     type: 'function',
+    name: 'getApproved',
+    stateMutability: 'view',
+    inputs: [{ name: 'tokenId', type: 'uint256' }],
+    outputs: [{ name: '', type: 'address' }],
+  },
+  {
+    type: 'function',
+    name: 'isApprovedForAll',
+    stateMutability: 'view',
+    inputs: [
+      { name: 'owner', type: 'address' },
+      { name: 'operator', type: 'address' },
+    ],
+    outputs: [{ name: '', type: 'bool' }],
+  },
+  {
+    type: 'function',
     name: 'balanceOf',
     stateMutability: 'view',
     inputs: [{ name: 'owner', type: 'address' }],
@@ -720,6 +737,8 @@ export const verifiedFeedbackAbi = [
   {"type":"error","name":"NonceAlreadyUsed","inputs":[{"name":"key","type":"bytes32"}]},
   {"type":"error","name":"NonceDeadlineTooFar","inputs":[{"name":"deadline","type":"uint256"},{"name":"maxDeadline","type":"uint256"}]},
   {"type":"error","name":"NonceExpired","inputs":[{"name":"deadline","type":"uint256"},{"name":"nowTimestamp","type":"uint256"}]},
+  {"type":"error","name":"NonceMaxAgeDecrease","inputs":[{"name":"currentMaxAge","type":"uint256"},{"name":"newMaxAge","type":"uint256"}]},
+  {"type":"error","name":"NonceMaxAgeOutOfRange","inputs":[{"name":"maxAge","type":"uint256"}]},
   {"type":"error","name":"NotInitializing","inputs":[]},
   {"type":"error","name":"OwnableInvalidOwner","inputs":[{"name":"owner","type":"address"}]},
   {"type":"error","name":"OwnableUnauthorizedAccount","inputs":[{"name":"account","type":"address"}]},
@@ -736,6 +755,9 @@ export const verifiedFeedbackAbi = [
   {"type":"error","name":"VerifiedFeedbackSummaryOverflow","inputs":[]},
   {"type":"error","name":"VerifiedFeedbackTaskMismatch","inputs":[{"name":"expected","type":"bytes32"},{"name":"actual","type":"bytes32"}]},
   {"type":"error","name":"VerifiedFeedbackInvalidTaskReveal","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackValueOutOfRange","inputs":[{"name":"value","type":"int128"},{"name":"valueDecimals","type":"uint8"}]},
+  {"type":"error","name":"VerifiedFeedbackEndpointRequired","inputs":[]},
+  {"type":"error","name":"VerifiedFeedbackInvalidProofTimestamp","inputs":[]},
 
   // ── Attest ──
   {
@@ -884,6 +906,15 @@ export const verifiedFeedbackAbi = [
     stateMutability: 'view',
     inputs: [],
     outputs: [{ name: '', type: 'address' }],
+  },
+  // NonceRegistry view: a ServeProof's nonce key is
+  // keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, signature)).
+  {
+    type: 'function',
+    name: 'isNonceConsumed',
+    stateMutability: 'view',
+    inputs: [{ name: 'key', type: 'bytes32' }],
+    outputs: [{ name: '', type: 'bool' }],
   },
 
   // ── Events ──

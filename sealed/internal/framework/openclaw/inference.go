@@ -3,16 +3,25 @@ package openclaw
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
+	"math"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -47,7 +56,7 @@ import (
 // actually know is not written, and it does not erase what is already on
 // disk either. Resolved.Effort()'s second return distinguishes "this model
 // takes no bound" (clear the key) from "the catalog was unreachable" (leave
-// the key); Resolved.PersistableMaxTokens() and ModelFacts.CatalogSourced
+// the key); Resolved.RequestMaxTokens() and ModelFacts.CatalogSourced
 // draw the same line for the output budget, the context window and the
 // reasoning flags. An outage boot must not be able to strip a bound from an
 // always-thinking model, nor shrink a 1M context window to a guessed 128k
@@ -61,10 +70,18 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 	cfg, rebuilt := loadConfigForRender()
 
 	overlay := frameworkOverlay(s.Others)
+	homeRelativeOverlayPaths(overlay)
 	dropRemovedOverlayKeys(cfg, loadAppliedOverlay(), overlay)
 	mergeInto(cfg, overlay)
 
 	applySettingsToConfig(cfg, s)
+	version := a.renderVersion(ctx)
+	if hasCompactCLI(version) {
+		applyCompactionConfig(cfg, s, overlay)
+	}
+	applyStuckSessionWatchdog(cfg, version)
+	applyMemoryWikiVault(cfg)
+	logRootHomePaths(cfg)
 
 	if err := saveOpenclawJSON(cfg); err != nil {
 		return err
@@ -98,7 +115,9 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 //
 // The unreadable bytes are set aside rather than deleted (one fixed name —
 // a per-boot suffix would pile up), so an owner or the agent can still look
-// at whatever hand edit broke it.
+// at whatever hand edit broke it. "Unreadable" includes an entry the privsep
+// read rules refuse (a link, a FIFO): the rename moves that entry itself,
+// never its target, and the rebuilt file is a fresh regular file.
 //
 // Returns rebuilt=true when the previous contents were lost. Start uses
 // that to re-write the gateway subtree, which lives in this same file and
@@ -109,7 +128,18 @@ func loadConfigForRender() (cfg map[string]any, rebuilt bool) {
 		return cfg, false
 	}
 	quarantine := openclawJSONPath() + ".corrupt"
-	if rerr := os.Rename(openclawJSONPath(), quarantine); rerr != nil {
+	rerr := privsep.Rename(openclawJSONPath(), quarantine)
+	if rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		// A directory at the quarantine name (one the agent made there)
+		// blocks the rename; a file there is simply replaced. The name holds
+		// only the latest unusable copy, so clear it and retry.
+		if cerr := privsep.RemoveAll(quarantine); cerr == nil {
+			rerr = privsep.Rename(openclawJSONPath(), quarantine)
+		}
+	}
+	if rerr != nil {
+		// The rebuilt file is written over whatever is left at the name
+		// (privsep.WriteFile replaces a link, a file or a directory there).
 		logger.Logf("openclaw: %s is unusable (%v) and could not be set aside (%v); rebuilding it from the owner's settings", openclawJSONPath(), err, rerr)
 	} else {
 		logger.Logf("openclaw: %s is unusable (%v); moved to %s and rebuilding it from the owner's settings", openclawJSONPath(), err, quarantine)
@@ -143,6 +173,179 @@ func frameworkOverlay(raw json.RawMessage) map[string]any {
 		delete(overlay, "gateway")
 	}
 	return overlay
+}
+
+// ── "~" in openclaw's config ─────────────────────────────────────────────────
+//
+// openclaw expands a leading "~" in path-valued keys of its config (keys
+// ending in dir, path, file, root or workspace, plugins' own config
+// included), and in most paths it is handed, its read/write/edit tools
+// aside, from OPENCLAW_HOME before HOME, and the gateway runs with
+// OPENCLAW_HOME=/root (stateEnv) while HOME is the agent's own. So "~/x" in
+// openclaw.json names /root/x: under ~/.openclaw that is the tree, as
+// intended, but anywhere else it is root's home, where the agent can create
+// nothing (privsep.SecureHome) — an agent given such a workspace fails
+// every turn with EACCES. When the agent owned /root (an earlier sealed),
+// the same "~/x" was the agent's, and ReclaimHome has since moved what it
+// made there to the agent's home. An absolute "/root/x" is the same path:
+// openclaw's own CLI stores one whenever it is given a "~" path (`openclaw
+// agents add --workspace ~/x` records the expanded "/root/x" when HOME was
+// /root).
+
+// homeRelativeOverlayPaths rewrites, in the owner's overlay, the path-valued
+// agent keys openclaw creates directories at (agents.defaults.workspace,
+// agents.list[].workspace and agentDir) from "~/x" or "/root/x" outside the
+// tree to x in the agent's own home (privsep.AgentHome) — what such a path
+// meant when the agent's home was /root, and where ReclaimHome moved what
+// the agent kept there. The rewritten overlay is what is merged and
+// recorded, so a later render compares like with like
+// (dropRemovedOverlayKeys). Paths under the tree, other absolute paths and
+// the agent's own edits to openclaw.json are left alone.
+func homeRelativeOverlayPaths(overlay map[string]any) {
+	agents, _ := overlay["agents"].(map[string]any)
+	if agents == nil {
+		return
+	}
+	fix := func(m map[string]any, key, where string) {
+		v, ok := m[key].(string)
+		if !ok {
+			return
+		}
+		if p, ok := agentHomePath(v); ok {
+			m[key] = p
+			logger.Once("openclaw.tilde-overlay:"+where+"="+digest(v), "openclaw: settings.framework %s %s would name root's home %s (openclaw expands \"~\" from OPENCLAW_HOME), where nothing outside the tree can be created; rendered as %s, in the agent's home", where, clipValue(v), filepath.Dir(openclawHome), clipValue(p))
+		}
+	}
+	if d, ok := agents["defaults"].(map[string]any); ok {
+		fix(d, "workspace", "agents.defaults.workspace")
+	}
+	if list, ok := agents["list"].([]any); ok {
+		for i, e := range list {
+			if m, ok := e.(map[string]any); ok {
+				fix(m, "workspace", fmt.Sprintf("agents.list[%d].workspace", i))
+				fix(m, "agentDir", fmt.Sprintf("agents.list[%d].agentDir", i))
+			}
+		}
+	}
+}
+
+// agentHomePath maps "~", "~/rel" or "/root/rel" to rel in the agent's
+// home, unless rel leads into the framework tree (~/.openclaw, as openclaw
+// resolves it from OPENCLAW_HOME). ok is false when v is left as it is.
+func agentHomePath(v string) (p string, ok bool) {
+	rel, ok := rootHomeRel(v)
+	if !ok {
+		return v, false
+	}
+	return filepath.Join(privsep.AgentHome(), rel), true
+}
+
+// rootHomeRel returns the path below root's home (OPENCLAW_HOME, the
+// directory holding the tree) that v names in openclaw — "~", "~/...", or
+// an absolute path in that directory — when that is not inside the
+// framework tree.
+func rootHomeRel(v string) (string, bool) {
+	var rest string
+	if r, ok := strings.CutPrefix(v, "~"); ok {
+		if r != "" && r[0] != '/' {
+			return "", false // "~user/...", which openclaw does not expand
+		}
+		for _, c := range strings.Split(r, "/") {
+			if c == ".." {
+				return "", false // climbs out of the home: not a path in it
+			}
+		}
+		rest = r
+	} else if strings.HasPrefix(v, "/") {
+		r, ok := strings.CutPrefix(filepath.Clean(v), filepath.Dir(openclawHome))
+		if !ok || (r != "" && r[0] != '/') {
+			return "", false // not in root's home ("/rootx", "/srv/x")
+		}
+		rest = r
+	} else {
+		return "", false
+	}
+	rel := filepath.Clean("/" + rest)[1:]
+	tree := filepath.Base(openclawHome)
+	if rel == tree || strings.HasPrefix(rel, tree+"/") {
+		return "", false
+	}
+	return rel, true
+}
+
+// logRootHomePaths logs, once per set of values, the string values in the
+// rendered config that openclaw would resolve in root's home outside the
+// tree ("~/x", "/root/x"): the agent's own edits, which the render keeps as
+// they are. On a container an earlier sealed ran, what such a path named
+// may have been moved to the agent's home at boot (ReclaimHome); the log
+// says where to look.
+//
+// The values are the agent's (openclaw.json is its file, up to
+// privsep.LimitConfig), and the agent can make the gateway restart, and so
+// re-render, at will: what is kept in the log is bounded (logMaxPaths
+// entries, each clipped) and the Once key is a digest, so no render keeps
+// a copy of an arbitrarily large value in memory.
+func logRootHomePaths(cfg map[string]any) {
+	type value struct{ at, v, rel string }
+	var values []value
+	var walk func(v any, at string)
+	walk = func(v any, at string) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, sub := range x {
+				walk(sub, strings.TrimPrefix(at+"."+k, "."))
+			}
+		case []any:
+			for i, sub := range x {
+				walk(sub, fmt.Sprintf("%s[%d]", at, i))
+			}
+		case string:
+			if rel, ok := rootHomeRel(x); ok {
+				values = append(values, value{at, x, rel})
+			}
+		}
+	}
+	walk(cfg, "")
+	if len(values) == 0 {
+		return
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].at < values[j].at })
+	h := sha256.New()
+	for _, v := range values {
+		fmt.Fprintf(h, "%d:%s%d:%s", len(v.at), v.at, len(v.v), v.v)
+	}
+	key := hex.EncodeToString(h.Sum(nil)[:12])
+	var found []string
+	for i, v := range values {
+		if i == logMaxPaths {
+			found = append(found, fmt.Sprintf("and %d more", len(values)-logMaxPaths))
+			break
+		}
+		found = append(found, fmt.Sprintf("%s=%s (moved at boot: %s)", clipValue(v.at), clipValue(v.v), clipValue(filepath.Join(privsep.AgentHome(), v.rel))))
+	}
+	logger.Once("openclaw.tilde-config:"+key, "openclaw: openclaw.json values openclaw resolves in root's home %s (\"~\" is OPENCLAW_HOME there, not the agent's home %s), where nothing outside the tree can be created: %s; use absolute paths in the agent's home (on a reused container, what was at such a path may have been moved there at boot: the path in parentheses)", filepath.Dir(openclawHome), privsep.AgentHome(), strings.Join(found, ", "))
+}
+
+// logMaxPaths is how many values logRootHomePaths names in one line.
+const logMaxPaths = 10
+
+// logValueMax is how many bytes of one config path or value a log line
+// carries.
+const logValueMax = 120
+
+// clipValue quotes s for a log line, keeping at most logValueMax bytes of
+// it and saying how long it was when it is cut.
+func clipValue(s string) string {
+	if len(s) <= logValueMax {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%s… (%d bytes)", strconv.Quote(s[:logValueMax]), len(s))
+}
+
+// digest is a short, fixed-size stand-in for s in a logger.Once key.
+func digest(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:12])
 }
 
 // mergeInto deep-merges src into dst: nested objects merge key by key,
@@ -192,41 +395,71 @@ func deepCopyJSON(v any) any {
 	}
 }
 
-// appliedOverlayPath records the overlay the last render merged — the
+// appliedOverlayState records the overlay the last render merged — the
 // "last applied configuration" trick, kept in a sidecar because
 // openclaw.json is openclaw's own schema and an unknown top-level key
-// there is not ours to add. Not chain-tracked (nothing under
-// ~/.openclaw outside workspace/ is), so it dies with the container
-// exactly like the config it describes.
-func appliedOverlayPath() string { return openclawHome + "/.sealed-overlay.json" }
+// there is not ours to add. It lives in framework.StateDir, outside the
+// tree handed to the agent: it decides which keys a later render removes,
+// so it must be sealed's own. Not chain-tracked, so it dies with the
+// container exactly like the config it describes.
+const appliedOverlayState = "openclaw-applied-overlay.json"
+
+func appliedOverlayPath() string { return framework.StatePath(appliedOverlayState) }
+
+// legacyAppliedOverlayPath is where an earlier sealed kept the record:
+// inside the tree handed to the agent. A container upgraded in place reads
+// it while framework.StateDir has no record yet (loadAppliedOverlay), so an
+// overlay key the owner removed around the upgrade is still withdrawn; the
+// first record saved in framework.StateDir supersedes and removes it.
+func legacyAppliedOverlayPath() string { return openclawHome + "/.sealed-overlay.json" }
 
 func loadAppliedOverlay() map[string]any {
-	b, err := os.ReadFile(appliedOverlayPath())
+	b, err := framework.ReadState(appliedOverlayState)
+	src := appliedOverlayPath()
+	if errors.Is(err, fs.ErrNotExist) {
+		// The agent can write the old record, but it decides only which
+		// keys of openclaw.json — a file the agent owns and can edit
+		// anyway — a render removes; "gateway" is never the overlay's.
+		b, err = privsep.ReadFile(legacyAppliedOverlayPath(), privsep.LimitConfig)
+		src = legacyAppliedOverlayPath()
+	}
 	if err != nil {
 		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(b, &m); err != nil {
-		logger.Logf("openclaw: applied-overlay record %s did not parse (%v); an overlay key removed from the settings document this boot may linger in openclaw.json", appliedOverlayPath(), err)
+		logger.Logf("openclaw: applied-overlay record %s did not parse (%v); an overlay key removed from the settings document this boot may linger in openclaw.json", src, err)
 		return nil
 	}
+	delete(m, "gateway")
 	return m
 }
 
+// saveAppliedOverlay records the overlay this render merged. An empty
+// overlay is recorded as {} rather than by removing the record: an absent
+// record is what sends loadAppliedOverlay to the one an earlier sealed kept
+// in the agent's tree, which must be read only until the first save.
 func saveAppliedOverlay(overlay map[string]any) {
-	if len(overlay) == 0 {
-		if err := os.Remove(appliedOverlayPath()); err != nil && !os.IsNotExist(err) {
-			logger.Logf("openclaw: could not clear applied-overlay record: %v", err)
-		}
-		return
+	if overlay == nil {
+		overlay = map[string]any{}
 	}
 	b, err := json.MarshalIndent(overlay, "", "  ")
 	if err != nil {
 		logger.Logf("openclaw: could not encode applied-overlay record: %v", err)
 		return
 	}
-	if err := os.WriteFile(appliedOverlayPath(), b, 0o600); err != nil {
+	if err := framework.WriteState(appliedOverlayState, b); err != nil {
 		logger.Logf("openclaw: could not write applied-overlay record: %v", err)
+		return
+	}
+	retireLegacyAppliedOverlay()
+}
+
+// retireLegacyAppliedOverlay removes the record an earlier sealed kept in the
+// agent's tree, once this render's record is sealed's own.
+func retireLegacyAppliedOverlay() {
+	if err := privsep.Remove(legacyAppliedOverlayPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		logger.Once("openclaw.legacy-overlay", "openclaw: could not remove the earlier applied-overlay record %s: %v", legacyAppliedOverlayPath(), err)
 	}
 }
 
@@ -277,9 +510,11 @@ func dropRemovedOverlayKeys(cfg, prev, next map[string]any) {
 //   - the pin and its auth profile apply to every provider the document
 //     gives openclaw a label for — and to nothing else (see the no-provider
 //     case below);
-//   - the reasoning bound and the stuck-session watchdog apply to every
-//     provider too — they are properties of the MODEL and of sealed's own
-//     supervision, not of who serves the request;
+//   - the reasoning bound applies to every provider too — it is a property
+//     of the MODEL, not of who serves the request (the stuck-session
+//     watchdog, which is not gated on the provider either, is written
+//     separately by applyStuckSessionWatchdog: whether openclaw accepts it
+//     depends on the version);
 //   - only the endpoint wiring (base URL, wire dialect, compat flags, key
 //     env name, idle timeout) is gated on the platform actually routing
 //     this model. A framework built-in brings its own.
@@ -361,28 +596,155 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 		logger.Logf("openclaw: catalog silent on %q; leaving agents.defaults.thinkingDefault as it stands", s.Model)
 	}
 
-	// Stuck-session watchdog headroom. openclaw's default (360s = warn 120s
-	// × 3) is tuned for fast models; a thinking model legitimately shows no
-	// "progress" for minutes — live, a PR-review run was killed at 446s as
-	// stalled_agent_run and the owner saw "internal error". 900s must stay
-	// ABOVE the provider idle timeout below (600s) so a single silent model
-	// call dies to that timeout first and 600–900s only ever catches a real
-	// deadlock. Deliberate stops don't depend on it (Esc / cancel).
-	//
-	// Not gated on routing: a native-provider thinking model stalls the same
-	// way, and the value is coupled to the timeout the platform writes, not
-	// to who serves the model. Not gated on the catalog either: it is
-	// sealed's own number, known whether or not the router answers.
-	diagnostics, _ := cfg["diagnostics"].(map[string]any)
-	if diagnostics == nil {
-		diagnostics = map[string]any{}
-	}
-	diagnostics["stuckSessionAbortMs"] = 900_000
-	cfg["diagnostics"] = diagnostics
+	// The ONE conversation must not end on a clock. openclaw's default
+	// session policy is "daily": the first turn after 04:00 (local time)
+	// starts a new session. Measured offline on 2026.7.1 by backdating a
+	// session past the boundary: the next turn reached the model with none
+	// of the earlier turns, and the old transcript was orphaned, out of
+	// /clear's reach. session.reset {mode:"idle"} with no idleMinutes never
+	// goes stale (reset-policy.ts: idle without a window sets no expiry), so
+	// the conversation ends only by /clear or a container recreate
+	// (CONVERSATION.md invariants 4–5). An owner's overlay that sets
+	// session.reset stands.
+	ensureSessionNeverResets(cfg)
+
+	// agents.defaults.workspace is left as it stands, not pinned: openclaw
+	// derives the default agent's workspace from OPENCLAW_HOME
+	// (<OPENCLAW_HOME>/.openclaw/workspace) and every other agent's from
+	// the state directory (workspace-<id>), and the gateway is given both
+	// (stateEnv), so the default agent works in the tree sealed restores
+	// and tracks with no link in the way. Pinning the key would also move
+	// every listed agent without a workspace of its own under the default
+	// agent's workspace: openclaw takes the key as their base directory.
 
 	if s.Endpoint != nil {
 		applyEndpointToConfig(cfg, clawProvider, s)
 	}
+}
+
+// memoryWikiVaultDefault is where memory-wiki keeps its vault unless its
+// config names one: <tree>/wiki/main, where openclaw's own default put it
+// when HOME was root's home.
+func memoryWikiVaultDefault() string { return filepath.Join(openclawHome, "wiki", "main") }
+
+// applyMemoryWikiVault gives an enabled memory-wiki plugin an absolute vault
+// path inside the tree when nothing (the owner's overlay, the agent)
+// configured one.
+//
+// memory-wiki derives its default vault from os.homedir(), which is HOME —
+// the agent's home — and not from OPENCLAW_HOME like openclaw core:
+// <HOME>/.openclaw/wiki/main, through the ~/.openclaw link. 2026.7.1
+// appends the vault's log with a symlink-refusing append, so through the
+// link vault initialisation and every logged wiki operation fail ("Refusing
+// to append under must not traverse symlinked directory"). A value in
+// openclaw.json does not have the problem: openclaw expands a "~" in it from
+// OPENCLAW_HOME, like any path-valued config key. So the render fills in the
+// default it used to resolve to, as an absolute path — and only the path:
+// it never enables the plugin, never creates its entry (2026.7.1 warns about
+// configuration for a plugin it does not load), and never replaces a value
+// that is set. When the plugin is no longer enabled and the default is all
+// that is left of its entry, the default is withdrawn again.
+func applyMemoryWikiVault(cfg map[string]any) {
+	plugins, _ := cfg["plugins"].(map[string]any)
+	entries, _ := plugins["entries"].(map[string]any)
+	entry, _ := entries["memory-wiki"].(map[string]any)
+	if entry == nil {
+		return
+	}
+	config, _ := entry["config"].(map[string]any)
+	vault, _ := config["vault"].(map[string]any)
+	path, set := vault["path"]
+	if enabled, _ := entry["enabled"].(bool); enabled {
+		if s, isString := path.(string); set && (!isString || strings.TrimSpace(s) != "") {
+			return
+		}
+		if config == nil {
+			config = map[string]any{}
+			entry["config"] = config
+		}
+		if vault == nil {
+			vault = map[string]any{}
+			config["vault"] = vault
+		}
+		vault["path"] = memoryWikiVaultDefault()
+		return
+	}
+	if path != memoryWikiVaultDefault() || len(vault) != 1 || len(config) != 1 {
+		return
+	}
+	delete(entry, "config")
+	if len(entry) == 0 {
+		delete(entries, "memory-wiki")
+	}
+}
+
+// stuckSessionWatchdogSince is the first whitelisted openclaw release whose
+// config schema has diagnostics.stuckSessionAbortMs. 2026.5.6 and 2026.5.7
+// reject the key ("diagnostics: Unrecognized key"), in `openclaw config
+// validate` and at gateway start alike, so writing it there fails every
+// Start: the validator rejects the platform half itself.
+const stuckSessionWatchdogSince = "2026.7.1"
+
+// stuckSessionAbortMs is the watchdog value sealed writes.
+const stuckSessionAbortMs = 900_000
+
+// applyStuckSessionWatchdog writes the stuck-session watchdog headroom for
+// an openclaw version that accepts it, and removes the key for one that
+// does not (an earlier render, or an owner overlay, may have put it there).
+//
+// openclaw's default (360s = warn 120s × 3) is tuned for fast models; a
+// thinking model legitimately shows no "progress" for minutes — live, a
+// PR-review run was killed at 446s as stalled_agent_run and the owner saw
+// "internal error". 900s must stay ABOVE the provider idle timeout
+// applyEndpointToConfig writes (600s) so a single silent model call dies to
+// that timeout first and 600–900s only ever catches a real deadlock.
+// Deliberate stops don't depend on it (Esc / cancel).
+//
+// Not gated on routing: a native-provider thinking model stalls the same
+// way, and the value is coupled to the timeout the platform writes, not to
+// who serves the model. Not gated on the catalog either: it is sealed's own
+// number, known whether or not the router answers.
+func applyStuckSessionWatchdog(cfg map[string]any, version string) {
+	diagnostics, _ := cfg["diagnostics"].(map[string]any)
+	if compareVersions(version, stuckSessionWatchdogSince) < 0 {
+		if _, ok := diagnostics["stuckSessionAbortMs"]; ok {
+			delete(diagnostics, "stuckSessionAbortMs")
+			if len(diagnostics) == 0 {
+				delete(cfg, "diagnostics")
+			}
+			logger.Once("openclaw.watchdog-unsupported:"+version, "openclaw: %s has no diagnostics.stuckSessionAbortMs (it rejects the key); removed it from openclaw.json, so openclaw's own stuck-session default applies", version)
+		}
+		return
+	}
+	if diagnostics == nil {
+		diagnostics = map[string]any{}
+	}
+	diagnostics["stuckSessionAbortMs"] = stuckSessionAbortMs
+	cfg["diagnostics"] = diagnostics
+}
+
+// renderVersion is the openclaw version the rendered config is for: the
+// one the next Start runs. Before the first Start that is the pinned
+// version Start installs; after it, Start installs nothing, so it is the
+// version on disk (ReconcileFramework, or the agent, may have changed it).
+// With neither known it is whitelistMax, what an unpinned binding installs.
+func (a *Adapter) renderVersion(ctx context.Context) string {
+	a.mu.RLock()
+	initialized := a.initialized
+	pinned := ""
+	if a.cfg != nil {
+		pinned = a.cfg.framework.PackageVersion
+	}
+	a.mu.RUnlock()
+	if initialized {
+		if v := probeOpenclawVersion(ctx); v != "" {
+			return v
+		}
+	}
+	if pinned != "" {
+		return pinned
+	}
+	return whitelistMax()
 }
 
 // clawProviderName is the provider LABEL openclaw indexes its config by.
@@ -399,6 +761,135 @@ func clawProviderName(s settings.Resolved) string {
 		return "anthropic"
 	}
 	return "openai"
+}
+
+// openclawKeepRecentTokens is openclaw's own default kept tail for
+// compaction (DEFAULT_COMPACTION_SETTINGS.keepRecentTokens, 2026.7.1).
+const openclawKeepRecentTokens = 20000
+
+// openclawCompactionTimeout bounds one compaction inside openclaw, in seconds:
+// 10 minutes, under the CLI's own deadline (compactCLITimeout − 1m = 11m).
+const openclawCompactionTimeout = 600
+
+// applyCompactionConfig writes the part of agents.defaults.compaction that the
+// owner's /compact depends on. RenderSettings calls it only for an openclaw
+// with `sessions compact` (hasCompactCLI). An older one refuses /compact
+// before anything runs, and there these keys would only change its automatic
+// compaction: 2026.5.6/5.7 give a compaction 900s by default, which the
+// timeout below would shorten.
+//
+// keepRecentTokens: a manual compaction (/_seal/compact → `sessions.compact`)
+// must keep the recent tail. openclaw 2026.7.1 summarizes everything before
+// its kept tail and then — unless keepRecentTokens is SET — rewrites the
+// compaction record so replay starts from the summary alone
+// (hardenManualCompactionBoundary): the tail is neither summarized nor
+// replayed, and the owner's latest turns silently vanish. Measured offline
+// with six ~27K-char turns: unset, the next turn reached the model as summary
+// + the new message; set, as summary + turns 4–6 + the new message. The value
+// is openclaw's own default, so automatic compaction is unchanged.
+//
+// timeoutSeconds: openclaw gives any compaction 180s
+// (EMBEDDED_COMPACTION_TIMEOUT_MS) and then fails it — measured offline, a
+// summary call that took 200s failed "Compaction timed out" at 180.2s,
+// whatever the CLI and sealed allow. A reasoning model summarizing a long
+// history takes minutes, so the render allows openclawCompactionTimeout,
+// inside the CLI's own deadline (compact.go).
+//
+// Either value stands when openclaw.json already holds a positive whole
+// number (the owner's overlay, or an edit on disk). Anything else is
+// replaced: openclaw's schema takes only positive integers, and a config it
+// rejects costs the owner the whole overlay (ensureConfigAcceptable).
+//
+// model: see setCompactionModel.
+func applyCompactionConfig(cfg map[string]any, s settings.Resolved, overlay map[string]any) {
+	agents, _ := cfg["agents"].(map[string]any)
+	if agents == nil {
+		agents = map[string]any{}
+		cfg["agents"] = agents
+	}
+	defaults, _ := agents["defaults"].(map[string]any)
+	if defaults == nil {
+		defaults = map[string]any{}
+		agents["defaults"] = defaults
+	}
+	compaction, _ := defaults["compaction"].(map[string]any)
+	if compaction == nil {
+		compaction = map[string]any{}
+		defaults["compaction"] = compaction
+	}
+	setPositiveIntDefault(compaction, "keepRecentTokens", openclawKeepRecentTokens)
+	setPositiveIntDefault(compaction, "timeoutSeconds", openclawCompactionTimeout)
+	setCompactionModel(compaction, s, overlay)
+}
+
+// maxJSONSafeInt is the largest whole number a JSON reader in JavaScript
+// holds exactly (Number.MAX_SAFE_INTEGER).
+const maxJSONSafeInt = 1<<53 - 1
+
+// setPositiveIntDefault sets m[key] to def unless it already holds a positive
+// whole number; anything else present is replaced, with a log line.
+func setPositiveIntDefault(m map[string]any, key string, def int) {
+	v, present := m[key]
+	switch n := v.(type) {
+	case float64:
+		if n >= 1 && n <= maxJSONSafeInt && n == math.Trunc(n) {
+			return
+		}
+	case int:
+		if n >= 1 {
+			return
+		}
+	}
+	if present {
+		logger.Logf("openclaw: agents.defaults.compaction.%s = %v is not a positive whole number — using %d", key, v, def)
+	}
+	m[key] = def
+}
+
+// setCompactionModel names the model a compaction summarizes with.
+//
+// openclaw summarizes with the model the session LAST ran on unless
+// agents.defaults.compaction.model names one (resolveEmbeddedCompactionTarget,
+// 2026.7.1). Right after a model switch the last model is the old one: the
+// summary is written with it, or fails as "Unknown model" once its provider
+// entry is gone (measured offline). So for a routed pin the render names the
+// pin itself, as "<label>/<model>" — the label and id it files the model under
+// in models.providers (applyEndpointToConfig), which is where openclaw looks it
+// up.
+//
+// A built-in provider's pin is left to openclaw, and a value a routed pin left
+// behind is removed. Such a pin may be an alias that openclaw resolves for
+// turns (anthropic/sonnet → claude-sonnet-5, parseModelRef), and naming the
+// model here was verified for routed pins only. A document with no provider
+// leaves the pin on disk as it is (applySettingsToConfig), and this key with
+// it. An owner's overlay that names a model stands.
+func setCompactionModel(compaction map[string]any, s settings.Resolved, overlay map[string]any) {
+	ovAgents, _ := overlay["agents"].(map[string]any)
+	ovDefaults, _ := ovAgents["defaults"].(map[string]any)
+	ovCompaction, _ := ovDefaults["compaction"].(map[string]any)
+	if _, owner := ovCompaction["model"]; owner {
+		return
+	}
+	switch {
+	case s.Endpoint != nil && s.Model != "":
+		compaction["model"] = clawProviderName(s) + "/" + s.Model
+	case s.Provider != "":
+		delete(compaction, "model")
+	}
+}
+
+// ensureSessionNeverResets sets session.reset to {mode:"idle"} — no idle
+// window, so never stale — unless a reset policy is already there.
+func ensureSessionNeverResets(cfg map[string]any) {
+	session, _ := cfg["session"].(map[string]any)
+	if session == nil {
+		session = map[string]any{}
+		cfg["session"] = session
+	}
+	if _, set := session["reset"]; set {
+		return
+	}
+	session["reset"] = map[string]any{"mode": "idle"}
 }
 
 // setModelPrimary writes agents.defaults.model.primary WITHOUT replacing
@@ -566,15 +1057,24 @@ func applyEndpointToConfig(cfg map[string]any, clawProvider string, s settings.R
 		modelDef["reasoning"] = s.Facts.SupportsReasoningEffort
 		compat["supportsReasoningEffort"] = s.Facts.SupportsReasoningEffort
 		// Output budget: only a CATALOG-sourced value may be written to disk
-		// (Resolved.PersistableMaxTokens enforces it). During an outage the
+		// (Resolved.RequestMaxTokens enforces it). During an outage the
 		// heuristic's 8192 would — with reasoning and the reply SHARING the
 		// budget — permanently starve replies. With the field absent openclaw
 		// sends no max_tokens at all and the model's own ceiling applies.
-		if mt := s.PersistableMaxTokens(); mt > 0 {
+		// openclaw sends maxTokens as max_tokens on EVERY request (captured on
+		// 2026.7.1), so this is the capped request budget, not the catalog's
+		// raw capability — see RequestMaxTokens for why.
+		if mt := s.RequestMaxTokens(); mt > 0 {
 			modelDef["maxTokens"] = mt
 		}
 	} else {
 		carryOver(prev, modelDef, "contextWindow", "maxTokens", "reasoning")
+		// A budget carried over from a render that predates the cap (the raw
+		// catalog 131072) must not survive an outage boot uncapped. prev comes
+		// from openclaw.json decoded into map[string]any, so it is a float64.
+		if mt, ok := modelDef["maxTokens"].(float64); ok && mt > settings.RequestOutputCeiling {
+			modelDef["maxTokens"] = settings.RequestOutputCeiling
+		}
 		prevCompat, _ := prev["compat"].(map[string]any)
 		carryOver(prevCompat, compat, "supportsReasoningEffort")
 		logger.Logf("openclaw: catalog silent on %q; keeping the model facts already on disk rather than writing heuristic ones", s.Model)
@@ -940,13 +1440,67 @@ func legacyThinking(defaults map[string]any) string {
 // acceptable. A func var so tests can stand in for the CLI; production runs
 // `openclaw config validate`, which is the same judgment the gateway applies
 // at startup — the platform deliberately holds no copy of that schema.
-var validateOpenclawConfig = func() error {
-	out, err := exec.Command("openclaw", "config", "validate").CombinedOutput()
+//
+// It runs as the agent user with a minimal environment (privsep.
+// AgentCommand) plus the tree locations the gateway is given (stateEnv),
+// so it validates the file the gateway will read: openclaw reads its
+// agent-writable home, and a CLI that does so never runs as root. The key
+// is not in that environment, matching the first boot, which has always
+// validated before the key was exported. How long it runs and how much it
+// prints depend on what the agent keeps in that home, so it gets a
+// deadline (validateTimeout, within Start's ctx) and only the tail of its
+// output is kept (privsep.BoundedOutput).
+//
+// Only a validator that ran to completion and exited non-zero is a judgment
+// on the config. Failing to resolve or start the CLI (no openclaw in a
+// root-only PATH directory, an unrunnable binary), a run cut short by the
+// deadline, or one ended by a signal (another process, the OOM killer) is
+// reported as errValidatorUnavailable, which says nothing about the
+// owner's overlay.
+var validateOpenclawConfig = func(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, validateTimeout)
+	defer cancel()
+	cmd, err := privsep.AgentCommand(ctx, "openclaw", "config", "validate")
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%w: %v", errValidatorUnavailable, err)
 	}
-	return nil
+	cmd.Env = append(cmd.Env, stateEnv()...)
+	out, err := privsep.BoundedOutput(cmd, validateOutputMax)
+	return validatorVerdict(ctx, err, out)
 }
+
+// validatorVerdict classifies how a validator run ended: nil when it
+// accepted the config, a plain error carrying its output when it exited
+// with a status (its judgment), errValidatorUnavailable otherwise.
+func validatorVerdict(ctx context.Context, err error, out []byte) error {
+	var exitErr *exec.ExitError
+	switch {
+	case err == nil:
+		return nil
+	case ctx.Err() != nil:
+		return fmt.Errorf("%w: it did not finish (%v)", errValidatorUnavailable, ctx.Err())
+	case errors.As(err, &exitErr) && exitErr.Exited():
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	case errors.As(err, &exitErr):
+		return fmt.Errorf("%w: it did not run to completion (%v)", errValidatorUnavailable, err)
+	default:
+		return fmt.Errorf("%w: %v", errValidatorUnavailable, err)
+	}
+}
+
+// validateTimeout bounds one `openclaw config validate` run. A cold start
+// takes seconds; the margin is for a loaded host. A var so tests can
+// shorten it; production code never reassigns it.
+var validateTimeout = 2 * time.Minute
+
+// validateOutputMax is how much of the validator's output is kept (the
+// tail, where the verdict is).
+const validateOutputMax = 64 << 10
+
+// errValidatorUnavailable marks a validateOpenclawConfig failure in which
+// openclaw's validator did not run, as opposed to one in which it rejected
+// the config.
+var errValidatorUnavailable = errors.New("openclaw config validator could not run")
 
 // ensureConfigAcceptable makes the rendered config one openclaw will run.
 //
@@ -959,11 +1513,16 @@ var validateOpenclawConfig = func() error {
 // sidecar attributes to the overlay, and never an agent edit) and the result
 // is validated once more. A failure with NO overlay in play is the platform's
 // own bug and fails the start loudly rather than shipping a config openclaw
-// already said it will not run.
+// already said it will not run. A validator that could not run at all
+// (errValidatorUnavailable) fails the start without touching the overlay:
+// that is a toolchain problem, not a verdict on the owner's settings.
 func (a *Adapter) ensureConfigAcceptable(ctx context.Context) error {
-	firstErr := validateOpenclawConfig()
+	firstErr := validateOpenclawConfig(ctx)
 	if firstErr == nil {
 		return nil
+	}
+	if errors.Is(firstErr, errValidatorUnavailable) {
+		return fmt.Errorf("cannot validate the rendered config; the owner overlay is left in place: %w", firstErr)
 	}
 
 	a.mu.RLock()
@@ -979,7 +1538,7 @@ func (a *Adapter) ensureConfigAcceptable(ctx context.Context) error {
 	if err := a.RenderSettings(ctx, stripped); err != nil {
 		return fmt.Errorf("re-render without the owner overlay: %w", err)
 	}
-	if err := validateOpenclawConfig(); err != nil {
+	if err := validateOpenclawConfig(ctx); err != nil {
 		return fmt.Errorf("openclaw still rejects the config with the owner overlay withdrawn — platform bug: %w", err)
 	}
 	return nil

@@ -6,13 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
 	"sort"
 	"strings"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -40,9 +40,9 @@ import (
 // outage (which starves a reasoning model's shared thinking+reply budget into
 // permanently empty replies — live on agent 404, three ~6min turns, textLen=0).
 // Nothing is restored now, so there is nothing to heal: the budget below is
-// recomputed from the live catalog every boot, and gated on
-// Resolved.PersistableMaxTokens so a guess made during an outage is omitted
-// rather than written down.
+// recomputed from the live catalog every boot, and taken from
+// Resolved.RequestMaxTokens — catalog-gated, so a guess made during an outage
+// is omitted rather than written down, and capped for every request.
 //
 // The file itself still has to exist, and that is not a leftover:
 //
@@ -74,9 +74,11 @@ const apiKeyEnvRef = "SEAL_MODEL_API_KEY"
 type modelEntry struct {
 	ID string `json:"id"`
 	// MaxTokens is the model's OUTPUT budget per call (the SDK sends it as
-	// max_tokens). Filled from Resolved.PersistableMaxTokens (the router
-	// catalog's max_completion_tokens); omitted — SDK default 16384 — for a
-	// budget the catalog did not supply.
+	// max_completion_tokens to the router: its detectCompat picks max_tokens
+	// only for a few named hosts). Filled from Resolved.RequestMaxTokens (the
+	// router catalog's max_completion_tokens, capped — the raw capability is
+	// not a per-call value, see settings.RequestMaxTokens); omitted — SDK
+	// default 16384 — for a budget the catalog did not supply.
 	MaxTokens int `json:"maxTokens,omitempty"`
 	// Reasoning marks the model as a thinking model. Required for the SDK to
 	// send reasoning_effort at all (its gate is reasoning && compat
@@ -148,14 +150,16 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 		// file an earlier render left — an owner who moves from the router to
 		// a built-in must not keep a registration aimed at the old endpoint,
 		// and this file is an artifact, so there is no agent state to lose.
-		if err := os.Remove(modelsJSONPath()); err != nil && !os.IsNotExist(err) {
+		// Whatever sits at the name goes, a directory included (RemoveAll
+		// follows no link), so nothing there can fail the render.
+		if err := privsep.RemoveAll(modelsJSONPath()); err != nil {
 			return fmt.Errorf("prime.RenderSettings: remove stale %s: %w", modelsJSONPath(), err)
 		}
 	} else {
 		if err := ensureDir(primeHome); err != nil {
 			return fmt.Errorf("prime.RenderSettings: %w", err)
 		}
-		if err := os.WriteFile(modelsJSONPath(), blob, 0o644); err != nil {
+		if err := privsep.WriteFile(modelsJSONPath(), blob, 0o644); err != nil {
 			return fmt.Errorf("prime.RenderSettings: write %s: %w", modelsJSONPath(), err)
 		}
 	}
@@ -166,7 +170,7 @@ func (a *Adapter) RenderSettings(ctx context.Context, s settings.Resolved) error
 
 	claim := reasoningClaimFor(s)
 	logger.Logf("prime.RenderSettings: %s/%s effort=%q decided=%v registered=%v maxTokens=%d",
-		s.Provider, s.Model, claim.level, claim.decided, blob != nil, s.PersistableMaxTokens())
+		s.Provider, s.Model, claim.level, claim.decided, blob != nil, s.RequestMaxTokens())
 	if !claim.decided {
 		logger.Logf("prime.RenderSettings: WARN the router catalog did not say whether %s takes a reasoning bound, so the registration claims nothing about it; if this model always thinks and nothing else marks it, it can reason unbounded — set a thinking level to pin one",
 			s.Model)
@@ -349,7 +353,9 @@ func reasoningClaimFor(s settings.Resolved) reasoningClaim {
 // retracting it. Absent file, absent entry or a different model all mean
 // "nothing to carry".
 func previousReasoning(provider, model string) (reasoningClaim, bool) {
-	raw, err := os.ReadFile(modelsJSONPath())
+	// Agent-writable file, read through internal/privsep: an entry the read
+	// rules refuse (a link, a FIFO) carries nothing forward.
+	raw, err := privsep.ReadFile(modelsJSONPath(), privsep.LimitConfig)
 	if err != nil {
 		return reasoningClaim{}, false
 	}
@@ -420,7 +426,7 @@ func platformModel(s settings.Resolved, c reasoningClaim) modelEntry {
 		// Catalog-sourced only: a heuristic guess written here during an
 		// outage is worse than the SDK's own default (see the file comment's
 		// agent-404 incident).
-		MaxTokens: s.PersistableMaxTokens(),
+		MaxTokens: s.RequestMaxTokens(),
 	}
 	if c.decided && c.level != "" {
 		e.Reasoning = true

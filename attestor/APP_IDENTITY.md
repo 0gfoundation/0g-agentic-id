@@ -70,9 +70,15 @@ timeout fails startup, with no expired identity, unauthorized key or manual-addr
 fallback. HTTP serving and job consumption start only after both identities are ready.
 Explicit mock mode skips production identity discovery as before.
 
-## AgenticID 1.2 contract migration
+## AgenticID 1.3 contract migration
 
-Upgrade through the existing beacon/timelock procedure. The owner then:
+AgenticID links the stateless `AttestorAppBindingLib`; it has no owner or
+independent configuration, and binding state remains in the proxy. Deploy/link
+the library and implementation with the pinned contract toolchain, then upgrade
+through the existing beacon/timelock procedure. Replacing library code requires
+a newly linked implementation through that same procedure, with no state migration.
+See [`contracts/UPGRADING.md`](../contracts/UPGRADING.md) for deployment and verification
+constraints. The owner then:
 
 1. Reads the current app registration and stable service signer.
 2. Calls `bindTrustedAttestorApp(signer, registry, appId, registeredAt)`.
@@ -82,7 +88,9 @@ Upgrade through the existing beacon/timelock procedure. The owner then:
 4. Calls the one-way `requireInstanceBoundAttestors()`.
 5. Removes obsolete legacy whitelist entries.
 
-Storage is appended in the existing ERC-7201 namespace. Before step 4, old address-only
+AgenticID 1.3.0 retains the 1.2.0 governance and proof rules. Its fields are appended
+after the existing `agentSealBound` mapping in the ERC-7201 namespace, preserving
+that map's slot and lifetime seal-address bindings. Before step 4, old address-only
 entries remain compatible; production API/worker refuse to start in that mode. After
 step 4, adding an address without a live instance binding grants no authority. All
 trusted-attestor gates, including agent URI writes, use the same check. App removal,

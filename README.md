@@ -3,7 +3,7 @@
 > Give every AI agent a chain-anchored identity that spans its entire lifecycle and that anyone can independently verify.
 
 AgenticID is a protocol built on the **0G ecosystem**. It anchors an agent's
-functional data on chain, runs its code inside a TEE, and stamps every response
+functional data on chain, runs its code inside a TEE, and stamps its served responses
 with a key that exists only inside that TEE — turning "this agent is
 trustworthy" from a claim you take on faith into a property anyone can verify
 for themselves.
@@ -97,9 +97,9 @@ below; circle back here whenever you hit an unfamiliar term elsewhere.
 
 | Name | What it is | Where it's used |
 |---|---|---|
-| **ServeProof** (PascalCase) | Solidity struct, the carrier for the on-chain reputation flow | `giveFeedback(ServeProof, ...)`, contract verifies via ecrecover |
+| **ServeProof** (PascalCase) | Solidity struct, the carrier for the on-chain reputation flow | `VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, ServeProof)`, contract verifies via ecrecover over a registry-bound digest |
 | **serve-proof** (lowercase hyphenated) | The general concept: any envelope sealed signs automatically | Informal term in docs; covers ServeProof, heartbeat, chain.Update, etc. |
-| **X-Agent-Proof** | HTTP response header name | The header sealed proxy auto-appends to every :8080 response; the payload is a signed envelope |
+| **X-Agent-Proof** | HTTP response header name | The header the sealed proxy auto-appends to signed :8080 responses (`/hello`, `/_seal/auth`, the agent's `/api/*` services) when the container has `VERIFIED_FEEDBACK_ADDR`; the payload is a signed envelope |
 
 Shorthand: **ServeProof** is its on-chain form, **X-Agent-Proof** is its HTTP form, and **serve-proof** is the umbrella.
 
@@ -142,7 +142,9 @@ discoverable and callable.
 The on-chain record isn't frozen. The agent can update its functional data
 autonomously. What the protocol guarantees is more precise: **you can always
 verify what iData the agent was running at the exact moment it served you.**
-Every response carries a signed proof of the current iData version. This
+Every signed response (`/hello`, `/_seal/auth`, the agent's `/api/*`
+services) carries a signed proof of the current iData version when the
+runtime has `VERIFIED_FEEDBACK_ADDR`. This
 isn't immutability — it's **verifiability at any point in time**, an
 audit-trail kind of trust.
 
@@ -189,9 +191,9 @@ specific TDX device), and accessible only inside a TEE.
 From this key material, AgenticID generates an **AgentSeal** for each
 agent — a key pair whose private key exists only inside the TEE runtime.
 The owner cannot get to it; no one outside the TEE can get to it. The agent
-uses AgentSeal to sign **every response** it produces, and this signature
-proves the response came from an agent running in a TEE, strictly following
-its on-chain record.
+uses AgentSeal to sign **the responses it serves** (its `/hello`,
+`/_seal/auth` and its `/api/*` services), and this signature proves the response came from an agent
+running in a TEE, strictly following its on-chain record.
 
 AgenticID's backend Attestor is itself a Tapp application registered on
 TappRegistry. Its registration entry contains three things:
@@ -271,17 +273,23 @@ the relationship is closer to guardian-and-ward, teacher-and-student.**
 
 ### 5 · Reputation: proof-gated
 
-AgenticID extends **ERC-8004** with one key requirement: **every review
-must come bundled with an AgentSeal-signed service proof (ServeProof)**.
-You can't fabricate a review out of thin air — a valid proof can only be
-produced by the live TEE runtime, so a review that was never backed by a
-real response is rejected.
+AgenticID extends **ERC-8004** with one key requirement: **a review is
+verified only when it comes bundled with an AgentSeal-signed service proof
+(ServeProof)**. You can't fabricate one out of thin air. The sealed runtime
+signs the proof in a domain of its own — EIP-191 version `0x00`, bound to the
+`VerifiedFeedbackRegistry` — that the agent process's sign socket cannot
+produce, so not even the agent can forge proof contents for a response that
+never happened. A review that was never backed by a real response gets no
+verification mark.
 
 This raises the cost of fake reviews but is **not** full sybil resistance:
-the runtime issues a proof on every response, including the unauthenticated
-public `GET /hello`, so proofs are cheaply obtainable, and one entity can
-request service from many wallets it controls. Preventing that (genuine
-one-entity-one-voice) needs an off-chain layer — rate-limiting per real
+the runtime issues a proof on every signed response, including the
+unauthenticated public `GET /hello`, so proofs are cheaply obtainable, and one entity can
+request service from many wallets it controls. That includes the agent
+itself: it can call its own proxy (e.g. loopback `:8080`) with an
+`X-Client-Address` it controls and get *genuine* proofs — signing-domain
+separation stops forged proof contents, not self-farming. Preventing that
+(genuine one-entity-one-voice) needs an off-chain layer — rate-limiting per real
 identity, staking, proof-of-personhood — which is out of scope for the
 on-chain contract.
 
@@ -295,6 +303,7 @@ designed (see [`REPUTATION_MODEL.md`](REPUTATION_MODEL.md)); today's on-chain
 ```solidity
 struct ServeProof {
     uint256   agentId;
+    address   submitter;      // the only address allowed to redeem it
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -304,11 +313,26 @@ struct ServeProof {
 }
 ```
 
-`giveFeedback` reconstructs the signed payload on chain, runs `ecrecover`,
-and compares against `getAgentSeal(agentId)`. Because `agentSeal_priv` is held
-only by the Agent TEE, no one can forge a ServeProof, and each proof is
-single-use (signature nonce). There is no `client` field — attribution is
-`msg.sender` at submission. Details in
+`VerifiedFeedbackRegistry.attestFeedback` reconstructs the inner `proofHash`
+on chain (bound to the chain, the identity registry and `submitter`), wraps it
+as EIP-191 version `0x00` with the registry's own proxy address as the
+intended validator — `keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash)` — runs
+`ecrecover`, and compares against `getAgentSeal(agentId)`. Key custody alone
+would not make that unforgeable: the agent process shares the TEE and can
+have the sealed sign socket sign with `agentSeal_priv`. What closes it is the
+signing domain. The socket only signs `personal_sign` (`0x19 0x45`), EIP-712
+(`0x19 0x01`) and transactions it builds from fields — never a raw hash, never
+a version-`0x00` message — so nobody, the agent included, can forge ServeProof
+contents offline. (Before `VerifiedFeedbackRegistry` 1.2.0 the digest was a
+plain `personal_sign` over `proofHash`, which the socket would sign — audit
+FIND-01. The deprecated `AgenticIDReputationRegistry` still verifies that
+legacy digest and must be paused.) Only `submitter` may redeem a proof
+(`submitter == msg.sender`, and the entry is attributed to `msg.sender`), each
+proof is single-use (signature nonce), and it verifies at exactly one
+registry. The switch to this digest is a hard cut: proofs from sealed images
+that predate it stop verifying at the registry upgrade, and a running agent
+moves to the new image only through an owner-signed `/reset` (rollout:
+[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) §7). Details in
 [`contracts/README.md`](contracts/README.md) §5.
 
 ### 6 · Transferring an agent = transferring its capabilities
@@ -343,6 +367,10 @@ chain from on-chain registration to each signed response.
 | **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) + the `validFrameworkHashes` allowlist |
 | **TappRegistry** | Code-fingerprint registry for all Tapp components |
 
+AgenticID 1.3 links the stateless `AttestorAppBindingLib` for app-instance authorization;
+permissions and binding state remain in the proxy. The pinned compiler and linking rules
+are documented in [`contracts/README.md`](contracts/README.md).
+
 ### TEE layer (deployed on 0g-Tapp)
 
 - **Attestor** — validates Sandbox's `signerAddress` (against TappRegistry)
@@ -355,7 +383,8 @@ chain from on-chain registration to each signed response.
 - **Agent runtime (`sealed`)** — the container running inside Sandbox that
   receives the key after RA. It restores encrypted iData from chain into a
   runnable agent, continuously writes state evolution back on chain, and
-  signs `X-Agent-Proof` on every response. (Go, see
+  signs `X-Agent-Proof` on its signed responses (`/hello`, `/_seal/auth`,
+  agent-registered `/api/*` services). (Go, see
   [`sealed/`](sealed/ARCHITECTURE.md))
 - **0g-kms** — provides hardware-security-grade key services with disaster
   recovery for the Tapp ecosystem.
@@ -381,7 +410,7 @@ Attestor validates 0g-Sandbox credentials + checks validFrameworkHashes
 0g-Sandbox confirms authorized owner + correct runtime code
         │
         ▼
-agent signs every response with AgentSeal (X-Agent-Proof)
+agent signs its served responses with AgentSeal (X-Agent-Proof)
         │
         ▼
 0g-compute attests every inference
@@ -434,8 +463,9 @@ protocol: `ag.agent` (deploy / clone / transfer, reads, agent-seal gas
 top-up), `ag.reputation` (capture a TEE-signed serve-proof, verify it,
 submit/read on-chain feedback), plus top-level trust-root ack and
 prepaid sandbox deposit. Hides the contract set and the attestor HTTP
-API behind one config object; every snippet in it runs against the
-live testnet deployment.
+API behind one config object; every snippet in it runs against a live
+deployment — `https://agenticid.0g.ai` (as written) is 0G mainnet; point it at
+`https://agenticid-testnet.0g.ai` for the Galileo testnet.
 
 **[`contracts/README.md`](contracts/README.md) — the contract layer**
 
@@ -445,8 +475,8 @@ protocol), ERC-8004 (identity registration and reputation), AgenticID
 (AccessProof and OwnershipProof dual-signature validation), and
 NonceRegistry (unified replay protection), along with their extension
 points and dependencies. Walks through the three main flows (`register`,
-`giveFeedback`, `iTransferFrom`) with their on-chain logic and ecrecover
-validation, plus 138 Foundry tests across 18 suites and full deploy, upgrade,
+`attestFeedback`, `iTransferFrom`) with their on-chain logic and ecrecover
+validation, plus 290 Foundry tests across 28 suites and full deploy, upgrade,
 and Etherscan-verify scripts.
 
 **[`sealed/ARCHITECTURE.md`](sealed/ARCHITECTURE.md) — the agent runtime**
@@ -508,11 +538,19 @@ The full end-to-end trust chain for AgenticID, across five themes:
   into two groups. **Group A (identity layer, 3 claims)** holds
   unconditionally as long as the priv stays in the TEE. **Group B
   (content layer, 5 claims)** additionally requires that the signing
-  capability not be abused, backstopped by the agent doctrine. Sealed's
-  sign socket is a schema-agnostic general signer, so distinguishing
-  framework-signed from agent-signed cannot be done cryptographically.
-  That's why content correctness has to rely on the on-chain reputation
-  layer rather than the cryptographic layer.
+  capability not be abused. For the serve-proof itself that holds
+  mechanically: it is signed under EIP-191 version `0x00`, bound to the
+  `VerifiedFeedbackRegistry`, a domain sealed's sign socket (only
+  `personal_sign`, EIP-712 and socket-built transactions; no raw-hash
+  signing) cannot produce — so a framework-signed ServeProof *is*
+  cryptographically distinguishable from anything the agent can sign.
+  For everything else the socket can sign (`chain.Update`, the agent's
+  own claims) it is a schema-agnostic general signer, and Group B is
+  backstopped by the agent doctrine. The agent can still obtain genuine
+  proofs by calling its own proxy from a wallet it controls, and no proof
+  says whether the response *content* is correct. That's why content
+  correctness has to rely on the on-chain reputation layer rather than
+  the cryptographic layer.
 
 ---
 

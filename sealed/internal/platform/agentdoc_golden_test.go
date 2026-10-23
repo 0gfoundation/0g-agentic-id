@@ -20,21 +20,22 @@ var updateBible = flag.Bool("update-bible", false, "regenerate AGENT_BIBLE.md")
 // a generic reference.
 func bibleTemplate() string {
 	rs := RuntimeSnapshot{
-		SealedVersion:    "(sealed version hash)",
-		FrameworkVersion: "(framework version)",
-		WhitelistMax:     "(whitelist max)",
-		AgentSeal:        "(agentSeal address)",
-		AgentID:          "(agentID)",
-		Owner:            "(owner address)",
-		ChainRPC:         "(chain RPC)",
-		ContractAddr:     "(contract address)",
-		AttestorURL:      "(attestor URL)",
-		PublicURL:        "(public URL)",
-		SealSignSock:     "/run/seal-sign.sock",
-		Provider:         "(provider)",
-		Model:            "(model)",
-		ZGComputeRouted:  false,
-		BootTime:         time.Unix(0, 0).UTC(),
+		SealedVersion:       "(sealed version hash)",
+		FrameworkVersion:    "(framework version)",
+		WhitelistMax:        "(whitelist max)",
+		AgentSeal:           "(agentSeal address)",
+		AgentID:             "(agentID)",
+		Owner:               "(owner address)",
+		ChainRPC:            "(chain RPC)",
+		ContractAddr:        "(contract address)",
+		ServeProofValidator: "(serve-proof validator address)",
+		AttestorURL:         "(attestor URL)",
+		PublicURL:           "(public URL)",
+		SealSignSock:        "/run/seal-sign.sock",
+		Provider:            "(provider)",
+		Model:               "(model)",
+		ZGComputeRouted:     false,
+		BootTime:            time.Unix(0, 0).UTC(),
 	}
 	facts := FrameworkFacts{
 		Home: "(framework home dir, e.g. ~/.acme/)",
@@ -46,6 +47,9 @@ func bibleTemplate() string {
 		},
 		DurableHints: []DurableHint{
 			{Ask: "(owner request, e.g. \"remember this\")", Place: "(where it goes, e.g. `memories/NOTES.md`)"},
+		},
+		Notes: []string{
+			"(framework-specific working rule that is not about tracking, e.g. how the framework resolves `~` — list each; leave empty if none)",
 		},
 		VersionScheme: "(release scheme, e.g. semver releases / CalVer tags)",
 		Versions:      []string{"(whitelisted version — list each)"},

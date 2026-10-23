@@ -3,12 +3,12 @@ package hermes
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"strings"
 
 	"seal-verify/internal/framework"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
+	"seal-verify/internal/privsep"
 	"seal-verify/internal/settings"
 )
 
@@ -97,9 +97,9 @@ func (a *Adapter) ingestPersona(ctx context.Context, plaintext []byte) error {
 		return nil
 	}
 
-	if err := os.MkdirAll(hermesHome, 0o755); err != nil {
+	if err := privsep.MkdirAll(hermesHome, 0o755); err != nil {
 		logger.Logf("hermes.HandleLegacy[persona]: WARN mkdir %s (%v); SOUL.md not written", hermesHome, err)
-	} else if err := os.WriteFile(soulMDPath(), []byte(p.SystemPrompt), 0o644); err != nil {
+	} else if err := privsep.WriteFile(soulMDPath(), []byte(p.SystemPrompt), 0o644); err != nil {
 		logger.Logf("hermes.HandleLegacy[persona]: WARN write SOUL.md (%v); the agent boots without this persona", err)
 	}
 

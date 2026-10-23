@@ -2,9 +2,9 @@ package uploader
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"fmt"
 	"math/big"
-	"os"
 
 	"github.com/ethereum/go-ethereum/common"
 
@@ -44,7 +44,7 @@ type ChainClient interface {
 
 // StorageClient abstracts the 0g-storage Upload + Download primitives so
 // tests can substitute in-memory blob storage. Production wrapper delegates
-// to the dataplane package's CLI-shelling implementation.
+// to the dataplane package (in-process SDK upload, CLI download).
 type StorageClient interface {
 	Upload(ctx context.Context, ciphertext []byte) (root [32]byte, err error)
 	Download(ctx context.Context, root [32]byte) ([]byte, error)
@@ -52,39 +52,27 @@ type StorageClient interface {
 
 // ── default dataplane-backed StorageClient ──────────────────────────────────
 
-// dataplaneStorage is the production StorageClient that wraps the CLI-based
+// dataplaneStorage is the production StorageClient that wraps the
 // dataplane package. Captures the per-deployment indexerURL / rpcURL /
 // signer key once at construction so individual calls have a clean
 // (ctx, ciphertext) signature.
 type dataplaneStorage struct {
-	indexerURL    string
-	rpcURL        string
-	signerPrivHex string
+	indexerURL string
+	rpcURL     string
+	signer     *ecdsa.PrivateKey
 }
 
 func (d *dataplaneStorage) Upload(ctx context.Context, ciphertext []byte) ([32]byte, error) {
-	return dataplane.Upload(ctx, ciphertext, d.indexerURL, d.rpcURL, d.signerPrivHex)
+	return dataplane.Upload(ctx, ciphertext, d.indexerURL, d.rpcURL, d.signer)
 }
 
-// Download fetches a blob from 0g-storage. The underlying dataplane.Download
-// writes to a tempfile (because the CLI requires it); this wrapper reads
-// the file back into memory and cleans up.
+// Download fetches a blob from 0g-storage. dataplane.Download stages the
+// CLI's output file in a root-only scratch directory and returns its bytes.
 func (d *dataplaneStorage) Download(ctx context.Context, root [32]byte) ([]byte, error) {
-	tmp, err := os.CreateTemp("", "0g-download-*.bin")
-	if err != nil {
-		return nil, fmt.Errorf("dataplaneStorage: create tempfile: %w", err)
-	}
-	tmpPath := tmp.Name()
-	tmp.Close()
-	defer os.Remove(tmpPath)
-
 	rootHex := "0x" + hexBytes(root[:])
-	if err := dataplane.Download(ctx, rootHex, d.indexerURL, tmpPath); err != nil {
-		return nil, fmt.Errorf("dataplaneStorage: download %s: %w", rootHex, err)
-	}
-	body, err := os.ReadFile(tmpPath)
+	body, err := dataplane.Download(ctx, rootHex, d.indexerURL)
 	if err != nil {
-		return nil, fmt.Errorf("dataplaneStorage: read downloaded blob: %w", err)
+		return nil, fmt.Errorf("dataplaneStorage: download %s: %w", rootHex, err)
 	}
 	return body, nil
 }

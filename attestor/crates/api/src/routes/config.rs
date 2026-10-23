@@ -38,8 +38,17 @@ pub struct ConfigResponse {
 
     // Protocol-domain siblings of agentic_id_addr, served so ONE URL
     // describes the whole environment (SDK bootstrap) — the attestor
-    // itself never calls either contract.
+    // never writes to the reputation contracts (its only call is the
+    // startup getIdentityRegistry() anchor check on verified_feedback_addr).
+    /// DEPRECATED AgenticIDReputationRegistry fork. Still verifies the legacy
+    /// personal_sign ServeProof digest, so it must be paused; clients use
+    /// `verified_feedback_addr`.
     pub reputation_registry_addr: Option<String>,
+    /// VerifiedFeedbackRegistry proxy — also the ServeProof validator: the
+    /// worker injects this same address into every new container as
+    /// `VERIFIED_FEEDBACK_ADDR`, and sealed signs the EIP-191 version-0x00
+    /// digest bound to it. Verifiers (SDK, console say-hi) recover against
+    /// it; absent → this environment's proofs are unverifiable.
     pub verified_feedback_addr: Option<String>,
     pub feedback_batcher_addr: Option<String>,
     pub clone_gate_addr: Option<String>,

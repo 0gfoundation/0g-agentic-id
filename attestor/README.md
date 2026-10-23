@@ -123,7 +123,7 @@ stay up.
 | Path | Purpose | Auth |
 |---|---|---|
 | `POST /provision` | Container exchanges credentials for `agentSeal_priv`, plus the owner's settings document (`encrypted_settings`, ECIES to the same container pubkey). This channel — not the sandbox env — because it runs on EVERY boot including a resume. The first boot after a push gets the new document; a container that keeps coming back without ever confirming it gets the last one that worked. The document half is additionally gated on a sandbox being on record (ghost container — every container this agent ever had holds the agentSeal key); the key half is not, because who may hold it is settled by the attestation | sandbox TEE signature + TappRegistry node validation + `validFrameworkHashes` allowlist |
-| `POST /status` | sealed heartbeat and status report. A `running` report promotes the settings version this boot was served to last-known-good — once, keyed on the version, so the repeating heartbeat cannot bless a document no boot exercised. An `error` report leaves the document alone: it fires on every failing heartbeat, and rolling back there made it impossible to land a change while an agent is unhealthy | agentSeal EIP-191 |
+| `POST /status` | sealed heartbeat and status report. A `running` report promotes the settings version this boot was served to last-known-good — once, keyed on the version, so the repeating heartbeat cannot bless a document no boot exercised. An `error` report leaves the document alone: it fires on every failing heartbeat, and rolling back there made it impossible to land a change while an agent is unhealthy | agentSeal signature over `StatusReport:0x<sealId>:<status>:<error_detail>` — raw keccak256, no EIP-191 prefix |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
@@ -131,7 +131,7 @@ stay up.
 | Path | Purpose |
 |---|---|
 | `GET /deployments` | List current deployments |
-| `GET /deployment/:seal_id` | Single deployment detail |
+| `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container pubkey + its MAC, or iData retry material) |
 | `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
@@ -141,7 +141,8 @@ Detailed signing canonicals live in `crates/shared/src/auth/`.
 
 | Contract | Purpose |
 |---|---|
-| **AgenticID** | NFT mint, iData registration, ServeProof verification, `validFrameworkHashes` allowlist |
+| **AgenticID** | NFT mint, iData registration, `validFrameworkHashes` allowlist |
+| **VerifiedFeedbackRegistry** | Verifies ServeProofs — the agentSeal's EIP-191 version-0x00 signature `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, validator = this proxy — and records TEE marks over the canonical ERC-8004 reputation registry. The attestor never writes to it: it serves the address on `GET /config` and injects it into every new container as `VERIFIED_FEEDBACK_ADDR` (`ATTESTOR_VERIFIED_FEEDBACK_ADDR`); its one read is at worker / api startup, where `getIdentityRegistry()` must equal `ATTESTOR_AGENTIC_ID_ADDR` or startup fails |
 | **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` calls `getNodeList` to validate the sandbox signer |
 | **SandboxServing** | Sandbox prepaid balance and voucher settlement. The frontend deploy gate requires owner balance ≥ 0.1 OG |
 
@@ -158,8 +159,9 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId |
+| `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId. The RPC URL is public (served in `GET /config` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID contract address |
+| `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** bound to that AgenticID. Served on `GET /config` and injected into every new container as `VERIFIED_FEEDBACK_ADDR`, the ServeProof validator. Blank or the zero address ⇒ `/config` serves none and containers get an empty value, so they emit no `X-Agent-Proof`; a non-address value fails startup, and so does one whose `getIdentityRegistry()` is not `ATTESTOR_AGENTIC_ID_ADDR` (worker and api read it once at startup). Container env is set only at create, so a change needs each agent recreated (owner-signed `/reset`) |
 | `ATTESTOR_CANONICAL_8004_ADDR` | Canonical ERC-8004 IdentityRegistry (optional; auto-derived from chainId — mainnet `0x8004A169…`, testnet `0x8004A818…`) |
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry contract address |
 | `ATTESTOR_PRIORITY_FEE_GWEI` / `ATTESTOR_MAX_FEE_GWEI` | EIP-1559 gas bounds (0G testnet requires `priority` ≥ 2) |
@@ -193,8 +195,8 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads) |
-| `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (stable app signer needs 0G testnet gas) |
+| `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads). Public (recorded on chain in each iData entry's `dataDescription` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
+| `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (stable app signer needs gas on the configured 0G chain) |
 
 ### Database / process
 

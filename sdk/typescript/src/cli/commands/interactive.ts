@@ -17,12 +17,13 @@ import * as readline from 'node:readline';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { SDK_VERSION } from '../../constants';
-import { parseEther, keccak256, toBytes, hexToBytes, concat, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
+import { parseEther, keccak256, isAddress, ContractFunctionRevertedError, type Address } from 'viem';
 import type { AgenticID } from '../../AgenticID';
 import type { AgentClient, ChatMessage } from '../../AgentClient';
 import type { ServeProof, TaskReveal } from '../../types';
+import { taskHashOf, requestUriCandidates } from '../../taskHash';
 import { buildClient } from '../sdk';
-import { saveProof, listProofs, removeProof, toServeProof, type SavedProof } from '../proofs';
+import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
 import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
@@ -35,7 +36,7 @@ import { pandaLines, svgPixelLines } from '../logo';
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -277,7 +278,11 @@ interface Session {
 async function connectSession(s: Session, url: string): Promise<void> {
   s.url = url;
   s.sandboxId = sbid(url);
-  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId });
+  // Pass the session's known agentId: the URL alone yields one only via
+  // /hello's proof envelope, which a container without VERIFIED_FEEDBACK_ADDR
+  // does not emit — and without it the handle would lose owner reauth.
+  const agentId = /^\d+$/.test(s.agentId) ? BigInt(s.agentId) : undefined;
+  s.client = await s.ag.agent.client(url, { instanceId: clientInstanceId, agentId });
   s.phase = 'running';
   // Take the single-driver seat (WeChat: the new login just wins; whoever
   // held it is told on their next message). Best-effort — a pre-seat
@@ -1140,7 +1145,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         try { pretty = JSON.stringify(JSON.parse(t.bodyText), null, 2); } catch { /* not JSON */ }
         out(pretty.length > 4096 ? `${pretty.slice(0, 4096)}\n… (${pretty.length} chars total)\n` : `${pretty}\n`);
         if (t.banked) out(`ticket  : banked (${method} ${path}) — spend with \`rate ${row.agentId}\` within ~60 min\n`);
-        else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript seen here\n');
+        else if (t.proof) out('ticket  : NOT banked — the signed taskHash does not match the transcript as sent from here ' +
+                              '(something between here and the agent re-encoded the request URI or a body)\n');
         else out('ticket  : NOT banked — no serve-proof on the response\n');
         continue;
       }
@@ -1196,12 +1202,24 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`rating the ${ticket.task.method} ${ticket.task.uri} interaction from ${new Date(ticket.capturedAt * 1000).toLocaleTimeString()}\n`);
         const proof = toServeProof(ticket);
 
-        // Free pre-check before spending gas.
+        // Free pre-check before spending gas, on the fields the registry
+        // checks (ticketRedeemable) — not on dataOnChain, which it doesn't.
         const v = await ag.reputation.verifyProof(proof);
-        if (!v.ok) {
-          removeProof(ticket.proof.signature);
-          out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+        if (!ticketRedeemable(v)) {
+          // Burn only on a defect of the ticket itself; keep it when the
+          // failure is this side's registry configuration (ticketDisposition).
+          if (ticketDisposition(v) === 'burn') {
+            removeProof(ticket.proof.signature);
+            out(`serve-proof failed verification (${v.reasons.join(', ')}) — ticket discarded\n`);
+          } else {
+            out(`serve-proof not verifiable in this environment (${v.reasons.join(', ')}) — ticket kept\n` +
+                `  → check the attestor's verified_feedback_addr / AGENTIC_VERIFIED_FEEDBACK_ADDR\n`);
+          }
           continue;
+        }
+        if (!v.dataOnChain) {
+          out(`note: the agent has committed new state since this interaction (a dataHash in the ticket is no longer current) — ` +
+              `the ticket still redeems, and the rating records the version that served you\n`);
         }
 
         if (!rawScore) rawScore = (await ask('score [1-5]: ')).trim();
@@ -1378,15 +1396,6 @@ async function fetchAvatarLines(attestorUrl: string, sealId: string): Promise<st
   }
 }
 
-/** The sealed proxy's taskHash composition, recomputed client-side:
- *  keccak256(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status). */
-function taskHashOf(task: TaskReveal): `0x${string}` {
-  return keccak256(concat([
-    toBytes(task.method), toBytes(task.uri),
-    hexToBytes(task.reqBodyHash), hexToBytes(task.respBodyHash),
-    toBytes(String(task.statusCode)),
-  ]));
-}
 
 /** Call one of an agent's endpoints, capturing the serve-proof AND its
  *  task-receipt materials. With `clientAddr` the request declares
@@ -1420,15 +1429,18 @@ async function callAgentWithTicket(
   let task: TaskReveal | null = null;
   let banked = false;
   if (proof) {
-    const u = new URL(target);
-    const candidate: TaskReveal = {
-      method,
-      uri: u.pathname + u.search,
-      reqBodyHash: keccak256(bodyBytes),
-      respBodyHash: keccak256(raw),
-      statusCode: res.status,
-    };
-    if (taskHashOf(candidate) === proof.taskHash) task = candidate;
+    // The uri is Go's r.URL.RequestURI() of what was sent (requestUriCandidates
+    // covers the forms a client may put on the wire).
+    for (const uri of requestUriCandidates(target)) {
+      const candidate: TaskReveal = {
+        method,
+        uri,
+        reqBodyHash: keccak256(bodyBytes),
+        respBodyHash: keccak256(raw),
+        statusCode: res.status,
+      };
+      if (taskHashOf(candidate) === proof.taskHash) { task = candidate; break; }
+    }
     if (clientAddr && proof.submitter.toLowerCase() === clientAddr.toLowerCase() && task) {
       saveProof(proof, task, target);
       banked = true;
@@ -1497,7 +1509,10 @@ async function showHello(ag: AgenticID, url: string, clientAddr?: `0x${string}`)
   } = {};
   try { body = JSON.parse(bodyText); } catch { /* body printed fields stay empty */ }
   const valid = proof ? await ag.reputation.verifyProof(proof) : null;
-  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${valid ? JSON.stringify(valid.ok) : '(no proof header)'}\n`);
+  const proofLine = valid
+    ? `${JSON.stringify(valid.ok)}${valid.ok ? '' : ` (${valid.reasons.join('; ')})`}`
+    : '(no proof header)';
+  out(`agent   : ${body.agent}\nowner   : ${body.owner}\nproof ok: ${proofLine}\n`);
   if (banked) out(`ticket  : banked (GET /hello) — spend with \`rate\` within ~60 min\n`);
   if (body.services?.length) {
     out('services:\n');
@@ -1828,7 +1843,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1857,6 +1872,12 @@ const L2_HELP_FULL = `session commands
   /clear                  wipe the agent's conversation and start fresh —
                           chain-tracked memory (what the agent chose to keep)
                           is untouched; that is the difference from /reset
+  /compact                compact the agent's conversation in place — older
+                          history becomes a summary, the newest part stays
+                          as it is (openclaw ~20K tokens, dsh its newest
+                          item), and the conversation goes on (unlike
+                          /clear). One or more model calls; can take
+                          minutes. dsh, and openclaw 2026.7.1 or later
   /tasks                  this session's long tasks with live status — on
                           agents with the responses transport a chat turn
                           survives dropped connections and keeps running
@@ -2037,6 +2058,42 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const msg = (e as Error).message;
           if (/HTTP 501/.test(msg)) { messages.length = 0; out('history is client-held for this framework — local history cleared\n'); }
           else out(`clear failed: ${msg}\n`);
+        }
+        continue;
+      }
+      if (line === '/compact') {
+        // Compact the agent's persisted conversation in place: older history
+        // becomes a summary, the newest part stays verbatim, and the
+        // conversation goes on (unlike /clear). The summary takes one or more
+        // model calls — minutes on a long history — and the agent finishes it
+        // even if this connection drops; the runtime log has the outcome. The
+        // local echo is left alone: the server-side history is the one
+        // compacted.
+        if (!s.url) { out(`agent is ${s.phase} — nothing to compact\n`); continue; }
+        out('compacting the conversation (one or more model calls; can take a few minutes)…\n');
+        try {
+          const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
+          out(`${r.note ?? 'conversation compacted'}\n`);
+        } catch (e) {
+          const msg = (e as Error).message;
+          const status = Number(msg.match(/^compactConversation: HTTP (\d+):/)?.[1] ?? 0);
+          const cause = (e as { cause?: { code?: string } }).cause?.code ?? '';
+          // The agent's own 500 ("compact failed: …") is a final outcome.
+          const failed = msg.match(/^compactConversation: HTTP 500: (compact failed: [\s\S]*)$/);
+          // A 501 that names a reason (an older framework version) shows it.
+          const why = msg.match(/^compactConversation: HTTP 501: [^(]*\(([\s\S]*)\)\s*$/)?.[1]?.split(': ').pop()?.trim();
+          // Sent, but no answer: this side gave up waiting (Node's fetch, after
+          // 300s: UND_ERR_HEADERS_TIMEOUT), the connection dropped, or a
+          // gateway on the way gave up (the agent's own route never answers
+          // 502/504). The agent goes on compacting regardless — unlike a
+          // connection that never opened, where nothing started.
+          const unanswered = status === 502 || status === 504 ||
+            ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET', 'ECONNRESET'].includes(cause);
+          if (status === 501) out(`this agent's framework${s.framework ? ` (${s.framework})` : ''} does not support /compact${why ? ` (${why})` : ' yet'} — /clear starts fresh instead\n`);
+          else if (status === 409) out(`compact refused: ${msg.replace(/^compactConversation: HTTP 409: /, '').trim()}\n`);
+          else if (failed) out(`${failed[1].trim()}\n`);
+          else if (unanswered) out(`no answer yet (${status ? `HTTP ${status} from a gateway on the way` : cause}); the agent may still be compacting — /startuplog shows the outcome (a "compact:" line). Wait for it before sending /compact again.\n`);
+          else out(`compact failed: ${msg}${cause ? ` (${cause})` : ''}\n`);
         }
         continue;
       }

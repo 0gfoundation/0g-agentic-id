@@ -1856,6 +1856,10 @@ mod tests {
             self.inner.is_trusted_attestor(addr).await
         }
 
+        async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
+            self.inner.identity_registry_of(registry).await
+        }
+
         async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
             self.inner.is_sandbox_node(addr).await
         }
