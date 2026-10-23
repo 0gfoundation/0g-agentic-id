@@ -21,6 +21,8 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 `/api/info` 的 app/provider。缓存过期前 single-flight 刷新并重新验证链上授权；每次请求
 使用同一 snapshot 绑定签名中的 provider 和 HTTP 连接。`GET /config` 同样刷新 snapshot，
 保持原 SDK 字段名。
+每次出站操作的所有重试都使用同一 snapshot，其绝对 lease deadline 同时限制连接建立
+和响应 body 读取；到期即取消操作。响应 body 失败不会重发可能已被处理的 create。
 
 仅有 node identity，或已有合法 TLS metadata、尚未获取 `app_signer` 的 current 节点可保留为 standby，
 但不贡献服务 TLS pins，也不决定服务 lease；至少一个 current 节点必须具备完整服务身份。

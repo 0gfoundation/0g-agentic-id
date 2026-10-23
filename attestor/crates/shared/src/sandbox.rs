@@ -224,6 +224,48 @@ fn apply_attestor_identity(
     Ok(())
 }
 
+/// One operation keeps the provider, URL, pins and signed envelope from one
+/// snapshot. Response bodies are consumed here too, before returning a result.
+async fn send_text_in_snapshot<F>(
+    connection: &crate::identity::SandboxConnection,
+    op: &'static str,
+    policy: RetryPolicy,
+    mut request: F,
+) -> anyhow::Result<(reqwest::StatusCode, String)>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let send = async {
+        let response = retry_send(op, policy, || {
+            let request = request();
+            async move { request.send().await }
+        })
+        .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok((status, body))
+    };
+    if connection.expires_at == i64::MAX {
+        // Explicit mock/manual connections have no discovery lease.
+        return send.await;
+    }
+    let expires_at = chrono::DateTime::from_timestamp(connection.expires_at, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid sandbox snapshot expiry"))?;
+    let remaining = (expires_at - chrono::Utc::now())
+        .to_std()
+        .map_err(|_| anyhow::anyhow!("sandbox snapshot expired before {op}"))?;
+    let deadline = tokio::time::Instant::now() + remaining;
+    tokio::select! {
+        // Check expiry before polling send again: an elapsed retry backoff
+        // must not start another request from an expired snapshot.
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            anyhow::bail!("sandbox snapshot expired during {op}")
+        }
+        result = send => result,
+    }
+}
+
 pub struct HttpSandbox {
     base_url: String,
     /// Public URL that containers use to reach this attestor. Injected into
@@ -429,8 +471,8 @@ impl SandboxClient for HttpSandbox {
         // an orphan container. Only retry on connect-class errors (we're
         // sure the request never landed).
         let url = format!("{}/api/sandbox", connection.base_url.trim_end_matches('/'));
-        let res = retry_send("sandbox create", RetryPolicy::Strict, || {
-            let req = connection
+        let res = send_text_in_snapshot(&connection, "sandbox create", RetryPolicy::Strict, || {
+            connection
                 .http
                 .post(&url)
                 .timeout(std::time::Duration::from_secs(120))
@@ -438,8 +480,7 @@ impl SandboxClient for HttpSandbox {
                 .header("X-Wallet-Address", &addr_hex)
                 .header("X-Signed-Message", &envelope.signed_message_b64)
                 .header("X-Wallet-Signature", &sig_hex)
-                .json(&body);
-            async move { req.send().await }
+                .json(&body)
         })
         .await;
         if res.is_err() {
@@ -447,18 +488,14 @@ impl SandboxClient for HttpSandbox {
                 discovery.invalidate().await;
             }
         }
-        let res = res?;
-
-        let status = res.status();
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("create", status.as_u16(), body).into());
         }
 
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
         // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
-        let body = res.text().await.unwrap_or_default();
         let parsed: SandboxCreateResponse = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e} — body={body}"))?;
         tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
@@ -538,27 +575,28 @@ impl SandboxClient for HttpSandbox {
 
         // Idempotent retry: force-delete on a sandbox_id is idempotent
         // (already-deleted returns OK or a 4xx the caller handles).
-        let res = retry_send("sandbox admin_delete", RetryPolicy::Idempotent, || {
-            let req = connection
-                .http
-                .delete(&url)
-                .header("Content-Length", "0")
-                .header("X-Wallet-Address", &addr_hex)
-                .header("X-Signed-Message", &signed_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
-        })
+        let res = send_text_in_snapshot(
+            &connection,
+            "sandbox admin_delete",
+            RetryPolicy::Idempotent,
+            || {
+                connection
+                    .http
+                    .delete(&url)
+                    .header("Content-Length", "0")
+                    .header("X-Wallet-Address", &addr_hex)
+                    .header("X-Signed-Message", &signed_b64)
+                    .header("X-Wallet-Signature", &sig_hex)
+            },
+        )
         .await;
         if res.is_err() {
             if let Some(discovery) = &self.discovery {
                 discovery.invalidate().await;
             }
         }
-        let res = res?;
-
-        let status = res.status();
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("admin_delete", status.as_u16(), body).into());
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
@@ -615,34 +653,33 @@ impl SandboxClient for HttpSandbox {
         let sig_hex = format!("0x{}", hex::encode(sig_65));
         let addr_hex = format!("{:#x}", signer.address);
 
-        let res = retry_send("sandbox get_sandbox", RetryPolicy::Idempotent, || {
-            let req = connection
-                .http
-                .get(&url)
-                .header("X-Wallet-Address", &addr_hex)
-                .header("X-Signed-Message", &signed_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
-        })
+        let res = send_text_in_snapshot(
+            &connection,
+            "sandbox get_sandbox",
+            RetryPolicy::Idempotent,
+            || {
+                connection
+                    .http
+                    .get(&url)
+                    .header("X-Wallet-Address", &addr_hex)
+                    .header("X-Signed-Message", &signed_b64)
+                    .header("X-Wallet-Signature", &sig_hex)
+            },
+        )
         .await;
         if res.is_err() {
             if let Some(discovery) = &self.discovery {
                 discovery.invalidate().await;
             }
         }
-        let res = res?;
-
-        let status = res.status();
+        let (status, body) = res?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("get_sandbox", status.as_u16(), body).into());
         }
-        let info: SandboxInfo = res
-            .json()
-            .await
+        let info: SandboxInfo = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("get_sandbox: parse response: {e}"))?;
         Ok(Some(info))
     }
@@ -695,15 +732,14 @@ impl HttpSandbox {
             "stop" => "sandbox stop",
             _ => "sandbox lifecycle",
         };
-        let res = retry_send(op, RetryPolicy::Idempotent, || {
-            let req = connection
+        let res = send_text_in_snapshot(&connection, op, RetryPolicy::Idempotent, || {
+            connection
                 .http
                 .post(&url)
                 .header("Content-Length", "0")
                 .header("X-Wallet-Address", &addr_hex)
                 .header("X-Signed-Message", &envelope.signed_message_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
+                .header("X-Wallet-Signature", &sig_hex)
         })
         .await;
         if res.is_err() {
@@ -711,11 +747,8 @@ impl HttpSandbox {
                 discovery.invalidate().await;
             }
         }
-        let res = res?;
-
-        let status = res.status();
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new(verb, status.as_u16(), body).into());
         }
         tracing::info!(?seal_id, sandbox_id = %canonical.resource_id, %verb, "sandbox: lifecycle ok");
@@ -726,6 +759,142 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LeaseDns {
+        expires_at: chrono::DateTime<chrono::Utc>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        late_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl reqwest::dns::Resolve for LeaseDns {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            use std::sync::atomic::Ordering;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let now = chrono::Utc::now();
+            if now >= self.expires_at {
+                self.late_attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            let delay = (self.expires_at - now).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(50);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test DNS failure")
+                        .into(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_cancels_connect_before_an_expired_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let late_attempts = Arc::new(AtomicUsize::new(0));
+        let expires_at = chrono::Utc::now().timestamp() + 2;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(LeaseDns {
+                expires_at: chrono::DateTime::from_timestamp(expires_at, 0).unwrap(),
+                attempts: attempts.clone(),
+                late_attempts: late_attempts.clone(),
+            }))
+            .build()
+            .unwrap();
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: "http://lease.invalid".into(),
+            registered_at: 1,
+            expires_at,
+            http,
+        };
+        let error =
+            send_text_in_snapshot(&connection, "test lease", RetryPolicy::Idempotent, || {
+                connection.http.get(&connection.base_url)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            late_attempts.load(Ordering::SeqCst),
+            0,
+            "retried after the snapshot expired"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the lease should cancel the first connect attempt"
+        );
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_rejects_expired_snapshot_without_starting_a_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: "http://lease.invalid".into(),
+            registered_at: 1,
+            expires_at: chrono::Utc::now().timestamp() - 1,
+            http: reqwest::Client::new(),
+        };
+        let error =
+            send_text_in_snapshot(&connection, "test lease", RetryPolicy::Idempotent, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                connection.http.get(&connection.base_url)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_includes_response_body_without_retrying_a_processed_create() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = headers_sent.send(());
+            std::future::pending::<()>().await;
+        });
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: format!("http://{address}"),
+            registered_at: 1,
+            expires_at: chrono::Utc::now().timestamp() + 2,
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+                .unwrap(),
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = send_text_in_snapshot(&connection, "create", RetryPolicy::Strict, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            connection.http.post(&connection.base_url)
+        })
+        .await;
+        server.abort();
+        received_headers
+            .await
+            .expect("the provider must have returned success headers");
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a possibly processed create must never be resent after a body failure"
+        );
+    }
 
     #[test]
     fn attestor_transport_overrides_deployer_and_extra_env() {

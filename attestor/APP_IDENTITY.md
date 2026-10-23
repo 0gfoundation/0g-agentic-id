@@ -23,6 +23,9 @@ require HTTPS, pin the app SPKI, reject redirects, and verify `/api/info` matche
 authorized app/provider. A single-flight cache refreshes and repeats chain authorization
 before its expiry. Each request signs against and connects with the same snapshot.
 `GET /config` refreshes that snapshot too, preserving existing SDK field names.
+An outbound operation keeps that same snapshot for every retry. Its absolute lease
+deadline also bounds connection setup and response-body reads; expiry cancels the
+operation. A response-body failure never resends a possibly processed create.
 
 A current node with only its node identity, or valid TLS metadata without
 `app_signer`, can remain a standby. It contributes neither service TLS pins nor the service lease;
