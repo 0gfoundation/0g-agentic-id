@@ -40,6 +40,11 @@ require HTTPS, pin the app SPKI, reject redirects, and verify `/api/info` matche
 authorized app/provider. A single-flight cache refreshes and repeats chain authorization
 before its expiry. Each request signs against and connects with the same snapshot.
 `GET /config` refreshes that snapshot too, preserving existing SDK field names.
+Both app identity caches bound each snapshot lookup to 180 seconds, including
+waiting for another refresh, local tapp resolution, and authorization checks.
+Their chain RPC clients use 5-second connection and 30-second request timeouts.
+A timeout releases the cache lock without publishing a replacement or extending
+the previous identity lease.
 An outbound operation keeps that same snapshot for every retry. Its absolute lease
 deadline also bounds connection setup and response-body reads; expiry cancels the
 operation. A response-body failure never resends a possibly processed create.

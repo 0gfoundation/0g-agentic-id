@@ -34,6 +34,10 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 `/api/info` 的 app/provider。缓存过期前 single-flight 刷新并重新验证链上授权；每次请求
 使用同一 snapshot 绑定签名中的 provider 和 HTTP 连接。`GET /config` 同样刷新 snapshot，
 保持原 SDK 字段名。
+两个 app identity 缓存的每次 snapshot 查询都受 180 秒总预算限制，包含等待其他刷新、local tapp
+解析和授权检查；链 RPC 连接超时为 5 秒，单请求超时为 30 秒。超时会释放缓存锁，
+不发布替换结果，也不延长此前 identity 的 lease。
+
 每次出站操作的所有重试都使用同一 snapshot，其绝对 lease deadline 同时限制连接建立
 和响应 body 读取；到期即取消操作。响应 body 失败不会重发可能已被处理的 create。
 

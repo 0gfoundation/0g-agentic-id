@@ -59,7 +59,11 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 		return
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("FAIL status: response body: %v", err)
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("FAIL status: HTTP %d: %s", resp.StatusCode, string(respBody))
 		return
@@ -123,7 +127,11 @@ func SeedSettings(attestorURL string, agentSealPriv []byte, sealID string, doc [
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("warn: settings seed: response body: %v", err)
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("warn: settings seed: HTTP %d: %s", resp.StatusCode, string(body))
 		return

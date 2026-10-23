@@ -76,7 +76,11 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("FAIL provision: response body: %v", err)
+		return Result{}
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("FAIL provision: HTTP %d: %s", resp.StatusCode, string(body))
 		return Result{}

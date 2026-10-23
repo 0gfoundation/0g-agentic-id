@@ -42,6 +42,9 @@ epoch, app signer and existing business URL. The runtime independently refreshes
 the app's TLS pins through that pinned Scan; expired or mismatched identities stop
 business requests. It receives no tapp socket. The explicit
 `ATTESTOR_ALLOW_UNPINNED_DEV=true` bypass is injected only by mock deployments.
+Each request and its response body share the resolved identity's absolute lease
+deadline. Expiry aborts the exchange, including a reused TLS connection or a body
+received after successful headers; an already processed request is not resent.
 See [application identity migration](../attestor/APP_IDENTITY.md).
 
 Everything in this document rests on **one** load-bearing property:

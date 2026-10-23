@@ -3,7 +3,6 @@
 use crate::{tapp_grpc, Config};
 use alloy::{
     primitives::{keccak256, Address, U256},
-    providers::ProviderBuilder,
     sol,
 };
 use std::{future::Future, sync::Arc, time::Duration};
@@ -11,6 +10,30 @@ use tokio::sync::Mutex;
 
 pub const STARTUP_IDENTITY_TIMEOUT: Duration = Duration::from_secs(180);
 const STARTUP_IDENTITY_RETRY: Duration = Duration::from_secs(2);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(180);
+
+type IdentityProvider =
+    alloy::providers::RootProvider<alloy::transports::http::Http<reqwest::Client>>;
+
+fn identity_provider(
+    url: reqwest::Url,
+    request_timeout: Duration,
+) -> anyhow::Result<IdentityProvider> {
+    let transport = crate::chain::rpc_http_transport(url, request_timeout)?;
+    let is_local = transport.guess_local();
+    Ok(IdentityProvider::new(alloy::rpc::client::RpcClient::new(
+        transport, is_local,
+    )))
+}
+
+async fn snapshot_with_deadline<T>(
+    budget: Duration,
+    snapshot: impl Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(budget, snapshot)
+        .await
+        .map_err(|_| anyhow::anyhow!("identity snapshot refresh timed out"))?
+}
 
 /// Initialize key material once, then wait for observations and authorization.
 /// The one deadline bounds initialization and every readiness attempt, including
@@ -260,6 +283,10 @@ impl AttestorDiscovery {
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<AttestorTlsDescriptor> {
+        snapshot_with_deadline(SNAPSHOT_TIMEOUT, self.snapshot_inner()).await
+    }
+
+    async fn snapshot_inner(&self) -> anyhow::Result<AttestorTlsDescriptor> {
         let mut cached = self.cached.lock().await;
         if let Some(descriptor) = &*cached {
             if descriptor.expires_at > chrono::Utc::now().timestamp() + 30 {
@@ -305,6 +332,10 @@ impl SandboxDiscovery {
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<Arc<SandboxConnection>> {
+        snapshot_with_deadline(SNAPSHOT_TIMEOUT, self.snapshot_inner()).await
+    }
+
+    async fn snapshot_inner(&self) -> anyhow::Result<Arc<SandboxConnection>> {
         let mut cache = self.cached.lock().await;
         let now = chrono::Utc::now().timestamp();
         if let Some(snapshot) = &*cache {
@@ -321,7 +352,10 @@ impl SandboxDiscovery {
             &resolved,
             chrono::Utc::now().timestamp(),
         )?;
-        let provider = ProviderBuilder::new().on_http(self.cfg.chain_rpc.parse()?);
+        let provider = identity_provider(
+            self.cfg.chain_rpc.parse()?,
+            crate::nonce_submit::RPC_TIMEOUT,
+        )?;
         let registry = IdentityRegistry::new(self.cfg.tapp_registry_addr, &provider);
         let app = registry.getAppInfo(app_id.to_string()).call().await?.info;
         anyhow::ensure!(
@@ -533,7 +567,7 @@ async fn attestor_descriptor(
         scan_pin.len() == 64 && hex::decode(scan_pin).is_ok(),
         "attestor identity has no pinned Scan trust anchor"
     );
-    let provider = ProviderBuilder::new().on_http(cfg.chain_rpc.parse()?);
+    let provider = identity_provider(cfg.chain_rpc.parse()?, crate::nonce_submit::RPC_TIMEOUT)?;
     let auth = AttestorAuthorization::new(cfg.agentic_id_addr, &provider);
     anyhow::ensure!(
         auth.instanceBoundAttestorsRequired().call().await?._0,
@@ -582,6 +616,78 @@ mod tests {
     use crate::tee::TeeKeyProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tapp_grpc::proto::{ResolveAppIdentityResponse, ResolvedAppNodeIdentity};
+
+    #[tokio::test]
+    async fn identity_rpc_deadline_bounds_a_real_silent_http_peer() {
+        use alloy::providers::Provider;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        // Both production discovery paths use this exact provider factory.
+        let provider = identity_provider(url, Duration::from_millis(50)).unwrap();
+        let request = tokio::spawn(async move { provider.get_block_number().await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(300), request).await;
+        server.abort();
+        assert!(result
+            .expect("identity RPC ignored the HTTP request deadline")
+            .unwrap()
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_timeout_cancels_refresh_and_releases_its_cache_lock() {
+        let cached_lease = chrono::Utc::now().timestamp() + 10;
+        let cache = Mutex::new(Some(cached_lease));
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = snapshot_with_deadline(Duration::from_millis(20), async {
+            let mut cached = cache.lock().await;
+            started.store(true, Ordering::SeqCst);
+            // A local tapp request or authorization RPC never responds.
+            // Publishing a replacement must happen only after it succeeds.
+            std::future::pending::<()>().await;
+            *cached = Some(cached_lease + 300);
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(started.load(Ordering::SeqCst));
+        let cached = cache
+            .try_lock()
+            .expect("cancelled refresh retained its lock");
+        assert_eq!(*cached, Some(cached_lease), "timeout extended the lease");
+    }
+
+    #[tokio::test]
+    async fn snapshot_timeout_also_bounds_waiting_for_another_refresh() {
+        let cache = Mutex::new(None::<()>);
+        let held = cache.lock().await;
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let result = snapshot_with_deadline(Duration::from_millis(20), async {
+            let _cached = cache.lock().await;
+            started.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(!started.load(Ordering::SeqCst));
+        drop(held);
+        assert!(cache.try_lock().is_ok());
+    }
 
     struct LookupCompletion {
         finished: Arc<std::sync::atomic::AtomicBool>,

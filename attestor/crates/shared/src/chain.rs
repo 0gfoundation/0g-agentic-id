@@ -259,7 +259,7 @@ pub fn connect_http(
     Ok(chain)
 }
 
-fn rpc_http_transport(
+pub(crate) fn rpc_http_transport(
     url: reqwest::Url,
     timeout: std::time::Duration,
 ) -> anyhow::Result<alloy::transports::http::Http<reqwest::Client>> {

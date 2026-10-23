@@ -6,6 +6,8 @@ attestor HTTP 请求（`/provision`、`/status`、`/settings/seed`）统一使�
 app signer 和现有业务 URL。runtime 独立向已 pin 的 Scan 刷新 app TLS pin；
 身份过期或不匹配时停止业务请求，不挂载 tapp socket。只有 mock 部署会明确注入
 `ATTESTOR_ALLOW_UNPINNED_DEV=true` 以绕过校验。
+每次请求及其响应正文共用已解析身份的绝对 lease 截止时间。身份过期会中断交换，
+包括复用的 TLS 连接或成功响应头之后才收到的正文；不会重发已被处理的请求。
 见 [应用身份迁移](../attestor/APP_IDENTITY.zh.md)。
 
 一个 agent 的身份如何在密码学上锚定到一段经过远程认证的代码上，每条

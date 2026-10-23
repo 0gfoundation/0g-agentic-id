@@ -137,7 +137,57 @@ func (r *resolver) RoundTrip(req *http.Request) (*http.Response, error) {
 	if time.Now().Unix() >= expiry {
 		return nil, fmt.Errorf("attestor identity expired")
 	}
-	return transport.RoundTrip(req)
+	return roundTripBefore(transport, req, time.Unix(expiry, 0))
+}
+
+// Keep one transport snapshot for the entire exchange, including response-body
+// reads. A successful response header cannot extend the identity's lease.
+func roundTripBefore(transport http.RoundTripper, req *http.Request, deadline time.Time) (*http.Response, error) {
+	ctx, cancel := context.WithDeadline(req.Context(), deadline)
+	if err := ctx.Err(); err != nil {
+		cancel()
+		return nil, err
+	}
+	response, err := transport.RoundTrip(req.Clone(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		cancel()
+		if response.Body != nil {
+			response.Body.Close()
+		}
+		return nil, err
+	}
+	if response.Body == nil {
+		cancel()
+	} else {
+		response.Body = &leasedBody{ReadCloser: response.Body, ctx: ctx, cancel: cancel}
+	}
+	return response, nil
+}
+
+type leasedBody struct {
+	io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func (b *leasedBody) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n, err := b.ReadCloser.Read(p)
+	if ctxErr := b.ctx.Err(); ctxErr != nil {
+		return 0, ctxErr
+	}
+	return n, err
+}
+
+func (b *leasedBody) Close() error {
+	b.cancel()
+	return b.ReadCloser.Close()
 }
 
 func pinnedTransport(pins []string, expiresAt int64) *http.Transport {
