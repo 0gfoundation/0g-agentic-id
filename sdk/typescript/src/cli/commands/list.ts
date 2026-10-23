@@ -7,8 +7,19 @@
  * failure reasons — #64). `--phase` filters client-side.
  *
  * JSON mode: `data` IS the row array (empty list → `[]`, exit 0 — not an
- * error). Human mode truncates sealIds for readability; use --json when you
- * need the full value.
+ * error) and carries the FULL row (sealId, url, sandboxId, framework, whole
+ * addresses, …). Human mode is the glance: the columns that identify a row
+ * and expose nesting — sealId (the paste-back ref, and the only handle for
+ * unminted rows) lives in --json.
+ *
+ * Nesting visibility (follow-up to #187 / #183-c4): the AGENTSEAL and OWNER
+ * columns use the same short form, so an agent-owned agent is visible at a
+ * glance — its OWNER matches another row's AGENTSEAL. The OWNER cell also
+ * carries an explicit `⇄ #<agentId>` annotation when the owner is another
+ * listed agent's seal (the map is built from the FULL fetch, so a --phase
+ * filter never hides the annotation); an owner that is an agent deployed
+ * via a different attestor annotates as nothing (no cross-attestor reverse
+ * map exists). Both columns are display-only: zero extra chain reads.
  */
 
 import { buildClient } from '../sdk';
@@ -16,9 +27,10 @@ import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
 
-/** 0x79f3e987…d91feb — human-mode display form of a 66-char sealId. */
-function shortSeal(s: string): string {
-  return `${s.slice(0, 12)}…${s.slice(-6)}`; // same 0x+10-hex…6 form as the REPL list (review F-D)
+/** 0xa932…9330 — human-mode display form of a 42-char address (agentSeal or owner). */
+function shortAddr(s: string | null | undefined): string {
+  if (!s) return '—';
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
 }
 
 /** The deployment phases derive_phase() can produce — the valid --phase values. */
@@ -35,9 +47,10 @@ export async function run(ctx: CommandContext): Promise<void> {
   // --mine is an owner-signed surface: withWallet makes a missing key fail
   // here as WALLET_REQUIRED (exit 3 + remedy), before any request is made.
   const ag = await buildClient(ctx.env, { withWallet: ctx.flags.mine });
-  let rows = ctx.flags.mine
+  const all = ctx.flags.mine
     ? await ag.agent.listMyDeployments()
     : await ag.agent.listDeployments();
+  let rows = all;
   if (ctx.flags.phase) rows = rows.filter((r) => r.phase === ctx.flags.phase);
 
   if (ctx.json) {
@@ -49,13 +62,31 @@ export async function run(ctx: CommandContext): Promise<void> {
     print('(no deployments)');
     return;
   }
+  // Nesting annotation map, from the UNFILTERED listing (minted rows only —
+  // unminted rows have no on-chain agentSeal). Case-folded: rows may carry
+  // checksummed addresses from different sources. Built from `all`, not
+  // `rows`: a --phase filter must not strip the annotation off a child row
+  // whose parent falls outside the filtered view — the owner's identity
+  // (agent vs human wallet) does not depend on what this view happens to show.
+  const sealToAgent = new Map<string, string>();
+  for (const r of all) {
+    if (r.agentSeal && r.agentId != null) sealToAgent.set(r.agentSeal.toLowerCase(), String(r.agentId));
+  }
+  const ownerCell = (owner: string | null | undefined): string => {
+    if (!owner) return '—';
+    const agentId = sealToAgent.get(owner.toLowerCase());
+    return agentId ? `${shortAddr(owner)} ⇄ #${agentId}` : shortAddr(owner);
+  };
   const cell = (v: unknown, w: number): string =>
     (v === null || v === undefined ? '—' : String(v)).padEnd(w);
-  print(`${'AGENTID'.padEnd(9)}${'SEALID'.padEnd(19)}${'PHASE'.padEnd(11)}${'NAME'.padEnd(18)}URL`);
+  print(
+    `${'AGENTID'.padEnd(9)}${'PHASE'.padEnd(11)}${'FRAMEWORK'.padEnd(12)}` +
+      `${'NAME'.padEnd(19)}${'AGENTSEAL'.padEnd(13)}OWNER`,
+  );
   for (const r of rows) {
     print(
-      `${cell(r.agentId, 9)}${cell(shortSeal(r.sealId), 19)}${cell(r.phase, 11)}` +
-        `${cell(r.name, 18)}${r.url ?? '—'}`,
+      `${cell(r.agentId, 9)}${cell(r.phase, 11)}${cell(r.framework, 12)}` +
+        `${cell(r.name, 19)}${cell(shortAddr(r.agentSeal), 13)}${ownerCell(r.owner)}`,
     );
   }
   print('');

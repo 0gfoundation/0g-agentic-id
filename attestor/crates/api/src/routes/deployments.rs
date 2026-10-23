@@ -4,11 +4,12 @@
 //!
 //! - **No query param → public, minimal.** Anyone can list, but each row
 //!   carries only non-sensitive fields (seal_id, agent_id, owner-when-minted,
-//!   framework, agent_card, phase, created_at). Used by the Discovery page.
-//!   `owner` appears only for MINTED rows — chain-public via ownerOf anyway;
-//!   unminted rows keep it withheld. Deliberately omits `sandbox_id` and
-//!   provisioning stages/errors — those leaked fleet/URL enumeration to the
-//!   whole world.
+//!   agent_seal_addr-when-minted, framework, agent_card, phase, created_at).
+//!   Used by the Discovery page. `owner` and `agent_seal_addr` appear only
+//!   for MINTED rows — both chain-public once the agent exists (ownerOf /
+//!   getAgentSeal) anyway; unminted rows keep them withheld. Deliberately
+//!   omits `sandbox_id` and provisioning stages/errors — those leaked
+//!   fleet/URL enumeration to the whole world.
 //! - **`?owner=0x…` → authenticated, full(er).** Gated by an EIP-191 owner
 //!   signature (`X-Auth-Message` = `0GDeployments:<owner>:<ts>`,
 //!   `X-Auth-Signature`); the recovered signer must equal `<owner>` and the
@@ -67,6 +68,13 @@ struct PublicDeployment {
     /// theater. Unminted rows keep it withheld — nothing is on chain yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<Address>,
+    /// Present only for MINTED rows (same gate as `owner`): the agent's
+    /// on-chain signing address, chain-public via getAgentSeal once the
+    /// agent exists. Lets listing consumers spot agent-owned agents
+    /// (an owner that is another listed row's agentSeal) without N×
+    /// per-row chain reads. Unminted rows keep it withheld.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_seal_addr: Option<Address>,
     #[serde(skip_serializing_if = "Option::is_none")]
     framework: Option<String>,
     agent_card: serde_json::Value,
@@ -79,6 +87,7 @@ impl From<Deployment> for PublicDeployment {
         Self {
             seal_id: d.seal_id,
             owner: d.agent_id.is_some().then_some(d.owner),
+            agent_seal_addr: d.agent_id.is_some().then_some(d.agent_seal_addr),
             agent_id: d.agent_id,
             framework: d.framework,
             agent_card: d.agent_card,
@@ -277,6 +286,24 @@ mod tests {
         assert_eq!(minted["framework"], "dsh");
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
         assert!(unminted.get("owner").is_none(), "unminted rows withhold owner");
+    }
+
+    #[test]
+    fn public_tier_agent_seal_only_when_minted() {
+        // Same gate as `owner`: the agentSeal address is chain-public via
+        // getAgentSeal once minted (#183-c4 — lets listings show agent-owned
+        // agents without per-row chain reads); before mint nothing is on
+        // chain, so it is withheld.
+        let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
+        assert!(
+            minted.get("agent_seal_addr").is_some(),
+            "minted rows expose agent_seal_addr"
+        );
+        let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
+        assert!(
+            unminted.get("agent_seal_addr").is_none(),
+            "unminted rows withhold agent_seal_addr"
+        );
     }
 
     #[test]
