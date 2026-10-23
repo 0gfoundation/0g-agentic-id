@@ -761,19 +761,14 @@ export class AgentApi {
    * `lastProvisionError` come back **null** here. No tier carries the owner's
    * settings document — read it with {@link AgentApi.getSettings}, which is
    * owner-signed. `agentId`/`sealId`/`phase`/
-   * `url`/`name` are still present, and `owner` and `agentSeal` appear for
-   * MINTED rows (both chain-public once the agent exists — ownerOf /
-   * getAgentSeal; unminted rows keep them withheld). `agentSeal` is the
-   * agent's on-chain signing address: matching it against another row's
-   * `owner` is how client code spots agent-owned agents (delegation
-   * hierarchies, self-funded runs).
+   * `url`/`name` are still present, and `owner` appears for MINTED rows
+   * (chain-public via ownerOf; unminted rows keep it withheld).
    * Use {@link AgentApi.listMyDeployments} — owner-signed — to get the withheld
    * fields for your own agents.
    */
   async listDeployments(): Promise<Array<{
     agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
-    agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
   }>> {
     // slim=1 drops the embedded avatar data-URIs (~95% of the payload); servers
@@ -806,15 +801,11 @@ export class AgentApi {
 
   /** Map one raw attestor deployment row to the normalized SDK shape. Shared
    *  by the public {@link AgentApi.listDeployments} and the owner-scoped
-   *  {@link AgentApi.listMyDeployments}; whatever the tier omits simply
-   *  comes through as null — public tier: owner/agentSeal only on minted
-   *  rows (agentSeal only from attestors carrying the field),
-   *  sandboxId/lastProvisionError never; owner tier: everything present
-   *  for your own rows, including unminted ones. */
+   *  {@link AgentApi.listMyDeployments}; fields absent on the public tier
+   *  (owner/sandboxId/lastProvisionError) simply come through as null. */
   private normalizeDeploymentRow(r: Record<string, unknown>): {
     agentId: bigint | null; sealId: Hash; phase: string; framework: string | null;
     sandboxId: string | null; url: string | null; owner: Address | null; name: string | null;
-    agentSeal: Address | null;
     createdAt: string | null; lastProvisionError: string | null;
   } {
     const card = (r.agent_card as Record<string, unknown>) ?? {};
@@ -847,7 +838,6 @@ export class AgentApi {
           : null;
     return {
       agentId: r.agent_id ? BigInt(r.agent_id as string) : null,
-      agentSeal: (r.agent_seal_addr as Address) ?? null,
       sealId: r.seal_id as Hash,
       phase,
       framework: (r.framework as string) ?? null,
