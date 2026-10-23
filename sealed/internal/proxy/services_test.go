@@ -52,6 +52,30 @@ func TestValidateServices_rejectsBadInputExample(t *testing.T) {
 	}
 }
 
+func TestValidateServices_transport(t *testing.T) {
+	ok, err := validateServices([]ServiceEntry{{Path: "/api/mcp", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "mcp"}})
+	if err != nil {
+		t.Fatalf("mcp transport on a POST route must be valid, got %v", err)
+	}
+	if ok[0].Transport != "mcp" {
+		t.Errorf("transport not preserved: %+v", ok[0])
+	}
+
+	cases := []struct {
+		name  string
+		entry ServiceEntry
+	}{
+		{"mcp requires POST", ServiceEntry{Path: "/api/mcp", Method: "GET", Backend: "http://127.0.0.1:9090", Transport: "mcp"}},
+		{"unknown transport", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "grpc"}},
+		{"not even whitespace-tolerated", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "MCP"}},
+	}
+	for _, c := range cases {
+		if _, err := validateServices([]ServiceEntry{c.entry}); err == nil {
+			t.Errorf("%s: expected rejection, got nil", c.name)
+		}
+	}
+}
+
 func TestValidateServices_rejectsDuplicatePath(t *testing.T) {
 	_, err := validateServices([]ServiceEntry{
 		svc("/api/x", "POST", "http://127.0.0.1:9090"),
@@ -75,7 +99,7 @@ func TestValidateServices_allOrNothing(t *testing.T) {
 
 func TestServicesForHello_mapsAndDropsBackend(t *testing.T) {
 	out := servicesForHello([]ServiceEntry{
-		{Path: "/api/x", Method: "POST", Description: "d", InputExample: `{"a":1}`, Backend: "http://127.0.0.1:9090"},
+		{Path: "/api/x", Method: "POST", Description: "d", InputExample: `{"a":1}`, Backend: "http://127.0.0.1:9090", Transport: "mcp"},
 	})
 	if len(out) != 1 {
 		t.Fatalf("want 1, got %d", len(out))
@@ -83,6 +107,9 @@ func TestServicesForHello_mapsAndDropsBackend(t *testing.T) {
 	got := out[0]
 	if got.Path != "/api/x" || got.Method != "POST" || got.Description != "d" || got.InputExample != `{"a":1}` {
 		t.Errorf("field mapping wrong: %+v", got)
+	}
+	if got.Transport != "mcp" {
+		t.Errorf("transport not surfaced in /hello: %+v", got)
 	}
 	// report.Service has no Backend field at all — the internal loopback
 	// address is dropped by construction (compile-time guarantee).

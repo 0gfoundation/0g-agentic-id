@@ -5,9 +5,11 @@ package report
 // metadata for the deploy console to render a discoverable endpoint
 // listing and for callers to draft `curl` requests.
 //
-// Schema matches attestor_shared::types::AgentService — identical field
-// names so it round-trips byte-for-byte. Adding a field here requires
-// adding it on the attestor side too.
+// The consuming counterpart is the SDK's AgentServiceEntry
+// (sdk/typescript/src/AgentClient.ts) — field names must stay identical
+// so the shape round-trips. (An earlier revision also matched an
+// attestor-side AgentService; that struct no longer exists — /hello is
+// consumed straight from the agent's proxy, the attestor never parses it.)
 //
 // Declarations no longer come from a per-framework file (the old
 // `~/.openclaw/services.json` + LoadServices). Agents register services
@@ -20,6 +22,14 @@ type Service struct {
 	Description  string `json:"description,omitempty"`
 	InputExample string `json:"input_example,omitempty"`
 	Skill        string `json:"skill,omitempty"`
+	// Transport marks the protocol a consumer should speak. Empty = plain
+	// HTTP. "mcp" = an MCP server endpoint (JSON-RPC over POST): an
+	// MCP-capable client mounts <public-url><path> as a streamable-HTTP MCP
+	// server. Responses still carry X-Agent-Proof like every agent service,
+	// which is what makes it a *trust-attributable* MCP server — the
+	// mounting client can verify each response came from this attested
+	// agent (sdk ServeSession.verifyProof).
+	Transport string `json:"transport,omitempty"`
 }
 
 // Route is one framework-declared path prefix, as surfaced in the `routes`

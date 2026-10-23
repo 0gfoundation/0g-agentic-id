@@ -259,7 +259,11 @@ await ag.agent.runtimeCosts(agentId);    // + that agent's evolution-gas balance
 ```ts
 const { hello, verification } = await ag.agent.sayHi(agentUrl);
 // hello → { agent, owner, public_url, message, services, routes }
-//   services: { path, method, description?, input_example? }   — proof-signed /api/* endpoints
+//   services: { path, method, description?, input_example?, transport? }   — proof-signed /api/* endpoints
+//   transport: "mcp" marks an MCP server endpoint (JSON-RPC over POST):
+//   mount `<base><path>` as a streamable-HTTP MCP server in any MCP client —
+//   every response still carries X-Agent-Proof, the trust attribution a
+//   random MCP server cannot offer. See mcpServices() in AgentClient.ts.
 //   routes:   { prefix, kind?, auth?, signed, description? }    — framework prefixes (e.g. chat at /v1/)
 
 const agent = await ag.agent.client(agentId);   // agentId OR agentUrl — the SDK fills in the other half

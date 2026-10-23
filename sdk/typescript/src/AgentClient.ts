@@ -29,6 +29,40 @@ export interface AgentServiceEntry {
   method: string;
   description?: string;
   input_example?: string;
+  /**
+   * Protocol the consumer should speak. `"mcp"` = an MCP server endpoint:
+   * the backend implements the MCP streamable-HTTP protocol (JSON-RPC over
+   * POST), so an MCP-capable client can mount `<base><path>` as an MCP
+   * server and this agent's tools become the client's tools. Responses
+   * carry `X-Agent-Proof` like every agent service — that proof is what
+   * makes it a *trust-attributable* MCP server (see {@link mcpServices}).
+   */
+  transport?: 'mcp';
+}
+
+/**
+ * The agent's MCP-mountable service endpoints — the `/hello` entries marked
+ * `transport: "mcp"`. This is the consumption half of trusted-MCP serving:
+ *
+ * ```ts
+ * const { hello, verification } = await ag.agent.sayHi(agentUrl);
+ * // hello.services carries transport: "mcp" on MCP endpoints — sayHi already
+ * // verified the /hello proof against chain (signer == on-chain agentSeal);
+ * // the same one-call check works per request:
+ * const client = await ag.agent.client(agentUrl);            // public handle
+ * const mcp = mcpServices(client);                           // → [{ path: "/api/mcp", … }]
+ * // Mount `${client.base}${mcp[0].path}` as a streamable-HTTP MCP server in
+ * // any MCP client. For per-response attribution, fetchWithProof captures
+ * // X-Agent-Proof and ServeSession.verifyProof (what sayHi uses internally)
+ * // checks it — the reason to prefer these over a random MCP server.
+ * ```
+ *
+ * Note the proxy pins one HTTP method per path, so an MCP route is POST-only:
+ * a stateless MCP server (each JSON-RPC request answered in one response,
+ * no server-initiated pushes) is the supported shape.
+ */
+export function mcpServices(client: AgentClient): AgentServiceEntry[] {
+  return client.services.filter((s) => s.transport === 'mcp');
 }
 
 /**
