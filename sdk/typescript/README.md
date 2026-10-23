@@ -35,6 +35,7 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ```ts
 import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
 
+// 0G mainnet; for the Galileo testnet use 'https://agenticid-testnet.0g.ai'
 const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only
 });
@@ -182,7 +183,8 @@ await ag.reputation.verifyProof(proof);
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
 //    is advertised) both land in ONE atomic type-4 tx; otherwise two sequential
 //    txs. An owner CANNOT attest feedback on their own agent, nor can the
-//    agent's own agentSeal (the verified registry rejects both).
+//    agent's own agentSeal or its payment wallet (the verified registry
+//    rejects all three). |value| must be ≤ 1e9 with 0..18 decimals.
 const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
 // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
 await ag.reputation.waitForTransaction(fb.attestTx);

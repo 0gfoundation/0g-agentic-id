@@ -383,7 +383,8 @@ Monorepo 四个子项目：
 `ag.reputation`（抓取 TEE 签名的 serve-proof、验证、链上 feedback
 读写），外加顶层的信任根 ack 和 sandbox 预付费充值。合约五件套和
 attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直接
-跑在 testnet 部署上。
+跑在线上部署上——示例里的 `https://agenticid.0g.ai` 是 0G mainnet；换成
+`https://agenticid-testnet.0g.ai` 即为 Galileo testnet。
 
 **[`contracts/README.zh.md`](contracts/README.zh.md) — 合约层**
 
@@ -391,8 +392,8 @@ attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 236
-个 Foundry 测试（25 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
+`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 290
+个 Foundry 测试（28 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
 

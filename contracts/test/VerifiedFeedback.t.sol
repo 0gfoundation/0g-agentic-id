@@ -22,14 +22,24 @@ import {
     VerifiedFeedbackNotVerified,
     VerifiedFeedbackClientsRequired,
     VerifiedFeedbackTaskMismatch,
-    VerifiedFeedbackInvalidTaskReveal
+    VerifiedFeedbackInvalidTaskReveal,
+    VerifiedFeedbackEndpointRequired,
+    VerifiedFeedbackValueOutOfRange,
+    VerifiedFeedbackInvalidProofTimestamp
 } from "../src/VerifiedFeedbackRegistry.sol";
 import {IVerifiedFeedbackRegistry, TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
 import {AgenticIDReputationRegistry, ReputationInvalidProofSignature} from "../src/AgenticIDReputationRegistry.sol";
-import {NonceExpired, NonceAlreadyUsed, NonceDeadlineTooFar} from "../src/utils/NonceRegistryUpgradeable.sol";
+import {
+    NonceRegistryUpgradeable,
+    NonceExpired,
+    NonceAlreadyUsed,
+    NonceDeadlineTooFar,
+    NonceMaxAgeDecrease,
+    NonceMaxAgeOutOfRange
+} from "../src/utils/NonceRegistryUpgradeable.sol";
 
 /// @notice Exposes the production ServeProof hash + wrap, so the known-answer
 ///         vector runs the registry's own code path, not a re-implementation.
@@ -417,6 +427,159 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         registry.attestFeedback(agentId, 1, proof);
     }
 
+    /// @dev The agent's payment wallet is owner-set, so it is self-feedback
+    ///      too (1.2.0, audit FIND-13).
+    function test_attestFeedback_revertsWhenAgentWalletAttests() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        Vm.Wallet memory payment = vm.createWallet("payment");
+        uint256 deadline = block.timestamp + 4 minutes;
+        bytes memory sig = _signSetAgentWallet(payment, agentId, deadline);
+        vm.prank(agentOwner);
+        agenticId.setAgentWallet(agentId, payment.addr, deadline, sig);
+
+        _canonicalFeedback(agentId, payment.addr, 100, 0);
+        ServeProof memory proof = _proofFor(agentId, payment.addr, dataHash, TASK_HASH);
+
+        vm.prank(payment.addr);
+        vm.expectRevert(
+            abi.encodeWithSelector(VerifiedFeedbackSelfFeedback.selector, agentId, payment.addr)
+        );
+        registry.attestFeedback(agentId, 1, proof);
+    }
+
+    // ── Value bound (1.2.0: FIND-04) ──────────────────────────────────────────
+
+    function _expectOutOfRange(int128 value, uint8 dec) internal {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, value, dec);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, TASK_HASH);
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(VerifiedFeedbackValueOutOfRange.selector, value, dec));
+        registry.attestFeedback(agentId, idx, proof);
+    }
+
+    function test_attestFeedback_revertsOnValueAboveBound() public {
+        _expectOutOfRange(1e9 + 1, 0);
+    }
+
+    function test_attestFeedback_revertsOnValueBelowBound() public {
+        _expectOutOfRange(-1e9 - 1, 18);
+    }
+
+    /// @dev The canonical registry's own ceiling (1e38) — what the audit used
+    ///      to brick every summary that included the client.
+    function test_attestFeedback_revertsOnCanonicalMaxValue() public {
+        _expectOutOfRange(1e38, 0);
+    }
+
+    function test_attestFeedback_revertsOnMoreThan18Decimals() public {
+        _expectOutOfRange(1, 19);
+    }
+
+    function test_attestFeedback_acceptsBoundaryValues() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 a = _canonicalFeedback(agentId, client, 1e9, 0);
+        _attest(agentId, client, a, _proofFor(agentId, client, dataHash, keccak256("bound-a")));
+        uint64 b = _canonicalFeedback(agentId, client, -1e9, 18);
+        _attest(agentId, client, b, _proofFor(agentId, client, dataHash, keccak256("bound-b")));
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        (uint64 count, int128 sum, uint8 dec) = registry.getVerifiedSummary(agentId, cs, "", "");
+        assertEq(count, 2, "both boundary entries count");
+        assertEq(sum, int128(1e27) - int128(1e9), "1e9 at 0 decimals + -1e9 at 18 decimals");
+        assertEq(dec, 18, "summary decimals");
+    }
+
+    // ── ServeProof timestamp sanity (1.2.0: FIND-15) ──────────────────────────
+
+    function _expectBadTimestamp(uint256 timestamp, uint256 deadline) internal {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        ServeProof memory proof = ServeProof({
+            agentId: agentId,
+            submitter: client,
+            timestamp: timestamp,
+            deadline: deadline,
+            taskHash: TASK_HASH,
+            dataHashes: dataHashes,
+            frameworkHash: FRAMEWORK_HASH,
+            signature: ""
+        });
+        // Genuinely seal-signed: only the timestamp check can reject it.
+        proof.signature = _sign(sealWallet.privateKey, _eip191ValidatorHash(address(registry), _innerOf(proof)));
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofTimestamp.selector);
+        registry.attestFeedback(agentId, idx, proof);
+    }
+
+    function test_attestFeedback_revertsOnTimestampAfterDeadline() public {
+        _expectBadTimestamp(block.timestamp + 2 hours, block.timestamp + 1 hours);
+    }
+
+    function test_attestFeedback_revertsOnZeroTimestamp() public {
+        _expectBadTimestamp(0, block.timestamp + 1 hours);
+    }
+
+    // ── maxProofAge is raise-only and bounded (1.2.0: FIND-07) ────────────────
+
+    /// @dev Lowering maxProofAge let the permissionless cleanup delete records
+    ///      whose proofs were still valid, reopening them to replay. The setter
+    ///      now only raises, within [2 hours, 365 days].
+    function test_setMaxProofAge_isRaiseOnlyAndBounded() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeDecrease.selector, MAX_PROOF_AGE, 12 hours));
+        registry.setMaxProofAge(12 hours);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, uint256(2 hours - 1)));
+        registry.setMaxProofAge(2 hours - 1);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, uint256(365 days + 1)));
+        registry.setMaxProofAge(365 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, type(uint256).max));
+        registry.setMaxProofAge(type(uint256).max);
+
+        vm.expectEmit(address(registry));
+        emit NonceRegistryUpgradeable.NonceMaxAgeUpdated(MAX_PROOF_AGE, 2 days);
+        registry.setMaxProofAge(2 days);
+        vm.stopPrank();
+        assertEq(registry.nonceMaxAge(), 2 days, "raised");
+    }
+
+    /// @dev The audit's replay: a consumed ServeProof stays consumed while it
+    ///      is still valid, because maxProofAge cannot shrink under it.
+    function test_consumedProof_cannotBeReopenedByLoweringMaxAge() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _mkServeProof(
+            agentId, client, TASK_HASH, _one(dataHash), FRAMEWORK_HASH,
+            block.timestamp + 20 hours, sealWallet.privateKey
+        );
+        _attest(agentId, client, idx, proof);
+        bytes32 key = keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, proof.signature));
+        assertTrue(registry.isNonceConsumed(key), "consumed");
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeDecrease.selector, MAX_PROOF_AGE, 12 hours));
+        registry.setMaxProofAge(12 hours);
+
+        vm.warp(block.timestamp + 19 hours + 30 minutes); // proof still valid
+        bytes32[] memory keys = new bytes32[](1);
+        keys[0] = key;
+        registry.cleanExpiredNonces(keys);
+        assertTrue(registry.isNonceConsumed(key), "cleanup keeps a record whose proof is still valid");
+
+        uint64 idx2 = _canonicalFeedback(agentId, client, 90, 0);
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(NonceAlreadyUsed.selector, key));
+        registry.attestFeedback(agentId, idx2, proof);
+    }
+
+    function _one(bytes32 h) internal pure returns (bytes32[] memory a) {
+        a = new bytes32[](1);
+        a[0] = h;
+    }
+
     // ── Registry-bound digest (1.2.0: FIND-01 / FIND-16) ──────────────────────
 
     /// @dev Cross-implementation known-answer vector for the ServeProof digest
@@ -732,10 +895,10 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "", "no endpoint without a reveal");
         address[] memory cs = new address[](1);
         cs[0] = client;
-        (uint64 count, , ) = registry.getVerifiedSummaryForEndpoint(agentId, cs, "");
-        // "" is the sentinel for "unproven", not a queryable endpoint — but even
-        // querying it aggregates only entries that genuinely stored "".
-        assertEq(count, 1, "unrevealed entries group under the empty sentinel");
+        // "" is the sentinel for "unproven", not a queryable endpoint: querying
+        // it would count exactly the unrevealed entries (FIND-09).
+        vm.expectRevert(VerifiedFeedbackEndpointRequired.selector);
+        registry.getVerifiedSummaryForEndpoint(agentId, cs, "");
     }
 
     function test_attestWithTask_revertsOnTaskMismatch() public {

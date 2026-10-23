@@ -5,13 +5,15 @@ import {Vm} from "forge-std/Vm.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {UpgradeableBeacon} from "@openzeppelin/contracts/proxy/beacon/UpgradeableBeacon.sol";
 import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol";
+import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {CanonicalReputationRegistryMock} from "./mocks/CanonicalReputationRegistryMock.sol";
 import {VerifiedFeedbackRegistryV1_1_0} from "./mocks/VerifiedFeedbackRegistryV1_1_0.sol";
 import {
     VerifiedFeedbackRegistry,
-    VerifiedFeedbackInvalidProofSignature
+    VerifiedFeedbackInvalidProofSignature,
+    VerifiedFeedbackSummaryOverflow
 } from "../src/VerifiedFeedbackRegistry.sol";
 import {TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
@@ -25,7 +27,9 @@ import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 ///         Locks storage survival (1.2.0 changes no storage) and the hard cut:
 ///         a proof under the legacy personal_sign wrap — what pre-1.2.0 sealed
 ///         images emit — stops verifying the moment the beacon flips, and a
-///         registry-bound proof verifies.
+///         registry-bound proof verifies. Also locks the two-step-ownership
+///         swap (Ownable → Ownable2Step, FIND-16): owner preserved, the new
+///         pendingOwner slot starts empty.
 contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
     TimelockController internal timelock;
     UpgradeableBeacon  internal vfBeacon;
@@ -38,8 +42,9 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
 
     address internal proposer = address(0xBEEF);
     address internal executor = address(0xCAFE);
-    /// @dev minDelay = 0, as on every deployed environment (DEPLOYMENT.md §6):
-    ///      no vm.warp, so an in-flight proof is still unexpired after the
+    /// @dev minDelay = 0, as on testnet / dev (mainnet is 1 day; the 1.2.0
+    ///      rollout schedules ≥ 86400 s ahead, DEPLOYMENT.md §7 step 3): no
+    ///      vm.warp, so an in-flight proof is still unexpired after the
     ///      upgrade and fails ONLY on its format.
     uint256 internal constant DELAY = 0;
 
@@ -196,6 +201,40 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
         assertTrue(registry.isNonceConsumed(nonceKey1), "nonce store survived");
     }
 
+    /// @dev 1.2.0 swaps OwnableUpgradeable for Ownable2StepUpgradeable. The
+    ///      owner (OZ's Ownable slot) survives untouched, the pending-owner
+    ///      slot (OZ's Ownable2Step namespace) starts empty, and a transfer
+    ///      needs the new owner's acceptOwnership.
+    function test_upgrade_ownershipBecomesTwoStep() public {
+        bytes32 ownableSlot = 0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300;
+        bytes32 pendingSlot = 0x237e158222e3e6968b72b9db0d8043aacf074ad9f650f0d1606b4d82ee432c00;
+        _seedUnderOldImpl();
+        bytes32 ownerWord = vm.load(address(registry), ownableSlot);
+        assertEq(vm.load(address(registry), pendingSlot), bytes32(0), "pending slot unused by 1.1.0");
+
+        _upgradeBeacon(address(new VerifiedFeedbackRegistry()));
+        assertEq(vm.load(address(registry), ownableSlot), ownerWord, "Ownable slot untouched");
+        assertEq(registry.owner(), owner, "owner preserved");
+        assertEq(registry.pendingOwner(), address(0), "no pending owner after upgrade");
+
+        address newOwner = address(0x0E1);
+        vm.prank(owner);
+        registry.transferOwnership(newOwner);
+        assertEq(registry.owner(), owner, "propose leaves owner unchanged");
+        assertEq(registry.pendingOwner(), newOwner, "pending owner recorded");
+
+        vm.prank(address(0xB0B));
+        vm.expectRevert(
+            abi.encodeWithSelector(OwnableUpgradeable.OwnableUnauthorizedAccount.selector, address(0xB0B))
+        );
+        registry.acceptOwnership();
+
+        vm.prank(newOwner);
+        registry.acceptOwnership();
+        assertEq(registry.owner(), newOwner, "owner moves on accept");
+        assertEq(registry.pendingOwner(), address(0), "pending cleared");
+    }
+
     /// @dev The hard cut: no dual-accept window. A legacy-format proof issued
     ///      before the upgrade (an old sealed image) is rejected afterwards; a
     ///      registry-bound proof for the same entry is accepted.
@@ -213,5 +252,34 @@ contract UpgradeVerifiedFeedbackTest is AgenticIDTestBase {
         vm.prank(client);
         registry.attestFeedback(agentId, i3, _proof(agentId, dataHash, keccak256("task-3"), true));
         assertTrue(registry.isVerified(agentId, client, i3), "registry-bound proof accepted post-upgrade");
+    }
+
+    /// @dev FIND-04 on the deployed state: 1.1.0 marks an entry at the
+    ///      canonical registry's ceiling (1e38, 0 decimals), after which every
+    ///      summary that includes the client reverts. 1.2.0 skips such
+    ///      pre-upgrade marks instead, and counts the rest.
+    function test_upgrade_summarySkipsPreUpgradeOutOfRangeMark() public {
+        (uint256 agentId, bytes32 dataHash) = _mintSealAgent();
+        uint64 normal = _canonicalFeedback(agentId); // 90
+        vm.prank(client);
+        canonicalRep.giveFeedback(agentId, 1e38, 0, "quality", "", "ep", "", bytes32(0));
+        uint64 extreme = canonicalRep.getLastIndex(agentId, client);
+
+        vm.startPrank(client);
+        registry.attestFeedback(agentId, normal, _proof(agentId, dataHash, keccak256("t-normal"), false));
+        registry.attestFeedback(agentId, extreme, _proof(agentId, dataHash, keccak256("t-extreme"), false));
+        vm.stopPrank();
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        vm.expectRevert(VerifiedFeedbackSummaryOverflow.selector);
+        registry.getVerifiedSummary(agentId, cs, "", "");
+
+        _upgradeBeacon(address(new VerifiedFeedbackRegistry()));
+
+        assertTrue(registry.isVerified(agentId, client, extreme), "the old mark itself survives");
+        (uint64 count, int128 sum, ) = registry.getVerifiedSummary(agentId, cs, "", "");
+        assertEq(count, 1, "out-of-range mark skipped");
+        assertEq(sum, int128(90e18), "only the in-range entry is summed");
     }
 }
