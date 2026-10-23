@@ -66,8 +66,9 @@ where
     }
 }
 
-/// Start both lookups together, then check both leases against the same final
-/// time. Neither side's result may expire while waiting for the other side.
+/// Start both lookups together and drain both before propagating either error,
+/// so a fast failure cannot cancel the other app's accepted Scan lookup. Check
+/// both leases against the same final time after both lookups succeed.
 async fn ready_snapshots<A, S>(
     attestor: A,
     sandbox: S,
@@ -79,7 +80,9 @@ where
     A: Future<Output = anyhow::Result<Option<AttestorTlsDescriptor>>>,
     S: Future<Output = anyhow::Result<Option<Arc<SandboxConnection>>>>,
 {
-    let (attestor, sandbox) = tokio::try_join!(attestor, sandbox)?;
+    let (attestor, sandbox) = tokio::join!(attestor, sandbox);
+    let attestor = attestor?;
+    let sandbox = sandbox?;
     let now = chrono::Utc::now().timestamp();
     anyhow::ensure!(
         attestor.as_ref().is_none_or(|a| a.expires_at > now + 5)
@@ -579,6 +582,76 @@ mod tests {
     use crate::tee::TeeKeyProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tapp_grpc::proto::{ResolveAppIdentityResponse, ResolvedAppNodeIdentity};
+
+    struct LookupCompletion {
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for LookupCompletion {
+        fn drop(&mut self) {
+            if !self.finished.load(Ordering::SeqCst) {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    async fn slow_lookup<T>(
+        gate: Arc<tokio::sync::Barrier>,
+        completion: LookupCompletion,
+    ) -> anyhow::Result<Option<T>> {
+        let _completion = completion;
+        gate.wait().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        _completion.finished.store(true, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn failed_lookup<T>(gate: Arc<tokio::sync::Barrier>) -> anyhow::Result<Option<T>> {
+        gate.wait().await;
+        anyhow::bail!("fixture Scan returned 429")
+    }
+
+    async fn check_lookup_error_drains_other_side(attestor_fails: bool) {
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completion = LookupCompletion {
+            finished: finished.clone(),
+            cancelled: cancelled.clone(),
+        };
+        let result = if attestor_fails {
+            ready_snapshots(failed_lookup(gate.clone()), slow_lookup(gate, completion)).await
+        } else {
+            ready_snapshots(slow_lookup(gate.clone(), completion), failed_lookup(gate)).await
+        };
+        assert!(
+            result.is_err(),
+            "a failed identity lookup must still fail startup"
+        );
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "fixture Scan returned 429"
+        );
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the sibling lookup was cancelled before it could publish its observation"
+        );
+        assert!(
+            !cancelled.load(Ordering::SeqCst),
+            "a fast error dropped the accepted sibling lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_lookup_error_drains_sandbox_before_returning_attestor_error() {
+        check_lookup_error_drains_other_side(true).await;
+    }
+
+    #[tokio::test]
+    async fn startup_lookup_error_drains_attestor_before_returning_sandbox_error() {
+        check_lookup_error_drains_other_side(false).await;
+    }
 
     #[tokio::test]
     async fn startup_snapshot_lookups_both_start_before_either_is_released() {

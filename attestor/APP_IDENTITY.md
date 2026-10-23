@@ -10,12 +10,21 @@ uploads take that same lock and wait for preceding pending transactions to be pa
 Every replica must use the same database. The indexer still only reads and derives seals.
 Nonce coordination has bounded waits: RPC connections time out after 5 seconds and
 requests after 30 seconds; a business submission has a 120-second total budget,
-including pool/lock acquisition and broadcast. PostgreSQL lock waits are capped
-at 30 seconds. Storage has a 750-second total budget, including up to 120 seconds
-to drain preceding pending transactions and 600 seconds for the SDK upload and
+including pool/lock acquisition and broadcast. PostgreSQL lock and statement deadlines
+use the remaining operation budget, so a healthy upload lasting more than one RPC
+timeout does not fail a waiting mint early. Storage has a 750-second total budget,
+including up to 120 seconds to drain preceding pending transactions and 600 seconds for the SDK upload and
 its retries. Cancellation releases the transaction-scoped lock. A timeout after
 submission starts reports an unknown outcome and is never automatically resent;
 check transaction/contract or storage state before retrying.
+
+A mint receipt RPC failure preserves `Submitted` and its transaction hash. `/retry`
+checks the live seal mapping, then polls the original transaction if it is not yet
+mapped; this also applies to clones. It never resubmits a known submitted mint or
+clone. An unavailable receipt or missing hash retains `Submitted` and returns an
+error; a conclusive reverted or invalid receipt marks the stage failed.
+A recovered clone also completes its pending AgentCard and URI without requiring
+a sandbox; an existing card keeps the normal bring-online flow.
 
 Production requires `ATTESTOR_TAPP_SOCKET`, `ATTESTOR_APP_ID`,
 `ATTESTOR_SANDBOX_APP_ID`, `ATTESTOR_TAPP_REGISTRY_ADDR`,
@@ -45,7 +54,9 @@ no identity error and explicitly clears its typed identities, commitments and ap
 
 API and worker initialize `GetAppSigner` once, then concurrently check their own identity
 and AgenticID instance authorization alongside sandbox identity, chain authorization and
-pinned `/api/info`. After both checks finish, both leases must still have more than five
+pinned `/api/info`. A lookup error waits for the sibling lookup to finish before retrying,
+within the same startup deadline, so it cannot cancel an accepted Scan observation.
+After both checks finish, both leases must still have more than five
 seconds remaining. This bootstrap has one 180-second budget, including the initial
 key fetch; every readiness attempt is bounded by that deadline and retried after two
 seconds. A stale Scan observation or a pending operator binding therefore need not

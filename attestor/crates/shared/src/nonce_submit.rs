@@ -6,6 +6,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
+use tokio::time::Instant;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RPC_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,11 +18,11 @@ fn lock_key(sender: &[u8]) -> String {
 
 async fn bounded<T>(
     operation: &'static str,
-    budget: Duration,
+    deadline: Instant,
     started: &AtomicBool,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    match tokio::time::timeout(budget, future).await {
+    match tokio::time::timeout_at(deadline, future).await {
         Ok(result) => result,
         Err(_) if started.load(Ordering::SeqCst) => anyhow::bail!(
             "{operation} timed out; broadcast status is unknown, reconcile before retrying"
@@ -50,16 +51,23 @@ where
         "nonce submission budget must be positive"
     );
     let started = AtomicBool::new(false);
-    bounded(operation, budget, &started, async {
+    let deadline = Instant::now() + budget;
+    bounded(operation, deadline, &started, async {
         let mut transaction = pool.begin().await
             .with_context(|| format!("{operation}: acquire signer nonce connection"))?;
         // Transaction-local PostgreSQL timeouts also stop an abandoned lock
         // query server-side, so queued SQLx rollback can return the connection.
-        let lock_ms = budget.min(Duration::from_secs(30)).as_millis().max(1);
-        let statement_ms = budget.min(Duration::from_secs(35)).as_millis().max(1);
+        // Waiting for a healthy storage upload may take longer than one RPC.
+        // Use the remaining total budget instead of imposing a separate,
+        // shorter lock limit. Zero disables PostgreSQL timeouts, so expire
+        // locally if less than one millisecond remains.
+        let remaining_ms = deadline.saturating_duration_since(Instant::now()).as_millis();
+        anyhow::ensure!(remaining_ms > 0,
+            "{operation} timed out while waiting for signer nonce lock");
+        let sql_timeout = format!("{remaining_ms}ms");
         sqlx::query("SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)")
-            .bind(format!("{lock_ms}ms"))
-            .bind(format!("{statement_ms}ms"))
+            .bind(&sql_timeout)
+            .bind(&sql_timeout)
             .execute(&mut *transaction).await
             .with_context(|| format!("{operation}: configure signer nonce lock deadline"))?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -94,13 +102,17 @@ mod tests {
         let started = AtomicBool::new(true);
         let active = Arc::new(AtomicBool::new(true));
         let calls = AtomicBool::new(false);
-        let result: Result<()> =
-            bounded("test submit", Duration::from_millis(10), &started, async {
+        let result: Result<()> = bounded(
+            "test submit",
+            Instant::now() + Duration::from_millis(10),
+            &started,
+            async {
                 let _guard = WorkGuard(active.clone());
                 assert!(!calls.swap(true, Ordering::SeqCst));
                 std::future::pending().await
-            })
-            .await;
+            },
+        )
+        .await;
         assert!(result
             .unwrap_err()
             .to_string()
@@ -110,7 +122,7 @@ mod tests {
         let started = AtomicBool::new(false);
         let result: Result<()> = bounded(
             "test wait",
-            Duration::from_millis(10),
+            Instant::now() + Duration::from_millis(10),
             &started,
             std::future::pending(),
         )
@@ -118,6 +130,55 @@ mod tests {
         let error = result.unwrap_err().to_string();
         assert!(error.contains("waiting for signer nonce lock"));
         assert!(!error.contains("broadcast"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local PostgreSQL via ATTESTOR_NONCE_TEST_DATABASE_URL; runs about 31 seconds"]
+    async fn postgres_healthy_upload_can_hold_the_lock_beyond_one_rpc_timeout() {
+        // A normal upload can hold the nonce lock for more than RPC_TIMEOUT,
+        // while the concurrent mint still has ample SUBMIT_TIMEOUT remaining.
+        // Keep the real durations to catch a reintroduced fixed 30-second cap.
+        let url = std::env::var("ATTESTOR_NONCE_TEST_DATABASE_URL")
+            .expect("set ATTESTOR_NONCE_TEST_DATABASE_URL to a dedicated local test database");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(3)
+            .connect(&url)
+            .await
+            .unwrap();
+        let sender = [0xadu8; 20];
+        let (locked, acquired) = tokio::sync::oneshot::channel();
+        let upload = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                with_nonce_lock(
+                    &pool,
+                    &sender,
+                    "test healthy storage upload",
+                    Duration::from_secs(750),
+                    || async {
+                        locked.send(()).unwrap();
+                        tokio::time::sleep(Duration::from_secs(31)).await;
+                        Ok(())
+                    },
+                )
+                .await
+            })
+        };
+        acquired.await.unwrap();
+        let called = AtomicBool::new(false);
+        let mint = with_nonce_lock(&pool, &sender, "test mint", SUBMIT_TIMEOUT, || async {
+            assert!(!called.swap(true, Ordering::SeqCst), "mint was retried");
+            Ok(())
+        })
+        .await;
+        let upload = upload.await.unwrap();
+        pool.close().await;
+        upload.unwrap();
+        assert!(
+            mint.is_ok(),
+            "healthy upload completed within both total budgets, but mint failed: {mint:?}"
+        );
+        assert!(called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

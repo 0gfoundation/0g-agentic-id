@@ -8,10 +8,18 @@ API/worker 广播交易时使用按 signer 共享的 Postgres advisory transacti
 上传使用同一锁，并等待此前 pending 交易打包。所有副本必须使用同一数据库。
 Indexer 仍只读取链与派生 agentSeal。
 Nonce 协调具有明确期限：RPC 连接 5 秒、单请求 30 秒；业务提交总预算为 120 秒，
-包含连接池/锁获取和广播。PostgreSQL 等锁最多 30 秒。存储总预算为 750 秒，
+包含连接池/锁获取和广播。PostgreSQL 等锁和语句期限使用操作剩余总预算，
+避免健康上传超过单次 RPC 期限后，使并行 mint 提前失败。存储总预算为 750 秒，
 其中等待此前 pending 交易最多 120 秒，SDK 上传及其重试最多 600 秒。
 取消会释放事务级锁。提交开始后超时会报告结果未知，不自动重发；重试前应先核对
 交易/合约或存储状态。
+
+Mint 收据 RPC 失败会保留 `Submitted` 和原交易 hash。`/retry` 先查询 seal 的链上映射，
+尚无映射时继续查询原交易，clone 同样如此；不会重新提交已知的 mint 或 clone。
+收据仍不可达或缺少 hash 时保留 `Submitted` 并返回错误；只有已确定回滚或无效的
+收据才会将阶段标为失败。
+恢复后的 clone 还会继续完成尚未生成的 AgentCard 和 URI，无需先有 sandbox；已有
+卡片的 clone 保持原有上线流程。
 
 生产必须设置 `ATTESTOR_TAPP_SOCKET`、`ATTESTOR_APP_ID`、
 `ATTESTOR_SANDBOX_APP_ID`、`ATTESTOR_TAPP_REGISTRY_ADDR`、
@@ -37,8 +45,9 @@ KMS appIdHash 和注册 epoch。连接要求 HTTPS、校验应用 SPKI、拒绝 
 identities、commitments 和 app signer 时，才视为 pending。
 
 API 和 worker 只初始化一次 `GetAppSigner`，随后并发验证自身身份和 AgenticID 实例授权，
-以及 sandbox 身份、链上授权及 pinned `/api/info`。两边查询均完成后，统一检查两边的
-lease 都还剩五秒以上。这一启动流程共用 180 秒预算，
+以及 sandbox 身份、链上授权及 pinned `/api/info`。一边查询失败时，会在同一启动
+deadline 内等待另一边查询结束后再重试，避免取消 Scan 已接受的观测请求。
+两边查询均完成后，统一检查两边的 lease 都还剩五秒以上。这一启动流程共用 180 秒预算，
 包含首次拿 key；每次就绪查询都受同一 deadline 限制，失败后间隔两秒重试。因此 Scan
 缓存尚未观察到新身份，或 operator 还在完成绑定时，不必立即重启进程。静态配置错误
 在拿 key 前拒绝；超时则启动失败，不使用过期身份、未授权 key 或手配地址回退。
