@@ -17,20 +17,32 @@ to compile ("stack too deep"). It's already enabled by default in
 ### forge-std pinned to v1.12.0
 
 `forge-std` changed its internal memory layout in v1.13.0+, which triggers a
-known codegen bug when combined with Solidity 0.8.24 + `via_ir`. Precondition
-for unpinning: bump solc to ≥ 0.8.27 (several via_ir bugs are fixed there).
+known codegen bug when combined with Solidity 0.8.24 + `via_ir`. That compiler
+combination is historical: the current pin is Solidity 0.8.38. Keep forge-std at
+v1.12.0 until a separate dependency update passes the full suite; the compiler
+upgrade alone does not establish compatibility with a newer forge-std.
 
-### `via_ir` peak memory exceeds 4 GB on solc 0.8.24
+### Historical: `via_ir` peak memory exceeded 4 GB on solc 0.8.24
 
 The full test tree (120 files as of the VerifiedFeedback/FeedbackBatcher
 suites) gets the compiler SIGKILLed in a 4 GB container, even at `-j 1`.
-Same tree compiles fine with `--use 0.8.28` — but solc stays pinned (see the
-forge-std pin above), so the fix is RAM: build contracts on a machine with
-more than 4 GB. Reported by the PR #144 round-2 review, reproduced there.
+The same tree compiled with `--use 0.8.28`; retaining 0.8.24 then required a
+machine with more than 4 GB. This records the PR #144 round-2 reproduction,
+not a measurement of the current 0.8.38 build.
+
+### Reproduce the linked implementation's build settings
+
+The checked-in settings are solc **0.8.38**, `via_ir = true`, optimizer runs **1**,
+EVM **Cancun**, and `bytecode_hash = "none"`. CBOR stays enabled and retains the
+compiler version; do not substitute `--no-metadata`. The current runtimes are
+24,543 bytes for AgenticID and 1,730 bytes for its stateless linked library.
+`Eip170Size.t.sol` is the size gate; repeat it after any source or compiler change.
+Keep the exact settings and library link address when verifying an implementation.
+Link/deploy and beacon-upgrade rules live in [`contracts/UPGRADING.md`](contracts/UPGRADING.md).
 
 ### The `via_ir + vm.warp` trap in tests
 
-Same root cause as the codegen bug above: after advancing time with
+The historical 0.8.24 review also exposed optimizer-dependent fixtures: after advancing time with
 `vm.warp(...)` in a test, **do not** keep reading a local that was derived from
 `block.timestamp` before the warp. The optimizer rematerializes that read and
 produces the wrong value (typical symptom: a deadline computed as double what

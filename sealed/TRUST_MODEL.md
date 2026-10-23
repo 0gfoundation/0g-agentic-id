@@ -39,6 +39,18 @@ sealed bug — it is an agent quality issue, expressed through reputation.
 
 ## Foundational invariant: owner never holds `agent_seal_priv`
 
+Attestor HTTP calls (`/provision`, `/status`, `/settings/seed`) use
+`internal/attestorhttp`. Production creation overwrites `ATTESTOR_TLS_DESCRIPTOR`
+with public Scan URL/SPKI anchors and the fixed appId, chain, registry, registration
+epoch, app signer and existing business URL. The runtime independently refreshes
+the app's TLS pins through that pinned Scan; expired or mismatched identities stop
+business requests. It receives no tapp socket. The explicit
+`ATTESTOR_ALLOW_UNPINNED_DEV=true` bypass is injected only by mock deployments.
+Each request and its response body share the resolved identity's absolute lease
+deadline. Expiry aborts the exchange, including a reused TLS connection or a body
+received after successful headers; an already processed request is not resent.
+See [application identity migration](../attestor/APP_IDENTITY.md).
+
 Everything in this document rests on **one** load-bearing property:
 
 > **`agent_seal_priv` exists only inside the sealed container's memory

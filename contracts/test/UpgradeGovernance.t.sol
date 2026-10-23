@@ -29,7 +29,7 @@ import {
     TransferValidityProof
 } from "../src/interfaces/IERC7857DataVerifier.sol";
 
-/// @notice AgenticID 1.1.0 → 1.2.0 and TEEDataVerifier 1.1.0 → 1.2.0 across a
+/// @notice AgenticID 1.1.0 → 1.3.0 and TEEDataVerifier 1.1.0 → 1.2.0 across a
 ///         real BeaconProxy + UpgradeableBeacon + TimelockController upgrade,
 ///         starting from the frozen 1.1.0 sources (test/mocks/*V1_1_0.sol) —
 ///         the code every environment runs today. The Timelock has 0G
@@ -226,7 +226,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertEq(beacon.implementation(), newImpl, "beacon points at the new impl");
     }
 
-    // ── AgenticID 1.1.0 → 1.2.0 ───────────────────────────────────────────────
+    // ── AgenticID 1.1.0 → 1.3.0 ───────────────────────────────────────────────
 
     function test_agenticID_upgrade_preservesState() public {
         assertEq(vm.load(address(agenticId), OWNABLE2STEP_SLOT), bytes32(0), "pending slot unused by 1.1.0");
@@ -234,7 +234,7 @@ contract UpgradeGovernanceTest is AgenticIDTestBase {
         assertEq(address(uint160(uint256(ownerWord))), owner, "owner lives in OZ's Ownable slot");
 
         _upgrade(agenticIdBeacon, address(new AgenticID()));
-        assertEq(agenticId.VERSION(), "1.2.0", "post-upgrade VERSION");
+        assertEq(agenticId.VERSION(), "1.3.0", "post-upgrade VERSION");
 
         // Governance config.
         assertEq(vm.load(address(agenticId), OWNABLE_SLOT), ownerWord, "Ownable slot untouched");

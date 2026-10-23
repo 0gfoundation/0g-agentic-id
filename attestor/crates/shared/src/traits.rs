@@ -170,6 +170,14 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
+    /// Public bootstrap trust; runtimes refresh independently through pinned Scan.
+    async fn attestor_tls_identity(&self) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
+        Ok(None)
+    }
+    /// Current authenticated connection metadata; mock implementations may omit it.
+    async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
+        Ok(None)
+    }
     /// Create a new sandbox container for `seal_id`. The user-signed
     /// `envelope` (action="create") is relayed as the three X-Wallet-*
     /// headers. Returns sandbox's id + lifecycle state so callers can

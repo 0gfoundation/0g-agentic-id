@@ -38,6 +38,36 @@ audit's Low fixes — new reverts, a changed `verifyTransferValidity` signature,
 one mapping appended to AgenticID's namespaced struct, no existing storage
 moved) is minor.
 
+AgenticID `1.2.0 → 1.3.0` adds instance-bound trusted attestors and a one-way
+migration from address-only authorization. It retains the 1.2.0 governance and
+proof rules, and appends its fields after `agentSealBound` in the existing
+ERC-7201 namespace. The 1.2.0 lifetime seal-address map must keep its original
+slot; the new binding map and migration flag must not replace it. After upgrading,
+follow [`attestor/APP_IDENTITY.md`](../attestor/APP_IDENTITY.md) to bind every
+intended attestor and enable the instance requirement.
+
+AgenticID 1.3.0 also links `AttestorAppBindingLib`. This library has no state,
+owner, configuration or independent upgrade endpoint. Its calls use `DELEGATECALL`:
+the existing proxy keeps the whitelist, binding map and migration flag, with the
+1.2.0 storage prefix unchanged. The linked library address is embedded in the
+implementation, not selected through an administrator-controlled proxy setting.
+
+Use the checked-in solc 0.8.38 / via-IR / optimizer-runs 1 / Cancun settings and
+`bytecode_hash = "none"`; compiler-version CBOR remains enabled. `forge script`
+automatically deploys and links the library when a script creates AgenticID.
+For standalone `forge create`, deploy the library first, then supply
+`--libraries src/AttestorAppBindingLib.sol:AttestorAppBindingLib:<LIB_ADDRESS>`
+when creating AgenticID. The generic implementation example below uses
+VerifiedFeedbackRegistry and does not supply AgenticID's library link.
+
+Record and verify both the library and the linked implementation with their
+exact compiler settings, sources and link address; retain build metadata even
+though its hash is not appended to bytecode. To change library code, deploy a
+new library and linked implementation, then schedule/execute the original
+beacon upgrade through its Timelock. Existing implementations continue to use
+their old library until the beacon changes; no proxy-state migration or new
+library owner is involved.
+
 **Consensus-critical digests: still minor, but a same-window rollout.** A change
 to a digest that off-chain code must reproduce byte-for-byte — e.g. the
 ServeProof digest, which `VerifiedFeedbackRegistry` 1.2.0 moved from
@@ -154,8 +184,9 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
       frozen copy of the deployed source (`test/mocks/*V1_1_0.sol`, whose
       base contracts are frozen too, in `test/mocks/v1_1_0/` — change a src
       base and the fixture must not move)
-- [ ] `forge build --sizes`: AgenticID stays under EIP-170 (`Eip170Size.t.sol`;
-      1.2.0 sits at 24,517 / 24,576 bytes)
+- [ ] `forge build --sizes --skip test --skip script`: AgenticID and its linked library pass EIP-170
+      (`Eip170Size.t.sol`; current runtimes 24,543 and 1,730 bytes respectively,
+      against the 24,576-byte limit — rerun rather than assuming this margin)
 - [ ] `forge test` green
 - [ ] On chain: `proxy.VERSION() == new version` and `beacon.implementation() == new impl`
 - [ ] Ownership moves after a 1.2.0 upgrade are two-step: the current owner
@@ -164,5 +195,8 @@ When storage is incompatible or the protocol is redesigned, a beacon upgrade is
       accepted or replaced — withdraw one with `transferOwnership(address(0))`
       (DEPLOYMENT.md §8)
 - [ ] `script/verify.sh <proxy>` re-verifies the new impl (see DEPLOYMENT §5)
+- [ ] AgenticID's linked library is verified and its address matches the new
+      implementation's link metadata; verification uses the pinned compiler,
+      EVM, optimizer and bytecode-hash settings
 - [ ] `DEPLOYMENT.md`: update the impl address + VERSION in the relevant §6 env; append a §7 changelog entry
 - [ ] Upgrade both dev and test as needed to avoid version drift (current state in §6)

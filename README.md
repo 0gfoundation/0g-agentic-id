@@ -367,6 +367,10 @@ chain from on-chain registration to each signed response.
 | **AgentSeal registry** (`AgenticID.sol`) | The agent's dynamic identity credential (set-once) + the `validFrameworkHashes` allowlist |
 | **TappRegistry** | Code-fingerprint registry for all Tapp components |
 
+AgenticID 1.3 links the stateless `AttestorAppBindingLib` for app-instance authorization;
+permissions and binding state remain in the proxy. The pinned compiler and linking rules
+are documented in [`contracts/README.md`](contracts/README.md).
+
 ### TEE layer (deployed on 0g-Tapp)
 
 - **Attestor** — validates Sandbox's `signerAddress` (against TappRegistry)

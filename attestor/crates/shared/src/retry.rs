@@ -120,22 +120,34 @@ mod tests {
     // We don't synthesize reqwest::Response in tests — its constructor
     // surface is private and would pull in the `http` crate as a dev-
     // dep just to satisfy `From<http::Response<_>> for reqwest::Response`.
-    // Instead, exercise the retry counter via real reqwest calls
-    // against a closed port (gives genuine `is_connect()` errors).
+    // Instead, exercise the retry counter via real reqwest connector errors.
+    // Failing DNS is immediate and cannot turn into an unrelated total-request
+    // timeout when the test runner is busy, or depend on a host's open ports.
     // The 5xx-response branches are eyeball-reviewed; their logic is
     // a single line of state check each.
 
-    async fn hit_closed_port(counter: Arc<AtomicU32>) -> reqwest::Result<reqwest::Response> {
+    struct FailingDns;
+
+    impl reqwest::dns::Resolve for FailingDns {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async {
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test DNS failure").into())
+            })
+        }
+    }
+
+    async fn connect_error(counter: Arc<AtomicU32>) -> reqwest::Result<reqwest::Response> {
         counter.fetch_add(1, Ordering::SeqCst);
-        // 127.0.0.1:1 — privileged port nobody listens on; reqwest
-        // returns a connect-class error fast.
-        reqwest::Client::builder()
-            .timeout(Duration::from_millis(150))
+        let result = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(FailingDns))
             .build()
             .unwrap()
-            .get("http://127.0.0.1:1")
+            .get("http://retry.invalid")
             .send()
-            .await
+            .await;
+        assert!(result.as_ref().unwrap_err().is_connect(), "fixture must produce a connect error: {result:?}");
+        result
     }
 
     #[tokio::test]
@@ -145,7 +157,7 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         let err = retry_send("test-op", RetryPolicy::Idempotent, move || {
-            hit_closed_port(c.clone())
+            connect_error(c.clone())
         })
         .await
         .unwrap_err();
@@ -166,7 +178,7 @@ mod tests {
         let counter = Arc::new(AtomicU32::new(0));
         let c = counter.clone();
         let _ = retry_send("test-op", RetryPolicy::Strict, move || {
-            hit_closed_port(c.clone())
+            connect_error(c.clone())
         })
         .await
         .unwrap_err();

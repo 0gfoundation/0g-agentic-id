@@ -303,6 +303,9 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 | **AgentSeal 注册表**（`AgenticID.sol`）| agent 的动态身份凭证（set-once）+ `validFrameworkHashes` 白名单 |
 | **TappRegistry** | 所有 Tapp 组件的代码指纹注册表 |
 
+AgenticID 1.3 通过无状态链接库 `AttestorAppBindingLib` 处理 app 实例授权，权限和绑定
+状态仍留在 proxy。固定编译器和链接规则见 [`contracts/README.zh.md`](contracts/README.zh.md)。
+
 ### TEE 层（0g-Tapp 部署）
 
 - **Attestor** — 校验 Sandbox 的 `signerAddress`（against TappRegistry）与容器

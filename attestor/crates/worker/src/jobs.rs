@@ -351,9 +351,9 @@ async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<(
     Ok(())
 }
 
-/// Soft-retry: walks the deployment row and re-runs any track whose
-/// current `StageStatus` is `Failed`. The container track is *not*
-/// touched here — sandbox creation requires a freshly-signed envelope
+/// Soft-retry: reconciles a submitted mint, then walks the deployment row
+/// and re-runs any track whose current `StageStatus` is `Failed`. The container
+/// track is *not* touched here — sandbox creation requires a freshly-signed envelope
 /// which lives in `/start`'s flow. Phase 2 also runs idempotently if
 /// it hadn't completed yet.
 async fn handle_resume_deploy(
@@ -366,11 +366,34 @@ async fn handle_resume_deploy(
     artifacts: Vec<IDataArtifact>,
     sandbox_envelope: Option<SandboxEnvelope>,
 ) -> anyhow::Result<()> {
-    let d = ctx
+    let mut d = ctx
         .deployments
         .get(seal_id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("resume: deployment vanished"))?;
+
+    // Reconcile a known submitted mint before either deploy or clone
+    // retry dispatch. A receipt transport failure never authorizes another
+    // registerWithSeal/cloneFrom, even if the indexer already filled agent_id.
+    if let StageStatus::Submitted { tx_hash, .. } = &d.mint_stage {
+        if let Some(agent_id) = ctx.chain.get_agent_id_by_seal_id(seal_id).await? {
+            ctx.deployments.set_agent_id(seal_id, agent_id).await?;
+            ctx.deployments
+                .set_mint_stage(seal_id, StageStatus::Confirmed { at: Utc::now() })
+                .await?;
+            ctx.events.publish(WsEvent::MintConfirmed { seal_id, agent_id }).await?;
+        } else {
+            let Some(tx_hash) = tx_hash else {
+                anyhow::bail!(
+                    "resume: mint Submitted without a transaction hash and no on-chain agent; \
+                     retaining Submitted, reconcile before retrying"
+                );
+            };
+            finish_submitted_mint(ctx, seal_id, *tx_hash).await?;
+        }
+        d = ctx.deployments.get(seal_id).await?
+            .ok_or_else(|| anyhow::anyhow!("resume: deployment vanished after mint reconciliation"))?;
+    }
 
     // ── Clone rows: re-drive the original clone, not the deploy tracks ──
     // A clone persists NO artifacts (the re-seal output would go stale the
@@ -409,8 +432,17 @@ async fn handle_resume_deploy(
             )
             .await;
         }
-        // Minted already — nothing pre-mint to redo; fall through so the
-        // idempotent phase-2 finalize below can complete if it hadn't.
+        // A clone identity finalizes before its owner creates a runtime,
+        // so no sandbox/envelope is required to finish its pending card.
+        if d.agent_id.is_some()
+            && matches!(d.mint_stage, StageStatus::Confirmed { .. })
+            && d.agent_uri.is_empty()
+        {
+            run_phase2(ctx, seal_id, &cp.name, &cp.description, cp.image.as_deref()).await?;
+            return Ok(());
+        }
+        // An existing card is already finalized. Continue through the
+        // normal BringOnline path when an envelope accompanies the retry.
     }
 
     // ── Storage track retry ──
@@ -1525,7 +1557,18 @@ async fn run_mint_track(
         })
         .await?;
 
-    let receipt = ctx.chain.wait_receipt(submit).await?;
+    finish_submitted_mint(ctx, seal_id, submit).await
+}
+
+/// Poll the known mint transaction; transport uncertainty must retain its
+/// Submitted hash. Only a conclusive receipt may confirm or fail the stage.
+async fn finish_submitted_mint(ctx: &Ctx, seal_id: SealId, submit: B256) -> anyhow::Result<()> {
+    let receipt = ctx.chain.wait_receipt(submit).await.map_err(|err| {
+        anyhow::anyhow!(
+            "mint receipt for submitted transaction {submit:?} unavailable; \
+             retaining Submitted, reconcile before retrying: {err:#}"
+        )
+    })?;
     if !receipt.success {
         let now = Utc::now();
         let reason = format!("mint tx reverted: {:?}", receipt.tx_hash);
@@ -1760,6 +1803,103 @@ mod tests {
             oss,
         };
         TestCtx { ctx, chain, storage, sandbox, deployments, events }
+    }
+
+    /// The transaction is mined by the underlying mock, but the first
+    /// receipt request fails just like a transient RPC transport timeout.
+    /// Subsequent requests can read the original transaction's receipt.
+    struct ReceiptErrorOnceChain {
+        inner: Arc<ConfigurableChain>,
+        receipt_hashes: std::sync::Mutex<Vec<B256>>,
+        receipt_unavailable: std::sync::atomic::AtomicBool,
+        receipt_override: std::sync::Mutex<Option<attestor_shared::ReceiptSummary>>,
+        clone_calls: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ChainClient for ReceiptErrorOnceChain {
+        async fn register_with_seal(&self, params: MintParams) -> anyhow::Result<B256> {
+            self.inner.register_with_seal(params).await
+        }
+
+        async fn wait_receipt(&self, tx_hash: B256) -> anyhow::Result<attestor_shared::ReceiptSummary> {
+            let first_request = {
+                let mut hashes = self.receipt_hashes.lock().unwrap();
+                hashes.push(tx_hash);
+                hashes.len() == 1
+            };
+            if first_request {
+                anyhow::bail!("simulated receipt RPC timeout after successful broadcast");
+            }
+            if self.receipt_unavailable.load(Ordering::SeqCst) {
+                anyhow::bail!("simulated receipt still unavailable");
+            }
+            if let Some(receipt) = self.receipt_override.lock().unwrap().clone() {
+                return Ok(receipt);
+            }
+            self.inner.wait_receipt(tx_hash).await
+        }
+
+        async fn get_agent_id_by_seal_id(&self, seal_id: SealId) -> anyhow::Result<Option<AgentId>> {
+            self.inner.get_agent_id_by_seal_id(seal_id).await
+        }
+
+        async fn owner_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
+            self.inner.owner_of(agent_id).await
+        }
+
+        async fn is_valid_framework_hash(&self, hash: B256) -> anyhow::Result<bool> {
+            self.inner.is_valid_framework_hash(hash).await
+        }
+
+        async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool> {
+            self.inner.is_trusted_attestor(addr).await
+        }
+
+        async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address> {
+            self.inner.identity_registry_of(registry).await
+        }
+
+        async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
+            self.inner.is_sandbox_node(addr).await
+        }
+
+        async fn is_acknowledged(&self, registry: Address, user: Address, app_id: &str) -> anyhow::Result<bool> {
+            self.inner.is_acknowledged(registry, user, app_id).await
+        }
+
+        async fn sandbox_balance(&self, serving: Address, user: Address, provider: Address) -> anyhow::Result<U256> {
+            self.inner.sandbox_balance(serving, user, provider).await
+        }
+
+        async fn token_uri(&self, agent_id: AgentId) -> anyhow::Result<String> {
+            self.inner.token_uri(agent_id).await
+        }
+
+        async fn intelligent_datas_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<IntelligentData>> {
+            self.inner.intelligent_datas_of(agent_id).await
+        }
+
+        async fn sealed_keys_of(&self, agent_id: AgentId) -> anyhow::Result<Vec<Bytes>> {
+            self.inner.sealed_keys_of(agent_id).await
+        }
+
+        async fn clone_authorizer_of(&self, agent_id: AgentId) -> anyhow::Result<Address> {
+            self.inner.clone_authorizer_of(agent_id).await
+        }
+
+        async fn can_clone(&self, authorizer: Address, source: AgentId, target: Address, caller: Address, data: Bytes) -> anyhow::Result<bool> {
+            self.inner.can_clone(authorizer, source, target, caller, data).await
+        }
+
+        async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<B256> {
+            self.clone_calls.fetch_add(1, Ordering::SeqCst);
+            ChainClient::clone_from(self.inner.as_ref(), params).await
+        }
+
+        async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<B256> {
+            self.inner.set_agent_uri(agent_id, uri).await
+        }
     }
 
     /// WYSIWYS: handle_deploy mints i_data verbatim, so tests feed it the
@@ -2383,6 +2523,258 @@ mod tests {
         let d = g.get_mut(&seal).unwrap();
         d.agent_uri = "http://oss.example/card.json".into();
         d.agent_card = serde_json::json!({"name": "Sage"});
+    }
+
+    async fn seed_receipt_failed_mint() -> (TestCtx, Arc<ReceiptErrorOnceChain>, B256, AgentId) {
+        let mut t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::NotStarted,
+            None,
+            Some("sb-1".into()),
+        );
+        // Isolate mint recovery from the independently tested phase-2 path.
+        mark_phase2_done(&t.deployments, seal);
+        let chain = Arc::new(ReceiptErrorOnceChain {
+            inner: t.chain.clone(),
+            receipt_hashes: std::sync::Mutex::new(Vec::new()),
+            receipt_unavailable: std::sync::atomic::AtomicBool::new(false),
+            receipt_override: std::sync::Mutex::new(None),
+            clone_calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        t.ctx.chain = chain.clone();
+
+        let err = run_mint_track(&t.ctx, seal, MintParams {
+            to: Address::from([0x66; 20]),
+            agent_uri: String::new(),
+            metadata: Vec::new(),
+            intelligent_datas: vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(1),
+            }],
+            sealed_keys: vec![Bytes::from_static(b"sealed")],
+            agent_seal: Address::from([0x55; 20]),
+            seal_id: seal,
+        }).await.expect_err("first receipt read must fail after broadcast");
+        assert!(err.to_string().contains("simulated receipt RPC timeout"));
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        let tx_hash = match d.mint_stage {
+            StageStatus::Submitted { tx_hash: Some(hash), .. } => hash,
+            other => panic!("receipt failure must preserve the submitted hash, got {other:?}"),
+        };
+        let minted_id = t.chain.get_agent_id_by_seal_id(seal).await.unwrap()
+            .expect("the original transaction already minted on chain");
+        assert_eq!(*chain.receipt_hashes.lock().unwrap(), vec![tx_hash]);
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1);
+        (t, chain, tx_hash, minted_id)
+    }
+
+    async fn assert_resume_submitted_mint_after_receipt_error(indexer_recorded_id: bool) {
+        let (t, chain, tx_hash, minted_id) = seed_receipt_failed_mint().await;
+        let seal = dummy_seal();
+        if indexer_recorded_id {
+            // Mirrors on_agent_seal_set: the indexer fills agent_id but
+            // does not transition mint_stage out of Submitted.
+            t.deployments.set_agent_id(seal, minted_id).await.unwrap();
+        }
+        run(&t.ctx, JobPayload::ResumeDeploy {
+            seal_id: seal,
+            artifacts: Vec::new(),
+            sandbox_envelope: None,
+        }).await.expect("resume must reconcile an already submitted mint");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1,
+            "resume must never register again while the original hash is known");
+        assert!(chain.receipt_hashes.lock().unwrap().iter().all(|hash| *hash == tx_hash),
+            "any receipt retry must poll the original submitted transaction");
+        assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }),
+            "resume must confirm the original mined transaction, got {:?} (agent_id={:?}, receipt_reads={})",
+            d.mint_stage, d.agent_id, chain.receipt_hashes.lock().unwrap().len());
+        assert_eq!(d.agent_id, Some(minted_id));
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_after_receipt_error_reconciles_chain() {
+        assert_resume_submitted_mint_after_receipt_error(false).await;
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_after_receipt_error_with_indexed_id_confirms_stage() {
+        assert_resume_submitted_mint_after_receipt_error(true).await;
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_after_receipt_error_polls_original_hash() {
+        let (t, chain, tx_hash, minted_id) = seed_receipt_failed_mint().await;
+        let seal = dummy_seal();
+        t.chain.seal_to_agent.lock().unwrap().clear();
+        run(&t.ctx, JobPayload::ResumeDeploy {
+            seal_id: seal,
+            artifacts: Vec::new(),
+            sandbox_envelope: None,
+        }).await.expect("the original receipt must recover a missing live mapping");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*chain.receipt_hashes.lock().unwrap(), vec![tx_hash, tx_hash]);
+        assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }));
+        assert_eq!(d.agent_id, Some(minted_id));
+    }
+
+    async fn assert_resume_submitted_clone_after_receipt_error(phase2_done: bool, live_mapping: bool) {
+        let mut t = make_test_ctx();
+        let seal = dummy_seal();
+        let source_seal = B256::repeat_byte(0x11);
+        let owner = Address::from([0x66; 20]);
+        let agent_seal = Address::from([0x55; 20]);
+        let authorizer = Address::from([0xa7; 20]);
+        // Keep the source recipe valid: the old dispatch would actually
+        // re-seal and submit cloneFrom again instead of failing earlier.
+        let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
+        seed_deployment(&t.deployments, source_seal, Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() }, Some(U256::from(42)), None);
+        t.chain.seed_idata(vec![IntelligentData {
+            description: "{}".into(), data_hash: B256::repeat_byte(1),
+        }], vec![Bytes::from(t.ctx.crypto.ecies_encrypt(&[9; 32], &source_kp.pub_key).unwrap())]);
+        seed_failed_clone_row(&t.deployments, seal, agent_seal, owner, source_seal,
+            JobCloneAuth::Contract { authorizer, caller: owner, auth_data: Bytes::new() });
+        if phase2_done {
+            mark_phase2_done(&t.deployments, seal);
+        } else {
+            t.deployments.by_seal.lock().unwrap().get_mut(&seal).unwrap()
+                .clone_params.as_mut().unwrap().image = Some("https://example/clone.png".into());
+        }
+        let chain = Arc::new(ReceiptErrorOnceChain {
+            inner: t.chain.clone(),
+            receipt_hashes: std::sync::Mutex::new(Vec::new()),
+            receipt_unavailable: std::sync::atomic::AtomicBool::new(false),
+            receipt_override: std::sync::Mutex::new(None),
+            clone_calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        t.ctx.chain = chain.clone();
+        run_clone_from_track(&t.ctx, seal, CloneFromParams {
+            source_agent_id: U256::from(42), to: owner,
+            data_hashes: vec![B256::repeat_byte(1)],
+            sealed_keys: vec![Bytes::from_static(b"sealed")],
+            agent_seal, seal_id: seal, caller: owner, authorizer, auth_data: Bytes::new(),
+        }).await.expect_err("first clone receipt read must fail after successful submission");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        let tx_hash = match d.mint_stage {
+            StageStatus::Submitted { tx_hash: Some(hash), .. } => hash,
+            other => panic!("expected Submitted clone transaction, got {other:?}"),
+        };
+        if !live_mapping {
+            t.chain.seal_to_agent.lock().unwrap().remove(&seal);
+        }
+        run(&t.ctx, JobPayload::ResumeDeploy {
+            seal_id: seal, artifacts: Vec::new(), sandbox_envelope: None,
+        }).await.expect("clone recovery must use its original receipt");
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(chain.clone_calls.load(Ordering::SeqCst), 1,
+            "a known Submitted clone must not re-enter handle_clone");
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(*chain.receipt_hashes.lock().unwrap(),
+            if live_mapping { vec![tx_hash] } else { vec![tx_hash, tx_hash] });
+        assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }));
+        assert!(d.agent_id.is_some());
+        assert!(!d.agent_uri.is_empty(),
+            "a recovered clone must finalize its identity without requiring a sandbox");
+        assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), if phase2_done { 0 } else { 1 });
+        if !phase2_done {
+            assert!(d.sandbox_id.is_none());
+            assert_eq!(d.agent_card.get("name").and_then(|v| v.as_str()), Some("Sage"));
+            assert_eq!(d.agent_card.get("description").and_then(|v| v.as_str()), Some("d"));
+            assert_eq!(d.agent_card.get("image").and_then(|v| v.as_str()), Some("https://example/clone.png"));
+            assert_eq!(d.phase, DeploymentPhase::Offline);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_clone_after_receipt_error_polls_original_hash_without_recloning() {
+        assert_resume_submitted_clone_after_receipt_error(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_clone_after_receipt_error_finalizes_identity_without_sandbox() {
+        for live_mapping in [false, true] {
+            assert_resume_submitted_clone_after_receipt_error(false, live_mapping).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_after_receipt_error_pending_hash_never_resubmits() {
+        let (t, chain, tx_hash, _) = seed_receipt_failed_mint().await;
+        let seal = dummy_seal();
+        // No live mapping yet, and the original hash is not readable.
+        // This is uncertainty about a submitted tx, never permission to
+        // mint again from the retry payload.
+        t.chain.seal_to_agent.lock().unwrap().clear();
+        chain.receipt_unavailable.store(true, Ordering::SeqCst);
+        let result = run(&t.ctx, JobPayload::ResumeDeploy {
+            seal_id: seal,
+            artifacts: vec![cleared_artifact(1)],
+            sandbox_envelope: None,
+        }).await;
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1,
+            "an unknown submitted transaction must not cause another register");
+        assert!(matches!(d.mint_stage, StageStatus::Submitted { tx_hash: Some(hash), .. } if hash == tx_hash),
+            "a receipt error must preserve the original Submitted hash");
+        assert_eq!(*chain.receipt_hashes.lock().unwrap(), vec![tx_hash, tx_hash],
+            "resume must retry the existing hash when there is no live mint mapping");
+        assert!(result.is_err(), "receipt unavailability must not be reported as successful recovery");
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_without_hash_remains_submitted() {
+        let (t, chain, tx_hash, _) = seed_receipt_failed_mint().await;
+        let seal = dummy_seal();
+        t.chain.seal_to_agent.lock().unwrap().clear();
+        t.deployments.set_mint_stage(seal, StageStatus::Submitted {
+            tx_hash: None,
+            at: Utc::now(),
+        }).await.unwrap();
+        let err = run(&t.ctx, JobPayload::ResumeDeploy {
+            seal_id: seal,
+            artifacts: vec![cleared_artifact(1)],
+            sandbox_envelope: None,
+        }).await.expect_err("an unknown hash must not be resubmitted");
+        assert!(err.to_string().contains("without a transaction hash"));
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.mint_stage, StageStatus::Submitted { tx_hash: None, .. }));
+        assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*chain.receipt_hashes.lock().unwrap(), vec![tx_hash]);
+    }
+
+    #[tokio::test]
+    async fn resume_submitted_mint_conclusive_bad_receipts_fail_without_resubmission() {
+        for (success, reason) in [(false, "mint tx reverted"), (true, "no Registered event")] {
+            let (t, chain, tx_hash, _) = seed_receipt_failed_mint().await;
+            let seal = dummy_seal();
+            t.chain.seal_to_agent.lock().unwrap().clear();
+            *chain.receipt_override.lock().unwrap() = Some(attestor_shared::ReceiptSummary {
+                tx_hash,
+                block_number: 7,
+                success,
+                agent_id: None,
+            });
+            let err = run(&t.ctx, JobPayload::ResumeDeploy {
+                seal_id: seal,
+                artifacts: Vec::new(),
+                sandbox_envelope: None,
+            }).await.expect_err("a conclusive invalid receipt must fail mint");
+            assert!(err.to_string().contains(reason));
+            let d = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(matches!(d.mint_stage, StageStatus::Failed { reason: ref r, .. } if r.contains(reason)));
+            assert!(d.agent_id.is_none());
+            assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*chain.receipt_hashes.lock().unwrap(), vec![tx_hash, tx_hash]);
+        }
     }
 
     #[tokio::test]

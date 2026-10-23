@@ -33,7 +33,7 @@ sol!(
     #[sol(rpc)]
     #[derive(Debug)]
     AgenticID,
-    "../../../contracts/out/AgenticID.sol/AgenticID.json"
+    concat!(env!("OUT_DIR"), "/AgenticID.abi.json")
 );
 
 // TappRegistry — minimal inline interface (not a JSON-ABI import, to keep
@@ -258,6 +258,7 @@ where
     // across submit (sub-second), NOT the receipt wait, so txs still pipeline.
     // tokio Mutex (not std) because the guard is held across an `.await`.
     submit_lock: tokio::sync::Mutex<()>,
+    submit_pool: sqlx::PgPool,
     _t: PhantomData<T>,
 }
 
@@ -274,6 +275,7 @@ where
         max_fee_gwei: u64,
         tapp_registry: Option<(Address, String)>,
         clone_gate: Option<Address>,
+        submit_pool: sqlx::PgPool,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
@@ -284,6 +286,7 @@ where
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
             tapp_registry,
             submit_lock: tokio::sync::Mutex::new(()),
+            submit_pool,
             _t: PhantomData,
         })
     }
@@ -314,16 +317,19 @@ pub fn connect_http(
     max_fee_gwei: u64,
     tapp_registry: Option<(Address, String)>,
     clone_gate: Option<Address>,
+    submit_pool: sqlx::PgPool,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
     let signer = PrivateKeySigner::from_slice(&signer_priv)?;
     let sender = signer.address();
     let wallet = EthereumWallet::from(signer);
     let url: reqwest::Url = rpc_url.parse()?;
+    let transport = rpc_http_transport(url, crate::nonce_submit::RPC_TIMEOUT)?;
+    let is_local = transport.guess_local();
     let provider = ProviderBuilder::new()
         .filler(ChainIdFiller::default())
         .filler(NonceFiller::<PendingNonceManager>::default())
         .wallet(wallet)
-        .on_http(url);
+        .on_client(alloy::rpc::client::RpcClient::new(transport, is_local));
     // Startup marker so a live process proves which build/strategy is running
     // (a missing line means the binary predates the #54 fix — stale image).
     tracing::info!(sender = %sender, "chain client ready — mint nonce = pending-read + submit_lock (#54)");
@@ -335,8 +341,20 @@ pub fn connect_http(
         max_fee_gwei,
         tapp_registry,
         clone_gate,
+        submit_pool,
     );
     Ok(chain)
+}
+
+pub(crate) fn rpc_http_transport(
+    url: reqwest::Url,
+    timeout: std::time::Duration,
+) -> anyhow::Result<alloy::transports::http::Http<reqwest::Client>> {
+    let client = reqwest::Client::builder()
+        .connect_timeout(crate::nonce_submit::CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .build()?;
+    Ok(alloy::transports::http::Http::with_client(client, url))
 }
 
 #[async_trait]
@@ -384,11 +402,7 @@ where
             .with_input(call_data);
 
         // Estimate gas limit, add 20% safety margin.
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -404,13 +418,17 @@ where
         // Serialize the nonce-read→submit window (see `submit_lock`). Guard is
         // released as soon as the tx is broadcast (pending nonce bumped), not
         // held through the receipt wait, so mints still pipeline into mempool.
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "registerWithSeal",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: registerWithSeal submitted");
         Ok(tx_hash)
@@ -524,11 +542,7 @@ where
             .with_to(gate)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -541,13 +555,17 @@ where
             "alloy: sending cloneFrom (policy-gated mint)"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "cloneFrom",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, "alloy: cloneFrom submitted");
         Ok(tx_hash)
@@ -629,11 +647,7 @@ where
         Ok(c.sealedKeysOf(agent_id).call().await?._0)
     }
 
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash> {
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
         let call_data = AgenticID::setAgentURICall {
             agentId: agent_id,
             newURI: uri,
@@ -645,11 +659,7 @@ where
             .with_to(self.contract_addr)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -661,13 +671,17 @@ where
             "alloy: sending setAgentURI"
         );
 
-        let pending = {
-            let _guard = self.submit_lock.lock().await;
-            self.provider
-                .send_transaction(tx)
-                .await
-                .map_err(decode_err)?
-        };
+        let pending = crate::nonce_submit::with_nonce_lock(
+            &self.submit_pool,
+            self.sender.as_slice(),
+            "setAgentURI",
+            crate::nonce_submit::SUBMIT_TIMEOUT,
+            || async {
+                let _guard = self.submit_lock.lock().await;
+                self.provider.send_transaction(tx).await.map_err(decode_err)
+            },
+        )
+        .await?;
         let tx_hash = *pending.tx_hash();
         tracing::info!(?tx_hash, %agent_id, "alloy: setAgentURI submitted");
         Ok(tx_hash)
@@ -686,6 +700,40 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rpc_deadline_bounds_a_real_silent_http_peer() {
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+            sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let transport = rpc_http_transport(url, Duration::from_millis(50)).unwrap();
+        let provider = alloy::providers::RootProvider::<_, Ethereum>::new(
+            alloy::rpc::client::RpcClient::new(transport, true),
+        );
+        let request = tokio::spawn(async move { provider.get_block_number().await });
+        tokio::time::timeout(Duration::from_secs(2), received)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(300), request).await;
+        server.abort();
+        assert!(result
+            .expect("Alloy RPC ignored the HTTP request deadline")
+            .unwrap()
+            .is_err());
+    }
 
     /// `0x042a85a4` == selector of `AgenticIDNotTrustedAttestor()`.
     /// This is the exact error we saw in production (attestor EOA not
