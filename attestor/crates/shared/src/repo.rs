@@ -11,7 +11,7 @@ use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -51,6 +51,17 @@ pub async fn connect(url: &str) -> anyhow::Result<PgPool> {
 
     bootstrap?;
     Ok(pool)
+}
+
+// Take the write-intent table lock before row locks. Otherwise an online
+// schema bootstrap can hold a Share lock while waiting for our row lock's
+// transaction, and our later UPDATE waits to upgrade its table lock.
+async fn deployment_tx(pool: &PgPool) -> anyhow::Result<Transaction<'_, Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE deployments IN ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    Ok(tx)
 }
 
 // ── DeploymentRepo ───────────────────────────────────────────────────────
@@ -174,7 +185,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(&d.agent_uri)
         .bind(&d.agent_card)
         .bind(serde_json::to_value(&d.i_data)?)
-        .bind(d.clone_params.as_ref().map(serde_json::to_value).transpose()?)
+        .bind(
+            d.clone_params
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+        )
         .bind(d.phase.serde_tag())
         .bind(serde_json::to_value(&d.storage_stage)?)
         .bind(serde_json::to_value(&d.mint_stage)?)
@@ -206,10 +222,11 @@ impl DeploymentRepo for PostgresDeploymentRepo {
     }
 
     async fn list_by_owner(&self, owner: Address) -> anyhow::Result<Vec<Deployment>> {
-        let rows = sqlx::query("SELECT * FROM deployments WHERE owner = $1 ORDER BY created_at DESC")
-            .bind(owner.as_slice())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT * FROM deployments WHERE owner = $1 ORDER BY created_at DESC")
+                .bind(owner.as_slice())
+                .fetch_all(&self.pool)
+                .await?;
         rows.iter().map(row_to_deployment).collect()
     }
 
@@ -229,11 +246,49 @@ impl DeploymentRepo for PostgresDeploymentRepo {
     }
 
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
-        self.update_stage(seal_id, "container_stage", stage).await
+        if matches!(
+            stage,
+            StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+        ) {
+            let mut tx = deployment_tx(&self.pool).await?;
+            let row = sqlx::query(
+                "SELECT storage_stage,mint_stage FROM deployments WHERE seal_id=$1 FOR UPDATE",
+            )
+            .bind(seal_id.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+            let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+            let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+            let phase = derive_phase(&storage, &mint, &stage);
+            sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,provision_deadline=NULL,updated_at=now() WHERE seal_id=$1").bind(seal_id.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag()).execute(&mut *tx).await?;
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1").bind(seal_id.as_slice()).execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok(())
+        } else {
+            self.update_stage(seal_id, "container_stage", stage).await
+        }
     }
 
-    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+    async fn reset_container_track(
+        &self,
+        seal_id: SealId,
+        expected_sandbox: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let sandbox: Option<String> =
+            sqlx::query_scalar("SELECT sandbox_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+                .bind(seal_id.as_slice())
+                .fetch_one(&mut *tx)
+                .await?;
+        if let Some(expected) = expected_sandbox {
+            if sandbox.as_deref() != Some(expected) {
+                return Ok(false);
+            }
+            let pending:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1 AND enabled=TRUE AND authorized_sandbox_id IS DISTINCT FROM $2)").bind(seal_id.as_slice()).bind(expected).fetch_one(&mut *tx).await?;
+            if pending {
+                return Ok(false);
+            }
+        }
         sqlx::query(
             "UPDATE deployments
              SET container_stage = $1, sandbox_id = NULL, provisioned_at = NULL, updated_at = now()
@@ -243,6 +298,8 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         .bind(seal_id.as_slice())
         .execute(&mut *tx)
         .await?;
+
+        sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1").bind(seal_id.as_slice()).execute(&mut *tx).await?;
 
         // Recompute phase from all stages (container now NotStarted → Ready
         // when storage + mint are Confirmed).
@@ -264,17 +321,15 @@ impl DeploymentRepo for PostgresDeploymentRepo {
             .await?;
 
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE deployments SET agent_id = $1, updated_at = now() WHERE seal_id = $2",
-        )
-        .bind(agent_id_to_text(&agent_id))
-        .bind(seal_id.as_slice())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE deployments SET agent_id = $1, updated_at = now() WHERE seal_id = $2")
+            .bind(agent_id_to_text(&agent_id))
+            .bind(seal_id.as_slice())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -287,60 +342,88 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(())
     }
 
-    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE deployments SET sandbox_id = $1, updated_at = now() WHERE seal_id = $2",
-        )
-        .bind(&sandbox_id)
-        .bind(seal_id.as_slice())
-        .execute(&self.pool)
-        .await?;
+    async fn set_sandbox_id(&self, seal: SealId, sandbox: String) -> anyhow::Result<()> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("UPDATE deployments SET sandbox_id=$2,updated_at=now() WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .bind(&sandbox)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE container_status_bindings SET authorized_sandbox_id=$2 WHERE seal_id=$1 AND enabled=TRUE").bind(seal.as_slice()).bind(sandbox).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     async fn set_container_binding(
         &self,
-        seal_id: SealId,
+        seal: SealId,
         pubkey: Vec<u8>,
         mac: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE deployments
-             SET container_pubkey = $1, container_pubkey_mac = $2, updated_at = now()
-             WHERE seal_id = $3",
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        let modern: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1)",
         )
-        .bind(&pubkey)
-        .bind(&mac)
-        .bind(seal_id.as_slice())
-        .execute(&self.pool)
+        .bind(seal.as_slice())
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(())
+        if modern {
+            return Ok(false);
+        }
+        {
+            sqlx::query("UPDATE deployments SET container_pubkey=$2,container_pubkey_mac=$3,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL,updated_at=now() WHERE seal_id=$1").bind(seal.as_slice()).bind(pubkey).bind(mac).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
-    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE deployments
-             SET container_pubkey = NULL, container_pubkey_mac = NULL, updated_at = now()
-             WHERE agent_id = $1",
-        )
-        .bind(agent_id_to_text(&agent_id))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn mark_provisioned(
+    async fn clear_container_binding(
         &self,
-        seal_id: SealId,
-        at: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+        agent: AgentId,
+        live_owner: Address,
+    ) -> anyhow::Result<Option<String>> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row =
+            sqlx::query("SELECT seal_id,sandbox_id FROM deployments WHERE agent_id=$1 FOR UPDATE")
+                .bind(agent_id_to_text(&agent))
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(row) = row else { return Ok(None) };
+        let seal: Vec<u8> = row.try_get("seal_id")?;
+        let sandbox: Option<String> = row.try_get("sandbox_id")?;
+        let auth=sqlx::query("SELECT authorized_owner,authorized_sandbox_id,enabled FROM container_status_bindings WHERE seal_id=$1").bind(&seal).fetch_optional(&mut *tx).await?;
+        if let Some(auth) = auth {
+            let owner: Option<Vec<u8>> = auth.try_get("authorized_owner")?;
+            if owner.as_deref() == Some(live_owner.as_slice())
+                && auth.try_get::<bool, _>("enabled")?
+            {
+                let authorized: Option<String> = auth.try_get("authorized_sandbox_id")?;
+                tx.commit().await?;
+                return Ok(if authorized.is_some() && authorized == sandbox {
+                    None
+                } else {
+                    sandbox
+                });
+            }
+        }
+        sqlx::query("UPDATE deployments SET container_pubkey=NULL,container_pubkey_mac=NULL,updated_at=now() WHERE seal_id=$1").bind(&seal).execute(&mut *tx).await?;
+        sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1").bind(seal).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(sandbox)
+    }
+
+    async fn mark_provisioned(&self, seal_id: SealId, at: DateTime<Utc>) -> anyhow::Result<()> {
         // First-writer-wins: once provisioned_at is set, further successful
         // /provision calls (e.g. container restarted and re-authenticated)
         // leave the original timestamp intact.
         sqlx::query(
             "UPDATE deployments
              SET provisioned_at = COALESCE(provisioned_at, $1), updated_at = now()
-             WHERE seal_id = $2",
+             WHERE seal_id = $2 AND NOT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$2)",
         )
         .bind(at)
         .bind(seal_id.as_slice())
@@ -350,13 +433,11 @@ impl DeploymentRepo for PostgresDeploymentRepo {
     }
 
     async fn set_owner(&self, agent_id: AgentId, new_owner: Address) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE deployments SET owner = $1, updated_at = now() WHERE agent_id = $2",
-        )
-        .bind(new_owner.as_slice())
-        .bind(agent_id_to_text(&agent_id))
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE deployments SET owner = $1, updated_at = now() WHERE agent_id = $2")
+            .bind(new_owner.as_slice())
+            .bind(agent_id_to_text(&agent_id))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -420,13 +501,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         agent_id: AgentId,
         keys: Vec<alloy::primitives::Bytes>,
     ) -> anyhow::Result<usize> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT seal_id, i_data FROM deployments WHERE agent_id = $1 FOR UPDATE",
-        )
-        .bind(agent_id_to_text(&agent_id))
-        .fetch_optional(&mut *tx)
-        .await?;
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row =
+            sqlx::query("SELECT seal_id, i_data FROM deployments WHERE agent_id = $1 FOR UPDATE")
+                .bind(agent_id_to_text(&agent_id))
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(0);
@@ -461,13 +541,12 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         description: String,
         data_hash: DataHash,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT seal_id, i_data FROM deployments WHERE agent_id = $1 FOR UPDATE",
-        )
-        .bind(agent_id_to_text(&agent_id))
-        .fetch_optional(&mut *tx)
-        .await?;
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row =
+            sqlx::query("SELECT seal_id, i_data FROM deployments WHERE agent_id = $1 FOR UPDATE")
+                .bind(agent_id_to_text(&agent_id))
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             tx.commit().await?;
             return Ok(());
@@ -486,13 +565,11 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         artifacts[index].description = description;
         artifacts[index].data_hash = data_hash;
 
-        sqlx::query(
-            "UPDATE deployments SET i_data = $1, updated_at = now() WHERE seal_id = $2",
-        )
-        .bind(serde_json::to_value(&artifacts)?)
-        .bind(seal_id.as_slice())
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("UPDATE deployments SET i_data = $1, updated_at = now() WHERE seal_id = $2")
+            .bind(serde_json::to_value(&artifacts)?)
+            .bind(seal_id.as_slice())
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -505,7 +582,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         sqlx::query(
             "UPDATE deployments
              SET provision_deadline = $1, updated_at = now()
-             WHERE seal_id = $2",
+             WHERE seal_id = $2 AND ($1 IS NULL OR NOT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$2 AND enabled=TRUE AND binding_hash IS NOT NULL))",
         )
         .bind(deadline)
         .bind(seal_id.as_slice())
@@ -599,11 +676,7 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         Ok(out)
     }
 
-    async fn mark_heartbeat(
-        &self,
-        seal_id: SealId,
-        now: DateTime<Utc>,
-    ) -> anyhow::Result<()> {
+    async fn mark_heartbeat(&self, seal_id: SealId, now: DateTime<Utc>) -> anyhow::Result<()> {
         // Touch updated_at too — heartbeats are themselves a form of
         // mutation, and keeping the two timestamps coherent simplifies
         // consumer queries (they can sort by updated_at).
@@ -695,6 +768,155 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         })
     }
 
+    async fn retry_settings(&self, seal_id: SealId, version: i64) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            "UPDATE deployments SET settings_attempts = 0, updated_at = now()
+             WHERE seal_id = $1 AND settings_version = $2
+               AND settings_version > settings_confirmed_version",
+        )
+        .bind(seal_id.as_slice())
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn has_status_binding(&self, seal_id: SealId) -> anyhow::Result<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM container_status_bindings WHERE seal_id=$1)",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn prepare_status_boot(
+        &self,
+        seal_id: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal_id.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        let generation: Option<i64> = if let Some(ticket) = ticket {
+            Some(sqlx::query_scalar("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,ticket_hash,enabled,authorized_owner) VALUES($1,NULL,1,$2,TRUE,$3) ON CONFLICT(seal_id) DO UPDATE SET generation=container_status_bindings.generation+1,ticket_hash=EXCLUDED.ticket_hash,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=EXCLUDED.authorized_owner,authorized_sandbox_id=NULL RETURNING generation")
+                .bind(seal_id.as_slice()).bind(ticket.as_slice()).bind(owner.as_slice()).fetch_one(&mut *tx).await?)
+        } else {
+            sqlx::query_scalar("UPDATE container_status_bindings SET generation=generation+1,enabled=TRUE,binding_hash=NULL,boot_started_at=0,boot_id=NULL,authorized_owner=$2 WHERE seal_id=$1 AND ticket_hash IS NOT NULL RETURNING generation")
+                .bind(seal_id.as_slice()).bind(owner.as_slice()).fetch_optional(&mut *tx).await?
+        };
+        tx.commit().await?;
+        Ok(generation)
+    }
+
+    async fn boot_authorization(
+        &self,
+        seal_id: SealId,
+    ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>> {
+        let row=sqlx::query("SELECT generation,ticket_hash,enabled,boot_started_at,authorized_owner,authorized_sandbox_id FROM container_status_bindings WHERE seal_id=$1 AND ticket_hash IS NOT NULL").bind(seal_id.as_slice()).fetch_optional(&self.pool).await?;
+        row.map(|r| {
+            Ok(crate::auth::status::BootAuthorization {
+                generation: r.try_get("generation")?,
+                ticket_hash: r
+                    .try_get::<Vec<u8>, _>("ticket_hash")?
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid ticket hash"))?,
+                enabled: r.try_get("enabled")?,
+                started_at: r.try_get("boot_started_at")?,
+                owner: r
+                    .try_get::<Option<Vec<u8>>, _>("authorized_owner")?
+                    .map(|v| Address::from_slice(&v)),
+                sandbox_id: r.try_get("authorized_sandbox_id")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn bind_status_boot(
+        &self,
+        seal_id: SealId,
+        pubkey: Vec<u8>,
+        mac: Vec<u8>,
+        hash: [u8; 32],
+        claim: &crate::auth::status::BootClaim,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        let row = sqlx::query(
+            "SELECT sandbox_id,container_stage FROM deployments WHERE seal_id=$1 FOR UPDATE",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else { return Ok(false) };
+        let sandbox: Option<String> = row.try_get("sandbox_id")?;
+        let stage: StageStatus = serde_json::from_value(row.try_get("container_stage")?)?;
+        if sandbox.as_deref().unwrap_or("").is_empty()
+            || matches!(stage, StageStatus::Stopped { .. })
+        {
+            return Ok(false);
+        }
+        let n=sqlx::query("UPDATE container_status_bindings SET binding_hash=$2,boot_id=$3,boot_started_at=$4 WHERE seal_id=$1 AND enabled=TRUE AND generation=$5 AND ticket_hash=$6 AND boot_started_at<$4 AND authorized_sandbox_id=$7")
+            .bind(seal_id.as_slice()).bind(hash.as_slice()).bind(claim.boot_id.as_slice()).bind(claim.started_at).bind(claim.generation).bind(claim.ticket_hash.as_slice()).bind(sandbox.as_deref()).execute(&mut *tx).await?.rows_affected();
+        if n != 1 {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE deployments SET container_pubkey=$2,container_pubkey_mac=$3,provisioned_at=COALESCE(provisioned_at,now()),provision_deadline=NULL WHERE seal_id=$1")
+            .bind(seal_id.as_slice()).bind(pubkey).bind(mac).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn apply_status_report(
+        &self,
+        seal_id: SealId,
+        hash: Option<[u8; 32]>,
+        stage: StageStatus,
+        version: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        // Lock the deployment before reading the receipt in a fresh statement.
+        // bind_status_boot uses the same lock order, preventing a stale report
+        // from passing validation while another boot replaces its receipt.
+        let row = sqlx::query("SELECT * FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal_id.as_slice())
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let d = row_to_deployment(&row)?;
+        if d.sandbox_id.as_deref().unwrap_or("").is_empty()
+            || matches!(d.container_stage, StageStatus::Stopped { .. })
+        {
+            return Ok(false);
+        }
+        let active: Option<Option<Vec<u8>>> = sqlx::query_scalar(
+            "SELECT CASE WHEN enabled THEN binding_hash ELSE NULL END FROM container_status_bindings WHERE seal_id=$1",
+        )
+        .bind(seal_id.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if match active {
+            Some(Some(active)) => hash.as_ref().map(|h| h.as_slice()) != Some(active.as_slice()),
+            Some(None) => true,
+            None => hash.is_some(),
+        } {
+            return Ok(false);
+        }
+        let confirm = hash.is_some()
+            && version == Some(d.settings_version)
+            && d.settings_confirmed_version < d.settings_version
+            && d.settings.is_some();
+        let phase = derive_phase(&d.storage_stage, &d.mint_stage, &stage);
+        sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,last_heartbeat=now(),updated_at=now(), settings_last_good=CASE WHEN $4 THEN settings ELSE settings_last_good END,settings_confirmed_version=CASE WHEN $4 THEN settings_version ELSE settings_confirmed_version END,settings_attempts=CASE WHEN $4 THEN 0 ELSE settings_attempts END WHERE seal_id=$1")
+            .bind(seal_id.as_slice()).bind(serde_json::to_value(stage)?).bind(phase.serde_tag()).bind(confirm).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn seed_settings(
         &self,
         seal_id: SealId,
@@ -747,21 +969,36 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         })
     }
 
-    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>> {
-        let row = sqlx::query(
-            "UPDATE deployments
-             SET settings_attempts = settings_attempts + 1, updated_at = now()
-             WHERE seal_id = $1
-               AND settings_version > settings_confirmed_version
-             RETURNING settings_attempts",
+    async fn note_settings_attempt(
+        &self,
+        seal: SealId,
+        version: i64,
+        generation: Option<i64>,
+    ) -> anyhow::Result<Option<i32>> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await?;
+        let auth = sqlx::query(
+            "SELECT generation,enabled FROM container_status_bindings WHERE seal_id=$1",
         )
-        .bind(seal_id.as_slice())
-        .fetch_optional(&self.pool)
+        .bind(seal.as_slice())
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(match row {
-            Some(r) => Some(r.try_get("settings_attempts")?),
-            None => None,
-        })
+        let allowed = match auth {
+            Some(row) => {
+                row.try_get::<bool, _>("enabled")?
+                    && generation == Some(row.try_get::<i64, _>("generation")?)
+            }
+            None => generation.is_none(),
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        let attempts:Option<i32>=sqlx::query_scalar("UPDATE deployments SET settings_attempts=settings_attempts+1,updated_at=now() WHERE seal_id=$1 AND settings_version=$2 AND settings_version>settings_confirmed_version RETURNING settings_attempts").bind(seal.as_slice()).bind(version).fetch_optional(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(attempts)
     }
 
     async fn stale_running_candidates(
@@ -801,11 +1038,10 @@ impl PostgresDeploymentRepo {
         column: &str,
         stage: StageStatus,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = deployment_tx(&self.pool).await?;
 
-        let sql = format!(
-            "UPDATE deployments SET {column} = $1, updated_at = now() WHERE seal_id = $2"
-        );
+        let sql =
+            format!("UPDATE deployments SET {column} = $1, updated_at = now() WHERE seal_id = $2");
         sqlx::query(&sql)
             .bind(serde_json::to_value(&stage)?)
             .bind(seal_id.as_slice())
@@ -814,7 +1050,7 @@ impl PostgresDeploymentRepo {
 
         // Recompute phase from all stages.
         let row = sqlx::query(
-            "SELECT storage_stage, mint_stage, container_stage FROM deployments WHERE seal_id = $1"
+            "SELECT storage_stage, mint_stage, container_stage FROM deployments WHERE seal_id = $1",
         )
         .bind(seal_id.as_slice())
         .fetch_one(&mut *tx)
@@ -850,11 +1086,7 @@ impl PostgresIdempotencyStore {
 
 #[async_trait]
 impl IdempotencyStore for PostgresIdempotencyStore {
-    async fn try_reserve(
-        &self,
-        key: &str,
-        seal_id: SealId,
-    ) -> anyhow::Result<Option<SealId>> {
+    async fn try_reserve(&self, key: &str, seal_id: SealId) -> anyhow::Result<Option<SealId>> {
         // Try to insert; if a row for `key` exists, return its seal_id.
         let row = sqlx::query(
             r#"
@@ -915,5 +1147,503 @@ impl DeploymentPhase {
             Self::Offline => "offline",
             Self::Failed => "failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod settings_retry_tests {
+    use super::*;
+    fn test_database_url() -> String {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated DB URL");
+        format!(
+            "{}{}application_name=agentdna_{}",
+            url,
+            if url.contains('?') { '&' } else { '?' },
+            hex::encode(rand::random::<[u8; 8]>())
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_owner_recreate_retries_only_the_expected_unconfirmed_settings() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").expect("isolated test DB URL");
+        let pool = connect(&url).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let previous = serde_json::json!({"provider":"0g-compute","model":"old"});
+        let current = serde_json::json!({"provider":"partner","model":"new"});
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,settings,settings_version,settings_last_good,settings_confirmed_version,settings_attempts) VALUES($1,$2,$2,$3,2,$4,1,3)")
+            .bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(&current).bind(&previous).execute(&pool).await.unwrap();
+
+        assert!(!repo.retry_settings(seal, 1).await.unwrap());
+        assert_eq!(repo.get(seal).await.unwrap().unwrap().settings_attempts, 3);
+        assert!(repo.retry_settings(seal, 2).await.unwrap());
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.settings.as_ref(), Some(&current));
+        assert_eq!(d.settings_last_good.as_ref(), Some(&previous));
+        assert_eq!(d.settings_version, 2);
+        assert_eq!(d.settings_confirmed_version, 1);
+        assert_eq!(d.settings_attempts, 0);
+        assert_eq!(
+            repo.note_settings_attempt(
+                seal,
+                repo.get(seal).await.unwrap().unwrap().settings_version,
+                repo.boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation)
+            )
+            .await
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            repo.promote_settings_last_good(seal).await.unwrap(),
+            Some(2)
+        );
+        assert!(!repo.retry_settings(seal, 2).await.unwrap());
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_status_receipt_guards_are_atomic_and_confirm_only_the_served_version() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = std::sync::Arc::new(PostgresDeploymentRepo::new(pool.clone()));
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let current = serde_json::json!({"model":"new"});
+        let previous = serde_json::json!({"model":"old"});
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,sandbox_id,settings,settings_version,settings_last_good,settings_confirmed_version,settings_attempts) VALUES($1,$2,$2,'sandbox',$3,2,$4,1,1)")
+            .bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(&current).bind(&previous).execute(&pool).await.unwrap();
+        let stage = StageStatus::Confirmed { at: Utc::now() };
+        // A legacy heartbeat remains useful for liveness but cannot bless settings.
+        assert!(repo
+            .apply_status_report(seal, None, stage.clone(), Some(2))
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings_confirmed_version,
+            1
+        );
+        let generation = repo
+            .prepare_status_boot(seal, Some([9; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.set_sandbox_id(seal, "sandbox".into()).await.unwrap();
+        let mut claim = crate::auth::status::BootClaim {
+            generation,
+            ticket_hash: [9; 32],
+            boot_id: B256::repeat_byte(1),
+            started_at: 1,
+        };
+        assert!(repo
+            .bind_status_boot(seal, vec![2; 33], vec![0; 32], [1; 32], &claim)
+            .await
+            .unwrap());
+        claim.started_at = 2;
+        claim.boot_id = B256::repeat_byte(2);
+        repo.bind_status_boot(seal, vec![3; 33], vec![0; 32], [2; 32], &claim)
+            .await
+            .unwrap();
+        assert!(!repo
+            .apply_status_report(seal, Some([1; 32]), stage.clone(), Some(2))
+            .await
+            .unwrap());
+        assert!(!repo
+            .apply_status_report(seal, None, stage.clone(), Some(2))
+            .await
+            .unwrap());
+        assert!(repo
+            .apply_status_report(seal, Some([2; 32]), stage.clone(), Some(1))
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.get(seal).await.unwrap().unwrap().settings_last_good,
+            Some(previous)
+        );
+
+        // Force a report to wait behind a boot rotation. Its SELECT FOR UPDATE
+        // began before commit; the receipt must be read again after the lock.
+        let mut tx = deployment_tx(&pool).await.unwrap();
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let task_repo = repo.clone();
+        let task_stage = stage.clone();
+        let task = tokio::spawn(async move {
+            task_repo
+                .apply_status_report(seal, Some([2; 32]), task_stage, Some(2))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=current_setting('application_name') AND wait_event_type='Lock' AND (query LIKE 'SELECT * FROM deployments WHERE seal_id=%FOR UPDATE%' OR query='LOCK TABLE deployments IN ROW EXCLUSIVE MODE'))").fetch_one(&pool).await.unwrap();
+                if waiting {break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("status report must be waiting on deployment lock");
+        sqlx::query("UPDATE container_status_bindings SET binding_hash=$2 WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .bind([3u8; 32].as_slice())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            !task.await.unwrap(),
+            "report validated a superseded receipt"
+        );
+        assert_eq!(
+            repo.get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings_confirmed_version,
+            1
+        );
+        assert!(repo
+            .apply_status_report(seal, Some([3; 32]), stage.clone(), Some(2))
+            .await
+            .unwrap());
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.settings_confirmed_version, 2);
+        assert_eq!(d.settings_last_good, Some(current));
+        assert_eq!(d.settings_attempts, 0);
+        sqlx::query("UPDATE deployments SET sandbox_id=NULL WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!repo
+            .apply_status_report(seal, Some([3; 32]), stage, Some(2))
+            .await
+            .unwrap());
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !repo.has_status_binding(seal).await.unwrap(),
+            "binding must cascade on delete"
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_boot_lifecycle_fences_stop_reset_transfer_and_waiting_provision() {
+        use crate::auth::status::BootClaim;
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,sandbox_id,agent_id) VALUES($1,$2,$2,'sandbox',$3)").bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(seal.to_string()).execute(&pool).await.unwrap();
+        let generation = repo
+            .prepare_status_boot(seal, Some([1; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.set_sandbox_id(seal, "sandbox".into()).await.unwrap();
+        let first = BootClaim {
+            generation,
+            ticket_hash: [1; 32],
+            boot_id: B256::repeat_byte(1),
+            started_at: 100,
+        };
+        assert!(repo
+            .bind_status_boot(seal, vec![2; 33], vec![0; 32], [1; 32], &first)
+            .await
+            .unwrap());
+        assert!(
+            !repo
+                .bind_status_boot(seal, vec![2; 33], vec![0; 32], [2; 32], &first)
+                .await
+                .unwrap(),
+            "duplicate boot must not rotate the receipt"
+        );
+        repo.set_provision_deadline(seal, Some(Utc::now()))
+            .await
+            .unwrap();
+        assert!(
+            repo.get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .provision_deadline
+                .is_none(),
+            "late create completion rearmed a completed boot's deadline"
+        );
+        let running = StageStatus::Confirmed { at: Utc::now() };
+        repo.set_container_stage(
+            seal,
+            StageStatus::Stopped {
+                at: Utc::now(),
+                reason: "user_stop".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!repo
+            .apply_status_report(seal, Some([1; 32]), running.clone(), None)
+            .await
+            .unwrap());
+        assert!(!repo
+            .apply_status_report(seal, None, running.clone(), None)
+            .await
+            .unwrap());
+        assert!(
+            !repo
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        let resumed = repo
+            .prepare_status_boot(seal, None, Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resumed > generation);
+        assert!(!repo
+            .bind_status_boot(seal, vec![2; 33], vec![0; 32], [2; 32], &first)
+            .await
+            .unwrap());
+        repo.set_container_stage(
+            seal,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let second = BootClaim {
+            generation: resumed,
+            started_at: 200,
+            ..first.clone()
+        };
+        assert!(repo
+            .bind_status_boot(seal, vec![2; 33], vec![0; 32], [2; 32], &second)
+            .await
+            .unwrap());
+        // Force a pending provision to cross a reset under the same row lock.
+        let mut tx = deployment_tx(&pool).await.unwrap();
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let stale = BootClaim {
+            started_at: 300,
+            ..second.clone()
+        };
+        let task_repo = repo.clone();
+        let task = tokio::spawn(async move {
+            task_repo
+                .bind_status_boot(seal, vec![2; 33], vec![0; 32], [3; 32], &stale)
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {loop {let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=current_setting('application_name') AND wait_event_type='Lock' AND (query LIKE 'SELECT sandbox_id,container_stage FROM deployments%FOR UPDATE%' OR query='LOCK TABLE deployments IN ROW EXCLUSIVE MODE'))").fetch_one(&pool).await.unwrap();if waiting {break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+        sqlx::query("UPDATE container_status_bindings SET generation=generation+1,ticket_hash=$2,binding_hash=NULL,boot_started_at=0 WHERE seal_id=$1").bind(seal.as_slice()).bind([9u8;32].as_slice()).execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        assert!(!task.await.unwrap(), "stale provision won after reset");
+        let reset = repo.boot_authorization(seal).await.unwrap().unwrap();
+        let current = BootClaim {
+            generation: reset.generation,
+            ticket_hash: [9; 32],
+            started_at: 400,
+            ..first.clone()
+        };
+        assert!(!repo
+            .bind_status_boot(seal, vec![2; 33], vec![0; 32], [4; 32], &second)
+            .await
+            .unwrap());
+        assert!(repo
+            .bind_status_boot(seal, vec![3; 33], vec![0; 32], [4; 32], &current)
+            .await
+            .unwrap());
+        assert!(
+            !repo
+                .set_container_binding(seal, vec![2; 33], vec![0; 32])
+                .await
+                .unwrap(),
+            "legacy downgrade was accepted"
+        );
+        // Transfer revokes both proof and ticket authorization atomically.
+        let agent = U256::from_be_slice(seal.as_slice());
+        repo.set_agent_id(seal, agent).await.unwrap();
+        repo.clear_container_binding(agent, Address::repeat_byte(0x99))
+            .await
+            .unwrap();
+        assert!(
+            !repo
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(!repo
+            .apply_status_report(seal, Some([4; 32]), running, None)
+            .await
+            .unwrap());
+        assert!(!repo
+            .bind_status_boot(seal, vec![3; 33], vec![0; 32], [5; 32], &current)
+            .await
+            .unwrap());
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_attempts_and_late_transfer_preserve_the_current_authorization() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,sandbox_id) VALUES($1,$2,$2,'old')").bind(seal.as_slice()).bind(Address::ZERO.as_slice()).execute(&pool).await.unwrap();
+        let agent = U256::from_be_slice(seal.as_slice());
+        repo.set_agent_id(seal, agent).await.unwrap();
+        repo.set_settings(seal, serde_json::json!({"model":"v1"}), 0)
+            .await
+            .unwrap();
+        let first = repo
+            .prepare_status_boot(seal, Some([1; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repo.note_settings_attempt(seal, 1, Some(first))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        repo.set_settings(seal, serde_json::json!({"model":"v2"}), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.note_settings_attempt(seal, 1, Some(first))
+                .await
+                .unwrap(),
+            None,
+            "old snapshot burned the new version's first attempt"
+        );
+        let buyer = Address::repeat_byte(0x99);
+        let current = repo
+            .prepare_status_boot(seal, Some([2; 32]), buyer)
+            .await
+            .unwrap()
+            .unwrap();
+        repo.retry_settings(seal, 2).await.unwrap();
+        assert_eq!(
+            repo.note_settings_attempt(seal, 2, Some(first))
+                .await
+                .unwrap(),
+            None,
+            "old generation burned reset's fresh attempt"
+        );
+        assert_eq!(
+            repo.note_settings_attempt(seal, 2, None).await.unwrap(),
+            None,
+            "legacy request burned a managed boot's attempt"
+        );
+        assert_eq!(repo.get(seal).await.unwrap().unwrap().settings_attempts, 0);
+        assert_eq!(
+            repo.clear_container_binding(agent, Address::repeat_byte(0x99))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("old")
+        );
+        assert!(
+            !repo.reset_container_track(seal, Some("old")).await.unwrap(),
+            "late cleanup revoked a pending new-owner create"
+        );
+        assert!(
+            repo.boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        repo.set_sandbox_id(seal, "buyer-new".into()).await.unwrap();
+        assert_eq!(
+            repo.clear_container_binding(agent, Address::repeat_byte(0x99))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(!repo.reset_container_track(seal, Some("old")).await.unwrap());
+        let auth = repo.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(auth.generation, current);
+        assert!(auth.enabled);
+        assert_eq!(auth.sandbox_id.as_deref(), Some("buyer-new"));
+        assert_eq!(
+            repo.note_settings_attempt(seal, 2, Some(current))
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_online_bootstrap_cannot_deadlock_runtime_lock_upgrades() {
+        let url = std::env::var("AGENTDNA_TEST_DATABASE_URL").unwrap();
+        let pool = connect(&url).await.unwrap();
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let app = format!("agentdna_bootstrap_{}", hex::encode(&seal[..8]));
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner) VALUES($1,$2,$2)")
+            .bind(seal.as_slice())
+            .bind(Address::ZERO.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = deployment_tx(&pool).await.unwrap();
+        sqlx::query("SELECT seal_id FROM deployments WHERE seal_id=$1 FOR UPDATE")
+            .bind(seal.as_slice())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let bootstrap_url = format!(
+            "{}{}application_name={}",
+            url,
+            if url.contains('?') { '&' } else { '?' },
+            app
+        );
+        let bootstrap = async { connect(&bootstrap_url).await.unwrap() };
+        let mutate = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5),async {loop {let waiting:bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock')").bind(&app).fetch_one(&pool).await.unwrap();if waiting {break;}tokio::time::sleep(std::time::Duration::from_millis(10)).await;}}).await.unwrap();
+            // An UPDATE after the row read must not need a table-lock upgrade
+            // behind the waiting migration. This used to form the deadlock cycle.
+            sqlx::query("UPDATE deployments SET updated_at=now() WHERE seal_id=$1")
+                .bind(seal.as_slice())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        };
+        let _ = tokio::join!(bootstrap, mutate);
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 }

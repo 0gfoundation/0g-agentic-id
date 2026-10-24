@@ -18,8 +18,8 @@ use attestor_shared::{
     chain::AgenticID,
     repo::{load_checkpoint, save_checkpoint},
     types::{
-        derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId,
-        StageStatus, StorageRoot,
+        derive_phase, AgentId, Deployment, DeploymentPhase, IDataArtifact, SealId, StageStatus,
+        StorageRoot,
     },
     Config, CryptoModule, DeploymentRepo, EventBus, JobPayload, JobQueue, WsEvent,
 };
@@ -151,7 +151,10 @@ impl Watcher {
             if let Ok(ev) = AgenticID::URIUpdated::decode_log(&log.inner, true) {
                 return self.on_uri_updated(ev.data, block).await;
             }
-            tracing::trace!(?log, "skipped canonical log (not an identity event we track)");
+            tracing::trace!(
+                ?log,
+                "skipped canonical log (not an identity event we track)"
+            );
             return Ok(());
         }
 
@@ -186,11 +189,7 @@ impl Watcher {
     }
 
     // ── Transfer ─────────────────────────────────────────────────────
-    async fn on_transfer(
-        &self,
-        ev: AgenticID::Transfer,
-        block: u64,
-    ) -> anyhow::Result<()> {
+    async fn on_transfer(&self, ev: AgenticID::Transfer, block: u64) -> anyhow::Result<()> {
         tracing::info!(
             from = %ev.from,
             to = %ev.to,
@@ -202,14 +201,34 @@ impl Watcher {
         if ev.from == Address::ZERO {
             return Ok(());
         }
-        self.deployments.set_owner(ev.tokenId, ev.to).await?;
+        let managed = match self.deployments.get_by_agent_id(ev.tokenId).await? {
+            Some(d) => self
+                .deployments
+                .boot_authorization(d.seal_id)
+                .await?
+                .is_some_and(|a| a.enabled && a.owner.is_some()),
+            None => false,
+        };
+        let live_owner = if managed {
+            AgenticID::new(self.contract_addr, self.provider.clone())
+                .ownerOf(ev.tokenId)
+                .call()
+                .await?
+                ._0
+        } else {
+            ev.to
+        };
+        self.deployments.set_owner(ev.tokenId, live_owner).await?;
         // Drop the container pubkey binding so the prior owner's resumed
         // container (reused SANDBOX_SEAL_KEY, stale attestation) can no longer
         // skip the freshness window — it now fails /provision instead of
         // silently inheriting the old binding. The new owner's fresh
         // container re-establishes a binding via a fresh attestation. See
         // {provision} step 5.
-        self.deployments.clear_container_binding(ev.tokenId).await?;
+        let old_sandbox = self
+            .deployments
+            .clear_container_binding(ev.tokenId, live_owner)
+            .await?;
         if let Some(d) = self.deployments.get_by_agent_id(ev.tokenId).await? {
             let _ = self
                 .events
@@ -223,10 +242,13 @@ impl Watcher {
             // holds the admin signer). Skip when there's no sandbox to kill
             // (non-seal/data tokens, or never-provisioned). Best-effort — the
             // sealed fail-safe self-kill (deferred #5) is the real guarantee.
-            if d.sandbox_id.as_deref().is_some_and(|s| !s.is_empty()) {
+            if let Some(old) = old_sandbox.filter(|s| !s.is_empty()) {
                 if let Err(e) = self
                     .jobs
-                    .submit(JobPayload::SandboxTeardown { seal_id: d.seal_id })
+                    .submit(JobPayload::SandboxTeardown {
+                        seal_id: d.seal_id,
+                        expected_sandbox_id: Some(old),
+                    })
                     .await
                 {
                     tracing::warn!(
@@ -388,11 +410,7 @@ impl Watcher {
     // Full-array iData replace (delete + push-all on chain). We don't
     // try to reconstruct the new datas+keys from `ev.newDatas` /
     // `ev.sealedKeys` — same rationale as ITransferred, pull from view.
-    async fn on_updated(
-        &self,
-        ev: AgenticID::Updated,
-        block: u64,
-    ) -> anyhow::Result<()> {
+    async fn on_updated(&self, ev: AgenticID::Updated, block: u64) -> anyhow::Result<()> {
         tracing::info!(
             token_id = %ev.tokenId,
             n_old = ev.oldDatas.len(),
@@ -433,11 +451,7 @@ impl Watcher {
     // already matches the event's URI we just broadcast (so subscribers
     // don't miss the attestor-written case); otherwise we fetch the new
     // AgentCard JSON best-effort and update both columns.
-    async fn on_uri_updated(
-        &self,
-        ev: AgenticID::URIUpdated,
-        block: u64,
-    ) -> anyhow::Result<()> {
+    async fn on_uri_updated(&self, ev: AgenticID::URIUpdated, block: u64) -> anyhow::Result<()> {
         tracing::info!(
             agent_id = %ev.agentId,
             updated_by = %ev.updatedBy,
@@ -482,11 +496,7 @@ impl Watcher {
     }
 
     // ── Registered ───────────────────────────────────────────────────
-    async fn on_registered(
-        &self,
-        ev: AgenticID::Registered,
-        block: u64,
-    ) -> anyhow::Result<()> {
+    async fn on_registered(&self, ev: AgenticID::Registered, block: u64) -> anyhow::Result<()> {
         tracing::info!(
             agent_id = %ev.agentId,
             owner = %ev.owner,
@@ -723,7 +733,11 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
         w.on_transfer(
-            AgenticID::Transfer { from: seller, to: buyer, tokenId: agent_id },
+            AgenticID::Transfer {
+                from: seller,
+                to: buyer,
+                tokenId: agent_id,
+            },
             100,
         )
         .await
@@ -740,7 +754,7 @@ mod tests {
         let submitted = jobs.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1, "exactly one teardown enqueued");
         match &submitted[0] {
-            JobPayload::SandboxTeardown { seal_id: s } => assert_eq!(*s, seal_id),
+            JobPayload::SandboxTeardown { seal_id: s, .. } => assert_eq!(*s, seal_id),
             other => panic!("expected SandboxTeardown, got {other:?}"),
         }
     }
@@ -759,7 +773,11 @@ mod tests {
         let jobs = Arc::new(InMemoryJobQueue::new());
         let w = test_watcher(deployments.clone(), events.clone(), jobs.clone());
         w.on_transfer(
-            AgenticID::Transfer { from: Address::ZERO, to: owner, tokenId: agent_id },
+            AgenticID::Transfer {
+                from: Address::ZERO,
+                to: owner,
+                tokenId: agent_id,
+            },
             100,
         )
         .await
@@ -775,5 +793,90 @@ mod tests {
             jobs.submitted.lock().unwrap().is_empty(),
             "mint enqueues no teardown"
         );
+    }
+    async fn serve_owner(owner: Address) -> (HttpProvider, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut raw = Vec::new();
+            let request = loop {
+                let mut b = [0; 2048];
+                let n = stream.read(&mut b).await.unwrap();
+                assert!(n > 0);
+                raw.extend_from_slice(&b[..n]);
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw[pos + 4..])
+                    {
+                        break value;
+                    }
+                }
+            };
+            let body=serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":format!("0x{}{}","00".repeat(12),hex::encode(owner))}).to_string();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).as_bytes()).await.unwrap();
+        });
+        (
+            ProviderBuilder::new().on_http(format!("http://{}", address).parse().unwrap()),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn late_transfer_preserves_a_new_owner_boot_and_captures_only_the_old_sandbox() {
+        for (published, cycled) in [(false, false), (true, false), (true, true)] {
+            let deployments = Arc::new(InMemoryDeploymentRepo::new());
+            let events = Arc::new(InMemoryEventBus::new());
+            let jobs = Arc::new(InMemoryJobQueue::new());
+            let seal = B256::repeat_byte(0xaa);
+            let agent = U256::from(7);
+            let seller = Address::repeat_byte(0x11);
+            let buyer = Address::repeat_byte(0x99);
+            seed_bound(&deployments, seal, agent, seller);
+            let active_owner = if cycled { seller } else { buyer };
+            let generation = deployments
+                .prepare_status_boot(seal, Some([9; 32]), active_owner)
+                .await
+                .unwrap()
+                .unwrap();
+            if published {
+                deployments
+                    .set_sandbox_id(seal, "buyer-new".into())
+                    .await
+                    .unwrap();
+            }
+            let mut w = test_watcher(deployments.clone(), events, jobs.clone());
+            let (provider, rpc) = serve_owner(active_owner).await;
+            w.provider = provider;
+            w.on_transfer(
+                AgenticID::Transfer {
+                    from: seller,
+                    to: buyer,
+                    tokenId: agent,
+                },
+                100,
+            )
+            .await
+            .unwrap();
+            rpc.await.unwrap();
+            assert_eq!(
+                deployments.get(seal).await.unwrap().unwrap().owner,
+                active_owner
+            );
+            let auth = deployments.boot_authorization(seal).await.unwrap().unwrap();
+            assert!(auth.enabled);
+            assert_eq!(auth.generation, generation);
+            let queued = jobs.submitted.lock().unwrap();
+            if published {
+                assert!(
+                    queued.is_empty(),
+                    "new owner's container was scheduled for deletion"
+                );
+            } else {
+                assert!(
+                    matches!(&queued[0],JobPayload::SandboxTeardown{expected_sandbox_id:Some(id),..} if id=="sb-1")
+                );
+            }
+        }
     }
 }

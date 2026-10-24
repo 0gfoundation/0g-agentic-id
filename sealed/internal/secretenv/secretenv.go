@@ -21,7 +21,9 @@
 //
 // `owner` is the envelope signer. Open requires it to equal the agent's live
 // on-chain owner, so a ciphertext signed by a previous owner cannot be
-// replayed into a container the next owner controls.
+// replayed into a container the next owner controls. Version 2 additionally
+// carries "provider", binding the credential to a registered provider ID.
+// Legacy v1 and plaintext credentials are restricted to 0g-compute.
 package secretenv
 
 import (
@@ -30,9 +32,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	"seal-verify/internal/inference"
 
 	eciesgo "github.com/ecies/go/v2"
 	"github.com/ethereum/go-ethereum/common"
@@ -41,7 +46,7 @@ import (
 // EnvVar is the container env var that carries the sealed secret env.
 const EnvVar = "SEAL_SECRET_ENV"
 
-// Version is the only plaintext version this binary understands.
+// Version is the legacy compute-only plaintext version; v2 binds a provider.
 const Version = 1
 
 // supported lists the names a secret env may set. Unknown names are ignored
@@ -85,6 +90,10 @@ func Reason(err error) string {
 
 // Opened is the validated content of a sealed secret env.
 type Opened struct {
+	Version   int
+	Provider  string
+	RouteHash string
+	Registry  *inference.RegistryPin
 	// Env holds only supported names with non-empty values.
 	Env map[string]string
 	// Ignored lists unsupported names (sorted), for a log line. Never values.
@@ -92,9 +101,12 @@ type Opened struct {
 }
 
 type payload struct {
-	V     int               `json:"v"`
-	Owner string            `json:"owner"`
-	Env   map[string]string `json:"env"`
+	V         int                    `json:"v"`
+	Owner     string                 `json:"owner"`
+	Provider  string                 `json:"provider,omitempty"`
+	RouteHash string                 `json:"route_hash,omitempty"`
+	Registry  *inference.RegistryPin `json:"registry,omitempty"`
+	Env       map[string]string      `json:"env"`
 }
 
 // Open decodes, decrypts and validates a sealed secret env.
@@ -125,10 +137,30 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, err
 	dec := json.NewDecoder(bytes.NewReader(pt))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&p); err != nil {
-		return nil, fail(ReasonMalformed, errors.New("plaintext is not a v1 secret env document"))
+		return nil, fail(ReasonMalformed, errors.New("plaintext is not a secret env document"))
 	}
-	if p.V != Version {
-		return nil, fail(ReasonUnsupportedVersion, fmt.Errorf("unsupported version %d (want %d)", p.V, Version))
+	if p.V != Version && p.V != 2 && p.V != 3 {
+		return nil, fail(ReasonUnsupportedVersion, fmt.Errorf("unsupported version %d (want 1, 2 or 3)", p.V))
+	}
+	if p.V >= 2 && !regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`).MatchString(p.Provider) {
+		return nil, fail(ReasonMalformed, errors.New("provider-bound secret env requires a provider"))
+	}
+	if p.V == 1 && p.Provider != "" {
+		return nil, fail(ReasonMalformed, errors.New("provider binding requires v2"))
+	}
+	if p.V == 3 && !regexp.MustCompile(`^0x[0-9a-f]{64}$`).MatchString(p.RouteHash) {
+		return nil, fail(ReasonMalformed, errors.New("v3 secret env requires a route_hash"))
+	}
+	if p.V != 3 && p.RouteHash != "" {
+		return nil, fail(ReasonMalformed, errors.New("route binding requires v3"))
+	}
+	if p.V == 3 && (p.Registry == nil || p.Registry.Version < 0 || p.Registry.Version > 9007199254740991 ||
+		(p.Registry.Version == 0 && p.Registry.Digest != "") ||
+		(p.Registry.Version > 0 && !regexp.MustCompile(`^0x[0-9a-f]{64}$`).MatchString(p.Registry.Digest))) {
+		return nil, fail(ReasonMalformed, errors.New("v3 secret env requires an accepted registry version and digest"))
+	}
+	if p.V != 3 && p.Registry != nil {
+		return nil, fail(ReasonMalformed, errors.New("registry binding requires v3"))
 	}
 	if !common.IsHexAddress(p.Owner) {
 		return nil, fail(ReasonMalformed, errors.New("owner is not an address"))
@@ -141,7 +173,7 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, err
 			common.HexToAddress(p.Owner).Hex(), common.HexToAddress(chainOwner).Hex()))
 	}
 
-	out := &Opened{Env: map[string]string{}}
+	out := &Opened{Version: p.V, Provider: p.Provider, RouteHash: p.RouteHash, Registry: p.Registry, Env: map[string]string{}}
 	for name, value := range p.Env {
 		if !supported[name] {
 			out.Ignored = append(out.Ignored, name)
@@ -159,48 +191,33 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, err
 	return out, nil
 }
 
-// NotAppliedPrefix starts the status detail ResolveAPIKey returns when an
-// owner supplied a sealed key that did not apply.
-const NotAppliedPrefix = "secret_env_not_applied: "
-
-// ResolveAPIKey returns the inference key the adapters should use, given the
-// plain API_KEY env value and the raw SEAL_SECRET_ENV value, plus an issue
-// for the attestor (empty when there is nothing to report):
-//
-//   - no secret env: plainKey, unchanged;
-//   - a secret env that opens (owner-bound) and carries API_KEY: that value,
-//     which wins over plainKey;
-//   - a secret env that fails to open: plainKey, with a FAIL line. If that
-//     leaves no key at all, the agent boots but cannot call its model, so
-//     issue is "secret_env_not_applied: <reason>" (a reason class, never a
-//     value) for the caller to report as an owner-recoverable warning.
-//
-// logf lines name variables and lengths only, never values.
-func ResolveAPIKey(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) (key, issue string) {
+// ResolveCredential is the runtime path. An explicitly supplied ciphertext that
+// fails validation never falls back to a plaintext key from another context.
+func ResolveCredential(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) (inference.Credential, string) {
+	credential := inference.Credential{Provider: inference.ZGComputeProvider, APIKey: plainKey}
 	if encoded == "" {
-		return plainKey, ""
+		return credential, ""
 	}
 	opened, err := Open(encoded, agentSealPriv, chainOwner)
 	if err != nil {
 		logf("FAIL %s not applied: %v", EnvVar, err)
-		if plainKey == "" {
-			issue = NotAppliedPrefix + Reason(err)
-		}
-		return plainKey, issue
+		return inference.Credential{Invalid: true}, NotAppliedPrefix + Reason(err)
 	}
 	for _, name := range opened.Ignored {
 		logf("warn: %s: ignoring unsupported name %q", EnvVar, name)
 	}
-	key = opened.Env["API_KEY"]
-	if key == "" {
-		return plainKey, ""
+	credential.APIKey = opened.Env["API_KEY"]
+	if opened.Version >= 2 {
+		credential.Provider, credential.Bound, credential.RouteHash = opened.Provider, true, opened.RouteHash
+		credential.Registry = opened.Registry
 	}
-	if plainKey != "" {
-		logf("warn: both API_KEY and %s are set; using the sealed value", EnvVar)
-	}
-	logf("OK   API_KEY (from %s, owner-bound): <set, %d chars>", EnvVar, len(key))
-	return key, ""
+	logf("OK inference credential: provider=%s bound=%v", credential.Provider, credential.Bound)
+	return credential, ""
 }
+
+// NotAppliedPrefix starts the status detail ResolveCredential returns when an
+// owner supplied a sealed key that did not apply.
+const NotAppliedPrefix = "secret_env_not_applied: "
 
 // LiveOwner returns known when it is set. Otherwise (the boot-time ownerOf
 // read failed, e.g. on a transient RPC error) it re-reads the owner up to

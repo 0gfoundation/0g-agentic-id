@@ -107,11 +107,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -198,6 +202,9 @@ mod tests {
         deployments.seed(d);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain,
@@ -207,7 +214,11 @@ mod tests {
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, jobs, seal_id }
+        Setup {
+            state,
+            jobs,
+            seal_id,
+        }
     }
 
     #[tokio::test]

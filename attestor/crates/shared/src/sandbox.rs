@@ -252,12 +252,20 @@ impl HttpSandbox {
     }
 }
 
+fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticket: Option<&str>) {
+    env.remove("SEAL_BOOT_TICKET");
+    if let Some(ticket) = ticket {
+        env.insert("SEAL_BOOT_TICKET".into(), ticket.into());
+    }
+}
+
 #[async_trait]
 impl SandboxClient for HttpSandbox {
     async fn create(
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
+        boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse> {
         // Sandbox's auth middleware only validates the three X- headers
         // against `signed_message_b64` — it does NOT cross-check that the
@@ -307,6 +315,7 @@ impl SandboxClient for HttpSandbox {
         for (k, v) in &self.extra_env {
             env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
+        apply_boot_ticket(env_obj, boot_ticket);
 
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
@@ -351,24 +360,16 @@ impl SandboxClient for HttpSandbox {
         // sandbox can evolve without breaking us.
         let body = res.text().await.unwrap_or_default();
         let parsed: SandboxCreateResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e} — body={body}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e}"))?;
         tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
         Ok(parsed)
     }
 
-    async fn start(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn start(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.lifecycle_call(seal_id, envelope, "start").await
     }
 
-    async fn stop(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn stop(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.lifecycle_call(seal_id, envelope, "stop").await
     }
 
@@ -402,9 +403,8 @@ impl SandboxClient for HttpSandbox {
             provider: self.provider_addr.clone(),
             resource_id: sandbox_id.to_string(),
         };
-        let msg_bytes = serde_json::to_vec(&canonical).map_err(|e| {
-            anyhow::anyhow!("sandbox admin_delete: serialize canonical: {e}")
-        })?;
+        let msg_bytes = serde_json::to_vec(&canonical)
+            .map_err(|e| anyhow::anyhow!("sandbox admin_delete: serialize canonical: {e}"))?;
         let digest = eip191_digest(&msg_bytes);
 
         // EIP-191 sign with the attestor's TEE EOA priv. v += 27 so
@@ -682,7 +682,10 @@ mod tests {
         let mut obj = serde_json::Map::new();
         obj.insert("snapshot".into(), serde_json::json!("img"));
         apply_public_ports(&mut obj, &[8080, 3000]);
-        assert_eq!(obj.get("publicPorts"), Some(&serde_json::json!([8080, 3000])));
+        assert_eq!(
+            obj.get("publicPorts"),
+            Some(&serde_json::json!([8080, 3000]))
+        );
     }
 
     #[test]
@@ -721,8 +724,8 @@ mod tests {
     fn verify_envelope_rejects_wrong_declared_address() {
         let (sk, _addr) = test_keypair();
         let (mut envelope, _) = make_envelope(&sk, Address::ZERO); // declare wrong addr
-        // The canonical bytes + signature are still from `sk`, but the
-        // envelope claims Address::ZERO signed it. Signer-mismatch path.
+                                                                   // The canonical bytes + signature are still from `sk`, but the
+                                                                   // envelope claims Address::ZERO signed it. Signer-mismatch path.
         envelope.wallet_address = Address::ZERO;
         let crypto = crypto_for_tests();
         let err = verify_envelope(&envelope, &crypto).unwrap_err().to_string();
@@ -817,5 +820,18 @@ mod tests {
         // Most important: AdminSigner.address == envelope's wallet_address
         // == recovered address.
         assert_eq!(envelope.wallet_address, signer.address);
+    }
+    #[test]
+    fn boot_ticket_is_reserved_for_attestor_create_not_owner_env() {
+        let mut env =
+            serde_json::json!({"SEAL_BOOT_TICKET":"forged-owner-value","API_KEY":"other"})
+                .as_object()
+                .unwrap()
+                .clone();
+        apply_boot_ticket(&mut env, Some("attestor-ticket"));
+        assert_eq!(env["SEAL_BOOT_TICKET"], "attestor-ticket");
+        assert_eq!(env["API_KEY"], "other");
+        apply_boot_ticket(&mut env, None);
+        assert!(!env.contains_key("SEAL_BOOT_TICKET"));
     }
 }

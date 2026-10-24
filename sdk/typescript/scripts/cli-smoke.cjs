@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Live-attestor smoke for the `0g-agenticid` CLI (stage 0: doctor / status /
+// Live-attestor smoke for the `0g-agentdna` CLI (stage 0: doctor / status /
 // list) — the CLI-side sibling of scripts/smoke.cjs. The unit suite
 // (test/cli.test.mjs) proves the contracts against mocks; this script proves
 // the same surface against a REAL attestor + chain, where wire-format drift

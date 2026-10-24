@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub cfg: Config,
+    pub providers: Arc<dyn attestor_shared::provider_registry::ProviderRegistryRepo>,
 
     pub crypto: Arc<dyn CryptoModule>,
     pub chain: Arc<dyn ChainClient>,

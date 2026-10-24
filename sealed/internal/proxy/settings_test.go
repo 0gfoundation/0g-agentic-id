@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/settings"
 	"seal-verify/internal/state"
 )
@@ -31,6 +32,51 @@ func settingsServer(t *testing.T, owner string) (*Server, *settings.Doc) {
 	)
 	s.SetSessionSettings(func(_ context.Context, d settings.Doc) error { *applied = d; return nil })
 	return s, applied
+}
+
+func TestAgentSettingsGetReadsRuntimeAndNeverIncludesCredentialsOrOpaqueConfig(t *testing.T) {
+	s, _ := settingsServer(t, "0x00")
+	// Merely having owner settings does not mean a runtime has adopted them.
+	w := httptest.NewRecorder()
+	s.handleAgentSettings(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HTTP %d before runtime ready", w.Code)
+	}
+	resolved := settings.Resolved{
+		Doc:      settings.Doc{Provider: "partner", Model: "running-model", Thinking: "high", Others: json.RawMessage(`{"private":"hidden-config"}`)},
+		APIKey:   "sk-secret-must-never-appear",
+		Endpoint: &inference.Endpoint{BaseURL: "https://old.example/v1", Format: inference.WireOpenAI},
+	}
+	credential := inference.Credential{APIKey: resolved.APIKey, Registry: &inference.RegistryPin{Version: 7}, RouteHash: "authorized-hash"}
+	s.SetRuntimeSettings(func() RuntimeSettings { return RuntimeSettingsFor(resolved, credential) })
+	w = httptest.NewRecorder()
+	s.handleAgentSettings(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	var got RuntimeSettings
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != "runtime" || got.Model != "running-model" || got.Thinking != "high" || got.BaseURL != "https://old.example/v1" || got.RegistryVersion != 7 {
+		t.Fatalf("wrong runtime view: %+v", got)
+	}
+	if strings.Contains(w.Body.String(), "secret") || strings.Contains(w.Body.String(), "hidden-config") || strings.Contains(w.Body.String(), "API_KEY") {
+		t.Fatal("GET exposed a credential or arbitrary config")
+	}
+	// Changes follow the container's adopted state, without a DB/catalog query.
+	resolved.Model = "hot-applied-model"
+	w = httptest.NewRecorder()
+	s.handleAgentSettings(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
+	if !strings.Contains(w.Body.String(), "hot-applied-model") {
+		t.Fatal("runtime query returned stale data")
+	}
+	// This capability does not remove the public HTTP route's owner gate.
+	w = httptest.NewRecorder()
+	s.handleSettings(w, httptest.NewRequest(http.MethodGet, "/_seal/settings", nil))
+	if w.Code == http.StatusOK {
+		t.Fatal("public settings became unauthenticated")
+	}
 }
 
 func settingsReq(t *testing.T, sign func(string) string, body string, digest string) *http.Request {
@@ -103,6 +149,38 @@ func TestSettingsPost_AppliesAValidDocument(t *testing.T) {
 	// The response must admit what it cost: the framework process restarts.
 	if !strings.Contains(w.Body.String(), "interrupted") {
 		t.Fatalf("response %s — an owner must be told the restart interrupts work", w.Body.String())
+	}
+}
+
+func TestSettingsPost_ProviderSwitchRequiresResetAndKeepsLiveSettings(t *testing.T) {
+	sign, owner := mustKey(t)
+	s, _ := settingsServer(t, owner)
+	current := settings.Doc{Provider: "0g-compute", Model: "old-model"}
+	s.SetSettings(func() settings.Doc { return current }, func(ctx context.Context, doc settings.Doc) error {
+		if _, err := settings.ResolveForCredential(ctx, doc, inference.Credential{Provider: "0g-compute", APIKey: "sk-compute"}); err != nil {
+			return err
+		}
+		current = doc
+		return nil
+	})
+	body := `{"provider":"openai","model":"new-model"}`
+	w := httptest.NewRecorder()
+	s.handleSettings(w, settingsReq(t, sign, body, sha256hex(body)))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("HTTP %d: %s", w.Code, w.Body.String())
+	}
+	var response map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "CREDENTIAL_PROVIDER_MISMATCH" {
+		t.Fatalf("wrong response: %v", response)
+	}
+	if current.Provider != "0g-compute" || current.Model != "old-model" {
+		t.Fatal("rejected change modified the live document")
+	}
+	if strings.Contains(w.Body.String(), "sk-compute") {
+		t.Fatal("response leaked a key")
 	}
 }
 

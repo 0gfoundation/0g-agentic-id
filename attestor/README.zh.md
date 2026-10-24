@@ -97,6 +97,8 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `GET /health` | 进程级 liveness probe | — |
 | `GET /config` | 链 RPC / 合约地址 / appId / snapshot 等前端要的公开配置 | — |
+| `GET /inference/providers` | 带版本的 provider 注册表；可用 `?version=N` 读取经接受凭据校验的历史版本，供 stop/start 保持旧路由；内置初始名单为版本 0 | 公开 |
+| `PUT /admin/inference/providers` | 通过 HTTP 发布完整名单，Postgres 留存历史并校验版本，无需 SSH 或重启，见 [运维流程](../sdk/typescript/PROVIDERS.zh.md) | attestor Tapp 当前 owner 签名（EOA/EIP-1271） |
 
 ### 生命周期（owner-driven）
 
@@ -113,8 +115,9 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
-| `POST /provision` | 容器换 `agentSeal_priv`，外加 owner 的配置文档（`encrypted_settings`，ECIES 给同一个容器公钥）。走这条而不是 sandbox env：**每次启动**（含 resume）都会调它。推送后的第一次启动拿新文档；反复重启却始终没确认的，改发上一次能跑起来的那份。文档这一半额外要求行上有 sandbox 记录（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）；密钥那一半不加这道闸，因为谁能拿密钥由 attestation 决定 | sandbox TEE 签名 + TappRegistry 节点验证 + `validFrameworkHashes` 白名单 |
-| `POST /status` | sealed 心跳 / 状态汇报。`running` 把这次启动真正拿到的那个 settings 版本提升为 last-known-good——按版本号记账，只提升一次，重复心跳不会给没人启动过的文档背书。`error` 不动文档：它在每次失败心跳都会来，在那里回滚会导致 agent 不健康时反而改不了配置 | agentSeal EIP-191 |
+| `GET /provision?seal_id=…` | 返回已启用的启动代次，不返回票据；sealed 用于构造容器私钥证明 | 公开元数据 |
+| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档，以及本次启动凭据（`status_binding_scheme: "agentdna-status-v2"` / `encrypted_status_binding`）。凭据绑定实际下发的配置版本和摘要，每次接受的新启动轮换。新协议要求行上已有 sandbox；create 尚未落库时返回 409，sealed 最多重试 180 秒。拒绝的 provision 请求不改状态或删除容器。未确认配置多次启动失败后仍回退至 last-known-good；登记新协议后拒绝旧协议降级 | sandbox TEE 签名 + 节点/镜像白名单 + owner 授权的票据、启动代次和容器私钥证明 |
+| `POST /status` | sealed 心跳与状态。签名覆盖启动凭据哈希和实际使用的配置摘要；在事务内检查当前凭据，再更新状态、心跳与精确版本确认。只有匹配当前版本的 `running` / `warning` 可提升配置；旧容器上报被忽略，`error` 不改配置。旧协议只在未登记新凭据时更新存活状态，永不提升配置 | agentSeal 原始 keccak 签名 + KMS HMAC 启动凭据 |
 | `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
 
 ### 读 / 实时
@@ -176,6 +179,8 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SECRET_ENV_ENABLED` | 显式开启（`true`/`1`/`on`/`yes`）。开启后 `GET /config` 公布 `secret_env_scheme`，SDK 在 start/reset/retry 时把推理 key 加密给 agentSeal 公钥，而不是明文签进 envelope。只有当 `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` 里所有镜像都能读 `SEAL_SECRET_ENV` 时才开启。默认关闭 |
 | `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
+
+attestor 与已配置 sealed 镜像统一发布。`/config.inference_capabilities` 根据本版本及已有 framework/snapshot 配置自动生成，不另设能力 ENV。provider 运维写入由 `ATTESTOR_TAPP_REGISTRY_ADDR` 中 `ATTESTOR_APP_ID` 的实时 owner 授权，见 [上线流程](../sdk/typescript/PROVIDERS.zh.md)。
 
 ### Storage（0g-storage）
 
