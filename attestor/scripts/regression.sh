@@ -7,6 +7,7 @@
 #   ATTESTOR_URL     attestor base URL           (default http://localhost:8080)
 #   OWNER_PRIV       funded owner key (required) — gas + sandbox balance; the
 #                    self-contained legs also fund ephemeral wallets from it
+#   MODEL_ID         compute model for the source identity smoke (optional)
 #   API_KEY          inference key injected into containers (default a dummy;
 #                    fine — the checks don't exercise the model)
 #   VERIFIED_FEEDBACK_ADDR  VerifiedFeedbackRegistry bound to this AgenticID
@@ -50,9 +51,10 @@ step() { # step "name" cmd...
 skip() { NAMES+=("$1"); RESULTS+=("SKIP"); printf '\n── %s: SKIPPED (%s) ──\n' "$1" "$2"; }
 
 # ── SDK build (needed by the .cjs legs) ───────────────────────────────
-if [ ! -f "$SDK/dist/index.js" ]; then
-  echo "building SDK…"; (cd "$SDK" && npm ci --silent && npm run build --silent) || { echo "SDK build failed"; exit 1; }
-fi
+# Build the working tree even if dist already exists: an old artifact would
+# silently test an earlier SDK against the candidate attestor/runtime.
+echo "building SDK…"
+(cd "$SDK" && { [ -d node_modules ] || npm ci --silent; } && npm run build --silent) || { echo "SDK build failed"; exit 1; }
 
 # ── T0 unit (optional, free) ──────────────────────────────────────────
 if [ "${RUN_UNIT:-0}" = "1" ]; then

@@ -56,6 +56,7 @@ function mockAttestor({ stored = null, version = stored ? 3 : 0, status = 200 } 
         res.writeHead(code, { 'content-type': 'application/json' });
         res.end(JSON.stringify(o));
       };
+      if (req.method === 'GET' && url.pathname === '/config') return json(200, { chain_id: 16602 });
       if (req.method === 'POST' && url.pathname === '/settings') {
         last = { headers: req.headers, raw: Buffer.concat(chunks).toString('utf8') };
         if (status === 200) return json(200, { ok: true, version: 7 });

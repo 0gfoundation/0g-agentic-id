@@ -69,7 +69,7 @@ Phase 1  provision        POST /provision → 用同一把容器密钥 ECIES 解
                             · agent_seal_priv            （缺了是致命的）
                             · owner 的 settings document （不透明 blob；未配置过的
                               agent 就没有，解密失败只记日志丢弃、不致命）
-                          然后 scrub SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION / API_KEY
+                          然后 scrub SEAL_BOOT_TICKET / SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION / API_KEY
                           ↓
 Phase 2  chain bootstrap  WaitForMint(sealId) → agentId
                           IntelligentDatasOf(agentId) → []IntelligentData
@@ -101,12 +101,13 @@ Phase 4  status report    通知 attestor /status 整条流水线成功（level=
 pre-Start 快照、phase 2 seed 是 framework 启动稳定后的 baseline ——
 这是 watcher 比对的真起点（详见 §4）。
 
-Phase 4 这次上报还在容器之外干了一件事：attestor 把 `running` 当作"它在
-`/provision` 下发的那个 settings 版本确实能起来"的证据，把它提升为
-last-known-good。一直确认不了的版本会被计数，反复几次之后 attestor 改发上一份
-document，而不是一直把同一份起不来的塞给容器
-（`attestor/crates/api/src/routes/status.rs:87-107`、
-`attestor/crates/api/src/routes/provision.rs:312-352`）。
+Phase 4 的 `running` / `warning` 报告还携带本次启动凭据和实际使用的配置摘要。
+attestor 只在凭据仍为当前启动、摘要匹配、下发版本仍为当前版本时，才把它提升为
+last-known-good。旧容器的状态不能覆盖新容器，回退配置也不能确认新版本。
+反复启动却未确认的版本仍由 `/provision` 的计数策略回退到上一份可用文档。
+凭据仅由已授权的新启动领取，重复、旧代次和旧容器票据均被拒绝；凭据 ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务中
+完成（`routes/status.rs`、`repo.rs::apply_status_report`）。新 sealed 要求新 attestor，
+先升级 attestor，再启用本版本的全部 sealed 镜像。旧协议心跳永不提升配置。
 
 ### settings document 为什么走 `/provision`
 
@@ -127,8 +128,8 @@ attestor 只把它当不透明字节存和发 —— 不解析、不校验、不
 `manager.StartParams.PreStart` 在**每一次** `adapter.Start` 之前跑 —— 首次、
 `Reload`、崩溃重启一视同仁（`internal/manager/manager.go:168`、`:209`、`:336`）。
 `main.go` 把它接到
-`adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`
-（`main.go:762-764`）。
+`adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`
+（`main.go` 的 `startAgent`）。
 
 之所以做成 hook 而不是 `RuntimeContext` 上的一个字段：`RuntimeContext` 在首次
 `Start` 时被捕获一次、之后每次重启原样回放，所以搭在它上面的东西在容器整个生命期
@@ -502,10 +503,15 @@ watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是
 | `/v1/responses*` | owner | 长任务面(OpenAI Responses 子集):turn 归属服务端 id、断线不死、`starting_after` 续播、`POST /{id}/cancel` 停止。框架声明了 `kind:"responses"` 路由时由其 bridge 原生提供(prime、dsh),否则由 sealed proxy 在框架自身 chat API 之前**合成**(openclaw、hermes)——见 `internal/proxy/responses.go` |
 | `/log` + `/log.html` | 运维 | sealed bootstrap 实时日志（带 phase 着色） |
 | `/log/agent` + `/log/agent.html` | 运维 | agent 子进程的 stdout/stderr（实时）;路径经 adapter 的 `SubprocessLogPath()` 解析。`/log/openclaw`（`.html`）作为 legacy 别名保留 |
-| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（agent 自己提配置变更 —— 见下）|
+| `unix:///run/seal-sign.sock` | **只允许容器内 agent 进程** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction`（用 `agent_seal_priv` 签名）+ `/services`（agent 注册 `/hello` 对外宣告的服务列表）+ `/settings`（GET 读当前运行配置；POST 仅临时改 thinking —— 见下）|
+
+`GET $SEAL_SIGN_SOCK/settings` 从 sealed 已渲染的运行状态返回 provider、model、
+thinking 和托管路由信息（URL、协议、注册表版本、路由 hash），不含 API key 或
+任意 framework 配置。它不同于 attestor 在 Postgres 保存的、可能等待 reset 的 owner
+文档。启动未准备好时返回 503；公开 HTTP 的 owner 签名要求不变。
 
 agent 自己那条 `/settings` 跟 owner 那条是刻意不对称的：校验、渲染、重启的流程一模
-一样，但**什么都不持久化**，所以改动只活到这个容器结束，任何一次重启回来的都是
+一样，但**什么都不持久化**，所以改动只活到这个容器结束，容器重启回来的都是
 owner 的 document。正是这个不对称让"把这条口子给 agent"变得安全 —— agent 的正当用途
 是"这个任务多想一会儿"，不是"把自己永久改掉"；而且它写的东西都不留存，它就没法把
 自己配置成一个起不来的状态 —— 当年就有 agent 手改框架配置把自己改砖了
@@ -529,6 +535,7 @@ env 这一面：
 
 | env | 含义 |
 |---|---|
+| `SEAL_BOOT_TICKET` | worker 在 create 时内部注入的随机启动票据，框架启动前清除。stop/start 保留容器票据但轮换启动代次，reset 换新票据；新镜像要求此值，不由运维手配 |
 | `SANDBOX_SEAL_KEY` | sandbox 注入的 ECDSA 私钥；用来跟 `SANDBOX_SEAL_ATTESTATION.pubkey` 互证（Phase 0）|
 | `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
 | `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
@@ -537,8 +544,8 @@ env 这一面：
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `INDEXER_URL` | 0g-storage 的 indexer URL，`dataDescription` 里 indexer 字段为空时 fallback。它是公开的，所以不能内嵌凭据：它会记进每个上传条目的链上 `dataDescription`（attestor 在 mint 时也这样记），打进启动日志（`/log`、`/log.html`，无需鉴权），并作为命令行参数传给负责下载的 `0g-storage-client` CLI |
 | `AGENT_FRAMEWORK` | （可选）链上无 framework binding 时的 adapter 名 **fallback**(本地 dev 用)。权威选择器是链上 binding;attestor 不注入这个 env |
-| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go:65-68`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go:166-173`）|
-| `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。解不开时记一行 `FAIL` 并忽略（`internal/secretenv`）；如果因此 agent 没有任何 key，状态保持 `warning`，detail 为 `secret_env_not_applied: <reason>`（原因类别，如 `owner_mismatch`，不含任何值），而不是 `running` |
+| `API_KEY` | 推理凭据，由 attestor 在 deploy / Recreate envelope 里转发。它被读进 `settings.Resolved.APIKey` 一次，**不**属于 settings document、也不被持久化；provision 之后从环境里 scrub 掉。框架怎么拿到它是 per-adapter 的：openclaw 用 env **引用**（只有变量名落进 openclaw.json，`openclaw/inference.go`），hermes 则把值直接写进 `config.yaml`，因为它的 `custom` provider 不声明任何 env var、无凭据直连线上实测 401（`hermes/spawn.go`）|
+| `SEAL_SECRET_ENV` | （可选）owner 的 secret env（目前只有 `API_KEY`），由 SDK 用 ECIES 加密给 agentSeal 公钥，owner 钱包签名弹窗里只看到密文（issue #166）。Phase 2 之后用 `agentSeal_priv` 解开；其中的 `owner` 必须等于链上实时 owner 才生效；优先于明文 `API_KEY`。v2 绑定 provider；v3 绑定路由 hash 及已接受注册表的版本/摘要，每次启动（含 stop/start）读取该历史快照。明文/v1 key 仅属于 compute。密文校验失败时记 `FAIL` 和 `secret_env_not_applied: <reason>`，拒绝回退到明文 key 及渲染 settings（`internal/secretenv`）。provider 不匹配时需用对应 key 执行 reset |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | 拼 `AGENT_PUBLIC_URL`，形如 `http://8080-<sandbox_id>.<proxy_domain>`；agent 自己暴露端口固定 `:8080`，由 sealed proxy 写死 |
 
 ### `AGENT_PUBLIC_URL` 怎么暴露给 agent
@@ -651,3 +658,5 @@ drift 检测只用 `content_hash`，但 serve-proof 要带 `data_hash` 给 verif
 openclaw 版本对得上时永远不会 drift，本实例自然没有自上传过，但链上有
 attestor mint 时上传的版本。没有路径 2 的话 envelope 里那条 role 报不出
 data_hash，verifier 会判 ✗。
+
+监督器耗尽重启次数后，进程失败会固定为 error；上传成功或心跳不能清除它。只有显式重启实际恢复到 Running 后才解除该错误，避免把已死亡的框架重新标为在线。

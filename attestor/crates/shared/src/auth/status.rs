@@ -8,7 +8,8 @@
 //! signatures where a human wallet UI isn't involved.
 //!
 //! Canonical format:
-//!   "StatusReport:0x<hex sealId>:<status>:<error_detail or empty>"
+//!   "StatusReport.v2:0x<seal>:<status>:<detail>:<receipt SHA-256>:<applied settings SHA-256>"
+//! Legacy (liveness only): "StatusReport:0x<seal>:<status>:<detail>"
 //!
 //! The `"StatusReport:"` prefix acts as the domain tag — signatures for
 //! this action cannot be replayed as `/provision` (which uses
@@ -17,12 +18,184 @@
 use crate::traits::CryptoModule;
 use crate::types::{ContainerReportStatus, StatusReport};
 use alloy::primitives::{keccak256, Address};
+use alloy::primitives::{Bytes, B256};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+pub const BINDING_SCHEME: &str = "agentdna-status-v2";
+const BINDING_INFO: &[u8] = b"agentdna.status-boot-receipt.v1";
+
+/// A ticket is injected only by the owner-authorized create worker. The
+/// sandbox retains it across resumes; the lifecycle generation changes.
+pub fn new_boot_ticket() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+#[derive(Clone, Debug)]
+pub struct BootAuthorization {
+    pub generation: i64,
+    pub ticket_hash: [u8; 32],
+    pub enabled: bool,
+    pub started_at: i64,
+    pub owner: Option<Address>,
+    pub sandbox_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BootClaim {
+    pub generation: i64,
+    pub ticket_hash: [u8; 32],
+    pub boot_id: B256,
+    pub started_at: i64,
+}
+
+pub fn boot_claim(
+    req: &crate::ProvisionRequest,
+    crypto: &dyn CryptoModule,
+) -> anyhow::Result<BootClaim> {
+    let ticket = req.boot_ticket.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("missing boot ticket; recreate with the upgraded attestor")
+    })?;
+    anyhow::ensure!(
+        ticket.len() == 64 && hex::decode(ticket)?.len() == 32,
+        "invalid boot ticket"
+    );
+    let generation = req
+        .boot_generation
+        .ok_or_else(|| anyhow::anyhow!("missing boot generation"))?;
+    let boot_id = req
+        .boot_id
+        .ok_or_else(|| anyhow::anyhow!("missing boot ID"))?;
+    let started_at = req
+        .boot_started_at
+        .ok_or_else(|| anyhow::anyhow!("missing boot timestamp"))?;
+    anyhow::ensure!(
+        generation > 0 && started_at > 0,
+        "invalid boot generation/timestamp"
+    );
+    let hash = binding_hash(ticket);
+    let message = boot_signing_message(req.seal_id, generation, &hash, boot_id, started_at);
+    let signer = crypto.recover_signer(
+        &keccak256(message.as_bytes()).0,
+        req.container_signature
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing container proof"))?,
+    )?;
+    let key = k256::PublicKey::from_sec1_bytes(&req.container_pubkey)?;
+    use k256::elliptic_curve::sec1::ToEncodedPoint;
+    let uncompressed = key.to_encoded_point(false);
+    let expected = Address::from_slice(&keccak256(&uncompressed.as_bytes()[1..])[12..]);
+    anyhow::ensure!(signer == expected, "container proof signer mismatch");
+    Ok(BootClaim {
+        generation,
+        ticket_hash: hash,
+        boot_id,
+        started_at,
+    })
+}
+
+pub fn boot_signing_message(
+    seal: B256,
+    generation: i64,
+    ticket_hash: &[u8; 32],
+    boot_id: B256,
+    started_at: i64,
+) -> String {
+    format!(
+        "ProvisionBoot.v1:0x{}:{}:{}:{}:{}",
+        hex::encode(seal),
+        generation,
+        hex::encode(ticket_hash),
+        hex::encode(boot_id),
+        started_at
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootReceipt {
+    pub chain_id: u64,
+    pub contract: Address,
+    pub seal_id: B256,
+    pub container_pubkey: Bytes,
+    pub settings_version: Option<i64>,
+    pub settings_digest: Option<B256>,
+    pub nonce: B256,
+}
+
+pub fn new_receipt(
+    chain_id: u64,
+    contract: Address,
+    seal_id: B256,
+    container_pubkey: Bytes,
+    settings_version: Option<i64>,
+    settings: Option<&serde_json::Value>,
+) -> anyhow::Result<BootReceipt> {
+    Ok(BootReceipt {
+        chain_id,
+        contract,
+        seal_id,
+        container_pubkey,
+        settings_version,
+        settings_digest: settings
+            .map(|doc| {
+                serde_json::to_vec(doc)
+                    .map(|bytes| B256::from(<[u8; 32]>::from(Sha256::digest(bytes))))
+            })
+            .transpose()?,
+        nonce: B256::from(rand::random::<[u8; 32]>()),
+    })
+}
+
+pub fn binding_hash(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
+}
+
+pub fn issue_binding(crypto: &dyn CryptoModule, receipt: &BootReceipt) -> anyhow::Result<String> {
+    let bytes = serde_json::to_vec(receipt)?;
+    let mac = crypto.hmac_binding(BINDING_INFO, &bytes);
+    Ok(format!(
+        "{}.{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+        hex::encode(mac)
+    ))
+}
+
+pub fn open_binding(crypto: &dyn CryptoModule, token: &str) -> anyhow::Result<BootReceipt> {
+    use k256::elliptic_curve::subtle::ConstantTimeEq;
+    anyhow::ensure!(token.len() <= 8192, "status binding too large");
+    let (data, mac) = token
+        .split_once('.')
+        .ok_or_else(|| anyhow::anyhow!("invalid status binding"))?;
+    let data = base64::engine::general_purpose::STANDARD.decode(data)?;
+    let mac = hex::decode(mac)?;
+    let expected = crypto.hmac_binding(BINDING_INFO, &data);
+    anyhow::ensure!(
+        expected.as_slice().ct_eq(&mac).unwrap_u8() == 1,
+        "invalid status binding MAC"
+    );
+    Ok(serde_json::from_slice(&data)?)
+}
 
 pub const STATUS_DOMAIN_PREFIX: &str = "StatusReport";
 
 /// Reconstruct the exact bytes the container signed. The container side
 /// MUST produce the same format when signing.
 pub fn canonical_message(report: &StatusReport) -> String {
+    if let Some(token) = &report.status_binding {
+        return format!(
+            "StatusReport.v2:0x{}:{}:{}:{}:{}",
+            hex::encode(report.seal_id),
+            status_slug(report.status),
+            report.error_detail.as_deref().unwrap_or(""),
+            hex::encode(binding_hash(token)),
+            report
+                .settings_digest
+                .map(|v| hex::encode(v))
+                .unwrap_or_default()
+        );
+    }
     format!(
         "{prefix}:0x{seal_id_hex}:{status}:{error_detail}",
         prefix = STATUS_DOMAIN_PREFIX,
@@ -50,6 +223,10 @@ pub fn verify_status_signature(
     expected_signer: Address,
     crypto: &dyn CryptoModule,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        report.status_binding.is_some() || report.settings_digest.is_none(),
+        "settings digest requires a bound status report"
+    );
     let canonical = canonical_message(report);
     let digest = keccak256(canonical.as_bytes()).0;
     let recovered = crypto
@@ -86,6 +263,8 @@ mod tests {
             seal_id,
             status,
             error_detail,
+            status_binding: None,
+            settings_digest: None,
             agent_seal_signature: Bytes::new(),
         };
         let canonical = canonical_message(&report);
@@ -102,6 +281,8 @@ mod tests {
             seal_id: B256::from_slice(&[0xaau8; 32]),
             status: ContainerReportStatus::Running,
             error_detail: None,
+            status_binding: None,
+            settings_digest: None,
             agent_seal_signature: Bytes::new(),
         };
         let msg = canonical_message(&report);
@@ -117,6 +298,8 @@ mod tests {
             seal_id: B256::from_slice(&[0x01u8; 32]),
             status: ContainerReportStatus::Error,
             error_detail: Some("oom".to_string()),
+            status_binding: None,
+            settings_digest: None,
             agent_seal_signature: Bytes::new(),
         };
         let msg = canonical_message(&report);
@@ -166,5 +349,108 @@ mod tests {
         let err =
             verify_status_signature(&report, signer.address(), crypto().as_ref()).unwrap_err();
         assert!(err.to_string().contains("signer mismatch"), "got: {err}");
+    }
+    #[test]
+    fn boot_receipt_rejects_tampering_and_other_attestor_secrets() {
+        let c = crypto();
+        let receipt = new_receipt(
+            16602,
+            Address::ZERO,
+            B256::repeat_byte(0xaa),
+            Bytes::from(vec![2; 33]),
+            Some(3),
+            Some(&serde_json::json!({"model":"test"})),
+        )
+        .unwrap();
+        let token = issue_binding(c.as_ref(), &receipt).unwrap();
+        let opened = open_binding(c.as_ref(), &token).unwrap();
+        assert_eq!(opened.settings_version, Some(3));
+        assert_eq!(opened.settings_digest, receipt.settings_digest);
+        assert!(open_binding(&RealCrypto::new_for_test([0x99; 32]), &token).is_err());
+        let (data, mac) = token.split_once('.').unwrap();
+        let changed = format!(
+            "{}.{}",
+            data,
+            if mac.starts_with('0') {
+                format!("1{}", &mac[1..])
+            } else {
+                format!("0{}", &mac[1..])
+            }
+        );
+        assert!(open_binding(c.as_ref(), &changed).is_err());
+        assert!(open_binding(c.as_ref(), &"x".repeat(8193)).is_err());
+    }
+
+    #[test]
+    fn bound_status_signature_covers_both_receipt_and_applied_digest() {
+        let signer = PrivateKeySigner::random();
+        let mut report = build(
+            &signer,
+            B256::repeat_byte(0xaa),
+            ContainerReportStatus::Running,
+            None,
+        );
+        report.status_binding = Some("opaque-boot-token".into());
+        report.settings_digest = Some(B256::repeat_byte(0x12));
+        report.agent_seal_signature = signer
+            .sign_hash_sync(&keccak256(canonical_message(&report).as_bytes()))
+            .unwrap()
+            .as_bytes()
+            .into();
+        verify_status_signature(&report, signer.address(), crypto().as_ref()).unwrap();
+        let mut bad = report.clone();
+        bad.status_binding = Some("other-token".into());
+        assert!(verify_status_signature(&bad, signer.address(), crypto().as_ref()).is_err());
+        let mut bad = report.clone();
+        bad.settings_digest = None;
+        assert!(verify_status_signature(&bad, signer.address(), crypto().as_ref()).is_err());
+    }
+    #[test]
+    fn go_status_v2_fixture_has_identical_canonical_bytes_and_signature() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../sealed/internal/inference/testdata/status-v2.json"
+        ))
+        .unwrap();
+        let report: StatusReport = serde_json::from_value(fixture["report"].clone()).unwrap();
+        assert_eq!(
+            canonical_message(&report),
+            fixture["canonical"].as_str().unwrap()
+        );
+        verify_status_signature(
+            &report,
+            fixture["signer"].as_str().unwrap().parse().unwrap(),
+            crypto().as_ref(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn boot_proof_fixture_and_tampering_are_verified_against_container_key() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../sealed/internal/inference/testdata/boot-v1.json"
+        ))
+        .unwrap();
+        let req: crate::ProvisionRequest =
+            serde_json::from_value(fixture["request"].clone()).unwrap();
+        let claim = boot_claim(&req, crypto().as_ref()).unwrap();
+        assert_eq!(
+            boot_signing_message(
+                req.seal_id,
+                claim.generation,
+                &claim.ticket_hash,
+                claim.boot_id,
+                claim.started_at
+            ),
+            fixture["canonical"]
+        );
+        for field in 0..4 {
+            let mut bad = req.clone();
+            match field {
+                0 => bad.boot_generation = Some(8),
+                1 => bad.boot_ticket = Some("22".repeat(32)),
+                2 => bad.boot_id = Some(B256::ZERO),
+                _ => bad.boot_started_at = Some(9),
+            }
+            assert!(boot_claim(&bad, crypto().as_ref()).is_err());
+        }
     }
 }

@@ -2,10 +2,10 @@
  * @file config.ts
  * @description Persisted CLI config so you don't re-export env vars every
  * session. Two files under the XDG config dir
- * (`$XDG_CONFIG_HOME/0g-agenticid`, default `~/.config/0g-agenticid`):
+ * (`$XDG_CONFIG_HOME/0g-agentdna`, default `~/.config/0g-agentdna`):
  *
  *   config.json   { attestorUrl, rpcUrl? }   — non-secret, selects the env
- *   credentials   0x<64 hex>\n               — the owner key, chmod 0600
+ *   credentials   { privateKey?, inferenceKeys? } — provider keys, chmod 0600
  *
  * The owner key is kept in its OWN file at 0600, not in config.json — the
  * standard split (gh / aws / docker do the same) so a shared or
@@ -17,19 +17,35 @@
  * fallback layer.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync, renameSync, unlinkSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export interface FileConfig {
   attestorUrl?: string;
   rpcUrl?: string;
+  inferenceProvider?: string;
 }
 
-/** Resolved on-disk locations (honors XDG_CONFIG_HOME). */
+/** Resolve on-disk locations and move an existing legacy directory once.
+ *  Renaming preserves credentials, proof tickets, downgrade pins, and modes.
+ *  An existing AgentDNA directory always wins; the two stores are never merged. */
 export function configPaths(env: NodeJS.ProcessEnv = process.env): { dir: string; config: string; credentials: string } {
   const base = env.XDG_CONFIG_HOME?.trim() || join(homedir(), '.config');
-  const dir = join(base, '0g-agenticid');
+  const dir = join(base, '0g-agentdna');
+  const legacy = join(base, '0g-agenticid');
+  if (!existsSync(dir) && existsSync(legacy)) {
+    try {
+      renameSync(legacy, dir);
+    } catch (error) {
+      // Another CLI process may have completed the same migration first.
+      if (!existsSync(dir)) {
+        const code = (error as NodeJS.ErrnoException).code ?? 'unknown';
+        throw new Error(`cannot migrate CLI config from ${legacy} to ${dir} (${code}); move the directory manually and retry`);
+      }
+    }
+  }
   return { dir, config: join(dir, 'config.json'), credentials: join(dir, 'credentials') };
 }
 
@@ -42,6 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FileConfig {
     return {
       attestorUrl: c.attestorUrl?.replace(/\/$/, ''),
       rpcUrl: c.rpcUrl,
+      inferenceProvider: c.inferenceProvider,
     };
   } catch {
     return {};
@@ -89,42 +106,68 @@ export function saveConfig(patch: FileConfig, env: NodeJS.ProcessEnv = process.e
   writeFileSync(config, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o644 });
 }
 
-/** Both secrets live in the one 0600 credentials file, as JSON. */
+/** Owner key and provider-scoped inference keys, stored at 0600. */
 export interface Credentials {
   privateKey?: `0x${string}`;
+  inferenceKeys?: Record<string, string>;
+  /** Read-only compatibility with the old compute-only credential format. */
   apiKey?: string;
 }
 
-/** Read the credentials file. Missing/corrupt → {}. Tolerates a legacy
- *  plain-`0x…`-key file (the earlier format) by reading it as privateKey. */
-export function loadCredentials(env: NodeJS.ProcessEnv = process.env): Credentials {
-  const { credentials } = configPaths(env);
-  if (!existsSync(credentials)) return {};
+function writeCredentials(next: Credentials, env: NodeJS.ProcessEnv): void {
+  const { dir, credentials } = configPaths(env);
+  mkdirSync(dir, { recursive: true });
+  const temporary = `${credentials}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    const t = readFileSync(credentials, 'utf8').trim();
-    if (!t) return {};
-    // Keys normalize on read (0x prefix optional — heals files written by
-    // pre-normalization builds); anything else is dropped as corrupt.
-    if (t.startsWith('{')) {
-      const c = JSON.parse(t) as Credentials;
-      const pk = c.privateKey ? normalizeKey(c.privateKey) : null;
-      return { ...(pk ? { privateKey: pk } : {}), ...(c.apiKey ? { apiKey: c.apiKey } : {}) };
-    }
-    const pk = normalizeKey(t);
-    return pk ? { privateKey: pk } : {};
-  } catch {
-    return {};
+    writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temporary, credentials);
+    chmodSync(credentials, 0o600);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* nothing was written */ }
+    throw error;
   }
 }
 
-/** Merge a patch into the credentials file, writing JSON at 0600. */
+/** Old single API keys are compute keys. Migrate on first read, atomically. */
+export function loadCredentials(env: NodeJS.ProcessEnv = process.env): Credentials {
+  const { credentials } = configPaths(env);
+  if (!existsSync(credentials)) return {};
+  let parsed: Credentials;
+  try {
+    const text = readFileSync(credentials, 'utf8').trim();
+    if (!text) return {};
+    parsed = text.startsWith('{') ? JSON.parse(text) as Credentials : { privateKey: text as `0x${string}` };
+  } catch { return {}; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const privateKey = typeof parsed.privateKey === 'string' ? normalizeKey(parsed.privateKey) : null;
+  const inferenceKeys: Record<string, string> = {};
+  if (parsed.inferenceKeys && typeof parsed.inferenceKeys === 'object' && !Array.isArray(parsed.inferenceKeys)) {
+    for (const [provider, value] of Object.entries(parsed.inferenceKeys)) {
+      if (/^[a-z0-9][a-z0-9-]*$/.test(provider) && typeof value === 'string' && value.trim()) {
+        inferenceKeys[provider] = value.trim();
+      }
+    }
+  }
+  if (typeof parsed.apiKey === 'string' && parsed.apiKey.trim() && !inferenceKeys['0g-compute']) {
+    inferenceKeys['0g-compute'] = parsed.apiKey.trim();
+  }
+  const result: Credentials = {
+    ...(privateKey ? { privateKey } : {}),
+    ...(Object.keys(inferenceKeys).length ? { inferenceKeys } : {}),
+  };
+  // Keep corrupt/empty documents untouched. A legacy key is removed only after
+  // the complete normalized replacement has been written successfully.
+  if (typeof parsed.apiKey === 'string' && parsed.apiKey.trim()) writeCredentials(result, env);
+  return result;
+}
+
 export function saveCredentials(patch: Credentials, env: NodeJS.ProcessEnv = process.env): void {
-  const { dir, credentials } = configPaths(env);
-  const next = { ...loadCredentials(env), ...patch };
-  for (const k of Object.keys(next) as (keyof Credentials)[]) if (!next[k]) delete next[k];
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(credentials, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(credentials, 0o600); // enforce even if the file pre-existed with looser bits
+  const previous = loadCredentials(env);
+  const inferenceKeys = { ...previous.inferenceKeys, ...patch.inferenceKeys };
+  if (patch.apiKey) inferenceKeys['0g-compute'] = patch.apiKey;
+  const next: Credentials = { ...previous, ...patch, ...(Object.keys(inferenceKeys).length ? { inferenceKeys } : {}) };
+  delete next.apiKey;
+  writeCredentials(next, env);
 }
 
 /** The owner key, or null. Normalizes on read (old CLI builds saved login
@@ -153,14 +196,30 @@ export function saveKey(key: string, env: NodeJS.ProcessEnv = process.env): void
   saveCredentials({ privateKey: k }, env);
 }
 
-/** The inference API key, or null. */
-export function loadApiKey(env: NodeJS.ProcessEnv = process.env): string | null {
-  return loadCredentials(env).apiKey ?? null;
+/** No provider argument retains the old compute-only helper signature. */
+export function loadApiKey(providerOrEnv: string | NodeJS.ProcessEnv = '0g-compute', env: NodeJS.ProcessEnv = process.env): string | null {
+  const provider = typeof providerOrEnv === 'string' ? providerOrEnv : '0g-compute';
+  const source = typeof providerOrEnv === 'string' ? env : providerOrEnv;
+  return loadCredentials(source).inferenceKeys?.[provider] ?? null;
 }
 
-/** Persist the inference API key. */
-export function saveApiKey(apiKey: string, env: NodeJS.ProcessEnv = process.env): void {
-  const k = apiKey.trim();
-  if (!k) throw new Error('api key is empty');
-  saveCredentials({ apiKey: k }, env);
+export function saveApiKey(apiKey: string, env?: NodeJS.ProcessEnv): void;
+export function saveApiKey(provider: string, apiKey: string, env?: NodeJS.ProcessEnv): void;
+export function saveApiKey(providerOrKey: string, keyOrEnv?: string | NodeJS.ProcessEnv, env: NodeJS.ProcessEnv = process.env): void {
+  const provider = typeof keyOrEnv === 'string' ? providerOrKey : '0g-compute';
+  const key = (typeof keyOrEnv === 'string' ? keyOrEnv : providerOrKey).trim();
+  const source = typeof keyOrEnv === 'string' ? env : keyOrEnv ?? env;
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(provider)) throw new Error('invalid inference provider');
+  if (!key) throw new Error('api key is empty');
+  saveCredentials({ inferenceKeys: { [provider]: key } }, source);
+}
+
+/** Global legacy variables only belong to compute; new overrides are bound. */
+export function inferenceKeyFromEnv(provider: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const key = env.AGENTDNA_API_KEY?.trim();
+  const binding = env.AGENTDNA_API_KEY_PROVIDER?.trim();
+  if (key && !binding) throw new Error('AGENTDNA_API_KEY requires AGENTDNA_API_KEY_PROVIDER');
+  if (key && binding === provider) return key;
+  if (provider === '0g-compute') return env.AGENTIC_API_KEY?.trim() || env.API_KEY?.trim() || null;
+  return null;
 }

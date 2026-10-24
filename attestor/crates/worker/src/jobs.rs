@@ -1,12 +1,12 @@
 //! Job handlers. Worker core logic.
 
-use alloy::primitives::{Address, B256, Bytes};
+use alloy::primitives::{Address, Bytes, B256};
 use attestor_shared::{
     agent_card::{build_agent_card, AgentCardInputs},
     oss::OssClient,
     sandbox::SandboxError,
-    AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo, EventBus,
-    IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobPayload, MintParams,
+    AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
+    EventBus, IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobPayload, MintParams,
     SandboxClient, SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -33,6 +33,24 @@ pub struct Ctx {
     /// OSS client for AgentCard uploads. Required — deploy fails if
     /// not configured (no more placeholder URIs).
     pub oss: Arc<OssClient>,
+}
+
+/// Jobs may wait past a transfer. Recheck the live owner immediately before
+/// granting a new boot generation or sending a queued owner lifecycle call.
+async fn recheck_job_owner(
+    ctx: &Ctx,
+    seal: SealId,
+    envelope: &SandboxEnvelope,
+) -> anyhow::Result<()> {
+    if let Some(d) = ctx.deployments.get(seal).await? {
+        if let Some(agent) = d.agent_id {
+            anyhow::ensure!(
+                ctx.chain.owner_of(agent).await? == envelope.wallet_address,
+                "queued lifecycle signer is no longer the on-chain owner"
+            );
+        }
+    }
+    Ok(())
 }
 
 pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
@@ -96,6 +114,27 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // Stopped → Stuck and the user can click "Bring back
             // online" → SandboxRecreate (action=create) for a fresh
             // sandbox.
+            recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
+            ctx.deployments
+                .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
+                .await?;
+            // Publish the pending stage before start can invoke provisioning;
+            // a fast Running callback must never be demoted after start returns.
+            ctx.deployments
+                .set_container_stage(
+                    seal_id,
+                    StageStatus::Submitted {
+                        tx_hash: None,
+                        at: Utc::now(),
+                    },
+                )
+                .await?;
+            ctx.deployments
+                .set_provision_deadline(seal_id, Some(Utc::now() + PROVISION_TIMEOUT))
+                .await?;
+            ctx.events
+                .publish(WsEvent::ContainerStarting { seal_id })
+                .await?;
             if let Err(e) = ctx.sandbox.start(seal_id, &sandbox_envelope).await {
                 // Classify by the provider's HTTP status (SandboxError), not
                 // by string-matching the body. A transient/recoverable
@@ -118,6 +157,15 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     } else {
                         "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
                     };
+                    ctx.deployments
+                        .set_container_stage(
+                            seal_id,
+                            StageStatus::Stopped {
+                                at: Utc::now(),
+                                reason: "resume_not_started".into(),
+                            },
+                        )
+                        .await?;
                     tracing::warn!(?seal_id, error = %e, "sandbox.start: transient condition; staying Stopped for retry");
                     ctx.events
                         .publish(WsEvent::ContainerWarning { seal_id, reason })
@@ -130,7 +178,10 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 ctx.deployments
                     .set_container_stage(
                         seal_id,
-                        StageStatus::Failed { at: now, reason: reason.clone() },
+                        StageStatus::Failed {
+                            at: now,
+                            reason: reason.clone(),
+                        },
                     )
                     .await?;
                 ctx.events
@@ -153,22 +204,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 }
                 anyhow::bail!(reason);
             }
-            // Sandbox has resumed; container will re-bootstrap and POST
-            // /status running back to attestor (existing flow), which flips
-            // container_stage to Confirmed. We just signal "starting" now.
-            let now = Utc::now();
-            ctx.deployments
-                .set_container_stage(
-                    seal_id,
-                    StageStatus::Submitted {
-                        tx_hash: None,
-                        at: now,
-                    },
-                )
-                .await?;
-            ctx.events
-                .publish(WsEvent::ContainerStarting { seal_id })
-                .await?;
             Ok(())
         }
         JobPayload::SandboxStop {
@@ -203,6 +238,7 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             // That's not a failure: the desired end state (stopped) IS
             // achieved. Fall through to the success path so the UI
             // doesn't flip Failed and force the user to recreate.
+            recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
             if let Err(e) = ctx.sandbox.stop(seal_id, &sandbox_envelope).await {
                 let msg = e.to_string();
                 let already_stopped = msg.contains("not started")
@@ -242,7 +278,10 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     ctx.deployments
                         .set_container_stage(
                             seal_id,
-                            StageStatus::Failed { at: now, reason: reason.clone() },
+                            StageStatus::Failed {
+                                at: now,
+                                reason: reason.clone(),
+                            },
                         )
                         .await?;
                     ctx.events
@@ -274,10 +313,15 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => handle_sandbox_recreate(ctx, seal_id, sandbox_envelope).await,
-        JobPayload::ResumeDeploy { seal_id, artifacts, sandbox_envelope } => {
-            handle_resume_deploy(ctx, seal_id, artifacts, sandbox_envelope).await
-        }
-        JobPayload::SandboxTeardown { seal_id } => handle_sandbox_teardown(ctx, seal_id).await,
+        JobPayload::ResumeDeploy {
+            seal_id,
+            artifacts,
+            sandbox_envelope,
+        } => handle_resume_deploy(ctx, seal_id, artifacts, sandbox_envelope).await,
+        JobPayload::SandboxTeardown {
+            seal_id,
+            expected_sandbox_id,
+        } => handle_sandbox_teardown(ctx, seal_id, expected_sandbox_id).await,
         JobPayload::Clone {
             new_seal_id,
             source_seal_id,
@@ -308,16 +352,29 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
 /// envelope) to `admin_delete` the sandbox. Best-effort: a failure here just
 /// means the container lingers until the sandbox runtime GCs it — the sealed
 /// fail-safe self-kill (deferred #5) is the guarantee, this is cleanup.
-async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<()> {
-    let sandbox_id = match ctx.deployments.get(seal_id).await? {
-        Some(d) => d.sandbox_id,
+async fn handle_sandbox_teardown(
+    ctx: &Ctx,
+    seal_id: SealId,
+    expected_sandbox_id: Option<String>,
+) -> anyhow::Result<()> {
+    // Never resolve an old teardown job to a newer owner's container.
+    let sandbox_id = match expected_sandbox_id {
+        Some(id) => Some(id),
         None => {
-            tracing::warn!(?seal_id, "teardown: deployment vanished, nothing to do");
-            return Ok(());
+            if ctx.deployments.has_status_binding(seal_id).await? {
+                tracing::warn!(
+                    ?seal_id,
+                    "legacy teardown without a captured target ignored for a managed boot"
+                );
+                return Ok(());
+            }
+            ctx.deployments
+                .get(seal_id)
+                .await?
+                .and_then(|d| d.sandbox_id)
         }
     };
     let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
-        tracing::info!(?seal_id, "teardown: no sandbox_id, nothing to delete");
         return Ok(());
     };
     tracing::info!(
@@ -339,13 +396,20 @@ async fn handle_sandbox_teardown(ctx: &Ctx, seal_id: SealId) -> anyhow::Result<(
     // the agent awaiting the NEW owner to bring it online via a fresh deploy.
     // This clears the now-stale sandbox_id / provisioned_at and drops it out
     // of the phase='running' health sweep so it can't be flipped to Failed.
-    if let Err(e) = ctx.deployments.reset_container_track(seal_id).await {
+    if let Err(e) = ctx
+        .deployments
+        .reset_container_track(seal_id, Some(&sb))
+        .await
+    {
         tracing::warn!(?seal_id, error = %e, "teardown: reset_container_track failed (non-fatal)");
     }
     if let Ok(Some(d)) = ctx.deployments.get(seal_id).await {
         let _ = ctx
             .events
-            .publish(WsEvent::PhaseChanged { seal_id, phase: d.phase })
+            .publish(WsEvent::PhaseChanged {
+                seal_id,
+                phase: d.phase,
+            })
             .await;
     }
     Ok(())
@@ -396,7 +460,10 @@ async fn handle_resume_deploy(
                 run_phase2(ctx, seal_id, &cp.name, &cp.description, cp.image.as_deref()).await?;
                 return Ok(());
             }
-            tracing::info!(?seal_id, "resume(clone): re-running handle_clone from the persisted recipe");
+            tracing::info!(
+                ?seal_id,
+                "resume(clone): re-running handle_clone from the persisted recipe"
+            );
             return handle_clone(
                 ctx,
                 seal_id,
@@ -451,10 +518,19 @@ async fn handle_resume_deploy(
                               re-run the clone itself)"
                     .to_string();
                 ctx.deployments
-                    .set_mint_stage(seal_id, StageStatus::Failed { at: now, reason: reason.clone() })
+                    .set_mint_stage(
+                        seal_id,
+                        StageStatus::Failed {
+                            at: now,
+                            reason: reason.clone(),
+                        },
+                    )
                     .await?;
                 ctx.events
-                    .publish(WsEvent::MintFailed { seal_id, reason: reason.clone() })
+                    .publish(WsEvent::MintFailed {
+                        seal_id,
+                        reason: reason.clone(),
+                    })
                     .await?;
                 anyhow::bail!(reason);
             }
@@ -507,7 +583,8 @@ async fn handle_resume_deploy(
     let needs_fresh_sandbox = matches!(
         d.container_stage,
         StageStatus::Failed { .. } | StageStatus::Stopped { .. }
-    ) || (matches!(d.container_stage, StageStatus::NotStarted) && d.sandbox_id.is_none());
+    ) || (matches!(d.container_stage, StageStatus::NotStarted)
+        && d.sandbox_id.is_none());
     if needs_fresh_sandbox {
         if let Some(env) = sandbox_envelope {
             tracing::info!(
@@ -547,9 +624,7 @@ async fn handle_resume_deploy(
 /// Errors if any required field is missing — that means the deploy
 /// flow was killed before the stub got persisted, in which case
 /// recovery isn't meaningful (no agent_id either, etc.).
-fn read_stub_card(
-    card: &serde_json::Value,
-) -> anyhow::Result<(String, String, Option<String>)> {
+fn read_stub_card(card: &serde_json::Value) -> anyhow::Result<(String, String, Option<String>)> {
     let obj = card
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("stub agent_card not a JSON object"))?;
@@ -582,15 +657,19 @@ async fn handle_sandbox_recreate(
 ) -> anyhow::Result<()> {
     // Capture the old sandbox_id BEFORE we overwrite — needed for
     // best-effort orphan cleanup at the end of this handler.
-    let old_sandbox_id = ctx
-        .deployments
-        .get(seal_id)
-        .await?
-        .and_then(|d| d.sandbox_id.clone());
+    recheck_job_owner(ctx, seal_id, &envelope).await?;
+    let deployment = ctx.deployments.get(seal_id).await?;
+    let old_sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
 
     let now = Utc::now();
     ctx.deployments
-        .set_container_stage(seal_id, StageStatus::Submitted { tx_hash: None, at: now })
+        .set_container_stage(
+            seal_id,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
+        )
         .await?;
     ctx.events
         .publish(WsEvent::ContainerStarting { seal_id })
@@ -600,7 +679,25 @@ async fn handle_sandbox_recreate(
     // place — its container is presumably still wherever it was, and
     // we don't want to leave the deployment pointing at a sandbox that
     // never came up.
-    let resp = match ctx.sandbox.create(seal_id, &envelope).await {
+    let boot_ticket = attestor_shared::auth::status::new_boot_ticket();
+    ctx.deployments
+        .prepare_status_boot(
+            seal_id,
+            Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
+            envelope.wallet_address,
+        )
+        .await?;
+    // Fence the previous boot before granting this revision its fresh attempt.
+    if let Some(d) = &deployment {
+        ctx.deployments
+            .retry_settings(seal_id, d.settings_version)
+            .await?;
+    }
+    let resp = match ctx
+        .sandbox
+        .create(seal_id, &envelope, Some(&boot_ticket))
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
@@ -625,7 +722,10 @@ async fn handle_sandbox_recreate(
             ctx.deployments
                 .set_container_stage(
                     seal_id,
-                    StageStatus::Failed { at: now, reason: reason.clone() },
+                    StageStatus::Failed {
+                        at: now,
+                        reason: reason.clone(),
+                    },
                 )
                 .await?;
             if transient {
@@ -636,7 +736,10 @@ async fn handle_sandbox_recreate(
                 return Ok(());
             }
             ctx.events
-                .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
+                .publish(WsEvent::ContainerFailed {
+                    seal_id,
+                    reason: reason.clone(),
+                })
                 .await?;
             anyhow::bail!(reason);
         }
@@ -645,13 +748,24 @@ async fn handle_sandbox_recreate(
     // New sandbox_id replaces the stale one; the old container_pubkey +
     // mac stay in the DB but `/provision` will overwrite them when the
     // new container hits us with its (different) pubkey.
-    let persisted_new = match ctx.deployments.set_sandbox_id(seal_id, resp.id.clone()).await {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(?seal_id, sandbox_id = %resp.id, error = %e, "failed to persist new sandbox_id");
-            false
-        }
-    };
+    if let Err(e) = ctx
+        .deployments
+        .set_sandbox_id(seal_id, resp.id.clone())
+        .await
+    {
+        ctx.deployments
+            .set_container_stage(
+                seal_id,
+                StageStatus::Failed {
+                    at: Utc::now(),
+                    reason: "failed to persist new sandbox ID".into(),
+                },
+            )
+            .await?;
+        let _ = ctx.sandbox.admin_delete(&resp.id).await;
+        return Err(e.context("persist new sandbox ID"));
+    }
+    let persisted_new = true;
 
     // Reset the provision deadline so the sweep doesn't immediately
     // refire on a deployment whose previous deadline has long passed.
@@ -735,14 +849,8 @@ async fn handle_sandbox_recreate(
         // Reconstruct phase 2 inputs from the stub agent_card.
         match read_stub_card(&post_recreate.agent_card) {
             Ok((name, description, image)) => {
-                if let Err(e) = run_phase2(
-                    ctx,
-                    seal_id,
-                    &name,
-                    &description,
-                    image.as_deref(),
-                )
-                .await
+                if let Err(e) =
+                    run_phase2(ctx, seal_id, &name, &description, image.as_deref()).await
                 {
                     // Non-fatal: agent itself can still come up; user
                     // can `/retry` to drive phase 2 once root cause is
@@ -996,7 +1104,10 @@ async fn handle_deploy(
             // (mint/storage) with a misleading "provision timeout". Only
             // when c was still active — a genuine container_failed keeps
             // its own reason.
-            if matches!(d.container_stage, StageStatus::Submitted { .. } | StageStatus::NotStarted) {
+            if matches!(
+                d.container_stage,
+                StageStatus::Submitted { .. } | StageStatus::NotStarted
+            ) {
                 let now = Utc::now();
                 let _ = ctx
                     .deployments
@@ -1008,10 +1119,7 @@ async fn handle_deploy(
                         },
                     )
                     .await;
-                let _ = ctx
-                    .deployments
-                    .set_provision_deadline(seal_id, None)
-                    .await;
+                let _ = ctx.deployments.set_provision_deadline(seal_id, None).await;
             }
         }
         // Propagate the identity error; both tracks already recorded their
@@ -1030,14 +1138,7 @@ async fn handle_deploy(
     let _ = container_res;
 
     // Identity finalize: AgentCard → OSS → setAgentURI → ciphertext cleanup.
-    run_phase2(
-        ctx,
-        seal_id,
-        &name,
-        &description,
-        image.as_deref(),
-    )
-    .await?;
+    run_phase2(ctx, seal_id, &name, &description, image.as_deref()).await?;
 
     let _ = deployment; // silence unused
     Ok(())
@@ -1115,7 +1216,9 @@ async fn handle_clone(
                 let mut out = Vec::with_capacity(sealed.len());
                 for sk in &sealed {
                     let data_key = ctx.crypto.ecies_decrypt(sk, &source_kp.priv_key)?;
-                    out.push(Bytes::from(ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?));
+                    out.push(Bytes::from(
+                        ctx.crypto.ecies_encrypt(&data_key, &new_kp.pub_key)?,
+                    ));
                 }
                 Ok(out)
             })(),
@@ -1131,7 +1234,10 @@ async fn handle_clone(
                 .deployments
                 .set_mint_stage(
                     new_seal_id,
-                    StageStatus::Failed { at: now, reason: reason.clone() },
+                    StageStatus::Failed {
+                        at: now,
+                        reason: reason.clone(),
+                    },
                 )
                 .await;
             anyhow::bail!(reason);
@@ -1183,7 +1289,11 @@ async fn handle_clone(
             };
             run_mint_track(ctx, new_seal_id, mint_params).await?;
         }
-        JobCloneAuth::Contract { authorizer, auth_data, caller } => {
+        JobCloneAuth::Contract {
+            authorizer,
+            auth_data,
+            caller,
+        } => {
             let clone_params = CloneFromParams {
                 source_agent_id,
                 to: target_owner,
@@ -1246,7 +1356,10 @@ async fn run_clone_from_track(
     ctx.deployments
         .set_mint_stage(
             seal_id,
-            StageStatus::Submitted { at: now, tx_hash: Some(submit) },
+            StageStatus::Submitted {
+                at: now,
+                tx_hash: Some(submit),
+            },
         )
         .await?;
     ctx.events
@@ -1411,7 +1524,10 @@ async fn run_storage_track(
     ctx.deployments
         .set_storage_stage(
             seal_id,
-            StageStatus::Submitted { tx_hash: None, at: now },
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
         )
         .await?;
 
@@ -1479,11 +1595,7 @@ async fn run_storage_track(
     Ok(())
 }
 
-async fn run_mint_track(
-    ctx: &Ctx,
-    seal_id: SealId,
-    params: MintParams,
-) -> anyhow::Result<()> {
+async fn run_mint_track(ctx: &Ctx, seal_id: SealId, params: MintParams) -> anyhow::Result<()> {
     let submit = match ctx.chain.register_with_seal(params).await {
         Ok(tx) => tx,
         Err(e) => {
@@ -1539,7 +1651,10 @@ async fn run_mint_track(
             )
             .await?;
         ctx.events
-            .publish(WsEvent::MintFailed { seal_id, reason: reason.clone() })
+            .publish(WsEvent::MintFailed {
+                seal_id,
+                reason: reason.clone(),
+            })
             .await?;
         anyhow::bail!(reason);
     }
@@ -1562,11 +1677,17 @@ async fn run_mint_track(
         ctx.deployments
             .set_mint_stage(
                 seal_id,
-                StageStatus::Failed { at: now, reason: reason.clone() },
+                StageStatus::Failed {
+                    at: now,
+                    reason: reason.clone(),
+                },
             )
             .await?;
         ctx.events
-            .publish(WsEvent::MintFailed { seal_id, reason: reason.clone() })
+            .publish(WsEvent::MintFailed {
+                seal_id,
+                reason: reason.clone(),
+            })
             .await?;
         anyhow::bail!(reason);
     };
@@ -1592,14 +1713,30 @@ async fn run_container_track(
     ctx.deployments
         .set_container_stage(
             seal_id,
-            StageStatus::Submitted { tx_hash: None, at: now },
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
         )
         .await?;
     ctx.events
         .publish(WsEvent::ContainerStarting { seal_id })
         .await?;
 
-    let resp = match ctx.sandbox.create(seal_id, envelope).await {
+    recheck_job_owner(ctx, seal_id, envelope).await?;
+    let boot_ticket = attestor_shared::auth::status::new_boot_ticket();
+    ctx.deployments
+        .prepare_status_boot(
+            seal_id,
+            Some(attestor_shared::auth::status::binding_hash(&boot_ticket)),
+            envelope.wallet_address,
+        )
+        .await?;
+    let resp = match ctx
+        .sandbox
+        .create(seal_id, envelope, Some(&boot_ticket))
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             let now = Utc::now();
@@ -1630,17 +1767,32 @@ async fn run_container_track(
                 )
                 .await?;
             ctx.events
-                .publish(WsEvent::ContainerFailed { seal_id, reason: reason.clone() })
+                .publish(WsEvent::ContainerFailed {
+                    seal_id,
+                    reason: reason.clone(),
+                })
                 .await?;
             anyhow::bail!(reason);
         }
     };
 
-    // Persist sandbox id so later /restart /stop envelopes can reference it
-    // as `resource_id`. A failure here is non-fatal for this deploy: the
-    // container is already spawned; we just lose the handle for restart.
-    if let Err(e) = ctx.deployments.set_sandbox_id(seal_id, resp.id.clone()).await {
-        tracing::warn!(?seal_id, sandbox_id = %resp.id, error = %e, "failed to persist sandbox_id");
+    // A container without a persisted identity must not retain a live ticket.
+    if let Err(e) = ctx
+        .deployments
+        .set_sandbox_id(seal_id, resp.id.clone())
+        .await
+    {
+        ctx.deployments
+            .set_container_stage(
+                seal_id,
+                StageStatus::Failed {
+                    at: Utc::now(),
+                    reason: "failed to persist sandbox ID".into(),
+                },
+            )
+            .await?;
+        let _ = ctx.sandbox.admin_delete(&resp.id).await;
+        return Err(e.context("persist sandbox ID"));
     }
 
     // Provision deadline. Sweep loop flips container_stage to Failed if
@@ -1648,7 +1800,11 @@ async fn run_container_track(
     // effort: a write failure just means the timeout wouldn't fire;
     // /status: Error or user-driven recreate would still recover.
     let deadline = Utc::now() + PROVISION_TIMEOUT;
-    if let Err(e) = ctx.deployments.set_provision_deadline(seal_id, Some(deadline)).await {
+    if let Err(e) = ctx
+        .deployments
+        .set_provision_deadline(seal_id, Some(deadline))
+        .await
+    {
         tracing::warn!(?seal_id, error = %e, "failed to write provision_deadline");
     }
 
@@ -1713,11 +1869,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -1759,7 +1919,14 @@ mod tests {
             events: events.clone(),
             oss,
         };
-        TestCtx { ctx, chain, storage, sandbox, deployments, events }
+        TestCtx {
+            ctx,
+            chain,
+            storage,
+            sandbox,
+            deployments,
+            events,
+        }
     }
 
     /// WYSIWYS: handle_deploy mints i_data verbatim, so tests feed it the
@@ -1890,11 +2057,17 @@ mod tests {
             }),
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
-                &StageStatus::Failed { at: now, reason: "receiver rejected".into() },
+                &StageStatus::Failed {
+                    at: now,
+                    reason: "receiver rejected".into(),
+                },
                 &StageStatus::NotStarted,
             ),
             storage_stage: StageStatus::Confirmed { at: now },
-            mint_stage: StageStatus::Failed { at: now, reason: "receiver rejected".into() },
+            mint_stage: StageStatus::Failed {
+                at: now,
+                reason: "receiver rejected".into(),
+            },
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
@@ -1966,7 +2139,10 @@ mod tests {
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         // Identity finalized.
         assert!(d.agent_id.is_some(), "agent must be minted");
-        assert!(!d.agent_uri.is_empty(), "agent_uri (stable OSS key) must be written");
+        assert!(
+            !d.agent_uri.is_empty(),
+            "agent_uri (stable OSS key) must be written"
+        );
         assert_eq!(
             t.chain.set_uri_calls.load(Ordering::SeqCst),
             1,
@@ -1977,7 +2153,11 @@ mod tests {
             matches!(d.container_stage, StageStatus::Failed { .. }),
             "container stage must be Failed"
         );
-        assert_eq!(d.phase, DeploymentPhase::Offline, "minted + container failed = Offline");
+        assert_eq!(
+            d.phase,
+            DeploymentPhase::Offline,
+            "minted + container failed = Offline"
+        );
         assert_eq!(
             d.agent_card.get("url").and_then(|v| v.as_str()),
             Some(""),
@@ -2088,7 +2268,11 @@ mod tests {
         // Source's AUTHORITATIVE on-chain iData: a known dataKey sealed to the
         // SOURCE agentSeal. Clone reads this from the chain (not the DB).
         let known_key = vec![0x9u8; 32];
-        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        let sealed = t
+            .ctx
+            .crypto
+            .ecies_encrypt(&known_key, &source_kp.pub_key)
+            .unwrap();
         t.chain.seed_idata(
             vec![IntelligentData {
                 description: "{}".into(),
@@ -2127,10 +2311,20 @@ mod tests {
         // agentSeal priv yields the SAME source dataKey (data reused).
         let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
         assert_eq!(to, target, "must mint to target_owner");
-        assert_eq!(agent_seal, new_kp.address, "must mint with the clone's agentSeal");
+        assert_eq!(
+            agent_seal, new_kp.address,
+            "must mint with the clone's agentSeal"
+        );
         assert_eq!(keys.len(), 1);
-        let got = t.ctx.crypto.ecies_decrypt(&keys[0], &new_kp.priv_key).unwrap();
-        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey under the clone agentSeal");
+        let got = t
+            .ctx
+            .crypto
+            .ecies_decrypt(&keys[0], &new_kp.priv_key)
+            .unwrap();
+        assert_eq!(
+            got, known_key,
+            "re-sealed key must yield the source dataKey under the clone agentSeal"
+        );
         // Storage reuse: NO upload happened (source roots reused via chain iData).
         assert_eq!(
             t.storage.upload_calls.load(Ordering::SeqCst),
@@ -2159,7 +2353,11 @@ mod tests {
         let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
         let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         let known_key = vec![0x9u8; 32];
-        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        let sealed = t
+            .ctx
+            .crypto
+            .ecies_encrypt(&known_key, &source_kp.pub_key)
+            .unwrap();
         t.chain.seed_idata(
             vec![IntelligentData {
                 description: "{}".into(),
@@ -2186,7 +2384,11 @@ mod tests {
             "Sage".into(),
             "d".into(),
             None,
-            JobCloneAuth::Contract { authorizer, auth_data: auth_data.clone(), caller: buyer },
+            JobCloneAuth::Contract {
+                authorizer,
+                auth_data: auth_data.clone(),
+                caller: buyer,
+            },
         )
         .await
         .expect("contract-mode clone must succeed");
@@ -2199,15 +2401,26 @@ mod tests {
         assert_eq!(p.caller, buyer, "caller = the buyer (route-proven)");
         assert_eq!(p.authorizer, authorizer, "live authorizer forwarded");
         assert_eq!(p.auth_data, auth_data, "buyer auth_data forwarded");
-        assert_eq!(p.data_hashes, vec![B256::repeat_byte(0x33)], "live dataHashes submitted");
+        assert_eq!(
+            p.data_hashes,
+            vec![B256::repeat_byte(0x33)],
+            "live dataHashes submitted"
+        );
         // …and NOT via registerWithSeal.
         assert!(
             t.chain.last_register.lock().unwrap().is_none(),
             "contract mode must not touch registerWithSeal"
         );
         // The re-sealed key decrypts under the clone's agentSeal.
-        let got = t.ctx.crypto.ecies_decrypt(&p.sealed_keys[0], &new_kp.priv_key).unwrap();
-        assert_eq!(got, known_key, "re-sealed key must yield the source dataKey");
+        let got = t
+            .ctx
+            .crypto
+            .ecies_decrypt(&p.sealed_keys[0], &new_kp.priv_key)
+            .unwrap();
+        assert_eq!(
+            got, known_key,
+            "re-sealed key must yield the source dataKey"
+        );
         // Identity finalized as usual.
         let clone = t.deployments.get(new_seal).await.unwrap().unwrap();
         assert_eq!(clone.phase, DeploymentPhase::Offline, "clone lands Offline");
@@ -2277,9 +2490,16 @@ mod tests {
         let source_kp = t.ctx.crypto.derive_agent_seal(source_seal).await.unwrap();
         let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         let known_key = vec![0x9u8; 32];
-        let sealed = t.ctx.crypto.ecies_encrypt(&known_key, &source_kp.pub_key).unwrap();
+        let sealed = t
+            .ctx
+            .crypto
+            .ecies_encrypt(&known_key, &source_kp.pub_key)
+            .unwrap();
         t.chain.seed_idata(
-            vec![IntelligentData { description: "{}".into(), data_hash: B256::repeat_byte(0x33) }],
+            vec![IntelligentData {
+                description: "{}".into(),
+                data_hash: B256::repeat_byte(0x33),
+            }],
             vec![Bytes::from(sealed)],
         );
         seed_deployment(
@@ -2292,7 +2512,12 @@ mod tests {
             None,
         );
         seed_failed_clone_row(
-            &t.deployments, new_seal, new_kp.address, target, source_seal, JobCloneAuth::Owner,
+            &t.deployments,
+            new_seal,
+            new_kp.address,
+            target,
+            source_seal,
+            JobCloneAuth::Owner,
         );
 
         // NOTE: empty artifacts — pre-#147 this path minted an empty iData
@@ -2303,12 +2528,26 @@ mod tests {
 
         let (to, agent_seal, keys) = t.chain.last_register.lock().unwrap().clone().unwrap();
         assert_eq!(to, target, "re-run must mint to the recipe's target");
-        assert_eq!(agent_seal, new_kp.address, "re-run must keep the SAME sealId identity");
-        let got = t.ctx.crypto.ecies_decrypt(&keys[0], &new_kp.priv_key).unwrap();
-        assert_eq!(got, known_key, "materials must be freshly re-sealed, not read from the row");
+        assert_eq!(
+            agent_seal, new_kp.address,
+            "re-run must keep the SAME sealId identity"
+        );
+        let got = t
+            .ctx
+            .crypto
+            .ecies_decrypt(&keys[0], &new_kp.priv_key)
+            .unwrap();
+        assert_eq!(
+            got, known_key,
+            "materials must be freshly re-sealed, not read from the row"
+        );
         let d = t.deployments.get(new_seal).await.unwrap().unwrap();
         assert!(d.agent_id.is_some(), "clone minted on retry");
-        assert_eq!(d.phase, DeploymentPhase::Offline, "clone lands Offline after retry");
+        assert_eq!(
+            d.phase,
+            DeploymentPhase::Offline,
+            "clone lands Offline after retry"
+        );
     }
 
     #[tokio::test]
@@ -2319,7 +2558,12 @@ mod tests {
         let target = Address::from([0xbb; 20]);
         let new_kp = t.ctx.crypto.derive_agent_seal(new_seal).await.unwrap();
         seed_failed_clone_row(
-            &t.deployments, new_seal, new_kp.address, target, source_seal, JobCloneAuth::Owner,
+            &t.deployments,
+            new_seal,
+            new_kp.address,
+            target,
+            source_seal,
+            JobCloneAuth::Owner,
         );
         // Chain says the original clone mint actually landed.
         t.chain.seed_minted(new_seal, U256::from(77u64));
@@ -2350,7 +2594,10 @@ mod tests {
             seal,
             Vec::new(), // nothing persisted
             StageStatus::Confirmed { at: Utc::now() },
-            StageStatus::Failed { at: Utc::now(), reason: "boom".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "boom".into(),
+            },
             None,
             None,
         );
@@ -2368,7 +2615,9 @@ mod tests {
             "must not submit a guaranteed-revert mint"
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
-        assert!(matches!(&d.mint_stage, StageStatus::Failed { reason, .. } if reason.contains("no persisted mint artifacts")));
+        assert!(
+            matches!(&d.mint_stage, StageStatus::Failed { reason, .. } if reason.contains("no persisted mint artifacts"))
+        );
     }
 
     // ── handle_resume_deploy ──────────────────────────────────────────
@@ -2400,14 +2649,19 @@ mod tests {
             seal,
             Vec::new(),
             StageStatus::Confirmed { at: Utc::now() },
-            StageStatus::Failed { at: Utc::now(), reason: "rpc".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "rpc".into(),
+            },
             None,
             Some("sb-1".into()),
         );
         mark_phase2_done(&t.deployments, seal);
         t.chain.seed_minted(seal, seeded_agent_id);
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -2419,7 +2673,9 @@ mod tests {
         assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }));
         // Verify the MintConfirmed event was published with the right id.
         let events = t.events.events.lock().unwrap();
-        let mint_confirmed = events.iter().find(|e| matches!(e, WsEvent::MintConfirmed { .. }));
+        let mint_confirmed = events
+            .iter()
+            .find(|e| matches!(e, WsEvent::MintConfirmed { .. }));
         assert!(mint_confirmed.is_some(), "MintConfirmed not emitted");
         if let Some(WsEvent::MintConfirmed { agent_id, .. }) = mint_confirmed {
             assert_eq!(*agent_id, seeded_agent_id);
@@ -2445,14 +2701,19 @@ mod tests {
             seal,
             arts.clone(),
             StageStatus::Confirmed { at: Utc::now() },
-            StageStatus::Failed { at: Utc::now(), reason: "first attempt".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "first attempt".into(),
+            },
             None,
             Some("sb-1".into()),
         );
         mark_phase2_done(&t.deployments, seal);
         // chain.seal_to_agent intentionally NOT seeded.
 
-        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None)
+            .await
+            .expect("resume must succeed");
 
         assert_eq!(
             t.chain.register_calls.load(Ordering::SeqCst),
@@ -2461,7 +2722,10 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(matches!(d.mint_stage, StageStatus::Confirmed { .. }));
-        assert!(d.agent_id.is_some(), "agent_id must be recorded after mint confirms");
+        assert!(
+            d.agent_id.is_some(),
+            "agent_id must be recorded after mint confirms"
+        );
         let _ = agent_seal_addr;
     }
 
@@ -2476,14 +2740,19 @@ mod tests {
             &t.deployments,
             seal,
             arts.clone(),
-            StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "storage flake".into(),
+            },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(99u64)),
             Some("sb-1".into()),
         );
         mark_phase2_done(&t.deployments, seal);
 
-        handle_resume_deploy(&t.ctx, seal, arts, None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, arts, None)
+            .await
+            .expect("resume must succeed");
 
         assert_eq!(
             t.storage.upload_calls.load(Ordering::SeqCst),
@@ -2512,7 +2781,10 @@ mod tests {
             &t.deployments,
             seal,
             Vec::new(), // snapshot empty on purpose
-            StageStatus::Failed { at: Utc::now(), reason: "storage flake".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "storage flake".into(),
+            },
             StageStatus::Confirmed { at: Utc::now() },
             Some(U256::from(5u64)),
             Some("sb-1".into()),
@@ -2551,7 +2823,9 @@ mod tests {
         );
         write_stub_card(&t.deployments, seal, "Sage");
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("phase 2 reconstruction must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("phase 2 reconstruction must succeed");
 
         // setAgentURI must have run exactly once.
         assert_eq!(
@@ -2622,7 +2896,9 @@ mod tests {
         d.agent_card = serde_json::json!({"name": "Sage"});
         t.deployments.seed(d);
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("noop resume");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("noop resume");
 
         assert_eq!(t.chain.register_calls.load(Ordering::SeqCst), 0);
         assert_eq!(t.storage.upload_calls.load(Ordering::SeqCst), 0);
@@ -2644,14 +2920,19 @@ mod tests {
             seal,
             vec![art],
             StageStatus::Confirmed { at: Utc::now() },
-            StageStatus::Failed { at: Utc::now(), reason: "first attempt".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "first attempt".into(),
+            },
             None,
             Some("sb-1".into()),
         );
         write_stub_card(&t.deployments, seal, "Sage");
         t.chain.seed_minted(seal, U256::from(7u64));
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must succeed");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("resume must succeed");
 
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         // Mint recovered.
@@ -2715,7 +2996,9 @@ mod tests {
         );
         // ContainerStarting event published before sandbox.create.
         let events = t.events.events.lock().unwrap();
-        let starting = events.iter().any(|e| matches!(e, WsEvent::ContainerStarting { .. }));
+        let starting = events
+            .iter()
+            .any(|e| matches!(e, WsEvent::ContainerStarting { .. }));
         assert!(starting, "ContainerStarting not emitted");
         // Orphan cleanup fired exactly once, on the OLD sandbox id.
         assert_eq!(
@@ -2872,14 +3155,18 @@ mod tests {
         t.deployments
             .set_container_stage(
                 seal,
-                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user".into(),
+                },
             )
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
         *t.sandbox.fail_status.lock().unwrap() = Some(402);
-        *t.sandbox.fail_msg.lock().unwrap() =
-            Some("sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
+        *t.sandbox.fail_msg.lock().unwrap() = Some(
+            "sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into(),
+        );
 
         run(
             &t.ctx,
@@ -2904,11 +3191,15 @@ mod tests {
         );
         let events = t.events.events.lock().unwrap();
         assert!(
-            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
             "expected a ContainerWarning top-up hint"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
             "must NOT emit ContainerFailed on a 402"
         );
     }
@@ -2936,7 +3227,10 @@ mod tests {
         t.deployments
             .set_container_stage(
                 seal,
-                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user".into(),
+                },
             )
             .await
             .unwrap();
@@ -2969,11 +3263,15 @@ mod tests {
         );
         let events = t.events.events.lock().unwrap();
         assert!(
-            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
             "expected a ContainerWarning retry hint"
         );
         assert!(
-            !events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            !events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
             "must NOT emit ContainerFailed on a transient lock"
         );
     }
@@ -2998,7 +3296,10 @@ mod tests {
         t.deployments
             .set_container_stage(
                 seal,
-                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user".into(),
+                },
             )
             .await
             .unwrap();
@@ -3029,7 +3330,9 @@ mod tests {
         );
         let events = t.events.events.lock().unwrap();
         assert!(
-            events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
             "fatal error must emit ContainerFailed"
         );
     }
@@ -3053,8 +3356,9 @@ mod tests {
         );
         t.sandbox.create_fails.store(true, Ordering::SeqCst);
         *t.sandbox.fail_status.lock().unwrap() = Some(402);
-        *t.sandbox.fail_msg.lock().unwrap() =
-            Some("sandbox create: 402 Payment Required — {\"error\":\"insufficient balance\"}".into());
+        *t.sandbox.fail_msg.lock().unwrap() = Some(
+            "sandbox create: 402 Payment Required — {\"error\":\"insufficient balance\"}".into(),
+        );
 
         handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
             .await
@@ -3073,7 +3377,9 @@ mod tests {
         );
         let events = t.events.events.lock().unwrap();
         assert!(
-            events.iter().any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
+            events
+                .iter()
+                .any(|e| matches!(e, WsEvent::ContainerWarning { .. })),
             "expected a ContainerWarning top-up hint"
         );
     }
@@ -3102,7 +3408,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("recreate") || err.contains("fail"), "got: {err}");
+        assert!(
+            err.contains("recreate") || err.contains("fail"),
+            "got: {err}"
+        );
 
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(
@@ -3115,7 +3424,9 @@ mod tests {
             "sandbox_id must NOT be overwritten when create errors"
         );
         let events = t.events.events.lock().unwrap();
-        let failed = events.iter().any(|e| matches!(e, WsEvent::ContainerFailed { .. }));
+        let failed = events
+            .iter()
+            .any(|e| matches!(e, WsEvent::ContainerFailed { .. }));
         assert!(failed, "ContainerFailed not emitted");
     }
 
@@ -3208,7 +3519,10 @@ mod tests {
         t.deployments
             .set_container_stage(
                 seal,
-                StageStatus::Submitted { tx_hash: None, at: Utc::now() },
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: Utc::now(),
+                },
             )
             .await
             .unwrap();
@@ -3244,7 +3558,10 @@ mod tests {
         t.deployments
             .set_container_stage(
                 seal,
-                StageStatus::Stopped { at: Utc::now(), reason: "user".into() },
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "user".into(),
+                },
             )
             .await
             .unwrap();
@@ -3360,7 +3677,10 @@ mod tests {
         // ciphertext intact on the persisted artifacts.
         let t = make_test_ctx();
         let seal = dummy_seal();
-        let arts = vec![artifact_with_ciphertext(0x10), artifact_with_ciphertext(0x20)];
+        let arts = vec![
+            artifact_with_ciphertext(0x10),
+            artifact_with_ciphertext(0x20),
+        ];
         seed_deployment(
             &t.deployments,
             seal,
@@ -3376,7 +3696,9 @@ mod tests {
         // Both upload calls should have fired.
         assert_eq!(t.storage.upload_calls.load(Ordering::SeqCst), 2);
         assert_eq!(
-            t.deployments.update_i_data_artifacts_calls.load(Ordering::SeqCst),
+            t.deployments
+                .update_i_data_artifacts_calls
+                .load(Ordering::SeqCst),
             0,
             "storage track must NOT clear ciphertext anymore"
         );
@@ -3401,14 +3723,17 @@ mod tests {
         let t = make_test_ctx();
         let seal = dummy_seal();
         let arts = vec![
-            cleared_artifact(0x30),                 // already on storage
-            artifact_with_ciphertext(0x40),         // still pending
+            cleared_artifact(0x30),         // already on storage
+            artifact_with_ciphertext(0x40), // still pending
         ];
         seed_deployment(
             &t.deployments,
             seal,
             arts.clone(),
-            StageStatus::Failed { at: Utc::now(), reason: "prev".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "prev".into(),
+            },
             StageStatus::NotStarted,
             None,
             None,
@@ -3448,12 +3773,16 @@ mod tests {
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(matches!(d.storage_stage, StageStatus::Failed { .. }));
         assert_eq!(
-            t.deployments.update_i_data_artifacts_calls.load(Ordering::SeqCst),
+            t.deployments
+                .update_i_data_artifacts_calls
+                .load(Ordering::SeqCst),
             0,
             "ciphertext must NOT be cleared on upload failure — needed for retry"
         );
         let events = t.events.events.lock().unwrap();
-        let failed = events.iter().any(|e| matches!(e, WsEvent::StorageFailed { .. }));
+        let failed = events
+            .iter()
+            .any(|e| matches!(e, WsEvent::StorageFailed { .. }));
         assert!(failed, "StorageFailed must be emitted");
     }
 
@@ -3470,7 +3799,10 @@ mod tests {
             &t.deployments,
             seal,
             arts.clone(),
-            StageStatus::Failed { at: Utc::now(), reason: "prev".into() },
+            StageStatus::Failed {
+                at: Utc::now(),
+                reason: "prev".into(),
+            },
             StageStatus::NotStarted,
             None,
             None,
@@ -3590,7 +3922,9 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("resume must Ok");
 
         // Critical: setAgentURI must NOT have been called — that would
         // upload the stale URL to chain.
@@ -3632,7 +3966,9 @@ mod tests {
             };
         }
 
-        handle_resume_deploy(&t.ctx, seal, Vec::new(), None).await.expect("resume must Ok");
+        handle_resume_deploy(&t.ctx, seal, Vec::new(), None)
+            .await
+            .expect("resume must Ok");
         assert_eq!(t.chain.set_uri_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -3690,6 +4026,132 @@ mod tests {
     }
 
     // ── handle_sandbox_recreate phase-2 fallback ──────────────────────
+
+    #[tokio::test]
+    async fn recreate_retries_current_settings_with_fresh_credentials() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(31u64)),
+            Some("sb-old".into()),
+        );
+        {
+            let mut g = t.deployments.by_seal.lock().unwrap();
+            let d = g.get_mut(&seal).unwrap();
+            d.agent_uri = "http://oss.example/card.json".into();
+            d.agent_card = serde_json::json!({"name":"Sage","url":"http://old"});
+        }
+        let previous = serde_json::json!({"provider":"0g-compute","model":"old"});
+        let current = serde_json::json!({"provider":"partner","model":"new"});
+        t.deployments
+            .set_settings(seal, previous.clone(), 0)
+            .await
+            .unwrap();
+        t.deployments
+            .note_settings_attempt(
+                seal,
+                t.deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                t.deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
+        t.deployments
+            .promote_settings_last_good(seal)
+            .await
+            .unwrap();
+        t.deployments
+            .set_settings(seal, current.clone(), 1)
+            .await
+            .unwrap();
+        t.deployments
+            .note_settings_attempt(
+                seal,
+                t.deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                t.deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
+        t.deployments
+            .note_settings_attempt(
+                seal,
+                t.deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                t.deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
+
+        handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+            .await
+            .unwrap();
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert_eq!(d.settings_attempts, 0);
+        assert_eq!(d.settings_version, 2);
+        assert_eq!(d.settings_confirmed_version, 1);
+        assert_eq!(d.settings.as_ref(), Some(&current));
+        assert_eq!(d.settings_last_good.as_ref(), Some(&previous));
+
+        // A concurrent write owns its own retry budget; stale versions cannot reset it.
+        t.deployments.set_settings(seal, current, 2).await.unwrap();
+        t.deployments
+            .note_settings_attempt(
+                seal,
+                t.deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                t.deployments
+                    .boot_authorization(seal)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
+        assert!(!t.deployments.retry_settings(seal, 2).await.unwrap());
+        assert_eq!(
+            t.deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings_attempts,
+            1
+        );
+    }
 
     #[tokio::test]
     async fn recreate_runs_full_phase2_when_agent_uri_empty() {
@@ -3772,7 +4234,11 @@ mod tests {
             "must target the OLD sandbox"
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
-        assert_eq!(d.sandbox_id.as_deref(), Some("mock-id"), "deployment points at the new sandbox");
+        assert_eq!(
+            d.sandbox_id.as_deref(),
+            Some("mock-id"),
+            "deployment points at the new sandbox"
+        );
     }
 
     #[tokio::test]
@@ -3843,9 +4309,30 @@ mod tests {
             d.container_stage = c;
             d.provision_deadline = deadline;
         };
-        make(0x01, StageStatus::Submitted { tx_hash: None, at: now }, Some(past));
-        make(0x02, StageStatus::Submitted { tx_hash: None, at: now }, Some(future));
-        make(0x03, StageStatus::Submitted { tx_hash: None, at: now }, None);
+        make(
+            0x01,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
+            Some(past),
+        );
+        make(
+            0x02,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
+            Some(future),
+        );
+        make(
+            0x03,
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
+            None,
+        );
         make(0x04, StageStatus::Confirmed { at: now }, Some(past));
 
         let flipped = t
@@ -3853,15 +4340,34 @@ mod tests {
             .flip_provision_timeouts(now, "test timeout".into())
             .await
             .unwrap();
-        assert_eq!(flipped.len(), 1, "only the past-deadline Submitted must flip");
+        assert_eq!(
+            flipped.len(),
+            1,
+            "only the past-deadline Submitted must flip"
+        );
         assert_eq!(flipped[0], B256::repeat_byte(0x01));
 
-        let d = t.deployments.get(B256::repeat_byte(0x01)).await.unwrap().unwrap();
+        let d = t
+            .deployments
+            .get(B256::repeat_byte(0x01))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
         // Sanity: the others are untouched.
-        let d2 = t.deployments.get(B256::repeat_byte(0x02)).await.unwrap().unwrap();
+        let d2 = t
+            .deployments
+            .get(B256::repeat_byte(0x02))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(d2.container_stage, StageStatus::Submitted { .. }));
-        let d4 = t.deployments.get(B256::repeat_byte(0x04)).await.unwrap().unwrap();
+        let d4 = t
+            .deployments
+            .get(B256::repeat_byte(0x04))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(d4.container_stage, StageStatus::Confirmed { .. }));
     }
 
@@ -3952,6 +4458,219 @@ mod tests {
             (240..=360).contains(&elapsed),
             "deadline ~5min in future (got {elapsed}s)"
         );
-        assert_eq!(t.deployments.set_provision_deadline_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            t.deployments
+                .set_provision_deadline_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+    #[tokio::test]
+    async fn queued_previous_owner_cannot_reauthorize_or_stop_after_transfer() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(103)),
+            Some("sandbox".into()),
+        );
+        let mut env = dummy_envelope("create");
+        env.wallet_address = Address::repeat_byte(0x99);
+        assert!(run(
+            &t.ctx,
+            JobPayload::SandboxRecreate {
+                seal_id: seal,
+                sandbox_envelope: env.clone()
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 0);
+        assert!(t
+            .deployments
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: seal,
+                sandbox_envelope: env.clone()
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(t.sandbox.stop_calls.load(Ordering::SeqCst), 0);
+        t.deployments
+            .set_container_stage(
+                seal,
+                StageStatus::Stopped {
+                    at: Utc::now(),
+                    reason: "stop".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(run(
+            &t.ctx,
+            JobPayload::SandboxStart {
+                seal_id: seal,
+                sandbox_envelope: env
+            }
+        )
+        .await
+        .is_err());
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn create_or_persistence_failure_revokes_the_new_ticket() {
+        for fail_create in [true, false] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_deployment(
+                &t.deployments,
+                seal,
+                Vec::new(),
+                StageStatus::Confirmed { at: Utc::now() },
+                StageStatus::Confirmed { at: Utc::now() },
+                Some(U256::from(103)),
+                Some("old-sandbox".into()),
+            );
+            t.sandbox.create_fails.store(fail_create, Ordering::SeqCst);
+            t.deployments
+                .fail_set_sandbox_id
+                .store(!fail_create, Ordering::SeqCst);
+            assert!(
+                handle_sandbox_recreate(&t.ctx, seal, dummy_envelope("create"))
+                    .await
+                    .is_err()
+            );
+            let auth = t
+                .deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!auth.enabled);
+            assert!(!t
+                .deployments
+                .status_bindings
+                .lock()
+                .unwrap()
+                .contains_key(&seal));
+            assert!(matches!(
+                t.deployments
+                    .get(seal)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .container_stage,
+                StageStatus::Failed { .. }
+            ));
+            let tickets = t.sandbox.boot_tickets.lock().unwrap();
+            assert_eq!(tickets.len(), 1);
+            assert_eq!(
+                auth.ticket_hash,
+                attestor_shared::auth::status::binding_hash(&tickets[0])
+            );
+            assert_eq!(
+                t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+                if fail_create { 0 } else { 1 }
+            );
+        }
+    }
+    #[tokio::test]
+    async fn delayed_teardown_only_deletes_its_captured_container() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(103)),
+            Some("old".into()),
+        );
+        let generation = t
+            .deployments
+            .prepare_status_boot(seal, Some([9; 32]), Address::ZERO)
+            .await
+            .unwrap()
+            .unwrap();
+        // Cleanup during a pending authorized create must not revoke it.
+        run(
+            &t.ctx,
+            JobPayload::SandboxTeardown {
+                seal_id: seal,
+                expected_sandbox_id: Some("old".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            t.deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        t.deployments
+            .set_sandbox_id(seal, "new".into())
+            .await
+            .unwrap();
+        run(
+            &t.ctx,
+            JobPayload::SandboxTeardown {
+                seal_id: seal,
+                expected_sandbox_id: Some("old".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            t.sandbox.last_admin_delete_id.lock().unwrap().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            t.deployments
+                .get(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .sandbox_id
+                .as_deref(),
+            Some("new")
+        );
+        assert_eq!(
+            t.deployments
+                .boot_authorization(seal)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            generation
+        );
+        let count = t.sandbox.admin_delete_calls.load(Ordering::SeqCst);
+        run(
+            &t.ctx,
+            JobPayload::SandboxTeardown {
+                seal_id: seal,
+                expected_sandbox_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
+            count,
+            "legacy targetless cleanup deleted a managed container"
+        );
     }
 }

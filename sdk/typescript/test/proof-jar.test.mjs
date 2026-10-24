@@ -62,7 +62,7 @@ test('expired tickets are pruned on load; near-expiry margin excluded from listi
   assert.ok(!listed.some((t) => t.proof.signature === dead.signature), 'expired ticket listed');
   assert.ok(!listed.some((t) => t.proof.signature === nearExpiry.signature), 'near-expiry ticket listed');
   // and the expired one is physically gone from the file after the next write
-  const file = JSON.parse(readFileSync(join(process.env.XDG_CONFIG_HOME, '0g-agenticid', 'proofs.json'), 'utf8'));
+  const file = JSON.parse(readFileSync(join(process.env.XDG_CONFIG_HOME, '0g-agentdna', 'proofs.json'), 'utf8'));
   assert.ok(!file.some((t) => t.proof.signature === dead.signature), 'expired ticket persisted');
 });
 

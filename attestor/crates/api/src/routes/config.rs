@@ -66,6 +66,12 @@ pub struct ConfigResponse {
     /// the plain `API_KEY` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_scheme: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inference_capabilities: Vec<attestor_shared::config::InferenceCapability>,
+    pub provider_registry_schema: u8,
+    pub provider_registry_version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_registry_digest: Option<String>,
     /// This attestor's own build version (CARGO_PKG_VERSION).
     pub attestor_version: &'static str,
     /// Newest published CLI/SDK version (ATTESTOR_CLI_LATEST) — an older CLI
@@ -79,7 +85,11 @@ pub struct ConfigResponse {
 }
 
 fn none_if_empty(s: &str) -> Option<String> {
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// The advertised secret-env scheme, if the operator enabled it.
@@ -87,8 +97,11 @@ fn secret_env_scheme(enabled: bool) -> Option<&'static str> {
     enabled.then_some(attestor_shared::config::SECRET_ENV_SCHEME)
 }
 
-pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
-    Json(ConfigResponse {
+pub async fn handle(
+    State(state): State<AppState>,
+) -> crate::error::ApiResult<Json<ConfigResponse>> {
+    let registry = super::providers::load_verified(&state).await?;
+    Ok(Json(ConfigResponse {
         sandbox_proxy_addr: state.cfg.sandbox_proxy_addr.clone(),
         agent_serve_port: state.cfg.agent_serve_port,
         agent_serve_path: state.cfg.agent_serve_path.clone(),
@@ -102,14 +115,8 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
         attestor_app_id: state.cfg.app_id.clone(),
         kms_app_id: state.cfg.kms_app_id.clone(),
         sandbox_app_id: state.cfg.sandbox_app_id.clone(),
-        sandbox_provider_addr: state
-            .cfg
-            .sandbox_provider_addr
-            .map(|a| format!("{:#x}", a)),
-        sandbox_serving_addr: state
-            .cfg
-            .sandbox_serving_addr
-            .map(|a| format!("{:#x}", a)),
+        sandbox_provider_addr: state.cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
+        sandbox_serving_addr: state.cfg.sandbox_serving_addr.map(|a| format!("{:#x}", a)),
         sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
         reputation_registry_addr: state
             .cfg
@@ -119,14 +126,8 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .cfg
             .verified_feedback_addr
             .map(|a| format!("{:#x}", a)),
-        feedback_batcher_addr: state
-            .cfg
-            .feedback_batcher_addr
-            .map(|a| format!("{:#x}", a)),
-        clone_gate_addr: state
-            .cfg
-            .clone_gate_addr
-            .map(|a| format!("{:#x}", a)),
+        feedback_batcher_addr: state.cfg.feedback_batcher_addr.map(|a| format!("{:#x}", a)),
+        clone_gate_addr: state.cfg.clone_gate_addr.map(|a| format!("{:#x}", a)),
         standard_clone_authorizer_addr: state
             .cfg
             .standard_clone_authorizer_addr
@@ -138,10 +139,16 @@ pub async fn handle(State(state): State<AppState>) -> Json<ConfigResponse> {
             .map(|a| format!("{:#x}", a)),
         frameworks: state.cfg.frameworks.clone(),
         secret_env_scheme: secret_env_scheme(state.cfg.secret_env_enabled),
+        inference_capabilities: state.cfg.inference_capabilities(),
+        provider_registry_schema: 1,
+        provider_registry_version: registry.as_ref().map_or(0, |r| r.version),
+        provider_registry_digest: registry
+            .as_ref()
+            .map(|r| attestor_shared::provider_registry::accepted_digest(&r.update)),
         attestor_version: env!("CARGO_PKG_VERSION"),
         cli_latest: none_if_empty(&state.cfg.cli_latest),
         cli_notes: none_if_empty(&state.cfg.cli_notes),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -188,10 +195,35 @@ mod tests {
             tee_data_verifier_addr: None,
             frameworks: vec![],
             secret_env_scheme: None,
+            inference_capabilities: vec![],
+            provider_registry_schema: 1,
+            provider_registry_version: 0,
+            provider_registry_digest: None,
+
             attestor_version: "9.9.9",
             cli_latest: none_if_empty(cli_latest),
             cli_notes: none_if_empty(cli_notes),
         }
+    }
+
+    #[test]
+    fn config_serializes_exact_image_provider_capabilities() {
+        let mut response = sample("", "");
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("inference_capabilities")
+            .is_none());
+        response
+            .inference_capabilities
+            .push(attestor_shared::config::InferenceCapability {
+                image: "new-sealed".into(),
+                providers: vec!["openai".into()],
+                secret_env_versions: vec![1, 2],
+                formats: vec![],
+            });
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["inference_capabilities"][0]["image"], "new-sealed");
+        assert_eq!(value["inference_capabilities"][0]["providers"][0], "openai");
     }
 
     #[test]
@@ -207,7 +239,13 @@ mod tests {
         // stale value.
         let unset = serde_json::to_value(sample("", "")).unwrap();
         assert_eq!(unset["attestor_version"], "9.9.9");
-        assert!(unset.get("cli_latest").is_none(), "cli_latest must be absent when unset");
-        assert!(unset.get("cli_notes").is_none(), "cli_notes must be absent when unset");
+        assert!(
+            unset.get("cli_latest").is_none(),
+            "cli_latest must be absent when unset"
+        );
+        assert!(
+            unset.get("cli_notes").is_none(),
+            "cli_notes must be absent when unset"
+        );
     }
 }

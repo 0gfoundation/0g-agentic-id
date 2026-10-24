@@ -392,6 +392,11 @@ openclaw 和 hermes 仍然写,但现在只对"文档里没有 model"的 agent �
 | `s.Endpoint`(`*inference.Endpoint`) | **只有**平台亲自路由这个模型时才非 nil;框架内置 provider 自带 wiring,这里是 nil |
 | `s.APIKey` | 本次开机的推理凭据;走 env 进来(`API_KEY`,或在任何 adapter 运行前从 `SEAL_SECRET_ENV` 解出),不属于文档,也从不持久化 |
 
+provider 定义取自签名平台注册表，`internal/inference/providers.json` 是内置初始值。运行时通过
+`ResolveForRegistry` 渲染，必须先处理其错误，再改动配置；不允许给另一家 managed
+provider 回退到 compute 的 endpoint 或 key。见
+[provider 扩展及镜像上线](../sdk/typescript/PROVIDERS.zh.md)。
+
 Facts/Endpoint 这个拆分是承重的,也正是"原生 provider 现在照样拿得到
 reasoning bound"的原因。两者原本共用一个结构、挡在同一个
 `provider == "0g-compute"` 判断后面,所以选原生 provider 会连 bound 带 endpoint
@@ -494,7 +499,7 @@ sealed 编出来、看上去像手工设定的数字
   共用的唯一调用点,"这样以后加路径的人不可能漏掉它"
   (`manager/manager.go:224-231`)。`PreStart` 报错会像 `Start` 报错一样中止这次
   启动。`main.go` 把钩子指向
-  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`,所以
+  `adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`,所以
   `Resolve` 也每次重跑,endpoint、预算、reasoning 标志都来自实时目录。
 
   它是钩子而不是 `RuntimeContext` 上的一个字段,是因为那个结构在首次 Start 时
@@ -613,7 +618,7 @@ proxy 是否回 503;如果你的框架没有预热阶段,可以和 Liveness 用�
                                        watcher 第一个 tick 丢掉旧 role 之前
   播种 #1:对所有 role 跑 EvolutionFor  → currentSnapshot(Start 前)
   manager.Start:
-    PreStart → RenderSettings(settings.Resolve(doc, apiKey))
+    PreStart → RenderSettings(settings.ResolveForRegistry(ctx, doc, credential, registry))
     Start(ctx, RuntimeContext)         spawn;上游监听后才返回
     MonitorExit(cb)                    布置死亡监视
     Liveness(ctx) 每 5s                探针循环开始

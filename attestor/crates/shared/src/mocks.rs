@@ -6,14 +6,13 @@
 //!   3. SandboxClient → real 0g-sandbox HTTP client
 
 use crate::events::WsEvent;
+use crate::sandbox::CanonicalSignedMessage;
 use crate::traits::{
-    ChainClient, DeploymentRepo, EventBus, IdempotencyStore, JobQueue, SandboxClient,
-    StorageClient,
+    ChainClient, DeploymentRepo, EventBus, IdempotencyStore, JobQueue, SandboxClient, StorageClient,
 };
 use crate::types::*;
-use alloy::primitives::{keccak256, Address, B256, Bytes, TxHash, U256};
+use alloy::primitives::{keccak256, Address, Bytes, TxHash, B256, U256};
 use async_trait::async_trait;
-use crate::sandbox::CanonicalSignedMessage;
 use base64::Engine as _;
 use k256::ecdsa::{signature::hazmat::PrehashSigner, RecoveryId, Signature, SigningKey};
 use std::collections::HashMap;
@@ -54,6 +53,9 @@ pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
 // ── ChainClient mock ─────────────────────────────────────────────────────
 
 pub struct MockChain {
+    tapp_owner: Mutex<Option<Address>>,
+    tapp_owner_failure: AtomicBool,
+    contract_signature_valid: AtomicBool,
     next_agent_id: AtomicU64,
     seal_to_agent: Mutex<HashMap<SealId, AgentId>>,
     tx_to_receipt: Mutex<HashMap<TxHash, ReceiptSummary>>,
@@ -77,6 +79,15 @@ pub struct MockChain {
 }
 
 impl MockChain {
+    pub fn set_tapp_owner(&self, owner: Address) {
+        *self.tapp_owner.lock().unwrap() = Some(owner);
+    }
+    pub fn set_tapp_owner_failure(&self, fail: bool) {
+        self.tapp_owner_failure.store(fail, Ordering::SeqCst);
+    }
+    pub fn set_contract_signature_valid(&self, valid: bool) {
+        self.contract_signature_valid.store(valid, Ordering::SeqCst);
+    }
     // Preflight knobs — MockChain is always permissive; ConfigurableChain
     // carries the real toggles for gate tests.
     fn preflight_acked(&self) -> bool {
@@ -87,6 +98,9 @@ impl MockChain {
     }
     pub fn new() -> Self {
         Self {
+            tapp_owner: Mutex::new(None),
+            tapp_owner_failure: AtomicBool::new(false),
+            contract_signature_valid: AtomicBool::new(false),
             next_agent_id: AtomicU64::new(1),
             seal_to_agent: Mutex::new(HashMap::new()),
             tx_to_receipt: Mutex::new(HashMap::new()),
@@ -140,6 +154,25 @@ impl Default for MockChain {
 
 #[async_trait]
 impl ChainClient for MockChain {
+    async fn tapp_app_owner(&self, _registry: Address, _app_id: &str) -> anyhow::Result<Address> {
+        anyhow::ensure!(
+            !self.tapp_owner_failure.load(Ordering::SeqCst),
+            "Tapp RPC unavailable"
+        );
+        self.tapp_owner
+            .lock()
+            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("Tapp owner not configured"))
+    }
+    async fn is_valid_contract_signature(
+        &self,
+        owner: Address,
+        _digest: [u8; 32],
+        _signature: &[u8],
+    ) -> anyhow::Result<bool> {
+        Ok(self.contract_signature_valid.load(Ordering::SeqCst)
+            && *self.tapp_owner.lock().unwrap() == Some(owner))
+    }
     async fn register_with_seal(&self, params: MintParams) -> anyhow::Result<TxHash> {
         let agent_id = U256::from(self.next_agent_id.fetch_add(1, Ordering::SeqCst));
         self.seal_to_agent
@@ -265,11 +298,7 @@ impl ChainClient for MockChain {
         Ok(tx_hash)
     }
 
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash> {
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
         let tx_hash = self.next_tx_hash();
         self.tx_to_receipt.lock().unwrap().insert(
             tx_hash,
@@ -319,7 +348,12 @@ impl StorageClient for MockStorage {
     async fn upload(&self, data: Vec<u8>) -> anyhow::Result<StorageUploadResult> {
         let root_hash = self.compute_root(&data).await?;
         let tx_hash = self.next_tx_hash();
-        tracing::info!(size = data.len(), ?root_hash, ?tx_hash, "mock storage: uploaded");
+        tracing::info!(
+            size = data.len(),
+            ?root_hash,
+            ?tx_hash,
+            "mock storage: uploaded"
+        );
         Ok(StorageUploadResult {
             root_hash,
             submit_tx_hash: tx_hash,
@@ -344,6 +378,7 @@ impl SandboxClient for MockSandbox {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
+        _boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse> {
         tracing::info!(
             ?seal_id,
@@ -358,11 +393,7 @@ impl SandboxClient for MockSandbox {
         })
     }
 
-    async fn start(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn start(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         tracing::info!(
             ?seal_id,
             signer = %envelope.wallet_address,
@@ -371,11 +402,7 @@ impl SandboxClient for MockSandbox {
         Ok(())
     }
 
-    async fn stop(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn stop(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         tracing::info!(
             ?seal_id,
             signer = %envelope.wallet_address,
@@ -428,6 +455,7 @@ pub struct ConfigurableSandbox {
     pub start_calls: AtomicU64,
     pub stop_calls: AtomicU64,
     pub admin_delete_calls: AtomicU64,
+    pub boot_tickets: Mutex<Vec<String>>,
     pub last_admin_delete_id: Mutex<Option<String>>,
 }
 
@@ -446,6 +474,7 @@ impl ConfigurableSandbox {
             start_calls: AtomicU64::new(0),
             stop_calls: AtomicU64::new(0),
             admin_delete_calls: AtomicU64::new(0),
+            boot_tickets: Mutex::new(Vec::new()),
             last_admin_delete_id: Mutex::new(None),
         }
     }
@@ -493,8 +522,12 @@ impl SandboxClient for ConfigurableSandbox {
         &self,
         _seal_id: SealId,
         _envelope: &SandboxEnvelope,
+        boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(ticket) = boot_ticket {
+            self.boot_tickets.lock().unwrap().push(ticket.to_owned());
+        }
         if self.create_fails.load(Ordering::SeqCst) {
             return Err(self.fail_error());
         }
@@ -505,11 +538,7 @@ impl SandboxClient for ConfigurableSandbox {
         })
     }
 
-    async fn start(
-        &self,
-        _seal_id: SealId,
-        _envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn start(&self, _seal_id: SealId, _envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.start_calls.fetch_add(1, Ordering::SeqCst);
         if self.start_fails.load(Ordering::SeqCst) {
             return Err(self.fail_error());
@@ -517,11 +546,7 @@ impl SandboxClient for ConfigurableSandbox {
         Ok(())
     }
 
-    async fn stop(
-        &self,
-        _seal_id: SealId,
-        _envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn stop(&self, _seal_id: SealId, _envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
         if self.stop_fails.load(Ordering::SeqCst) {
             anyhow::bail!("configured to fail");
@@ -538,7 +563,8 @@ impl SandboxClient for ConfigurableSandbox {
         // Counted transient failures first (see admin_delete_fail_times).
         let remaining = self.admin_delete_fail_times.load(Ordering::SeqCst);
         if remaining > 0 {
-            self.admin_delete_fail_times.store(remaining - 1, Ordering::SeqCst);
+            self.admin_delete_fail_times
+                .store(remaining - 1, Ordering::SeqCst);
             return Err(self.fail_error());
         }
         Ok(())
@@ -878,6 +904,8 @@ impl StorageClient for ConfigurableStorage {
 // stage cleared, ciphertext blanked) without touching Postgres.
 
 pub struct InMemoryDeploymentRepo {
+    pub status_bindings: Mutex<HashMap<SealId, [u8; 32]>>,
+    pub boot_authorizations: Mutex<HashMap<SealId, crate::auth::status::BootAuthorization>>,
     pub by_seal: Mutex<HashMap<SealId, Deployment>>,
     pub by_agent: Mutex<HashMap<AgentId, SealId>>,
     /// Mirror of `last_heartbeat` (DB column not surfaced on the
@@ -889,6 +917,7 @@ pub struct InMemoryDeploymentRepo {
     pub set_container_stage_calls: AtomicU64,
     pub set_agent_id_calls: AtomicU64,
     pub set_sandbox_id_calls: AtomicU64,
+    pub fail_set_sandbox_id: AtomicBool,
     pub set_i_data_artifacts_calls: AtomicU64,
     pub update_i_data_artifacts_calls: AtomicU64,
     pub set_agent_uri_and_card_calls: AtomicU64,
@@ -900,8 +929,18 @@ pub struct InMemoryDeploymentRepo {
 }
 
 impl InMemoryDeploymentRepo {
+    fn revoke_status_boot(&self, seal: SealId) {
+        if let Some(auth) = self.boot_authorizations.lock().unwrap().get_mut(&seal) {
+            auth.enabled = false;
+            auth.generation += 1;
+        }
+        self.status_bindings.lock().unwrap().remove(&seal);
+    }
+
     pub fn new() -> Self {
         Self {
+            status_bindings: Mutex::new(HashMap::new()),
+            boot_authorizations: Mutex::new(HashMap::new()),
             by_seal: Mutex::new(HashMap::new()),
             by_agent: Mutex::new(HashMap::new()),
             heartbeats: Mutex::new(HashMap::new()),
@@ -910,6 +949,7 @@ impl InMemoryDeploymentRepo {
             set_container_stage_calls: AtomicU64::new(0),
             set_agent_id_calls: AtomicU64::new(0),
             set_sandbox_id_calls: AtomicU64::new(0),
+            fail_set_sandbox_id: AtomicBool::new(false),
             set_i_data_artifacts_calls: AtomicU64::new(0),
             update_i_data_artifacts_calls: AtomicU64::new(0),
             set_agent_uri_and_card_calls: AtomicU64::new(0),
@@ -1006,25 +1046,51 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
     }
 
     async fn set_container_stage(&self, seal_id: SealId, stage: StageStatus) -> anyhow::Result<()> {
-        self.set_container_stage_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_container_stage_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| {
+            if matches!(
+                stage,
+                StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+            ) {
+                self.revoke_status_boot(seal_id);
+                d.provision_deadline = None;
+            }
             d.container_stage = stage;
             d.phase =
                 crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
         })
     }
 
-    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()> {
-        self.mut_with(seal_id, |d| {
-            d.container_stage = StageStatus::NotStarted;
-            d.sandbox_id = None;
-            d.provisioned_at = None;
-            d.phase = crate::types::derive_phase(
-                &d.storage_stage,
-                &d.mint_stage,
-                &d.container_stage,
-            );
-        })
+    async fn reset_container_track(
+        &self,
+        seal: SealId,
+        expected: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(false);
+        };
+        if let Some(expected) = expected {
+            if d.sandbox_id.as_deref() != Some(expected) {
+                return Ok(false);
+            }
+            if self
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .get(&seal)
+                .is_some_and(|a| a.enabled && a.sandbox_id.as_deref() != Some(expected))
+            {
+                return Ok(false);
+            }
+        }
+        self.revoke_status_boot(seal);
+        d.container_stage = StageStatus::NotStarted;
+        d.sandbox_id = None;
+        d.provisioned_at = None;
+        d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        Ok(true)
     }
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()> {
@@ -1039,30 +1105,68 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
 
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
         self.set_sandbox_id_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.sandbox_id = Some(sandbox_id))
+        anyhow::ensure!(
+            !self.fail_set_sandbox_id.load(Ordering::SeqCst),
+            "injected sandbox ID persistence failure"
+        );
+        self.mut_with(seal_id, |d| {
+            if let Some(auth) = self.boot_authorizations.lock().unwrap().get_mut(&seal_id) {
+                if auth.enabled {
+                    auth.sandbox_id = Some(sandbox_id.clone());
+                }
+            }
+            d.sandbox_id = Some(sandbox_id);
+        })
     }
 
     async fn set_container_binding(
         &self,
-        seal_id: SealId,
+        seal: SealId,
         pubkey: Vec<u8>,
         mac: Vec<u8>,
-    ) -> anyhow::Result<()> {
-        self.mut_with(seal_id, |d| {
-            d.container_pubkey = Some(Bytes::from(pubkey));
-            d.container_pubkey_mac = Some(Bytes::from(mac));
-        })
+    ) -> anyhow::Result<bool> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(false);
+        };
+        if self.boot_authorizations.lock().unwrap().contains_key(&seal)
+            || self.status_bindings.lock().unwrap().contains_key(&seal)
+        {
+            return Ok(false);
+        }
+        d.container_pubkey = Some(pubkey.into());
+        d.container_pubkey_mac = Some(mac.into());
+        d.provisioned_at.get_or_insert(chrono::Utc::now());
+        d.provision_deadline = None;
+        Ok(true)
     }
 
-    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()> {
-        let seal = match self.by_agent.lock().unwrap().get(&agent_id).copied() {
-            Some(s) => s,
-            None => return Ok(()),
+    async fn clear_container_binding(
+        &self,
+        agent: AgentId,
+        live_owner: Address,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(seal) = self.by_agent.lock().unwrap().get(&agent).copied() else {
+            return Ok(None);
         };
-        self.mut_with(seal, |d| {
-            d.container_pubkey = None;
-            d.container_pubkey_mac = None;
-        })
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(None);
+        };
+        let sandbox = d.sandbox_id.clone();
+        if let Some(a) = self.boot_authorizations.lock().unwrap().get(&seal) {
+            if a.enabled && a.owner == Some(live_owner) {
+                return Ok(if a.sandbox_id.is_some() && a.sandbox_id == sandbox {
+                    None
+                } else {
+                    sandbox
+                });
+            }
+        }
+        self.revoke_status_boot(seal);
+        d.container_pubkey = None;
+        d.container_pubkey_mac = None;
+        Ok(sandbox)
     }
 
     async fn mark_provisioned(
@@ -1087,7 +1191,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         artifacts: Vec<IDataArtifact>,
         agent_uri: String,
     ) -> anyhow::Result<()> {
-        self.set_i_data_artifacts_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_i_data_artifacts_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| {
             d.i_data = artifacts;
             d.agent_uri = agent_uri;
@@ -1099,7 +1204,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal_id: SealId,
         artifacts: Vec<IDataArtifact>,
     ) -> anyhow::Result<()> {
-        self.update_i_data_artifacts_calls.fetch_add(1, Ordering::SeqCst);
+        self.update_i_data_artifacts_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| d.i_data = artifacts)
     }
 
@@ -1109,7 +1215,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         agent_uri: String,
         agent_card: serde_json::Value,
     ) -> anyhow::Result<()> {
-        self.set_agent_uri_and_card_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_agent_uri_and_card_calls
+            .fetch_add(1, Ordering::SeqCst);
         self.mut_with(seal_id, |d| {
             d.agent_uri = agent_uri;
             d.agent_card = agent_card;
@@ -1160,8 +1267,13 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal_id: SealId,
         deadline: Option<chrono::DateTime<chrono::Utc>>,
     ) -> anyhow::Result<()> {
-        self.set_provision_deadline_calls.fetch_add(1, Ordering::SeqCst);
-        self.mut_with(seal_id, |d| d.provision_deadline = deadline)
+        self.set_provision_deadline_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.mut_with(seal_id, |d| {
+            if deadline.is_none() || !self.status_bindings.lock().unwrap().contains_key(&seal_id) {
+                d.provision_deadline = deadline;
+            }
+        })
     }
 
     async fn record_provision_error(
@@ -1170,7 +1282,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         reason: String,
         mark_failed: bool,
     ) -> anyhow::Result<()> {
-        self.record_provision_error_calls.fetch_add(1, Ordering::SeqCst);
+        self.record_provision_error_calls
+            .fetch_add(1, Ordering::SeqCst);
         let now = chrono::Utc::now();
         self.mut_with(seal_id, |d| {
             d.last_provision_error = Some(reason.clone());
@@ -1180,11 +1293,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                     at: now,
                     reason: reason.clone(),
                 };
-                d.phase = crate::types::derive_phase(
-                    &d.storage_stage,
-                    &d.mint_stage,
-                    &d.container_stage,
-                );
+                d.phase =
+                    crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             }
         })
     }
@@ -1194,11 +1304,14 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         now: chrono::DateTime<chrono::Utc>,
         reason: String,
     ) -> anyhow::Result<Vec<SealId>> {
-        self.flip_provision_timeouts_calls.fetch_add(1, Ordering::SeqCst);
+        self.flip_provision_timeouts_calls
+            .fetch_add(1, Ordering::SeqCst);
         let mut affected = Vec::new();
         let mut g = self.by_seal.lock().unwrap();
         for d in g.values_mut() {
-            let Some(deadline) = d.provision_deadline else { continue };
+            let Some(deadline) = d.provision_deadline else {
+                continue;
+            };
             if deadline >= now {
                 continue;
             }
@@ -1209,11 +1322,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 at: now,
                 reason: reason.clone(),
             };
-            d.phase = crate::types::derive_phase(
-                &d.storage_stage,
-                &d.mint_stage,
-                &d.container_stage,
-            );
+            d.phase =
+                crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             d.updated_at = now;
             affected.push(d.seal_id);
         }
@@ -1238,6 +1348,142 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(version)
     }
 
+    async fn retry_settings(&self, seal_id: SealId, version: i64) -> anyhow::Result<bool> {
+        let mut reset = false;
+        self.mut_with(seal_id, |d| {
+            if d.settings_version == version && d.settings_version > d.settings_confirmed_version {
+                d.settings_attempts = 0;
+                reset = true;
+            }
+        })?;
+        Ok(reset)
+    }
+
+    async fn has_status_binding(&self, seal: SealId) -> anyhow::Result<bool> {
+        Ok(self.boot_authorizations.lock().unwrap().contains_key(&seal)
+            || self.status_bindings.lock().unwrap().contains_key(&seal))
+    }
+    async fn prepare_status_boot(
+        &self,
+        seal: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+    ) -> anyhow::Result<Option<i64>> {
+        let rows = self.by_seal.lock().unwrap();
+        anyhow::ensure!(rows.contains_key(&seal), "unknown seal");
+        let mut auths = self.boot_authorizations.lock().unwrap();
+        let generation = auths.get(&seal).map_or(1, |a| a.generation + 1);
+        let sandbox_id = if ticket.is_none() {
+            auths.get(&seal).and_then(|a| a.sandbox_id.clone())
+        } else {
+            None
+        };
+        let ticket = ticket.or_else(|| auths.get(&seal).map(|a| a.ticket_hash));
+        let Some(ticket_hash) = ticket else {
+            return Ok(None);
+        };
+        auths.insert(
+            seal,
+            crate::auth::status::BootAuthorization {
+                generation,
+                ticket_hash,
+                enabled: true,
+                started_at: 0,
+                owner: Some(owner),
+                sandbox_id,
+            },
+        );
+        self.status_bindings.lock().unwrap().remove(&seal);
+        Ok(Some(generation))
+    }
+    async fn boot_authorization(
+        &self,
+        seal: SealId,
+    ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>> {
+        Ok(self.boot_authorizations.lock().unwrap().get(&seal).cloned())
+    }
+    async fn bind_status_boot(
+        &self,
+        seal: SealId,
+        pubkey: Vec<u8>,
+        mac: Vec<u8>,
+        hash: [u8; 32],
+        claim: &crate::auth::status::BootClaim,
+    ) -> anyhow::Result<bool> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(false);
+        };
+        if d.sandbox_id.as_deref().unwrap_or("").is_empty()
+            || matches!(d.container_stage, StageStatus::Stopped { .. })
+        {
+            return Ok(false);
+        }
+        let mut auths = self.boot_authorizations.lock().unwrap();
+        let Some(a) = auths.get_mut(&seal) else {
+            return Ok(false);
+        };
+        if !a.enabled
+            || a.generation != claim.generation
+            || a.ticket_hash != claim.ticket_hash
+            || a.started_at >= claim.started_at
+            || a.sandbox_id != d.sandbox_id
+        {
+            return Ok(false);
+        }
+        a.started_at = claim.started_at;
+        d.container_pubkey = Some(pubkey.into());
+        d.container_pubkey_mac = Some(mac.into());
+        d.provisioned_at.get_or_insert(chrono::Utc::now());
+        d.provision_deadline = None;
+        self.status_bindings.lock().unwrap().insert(seal, hash);
+        Ok(true)
+    }
+
+    async fn apply_status_report(
+        &self,
+        seal_id: SealId,
+        hash: Option<[u8; 32]>,
+        stage: StageStatus,
+        version: Option<i64>,
+    ) -> anyhow::Result<bool> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal_id) else {
+            return Ok(false);
+        };
+        if d.sandbox_id.as_deref().unwrap_or("").is_empty()
+            || matches!(d.container_stage, StageStatus::Stopped { .. })
+            || self
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .get(&seal_id)
+                .is_some_and(|a| !a.enabled || hash.is_none())
+            || self.status_bindings.lock().unwrap().get(&seal_id).copied() != hash
+        {
+            return Ok(false);
+        }
+        d.container_stage = stage;
+        d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
+        if hash.is_some()
+            && version == Some(d.settings_version)
+            && d.settings_confirmed_version < d.settings_version
+            && d.settings.is_some()
+        {
+            d.settings_last_good = d.settings.clone();
+            d.settings_confirmed_version = d.settings_version;
+            d.settings_attempts = 0;
+        }
+        self.heartbeats
+            .lock()
+            .unwrap()
+            .insert(seal_id, chrono::Utc::now());
+        self.mark_heartbeat_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_container_stage_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Ok(true)
+    }
+
     async fn seed_settings(
         &self,
         seal_id: SealId,
@@ -1258,8 +1504,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
     async fn promote_settings_last_good(&self, seal_id: SealId) -> anyhow::Result<Option<i64>> {
         let mut promoted = None;
         self.mut_with(seal_id, |d| {
-            let served_the_current_document =
-                d.settings_attempts >= 1 && (d.settings_attempts == 1 || d.settings_last_good.is_none());
+            let served_the_current_document = d.settings_attempts >= 1
+                && (d.settings_attempts == 1 || d.settings_last_good.is_none());
             if d.settings_confirmed_version < d.settings_version && served_the_current_document {
                 d.settings_last_good = d.settings.clone();
                 d.settings_confirmed_version = d.settings_version;
@@ -1270,15 +1516,32 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(promoted)
     }
 
-    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>> {
-        let mut attempts = None;
-        self.mut_with(seal_id, |d| {
-            if d.settings_version > d.settings_confirmed_version {
-                d.settings_attempts += 1;
-                attempts = Some(d.settings_attempts);
+    async fn note_settings_attempt(
+        &self,
+        seal: SealId,
+        version: i64,
+        generation: Option<i64>,
+    ) -> anyhow::Result<Option<i32>> {
+        let mut rows = self.by_seal.lock().unwrap();
+        let Some(d) = rows.get_mut(&seal) else {
+            return Ok(None);
+        };
+        let auths = self.boot_authorizations.lock().unwrap();
+        let allowed = match auths.get(&seal) {
+            Some(a) => a.enabled && generation == Some(a.generation),
+            None => {
+                generation.is_none() && !self.status_bindings.lock().unwrap().contains_key(&seal)
             }
-        })?;
-        Ok(attempts)
+        };
+        if allowed
+            && d.settings_version == version
+            && d.settings_version > d.settings_confirmed_version
+        {
+            d.settings_attempts += 1;
+            Ok(Some(d.settings_attempts))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn stale_running_candidates(
@@ -1322,7 +1585,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         threshold_secs: i64,
         reason: String,
     ) -> anyhow::Result<Vec<SealId>> {
-        self.flip_stale_heartbeats_calls.fetch_add(1, Ordering::SeqCst);
+        self.flip_stale_heartbeats_calls
+            .fetch_add(1, Ordering::SeqCst);
         let cutoff = now - chrono::Duration::seconds(threshold_secs);
         let stale: Vec<SealId> = {
             let hb = self.heartbeats.lock().unwrap();
@@ -1334,7 +1598,9 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         let mut affected = Vec::new();
         let mut g = self.by_seal.lock().unwrap();
         for seal_id in stale {
-            let Some(d) = g.get_mut(&seal_id) else { continue };
+            let Some(d) = g.get_mut(&seal_id) else {
+                continue;
+            };
             if d.phase != crate::types::DeploymentPhase::Running {
                 continue;
             }
@@ -1431,7 +1697,10 @@ impl EventBus for InMemoryEventBus {
         Ok(())
     }
 
-    async fn subscribe(&self, _seal_id: SealId) -> anyhow::Result<crate::traits::EventSubscription> {
+    async fn subscribe(
+        &self,
+        _seal_id: SealId,
+    ) -> anyhow::Result<crate::traits::EventSubscription> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
     }

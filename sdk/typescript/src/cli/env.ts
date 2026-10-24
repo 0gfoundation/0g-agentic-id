@@ -27,7 +27,7 @@ export interface CliEnv {
 
 /**
  * Resolve the CLI environment. Environment variables WIN; the persisted
- * config files (config.ts) are the fallback layer, so `0g-agenticid` works
+ * config files (config.ts) are the fallback layer, so `0g-agentdna` works
  * across sessions without re-exporting, while a one-off `AGENTIC_*=… ` or CI
  * still overrides without touching disk.
  */

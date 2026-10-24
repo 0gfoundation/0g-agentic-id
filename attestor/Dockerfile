@@ -29,6 +29,8 @@ COPY attestor/crates ./attestor/crates
 COPY attestor/version-meld ./attestor/version-meld
 # Only the one ABI JSON is actually needed — no need to ship forge sources.
 COPY contracts/out/AgenticID.sol/AgenticID.json ./contracts/out/AgenticID.sol/AgenticID.json
+# Shared built-in provider seed, also embedded by the sealed runtime.
+COPY sealed/internal/inference/providers.json ./sealed/internal/inference/providers.json
 
 WORKDIR /build/attestor
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \

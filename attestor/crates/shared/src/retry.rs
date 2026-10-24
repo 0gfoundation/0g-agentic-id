@@ -127,13 +127,18 @@ mod tests {
 
     async fn hit_closed_port(counter: Arc<AtomicU32>) -> reqwest::Result<reqwest::Response> {
         counter.fetch_add(1, Ordering::SeqCst);
-        // 127.0.0.1:1 — privileged port nobody listens on; reqwest
-        // returns a connect-class error fast.
+        // Reserve then release an ephemeral loopback port. Privileged ports
+        // can be silently filtered, and host proxy settings can turn a local
+        // connection refusal into a timeout (which Strict must not retry).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
         reqwest::Client::builder()
-            .timeout(Duration::from_millis(150))
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
             .build()
             .unwrap()
-            .get("http://127.0.0.1:1")
+            .get(format!("http://{address}"))
             .send()
             .await
     }
@@ -149,7 +154,10 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(err.to_string().starts_with("test-op:"), "op label preserved: {err}");
+        assert!(
+            err.to_string().starts_with("test-op:"),
+            "op label preserved: {err}"
+        );
         assert_eq!(
             counter.load(Ordering::SeqCst),
             MAX_ATTEMPTS,

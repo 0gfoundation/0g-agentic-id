@@ -542,6 +542,13 @@ func applySettingsToConfig(cfg map[string]any, s settings.Resolved) {
 			keep = clawProvider
 		}
 		pruneStaleRouterProviders(cfg, keep)
+		if s.Endpoint == nil {
+			// The pinned native provider supplies its own wiring. An overlay
+			// must not redefine its endpoint while receiving that provider's key.
+			models, _ := cfg["models"].(map[string]any)
+			providers, _ := models["providers"].(map[string]any)
+			delete(providers, s.Provider)
+		}
 	}
 
 	switch {
@@ -754,6 +761,9 @@ func (a *Adapter) renderVersion(ctx context.Context) string {
 // the router as an "openai"/"anthropic" provider pointing at the router's
 // base URL. For a framework built-in the owner's own name is the label.
 func clawProviderName(s settings.Resolved) string {
+	if s.Endpoint != nil && s.Endpoint.ProviderID != "" && s.Endpoint.ProviderID != inference.ZGComputeProvider {
+		return s.Endpoint.ProviderID
+	}
 	if s.Endpoint == nil {
 		return s.Provider
 	}
@@ -967,9 +977,8 @@ func pruneStaleRouterProviders(cfg map[string]any, keep string) {
 		if !ok {
 			continue
 		}
-		switch baseURL, _ := entry["baseUrl"].(string); baseURL {
-		case inference.ZGOpenAIBaseURL, inference.ZGAnthropicBaseURL:
-		default:
+		baseURL, _ := entry["baseUrl"].(string)
+		if !inference.IsManagedURL(baseURL) {
 			continue
 		}
 		delete(providers, label)
@@ -1043,14 +1052,7 @@ func applyEndpointToConfig(cfg map[string]any, clawProvider string, s settings.R
 		"input": []string{"text"},
 		"cost":  map[string]any{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
 	}
-	compat := map[string]any{
-		"requiresStringContent":    true,
-		"supportsStore":            false,
-		"supportsDeveloperRole":    false,
-		"supportsUsageInStreaming": false,
-		"supportsStrictMode":       false,
-		"maxTokensField":           "max_tokens",
-	}
+	compat := inference.EndpointCompatibility(s.Endpoint, s.Provider)
 
 	if s.Facts.CatalogSourced {
 		modelDef["contextWindow"] = s.Facts.ContextWindow

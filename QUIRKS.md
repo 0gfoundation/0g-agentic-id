@@ -106,6 +106,25 @@ call.
 
 ## Misc
 
+### Linux process hardening must remain behind a platform build tag
+
+`unix.Prctl(PR_SET_DUMPABLE, ...)` is Linux-only. Its implementation lives in
+`sealed/internal/privsep/harden_linux.go`; non-Linux local development uses a
+no-op implementation so the adapter and proxy suites can compile on macOS.
+Production images compile the Linux implementation. Verify runtime changes
+with both native tests and a Linux target build.
+
+### AgentDNA updates must follow the package that owns the CLI links
+
+The old CLI updater queries `@0gfoundation/0g-agenticid-sdk`, so the rename
+needs a compatibility release under that package name. Its launcher exposes
+both command names and depends on the matching `0g-agentdna` release.
+`sdk/typescript/src/cli/commands/update.ts` detects this launcher and updates
+the compatibility package: installing the canonical package over its global
+command links instead can fail with npm `EEXIST`. Keep both release versions
+aligned while supporting this path. See the [migration release order](sdk/typescript/MIGRATION.md#release-order)
+([中文](sdk/typescript/MIGRATION.zh.md#发布顺序)).
+
 ### 0g-storage Rust SDK dependency patch
 
 The `core2` crate that `zg-storage-client` pulls in upstream was yanked from
@@ -442,3 +461,23 @@ below to attribute it to the right layer:
 
 See [`sealed/TRUST_MODEL.md`](sealed/TRUST_MODEL.md) for the trust model's
 layering.
+
+
+### HTTP retry tests must use a closed ephemeral loopback port
+
+A fixed privileged port such as `127.0.0.1:1` can be silently filtered on a
+host, yielding a timeout instead of a connect-class error. Host HTTP proxies
+can also change that classification. The retry tests reserve/release an
+ephemeral loopback port and bypass proxies. Keep the production Strict policy
+connect-only: retrying timeouts could duplicate non-idempotent sandbox creates.
+
+
+### Deployment transactions take write intent before row locks
+
+Online schema bootstrap can hold a table Share lock before requesting an
+AccessExclusive lock. A runtime transaction that first acquires RowShare via
+`SELECT FOR UPDATE` and later needs RowExclusive for UPDATE can deadlock with
+that migration. `repo.rs::deployment_tx` obtains RowExclusive first (compatible
+with other runtime writers), then takes per-deployment row locks. Bootstrap
+orders deployments before its status child. Keep both orders: the Postgres
+regression deliberately pauses a migration behind an active runtime transaction.

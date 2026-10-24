@@ -345,18 +345,22 @@ Monorepo 四个子项目：
 | [`contracts/`](contracts/README.zh.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
 | [`attestor/`](attestor/README.zh.md) | 后端服务（Attestor / Oracle TEE、API、worker、indexer）| Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
-| [`sdk/typescript/`](sdk/typescript/README.zh.md) | 客户端 SDK（`@0gfoundation/agentic-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`0g-agentdna`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
 
 ### 进一步阅读
 
-**[`sdk/typescript/README.zh.md`](sdk/typescript/README.zh.md) — 客户端 SDK**
+**[`sdk/typescript/README.md`](sdk/typescript/README.md) — 客户端 SDK**
 
-单入口（`AgenticID`）的 TypeScript 门面，罩住整个协议：`ag.agent`
+单入口（`AgentDNA`，保留旧 `AgenticID` 别名）的 TypeScript 门面，罩住整个协议：`ag.agent`
 （deploy / clone / transfer、各类读、agentSeal gas 充值）、
 `ag.reputation`（抓取 TEE 签名的 serve-proof、验证、链上 feedback
 读写），外加顶层的信任根 ack 和 sandbox 预付费充值。合约五件套和
 attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直接
 跑在 testnet 部署上。
+
+已有 CLI 用户可参考 [AgentDNA 升级说明](sdk/typescript/MIGRATION.zh.md)。
+
+推理 provider 扩展及切换：[provider 说明](sdk/typescript/PROVIDERS.zh.md)。
 
 **[`contracts/README.zh.md`](contracts/README.zh.md) — 合约层**
 

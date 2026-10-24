@@ -1,0 +1,14 @@
+{
+  "settings": "{\"model\":\"fixture\",\"provider\":\"partner\"}",
+  "private_key": "0x4242424242424242424242424242424242424242424242424242424242424242",
+  "signer": "0x17c5185167401eD00cF5F5b2fc97D9BBfDb7D025",
+  "canonical": "StatusReport.v2:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:running::890ce36a9b0ecbdb2d936e5ad40a6197038a4189a0f0f9ec72c38ddae2ed3de8:8d858f20e6cd998899e487bf86e2d781780221d3fba39c338dc4bfa8764b0b7e",
+  "report": {
+    "seal_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "status": "running",
+    "error_detail": "",
+    "status_binding": "fixture-boot-receipt",
+    "settings_digest": "0x8d858f20e6cd998899e487bf86e2d781780221d3fba39c338dc4bfa8764b0b7e",
+    "agent_seal_signature": "0x3d50495458e2310699a9ec25b20781b581803f1fabecbcf73ed191c718b789a4429a654d4c425449321da068f97ce44280d43f14e1cf2c42ed83d51fd32ede4b1b"
+  }
+}

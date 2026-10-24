@@ -8,6 +8,7 @@
 #                  any valid key works; for real sandbox the derived address
 #                  must be funded (sandbox charges per create).
 #   API          — attestor-api base URL (default http://localhost:8080)
+#   MODEL_ID     — compute model used by the identity smoke (default gpt-oss-120b)
 
 set -euo pipefail
 
@@ -96,10 +97,11 @@ AGENT_DESCRIPTION="smoke test"
 # complete set, and a role="framework" binding is REQUIRED (validated
 # against /config's supported_frameworks before the mint). This is the
 # same two-entry default the SDK's defaultIData() builds.
-IDATA=$(jq -cn --arg name "$AGENT_NAME" --arg desc "$AGENT_DESCRIPTION" '[
+MODEL_ID="${MODEL_ID:-gpt-oss-120b}"
+IDATA=$(jq -cn --arg name "$AGENT_NAME" --arg desc "$AGENT_DESCRIPTION" --arg model "$MODEL_ID" '[
   {role:"framework", plaintext:{name:"openclaw", schema_version:1}, extra:{}},
   {role:"persona", plaintext:{system_prompt:("You are "+$name+". "+$desc+"\n"),
-    inference:{provider:"anthropic", model:"claude-opus-4-6"}}, extra:{}}
+    inference:{provider:"0g-compute", model:$model}}, extra:{}}
 ]')
 
 # Build the canonical owner-signed payload. Field order here doesn't need

@@ -32,7 +32,7 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 
 | 字段 | 含义 |
 |---|---|
-| `provider` | 谁来服务这个模型。`inference.ZGComputeProvider` = `"0g-compute"`(`internal/inference/zgcompute.go:109`)表示**由平台**提供 endpoint;其他任何取值都指向一个自带接线的框架内置 provider |
+| `provider` | 谁来服务这个模型。取自签名平台注册表（`GET /inference/providers`）的 ID，`internal/inference/providers.json` 提供初始值；managed provider 使用固定 endpoint，native provider 使用框架自带接线 |
 | `model` | 模型 id,按该 provider 自己的拼法 |
 | `thinking` | owner 的推理深度偏好,取自 `settings.Levels` = `{low, high, max}`(`settings.go:56`) |
 | `others` | 三个具名设置之外的一切:该框架自己的旋钮 —— `json.RawMessage`,不透明(`settings.go:45`)。曾名 `framework`,真机演练里 owner 的第一反应是"能选框架?"——而这恰恰是它做不到的事(框架绑定是 mint 时的身份),故改名 |
@@ -56,10 +56,9 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 - `thinking` 必须属于 `Levels`,大小写不敏感;
 - `others` 必须是合法 JSON,仅此而已。
 
-**router 目录里没有的模型不会被拒。**那份目录只覆盖 0g router,`anthropic/claude-…`
-本来就不在里面;拒绝未列出的模型等于把 owner 锁死在 `0g-compute` 上。CLI 在签名前会跑
-同样的检查,好让 owner 立刻知情,但那只是**建议性**的 —— 调用方可以绕开 CLI,所以真正
-做决定的是容器这一侧(`sdk/typescript/src/cli/commands/settings.ts`)。
+**模型建议检查不会拒绝目录外的模型。**CLI 在签名前查询所选 provider 自己的目录；
+没有配置目录的 native provider 允许手动输入模型 ID。注册表成员及凭据绑定由
+`ResolveForRegistry` 分别强制校验。
 
 空 blob 解析成空文档,不是错误:那是一个还没人配置过的 agent,是合法状态
 (`Parse`,`settings.go:75`)。
@@ -71,14 +70,14 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 `settings.Resolved`(`settings.go:60`)是 `Doc` 加上平台为这次启动算出来的一切:
 `Facts`、`Endpoint`、`APIKey`。adapter 只看得到 `Resolved`;没有任何东西会把它存下来。
 
-`settings.Resolve(ctx, doc, apiKey)`(`settings.go:127`)调用
-`inference.Resolve(provider, model)`(`zgcompute.go:121`),整条通道能成立的那个拆分就
-在这里:
+运行时调用 `settings.ResolveForRegistry(ctx, doc, credential, registry)`，先校验凭据绑定，
+再用本次启动固定的注册表快照解析；原有 `settings.Resolve` 保留为兼容的元数据
+辅助函数。整条通道能成立的那个拆分在这里:
 
 | | 是什么 | 什么时候拿得到 |
 |---|---|---|
 | `inference.ModelFacts`(`zgcompute.go:66`) | 关于**模型本身**、与谁来服务无关的事实:上下文窗口、输出预算、是否接受 `reasoning_effort`、以及这些是否来自实时目录 | 总是 |
-| `inference.Endpoint`(`zgcompute.go:91`) | **平台**才需要提供的接线,因为框架自己没有内置:wire format、base URL、其客户端读取密钥的环境变量名 | 仅当 `provider == "0g-compute"`;否则为 `nil` |
+| `inference.Endpoint`(`zgcompute.go:91`) | **平台**才需要提供的接线,因为框架自己没有内置:wire format、base URL、其客户端读取密钥的环境变量名 | 注册的 managed provider 才有；native provider 为 `nil` |
 
 即便是 native provider,也仍然按 model id 查一次 router 目录 —— 同一个模型通常也列在那
 里 —— 这样在 router 之外也能施加推理上界(`zgcompute.go:117-120`)。
@@ -89,6 +88,11 @@ owner 的配置通道:**每个 agent 一份文档**,由 owner 撰写,attestor �
 `framework/dsh/settings.go:147-154`)。拆开它正是 native provider 今天仍然拿得到上界的
 原因,并且有专门的回归测试(`internal/settings/settings_test.go`,
 `TestNativeProviderStillGetsBoundedReasoning`)。
+
+
+新增 managed provider 只使用自己的目录、静态元数据及声明的默认协议，不继承
+compute 的路由猜测或兼容参数。provider ID 和 endpoint 由运维发布、attestor 存储，不属于
+owner settings；见 [provider 扩展及上线](../sdk/typescript/PROVIDERS.zh.md)。
 
 ### 3.1 `Effort()` 有三种结果,任何两种都不能合并
 
@@ -259,6 +263,11 @@ POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第�
 
 ### 5.3 agent 自己的杠杆
 
+`GET $SEAL_SIGN_SOCK/settings` 只在内部 0600 socket 上返回当前运行配置（provider、
+model、thinking、托管路由 URL/协议、注册表版本和路由 hash）。数据取自 sealed
+已成功渲染的状态，不从 attestor 的待应用文档读取，不返回 key 或任意 framework
+配置；启动未准备好时返回 503。
+
 `POST $SEAL_SIGN_SOCK/settings` 搭的是 agent 本来就在用的那个 socket(注册对外服务、
 获取 agentSeal 签名)。它只在容器内部通过 0600 的 unix socket 可达,所以 agent 进程是
 唯一可能的调用者,也就不涉及任何签名 —— **socket 本身就是凭据**
@@ -342,11 +351,14 @@ dsh 的旋钮集合是白名单而不是透传,原因很具体:`workspaceContext
 推理 API key 是 `Resolved.APIKey`(`settings.go:70`):它从容器环境到来,从不属于 `Doc`,
 也不在任何地方持久化。自 #167 起它可以密文到达:attestor 声明 `secret_env_scheme` 时,
 SDK 把它装进 `SEAL_SECRET_ENV` —— 用 agentSeal 公钥 ECIES 加密、绑定 owner ——
-`main.go` 在 Phase 2 之后、任何 adapter 运行之前解开,所以两条路殊途同归到同一个
-`Resolved.APIKey`(`internal/secretenv`)。解不开的密文把 `secret_env_not_applied`
-warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 settings 版本**(文档确实被
-消费了 —— 回退 settings 治不了 key 的病),这正是 attestor 在 `warning` 上和 `running`
-一样晋升的原因。它到达各框架的方式依然不同,而这**不是可以统一的** —— 那就是各框架
+`main.go` 在 Phase 2 之后、任何 adapter 运行之前解开（`internal/secretenv`）。
+v2 明文绑定 provider ID；v3 还绑定 endpoint/协议的路由 hash，以及已接受注册表的
+版本和摘要。每次启动（含 stop/start）读取并校验该历史版本，匹配路由后才渲染，
+不改用最新地址。旧明文/v1 密钥仅属于 compute。显式提供的密文校验失败时，
+拒绝回退到明文 key，拒绝渲染 settings，并记录 `secret_env_not_applied: <reason>`。
+热更新中 provider 与凭据不匹配时，在改动 live document 前返回 HTTP 409
+`CREDENTIAL_PROVIDER_MISMATCH`；通过 reset 注入新 provider 的 key。
+密钥到达各框架的方式依然不同，这是各框架
 客户端实际读取的地方:
 
 | | 密钥怎么到达框架 |
@@ -376,8 +388,8 @@ warning 钉住整个 boot 生命周期;这样的 boot **仍然确认它的 setti
 任何被接受的修改都会重启框架进程。没有阶梯:
 
 - `manager.StartParams.PreStart`(`internal/manager/manager.go:122`)在**每一次**
-  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go:762` 把它
-  指向 `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`。
+  `adapter.Start` 之前立刻跑渲染 —— 首次、`Reload`、崩溃重启一视同仁。`main.go` 把它
+  指向 `adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`。
 - 两条推送路径都是先渲染再调 `manager.Reload`,而 Reload 就是 Stop+Start。
 - `framework.Reloadable` 依然只是声明、依然没有任何消费方
   (`framework.go:211`、`prime/prime.go:387`)。
@@ -434,22 +446,32 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 在途的那一轮�
 | `settings_confirmed_version` | `settings_last_good` 对应的版本 |
 | `settings_attempts` | 当前这份未确认文档已经被投递给多少次开机 |
 
-**提升(promotion)**发生在 `running` 报告上,并且只以版本为准:
-`settings_confirmed_version < settings_version`(`routes/status.rs` (`handle`)、
-`crates/shared/src/traits.rs` (`promote_settings_last_good`))。这让它在构造上幂等 —— 5 分钟一次的心跳会重复同一份
-报告,而它**绝不能**给一份没有任何开机跑过的文档背书。早先的规则是从"容器轨道还不是
-`Confirmed`"去推断"这是开机后的首份报告";但有若干路径会在没有任何开机的情况下把一个
-仍在运行的容器从 `Confirmed` 降级,于是那个推断给从未跑过的文档发了背书。
+**提升(promotion)**只发生在绑定当前启动凭据的 `running` / `warning` 报告上。
+`/provision` 为每次启动生成随机凭据，包含环境、seal、容器公钥、实际下发的配置版本和
+SHA-256 摘要，经 KMS HMAC 认证后，ECIES 加密给容器。数据库的
+`container_status_bindings` 保存当前凭据哈希、票据哈希、启动代次及授权 owner/sandbox。
+worker 在 owner 授权的 create 前生成独立票据，通过保留的内部环境变量
+`SEAL_BOOT_TICKET` 注入容器，owner env 不能覆盖它。sealed 先读
+`GET /provision?seal_id=…` 获得代次，再用容器私钥签署 `ProvisionBoot.v1`，绑定票据哈希、
+代次、启动 ID 与时间。POST 要求票据、容器私钥证明及实际 sandbox 身份均匹配，
+并复核链上 owner。重复或更早的启动请求不能换新凭据。票据在框架启动前从环境中清除。
 
-另有两个条件,都是关于**那个开机中的容器实际被投递了什么**(`traits.rs` (`promote_settings_last_good`)):
+stop 和 worker 的致命启动失败会在同一事务中撤销凭据；resume 先开新代次，再调用
+sandbox.start。reset 在恢复配置首次尝试计数之前先隔离旧代次，因此旧请求不能消耗
+新启动的重试机会。新 sandbox ID 尚未落库时返回 409，sealed 在 180 秒内重试。
+创建或 ID 落库失败会撤销票据，清理新容器。转让清理绑定捕获的旧 sandbox ID，
+不会删除或撤销新 owner 已授权的容器。排队的 owner 操作会在执行前复核链上 owner。
 
-- `settings_attempts >= 1` —— 至少有一次开机被投递过这个版本。**在 agent 运行期间推送的
-  文档并没有**(写入会重置计数器,而容器不会重新 provision),所以五分钟后的心跳不能给它
-  背书。
-- `settings_attempts = 1`,除非根本没有 `settings_last_good` —— 过了第一次尝试,
-  `/provision` 改投 last-known-good,于是此时的 `running` 报告说明的是**兜底那份**能跑,
-  与当前文档无关。在它上面提升,等于用正在失败的那份覆盖掉唯一已知可用的那份,而且再也
-  回不去。
+sealed 只有在使用下发的配置完成框架启动后，才在报告里附上该配置原始字节的摘要。
+`StatusReport.v2` 的原始 keccak 签名覆盖凭据哈希和配置摘要。attestor 校验凭据，
+并在同一个数据库事务内锁住 deployment，检查它仍是当前凭据，再更新状态、心跳及确认版本
+（`routes/status.rs`、`repo.rs::apply_status_report`）。只有凭据版本等于当前
+`settings_version` 且摘要匹配时，才提升尚未确认的文档；回退版本不会确认当前版本。
+因此旧容器的延迟心跳、运行中推送的新文档，都不能误确认配置。
+
+没有凭据的旧容器只在该 agent 尚未登记新协议启动时能更新存活状态，永不提升配置。
+一旦登记受管启动，旧协议 provision 和心跳不再接受。新 sealed 要求 attestor 返回加密的
+启动凭据与启动票据，因此应先构建全部 sealed 镜像，再统一升级 attestor API/worker/indexer 并启用对应镜像。已有 agent 用 reset 进入新镜像；无需新增运维环境变量。
 
 **兜底(fallback)以重复尝试为准,而不是以错误报告为准。**当前版本未确认时,`/provision`
 会给 `settings_attempts` 加一,过了第一次就改投 `settings_last_good`:推送后的第一次开机
@@ -465,6 +487,11 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 在途的那一轮�
 
 一次写入或一次提升都会把 `settings_attempts` 清零,所以新文档总是欠它自己的第一次尝试
 (`traits.rs` (`flip_stale_heartbeats`)、`:467`)。
+
+owner 授权创建新容器时，也会重新尝试当前未确认版本。worker 在 create 前按读取的
+版本清零尝试计数，版本检查保护并发 settings 写入；文档、版本和 last-known-good
+均不变。这样 provider 切换失败后，reset 可以重新尝试当前配置，而不会反复给
+新凭据下发旧 provider 的回退配置。容器自动重启仍遵循原有回退规则。
 
 ## 10. 迁移:通道出现之前铸造的 agent
 
@@ -594,11 +621,8 @@ hermes 的 `approvals` 与 `terminal` 也一并离开,而且不是顺带。它�
 
 - ~~迁移覆盖~~ —— 已关闭。四家都恢复两个遗留来源(退役配置角色 + mint 时的 persona
   种子),显式排位、有测试(§10)。
-- **agent socket 这半条推送路径还没有客户端。**owner 那半已经有了:CLI 的
-  `settings` 命令在持久写入后会推给运行中的容器,会话内的 `/settings` 与 `/think`
-  同样热推。仍未接线的是 AGENT 那半 —— 没有任何东西调用
-  `$SEAL_SIGN_SOCK/settings`,agent 圣经(`internal/platform`)也没提到这个
-  socket,agent 无从得知这个杠杆存在。
+- ~~agent socket 的可发现性~~ —— 已补齐。注入的 capabilities 说明如何通过内部
+  socket 查询当前配置，以及用 POST 临时改变 thinking；无需 owner 钱包签名。
 - **凭据通道仍然只有一条。**就是那个单数的 `API_KEY` 环境变量。一个干真活的 agent 迟早
   需要第二个凭据 —— 一个付费 API、一个 webhook secret —— 而它**没地方放**,于是它会写进
   文件;`memories/`、`skills/` 与人格文件**都是被追踪的角色**,凭据就这样加密上了 0g

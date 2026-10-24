@@ -14,6 +14,7 @@ pub mod jobs;
 pub mod kms;
 pub mod mocks;
 pub mod oss;
+pub mod provider_registry;
 pub mod repo;
 pub mod retry;
 pub mod sandbox;

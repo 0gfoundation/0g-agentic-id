@@ -134,6 +134,47 @@ func Resolve(ctx context.Context, d Doc, apiKey string) Resolved {
 	}
 }
 
+// ResolveForCredential checks ownership of the key before catalog access or
+// framework writes. A rejected push cannot redirect the existing credential.
+func ResolveForCredential(ctx context.Context, d Doc, credential inference.ProviderCredential) (Resolved, error) {
+	return ResolveForRegistry(ctx, d, credential, inference.DefaultRegistry)
+}
+
+func ResolveForRegistry(ctx context.Context, d Doc, credential inference.ProviderCredential, registry *inference.Registry) (Resolved, error) {
+	if credential.Invalid {
+		return Resolved{}, fmt.Errorf("INVALID_INFERENCE_CREDENTIAL: reset with a valid owner/provider-bound key")
+	}
+	if d.Provider == "" {
+		return Resolve(ctx, d, ""), nil
+	}
+	boundProvider := credential.Provider
+	if boundProvider == "" {
+		boundProvider = inference.ZGComputeProvider
+	}
+	if d.Provider != boundProvider {
+		return Resolved{}, fmt.Errorf("CREDENTIAL_PROVIDER_MISMATCH: key belongs to %s; reset with a key for %s", boundProvider, d.Provider)
+	}
+	if d.Provider != inference.ZGComputeProvider && !credential.Bound {
+		return Resolved{}, fmt.Errorf("PROVIDER_BOUND_CREDENTIAL_REQUIRED: reset with a v2 key for %s", d.Provider)
+	}
+	if credential.RouteHash != "" {
+		hash, err := registry.RouteHash(d.Provider)
+		if err != nil {
+			return Resolved{}, err
+		}
+		if hash != credential.RouteHash {
+			return Resolved{}, fmt.Errorf("CREDENTIAL_ROUTE_MISMATCH: reset to authorize the new route for %s", d.Provider)
+		}
+	} else if registry != inference.DefaultRegistry {
+		return Resolved{}, fmt.Errorf("PROVIDER_BOUND_CREDENTIAL_REQUIRED: dynamic registry requires a v3 key")
+	}
+	facts, endpoint, err := registry.Resolve(ctx, d.Provider, d.Model)
+	if err != nil {
+		return Resolved{}, err
+	}
+	return Resolved{Doc: d, Facts: facts, Endpoint: endpoint, APIKey: credential.APIKey}, nil
+}
+
 // Effort reports the reasoning bound to apply, and whether the platform
 // knows enough to decide at all.
 //

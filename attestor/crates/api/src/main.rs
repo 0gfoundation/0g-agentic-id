@@ -64,11 +64,8 @@ async fn main() -> anyhow::Result<()> {
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
-    // SandboxClient — api only uses `admin_delete` (kill a permanently
-    // failed container during /provision rejection). `create / start /
-    // stop` calls all live in the worker, so the mock here would also
-    // be fine for those — but using the same client matches worker's
-    // config so admin_delete signs with the same TEE EOA address.
+    // Shared sandbox interface; lifecycle mutations and cleanup run in the
+    // worker. Provision rejection must never invoke destructive operations.
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         Arc::new(MockSandbox)
     } else {
@@ -85,7 +82,13 @@ async fn main() -> anyhow::Result<()> {
         ))
     };
 
+    let providers = attestor_shared::provider_registry::PostgresProviderRegistry::new(
+        pool.clone(),
+        cfg.chain_id,
+        cfg.agentic_id_addr,
+    );
     let state = AppState {
+        providers,
         cfg: cfg.clone(),
         crypto,
         chain,
@@ -121,7 +124,9 @@ async fn build_tee_provider(cfg: &Config) -> anyhow::Result<Arc<dyn TeeKeyProvid
             .mock_app_eth_address
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("MOCK_TEE=true but MOCK_APP_ETH_ADDRESS not set"))?;
-        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(priv_hex, addr_hex)?))
+        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(
+            priv_hex, addr_hex,
+        )?))
     } else {
         Ok(Arc::new(TappTeeKeyProvider::connect(cfg).await?))
     }
@@ -138,3 +143,7 @@ async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
         Ok(Arc::new(TappKmsClient::connect(cfg).await?))
     }
 }
+
+#[cfg(test)]
+#[path = "../../worker/src/jobs.rs"]
+mod test_worker_jobs;

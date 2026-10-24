@@ -1,11 +1,11 @@
-# @0gfoundation/0g-agenticid-sdk
+# 0g-agentdna
 
-[![npm](https://img.shields.io/npm/v/@0gfoundation/0g-agenticid-sdk.svg)](https://www.npmjs.com/package/@0gfoundation/0g-agenticid-sdk) [![license: MIT](https://img.shields.io/npm/l/@0gfoundation/0g-agenticid-sdk.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/0g-agentdna.svg)](https://www.npmjs.com/package/0g-agentdna) [![license: MIT](https://img.shields.io/npm/l/0g-agentdna.svg)](./LICENSE)
 
-TypeScript SDK for **0G AgenticID** — deploy, call, and build on-chain reputation for autonomous AI agents. Built on [viem](https://viem.sh).
+**0G AgentDNA** TypeScript SDK for the AgenticID protocol — deploy, call, and build on-chain reputation for autonomous AI agents. Built on [viem](https://viem.sh).
 
 ```bash
-npm install @0gfoundation/0g-agenticid-sdk viem
+npm install 0g-agentdna viem
 ```
 
 **What do you want to do?**
@@ -16,9 +16,12 @@ npm install @0gfoundation/0g-agenticid-sdk viem
 
 > This README is the **interface reference** — signatures and shapes. The **[Guide](./GUIDE.md)** explains the reasoning behind each call; the [repo](https://github.com/0gfoundation/0g-agentic-id) has protocol docs + source.
 
+Upgrading from the old SDK/CLI? See [migration](./MIGRATION.md) ([中文](./MIGRATION.zh.md)).
+Provider registration, CLI switching, and image rollout: [providers](./PROVIDERS.md) ([中文](./PROVIDERS.zh.md)).
+
 ## The API at a glance
 
-One entry point, two namespaces + top-level ops.
+One entry point: agent, reputation, and admin namespaces + top-level ops.
 
 | Surface | What |
 |---|---|
@@ -33,14 +36,14 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ## Quickstart
 
 ```ts
-import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
+import { AgentDNA } from '0g-agentdna';
 
-const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
+const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only
 });
 ```
 
-`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgenticID({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape are covered in the [setup guide](./GUIDE.md#setup).
+`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgentDNA({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape are covered in the [setup guide](./GUIDE.md#setup).
 
 **What you pass grows with what you do:**
 
@@ -135,11 +138,11 @@ const { settings, version } = await ag.agent.getSettings(sealId);
 //   version  → the number to write back against (0 when there is no document)
 await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3b', thinking: 'high' }, {
   baseVersion: version,                       // compare-and-swap: a stale one is refused, not applied
-  onWarn: console.warn,                       // advisory 0G-router catalog check, run before signing
+  onWarn: console.warn,                       // advisory provider catalog check, run before signing
 });                                           // → { version }
 ```
 
-`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: a model absent from the 0G router catalog is reported, never blocked (a framework built-in is legitimately absent, and the container is the real gate).
+`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: an unlisted model is reported against its provider's configured catalog without blocking; native providers without a catalog accept manual model IDs. Non-compute providers require runtime image support and a provider-bound key; see [providers](./PROVIDERS.md).
 
 Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
 
@@ -238,6 +241,8 @@ await ag.waitForTransaction(depositTx);
 You don't pass a sealed image — the SDK resolves it from your `framework` via `GET /config`'s `frameworks[]` (each `{ name, image? }`). `iData` is an array of `{ role, plaintext, extra }`; `deploy` builds a `framework` + `persona` entry by default. The [iData guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) has the shapes and rules (WYSIWYS, persona is a one-shot seed, what the attestor validates).
 
 ```ts
+await ag.agent.refreshProviders(); // refresh the platform registry
+ag.agent.listProviders();          // cached provider descriptors
 await ag.agent.listModels();   // → ['claude-opus-4-8', …]   the 0G router's live catalog
 ```
 
@@ -297,7 +302,7 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
 - **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec.
-- **[CLI](./GUIDE.md#cli-0g-agenticid)** `npx 0g-agenticid` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
+- **[CLI](./GUIDE.md#cli-0g-agentdna)** `npx 0g-agentdna` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
 

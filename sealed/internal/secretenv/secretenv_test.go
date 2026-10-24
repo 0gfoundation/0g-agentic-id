@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -57,6 +58,35 @@ func TestOpenSDKVector(t *testing.T) {
 	}
 }
 
+func TestProviderBoundSecretAndFailureNeverReusePlaintext(t *testing.T) {
+	const key = "sk-new-provider"
+	encoded := seal(t, map[string]any{"v": 2, "owner": testOwner, "provider": "openai", "env": map[string]string{"API_KEY": key}})
+	credential, issue := ResolveCredential("sk-old-compute", encoded, testPriv(t), testOwner, func(string, ...any) {})
+	if issue != "" || credential.Provider != "openai" || credential.APIKey != key || !credential.Bound {
+		t.Fatalf("invalid bound credential: provider=%s bound=%v issue=%s", credential.Provider, credential.Bound, issue)
+	}
+	credential, issue = ResolveCredential("sk-old-compute", encoded, testPriv(t), "0x00000000000000000000000000000000000000bb", func(string, ...any) {})
+	if issue == "" || !credential.Invalid || credential.APIKey != "" {
+		t.Fatal("invalid sealed credential reused the plaintext key")
+	}
+	legacy, issue := ResolveCredential("", sdkVector, testPriv(t), testOwner, func(string, ...any) {})
+	if issue != "" || legacy.Provider != "0g-compute" || legacy.Bound {
+		t.Fatal("legacy key is not compute-only")
+	}
+}
+
+func TestProviderBindingRequiresV2AndValidProvider(t *testing.T) {
+	for _, doc := range []map[string]any{
+		{"v": 2, "owner": testOwner, "env": map[string]string{"API_KEY": "k"}},
+		{"v": 2, "owner": testOwner, "provider": "https://evil.example", "env": map[string]string{"API_KEY": "k"}},
+		{"v": 1, "owner": testOwner, "provider": "openai", "env": map[string]string{"API_KEY": "k"}},
+	} {
+		if _, err := Open(seal(t, doc), testPriv(t), testOwner); err == nil {
+			t.Fatal("accepted invalid provider binding")
+		}
+	}
+}
+
 func TestOpenOwnerMatchIsCaseInsensitive(t *testing.T) {
 	enc := seal(t, map[string]any{"v": 1, "owner": "0xAbCdEf0000000000000000000000000000000001", "env": map[string]string{"API_KEY": "k"}})
 	if _, err := Open(enc, testPriv(t), "0xabcdef0000000000000000000000000000000001"); err != nil {
@@ -97,8 +127,8 @@ func TestOpenRejects(t *testing.T) {
 		{"sealed to another agent", base64.StdEncoding.EncodeToString(otherCT), testOwner, "ecies decrypt", ReasonNotSealedToAgent},
 		{"previous owner's ciphertext", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "0x00000000000000000000000000000000000000bb", "sealed for owner", ReasonOwnerMismatch},
 		{"owner unknown on chain", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), "", "on-chain owner unknown", ReasonOwnerUnknown},
-		{"future version", seal(t, map[string]any{"v": 2, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), testOwner, "unsupported version", ReasonUnsupportedVersion},
-		{"unknown field", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}, "x": 1}), testOwner, "not a v1", ReasonMalformed},
+		{"future version", seal(t, map[string]any{"v": 4, "owner": testOwner, "env": map[string]string{"API_KEY": secret}}), testOwner, "unsupported version", ReasonUnsupportedVersion},
+		{"unknown field", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": secret}, "x": 1}), testOwner, "not a secret env", ReasonMalformed},
 		{"not an owner address", seal(t, map[string]any{"v": 1, "owner": "alice", "env": map[string]string{"API_KEY": secret}}), testOwner, "owner is not an address", ReasonMalformed},
 		{"nothing supported", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"OTHER": secret}}), testOwner, "no supported names", ReasonMalformed},
 		{"empty value", seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": ""}}), testOwner, "empty or invalid", ReasonMalformed},
@@ -133,10 +163,10 @@ func TestOpenRejectsShortKey(t *testing.T) {
 	}
 }
 
-// ResolveAPIKey is the only place the sealed key becomes the key the
+// ResolveCredential is the only place the sealed key becomes the key the
 // adapters use; these pin its precedence and its fail-safe behavior, and
 // that no log line carries a key.
-func TestResolveAPIKey(t *testing.T) {
+func TestResolveCredential(t *testing.T) {
 	good := seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": "sk-sealed"}})
 	const other = "0x00000000000000000000000000000000000000bb"
 	cases := []struct {
@@ -144,10 +174,10 @@ func TestResolveAPIKey(t *testing.T) {
 	}{
 		{"no secret env keeps the plain key", "sk-plain", "", testOwner, "sk-plain", "", ""},
 		{"no key at all is not an issue", "", "", testOwner, "", "", ""},
-		{"sealed key applies", "", good, testOwner, "sk-sealed", "OK   API_KEY (from SEAL_SECRET_ENV", ""},
-		{"sealed key wins over a plain key", "sk-plain", good, testOwner, "sk-sealed", "using the sealed value", ""},
+		{"sealed key applies", "", good, testOwner, "sk-sealed", "OK inference credential: provider=0g-compute bound=false", ""},
+		{"sealed key wins over a plain key", "sk-plain", good, testOwner, "sk-sealed", "OK inference credential: provider=0g-compute bound=false", ""},
 		{"owner mismatch applies nothing", "", good, other, "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: owner_mismatch"},
-		{"owner mismatch keeps the plain key", "sk-plain", good, other, "sk-plain", "FAIL SEAL_SECRET_ENV not applied", ""},
+		{"owner mismatch never falls back to a plain key", "sk-plain", good, other, "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: owner_mismatch"},
 		{"unknown owner applies nothing", "", good, "", "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: owner_unknown"},
 		{"garbage applies nothing", "", "not-base64!", testOwner, "", "FAIL SEAL_SECRET_ENV not applied", "secret_env_not_applied: malformed"},
 	}
@@ -155,9 +185,9 @@ func TestResolveAPIKey(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			var lines []string
 			logf := func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }
-			got, issue := ResolveAPIKey(c.plain, c.secret, testPriv(t), c.chainOwner, logf)
-			if got != c.want {
-				t.Fatalf("key = %q, want %q", got, c.want)
+			got, issue := ResolveCredential(c.plain, c.secret, testPriv(t), c.chainOwner, logf)
+			if got.APIKey != c.want {
+				t.Fatalf("key = %q, want %q", got.APIKey, c.want)
 			}
 			if issue != c.issue {
 				t.Fatalf("issue = %q, want %q", issue, c.issue)
@@ -214,7 +244,44 @@ func TestLiveOwner(t *testing.T) {
 	}
 	// An owner that stays unknown still fails closed in Open.
 	good := seal(t, map[string]any{"v": 1, "owner": testOwner, "env": map[string]string{"API_KEY": "sk-sealed"}})
-	if key, issue := ResolveAPIKey("", good, testPriv(t), LiveOwner("", down, 1, 0, noLog), noLog); key != "" || issue == "" {
+	if key, issue := ResolveCredential("", good, testPriv(t), LiveOwner("", down, 1, 0, noLog), noLog); key.APIKey != "" || issue == "" {
 		t.Fatalf("an unknown owner must not apply a sealed key, and must be reported (issue %q)", issue)
+	}
+}
+
+func TestSDKV3CredentialBindsTheRoute(t *testing.T) {
+	raw, err := os.ReadFile("../inference/testdata/registry-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixture struct {
+		Encoded   string `json:"secret_env_v3"`
+		RouteHash string `json:"route_hash"`
+	}
+	if err := json.Unmarshal(raw, &fixture); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := Open(fixture.Encoded, testPriv(t), testOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.Version != 3 || opened.Provider != "partner" || opened.RouteHash != fixture.RouteHash || opened.Env["API_KEY"] != "test-partner-key" {
+		t.Fatalf("wrong v3 content: version=%d provider=%s", opened.Version, opened.Provider)
+	}
+	credential, issue := ResolveCredential("wrong-plain-key", fixture.Encoded, testPriv(t), testOwner, func(string, ...any) {})
+	if issue != "" || !credential.Bound || credential.RouteHash != fixture.RouteHash || credential.Provider != "partner" || credential.Registry == nil || credential.Registry.Version != 1 {
+		t.Fatal("v3 credential binding lost")
+	}
+	for _, pin := range []any{nil, map[string]any{"version": -1}, map[string]any{"version": 1}, map[string]any{"version": 0, "digest": "invalid"}} {
+		invalid := seal(t, map[string]any{"v": 3, "owner": testOwner, "provider": "partner", "route_hash": fixture.RouteHash, "registry": pin, "env": map[string]string{"API_KEY": "secret"}})
+		if _, err := Open(invalid, testPriv(t), testOwner); err == nil {
+			t.Fatal("invalid registry pin accepted")
+		}
+	}
+	for _, version := range []int{1, 2} {
+		invalid := seal(t, map[string]any{"v": version, "owner": testOwner, "provider": "partner", "route_hash": fixture.RouteHash, "env": map[string]string{"API_KEY": "secret"}})
+		if _, err := Open(invalid, testPriv(t), testOwner); err == nil {
+			t.Fatal("a legacy payload must not claim a route binding")
+		}
 	}
 }

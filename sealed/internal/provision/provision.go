@@ -6,6 +6,9 @@ package provision
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -44,7 +47,8 @@ type Result struct {
 	// reason it is here and not in the sandbox env: env is supplied only on
 	// container create, so a resumed container would come up with no
 	// configuration at all.
-	Settings []byte
+	Settings    []byte
+	StatusToken string
 }
 
 // FromAttestor calls attestorURL/provision with the sandbox's identity proof
@@ -54,18 +58,83 @@ type Result struct {
 // key is nil; details are logged. A settings blob that fails to decrypt is
 // logged and dropped rather than being fatal: an agent that boots on its
 // last-good configuration beats one that refuses to boot.
-func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result {
+func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation, ticket string) Result {
+	if decoded, err := hex.DecodeString(ticket); err != nil || len(decoded) != 32 {
+		logger.Logf("FAIL provision: missing/invalid boot ticket; recreate with upgraded attestor")
+		return Result{}
+	}
+	// One claim per PID-1 boot. Retries preserve it; delayed claims from older
+	// boots cannot displace a newer accepted timestamp within the generation.
+	startedAt := time.Now().UnixNano()
+	bootID := make([]byte, 32)
+	if _, err := rand.Read(bootID); err != nil {
+		return Result{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 10 * time.Second}
+	discovery, err := http.NewRequestWithContext(ctx, http.MethodGet, attestorURL+"/provision?seal_id=0x"+a.SealID, nil)
+	if err != nil {
+		return Result{}
+	}
+	response, err := client.Do(discovery)
+	if err != nil {
+		logger.Logf("FAIL provision: boot generation discovery: %v", err)
+		return Result{}
+	}
+	var authorization struct {
+		Generation int64 `json:"generation"`
+	}
+	err = json.NewDecoder(response.Body).Decode(&authorization)
+	response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusOK || authorization.Generation <= 0 {
+		logger.Logf("FAIL provision: no authorized boot; reset required")
+		return Result{}
+	}
+	ticketHash := sha256.Sum256([]byte(ticket))
+	canonical := bootMessage(a.SealID, authorization.Generation, ticketHash, bootID, startedAt)
+	privateKey, err := crypto.ToECDSA(sealKeyBytes)
+	if err != nil {
+		return Result{}
+	}
+	signature, err := crypto.Sign(crypto.Keccak256([]byte(canonical)), privateKey)
+	if err != nil {
+		return Result{}
+	}
+	signature[64] += 27
+
 	imageHashHex := strings.TrimPrefix(a.ImageHash, "sha256:")
 	reqBody, _ := json.Marshal(map[string]any{
-		"seal_id":           "0x" + a.SealID,
-		"container_pubkey":  a.Pubkey,
-		"image_hash":        "0x" + imageHashHex,
-		"issued_at":         a.Ts,
-		"sandbox_signature": a.Signature,
+		"seal_id":               "0x" + a.SealID,
+		"container_pubkey":      a.Pubkey,
+		"image_hash":            "0x" + imageHashHex,
+		"issued_at":             a.Ts,
+		"sandbox_signature":     a.Signature,
+		"status_binding_scheme": "agentdna-status-v2",
+		"boot_ticket":           ticket, "boot_generation": authorization.Generation, "boot_id": "0x" + hex.EncodeToString(bootID), "boot_started_at": startedAt, "container_signature": "0x" + hex.EncodeToString(signature),
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(attestorURL+"/provision", "application/json", bytes.NewReader(reqBody))
+	var resp *http.Response
+	for {
+		req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, attestorURL+"/provision", bytes.NewReader(reqBody))
+		if requestErr != nil {
+			return Result{}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusConflict {
+			break
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		select {
+		case <-ctx.Done():
+			logger.Logf("FAIL provision: create bookkeeping deadline exceeded")
+			return Result{}
+		case <-time.After(time.Second):
+		}
+	}
+
 	if err != nil {
 		logger.Logf("FAIL provision: POST error: %v", err)
 		return Result{}
@@ -80,6 +149,7 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	var out struct {
 		EncryptedAgentSealPriv string `json:"encrypted_agent_seal_priv"`
 		EncryptedSettings      string `json:"encrypted_settings"`
+		EncryptedStatusBinding string `json:"encrypted_status_binding"`
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		logger.Logf("FAIL provision: decode response: %v", err)
@@ -99,6 +169,21 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	plaintext, err := eciesgo.Decrypt(priv, ctBytes)
 	if err != nil {
 		logger.Logf("FAIL provision: ECIES decrypt: %v", err)
+		return Result{}
+	}
+	var binding struct {
+		Token string `json:"token"`
+	}
+	ct, err := hex.DecodeString(strings.TrimPrefix(out.EncryptedStatusBinding, "0x"))
+	if err == nil && len(ct) > 0 {
+		var opened []byte
+		opened, err = eciesgo.Decrypt(priv, ct)
+		if err == nil {
+			err = json.Unmarshal(opened, &binding)
+		}
+	}
+	if err != nil || binding.Token == "" {
+		logger.Logf("FAIL provision: encrypted status binding missing or invalid; upgrade attestor")
 		return Result{}
 	}
 
@@ -122,9 +207,13 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 			logger.Logf("OK   provisioned agent_seal_priv (%d bytes)", len(plaintext))
 		}
 	}
-	return Result{AgentSealPriv: plaintext, Settings: settingsBlob}
+	return Result{AgentSealPriv: plaintext, Settings: settingsBlob, StatusToken: binding.Token}
 }
 
 // fmt is referenced indirectly via fmt.Errorf elsewhere in this package once
 // outbound provisioning is added; kept silent here for now.
 var _ = fmt.Errorf
+
+func bootMessage(seal string, generation int64, ticketHash [32]byte, bootID []byte, startedAt int64) string {
+	return fmt.Sprintf("ProvisionBoot.v1:0x%s:%d:%x:%x:%d", seal, generation, ticketHash, bootID, startedAt)
+}

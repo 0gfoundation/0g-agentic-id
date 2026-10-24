@@ -450,6 +450,12 @@ value (`settings/settings.go` package doc).
 | `s.Endpoint` (`*inference.Endpoint`) | non-nil **only** when the platform routes this model; nil for a framework built-in, which brings its own wiring |
 | `s.APIKey` | this boot's inference credential; arrives by env (`API_KEY`, or opened from `SEAL_SECRET_ENV` before any adapter runs), is never part of the document, is never persisted |
 
+Provider definitions come from the signed platform registry;
+`internal/inference/providers.json` is the built-in seed. Runtime renders
+use `ResolveForRegistry` and must handle its error before touching configuration.
+Do not substitute endpoints or keys from compute for another managed provider.
+See [provider extension and image rollout](../sdk/typescript/PROVIDERS.md).
+
 The Facts/Endpoint split is load-bearing, and it is why a native provider now
 still gets a reasoning bound. The two used to share one struct behind a single
 `provider == "0g-compute"` check, so picking a native provider silently
@@ -579,7 +585,7 @@ re-point inference (`hermes/spawn.go:53-60`).
   single call site all three paths share, "so none can be added later without
   it" (`manager/manager.go:224-231`). A `PreStart` error aborts that start
   exactly like a `Start` error. `main.go` points the hook at
-  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`, so
+  `adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`, so
   `Resolve` re-runs too and the endpoint, budget and reasoning flags come from
   the live catalog each time.
 
@@ -725,7 +731,7 @@ boot (Phase 3 of main.go):
                                        stale role
   seed #1: EvolutionFor(role) ∀ roles  → currentSnapshot (pre-Start)
   manager.Start:
-    PreStart → RenderSettings(settings.Resolve(doc, apiKey))
+    PreStart → RenderSettings(settings.ResolveForRegistry(ctx, doc, credential, registry))
     Start(ctx, RuntimeContext)         spawn; return once upstream listens
     MonitorExit(cb)                    arm death watcher
     Liveness(ctx) every 5s             probe loop begins

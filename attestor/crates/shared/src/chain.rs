@@ -17,6 +17,7 @@
 use crate::traits::ChainClient;
 use crate::types::*;
 use alloy::network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
+use alloy::primitives::B256;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::fillers::{ChainIdFiller, NonceFiller, NonceManager};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -43,8 +44,17 @@ sol!(
 sol!(
     #[sol(rpc)]
     interface TappRegistry {
+        struct AppInfo { bytes composeHash; bytes volumesHash; bytes[] imageHashes; address owner; uint256 registeredAt; }
+        function getAppInfo(string calldata appId) external view returns (AppInfo memory);
         function getNodeList(string calldata appId) external view returns (address[] memory);
         function isAcknowledged(address user, string calldata appId) external view returns (bool);
+    }
+);
+
+sol!(
+    #[sol(rpc)]
+    interface IERC1271 {
+        function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
     }
 );
 
@@ -297,11 +307,7 @@ where
             .with_input(call_data);
 
         // Estimate gas limit, add 20% safety margin.
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -437,11 +443,7 @@ where
             .with_to(gate)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);
@@ -484,6 +486,34 @@ where
         let r = TappRegistry::new(*registry_addr, self.provider.clone());
         let nodes = r.getNodeList(app_id.clone()).call().await?._0;
         Ok(nodes.iter().any(|n| *n == addr))
+    }
+
+    async fn tapp_app_owner(&self, registry: Address, app_id: &str) -> anyhow::Result<Address> {
+        let registry = TappRegistry::new(registry, self.provider.clone());
+        Ok(registry
+            .getAppInfo(app_id.to_string())
+            .call()
+            .await?
+            ._0
+            .owner)
+    }
+
+    async fn is_valid_contract_signature(
+        &self,
+        owner: Address,
+        digest: [u8; 32],
+        signature: &[u8],
+    ) -> anyhow::Result<bool> {
+        if self.provider.get_code_at(owner).await?.is_empty() {
+            return Ok(false);
+        }
+        let wallet = IERC1271::new(owner, self.provider.clone());
+        let result = wallet
+            .isValidSignature(B256::from(digest), Bytes::copy_from_slice(signature))
+            .call()
+            .await?
+            ._0;
+        Ok(result.as_slice() == [0x16, 0x26, 0xba, 0x7e])
     }
 
     async fn is_acknowledged(
@@ -533,11 +563,7 @@ where
         Ok(c.sealedKeysOf(agent_id).call().await?._0)
     }
 
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash> {
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
         let call_data = AgenticID::setAgentURICall {
             agentId: agent_id,
             newURI: uri,
@@ -549,11 +575,7 @@ where
             .with_to(self.contract_addr)
             .with_input(call_data);
 
-        let gas = self
-            .provider
-            .estimate_gas(&tx)
-            .await
-            .map_err(decode_err)? as u128;
+        let gas = self.provider.estimate_gas(&tx).await.map_err(decode_err)? as u128;
         let gas_limit = (gas * GAS_LIMIT_BUFFER_NUMERATOR) / GAS_LIMIT_BUFFER_DENOMINATOR;
         tx.set_gas_limit(gas_limit);
         tx.set_max_priority_fee_per_gas(self.priority_fee_wei);

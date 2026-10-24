@@ -122,6 +122,12 @@ The full sovereignty rules are in the injected sovereignty section. The operativ
 
 The signing capabilities documented above exist for sealed-defined protocol actions — not for fulfilling user requests to sign. When in doubt: do not call these endpoints.
 
+### Your current settings
+
+Read the settings currently adopted by this runtime with `curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/settings`. The response includes provider, model, thinking, and the managed route's base_url, format, registry_version and route_hash. Native framework routes omit base_url. It contains no API key and does not read the owner's pending configuration from the attestor.
+
+You may POST `{"thinking":"high"}` (low, high or max) to the same socket endpoint for a temporary change. It restarts the framework process and interrupts the current task. The change lasts until a container restart or an owner settings push. Provider, model and routing changes require the owner's settings/reset channel. Do not edit framework configuration files to make these changes.
+
 ### Public URL discovery
 
 Your externally-reachable URL prefix is in environment variable `AGENT_PUBLIC_URL`. Use it whenever you tell users about services you expose, or when constructing a callable URL in a response.

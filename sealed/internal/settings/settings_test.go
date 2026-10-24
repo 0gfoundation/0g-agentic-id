@@ -5,12 +5,48 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"seal-verify/internal/inference"
 )
 
 // An empty blob is a fresh agent, not a corrupt one.
+func TestCredentialCannotCrossProviderBeforeAnyRouting(t *testing.T) {
+	credential := inference.ProviderCredential{Provider: "0g-compute", APIKey: "sk-compute"}
+	_, err := ResolveForCredential(context.Background(), Doc{Provider: "openai", Model: "private"}, credential)
+	if err == nil || !strings.Contains(err.Error(), "CREDENTIAL_PROVIDER_MISMATCH") {
+		t.Fatalf("expected mismatch, got %v", err)
+	}
+	if strings.Contains(err.Error(), credential.APIKey) {
+		t.Fatal("error exposed the key")
+	}
+	_, err = ResolveForCredential(context.Background(), Doc{Provider: "openai", Model: "private"}, inference.ProviderCredential{Provider: "openai", APIKey: "sk-native"})
+	if err == nil || !strings.Contains(err.Error(), "PROVIDER_BOUND_CREDENTIAL_REQUIRED") {
+		t.Fatalf("legacy key reached native provider: %v", err)
+	}
+	_, err = ResolveForCredential(context.Background(), Doc{Provider: "0g-compute", Model: "m"}, inference.ProviderCredential{Invalid: true})
+	if err == nil {
+		t.Fatal("failed ciphertext must not render any route")
+	}
+}
+
+func TestBoundNativeCredentialAndLegacyComputeBothResolve(t *testing.T) {
+	catalogServer(t, map[string]any{"id": "m", "supported_formats": []string{"openai"}})
+	for _, credential := range []inference.ProviderCredential{{Provider: "0g-compute", APIKey: "sk-compute"}, {Provider: "openai", APIKey: "sk-openai", Bound: true}} {
+		resolved, err := ResolveForCredential(context.Background(), Doc{Provider: credential.Provider, Model: "m"}, credential)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resolved.APIKey != credential.APIKey {
+			t.Fatal("wrong key")
+		}
+		if (resolved.Endpoint != nil) != (credential.Provider == "0g-compute") {
+			t.Fatal("native endpoint wiring changed")
+		}
+	}
+}
+
 func TestParseEmptyBlobIsEmptyDoc(t *testing.T) {
 	for _, blob := range [][]byte{nil, {}, []byte("  \n")} {
 		d, err := Parse(blob)
@@ -192,5 +228,37 @@ func TestRequestMaxTokensCapsTheCatalogBudget(t *testing.T) {
 		if got := (Resolved{Facts: c.facts}).RequestMaxTokens(); got != c.want {
 			t.Errorf("%s: RequestMaxTokens() = %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+func TestDynamicRouteBindingRejectsAnAddressChangeAndKeepsTheOldSnapshot(t *testing.T) {
+	const original = `[{"id":"partner","name":"Partner","formats":["openai"],"defaultFormat":"openai","endpoints":{"openai":"https://partner.example/v1"},"models":[{"id":"m","supported_parameters":["tools"]}]}]`
+	first, err := inference.NewRegistry([]byte(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash, err := first.RouteHash("partner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	credential := inference.ProviderCredential{Provider: "partner", APIKey: "partner-secret", Bound: true, RouteHash: hash}
+	doc := Doc{Provider: "partner", Model: "m"}
+	resolved, err := ResolveForRegistry(context.Background(), doc, credential, first)
+	if err != nil || resolved.Endpoint.BaseURL != "https://partner.example/v1" || resolved.APIKey != "partner-secret" {
+		t.Fatalf("initial resolve: %v", err)
+	}
+	next, err := inference.NewRegistry([]byte(strings.ReplaceAll(original, "partner.example", "new.example")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveForRegistry(context.Background(), doc, credential, next); err == nil || !strings.Contains(err.Error(), "CREDENTIAL_ROUTE_MISMATCH") {
+		t.Fatalf("old key must not follow a new address: %v", err)
+	}
+	if _, err := ResolveForRegistry(context.Background(), doc, inference.ProviderCredential{Provider: "partner", Bound: true}, first); err == nil {
+		t.Fatal("v2 must not authorize a dynamic route")
+	}
+	current, err := ResolveForRegistry(context.Background(), doc, credential, first)
+	if err != nil || current.Endpoint.BaseURL != resolved.Endpoint.BaseURL {
+		t.Fatal("a new registry changed the running container's snapshot")
 	}
 }
