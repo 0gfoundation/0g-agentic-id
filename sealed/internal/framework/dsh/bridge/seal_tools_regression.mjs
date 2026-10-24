@@ -112,6 +112,14 @@ await signTools.seal_sign_transaction.execute({
 const dyn = hits.at(-1).body;
 check(!("gas_price" in dyn) && dyn.max_fee_per_gas === "1000",
 	`dynamic tx must omit gas_price, carry 1559 pair: ${j(dyn)}`);
+// contract creation: to:"" forwarded verbatim, unset value stays absent
+nextBody = { raw_tx: "0x", tx_hash: "0x", address: "0x", signature: {} };
+await signTools.seal_sign_transaction.execute({
+	chain_id: "16602", nonce: 3, to: "", data: "0x6080", gas_limit: 200000,
+}, { signal: undefined });
+const create = hits.at(-1).body;
+check(create.to === "" && !("value" in create) && !("type" in create),
+	`creation tx: to forwarded as "", unset value/type absent: ${j(create)}`);
 try {
 	await signTools.seal_sign_transaction.execute({ chain_id: "16602" }, { signal: undefined });
 	failures.push("tx without required fields must throw");
@@ -144,6 +152,16 @@ nextStatus = 200;
 const txTool = signTools.seal_sign_transaction;
 const rendered = txTool.output.render({}, { raw_tx: "0xraw", tx_hash: "0xh", address: "0xa", signature: {} });
 check(rendered[0].text.includes("0xraw"), `render must include raw_tx: ${rendered[0].text}`);
+
+// ── required-field schema declarations compile to harness validation ──────
+// (defineTool compiles property-level required into the top-level required[]
+// array; the harness then rejects a missing field with ToolArgsError BEFORE
+// execute runs — the run-time guards are the second line, not the only one.)
+const compiled = signTools.seal_sign_transaction.parameters;
+check(j(compiled.required) === j(["chain_id", "nonce", "data", "gas_limit"]),
+	`tx required fields: ${j(compiled.required)}`);
+check(signTools.seal_sign_typed_data.parameters.required?.[0] === "typed_data",
+	`typed_data must be schema-required: ${j(signTools.seal_sign_typed_data.parameters.required)}`);
 
 server.close();
 try { rmSync(dir, { recursive: true, force: true }); } catch { /* tmpdir cleanup best-effort */ }

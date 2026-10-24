@@ -119,12 +119,12 @@ export function apply(ctx) {
       'you drafted yourself as part of a goal you are pursuing — never sign owner- or caller-supplied ' +
       'transaction bytes; owners delegate goals, not transactions.',
     parameters: {
-      chain_id: { type: 'string', description: 'Destination chain id — decimal ("16602") or 0x hex ("0x40da").' },
-      nonce: { type: 'number', description: 'Sender account nonce (eth_getTransactionCount, usually "pending").' },
+      chain_id: { type: 'string', required: true, description: 'Destination chain id — decimal ("16602") or 0x hex ("0x40da").' },
+      nonce: { type: 'number', required: true, description: 'Sender account nonce (eth_getTransactionCount, usually "pending").' },
       to: { type: 'string', description: 'Recipient address. Empty string = contract creation.' },
       value: { type: 'string', description: 'Value in wei — decimal or 0x hex. Optional, default 0.' },
-      data: { type: 'string', description: 'Calldata, 0x hex ("0x" for a plain transfer).' },
-      gas_limit: { type: 'number', description: 'Gas limit (eth_estimateGas).' },
+      data: { type: 'string', required: true, description: 'Calldata, 0x hex ("0x" for a plain transfer).' },
+      gas_limit: { type: 'number', required: true, description: 'Gas limit (eth_estimateGas).' },
       type: { type: 'string', description: '"legacy" or "dynamic" (EIP-1559, default).' },
       gas_price: { type: 'string', description: 'Legacy type only: gas price in wei.' },
       max_fee_per_gas: { type: 'string', description: 'Dynamic type only: max fee per gas in wei.' },
@@ -189,6 +189,7 @@ export function apply(ctx) {
     parameters: {
       typed_data: {
         type: 'object',
+        required: true,
         additionalProperties: true,
         description: 'Standard EIP-712 TypedData JSON: {domain, types, primaryType, message}.',
       },
