@@ -550,7 +550,10 @@ priv 没漏、TEE 没破，verifier 仍然能验出"这条断言由合法 TEE �
 除了上文 `report.Status` / `chain.Update` / `X-Agent-Proof` 这类
 framework 自动签名以外，agent 自己也会通过 unix socket
 （`/sign/personal_sign`、`/sign/typed_data`、`/sign/transaction`）
-请求签名，让自己能作为一等 Web3 actor 参与：
+请求签名，让自己能作为一等 Web3 actor 参与。在 DSH 组合里，socket
+只能通过原生工具到达（`seal_sign`、`seal_sign_typed_data`、
+`seal_sign_transaction` —— 每个端点一个工具，每次调用都是一条
+结构化的 session log 记录）；其它框架则按各自组合允许的方式到达：
 
 - 调用 `msg.sender == agent_seal_addr` 的合约
 - 发布跟 TEE-attested 身份绑定的链下声明

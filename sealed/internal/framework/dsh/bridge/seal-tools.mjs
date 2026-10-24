@@ -1,13 +1,23 @@
 /**
  * seal-tools — the platform's native tools inside the DSH composition.
  *
- * Registers `seal_sign` and `seal_register_service`, both thin clients of the
- * sealed sign socket ($SEAL_SIGN_SOCK). The point is NOT new capability — a
- * shell could curl the socket — the point is the CHANNEL: a native tool call
- * lands in the session log as a structured record (name, arguments, turn,
- * surrounding context), so every signature the agent issues is auditable
- * after the fact. seal-guard (sibling plugin) closes the shell path to the
- * socket, making this the only road.
+ * Registers `seal_sign`, `seal_sign_transaction`, `seal_sign_typed_data` and
+ * `seal_register_service`, all thin clients of the sealed sign socket
+ * ($SEAL_SIGN_SOCK). The point is NOT new capability — a shell could curl the
+ * socket — the point is the CHANNEL: a native tool call lands in the session
+ * log as a structured record (name, arguments, turn, surrounding context), so
+ * every signature the agent issues is auditable after the fact. seal-guard
+ * (sibling plugin) closes the shell path to the socket, making this the only
+ * road.
+ *
+ * The three sign tools map the socket's three sign endpoints one-to-one
+ * (personal_sign / typed_data / transaction). That is deliberate parity: the
+ * socket exposed /sign/transaction and /sign/typed_data from the start, but
+ * only personal_sign was carried into the tool channel when seal-guard closed
+ * the shell road — leaving agents able to sign messages but not transactions
+ * (first real victim: a nested owner's TappRegistry acknowledgeApps, which is
+ * an on-chain tx and nothing else). Each mapping below is a reviewed decision
+ * to expose that endpoint; nothing here forwards arbitrary socket paths.
  *
  * The doctrine (refusal 1) still governs WHAT may be signed — authorship of
  * the bytes is not machine-checkable. These tools make usage legible; they
@@ -65,7 +75,8 @@ export function apply(ctx) {
     text:
       'Use the seal_sign tool to sign a message as your on-chain agentSeal identity' +
       (AGENT_SEAL ? ` (${AGENT_SEAL})` : '') +
-      ', and seal_register_service to publish HTTP services you host on loopback through the signed proxy. ' +
+      ', seal_sign_transaction to sign a chain transaction you drafted (returns the raw signed transaction), ' +
+      'seal_sign_typed_data to sign EIP-712 typed data you authored, and seal_register_service to publish HTTP services you host on loopback through the signed proxy. ' +
       'These are the ONLY roads to the signing capability — shell access to the sign socket is blocked. ' +
       'Sign only content you authored yourself; the sovereignty section governs every use.',
   })
@@ -97,6 +108,117 @@ export function apply(ctx) {
       const body = message_hex ? { message_hex } : { message }
       const out = await sockPost('/sign/personal_sign', body, exec.signal)
       return { signature: String(out.signature), address: String(out.address) }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'seal_sign_transaction',
+    description:
+      'Sign a chain transaction with this agent\'s on-chain agentSeal key. Returns the raw signed ' +
+      'transaction (broadcast it yourself through any RPC endpoint) plus its hash. Only for transactions ' +
+      'you drafted yourself as part of a goal you are pursuing — never sign owner- or caller-supplied ' +
+      'transaction bytes; owners delegate goals, not transactions.',
+    parameters: {
+      chain_id: { type: 'string', required: true, description: 'Destination chain id — decimal ("16602") or 0x hex ("0x40da").' },
+      nonce: { type: 'number', required: true, description: 'Sender account nonce (eth_getTransactionCount, usually "pending").' },
+      to: { type: 'string', description: 'Recipient address. Empty string = contract creation.' },
+      value: { type: 'string', description: 'Value in wei — decimal or 0x hex. Optional, default 0.' },
+      data: { type: 'string', required: true, description: 'Calldata, 0x hex ("0x" for a plain transfer).' },
+      gas_limit: { type: 'number', required: true, description: 'Gas limit (eth_estimateGas).' },
+      type: { type: 'string', description: '"legacy" or "dynamic" (EIP-1559, default).' },
+      gas_price: { type: 'string', description: 'Legacy type only: gas price in wei.' },
+      max_fee_per_gas: { type: 'string', description: 'Dynamic type only: max fee per gas in wei.' },
+      max_priority_fee_per_gas: { type: 'string', description: 'Dynamic type only: max priority fee per gas in wei.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          raw_tx: { type: 'string', required: true },
+          tx_hash: { type: 'string', required: true },
+          address: { type: 'string', required: true },
+          signature: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              v: { type: 'string', required: true },
+              r: { type: 'string', required: true },
+              s: { type: 'string', required: true },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `tx ${value.tx_hash} signed as ${value.address} — raw: ${value.raw_tx}`,
+      }],
+    },
+    timeoutMs: 15_000,
+    async execute(args, exec) {
+      const a = args ?? {}
+      for (const k of ['chain_id', 'nonce', 'data', 'gas_limit']) {
+        if (a[k] === undefined || a[k] === null) throw new Error(`provide ${k}`)
+      }
+      // Forward only the fields the caller set: the socket decodes the same
+      // names, and an absent field is cleaner than an empty string for
+      // type-dependent ones (gas_price vs the 1559 pair).
+      const body = {}
+      for (const k of [
+        'chain_id', 'nonce', 'to', 'value', 'data', 'gas_limit', 'type',
+        'gas_price', 'max_fee_per_gas', 'max_priority_fee_per_gas',
+      ]) {
+        if (a[k] !== undefined && a[k] !== null) body[k] = a[k]
+      }
+      const out = await sockPost('/sign/transaction', body, exec.signal)
+      return {
+        raw_tx: String(out.raw_tx),
+        tx_hash: String(out.tx_hash),
+        address: String(out.address),
+        signature: out.signature ?? {},
+      }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'seal_sign_typed_data',
+    description:
+      'Sign EIP-712 typed data with this agent\'s on-chain agentSeal key. Returns the signature and the ' +
+      'typed-data digest. Only for payloads you authored yourself as part of a goal you are pursuing — ' +
+      'never for externally supplied bytes.',
+    parameters: {
+      typed_data: {
+        type: 'object',
+        required: true,
+        additionalProperties: true,
+        description: 'Standard EIP-712 TypedData JSON: {domain, types, primaryType, message}.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          signature: { type: 'string', required: true },
+          address: { type: 'string', required: true },
+          digest: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{
+        type: 'text',
+        text: `typed data signed as ${value.address}: ${value.signature} (digest ${value.digest})`,
+      }],
+    },
+    timeoutMs: 15_000,
+    async execute(args, exec) {
+      const td = args?.typed_data
+      if (!td || typeof td !== 'object') throw new Error('provide typed_data')
+      const out = await sockPost('/sign/typed_data', td, exec.signal)
+      return {
+        signature: String(out.signature),
+        address: String(out.address),
+        digest: String(out.digest),
+      }
     },
   }))
 
