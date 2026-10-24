@@ -136,11 +136,11 @@ func Resolve(ctx context.Context, d Doc, apiKey string) Resolved {
 
 // ResolveForCredential checks ownership of the key before catalog access or
 // framework writes. A rejected push cannot redirect the existing credential.
-func ResolveForCredential(ctx context.Context, d Doc, credential inference.Credential) (Resolved, error) {
+func ResolveForCredential(ctx context.Context, d Doc, credential inference.ProviderCredential) (Resolved, error) {
 	return ResolveForRegistry(ctx, d, credential, inference.DefaultRegistry)
 }
 
-func ResolveForRegistry(ctx context.Context, d Doc, credential inference.Credential, registry *inference.Registry) (Resolved, error) {
+func ResolveForRegistry(ctx context.Context, d Doc, credential inference.ProviderCredential, registry *inference.Registry) (Resolved, error) {
 	if credential.Invalid {
 		return Resolved{}, fmt.Errorf("INVALID_INFERENCE_CREDENTIAL: reset with a valid owner/provider-bound key")
 	}

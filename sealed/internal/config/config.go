@@ -60,7 +60,7 @@ type Bootstrap struct {
 
 	// Optional pipeline knobs
 	APIKey              string
-	InferenceCredential *inference.Credential
+	InferenceCredential *inference.ProviderCredential
 	StatusBinding       *report.Binding
 	BootTicket          string
 	AttestorURL         string

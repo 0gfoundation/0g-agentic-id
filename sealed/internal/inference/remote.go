@@ -70,7 +70,7 @@ func LoadRemoteRegistry(ctx context.Context, base string, chainID uint64, contra
 // LoadPinnedRegistry reads the historical version authorized by the owner,
 // including after stop/start or a publication between signing and first boot.
 // Failure never substitutes the latest registry or a different endpoint.
-func LoadPinnedRegistry(ctx context.Context, base string, chainID uint64, contract string, credential Credential) (*Registry, error) {
+func LoadPinnedRegistry(ctx context.Context, base string, chainID uint64, contract string, credential ProviderCredential) (*Registry, error) {
 	if credential.Registry == nil || credential.Registry.Version < 0 || credential.RouteHash == "" {
 		return nil, fmt.Errorf("missing credential registry binding")
 	}

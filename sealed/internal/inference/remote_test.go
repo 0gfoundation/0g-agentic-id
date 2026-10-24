@@ -41,7 +41,7 @@ func TestPinnedRegistrySurvivesPublicationAndProcessRestart(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(newSnapshot)
 	}))
 	defer server.Close()
-	credential := Credential{Provider: "partner", RouteHash: fixture["route_hash"].(string), Registry: &RegistryPin{Version: 1, Digest: oldDigest}}
+	credential := ProviderCredential{Provider: "partner", RouteHash: fixture["route_hash"].(string), Registry: &RegistryPin{Version: 1, Digest: oldDigest}}
 	for boot := 0; boot < 2; boot++ {
 		registry, err := LoadPinnedRegistry(context.Background(), server.URL, uint64(fixture["chain_id"].(float64)), fixture["agentic_id_addr"].(string), credential)
 		if err != nil {
@@ -80,7 +80,7 @@ func TestPinnedRegistryNeverFallsBackToLatest(t *testing.T) {
 			fixture := registryFixture(t)
 			config := fixture["config"].(map[string]any)
 			snapshot := fixture["snapshot"].(map[string]any)
-			credential := Credential{Provider: "partner", RouteHash: fixture["route_hash"].(string), Registry: &RegistryPin{Version: 1, Digest: config["provider_registry_digest"].(string)}}
+			credential := ProviderCredential{Provider: "partner", RouteHash: fixture["route_hash"].(string), Registry: &RegistryPin{Version: 1, Digest: config["provider_registry_digest"].(string)}}
 			switch cause {
 			case "wrong-version":
 				snapshot["version"] = 2
@@ -127,7 +127,7 @@ func TestBuiltinRegistryPinSurvivesFirstPublication(t *testing.T) {
 	}))
 	defer server.Close()
 	hash, _ := DefaultRegistry.RouteHash(ZGComputeProvider)
-	credential := Credential{Provider: ZGComputeProvider, RouteHash: hash, Registry: &RegistryPin{Version: 0}}
+	credential := ProviderCredential{Provider: ZGComputeProvider, RouteHash: hash, Registry: &RegistryPin{Version: 0}}
 	r, err := LoadPinnedRegistry(context.Background(), server.URL, uint64(fixture["chain_id"].(float64)), fixture["agentic_id_addr"].(string), credential)
 	if err != nil {
 		t.Fatal(err)

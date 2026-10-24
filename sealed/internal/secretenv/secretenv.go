@@ -193,15 +193,15 @@ func Open(encoded string, agentSealPriv []byte, chainOwner string) (*Opened, err
 
 // ResolveCredential is the runtime path. An explicitly supplied ciphertext that
 // fails validation never falls back to a plaintext key from another context.
-func ResolveCredential(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) (inference.Credential, string) {
-	credential := inference.Credential{Provider: inference.ZGComputeProvider, APIKey: plainKey}
+func ResolveCredential(plainKey, encoded string, agentSealPriv []byte, chainOwner string, logf func(string, ...any)) (inference.ProviderCredential, string) {
+	credential := inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: plainKey}
 	if encoded == "" {
 		return credential, ""
 	}
 	opened, err := Open(encoded, agentSealPriv, chainOwner)
 	if err != nil {
 		logf("FAIL %s not applied: %v", EnvVar, err)
-		return inference.Credential{Invalid: true}, NotAppliedPrefix + Reason(err)
+		return inference.ProviderCredential{Invalid: true}, NotAppliedPrefix + Reason(err)
 	}
 	for _, name := range opened.Ignored {
 		logf("warn: %s: ignoring unsupported name %q", EnvVar, name)

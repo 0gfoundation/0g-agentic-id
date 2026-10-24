@@ -45,7 +45,7 @@ type RuntimeSettings struct {
 	RouteHash       string               `json:"route_hash,omitempty"`
 }
 
-func RuntimeSettingsFor(resolved settings.Resolved, credential inference.Credential) RuntimeSettings {
+func RuntimeSettingsFor(resolved settings.Resolved, credential inference.ProviderCredential) RuntimeSettings {
 	view := RuntimeSettings{Source: "runtime", Provider: resolved.Provider, Model: resolved.Model, Thinking: resolved.Thinking, RouteHash: credential.RouteHash}
 	if resolved.Endpoint != nil {
 		view.BaseURL, view.Format = resolved.Endpoint.BaseURL, resolved.Endpoint.Format

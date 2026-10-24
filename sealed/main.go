@@ -685,7 +685,7 @@ func startAgent(
 	// Held behind a mutex because two goroutines reach it: the manager's
 	// PreStart hook on every spawn, and an owner push arriving on the proxy.
 	live := &liveSettings{doc: settingsDoc}
-	credential := inference.Credential{Provider: inference.ZGComputeProvider, APIKey: apiKey}
+	credential := inference.ProviderCredential{Provider: inference.ZGComputeProvider, APIKey: apiKey}
 	if cfg.InferenceCredential != nil {
 		credential = *cfg.InferenceCredential
 	}

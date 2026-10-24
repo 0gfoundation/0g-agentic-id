@@ -36,7 +36,7 @@ type Registry struct {
 }
 
 // Legacy plaintext/v1 keys are compute-only; v2 ciphertext binds a provider.
-type Credential struct {
+type ProviderCredential struct {
 	Provider  string
 	APIKey    string
 	RouteHash string

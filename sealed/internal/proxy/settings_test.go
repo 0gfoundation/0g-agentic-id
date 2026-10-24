@@ -47,7 +47,7 @@ func TestAgentSettingsGetReadsRuntimeAndNeverIncludesCredentialsOrOpaqueConfig(t
 		APIKey:   "sk-secret-must-never-appear",
 		Endpoint: &inference.Endpoint{BaseURL: "https://old.example/v1", Format: inference.WireOpenAI},
 	}
-	credential := inference.Credential{APIKey: resolved.APIKey, Registry: &inference.RegistryPin{Version: 7}, RouteHash: "authorized-hash"}
+	credential := inference.ProviderCredential{APIKey: resolved.APIKey, Registry: &inference.RegistryPin{Version: 7}, RouteHash: "authorized-hash"}
 	s.SetRuntimeSettings(func() RuntimeSettings { return RuntimeSettingsFor(resolved, credential) })
 	w = httptest.NewRecorder()
 	s.handleAgentSettings(w, httptest.NewRequest(http.MethodGet, "/settings", nil))
@@ -157,7 +157,7 @@ func TestSettingsPost_ProviderSwitchRequiresResetAndKeepsLiveSettings(t *testing
 	s, _ := settingsServer(t, owner)
 	current := settings.Doc{Provider: "0g-compute", Model: "old-model"}
 	s.SetSettings(func() settings.Doc { return current }, func(ctx context.Context, doc settings.Doc) error {
-		if _, err := settings.ResolveForCredential(ctx, doc, inference.Credential{Provider: "0g-compute", APIKey: "sk-compute"}); err != nil {
+		if _, err := settings.ResolveForCredential(ctx, doc, inference.ProviderCredential{Provider: "0g-compute", APIKey: "sk-compute"}); err != nil {
 			return err
 		}
 		current = doc
