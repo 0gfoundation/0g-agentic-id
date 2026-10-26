@@ -195,9 +195,13 @@ if (proof) await ag.reputation.verifyProof(proof, { task });
 //    txs. An owner CANNOT attest feedback on their own agent, nor can the
 //    agent's own agentSeal or its payment wallet (the verified registry
 //    rejects all three). |value| must be ≤ 1e9 with 0..18 decimals.
-const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof! });
-// → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
-await ag.reputation.waitForTransaction(fb.attestTx);
+// inside the same guard — serveProof is ServeProof here; the old `proof!`
+// form would have compiled and passed null at runtime
+if (proof) {
+  const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+  // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
+  await ag.reputation.waitForTransaction(fb.attestTx);
+}
 // optional params: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
 // escape hatch: attestFeedback(agentId, idx, proof) marks an entry submitted separately
 

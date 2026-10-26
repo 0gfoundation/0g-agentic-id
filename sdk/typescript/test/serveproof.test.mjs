@@ -639,8 +639,9 @@ test('verifyProof: an explicit task: null fails closed, not signer-only', async 
 
 test('unsigned INFINITE SSE: both wrappers resolve promptly, task null', async () => {
   // A never-ending event stream with no X-Agent-Proof. Reintroducing an
-  // unconditional body await would hang this test (the old bug: the MCP
-  // listener GET never resolved).
+  // unconditional body await would fail this test in ~2s via the timer
+  // race below (the old bug hung the suite: the MCP listener GET never
+  // resolved and the open socket kept the loop alive).
   const srv = nodeHttp.createServer((req, res) => {
     if (req.url === '/hello') {
       // discovery must complete — only the SERVICE path hangs

@@ -74,7 +74,10 @@ export interface AgentServiceEntry {
  * ```
  * `task` is recorded from the actual bytes (response read via clone()), so a
  * genuine proof replayed next to a swapped body fails (`taskMatches: false`).
- * For hand-rolled fetches, build the reveal yourself with `taskRevealOf()`.
+ * For hand-rolled fetches, pass the `TaskExchange` you captured (method, url,
+ * requestBytes, responseBytes, status) — `verifyProof` derives and tries
+ * every URI candidate from it. (`taskRevealOf()` returns an array; its
+ * element 0 can name the wrong URI form for a trailing-`?` URL.)
  *
  * Note the proxy pins one HTTP method per path, so an MCP route is POST-only:
  * a stateless MCP server (each JSON-RPC request answered in one response,
