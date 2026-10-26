@@ -19,16 +19,6 @@ pub trait ChainClient: Send + Sync {
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
-    /// Returns whether `addr` is a currently-active node signer of the
-    /// configured sandbox app in TappRegistry. Used by `/provision` to
-    /// validate that the recovered sandbox attestation signer is one
-    /// the sandbox provider has registered (and rotations propagate
-    /// without an attestor restart).
-    ///
-    /// Returns `Err` when TappRegistry isn't wired in the chain client
-    /// — the attestor requires it to be configured.
-    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool>;
-
     /// Live owner of this attestor's Tapp, used for administrative writes.
     async fn tapp_app_owner(&self, _registry: Address, _app_id: &str) -> anyhow::Result<Address> {
         anyhow::bail!("Tapp owner lookup not implemented")
@@ -153,11 +143,11 @@ pub trait CryptoModule: Send + Sync {
     /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
     /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
     /// separator string so the same master secret can back independent
-    /// MACs (`"agentic-id.container-pubkey-binding.v1"` etc.) without
+    /// MACs (`"agentic-id.container-pubkey-binding.v2"` etc.) without
     /// cross-protocol attacks.
     fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
 
-    /// Recover signer from (eth personal_sign digest, 65-byte signature).
+    /// Recover signer from a 32-byte prehash and a 65-byte signature.
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address>;
 }
 
@@ -180,6 +170,19 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
+    /// Public bootstrap trust; runtimes refresh independently through pinned Scan.
+    async fn attestor_tls_identity(&self) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
+        Ok(None)
+    }
+    /// Full authenticated issuer scope used by workload attestations. Explicit
+    /// mocks must configure it; the default never authorizes an arbitrary key.
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        Ok(None)
+    }
+    /// Current authenticated connection metadata; mock implementations may omit it.
+    async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
+        Ok(None)
+    }
     /// Create a new sandbox container for `seal_id`. The user-signed
     /// `envelope` (action="create") is relayed as the three X-Wallet-*
     /// headers. Returns sandbox's id + lifecycle state so callers can
@@ -265,9 +268,9 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
 
     /// Persist the container's `(pubkey, mac)` pair on first /provision.
-    /// `mac` is `HMAC(binding_key, seal_id || pubkey)` — the binding_key
-    /// lives only in attestor memory (HKDF from master secret), so DB
-    /// tampering is detectable at verify time.
+    /// V2 `mac` covers `image_attestation_digest32 || authenticated_app_signer20`
+    /// with the v2-domain binding key (HKDF from the master secret). The digest
+    /// binds the full issuer scope and workload payload; v1 MACs are incompatible.
     async fn set_container_binding(
         &self,
         seal_id: SealId,

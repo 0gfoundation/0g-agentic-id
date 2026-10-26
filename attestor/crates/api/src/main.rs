@@ -24,15 +24,19 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let cfg = Config::from_env()?;
+    let mut cfg = Config::from_env()?;
     tracing::info!(rpc = %cfg.chain_rpc, bind = %cfg.bind, "attestor-api starting");
 
     let pool = repo::connect(&cfg.db_url).await?;
 
     // Attestor EOA key. MOCK_TEE=true uses env vars; false goes over local
-    // gRPC to tapp-server's GetAppSecretKey.
+    // gRPC to tapp-server's GetAppSigner.
     let tee = build_tee_provider(&cfg).await?;
-    let app_priv = tee.app_private_key().await?;
+    let identities =
+        attestor_shared::identity::initialize_for_startup(&mut cfg, tee.as_ref()).await?;
+    let app_priv = identities.app_private_key;
+    let attestor_identity = identities.attestor;
+    let discovery = identities.sandbox;
 
     // KMS master (app-scoped 32B secret). All three binaries must resolve
     // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value
@@ -55,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
-        cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
+        pool.clone(),
     )?;
     // GET /config advertises this validator to every verifier; refuse to
     // serve one that is not anchored to ATTESTOR_AGENTIC_ID_ADDR.
@@ -72,13 +76,13 @@ async fn main() -> anyhow::Result<()> {
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
-    // Shared sandbox interface; lifecycle mutations and cleanup run in the
-    // worker. Provision rejection must never invoke destructive operations.
+    // Authenticated discovery is shared with the worker; lifecycle mutations
+    // and cleanup belong to the worker. Provision rejection stays read-only.
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         Arc::new(MockSandbox)
     } else {
         let admin_signer = AdminSigner::from_priv(app_priv).ok();
-        Arc::new(HttpSandbox::new(
+        let client = HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
             // api never spawns containers, so extra_env / public_ports are
@@ -87,7 +91,15 @@ async fn main() -> anyhow::Result<()> {
             Vec::new(),
             admin_signer,
             cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
-        ))
+        );
+        let client = match &discovery {
+            Some(d) => client.with_discovery(d.clone()),
+            None => client,
+        };
+        Arc::new(match &attestor_identity {
+            Some(identity) => client.with_attestor_identity(identity.clone()),
+            None => client,
+        })
     };
 
     let providers = attestor_shared::provider_registry::PostgresProviderRegistry::new(

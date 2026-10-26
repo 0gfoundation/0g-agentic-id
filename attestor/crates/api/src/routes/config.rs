@@ -110,6 +110,14 @@ pub async fn handle(
     State(state): State<AppState>,
 ) -> crate::error::ApiResult<Json<ConfigResponse>> {
     let registry = super::providers::load_verified(&state).await?;
+    let connection =
+        state.sandbox.service_identity().await.map_err(|_| {
+            crate::error::ApiError::unavailable("sandbox identity lookup unavailable")
+        })?;
+    let (provider, endpoint) = connection.map(|(p, url)| (Some(p), Some(url))).unwrap_or((
+        state.cfg.sandbox_provider_addr,
+        Some(state.cfg.sandbox_endpoint.clone()),
+    ));
     Ok(Json(ConfigResponse {
         sandbox_proxy_addr: state.cfg.sandbox_proxy_addr.clone(),
         agent_serve_port: state.cfg.agent_serve_port,
@@ -124,7 +132,7 @@ pub async fn handle(
         attestor_app_id: state.cfg.app_id.clone(),
         kms_app_id: state.cfg.kms_app_id.clone(),
         sandbox_app_id: state.cfg.sandbox_app_id.clone(),
-        sandbox_provider_addr: state.cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
+        sandbox_provider_addr: provider.map(|a| format!("{:#x}", a)),
         sandbox_serving_addr: state.cfg.sandbox_serving_addr.map(|a| format!("{:#x}", a)),
         sandbox_snapshot: state.cfg.sandbox_snapshot.clone(),
         reputation_registry_addr: state
@@ -141,7 +149,7 @@ pub async fn handle(
             .cfg
             .standard_clone_authorizer_addr
             .map(|a| format!("{:#x}", a)),
-        sandbox_endpoint: Some(state.cfg.sandbox_endpoint.clone()).filter(|s| !s.is_empty()),
+        sandbox_endpoint: endpoint.filter(|s| !s.is_empty()),
         tee_data_verifier_addr: state
             .cfg
             .tee_data_verifier_addr

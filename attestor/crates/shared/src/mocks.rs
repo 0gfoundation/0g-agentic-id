@@ -56,6 +56,7 @@ pub struct MockChain {
     tapp_owner: Mutex<Option<Address>>,
     tapp_owner_failure: AtomicBool,
     contract_signature_valid: AtomicBool,
+    valid_framework: AtomicBool,
     next_agent_id: AtomicU64,
     seal_to_agent: Mutex<HashMap<SealId, AgentId>>,
     tx_to_receipt: Mutex<HashMap<TxHash, ReceiptSummary>>,
@@ -104,6 +105,7 @@ impl MockChain {
             tapp_owner: Mutex::new(None),
             tapp_owner_failure: AtomicBool::new(false),
             contract_signature_valid: AtomicBool::new(false),
+            valid_framework: AtomicBool::new(true),
             next_agent_id: AtomicU64::new(1),
             seal_to_agent: Mutex::new(HashMap::new()),
             tx_to_receipt: Mutex::new(HashMap::new()),
@@ -116,6 +118,10 @@ impl MockChain {
             last_clone_from: Mutex::new(None),
             identity_registry: Mutex::new(None),
         }
+    }
+
+    pub fn set_valid_framework(&self, valid: bool) {
+        self.valid_framework.store(valid, Ordering::SeqCst);
     }
 
     /// Seed what `identity_registry_of` returns (test-only); `None` makes
@@ -223,15 +229,10 @@ impl ChainClient for MockChain {
     }
 
     async fn is_valid_framework_hash(&self, _hash: ImageHash) -> anyhow::Result<bool> {
-        Ok(true)
+        Ok(self.valid_framework.load(Ordering::SeqCst))
     }
 
     async fn is_trusted_attestor(&self, _addr: Address) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
-        // Mock defaults to passing; tests needing rejection use ConfigurableChain.
         Ok(true)
     }
 
@@ -449,6 +450,9 @@ impl SandboxClient for MockSandbox {
 // assert which method was hit.
 
 pub struct ConfigurableSandbox {
+    /// Authenticated issuer scope is opt-in; no arbitrary-signer acceptance.
+    pub authenticated_identity: Mutex<Option<crate::identity::SandboxServiceIdentity>>,
+    pub identity_fails: AtomicBool,
     pub create_id: Mutex<String>,
     pub create_fails: AtomicBool,
     pub start_fails: AtomicBool,
@@ -477,6 +481,8 @@ pub struct ConfigurableSandbox {
 impl ConfigurableSandbox {
     pub fn new() -> Self {
         Self {
+            authenticated_identity: Mutex::new(None),
+            identity_fails: AtomicBool::new(false),
             create_id: Mutex::new("mock-id".to_string()),
             create_fails: AtomicBool::new(false),
             start_fails: AtomicBool::new(false),
@@ -533,6 +539,13 @@ impl Default for ConfigurableSandbox {
 
 #[async_trait]
 impl SandboxClient for ConfigurableSandbox {
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        if self.identity_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("configured discovery failure");
+        }
+        Ok(self.authenticated_identity.lock().unwrap().clone())
+    }
+
     async fn create(
         &self,
         _seal_id: SealId,
@@ -756,11 +769,6 @@ impl ChainClient for ConfigurableChain {
     }
 
     async fn is_trusted_attestor(&self, _addr: Address) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    async fn is_sandbox_node(&self, _addr: Address) -> anyhow::Result<bool> {
-        // Mock defaults to passing; tests needing rejection use ConfigurableChain.
         Ok(true)
     }
 

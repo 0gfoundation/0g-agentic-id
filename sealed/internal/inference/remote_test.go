@@ -13,6 +13,8 @@ import (
 )
 
 func TestPinnedRegistrySurvivesPublicationAndProcessRestart(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	fixture := registryFixture(t)
 	old := fixture["snapshot"].(map[string]any)
 	config := fixture["config"].(map[string]any)
@@ -75,6 +77,8 @@ func mustJSON(t *testing.T, v any) []byte {
 }
 
 func TestPinnedRegistryNeverFallsBackToLatest(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	for _, cause := range []string{"missing", "wrong-version", "tampered", "route", "rollback"} {
 		t.Run(cause, func(t *testing.T) {
 			fixture := registryFixture(t)
@@ -114,6 +118,8 @@ func TestPinnedRegistryNeverFallsBackToLatest(t *testing.T) {
 }
 
 func TestBuiltinRegistryPinSurvivesFirstPublication(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	fixture := registryFixture(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == "/config" {
@@ -151,6 +157,8 @@ func registryFixture(t *testing.T) map[string]any {
 }
 
 func TestSignedRemoteRegistryMatchesSDKRouteHash(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	fixture := registryFixture(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Header.Get("Authorization") != "" {
@@ -184,6 +192,8 @@ func TestSignedRemoteRegistryMatchesSDKRouteHash(t *testing.T) {
 }
 
 func TestRemoteRegistryRefusesUntrustedTamperedAndWrongEnvironment(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	for _, cause := range []string{"bad-receipt", "tampered", "environment", "unavailable", "unsigned"} {
 		t.Run(cause, func(t *testing.T) {
 			fixture := registryFixture(t)
@@ -217,5 +227,19 @@ func TestRemoteRegistryRefusesUntrustedTamperedAndWrongEnvironment(t *testing.T)
 				t.Fatal("invalid registry accepted")
 			}
 		})
+	}
+}
+
+func TestRemoteRegistryRequiresAuthenticatedAttestor(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "false")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(500) }))
+	defer server.Close()
+	if _, err := LoadRemoteRegistry(context.Background(), server.URL, 16602, "0x"+strings.Repeat("11", 20)); err == nil {
+		t.Fatal("accepted registry without an authenticated attestor")
+	}
+	if calls != 0 {
+		t.Fatal("contacted unauthenticated registry")
 	}
 }

@@ -553,8 +553,8 @@ env 这一面：
 |---|---|
 | `SEAL_BOOT_TICKET` | worker 在 create 时内部注入的随机启动票据，框架启动前清除。stop/start 保留容器票据但轮换启动代次，reset 换新票据；新镜像要求此值，不由运维手配 |
 | `SANDBOX_SEAL_KEY` | sandbox 注入的 ECDSA 私钥；用来跟 `SANDBOX_SEAL_ATTESTATION.pubkey` 互证（Phase 0）|
-| `SANDBOX_SEAL_ATTESTATION` | sandbox 签的 attestation JSON，含 `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`；sealId 从这里取，不是独立 env |
-| `TEE_SIGNER_ADDRESS` | （可选，**生产通常不设**）若设，Phase 0 要求从 attestation signature recover 出的地址 == 这个值，否则 fail loud。权威的 sandbox signer 校验在 attestor `/provision` 那一头（查 `TappRegistry.getNodeList(sandbox_app_id)`）；sealed 这条 pin 只是 dev / 本地调试早死的辅助，不是安全边界 |
+| `SANDBOX_SEAL_ATTESTATION` | 稳定 app signer 签发的 v2 attestation JSON，含 `version=2`、`chain_id`、`registry_address`、原样 `app_id`、`registered_at`、`image_hash`、`pubkey`、`seal_id`、`ts` 和 `signature`；sealId 从这里取，不是独立 env。缺失版本、旧版本和未知版本均拒绝 |
+| `TEE_SIGNER_ADDRESS` | （可选）预期的稳定 sandbox app signer。设置后，Phase 0 要求 v2 签名恢复出的地址与之相同。权威的 `/provision` 校验通过 Scan、TappRegistry 和 SandboxServing 认证 sandbox app signer 及完整 app 实例 scope；本地校验永不替换为当前或历史 node key |
 | `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
 | `CHAIN_RPC_URL` | AgenticID 合约所在 0G 链的 RPC——由 attestor worker 注入其自身的 `ATTESTOR_CHAIN_RPC`（`agenticid.0g.ai` 为 mainnet，`agenticid-testnet.0g.ai` 为 Galileo testnet）。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，需 owner 鉴权），attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |

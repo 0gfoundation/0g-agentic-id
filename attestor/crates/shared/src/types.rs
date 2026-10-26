@@ -372,11 +372,12 @@ pub struct Deployment {
     #[serde(default, skip_serializing)]
     pub container_pubkey: Option<alloy::primitives::Bytes>,
 
-    /// HMAC over `seal_id || container_pubkey` using a binding key derived
-    /// from the attestor master secret. DB is considered untrusted; this MAC
-    /// is what makes the binding tamper-evident — an attacker with DB write
-    /// access can't forge `(container_pubkey, mac)` without the binding key.
-    /// Derived from the master secret, so it never leaves the process:
+    /// V2 HMAC over `image_attestation_digest32 || authenticated_app_signer20`
+    /// under `agentic-id.container-pubkey-binding.v2`. The digest covers the
+    /// complete signed issuer scope, key, image and timestamp. Legacy v1
+    /// pubkey-only bindings never satisfy this domain/payload. DB writes
+    /// cannot forge a binding without the master-secret-derived binding key.
+    /// This binding material never leaves the process:
     /// `GET /deployment/:seal_id` serializes the row and is unauthenticated.
     #[serde(default, skip_serializing)]
     pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
@@ -929,8 +930,19 @@ mod tests {
 // ── /provision ──────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionRequest {
+    // Defaults let old envelopes reach the explicit unsupported-version error.
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub chain_id: u64,
+    #[serde(default)]
+    pub registry_address: Address,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub registered_at: u64,
     pub seal_id: SealId,
-    pub container_pubkey: Bytes, // 33 or 65 bytes secp256k1 pubkey
+    pub container_pubkey: Bytes,     // 33-byte compressed secp256k1 pubkey
     pub image_hash: ImageHash,
     pub issued_at: u64,
     pub sandbox_signature: Bytes,

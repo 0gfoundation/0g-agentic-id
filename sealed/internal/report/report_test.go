@@ -8,10 +8,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // This fixture is also verified by Rust's status signature tests.
 func TestBoundStatusCrossLanguage(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	raw, err := os.ReadFile("../inference/testdata/status-v2.json")
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +52,12 @@ func TestBoundStatusCrossLanguage(t *testing.T) {
 	defer srv.Close()
 	key, _ := hex.DecodeString(strings.TrimPrefix(fixture.PrivateKey, "0x"))
 	Status(srv.URL, key, seal, "running", "", binding)
-	packet := <-seen
+	var packet map[string]any
+	select {
+	case packet = <-seen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("status report did not reach the mock attestor")
+	}
 	for _, field := range []string{"seal_id", "status", "error_detail", "status_binding", "settings_digest", "agent_seal_signature"} {
 		if packet[field] != fixture.Report[field] {
 			t.Errorf("%s differs: got %v want %v", field, packet[field], fixture.Report[field])

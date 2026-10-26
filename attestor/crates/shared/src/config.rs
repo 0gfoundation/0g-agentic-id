@@ -90,8 +90,8 @@ pub struct Config {
     /// `tapp_ip`/`tapp_port`, which are then ignored. Mount the socket into
     /// the container to use it, keeping the TEE-key/KMS RPCs off any TCP port.
     pub tapp_socket: Option<String>,
-    /// App identifier registered in TappRegistry. Shared by `GetAppSecretKey`
-    /// (TEE EOA) and `GetSecretResource` (KMS secret). Required when
+    /// App identifier registered in TappRegistry. Shared by `GetAppSigner`
+    /// (stable business EOA) and `GetSecretResource` (encryption secrets). Required when
     /// either `mock_tee=false` or `mock_kms=false`. Also surfaced to the
     /// frontend as the "attestor" slot in the trust-roots ack modal.
     pub app_id: Option<String>,
@@ -252,24 +252,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns `(tapp_registry_addr, sandbox_app_id)` when both are
-    /// configured — used by the chain client constructor to enable
-    /// `is_sandbox_node` lookups. Returns `None` when TappRegistry isn't
-    /// wired (mock / partial dev setups), so chain clients silently fall
-    /// back to env-configured single signers.
-    pub fn tapp_registry_for_chain(&self) -> Option<(Address, String)> {
-        if self.tapp_registry_addr == Address::ZERO {
-            return None;
-        }
-        match self.sandbox_app_id.as_deref() {
-            Some(s) if !s.is_empty() => Some((
-                self.tapp_registry_addr,
-                self.sandbox_app_id.clone().unwrap(),
-            )),
-            _ => None,
-        }
-    }
-
     /// Supported framework names only — the deploy edge validates the
     /// binding's name against this (images are the SDK's concern at signing).
     pub fn framework_names(&self) -> Vec<String> {
@@ -296,7 +278,7 @@ impl Config {
 
             storage_indexer: env("ATTESTOR_STORAGE_INDEXER")?,
 
-            sandbox_endpoint: env("ATTESTOR_SANDBOX_ENDPOINT")?,
+            sandbox_endpoint: env_opt("ATTESTOR_SANDBOX_ENDPOINT").unwrap_or_default(),
             mock_sandbox: env_opt("MOCK_SANDBOX")
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
                 .unwrap_or(true),

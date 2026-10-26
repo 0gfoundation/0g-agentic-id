@@ -18,7 +18,7 @@ Guidance for AI coding agents working in this repository. (Claude Code loads thi
 ```bash
 # contracts — submodules first, once:
 git submodule update --init --recursive
-cd contracts && forge build && forge test          # 290 tests / 28 suites; 2 fork tests skip unless FORK_RPC is set
+cd contracts && forge build && forge test          # latest run: 299 passed; 2 fork tests skip unless FORK_RPC is set
 forge test --match-contract TransferFlow           # one suite
 forge test --match-test test_iCloneFrom_succeeds   # one test
 
@@ -70,7 +70,7 @@ There is no CI — run the relevant suite(s) locally before pushing. `attestor/T
 
 **Address/config discovery**: contract addresses are deployment artifacts, deliberately NOT baked into the SDK. Source of truth: `contracts/DEPLOYMENT.md` §6 and the attestor's `GET /config` (which also serves the current `sandbox_snapshot` image name — environment-specific: production `0g-sealed`, dev default `0g-test-sealed`). Production (`agenticid.0g.ai`) runs the §6.2m address set on 0G **mainnet** (chain id 16661, `https://evmrpc.0g.ai`); the testnet attestor (`agenticid-testnet.0g.ai`) runs the §6.1 "test" set on 0G Galileo (chain id 16602, `https://evmrpc-testnet.0g.ai`).
 
-**Governance** (`contracts/DEPLOYMENT.md` §1 / §6.2m / §8): owner-only admin calls are direct (not timelocked); only beacon upgrades go through the Timelock. Mainnet's owner/pauser/TEE-oracle is a Fordefi MPC vault and its Timelock `minDelay` is 1 day (`Deploy.s.sol` refuses less on chain 16661); testnet/dev deliberately keep one EOA each (separate keys) and `minDelay` 0 — never reuse a testnet key on mainnet. From 1.2.0, AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry ownership is two-step (`transferOwnership`, then the new owner's `acceptOwnership`). AgenticID sits ~136 bytes under EIP-170: run `forge build --sizes` on any change to it or its bases (`Eip170Size.t.sol` fails the suite otherwise).
+**Governance** (`contracts/DEPLOYMENT.md` §1 / §6.2m / §8): owner-only admin calls are direct (not timelocked); only beacon upgrades go through the Timelock. Mainnet's owner/pauser/TEE-oracle is a Fordefi MPC vault and its Timelock `minDelay` is 1 day (`Deploy.s.sol` refuses less on chain 16661); testnet/dev deliberately keep one EOA each (separate keys) and `minDelay` 0 — never reuse a testnet key on mainnet. From 1.2.0, AgenticID / TEEDataVerifier / VerifiedFeedbackRegistry ownership is two-step (`transferOwnership`, then the new owner's `acceptOwnership`). Contract builds use the checked-in solc 0.8.38 / via-IR / runs 1 / Cancun settings with `bytecode_hash = "none"` and compiler-version CBOR retained. AgenticID links the stateless `AttestorAppBindingLib`; proxy storage and owner gates stay in AgenticID. Current measured runtimes are 24,543 and 1,730 bytes respectively, but `forge build --sizes --skip test --skip script` and `Eip170Size.t.sol` are the gate after every change; do not assume an old margin. Linking and verification rules are in `contracts/UPGRADING.md`.
 
 ## Conventions
 

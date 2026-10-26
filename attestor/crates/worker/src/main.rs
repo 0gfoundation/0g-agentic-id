@@ -56,15 +56,19 @@ fn container_extra_env(cfg: &Config) -> Vec<(String, String)> {
 async fn main() -> anyhow::Result<()> {
     init_tracing();
 
-    let cfg = Config::from_env()?;
+    let mut cfg = Config::from_env()?;
     let worker_id = format!("worker-{}", uuid::Uuid::new_v4());
     tracing::info!(%worker_id, rpc = %cfg.chain_rpc, "attestor-worker starting");
 
     let pool = repo::connect(&cfg.db_url).await?;
 
-    // Attestor EOA key (mock env or tapp-server GetAppSecretKey).
+    // Attestor EOA key (mock env or local tapp GetAppSigner).
     let tee = build_tee_provider(&cfg).await?;
-    let app_priv = tee.app_private_key().await?;
+    let identities =
+        attestor_shared::identity::initialize_for_startup(&mut cfg, tee.as_ref()).await?;
+    let app_priv = identities.app_private_key;
+    let attestor_identity = identities.attestor;
+    let discovery = identities.sandbox;
 
     // Resolve app-scoped key from KMS (same source as api).
     let kms = build_kms_client(&cfg).await?;
@@ -78,17 +82,14 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_id,
         cfg.agentic_id_addr,
     ));
-    // Worker doesn't call is_sandbox_node today, but threading the same
-    // wiring keeps both binaries' ChainClient identically configured —
-    // avoids surprises if a future worker job needs the TappRegistry view.
     let chain: Arc<dyn ChainClient> = chain_connect_http(
         &cfg.chain_rpc,
         cfg.agentic_id_addr,
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
-        cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
+        pool.clone(),
     )?;
     // The validator every new container is handed must verify against this
     // AgenticID — refuse to start rather than bake a wrong one fleet-wide.
@@ -109,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.chain_id,
                 app_priv,
                 cfg.storage_indexer.clone(),
+                pool.clone(),
             )
             .await?,
         )
@@ -118,11 +120,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(MockSandbox)
     } else {
         tracing::info!(endpoint = %cfg.sandbox_endpoint, "sandbox: using HttpSandbox");
-        // Admin signer for orphan force-stop. Attestor's TEE EOA
-        // doubles as the admin identity — its address must be in the
-        // sandbox's ADMIN_ADDRESSES allowlist for force-stop to be
-        // accepted. If construction fails the worker still boots; admin
-        // calls just no-op and orphans fall back to sandbox runtime GC.
+        // Stable app signer is authorized by the sandbox's attestor appId
+        // role for orphan cleanup and sandbox state inspection.
         let admin_signer = AdminSigner::from_priv(app_priv).ok();
         if cfg.verified_feedback_addr.is_none() {
             tracing::warn!(
@@ -130,7 +129,7 @@ async fn main() -> anyhow::Result<()> {
                  VERIFIED_FEEDBACK_ADDR and emit no X-Agent-Proof (no ServeProofs)"
             );
         }
-        Arc::new(HttpSandbox::new(
+        let client = HttpSandbox::new(
             cfg.sandbox_endpoint.clone(),
             cfg.attestor_public_url.clone(),
             container_extra_env(&cfg),
@@ -140,7 +139,15 @@ async fn main() -> anyhow::Result<()> {
             cfg.sandbox_public_ports.clone(),
             admin_signer,
             cfg.sandbox_provider_addr.map(|a| format!("{:#x}", a)),
-        ))
+        );
+        let client = match &discovery {
+            Some(d) => client.with_discovery(d.clone()),
+            None => client,
+        };
+        Arc::new(match &attestor_identity {
+            Some(identity) => client.with_attestor_identity(identity.clone()),
+            None => client,
+        })
     };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
@@ -210,7 +217,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
                 for seal_id in timeouts {
-                    tracing::info!(?seal_id, "provision timeout: container_stage flipped Failed");
+                    tracing::info!(
+                        ?seal_id,
+                        "provision timeout: container_stage flipped Failed"
+                    );
                     if let Err(e) = events
                         .publish(attestor_shared::WsEvent::ContainerFailed {
                             seal_id,
@@ -325,14 +335,20 @@ async fn main() -> anyhow::Result<()> {
                             if let Err(e) = deployments
                                 .set_container_stage(
                                     seal_id,
-                                    attestor_shared::StageStatus::Stopped { at: now, reason: reason.clone() },
+                                    attestor_shared::StageStatus::Stopped {
+                                        at: now,
+                                        reason: reason.clone(),
+                                    },
                                 )
                                 .await
                             {
                                 tracing::warn!(?seal_id, error = %e, "sweep: set Stopped failed");
                             }
                             let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerStopped { seal_id, reason })
+                                .publish(attestor_shared::WsEvent::ContainerStopped {
+                                    seal_id,
+                                    reason,
+                                })
                                 .await;
                             tracing::info!(?seal_id, sandbox_id = %sb, "sweep: sandbox stopped → c=Stopped");
                         }
@@ -345,14 +361,20 @@ async fn main() -> anyhow::Result<()> {
                             if let Err(e) = deployments
                                 .set_container_stage(
                                     seal_id,
-                                    attestor_shared::StageStatus::Failed { at: now, reason: reason.clone() },
+                                    attestor_shared::StageStatus::Failed {
+                                        at: now,
+                                        reason: reason.clone(),
+                                    },
                                 )
                                 .await
                             {
                                 tracing::warn!(?seal_id, error = %e, "sweep: set Failed failed");
                             }
                             let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerFailed { seal_id, reason })
+                                .publish(attestor_shared::WsEvent::ContainerFailed {
+                                    seal_id,
+                                    reason,
+                                })
                                 .await;
                             tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, "sweep: → c=Failed");
                         }
@@ -408,7 +430,9 @@ async fn build_tee_provider(cfg: &Config) -> anyhow::Result<Arc<dyn TeeKeyProvid
             .mock_app_eth_address
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("MOCK_TEE=true but MOCK_APP_ETH_ADDRESS not set"))?;
-        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(priv_hex, addr_hex)?))
+        Ok(Arc::new(MockTeeKeyProvider::from_env_pair(
+            priv_hex, addr_hex,
+        )?))
     } else {
         Ok(Arc::new(TappTeeKeyProvider::connect(cfg).await?))
     }

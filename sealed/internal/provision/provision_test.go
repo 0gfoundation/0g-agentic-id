@@ -4,20 +4,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	eciesgo "github.com/ecies/go/v2"
 	"github.com/ethereum/go-ethereum/crypto"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
-
-	eciesgo "github.com/ecies/go/v2"
 )
 
 func TestProvisionRequiresEncryptedBootReceipt(t *testing.T) {
-	containerKey := make([]byte, 32)
-	containerKey[31] = 7
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
+	vector := loadAttestationVector(t)
+	containerKey, err := hex.DecodeString(strings.TrimPrefix(vector.ContainerKey, "0x"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	priv := eciesgo.NewPrivateKeyFromBytes(containerKey)
 	seal := make([]byte, 32)
 	seal[31] = 9
@@ -100,7 +106,7 @@ func TestProvisionRequiresEncryptedBootReceipt(t *testing.T) {
 				_ = json.NewEncoder(w).Encode(map[string]string{"encrypted_agent_seal_priv": keyCT, "encrypted_settings": settingsCT, "encrypted_status_binding": test.receipt})
 			}))
 			defer srv.Close()
-			got := FromAttestor(srv.URL, containerKey, Attestation{SealID: strings.Repeat("aa", 32)}, strings.Repeat("11", 32))
+			got := FromAttestor(srv.URL, containerKey, vector.Envelope, strings.Repeat("11", 32))
 			if test.ok {
 				if hex.EncodeToString(got.AgentSealPriv) != hex.EncodeToString(seal) || got.StatusToken != "current-boot" || string(got.Settings) != `{"model":"m"}` {
 					t.Fatal("provision payload mismatch")
@@ -141,5 +147,87 @@ func TestBootProofCrossLanguage(t *testing.T) {
 	got := bootMessage(strings.TrimPrefix(fixture.Request.Seal, "0x"), fixture.Request.Generation, sha256.Sum256([]byte(fixture.Request.Ticket)), id, fixture.Request.Started)
 	if got != fixture.Canonical {
 		t.Fatalf("boot canonical differs: %s", got)
+	}
+}
+
+func TestFromAttestorForwardsV2SignedScopeAndDecrypts(t *testing.T) {
+	vector := loadAttestationVector(t)
+	containerKey, err := hex.DecodeString(strings.TrimPrefix(vector.ContainerKey, "0x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Public test bytes stand in for the response payload only. The production
+	// container key and agentSeal ECIES path are exercised without alteration.
+	agentKey := []byte(strings.Repeat("k", 32))
+	settings := []byte(`{"version":1,"others":{}}`)
+	container := eciesgo.NewPrivateKeyFromBytes(containerKey)
+	encryptedKey, err := eciesgo.Encrypt(container.PublicKey, agentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encryptedSettings, err := eciesgo.Encrypt(container.PublicKey, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := eciesgo.Encrypt(container.PublicKey, []byte(`{"token":"v2-boot"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_ = json.NewEncoder(w).Encode(map[string]int{"generation": 1})
+			return
+		}
+		requests.Add(1)
+		if r.Method != http.MethodPost || r.URL.Path != "/provision" {
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(400)
+			return
+		}
+		var got map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		if got["status_binding_scheme"] != "agentdna-status-v2" {
+			t.Error("missing boot binding")
+		}
+		for _, field := range []string{"status_binding_scheme", "boot_ticket", "boot_generation", "boot_id", "boot_started_at", "container_signature"} {
+			delete(got, field)
+		}
+		if !reflect.DeepEqual(got, vector.ProvisionRequest) {
+			t.Errorf("forwarded request differs from signed v2 fixture: %#v", got)
+			w.WriteHeader(400)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"encrypted_agent_seal_priv": "0x" + hex.EncodeToString(encryptedKey), "encrypted_settings": "0x" + hex.EncodeToString(encryptedSettings), "encrypted_status_binding": "0x" + hex.EncodeToString(receipt)})
+	}))
+	defer server.Close()
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
+	result := FromAttestor(server.URL, containerKey, vector.Envelope, strings.Repeat("11", 32))
+	if requests.Load() != 1 || !reflect.DeepEqual(result.AgentSealPriv, agentKey) || !reflect.DeepEqual(result.Settings, settings) {
+		t.Fatal("v2 request/decryption did not preserve the original payloads")
+	}
+}
+
+func TestFromAttestorRejectsUnsupportedBeforeHTTP(t *testing.T) {
+	vector := loadAttestationVector(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(500) }))
+	defer server.Close()
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
+	for _, version := range []uint64{0, 1, 3} {
+		a := vector.Envelope
+		a.Version = version
+		if result := FromAttestor(server.URL, nil, a, strings.Repeat("11", 32)); result.AgentSealPriv != nil {
+			t.Fatalf("version %d returned a key", version)
+		}
+	}
+	if requests.Load() != 0 {
+		t.Fatal("unsupported envelope reached the attestor")
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"seal-verify/internal/attestorhttp"
 )
 
 // RouteHash binds the credential to the recipient, independently of mutable
@@ -99,7 +100,10 @@ func loadRegistry(ctx context.Context, base string, chainID uint64, contract str
 		Version      int64  `json:"provider_registry_version"`
 		Digest       string `json:"provider_registry_digest"`
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(base)
+	if err != nil {
+		return nil, fmt.Errorf("provider registry attestor identity: %w", err)
+	}
 	if err := fetchRegistryJSON(ctx, client, base+"/config", &config); err != nil {
 		return nil, err
 	}

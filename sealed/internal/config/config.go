@@ -5,13 +5,16 @@
 //
 //	SANDBOX_SEAL_KEY            (required) hex-encoded ephemeral private key
 //	SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
-//	TEE_SIGNER_ADDRESS          (optional) 0x-prefixed Ethereum address; if set,
-//	                            the attestation signer must match exactly
+//	TEE_SIGNER_ADDRESS          (optional) stable sandbox app signer address; if set,
+//	                            the v2 attestation signer must match exactly
 //	API_KEY                     (optional, legacy) inference provider API key in clear
 //	SEAL_SECRET_ENV             (optional) the owner's secret env (API_KEY) sealed to the
 //	                            agentSeal key; opened after provisioning, wins over API_KEY
 //	                            (internal/secretenv, issue #166)
 //	ATTESTOR_URL                (optional) provisioning endpoint root URL
+//	ATTESTOR_TLS_DESCRIPTOR     public Scan anchor + immutable attestor app scope,
+//	                            injected by attestor; required when ATTESTOR_URL is set
+//	ATTESTOR_ALLOW_UNPINNED_DEV  explicit development-only bypass ("true")
 //	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //	AGENTIC_ID_ADDR             (optional) AgenticID contract address
 //	VERIFIED_FEEDBACK_ADDR      (optional) VerifiedFeedbackRegistry proxy address — the
@@ -131,6 +134,9 @@ func Load() (*Bootstrap, error) {
 
 	var teeSignerPtr *common.Address
 	if v := os.Getenv("TEE_SIGNER_ADDRESS"); v != "" {
+		if !common.IsHexAddress(v) || common.HexToAddress(v) == (common.Address{}) {
+			return nil, fmt.Errorf("TEE_SIGNER_ADDRESS must be a nonzero Ethereum address")
+		}
 		addr := common.HexToAddress(v)
 		teeSignerPtr = &addr
 	}
@@ -219,11 +225,15 @@ func composePublicURL() string {
 // verifyAttestation runs the two-part Phase 0 check:
 //
 //  1. SANDBOX_SEAL_KEY derives the same compressed pubkey as attestation.pubkey
-//  2. attestation.signature recovers the TEE signer address (and matches
+//  2. the v2 fixed-word digest recovers the stable app signer (and matches
 //     expectedSigner when supplied)
 //
 // On success logs the recovered signer + image_hash for forensic visibility.
 func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner *common.Address) error {
+	recovered, err := a.RecoverSigner()
+	if err != nil {
+		return err
+	}
 	logger.Logf("--- Sealed Container Bootstrap ---")
 	logger.Logf("seal_id:    %s", a.SealID)
 	logger.Logf("pubkey:     %s", a.Pubkey)
@@ -240,39 +250,12 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 	}
 	logger.Logf("OK   keypair match: SANDBOX_SEAL_KEY -> %s", derived)
 
-	canonical := fmt.Sprintf("ImageAttestation:%s:%s:%s:%d", a.SealID, a.Pubkey, a.ImageHash, a.Ts)
-	hash := crypto.Keccak256Hash([]byte(canonical))
-	sigBytes, err := hex.DecodeString(strings.TrimPrefix(a.Signature, "0x"))
-	if err != nil {
-		return fmt.Errorf("decode signature: %w", err)
-	}
-	if len(sigBytes) != 65 {
-		return fmt.Errorf("signature must be 65 bytes, got %d", len(sigBytes))
-	}
-	// The sandbox TEE signer is external code we don't control; its library
-	// may emit the recovery id as raw 0/1 or as Ethereum's 27/28 convention.
-	// crypto.SigToPub only accepts 0/1, so normalize both forms explicitly
-	// instead of blindly subtracting 27 (which corrupts an already-raw 0/1
-	// byte into garbage and rejects an otherwise-valid signature).
-	switch sigBytes[64] {
-	case 27, 28:
-		sigBytes[64] -= 27
-	case 0, 1:
-		// already normalized
-	default:
-		return fmt.Errorf("invalid signature recovery id %d", sigBytes[64])
-	}
-	pub, err := crypto.SigToPub(hash[:], sigBytes)
-	if err != nil {
-		return fmt.Errorf("recover TEE signer: %w", err)
-	}
-	recovered := crypto.PubkeyToAddress(*pub).Hex()
-	logger.Logf("OK   TEE signature valid, signer: %s", recovered)
+	logger.Logf("OK   v2 app signature valid, signer: %s", recovered.Hex())
 	if expectedSigner != nil {
-		if !strings.EqualFold(recovered, expectedSigner.Hex()) {
-			return fmt.Errorf("TEE signer mismatch: recovered %s, expected %s", recovered, expectedSigner.Hex())
+		if recovered != *expectedSigner {
+			return fmt.Errorf("app signer mismatch: recovered %s, expected %s", recovered.Hex(), expectedSigner.Hex())
 		}
-		logger.Logf("OK   TEE signer matches TEE_SIGNER_ADDRESS: %s", expectedSigner.Hex())
+		logger.Logf("OK   app signer matches TEE_SIGNER_ADDRESS: %s", expectedSigner.Hex())
 	}
 	return nil
 }
