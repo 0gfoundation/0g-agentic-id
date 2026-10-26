@@ -1,7 +1,9 @@
 /**
  * Proof-jar behavior pins (CLI rating tickets): expired entries pruned on
  * load, the per-(agent,wallet) cap enforced, burn-by-signature removes only
- * the spent ticket, and the bigint round-trip through JSON is lossless.
+ * the spent ticket, the bigint round-trip through JSON is lossless
+ * (including the optional envelope `validator`), and `rate`'s burn-or-keep
+ * decision for a ticket that failed its free pre-check.
  */
 
 import { test } from 'node:test';
@@ -14,7 +16,7 @@ import { join } from 'node:path';
 // throwaway dir BEFORE importing so every test is hermetic.
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'jar-'));
 
-const { saveProof, listProofs, removeProof, toServeProof } = await import('../dist/cli/proofs.js');
+const { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable } = await import('../dist/cli/proofs.js');
 
 const WALLET = '0xC11e0000000000000000000000000000000000C1';
 const now = Math.floor(Date.now() / 1000);
@@ -89,4 +91,39 @@ test('removeProof burns exactly the spent ticket', () => {
   const left = listProofs(777n, WALLET);
   assert.equal(left.length, 1);
   assert.equal(left[0].proof.signature, keep.signature);
+});
+
+test('the envelope validator round-trips when present (rate tells registry mismatch from a bad ticket)', () => {
+  const p = { ...mkProof({ agentId: 555n }), validator: '0x0000000000000000000000000000000000000aaa' };
+  saveProof(p, TASK, 'http://a');
+  const [t] = listProofs(555n, WALLET);
+  assert.deepEqual(toServeProof(t), p);
+});
+
+test('rate burns a ticket only for its own defects, keeps it on a registry-config mismatch', () => {
+  // A ticket that verified in every respect, for overriding one field at a time.
+  const good = { notExpired: true, dataOnChain: true, registryMatches: true, signerMatches: true };
+  const cases = [
+    ['expired', { notExpired: false }, 'burn'],
+    // The registry never checks dataHashes against chain: an agent that has
+    // committed new state since the interaction leaves the ticket redeemable.
+    ['data not on chain', { dataOnChain: false }, 'keep'],
+    ['signature mismatch under the matching registry', { signerMatches: false }, 'burn'],
+    // registryMatches false ⇒ the signature was not checked (signerMatches false too)
+    ['no registry configured / names a different registry', { registryMatches: false, signerMatches: false }, 'keep'],
+    ['different registry AND expired', { registryMatches: false, signerMatches: false, notExpired: false }, 'burn'],
+    ['different registry AND data not on chain', { registryMatches: false, signerMatches: false, dataOnChain: false }, 'keep'],
+  ];
+  for (const [name, over, want] of cases) {
+    assert.equal(ticketDisposition({ ...good, ...over }), want, name);
+  }
+});
+
+test('rate gates on what the registry checks — data not on chain alone does not block', () => {
+  const good = { notExpired: true, dataOnChain: true, registryMatches: true, signerMatches: true };
+  assert.equal(ticketRedeemable(good), true);
+  assert.equal(ticketRedeemable({ ...good, dataOnChain: false }), true, 'stale dataHashes still redeem');
+  assert.equal(ticketRedeemable({ ...good, notExpired: false }), false);
+  assert.equal(ticketRedeemable({ ...good, signerMatches: false }), false);
+  assert.equal(ticketRedeemable({ ...good, registryMatches: false, signerMatches: false }), false);
 });

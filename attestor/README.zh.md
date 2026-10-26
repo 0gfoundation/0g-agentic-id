@@ -125,7 +125,7 @@ cargo run -p attestor-indexer# 第三个终端
 | 路径 | 干什么 |
 |---|---|
 | `GET /deployments` | 列出当前 deployment |
-| `GET /deployment/:seal_id` | 单条 deployment 详情 |
+| `GET /deployment/:seal_id` | 单条 deployment 详情（无需认证；不返回 settings 文档、容器公钥及其 MAC、iData 重试材料） |
 | `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
 
@@ -135,7 +135,8 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 合约 | 用途 |
 |---|---|
-| **AgenticID** | NFT mint、iData 注册、ServeProof 验证、`validFrameworkHashes` 白名单 |
+| **AgenticID** | NFT mint、iData 注册、`validFrameworkHashes` 白名单 |
+| **VerifiedFeedbackRegistry** | 验证 ServeProof——agentSeal 的 EIP-191 version 0x00 签名 `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`，validator = 本 proxy——并在官方 ERC-8004 reputation registry 之上记录 TEE 标记。attestor 从不写它：只在 `GET /config` 公布地址，并作为 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器（`ATTESTOR_VERIFIED_FEEDBACK_ADDR`）；唯一的读取在 worker / api 启动时——`getIdentityRegistry()` 必须等于 `ATTESTOR_AGENTIC_ID_ADDR`，否则启动失败 |
 | **TappRegistry** | attestor / 0g-kms / 0g-sandbox-provider 三个 Tapp app 的代码身份 + 节点签名注册表；`/provision` 走 `getNodeList` 验 sandbox signer |
 | **SandboxServing** | sandbox 预付费余额 + voucher 结算；前端 deploy gate 要求 owner 余额 ≥ 0.1 OG |
 
@@ -151,6 +152,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G 链 RPC + chainId。RPC URL 是公开的（`GET /config` 会返回它，agent 的启动日志也会打印它），所以不能内嵌凭据；见 `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID 合约地址 |
+| `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | 绑定该 AgenticID 的 VerifiedFeedbackRegistry **proxy**。在 `GET /config` 公布，并作为 ServeProof validator 以 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器。留空或为零地址 ⇒ `/config` 不公布该地址，容器拿到空值，因而不发 `X-Agent-Proof`；填了但不是地址则启动失败，其 `getIdentityRegistry()` 不是 `ATTESTOR_AGENTIC_ID_ADDR` 也启动失败（worker 和 api 启动时各读一次）。容器 env 只在创建时写入，改值需要逐个重建 agent（owner 签名的 `/reset`）|
 | `ATTESTOR_CANONICAL_8004_ADDR` | 官方 ERC-8004 IdentityRegistry（可选；按 chainId 自动选——主网 `0x8004A169…`、测试网 `0x8004A818…`）|
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry 合约地址 |
 | `ATTESTOR_PRIORITY_FEE_GWEI` / `ATTESTOR_MAX_FEE_GWEI` | EIP-1559 gas 上下界（0G testnet `priority` 最低 2）|

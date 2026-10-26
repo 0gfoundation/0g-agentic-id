@@ -120,21 +120,22 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// system-prompt section (the authoritative channel). No markers, nothing a
 	// tracked role carries.
 	pc := platform.Build(platform.RuntimeSnapshot{
-		SealedVersion:    rt.SealedVersion,
-		FrameworkVersion: version,
-		WhitelistMax:     whitelistMax(),
-		AgentSeal:        rt.AgentSeal,
-		AgentID:          rt.AgentID,
-		Owner:            rt.Owner,
-		ChainRPC:         rt.ChainRPC,
-		ContractAddr:     rt.ContractAddr,
-		AttestorURL:      rt.AttestorURL,
-		PublicURL:        rt.PublicURL,
-		SealSignSock:     rt.SealSignSock,
-		Provider:         provider,
-		Model:            model,
-		ZGComputeRouted:  rendered.resolved.Endpoint != nil && provider == "0g-compute",
-		BootTime:         time.Now(),
+		SealedVersion:       rt.SealedVersion,
+		FrameworkVersion:    version,
+		WhitelistMax:        whitelistMax(),
+		AgentSeal:           rt.AgentSeal,
+		AgentID:             rt.AgentID,
+		Owner:               rt.Owner,
+		ChainRPC:            rt.ChainRPC,
+		ContractAddr:        rt.ContractAddr,
+		ServeProofValidator: rt.VerifiedFeedbackAddr,
+		AttestorURL:         rt.AttestorURL,
+		PublicURL:           rt.PublicURL,
+		SealSignSock:        rt.SealSignSock,
+		Provider:            provider,
+		Model:               model,
+		ZGComputeRouted:     rendered.resolved.Endpoint != nil && provider == "0g-compute",
+		BootTime:            time.Now(),
 	})
 	if err := privsep.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its

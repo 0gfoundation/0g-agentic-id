@@ -86,6 +86,12 @@ const dec = (v: bigint | number | undefined): string | undefined =>
  * Unsupported on purpose (the socket signs legacy + EIP-1559 only): tx
  * types eip2930/eip4844/eip7702 and access lists — those throw an explicit
  * error rather than mis-signing.
+ *
+ * Deliberately absent, and must stay so: raw-hash signing (`sign({ hash })`)
+ * and any EIP-191 version 0x00 path. The socket's preimages are only
+ * personal_sign (0x19 0x45), typed data (0x19 0x01) and transactions it
+ * encodes itself; ServeProofs are signed over a 0x19 0x00 digest that only
+ * the sealed proxy produces, so this account cannot forge one.
  */
 export async function sealAccount(opts?: SealAccountOptions): Promise<LocalAccount> {
   const socketPath = opts?.socketPath ?? process.env.SEAL_SIGN_SOCK ?? '/run/seal-sign.sock';

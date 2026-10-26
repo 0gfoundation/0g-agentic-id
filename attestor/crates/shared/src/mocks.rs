@@ -76,6 +76,9 @@ pub struct MockChain {
     can_clone_verdict: Mutex<Option<bool>>,
     /// Last `clone_from` params (recorder for worker-test assertions).
     pub last_clone_from: Mutex<Option<CloneFromParams>>,
+    /// What `identity_registry_of` answers: `Some(addr)` = the registry's
+    /// getIdentityRegistry(); `None` (default) = the read fails.
+    identity_registry: Mutex<Option<Address>>,
 }
 
 impl MockChain {
@@ -111,7 +114,14 @@ impl MockChain {
             authorizer: Mutex::new(Address::ZERO),
             can_clone_verdict: Mutex::new(None),
             last_clone_from: Mutex::new(None),
+            identity_registry: Mutex::new(None),
         }
+    }
+
+    /// Seed what `identity_registry_of` returns (test-only); `None` makes
+    /// the read fail.
+    pub fn set_identity_registry(&self, v: Option<Address>) {
+        *self.identity_registry.lock().unwrap() = v;
     }
 
     /// Set the address `owner_of` returns (test-only).
@@ -296,6 +306,11 @@ impl ChainClient for MockChain {
             },
         );
         Ok(tx_hash)
+    }
+
+    async fn identity_registry_of(&self, _registry: Address) -> anyhow::Result<Address> {
+        (*self.identity_registry.lock().unwrap())
+            .ok_or_else(|| anyhow::anyhow!("mock: getIdentityRegistry() reverts"))
     }
 
     async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {
@@ -820,6 +835,10 @@ impl ChainClient for ConfigurableChain {
             },
         );
         Ok(tx_hash)
+    }
+
+    async fn identity_registry_of(&self, _registry: Address) -> anyhow::Result<Address> {
+        anyhow::bail!("ConfigurableChain: identity_registry_of not configured")
     }
 
     async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash> {

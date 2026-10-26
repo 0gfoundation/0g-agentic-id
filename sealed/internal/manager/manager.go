@@ -246,6 +246,7 @@ func (m *Manager) armState(res framework.StartResult) {
 		m.params.Runtime.FrameworkHash,
 		m.params.Runtime.ChainID,
 		m.params.Runtime.ContractAddr,
+		m.params.Runtime.VerifiedFeedbackAddr,
 	)
 }
 

@@ -211,8 +211,9 @@ sealed/
 │   ├── uploader/                 drift → 0g-storage upload + signed chain.Update
 │   ├── watcher/                  30s tick running EvolutionFor, triggers uploader.Apply
 │   └── proxy/                    :8080 reverse proxy + signing + log pages
+├── Dockerfile                    the openclaw sealed image that ships (0g-sealed): the bootstrap binary on the images/openclaw/ base
 ├── images/openclaw/              openclaw base-image build scripts (independent artifact, layered separately from the sealed bootstrap image)
-├── images/sealed/                sealed sandbox image, node flavour (openclaw; npm installs are warm cache only)
+├── images/sealed/                universal node image (npm installs are warm cache only); builds no image that ships — openclaw's is Dockerfile above
 ├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
 ├── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
 └── images/dsh/                   sealed sandbox image, dsh flavour
@@ -551,11 +552,22 @@ container's `:8080`.
 | `/_seal/claim` | **owner's wallet** | take the single-driver seat (tag `0GSealClaim`, body-digest-bound like the settings push); the displaced client instance gets 409 on its next driving request. Proxy memory only — a restart clears the seat (`internal/proxy/occupancy.go`) |
 | `/_seal/clear` | **owner's wallet** | wipe the agent's ONE persisted conversation and restart the framework process (tag `0GSealClear`, seat-gated); 501 when the framework keeps no server-side history (`CONVERSATION.md`) |
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
-| `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth, responses proof-signed); every undeclared path 404s — there is no catch-all relay |
+| `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
+| `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
 | `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
-| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (GET reads runtime settings; POST changes only temporary thinking — see below) |
+| `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
+
+Exactly three surfaces are proof-signed: `/hello`, `/_seal/auth` and the
+agent-registered `/api/*` services — and only when `VERIFIED_FEEDBACK_ADDR`
+is usable and anchored (its `getIdentityRegistry()` is `AGENTIC_ID_ADDR`,
+checked once the chain is dialled) and the agent has an on-chain identity.
+Framework routes (`/v1/*`, `/v1/responses*`, any UI) — their SSE streams
+included — and WebSocket upgrades never carry an `X-Agent-Proof`; an
+`/api/*` backend's SSE is buffered, then signed. The proxy also drops one an
+upstream backend sets, as a header or a trailer, so the header is always the
+runtime's own.
 
 `GET $SEAL_SIGN_SOCK/settings` returns provider, model, thinking and managed
 route metadata (URL, format, registry version, route hash) from sealed's rendered
@@ -577,12 +589,20 @@ it over what is in force, so the agent need not restate a pin it does not own.
 The sign socket is the critical trust boundary between sealed and the
 outside world (which is really the same-container agent process). The
 private key never leaves the sealed process; the agent hands the
-message to sign over the unix socket. The socket itself is just
-transport. **Refusal logic lives on the agent side, constrained by
-SOUL.md's refusal rules**: any sign request originating from external
-prompts must be refused, without relying on "describe what to sign in
-plain language" heuristics, which are easily fooled by identity
-phishing. See `internal/framework/openclaw/soulmd.go`.
+message to sign over the unix socket. The socket enforces one thing
+itself, its **signing-domain invariant**: it signs only `0x19 0x45`
+personal messages, `0x19 0x01` EIP-712 digests, and transactions it
+assembles from fields. It never signs a raw hash and never signs
+EIP-191 version `0x00` data. Serve-proofs are signed in that `0x00`
+domain, bound to the VerifiedFeedbackRegistry, so nothing the agent
+signs through the socket verifies as one (audit FIND-01;
+`internal/proxy/sign.go` header, pinned by `sign_test.go`). Within
+those shapes the socket is just transport. **Refusal logic lives on
+the agent side, constrained by SOUL.md's refusal rules**: any sign
+request originating from external prompts must be refused, without
+relying on "describe what to sign in plain language" heuristics,
+which are easily fooled by identity phishing. See
+`internal/framework/openclaw/soulmd.go`.
 
 ## 8. Configuration surface
 
@@ -602,9 +622,10 @@ The env surface:
 | `SANDBOX_SEAL_ATTESTATION` | sandbox-signed attestation JSON containing `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`; sealId is read from here, not a separate env |
 | `TEE_SIGNER_ADDRESS` | (optional, **usually unset in production**) if set, Phase 0 requires the address recovered from the attestation signature == this value, otherwise fail loud. The authoritative sandbox signer check is at the attestor `/provision` end (querying `TappRegistry.getNodeList(sandbox_app_id)`); this pin in sealed is only a dev / local-debug fail-early aid, not a security boundary |
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
-| `CHAIN_RPC_URL` | 0G testnet RPC, the chain where the AgenticID contract lives. Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, unauthenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
+| `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`). Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, owner-authenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
-| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty. Public, so it must not embed a credential: it is recorded in each uploaded entry's on-chain `dataDescription` (as the attestor records it at mint), printed in the boot log (`/log`, `/log.html`, unauthenticated) and passed to the `0g-storage-client` download CLI as a command-line argument |
+| `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. Once the chain client has dialled, sealed also reads its `getIdentityRegistry()`: unless that is `AGENTIC_ID_ADDR` (no code, a revert or an unreadable result after retries count as not), it logs a `WARN` naming both addresses and takes the same no-proof path. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
+| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty. Public, so it must not embed a credential: it is recorded in each uploaded entry's on-chain `dataDescription` (as the attestor records it at mint), printed in the boot log (`/log`, `/log.html`, owner-authenticated) and passed to the `0g-storage-client` download CLI as a command-line argument |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
 | `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go`) |
 | `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. V2 binds the provider; v3 binds its routing hash and accepted registry version/digest, reading that historical snapshot on every boot (including stop/start). Plaintext/v1 keys are compute-only. Invalid ciphertext logs `FAIL`, records `secret_env_not_applied: <reason>`, and refuses plaintext fallback and settings rendering (`internal/secretenv`). Provider mismatch requires reset with the matching key |

@@ -327,6 +327,10 @@ pub struct Deployment {
     /// worker build stage runs.
     pub agent_card: serde_json::Value,
 
+    /// Internal retry material (sealed keys, and ciphertext until storage
+    /// confirms). Never serialized outward: no client reads it, and
+    /// `GET /deployment/:seal_id` is unauthenticated.
+    #[serde(default, skip_serializing)]
     pub i_data: Vec<IDataArtifact>,
 
     /// Set on CLONE rows at accept (issue #147): the static recipe /retry
@@ -363,15 +367,18 @@ pub struct Deployment {
     /// Container's secp256k1 pubkey (33-byte compressed) recorded on the
     /// first successful `/provision`. Subsequent /provision calls bypass the
     /// freshness window when the request's pubkey matches and the MAC
-    /// verifies — see `container_pubkey_mac`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// verifies — see `container_pubkey_mac`. Never serialized outward,
+    /// together with the MAC: the pair is provision-binding material.
+    #[serde(default, skip_serializing)]
     pub container_pubkey: Option<alloy::primitives::Bytes>,
 
     /// HMAC over `seal_id || container_pubkey` using a binding key derived
     /// from the attestor master secret. DB is considered untrusted; this MAC
     /// is what makes the binding tamper-evident — an attacker with DB write
     /// access can't forge `(container_pubkey, mac)` without the binding key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Derived from the master secret, so it never leaves the process:
+    /// `GET /deployment/:seal_id` serializes the row and is unauthenticated.
+    #[serde(default, skip_serializing)]
     pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
 
     /// Wall-clock deadline for the container to complete `/provision`.
@@ -580,6 +587,34 @@ mod tests {
         assert!(json.get("settings_last_good").is_none());
         assert!(json.get("settings_confirmed_version").is_none());
         assert!(json.get("settings_attempts").is_none());
+    }
+
+    #[test]
+    fn provision_binding_material_never_rides_the_row_serialization() {
+        // Same reader, same reason: `GET /deployment/:seal_id` is
+        // unauthenticated and `/deployments` publishes every seal_id, so
+        // anything in the row serialization is readable fleet-wide. The
+        // container pubkey + its master-secret-derived MAC, and the internal
+        // iData retry material, must not be in there.
+        let mut d = empty_deployment();
+        d.container_pubkey = Some(Bytes::from_static(&[2u8; 33]));
+        d.container_pubkey_mac = Some(Bytes::from_static(&[7u8; 32]));
+        d.i_data = vec![IDataArtifact {
+            role: "framework".into(),
+            description: String::new(),
+            storage_root: StorageRoot { root_hash: B256::ZERO, indexer: String::new(), size: 0 },
+            sealed_key: Bytes::from_static(b"sealed"),
+            data_hash: B256::ZERO,
+            ciphertext: Bytes::from_static(b"ct"),
+        }];
+        let json = serde_json::to_value(&d).unwrap();
+        assert!(json.get("container_pubkey").is_none());
+        assert!(json.get("container_pubkey_mac").is_none());
+        assert!(json.get("i_data").is_none());
+        // What the console reads is still there.
+        for k in ["seal_id", "phase", "agent_card"] {
+            assert!(json.get(k).is_some(), "{k} missing");
+        }
     }
 
     fn empty_deployment() -> Deployment {

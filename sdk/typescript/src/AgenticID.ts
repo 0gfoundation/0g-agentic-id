@@ -44,6 +44,20 @@ import type {
 
 const ZERO = '0x0000000000000000000000000000000000000000';
 
+/**
+ * The agentId for a URL-form handle (`client` / `authenticate`): the one
+ * `/hello`'s X-Agent-Proof envelope carries, or the caller's hint when the
+ * envelope is absent. A hint that contradicts a signed `/hello` is refused.
+ * The caller still binds the result to the URL on chain (#62).
+ */
+function urlAgentId(op: string, base: string, discovered: bigint | undefined, hint: bigint | undefined): bigint | undefined {
+  if (hint === undefined) return discovered;
+  if (discovered !== undefined && discovered !== hint) {
+    throw new Error(`${op}: ${base}/hello is signed as agent ${discovered}, not the expected agent ${hint} — refusing to connect`);
+  }
+  return hint;
+}
+
 function assertSealBound(seal: Address, op: string): void {
   if (seal === ZERO) {
     throw new Error(`${op}: non-seal-bound agents are not supported yet (would go through iTransferFrom/iCloneFrom)`);
@@ -397,16 +411,32 @@ export class AgentApi {
    * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
+   *
+   * With an `agentUrl`, the agentId comes from `/hello`'s proof envelope — which
+   * is absent when the runtime signs nothing (no `VERIFIED_FEEDBACK_ADDR`).
+   * Callers that already know the id pass it as `opts.agentId`: it is used when
+   * `/hello` carries no proof, must equal the envelope's id when it does, and
+   * is bound to the URL on chain like a discovered id. An `ag` with a key that
+   * still ends up with no agentId gets a public handle and a console warning —
+   * never a silent downgrade.
    */
-  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string; agentId?: bigint }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
-    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
-    // this URL via chain before this handle could ever sign for it.
+    const agentId = fromUrl ? urlAgentId('client', base, disc.agentId, opts?.agentId) : idOrUrl;
+    // #62: when the agentId came from the agent's (untrusted) /hello — or from
+    // the caller's hint — bind it to this URL via chain before this handle
+    // could ever sign for it.
     if (fromUrl && agentId !== undefined && this.hasAccount()) {
       await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    if (agentId === undefined && this.hasAccount()) {
+      console.warn(
+        `[agentic-sdk] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
+          'this handle has NO owner ops (chat/logs) although this AgenticID holds a key. ' +
+          'Pass { agentId } (or call client(agentId)) to connect as the owner.',
+      );
     }
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
@@ -418,15 +448,23 @@ export class AgentApi {
    * Owner handshake, eager: like {@link client} on an `ag` with a key, but
    * mints the token up front so a non-owner fails HERE, not at first chat.
    * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   *
+   * With an `agentUrl`, `opts.agentId` works as in {@link client}: used when
+   * `/hello` carries no proof (runtime without `VERIFIED_FEEDBACK_ADDR`),
+   * must equal the envelope's id when it does, and is bound to the URL on
+   * chain before anything is signed.
    */
-  async authenticate(idOrUrl: bigint | string): Promise<AgentClient> {
+  async authenticate(idOrUrl: bigint | string, opts?: { agentId?: bigint }): Promise<AgentClient> {
     requireWallet(this.ctx);
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    const agentId = fromUrl ? urlAgentId('authenticate', base, disc.agentId, opts?.agentId) : idOrUrl;
     if (agentId === undefined) {
-      throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
+      throw new Error(
+        `authenticate: ${base}/hello carried no X-Agent-Proof (the runtime has no VERIFIED_FEEDBACK_ADDR, ` +
+          'or the agent is not provisioned yet), so its agentId is unknown — pass { agentId } or call authenticate(agentId)',
+      );
     }
     // #62: reject a lying /hello (URL claims someone else's agentId) before signing.
     if (fromUrl) await this.assertAgentIdBoundToUrl(agentId, base);
@@ -711,6 +749,12 @@ export class AgentApi {
    * plus a structured verification. The whole "is this agent who it
    * claims, running what chain says" check, without hand-rolling the
    * fetch + parse + verify.
+   *
+   * The proof signature is bound to the VerifiedFeedbackRegistry, so the
+   * check needs `addresses.verifiedFeedback` (fromAttestor fills it from
+   * /config). Without it `verification.signerMatches` is false with the
+   * reason 'no VerifiedFeedbackRegistry configured — cannot verify
+   * serve-proof'.
    */
   async sayHi(agentUrl: string): Promise<{
     hello: {

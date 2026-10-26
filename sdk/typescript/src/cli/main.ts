@@ -138,6 +138,9 @@ ENVIRONMENT
   AGENTIC_VERIFIED_FEEDBACK_ADDR / AGENTIC_FEEDBACK_BATCHER_ADDR
                          optional. Reputation-pair address overrides for
                          attestors whose /config doesn't advertise them yet.
+                         The registry must be the one the agents' sealed
+                         proxy signs serve-proofs for, or every proof fails
+                         verification.
 
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
