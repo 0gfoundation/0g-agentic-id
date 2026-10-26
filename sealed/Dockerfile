@@ -15,18 +15,16 @@
 # layer digest, #130).
 #
 # The base image (OPENCLAW_BASE below) is built separately from
-# sealed/images/openclaw/ — its Dockerfile builds the local tag
-# `openclaw-sandbox:1.1.0`, and the registry tag is applied when pushing.
-# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.0. It is
-# the same image as the aliyun eliza/0g-sandbox:openclaw-1.1.0 it replaces
-# (#130; same image ID and digest on the build host, 2026-10-20). You only
-# need to rebuild the base when bumping node / openclaw versions.
+# sealed/images/openclaw/ as openclaw-sandbox:1.1.1, then tagged and pushed.
+# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.1.
+# Build and publish the versioned node/openclaw bases before this runtime;
+# see sealed/images/openclaw/base.Dockerfile and Dockerfile for the order.
 
 # Global build arg (declared before the first FROM so the stage-3 FROM can
 # reference it): the openclaw base registry. GCP by default — reachable from
 # GCP build environments and replacing the aliyun VPC registry. Override with
 # --build-arg OPENCLAW_BASE=<aliyun tag> to build against the aliyun mirror.
-ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.0
+ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.1
 
 # Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data;
 # uploads run inside the bootstrap binary, through the same client's Go SDK).
