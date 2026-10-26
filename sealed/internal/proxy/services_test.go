@@ -67,7 +67,7 @@ func TestValidateServices_transport(t *testing.T) {
 	}{
 		{"mcp requires POST", ServiceEntry{Path: "/api/mcp", Method: "GET", Backend: "http://127.0.0.1:9090", Transport: "mcp"}},
 		{"unknown transport", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "grpc"}},
-		{"not even whitespace-tolerated", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "MCP"}},
+		{"case-sensitive: MCP is rejected too", ServiceEntry{Path: "/api/x", Method: "POST", Backend: "http://127.0.0.1:9090", Transport: "MCP"}},
 	}
 	for _, c := range cases {
 		if _, err := validateServices([]ServiceEntry{c.entry}); err == nil {

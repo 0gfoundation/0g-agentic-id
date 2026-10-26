@@ -25,10 +25,13 @@ type Service struct {
 	// Transport marks the protocol a consumer should speak. Empty = plain
 	// HTTP. "mcp" = an MCP server endpoint (JSON-RPC over POST): an
 	// MCP-capable client mounts <public-url><path> as a streamable-HTTP MCP
-	// server. Responses still carry X-Agent-Proof like every agent service,
-	// which is what makes it a *trust-attributable* MCP server — the
-	// mounting client can verify each response came from this attested
-	// agent (sdk ServeSession.verifyProof).
+	// server. Responses still carry X-Agent-Proof like every agent service:
+	// the proof attributes the exchange to the agent's on-chain agentSeal
+	// (signer + deadline + declared data hashes — see sdk ServeSession.
+	// verifyProof). It does NOT by itself bind the proof to a specific
+	// response body; per-exchange verification also recomputes the task
+	// digest from the raw request/response bytes (see ServeProof). That is
+	// still the trust attribution a random MCP server cannot offer.
 	Transport string `json:"transport,omitempty"`
 }
 

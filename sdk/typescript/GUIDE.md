@@ -602,8 +602,10 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
 
   The card carries two declared surfaces:
   - `services` — the agent's own registered endpoints (exact `/api/*` paths):
-    `{ path, method, description?, input_example? }`. Plain HTTP against these;
+    `{ path, method, description?, input_example?, transport? }`. Plain HTTP against these;
     each response is proof-signed (that is what you `capture()` and rate).
+    `transport: "mcp"` marks an MCP server endpoint (JSON-RPC over POST) —
+    mount the path in an MCP client rather than plain-calling it.
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;

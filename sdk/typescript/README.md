@@ -262,8 +262,12 @@ const { hello, verification } = await ag.agent.sayHi(agentUrl);
 //   services: { path, method, description?, input_example?, transport? }   — proof-signed /api/* endpoints
 //   transport: "mcp" marks an MCP server endpoint (JSON-RPC over POST):
 //   mount `<base><path>` as a streamable-HTTP MCP server in any MCP client —
-//   every response still carries X-Agent-Proof, the trust attribution a
-//   random MCP server cannot offer. See mcpServices() in AgentClient.ts.
+//   every response carries X-Agent-Proof, attributing the exchange to the
+//   agent's on-chain agentSeal (something a random MCP server cannot offer).
+//   The proof is signer attribution, not per-body binding; see the caveat in
+//   mcpServices()'s doc (AgentClient.ts) for what full per-exchange
+//   verification requires. Also: the deploy console's copy-ready curl needs
+//   `Accept: application/json, text/event-stream` for MCP routes.
 //   routes:   { prefix, kind?, auth?, signed, description? }    — framework prefixes (e.g. chat at /v1/)
 
 const agent = await ag.agent.client(agentId);   // agentId OR agentUrl — the SDK fills in the other half

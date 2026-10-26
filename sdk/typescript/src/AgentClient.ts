@@ -46,22 +46,44 @@ export interface AgentServiceEntry {
  *
  * ```ts
  * const { hello, verification } = await ag.agent.sayHi(agentUrl);
- * // hello.services carries transport: "mcp" on MCP endpoints — sayHi already
- * // verified the /hello proof against chain (signer == on-chain agentSeal);
- * // the same one-call check works per request:
+ * // hello.services carries transport: "mcp" on MCP endpoints — sayHi
+ * // verified the /hello proof's signer against the on-chain agentSeal.
  * const client = await ag.agent.client(agentUrl);            // public handle
  * const mcp = mcpServices(client);                           // → [{ path: "/api/mcp", … }]
  * // Mount `${client.base}${mcp[0].path}` as a streamable-HTTP MCP server in
- * // any MCP client. For per-response attribution, fetchWithProof captures
- * // X-Agent-Proof and ServeSession.verifyProof (what sayHi uses internally)
- * // checks it — the reason to prefer these over a random MCP server.
+ * // any MCP client.
  * ```
+ *
+ * What a proof does and does not tell you — read this before trusting a
+ * transcript: `verifyProof` checks the SIGNER (it must be the on-chain
+ * agentSeal of this agent id), the deadline, and the declared data hashes.
+ * It does NOT recompute the task hash from your own request/response bytes,
+ * so it proves "the attested runtime produced SOME exchange in this window",
+ * not "this exact response body came from it". For per-exchange binding,
+ * recompute the task digest (keccak of method‖uri‖keccak(reqBody)‖
+ * keccak(respBody)‖status, see ServeProof.ts) from the raw bytes you sent
+ * and received and compare it to the proof's taskHash. And note the digest
+ * format that makes this binding unforgeable-by-the-agent lands with the
+ * 1.2.0 serving stack — on deployments still running the pre-1.2.0 format,
+ * the proof is signer attribution only.
  *
  * Note the proxy pins one HTTP method per path, so an MCP route is POST-only:
  * a stateless MCP server (each JSON-RPC request answered in one response,
- * no server-initiated pushes) is the supported shape.
+ * no server-initiated pushes) is the supported shape — and because the proxy
+ * buffers the whole response before signing, progress notifications and
+ * server→client requests (sampling, elicitation) inside a POST stream are
+ * not supported; keep tool calls short and return one JSON response.
+ *
+ * Two environment notes for generic MCP clients: (1) the proof envelope's
+ * `submitter` comes from the `X-Client-Address` request header — generic
+ * MCP clients don't send one, so proofs come back with submitter 0x0 and
+ * cannot be redeemed in protocols that require a real submitter; set the
+ * header through your MCP client's custom-headers option if you need it.
+ * (2) browser MCP clients only get to read `X-Agent-Proof` (the only
+ * CORS-exposed header) and an OPTIONS preflight to the service path 405s —
+ * use a non-browser client for verified MCP.
  */
-export function mcpServices(client: AgentClient): AgentServiceEntry[] {
+export function mcpServices(client: Pick<AgentClient, 'services'>): AgentServiceEntry[] {
   return client.services.filter((s) => s.transport === 'mcp');
 }
 

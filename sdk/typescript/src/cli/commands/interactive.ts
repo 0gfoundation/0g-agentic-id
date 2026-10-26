@@ -1116,8 +1116,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         if (!args[1]) {
           if (!services.length) { out('this agent registers no public services (only /hello)\n'); continue; }
           out('services:\n');
-          for (const sv of services) out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
-          out(`call one with: call ${args[0]} <path> [json-body]\n`);
+          for (const sv of services) out(`  ${sv.method.padEnd(4)} ${sv.path.padEnd(24)} ${sv.transport === 'mcp' ? '[mcp] ' : ''}${sv.description ?? ''}${sv.skill ? `  [skill: ${sv.skill}]` : ''}\n`);
+          out(`call one with: call ${args[0]} <path> [json-body]${services.some((sv) => sv.transport === 'mcp') ? '\n[mcp] entries speak MCP (JSON-RPC over POST) — mount the path in an MCP client; a plain call posts raw JSON' : ''}\n`);
           continue;
         }
         const path = args[1];
@@ -1471,10 +1471,10 @@ function pickRow<T extends { agentId?: unknown; sealId?: string }>(
 }
 
 /** The agent's registered service table (from its /hello; empty on failure). */
-async function servicesOf(url: string): Promise<{ path: string; method: string; description?: string; skill?: string }[]> {
+async function servicesOf(url: string): Promise<Array<{ path: string; method: string; description?: string; skill?: string; transport?: string }>> {
   try {
     const b = (await (await fetch(`${url}/hello`)).json()) as {
-      services?: { path: string; method: string; description?: string; skill?: string }[];
+      services?: Array<{ path: string; method: string; description?: string; skill?: string; transport?: string }>;
     };
     // entry #0 is /hello itself — callable but not a business service; keep it out of the picker
     return (b.services ?? []).filter((sv) => sv.path !== '/hello');

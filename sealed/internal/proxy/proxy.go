@@ -661,6 +661,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	frameworkRoute := false
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
+			// RFC 9110: a 405 should carry Allow naming the one method
+			// this pinned path accepts (the proxy pins exactly one).
+			w.Header().Set("Allow", svc.Method)
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
