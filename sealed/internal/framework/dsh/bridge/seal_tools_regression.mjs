@@ -240,7 +240,7 @@ try { rmSync(dir, { recursive: true, force: true }); } catch { /* tmpdir cleanup
 		// ALLOWED: a /sign/ path with NO socket spelling — pins the AND's
 		// socket half (dropping namesSocket && must fail this case)
 		["allow", "bash", { command: "curl http://localhost:9999/sign/personal_sign" }],
-		["allow", "bash", { command: "cat docs/sign-endpoints.md && echo done" }],
+		["allow", "bash", { command: "cat docs/sign/endpoints.md && echo done" }],
 		// NOT scanned at all: non-shell tools (the SHELL_TOOLS bound)
 		["allow", "read_file", { command: `curl --unix-socket ${sockPath} http://localhost/sign/personal_sign` }],
 	];
