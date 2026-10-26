@@ -169,7 +169,11 @@ export function displacedFailure(failure: string): boolean {
  * prompt that is waiting for an answer).
  */
 export function makeBrake(
-  client: { interrupt?: () => Promise<{ aborted: boolean; note?: string }> } | null | undefined,
+  // A GETTER, not the client: s.client is replaced mid-session (/start,
+  // /reset, the loop-top and bare-Enter reconnects, /stop) — capturing it
+  // here would pin the brake to a stale (or stopped) container for the rest
+  // of the session.
+  getClient: () => { interrupt?: () => Promise<{ aborted: boolean; note?: string }> } | null | undefined,
   print: (line: string) => void,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars -- passed so the test can assert it is never used
   seat: (failure: string, reclaimedHint: string, leavesWhat?: string) => Promise<'reclaimed' | 'left' | null>,
@@ -181,6 +185,7 @@ export function makeBrake(
     if (now - last < 2000) return;
     last = now;
     if (seatPromptPending()) return; // the seat prompt owns the screen — stay quiet
+    const client = getClient();
     if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     client.interrupt().then(
       (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
@@ -2116,7 +2121,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       }
     };
 
-  irq.brake = makeBrake(s.client, out, displacedSeat, () => seatPromptPending);
+  irq.brake = makeBrake(() => s.client, out, displacedSeat, () => seatPromptPending);
   // A friendly message that hides WHICH failure happened costs a whole
   // debugging round trip: "no headers ever arrived" and "the stream was cut
   // mid-way" have different causes and used to print identically. Append the
