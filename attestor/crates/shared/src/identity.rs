@@ -229,6 +229,18 @@ sol! {
     }
 }
 
+/// Authenticated app scope from one SandboxDiscovery snapshot. A node signer
+/// is deliberately absent: workloads survive node rotations within this epoch.
+#[derive(Clone, Debug)]
+pub struct SandboxServiceIdentity {
+    pub provider: Address,
+    pub chain_id: u64,
+    pub registry_address: Address,
+    pub app_id: String,
+    pub registered_at: u64,
+    pub expires_at: i64,
+}
+
 #[derive(Clone)]
 pub struct SandboxConnection {
     pub provider: Address,
@@ -329,6 +341,18 @@ impl SandboxDiscovery {
             cfg: cfg.clone(),
             cached: Mutex::new(None),
         }))
+    }
+
+    pub async fn service_identity(&self) -> anyhow::Result<SandboxServiceIdentity> {
+        let snapshot = self.snapshot().await?;
+        Ok(SandboxServiceIdentity {
+            provider: snapshot.provider,
+            chain_id: self.cfg.chain_id,
+            registry_address: self.cfg.tapp_registry_addr,
+            app_id: self.cfg.sandbox_app_id.clone().expect("validated sandbox app id"),
+            registered_at: snapshot.registered_at,
+            expires_at: snapshot.expires_at,
+        })
     }
 
     pub async fn snapshot(&self) -> anyhow::Result<Arc<SandboxConnection>> {

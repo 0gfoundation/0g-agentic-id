@@ -1,45 +1,23 @@
 //! POST /provision — container authenticates via a 0g-sandbox-signed
 //! attestation and receives `agentSeal_priv` encrypted with its own pubkey.
 //!
-//! Authorization chain:
-//!   sandbox TEE signs {seal_id, container_pubkey, image_hash, issued_at}
-//!   → attestor recovers signer, checks it's an active node of the sandbox
-//!     app on TappRegistry (sandbox-side key rotations propagate without
-//!     an attestor restart)
-//!   → checks image_hash ∈ on-chain validFrameworkHashes
-//!   → checks |now - issued_at| ≤ 300s
-//!   → derives agentSeal_priv(seal_id), ECIES-encrypts to container_pubkey
-//!   → attaches the owner's settings document, ECIES-encrypted to the SAME
-//!     pubkey. This is the channel for it precisely because /provision runs
-//!     on EVERY boot including a resume, whereas the sandbox env is supplied
-//!     only at container create — a resumed container would otherwise come
-//!     up unconfigured. That half — and only that half — is additionally
-//!     gated on there being a sandbox on record, the same ghost-container
-//!     guard `/status` and `/settings/seed` apply (step 6b).
-//!
-//! Canonical bytes the sandbox signs (keccak256 prehash, NO EIP-191):
-//!   "ImageAttestation:{seal_id}:0x{pubkey}:sha256:{image_hash}:{ts}"
-//!     - seal_id / image_hash: lowercase 64 hex, no 0x prefix
-//!     - pubkey: lowercase 66 hex, 0x prefix (33-byte compressed secp256k1)
-//!     - ts: decimal integer, no padding
+//! The v2 envelope binds the chain, registry, appId and registration epoch to
+//! the workload key, image and timestamp. The signer must be the current stable
+//! app signer authenticated by SandboxDiscovery. Node rotations do not affect
+//! existing containers. Legacy envelopes require an owner reset.
 
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
-use alloy::primitives::keccak256;
-use attestor_shared::{ProvisionRequest, ProvisionResponse, SealId, WsEvent};
+use attestor_shared::{image_attestation, ProvisionRequest, ProvisionResponse, SealId, WsEvent};
 use axum::extract::State;
 use axum::Json;
 use chrono::Utc;
 
 /// Accepted clock skew between sandbox and attestor (seconds, each direction).
 const ATTESTATION_FRESHNESS_SECS: u64 = 300;
-/// Required length of the compressed secp256k1 pubkey in `container_pubkey`.
-const COMPRESSED_PUBKEY_LEN: usize = 33;
-
-/// Domain-separation tag for the container-pubkey HMAC binding. Bumping the
-/// `.v1` suffix invalidates all previous bindings — current containers
-/// would fall back through the freshness path on next /provision.
-const BINDING_INFO: &[u8] = b"agentic-id.container-pubkey-binding.v1";
+/// Full signed v2 payload + authenticated app signer; legacy pubkey-only MACs
+/// never authorize a resumed workload under another issuer or app epoch.
+const BINDING_INFO: &[u8] = b"agentic-id.container-pubkey-binding.v2";
 
 pub async fn handle(
     State(state): State<AppState>,
@@ -52,70 +30,40 @@ pub async fn handle(
         "provision request"
     );
 
-    // 1. Shape check: pubkey must be 33-byte compressed secp256k1, otherwise
-    //    the canonical bytes sandbox signed won't recreate on this side.
-    if req.container_pubkey.len() != COMPRESSED_PUBKEY_LEN {
-        let reason = format!(
-            "container_pubkey must be {COMPRESSED_PUBKEY_LEN}-byte compressed secp256k1 (got {} bytes)",
-            req.container_pubkey.len()
-        );
-        // Permanent: container resending the same wrong shape won't fix it.
-        record_provision_error(&state, req.seal_id, reason.clone(), true).await;
-        return Err(ApiError::bad_request(reason));
-    }
-
-    // 2. Rebuild canonical bytes from the request fields exactly as sandbox
-    //    formatted them for signing.
-    let canonical = format!(
-        "ImageAttestation:{}:0x{}:sha256:{}:{}",
-        hex::encode(req.seal_id.as_slice()),
-        hex::encode(req.container_pubkey.as_ref()),
-        hex::encode(req.image_hash.as_slice()),
-        req.issued_at,
-    );
-    let digest = keccak256(canonical.as_bytes()).0;
-
-    // 3. Recover signer, compare to configured sandbox TEE signer.
-    let signer = match state
-        .crypto
-        .recover_signer(&digest, req.sandbox_signature.as_ref())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            // Soft: malformed sig might be a one-off (truncation, base64
-            // hiccup); container could retry with a fresh attestation.
-            // Don't flip Failed.
-            let reason = format!("sandbox attestation: recover: {e}");
-            record_provision_error(&state, req.seal_id, reason.clone(), false).await;
-            return Err(ApiError::unauthorized(reason));
+    // Missing/unknown versions are explicit migration errors, not a node-key
+    // fallback. Authenticate the complete issuer scope before consulting a MAC.
+    let digest = image_attestation::signing_digest(&req)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let identity = match state.sandbox.authenticated_service_identity().await {
+        Ok(Some(identity)) if identity.expires_at > Utc::now().timestamp() => identity,
+        Ok(_) => {
+            return Err(ApiError::unavailable(
+                "authenticated sandbox identity is unavailable or expired; retry",
+            ));
+        }
+        Err(error) => {
+            tracing::warn!(%error, "provision: sandbox discovery unavailable");
+            return Err(ApiError::unavailable(
+                "authenticated sandbox discovery failed; retry",
+            ));
         }
     };
-    // Validate the recovered signer against TappRegistry's live node
-    // list. Sandbox-side key rotations propagate via `addNode` /
-    // `updateNode` on TappRegistry; no attestor config change required.
-    match state.chain.is_sandbox_node(signer).await {
-        Ok(true) => {
-            tracing::debug!(?signer, "provision: sandbox signer matches TappRegistry node list");
-        }
-        Ok(false) => {
-            // Permanent: container retry can't change which key the
-            // sandbox is signing with. The sandbox provider must call
-            // `addNode` / `updateNode` for this signer to be accepted.
-            let reason = format!(
-                "sandbox attestation: signer {signer} is not an active node of the sandbox app"
-            );
-            record_provision_error(&state, req.seal_id, reason.clone(), true).await;
-            return Err(ApiError::unauthorized(reason));
-        }
-        Err(e) => {
-            // Chain RPC failure or TappRegistry not configured at all.
-            // Soft (transient) — don't flip Failed so the container can
-            // retry once the operator fixes the upstream issue.
-            let reason = format!("sandbox attestation: TappRegistry lookup failed: {e}");
-            record_provision_error(&state, req.seal_id, reason.clone(), false).await;
-            return Err(ApiError::internal(reason));
-        }
+    image_attestation::validate_scope(&req, &identity, Utc::now().timestamp())
+        .map_err(|error| ApiError::unauthorized(error.to_string()))?;
+    let signer = state
+        .crypto
+        .recover_signer(&digest, req.sandbox_signature.as_ref())
+        .map_err(|error| {
+            ApiError::unauthorized(format!("sandbox attestation signature: {error}"))
+        })?;
+    if signer != identity.provider {
+        return Err(ApiError::unauthorized(
+            "sandbox attestation signer is not the authenticated app signer",
+        ));
     }
+    let mut binding_data = Vec::with_capacity(52);
+    binding_data.extend_from_slice(&digest);
+    binding_data.extend_from_slice(identity.provider.as_slice());
 
     // 4. image_hash must be in the on-chain framework whitelist.
     let valid = match state.chain.is_valid_framework_hash(req.image_hash).await {
@@ -144,16 +92,9 @@ pub async fn handle(
 
     // 5. Freshness OR pubkey-binding (whichever passes — see module docs).
     //
-    //    Sandbox-signed envelopes carry an `issued_at` timestamp; the 5-minute
-    //    window prevents an attacker from replaying an old envelope. But once
-    //    we've seen this seal_id's container before, we have a stronger
-    //    anchor: we recorded its pubkey + an HMAC over `seal_id || pubkey`.
-    //    On restart Daytona reuses the same SANDBOX_SEAL_KEY, so the new
-    //    /provision request's pubkey matches the stored one. The MAC defends
-    //    against DB tampering: an attacker who can write to the DB but
-    //    doesn't have the attestor master secret can't forge a valid
-    //    (pubkey, mac) pair, so any tampered binding fails verification and
-    //    we fall back to the freshness check.
+    // A resume reuses its original v2 envelope. The domain-separated MAC
+    // covers its complete digest and authenticated app signer, so changing
+    // issuer/epoch/image/timestamp cannot reuse a historical pubkey binding.
     let stored = state
         .deployments
         .get(req.seal_id)
@@ -162,15 +103,11 @@ pub async fn handle(
     let binding_valid = stored.as_ref().is_some_and(|d| {
         match (&d.container_pubkey, &d.container_pubkey_mac) {
             (Some(pk), Some(mac)) if pk.as_ref() == req.container_pubkey.as_ref() => {
-                let mut data = Vec::with_capacity(32 + pk.len());
-                data.extend_from_slice(req.seal_id.as_slice());
-                data.extend_from_slice(pk.as_ref());
-                let expected = state.crypto.hmac_binding(BINDING_INFO, &data);
+                let expected = state.crypto.hmac_binding(BINDING_INFO, &binding_data);
                 // Constant-time equality to avoid timing leaks. Both sides
                 // are 32-byte HMAC tags so the length check is trivial.
                 use subtle::ConstantTimeEq;
-                mac.as_ref().len() == expected.len()
-                    && mac.as_ref().ct_eq(&expected).into()
+                mac.as_ref().len() == expected.len() && mac.as_ref().ct_eq(&expected).into()
             }
             _ => false,
         }
@@ -193,6 +130,14 @@ pub async fn handle(
             record_provision_error(&state, req.seal_id, reason.clone(), false).await;
             return Err(ApiError::unauthorized(reason));
         }
+    }
+
+    // Discovery and downstream reads can outlive a lease. An expired snapshot
+    // remains retryable and never triggers permanent container cleanup.
+    if identity.expires_at <= Utc::now().timestamp() {
+        return Err(ApiError::unavailable(
+            "sandbox identity expired during provision; retry",
+        ));
     }
 
     // 6. Derive agentSeal_priv + ECIES-encrypt to the sandbox-signed pubkey.
@@ -293,17 +238,10 @@ pub async fn handle(
     //    future restarts of this container can short-circuit step 5.
     //    `binding_valid` already guarantees we don't need to write again.
     if !binding_valid {
-        let mut data = Vec::with_capacity(32 + req.container_pubkey.len());
-        data.extend_from_slice(req.seal_id.as_slice());
-        data.extend_from_slice(req.container_pubkey.as_ref());
-        let mac = state.crypto.hmac_binding(BINDING_INFO, &data);
+        let mac = state.crypto.hmac_binding(BINDING_INFO, &binding_data);
         if let Err(e) = state
             .deployments
-            .set_container_binding(
-                req.seal_id,
-                req.container_pubkey.to_vec(),
-                mac.to_vec(),
-            )
+            .set_container_binding(req.seal_id, req.container_pubkey.to_vec(), mac.to_vec())
             .await
         {
             tracing::warn!(
@@ -314,6 +252,11 @@ pub async fn handle(
         }
     }
 
+    if identity.expires_at <= Utc::now().timestamp() {
+        return Err(ApiError::unavailable(
+            "sandbox identity expired during provision; retry",
+        ));
+    }
     Ok(Json(ProvisionResponse {
         encrypted_agent_seal_priv: encrypted.into(),
         encrypted_settings,
@@ -459,12 +402,11 @@ mod tests {
     use alloy::signers::SignerSync;
     use attestor_shared::crypto::RealCrypto;
     use attestor_shared::mocks::{
-        InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
-        MockChain, MockSandbox,
+        ConfigurableSandbox, InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore,
+        InMemoryJobQueue, MockChain,
     };
     use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, ProvisionRequest, SealId,
-        StageStatus,
+        derive_phase, Config, Deployment, DeploymentRepo, ProvisionRequest, SealId, StageStatus,
     };
     use std::sync::Arc;
 
@@ -512,7 +454,10 @@ mod tests {
             secret_env_enabled: false,
             cli_latest: String::new(),
             cli_notes: String::new(),
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -528,40 +473,70 @@ mod tests {
 
     fn container_pubkey() -> Vec<u8> {
         let sk = SigningKey::from_bytes(&CONTAINER_PRIV.into()).expect("valid key");
-        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+        sk.verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .to_vec()
     }
 
-    /// A sandbox-signed provision request. MockChain accepts any signer as a
-    /// registered sandbox node, so the signing key here is arbitrary.
-    fn provision_req(seal_id: SealId) -> ProvisionRequest {
-        let sandbox = PrivateKeySigner::random();
-        let pubkey = container_pubkey();
-        let image_hash = B256::repeat_byte(0x11);
-        let issued_at = chrono::Utc::now().timestamp().max(0) as u64;
-        let canonical = format!(
-            "ImageAttestation:{}:0x{}:sha256:{}:{}",
-            hex::encode(seal_id.as_slice()),
-            hex::encode(&pubkey),
-            hex::encode(image_hash.as_slice()),
-            issued_at,
-        );
-        let sig: Vec<u8> = sandbox
-            .sign_hash_sync(&keccak256(canonical.as_bytes()))
-            .unwrap()
-            .into();
-        ProvisionRequest {
-            seal_id,
-            container_pubkey: Bytes::from(pubkey),
-            image_hash,
-            issued_at,
-            sandbox_signature: Bytes::from(sig),
+    fn app_signer() -> PrivateKeySigner {
+        PrivateKeySigner::from_bytes(&B256::repeat_byte(0x55)).unwrap()
+    }
+
+    fn authenticated_identity() -> attestor_shared::identity::SandboxServiceIdentity {
+        attestor_shared::identity::SandboxServiceIdentity {
+            provider: app_signer().address(),
+            chain_id: 16602,
+            registry_address: Address::repeat_byte(0x11),
+            app_id: "sandbox-test".into(),
+            registered_at: 100,
+            expires_at: Utc::now().timestamp() + 300,
         }
+    }
+
+    fn sandbox_with_identity(
+        identity: attestor_shared::identity::SandboxServiceIdentity,
+    ) -> Arc<ConfigurableSandbox> {
+        let sandbox = Arc::new(ConfigurableSandbox::new());
+        *sandbox.authenticated_identity.lock().unwrap() = Some(identity);
+        sandbox
+    }
+
+    fn sign_request(mut request: ProvisionRequest) -> ProvisionRequest {
+        request.sandbox_signature = app_signer()
+            .sign_hash_sync(&B256::from(
+                image_attestation::signing_digest(&request).unwrap(),
+            ))
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+            .into();
+        request
+    }
+
+    /// Explicit app signer and authenticated issuer scope; no permissive node mock.
+    fn provision_req(seal_id: SealId) -> ProvisionRequest {
+        let identity = authenticated_identity();
+        sign_request(ProvisionRequest {
+            version: 2,
+            chain_id: identity.chain_id,
+            registry_address: identity.registry_address,
+            app_id: identity.app_id,
+            registered_at: identity.registered_at,
+            seal_id,
+            container_pubkey: Bytes::from(container_pubkey()),
+            image_hash: B256::repeat_byte(0x11),
+            issued_at: Utc::now().timestamp().max(0) as u64,
+            sandbox_signature: Bytes::new(),
+        })
     }
 
     /// A deployment ready to provision. A seeded document counts as
     /// version 1 and unconfirmed — the state right after an owner write,
     /// before any boot has reported back.
-    fn setup(settings: Option<serde_json::Value>) -> (AppState, Arc<InMemoryDeploymentRepo>, SealId) {
+    fn setup(
+        settings: Option<serde_json::Value>,
+    ) -> (AppState, Arc<InMemoryDeploymentRepo>, SealId) {
         let settings_version = i64::from(settings.is_some());
         let repo = Arc::new(InMemoryDeploymentRepo::new());
         let seal_id = B256::from_slice(&SEAL);
@@ -583,7 +558,10 @@ mod tests {
             ),
             storage_stage: StageStatus::NotStarted,
             mint_stage: StageStatus::NotStarted,
-            container_stage: StageStatus::Submitted { tx_hash: None, at: now },
+            container_stage: StageStatus::Submitted {
+                tx_hash: None,
+                at: now,
+            },
             sandbox_id: Some("sb-1".into()),
             provisioned_at: None,
             container_pubkey: None,
@@ -603,7 +581,7 @@ mod tests {
             cfg: test_config(),
             crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
             chain: Arc::new(MockChain::new()),
-            sandbox: Arc::new(MockSandbox),
+            sandbox: sandbox_with_identity(authenticated_identity()),
             deployments: repo.clone(),
             idempotency: Arc::new(InMemoryIdempotencyStore::new()),
             jobs: Arc::new(InMemoryJobQueue::new()),
@@ -682,7 +660,10 @@ mod tests {
         let resp = handle(State(state.clone()), Json(provision_req(seal_id)))
             .await
             .expect("provision must succeed");
-        assert_eq!(opened(&state, &resp.0), serde_json::json!({"model": "newer"}));
+        assert_eq!(
+            opened(&state, &resp.0),
+            serde_json::json!({"model": "newer"})
+        );
         assert_eq!(
             repo.get(seal_id).await.unwrap().unwrap().settings_attempts,
             1,
@@ -795,5 +776,240 @@ mod tests {
             repo.get(seal_id).await.unwrap().unwrap().settings_attempts,
             0
         );
+    }
+    async fn seed_binding(state: &AppState, request: &ProvisionRequest, legacy: bool) {
+        let mut data = Vec::new();
+        let domain = if legacy {
+            data.extend_from_slice(request.seal_id.as_slice());
+            data.extend_from_slice(request.container_pubkey.as_ref());
+            b"agentic-id.container-pubkey-binding.v1".as_slice()
+        } else {
+            data.extend_from_slice(&image_attestation::signing_digest(request).unwrap());
+            data.extend_from_slice(app_signer().address().as_slice());
+            BINDING_INFO
+        };
+        let mac = state.crypto.hmac_binding(domain, &data);
+        state
+            .deployments
+            .set_container_binding(
+                request.seal_id,
+                request.container_pubkey.to_vec(),
+                mac.to_vec(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_app_signed_envelope_resumes_beyond_freshness_after_node_rotation() {
+        // The discovery interface contains no node identity: rotating current
+        // nodes cannot invalidate a still-authorized stable app signer/epoch.
+        let (mut state, repo, seal_id) = setup(Some(serde_json::json!({"model":"retained"})));
+        let mut request = provision_req(seal_id);
+        request.issued_at -= ATTESTATION_FRESHNESS_SECS + 60;
+        request = sign_request(request);
+        seed_binding(&state, &request, false).await;
+        // A new discovery observation after a node boot keeps the app scope.
+        state.sandbox = sandbox_with_identity(authenticated_identity());
+        let response = handle(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap()
+            .0;
+        let key = state
+            .crypto
+            .ecies_decrypt(response.encrypted_agent_seal_priv.as_ref(), &CONTAINER_PRIV)
+            .unwrap();
+        let expected = state.crypto.derive_agent_seal(seal_id).await.unwrap();
+        assert_eq!(key, expected.priv_key);
+        assert_eq!(
+            opened(&state, &response),
+            serde_json::json!({"model":"retained"})
+        );
+        assert_eq!(
+            repo.get(seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .container_pubkey
+                .as_ref(),
+            Some(&request.container_pubkey)
+        );
+    }
+
+    #[tokio::test]
+    async fn same_app_key_new_registration_rejects_old_envelope_and_mac() {
+        let (mut state, _repo, seal_id) = setup(None);
+        let mut request = provision_req(seal_id);
+        request.issued_at -= ATTESTATION_FRESHNESS_SECS + 60;
+        request = sign_request(request);
+        seed_binding(&state, &request, false).await;
+        let mut next = authenticated_identity();
+        next.registered_at += 1; // Provider key intentionally stays identical.
+        state.sandbox = sandbox_with_identity(next.clone());
+        let error = handle(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("app instance"));
+        // Editing only the epoch invalidates the app signature too.
+        request.registered_at = next.registered_at;
+        assert!(handle(State(state.clone()), Json(request.clone()))
+            .await
+            .is_err());
+        // Even a correctly signed new-epoch payload cannot use an old MAC to
+        // bypass freshness: the full payload digest changed.
+        request = sign_request(request);
+        let error = handle(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("stale"));
+        request.issued_at = Utc::now().timestamp() as u64;
+        assert!(handle(State(state), Json(sign_request(request)))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_pubkey_mac_never_bypasses_v2_freshness() {
+        let (state, _repo, seal_id) = setup(None);
+        let mut request = provision_req(seal_id);
+        request.issued_at -= ATTESTATION_FRESHNESS_SECS + 60;
+        request = sign_request(request);
+        seed_binding(&state, &request, true).await;
+        let error = handle(State(state), Json(request)).await.unwrap_err();
+        assert!(error.message.contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn legacy_and_unknown_versions_require_reset_without_node_fallback() {
+        for version in [0, 1, 3] {
+            let (state, _repo, seal_id) = setup(None);
+            let mut request = provision_req(seal_id);
+            request.version = version;
+            let error = handle(State(state), Json(request)).await.unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("owner reset required"));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_issuer_field_and_app_signature_are_checked() {
+        let (state, _repo, seal_id) = setup(None);
+        let good = provision_req(seal_id);
+        for field in [
+            "chain_id",
+            "registry_address",
+            "app_id",
+            "registered_at",
+            "signature",
+        ] {
+            let mut request = good.clone();
+            match field {
+                "chain_id" => request.chain_id += 1,
+                "registry_address" => request.registry_address = Address::repeat_byte(0x66),
+                "app_id" => request.app_id.push(' '),
+                "registered_at" => request.registered_at += 1,
+                "signature" => {
+                    let other = PrivateKeySigner::from_bytes(&B256::repeat_byte(0x77)).unwrap();
+                    request.sandbox_signature = other
+                        .sign_hash_sync(&B256::from(
+                            image_attestation::signing_digest(&request).unwrap(),
+                        ))
+                        .unwrap()
+                        .as_bytes()
+                        .to_vec()
+                        .into();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                handle(State(state.clone()), Json(request)).await.is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_issuer_does_not_bypass_the_framework_allowlist() {
+        let (mut state, _repo, seal_id) = setup(None);
+        let chain = Arc::new(MockChain::new());
+        chain.set_valid_framework(false);
+        state.chain = chain;
+        let error = handle(State(state), Json(provision_req(seal_id)))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("validFrameworkHashes"));
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_or_expired_lease_is_retryable_without_container_deletion() {
+        use std::sync::atomic::Ordering;
+        for expired in [false, true] {
+            let (mut state, repo, seal_id) = setup(None);
+            let mut identity = authenticated_identity();
+            if expired {
+                identity.expires_at = Utc::now().timestamp() - 1;
+            }
+            let sandbox = sandbox_with_identity(identity);
+            sandbox.identity_fails.store(!expired, Ordering::SeqCst);
+            state.sandbox = sandbox.clone();
+            let error = handle(State(state), Json(provision_req(seal_id)))
+                .await
+                .unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+            let deployment = repo.get(seal_id).await.unwrap().unwrap();
+            assert!(matches!(
+                deployment.container_stage,
+                StageStatus::Submitted { .. }
+            ));
+            assert_eq!(deployment.sandbox_id.as_deref(), Some("sb-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_mac_authenticates_the_complete_signed_payload() {
+        let (state, _repo, seal_id) = setup(None);
+        let mut original = provision_req(seal_id);
+        original.issued_at -= ATTESTATION_FRESHNESS_SECS + 60;
+        original = sign_request(original);
+        seed_binding(&state, &original, false).await;
+        for field in ["timestamp", "image", "container_key", "seal_id"] {
+            let mut changed = original.clone();
+            match field {
+                "timestamp" => changed.issued_at -= 1,
+                "image" => changed.image_hash = B256::repeat_byte(0x99),
+                "container_key" => {
+                    let key = SigningKey::from_bytes(&[0x77; 32].into()).unwrap();
+                    changed.container_pubkey = key
+                        .verifying_key()
+                        .to_encoded_point(true)
+                        .as_bytes()
+                        .to_vec()
+                        .into();
+                }
+                "seal_id" => changed.seal_id = B256::repeat_byte(0x88),
+                _ => unreachable!(),
+            }
+            // Even a new signature by the authorized app cannot reuse an old
+            // stored binding after changing any covered payload component.
+            let error = handle(State(state.clone()), Json(sign_request(changed)))
+                .await
+                .unwrap_err();
+            assert!(
+                error.message.contains("stale"),
+                "{field}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_mock_cannot_authorize_any_app_signer() {
+        let (mut state, _repo, seal_id) = setup(None);
+        state.sandbox = Arc::new(attestor_shared::mocks::MockSandbox);
+        let error = handle(State(state), Json(provision_req(seal_id)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }

@@ -110,3 +110,30 @@ HTTPS，并独立通过 pinned Scan 刷新身份；appId、chain/registry、注�
 
 Typed 公钥绑定是受测量 tapp 程序按实际派生规则与来源计算的认证声明，不是 ZK proof，
 也不证明独占保管；尚未实现的 `evidence.extensions` proof 不会被当作已有能力。
+
+## Workload 配置与重启恢复（v2）
+
+`POST /provision` 接受 ImageAttestation version2。新增平铺 issuer 字段为 `version`、
+`chain_id`、`registry_address`、`app_id`、`registered_at`；原有 seal、压缩容器公钥、
+镜像 hash、签发时间和签名保留。经过认证的 sandbox discovery snapshot 提供预期稳定
+app signer 与当前 chain/registry/app/注册实例。恢复出的签名地址必须匹配该 app signer；
+当前或历史 node 列表成员身份不能代替服务身份。
+
+签名 digest 使用 sandbox `docs/APP_IDENTITY.md` 定义的九个 ABI word：
+`0g.sandbox.ImageAttestation.v2` 的 domain hash、chainId、registry、精确 UTF-8 appId
+hash、registeredAt、sealId、压缩公钥 hash、imageHash、issuedAt。两端签验原始 digest，
+不添加 `personal_sign` 包装。
+
+继续校验 framework 镜像白名单与首次配置的 300 秒新鲜度窗口。成功配置后，持久绑定
+使用 domain `agentic-id.container-pubkey-binding.v2`，MAC 输入为 `signingDigest || appSigner`
+（32 字节原始 digest 后接20 字节地址）。它通过现有数据库绑定列认证完整证明，包括
+issuer 实例、镜像和容器公钥，无需数据库 schema 迁移。匹配的 v2 绑定允许稍后恢复
+时继续使用原证明；v1 MAC 不会通过新绑定校验。
+
+使用持久绑定前，仍需对照当前已认证 discovery 校验 issuer scope。同 app signer、同
+注册 epoch 的正常重启，在节点替换后可以恢复原 v2 容器。registeredAt 改变则视为新
+实例，即使稳定 key 未变。身份发现失败或 lease 过期可重试，不回退到节点 key。
+
+应同时升级 sandbox、attestor 和 sealed 镜像。旧 v1/node 签名容器需要 owner 明确
+执行 reset，事先保存运行时状态。Reset 保留 agentId、agentSeal 与已提交的
+ iData/settings，生成新的容器身份及 v2 证明；不会静默重签旧证明或恢复已退役节点。

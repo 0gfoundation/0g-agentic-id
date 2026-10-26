@@ -241,23 +241,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns `(tapp_registry_addr, sandbox_app_id)` when both are
-    /// configured — used by the chain client constructor to enable
-    /// `is_sandbox_node` lookups. Returns `None` when TappRegistry isn't
-    /// wired (mock / partial dev setups), so chain clients silently fall
-    /// back to env-configured single signers.
-    pub fn tapp_registry_for_chain(&self) -> Option<(Address, String)> {
-        if self.tapp_registry_addr == Address::ZERO {
-            return None;
-        }
-        match self.sandbox_app_id.as_deref() {
-            Some(s) if !s.is_empty() => {
-                Some((self.tapp_registry_addr, self.sandbox_app_id.clone().unwrap()))
-            }
-            _ => None,
-        }
-    }
-
     /// Supported framework names only — the deploy edge validates the
     /// binding's name against this (images are the SDK's concern at signing).
     pub fn framework_names(&self) -> Vec<String> {

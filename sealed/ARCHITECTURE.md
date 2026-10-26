@@ -608,8 +608,8 @@ The env surface:
 | env | Meaning |
 |---|---|
 | `SANDBOX_SEAL_KEY` | sandbox-injected ECDSA private key; used to cross-verify with `SANDBOX_SEAL_ATTESTATION.pubkey` (Phase 0) |
-| `SANDBOX_SEAL_ATTESTATION` | sandbox-signed attestation JSON containing `image_hash` / `pubkey` / `seal_id` / `ts` / `signature`; sealId is read from here, not a separate env |
-| `TEE_SIGNER_ADDRESS` | (optional, **usually unset in production**) if set, Phase 0 requires the address recovered from the attestation signature == this value, otherwise fail loud. The authoritative sandbox signer check is at the attestor `/provision` end (querying `TappRegistry.getNodeList(sandbox_app_id)`); this pin in sealed is only a dev / local-debug fail-early aid, not a security boundary |
+| `SANDBOX_SEAL_ATTESTATION` | v2 app-signer-signed attestation JSON containing `version=2`, `chain_id`, `registry_address`, exact `app_id`, `registered_at`, `image_hash`, `pubkey`, `seal_id`, `ts` and `signature`; sealId is read from here, not a separate env. Missing, legacy and unknown versions are rejected |
+| `TEE_SIGNER_ADDRESS` | (optional) expected stable sandbox app signer. Phase 0 requires the address recovered from the v2 signature to match when set. The authoritative `/provision` check authenticates the sandbox app signer and full app-instance scope through Scan, TappRegistry and SandboxServing. This local check never substitutes a current or historical node key |
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
 | `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`). Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, unauthenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |

@@ -136,3 +136,38 @@ sets `ATTESTOR_ALLOW_UNPINNED_DEV=true` and removes any caller-provided descript
 Typed public-key bindings are authenticated declarations computed by measured tapp
 code, including the exact derivation and source. They are not ZK proofs, nor exclusive
 custody proofs. No future `evidence.extensions` proof is treated as implemented here.
+
+## Workload provisioning and reboot recovery (v2)
+
+`POST /provision` accepts ImageAttestation version2. Its flat issuer fields are
+`version`, `chain_id`, `registry_address`, `app_id`, and `registered_at`; the existing
+seal, compressed container public key, image hash, issue time and signature remain.
+The authenticated sandbox discovery snapshot supplies the expected stable app signer
+and current chain/registry/app/registration instance. The recovered signature must
+match that app signer; membership in the current or historical node list does not
+substitute for service identity.
+
+The signing digest uses the nine-word ABI encoding documented in the sandbox's
+`docs/APP_IDENTITY.md`: domain hash for `0g.sandbox.ImageAttestation.v2`, chainId,
+registry, exact UTF-8 appId hash, registeredAt, sealId, compressed-public-key hash,
+imageHash and issuedAt. Both sides sign/verify the raw digest without `personal_sign`.
+
+Framework-image authorization and the initial 300-second freshness window still
+apply. After a successful provision, the stored binding uses domain
+`agentic-id.container-pubkey-binding.v2` and MAC input `signingDigest || appSigner`
+(32 raw digest bytes followed by20 raw address bytes). It authenticates the complete
+proof, including issuer instance, image and public key, using the existing database
+binding columns. A matching v2 binding permits the same stored proof on a later
+resume; a v1 MAC does not satisfy it. There is no database schema migration.
+
+Issuer scope is checked against current authenticated discovery before using a
+stored binding. A reboot with the same app signer and epoch can resume the original
+v2 container after node replacement. A different registeredAt is a new issuer
+instance even if the stable key is unchanged. Discovery failures and expired leases
+remain retryable and never authorize a node-key fallback.
+
+Upgrade sandbox, attestor and sealed images together. Existing v1/node-signed
+containers require an owner-authorized reset; preserve runtime state beforehand.
+Reset retains the agentId, agentSeal and committed iData/settings, and creates a new
+container identity with a v2 proof. This upgrade does not silently re-sign v1 proofs
+or add retired nodes back to the active list.

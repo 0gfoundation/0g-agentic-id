@@ -11,6 +11,7 @@ pub mod events;
 pub mod events_bus;
 pub mod i_data_validate;
 pub mod identity;
+pub mod image_attestation;
 pub mod jobs;
 pub mod kms;
 pub mod mocks;

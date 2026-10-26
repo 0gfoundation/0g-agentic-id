@@ -1860,10 +1860,6 @@ mod tests {
             self.inner.identity_registry_of(registry).await
         }
 
-        async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
-            self.inner.is_sandbox_node(addr).await
-        }
-
         async fn is_acknowledged(&self, registry: Address, user: Address, app_id: &str) -> anyhow::Result<bool> {
             self.inner.is_acknowledged(registry, user, app_id).await
         }

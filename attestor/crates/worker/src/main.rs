@@ -82,16 +82,12 @@ async fn main() -> anyhow::Result<()> {
         cfg.chain_id,
         cfg.agentic_id_addr,
     ));
-    // Worker doesn't call is_sandbox_node today, but threading the same
-    // wiring keeps both binaries' ChainClient identically configured —
-    // avoids surprises if a future worker job needs the TappRegistry view.
     let chain: Arc<dyn ChainClient> = chain_connect_http(
         &cfg.chain_rpc,
         cfg.agentic_id_addr,
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
-        cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
         pool.clone(),
     )?;

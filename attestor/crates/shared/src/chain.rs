@@ -36,14 +36,10 @@ sol!(
     concat!(env!("OUT_DIR"), "/AgenticID.abi.json")
 );
 
-// TappRegistry — minimal inline interface (not a JSON-ABI import, to keep
-// this crate self-contained without a cross-repo dep on 0g-tapp). Add
-// methods here as the attestor needs them; today we only read the sandbox
-// app's active node list to validate /provision attestations.
+// Minimal TappRegistry interface for the owner acknowledgement preflight.
 sol!(
     #[sol(rpc)]
     interface TappRegistry {
-        function getNodeList(string calldata appId) external view returns (address[] memory);
         function isAcknowledged(address user, string calldata appId) external view returns (bool);
     }
 );
@@ -247,10 +243,6 @@ where
     sender: Address,
     priority_fee_wei: u128,
     max_fee_wei: u128,
-    // TappRegistry + sandbox appId — present together iff TappRegistry is
-    // wired. Both unset → is_sandbox_node returns Ok(None) and the caller
-    // falls back to its env-configured single sandbox signer.
-    tapp_registry: Option<(Address, String)>,
     // Serializes the read-nonce→submit window for every write from `sender`.
     // SimpleNonceManager reads the pending nonce fresh on each send; without
     // this lock two concurrent sends read the same nonce and collide (#54:
@@ -273,7 +265,6 @@ where
         sender: Address,
         priority_fee_gwei: u64,
         max_fee_gwei: u64,
-        tapp_registry: Option<(Address, String)>,
         clone_gate: Option<Address>,
         submit_pool: sqlx::PgPool,
     ) -> Arc<Self> {
@@ -284,7 +275,6 @@ where
             sender,
             priority_fee_wei: priority_fee_gwei as u128 * GWEI_TO_WEI,
             max_fee_wei: max_fee_gwei as u128 * GWEI_TO_WEI,
-            tapp_registry,
             submit_lock: tokio::sync::Mutex::new(()),
             submit_pool,
             _t: PhantomData,
@@ -315,7 +305,6 @@ pub fn connect_http(
     signer_priv: [u8; 32],
     priority_fee_gwei: u64,
     max_fee_gwei: u64,
-    tapp_registry: Option<(Address, String)>,
     clone_gate: Option<Address>,
     submit_pool: sqlx::PgPool,
 ) -> anyhow::Result<Arc<dyn ChainClient>> {
@@ -339,7 +328,6 @@ pub fn connect_http(
         sender,
         priority_fee_gwei,
         max_fee_gwei,
-        tapp_registry,
         clone_gate,
         submit_pool,
     );
@@ -588,16 +576,6 @@ where
         }
         let r = IVerifiedFeedbackAnchor::new(registry, self.provider.clone());
         Ok(r.getIdentityRegistry().call().await?._0)
-    }
-
-    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool> {
-        let (registry_addr, app_id) = self
-            .tapp_registry
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("TappRegistry not configured (ATTESTOR_TAPP_REGISTRY_ADDR + ATTESTOR_SANDBOX_APP_ID required)"))?;
-        let r = TappRegistry::new(*registry_addr, self.provider.clone());
-        let nodes = r.getNodeList(app_id.clone()).call().await?._0;
-        Ok(nodes.iter().any(|n| *n == addr))
     }
 
     async fn is_acknowledged(

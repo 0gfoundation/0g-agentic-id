@@ -72,7 +72,7 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
 | 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,dsh,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
-| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go:180-188`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由 TappRegistry 注册过的 sandbox node key 所签 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
+| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由已认证的稳定 sandbox app signer 签发、并绑定 chain、registry、appId 和注册 epoch 的 v2 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
 任何对 sealed 的未来变更，只要可能跨越这条边界 —— 即使是间接的
 （例如把 priv 字节写日志、通过 debug endpoint 暴露、把它放进与
@@ -253,31 +253,35 @@ Sealed 容器启动时：
    （`container_pubkey`、`container_privkey`），并把私钥那一半作为
    `SANDBOX_SEAL_KEY` 环境变量注入。容器**不**生成它：Phase 0 只检查
    注入进来的这把 key 派生出的压缩 `pubkey` 跟签名 attestation envelope
-   里的那个一致，不一致就 fail loud（`internal/config/config.go:180-188`）。
+   里的那个一致，不一致就 fail loud（`internal/config/config.go`）。
    容器也不会自己独立得到那个 pubkey —— 它转发的就是 envelope 里带的那个
-   （`internal/provision/provision.go:58-65`）。
-2. 0g-Sandbox 观察容器启动、测量它的 `image_hash`，用自己
-   TappRegistry 注册过的某把 node key 签出一个 attestation
-   envelope：
-   `keccak256("ImageAttestation:{seal_id}:0x{container_pubkey}:sha256:{image_hash}:{ts}")`。
-3. 容器 POST `/provision { seal_id, container_pubkey, image_hash,
-   issued_at, sandbox_signature }` 到 Attestor。
+   （`internal/provision/provision.go`）。
+2. 0g-Sandbox 用稳定 app/provider key 签发 version2 envelope，独立于
+   每次启动的 node key 和每容器 key。摘要是以下九个固定 ABI word 顺序拼接后
+   的原始 `keccak256`：`0g.sandbox.ImageAttestation.v2` 的哈希、`chain_id`、
+   registry 地址、`keccak256(原样 UTF-8 app_id)`、`registered_at`、sealId、
+   `keccak256(压缩 container pubkey)`、image hash、timestamp。整数用 uint256
+   大端 word 编码，取值范围为 uint64；地址左补12个零字节。不接受 EIP-191 前缀
+   或旧字符串摘要。
+3. 容器校验版本、scope 格式、密钥对与签名，将五个 issuer 字段原样转发，连同
+   原有 `seal_id`、`container_pubkey`、`image_hash`、`issued_at`、
+   `sandbox_signature` POST 到 `/provision`。缺失、v1、未知版本均在请求前拒绝，
+   永不回退 node key。共享固定向量位于
+   `internal/provision/testdata/attestation-v2.json`。
 
 Attestor 的校验有三道独立闸门：
 
 | 闸门 | 谓词 | 真源 |
 |---|---|---|
-| **Sandbox 身份** | `recover(sandbox_signature)` ∈ `TappRegistry.getNodeList(sandbox_app_id)` | TappRegistry，live 查询 —— sandbox 侧 key rotation 时 attestor 不用重启 |
+| **Sandbox 身份** | v2 签名 scope 等于已认证的 sandbox app 实例；恢复的 signer 等于其稳定 provider signer | Scan typed identities/attestation、live TappRegistry epoch、SandboxServing provider 绑定及未过期的 discovery lease |
 | **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
-| **新鲜度 OR 绑定** | `\|now − issued_at\| ≤ 300s`，OR `(container_pubkey, mac)` 命中此前一次成功 provision 留下的绑定（HMAC over `seal_id ‖ pubkey`，用 Attestor 的 app-scoped KMS key）| 本地 DB + app-scoped key |
+| **新鲜度 OR 绑定** | `\|now − issued_at\| ≤ 300s`，或匹配此前成功的 v2 绑定 | 本地 DB + app-scoped HMAC：消息 `signing_digest32 ‖ authenticated_app_signer20`，domain `agentic-id.container-pubkey-binding.v2` |
 
-**第一道闸门**又一次把信任落回**用户对 0g-Sandbox 的 ack** ——
-Layer 1 那条"两条 ack 各自兜底"的逻辑在这里再演一遍：**Attestor
-不校验 sandbox 跑的是什么代码**，它只信"TappRegistry 里
-`sandbox_app_id` 这条注册条目当前列出的 signer 集合"。这些 signer
-之所以可信、能给 image attestation 背书，靠的是用户上游已经审过
-sandbox 的代码、并对那个 `app_id` 发过 ack —— 信任沿 **"用户 ack
-→ 链上注册 → Attestor 校验"** 这条链一路传导过来。
+**第一道闸门**认证 app signer 与完整 app 实例 scope，当前或历史 node list
+成员身份都不能替代它。用户 ack 仍是对上游 sandbox app 的批准。因此每次启动的
+node 轮换可保留原 v2 envelope 与容器 key；新的注册 epoch 则不能沿用旧绑定，
+即使 appId 和 app key 未变也一样。v1 envelope 与 v1 MAC 不会隐式迁移：应重建
+容器以取得 v2，而不是绕过 issuer 认证。
 
 **第二道闸门** —— `validFrameworkHashes` 白名单 —— 思想上跟 Tapp
 那套"代码身份上链、用户审过再用"一致：sealed runtime image hash

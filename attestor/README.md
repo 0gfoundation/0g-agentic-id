@@ -143,7 +143,7 @@ Detailed signing canonicals live in `crates/shared/src/auth/`.
 |---|---|
 | **AgenticID** | NFT mint, iData registration, `validFrameworkHashes` allowlist |
 | **VerifiedFeedbackRegistry** | Verifies ServeProofs — the agentSeal's EIP-191 version-0x00 signature `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, validator = this proxy — and records TEE marks over the canonical ERC-8004 reputation registry. The attestor never writes to it: it serves the address on `GET /config` and injects it into every new container as `VERIFIED_FEEDBACK_ADDR` (`ATTESTOR_VERIFIED_FEEDBACK_ADDR`); its one read is at worker / api startup, where `getIdentityRegistry()` must equal `ATTESTOR_AGENTIC_ID_ADDR` or startup fails |
-| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` calls `getNodeList` to validate the sandbox signer |
+| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` validates the stable sandbox app signer and signed registration scope through authenticated discovery |
 | **SandboxServing** | Sandbox prepaid balance and voucher settlement. The frontend deploy gate requires owner balance ≥ 0.1 OG |
 
 For contract deploy, upgrade, and verify steps, see

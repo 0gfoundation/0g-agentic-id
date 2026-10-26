@@ -59,7 +59,6 @@ async fn main() -> anyhow::Result<()> {
         app_priv,
         cfg.chain_priority_fee_gwei,
         cfg.chain_max_fee_gwei,
-        cfg.tapp_registry_for_chain(),
         cfg.clone_gate_addr,
         pool.clone(),
     )?;
@@ -77,11 +76,9 @@ async fn main() -> anyhow::Result<()> {
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
-    // SandboxClient — api only uses `admin_delete` (kill a permanently
-    // failed container during /provision rejection). `create / start /
-    // stop` calls all live in the worker, so the mock here would also
-    // be fine for those — but using the same client matches worker's
-    // config so admin_delete signs with the same stable app signer.
+    // Share the worker's discovery client: /provision authenticates the
+    // sandbox app signer/scope and cleanup uses the attestor's app signer.
+    // Container create/start/stop operations remain in the worker.
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         Arc::new(MockSandbox)
     } else {

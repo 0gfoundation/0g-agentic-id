@@ -315,7 +315,7 @@ pub struct HttpSandbox {
     /// None disables admin calls
     /// (orphans get GC'd by sandbox runtime instead).
     admin_signer: Option<AdminSigner>,
-    /// The provider's TEE signer address — bound into every envelope this
+    /// The stable provider app signer address — bound into every envelope this
     /// client SIGNS itself (0g-sandbox#93). Relayed owner envelopes are
     /// untouched (the owner binds their own).
     provider_addr: Option<String>,
@@ -405,6 +405,13 @@ impl HttpSandbox {
 
 #[async_trait]
 impl SandboxClient for HttpSandbox {
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "workload attestation requires authenticated sandbox discovery"
+        ))?;
+        Ok(Some(discovery.service_identity().await?))
+    }
+
     async fn attestor_tls_identity(
         &self,
     ) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
