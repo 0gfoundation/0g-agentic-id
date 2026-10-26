@@ -1,0 +1,41 @@
+{
+  "name": "@0gfoundation/0g-agenticid-sdk",
+  "version": "0.2.0",
+  "description": "Compatibility entry points for the renamed 0g-agentdna SDK and CLI",
+  "agentdnaLegacyBridge": true,
+  "main": "./index.cjs",
+  "types": "./index.d.ts",
+  "bin": {
+    "0g-agenticid": "./cli.cjs",
+    "0g-agentdna": "./cli.cjs"
+  },
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.cjs"
+    },
+    "./seal": {
+      "types": "./seal.d.ts",
+      "default": "./seal.cjs"
+    }
+  },
+  "files": [
+    "cli.cjs",
+    "index.cjs",
+    "index.d.ts",
+    "seal.cjs",
+    "seal.d.ts",
+    "README.md",
+    "README.zh.md"
+  ],
+  "dependencies": {
+    "0g-agentdna": "0.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
+}

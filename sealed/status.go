@@ -42,13 +42,17 @@ type runtimeStatus struct {
 	// the runtime itself is "running", it shows as a "warning" with this
 	// message, so a later drift success or heartbeat cannot report the
 	// agent healthy. A real warning or error still takes precedence.
-	pinned string
+	pinned            string
+	supervisorFailure string
 }
 
 var currentStatus = &runtimeStatus{level: "running"}
 
 // effective is what a /status report should declare. Caller holds mu.
 func (s *runtimeStatus) effective() (string, string) {
+	if s.supervisorFailure != "" {
+		return "error", s.supervisorFailure
+	}
 	if s.level == "running" && s.pinned != "" {
 		return "warning", s.pinned
 	}
@@ -149,4 +153,17 @@ func summarizeError(err error) string {
 		}
 	}
 	return raw
+}
+
+// SupervisorFailed survives unrelated upload successes. Only a confirmed
+// process restart may clear it, otherwise heartbeats would revive a dead agent.
+func (s *runtimeStatus) SupervisorFailed(message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.supervisorFailure = message
+}
+func (s *runtimeStatus) SupervisorRecovered() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.supervisorFailure = ""
 }

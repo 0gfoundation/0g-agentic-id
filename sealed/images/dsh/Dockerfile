@@ -77,7 +77,7 @@ RUN useradd --system --no-create-home --home-dir /home/agent --shell /usr/sbin/n
 ENV HOME=/root
 
 # Node from the official tarball (debian's node is too old for the SDK).
-ARG NODE_VERSION=24.15.0
+ARG NODE_VERSION=24.22.1
 #
 # --no-same-owner: the release tarball records its build user's uid/gid
 # (1001), and GNU tar run as root restores it by default — onto

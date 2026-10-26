@@ -1,0 +1,23 @@
+[
+  {
+    "id": "0g-compute",
+    "name": "0G Compute",
+    "formats": ["openai", "anthropic"],
+    "defaultFormat": "openai",
+    "endpoints": {
+      "openai": "https://router-api.0g.ai/v1",
+      "anthropic": "https://router-api.0g.ai"
+    },
+    "modelCatalog": "https://router-api.0g.ai/v1/models",
+    "compatibility": {
+      "requiresStringContent": true,
+      "supportsStore": false,
+      "supportsDeveloperRole": false,
+      "supportsUsageInStreaming": false,
+      "supportsStrictMode": false,
+      "maxTokensField": "max_tokens"
+    }
+  },
+  { "id": "openai", "name": "OpenAI", "native": true, "formats": ["openai"] },
+  { "id": "anthropic", "name": "Anthropic", "native": true, "formats": ["anthropic"] }
+]

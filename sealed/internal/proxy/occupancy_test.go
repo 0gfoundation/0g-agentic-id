@@ -28,7 +28,7 @@ func occupancyServer(t *testing.T) (*Server, func(string) string) {
 	t.Helper()
 	sign, owner := mustKey(t)
 	ag := state.New()
-	ag.Set([]byte{1}, "http://127.0.0.1:1", "deadbeef", owner, "1", "0x00", "1", "0x00")
+	ag.Set([]byte{1}, "http://127.0.0.1:1", "deadbeef", owner, "1", "0x00", "1", "0x00", "")
 	return &Server{agent: ag}, sign
 }
 

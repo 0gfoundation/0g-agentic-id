@@ -242,3 +242,23 @@ func TestRuntimeStatus_PinnedWarningOverridesRunning(t *testing.T) {
 		t.Fatalf("cleared pin: (%q, %q)", level, msg)
 	}
 }
+
+func TestSupervisorFailureCannotBeClearedByDriftOrHeartbeat(t *testing.T) {
+	s := &runtimeStatus{level: "running"}
+	s.SupervisorFailed("supervisor exhausted retries")
+	s.Set("running", "")
+	level, message := s.Get()
+	if level != "error" || message != "supervisor exhausted retries" {
+		t.Fatal("upload recovery revived a dead process")
+	}
+	s.Set("warning", "needs funds")
+	level, _ = s.Get()
+	if level != "error" {
+		t.Fatal("warning hid the supervisor failure")
+	}
+	s.SupervisorRecovered()
+	level, _ = s.Get()
+	if level != "warning" {
+		t.Fatal("confirmed process recovery did not release supervisor failure")
+	}
+}

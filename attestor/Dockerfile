@@ -4,8 +4,8 @@
 # All three ship in one image; compose picks which to run via `command:`.
 #
 # Build context MUST be the repo root (0g-agentic-id/), not attestor/ —
-# `crates/shared/src/chain.rs` uses alloy's `sol!` macro to load the
-# contract ABI from `../../../contracts/out/AgenticID.sol/AgenticID.json`,
+# `crates/shared/build.rs` extracts the ABI for alloy's `sol!` macro from
+# `../../../contracts/out/AgenticID.sol/AgenticID.json`,
 # so `contracts/` has to sit alongside `attestor/` inside the build.
 # Requires `forge build` in contracts/ to have produced the artifact.
 
@@ -29,6 +29,8 @@ COPY attestor/crates ./attestor/crates
 COPY attestor/version-meld ./attestor/version-meld
 # Only the one ABI JSON is actually needed — no need to ship forge sources.
 COPY contracts/out/AgenticID.sol/AgenticID.json ./contracts/out/AgenticID.sol/AgenticID.json
+# Shared built-in provider seed, also embedded by the sealed runtime.
+COPY sealed/internal/inference/providers.json ./sealed/internal/inference/providers.json
 
 WORKDIR /build/attestor
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
