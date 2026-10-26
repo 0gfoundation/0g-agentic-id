@@ -557,12 +557,12 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-在 DSH 组合里，`seal-guard.mjs` 通过拒绝点名 socket 路径的 tool
-调用，把模型引向原生工具（`seal_sign`、`seal_sign_typed_data`、
-`seal_sign_transaction` —— 每个端点一个工具，每次调用都是一条
-结构化的 session log 记录）。这是引导而非强制：guard 只匹配字面
-路径（`$SEAL_SIGN_SOCK` 式的间接引用可以绕开），session log 也
-不是防篡改的。其它框架则按各自组合允许的方式到达 socket。
+在 DSH 组合里，`seal-guard.mjs` 通过拒绝点名 socket 路径或
+`SEAL_SIGN_SOCK` 变量名的 tool 调用，把模型引向原生工具
+（`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
+每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
+这是引导而非强制：其它间接写法仍可绕开，session log 也不是
+防篡改的。其它框架则按各自组合允许的方式到达 socket。
 
 unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
 （`internal/privsep`），并且**永不暴露到网络上** —— sandbox

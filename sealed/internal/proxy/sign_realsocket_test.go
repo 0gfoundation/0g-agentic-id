@@ -208,3 +208,35 @@ func TestSignTypedDataRealSocket(t *testing.T) {
 // The mjs regression's recipe, documented: the real-socket leg runs as a
 // plain Go test (`go test ./internal/proxy/ -run RealSocket`); no extra
 // environment is needed.
+
+// Negative amounts parse fine (big.Int accepts "-1") but are nonsense on
+// the wire; the socket must reject them for every caller, not just the
+// tool channel (other frameworks reach the socket directly).
+func TestSignTransactionRejectsNegativeAmounts(t *testing.T) {
+	sock, _ := newRealSocketSignServer(t)
+	to := "0x2ce80374318b1d7fb3345724457a182e0ad165c9"
+
+	cases := []struct {
+		name string
+		body map[string]any
+	}{
+		{"negative value", map[string]any{
+			"chain_id": "16602", "nonce": 1, "to": to, "value": "-1",
+			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "1",
+		}},
+		{"negative legacy gas_price", map[string]any{
+			"chain_id": "16602", "nonce": 1, "to": to,
+			"data": "0x", "gas_limit": 21000, "type": "legacy", "gas_price": "-7",
+		}},
+		{"negative 1559 fee", map[string]any{
+			"chain_id": "16602", "nonce": 1, "to": to,
+			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "-1000", "max_priority_fee_per_gas": "1",
+		}},
+	}
+	for _, c := range cases {
+		code, out := sockPost(t, sock, "/sign/transaction", c.body)
+		if code != http.StatusBadRequest {
+			t.Errorf("%s: got %d %v, want 400", c.name, code, out)
+		}
+	}
+}

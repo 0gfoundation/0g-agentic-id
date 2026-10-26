@@ -8,9 +8,9 @@
  * log as a structured record (name, arguments, turn, surrounding context), so
  * every signature the agent issues is auditable after the fact. seal-guard
  * (sibling plugin) closes the shell path to the socket by denying tool calls
- * that name the literal socket path — a steer, not an enforcement: it does
- * not match `$SEAL_SIGN_SOCK`-style indirection, and the session log is not
- * tamper-evident. Prefer the tools because they are the logged channel.
+ * that name the socket path or the SEAL_SIGN_SOCK variable — a steer, not an
+ * enforcement: other indirections still get past it, and the session log is
+ * not tamper-evident. Prefer the tools because they are the logged channel.
  *
  * The three sign tools map the socket's three sign endpoints one-to-one
  * (personal_sign / typed_data / transaction). That is deliberate parity: the

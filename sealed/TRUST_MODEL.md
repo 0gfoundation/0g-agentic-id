@@ -653,11 +653,11 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 In the DSH composition, `seal-guard.mjs` steers the model toward the
 native tools (`seal_sign`, `seal_sign_typed_data`,
 `seal_sign_transaction` — one per endpoint, every call a structured
-session-log record) by denying tool calls that name the socket path.
-That is a steer, not an enforcement: the guard matches only the literal
-path (a `$SEAL_SIGN_SOCK`-style indirection escapes it), and the
-session log is not tamper-evident. The other frameworks reach the
-socket however their own composition allows.
+session-log record) by denying tool calls that name the socket path or
+the `SEAL_SIGN_SOCK` variable. That is a steer, not an enforcement:
+other indirections still get past it, and the session log is not
+tamper-evident. The other frameworks reach the socket however their
+own composition allows.
 
 The unix socket is bound 0600 and owned by the low-privilege `agent`
 user the framework subprocess runs as (`internal/privsep`), and **never

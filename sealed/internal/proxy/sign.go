@@ -265,10 +265,16 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 	}
 	// An unparseable non-empty value would otherwise sign as 0 wei: "1.5"
 	// and "1e18" both produce a valid-looking tx with the value silently
-	// dropped. Same for the fee fields below.
+	// dropped. A negative amount parses fine (big.Int accepts a leading
+	// "-") but is nonsense on the wire; reject both here. Same for the
+	// fee fields below.
 	value, ok := parseBigInt(req.Value)
 	if !ok && strings.TrimSpace(req.Value) != "" {
 		writeSignError(w, http.StatusBadRequest, "value: not a decimal or 0x-hex integer")
+		return
+	}
+	if value != nil && value.Sign() < 0 {
+		writeSignError(w, http.StatusBadRequest, "value: negative")
 		return
 	}
 	if value == nil {
@@ -303,6 +309,11 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 				"dynamic tx requires max_fee_per_gas and max_priority_fee_per_gas")
 			return
 		}
+		if maxFee.Sign() < 0 || tip.Sign() < 0 {
+			writeSignError(w, http.StatusBadRequest,
+				"max_fee_per_gas and max_priority_fee_per_gas must be non-negative")
+			return
+		}
 		tx = types.NewTx(&types.DynamicFeeTx{
 			ChainID:   chainID,
 			Nonce:     req.Nonce,
@@ -317,6 +328,10 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		gasPrice, _ := parseBigInt(req.GasPrice)
 		if gasPrice == nil {
 			writeSignError(w, http.StatusBadRequest, "legacy tx requires gas_price")
+			return
+		}
+		if gasPrice.Sign() < 0 {
+			writeSignError(w, http.StatusBadRequest, "gas_price must be non-negative")
 			return
 		}
 		tx = types.NewTx(&types.LegacyTx{
