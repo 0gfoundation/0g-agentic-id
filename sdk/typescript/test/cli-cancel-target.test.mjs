@@ -139,7 +139,8 @@ test('Esc brake while displaced: notice, never a second prompt', async () => {
   const line = brakeInterruptLine(new Error('interrupt: HTTP 409: {"error":"displaced"}'));
   assert.equal(waiters.length, 1, 'no second waiter queued — the notice is not a prompt');
   assert.match(line, /driven by another client/, 'the displaced notice prints');
-  assert.match(line, /send a message or \/cancel/, 'it points at the paths that CAN prompt');
+  assert.match(line, /send a message to take the seat back/, 'points at the chat turn (the path that CAN prompt)');
+  assert.doesNotMatch(line, /\/cancel/, 'bare /cancel sends no POST when idle — the advice would dead-end');
   assert.doesNotMatch(line, /: \n?$/, 'not shaped like a prompt — expects no input');
 
   // the user's Enter still reaches THE LOOP (status refresh), not a phantom
@@ -156,4 +157,97 @@ test('Esc brake: a non-seat failure keeps the old raw line', () => {
   const line = brakeInterruptLine(new Error('interrupt: HTTP 500: gateway broke'));
   assert.match(line, /\(interrupt failed: interrupt: HTTP 500: gateway broke\)/);
   assert.doesNotMatch(line, /driven by another client/);
+});
+
+// makeBrake — the REAL brake handler, driven outside sessionRepl. The seat
+// stub THROWS if invoked: the 06d7a7d regression called it from the brake's
+// rejection handler, queueing a second ask-waiter that stole lines FIFO.
+import { makeBrake } from '../dist/cli/commands/interactive.js';
+
+test('the real brake handler never invokes the seat — the FIFO regression pinned', async () => {
+  const waiters = [];
+  const ask = () => new Promise((resolve) => waiters.push(resolve));
+  const deliver = (line) => { const w = waiters.shift(); if (w) w(line); };
+  const loopAsk = ask(); // the main loop is parked here when the idle Esc fires
+  const printed = [];
+
+  const brake = makeBrake(
+    () => ({ interrupt: async () => { throw new Error('interrupt: HTTP 409: {"error":"displaced"}'); } }),
+    (l) => printed.push(l),
+    async () => { throw new Error('seat invoked from the brake — the FIFO bug is back'); },
+    () => false,
+  );
+  brake();
+  await new Promise((r) => setTimeout(r, 20)); // let the rejection handler run
+
+  assert.equal(printed.length, 1, 'exactly the notice printed');
+  assert.match(printed[0], /driven by another client/, 'displaced 409 → notice');
+  assert.equal(waiters.length, 1, 'no second waiter queued — the loop ask is the only one');
+  // the user's Enter still reaches THE LOOP
+  deliver('\n');
+  assert.equal(await loopAsk, '\n');
+  // and their next chat message is not eaten
+  const chatAsk = ask();
+  deliver('hello');
+  assert.equal(await chatAsk, 'hello');
+});
+
+test('the brake stays quiet while a seat prompt is on screen', async () => {
+  const printed = [];
+  const brake = makeBrake(
+    () => ({ interrupt: async () => { throw new Error('must not even POST while the prompt owns the screen'); } }),
+    (l) => printed.push(l),
+    async () => { throw new Error('no seat from the brake'); },
+    () => true, // displacedSeat's ask() is pending
+  );
+  brake();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(printed.length, 0, 'no contradictory advice under the pending seat prompt');
+});
+
+test('the brake keeps its normal lines when no seat prompt is pending', async () => {
+  const printed = [];
+  const brake = makeBrake(
+    () => ({ interrupt: async () => ({ aborted: true }) }),
+    (l) => printed.push(l),
+    async () => { throw new Error('no seat from the brake'); },
+    () => false,
+  );
+  brake();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(printed[0], /stopped the running task/, 'a successful interrupt still reports');
+});
+
+test('the brake reads the CURRENT client — a mid-session swap is not pinned out', async () => {
+  // s.client is replaced while the session stays open (/start, /reset, the
+  // loop-top and bare-Enter reconnects, /stop). The old inline brake read
+  // s.client on every Esc; capturing it in makeBrake would keep POSTing to
+  // the stopped/old container for the rest of the session.
+  const printed = [];
+  let current = { interrupt: async () => ({ aborted: false, note: 'old container' }) };
+  const brake = makeBrake(
+    () => current,
+    (l) => printed.push(l),
+    async () => { throw new Error('no seat from the brake'); },
+    () => false,
+  );
+  brake();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(printed[0], /old container/, 'first Esc hits the original client');
+
+  // the brake throttles at 2s (spamming Esc is not a second interrupt) —
+  // wait the window out, as a real user's second Esc would
+  await new Promise((r) => setTimeout(r, 2100));
+  // the session reconnects to a new container (refreshSession / connectSession)
+  current = { interrupt: async () => ({ aborted: true, note: 'new container' }) };
+  brake();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(printed[1], /stopped the running task/, 'the SAME brake now hits the new client');
+
+  // /stop sets s.client to undefined — the brake must notice that too
+  await new Promise((r) => setTimeout(r, 2100));
+  current = undefined;
+  brake();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(printed[2], /no interrupt endpoint/, 'a stopped session reports honestly, not a stale fetch failure');
 });
