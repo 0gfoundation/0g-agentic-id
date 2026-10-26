@@ -4663,13 +4663,8 @@ window.resetAgent = async function (sealId, sandboxId) {
 // Origin: *`, so a browser fetch from the attestor origin works as
 // long as the agent itself doesn't add stricter CORS headers.
 // ───────────────────────────────────────────────────────────────────
-// `/hello` is expected to return the body bytes signed (EIP-191 personal_sign)
-// by the agent's seal key, with the 65-byte signature served back as
-// `X-Agent-Signature: 0x...`. We verify by recovering the signer with
-// ethers and cross-checking against the on-chain agent_seal address pulled
-// from the AgentCard. The result is shown as an animated badge above the
-// raw body — verifying spinner → ✓ verified (green pulse) / ✗ failed
-// (red shake) / ⚠ unverified (no header).
+// `/hello`'s proof is the X-Agent-Proof envelope, verified as described at
+// serveProofSignedDigest / the serve-verification checklist below.
 // SIWE-style dashboard auth, route-driven. The agent declares its
 // interaction surfaces in `/hello`'s `routes`; we pick the one with
 // kind="dashboard". Owner signs `0GSealAuth:{sealId}:{ts}` with MetaMask,
@@ -4761,12 +4756,95 @@ function fireProbe(sealIdHex) {
 //   ⟳ Response body integrity — recomputed taskHash matches envelope.task_hash
 //   ⟳ On-chain data hashes    — every envelope.data_hashes entry is on chain
 // Header format: `X-Agent-Proof: <sig>.<base64url(envelope_json)>`,
-// envelope = `{ agent_id, timestamp, deadline, task_hash, data_hashes[], framework_hash }`.
-// sig is EIP-191 over keccak256(abi.encode(agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)) — the contract's ServeProof digest.
+// envelope = `{ agent_id, submitter, timestamp, deadline, task_hash,
+// data_hashes[], framework_hash, validator }` (`validator` is diagnostic only —
+// not part of the signed tuple). sig is over the ServeProof digest, see
+// serveProofSignedDigest.
 function b64urlDecode(s) {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   return atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+}
+
+// ServeProof signed digest — one of five copies of this consensus-critical
+// digest (VerifiedFeedbackRegistry, sealed proxy writeServeProof, SDK
+// ServeProof.ts, this, attestor/scripts/verify-agent.sh check 3b; see
+// AGENTS.md). Pinned by sdk/typescript/test/serveproof-copies.test.mjs, which
+// runs this function verbatim: validator 0x…B7 + the shared fixed tuple →
+// 0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b.
+// Inner proofHash = keccak256(abi.encode(chainId, identityRegistry,
+// submitter, agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)); the signed digest
+// is EIP-191 version 0x00 ("data with intended validator"):
+// keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash), validator = the
+// VerifiedFeedbackRegistry proxy. Recover it RAW (ethers.recoverAddress) —
+// verifyMessage would apply the personal_sign wrap, which the registry
+// rejects. chainId / identityRegistry come from /config, never the envelope.
+function serveProofSignedDigest(chainId, identityRegistry, validator, envelope) {
+  const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
+  const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
+  const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ['uint256', 'address', 'address', 'uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
+    [BigInt(chainId), identityRegistry, envelope.submitter || ethers.ZeroAddress,
+     BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
+     envelope.task_hash, dhHash, envelope.framework_hash],
+  ));
+  return ethers.keccak256(ethers.concat(['0x1900', ethers.getAddress(validator), proofHash]));
+}
+
+// The uri a ServeProof taskHash commits to: Go's r.URL.RequestURI() of the
+// request target as the sealed proxy received it — one of the taskHash
+// copies (VerifiedFeedbackRegistry, sealed proxy, SDK taskHash.ts, this; see
+// AGENTS.md), pinned by sdk/typescript/test/serveproof-copies.test.mjs against
+// sealed's requestURIForms table. The path is kept when Go accepts its
+// encoding; otherwise (a raw '|', '^', … that WHATWG URLs leave alone) it is
+// decoded and every byte outside Go's path set re-escaped as upper-case %XX.
+// The query is kept verbatim, a bare trailing '?' included.
+function goRequestURI(target) {
+  const isAlnum = (c) => (c >= 0x61 && c <= 0x7a) || (c >= 0x41 && c <= 0x5a) || (c >= 0x30 && c <= 0x39);
+  const shouldEscape = (c) => !(isAlnum(c) || '-_.~$&+,/:;=@'.includes(String.fromCharCode(c)));
+  const q = target.indexOf('?');
+  const rawPath = q < 0 ? target : target.slice(0, q);
+  const query = q < 0 ? '' : target.slice(q);
+  let valid = true;
+  for (let i = 0; i < rawPath.length; i++) {
+    const c = rawPath.charCodeAt(i);
+    if ("!$&'()*+,;=:@[]%".includes(rawPath[i])) continue;
+    if (c > 0x7f || shouldEscape(c)) { valid = false; break; }
+  }
+  if (rawPath === '' || valid) return (rawPath || '/') + query;
+  const bytes = [];
+  for (let i = 0; i < rawPath.length; i++) {
+    if (rawPath[i] === '%') {
+      const h = rawPath.slice(i + 1, i + 3);
+      if (!/^[0-9a-fA-F]{2}$/.test(h)) return target; // the proxy 400s it
+      bytes.push(parseInt(h, 16));
+      i += 2;
+    } else {
+      for (const b of new TextEncoder().encode(rawPath[i])) bytes.push(b);
+    }
+  }
+  const hex = '0123456789ABCDEF';
+  let out = '';
+  for (const b of bytes) out += shouldEscape(b) ? '%' + hex[b >> 4] + hex[b & 15] : String.fromCharCode(b);
+  return (out || '/') + query;
+}
+
+// The uri forms the proxy may have hashed for a fetch of `url`: the browser
+// (WHATWG fetch) sends a bare trailing '?', some clients drop it — try both.
+function serveProofRequestURIs(url) {
+  const u = new URL(url);
+  const out = [goRequestURI(u.pathname + u.search)];
+  if (u.search === '' && u.href.replace(/#.*$/, '').endsWith('?')) out.push(goRequestURI(u.pathname + '?'));
+  return out;
+}
+
+// The configured ServeProof validator (/config verified_feedback_addr), or
+// null when this attestor advertises none (blank, malformed or zero) — the
+// containers then emit no proof, and any proof is unverifiable here.
+function configuredServeProofValidator(cfg) {
+  const v = cfg && cfg.verified_feedback_addr;
+  if (!v || !ethers.isAddress(v) || BigInt(v) === 0n) return null;
+  return v;
 }
 
 // Flatten an agent-declared JSON input_example into a URL query string
@@ -4988,25 +5066,60 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     paint('verifying', '', 'Verifying agent identity…', null, null, null);
     await sleep(550);
 
-    let envelope, recovered, sigInfo;
+    const short = a => `${String(a).slice(0,6)}…${String(a).slice(-4)}`;
+    let envelope, sig;
     try {
       const parts = proofHeader.split('.');
       if (parts.length !== 2) throw new Error('malformed X-Agent-Proof (expected sig.envelope)');
-      const [sig, envB64] = parts;
-      envelope = JSON.parse(b64urlDecode(envB64));
-      // Reconstruct the contract's signed digest: keccak256(abi.encode(agentId,
-      // timestamp, deadline, taskHash, keccak256(abi.encodePacked(dataHashes)),
-      // frameworkHash)), then EIP-191 — matches AgenticIDReputationRegistry._verifyServeProof
-      // and the sealed proxy's writeServeProof.
-      const dh = Array.isArray(envelope.data_hashes) ? envelope.data_hashes : [];
-      const dhHash = ethers.keccak256(dh.length ? ethers.concat(dh) : '0x');
-      const proofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
-        ['uint256', 'uint256', 'uint256', 'bytes32', 'bytes32', 'bytes32'],
-        [BigInt(envelope.agent_id), BigInt(envelope.timestamp), BigInt(envelope.deadline),
-         envelope.task_hash, dhHash, envelope.framework_hash],
-      ));
-      recovered = ethers.verifyMessage(ethers.getBytes(proofHash), sig);
-      sigInfo = { full: recovered, short: `${recovered.slice(0,6)}…${recovered.slice(-4)}` };
+      sig = parts[0];
+      envelope = JSON.parse(b64urlDecode(parts[1]));
+    } catch (e) {
+      setRow('identity', 'failed', `envelope: ${e.message || e}`);
+      skipRest();
+      paint('failed', '✗', 'Envelope error', null, null, null);
+      return;
+    }
+
+    // The digest binds chainId + identityRegistry + validator, all taken
+    // from /config. Without a loaded /config, or one naming no registry, the
+    // proof is unverifiable here — that is not an identity mismatch.
+    if (!State.config) {
+      setRow('identity', 'skipped', 'unverifiable: /config not loaded (reload the page to retry)');
+      skipRest();
+      paint('warn', '⚠', 'Response received',
+        'Proof unverifiable — /config not loaded', null, humanMsg);
+      return;
+    }
+    const cfgDomain = State.config;
+    const validator = configuredServeProofValidator(cfgDomain);
+    if (!validator || !cfgDomain.chain_id || !cfgDomain.agentic_id_addr) {
+      const what = validator
+        ? '/config lacks chain_id / agentic_id_addr'
+        : 'this attestor advertises no VerifiedFeedbackRegistry (verified_feedback_addr)';
+      setRow('identity', 'skipped', `unverifiable: ${what}`);
+      skipRest();
+      paint('warn', '⚠', 'Response received',
+        validator
+          ? 'Proof unverifiable — /config is missing the chain domain'
+          : 'Proof unverifiable — no VerifiedFeedbackRegistry configured on this attestor', null, humanMsg);
+      return;
+    }
+    // envelope.validator is diagnostic (not signed): a different one means
+    // the container was created for another registry deployment.
+    if (envelope.validator && String(envelope.validator).toLowerCase() !== validator.toLowerCase()) {
+      setRow('identity', 'failed',
+        `proof signed for a different registry: ${short(envelope.validator)} ≠ configured ${short(validator)}`);
+      skipRest();
+      paint('failed', '✗', 'Registry mismatch',
+        'Proof signed for a different registry', null, humanMsg);
+      return;
+    }
+
+    let recovered, sigInfo;
+    try {
+      const digest = serveProofSignedDigest(cfgDomain.chain_id, cfgDomain.agentic_id_addr, validator, envelope);
+      recovered = ethers.recoverAddress(digest, sig);
+      sigInfo = { full: recovered, short: short(recovered) };
     } catch (e) {
       setRow('identity', 'failed', `envelope: ${e.message || e}`);
       skipRest();
@@ -5015,10 +5128,12 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     }
 
     if (!expectedSealAddr || expectedSealAddr.toLowerCase() !== recovered.toLowerCase()) {
-      const want = expectedSealAddr
-        ? `${expectedSealAddr.slice(0,6)}…${expectedSealAddr.slice(-4)}`
-        : '(unknown)';
-      setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}`);
+      const want = expectedSealAddr ? short(expectedSealAddr) : '(unknown)';
+      // No envelope.validator → a pre-validator sealed image signing the
+      // legacy personal_sign digest; only an owner /reset onto a current
+      // image fixes it (no fallback verification — the registry has none).
+      const legacy = envelope.validator ? '' : ' (no validator in envelope — legacy sealed image? reset the agent)';
+      setRow('identity', 'failed', `signer ${sigInfo.short} ≠ on-chain ${want}${legacy}`);
       skipRest();
       paint('failed', '✗', 'Identity mismatch',
         'Recovered signer is not the on-chain agent_seal',
@@ -5033,16 +5148,19 @@ window.sayHiToAgent = async function (url, expectedSealAddr, agentId) {
     await sleep(500);
 
     // taskHash binds the transcript: keccak256(method ‖ uri ‖ keccak(reqBody) ‖
-    // keccak(respBody) ‖ status). /hello is a GET with an empty request body.
-    const uriPath = (() => { try { const u = new URL(url); return u.pathname + u.search; } catch { return '/hello'; } })();
-    const localTask = ethers.keccak256(ethers.concat([
+    // keccak(respBody) ‖ status), uri = Go's RequestURI (serveProofRequestURIs).
+    // /hello is a GET with an empty request body.
+    const uris = (() => { try { return serveProofRequestURIs(url); } catch { return ['/hello']; } })();
+    const claimedTask = String(envelope.task_hash || '').toLowerCase();
+    const taskOf = (uriPath) => ethers.keccak256(ethers.concat([
       ethers.toUtf8Bytes('GET'),
       ethers.toUtf8Bytes(uriPath),
       ethers.keccak256('0x'),                       // keccak(reqBody), empty
       ethers.keccak256(ethers.toUtf8Bytes(text)),   // keccak(respBody)
       ethers.toUtf8Bytes(String(r.status)),
     ])).toLowerCase();
-    const claimedTask = String(envelope.task_hash || '').toLowerCase();
+    const tasks = uris.map(taskOf);
+    const localTask = tasks.find((h) => h === claimedTask) || tasks[0];
     if (claimedTask !== localTask) {
       setRow('body', 'failed', `taskHash ${localTask.slice(0,10)}… ≠ envelope.task_hash`);
       setRow('data', 'skipped');

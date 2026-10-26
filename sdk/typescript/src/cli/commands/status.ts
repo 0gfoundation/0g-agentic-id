@@ -1,6 +1,6 @@
 /**
  * @file status.ts
- * @description `0g-agenticid status <agent>` — one agent's full picture
+ * @description `0g-agentdna status <agent>` — one agent's full picture
  * (spec v0.03 §3.2): all three coordinates (agentId / sealId / agentSeal),
  * phase, url, and the FOLDED failure reason. `<agent>` is a decimal agentId
  * or a 0x… sealId; the command resolves the other coordinates from chain +
@@ -56,7 +56,7 @@ export async function run(ctx: CommandContext): Promise<void> {
         hits.length
           ? `"${ctx.positionals[0]}" matches ${hits.length} agents — add more hex chars`
           : `no agent matching ${ctx.positionals[0]} on this attestor`,
-        { remedy: '0g-agenticid list   # to discover existing agents' },
+        { remedy: '0g-agentdna list   # to discover existing agents' },
       );
     }
     ref = { kind: 'sealId', sealId: hits[0].sealId as Hash };
@@ -72,7 +72,7 @@ export async function run(ctx: CommandContext): Promise<void> {
       await ag.agent.ownerOf(agentId);
     } catch {
       throw new CliError('AGENT_NOT_FOUND', `agent ${agentId} not found on chain`, {
-        remedy: '0g-agenticid list   # to discover existing agents',
+        remedy: '0g-agentdna list   # to discover existing agents',
       });
     }
     try {
@@ -105,7 +105,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // Not minted AND no deployment row → the sealId leads nowhere.
     if (!row && agentId === null) {
       throw new CliError('AGENT_NOT_FOUND', `seal ${sealId} has no deployment and no minted agent`, {
-        remedy: '0g-agenticid list   # to discover existing agents',
+        remedy: '0g-agentdna list   # to discover existing agents',
       });
     }
 

@@ -2,8 +2,10 @@
 pragma solidity ^0.8.24;
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
-import {AgenticIDNotTrustedAttestor} from "../src/AgenticID.sol";
+import {AgenticID, AgenticIDNotTrustedAttestor, AgenticIDZeroAddress} from "../src/AgenticID.sol";
 import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 
@@ -99,5 +101,91 @@ contract AgenticIDAdminTest is AgenticIDTestBase {
             )
         );
         agenticId.setVerifier(address(0xDEAD));
+    }
+
+    /// @dev FIND-12: a zero verifier would brick every proof-gated
+    ///      iTransferFrom / iCloneFrom (the call into address(0) fails), so
+    ///      1.2.0 refuses it outright and the old verifier stays in place.
+    function test_setVerifier_revertsOnZeroAddress() public {
+        vm.prank(owner);
+        vm.expectRevert(AgenticIDZeroAddress.selector);
+        agenticId.setVerifier(address(0));
+        assertEq(address(agenticId.verifier()), address(verifier), "verifier unchanged");
+    }
+
+    /// @dev FIND-12: the swap is observable on chain — old and new address.
+    function test_setVerifier_emitsVerifierUpdated() public {
+        address newVerifier = address(0xDEAD);
+        vm.expectEmit(true, true, false, false, address(agenticId));
+        emit AgenticID.VerifierUpdated(address(verifier), newVerifier);
+        vm.prank(owner);
+        agenticId.setVerifier(newVerifier);
+    }
+
+    // ── What a pause covers (1.2.0: FIND-11) ─────────────────────────────────
+
+    /// @dev Writes that add or change an agent's canonical record stop while
+    ///      paused — including a trusted attestor's URI rewrite, so pausing
+    ///      contains a compromised attestor.
+    function test_pause_blocksUriMetadataAndWalletWrites() public {
+        _whitelistAttestor();
+        (uint256 agentId, ) = _mintWithSeal(alice);
+        Vm.Wallet memory payment = vm.createWallet("payment");
+        uint256 deadline = block.timestamp + 4 minutes;
+        bytes memory sig = _signSetAgentWallet(payment, agentId, deadline);
+
+        vm.prank(pauser);
+        agenticId.pause();
+
+        vm.prank(alice);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        agenticId.setAgentURI(agentId, "ipfs://owner");
+        vm.prank(attestor);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        agenticId.setAgentURI(agentId, "ipfs://attestor");
+        vm.prank(alice);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        agenticId.setMetadata(agentId, "k", bytes("v"));
+        vm.prank(alice);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        agenticId.setAgentWallet(agentId, payment.addr, deadline, sig);
+        vm.prank(alice);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        agenticId.authorizeUsage(agentId, stranger);
+
+        vm.prank(pauser);
+        agenticId.unpause();
+        vm.prank(alice);
+        agenticId.setAgentWallet(agentId, payment.addr, deadline, sig);
+        assertEq(agenticId.getAgentWallet(agentId), payment.addr, "writes resume after unpause");
+    }
+
+    /// @dev Actions that only take a privilege away stay open while paused, so
+    ///      an owner can still defend during an incident.
+    function test_pause_allowsRevocations() public {
+        _whitelistAttestor();
+        (uint256 agentId, ) = _mintWithSeal(alice);
+        Vm.Wallet memory payment = vm.createWallet("payment");
+        uint256 deadline = block.timestamp + 4 minutes;
+        bytes memory sig = _signSetAgentWallet(payment, agentId, deadline);
+        address userA = address(0xA10);
+        address userB = address(0xB20);
+        vm.startPrank(alice);
+        agenticId.setAgentWallet(agentId, payment.addr, deadline, sig);
+        agenticId.authorizeUsage(agentId, userA);
+        agenticId.authorizeUsage(agentId, userB);
+        vm.stopPrank();
+
+        vm.prank(pauser);
+        agenticId.pause();
+
+        vm.startPrank(alice);
+        agenticId.revokeAuthorization(agentId, userA);
+        agenticId.clearAuthorizedUsers(agentId);
+        agenticId.unsetAgentWallet(agentId);
+        vm.stopPrank();
+
+        assertEq(agenticId.authorizedUsersOf(agentId).length, 0, "authorizations cleared while paused");
+        assertEq(agenticId.getAgentWallet(agentId), address(0), "wallet unset while paused");
     }
 }

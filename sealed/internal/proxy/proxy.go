@@ -13,15 +13,26 @@
 //	POST /_seal/claim   - take the single-driver seat (owner-signed)
 //	POST /_seal/clear   - wipe the persisted conversation + restart (owner-signed)
 //	POST /_seal/compact - compact the persisted conversation in place (owner-signed)
-//	*    /              - signed reverse proxy to agent upstream (returns 503 until armed)
+//	*    /              - reverse proxy (returns 503 until armed): agent-registered
+//	                      /api/* services (signed) and framework-declared routes
+//	                      (never signed); any other path 404s
 //
 // /log/agent(.html) is gated on an owner EIP-191 signature (X-Auth-Message /
 // X-Auth-Signature, tag "0GSealLog") — it exposes the agent's own process
 // output, which is owner-private. /healthz and /log stay open.
 //
-// All signed responses (everything except /healthz, /log, /log/agent) carry an
-// X-Agent-Proof header packing both an EIP-191 signature and the canonical
-// envelope JSON. Callers verify with ethers.verifyMessage(envelope, sig).
+// Signed responses carry an X-Agent-Proof header packing an agentSeal
+// signature and the envelope JSON it covers. The signed set is exactly:
+// /hello, /_seal/auth and agent-registered /api/* services — and only when
+// VERIFIED_FEEDBACK_ADDR names a usable registry (and the agent has an
+// on-chain identity). Framework routes (chat/UI), WebSocket upgrades and
+// streamed (SSE) responses are never signed, nor is anything else. The
+// header is runtime-owned: an X-Agent-Proof set by an upstream backend is
+// dropped on every relay path, so the only one a client ever sees is the one
+// writeServeProof attached. The signature is EIP-191 version 0x00 bound to the
+// VerifiedFeedbackRegistry (see writeServeProof) — not a personal_sign, so
+// there is no verifyMessage-style check: verifiers rebuild the ServeProof hash
+// from the envelope plus their configured deployment and recover the digest.
 package proxy
 
 import (
@@ -42,6 +53,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
 	"seal-verify/internal/framework"
@@ -69,15 +81,16 @@ type Server struct {
 	adapter      framework.Framework
 	agentLogPath string            // adapter's subprocess log file; empty renders "not available"
 	services     []ServiceEntry    // agent-registered external services (see services.go); nil until first POST /services
-	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ legacy forward-all
+	fwRoutes     []framework.Route // framework-declared routes (see framework.RouteProvider); nil ⇒ every framework path 404s
 
 	// synth backs the synthesized /v1/responses surface (responses.go) for
 	// adapters that don't serve one natively.
 	synth *synthHub
 
-	readSettings  SettingsReader
-	applySettings SettingsApplier
-	applyClear    ClearApplier
+	readSettings        SettingsReader
+	readRuntimeSettings func() RuntimeSettings
+	applySettings       SettingsApplier
+	applyClear          ClearApplier
 
 	// compact backs POST /_seal/compact (compact.go): its applier plus the
 	// single-flight and replay guards, under their own lock.
@@ -103,6 +116,10 @@ type Server struct {
 	// the chain client only exists after Phase 2. See verifyOwnerSig for why
 	// the cached owner is not good enough.
 	liveOwner OwnerResolver
+
+	// chainID is the chain the bootstrap client dialled (decimal), late-bound
+	// via SetChainID; it picks the explorer the HTML log pages link to.
+	chainID string
 }
 
 // OwnerResolver returns the agent's owner as of right now, by reading the
@@ -333,9 +350,9 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 //	  "ts":         <unix>
 //	}
 //
-// The X-Agent-Proof header signs (method, uri, req_body_hash, status,
-// resp_body_hash, data_hashes, ts) so verifiers can confirm the response
-// originated from this attested instance.
+// The X-Agent-Proof header signs a ServeProof (taskHash over method, uri,
+// req/resp body hashes and status; data_hashes; timestamp/deadline) so
+// verifiers can confirm the response originated from this attested instance.
 //
 // `services` is built from sealed's service registry (agent-registered
 // via POST /services) on each call — fresh per request, no caching. An
@@ -344,7 +361,7 @@ func (s *Server) handleAgentLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	priv, _, _, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -392,7 +409,7 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -561,7 +578,7 @@ func (s *Server) resolveOwner(ctx context.Context, cached string) (string, bool)
 func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	priv, _, sealID, owner, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil || owner == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -598,7 +615,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, nil, body, dataHashes, http.StatusOK, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -608,7 +625,7 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	priv, upstream, _, _, dataHashes := s.agent.Snapshot()
 	agentID, frameworkHash := s.agent.ProofIdentity()
-	chainID, identityAddr := s.agent.ProofDomain()
+	chainID, identityAddr, validator := s.agent.ProofDomain()
 	if priv == nil || upstream == "" {
 		http.Error(w, "agent not ready", http.StatusServiceUnavailable)
 		return
@@ -641,11 +658,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	//   1. an agent-registered service (exact path) → its loopback backend,
 	//      always signed;
 	//   2. a framework-declared route (longest-prefix) → the framework
-	//      upstream, signed per Route.Signed;
-	//   3. otherwise, if the adapter declared any routes, 404 — an undeclared
-	//      path is NOT blind-forwarded (bounds the public + signing surface).
-	// Legacy fallback: an adapter that declares no routes keeps the old
-	// behaviour — forward every path to the upstream and sign every response.
+	//      upstream, never signed;
+	//   3. otherwise 404 — an undeclared path is NOT blind-forwarded (bounds
+	//      the public + signing surface), whether or not the adapter declared
+	//      any routes.
 	// Signing follows a proxy-owned invariant, NOT the adapter's declared
 	// Signed flag:
 	//   - agent-registered /api/* service → signed. The outward, attributable
@@ -742,8 +758,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// Gated on frameworkRoute, NOT on Content-Type alone: only a
 	// framework-declared route (the owner↔agent steering channel — chat/UI) may
 	// go unsigned. An agent-registered /api/* service (the outward, attributable
-	// surface) and the legacy forward-all path must stay buffered + signed, so
-	// they never lose their X-Agent-Proof merely by emitting text/event-stream —
+	// surface) must stay buffered + signed, so it never loses its
+	// X-Agent-Proof merely by emitting text/event-stream —
 	// even if that means a long /api/* stream is buffered (and can still hit the
 	// idle cutoff; model such a service as short, discrete responses instead).
 	if shouldStreamRelay(frameworkRoute, resp) {
@@ -763,6 +779,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(k, "Access-Control-") {
 			continue
 		}
+		// X-Agent-Proof is runtime-owned: only writeServeProof attaches it.
+		if isAgentProofHeader(k) {
+			continue
+		}
 		for _, v := range vs {
 			w.Header().Add(k, v)
 		}
@@ -776,7 +796,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(respBody)
 		return
 	}
-	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr); err != nil {
+	if err := writeServeProof(w, r, priv, reqBody, respBody, dataHashes, resp.StatusCode, agentID, frameworkHash, chainID, identityAddr, validator); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
@@ -794,9 +814,9 @@ func isEventStream(resp *http.Response) bool {
 // shouldStreamRelay decides whether a response is relayed as an unsigned stream
 // rather than buffered + signed. Only a framework-declared route (the
 // owner↔agent steering channel: chat/UI) may stream: it has no attribution
-// consumer, so an unsigned stream is fine. Agent-registered /api/* services and
-// the legacy forward-all path never stream here — they stay buffered + signed
-// so the attributable surface keeps its X-Agent-Proof even when it emits SSE.
+// consumer, so an unsigned stream is fine. Agent-registered /api/* services
+// never stream here — they stay buffered + signed so the attributable surface
+// keeps its X-Agent-Proof even when it emits SSE.
 func shouldStreamRelay(frameworkRoute bool, resp *http.Response) bool {
 	return frameworkRoute && isEventStream(resp)
 }
@@ -816,6 +836,11 @@ func streamRelay(w http.ResponseWriter, resp *http.Response) {
 		// corsMiddleware already set our Access-Control-*; duplicates make
 		// browsers reject the response.
 		if strings.HasPrefix(k, "Access-Control-") {
+			continue
+		}
+		// A stream is never signed, so an upstream X-Agent-Proof can only be
+		// one the runtime did not issue — drop it.
+		if isAgentProofHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -895,28 +920,73 @@ func wsReverseProxy(upstream string) *httputil.ReverseProxy {
 			resp.Header.Del("Access-Control-Allow-Methods")
 			resp.Header.Del("Access-Control-Allow-Headers")
 			resp.Header.Del("Access-Control-Expose-Headers")
+			// Upgrades are never signed; the header is runtime-owned.
+			dropAgentProof(resp.Header)
+			// A non-101 reply (the upstream refused the upgrade) is relayed
+			// as a normal body, and httputil.ReverseProxy forwards every
+			// upstream trailer after it — so the trailer copy is dropped
+			// too. Announced trailers are removed here; the transport fills
+			// resp.Trailer only at body EOF, so the body is wrapped to drop
+			// it again then (ReverseProxy copies trailers after that). A 101
+			// body must stay the transport's io.ReadWriteCloser, and carries
+			// no trailers.
+			if resp.StatusCode != http.StatusSwitchingProtocols {
+				dropAgentProof(resp.Trailer)
+				resp.Body = &trailerProofStripper{ReadCloser: resp.Body, resp: resp}
+			}
 			return nil
 		},
 	}
 }
 
+// dropAgentProof deletes every X-Agent-Proof key from h, whatever its case.
+func dropAgentProof(h http.Header) {
+	for k := range h {
+		if isAgentProofHeader(k) {
+			delete(h, k)
+		}
+	}
+}
+
+// trailerProofStripper drops X-Agent-Proof from resp.Trailer once the body
+// has been read to EOF (when the transport populates trailers) and on Close.
+type trailerProofStripper struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (b *trailerProofStripper) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		dropAgentProof(b.resp.Trailer)
+	}
+	return n, err
+}
+
+func (b *trailerProofStripper) Close() error {
+	err := b.ReadCloser.Close()
+	dropAgentProof(b.resp.Trailer)
+	return err
+}
+
 // ── Serve-proof signing ─────────────────────────────────────────────────────
 
 // serveProofDeadlineWindow is how long (seconds) a serve-proof stays
-// submittable on chain after issuance — the buyer must call giveFeedback
-// before it lapses.
+// submittable on chain after issuance — the buyer must redeem it
+// (VerifiedFeedbackRegistry.attestFeedback / attestFeedbackWithTask) before
+// it lapses.
 const serveProofDeadlineWindow = 3600
 
-// serveProof is the canonical envelope signed by agent_seal_priv and packed
-// into X-Agent-Proof. It mirrors the on-chain
-// AgenticIDReputationRegistry.ServeProof tuple (minus the signature, which
-// travels alongside in the header). It is bound to a single redeemer via
-// `submitter` — the address the client declared in the X-Client-Address
-// request header — so a copied proof can't be front-run or spent by anyone
-// else. The chain id and identity-registry address are also part of the
-// signed digest (cross-chain / cross-deployment separation) but are NOT
-// carried in the envelope: the contract derives them from block.chainid and
-// its own storage, and the SDK from its configured deployment.
+// serveProof is the envelope packed into X-Agent-Proof next to the agentSeal
+// signature. It mirrors the on-chain VerifiedFeedbackRegistry ServeProof tuple
+// (minus the signature, which travels alongside in the header). It is bound to
+// a single redeemer via `submitter` — the address the client declared in the
+// X-Client-Address request header — so a copied proof can't be front-run or
+// spent by anyone else. The chain id and identity-registry address are also
+// part of the signed digest (cross-chain / cross-deployment separation) but
+// are NOT carried in the envelope: the contract derives them from
+// block.chainid and its own storage, and the SDK from its configured
+// deployment.
 //
 //	agent_id       : on-chain token id (uint256 decimal string)
 //	submitter      : the only address allowed to redeem this proof (0x0 if the
@@ -929,6 +999,10 @@ const serveProofDeadlineWindow = 3600
 //	                 against AgenticID.intelligentDatasOf); dims not yet on chain
 //	                 are omitted
 //	framework_hash : the sealed image measurement (AgenticID Framework code)
+//	validator      : the VerifiedFeedbackRegistry (proxy) address the signature
+//	                 is bound to — diagnostics only, NOT a ServeProof tuple
+//	                 field. A verifier compares it with the registry it will
+//	                 redeem at; a mismatch means the proof can't verify there.
 type serveProof struct {
 	AgentID       string   `json:"agent_id"`
 	Submitter     string   `json:"submitter"`
@@ -937,33 +1011,56 @@ type serveProof struct {
 	TaskHash      string   `json:"task_hash"`
 	DataHashes    []string `json:"data_hashes"`
 	FrameworkHash string   `json:"framework_hash"`
+	Validator     string   `json:"validator"`
 }
 
 // clientAddressHeader is the request header a client sets to declare the
 // address that will redeem the serve-proof (bound into the signature).
 const clientAddressHeader = "X-Client-Address"
 
+// agentProofHeader carries the serve-proof. It is runtime-owned: writeServeProof
+// is the only place that sets it, and every path relaying an upstream response
+// (buffered, streamed, WebSocket upgrade — header and trailer) drops an
+// upstream-supplied copy, so a backend cannot put a header of its own choosing
+// under the runtime's name.
+const agentProofHeader = "X-Agent-Proof"
+
+// isAgentProofHeader reports whether a response header key names
+// X-Agent-Proof. Keys from net/http are canonical already; the comparison is
+// case-insensitive anyway so a non-canonical map key cannot slip past.
+func isAgentProofHeader(k string) bool {
+	return strings.EqualFold(k, agentProofHeader)
+}
+
 // writeServeProof signs the contract-shaped envelope with agent_seal_priv and
 // emits a single header packing the signature and base64-url envelope JSON:
 //
 //	X-Agent-Proof: 0x<65-byte sig hex>.<base64-url-encoded envelope JSON>
 //
-// The signature is over keccak256(abi.encode(chainId, identityRegistry,
-// submitter, agentId, timestamp, deadline, taskHash,
-// keccak256(abi.encodePacked(dataHashes)), frameworkHash)), wrapped EIP-191 —
-// exactly what AgenticIDReputationRegistry._verifyServeProof checks. chainId +
+// The signed digest is serveProofDigest(validator, serveProofHash(...)) —
+// exactly what VerifiedFeedbackRegistry._verifyServeProof checks. chainId +
 // identityRegistry give cross-chain / cross-deployment separation; submitter
-// (declared by the client in X-Client-Address) binds the proof to one redeemer.
+// (declared by the client in X-Client-Address) binds the proof to one
+// redeemer; validator (the registry proxy) binds the signature to the one
+// contract that redeems it, in a signing domain the sign socket never
+// produces (see sign.go).
 //
 // When the agent has no on-chain identity yet (agentID/frameworkHash/chainID
-// empty, e.g. local dev without a chain), the body is written without a proof
-// header — a reputation proof would be meaningless.
-func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr string) error {
+// empty, e.g. local dev without a chain), or no usable validator
+// (VERIFIED_FEEDBACK_ADDR unset, malformed, zero, or not anchored to
+// AGENTIC_ID_ADDR — see main.anchorValidator), the body is written
+// without a proof header — a reputation proof would be meaningless, and there
+// is deliberately no fallback to the legacy personal_sign wrap.
+func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body []byte, dataHashes map[string]state.DimHashes, statusCode int, agentID, frameworkHash, chainID, identityAddr, validator string) error {
 	agentIDBig, ok := new(big.Int).SetString(agentID, 10)
 	chainIDBig, chainOK := new(big.Int).SetString(chainID, 10)
 	fwBytes, fwErr := hexToBytes32(frameworkHash)
-	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 {
-		// No on-chain identity — serve the body without a serve-proof.
+	validatorAddr, validatorOK := parseValidator(validator)
+	if !ok || !chainOK || fwErr != nil || agentIDBig.Sign() == 0 || !validatorOK {
+		// No on-chain identity (or nothing to bind the proof to) — serve the
+		// body without a serve-proof, and without any X-Agent-Proof a caller
+		// may have left on w.
+		w.Header().Del(agentProofHeader)
 		w.Header().Del("Content-Length")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(statusCode)
@@ -1018,44 +1115,28 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 		TaskHash:      "0x" + hex.EncodeToString(taskHash),
 		DataHashes:    dhHex,
 		FrameworkHash: frameworkHash,
+		Validator:     "0x" + hex.EncodeToString(validatorAddr.Bytes()),
 	}
 	proofJSON, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("marshal serve-proof: %w", err)
 	}
 
-	// abi.encode of (uint256 chainId, address identityRegistry, address submitter,
-	// uint256 agentId, uint256 timestamp, uint256 deadline, bytes32 taskHash,
-	// bytes32 dataHashesHash, bytes32 frameworkHash) — all static 32-byte words,
-	// so it's a plain concatenation.
-	encoded := bytes.Join([][]byte{
-		word256(chainIDBig),
-		addrWord(identityAddr),
-		submitterWord,
-		word256(agentIDBig),
-		word256(big.NewInt(now)),
-		word256(big.NewInt(deadline)),
-		taskHash,
-		crypto.Keccak256(packed),
-		fwBytes,
-	}, nil)
-	proofHash := crypto.Keccak256(encoded)
-
-	// EIP-191: keccak256("\x19Ethereum Signed Message:\n32" || proofHash),
-	// matching OpenZeppelin MessageHashUtils.toEthSignedMessageHash(bytes32).
-	ethHash := crypto.Keccak256([]byte("\x19Ethereum Signed Message:\n32"), proofHash)
+	proofHash := serveProofHash(chainIDBig, addrWord(identityAddr), submitterWord,
+		agentIDBig, now, deadline, taskHash, packed, fwBytes)
+	digest := serveProofDigest(validatorAddr, proofHash)
 
 	privKey, err := crypto.ToECDSA(priv)
 	if err != nil {
 		return fmt.Errorf("agent priv: %w", err)
 	}
-	sig, err := crypto.Sign(ethHash, privKey)
+	sig, err := crypto.Sign(digest, privKey)
 	if err != nil {
 		return fmt.Errorf("sign: %w", err)
 	}
 	sig[64] += 27
 
-	w.Header().Set("X-Agent-Proof",
+	w.Header().Set(agentProofHeader,
 		"0x"+hex.EncodeToString(sig)+"."+base64.RawURLEncoding.EncodeToString(proofJSON))
 	w.Header().Del("Content-Length")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
@@ -1063,6 +1144,59 @@ func writeServeProof(w http.ResponseWriter, r *http.Request, priv, reqBody, body
 	w.WriteHeader(statusCode)
 	_, _ = w.Write(body)
 	return nil
+}
+
+// serveProofHash is the inner ServeProof hash, keccak256(abi.encode(chainId,
+// identityRegistry, submitter, agentId, timestamp, deadline, taskHash,
+// keccak256(abi.encodePacked(dataHashes)), frameworkHash)). Every field is a
+// static 32-byte word, so abi.encode is a plain concatenation. identityRegistry
+// and submitter are abi address words (addrWord); dataHashesPacked is
+// abi.encodePacked(bytes32[]) — the on-chain roots back to back.
+//
+// Consensus-critical: byte-identical to VerifiedFeedbackRegistry, the SDK
+// (sdk/typescript/src/ServeProof.ts), the attestor console's say-hi check and
+// attestor/scripts/verify-agent.sh check 3b (the five copies in AGENTS.md).
+func serveProofHash(chainID *big.Int, identityRegistry, submitter []byte, agentID *big.Int, timestamp, deadline int64, taskHash, dataHashesPacked, frameworkHash []byte) []byte {
+	return crypto.Keccak256(bytes.Join([][]byte{
+		word256(chainID),
+		identityRegistry,
+		submitter,
+		word256(agentID),
+		word256(big.NewInt(timestamp)),
+		word256(big.NewInt(deadline)),
+		taskHash,
+		crypto.Keccak256(dataHashesPacked),
+		frameworkHash,
+	}, nil))
+}
+
+// serveProofDigest is what agent_seal_priv actually signs (raw, no further
+// wrap): EIP-191 version 0x00, "data with intended validator",
+//
+//	keccak256(0x19 ‖ 0x00 ‖ validator (20 bytes) ‖ proofHash (32 bytes))
+//
+// matching OpenZeppelin MessageHashUtils.toDataWithIntendedValidatorHash(
+// address(this), abi.encodePacked(proofHash)) inside VerifiedFeedbackRegistry,
+// whose address(this) is its proxy. This is the FIND-01 fix: the sign socket
+// can only produce 0x19 0x45 (personal_sign), 0x19 0x01 (EIP-712) and
+// transaction preimages, so no signature the agent can request there is a
+// valid ServeProof signature. The legacy toEthSignedMessageHash wrap is
+// rejected on chain — never sign it here.
+func serveProofDigest(validator common.Address, proofHash []byte) []byte {
+	return crypto.Keccak256([]byte{0x19, 0x00}, validator.Bytes(), proofHash)
+}
+
+// parseValidator parses the VerifiedFeedbackRegistry (proxy) address a
+// serve-proof is bound to. Empty, malformed and the zero address all mean "no
+// validator": a proof bound to none would verify nowhere, and the caller takes
+// the no-proof path rather than falling back to any other wrap.
+func parseValidator(s string) (common.Address, bool) {
+	s = strings.TrimSpace(s)
+	if !common.IsHexAddress(s) {
+		return common.Address{}, false
+	}
+	a := common.HexToAddress(s)
+	return a, a != (common.Address{})
 }
 
 // word256 left-pads a non-negative big.Int to a 32-byte big-endian word.
@@ -1073,14 +1207,18 @@ func word256(x *big.Int) []byte {
 }
 
 // addrWord left-pads a hex address (with or without "0x") into a 32-byte abi
-// word, matching Solidity's abi.encode(address). An empty or unparseable input
-// yields the zero word — the sentinel for "no redeemer declared".
+// word, matching Solidity's abi.encode(address). Anything that is not exactly
+// a 20-byte hex address — empty, malformed, or an over-long client-supplied
+// X-Client-Address — yields the zero word, the sentinel for "no redeemer
+// declared". (Parsing it as an integer instead panicked past 32 bytes and
+// signed a non-address word for 21–32-byte values, while the envelope echoed
+// only the low 20 bytes — an unredeemable proof.)
 func addrWord(hexAddr string) []byte {
-	v, ok := new(big.Int).SetString(strings.TrimPrefix(strings.TrimSpace(hexAddr), "0x"), 16)
-	if !ok {
-		v = big.NewInt(0)
+	out := make([]byte, 32)
+	if s := strings.TrimSpace(hexAddr); common.IsHexAddress(s) {
+		copy(out[12:], common.HexToAddress(s).Bytes())
 	}
-	return word256(v)
+	return out
 }
 
 // hexToBytes32 parses a "0x"-prefixed 32-byte hex string.

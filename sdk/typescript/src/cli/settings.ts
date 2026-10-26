@@ -36,7 +36,7 @@ export interface Assignment {
   value: string | ThinkingLevel | unknown | undefined;
 }
 
-const USAGE = '0g-agenticid settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
+const USAGE = '0g-agentdna settings <agent> [provider=… model=… thinking=low|high|max others=<json>]';
 
 /** How to quote a JSON value, in either place it can be typed. */
 const FRAMEWORK_QUOTING =

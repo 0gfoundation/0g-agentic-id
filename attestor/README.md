@@ -32,8 +32,8 @@ payloads and the provision-binding MAC use the KMS **app-scoped** key,
 so every node of the same Tapp app can open them; and each agentSeal
 is derived per seal by KMS on demand, so any node can provision any
 agent with no node-local key state. Multi-node has **not** been run
-yet — what it still needs: each node's TEE EOA in
-`AgenticID.trustedAttestors` (plus gas), a shared Postgres outside the
+yet — production uses one KMS stable app signer with instance-bound
+AgenticID authorization (plus gas), a shared Postgres outside the
 per-host compose, and the **indexer kept to a single instance** (its
 chain checkpoint is single-writer; two indexers would double-process
 events). Tracked as the node-federation workstream.
@@ -106,6 +106,8 @@ stay up.
 |---|---|---|
 | `GET /health` | Process-level liveness probe | — |
 | `GET /config` | Public config the frontend needs (chain RPC, contract addresses, appId, snapshot, etc.) | — |
+| `GET /inference/providers` | Versioned provider registry; `?version=N` reads verified accepted history for stop/start route continuity. Built-in seed is version 0 | public |
+| `PUT /admin/inference/providers` | Publish the full registry through HTTP; Postgres history + compare-and-swap, no SSH/restart. See [operator workflow](../sdk/typescript/PROVIDERS.md) | current attestor Tapp owner signature (EOA/EIP-1271) |
 
 ### Lifecycle (owner-driven)
 
@@ -122,8 +124,9 @@ stay up.
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `POST /provision` | Container exchanges credentials for `agentSeal_priv`, plus the owner's settings document (`encrypted_settings`, ECIES to the same container pubkey). This channel — not the sandbox env — because it runs on EVERY boot including a resume. The first boot after a push gets the new document; a container that keeps coming back without ever confirming it gets the last one that worked. The document half is additionally gated on a sandbox being on record (ghost container — every container this agent ever had holds the agentSeal key); the key half is not, because who may hold it is settled by the attestation | sandbox TEE signature + TappRegistry node validation + `validFrameworkHashes` allowlist |
-| `POST /status` | sealed heartbeat and status report. A `running` report promotes the settings version this boot was served to last-known-good — once, keyed on the version, so the repeating heartbeat cannot bless a document no boot exercised. An `error` report leaves the document alone: it fires on every failing heartbeat, and rolling back there made it impossible to land a change while an agent is unhealthy | agentSeal EIP-191 |
+| `GET /provision?seal_id=…` | Returns an enabled boot generation without its ticket; sealed uses it for its container private-key proof | public metadata |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, and a per-boot receipt (`status_binding_scheme: "agentdna-status-v2"` / `encrypted_status_binding`). The receipt binds the actual served settings version/digest and rotates on each accepted new boot. Modern provision requires a tracked sandbox; it returns 409 before create bookkeeping is persisted, which sealed retries within 180 seconds. Rejected provision requests never mutate or delete containers. Repeated unconfirmed boots still fall back to last-known-good. Modern registration prevents legacy protocol downgrade | sandbox TEE signature + node/image allowlists + owner-authorized ticket, generation and container private-key proof |
+| `POST /status` | sealed heartbeat/status. Signature covers boot receipt hash and applied settings digest; one transaction checks the active receipt and updates stage, liveness, and exact-version confirmation. Only matching current-version `running` / `warning` reports promote settings. Stale instances are ignored; errors leave settings unchanged. Legacy reports update liveness only before modern registration, and never promote settings | agentSeal raw-keccak signature + KMS HMAC boot receipt |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
@@ -131,7 +134,7 @@ stay up.
 | Path | Purpose |
 |---|---|
 | `GET /deployments` | List current deployments |
-| `GET /deployment/:seal_id` | Single deployment detail |
+| `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container pubkey + its MAC, or iData retry material) |
 | `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
@@ -141,8 +144,9 @@ Detailed signing canonicals live in `crates/shared/src/auth/`.
 
 | Contract | Purpose |
 |---|---|
-| **AgenticID** | NFT mint, iData registration, ServeProof verification, `validFrameworkHashes` allowlist |
-| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` calls `getNodeList` to validate the sandbox signer |
+| **AgenticID** | NFT mint, iData registration, `validFrameworkHashes` allowlist |
+| **VerifiedFeedbackRegistry** | Verifies ServeProofs — the agentSeal's EIP-191 version-0x00 signature `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, validator = this proxy — and records TEE marks over the canonical ERC-8004 reputation registry. The attestor never writes to it: it serves the address on `GET /config` and injects it into every new container as `VERIFIED_FEEDBACK_ADDR` (`ATTESTOR_VERIFIED_FEEDBACK_ADDR`); its one read is at worker / api startup, where `getIdentityRegistry()` must equal `ATTESTOR_AGENTIC_ID_ADDR` or startup fails |
+| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` validates the stable sandbox app signer and signed registration scope through authenticated discovery |
 | **SandboxServing** | Sandbox prepaid balance and voucher settlement. The frontend deploy gate requires owner balance ≥ 0.1 OG |
 
 For contract deploy, upgrade, and verify steps, see
@@ -160,6 +164,7 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_CHAIN_RPC` / `ATTESTOR_CHAIN_ID` | 0G chain RPC and chainId. The RPC URL is public (served in `GET /config` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
 | `ATTESTOR_AGENTIC_ID_ADDR` | AgenticID contract address |
+| `ATTESTOR_VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** bound to that AgenticID. Served on `GET /config` and injected into every new container as `VERIFIED_FEEDBACK_ADDR`, the ServeProof validator. Blank or the zero address ⇒ `/config` serves none and containers get an empty value, so they emit no `X-Agent-Proof`; a non-address value fails startup, and so does one whose `getIdentityRegistry()` is not `ATTESTOR_AGENTIC_ID_ADDR` (worker and api read it once at startup). Container env is set only at create, so a change needs each agent recreated (owner-signed `/reset`) |
 | `ATTESTOR_CANONICAL_8004_ADDR` | Canonical ERC-8004 IdentityRegistry (optional; auto-derived from chainId — mainnet `0x8004A169…`, testnet `0x8004A818…`) |
 | `ATTESTOR_TAPP_REGISTRY_ADDR` | TappRegistry contract address |
 | `ATTESTOR_PRIORITY_FEE_GWEI` / `ATTESTOR_MAX_FEE_GWEI` | EIP-1559 gas bounds (0G testnet requires `priority` ≥ 2) |
@@ -170,7 +175,7 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_APP_ID` | Attestor's own appId registered on TappRegistry |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | The other two Tapp apps to trust (used for the trust-roots ack) |
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the TEE EOA key and KMS-derived keys (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides KMS-derived encryption keys; production signing/discovery require the local socket (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
 | `MOCK_TEE` / `MOCK_KMS` | Dev mock switches |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | Required when `MOCK_TEE=true`. The priv key must derive the address (validated on startup) |
 | `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived subkeys diverge |
@@ -179,9 +184,9 @@ load-bearing ones, grouped:
 
 | env | Meaning |
 |---|---|
-| `ATTESTOR_SANDBOX_PROVIDER_ADDR` | Sandbox provider EOA (registered on SandboxServing) |
+| `ATTESTOR_SANDBOX_PROVIDER_ADDR` | Dev-only override (`MOCK_TEE=true`); production resolves app_signer from sandbox appId |
 | `ATTESTOR_SANDBOX_SERVING_ADDR` | SandboxServing contract address. The frontend deploy gate uses it to check owner balance ≥ 0.1 OG |
-| `ATTESTOR_SANDBOX_ENDPOINT` | 0g-sandbox HTTP endpoint |
+| `ATTESTOR_SANDBOX_ENDPOINT` | Dev-only locator; production uses the authorized on-chain HTTPS URL |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | Sealed runtime snapshot used when instantiating new agent containers. Bump this on image upgrade |
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
@@ -189,12 +194,14 @@ load-bearing ones, grouped:
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 
+Attestor and configured sealed images are released together. `/config.inference_capabilities` is derived from that release and the existing framework/snapshot configuration; there is no extra capability ENV. Administrative provider writes require the live owner of `ATTESTOR_APP_ID` in `ATTESTOR_TAPP_REGISTRY_ADDR`. See [rollout](../sdk/typescript/PROVIDERS.md).
+
 ### Storage (0g-storage)
 
 | env | Meaning |
 |---|---|
 | `ATTESTOR_STORAGE_INDEXER` | 0g-storage indexer URL (target for encrypted dataKey uploads). Public (recorded on chain in each iData entry's `dataDescription` and printed in agents' boot logs), so it must not embed a credential; see `.env.example` |
-| `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (attestor's TEE EOA needs 0G testnet gas) |
+| `MOCK_STORAGE` | When `true`, uses keccak256 as a stand-in for the real merkle root and skips upload. When `false`, uses the real SDK (stable app signer needs gas on the configured 0G chain) |
 
 ### Database / process
 
@@ -241,3 +248,11 @@ sandbox dependencies. A single test starts in ~6s.
 For the full regression procedure (local stack, live testnet, and the
 failure-triage table), see [TESTING.md](TESTING.md) —
 `scripts/e2e.sh` deploys, `scripts/verify-agent.sh` verifies.
+
+Live checks discover container URLs from the deployment/SDK and authenticate
+startup-log reads as the owner. CLI smoke uses a temporary config directory.
+Clone/transfer checks retain generated wallet keys in a temporary directory
+(or beneath `TEST_ARTIFACT_DIR`) with mode `0600`, so test assets remain
+recoverable after a failure; stop their containers after the run.
+
+Stable application identities and the production contract/TLS migration are documented in [APP_IDENTITY.md](APP_IDENTITY.md).

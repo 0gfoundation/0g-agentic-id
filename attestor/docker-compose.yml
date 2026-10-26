@@ -36,7 +36,7 @@ services:
 
   # All three services reach tapp-server on the host via
   # `host.docker.internal` when MOCK_TEE=false or MOCK_KMS=false (api/worker
-  # fetch the TEE EOA key; all three fetch the KMS secret). On Linux,
+  # fetch the stable app signer; all three fetch the KMS secret). On Linux,
   # host.docker.internal doesn't resolve by default — extra_hosts maps it
   # to the Docker host gateway.
   attestor-api:
@@ -44,7 +44,7 @@ services:
     container_name: attestor-api
     command: ["attestor-api"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./.env:/app/.env:ro
     extra_hosts:

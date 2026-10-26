@@ -1,6 +1,6 @@
 /**
  * @file doctor.ts
- * @description `0g-agenticid doctor` — six-point environment health check
+ * @description `0g-agentdna doctor` — six-point environment health check
  * (spec v0.03 §3.1): attestor, RPC, wallet, gas, trust-root ack, sandbox
  * balance. ALL six checks are always reported (pass/fail/skip) so even a
  * broken environment yields the full picture; a check whose prerequisite

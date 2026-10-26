@@ -1,6 +1,7 @@
 // Package report sends post-bootstrap status updates back to the attestor.
 //
-// Canonical message: "StatusReport:<seal_id_0x>:<status>:<error_detail>"
+// Canonical v2: "StatusReport.v2:<seal_id_0x>:<status>:<error_detail>:<receipt_sha256>:<settings_sha256>"
+// Legacy without a receipt: "StatusReport:<seal_id_0x>:<status>:<error_detail>"
 // hashed with raw keccak256 (NOT EIP-191), V=27/28. Signed by agent_seal_priv.
 //
 // Services declarations are NOT shipped here — /hello carries them
@@ -17,17 +18,60 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
+	"sync"
 
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/logger"
 )
 
+// Binding is root-process-only receipt material, never a subprocess env value.
+type Binding struct {
+	mu     sync.RWMutex
+	token  string
+	digest string
+}
+
+func NewBinding(token string) *Binding { return &Binding{token: token} }
+func (b *Binding) AdoptSettings(raw []byte) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.digest = ""
+	if len(raw) > 0 {
+		sum := sha256.Sum256(raw)
+		b.digest = hex.EncodeToString(sum[:])
+	}
+}
+func (b *Binding) snapshot() (string, string) {
+	if b == nil {
+		return "", ""
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.token, b.digest
+}
+
+func statusMessage(sealID, status, detail, token, digest string) string {
+	if token == "" {
+		return fmt.Sprintf("StatusReport:0x%s:%s:%s", sealID, status, detail)
+	}
+	h := sha256.Sum256([]byte(token))
+	return fmt.Sprintf("StatusReport.v2:0x%s:%s:%s:%x:%s", sealID, status, detail, h, digest)
+}
+
 // Status posts a status report (running / error / warning / starting / stopping)
 // for a sealId. Failures are logged; this is a best-effort notification.
-func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetail string) {
-	msg := fmt.Sprintf("StatusReport:0x%s:%s:%s", sealID, status, errorDetail)
+func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetail string, bindings ...*Binding) {
+	var binding *Binding
+	if len(bindings) > 0 {
+		binding = bindings[0]
+	}
+	token, digest := binding.snapshot()
+	msg := statusMessage(sealID, status, errorDetail, token, digest)
 	hash := crypto.Keccak256([]byte(msg))
 	priv, err := crypto.ToECDSA(agentSealPriv)
 	if err != nil {
@@ -41,21 +85,36 @@ func Status(attestorURL string, agentSealPriv []byte, sealID, status, errorDetai
 	}
 	sig[64] += 27
 
-	reqBody, _ := json.Marshal(map[string]any{
+	body := map[string]any{
 		"seal_id":              "0x" + sealID,
 		"status":               status,
 		"error_detail":         errorDetail,
 		"agent_seal_signature": "0x" + hex.EncodeToString(sig),
-	})
+	}
+	if token != "" {
+		body["status_binding"] = token
+	}
+	if digest != "" {
+		body["settings_digest"] = "0x" + digest
+	}
+	reqBody, _ := json.Marshal(body)
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("FAIL status: attestor identity: %v", err)
+		return
+	}
 	resp, err := client.Post(attestorURL+"/status", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("FAIL status: POST error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("FAIL status: response body: %v", err)
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("FAIL status: HTTP %d: %s", resp.StatusCode, string(respBody))
 		return
@@ -108,14 +167,22 @@ func SeedSettings(attestorURL string, agentSealPriv []byte, sealID string, doc [
 		"agent_seal_signature": "0x" + hex.EncodeToString(sig),
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("warn: settings seed: attestor identity: %v", err)
+		return
+	}
 	resp, err := client.Post(attestorURL+"/settings/seed", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("warn: settings seed: POST error: %v", err)
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("warn: settings seed: response body: %v", err)
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("warn: settings seed: HTTP %d: %s", resp.StatusCode, string(body))
 		return
