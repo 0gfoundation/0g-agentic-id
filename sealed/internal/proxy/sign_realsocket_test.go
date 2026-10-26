@@ -45,7 +45,9 @@ func newRealSocketSignServer(t *testing.T) (sockPath, sealAddr string) {
 	sealAddr = crypto.PubkeyToAddress(key.PublicKey).Hex()
 
 	st := state.New()
-	st.Set(priv, "http://upstream", "seal-id", "0xowner", "466", "fw-hash", "16602", "0xident")
+	// 9 args incl. dev's validator (#175) — the fake-socket tests pass it; a
+	// stale 8-arg call here broke the whole package's build at f360b6d.
+	st.Set(priv, "http://upstream", "seal-id", "0xowner", "466", "fw-hash", "16602", "0xident", "0xvalidator")
 
 	dir := t.TempDir()
 	sockPath = filepath.Join(dir, "sign.sock")
@@ -215,28 +217,44 @@ func TestSignTypedDataRealSocket(t *testing.T) {
 func TestSignTransactionRejectsNegativeAmounts(t *testing.T) {
 	sock, _ := newRealSocketSignServer(t)
 	to := "0x2ce80374318b1d7fb3345724457a182e0ad165c9"
+	// 2^256: parses fine, overflows every uint256 tx field.
+	overflow := "0x1" + strings.Repeat("0", 64)
 
 	cases := []struct {
-		name string
-		body map[string]any
+		name    string
+		body    map[string]any
+		wantMsg string
 	}{
 		{"negative value", map[string]any{
 			"chain_id": "16602", "nonce": 1, "to": to, "value": "-1",
 			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "1",
-		}},
+		}, "value: negative"},
 		{"negative legacy gas_price", map[string]any{
 			"chain_id": "16602", "nonce": 1, "to": to,
 			"data": "0x", "gas_limit": 21000, "type": "legacy", "gas_price": "-7",
-		}},
-		{"negative 1559 fee", map[string]any{
+		}, "gas_price: negative"},
+		{"negative 1559 max_fee", map[string]any{
 			"chain_id": "16602", "nonce": 1, "to": to,
 			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "-1000", "max_priority_fee_per_gas": "1",
-		}},
+		}, "max_fee_per_gas: negative"},
+		{"negative 1559 tip", map[string]any{
+			"chain_id": "16602", "nonce": 1, "to": to,
+			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "-1",
+		}, "max_priority_fee_per_gas: negative"},
+		{"value at 2^256", map[string]any{
+			"chain_id": "16602", "nonce": 1, "to": to, "value": overflow,
+			"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "1",
+		}, "value: exceeds uint256"},
 	}
 	for _, c := range cases {
 		code, out := sockPost(t, sock, "/sign/transaction", c.body)
 		if code != http.StatusBadRequest {
 			t.Errorf("%s: got %d %v, want 400", c.name, code, out)
+		}
+		// The 400 must NAME the field — a generic message sends the caller
+		// hunting through five amount fields.
+		if !strings.Contains(fmt.Sprint(out), c.wantMsg) {
+			t.Errorf("%s: error %v does not name the field (want %q)", c.name, out, c.wantMsg)
 		}
 	}
 }

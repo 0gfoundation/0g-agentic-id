@@ -7,10 +7,13 @@
  * socket — the point is the CHANNEL: a native tool call lands in the session
  * log as a structured record (name, arguments, turn, surrounding context), so
  * every signature the agent issues is auditable after the fact. seal-guard
- * (sibling plugin) closes the shell path to the socket by denying tool calls
- * that name the socket path or the SEAL_SIGN_SOCK variable — a steer, not an
- * enforcement: other indirections still get past it, and the session log is
- * not tamper-evident. Prefer the tools because they are the logged channel.
+ * (sibling plugin) steers the shell path away from the socket's SIGN
+ * endpoints by denying tool calls that name a socket spelling AND a /sign/
+ * path — a steer, not an enforcement: other indirections still get past it,
+ * and the session log is not tamper-evident. The socket's /settings endpoint
+ * is NOT guarded: the platform doc tells the agent to curl it (there is no
+ * structured-tool equivalent), and it signs nothing. Prefer the tools for
+ * signing because they are the logged channel.
  *
  * The three sign tools map the socket's three sign endpoints one-to-one
  * (personal_sign / typed_data / transaction). That is deliberate parity: the

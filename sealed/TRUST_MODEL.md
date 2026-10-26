@@ -768,11 +768,13 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 In the DSH composition, `seal-guard.mjs` steers the model toward the
 native tools (`seal_sign`, `seal_sign_typed_data`,
 `seal_sign_transaction` — one per endpoint, every call a structured
-session-log record) by denying tool calls that name the socket path or
-the `SEAL_SIGN_SOCK` variable. That is a steer, not an enforcement:
-other indirections still get past it, and the session log is not
-tamper-evident. The other frameworks reach the socket however their
-own composition allows.
+session-log record) by denying tool calls that name a socket spelling
+AND a `/sign/` path. The socket's `/settings` endpoint is deliberately
+NOT guarded: the platform doc tells the agent to curl it (no structured
+tool exists for it), and it signs nothing. That is a steer, not an
+enforcement: other indirections still get past it, and the session log
+is not tamper-evident. The other frameworks reach the socket however
+their own composition allows.
 
 What the socket **never** signs, by invariant (`sealed/internal/proxy/sign.go`):
 

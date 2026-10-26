@@ -105,7 +105,14 @@ Endpoints (all POST, all JSON):
 
 These are the only three shapes the socket signs: an EIP-191 `0x19 0x45` personal message, an EIP-712 `0x19 0x01` digest, or a transaction it assembles from the fields. It has no raw-hash signing and no EIP-191 version `0x00` (intended-validator) signing, by design: that is the domain your serve-proofs are signed in, so nothing you sign here can stand in for one.
 
-Mechanics: POST JSON over the unix socket at `$SEAL_SIGN_SOCK` (details in the runtime docs). Do not shell out to it: use your framework's native sign tools where they exist, so every signature is a structured session-log record instead of an opaque command string.
+Example (curl over unix socket):
+
+    curl --unix-socket "$SEAL_SIGN_SOCK" \
+      -H 'Content-Type: application/json' \
+      -d '{"message":"hello"}' \
+      http://localhost/sign/personal_sign
+
+If your framework's tool list includes native sign tools, prefer them: a native tool call lands in the session log as a structured record, while a shell command is an opaque string. If it does not, the curl route above is the documented way to reach the socket — the socket is the capability, the tool is just the preferred channel.
 
 ### When to use agentSeal
 
