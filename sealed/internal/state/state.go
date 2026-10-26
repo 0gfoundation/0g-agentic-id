@@ -87,9 +87,12 @@ type Agent struct {
 	frameworkHash string
 	// Serve-proof domain (Phase 2). chainID (decimal) and identityAddr (the
 	// AgenticID contract) are signed into the proof digest so a copied proof
-	// can't be replayed across chains or protocol deployments.
+	// can't be replayed across chains or protocol deployments. validator is
+	// the VerifiedFeedbackRegistry proxy (VERIFIED_FEEDBACK_ADDR) the EIP-191
+	// v0x00 signature is bound to; empty means no serve-proof is signed.
 	chainID      string
 	identityAddr string
+	validator    string
 
 	// Two snapshots; see package doc.
 	chainSnapshot   Snapshot
@@ -136,7 +139,7 @@ func (a *Agent) SetPhase(p Phase) {
 // UpdateCurrentSnapshot.
 //
 // Transitions phase to PhaseRunning.
-func (a *Agent) Set(priv []byte, upstream, sealID, owner, agentID, frameworkHash, chainID, identityAddr string) {
+func (a *Agent) Set(priv []byte, upstream, sealID, owner, agentID, frameworkHash, chainID, identityAddr, validator string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.agentSealPriv = append([]byte(nil), priv...)
@@ -147,6 +150,7 @@ func (a *Agent) Set(priv []byte, upstream, sealID, owner, agentID, frameworkHash
 	a.frameworkHash = frameworkHash
 	a.chainID = chainID
 	a.identityAddr = identityAddr
+	a.validator = validator
 	a.phase = PhaseRunning
 }
 
@@ -159,12 +163,15 @@ func (a *Agent) ProofIdentity() (agentID, frameworkHash string) {
 }
 
 // ProofDomain returns the serve-proof domain fields (chainID decimal string,
-// identityAddr the AgenticID contract). Signed into the proof digest for
-// cross-chain / cross-deployment separation. Empty in local dev without a chain.
-func (a *Agent) ProofDomain() (chainID, identityAddr string) {
+// identityAddr the AgenticID contract, validator the VerifiedFeedbackRegistry
+// proxy). chainID + identityAddr are signed into the proof hash for
+// cross-chain / cross-deployment separation; validator is the EIP-191 v0x00
+// intended validator the digest is bound to. Empty in local dev without a
+// chain (and validator empty whenever VERIFIED_FEEDBACK_ADDR is unusable).
+func (a *Agent) ProofDomain() (chainID, identityAddr, validator string) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.chainID, a.identityAddr
+	return a.chainID, a.identityAddr, a.validator
 }
 
 // Clear resets identity fields and snapshots. Used when the agent process
@@ -180,6 +187,7 @@ func (a *Agent) Clear() {
 	a.frameworkHash = ""
 	a.chainID = ""
 	a.identityAddr = ""
+	a.validator = ""
 	a.chainSnapshot = Snapshot{PerDim: map[string]DimEntry{}}
 	a.currentSnapshot = Snapshot{PerDim: map[string]DimEntry{}}
 	a.phase = PhaseBootstrapping

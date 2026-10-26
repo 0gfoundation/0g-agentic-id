@@ -1,4 +1,11 @@
-# The sealed sandbox image, node/openclaw flavour. Images are per
+# NOT the openclaw sealed image that ships. That one (zg-sealed/0g-sealed)
+# is built by sealed/Dockerfile, FROM the openclaw base that
+# sealed/images/openclaw/ builds; it was matched against the production
+# image by layer digest (#130). This file copies in no bootstrap binary (see
+# "No CMD" below). It is the universal-image target FRAMEWORK_ADAPTER.md
+# describes, for a deployment that ships it.
+#
+# A universal sealed sandbox image, node flavour. Images are per
 # framework runtime (this one carries node; images/hermes/ carries
 # python/uv — see that Dockerfile's header for why they're split), but
 # which adapter actually runs is still decided at boot by the agent's

@@ -1,11 +1,11 @@
 /**
  * @file envelope.ts
- * @description Output discipline for the `0g-agenticid` CLI — the gene-layer
+ * @description Output discipline for the `0g-agentdna` CLI — the gene-layer
  * contract of spec v0.03 §2.2:
  *
  *   - stdout carries DATA ONLY. With `--json` that is exactly one
  *     `{ok, data} | {ok, error}` envelope per invocation, so
- *     `0g-agenticid … --json | jq` never sees anything else.
+ *     `0g-agentdna … --json | jq` never sees anything else.
  *   - Human-facing progress/notes go to stderr, in both modes.
  *   - bigint values serialize as strings (JSON numbers lose precision past
  *     2^53 — agentIds are uint256 on chain).

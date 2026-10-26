@@ -52,7 +52,7 @@ export interface SealedKeyEntry {
 
 /**
  * Serve proof — attests that an agent served a task at a specific time.
- * No client binding: attribution is via msg.sender at submission.
+ * Attribution is msg.sender at submission; redemption is bound to `submitter`.
  * @struct
  */
 export interface ServeProof {
@@ -72,8 +72,15 @@ export interface ServeProof {
   dataHashes: `0x${string}`[];
   /** Hash of the agent framework version */
   frameworkHash: `0x${string}`;
-  /** EIP-191 signature from agentSeal over the proof payload */
+  /** agentSeal signature: EIP-191 version 0x00 (data with intended validator
+   *  = the VerifiedFeedbackRegistry proxy) over the proof's abi.encode hash —
+   *  see buildServeProofSigningHash. NOT personal_sign. */
   signature: `0x${string}`;
+  /** The VerifiedFeedbackRegistry the sealed proxy signed this proof for, as
+   *  echoed in the X-Agent-Proof envelope. Diagnostics only: unsigned, NOT part
+   *  of the on-chain ServeProof tuple (the registry uses its own address), and
+   *  absent on proofs from images that predate it. */
+  validator?: `0x${string}`;
 }
 
 /**
@@ -265,7 +272,7 @@ export interface GiveFeedbackParams {
  * Opening of a ServeProof's `taskHash` commitment — the receipt materials of
  * the exact interaction that earned the proof. The sealed proxy computes
  * taskHash = keccak256(method ‖ uri ‖ keccak256(reqBody) ‖ keccak256(respBody)
- * ‖ decimal status), so revealing these five values (bodies stay private —
+ * ‖ 3-digit decimal status), so revealing these five values (bodies stay private —
  * only hashes go on-chain) lets the VerifiedFeedbackRegistry verify WHICH
  * endpoint the interaction hit and record it as the entry's TEE-verified
  * endpoint.
@@ -279,7 +286,9 @@ export interface TaskReveal {
   reqBodyHash: `0x${string}`;
   /** keccak256 of the raw response body bytes as received. */
   respBodyHash: `0x${string}`;
-  /** HTTP status code of the response. */
+  /** HTTP status code of the response — an integer in 100..999. The registry
+   *  hashes it as fixed-width 3-digit decimal and rejects anything else
+   *  (VerifiedFeedbackInvalidTaskReveal); the SDK refuses it before broadcast. */
   statusCode: number;
 }
 

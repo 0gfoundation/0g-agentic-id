@@ -126,6 +126,20 @@ use crate::tapp_grpc;
 use crate::Config;
 use tonic::transport::Channel;
 
+fn secret_from_response(resp: tapp_grpc::proto::GetSecretResourceResponse) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(resp.success, "GetSecretResource failed: {}", resp.message);
+    anyhow::ensure!(resp.secret.len() == 32,
+        "GetSecretResource bad secret length: {}", resp.secret.len());
+    crate::tee::validate_measured_commitment(
+        &resp.commitment_scheme,
+        &resp.commitment,
+        resp.measured_in_evidence,
+    )?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&resp.secret);
+    Ok(out)
+}
+
 /// Fetches KMS-derived key material via tapp-server's `GetSecretResource`
 /// RPC. tapp-server signs the upstream KMS request with its in-memory key,
 /// decrypts the ECIES response, and returns the 32-byte plaintext to us
@@ -179,16 +193,7 @@ impl TappKmsClient {
 
             let err = match outcome {
                 Ok(Ok(r)) => {
-                    let resp = r.into_inner();
-                    if !resp.success {
-                        anyhow::bail!("GetSecretResource failed: {}", resp.message);
-                    }
-                    if resp.secret.len() != 32 {
-                        anyhow::bail!("GetSecretResource bad secret length: {}", resp.secret.len());
-                    }
-                    let mut out = [0u8; 32];
-                    out.copy_from_slice(&resp.secret);
-                    return Ok(out);
+                    return secret_from_response(r.into_inner());
                 }
                 Ok(Err(e)) => anyhow::anyhow!("GetSecretResource RPC failed: {}", e),
                 Err(_) => anyhow::anyhow!(
@@ -235,6 +240,38 @@ impl KmsClient for TappKmsClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn measured_response() -> tapp_grpc::proto::GetSecretResourceResponse {
+        tapp_grpc::proto::GetSecretResourceResponse {
+            success: true,
+            secret: vec![255; 32],
+            commitment_scheme: "poseidon-bn254-4-v1".into(),
+            commitment: vec![1; 32],
+            measured_in_evidence: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generic_secret_remains_opaque_even_outside_curve_scalar_ranges() {
+        assert_eq!(secret_from_response(measured_response()).unwrap(), [255; 32]);
+    }
+
+    #[test]
+    fn generic_secret_requires_measured_canonical_commitment() {
+        let mutations: [fn(&mut tapp_grpc::proto::GetSecretResourceResponse); 5] = [
+            |r| r.success = false,
+            |r| r.secret.truncate(31),
+            |r| r.measured_in_evidence = false,
+            |r| r.commitment_scheme = "other".into(),
+            |r| r.commitment = vec![255; 32],
+        ];
+        for mutate in mutations {
+            let mut response = measured_response();
+            mutate(&mut response);
+            assert!(secret_from_response(response).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn mock_kms_app_key_is_deterministic() {

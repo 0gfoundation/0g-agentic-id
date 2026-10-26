@@ -56,6 +56,7 @@ export type SecretEnvMode = 'auto' | 'sealed' | 'plaintext';
  *  signed or sent. */
 export type SecretEnvRefusalCode =
   /** `secretEnv` is not 'auto' | 'sealed' | 'plaintext'. */
+  | 'provider_binding_unsupported'
   | 'invalid_mode'
   /** Both `apiKey` and `sealedSecretEnv`, or `sealedSecretEnv` with 'plaintext'. */
   | 'conflicting_inputs'
@@ -177,9 +178,18 @@ function randomValidPriv(): Uint8Array {
  * the envelope (the container requires it to be the agent's on-chain owner).
  * Returns the base64 value for `env.SEAL_SECRET_ENV`.
  */
-export function sealSecretEnv(agentSealPubkey: Hex, owner: Address, env: Record<string, string>): string {
+export function sealSecretEnv(agentSealPubkey: Hex, owner: Address, env: Record<string, string>, provider?: string, routeHash?: string, registry?: import('./Providers').ProviderRegistryPin): string {
+  if (provider !== undefined && !/^[a-z0-9][a-z0-9-]*$/.test(provider)) {
+    throw new SecretEnvRefusedError('invalid_input', 'invalid inference provider');
+  }
+  if (routeHash && (!provider || !/^0x[0-9a-f]{64}$/.test(routeHash))) throw new SecretEnvRefusedError('invalid_input', 'invalid credential route hash');
+  if (routeHash && (!registry || !Number.isSafeInteger(registry.version) || registry.version < 0 ||
+      (registry.version > 0 ? !/^0x[0-9a-f]{64}$/.test(registry.digest ?? '') : registry.digest !== undefined))) {
+    throw new SecretEnvRefusedError('invalid_input', 'v3 credentials require an accepted registry version and digest');
+  }
+  if (registry && !routeHash) throw new SecretEnvRefusedError('invalid_input', 'registry binding requires v3');
   const plaintext = new TextEncoder().encode(
-    JSON.stringify({ v: 1, owner: getAddress(owner), env }),
+    JSON.stringify(routeHash ? { v: 3, owner: getAddress(owner), provider, route_hash: routeHash, registry, env } : provider === undefined ? { v: 1, owner: getAddress(owner), env } : { v: 2, owner: getAddress(owner), provider, env }),
   );
   return base64(eciesEncrypt(hexToBytes(agentSealPubkey), plaintext));
 }
