@@ -150,7 +150,10 @@ export function proofRecordingFetch(
   return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     // A Request as input: clone it BEFORE fetch consumes its body, so the
     // request bytes stay recoverable if the response turns out signed.
-    const reqClone = input instanceof Request && input.body ? input.clone() : null;
+    // init.body (when set) overrides the Request's own body on the wire —
+    // clone only when the Request's body is what will actually be sent.
+    const reqClone =
+      input instanceof Request && input.body && init?.body === undefined ? input.clone() : null;
     const response = await fetch(input, init);
     // Record the task only when the response carries X-Agent-Proof: a
     // signed response is always finite (the proxy buffers it whole), so
@@ -318,11 +321,13 @@ export class ServeSession {
    * taskHash = keccak(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖
    * status) from your bytes and compares it to the proof's commitment — a
    * genuine proof attached to a different response body yields
-   * `taskMatches: false` and `ok: false`.
+   * `taskMatches: false` and `ok: false`. An explicit `task: null` (what
+   * the recorders return when the exchange wasn't captured) fails closed:
+   * `ok: false`, never a silent fall-back to signer-only.
    */
   async verifyProof(
     proof: ServeProof,
-    opts?: { task?: TaskReveal | TaskExchange },
+    opts?: { task?: TaskReveal | TaskExchange | null },
   ): Promise<ProofVerification> {
     const reasons: string[] = [];
 

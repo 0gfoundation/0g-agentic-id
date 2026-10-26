@@ -1185,7 +1185,13 @@ export class ReputationApi {
   capture(call: () => Promise<Response>) { return captureProof(call); }
   proofFromResponse(res: Response): ServeProof | null { return proofFromResponse(res); }
   parseServeProofHeader(value: string): ServeProof { return parseServeProofHeader(value); }
-  verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
+  /** Verify a serve-proof. Without `opts.task`: signer attribution only.
+   *  With a task (a TaskReveal, the TaskExchange a recorder returned, or
+   *  null for "not recorded") the verdict additionally binds the proof to
+   *  that exchange's bytes — see ServeSession.verifyProof. */
+  verifyProof(proof: ServeProof, opts?: { task?: TaskReveal | TaskExchange | null }) {
+    return this.session.verifyProof(proof, opts);
+  }
 
   // — feedback (canonical write + TEE verification mark, bundled) —
   giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> { return this.rep.giveFeedback(params); }

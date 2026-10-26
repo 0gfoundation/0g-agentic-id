@@ -634,3 +634,125 @@ test('verifyProof: an explicit task: null fails closed, not signer-only', async 
   assert.equal(v2.taskMatches, null);
   assert.equal(v2.ok, true);
 });
+
+// ── round-4 pins: the non-blocking rule and the capture shapes ──
+
+test('unsigned INFINITE SSE: both wrappers resolve promptly, task null', async () => {
+  // A never-ending event stream with no X-Agent-Proof. Reintroducing an
+  // unconditional body await would hang this test (the old bug: the MCP
+  // listener GET never resolved).
+  const srv = nodeHttp.createServer((req, res) => {
+    if (req.url === '/hello') {
+      // discovery must complete — only the SERVICE path hangs
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ agent: seal.address, owner: seal.address, services: [], routes: [] }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write('data: chunk\n\n');
+    // deliberately never end
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${srv.address().port}`;
+  const api = new AgentApi({
+    addresses: {},
+    publicClient: { readContract: async () => { throw new Error('no reads expected'); } },
+  });
+  try {
+    const client = await api.client(base);
+    const t0 = Date.now();
+    const rec = await client.fetchWithProof('/api/mcp', { method: 'POST', body: MCP_REQ });
+    const dt1 = Date.now() - t0;
+    assert.equal(rec.proof, null);
+    assert.equal(rec.task, null);
+    assert.ok(dt1 < 1000, `fetchWithProof took ${dt1}ms on an unsigned stream — must not await the body`);
+
+    const log = [];
+    const t1 = Date.now();
+    const r2 = await proofRecordingFetch(log)(`${base}/api/mcp`, { method: 'POST', body: MCP_REQ });
+    const dt2 = Date.now() - t1;
+    assert.equal(log[0].proof, null);
+    assert.equal(log[0].task, null);
+    assert.ok(dt2 < 1000, `proofRecordingFetch took ${dt2}ms — must not await the body`);
+    await r2.body?.cancel(); // release the socket
+  } finally {
+    srv.closeAllConnections?.();
+    srv.close();
+  }
+});
+
+test('requestBytesOf: table of wire shapes — captured or null, never wrong', async () => {
+  const { requestBytesOf } = await import('../dist/ServeSession.js');
+  assert.equal(requestBytesOf(undefined), '', 'no body → empty');
+  assert.equal(requestBytesOf(null), '');
+  assert.equal(requestBytesOf('raw string'), 'raw string');
+  const u8 = new Uint8Array([1, 2, 3]);
+  assert.equal(requestBytesOf(u8), u8, 'Uint8Array passes through');
+  const ab = new Uint8Array([9, 8, 7]).buffer;
+  assert.deepEqual(requestBytesOf(ab), new Uint8Array([9, 8, 7]), 'ArrayBuffer → view');
+  assert.equal(requestBytesOf(new URLSearchParams({ a: 'b', c: 'd' })), 'a=b&c=d',
+    'URLSearchParams → its toString(), exactly what undici sends');
+  const pool = new Uint8Array([0, 1, 2, 3, 4, 5]);
+  const dv = new DataView(pool.buffer, 2, 3); // subview with offset
+  assert.deepEqual(requestBytesOf(dv), new Uint8Array([2, 3, 4]), 'DataView subview, offset respected');
+  assert.equal(requestBytesOf(new Blob(['x'])), null, 'Blob → null (async, not a wrong stand-in)');
+  assert.equal(requestBytesOf(new FormData()), null, 'FormData → null');
+  assert.equal(requestBytesOf(new ReadableStream()), null, 'ReadableStream → null');
+});
+
+test('normalizedMethod: exactly the six fetch-normalized methods uppercased', async () => {
+  const { normalizedMethod } = await import('../dist/ServeSession.js');
+  assert.equal(normalizedMethod('get'), 'GET');
+  assert.equal(normalizedMethod('head'), 'HEAD');
+  assert.equal(normalizedMethod('post'), 'POST');
+  assert.equal(normalizedMethod('put'), 'PUT');
+  assert.equal(normalizedMethod('delete'), 'DELETE');
+  assert.equal(normalizedMethod('options'), 'OPTIONS');
+  assert.equal(normalizedMethod('patch'), 'patch', 'fetch sends patch as written');
+  assert.equal(normalizedMethod('Patch'), 'Patch');
+  assert.equal(normalizedMethod('CUSTOM'), 'CUSTOM');
+  assert.equal(normalizedMethod(undefined), 'GET');
+});
+
+test('proofRecordingFetch: a Request input records its own method and body', async () => {
+  const signed = await signServeProof(
+    proofParams({ taskHash: mcpHash(MCP_REQ, MCP_RESP) }), (h) => seal.sign({ hash: h }));
+  const s = mcpServer(signed);
+  await s.start();
+  try {
+    const log = [];
+    const req = new Request(`http://127.0.0.1:${s.port()}/api/mcp`, {
+      method: 'POST', body: MCP_REQ, headers: { 'content-type': 'application/json' },
+    });
+    const response = await proofRecordingFetch(log)(req);
+    await response.text();
+    const { session } = mkSession(VFR);
+    const v = await session.verifyProof(log[0].proof, { task: log[0].task });
+    assert.equal(v.taskMatches, true, 'Request-input body recorded from its clone');
+    assert.equal(v.ok, true);
+  } finally {
+    s.server.close();
+  }
+});
+
+test('proofRecordingFetch: init.body OVERRIDES the Request body — the override is recorded', async () => {
+  const OVERRIDE = '{"jsonrpc":"2.0","id":1,"method":"override"}';
+  const signed = await signServeProof(
+    proofParams({ taskHash: mcpHash(OVERRIDE, MCP_RESP) }), (h) => seal.sign({ hash: h }));
+  const s = mcpServer(signed);
+  await s.start();
+  try {
+    const log = [];
+    const req = new Request(`http://127.0.0.1:${s.port()}/api/mcp`, {
+      method: 'POST', body: MCP_REQ, // the STALE body — must NOT be what's recorded
+    });
+    const response = await proofRecordingFetch(log)(req, { body: OVERRIDE });
+    await response.text();
+    const { session } = mkSession(VFR);
+    const v = await session.verifyProof(log[0].proof, { task: log[0].task });
+    assert.equal(v.taskMatches, true, 'init.body override recorded, not the Request clone');
+    assert.equal(v.ok, true);
+  } finally {
+    s.server.close();
+  }
+});

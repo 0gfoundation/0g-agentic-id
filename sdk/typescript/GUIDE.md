@@ -322,8 +322,9 @@ const data = await response.json();                   // your normal response bo
 await ag.reputation.verifyProof(proof);
 // → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
 //     taskMatches: null, reasons: [] }
-// signer attribution only. Pass { task } (what fetchWithProof recorded, or a
-// TaskReveal from taskRevealOf) to also get taskMatches — the proof bound to
+// signer attribution only. Pass { task } (the TaskExchange fetchWithProof
+// recorded — or one element of taskRevealOf(...)'s array, since it returns
+// one reveal per URI candidate) to also get taskMatches — the proof bound to
 // THIS exchange's bytes; ok requires the match, and task: null fails closed.
 // registryMatches: false (signerMatches false too) = no VerifiedFeedbackRegistry is configured
 // ('no VerifiedFeedbackRegistry configured — cannot verify serve-proof') or the envelope names

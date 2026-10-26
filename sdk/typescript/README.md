@@ -170,7 +170,7 @@ import { keccak256, toBytes } from 'viem';
 
 // 1. call one of the agent's signed /api/* services and capture the proof (public handle needs no wallet)
 const agent = await ag.agent.connect(agentId);
-const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+const { response, proof, task } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
 // proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature,
@@ -179,11 +179,12 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
 
 // 2. verify before spending gas — the signature is bound to addresses.verifiedFeedback
 //    (fromAttestor fills it); registryMatches: false = none configured / a different one
-await ag.reputation.verifyProof(proof);
-// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
-// pass { task } (the exchange fetchWithProof/taskRevealOf recorded) to also
-// get taskMatches — the proof bound to THIS response's bytes, not just the
-// signer; ok requires it. task: null (unrecorded) fails closed with ok: false.
+await ag.reputation.verifyProof(proof, { task });
+// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, taskMatches, reasons }
+// pass { task } (the TaskExchange fetchWithProof recorded — or one element of
+// taskRevealOf(...)'s array for a hand-rolled fetch) to also get taskMatches —
+// the proof bound to THIS response's bytes, not just the signer; ok requires
+// it. task: null (unrecorded) fails closed with ok: false.
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
