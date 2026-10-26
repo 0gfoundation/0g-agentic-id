@@ -126,7 +126,7 @@ Sandbox creation overrides `ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_URL` and
 `ATTESTOR_ALLOW_UNPINNED_DEV` after all other environment fields. Production supplies
 only public scope, app instance, app signer, TLS pins, expiry and the claimed Scan
 URL/SPKI trust anchor; the dev bypass is forced false. The sealed runtime keeps the
-existing attestor locator and pins HTTPS for `/provision` and `/status`. It independently
+existing attestor locator and pins HTTPS for `/provision`, `/status`, settings and provider-registry reads. It independently
 refreshes identities through pinned Scan; appId, chain/registry, registration epoch,
 app signer and locator cannot change. It never accepts the app's own claims as a lease
 renewal. Changing the Scan trust anchor or app instance requires recreating runtimes.
@@ -171,3 +171,8 @@ containers require an owner-authorized reset; preserve runtime state beforehand.
 Reset retains the agentId, agentSeal and committed iData/settings, and creates a new
 container identity with a v2 proof. This upgrade does not silently re-sign v1 proofs
 or add retired nodes back to the active list.
+
+The stored image binding authenticates a reusable v2 image proof. Each PID-1 boot
+also proves possession of its container key against the current boot ticket and
+generation, and receives an encrypted status receipt. Resuming the same image
+proof does not permit replaying an old boot claim or status receipt.

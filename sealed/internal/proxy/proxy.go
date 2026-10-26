@@ -87,9 +87,10 @@ type Server struct {
 	// adapters that don't serve one natively.
 	synth *synthHub
 
-	readSettings  SettingsReader
-	applySettings SettingsApplier
-	applyClear    ClearApplier
+	readSettings        SettingsReader
+	readRuntimeSettings func() RuntimeSettings
+	applySettings       SettingsApplier
+	applyClear          ClearApplier
 
 	// compact backs POST /_seal/compact (compact.go): its applier plus the
 	// single-flight and replay guards, under their own lock.

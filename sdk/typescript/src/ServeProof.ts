@@ -191,7 +191,7 @@ export function buildServeProof(
  *
  * @example
  * ```typescript
- * import { signServeProof } from '@0gfoundation/0g-agenticid-sdk';
+ * import { signServeProof } from '0g-agentdna';
  *
  * const proof = await signServeProof(
  *   { chainId: 16602n, verifyingContract: '0x...', submitter: '0x...',

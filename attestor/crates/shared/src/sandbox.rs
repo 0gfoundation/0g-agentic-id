@@ -403,6 +403,13 @@ impl HttpSandbox {
     }
 }
 
+fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticket: Option<&str>) {
+    env.remove("SEAL_BOOT_TICKET");
+    if let Some(ticket) = ticket {
+        env.insert("SEAL_BOOT_TICKET".into(), ticket.into());
+    }
+}
+
 #[async_trait]
 impl SandboxClient for HttpSandbox {
     async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
@@ -428,6 +435,7 @@ impl SandboxClient for HttpSandbox {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
+        boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse> {
         // Sandbox's auth middleware only validates the three X- headers
         // against `signed_message_b64` — it does NOT cross-check that the
@@ -480,6 +488,7 @@ impl SandboxClient for HttpSandbox {
         // Own Scan refresh can block; acquire the sandbox lease afterwards.
         let connection = self.connection().await?;
         self.check_provider(&canonical, &connection)?;
+        apply_boot_ticket(env_obj, boot_ticket);
 
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
@@ -525,7 +534,7 @@ impl SandboxClient for HttpSandbox {
         // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
         let parsed: SandboxCreateResponse = serde_json::from_str(&body)
-            .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e} — body={body}"))?;
+            .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e}"))?;
         tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
         Ok(parsed)
     }
@@ -1090,7 +1099,10 @@ mod tests {
         let env = &obj["env"];
         assert_eq!(env["ATTESTOR_URL"], "http://attestor");
         assert_eq!(env["AGENTIC_ID_ADDR"], "0xa9");
-        assert_eq!(env["VERIFIED_FEEDBACK_ADDR"], "", "blank must still override");
+        assert_eq!(
+            env["VERIFIED_FEEDBACK_ADDR"], "",
+            "blank must still override"
+        );
         // Keys the attestor does not own pass through untouched.
         assert_eq!(env["API_KEY"], "sk-owner");
 
@@ -1117,7 +1129,10 @@ mod tests {
         let mut obj = serde_json::Map::new();
         obj.insert("env".into(), serde_json::json!("K=V"));
         let err = apply_attestor_env(&mut obj, "http://attestor", &extra).unwrap_err();
-        assert!(err.to_string().contains("env must be a JSON object"), "got: {err}");
+        assert!(
+            err.to_string().contains("env must be a JSON object"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1233,5 +1248,18 @@ mod tests {
         // Most important: AdminSigner.address == envelope's wallet_address
         // == recovered address.
         assert_eq!(envelope.wallet_address, signer.address);
+    }
+    #[test]
+    fn boot_ticket_is_reserved_for_attestor_create_not_owner_env() {
+        let mut env =
+            serde_json::json!({"SEAL_BOOT_TICKET":"forged-owner-value","API_KEY":"other"})
+                .as_object()
+                .unwrap()
+                .clone();
+        apply_boot_ticket(&mut env, Some("attestor-ticket"));
+        assert_eq!(env["SEAL_BOOT_TICKET"], "attestor-ticket");
+        assert_eq!(env["API_KEY"], "other");
+        apply_boot_ticket(&mut env, None);
+        assert!(!env.contains_key("SEAL_BOOT_TICKET"));
     }
 }

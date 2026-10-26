@@ -76,9 +76,8 @@ async fn main() -> anyhow::Result<()> {
     let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
-    // Share the worker's discovery client: /provision authenticates the
-    // sandbox app signer/scope and cleanup uses the attestor's app signer.
-    // Container create/start/stop operations remain in the worker.
+    // Authenticated discovery is shared with the worker; lifecycle mutations
+    // and cleanup belong to the worker. Provision rejection stays read-only.
     let sandbox: Arc<dyn SandboxClient> = if cfg.mock_sandbox {
         Arc::new(MockSandbox)
     } else {
@@ -103,7 +102,13 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    let providers = attestor_shared::provider_registry::PostgresProviderRegistry::new(
+        pool.clone(),
+        cfg.chain_id,
+        cfg.agentic_id_addr,
+    );
     let state = AppState {
+        providers,
         cfg: cfg.clone(),
         crypto,
         chain,
@@ -158,3 +163,7 @@ async fn build_kms_client(cfg: &Config) -> anyhow::Result<Arc<dyn KmsClient>> {
         Ok(Arc::new(TappKmsClient::connect(cfg).await?))
     }
 }
+
+#[cfg(test)]
+#[path = "../../worker/src/jobs.rs"]
+mod test_worker_jobs;

@@ -54,8 +54,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/provision"
+	"seal-verify/internal/report"
 )
 
 // Bootstrap holds all parsed and validated startup inputs.
@@ -66,11 +68,14 @@ type Bootstrap struct {
 	TEESigner    *common.Address // nil if not enforced
 
 	// Optional pipeline knobs
-	APIKey          string
-	AttestorURL     string
-	ChainRPC        string
-	ContractAddr    string
-	FallbackIndexer string
+	APIKey              string
+	InferenceCredential *inference.ProviderCredential
+	StatusBinding       *report.Binding
+	BootTicket          string
+	AttestorURL         string
+	ChainRPC            string
+	ContractAddr        string
+	FallbackIndexer     string
 
 	// VerifiedFeedbackAddr is the VerifiedFeedbackRegistry proxy address
 	// (VERIFIED_FEEDBACK_ADDR, injected by the attestor worker next to
@@ -142,6 +147,7 @@ func Load() (*Bootstrap, error) {
 
 	return &Bootstrap{
 		SealKeyBytes:         keyBytes,
+		BootTicket:           os.Getenv("SEAL_BOOT_TICKET"),
 		Attestation:          a,
 		TEESigner:            teeSignerPtr,
 		APIKey:               os.Getenv("API_KEY"),
@@ -263,6 +269,7 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 // a clean self — out of scope for v1. The defence-in-depth here pairs with
 // the env whitelist applied when spawning openclaw.
 func ScrubProvisioningSecrets(keyBytes []byte) {
+	os.Unsetenv("SEAL_BOOT_TICKET")
 	os.Unsetenv("SANDBOX_SEAL_KEY")
 	os.Unsetenv("SANDBOX_SEAL_ATTESTATION")
 	os.Unsetenv("API_KEY")

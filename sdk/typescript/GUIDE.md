@@ -1,6 +1,6 @@
-# 0G AgenticID SDK — Guide
+# 0G AgentDNA SDK — Guide
 
-The full guide for **[@0gfoundation/0g-agenticid-sdk](https://www.npmjs.com/package/@0gfoundation/0g-agenticid-sdk)**:
+The full guide for **[0g-agentdna](https://www.npmjs.com/package/0g-agentdna)**:
 every method with the reasoning behind it. The package [README](./README.md) is
 the terse interface reference (signatures + shapes); this file is the "why".
 
@@ -11,9 +11,9 @@ Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://g
 **Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agenticid.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agenticid-testnet.0g.ai` (0G Galileo testnet, chain 16602):
 
 ```ts
-import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
+import { AgentDNA } from '0g-agentdna';
 
-const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
+const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
 });
 // Verifying addresses out-of-band instead of trusting the attestor?
@@ -29,7 +29,7 @@ Not every environment deploys every contract. An address absent from
 reads, deploy, etc. all work), and the affected namespace fails fast with
 a named error only when actually invoked — e.g. an environment without a
 VerifiedFeedbackRegistry throws `reputation: this environment has no
-VerifiedFeedbackRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgenticID({ addresses, … })`
+VerifiedFeedbackRegistry deployed …` instead of an undecodable ABI error. (Advanced: `new AgentDNA({ addresses, … })`
 still exists for hand-picked addresses — audit tooling, or reading a
 chain with no attestor running — and `overrides` lets you pin any single
 address without giving up the bootstrap.)
@@ -37,7 +37,7 @@ address without giving up the bootstrap.)
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client. `rpcUrl` and `chain` both default to the 0G Galileo testnet, so they're optional there; for mainnet pass both (below).
 
 ```ts
-import { AgenticID, type ContractAddresses } from '@0gfoundation/0g-agenticid-sdk';
+import { AgentDNA, type ContractAddresses } from '0g-agentdna';
 
 // Addresses are a deployment artifact — copy the set you target from
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
@@ -52,10 +52,10 @@ const addresses: ContractAddresses = {
 };
 
 // read-only:
-const ro = new AgenticID({ addresses });
+const ro = new AgentDNA({ addresses });
 
 // with a signer (for writes):
-const ag = new AgenticID({
+const ag = new AgentDNA({
   addresses,
   account: process.env.PRIVATE_KEY as `0x${string}`,   // a private key (0x…) or a viem Account; enables writes
   attestorUrl: process.env.ATTESTOR_URL,  // for container ops + deploy status (deploy/clone/stop/start/reset/retry/waitForRunning/listDeployments/listMyDeployments)
@@ -88,7 +88,7 @@ Or skip the hand wiring: `AgenticID.fromAttestor('https://agenticid.0g.ai', …)
 
 `attestorUrl` also lets the SDK auto-resolve a few values from the attestor's `/config` (sandbox-provider address, trust-root appIds, current sealed image). Without it those methods still work — you just pass those arguments explicitly.
 
-`AgenticIDConfig` full shape: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
+`AgentDNAConfig` full shape: `{ addresses, account?, rpcUrl?, attestorUrl?, walletClient?, chain?, componentAppIds? }`.
 
 - **`account`** — a private key or a viem `Account`. That alone enables writes; the SDK builds the signing (wallet) client for you.
 - **`walletClient`** (advanced) — supply your own signer instead of handing over a key, e.g. a browser wallet where MetaMask does the signing and the key never enters your code. `ZERO_G_TESTNET` / `ZERO_G_MAINNET` and `RPC_URL` (the testnet RPC) are exported to help build one.
@@ -117,7 +117,7 @@ const params = {
   framework: 'openclaw',                           // must be a name GET /config's frameworks[] advertises.
                                                    // the SDK resolves this framework's sealed image from /config — you don't pass one.
   inference: { provider: '0g-compute', model: 'claude-sonnet-5' },   // which model; optional, defaults to 0g-compute/0gm-1.0-35b-a3b.
-                                                   // provider is effectively '0g-compute' (the 0G router) today; run ag.agent.listModels()
+                                                   // registered providers: ag.agent.listProviders(); models: ag.agent.listModels({ provider })
                                                    // first to see the router's live catalog before picking `model`.
   // ↑ these two are just inputs to defaultIData(). For full control over
   //   the minted content, pass iData: [...] instead (see the iData section).
@@ -256,7 +256,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 **Compare-and-swap.** `baseVersion` is the version you read before editing. If the stored version has moved on — another client, another device, a replayed request — the write is refused with `SettingsConflictError`, which carries the live document and its version:
 
 ```ts
-import { SettingsConflictError } from '@0gfoundation/0g-agenticid-sdk';
+import { SettingsConflictError } from '0g-agentdna';
 
 try {
   await ag.agent.setSettings(sealId, next, { baseVersion: version });
@@ -275,7 +275,7 @@ Do not wrap that in a retry loop. The refusal exists so a human sees the other w
 
 **When it takes effect.** The container receives it on **every** boot — including a resume, which a container-create-time environment variable would miss — and the first `running` report after a push promotes it to last-known-good. A container that keeps coming back without ever confirming one is handed the last document a boot did confirm instead, so pushing a document that prevents boot costs a boot rather than the agent. Nothing rolls a document back on an error report: an unhealthy agent is exactly when an owner needs to be able to land a fix.
 
-**The model check is advisory.** `onWarn` runs the 0G router's public catalog check before signing. A model the catalog does not list is *reported*, never blocked: a framework built-in (`anthropic/claude-…`) is legitimately absent from a catalog that covers the 0G router alone, and the container is the real gate. An unreachable catalog produces no warning at all. Omit `onWarn` and no catalog request is made.
+**The model check is advisory.** `onWarn` checks the selected provider's configured catalog before signing. An unlisted model is reported without blocking; an unreachable catalog produces no warning. Native providers without a catalog accept manual model IDs. Omit `onWarn` and no catalog request is made. Provider support and credential binding are separate required checks; see [providers](./PROVIDERS.md).
 
 **Which identifier does what** — three IDs refer to the same agent from different angles:
 
@@ -538,7 +538,9 @@ is enough (`framework` overrides the row; `sealedImage` pins a specific
 image). Pick with `framework`;
 the name must be in `/config.frameworks[]`. openclaw's persona seed supports
 `inference.provider` of `anthropic`, `openai`, or `0g-compute` (the 0G
-router). For the router's live model catalog:
+router). The registry also supports additional managed providers; see
+[providers](./PROVIDERS.md) for credential binding and image rollout.
+For the router's live model catalog:
 
 ```ts
 await ag.agent.listModels();   // → ['claude-opus-4-8', 'deepseek-v4-pro', …]
@@ -559,7 +561,12 @@ envelope before the agent exists, so its key still rides in clear. To keep
 a key out of the wallet prompt, deploy without `sandbox`, then call
 `start(sealId, { apiKey })`. Pass `secretEnv: 'sealed'` to make any call
 throw rather than sign a key in clear, or `'plaintext'` to force the legacy
-`API_KEY` path (for a sealed image that predates `SEAL_SECRET_ENV`).
+`API_KEY` path (for a sealed image that predates `SEAL_SECRET_ENV`). These
+legacy plaintext and v1 credentials belong only to compute. Non-compute
+built-in providers require v2 owner/provider binding; dynamic routes require
+v3 owner/provider/route binding and an exact image capability advertisement; plaintext downgrade is refused. Deploy those agents
+without `sandbox`, persist the provider/model settings, then
+`start(sealId, { provider, apiKey, framework })` after mint.
 
 **When your app supplies the key and the user signs.** Sealing in the
 browser still means the key reaches the user's browser. Seal it on your
@@ -567,7 +574,7 @@ server instead, and hand the browser only the ciphertext:
 
 ```ts
 // server: a read-only client is enough (no wallet)
-const ag = new AgenticID({ attestorUrl, addresses, rpcUrl, chain });
+const ag = new AgentDNA({ attestorUrl, addresses, rpcUrl, chain });
 const sealed = await ag.agent.sealApiKey(sealId, { owner, apiKey });
 
 // browser: signs ciphertext only; the key never reaches it
@@ -807,10 +814,10 @@ requests signatures over the container's unix sign socket
 adapter wraps that socket as a viem Account:
 
 ```ts
-import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
-import { sealAccount } from '@0gfoundation/0g-agenticid-sdk/seal';   // node-only subpath
+import { AgentDNA } from '0g-agentdna';
+import { sealAccount } from '0g-agentdna/seal';   // node-only subpath
 
-const ag = await AgenticID.fromAttestor(url, { account: await sealAccount() });
+const ag = await AgentDNA.fromAttestor(url, { account: await sealAccount() });
 // address auto-discovers from $AGENT_SEAL, socket path from $SEAL_SIGN_SOCK
 ```
 
@@ -845,7 +852,7 @@ digest change does not close it.
 
 Contract addresses are a **deployment artifact, not baked into the SDK** — an RPC + these addresses fully determine the target contracts, and keeping them out of the library means a proxy upgrade or redeploy can't silently stale a bundled constant.
 
-**Source of truth: the attestor's `GET /config`** — `AgenticID.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agenticid.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agenticid-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
+**Source of truth: the attestor's `GET /config`** — `AgentDNA.fromAttestor(url)` reads it and fills every address for you, so pointing `attestorUrl` at an attestor selects its deployment set. Several canonical-bound deployments run in parallel: on 0G mainnet (`chainId 16661`, served by `https://agenticid.0g.ai`) and on 0G Galileo Testnet (`chainId 16602`, e.g. `https://agenticid-testnet.0g.ai`). To wire addresses manually instead, copy the set into a `ContractAddresses` object (shape above), or load them from your own config/env.
 
 The stable protocol-level constants **are** exported: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` (viem chains), `RPC_URL`, `CHAIN_ID`, `RECEIPT_WAIT`.
 
@@ -910,24 +917,27 @@ agent picks up the new image only through an owner-signed reset.
 
 The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`, `AttestorClient`, `ServeSession`) are the internal building blocks behind the namespaces.
 
-## CLI: `0g-agenticid`
+## CLI: `0g-agentdna`
 
-The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agenticid` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
+The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
 
 ```bash
-npm install @0gfoundation/0g-agenticid-sdk
-npx 0g-agenticid          # interactive shell
-npx 0g-agenticid 286      # jump straight into agent 286's session
-npx 0g-agenticid --help
+npm install 0g-agentdna
+npx 0g-agentdna          # interactive shell
+npx 0g-agentdna 286      # jump straight into agent 286's session
+npx 0g-agentdna --help
 ```
+
+For the old CLI update path and automatic local-config migration, see
+[migration](./MIGRATION.md) ([中文](./MIGRATION.zh.md)).
 
 ### Interactive shell
 
-Two levels. The **manager** (`0g-agenticid>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login` (guided setup: attestor URL → owner key → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
+Two levels. The **manager** (`0g-agentdna>`): `list` (public listing with sealIds, `*` marks your wallet's agents), `use <agentId|sealId>` (enter an agent's session in **any** phase), `hello <id>` (any agent's public /hello — with a wallet configured it also banks a rating ticket), `call <id> [path [json-body]]` (use an agent's registered public service as a client; bare `call <id>` lists its services; the response banks a rating ticket), `rate <id> [score] [/endpoint]` (rate an agent on-chain, spending a ticket banked by call/hello — no interaction, no rating; owners cannot rate their own agents), `deploy` (framework + model wizard), `start`/`stop`/`reset <id>`, `settings <id> [key=value …]` (show or change the agent's configuration document), `balance` / `deposit [og]` / `withdraw [og]` (prepaid sandbox account), `ack`, `login [provider]` (guided setup: attestor URL → owner key → provider → inference key; Enter keeps the current value, keys echo `*`), `whoami` (bare Enter does the same), `quit`.
 
 The **session** (`agent 286 ›`): type to chat — **Esc / Ctrl-C interrupts the turn in flight** (the runtime cancels server-side on every bundled framework) and also cancels a `/start`//`/reset` wait. Slash commands: `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [key=value …]` `/think [level]` `/clear` (wipe the agent's conversation and start fresh — chain-tracked memory is untouched, unlike `/reset`) `/compact` (keep the conversation but have the framework summarize its older part now — dsh, and openclaw 2026.7.1 or later; one or more model calls, can take minutes) `/tasks` `/result [id]` `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit`. The framework (used by `/reset` and the chat model selector) is picked by you from the attestor's list — never guessed.
 
-Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attestor URL), `credentials` (owner key + inference key, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
+Configuration persists under `~/.config/0g-agentdna/` — `config.json` (attestor URL), `credentials` (owner key + provider-scoped inference keys, JSON, chmod 600), and `proofs.json` (the **rating-ticket jar**, chmod 600): serve-proofs banked by `call`/`hello`, spent by `rate`. Ticket physics: they expire ~1 hour after the interaction (the sealed proxy sets the deadline; the chain enforces it), are single-use, capped at 5 per (agent, wallet) pair, and are redeemable ONLY by the wallet named in the proof's `submitter` — a leaked jar is useless to anyone else. `rate` checks a ticket on what the registry checks — expiry and the signature — and discards one that fails on its own merits (bad signature — e.g. one banked from a pre-1.2.0 sealed image — or expiry), but keeps one that fails only because no VerifiedFeedbackRegistry, or a different one, is configured on this side. A ticket whose data hashes the agent has since replaced (it commits state drift every 30 s) still redeems — the registry records the version that served you without comparing it to current chain state — so `rate` only notes it and goes ahead. The `AGENTIC_*` environment variables always override the files, so CI and one-off runs need no disk.
 
 ### Diagnostics subcommands
 
@@ -936,7 +946,7 @@ Configuration persists under `~/.config/0g-agenticid/` — `config.json` (attest
 | `doctor` | Checks every deploy prerequisite — attestor reachable, RPC, wallet, gas, trust-root ack, sandbox balance ≥ 0.1 OG — and prints a remedy per failing item. Exit 0 when all green, 3 otherwise. |
 | `status <agent>` | One agent's full picture: phase, all three coordinates (agentId / sealId / agentSeal), url, failure reason. `<agent>` is a decimal agentId **or** a `0x…` sealId — the CLI converts between them. When a failed deployment's reason is withheld from the public listing (#64), a configured key makes the CLI fetch it via the owner-signed listing automatically. |
 | `list [--mine] [--phase p]` | Deployment listing; `--mine` (owner-signed, needs the key) adds the owner-only fields. Empty result is `[]` + exit 0. |
-| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `framework` (opaque JSON — quote it: `framework='{"a": 1}'`, in the REPL too). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against the 0G router catalog before signing — an absence is a warning on stderr, never a refusal. |
+| `settings <agent> [k=v …]` | Show the agent's configuration document; with `key=value` assignments, change it. Keys: `provider`, `model`, `thinking` (`low\|high\|max`), `framework` (opaque JSON — quote it: `framework='{"a": 1}'`, in the REPL too). Assignments **merge** onto the stored document; an empty value (`thinking=`) clears a field. **Both** directions are owner-signed (needs the key). A write is a compare-and-swap against the version just read: a concurrent edit by another client is refused with `SETTINGS_CONFLICT` (exit 3), never overwritten. A merged document with no `model` is refused before signing — that is the one state the container hard-fails on. The chosen model is checked against its provider's configured catalog before signing — an absence is a warning on stderr. Native providers without a catalog accept a manual model ID. A provider change requires a registered matching key and image support, then reports pending reset; execute `reset` with that provider's key. |
 
 Environment variables (override the config files):
 

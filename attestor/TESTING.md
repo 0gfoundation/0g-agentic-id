@@ -259,3 +259,101 @@ the sandbox (it keeps running and billing until the provider GCs it).
 | container_stage failed: `snapshot "…" not found` (mint/storage fine) | config skew | `ATTESTOR_SANDBOX_SNAPSHOT` (or a hardcoded snapshot in a client) doesn't exist on the sandbox provider — align the name; agents minted this way sit `offline` and can be brought up via retry with a corrected envelope |
 | every reset leaks the old container; worker logs `orphan admin_delete failed … 403 "admin only"` | sandbox provider env | the attestor's TEE EOA isn't in the provider's `ADMIN_ADDRESSES` — add it and restart the provider, then clean accumulated orphans |
 | deploy UI does nothing, api log stops after `deploy request` | attestor (fixed) | pre-timeout builds hung forever on a slow KMS call and axum cancelled the handler silently — fixed by the 20s KMS call timeout + UI submit feedback; if seen again, the running image predates that fix |
+
+### Provider registry publication
+
+T0 API tests cover live Tapp-owner authorization, exact-byte signature binding,
+chain/contract/Tapp separation, expiry, validation, replay, concurrent publication,
+ownership transfer, EIP-1271, historical reads, and database receipt tampering:
+
+```bash
+cargo test -p attestor-api providers::
+```
+
+SDK and Go share `sealed/internal/inference/testdata/registry-v1.json` to verify
+the same operator signature, route hash, and encrypted v3 credential. The SDK
+suite publishes through HTTP and checks that a stale base version is refused.
+Publication belongs to the operations API and `ag.admin`; the CLI only reads
+providers and registers local inference keys. Regression coverage checks that
+removed CLI publication commands cannot publish, while discovery and login work.
+Regression tests also reject a first-read 404 from an advertised registry before
+sealing/signing, and exercise changed-compute deployment through mint/settings/start.
+Owner-authorized fresh sandbox tests verify that reset grants the current
+unconfirmed settings a fresh boot without rewriting the document, its version,
+or last-known-good. A real Postgres test checks the version guard and promotion:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_owner_recreate_retries_only_the_expected_unconfirmed_settings -- --ignored
+```
+
+The encrypted credential pins the registry version and acceptance digest.
+Go tests re-create a reader after publication and verify that stop/start keeps
+the old route, reset authorizes the new one, and missing/tampered history never
+falls back to the latest endpoint. Internal settings GET tests check runtime
+state, readiness, and exclusion of credentials/opaque framework configuration.
+
+The Postgres repository integration test is explicitly ignored by default.
+Run it against a disposable database, not an existing deployment database:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_registry_survives_reconnect_and_serializes_publishers -- --ignored
+```
+
+It boots the normal schema, publishes a revision, reconnects through another
+pool, races two publishers, refuses stale replay, and checks immutable history.
+This proves database persistence and concurrency, not a live TEE/router call.
+The real rollout still requires an upgraded image and registered attestor Tapp
+owner; see [operator workflow](../sdk/typescript/PROVIDERS.md).
+
+
+Status boot receipts have a shared Rust/Go signature fixture at
+`sealed/internal/inference/testdata/status-v2.json`. API tests rotate receipts
+and verify that delayed running/warning/error/starting/stopping reports from an
+old instance cannot change stage, liveness, or confirmed settings. They also
+cover absent/mismatched applied digests and legacy reports that never promote.
+SDK tests cover unreadable/withdrawn discovery after factory construction and
+concurrent refreshes with different versions, digests, and first-call failures.
+
+The database race test holds a deployment lock while rotating the receipt and
+checks that a waiting report reads the new binding after the lock is released:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_status_receipt_guards_are_atomic_and_confirm_only_the_served_version -- --ignored
+```
+
+Upgrade attestor before enabling the matching sealed images. New sealed refuses
+provisioning without its encrypted boot receipt; legacy heartbeats do not
+confirm settings. This protocol adds no environment variables.
+
+
+Lifecycle convergence coverage additionally verifies container private-key proof
+vectors (`boot-v1.json`), reserved/scrubbed internal tickets, duplicate/old boot
+rejection, exact sandbox identity, live owner changes, stop/start round trips,
+creation and persistence failures, version/generation-fenced retry counters,
+late transfer events, and captured teardown targets. The API test crate includes
+the actual worker handlers to test stop → delayed status → start end to end.
+The Postgres tests run concurrently and explicitly test schema bootstrap waiting
+behind runtime locks; do not serialize them to hide lock-order regressions.
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_ -- --ignored
+```
+
+Build sealed images before activating the matching attestor API/worker/indexer.
+Existing agents use reset to adopt the new image and its internal boot ticket.
+Operator environment variables do not change.
+
+
+The live regression runner rebuilds the SDK from the working tree before running.
+Its source identity smoke uses a compute credential and a matching compute
+persona model (`MODEL_ID`, default `gpt-oss-120b`). The default dummy `API_KEY`
+only proves identity/bootstrap/lifecycle: it does not prove inference. For the
+provider release, additionally test a real managed provider/key, an actual model
+reply, publication A → B while the existing agent and stop/start remain on A,
+then reset with the newly authorized key/route to B. Verify both runtime settings
+and upstream request logs. Provider publication is an operations API/SDK action;
+there is no CLI publication command.

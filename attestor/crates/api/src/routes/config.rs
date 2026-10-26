@@ -75,6 +75,12 @@ pub struct ConfigResponse {
     /// the plain `API_KEY` path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secret_env_scheme: Option<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inference_capabilities: Vec<attestor_shared::config::InferenceCapability>,
+    pub provider_registry_schema: u8,
+    pub provider_registry_version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_registry_digest: Option<String>,
     /// This attestor's own build version (CARGO_PKG_VERSION).
     pub attestor_version: &'static str,
     /// Newest published CLI/SDK version (ATTESTOR_CLI_LATEST) — an older CLI
@@ -102,13 +108,12 @@ fn secret_env_scheme(enabled: bool) -> Option<&'static str> {
 
 pub async fn handle(
     State(state): State<AppState>,
-) -> Result<Json<ConfigResponse>, (axum::http::StatusCode, String)> {
-    let connection = state.sandbox.service_identity().await.map_err(|_| {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "sandbox identity lookup unavailable".to_string(),
-        )
-    })?;
+) -> crate::error::ApiResult<Json<ConfigResponse>> {
+    let registry = super::providers::load_verified(&state).await?;
+    let connection =
+        state.sandbox.service_identity().await.map_err(|_| {
+            crate::error::ApiError::unavailable("sandbox identity lookup unavailable")
+        })?;
     let (provider, endpoint) = connection.map(|(p, url)| (Some(p), Some(url))).unwrap_or((
         state.cfg.sandbox_provider_addr,
         Some(state.cfg.sandbox_endpoint.clone()),
@@ -151,6 +156,12 @@ pub async fn handle(
             .map(|a| format!("{:#x}", a)),
         frameworks: state.cfg.frameworks.clone(),
         secret_env_scheme: secret_env_scheme(state.cfg.secret_env_enabled),
+        inference_capabilities: state.cfg.inference_capabilities(),
+        provider_registry_schema: 1,
+        provider_registry_version: registry.as_ref().map_or(0, |r| r.version),
+        provider_registry_digest: registry
+            .as_ref()
+            .map(|r| attestor_shared::provider_registry::accepted_digest(&r.update)),
         attestor_version: env!("CARGO_PKG_VERSION"),
         cli_latest: none_if_empty(&state.cfg.cli_latest),
         cli_notes: none_if_empty(&state.cfg.cli_notes),
@@ -201,10 +212,35 @@ mod tests {
             tee_data_verifier_addr: None,
             frameworks: vec![],
             secret_env_scheme: None,
+            inference_capabilities: vec![],
+            provider_registry_schema: 1,
+            provider_registry_version: 0,
+            provider_registry_digest: None,
+
             attestor_version: "9.9.9",
             cli_latest: none_if_empty(cli_latest),
             cli_notes: none_if_empty(cli_notes),
         }
+    }
+
+    #[test]
+    fn config_serializes_exact_image_provider_capabilities() {
+        let mut response = sample("", "");
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("inference_capabilities")
+            .is_none());
+        response
+            .inference_capabilities
+            .push(attestor_shared::config::InferenceCapability {
+                image: "new-sealed".into(),
+                providers: vec!["openai".into()],
+                secret_env_versions: vec![1, 2],
+                formats: vec![],
+            });
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["inference_capabilities"][0]["image"], "new-sealed");
+        assert_eq!(value["inference_capabilities"][0]["providers"][0], "openai");
     }
 
     #[test]

@@ -182,3 +182,41 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_confirmed_version BIGI
 -- a configuration change while an agent is unhealthy, which is exactly when
 -- an owner most needs to.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL DEFAULT 0;
+
+
+-- Global provider revisions, scoped to the deployment environment. Exact signed
+-- bytes and history survive API restarts and are shared by all replicas.
+-- Lock parent deployments before its status child, matching lifecycle transactions.
+-- Only the latest attested boot may report status. The opaque receipt itself
+-- is encrypted to the container, never persisted in plaintext here.
+CREATE TABLE IF NOT EXISTS container_status_bindings (
+    seal_id BYTEA PRIMARY KEY REFERENCES deployments(seal_id) ON DELETE CASCADE,
+    binding_hash BYTEA NOT NULL CHECK (octet_length(binding_hash) = 32)
+);
+
+-- Lifecycle authorization remains after stop to prevent legacy downgrade.
+ALTER TABLE container_status_bindings ALTER COLUMN binding_hash DROP NOT NULL;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_hash BYTEA;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_started_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_id BYTEA;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_owner BYTEA;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_sandbox_id TEXT;
+
+CREATE TABLE IF NOT EXISTS inference_provider_registry (
+    chain_id BIGINT NOT NULL,
+    contract BYTEA NOT NULL CHECK (octet_length(contract) = 20),
+    version BIGINT NOT NULL CHECK (version > 0),
+    document TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    publisher BYTEA NOT NULL CHECK (octet_length(publisher) = 20),
+    acceptance_mac BYTEA NOT NULL CHECK (octet_length(acceptance_mac) = 32),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (chain_id, contract, version)
+);
+
+-- Support development databases that already have the earlier registry table.
+-- Old rows without an authenticated acceptance record are never trusted.
+ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA;
+ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS acceptance_mac BYTEA;

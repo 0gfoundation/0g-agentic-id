@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/settings"
 )
@@ -29,6 +31,36 @@ type SettingsApplier func(ctx context.Context, doc settings.Doc) error
 // SettingsReader returns the document currently in force, so an owner can read
 // before writing without keeping an authoritative copy of their own.
 type SettingsReader func() settings.Doc
+
+// RuntimeSettings is an explicit public projection. Never serialize Resolved:
+// it contains the inference key and arbitrary framework configuration.
+type RuntimeSettings struct {
+	Source          string               `json:"source"`
+	Provider        string               `json:"provider"`
+	Model           string               `json:"model"`
+	Thinking        string               `json:"thinking,omitempty"`
+	BaseURL         string               `json:"base_url,omitempty"`
+	Format          inference.WireFormat `json:"format,omitempty"`
+	RegistryVersion int64                `json:"registry_version"`
+	RouteHash       string               `json:"route_hash,omitempty"`
+}
+
+func RuntimeSettingsFor(resolved settings.Resolved, credential inference.ProviderCredential) RuntimeSettings {
+	view := RuntimeSettings{Source: "runtime", Provider: resolved.Provider, Model: resolved.Model, Thinking: resolved.Thinking, RouteHash: credential.RouteHash}
+	if resolved.Endpoint != nil {
+		view.BaseURL, view.Format = resolved.Endpoint.BaseURL, resolved.Endpoint.Format
+	}
+	if credential.Registry != nil {
+		view.RegistryVersion = credential.Registry.Version
+	}
+	return view
+}
+
+func (s *Server) SetRuntimeSettings(read func() RuntimeSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.readRuntimeSettings = read
+}
 
 // SetSettings installs the two halves. Late-bound like the adapter: both need
 // state that only exists after chain bootstrap.
@@ -131,6 +163,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := apply(r.Context(), doc); err != nil {
 			logger.Logf("settings: apply failed: %v", err)
+			for _, code := range []string{"CREDENTIAL_PROVIDER_MISMATCH", "CREDENTIAL_ROUTE_MISMATCH", "PROVIDER_BOUND_CREDENTIAL_REQUIRED"} {
+				if strings.HasPrefix(err.Error(), code+":") {
+					writeJSON(w, http.StatusConflict, map[string]string{"code": code, "message": err.Error()})
+					return
+				}
+			}
 			http.Error(w, "apply failed: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -166,7 +204,7 @@ func (s *Server) SetSessionSettings(apply SessionSettingsApplier) {
 	s.applySession = apply
 }
 
-// handleAgentSettings serves POST $SEAL_SIGN_SOCK/settings.
+// handleAgentSettings serves GET/POST $SEAL_SIGN_SOCK/settings.
 //
 // Reachable only over the 0600 unix socket inside the container, so the agent
 // process is the only possible caller and no signature is involved — the same
@@ -185,7 +223,19 @@ func (s *Server) SetSessionSettings(apply SessionSettingsApplier) {
 // The response says plainly that the change is not durable, because the agent
 // reads it and would otherwise have no way to know.
 func (s *Server) handleAgentSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		s.mu.RLock()
+		read := s.readRuntimeSettings
+		s.mu.RUnlock()
+		if read == nil {
+			http.Error(w, "runtime settings not ready", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, read())
+		return
+	}
 	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -233,7 +283,7 @@ func (s *Server) handleAgentSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"durable":  false,
-		"note":     "applied for this container's lifetime only; a restart restores your owner's settings",
-		"settings": doc,
+		"note":     "applied for this container's lifetime only; a container restart restores your owner's settings",
+		"settings": read(),
 	})
 }

@@ -181,6 +181,9 @@ func buildCapabilities(rs RuntimeSnapshot) string {
 	// Signing mechanics
 	if rs.SealSignSock != "" && rs.AgentSeal != "" {
 		b.WriteString(buildSigningSection(rs.SealSignSock))
+		b.WriteString("### Your current settings\n\n")
+		b.WriteString("Read the settings currently adopted by this runtime with `curl --unix-socket \"$SEAL_SIGN_SOCK\" http://localhost/settings`. The response includes provider, model, thinking, and the managed route's base_url, format, registry_version and route_hash. Native framework routes omit base_url. It contains no API key and does not read the owner's pending configuration from the attestor.\n\n")
+		b.WriteString("You may POST `{\"thinking\":\"high\"}` (low, high or max) to the same socket endpoint for a temporary change. It restarts the framework process and interrupts the current task. The change lasts until a container restart or an owner settings push. Provider, model and routing changes require the owner's settings/reset channel. Do not edit framework configuration files to make these changes.\n\n")
 	}
 
 	// Public URL + service exposure

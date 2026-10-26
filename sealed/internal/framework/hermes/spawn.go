@@ -99,7 +99,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		SealSignSock:        rt.SealSignSock,
 		Provider:            provider,
 		Model:               model,
-		ZGComputeRouted:     rs.Endpoint != nil,
+		ZGComputeRouted:     rs.Endpoint != nil && provider == "0g-compute",
 		BootTime:            time.Now(),
 	})
 	if err := upsertSoulMD(pc, a.FrameworkFacts()); err != nil {

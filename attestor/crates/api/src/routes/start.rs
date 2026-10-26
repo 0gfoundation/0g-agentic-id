@@ -71,7 +71,10 @@ pub async fn handle(
                     supported.join(", ")
                 )));
             }
-            state.deployments.set_framework(req.seal_id, fw.clone()).await?;
+            state
+                .deployments
+                .set_framework(req.seal_id, fw.clone())
+                .await?;
         }
     }
 
@@ -143,11 +146,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -236,6 +243,9 @@ mod tests {
         deployments.seed(d);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain,
@@ -245,7 +255,13 @@ mod tests {
             jobs: jobs.clone(),
             events,
         };
-        Setup { state, deployments, jobs, owner, seal_id }
+        Setup {
+            state,
+            deployments,
+            jobs,
+            owner,
+            seal_id,
+        }
     }
 
     fn envelope_with_action(action: &str) -> SandboxEnvelope {
@@ -267,7 +283,11 @@ mod tests {
         }
     }
 
-    fn lifecycle_req(seal_id: SealId, owner: Address, action: &str) -> attestor_shared::LifecycleRequest {
+    fn lifecycle_req(
+        seal_id: SealId,
+        owner: Address,
+        action: &str,
+    ) -> attestor_shared::LifecycleRequest {
         attestor_shared::LifecycleRequest {
             seal_id,
             owner,
@@ -320,8 +340,10 @@ mod tests {
             .err()
             .expect("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(s.jobs.submitted.lock().unwrap().is_empty(),
-            "no job should be enqueued on rejection");
+        assert!(
+            s.jobs.submitted.lock().unwrap().is_empty(),
+            "no job should be enqueued on rejection"
+        );
     }
 
     #[tokio::test]
@@ -390,12 +412,7 @@ mod tests {
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
         // sanity: deployment row untouched
-        let d = s
-            .deployments
-            .get(s.seal_id)
-            .await
-            .unwrap()
-            .expect("seeded");
+        let d = s.deployments.get(s.seal_id).await.unwrap().expect("seeded");
         assert_eq!(d.sandbox_id.as_deref(), Some("sb-old"));
     }
 }

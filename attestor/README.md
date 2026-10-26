@@ -106,6 +106,8 @@ stay up.
 |---|---|---|
 | `GET /health` | Process-level liveness probe | — |
 | `GET /config` | Public config the frontend needs (chain RPC, contract addresses, appId, snapshot, etc.) | — |
+| `GET /inference/providers` | Versioned provider registry; `?version=N` reads verified accepted history for stop/start route continuity. Built-in seed is version 0 | public |
+| `PUT /admin/inference/providers` | Publish the full registry through HTTP; Postgres history + compare-and-swap, no SSH/restart. See [operator workflow](../sdk/typescript/PROVIDERS.md) | current attestor Tapp owner signature (EOA/EIP-1271) |
 
 ### Lifecycle (owner-driven)
 
@@ -122,8 +124,9 @@ stay up.
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `POST /provision` | Container exchanges credentials for `agentSeal_priv`, plus the owner's settings document (`encrypted_settings`, ECIES to the same container pubkey). This channel — not the sandbox env — because it runs on EVERY boot including a resume. The first boot after a push gets the new document; a container that keeps coming back without ever confirming it gets the last one that worked. The document half is additionally gated on a sandbox being on record (ghost container — every container this agent ever had holds the agentSeal key); the key half is not, because who may hold it is settled by the attestation | sandbox TEE signature + TappRegistry node validation + `validFrameworkHashes` allowlist |
-| `POST /status` | sealed heartbeat and status report. A `running` report promotes the settings version this boot was served to last-known-good — once, keyed on the version, so the repeating heartbeat cannot bless a document no boot exercised. An `error` report leaves the document alone: it fires on every failing heartbeat, and rolling back there made it impossible to land a change while an agent is unhealthy | agentSeal signature over `StatusReport:0x<sealId>:<status>:<error_detail>` — raw keccak256, no EIP-191 prefix |
+| `GET /provision?seal_id=…` | Returns an enabled boot generation without its ticket; sealed uses it for its container private-key proof | public metadata |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, and a per-boot receipt (`status_binding_scheme: "agentdna-status-v2"` / `encrypted_status_binding`). The receipt binds the actual served settings version/digest and rotates on each accepted new boot. Modern provision requires a tracked sandbox; it returns 409 before create bookkeeping is persisted, which sealed retries within 180 seconds. Rejected provision requests never mutate or delete containers. Repeated unconfirmed boots still fall back to last-known-good. Modern registration prevents legacy protocol downgrade | sandbox TEE signature + node/image allowlists + owner-authorized ticket, generation and container private-key proof |
+| `POST /status` | sealed heartbeat/status. Signature covers boot receipt hash and applied settings digest; one transaction checks the active receipt and updates stage, liveness, and exact-version confirmation. Only matching current-version `running` / `warning` reports promote settings. Stale instances are ignored; errors leave settings unchanged. Legacy reports update liveness only before modern registration, and never promote settings | agentSeal raw-keccak signature + KMS HMAC boot receipt |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
@@ -191,6 +194,8 @@ load-bearing ones, grouped:
 | `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 
+Attestor and configured sealed images are released together. `/config.inference_capabilities` is derived from that release and the existing framework/snapshot configuration; there is no extra capability ENV. Administrative provider writes require the live owner of `ATTESTOR_APP_ID` in `ATTESTOR_TAPP_REGISTRY_ADDR`. See [rollout](../sdk/typescript/PROVIDERS.md).
+
 ### Storage (0g-storage)
 
 | env | Meaning |
@@ -243,5 +248,11 @@ sandbox dependencies. A single test starts in ~6s.
 For the full regression procedure (local stack, live testnet, and the
 failure-triage table), see [TESTING.md](TESTING.md) —
 `scripts/e2e.sh` deploys, `scripts/verify-agent.sh` verifies.
+
+Live checks discover container URLs from the deployment/SDK and authenticate
+startup-log reads as the owner. CLI smoke uses a temporary config directory.
+Clone/transfer checks retain generated wallet keys in a temporary directory
+(or beneath `TEST_ARTIFACT_DIR`) with mode `0600`, so test assets remain
+recoverable after a failure; stop their containers after the run.
 
 Stable application identities and the production contract/TLS migration are documented in [APP_IDENTITY.md](APP_IDENTITY.md).

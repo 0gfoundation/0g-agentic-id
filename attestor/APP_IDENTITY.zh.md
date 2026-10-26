@@ -137,3 +137,8 @@ issuer 实例、镜像和容器公钥，无需数据库 schema 迁移。匹配�
 应同时升级 sandbox、attestor 和 sealed 镜像。旧 v1/node 签名容器需要 owner 明确
 执行 reset，事先保存运行时状态。Reset 保留 agentId、agentSeal 与已提交的
  iData/settings，生成新的容器身份及 v2 证明；不会静默重签旧证明或恢复已退役节点。
+
+sealed 对 `/provision`、`/status`、settings 和 provider registry 的请求使用同一个
+已认证、固定 TLS 公钥的 attestor 客户端。持久化的镜像绑定认证可复用的 v2 镜像证明；
+每次 PID-1 启动仍需用容器私钥证明当前 boot ticket 与 generation，并取得加密的
+status receipt。复用镜像证明不允许重放旧 boot claim 或 status receipt。

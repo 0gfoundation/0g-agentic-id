@@ -62,6 +62,7 @@ export interface AttestorPublicConfig {
   attestor_app_id?: string;
   kms_app_id?: string;
   sandbox_app_id?: string;
+  sandbox_endpoint?: string;
   sandbox_provider_addr?: `0x${string}`;
   sandbox_serving_addr?: `0x${string}`;
   /** Default sealed image when a framework declares none. */
@@ -73,6 +74,10 @@ export interface AttestorPublicConfig {
    *  (`'agent-seal-ecies-v1'`, issue #166): start/reset/retry then seal the
    *  inference key to the agent instead of signing it in clear. */
   secret_env_scheme?: string;
+  inference_capabilities?: Array<{ image: string; providers: string[]; secret_env_versions: number[]; formats?: string[] }>;
+  provider_registry_schema?: number;
+  provider_registry_version?: number;
+  provider_registry_digest?: string;
 }
 
 /** Resolved context shared by the internal clients. */

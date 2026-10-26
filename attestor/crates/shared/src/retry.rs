@@ -161,7 +161,10 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert!(err.to_string().starts_with("test-op:"), "op label preserved: {err}");
+        assert!(
+            err.to_string().starts_with("test-op:"),
+            "op label preserved: {err}"
+        );
         assert_eq!(
             counter.load(Ordering::SeqCst),
             MAX_ATTEMPTS,

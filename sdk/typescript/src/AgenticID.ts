@@ -1,9 +1,11 @@
+import { modelsForProvider, type InferenceProvider } from './Providers';
 /**
  * @file AgenticID.ts
  * @description The single entry point. Construct once with rpc + addresses (+
- * attestorUrl + signer), then use two intent namespaces:
+ * attestorUrl + signer), then use the agent/reputation namespaces and admin operations:
  *   - `agent`      — lifecycle (deploy / clone / transfer), reads, agent-seal gas top-up
  *   - `reputation` — serve-proof capture/verify + on-chain feedback
+ *   - `admin`      — attestor-wide provider publication, authorized by its Tapp owner
  *
  * plus top-level ops that don't belong to a single agent: `ack` / `ackStatus`
  * (acknowledge the TEE trust-root component set) and `deposit` / `getBalance`
@@ -14,8 +16,8 @@
  *
  * @example
  * ```typescript
- * import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
- * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
+ * import { AgentDNA } from '0g-agentdna';
+ * const ag = new AgentDNA({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * await ag.agent.transferFrom(from, to, 33n);
  * const { proof } = await ag.reputation.capture(() => fetch(`${url}/chat`, ...));
  * await ag.ack();
@@ -101,10 +103,10 @@ export class AgentApi {
   private readonly attestor: AttestorClient;
   private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
-  constructor(ctx: Ctx) {
+  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
-    this.attestor = new AttestorClient(ctx);
+    this.attestor = new AttestorClient(ctx, initialConfig);
     this.infra = new SandboxClient(ctx);
   }
 
@@ -371,30 +373,27 @@ export class AgentApi {
    * inference path). Public endpoint, no key needed — use it to populate
    * a model picker before deploy.
    */
-  async listModels(): Promise<string[]> {
-    return (await this.listModelCaps()).map((m) => m.id);
+  listProviders(): InferenceProvider[] { return this.attestor.listProviders(); }
+
+  async refreshProviders(): Promise<InferenceProvider[]> { return (await this.attestor.getProviderRegistry()).providers; }
+
+  getProviderRegistry() { return this.attestor.getProviderRegistry(); }
+
+  assertProviderSupported(provider: string, options: { sealId?: Hash; framework?: string; sealedImage?: string } = {}): Promise<void> {
+    return this.attestor.assertProviderSupported(provider, options);
   }
 
-  /**
-   * Models with the capability bits a picker needs: `chat` (a chatbot at all —
-   * the router also lists image/audio models) and `tools` (function calling —
-   * required by tool-driven frameworks; a chat-only model deploys fine and
-   * then fails EVERY turn). 10s timeout: a wedged router must not hang the
-   * deploy wizard.
-   */
-  async listModelCaps(): Promise<Array<{ id: string; chat: boolean; tools: boolean }>> {
-    const r = await fetch('https://router-api.0g.ai/v1/models', { signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
-    const body = (await r.json()) as {
-      data?: Array<{ id?: string; type?: string; supported_parameters?: string[] }>;
-    };
-    return (body.data ?? [])
-      .filter((m): m is { id: string; type?: string; supported_parameters?: string[] } => !!m.id)
-      .map((m) => ({
-        id: m.id,
-        chat: (m.type ?? 'chatbot') === 'chatbot',
-        tools: (m.supported_parameters ?? []).includes('tools'),
-      }));
+  async listModels(opts: { provider?: string } = {}): Promise<string[]> {
+    return (await this.listModelCaps(opts)).map((model) => model.id);
+  }
+
+  async listModelCaps(opts: { provider?: string } = {}): Promise<Array<{ id: string; chat: boolean; tools: boolean; formats: string[] }>> {
+    return (await modelsForProvider(await this.attestor.providerDefinition(opts.provider ?? '0g-compute'))).map((model) => ({
+      id: model.id,
+      chat: (model.type ?? 'chatbot') === 'chatbot',
+      tools: (model.supported_parameters ?? []).includes('tools'),
+      formats: model.supported_formats ?? [],
+    }));
   }
 
   /**
@@ -918,13 +917,13 @@ export class AgentApi {
    *    signer at all.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
-  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+  start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
+  start(sealId: Hash, arg?: string | { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
+    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -938,8 +937,8 @@ export class AgentApi {
    * refuses the clear path). The attestor keeps no reusable copy, which
    * is WHY it must be passed again on every recreate.
    */
-  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
   }
 
   /**
@@ -1017,8 +1016,8 @@ export class AgentApi {
    * Requires the attestor to advertise `secret_env_scheme`. Refusals throw
    * {@link SecretEnvRefusedError}.
    */
-  sealApiKey(sealId: Hash, opts: { owner: Address; apiKey: string }): Promise<string> {
-    return this.attestor.sealApiKey({ sealId, owner: opts.owner, apiKey: opts.apiKey });
+  sealApiKey(sealId: Hash, opts: { owner: Address; apiKey: string; provider?: string; framework?: string; sealedImage?: string }): Promise<string> {
+    return this.attestor.sealApiKey({ sealId, ...opts });
   }
 
   /**
@@ -1033,8 +1032,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied (and is
    * sealed the same way, see `secretEnv`).
    */
-  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  retry(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.retry({ sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
   }
 
   /**
@@ -1205,8 +1204,20 @@ export class ReputationApi {
 }
 
 /** The AgenticID SDK entry point. */
+/** Attestor-wide operations, authorized by its current Tapp owner. */
+export class AdminApi {
+  constructor(private readonly attestor: AttestorClient) {}
+
+  updateProviders(providers: InferenceProvider[], opts: { baseVersion: number }) { return this.attestor.updateProviders(providers, opts.baseVersion); }
+
+  prepareProviderUpdate(providers: InferenceProvider[], opts: { baseVersion: number }) { return this.attestor.prepareProviderUpdate(providers, opts.baseVersion); }
+
+  publishSignedProviders(update: { document: string; signature: `0x${string}` }) { return this.attestor.publishSignedProviders(update); }
+}
+
 export class AgenticID {
   readonly agent: AgentApi;
+  readonly admin: AdminApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
   /** Long-lived so its instance caches (/config: provider address, sandbox
@@ -1214,13 +1225,14 @@ export class AgenticID {
   private readonly attestor: AttestorClient;
   private readonly ctx: Ctx;
 
-  constructor(config: AgenticIDConfig) {
+  constructor(config: AgenticIDConfig, initialConfig?: import('./context').AttestorPublicConfig) {
     const ctx = buildCtx(config);
     this.ctx = ctx;
-    this.agent = new AgentApi(ctx);
+    this.agent = new AgentApi(ctx, initialConfig);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
-    this.attestor = new AttestorClient(ctx);
+    this.attestor = new AttestorClient(ctx, initialConfig);
+    this.admin = new AdminApi(this.attestor);
   }
 
   /**
@@ -1267,7 +1279,7 @@ export class AgenticID {
         : cfgChainId != null
           ? ({ id: cfgChainId, name: `chain-${cfgChainId}`, nativeCurrency: { name: '0G', symbol: '0G', decimals: 18 }, rpcUrls: { default: { http: [cfg.chain_rpc ?? ''] } } } as unknown as import('viem').Chain)
           : undefined);
-    return new AgenticID({
+    const client = new AgenticID({
       ...rest,
       attestorUrl: base,
       rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
@@ -1282,7 +1294,9 @@ export class AgenticID {
         sandboxServing: addr(cfg.sandbox_serving_addr),
         ...overrides,
       },
-    });
+    }, cfg as unknown as import('./context').AttestorPublicConfig);
+    if (Number(cfg.provider_registry_schema) === 1) await client.agent.refreshProviders();
+    return client;
   }
 
   // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —

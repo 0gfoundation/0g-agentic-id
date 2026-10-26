@@ -90,8 +90,6 @@ CHAIN_ID=$(echo "$CONFIG" | jq -r .chain_id)
 # injects into containers as VERIFIED_FEEDBACK_ADDR. Blank → no proofs.
 VF=$(echo "$CONFIG" | jq -r '.verified_feedback_addr // empty' | tr '[:upper:]' '[:lower:]')
 [ "$VF" = "0x0000000000000000000000000000000000000000" ] && VF=""
-PROXY=$(echo "$CONFIG" | jq -r .sandbox_proxy_addr)
-SERVE_PORT=$(echo "$CONFIG" | jq -r .agent_serve_port)
 
 # ── locate the deployment row via the attestor API ─────────────────────
 # agent_id is served as 0x-hex; accept a decimal AGENT_ID and match on value.
@@ -121,8 +119,9 @@ if [ "$CHAIN_ADDR" = "$DB_ADDR" ]; then ok "chain getAgentSeal == attestor row (
 else bad "chain getAgentSeal=$CHAIN_ADDR != row=$DB_ADDR"; fi
 
 # ── 1b + 2. sealed bootstrap log: provisioned addr + decrypt health ─────
-LOG_URL="http://${SERVE_PORT}-${SANDBOX}.${PROXY}/log.html"
-LOG=$(curl -fsS -m 20 "$LOG_URL" | sed 's/<[^>]*>/\n/g')
+AGENT_BASE=$(echo "$ROW" | jq -er '.agent_card.url | select(. != null and . != "") | sub("/hello$"; "")')
+LOG_URL="$AGENT_BASE/log"
+LOG=$(API="$API" node "$(dirname "$0")/../../sdk/typescript/scripts/owner-log.cjs")
 # The log page abbreviates addresses ("0xBbab...d211"), so compare by
 # prefix+suffix instead of full equality.
 PROV_ABBR=$(printf '%s' "$LOG" | grep -aA3 "provisioned agent_seal_priv" | grep -aoE "0x[a-fA-F0-9]+(\.\.\.[a-fA-F0-9]+)?" | head -1 | tr '[:upper:]' '[:lower:]' || true)
@@ -146,7 +145,7 @@ else
 fi
 
 # ── 3. /hello + X-Agent-Proof ───────────────────────────────────────────
-HELLO_URL="http://${SERVE_PORT}-${SANDBOX}.${PROXY}/hello"
+HELLO_URL="$AGENT_BASE/hello"
 HDRS=$(mktemp); BODY=$(mktemp)
 HTTP=$(curl -s -m 20 -D "$HDRS" -o "$BODY" -w "%{http_code}" "$HELLO_URL" || echo 000)
 PROOF=$(grep -ai "^x-agent-proof:" "$HDRS" | head -1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r' || true)

@@ -452,13 +452,13 @@ This is a monorepo with four sub-projects:
 | [`contracts/`](contracts/README.md) | Solidity contracts, Foundry tests, deploy / upgrade / verify scripts | Foundry (forge / cast) |
 | [`attestor/`](attestor/README.md) | Backend services (Attestor / Oracle TEE, API, worker, indexer) | Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.md) | Agent runtime container (restores iData inside TEE, pushes evolution on chain, signs responses) | Go |
-| [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`@0gfoundation/agentic-sdk`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`0g-agentdna`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
 
 ### Further reading
 
 **[`sdk/typescript/README.md`](sdk/typescript/README.md) — the client SDK**
 
-The one-entry-point (`AgenticID`) TypeScript facade over the whole
+The one-entry-point (`AgentDNA`, with the legacy `AgenticID` alias) TypeScript facade over the whole
 protocol: `ag.agent` (deploy / clone / transfer, reads, agent-seal gas
 top-up), `ag.reputation` (capture a TEE-signed serve-proof, verify it,
 submit/read on-chain feedback), plus top-level trust-root ack and
@@ -466,6 +466,10 @@ prepaid sandbox deposit. Hides the contract set and the attestor HTTP
 API behind one config object; every snippet in it runs against a live
 deployment — `https://agenticid.0g.ai` (as written) is 0G mainnet; point it at
 `https://agenticid-testnet.0g.ai` for the Galileo testnet.
+
+Existing CLI users can follow the [AgentDNA migration guide](sdk/typescript/MIGRATION.md).
+
+Inference provider extension and switching: [providers](sdk/typescript/PROVIDERS.md).
 
 **[`contracts/README.md`](contracts/README.md) — the contract layer**
 

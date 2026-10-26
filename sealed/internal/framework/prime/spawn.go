@@ -124,7 +124,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		SealSignSock:        rt.SealSignSock,
 		Provider:            provider,
 		Model:               model,
-		ZGComputeRouted:     cfg.Endpoint != nil,
+		ZGComputeRouted:     cfg.Endpoint != nil && provider == "0g-compute",
 		BootTime:            time.Now(),
 	})
 	if err := privsep.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {

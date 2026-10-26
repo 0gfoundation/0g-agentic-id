@@ -14,6 +14,17 @@ pub struct Framework {
     pub image: Option<String>,
 }
 
+/// Capabilities of this release, attached to configured snapshots. Attestor and
+/// all advertised sealed runtimes are upgraded together; routes live in the registry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InferenceCapability {
+    pub image: String,
+    pub providers: Vec<String>,
+    pub secret_env_versions: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub chain_rpc: String,
@@ -312,8 +323,7 @@ impl Config {
             verified_feedback_addr: env_opt_addr("ATTESTOR_VERIFIED_FEEDBACK_ADDR")?,
             feedback_batcher_addr: env_opt("ATTESTOR_FEEDBACK_BATCHER_ADDR")
                 .and_then(|s| s.parse().ok()),
-            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR")
-                .and_then(|s| s.parse().ok()),
+            clone_gate_addr: env_opt("ATTESTOR_CLONE_GATE_ADDR").and_then(|s| s.parse().ok()),
             standard_clone_authorizer_addr: env_opt("ATTESTOR_STANDARD_CLONE_AUTHORIZER_ADDR")
                 .and_then(|s| s.parse().ok()),
             tee_data_verifier_addr: env_opt("ATTESTOR_TEE_VERIFIER_ADDR")
@@ -420,6 +430,60 @@ fn env_opt(key: &str) -> Option<String> {
     std::env::var(key).ok()
 }
 
+// The release deploys attestor and its configured sealed images together.
+// Only configured images are advertised; explicit unknown images remain unsupported.
+fn runtime_capabilities(
+    enabled: bool,
+    default_image: &str,
+    frameworks: &[Framework],
+) -> Vec<InferenceCapability> {
+    if !enabled {
+        return Vec::new();
+    }
+    let mut images: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    if !default_image.trim().is_empty() {
+        images.insert(
+            default_image.to_string(),
+            vec!["openai".into(), "anthropic".into()],
+        );
+    }
+    for framework in frameworks {
+        let formats: &[&str] = match framework.name.as_str() {
+            "hermes" => &["openai"],
+            "openclaw" | "prime-agent" | "dsh" => &["openai", "anthropic"],
+            _ => continue,
+        };
+        let image = framework.image.as_deref().unwrap_or(default_image);
+        if image.trim().is_empty() {
+            continue;
+        }
+        images
+            .entry(image.to_string())
+            .and_modify(|current| current.retain(|f| formats.contains(&f.as_str())))
+            .or_insert_with(|| formats.iter().map(|f| (*f).to_string()).collect());
+    }
+    images
+        .into_iter()
+        .map(|(image, formats)| InferenceCapability {
+            image,
+            formats,
+            providers: vec!["0g-compute".into(), "openai".into(), "anthropic".into()],
+            secret_env_versions: vec![1, 2, 3],
+        })
+        .collect()
+}
+
+impl Config {
+    pub fn inference_capabilities(&self) -> Vec<InferenceCapability> {
+        runtime_capabilities(
+            self.secret_env_enabled,
+            &self.sandbox_snapshot,
+            &self.frameworks,
+        )
+    }
+}
+
 /// An optional address env var, parsed strictly: unset, blank or the zero
 /// address → None, but a non-empty value that is not an address is a startup
 /// error (a typo must not silently read as "unset"). The zero address names
@@ -460,7 +524,10 @@ fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
         })
         .unwrap_or_default();
     if parsed.is_empty() {
-        vec![Framework { name: "openclaw".to_string(), image: None }]
+        vec![Framework {
+            name: "openclaw".to_string(),
+            image: None,
+        }]
     } else {
         parsed
     }
@@ -469,6 +536,42 @@ fn parse_frameworks(raw: Option<String>) -> Vec<Framework> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_follow_the_release_and_configured_framework_images() {
+        let frameworks = parse_frameworks(Some(
+            "openclaw,hermes:hermes-new,prime-agent:prime-new,dsh:dsh-new".into(),
+        ));
+        let caps = runtime_capabilities(true, "openclaw-new", &frameworks);
+        assert_eq!(caps.len(), 4);
+        for capability in &caps {
+            assert_eq!(capability.secret_env_versions, vec![1, 2, 3]);
+            assert!(capability.providers.contains(&"openai".to_string()));
+            let expected = if capability.image == "hermes-new" {
+                vec!["openai"]
+            } else {
+                vec!["openai", "anthropic"]
+            };
+            assert_eq!(capability.formats, expected);
+        }
+        assert!(runtime_capabilities(false, "openclaw-new", &frameworks).is_empty());
+    }
+
+    #[test]
+    fn capabilities_do_not_advertise_unknown_images_or_protocols() {
+        let frameworks = parse_frameworks(Some(
+            "future:unknown-image,openclaw:shared,hermes:shared".into(),
+        ));
+        let caps = runtime_capabilities(true, "default", &frameworks);
+        assert!(!caps.iter().any(|cap| cap.image == "unknown-image"));
+        assert_eq!(
+            caps.iter()
+                .find(|cap| cap.image == "shared")
+                .unwrap()
+                .formats,
+            vec!["openai"]
+        );
+    }
 
     #[test]
     fn secret_env_flag_is_opt_in() {
@@ -498,9 +601,16 @@ mod tests {
         let a = parse_opt_addr(K, Some(" 0x00000000000000000000000000000000000000B7 "))
             .unwrap()
             .expect("valid address");
-        assert_eq!(format!("{a:#x}"), "0x00000000000000000000000000000000000000b7");
+        assert_eq!(
+            format!("{a:#x}"),
+            "0x00000000000000000000000000000000000000b7"
+        );
         // A typo must fail startup, not silently disable ServeProofs.
-        for bad in ["0x1234", "not-an-address", "0x00000000000000000000000000000000000000ZZ"] {
+        for bad in [
+            "0x1234",
+            "not-an-address",
+            "0x00000000000000000000000000000000000000ZZ",
+        ] {
             let err = parse_opt_addr(K, Some(bad)).unwrap_err().to_string();
             assert!(err.contains(K), "error must name the var: {err}");
         }
@@ -508,7 +618,9 @@ mod tests {
 
     #[test]
     fn parse_frameworks_name_and_image() {
-        let fws = parse_frameworks(Some("openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string()));
+        let fws = parse_frameworks(Some(
+            "openclaw, hermes:0g-sealed-hermes ,prime:0g-sealed-prime".to_string(),
+        ));
         assert_eq!(fws.len(), 3);
         assert_eq!(fws[0].name, "openclaw");
         assert_eq!(fws[0].image, None); // no image → default snapshot
@@ -531,7 +643,10 @@ mod tests {
     fn parse_frameworks_legacy_names_only_still_works() {
         // legacy ATTESTOR_SUPPORTED_FRAMEWORKS value shape (no images)
         let fws = parse_frameworks(Some("openclaw,hermes".to_string()));
-        assert_eq!(fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), vec!["openclaw", "hermes"]);
+        assert_eq!(
+            fws.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["openclaw", "hermes"]
+        );
         assert!(fws.iter().all(|f| f.image.is_none()));
     }
 }

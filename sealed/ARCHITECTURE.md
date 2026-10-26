@@ -81,7 +81,7 @@ Phase 1  provision        POST /provision → ECIES-decrypt, with the one contai
                             · the owner's settings document  (opaque blob; absent for an
                               unconfigured agent, and a decrypt failure is logged and
                               dropped rather than fatal)
-                          then scrub SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION / API_KEY
+                          then scrub SEAL_BOOT_TICKET / SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION / API_KEY
                           ↓
 Phase 2  chain bootstrap  WaitForMint(sealId) → agentId
                           IntelligentDatasOf(agentId) → []IntelligentData
@@ -116,13 +116,17 @@ is the pre-Start snapshot. The phase-2 seed is the baseline taken
 after the framework has stabilized, and that baseline is the actual
 reference point for watcher comparisons (see §4).
 
-That Phase 4 report also does something off-container: attestor reads a
-`running` report as proof that the settings version it served at `/provision`
-actually boots, and promotes it to last-known-good. A version that never
-confirms gets counted, and after repeated boots attestor serves the previous
-document instead of handing the container the same non-booting one forever
-(`attestor/crates/api/src/routes/status.rs:87-107`,
-`attestor/crates/api/src/routes/provision.rs:312-352`).
+The Phase 4 `running` / `warning` report also carries this boot's receipt and
+the digest of its applied document. Attestor promotes to last-known-good only
+when the receipt is still active, the digest matches, and the served version
+is still current. Old containers cannot overwrite a new container's status,
+and fallback boots cannot confirm a newer version. Repeated unconfirmed boots
+still trigger `/provision`'s fallback counter. Only an authorized new boot may
+obtain a receipt; replayed/older generations or tickets are refused. Receipts
+are ECIES-encrypted to the container; status, liveness and version promotion
+share one database transaction (`routes/status.rs`, `repo.rs::apply_status_report`).
+New sealed requires the new attestor: upgrade attestor before enabling all sealed
+images from this release. Legacy heartbeats never promote settings.
 
 ### Why the settings document comes down `/provision`
 
@@ -146,8 +150,8 @@ covers only where it lands in the boot.
 `manager.StartParams.PreStart` runs immediately before every `adapter.Start` —
 the first one, a `Reload`, and a crash-restart alike
 (`internal/manager/manager.go:168`, `:209`, `:336`). `main.go` points it at
-`adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`
-(`main.go:762-764`).
+`adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`
+(`startAgent` in `main.go`).
 
 It is a hook rather than a field on `RuntimeContext` because `RuntimeContext`
 is captured once at the initial `Start` and replayed verbatim on every
@@ -565,10 +569,16 @@ included — and WebSocket upgrades never carry an `X-Agent-Proof`; an
 upstream backend sets, as a header or a trailer, so the header is always the
 runtime's own.
 
+`GET $SEAL_SIGN_SOCK/settings` returns provider, model, thinking and managed
+route metadata (URL, format, registry version, route hash) from sealed's rendered
+runtime state. It contains no API key or arbitrary framework configuration.
+This differs from the owner's Postgres document, which can await reset. Before
+readiness it returns 503; the public HTTP route remains owner-signed.
+
 The agent's own `/settings` lever is deliberately asymmetric with the owner's:
 it validates, renders and restarts exactly like the owner path, but persists
 **nothing**, so the change lasts as long as this container and the owner's
-document is what comes back after any restart. That asymmetry is what makes
+document is what comes back after a container restart. That asymmetry is what makes
 granting it safe — the agent's legitimate use is "think harder on this task",
 not "permanently reconfigure yourself", and because nothing it writes
 survives, it cannot configure itself into a state it will not boot from, which
@@ -607,17 +617,18 @@ The env surface:
 
 | env | Meaning |
 |---|---|
+| `SEAL_BOOT_TICKET` | random ticket injected internally by the create worker and scrubbed before framework startup. Stop/start retains the ticket but rotates the generation; reset replaces the ticket. Required by the new image; operators do not set it |
 | `SANDBOX_SEAL_KEY` | sandbox-injected ECDSA private key; used to cross-verify with `SANDBOX_SEAL_ATTESTATION.pubkey` (Phase 0) |
 | `SANDBOX_SEAL_ATTESTATION` | v2 app-signer-signed attestation JSON containing `version=2`, `chain_id`, `registry_address`, exact `app_id`, `registered_at`, `image_hash`, `pubkey`, `seal_id`, `ts` and `signature`; sealId is read from here, not a separate env. Missing, legacy and unknown versions are rejected |
 | `TEE_SIGNER_ADDRESS` | (optional) expected stable sandbox app signer. Phase 0 requires the address recovered from the v2 signature to match when set. The authoritative `/provision` check authenticates the sandbox app signer and full app-instance scope through Scan, TappRegistry and SandboxServing. This local check never substitutes a current or historical node key |
 | `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
-| `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`). Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, unauthenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
+| `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`). Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, owner-authenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. Once the chain client has dialled, sealed also reads its `getIdentityRegistry()`: unless that is `AGENTIC_ID_ADDR` (no code, a revert or an unreadable result after retries count as not), it logs a `WARN` naming both addresses and takes the same no-proof path. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |
-| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty. Public, so it must not embed a credential: it is recorded in each uploaded entry's on-chain `dataDescription` (as the attestor records it at mint), printed in the boot log (`/log`, `/log.html`, unauthenticated) and passed to the `0g-storage-client` download CLI as a command-line argument |
+| `INDEXER_URL` | 0g-storage indexer URL; fallback used when the `dataDescription`'s indexer field is empty. Public, so it must not embed a credential: it is recorded in each uploaded entry's on-chain `dataDescription` (as the attestor records it at mint), printed in the boot log (`/log`, `/log.html`, owner-authenticated) and passed to the `0g-storage-client` download CLI as a command-line argument |
 | `AGENT_FRAMEWORK` | (optional) adapter-name **fallback** for chains without a framework binding (local dev). The on-chain binding is the authoritative selector; attestor does not inject this env |
-| `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go:65-68`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go:166-173`) |
-| `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. A value that does not open is logged as `FAIL` and ignored (`internal/secretenv`); if that leaves the agent with no key, its status stays `warning` with detail `secret_env_not_applied: <reason>` (a reason class such as `owner_mismatch`, never a value) instead of `running` |
+| `API_KEY` | the inference credential, forwarded by attestor in the deploy / Recreate envelope. It is read once into `settings.Resolved.APIKey` and is never part of the settings document and never persisted; scrubbed from the environment after provisioning. How the framework then receives it is per-adapter: openclaw takes it by env *reference* (only the variable NAME reaches openclaw.json, `openclaw/inference.go`), hermes gets the literal value written into `config.yaml` because its `custom` provider declares no env vars and dialing it keyless produced a live 401 (`hermes/spawn.go`) |
+| `SEAL_SECRET_ENV` | (optional) the owner's secret env (today only `API_KEY`), ECIES-sealed by the SDK to the agentSeal public key so the owner's wallet prompt shows ciphertext only (issue #166). Opened after Phase 2 with `agentSeal_priv`; applied only when its `owner` equals the live on-chain owner; wins over a plain `API_KEY`. V2 binds the provider; v3 binds its routing hash and accepted registry version/digest, reading that historical snapshot on every boot (including stop/start). Plaintext/v1 keys are compute-only. Invalid ciphertext logs `FAIL`, records `secret_env_not_applied: <reason>`, and refuses plaintext fallback and settings rendering (`internal/secretenv`). Provider mismatch requires reset with the matching key |
 | `SANDBOX_PROXY_DOMAIN` + `DAYTONA_SANDBOX_ID` | used to build `AGENT_PUBLIC_URL`, in the form `http://8080-<sandbox_id>.<proxy_domain>`; the agent's own exposed port is hard-coded `:8080` by sealed proxy |
 
 ### How `AGENT_PUBLIC_URL` is surfaced to the agent
@@ -745,3 +756,5 @@ instance never uploaded the role itself, but the chain holds the
 version attestor uploaded at mint. Without path 2, that role's
 data_hash would be missing from the envelope and verifier would mark
 it ✗.
+
+An exhausted supervisor pins process failure as error. Upload success or a heartbeat cannot clear it; only an explicit restart that actually reaches Running releases that failure, preventing a dead framework from being marked online.

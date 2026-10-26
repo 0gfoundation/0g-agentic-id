@@ -2,7 +2,7 @@
  * @file interactive.ts
  * @description The default action: a two-level interactive shell.
  *
- *   L1 — manager REPL (`0g-agenticid>`): list your agents, link one, deploy a
+ *   L1 — manager REPL (`0g-agentdna>`): list your agents, link one, deploy a
  *        new one, configure the environment (attestor URL) and wallet.
  *   L2 — session REPL (`agent 286 ›`): chat with one agent. Esc / Ctrl-C
  *        interrupts a turn in flight; `/back` returns to L1; `/quit` exits.
@@ -26,12 +26,14 @@ import { buildClient } from '../sdk';
 import { saveProof, listProofs, removeProof, toServeProof, ticketDisposition, ticketRedeemable, type SavedProof } from '../proofs';
 import { CliError } from '../errors';
 import { requireAttestorUrl } from '../env';
-import { loadKey, saveKey, normalizeKey, loadApiKey, saveApiKey, saveConfig, configPaths } from '../config';
+import { loadKey, saveKey, normalizeKey, saveApiKey, loadConfig, saveConfig, configPaths } from '../config';
 import { parseAgentRef, refMatchesSeal, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type ThinkingLevel } from '../../Settings';
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
+import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
+import { configuredInferenceKey, requireConfiguredInferenceKey, agentInferenceProvider, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
@@ -102,7 +104,7 @@ async function maybePrintUpdateHint(attestorUrl?: string): Promise<void> {
         mkdirSync(configPaths().dir, { recursive: true });
         writeFileSync(stamp, JSON.stringify({ day: today, latest }));
       } catch (e) { console.error(`(update-hint stamp unwritable: ${(e as Error).message} — the hint may repeat)`); }
-      out(`\n  update available: ${mine} → ${latest}   npm i -g @0gfoundation/0g-agenticid-sdk\n`);
+      out(`\n  update available: ${mine} → ${latest}   0g-agentdna update\n`);
       if (cfg.cli_notes?.trim()) out(`  ${cfg.cli_notes.trim()}\n`);
     } catch { /* a down attestor never blocks or complains here */ }
   }
@@ -143,11 +145,21 @@ const AGENT = (): string[] => knownAgentIds;
 // REPL entry populates it, and until it lands `model=<tab>` simply offers
 // nothing rather than blocking on the network.
 let chatModelIds: string[] = [];
+let completionProvider = '0g-compute';
+const providerModelIds: Record<string, string[]> = {};
+let knownProviders: InferenceProvider[] = listInferenceProviders();
 function prefetchModelIds(ag: AgenticID): void {
-  ag.agent
-    .listModelCaps()
-    .then((caps) => { chatModelIds = caps.filter((m) => m.chat).map((m) => m.id); })
-    .catch(() => { /* a wedged router must not break the prompt; leave the cache empty */ });
+  completionProvider = loadConfig().inferenceProvider ?? '0g-compute';
+  chatModelIds = providerModelIds[completionProvider] ?? [];
+  ag.agent.refreshProviders().then((providers) => {
+    knownProviders = providers;
+    for (const provider of providers) {
+      ag.agent.listModelCaps({ provider: provider.id }).then((caps) => {
+        providerModelIds[provider.id] = caps.filter((m) => m.chat).map((m) => m.id);
+        if (provider.id === completionProvider) chatModelIds = providerModelIds[provider.id];
+      }).catch(() => { /* completion must not block the prompt */ });
+    }
+  }).catch(() => { /* only completions; explicit operations refresh strictly */ });
 }
 const L1_ARGS: Record<string, string[] | (() => string[])> = {
   use: AGENT, hello: AGENT, start: AGENT, stop: AGENT, reset: AGENT,
@@ -174,12 +186,12 @@ const TAIL_ARGS: Record<string, string[]> = {
 
 // completeTail finishes the word being typed in a k=v run: key names, and
 // the value set for thinking=.
-export function completeTail(cmd: string, word: string, models: string[]): string[] {
+export function completeTail(cmd: string, word: string, models: string[], providers = knownProviders.map((p) => p.id)): string[] {
   const keys = TAIL_ARGS[cmd];
   if (!keys) return [];
   // Value completion for the keys whose values are a known set. thinking is a
-  // fixed trio; model is the router catalog; provider is the one name the
-  // platform routes. others= is opaque JSON — nothing to suggest.
+  // fixed trio; model and provider suggestions come from the registry.
+  // others= is opaque JSON — nothing to suggest.
   if (word.startsWith('thinking=')) {
     return ['low', 'high', 'max'].map((v) => 'thinking=' + v).filter((c) => c.startsWith(word));
   }
@@ -188,7 +200,7 @@ export function completeTail(cmd: string, word: string, models: string[]): strin
     return hits.length ? hits : ['model='];
   }
   if (word.startsWith('provider=')) {
-    return ['provider=0g-compute'].filter((c) => c.startsWith(word));
+    return providers.map((provider) => `provider=${provider}`).filter((candidate) => candidate.startsWith(word));
   }
   const hits = keys.filter((c) => c.startsWith(word));
   return hits.length ? hits : keys;
@@ -199,7 +211,7 @@ export function completeTail(cmd: string, word: string, models: string[]): strin
 // completer is a one-line adapter that hands it the mutable module state.
 export function completeLine(
   line: string,
-  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[] },
+  state: { completions: string[]; args: Record<string, string[] | (() => string[])>; models: string[]; provider?: string; providerModels?: Record<string, string[]>; providers?: string[] },
 ): [string[], string] {
   const sp = line.indexOf(' ');
   if (sp === -1) {
@@ -215,7 +227,9 @@ export function completeLine(
   // word is already k=v. This split is exactly what broke `/settings model=`.
   const firstTokenIsAgent = cmd === 'settings' && !rest.includes(' ');
   if (TAIL_ARGS[cmd] && !firstTokenIsAgent) {
-    const hits = completeTail(cmd, word, state.models);
+    const provider = rest.match(/(?:^|\s)provider=([^\s]+)/)?.[1] ?? state.provider ?? '0g-compute';
+    const models = state.providerModels?.[provider] ?? (provider === (state.provider ?? '0g-compute') ? state.models : []);
+    const hits = completeTail(cmd, word, models, state.providers);
     return hits.length ? [hits, word] : [[], line];
   }
   const cand = state.args[cmd];
@@ -463,7 +477,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // so the candidate set is swapped by whichever REPL loop is active
     // (activeCompletions); empty line + Tab lists everything.
     completer: (line: string): [string[], string] =>
-      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds }),
+      completeLine(line, { completions: activeCompletions, args: activeArgs, models: chatModelIds, provider: completionProvider, providerModels: providerModelIds }),
   });
   // `ask` is a line QUEUE, not rl.question: lines that arrive while no
   // question is pending (piped input racing the ~4s async banner) used to be
@@ -518,7 +532,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   });
 
   try {
-    // Shortcut: `0g-agenticid <agent>` links straight into L2, then drops to L1.
+    // Shortcut: `0g-agentdna <agent>` links straight into L2, then drops to L1.
     if (ctx.positionals[0]) {
       // Validate the argument BEFORE demanding a wallet: a typo'd agent ref
       // must exit 2 (BAD_AGENT_REF) per the --help EXIT CODES contract, not
@@ -609,7 +623,7 @@ const L1_HELP_FULL = `manager commands
                           much (more) to withdraw (time-locked)
   ack                     acknowledge the TEE trust root (deploy/start/reset
                           do this implicitly; re-run after an attestor upgrade)
-  login                   guided setup: attestor URL, owner key, inference key
+  login [provider]        setup: attestor URL, owner key, provider, inference key
                           (Enter keeps the current value; secrets echo *)
   whoami                  show attestor / wallet / api-key / ack status
   help                    this text
@@ -623,20 +637,20 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   // attestor mid-session, and a stale label then disagrees with the real
   // backend (the exact confusion this marker exists to prevent).
   const key = ctx.env.privateKey ?? loadKey() ?? undefined;
-  const hasApiKey = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
+  const hasApiKey = !!configuredInferenceKey(loadConfig().inferenceProvider ?? '0g-compute');
   const wallet = key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : null;
   const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`;
   // Pixel splash (the avatar generator's panda) when the terminal can show
   // it; the plain box otherwise (pipes, NO_COLOR, dumb terminals).
   if (process.stdout.isTTY && !process.env.NO_COLOR) {
     const art = pandaLines();
-    const caption = ['', '', '', '   \x1b[1m0G AgenticID\x1b[0m', '   interactive shell', '', '', ''];
+    const caption = ['', '', '', '   \x1b[1m0G AgentDNA\x1b[0m', '   interactive shell', '', '', ''];
     out('\n');
     art.forEach((l, i) => out(`  ${l}${caption[i] ?? ''}\n`));
     out('\n');
   } else {
     out('\n╭──────────────────────────────────────╮\n');
-    out('│   0G AgenticID — interactive shell   │\n');
+    out(`│${'   0G AgentDNA — interactive shell'.padEnd(38)}│\n`);
     out('╰──────────────────────────────────────╯\n\n');
   }
   // Ack read and the update hint both hit the attestor; they start before the
@@ -687,7 +701,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
   for (;;) {
     activeCompletions = L1_WORDS;
     activeArgs = L1_ARGS;
-    const line = (await ask(`\n0g-agenticid [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
+    const line = (await ask(`\n0g-agentdna [${hostOf(ctx.env.attestorUrl)}]> `)).trim();
     // Bare Enter refreshes the account status — the L1 analog of L2's
     // bare-Enter agent refresh.
     // Quote-aware, so a value with a space in it (`settings 286
@@ -698,7 +712,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
       if (cmd === 'help') { out(`${L1_HELP_FULL}\n`); continue; }
 
       if (cmd === 'login' || cmd === 'config') {
-        // One guided setup — attestor URL, owner key, inference key. Enter
+        // Guided setup — attestor URL, owner key, provider, inference key. Enter
         // keeps the current value; a typed value replaces it. Secrets masked.
         const url = (await ask(`attestor URL [${ctx.env.attestorUrl ?? 'unset'}]: `)).trim();
         if (url) { saveConfig({ attestorUrl: url.replace(/\/$/, '') }); ctx.env.attestorUrl = url.replace(/\/$/, ''); }
@@ -713,12 +727,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           catch (e) { out(`private key not saved: ${(e as Error).message}\n`); }
         }
 
-        const hasApi = !!(process.env.AGENTIC_API_KEY?.trim() || loadApiKey());
-        const api = (await askSecret(ask, `inference API key [${hasApi ? 'set — Enter to keep' : 'unset'}]: `)).trim();
-        if (api) {
-          try { saveApiKey(api); }
-          catch (e) { out(`api key not saved: ${(e as Error).message}\n`); }
-        }
+        if (ctx.env.attestorUrl) {
+          const client = await buildClient(ctx.env);
+          knownProviders = await client.agent.refreshProviders();
+        } else { knownProviders = listInferenceProviders(); }
+        const selected = args[0] ?? await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
+        if (!knownProviders.some((provider) => provider.id === selected)) throw new CliError('BAD_FLAG', `unknown inference provider: ${selected}`);
+        saveConfig({ inferenceProvider: selected });
+        const hasApi = !!configuredInferenceKey(selected);
+        const api = (await askSecret(ask, `${selected} API key [${hasApi ? 'set — Enter to keep' : 'unset'}]: `)).trim();
+        if (api) saveApiKey(selected, api);
         out(`saved to ${configPaths().dir} (credentials chmod 600)\n`);
         // Re-seed the startup-time caches that were filled from the OLD
         // attestor or wallet: without this, Tab completion keeps offering the
@@ -726,7 +744,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         // per-wallet) agent ids and model names until the next `list` (same
         // root cause as the prompt marker — a login mid-session leaves
         // startup-seeded state stale). Best-effort, completion-only.
-        if ((url || key) && ctx.env.privateKey) {
+        if (ctx.env.privateKey) {
           withWallet(ctx).then((ag) => {
             ag.agent.listMyDeployments().then(rememberAgentIds).catch(() => { /* completions only */ });
             prefetchModelIds(ag);
@@ -818,7 +836,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`attestor: ${ctx.env.attestorUrl ?? '(unset)'}\n`);
         const key = ctx.env.privateKey ?? loadKey() ?? undefined;
         out(`wallet  : ${key ? await addressOf(key).catch(() => '(malformed key — run `login`)') : '(no key — run `login`)'}\n`);
-        out(`api key : ${process.env.AGENTIC_API_KEY?.trim() || loadApiKey() ? 'set' : '(none — run `login`)'}\n`);
+        out(`provider: ${loadConfig().inferenceProvider ?? '0g-compute'} (default for deploy/login)\n`);
+        for (const provider of knownProviders) out(`key ${provider.id}: ${configuredInferenceKey(provider.id) ? 'set' : '(not registered)'}\n`);
         if (key && ctx.env.attestorUrl) {
           // The three status reads are independent — fetch them in parallel
           // (they were serial: 2.9s measured; parallel is bounded by the
@@ -947,10 +966,12 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
-        const apiKey = await inferenceKey(ctx, ask);
+        const provider = await agentInferenceProvider(ag, row.sealId);
+        await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
+        const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
-        await ag.agent.reset(row.sealId, { framework, apiKey });
+        await ag.agent.reset(row.sealId, { provider, framework, apiKey });
         const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
         if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
         continue;
@@ -1320,12 +1341,20 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
   // A document with no model is the one the container hard-fails on and
   // last-known-good cannot cover — refuse before signing, and say so.
   assertModelPresent(next, current !== null);
+  const providerChanged = changesProvider(current, next);
+  if (providerChanged) requireConfiguredInferenceKey(next.provider ?? '0g-compute');
   try {
     const { version: written } = await ag.agent.setSettings(sealId, next, {
       baseVersion: version,
       onWarn: (w) => out(`⚠ ${w}\n`),
     });
     for (const l of renderSettings(next)) out(`  ${l}\n`);
+    if (providerChanged) {
+      out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+      completionProvider = next.provider ?? '0g-compute';
+      chatModelIds = providerModelIds[completionProvider] ?? [];
+      return next;
+    }
     // Push to the running container so a change made mid-conversation takes
     // effect NOW, not at the next boot. Best-effort: the write above is
     // durable, so a push failure is a note, never an error. The command-line
@@ -1340,6 +1369,10 @@ async function settingsOp(ag: AgenticID, sealId: `0x${string}`, args: string[], 
         out(`written — version ${written}; ${r.note ?? 'applied to the running container'}\n`);
       } catch (e2) {
         const msg = (e2 as Error).message;
+        if (requiresProviderReset(e2)) {
+          out(`written — version ${written}; provider change pending — run reset with the ${next.provider} key\n`);
+          return next;
+        }
         // A container that ANSWERED and refused (HTTP status) will refuse the
         // same document on the next boot too and fall back to last-known-good;
         // only an UNREACHABLE container (no HTTP status) applies it next boot.
@@ -1609,18 +1642,26 @@ async function addressOf(key: `0x${string}`): Promise<string> {
 
 // ── deploy / attach (from the former chat command) ───────────────────────────
 
-async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<string>): Promise<string> {
-  // env wins, then the persisted credentials file, then a one-off prompt.
-  const fromEnv = process.env.AGENTIC_API_KEY?.trim() || process.env.API_KEY?.trim();
-  if (fromEnv) return fromEnv;
-  const stored = loadApiKey();
-  if (stored) return stored;
-  const typed = (await askSecret(ask, 'inference API key (saved to credentials): ')).trim();
-  if (typed) { try { saveApiKey(typed); } catch { /* keep going with the typed value */ } return typed; }
+async function pickInferenceProvider(ask: (q: string) => Promise<string>, preferred: string): Promise<string> {
+  const providers = knownProviders;
+  const fallback = Math.max(0, providers.findIndex((provider) => provider.id === preferred));
+  out('providers:\n');
+  providers.forEach((provider, index) => out(`  ${index}. ${provider.id} (${provider.name})${index === fallback ? ' (default)' : ''}\n`));
+  const input = (await ask(`provider [${fallback}]: `)).trim();
+  const chosen = !input ? providers[fallback] : providers.find((provider) => provider.id === input) ?? providers[Number(input)];
+  if (!chosen) throw new CliError('BAD_FLAG', `unknown inference provider: ${input}`);
+  return chosen.id;
+}
+
+async function inferenceKey(ctx: CommandContext, ask: (q: string) => Promise<string>, provider = '0g-compute'): Promise<string> {
+  const configured = configuredInferenceKey(provider);
+  if (configured) return configured;
+  const typed = (await askSecret(ask, `${provider} inference API key (saved to credentials): `)).trim();
+  if (typed) { saveApiKey(provider, typed); return typed; }
   // No key anywhere: deploying anyway would provision a container that 401s
   // on every turn minutes later — fail HERE with the fix instead.
-  throw new CliError('WALLET_REQUIRED', 'no inference API key configured — the agent could not reach its model', {
-    remedy: 'run `login` (stores it, chmod 600) or set AGENTIC_API_KEY',
+  throw new CliError('INFERENCE_KEY_REQUIRED', `no API key registered for ${provider}`, {
+    remedy: `run login and register the ${provider} key`,
   });
 }
 
@@ -1693,17 +1734,26 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   // (the router also lists image/audio models), and function-calling models
   // for the tool-driven frameworks — a chat-only model deploys "successfully"
   // and then fails EVERY turn, with no way to fix it in-CLI (feedback.md F14).
+  knownProviders = await ag.agent.refreshProviders();
+  const provider = await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
+  const definition = knownProviders.find((entry) => entry.id === provider)!;
+  await ag.agent.assertProviderSupported(provider, { framework });
   const NEEDS_TOOLS = new Set(['openclaw', 'dsh', 'prime-agent']);
-  const caps = await ag.agent.listModelCaps();
-  const models = caps
-    .filter((m) => m.chat)
-    .filter((m) => !NEEDS_TOOLS.has(framework) || m.tools)
-    .map((m) => m.id)
-    .filter((m) => framework !== 'hermes' || !m.startsWith('claude'));
-  if (!models.length) throw new CliError('UNKNOWN', `no compatible models advertised for ${framework}`, { remedy: 'try again later, or another framework' });
-  out('\nmodels:\n');
-  models.forEach((m, i) => out(`  ${i}. ${m}\n`));
-  const model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
+  const caps = await ag.agent.listModelCaps({ provider });
+  const models = caps.filter((model) => model.chat)
+    .filter((model) => !NEEDS_TOOLS.has(framework) || model.tools)
+    .filter((model) => framework !== 'hermes' || definition.native || model.formats.includes('openai') || (!model.formats.length && !model.id.startsWith('claude')))
+    .map((model) => model.id);
+  let model: string;
+  if (!models.length && !definition.modelCatalog) {
+    model = (await ask(`${provider} model id (required): `)).trim();
+    if (!model) throw new CliError('BAD_FLAG', 'model is required');
+  } else {
+    if (!models.length) throw new CliError('UNKNOWN', `no compatible models advertised for ${framework} on ${provider}`);
+    out('\nmodels:\n');
+    models.forEach((id, index) => out(`  ${index}. ${id}\n`));
+    model = models[Number((await ask('model [0]: ')).trim()) || 0] ?? models[0];
+  }
 
   const name = (await ask(`name [chat-${framework}]: `)).trim() || `chat-${framework}`;
 
@@ -1713,18 +1763,10 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   // container is actually provisioned, so skip both in mint-only mode.
   const provision = !(await ask('bring it online now (start a container)? [Y/n]: ')).trim().toLowerCase().startsWith('n');
 
-  const apiKey = provision ? await inferenceKey(ctx, ask) : undefined;
+  const apiKey = provision ? await inferenceKey(ctx, ask, provider) : undefined;
   if (provision && !(await ensureOwnerReady(ag, ask))) throw new CliError('WALLET_REQUIRED', 'deploy cancelled — prepaid balance too low', { remedy: 'run `deposit`, then `deploy` again' });
   out(`\ndeploying ${name} (${framework} · ${model})${provision ? '' : ' — mint only, no container'}…\n`);
-  const dep = await ag.agent.deploy({
-    name,
-    description: 'deployed from 0g-agenticid',
-    framework,
-    inference: { provider: '0g-compute', model },
-    ...(provision ? { sandbox: { apiKey: apiKey! } } : {}),
-  });
-  const mint = await ag.agent.waitForMint(dep.sealId, { timeoutMs: 180000 });
-  const agentId = String((mint as { agentId?: unknown }).agentId ?? mint);
+  const { deployment: dep, agentId } = await deployWithInference(ag, { name, framework, provider, model, provision, apiKey });
   if (!provision) {
     out(`minted agentId ${agentId} — offline (no container). Bring it online with: reset ${agentId}\n`);
     return null;
@@ -2034,10 +2076,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } else {
           s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         }
-        const apiKey = await inferenceKey(ctx, ask);
+        const provider = await agentInferenceProvider(s.ag, s.sealId);
+        await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
+        const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
-        await s.ag.agent.reset(s.sealId, { framework: s.framework, apiKey });
+        await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, apiKey });
         const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
         if (!r) continue;
         await connectSession(s, r.url);
