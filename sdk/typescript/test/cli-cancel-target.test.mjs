@@ -114,3 +114,46 @@ test('routeTaskFailure: an empty rawLine prints nothing (caller handles its own 
   assert.equal(d, 'raw');
   assert.equal(printed.length, 0);
 });
+
+// brakeInterruptLine — the Esc brake under displacement must NOT prompt. The
+// brake fires on an idle Esc, while the main loop is parked in its own ask();
+// a second queued waiter would steal lines FIFO: the user's Enter would
+// refresh status instead of reclaiming, and their next chat message would be
+// eaten as the prompt's non-empty answer. This drives the brake path with a
+// verbatim ask-queue shape while a loop ask is pending.
+import { brakeInterruptLine } from '../dist/cli/commands/interactive.js';
+
+test('Esc brake while displaced: notice, never a second prompt', async () => {
+  // the ask queue, verbatim shape: waiters are handed lines FIFO
+  const waiters = [];
+  const ask = () => new Promise((resolve) => waiters.push(resolve));
+  const deliver = (line) => { const w = waiters.shift(); if (w) w(line); };
+
+  // the main loop is parked in its prompt when the idle Esc fires
+  const loopAsk = ask();
+  assert.equal(waiters.length, 1);
+
+  // the brake's interrupt POST gets the occupancy 409 → the FIXED handler
+  // (a pure line, no ask — the 06d7a7d regression called the seat handler,
+  // queueing a second waiter)
+  const line = brakeInterruptLine(new Error('interrupt: HTTP 409: {"error":"displaced"}'));
+  assert.equal(waiters.length, 1, 'no second waiter queued — the notice is not a prompt');
+  assert.match(line, /driven by another client/, 'the displaced notice prints');
+  assert.match(line, /send a message or \/cancel/, 'it points at the paths that CAN prompt');
+  assert.doesNotMatch(line, /: \n?$/, 'not shaped like a prompt — expects no input');
+
+  // the user's Enter still reaches THE LOOP (status refresh), not a phantom
+  deliver('\n');
+  assert.equal(await loopAsk, '\n');
+  // and their next chat message is not eaten by a leftover waiter
+  const chatAsk = ask();
+  deliver('hello');
+  assert.equal(await chatAsk, 'hello');
+  assert.equal(waiters.length, 0);
+});
+
+test('Esc brake: a non-seat failure keeps the old raw line', () => {
+  const line = brakeInterruptLine(new Error('interrupt: HTTP 500: gateway broke'));
+  assert.match(line, /\(interrupt failed: interrupt: HTTP 500: gateway broke\)/);
+  assert.doesNotMatch(line, /driven by another client/);
+});

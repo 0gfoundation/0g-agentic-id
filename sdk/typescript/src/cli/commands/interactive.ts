@@ -147,6 +147,26 @@ export function displacedFailure(failure: string): boolean {
 }
 
 /**
+ * The Esc brake's failure line — a PURE function on purpose. The brake fires
+ * on an idle Esc, and at that moment the main loop is parked in its own
+ * ask() prompt; calling ask() from here (via the seat handler) would queue a
+ * second waiter, and ask hands lines out FIFO — the user's Enter would go to
+ * the wrong prompt (a bare-Enter status refresh instead of a reclaim), and
+ * their next chat message would be eaten as the prompt's non-empty answer.
+ * So a displaced 409 prints a NOTICE that points at the paths which CAN
+ * prompt (a chat turn, /cancel); every other failure keeps the old raw line.
+ * Taking no ask and returning a string is the guarantee — pinned by a test
+ * that drives the brake while a loop ask is pending.
+ */
+export function brakeInterruptLine(e: unknown): string {
+  const msg = (e as Error)?.message ?? '';
+  if (displacedFailure(msg)) {
+    return '\n⚠ this agent is now driven by another client — send a message or /cancel to take the seat back\n';
+  }
+  return `\n(interrupt failed: ${msg})\n`;
+}
+
+/**
  * The shared catch for a gated-POST failure: displaced → the seat handler
  * (which prompts and may reclaim); anything else → the caller's raw line.
  * `leavesWhat` for these paths is "leaves the seat with the other client" —
@@ -2044,8 +2064,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!c?.interrupt) { out('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     c.interrupt().then(
       (r) => out(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
-      // the brake POST is seat-gated too — a displaced 409 gets the prompt
-      (e) => { void routeTaskFailure(out, displacedSeat, e, `\n(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt'); },
+      // NOT a prompt: the brake fires on an IDLE Esc, so the main loop is
+      // parked in its own ask() at this moment — queueing a second waiter
+      // would steal its lines FIFO (the user's Enter would refresh status
+      // instead of reclaiming; their next chat message would be eaten as the
+      // prompt's non-empty answer). Print the notice; the paths that CAN
+      // prompt (a chat turn, /cancel) run the seat handler themselves.
+      (e) => out(brakeInterruptLine(e)),
     );
   };
   // A friendly message that hides WHICH failure happened costs a whole
