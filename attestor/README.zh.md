@@ -231,3 +231,8 @@ Postgres / chain / sandbox 依赖，单测从 6s 起。
 完整回归流程（本地全 mock、testnet 实测、故障速查表）见
 [TESTING.md](TESTING.md)——`scripts/e2e.sh` 负责部署，
 `scripts/verify-agent.sh` 负责验证。
+
+实测脚本从部署记录或 SDK 获取容器 URL，并以 owner 身份读取启动日志。
+CLI smoke 使用临时配置目录。clone/transfer 测试把生成的钱包私钥保存到
+临时目录（或 `TEST_ARTIFACT_DIR` 下），文件权限为 `0600`，便于失败后恢复
+测试资产；测试结束后应停止对应容器。

@@ -246,3 +246,9 @@ sandbox dependencies. A single test starts in ~6s.
 For the full regression procedure (local stack, live testnet, and the
 failure-triage table), see [TESTING.md](TESTING.md) —
 `scripts/e2e.sh` deploys, `scripts/verify-agent.sh` verifies.
+
+Live checks discover container URLs from the deployment/SDK and authenticate
+startup-log reads as the owner. CLI smoke uses a temporary config directory.
+Clone/transfer checks retain generated wallet keys in a temporary directory
+(or beneath `TEST_ARTIFACT_DIR`) with mode `0600`, so test assets remain
+recoverable after a failure; stop their containers after the run.

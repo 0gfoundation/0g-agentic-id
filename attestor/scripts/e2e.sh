@@ -29,7 +29,7 @@ banner() { printf "\n── %s ──\n" "$1"; }
 
 # ── Build sandbox envelope ─────────────────────────────────────────────
 # User signs a canonical JSON; attestor relays the bytes + sig verbatim to
-# sandbox. Field order MUST be {action, expires_at, nonce, payload, resource_id}
+# sandbox. Field order MUST be {action, expires_at, nonce, payload, provider, resource_id}
 # — matches Go's json.Marshal of the sandbox `signedRequest` struct.
 
 NONCE=$(openssl rand -hex 16)
@@ -59,13 +59,15 @@ PAYLOAD=$(jq -cn \
 # Canonical JSON with strict field order. `-c` is mandatory: any whitespace
 # will shift the bytes vs what base64 encodes, and the signature will no
 # longer recover to OWNER.
+PROVIDER=$(curl -fsS -m 10 "$API/config" | jq -er '.sandbox_provider_addr | select(. != null and . != "")')
 CANONICAL=$(jq -cn \
   --arg action "create" \
   --argjson expires_at "$EXPIRES_AT" \
   --arg nonce "$NONCE" \
   --argjson payload "$PAYLOAD" \
+  --arg provider "$PROVIDER" \
   --arg resource_id "" \
-  '{action:$action, expires_at:$expires_at, nonce:$nonce, payload:$payload, resource_id:$resource_id}')
+  '{action:$action, expires_at:$expires_at, nonce:$nonce, payload:$payload, provider:$provider, resource_id:$resource_id}')
 
 # EIP-191 personal_sign with V ∈ {27,28}. `cast wallet sign` does this by
 # default — do NOT add --no-hash (that skips the prefix and breaks recover).

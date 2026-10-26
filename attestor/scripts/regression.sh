@@ -66,7 +66,7 @@ fi
 step "smoke (negative deploy → 400)" bash -c "cd '$SDK' && node scripts/smoke.cjs"
 
 # ── CLI smoke, public tier (free): read paths + the WALLET_REQUIRED gates ──
-step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
+step "cli-smoke (public tier + gates)" bash -c "cd '$SDK' && env -u OWNER_PRIV -u AGENTIC_PRIVATE_KEY -u AGENTDNA_PRIVATE_KEY AGENTIC_ATTESTOR_URL='$API' node scripts/cli-smoke.cjs"
 
 # ── deploy a fresh source, capture its coordinates ────────────────────
 DEPLOY_LOG="$(mktemp)"
@@ -84,9 +84,7 @@ if [ -n "${SEAL_ID:-}" ]; then
   AGENT_ID=$((AGENT_HEX))
   SANDBOX=$(echo "$ROW" | jq -r .sandbox_id)
   SEAL_ADDR=$(echo "$ROW" | jq -r .agent_seal_addr)
-  PROXY=$(curl -fsS "$API/config" | jq -r .sandbox_proxy_addr)
-  PORT=$(curl -fsS "$API/config" | jq -r .agent_serve_port)
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  AGENT_URL=$(echo "$ROW" | jq -er '.agent_card.url | sub("/hello$"; "")')
   echo "source: agent_id=$AGENT_ID seal=$SEAL_ID sandbox=$SANDBOX url=$AGENT_URL"
 
   # CLI owner tier against the fresh deployment: doctor all six green,
@@ -102,8 +100,8 @@ if [ -n "${SEAL_ID:-}" ]; then
   # clone + feedback + transfer + owner gate (consumes the source via transfer, so LAST among source-bound legs).
   # Re-derive the URL first: agent-e2e's reset above recreated the container
   # with a NEW sandbox_id, so the deploy-time AGENT_URL is now stale.
-  SANDBOX=$(owner_deployments | jq -r --arg s "$SEAL_ID" '.[] | select(.seal_id==$s) | .sandbox_id')
-  AGENT_URL="http://${PORT}-${SANDBOX}.${PROXY}"
+  ROW=$(owner_deployments | jq -c --arg s "$SEAL_ID" '.[] | select(.seal_id==$s)')
+  AGENT_URL=$(echo "$ROW" | jq -er '.agent_card.url | sub("/hello$"; "")')
   echo "source url refreshed post-reset: $AGENT_URL"
   if [ -n "${VERIFIED_FEEDBACK_ADDR:-}" ]; then
     step "lifecycle-e2e (clone+feedback+transfer+gate)" bash -c "cd '$SDK' && AGENT_URL='$AGENT_URL' SEAL_ID='$SEAL_ID' AGENT_ID='$AGENT_ID' VERIFIED_FEEDBACK_ADDR='$VERIFIED_FEEDBACK_ADDR' FEEDBACK_BATCHER_ADDR='${FEEDBACK_BATCHER_ADDR:-}' node scripts/lifecycle-e2e.cjs"

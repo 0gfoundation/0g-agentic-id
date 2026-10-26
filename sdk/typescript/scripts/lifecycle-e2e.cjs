@@ -24,7 +24,8 @@
 //   SEAL_ID=0x… AGENT_ID=61 VERIFIED_FEEDBACK_ADDR=0x… node scripts/lifecycle-e2e.cjs
 'use strict';
 const { AgenticID } = require('../dist/index.js');
-const { generatePrivateKey, privateKeyToAccount } = require('viem/accounts');
+const { privateKeyToAccount } = require('viem/accounts');
+const { createTestWallet } = require('./test-wallet.cjs');
 const { createWalletClient, http, parseEther } = require('viem');
 const { execSync } = require('child_process');
 
@@ -90,7 +91,7 @@ function mkClient(privKey, cfg) {
   const ownerA = privateKeyToAccount(OWNER_PRIV).address;
 
   // ── second wallet B: fresh key, funded with a little gas from A ───────
-  const privB = generatePrivateKey();
+  const { privateKey: privB } = createTestWallet('lifecycle-e2e');
   const acctB = privateKeyToAccount(privB);
   console.log(`· wallet B = ${acctB.address} (ephemeral, funded from owner)`);
   {
@@ -103,7 +104,6 @@ function mkClient(privKey, cfg) {
   // listMyDeployments(); list as the owning client and match agentId.
   const rowOf = async (client, id) => (await client.agent.listMyDeployments()).find((r) => r.agentId === id);
   const API_KEY = process.env.API_KEY || 'sk-lifecycle-e2e';
-  const proxy = cfg.sandbox_proxy_addr, port = cfg.agent_serve_port;
 
   // Provision B up-front (ack + deposit) so it can actually BRING AGENTS UP —
   // both the clone (below) and the transferred source (gate). Without this a
@@ -160,7 +160,7 @@ function mkClient(privKey, cfg) {
   for (let i = 0; i < 40; i++) { crow = await rowOf(B, cloneId); if (crow && crow.phase === 'running') break; await sleep(10000); }
   check('clone reaches RUNNING under new owner', crow && crow.phase === 'running', `phase=${crow && crow.phase}`);
   if (crow && crow.sandboxId) {
-    const cbase = `http://${port}-${crow.sandboxId}.${proxy}`;
+    const cbase = (await B.agent.waitForRunning(cloned.sealId)).url;
     let ch = null;
     for (let i = 0; i < 8 && !ch; i++) { ch = curlHelloHeader(cbase); if (!ch) await sleep(8000); }
     check('clone /hello serves a proof for the clone identity', !!ch && A.reputation.parseServeProofHeader(ch).agentId === cloneId,

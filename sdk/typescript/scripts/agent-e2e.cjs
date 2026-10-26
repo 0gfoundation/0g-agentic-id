@@ -95,6 +95,7 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
 
   // ── recovery / reload: reset → recreate → same identity, same iData ───
   console.log('· reset() — recreating container…');
+  const oldSandbox = (await ai.agent.listMyDeployments()).find((row) => row.sealId === SEAL_ID)?.sandboxId;
   await ai.agent.reset(SEAL_ID, { apiKey: API_KEY });
   // poll deployment back to running; capture the NEW sandbox_id — reset makes a
   // fresh container (new sandbox → new URL), so the deploy-time AGENT_URL is stale.
@@ -103,11 +104,13 @@ const roles = (idatas) => idatas.map((d) => { try { return JSON.parse(d.dataDesc
     const d = await (await fetch(`${ATTESTOR_URL}/deployment/${SEAL_ID}`)).json();
     phase = d.phase;
     if (d.sandbox_id) newSandbox = d.sandbox_id;
-    if (phase === 'running') break;
+    if (phase === 'running' && newSandbox && newSandbox !== oldSandbox) break;
     await new Promise((r) => setTimeout(r, 6000));
   }
-  check('agent back to running after reset', phase === 'running', `phase=${phase}`);
-  const resetUrl = `http://${cfg.agent_serve_port}-${newSandbox}.${cfg.sandbox_proxy_addr}`;
+  const resetReady = phase === 'running' && !!newSandbox && newSandbox !== oldSandbox;
+  check('agent back to running in a new sandbox after reset', resetReady, `phase=${phase}`);
+  if (!resetReady) throw new Error('reset did not produce a new running sandbox');
+  const resetUrl = (await ai.agent.waitForRunning(SEAL_ID)).url;
 
   const after = await ai.agent.intelligentDatasOf(AGENT_ID);
   const rolesAfter = roles(after);
