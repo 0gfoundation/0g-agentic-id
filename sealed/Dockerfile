@@ -54,6 +54,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 # OPENCLAW_BASE is the global arg declared at the top of this file.
 FROM ${OPENCLAW_BASE}
 
+# The node this image ships comes from OPENCLAW_BASE, which can be overridden;
+# fail the build if that base carries any node other than the pinned one
+# (keep in step with images/openclaw/Dockerfile's NODE_VERSION).
+ARG NODE_VERSION=24.22.1
+RUN test "$(node --version)" = "v${NODE_VERSION}"
+
 # Low-privilege user the framework subprocess runs as (internal/privsep):
 # sealed (root, PID 1) drops the agent process to it so the agent cannot
 # read sealed's memory or bootstrap env. Its home is /home/agent, which
