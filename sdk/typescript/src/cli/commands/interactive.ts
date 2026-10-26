@@ -158,10 +158,48 @@ export function displacedFailure(failure: string): boolean {
  * Taking no ask and returning a string is the guarantee — pinned by a test
  * that drives the brake while a loop ask is pending.
  */
+/**
+ * The Esc brake: an idle Esc interrupts whatever the agent is still running
+ * in the background. A top-level factory so the test can drive the REAL
+ * handler (the 06d7a7d regression hid inside sessionRepl where no test could
+ * reach it): `seat` is passed in and must NEVER be invoked — the brake fires
+ * while the loop's ask() is pending, and any prompt from here is the FIFO
+ * bug. `seatPromptPending` keeps the brake quiet while displacedSeat's own
+ * prompt is on screen (firing then would print contradictory advice under a
+ * prompt that is waiting for an answer).
+ */
+export function makeBrake(
+  client: { interrupt?: () => Promise<{ aborted: boolean; note?: string }> } | null | undefined,
+  print: (line: string) => void,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- passed so the test can assert it is never used
+  seat: (failure: string, reclaimedHint: string, leavesWhat?: string) => Promise<'reclaimed' | 'left' | null>,
+  seatPromptPending: () => boolean,
+): () => void {
+  let last = 0;
+  return () => {
+    const now = Date.now();
+    if (now - last < 2000) return;
+    last = now;
+    if (seatPromptPending()) return; // the seat prompt owns the screen — stay quiet
+    if (!client?.interrupt) { print('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
+    client.interrupt().then(
+      (r) => print(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
+      // NOT a prompt: the loop's ask() is pending right now — a notice only.
+      // The seat argument is deliberately NOT called from here.
+      (e) => print(brakeInterruptLine(e)),
+    );
+  };
+}
+
 export function brakeInterruptLine(e: unknown): string {
   const msg = (e as Error)?.message ?? '';
   if (displacedFailure(msg)) {
-    return '\n⚠ this agent is now driven by another client — send a message or /cancel to take the seat back\n';
+    // "/cancel" is NOT advised: an idle Esc usually means nothing is running,
+    // and bare /cancel sends no POST then (no tasks / none in flight / status
+    // GETs failing), so the seat prompt would never appear. "Send a message"
+    // DOES work: the chat POST is seat-gated, gets the 409, and displacedSeat
+    // reclaims and resends.
+    return '\n⚠ this agent is now driven by another client — send a message to take the seat back\n';
   }
   return `\n(interrupt failed: ${msg})\n`;
 }
@@ -2049,43 +2087,36 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   // distinguishes the chat turn ("leaves the session" — it returns) from the
   // task paths ("leaves the seat with the other client" — this window stays
   // open, it just stops driving the agent).
+  // A seat prompt pending flag: while displacedSeat's ask() is on screen,
+  // the brake must stay quiet — firing it then would print "send a message
+  // to take the seat back" UNDER a prompt that is already waiting, and
+  // following that advice would answer the prompt instead of sending.
+  let seatPromptPending = false;
     const displacedSeat = async (
       failure: string,
       reclaimedHint: string,
       leavesWhat = 'leaves the session',
     ): Promise<'reclaimed' | 'left' | null> => {
       if (!displacedFailure(failure)) return null;
-      out(`\n⚠ this agent is now driven by another client\n`);
-      const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
-      if (takeBack === '') {
-        try {
-          if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
-        } catch (e) {
-          out(`reclaim failed: ${(e as Error).message}\n`);
+      seatPromptPending = true;
+      try {
+        out(`\n⚠ this agent is now driven by another client\n`);
+        const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
+        if (takeBack === '') {
+          try {
+            if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
+          } catch (e) {
+            out(`reclaim failed: ${(e as Error).message}\n`);
+          }
         }
+        out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
+        return 'left';
+      } finally {
+        seatPromptPending = false;
       }
-      out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
-      return 'left';
     };
 
-  let lastBrake = 0;
-  irq.brake = () => {
-    const now = Date.now();
-    if (now - lastBrake < 2000) return;
-    lastBrake = now;
-    const c = s.client;
-    if (!c?.interrupt) { out('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
-    c.interrupt().then(
-      (r) => out(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
-      // NOT a prompt: the brake fires on an IDLE Esc, so the main loop is
-      // parked in its own ask() at this moment — queueing a second waiter
-      // would steal its lines FIFO (the user's Enter would refresh status
-      // instead of reclaiming; their next chat message would be eaten as the
-      // prompt's non-empty answer). Print the notice; the paths that CAN
-      // prompt (a chat turn, /cancel) run the seat handler themselves.
-      (e) => out(brakeInterruptLine(e)),
-    );
-  };
+  irq.brake = makeBrake(s.client, out, displacedSeat, () => seatPromptPending);
   // A friendly message that hides WHICH failure happened costs a whole
   // debugging round trip: "no headers ever arrived" and "the stream was cut
   // mid-way" have different causes and used to print identically. Append the
