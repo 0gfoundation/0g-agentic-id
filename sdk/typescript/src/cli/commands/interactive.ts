@@ -38,7 +38,7 @@ import { configuredInferenceKey, requireConfiguredInferenceKey, agentInferencePr
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
 const L1_WORDS = ['list', 'use ', 'hello ', 'call ', 'rate ', 'deploy', 'start ', 'stop ', 'reset ', 'retry ', 'settings ', 'clone ', 'transfer ', 'authorizer ', 'grant ', 'revoke ', 'balance', 'deposit', 'withdraw', 'ack', 'login', 'whoami', 'help', 'quit'];
-const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
+const L2_WORDS = ['/hello', '/balance', '/topup', '/start', '/stop', '/reset', '/settings', '/think', '/clear', '/compact', '/tasks', '/result', '/cancel', '/agentlog', '/startuplog', '/back', '/help', '/quit'];
 let activeCompletions: string[] = L1_WORDS;
 // First-argument completion per command (Tab after the command word).
 // Static lists inline; AGENT resolves to the ids seen in the latest
@@ -130,6 +130,78 @@ export function compareVersions(a: string, b: string): number {
 export function hostOf(url?: string): string {
   if (!url) return 'unset';
   try { return new URL(url).hostname; } catch { return url.slice(0, 24); }
+}
+
+/**
+ * A failure meaning the SEAT was taken (occupancy.go): HTTP 409 with
+ * 'displaced' or 'in use by another client' in the body. The seat gates the
+ * chat turn and the seat-gated POSTs (cancelTask, /clear, /compact, the
+ * interrupt brake) — all of them route through the displaced-seat prompt
+ * instead of surfacing the raw error. The status-check GETs (task()) are
+ * ungated today, so their routing is defensive: if the gate ever widens,
+ * those paths still do the right thing. Exported for the tests: this is the
+ * routing decision (which errors are seat events, not task errors).
+ */
+export function displacedFailure(failure: string): boolean {
+  return /displaced|in use by another client/i.test(failure);
+}
+
+/**
+ * The Esc brake's failure line — a PURE function on purpose. The brake fires
+ * on an idle Esc, and at that moment the main loop is parked in its own
+ * ask() prompt; calling ask() from here (via the seat handler) would queue a
+ * second waiter, and ask hands lines out FIFO — the user's Enter would go to
+ * the wrong prompt (a bare-Enter status refresh instead of a reclaim), and
+ * their next chat message would be eaten as the prompt's non-empty answer.
+ * So a displaced 409 prints a NOTICE that points at the paths which CAN
+ * prompt (a chat turn, /cancel); every other failure keeps the old raw line.
+ * Taking no ask and returning a string is the guarantee — pinned by a test
+ * that drives the brake while a loop ask is pending.
+ */
+export function brakeInterruptLine(e: unknown): string {
+  const msg = (e as Error)?.message ?? '';
+  if (displacedFailure(msg)) {
+    return '\n⚠ this agent is now driven by another client — send a message or /cancel to take the seat back\n';
+  }
+  return `\n(interrupt failed: ${msg})\n`;
+}
+
+/**
+ * The shared catch for a gated-POST failure: displaced → the seat handler
+ * (which prompts and may reclaim); anything else → the caller's raw line.
+ * `leavesWhat` for these paths is "leaves the seat with the other client" —
+ * unlike the chat turn, declining does NOT close this window. Exported for
+ * the tests: every task-path catch routes through here, so the routing
+ * behavior is pinned in one place.
+ */
+export async function routeTaskFailure(
+  print: (line: string) => void,
+  seat: (failure: string, reclaimedHint: string, leavesWhat?: string) => Promise<'reclaimed' | 'left' | null>,
+  e: unknown,
+  rawLine: string,
+  seatHint: string,
+): Promise<'reclaimed' | 'left' | 'raw'> {
+  const d = await seat((e as Error)?.message ?? '', seatHint, 'leaves the seat with the other client');
+  if (d !== null) return d;
+  if (rawLine) print(rawLine);
+  return 'raw';
+}
+
+/**
+ * The tasks bare `/cancel` stops: everything still in flight, NEWEST FIRST
+ * (stopping only the newest would leave an older running turn alive; dsh/
+ * prime serialize turns, so a queued one is waiting on the running one).
+ * Statuses arrive live from the agent; "unknown" (evicted or agent
+ * restarted, 404) counts as not in flight — cancelling an unknown record
+ * would claim to stop something nobody can see. Exported for the tests:
+ * this is the re-attach story's decision core.
+ */
+export function inFlightIds(rows: Array<{ id: string; status: string }>): string[] {
+  const out: string[] = [];
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].status === 'queued' || rows[i].status === 'in_progress') out.push(rows[i].id);
+  }
+  return out;
 }
 
 let knownAgentIds: string[] = [];
@@ -1898,7 +1970,7 @@ async function pickFramework(attestorUrl: string, ask: (q: string) => Promise<st
 // ── L2: session REPL ─────────────────────────────────────────────────────────
 
 const L2_HELP =
-  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
+  'chat, or: /hello /balance /topup /stop /start /reset /settings /think /clear /compact /tasks /result /cancel /agentlog /startuplog /back /quit — Esc interrupts a turn (help: /help)';
 
 const L2_HELP_FULL = `session commands
   <anything else>         chat with the agent — Esc or Ctrl-C interrupts the
@@ -1938,6 +2010,15 @@ const L2_HELP_FULL = `session commands
                           survives dropped connections and keeps running
   /result [id]            re-attach to a task (default: latest): prints a
                           finished one, follows a running one live
+  /cancel [id]            stop tasks — the brake for orphaned turns: Esc only
+                          cancels a turn THIS connection started (on dsh/prime
+                          it interrupts the bridge-wide current turn), so after
+                          a dropped stream /cancel is the way to stop what
+                          survived. Bare form stops everything this session
+                          knows to be in flight (newest first); with an id,
+                          just that one — /result <id> adopts an id into the
+                          session first. Session memory starts empty after a
+                          CLI restart or /back + use
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
@@ -1962,6 +2043,31 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   advisoryWindowOpen = false;
   // Esc at the idle prompt = stop whatever this agent is doing server-side.
   // Throttled: hammering Esc must not queue N interrupts.
+  // Displaced seat (occupancy.go): WeChat semantics — this window bows
+  // out; Enter claims the seat back. Defined at session scope (the Esc brake
+  // below, the command dispatch, and the chat turn all share it). `leavesWhat`
+  // distinguishes the chat turn ("leaves the session" — it returns) from the
+  // task paths ("leaves the seat with the other client" — this window stays
+  // open, it just stops driving the agent).
+    const displacedSeat = async (
+      failure: string,
+      reclaimedHint: string,
+      leavesWhat = 'leaves the session',
+    ): Promise<'reclaimed' | 'left' | null> => {
+      if (!displacedFailure(failure)) return null;
+      out(`\n⚠ this agent is now driven by another client\n`);
+      const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
+      if (takeBack === '') {
+        try {
+          if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
+        } catch (e) {
+          out(`reclaim failed: ${(e as Error).message}\n`);
+        }
+      }
+      out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
+      return 'left';
+    };
+
   let lastBrake = 0;
   irq.brake = () => {
     const now = Date.now();
@@ -1971,7 +2077,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!c?.interrupt) { out('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     c.interrupt().then(
       (r) => out(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
-      (e) => out(`\n(interrupt failed: ${(e as Error).message})\n`),
+      // NOT a prompt: the brake fires on an IDLE Esc, so the main loop is
+      // parked in its own ask() at this moment — queueing a second waiter
+      // would steal its lines FIFO (the user's Enter would refresh status
+      // instead of reclaiming; their next chat message would be eaten as the
+      // prompt's non-empty answer). Print the notice; the paths that CAN
+      // prompt (a chat turn, /cancel) run the seat handler themselves.
+      (e) => out(brakeInterruptLine(e)),
     );
   };
   // A friendly message that hides WHICH failure happened costs a whole
@@ -2112,6 +2224,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           messages.length = 0;
           out(`${r.note ?? 'conversation cleared'}\n`);
         } catch (e) {
+          // clear is a seat-gated POST — a displaced 409 is a seat event here too
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /clear') !== 'raw') continue;
           const msg = (e as Error).message;
           if (/HTTP 501/.test(msg)) { messages.length = 0; out('history is client-held for this framework — local history cleared\n'); }
           else out(`clear failed: ${msg}\n`);
@@ -2132,6 +2246,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
           out(`${r.note ?? 'conversation compacted'}\n`);
         } catch (e) {
+          // compact is a seat-gated POST — a displaced 409 is a seat event;
+          // every other 409 (e.g. "compact refused") stays a compact error
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /compact') !== 'raw') continue;
           const msg = (e as Error).message;
           const status = Number(msg.match(/^compactConversation: HTTP (\d+):/)?.[1] ?? 0);
           const cause = (e as { cause?: { code?: string } }).cause?.code ?? '';
@@ -2211,10 +2328,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // memory of submitted ids; status is fetched live from the agent.
         if (!s.client?.task) { out('(this agent has no task surface — chat turns are connection-bound here)\n'); continue; }
         if (!s.tasks?.length) { out('no tasks started from this session yet — every chat turn on this agent is one; /result <id> also re-attaches by id\n'); continue; }
+        let displacedFromTasks: string | null = null;
         const rows = await Promise.all(s.tasks.map(async (t) => {
-          const snap = await s.client!.task!(t.id).catch(() => null);
+          const snap = await s.client!.task!(t.id).catch((e: Error) => {
+            // DEFENSIVE: task() is an ungated GET today (the seat gates only
+            // POST /v1/*), so this leg cannot fire on current images — but if
+            // the gate ever widens, a 409 displaced is a seat event and routes
+            // to the same prompt instead of "unknown (evicted…)".
+            if (displacedFailure(e.message ?? '')) displacedFromTasks = e.message;
+            return null;
+          });
           return { ...t, status: snap?.status ?? 'unknown (evicted or agent restarted)' };
         }));
+        if (displacedFromTasks && (await displacedSeat(displacedFromTasks, 'retry /tasks')) !== null) continue;
         for (const t of rows.reverse()) {
           out(`  ${t.id}  ${t.status.padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${t.prompt}\n`);
         }
@@ -2225,7 +2351,19 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (!s.client?.task || !s.client.followTask) { out('(this agent has no task surface)\n'); continue; }
         const id = line.split(/\s+/)[1] ?? s.tasks?.[s.tasks.length - 1]?.id;
         if (!id) { out('no task to show — /result <id>, or start one by chatting\n'); continue; }
-        const snap = await s.client.task(id).catch((e) => { out(`(${(e as Error).message})\n`); return null; });
+        // Adopt an explicitly-named id into this session's task memory: the
+        // id may come from another window, a /tasks listing before a restart,
+        // or a dropped-connection message — once /result shows it, /cancel
+        // (bare form) can stop it without re-typing the id.
+        if (line.split(/\s+/)[1] && !s.tasks?.some((t) => t.id === id)) {
+          (s.tasks ??= []).push({ id, prompt: '(adopted by /result)', at: Date.now() });
+        }
+        const snap = await s.client.task(id).catch(async (e: Error) => {
+          // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
+          if ((await displacedSeat(e.message ?? '', `retry /result ${id}`)) !== null) return null;
+          out(`(${e.message})\n`);
+          return null;
+        });
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
           out(`task ${id} — ${snap.status}\n`);
@@ -2237,7 +2375,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // (followTask starts at sequence 0), so don't pre-print the snapshot.
         // Esc here stops WATCHING only (the deliberate stop stays on the chat
         // turn's Esc / the task's cancel).
-        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task)\nagent> `);
+        out(`task ${id} — ${snap.status}; following (esc stops watching, not the task; then /cancel ${id} stops it)\nagent> `);
         const ac = new AbortController();
         irq.streaming = ac;
         try {
@@ -2245,11 +2383,108 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           out('\n');
         } catch (e) {
           out(ac.signal.aborted
-            ? '\n(stopped watching — the task continues; /result re-attaches, Esc during a chat turn cancels)\n'
+            ? `\n(stopped watching — the task continues; /result re-attaches, then /cancel ${id} stops it)\n`
             : `\n(${(e as Error).message})\n`);
         } finally {
           irq.streaming = null;
         }
+        continue;
+      }
+      if (line === '/cancel' || line.startsWith('/cancel ')) {
+        if (!s.client) { out(`agent is ${s.phase} — /start or /reset to connect; /cancel needs a live connection (a task to cancel, if any, keeps running server-side)\n`); continue; }
+        // The re-attach gap: Esc only cancels a turn THIS connection started
+        // (s.currentTask); after a dropped stream the id is gone while the
+        // turn keeps running server-side (on the responses transport that
+        // survival is the feature). /cancel is the explicit brake: by id, or
+        // everything in flight this session knows.
+        let id = line.split(/\s+/)[1];
+        if (!id && s.client?.task) {
+          if (!s.tasks?.length) { out('no task id given and none started from this session — /cancel <id>, or /tasks to list (after a CLI restart or /back+use, this session starts empty)\n'); continue; }
+          // Fetch live statuses; a fetch FAILURE is not "not in flight" —
+          // only a 404 means the record is gone. Anything else (network
+          // error, 5xx, 401, 409) means we could not CHECK, and the honest
+          // answer is to say so, not to claim nothing is running.
+          const rows: Array<{ id: string; status: string }> = [];
+          let displacedDuringCheck: string | null = null;
+          const unreachable: string[] = [];
+          for (const t of s.tasks) {
+            try {
+              const snap = await s.client!.task!(t.id);
+              rows.push({ id: t.id, status: snap.status });
+            } catch (e) {
+              const msg = (e as Error).message ?? '';
+              // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
+              if (displacedFailure(msg)) { displacedDuringCheck = msg; break; }
+              if (msg.includes('HTTP 404')) rows.push({ id: t.id, status: 'unknown' });
+              else unreachable.push(t.id);
+            }
+          }
+          if (displacedDuringCheck && (await displacedSeat(displacedDuringCheck, 'retry /cancel')) !== null) continue;
+          if (unreachable.length) {
+            out(`could not reach the agent to check: ${unreachable.join(', ')} — the tasks may still be running; retry /cancel, or /cancel <id> directly\n`);
+            continue;
+          }
+          // A brake stops everything in flight, newest first — stopping only
+          // the newest would leave an older running turn alive (dsh/prime
+          // serialize turns, so a queued one is waiting on the running one).
+          const inFlight = inFlightIds(rows);
+          if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
+          if (s.client?.cancelTask) {
+            let seatGone = false;
+            for (const tid of inFlight) {
+              // Retry the SAME id after a reclaim — the 409 killed this
+              // cancel, not the task; every other in-flight id still needs
+              // its own brake.
+              for (;;) {
+                try {
+                  const t = await s.client.cancelTask(tid);
+                  out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+                  break;
+                } catch (e) {
+                  const d = await routeTaskFailure(out, displacedSeat, e, `(cancel ${tid} failed: ${(e as Error).message})\n`, `retry /cancel ${tid}`);
+                  if (d === 'reclaimed') continue; // seat is back — retry this id
+                  if (d === 'left') { out(`(cancel ${tid} skipped — the seat is held by another client)\n`); seatGone = true; }
+                  break;
+                }
+              }
+              if (seatGone) break; // every further POST would 409 the same way
+            }
+            continue;
+          }
+        }
+        if (id && s.client?.cancelTask) {
+          for (;;) {
+            try {
+              const t = await s.client.cancelTask(id);
+              out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+              break;
+            } catch (e) {
+              const d = await routeTaskFailure(out, displacedSeat, e, `(cancel failed: ${(e as Error).message})\n`, `retry /cancel ${id}`);
+              if (d === 'reclaimed') continue; // seat is back — retry
+              break;
+            }
+          }
+          continue;
+        }
+        if (id && !s.client?.cancelTask) {
+          // An id was asked for but this image has no task-level cancel: do
+          // NOT silently interrupt "whatever is running" instead — but on
+          // dsh/prime the bridge-wide interrupt DOES stop the running turn,
+          // so point there instead of claiming nothing can be done.
+          out(s.client?.interrupt
+            ? '(this agent image has no per-task cancel — the bridge interrupt stops the current running turn; try /cancel with no id)\n'
+            : '(this agent image has no task-level cancel — on agents without the task surface turns stop when the connection drops)\n');
+          continue;
+        }
+        // Bare /cancel on an image without the task surface: same brake as
+        // Esc at the idle prompt.
+        if (!s.client?.interrupt) { out('(this agent image has no cancel path — /stop stops the whole container)\n'); continue; }
+        const r = await s.client.interrupt().catch(async (e) => {
+          // gated POST, same as the Esc brake
+          if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
+          return null;
+        });
+        if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
         continue;
       }
       if (line.startsWith('/')) { out(`unknown command ${line}\n${L2_HELP}\n`); continue; }
@@ -2368,7 +2603,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // hard-interrupt + reap — so the disconnect Esc just did IS the stop.
           out(stopped?.aborted || (stopped && /disconnects/.test(stopped.note ?? ''))
             ? '\n⏹ interrupted — the task stopped (already-executed actions are not rolled back)'
-            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''})`);
+            : `\n(interrupted the stream — but the task may still be running${stopped?.note ? `: ${stopped.note}` : ''}; /cancel stops it${s.client?.cancelTask ? '' : ' (bare form — this image has no per-id cancel)'})`);
         } else if (/lost the agent while following/.test((e as Error).message)) {
           // Responses transport: the SDK already auto-resumed through drops
           // and only gives up after repeated reconnect failures — the agent
@@ -2383,7 +2618,15 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // running through disconnects (only /v1/interrupt stops work), so
           // this is a lost window, not a failed task — say so instead of
           // crying failure, and route the user to the reattach paths.
-          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — the task CONTINUES on the agent. Follow it with /agentlog; send a message later to get results, or Esc/${'/'}reset to stop it)${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
+          // The hint must match the transport: on the responses transport
+          // the task survives and /result re-attaches; on plain chat/
+          // completions (no task surface) the turn dies with the connection
+          // and the old advice — send a message to see if the agent answers —
+          // was the working one.
+          const hint = s.client?.task
+            ? `Re-attach with /result${s.currentTask ? ` ${s.currentTask}` : ''}; /agentlog shows its log; /cancel${s.currentTask ? ` ${s.currentTask}` : ''} stops it`
+            : 'the turn stopped with it (no task surface on this image) — send a message to see if the agent answers; /agentlog shows its log';
+          out(`\n(connection dropped after ${Math.round((Date.now() - turnT0) / 1000)}s — ${s.client?.task ? `the task CONTINUES on the agent${s.currentTask ? ` as ${s.currentTask}` : ''}. ${hint}` : hint})${failureDetail(e, s.client?.task ? 'responses' : 'chat')}\n`);
           messages.push({ role: 'assistant', content: `${reply} [connection dropped mid-turn — task continued server-side]` });
           break;
         } else {
@@ -2409,18 +2652,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // window bows out to the manager (same exit as /back; the try/finally
       // still releases the Esc brake). Entering the session again claims the
       // seat back.
-      if (failure && /displaced|in use by another client/i.test(failure)) {
-        out(`\n⚠ this agent is now driven by another client\n`);
-        const takeBack = (await ask('press Enter to take the seat back (anything else leaves the session): ')).trim();
-        if (takeBack === '') {
-          try {
-            if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out('seat reclaimed — continue chatting\n'); continue; }
-          } catch (e) {
-            out(`reclaim failed: ${(e as Error).message}\n`);
-          }
-        }
-        out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
-        return;
+      if (failure) {
+        const d = await displacedSeat(failure, 'continue chatting', 'leaves the session');
+        if (d === 'reclaimed') continue;
+        if (d === 'left') return;
       }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
         out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');
