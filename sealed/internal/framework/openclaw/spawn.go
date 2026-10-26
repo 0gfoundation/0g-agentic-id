@@ -119,20 +119,21 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// See internal/platform/context.go for content generation.
 	fwVersion := probeOpenclawVersion(ctx)
 	rs := platform.RuntimeSnapshot{
-		SealedVersion:    rt.SealedVersion,
-		FrameworkVersion: fwVersion,
-		AgentSeal:        rt.AgentSeal,
-		AgentID:          rt.AgentID,
-		Owner:            rt.Owner,
-		ChainRPC:         rt.ChainRPC,
-		ContractAddr:     rt.ContractAddr,
-		AttestorURL:      rt.AttestorURL,
-		PublicURL:        rt.PublicURL,
-		SealSignSock:     rt.SealSignSock,
-		Provider:         provider,
-		Model:            model,
-		ZGComputeRouted:  isZGComputeRouted(provider),
-		BootTime:         time.Now(),
+		SealedVersion:       rt.SealedVersion,
+		FrameworkVersion:    fwVersion,
+		AgentSeal:           rt.AgentSeal,
+		AgentID:             rt.AgentID,
+		Owner:               rt.Owner,
+		ChainRPC:            rt.ChainRPC,
+		ContractAddr:        rt.ContractAddr,
+		ServeProofValidator: rt.VerifiedFeedbackAddr,
+		AttestorURL:         rt.AttestorURL,
+		PublicURL:           rt.PublicURL,
+		SealSignSock:        rt.SealSignSock,
+		Provider:            provider,
+		Model:               model,
+		ZGComputeRouted:     isZGComputeRouted(provider),
+		BootTime:            time.Now(),
 	}
 	rs.WhitelistMax = whitelistMax()
 

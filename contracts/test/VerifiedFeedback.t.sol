@@ -5,6 +5,8 @@ import {Vm} from "forge-std/Vm.sol";
 import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {CanonicalReputationRegistryMock} from "./mocks/CanonicalReputationRegistryMock.sol";
@@ -20,13 +22,38 @@ import {
     VerifiedFeedbackNotVerified,
     VerifiedFeedbackClientsRequired,
     VerifiedFeedbackTaskMismatch,
-    VerifiedFeedbackInvalidTaskReveal
+    VerifiedFeedbackInvalidTaskReveal,
+    VerifiedFeedbackEndpointRequired,
+    VerifiedFeedbackValueOutOfRange,
+    VerifiedFeedbackInvalidProofTimestamp
 } from "../src/VerifiedFeedbackRegistry.sol";
 import {IVerifiedFeedbackRegistry, TaskReveal} from "../src/interfaces/IVerifiedFeedbackRegistry.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {ServeProof} from "../src/interfaces/IAgenticIDReputationRegistry.sol";
-import {NonceExpired, NonceAlreadyUsed, NonceDeadlineTooFar} from "../src/utils/NonceRegistryUpgradeable.sol";
+import {AgenticIDReputationRegistry, ReputationInvalidProofSignature} from "../src/AgenticIDReputationRegistry.sol";
+import {
+    NonceRegistryUpgradeable,
+    NonceExpired,
+    NonceAlreadyUsed,
+    NonceDeadlineTooFar,
+    NonceMaxAgeDecrease,
+    NonceMaxAgeOutOfRange
+} from "../src/utils/NonceRegistryUpgradeable.sol";
+
+/// @notice Exposes the production ServeProof hash + wrap, so the known-answer
+///         vector runs the registry's own code path, not a re-implementation.
+contract VerifiedFeedbackDigestHarness is VerifiedFeedbackRegistry {
+    function exposedServeProofHash(uint256 chainId, address identityRegistry, ServeProof calldata proof)
+        external pure returns (bytes32)
+    {
+        return _serveProofHash(chainId, identityRegistry, proof);
+    }
+
+    function exposedServeProofDigest(address validator, bytes32 proofHash) external pure returns (bytes32) {
+        return _serveProofDigest(validator, proofHash);
+    }
+}
 
 contract VerifiedFeedbackTest is AgenticIDTestBase {
     VerifiedFeedbackRegistry internal registry;
@@ -46,7 +73,15 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
 
         sealWallet = vm.createWallet("agent-seal");
         canonicalRep = new CanonicalReputationRegistryMock();
+        registry = _deployRegistry();
+    }
 
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// @dev A VerifiedFeedbackRegistry proxy anchored to this suite's
+    ///      (identity, canonical) pair — a second call yields a second
+    ///      instance over the SAME pair (the FIND-16 setting).
+    function _deployRegistry() internal returns (VerifiedFeedbackRegistry) {
         VerifiedFeedbackRegistry impl = new VerifiedFeedbackRegistry();
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
@@ -55,10 +90,8 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
                 (address(agenticId), address(canonicalRep), owner, pauser, MAX_PROOF_AGE)
             )
         );
-        registry = VerifiedFeedbackRegistry(address(proxy));
+        return VerifiedFeedbackRegistry(address(proxy));
     }
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// @dev Like base's `_mintWithSeal` but the seal address comes from a real
     ///      wallet we control, so we can sign ServeProofs that recover to it.
@@ -76,8 +109,9 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         );
     }
 
-    /// @dev Build + sign a ServeProof with the controlled sealWallet — same
-    ///      digest as the fork registry (chainId ‖ identityRegistry ‖ submitter ‖ …).
+    /// @dev Build + sign a ServeProof with the controlled sealWallet: inner hash
+    ///      (chainId ‖ identityRegistry ‖ submitter ‖ …) wrapped as EIP-191
+    ///      version 0x00 with the registry proxy as the intended validator.
     function _mkServeProof(
         uint256 agentId,
         address submitter,
@@ -86,21 +120,8 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         bytes32 frameworkHash,
         uint256 deadline,
         uint256 signerPk
-    ) internal view returns (ServeProof memory) {
-        bytes32 inner = keccak256(
-            abi.encode(
-                block.chainid,
-                address(agenticId),
-                submitter,
-                agentId,
-                block.timestamp,
-                deadline,
-                taskHash,
-                keccak256(abi.encodePacked(dataHashes)),
-                frameworkHash
-            )
-        );
-        return ServeProof({
+    ) internal view returns (ServeProof memory proof) {
+        proof = ServeProof({
             agentId: agentId,
             submitter: submitter,
             timestamp: block.timestamp,
@@ -108,8 +129,20 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
             taskHash: taskHash,
             dataHashes: dataHashes,
             frameworkHash: frameworkHash,
-            signature: _sign(signerPk, _eip191RawHash(inner))
+            signature: ""
         });
+        proof.signature = _sign(signerPk, _eip191ValidatorHash(address(registry), _innerOf(proof)));
+    }
+
+    /// @dev The proof's inner hash (pre-wrap): chainId ‖ identityRegistry ‖
+    ///      submitter ‖ agentId ‖ timestamp ‖ deadline ‖ taskHash ‖
+    ///      keccak(dataHashes) ‖ frameworkHash.
+    function _innerOf(ServeProof memory p) internal view returns (bytes32) {
+        return keccak256(abi.encode(
+            block.chainid, address(agenticId), p.submitter, p.agentId,
+            p.timestamp, p.deadline, p.taskHash,
+            keccak256(abi.encodePacked(p.dataHashes)), p.frameworkHash
+        ));
     }
 
     function _proofFor(uint256 agentId, address submitter, bytes32 dataHash, bytes32 taskHash)
@@ -379,6 +412,317 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         registry.attestFeedback(agentId, 1, proof);
     }
 
+    /// @dev The agent's own agentSeal must not attest its own agent (1.2.0).
+    ///      Conformance only — a fresh wallet the seal funds still passes (the
+    ///      documented sybil class).
+    function test_attestFeedback_revertsWhenAgentSealSelfAttests() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        _canonicalFeedback(agentId, sealWallet.addr, 100, 0);
+        ServeProof memory proof = _proofFor(agentId, sealWallet.addr, dataHash, TASK_HASH);
+
+        vm.prank(sealWallet.addr);
+        vm.expectRevert(
+            abi.encodeWithSelector(VerifiedFeedbackSelfFeedback.selector, agentId, sealWallet.addr)
+        );
+        registry.attestFeedback(agentId, 1, proof);
+    }
+
+    /// @dev The agent's payment wallet is owner-set, so it is self-feedback
+    ///      too (1.2.0, audit FIND-13).
+    function test_attestFeedback_revertsWhenAgentWalletAttests() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        Vm.Wallet memory payment = vm.createWallet("payment");
+        uint256 deadline = block.timestamp + 4 minutes;
+        bytes memory sig = _signSetAgentWallet(payment, agentId, deadline);
+        vm.prank(agentOwner);
+        agenticId.setAgentWallet(agentId, payment.addr, deadline, sig);
+
+        _canonicalFeedback(agentId, payment.addr, 100, 0);
+        ServeProof memory proof = _proofFor(agentId, payment.addr, dataHash, TASK_HASH);
+
+        vm.prank(payment.addr);
+        vm.expectRevert(
+            abi.encodeWithSelector(VerifiedFeedbackSelfFeedback.selector, agentId, payment.addr)
+        );
+        registry.attestFeedback(agentId, 1, proof);
+    }
+
+    // ── Value bound (1.2.0: FIND-04) ──────────────────────────────────────────
+
+    function _expectOutOfRange(int128 value, uint8 dec) internal {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, value, dec);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, TASK_HASH);
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(VerifiedFeedbackValueOutOfRange.selector, value, dec));
+        registry.attestFeedback(agentId, idx, proof);
+    }
+
+    function test_attestFeedback_revertsOnValueAboveBound() public {
+        _expectOutOfRange(1e9 + 1, 0);
+    }
+
+    function test_attestFeedback_revertsOnValueBelowBound() public {
+        _expectOutOfRange(-1e9 - 1, 18);
+    }
+
+    /// @dev The canonical registry's own ceiling (1e38) — what the audit used
+    ///      to brick every summary that included the client.
+    function test_attestFeedback_revertsOnCanonicalMaxValue() public {
+        _expectOutOfRange(1e38, 0);
+    }
+
+    function test_attestFeedback_revertsOnMoreThan18Decimals() public {
+        _expectOutOfRange(1, 19);
+    }
+
+    function test_attestFeedback_acceptsBoundaryValues() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 a = _canonicalFeedback(agentId, client, 1e9, 0);
+        _attest(agentId, client, a, _proofFor(agentId, client, dataHash, keccak256("bound-a")));
+        uint64 b = _canonicalFeedback(agentId, client, -1e9, 18);
+        _attest(agentId, client, b, _proofFor(agentId, client, dataHash, keccak256("bound-b")));
+
+        address[] memory cs = new address[](1);
+        cs[0] = client;
+        (uint64 count, int128 sum, uint8 dec) = registry.getVerifiedSummary(agentId, cs, "", "");
+        assertEq(count, 2, "both boundary entries count");
+        assertEq(sum, int128(1e27) - int128(1e9), "1e9 at 0 decimals + -1e9 at 18 decimals");
+        assertEq(dec, 18, "summary decimals");
+    }
+
+    // ── ServeProof timestamp sanity (1.2.0: FIND-15) ──────────────────────────
+
+    function _expectBadTimestamp(uint256 timestamp, uint256 deadline) internal {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        bytes32[] memory dataHashes = new bytes32[](1);
+        dataHashes[0] = dataHash;
+        ServeProof memory proof = ServeProof({
+            agentId: agentId,
+            submitter: client,
+            timestamp: timestamp,
+            deadline: deadline,
+            taskHash: TASK_HASH,
+            dataHashes: dataHashes,
+            frameworkHash: FRAMEWORK_HASH,
+            signature: ""
+        });
+        // Genuinely seal-signed: only the timestamp check can reject it.
+        proof.signature = _sign(sealWallet.privateKey, _eip191ValidatorHash(address(registry), _innerOf(proof)));
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofTimestamp.selector);
+        registry.attestFeedback(agentId, idx, proof);
+    }
+
+    function test_attestFeedback_revertsOnTimestampAfterDeadline() public {
+        _expectBadTimestamp(block.timestamp + 2 hours, block.timestamp + 1 hours);
+    }
+
+    function test_attestFeedback_revertsOnZeroTimestamp() public {
+        _expectBadTimestamp(0, block.timestamp + 1 hours);
+    }
+
+    // ── maxProofAge is raise-only and bounded (1.2.0: FIND-07) ────────────────
+
+    /// @dev Lowering maxProofAge let the permissionless cleanup delete records
+    ///      whose proofs were still valid, reopening them to replay. The setter
+    ///      now only raises, within [2 hours, 365 days].
+    function test_setMaxProofAge_isRaiseOnlyAndBounded() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeDecrease.selector, MAX_PROOF_AGE, 12 hours));
+        registry.setMaxProofAge(12 hours);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, uint256(2 hours - 1)));
+        registry.setMaxProofAge(2 hours - 1);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, uint256(365 days + 1)));
+        registry.setMaxProofAge(365 days + 1);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeOutOfRange.selector, type(uint256).max));
+        registry.setMaxProofAge(type(uint256).max);
+
+        vm.expectEmit(address(registry));
+        emit NonceRegistryUpgradeable.NonceMaxAgeUpdated(MAX_PROOF_AGE, 2 days);
+        registry.setMaxProofAge(2 days);
+        vm.stopPrank();
+        assertEq(registry.nonceMaxAge(), 2 days, "raised");
+    }
+
+    /// @dev The audit's replay: a consumed ServeProof stays consumed while it
+    ///      is still valid, because maxProofAge cannot shrink under it.
+    function test_consumedProof_cannotBeReopenedByLoweringMaxAge() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _mkServeProof(
+            agentId, client, TASK_HASH, _one(dataHash), FRAMEWORK_HASH,
+            block.timestamp + 20 hours, sealWallet.privateKey
+        );
+        _attest(agentId, client, idx, proof);
+        bytes32 key = keccak256(abi.encode(keccak256("SERVEPROOF"), agentId, proof.signature));
+        assertTrue(registry.isNonceConsumed(key), "consumed");
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(NonceMaxAgeDecrease.selector, MAX_PROOF_AGE, 12 hours));
+        registry.setMaxProofAge(12 hours);
+
+        vm.warp(block.timestamp + 19 hours + 30 minutes); // proof still valid
+        bytes32[] memory keys = new bytes32[](1);
+        keys[0] = key;
+        registry.cleanExpiredNonces(keys);
+        assertTrue(registry.isNonceConsumed(key), "cleanup keeps a record whose proof is still valid");
+
+        uint64 idx2 = _canonicalFeedback(agentId, client, 90, 0);
+        vm.prank(client);
+        vm.expectRevert(abi.encodeWithSelector(NonceAlreadyUsed.selector, key));
+        registry.attestFeedback(agentId, idx2, proof);
+    }
+
+    function _one(bytes32 h) internal pure returns (bytes32[] memory a) {
+        a = new bytes32[](1);
+        a[0] = h;
+    }
+
+    // ── Registry-bound digest (1.2.0: FIND-01 / FIND-16) ──────────────────────
+
+    /// @dev Cross-implementation known-answer vector for the ServeProof digest
+    ///      — the anchor the sealed proxy and the SDK pin the same constants
+    ///      against. Runs the PRODUCTION hash + wrap (via the harness); the
+    ///      library call and the byte-wise test helper are cross-checked
+    ///      against the same constant. The legacy personal_sign digest of the
+    ///      same inner hash (pre-1.2.0, now rejected) is pinned as the shared
+    ///      negative vector.
+    function test_serveProofDigest_knownAnswerVector() public {
+        VerifiedFeedbackDigestHarness h = new VerifiedFeedbackDigestHarness();
+        bytes32[] memory dataHashes = new bytes32[](2);
+        dataHashes[0] = bytes32(uint256(0x2222222222222222222222222222222222222222222222222222222222222222));
+        dataHashes[1] = bytes32(uint256(0x3333333333333333333333333333333333333333333333333333333333333333));
+        ServeProof memory p = ServeProof({
+            agentId: 42,
+            submitter: address(uint160(0xC1)),
+            timestamp: 1700000000,
+            deadline: 1700003600,
+            taskHash: bytes32(0x1111111111111111111111111111111111111111111111111111111111111111),
+            dataHashes: dataHashes,
+            frameworkHash: bytes32(0x4444444444444444444444444444444444444444444444444444444444444444),
+            signature: ""
+        });
+
+        bytes32 inner = h.exposedServeProofHash(16602, address(uint160(0xA9)), p);
+        assertEq(
+            inner,
+            0xabfe2e6d0cc940ac398826e607b3d4d9bce2002bda0281c1b9e2efc7aaef3d5b,
+            "inner proofHash drifted from the cross-impl known-answer vector"
+        );
+
+        address validator = address(uint160(0xB7));
+        bytes32 signed = h.exposedServeProofDigest(validator, inner);
+        assertEq(
+            signed,
+            0xd496f88d3bf02a04b2a078a15fcbf00f0793088cf291bb58a4534853af155d0b,
+            "signed (EIP-191 v0) digest drifted from the cross-impl known-answer vector"
+        );
+        assertEq(
+            MessageHashUtils.toDataWithIntendedValidatorHash(validator, abi.encodePacked(inner)),
+            signed, "MessageHashUtils v0 wrap disagrees"
+        );
+        assertEq(_eip191ValidatorHash(validator, inner), signed, "byte-wise v0 wrap disagrees");
+
+        bytes32 legacy = MessageHashUtils.toEthSignedMessageHash(inner);
+        assertEq(
+            legacy,
+            0x6286d77e85057c51844833e65baab36380e73b1f8a5ec91cbdf23de60e077dcf,
+            "legacy personal_sign vector drifted"
+        );
+        assertTrue(legacy != signed, "legacy and v0 digests must differ");
+    }
+
+    /// @dev FIND-01 regression. The sealed sign socket's /sign/personal_sign
+    ///      signs ANY agent-chosen message; for a 32-byte proofHash that is
+    ///      toEthSignedMessageHash(proofHash) — the pre-1.2.0 ServeProof format.
+    ///      Signed by the REAL seal key it must not verify; the same fields
+    ///      under the registry-bound digest must.
+    function test_attestFeedback_rejectsLegacyPersonalSignProof() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, TASK_HASH);
+        bytes memory registryBoundSig = proof.signature;
+
+        proof.signature = _sign(sealWallet.privateKey, _eip191RawHash(_innerOf(proof)));
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofSignature.selector);
+        registry.attestFeedback(agentId, idx, proof);
+
+        proof.signature = registryBoundSig;
+        _attest(agentId, client, idx, proof);
+        assertTrue(registry.isVerified(agentId, client, idx), "registry-bound proof accepted");
+    }
+
+    /// @dev The socket's /sign/typed_data signs 0x19 0x01 ‖ domainSeparator ‖
+    ///      structHash. An EIP-712-wrapped signature over the proofHash — even
+    ///      under a domain naming this registry — must not verify.
+    function test_attestFeedback_rejectsEip712WrappedProof() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, TASK_HASH);
+
+        bytes32 domainSeparator = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256("VerifiedFeedbackRegistry"), keccak256("1"), block.chainid, address(registry)
+        ));
+        proof.signature = _sign(
+            sealWallet.privateKey, MessageHashUtils.toTypedDataHash(domainSeparator, _innerOf(proof))
+        );
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofSignature.selector);
+        registry.attestFeedback(agentId, idx, proof);
+    }
+
+    /// @dev FIND-16: a proof binds to ONE registry. A second instance over the
+    ///      same (identity, canonical) pair rejects a proof bound to the first
+    ///      and vice versa; each redeems only at its own validator.
+    function test_attestFeedback_rejectsProofBoundToOtherValidator() public {
+        VerifiedFeedbackRegistry other = _deployRegistry();
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+
+        ServeProof memory forRegistry = _proofFor(agentId, client, dataHash, TASK_HASH);
+        ServeProof memory forOther = _proofFor(agentId, client, dataHash, keccak256("task-2"));
+        forOther.signature = _sign(
+            sealWallet.privateKey, _eip191ValidatorHash(address(other), _innerOf(forOther))
+        );
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofSignature.selector);
+        other.attestFeedback(agentId, idx, forRegistry);
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidProofSignature.selector);
+        registry.attestFeedback(agentId, idx, forOther);
+
+        _attest(agentId, client, idx, forRegistry);
+        vm.prank(client);
+        other.attestFeedback(agentId, idx, forOther);
+        assertTrue(registry.isVerified(agentId, client, idx), "bound proof redeemed at its registry");
+        assertTrue(other.isVerified(agentId, client, idx), "other's proof redeemed at other");
+    }
+
+    /// @dev FIND-16, fork direction: a registry-bound proof does not verify on
+    ///      the deprecated fork (legacy personal_sign wrap), so one proof can no
+    ///      longer be redeemed on both. The fork still accepts legacy-format
+    ///      proofs — which is why live fork instances must be paused.
+    function test_registryBoundProof_rejectedByDeprecatedFork() public {
+        AgenticIDReputationRegistry forkImpl = new AgenticIDReputationRegistry();
+        AgenticIDReputationRegistry fork = AgenticIDReputationRegistry(address(new ERC1967Proxy(
+            address(forkImpl),
+            abi.encodeCall(AgenticIDReputationRegistry.initialize, (address(agenticId), owner, pauser, MAX_PROOF_AGE))
+        )));
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, TASK_HASH);
+
+        vm.prank(client);
+        vm.expectRevert(ReputationInvalidProofSignature.selector);
+        fork.giveFeedback(agentId, 90, 0, "q", "l", "ep", "", bytes32(0), proof);
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     function test_getServeData_revertsWhenNotVerified() public {
@@ -452,18 +796,65 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         );
     }
 
+    /// @dev The taskHash known-answer vector the sealed proxy pins by driving
+    ///      writeServeProof (sealed/internal/proxy/serveproof_test.go,
+    ///      katTaskHash): POST /api/x?q=1 (RequestURI, query included),
+    ///      request body {"q":"in"}, response body {"a":"out"}, status 201.
+    ///      Recomputed exactly as attestFeedbackWithTask does, then redeemed
+    ///      with a proof committing to the pinned constant — a receipt the
+    ///      runtime signs must open on chain.
+    bytes32 private constant SEALED_KAT_TASK_HASH =
+        0x6c37771076037daf6053adca6126264030e249e0c9a6fc0cc238c56509f842db;
+
+    function test_taskHash_sealedProxyVector_redeems() public {
+        TaskReveal memory task = TaskReveal({
+            method: "POST",
+            uri: "/api/x?q=1",
+            reqBodyHash: keccak256('{"q":"in"}'),
+            respBodyHash: keccak256('{"a":"out"}'),
+            statusCode: 201
+        });
+        bytes32 recomputed = keccak256(abi.encodePacked(
+            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash,
+            bytes(Strings.toString(uint256(task.statusCode)))
+        ));
+        assertEq(recomputed, SEALED_KAT_TASK_HASH, "taskHash drifted from the sealed proxy's pinned vector");
+
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        ServeProof memory proof = _proofFor(agentId, client, dataHash, SEALED_KAT_TASK_HASH);
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, idx, proof, task);
+
+        assertTrue(registry.isVerified(agentId, client, idx), "verified");
+        assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "/api/x?q=1", "endpoint recorded verbatim");
+    }
+
     function _taskAndProof(uint256 agentId, address submitter, bytes32 dataHash, string memory uri)
         internal view returns (TaskReveal memory task, ServeProof memory proof)
     {
+        return _taskAndProofWithStatus(agentId, submitter, dataHash, uri, 200);
+    }
+
+    /// @dev Reveal + a proof whose taskHash genuinely commits to `statusCode`
+    ///      (its decimal form, as the sealed proxy composes it).
+    function _taskAndProofWithStatus(
+        uint256 agentId,
+        address submitter,
+        bytes32 dataHash,
+        string memory uri,
+        uint16 statusCode
+    ) internal view returns (TaskReveal memory task, ServeProof memory proof) {
         task = TaskReveal({
             method: "GET",
             uri: uri,
             reqBodyHash: keccak256(""),
             respBodyHash: keccak256("resp-body"),
-            statusCode: 200
+            statusCode: statusCode
         });
         bytes32 taskHash = keccak256(abi.encodePacked(
-            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash, bytes("200")
+            bytes(task.method), bytes(task.uri), task.reqBodyHash, task.respBodyHash,
+            bytes(Strings.toString(uint256(statusCode)))
         ));
         bytes32[] memory dataHashes = new bytes32[](1);
         dataHashes[0] = dataHash;
@@ -504,10 +895,10 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "", "no endpoint without a reveal");
         address[] memory cs = new address[](1);
         cs[0] = client;
-        (uint64 count, , ) = registry.getVerifiedSummaryForEndpoint(agentId, cs, "");
-        // "" is the sentinel for "unproven", not a queryable endpoint — but even
-        // querying it aggregates only entries that genuinely stored "".
-        assertEq(count, 1, "unrevealed entries group under the empty sentinel");
+        // "" is the sentinel for "unproven", not a queryable endpoint: querying
+        // it would count exactly the unrevealed entries (FIND-09).
+        vm.expectRevert(VerifiedFeedbackEndpointRequired.selector);
+        registry.getVerifiedSummaryForEndpoint(agentId, cs, "");
     }
 
     function test_attestWithTask_revertsOnTaskMismatch() public {
@@ -542,6 +933,80 @@ contract VerifiedFeedbackTest is AgenticIDTestBase {
         vm.prank(client);
         vm.expectRevert(VerifiedFeedbackInvalidTaskReveal.selector);
         registry.attestFeedbackWithTask(agentId, 1, proof, task);
+    }
+
+    /// @dev FIND-02: statusCode must be exactly three digits. Each proof here
+    ///      genuinely commits to its out-of-range status, so without the bound
+    ///      the recompute would MATCH — the revert is the range check, not a
+    ///      TaskMismatch.
+    function test_attestWithTask_revertsOnStatusCodeOutOfRange() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        uint16[3] memory bad = [uint16(0), uint16(99), uint16(1000)];
+        for (uint256 i = 0; i < bad.length; i++) {
+            (TaskReveal memory task, ServeProof memory proof) =
+                _taskAndProofWithStatus(agentId, client, dataHash, "/hello", bad[i]);
+            vm.prank(client);
+            vm.expectRevert(VerifiedFeedbackInvalidTaskReveal.selector);
+            registry.attestFeedbackWithTask(agentId, idx, proof, task);
+        }
+    }
+
+    /// @dev The bound's edges are legitimate statuses (Go's net/http emits
+    ///      100..999) — both verify.
+    function test_attestWithTask_acceptsStatusCodeBounds() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 i1 = _canonicalFeedback(agentId, client, 90, 0);
+        uint64 i2 = _canonicalFeedback(agentId, client, 70, 0);
+
+        (TaskReveal memory t100, ServeProof memory p100) =
+            _taskAndProofWithStatus(agentId, client, dataHash, "/hello", 100);
+        (TaskReveal memory t999, ServeProof memory p999) =
+            _taskAndProofWithStatus(agentId, client, dataHash, "/hello", 999);
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, i1, p100, t100);
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, i2, p999, t999);
+
+        assertEq(registry.getVerifiedEndpoint(agentId, client, i1), "/hello", "status 100 accepted");
+        assertEq(registry.getVerifiedEndpoint(agentId, client, i2), "/hello", "status 999 accepted");
+    }
+
+    /// @dev FIND-02, the concrete forgery: a genuine GET /hello → 200 receipt
+    ///      re-split with status "0" — two body-hash bytes shift into the URI
+    ///      and "20" into the response-hash slot — hashes identically, so
+    ///      pre-1.2.0 the client could record "/hello" + 2 junk bytes as its
+    ///      TEE-verified endpoint. The 3-digit bound rejects it; the genuine
+    ///      reveal still verifies.
+    function test_attestWithTask_rejectsStatusZeroShiftedSplit() public {
+        (uint256 agentId, bytes32 dataHash) = _mintWithSealWallet(agentOwner);
+        uint64 idx = _canonicalFeedback(agentId, client, 90, 0);
+        (TaskReveal memory genuine, ServeProof memory proof) =
+            _taskAndProof(agentId, client, dataHash, "/hello");
+
+        TaskReveal memory forged = TaskReveal({
+            method: genuine.method,
+            uri: string(abi.encodePacked(genuine.uri, bytes2(genuine.reqBodyHash))),
+            reqBodyHash: (genuine.reqBodyHash << 16) | (genuine.respBodyHash >> 240),
+            respBodyHash: (genuine.respBodyHash << 16) | bytes32(uint256(uint16(bytes2("20")))),
+            statusCode: 0
+        });
+        // The collision is real: the forged split hashes to the signed taskHash.
+        assertEq(
+            keccak256(abi.encodePacked(
+                bytes(forged.method), bytes(forged.uri), forged.reqBodyHash, forged.respBodyHash, bytes("0")
+            )),
+            proof.taskHash,
+            "shifted split collides with the genuine receipt"
+        );
+
+        vm.prank(client);
+        vm.expectRevert(VerifiedFeedbackInvalidTaskReveal.selector);
+        registry.attestFeedbackWithTask(agentId, idx, proof, forged);
+
+        vm.prank(client);
+        registry.attestFeedbackWithTask(agentId, idx, proof, genuine);
+        assertEq(registry.getVerifiedEndpoint(agentId, client, idx), "/hello", "genuine endpoint recorded");
     }
 
     // ── Pause / initializer guards ────────────────────────────────────────────

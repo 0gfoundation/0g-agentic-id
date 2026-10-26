@@ -1,5 +1,5 @@
 /**
- * Unit + contract tests for the 0g-agenticid CLI (spec v0.03 Issue E).
+ * Unit + contract tests for the 0g-agentdna CLI (spec v0.03 Issue E).
  * Plain node:test against the compiled dist — zero extra dependencies, and
  * test/ is not in package.json "files", so nothing here ships to npm.
  *
@@ -32,7 +32,7 @@ function run(args, env = {}, input) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [MAIN, ...args], {
       // Deliberately NOT inheriting AGENTIC_*; XDG_CONFIG_HOME points at an
-      // empty dir so the persisted ~/.config/0g-agenticid files (readEnv's
+      // empty dir so the persisted ~/.config/0g-agentdna files (readEnv's
       // fallback layer) can never leak the developer's real key/attestor in.
       env: { PATH: process.env.PATH, XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'agcli-')), ...env },
     });
@@ -508,7 +508,7 @@ function mockAgent() {
 
 /** Attestor double for the REPL: the public listing both `call` and `settings`
  *  resolve an agent ref through, plus the owner-signed settings document. */
-function replAttestor(agentUrl, stored = null) {
+function replAttestor(agentUrl, stored = null, configExtra = {}) {
   let posted = null;
   const server = createServer((req, res) => {
     const chunks = [];
@@ -519,7 +519,7 @@ function replAttestor(agentUrl, stored = null) {
         res.writeHead(code, { 'content-type': 'application/json' });
         res.end(JSON.stringify(o));
       };
-      if (req.method === 'GET' && url.pathname === '/config') return json({ chain_rpc: `http://127.0.0.1:${server.address().port}/rpc` });
+      if (req.method === 'GET' && url.pathname === '/config') return json({ chain_rpc: `http://127.0.0.1:${server.address().port}/rpc`, ...configExtra });
       if (req.method === 'GET' && url.pathname === '/deployments') {
         return json([{
           seal_id: REPL_SEAL,
@@ -531,6 +531,7 @@ function replAttestor(agentUrl, stored = null) {
           created_at: '2026-09-01T00:00:00Z',
         }]);
       }
+      if (req.method === 'GET' && url.pathname === `/deployment/${REPL_SEAL}`) return json({ phase: 'running', framework: 'openclaw', url: agentUrl });
       if (req.method === 'GET' && url.pathname === '/settings') return json({ settings: stored, version: 4 });
       if (req.method === 'POST' && url.pathname === '/settings') {
         posted = Buffer.concat(chunks).toString('utf8');
@@ -588,4 +589,49 @@ test('REPL `settings <id> others={…}`: the unquoted document is written as typ
     att.server.closeAllConnections?.();
     att.server.close();
   }
+});
+
+
+test('CLI provider switch saves pending reset without pushing an old credential', async () => {
+  let pushes = 0;
+  const agent = createServer((req, res) => { pushes++; res.end('{}'); });
+  await new Promise((resolve) => agent.listen(0, '127.0.0.1', resolve));
+  const att = await replAttestor(`http://127.0.0.1:${agent.address().port}`,
+    { provider: '0g-compute', model: 'old', thinking: 'low' }, {
+      sandbox_snapshot: 'new-sealed', secret_env_scheme: 'agent-seal-ecies-v1',
+      inference_capabilities: [{ image: 'new-sealed', providers: ['openai'], secret_env_versions: [1, 2] }],
+    });
+  try {
+    const r = await run(['settings', REPL_SEAL, 'provider=openai', 'model=private-model', '--json'], {
+      ...KEY_ENV, AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${att.server.address().port}`,
+      AGENTIC_API_KEY: 'compute-secret', AGENTDNA_API_KEY_PROVIDER: 'openai', AGENTDNA_API_KEY: 'openai-secret',
+    });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const result = JSON.parse(r.stdout).data;
+    assert.equal(result.pendingReset, true);
+    assert.equal(result.rejected, false);
+    assert.equal(result.settings.provider, 'openai');
+    assert.equal(result.settings.thinking, 'low');
+    assert.ok(att.posted());
+    assert.doesNotMatch(att.posted(), /compute-secret|openai-secret/);
+    assert.equal(pushes, 0, 'provider switch must wait for reset');
+  } finally {
+    for (const server of [agent, att.server]) { server.closeAllConnections?.(); server.close(); }
+  }
+});
+
+test('CLI refuses provider switch before storing when key or image support is missing', async () => {
+  const att = await replAttestor(null, { provider: '0g-compute', model: 'old' });
+  try {
+    const common = { ...KEY_ENV, AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${att.server.address().port}`, AGENTIC_API_KEY: 'compute-only' };
+    const args = ['settings', REPL_SEAL, 'provider=openai', 'model=private-model', '--json'];
+    const keyMissing = await run(args, common);
+    assert.equal(keyMissing.code, 3, keyMissing.stdout + keyMissing.stderr);
+    assert.equal(JSON.parse(keyMissing.stdout).error.code, 'INFERENCE_KEY_REQUIRED');
+    assert.equal(att.posted(), null);
+    const imageMissing = await run(args, { ...common, AGENTDNA_API_KEY_PROVIDER: 'openai', AGENTDNA_API_KEY: 'new-secret' });
+    assert.equal(imageMissing.code, 3, imageMissing.stdout + imageMissing.stderr);
+    assert.equal(JSON.parse(imageMissing.stdout).error.code, 'INFERENCE_PROVIDER_UNSUPPORTED');
+    assert.equal(att.posted(), null);
+  } finally { att.server.closeAllConnections?.(); att.server.close(); }
 });

@@ -9,6 +9,7 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 
 import {VerifiedFeedbackRegistry} from "../src/VerifiedFeedbackRegistry.sol";
 import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
+import {MainnetGovernance} from "./MainnetGovernance.sol";
 
 /// @notice Incremental deploy: add a VerifiedFeedbackRegistry (impl + beacon +
 ///         proxy) to an EXISTING AgenticID environment (DEPLOYMENT.md §6),
@@ -18,10 +19,12 @@ import {FeedbackBatcher} from "../src/FeedbackBatcher.sol";
 ///
 ///         Environment variables:
 ///           AGENTIC_ID                — existing AgenticID proxy (proof anchor)
-///           TIMELOCK                  — existing TimelockController (beacon owner)
-///           OWNER                     — admin role (setPauser / setMaxProofAge)
+///           TIMELOCK                  — existing TimelockController (beacon owner); on
+///                                       0G mainnet (16661) it must have minDelay >= 86400
+///           OWNER                     — owner (two-step Ownable; setPauser / setMaxProofAge,
+///                                       direct calls, not timelocked)
 ///           PAUSER                    — pause / unpause role
-///           MAX_PROOF_AGE             — nonce GC horizon in seconds (default 86400)
+///           MAX_PROOF_AGE             — nonce GC horizon in seconds (default 86400; 7200..31536000)
 ///           CANONICAL_8004_REPUTATION — override the chainId default
 contract DeployVerifiedFeedback is Script {
     function run() external returns (address impl, address beacon, address proxy, address batcher) {
@@ -33,8 +36,10 @@ contract DeployVerifiedFeedback is Script {
         address canonicalReputation =
             vm.envOr("CANONICAL_8004_REPUTATION", _defaultCanonicalReputation(block.chainid));
 
-        // Fail fast — the anchoring checks live here, NOT in initialize
+        // Fail fast — the beacon owner must be a real >= 1-day Timelock on 0G
+        // mainnet, and the anchoring checks live here, NOT in initialize
         // (see DEPLOYMENT.md §2.1: deploy through scripts only).
+        MainnetGovernance.requireMainnetTimelock(block.chainid, timelock);
         require(
             keccak256(bytes(IVersioned(canonicalReputation).getVersion())) == keccak256(bytes("2.0.0")),
             "canonicalReputation is not ERC-8004 ReputationRegistry v2.0.0 on this chain"

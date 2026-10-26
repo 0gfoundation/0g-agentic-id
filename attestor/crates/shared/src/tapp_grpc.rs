@@ -1,10 +1,9 @@
 //! Local gRPC channel to tapp-server. Shared between `tee.rs`
-//! (`GetAppSecretKey` for the attestor's EOA) and `kms.rs`
+//! (`GetAppSigner` for the stable attestor EOA) and `kms.rs`
 //! (`GetSecretResource` for the app-scoped KMS secret).
 //!
 //! Both RPCs are "LOCAL ACCESS ONLY" on tapp-server: the attestor must
-//! reach it over localhost or same-host Docker network (in docker compose,
-//! via `host.docker.internal` → `host-gateway`, see `docker-compose.yml`).
+//! reach it over the mounted Unix socket. TCP does not serve private keys.
 
 use crate::Config;
 use anyhow::{anyhow, Result};

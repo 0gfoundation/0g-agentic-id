@@ -10,9 +10,10 @@
 
 import type { Address } from 'viem';
 import { getAddress, hexToBytes, isAddress, keccak256 } from 'viem';
-import { requireWallet, type Ctx } from './context';
+import { requireWallet, type Ctx, type AttestorPublicConfig } from './context';
+import { listInferenceProviders, ProviderRegistryClient, routeHash, registrySigningMessage, acceptedRegistryDigest, validateProvider, type InferenceProvider, type ProviderRegistrySnapshot } from './Providers';
 import { SDK_VERSION } from './constants';
-import { agenticIDAbi, cloneGateAbi } from './abi';
+import { agenticIDAbi, cloneGateAbi, tappRegistryAbi } from './abi';
 import {
   canonicalSettings, modelAdvisory, settingsAuthMessage, SettingsConflictError, sha256Hex,
   type SettingsDoc,
@@ -280,7 +281,10 @@ export class AttestorClient {
   /** In-memory half of the secret-env sticky pin (see secretEnvScheme). */
   private schemeSeen = false;
 
-  constructor(private readonly ctx: Ctx) {}
+  constructor(private readonly ctx: Ctx, initialConfig?: AttestorPublicConfig) {
+    this.remoteRegistrySeen = initialConfig?.provider_registry_schema === 1;
+    this.schemeSeen = initialConfig?.secret_env_scheme === SECRET_ENV_SCHEME;
+  }
 
   private baseUrl(): string {
     if (!this.ctx.attestorUrl) throw new Error('attestorUrl is required for deploy/clone');
@@ -335,8 +339,8 @@ export class AttestorClient {
    *  (0g-sandbox#93 envelope binding), sandbox endpoint (effective balance),
    *  and future needs ride the same round-trip. {} on failure: every
    *  consumer already degrades on missing fields. */
-  private cfgPromise: Promise<Record<string, string | undefined>> | undefined;
-  private attestorConfig(opts?: { fresh?: boolean }): Promise<Record<string, string | undefined>> {
+  private cfgPromise: Promise<AttestorPublicConfig> | undefined;
+  private attestorConfig(opts?: { fresh?: boolean }): Promise<AttestorPublicConfig> {
     // `fresh` re-reads (and re-memoizes) /config: the secret-env decision
     // must see an operator's flag change on a long-lived client.
     if (opts?.fresh) this.cfgPromise = undefined;
@@ -348,7 +352,7 @@ export class AttestorClient {
         // An error page is not a config: treat a non-2xx like a network
         // failure (consumers degrade on {}, and the memo is cleared).
         if (!r.ok) throw new Error(`GET /config: HTTP ${r.status}`);
-        return r.json() as Promise<Record<string, string | undefined>>;
+        return r.json() as Promise<AttestorPublicConfig>;
       })
       .catch(() => { this.cfgPromise = undefined; return {}; });
     return this.cfgPromise;
@@ -434,6 +438,99 @@ export class AttestorClient {
   }
 
 
+  private providerRegistry?: ProviderRegistryClient;
+  private remoteRegistrySeen = false;
+
+  listProviders(): InferenceProvider[] { return this.providerRegistry?.list() ?? listInferenceProviders(); }
+
+  async getProviderRegistry(): Promise<ProviderRegistrySnapshot> {
+    if (!this.ctx.attestorUrl) return { version: 0, providers: listInferenceProviders() };
+    const cfg = await this.attestorConfig({ fresh: true });
+    this.providerRegistry ??= new ProviderRegistryClient(this.ctx.attestorUrl);
+    if (Object.keys(cfg).length === 0) throw new SecretEnvRefusedError('config_unreadable', 'cannot read GET /config to resolve inference providers');
+    if (cfg.provider_registry_schema !== 1) {
+      if (this.remoteRegistrySeen) throw new Error('provider registry capability was withdrawn');
+      return { version: 0, providers: this.listProviders() };
+    }
+    this.remoteRegistrySeen = true;
+    return this.providerRegistry.refresh({ chainId: this.ctx.chain?.id,
+      contract: this.ctx.addresses?.agenticID, appId: cfg.attestor_app_id, tappRegistry: this.ctx.addresses?.tappRegistry, version: cfg.provider_registry_version, digest: cfg.provider_registry_digest });
+  }
+
+  async providerDefinition(id: string): Promise<InferenceProvider> {
+    const provider = (await this.getProviderRegistry()).providers.find((entry) => entry.id === id);
+    if (!provider) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${id}`);
+    return provider;
+  }
+
+  /** Build an owner-authorized publication request. Contract-wallet owners
+   * can obtain their signature externally and call publishSignedProviders. */
+  async prepareProviderUpdate(providers: InferenceProvider[], baseVersion: number): Promise<{ document: string; message: string; owner: Address }> {
+    if (!Number.isSafeInteger(baseVersion) || baseVersion < 0) throw new Error('invalid provider base version');
+    providers.forEach(validateProvider);
+    if (!providers.length || providers.length > 128 || new Set(providers.map((p) => p.id)).size !== providers.length || !providers.some((p) => p.id === '0g-compute')) throw new Error('invalid provider registry');
+    const cfg = await this.attestorConfig({ fresh: true });
+    const registry = this.ctx.addresses.tappRegistry;
+    if (!registry || /^0x0{40}$/i.test(registry) || !cfg.attestor_app_id) throw new Error('attestor TappRegistry/app ID is not configured');
+    const info = await this.ctx.publicClient.readContract({ address: registry, abi: tappRegistryAbi,
+      functionName: 'getAppInfo', args: [cfg.attestor_app_id] });
+    const owner = info.owner;
+    if (/^0x0{40}$/i.test(owner)) throw new Error('attestor Tapp has no owner');
+    if (!this.ctx.addresses.agenticID) throw new Error('provider update requires an AgenticID contract');
+    const document = JSON.stringify({ schema: 1, chain_id: this.ctx.chain.id, agentic_id_addr: this.ctx.addresses.agenticID,
+      tapp_registry_addr: registry, attestor_app_id: cfg.attestor_app_id, base_version: baseVersion, expires_at: Math.floor(Date.now() / 1000) + 180, providers });
+    if (new TextEncoder().encode(document).length > 256 * 1024) throw new Error('provider document too large');
+    return { document, message: registrySigningMessage(document), owner };
+  }
+
+  async publishSignedProviders(update: { document: string; signature: `0x${string}` }): Promise<{ version: number }> {
+    const response = await fetch(`${this.baseUrl()}/admin/inference/providers`, { method: 'PUT',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(update), signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) throw new Error(`provider update: HTTP ${response.status} ${await response.text()}`);
+    return response.json() as Promise<{ version: number }>;
+  }
+
+  async updateProviders(providers: InferenceProvider[], baseVersion: number): Promise<{ version: number }> {
+    const { account, walletClient } = requireWallet(this.ctx);
+    const prepared = await this.prepareProviderUpdate(providers, baseVersion);
+    if (prepared.owner.toLowerCase() !== account.address.toLowerCase()) throw new Error('wallet is not the current attestor Tapp owner; contract wallets can use prepareProviderUpdate/publishSignedProviders');
+    const signature = await walletClient.signMessage({ account, message: prepared.message });
+    return this.publishSignedProviders({ document: prepared.document, signature });
+  }
+
+  private async credentialRoute(provider: string, image: string | undefined, sealId: `0x${string}` | undefined): Promise<{ hash: string; registry: import('./Providers').ProviderRegistryPin } | undefined> {
+    const accepted = await this.getProviderRegistry();
+    const definition = accepted.providers.find((p) => p.id === provider);
+    if (!definition) throw new Error(`UNSUPPORTED_INFERENCE_PROVIDER: ${provider}`);
+    const builtin = listInferenceProviders().find((entry) => entry.id === provider);
+    const changed = !builtin || routeHash(builtin) !== routeHash(definition);
+    if (changed && !sealId) throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
+    const cfg = await this.attestorConfig();
+    const snapshot = image ?? (sealId ? await this.resolveSealedImage(undefined, undefined, sealId) : undefined);
+    const capable = cfg.inference_capabilities?.some((entry) => entry.image === snapshot && entry.secret_env_versions.includes(3)
+      && (definition.native ? entry.providers.includes(provider) : definition.formats.every((format) => entry.formats?.includes(format))));
+    if (changed && !capable) throw new SecretEnvRefusedError('provider_binding_unsupported', `image ${snapshot || '(unknown)'} does not support dynamic provider routes for ${provider}`);
+    return capable && sealId ? { hash: routeHash(definition), registry: { version: accepted.version,
+      ...(accepted.version > 0 ? { digest: acceptedRegistryDigest(accepted.document!, accepted.signature!) } : {}) } } : undefined;
+  }
+
+  /** Verify support for an exact runtime image before signing an owner action. */
+  async assertProviderSupported(provider: string, options: { sealId?: `0x${string}`; framework?: string; sealedImage?: string } = {}): Promise<void> {
+    const definition = await this.providerDefinition(provider);
+    const builtin = listInferenceProviders().find((entry) => entry.id === provider);
+    const changed = !builtin || routeHash(builtin) !== routeHash(definition);
+    if (provider === '0g-compute' && !changed) return;
+    const cfg = await this.attestorConfig({ fresh: true });
+    const image = await this.resolveSealedImage(options.sealedImage, options.framework, options.sealId);
+    const capabilities = Array.isArray(cfg.inference_capabilities) ? cfg.inference_capabilities : [];
+    const supported = !!image && cfg.secret_env_scheme === SECRET_ENV_SCHEME && capabilities.some((entry) =>
+      entry.image === image && (
+        (!changed && entry.providers.includes(provider) && entry.secret_env_versions.includes(2)) ||
+        (entry.secret_env_versions.includes(3) && (definition.native ? entry.providers.includes(provider) : definition.formats.every((format) => entry.formats?.includes(format))))));
+    if (!supported) throw new SecretEnvRefusedError('provider_binding_unsupported',
+      `image ${image || '(unknown)'} does not advertise provider-bound credentials for ${provider}; upgrade the sealed image and its attestor capabilities first`);
+  }
+
   /**
    * The agent's agentSeal public key (compressed hex), verified before
    * anything is sealed to it: the answer must be for `sealId`, the key must
@@ -501,10 +598,14 @@ export class AttestorClient {
    * does. Throws {@link SecretEnvRefusedError}; returns the base64 value for
    * `env.SEAL_SECRET_ENV`.
    */
-  async sealApiKey(params: { sealId: `0x${string}`; owner: Address; apiKey: string }): Promise<string> {
+  async sealApiKey(params: { sealId: `0x${string}`; owner: Address; apiKey: string; provider?: string; framework?: string; sealedImage?: string }): Promise<string> {
     if (!params.apiKey) throw new SecretEnvRefusedError('invalid_input', 'sealApiKey: apiKey is required');
     if (!isAddress(params.owner)) throw new SecretEnvRefusedError('invalid_input', 'sealApiKey: owner is not an address');
     await this.requireSecretEnvScheme('sealApiKey');
+    const provider = params.provider ?? '0g-compute';
+    await this.assertProviderSupported(provider, params);
+    const image = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
+    const boundRoute = await this.credentialRoute(provider, image, params.sealId);
     const { pubkey, onChain } = await this.verifiedAgentSeal(params.sealId);
     if (onChain) {
       let chainOwner: Address;
@@ -526,7 +627,7 @@ export class AttestorClient {
         );
       }
     }
-    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey });
+    return sealSecretEnv(pubkey, params.owner, { API_KEY: params.apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry);
   }
 
   /** On-chain agentId + agentSeal of a minted agent; null before the mint
@@ -619,14 +720,16 @@ export class AttestorClient {
    *  EVERY boot (including a resume, which a create-time variable misses) and
    *  can be changed without a recreate. See {@link SettingsDoc}. */
   private async sandboxEnv(p: {
+    image?: string;
     sealId?: `0x${string}`;
     apiKey?: string;
+    provider?: string;
     sealedSecretEnv?: string;
     mode?: SecretEnvMode;
   }): Promise<Record<string, string>> {
     const env: Record<string, string> = {};
     if (p.apiKey || p.sealedSecretEnv !== undefined) {
-      Object.assign(env, await this.keyEnv(p.apiKey, p.sealedSecretEnv, p.mode ?? 'auto', p.sealId));
+      Object.assign(env, await this.keyEnv(p.apiKey, p.sealedSecretEnv, p.mode ?? 'auto', p.sealId, p.provider, p.image));
     }
     return env;
   }
@@ -653,8 +756,21 @@ export class AttestorClient {
     sealedSecretEnv: string | undefined,
     mode: SecretEnvMode,
     sealId?: `0x${string}`,
+    provider = '0g-compute',
+    image?: string,
   ): Promise<Record<string, string>> {
     assertSecretEnvMode(mode);
+    const boundRoute = await this.credentialRoute(provider, image, sealId);
+    if (boundRoute) {
+      if (mode === 'plaintext') throw new SecretEnvRefusedError('provider_binding_unsupported', 'dynamic routes require sealed credentials');
+      mode = 'sealed';
+    }
+    if (provider !== '0g-compute') {
+      if (!sealId) throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
+      if (mode === 'plaintext') throw new SecretEnvRefusedError('provider_binding_unsupported', 'non-compute providers require a provider-bound sealed key');
+      await this.assertProviderSupported(provider, { sealId, sealedImage: image });
+      mode = 'sealed';
+    }
     if (sealedSecretEnv !== undefined) {
       if (apiKey) {
         throw new SecretEnvRefusedError('conflicting_inputs', 'pass apiKey or sealedSecretEnv, not both');
@@ -679,7 +795,7 @@ export class AttestorClient {
     }
     const { account } = requireWallet(this.ctx);
     const pubkey = await this.agentSealPubkey(sealId);
-    return { [SECRET_ENV_VAR]: sealSecretEnv(pubkey, account.address, { API_KEY: apiKey }) };
+    return { [SECRET_ENV_VAR]: sealSecretEnv(pubkey, account.address, { API_KEY: apiKey }, boundRoute || provider !== '0g-compute' ? provider : undefined, boundRoute?.hash, boundRoute?.registry) };
   }
 
   /** Sandbox "create" envelope for deploy (relayed to the provider). */
@@ -725,6 +841,8 @@ export class AttestorClient {
        *  comes back alive but can't call its model. Sealed to the agent when
        *  the attestor supports it (see `secretEnv`). */
       apiKey?: string;
+      /** Credential provider; defaults to legacy compute. */
+      provider?: string;
       /** The key already sealed to this agent (the value {@link sealApiKey}
        *  returned, e.g. on an integrator's server), in place of `apiKey`:
        *  signed verbatim as `SEAL_SECRET_ENV`, so the key never has to reach
@@ -742,6 +860,9 @@ export class AttestorClient {
     // agent: both spin a FRESH container via the `create` envelope. A `start`
     // WITH a sandboxId resumes an existing (stopped) container instead.
     if (op === 'reset' || (op === 'start' && !params.sandboxId)) {
+      if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+        throw new SecretEnvRefusedError('invalid_input', `reset/start for ${params.provider} requires its API key`);
+      }
       const snapshot = await this.resolveSealedImage(params.sealedImage, params.framework, params.sealId);
       envelope = await this.signEnvelope(
         'create',
@@ -753,6 +874,8 @@ export class AttestorClient {
             ? {
                 env: await this.sandboxEnv({
                   sealId: params.sealId,
+                  provider: params.provider,
+                  image: snapshot,
                   apiKey: params.apiKey,
                   sealedSecretEnv: params.sealedSecretEnv,
                   mode: params.secretEnv,
@@ -867,8 +990,9 @@ export class AttestorClient {
     onWarn?: (warning: string) => void;
   }): Promise<{ version: number }> {
     const { walletClient, account } = requireWallet(this.ctx);
+    if (params.settings.provider) await this.assertProviderSupported(params.settings.provider, { sealId: params.sealId });
     if (params.onWarn) {
-      for (const w of await modelAdvisory(params.settings)) params.onWarn(w);
+      for (const w of await modelAdvisory(params.settings, await this.providerDefinition(params.settings.provider ?? '0g-compute'))) params.onWarn(w);
     }
     // ONE serialization: hashed here, spliced into the body below.
     const canonical = canonicalSettings(params.settings);
@@ -951,6 +1075,7 @@ export class AttestorClient {
     framework?: string;
     sealedImage?: string;
     apiKey?: string;
+    provider?: string;
     /** In place of `apiKey`: the key already sealed to this agent; see
      *  {@link lifecycle}'s `sealedSecretEnv`. */
     sealedSecretEnv?: string;
@@ -958,6 +1083,9 @@ export class AttestorClient {
     secretEnv?: SecretEnvMode;
     envelopeTtlSec?: number;
   }): Promise<void> {
+    if (params.provider && params.provider !== '0g-compute' && !params.apiKey && params.sealedSecretEnv === undefined) {
+      throw new SecretEnvRefusedError('invalid_input', `retry for ${params.provider} requires its API key`);
+    }
     const { account } = requireWallet(this.ctx);
     const body: Record<string, unknown> = { seal_id: params.sealId, owner: account.address };
     if (params.apiKey || params.sealedSecretEnv !== undefined) {
@@ -970,6 +1098,8 @@ export class AttestorClient {
           sealed: true,
           env: await this.sandboxEnv({
             sealId: params.sealId,
+            provider: params.provider,
+            image: snapshot,
             apiKey: params.apiKey,
             sealedSecretEnv: params.sealedSecretEnv,
             mode: params.secretEnv,
@@ -999,6 +1129,10 @@ export class AttestorClient {
     // Fail before the first signature: a one-shot deploy signs its create
     // envelope before the agent exists, so it can never seal the key.
     assertSecretEnvMode(params.sandbox?.secretEnv);
+    const seed = params.iData?.find((entry) => entry.role === 'persona')?.plaintext as { inference?: { provider?: string } } | undefined;
+    const provider = seed?.inference?.provider ?? params.inference?.provider ?? '0g-compute';
+    await this.providerDefinition(provider);
+    if (params.sandbox && provider !== '0g-compute') throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
     if (params.sandbox?.apiKey && params.sandbox.secretEnv === 'sealed') {
       throw new SecretEnvRefusedError('sealed_needs_agent', SEALED_NEEDS_AGENT);
     }

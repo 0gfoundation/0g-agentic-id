@@ -38,7 +38,7 @@ vocabulary:
 
 | Field | Meaning |
 |---|---|
-| `provider` | who serves the model. `inference.ZGComputeProvider` = `"0g-compute"` (`internal/inference/zgcompute.go:109`) means the PLATFORM supplies the endpoint; any other value names a framework built-in that wires itself |
+| `provider` | who serves the model. an ID from the signed platform registry (`GET /inference/providers`), seeded by `internal/inference/providers.json`; managed providers supply fixed endpoints, and native providers use framework wiring |
 | `model` | the model id, spelled the way that provider spells it |
 | `thinking` | the owner's reasoning-depth preference, one of `settings.Levels` = `{low, high, max}` (`settings.go:56`) |
 | `others` | everything beyond the three named settings: this framework's own knobs — `json.RawMessage`, opaque (`settings.go:45`). Formerly `framework`; a live drill showed owners read that name as "choose the framework", which is the one thing it cannot do (the framework binding is minted identity) — renamed |
@@ -69,12 +69,10 @@ nothing else.
 - `thinking` must be one of `Levels`, case-insensitively;
 - `framework` must be valid JSON, and nothing more.
 
-**A model the router catalog does not list is NOT rejected.** The catalog
-covers the 0g router only, so `anthropic/claude-…` is legitimately absent from
-it; refusing an unlisted model would lock owners onto `0g-compute`. The CLI
-runs the same check before signing so the owner learns immediately, but that
-check is advisory — a caller can skip the CLI, so the container-side one
-decides (`sdk/typescript/src/cli/commands/settings.ts`).
+**An unlisted model is not rejected by the model advisory.** The CLI checks
+the selected provider's configured catalog before signing; native providers
+without a catalog accept manual IDs. Registry membership and credential binding
+are enforced separately by `ResolveForRegistry`.
 
 An empty blob parses to an empty document, not an error: that is an agent
 nobody has configured yet, which is a legal state (`Parse`, `settings.go:75`).
@@ -87,14 +85,15 @@ nobody has configured yet, which is a legal state (`Parse`, `settings.go:75`).
 works out for it on this boot: `Facts`, `Endpoint`, `APIKey`. Adapters only
 ever see a `Resolved`; nothing persists one.
 
-`settings.Resolve(ctx, doc, apiKey)` (`settings.go:127`) calls
-`inference.Resolve(provider, model)` (`zgcompute.go:121`), and that is where
+The runtime calls `settings.ResolveForRegistry(ctx, doc, credential, registry)`,
+which checks the credential binding before resolving against this boot's immutable registry snapshot.
+The metadata-only `settings.Resolve` helper remains for compatibility. This is where
 the split which makes the whole channel work lives:
 
 | | what it is | when you get it |
 |---|---|---|
 | `inference.ModelFacts` (`zgcompute.go:66`) | what is true of the MODEL whoever serves it: context window, output budget, whether it accepts `reasoning_effort`, and whether any of that came from the live catalog | always |
-| `inference.Endpoint` (`zgcompute.go:91`) | wiring the PLATFORM supplies because the framework has no built-in for it: wire format, base URL, the env var its client reads the key from | only when `provider == "0g-compute"`; `nil` otherwise |
+| `inference.Endpoint` (`zgcompute.go:91`) | wiring the PLATFORM supplies because the framework has no built-in for it: wire format, base URL, the env var its client reads the key from | for a registered managed provider; `nil` for a native provider |
 
 The catalog is consulted by model id even for a native provider, because the
 same model is usually listed there too — so an effort bound can be applied
@@ -108,6 +107,12 @@ hermes and dsh both shipped that bug (`zgcompute.go:62-65`,
 now still gets a bound, and there is a regression test for exactly that
 (`internal/settings/settings_test.go`,
 `TestNativeProviderStillGetsBoundedReasoning`).
+
+
+Additional managed providers use only their own catalog/static metadata and declared
+default protocol. They never inherit compute routing guesses or compatibility flags.
+Provider IDs and endpoints are operator-published configuration stored by the attestor, not owner settings; see
+[provider extension and rollout](../sdk/typescript/PROVIDERS.md).
 
 ### 3.1 `Effort()` has three outcomes and none may be collapsed
 
@@ -325,6 +330,12 @@ owner last wrote through §5.1.
 
 ### 5.3 The agent's own lever
 
+`GET $SEAL_SIGN_SOCK/settings` exposes a read-only runtime view on the internal
+0600 socket: provider, model, thinking and managed route URL/format, registry
+version and route hash. It reads sealed's successfully rendered state, not the
+attestor's pending document. It excludes keys and arbitrary framework config,
+and returns 503 before readiness.
+
 `POST $SEAL_SIGN_SOCK/settings` rides the socket the agent already uses to
 register services and to obtain agentSeal signatures. It is reachable only
 over the 0600 unix socket inside the container, so the agent process is the
@@ -432,12 +443,14 @@ the container's environment, is never part of `Doc`, and is persisted nowhere.
 Since #167 it can arrive sealed: when the attestor advertises
 `secret_env_scheme`, the SDK ships it as `SEAL_SECRET_ENV` — ECIES to the
 agentSeal public key, owner-bound — and `main.go` opens it after Phase 2,
-before any adapter runs, so `Resolved.APIKey` is the same thing either way
-(`internal/secretenv`). A sealed value that does not open pins a
-`secret_env_not_applied` warning for the boot's life; that boot still
-confirms its settings version (the document was consumed — a settings
-rollback cannot fix a key), which is why the attestor promotes on `warning`
-exactly as on `running`.
+before any adapter runs (`internal/secretenv`). V2 plaintext binds a provider ID; v3 additionally binds the endpoint/protocol
+route hash and accepted registry version/digest. The pinned historical registry
+is fetched and verified once on each boot, including stop/start;
+its route must match before rendering. Legacy plaintext/v1 keys are compute-only. An explicitly supplied
+ciphertext that fails validation refuses plaintext fallback and settings
+rendering, and records `secret_env_not_applied: <reason>`. A hot provider change
+with a different bound key returns HTTP 409 `CREDENTIAL_PROVIDER_MISMATCH`
+before changing the live document; reset supplies the new provider's key.
 It still reaches each framework differently, and that is not tidiable — it is
 what each framework's client actually reads:
 
@@ -473,8 +486,8 @@ Every accepted change restarts the framework process. There is no ladder:
 
 - `manager.StartParams.PreStart` (`internal/manager/manager.go:122`) runs the
   render immediately before EVERY `adapter.Start` — the first one, a `Reload`,
-  and a crash-restart alike. `main.go:762` points it at
-  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`.
+  and a crash-restart alike. `main.go` points it at
+  `adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`.
 - Both push paths render and then call `manager.Reload`, which is Stop+Start.
 - `framework.Reloadable` is still declared and still consumed by nothing
   (`framework.go:211`, `prime/prime.go:387`).
@@ -549,27 +562,46 @@ lives server-side, in three columns
 | `settings_confirmed_version` | the version `settings_last_good` holds |
 | `settings_attempts` | how many boots have been served the current unconfirmed document |
 
-**Promotion** happens on a `running` report and is keyed on the version:
-`settings_confirmed_version < settings_version`
-(`routes/status.rs` (`handle`, the running branch), `crates/shared/src/traits.rs` (`promote_settings_last_good`)). That makes it
-idempotent by construction — the 5-minute heartbeat repeats the same report
-and must not bless a document no boot exercised. The earlier rule inferred
-"this is the post-boot report" from the container track not being `Confirmed`;
-several paths demote a still-running container out of `Confirmed` without any
-boot, so that inference promoted documents nothing had run.
+**Promotion** requires a `running` / `warning` report bound to the active boot
+receipt. Each `/provision` creates a random receipt carrying the environment,
+seal, container public key, and the exact served settings version and SHA-256
+digest. A KMS HMAC authenticates it, and ECIES encrypts it to the container.
+`container_status_bindings` stores the active receipt hash, ticket hash,
+generation, and authorized owner/sandbox. Before an owner-authorized create,
+the worker generates a separate ticket and injects the reserved internal
+`SEAL_BOOT_TICKET` environment value; owner env cannot override it. sealed
+reads `GET /provision?seal_id=…` for the generation, then signs `ProvisionBoot.v1`
+with its container private key, binding the ticket hash, generation, boot ID
+and start time. POST checks the ticket, private-key proof and actual sandbox
+identity and rechecks the live chain owner. Replayed or older boot requests
+cannot rotate receipts. The ticket is scrubbed before spawning the framework.
 
-Two further conditions, both about what the booting container was actually
-*served* (`traits.rs` (`promote_settings_last_good`)):
+Stop and fatal worker startup failures revoke receipts in the same transaction.
+Resume opens a generation before sandbox.start. Reset fences the old generation
+before resetting settings attempts, so delayed requests cannot consume the new
+boot's retry. Before the new sandbox ID is persisted, provisioning returns 409;
+sealed retries within a 180-second deadline. Creation/ID persistence failures
+revoke the ticket and clean up the new container. Transfer cleanup targets the
+captured old sandbox ID and preserves a newer owner's authorized container.
+Queued owner operations recheck the live chain owner before execution.
 
-- `settings_attempts >= 1` — some boot has been handed this version. A
-  document pushed while the agent runs has not been (the write resets the
-  counter and the container does not re-provision), so the heartbeat five
-  minutes later must not bless it.
-- `settings_attempts = 1`, unless there is no `settings_last_good` at all —
-  past the first attempt `/provision` serves the last known good instead, so a
-  `running` report then says the FALLBACK boots and nothing about the current
-  document. Promoting on it would overwrite the only document known to work
-  with the one that is failing, and leave no way back.
+sealed attaches the digest of the original provisioned document only after it
+uses that document to start the framework successfully. The raw-keccak
+`StatusReport.v2` signature covers the receipt hash and applied settings digest.
+After verifying the receipt, attestor locks the deployment and checks the active
+receipt, updates status/liveness, and confirms settings in one transaction
+(`routes/status.rs`, `repo.rs::apply_status_report`). Promotion requires the
+served version to equal the current `settings_version` and the digests to
+match. A fallback version cannot confirm the current document. Delayed old
+container heartbeats and documents pushed mid-run cannot bless new settings.
+
+Legacy reports without receipts can update liveness only before this agent
+registers its first managed boot, and never promote settings. After modern
+registration, legacy provisioning and heartbeats are refused/ignored. New sealed
+requires both the encrypted receipt and boot ticket. Build all sealed images
+first, then upgrade attestor API/worker/indexer and enable the matching images
+together. Existing agents enter the new image through reset. No new operator
+environment variables are required.
 
 **Fallback** is keyed on repeated attempts, not on an error report.
 `/provision` bumps `settings_attempts` while the current version is
@@ -590,6 +622,13 @@ made it impossible to land a configuration change while an agent is unhealthy
 
 A write or a promotion resets `settings_attempts` to 0, so a fresh document is
 always owed its own first attempt (`traits.rs` (`flip_stale_heartbeats`), `:467`).
+
+An owner-authorized fresh sandbox also retries the current unconfirmed revision.
+Before create, the worker resets its attempt counter against the version it read;
+a concurrent settings write is protected by the version check. The document,
+its version and last-known-good stay unchanged. This lets reset recover after a
+provider switch without repeatedly serving the old provider fallback to the
+new credential. Automatic container reboots retain the fallback policy.
 
 ## 10. Migration: agents minted before the channel
 
@@ -755,12 +794,8 @@ chain dissolved the problem they addressed.
 
 - ~~Migration coverage~~ — closed. All four adapters recover both legacy
   sources (retired config role + mint-time persona seed), ranked, tested (§10).
-- **The agent-socket push path has no shipped client.** The owner path now
-  does: the CLI `settings` command pushes to the running container after the
-  durable write, and the in-session `/settings` and `/think` do the same. The
-  AGENT half is still unwired — nothing calls `$SEAL_SIGN_SOCK/settings`, and
-  the agent doc (`internal/platform`) does not mention the socket, so an agent
-  has no way to learn the lever exists.
+- ~~Agent-socket discoverability~~ — closed. Injected capabilities document
+  the internal GET query and thinking-only POST, without an owner signature.
 - **There is still only one credential channel.** The single `API_KEY`
   environment variable is it. An agent doing real work will need a second
   credential — a paid API, a webhook secret — and has nowhere to put it, so it

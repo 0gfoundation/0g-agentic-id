@@ -10,11 +10,15 @@
 #
 #   cd sealed && docker build -t openclaw-sealed:0.1.0 .
 #
-# The base image (eliza/0g-sealed:openclaw-1.1.1) is built separately
-# from sealed/images/openclaw/ — its Dockerfile builds the local tag
-# `openclaw-sandbox:1.1.1`; the eliza/0g-sealed:openclaw-1.1.1 registry
-# tag is applied when pushing that image to the registry. You
-# only need to rebuild the base when bumping node / openclaw versions.
+# This file, not sealed/images/sealed/, builds the openclaw sealed image
+# that ships (zg-sealed/0g-sealed; matched against the production image by
+# layer digest, #130).
+#
+# The base image (OPENCLAW_BASE below) is built separately from
+# sealed/images/openclaw/ as openclaw-sandbox:1.1.1, then tagged and pushed.
+# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.1.
+# Build and publish the versioned node/openclaw bases before this runtime;
+# see sealed/images/openclaw/base.Dockerfile and Dockerfile for the order.
 
 # Global build arg (declared before the first FROM so the stage-3 FROM can
 # reference it): the openclaw base registry. GCP by default — reachable from

@@ -68,3 +68,18 @@ func TestBuild_SectionsNonEmpty(t *testing.T) {
 		}
 	}
 }
+
+// The runtime snapshot names the serve-proof validator, or says plainly that
+// responses are unsigned — the agent cannot read VERIFIED_FEEDBACK_ADDR
+// itself, so this row is how it knows which state it is in.
+func TestBuildRuntime_ServeProofValidatorRow(t *testing.T) {
+	const v = "0x00000000000000000000000000000000000000B7"
+	signed := Build(RuntimeSnapshot{ServeProofValidator: v}).Runtime
+	if !strings.Contains(signed, "| serve-proof validator | `"+v+"`") {
+		t.Errorf("validator row missing the address:\n%s", signed)
+	}
+	unsigned := Build(RuntimeSnapshot{}).Runtime
+	if !strings.Contains(unsigned, "| serve-proof validator | `none` — responses are unsigned") {
+		t.Errorf("no-validator row missing:\n%s", unsigned)
+	}
+}
