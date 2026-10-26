@@ -152,8 +152,10 @@ export function proofRecordingFetch(
     // request bytes stay recoverable if the response turns out signed.
     // init.body (when set) overrides the Request's own body on the wire —
     // clone only when the Request's body is what will actually be sent.
+    // Per the Fetch spec, `init.body: null` falls back to the Request's
+    // body too, so only a non-null override defeats the clone.
     const reqClone =
-      input instanceof Request && input.body && init?.body === undefined ? input.clone() : null;
+      input instanceof Request && input.body && init?.body == null ? input.clone() : null;
     const response = await fetch(input, init);
     // Record the task only when the response carries X-Agent-Proof: a
     // signed response is always finite (the proxy buffers it whole), so

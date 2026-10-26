@@ -241,3 +241,54 @@ func TestProxy_CompressingBackendDeliversPlainBytes(t *testing.T) {
 		t.Fatalf("client got %q (%d bytes), want the plain body — a compressing backend breaks per-exchange verification otherwise", body[:min(20, len(body))], len(body))
 	}
 }
+
+func TestProxy_FrameworkRouteKeepsAcceptEncodingNegotiation(t *testing.T) {
+	// Framework routes are never hashed (no serve-proof), so the client's
+	// Accept-Encoding is forwarded verbatim and Content-Encoding is relayed
+	// — br/zstd negotiation and compressed UI assets survive. Reverting the
+	// `if signed` scope (dropping AE everywhere) must fail this test.
+	plain := []byte("framework asset — never covered by a taskHash")
+	var backendSaw string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendSaw = r.Header.Get("Accept-Encoding")
+		if strings.Contains(backendSaw, "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			_, _ = gz.Write(plain)
+			_ = gz.Close()
+			return
+		}
+		_, _ = w.Write(plain)
+	}))
+	t.Cleanup(backend.Close)
+	s, _ := armedProxy(t, backend.URL, testValidator)
+	front := httptest.NewServer(http.HandlerFunc(s.handleProxy))
+	t.Cleanup(front.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, front.URL+"/v1/chat/completions", nil)
+	req.Header.Set("Accept-Encoding", "gzip, br, zstd")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if backendSaw != "gzip, br, zstd" {
+		t.Fatalf("backend saw Accept-Encoding %q, want the client's verbatim — framework routes keep negotiation", backendSaw)
+	}
+	if resp.Header.Get("X-Agent-Proof") != "" {
+		t.Fatal("framework route response carries X-Agent-Proof — it is not a signed service path")
+	}
+	// The client pinned gzip explicitly, so the transport skips decompression
+	// and the gzip bytes surface as-is with the encoding header relayed.
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatalf("Content-Encoding %q, want gzip relayed", resp.Header.Get("Content-Encoding"))
+	}
+	if string(raw) == string(plain) {
+		t.Fatal("client got the PLAIN body — the gzip bytes must survive end to end on a framework route")
+	}
+	if !resp.ProtoAtLeast(1, 1) {
+		t.Fatal("unexpected protocol")
+	}
+}

@@ -208,7 +208,7 @@ function mkSession(verifiedFeedback) {
       },
     },
   };
-  return { session: new ServeSession(ctx, { now: () => NOW }), reads };
+  return { session: new ServeSession(ctx, { now: () => NOW }), reads, ctx };
 }
 
 /** The X-Agent-Proof header sealed would emit for this proof. */
@@ -660,8 +660,15 @@ test('unsigned INFINITE SSE: both wrappers resolve promptly, task null', async (
   });
   try {
     const client = await api.client(base);
+    // Race each call against a 2s timer: if the regression returns (an
+    // unconditional body await), the TEST fails here instead of hanging the
+    // suite, and the finally below closes the server.
+    const withTimer = (p, who) => Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(who + ' never resolved — the wrapper awaited the body')), 2000)),
+    ]);
     const t0 = Date.now();
-    const rec = await client.fetchWithProof('/api/mcp', { method: 'POST', body: MCP_REQ });
+    const rec = await withTimer(client.fetchWithProof('/api/mcp', { method: 'POST', body: MCP_REQ }), 'fetchWithProof');
     const dt1 = Date.now() - t0;
     assert.equal(rec.proof, null);
     assert.equal(rec.task, null);
@@ -669,7 +676,7 @@ test('unsigned INFINITE SSE: both wrappers resolve promptly, task null', async (
 
     const log = [];
     const t1 = Date.now();
-    const r2 = await proofRecordingFetch(log)(`${base}/api/mcp`, { method: 'POST', body: MCP_REQ });
+    const r2 = await withTimer(proofRecordingFetch(log)(`${base}/api/mcp`, { method: 'POST', body: MCP_REQ }), 'proofRecordingFetch');
     const dt2 = Date.now() - t1;
     assert.equal(log[0].proof, null);
     assert.equal(log[0].task, null);
@@ -755,4 +762,56 @@ test('proofRecordingFetch: init.body OVERRIDES the Request body — the override
   } finally {
     s.server.close();
   }
+});
+
+test('proofRecordingFetch: init.body NULL falls back to the Request body — the Request is recorded', async () => {
+  // Per the Fetch spec, `init.body: null` does not override the Request's
+  // own body — the wire (and the recording) carries the Request's body.
+  const signed = await signServeProof(
+    proofParams({ taskHash: mcpHash(MCP_REQ, MCP_RESP) }), (h) => seal.sign({ hash: h }));
+  const s = mcpServer(signed);
+  await s.start();
+  try {
+    const log = [];
+    const req = new Request(`http://127.0.0.1:${s.port()}/api/mcp`, {
+      method: 'POST', body: MCP_REQ,
+    });
+    const response = await proofRecordingFetch(log)(req, { body: null });
+    await response.text();
+    const { session } = mkSession(VFR);
+    const v = await session.verifyProof(log[0].proof, { task: log[0].task });
+    assert.equal(v.taskMatches, true, 'init.body null → the Request clone recorded (spec fallback)');
+    assert.equal(v.ok, true);
+  } finally {
+    s.server.close();
+  }
+});
+
+test('the facade forwards { task }: swapped body and null both fail closed', async () => {
+  // Reverting the facade's opts pass-through leaves this test red: through
+  // the facade a swapped body MUST give ok: false, not a silent signer-only
+  // ok: true; and { task: null } must fail closed.
+  const { ReputationApi, AgenticIDApi } = await import('../dist/index.js');
+  // The facade builds its own ServeSession with the REAL clock — fresh
+  // timestamps, like the sayHi test (a fixed-NOW proof reads as expired).
+  const fresh = Math.floor(Date.now() / 1000);
+  const good = await signServeProof(
+    proofParams({ taskHash: mcpHash(MCP_REQ, MCP_RESP), timestamp: BigInt(fresh), deadline: BigInt(fresh + 3600) }),
+    (h) => seal.sign({ hash: h }));
+  const { ctx } = mkSession(VFR);
+  const facade = new ReputationApi(ctx);
+  // the exchange that actually happened (TaskExchange shape: url, not uri —
+  // verifyProof derives the URI candidates from it)
+  const realTask = { method: 'POST', url: 'http://127.0.0.1:9/api/mcp', requestBytes: MCP_REQ, responseBytes: MCP_RESP, status: 200 };
+  // the same signer, but bound to a DIFFERENT response body
+  const swapped = { method: 'POST', url: 'http://127.0.0.1:9/api/mcp', requestBytes: MCP_REQ, responseBytes: '{"jsonrpc":"2.0","id":1,"result":{"swapped":true}}', status: 200 };
+  const vSwap = await facade.verifyProof(good, { task: swapped });
+  assert.equal(vSwap.taskMatches, false, 'facade: swapped body → taskMatches false');
+  assert.equal(vSwap.ok, false, 'facade: swapped body → ok false (not a silent signer-only pass)');
+  const vNull = await facade.verifyProof(good, { task: null });
+  assert.equal(vNull.taskMatches, false, 'facade: task null → fails closed');
+  assert.equal(vNull.ok, false);
+  const vReal = await facade.verifyProof(good, { task: realTask });
+  assert.equal(vReal.taskMatches, true, 'facade: the real exchange passes');
+  assert.equal(vReal.ok, true);
 });
