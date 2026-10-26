@@ -46,7 +46,7 @@ Environment variables **always override** the config files — CI and one-off ru
 | `AGENTIC_ATTESTOR_URL` | yes (for writes) | attestor base URL — **one URL pins the whole environment** (contracts, RPC, appIds all come from its `/config`). Production `https://agenticid.0g.ai`, testnet `https://agenticid-testnet.0g.ai` |
 | `AGENTIC_PRIVATE_KEY` | no | owner key (`0x…` hex). **Env only — there is deliberately no `--key` flag.** Unlocks all write operations and owner-signed surfaces |
 | `AGENTIC_RPC_URL` | no | overrides the RPC the attestor advertises |
-| `AGENTIC_API_KEY` | no | inference key (deploy/reset) for the selected provider; overrides the matching key stored by `login` |
+| `AGENTIC_API_KEY` | no | legacy compute-only inference key (deploy/reset); other providers use their matching key stored by `login` |
 | `AGENTIC_VERIFIED_FEEDBACK_ADDR` | no | reputation-pair address override, for attestors whose `/config` doesn't advertise them yet |
 | `AGENTIC_FEEDBACK_BATCHER_ADDR` | no | FeedbackBatcher address override, same situation |
 

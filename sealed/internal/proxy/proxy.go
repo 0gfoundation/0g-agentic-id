@@ -96,10 +96,6 @@ type Server struct {
 	// single-flight and replay guards, under their own lock.
 	compact compactState
 
-	// compact backs POST /_seal/compact (compact.go): its applier plus the
-	// single-flight and replay guards, under their own lock.
-	compact compactState
-
 	// Stateful-door conversation binding (framework.ConversationSession),
 	// wired by main.go only for adapters that hold the conversation
 	// server-side. Applied ONLY to the synthesized responses door's upstream
