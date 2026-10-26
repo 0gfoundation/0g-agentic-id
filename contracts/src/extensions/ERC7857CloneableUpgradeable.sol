@@ -64,10 +64,7 @@ contract ERC7857CloneableUpgradeable is IERC7857Cloneable, ERC7857Upgradeable {
         // `entries[i].sealedKey` is the wrap for `datas[i]` — `_proofCheck`
         // already verified `entries[i].dataHash == datas[i].dataHash`
         // index-wise, so we just project the field through.
-        bytes[] memory sealedKeys = new bytes[](entries.length);
-        for (uint256 i; i < entries.length; ++i) {
-            sealedKeys[i] = entries[i].sealedKey;
-        }
+        bytes[] memory sealedKeys = _sealedKeysFromEntries(entries);
         _updateData(newTokenId, datas, sealedKeys);
 
         emit Cloned(tokenId, newTokenId, from, to, entries);

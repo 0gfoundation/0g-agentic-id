@@ -1,9 +1,11 @@
+import { modelsForProvider, type InferenceProvider } from './Providers';
 /**
  * @file AgenticID.ts
  * @description The single entry point. Construct once with rpc + addresses (+
- * attestorUrl + signer), then use two intent namespaces:
+ * attestorUrl + signer), then use the agent/reputation namespaces and admin operations:
  *   - `agent`      — lifecycle (deploy / clone / transfer), reads, agent-seal gas top-up
  *   - `reputation` — serve-proof capture/verify + on-chain feedback
+ *   - `admin`      — attestor-wide provider publication, authorized by its Tapp owner
  *
  * plus top-level ops that don't belong to a single agent: `ack` / `ackStatus`
  * (acknowledge the TEE trust-root component set) and `deposit` / `getBalance`
@@ -14,8 +16,8 @@
  *
  * @example
  * ```typescript
- * import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
- * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
+ * import { AgentDNA } from '0g-agentdna';
+ * const ag = new AgentDNA({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * await ag.agent.transferFrom(from, to, 33n);
  * const { proof } = await ag.reputation.capture(() => fetch(`${url}/chat`, ...));
  * await ag.ack();
@@ -41,6 +43,20 @@ import type {
 } from './types';
 
 const ZERO = '0x0000000000000000000000000000000000000000';
+
+/**
+ * The agentId for a URL-form handle (`client` / `authenticate`): the one
+ * `/hello`'s X-Agent-Proof envelope carries, or the caller's hint when the
+ * envelope is absent. A hint that contradicts a signed `/hello` is refused.
+ * The caller still binds the result to the URL on chain (#62).
+ */
+function urlAgentId(op: string, base: string, discovered: bigint | undefined, hint: bigint | undefined): bigint | undefined {
+  if (hint === undefined) return discovered;
+  if (discovered !== undefined && discovered !== hint) {
+    throw new Error(`${op}: ${base}/hello is signed as agent ${discovered}, not the expected agent ${hint} — refusing to connect`);
+  }
+  return hint;
+}
 
 function assertSealBound(seal: Address, op: string): void {
   if (seal === ZERO) {
@@ -87,10 +103,10 @@ export class AgentApi {
   private readonly attestor: AttestorClient;
   private readonly infra: SandboxClient;
   private readonly ctx: Ctx;
-  constructor(ctx: Ctx) {
+  constructor(ctx: Ctx, initialConfig?: import('./context').AttestorPublicConfig) {
     this.ctx = ctx;
     this.id = new AgenticIDClient(ctx);
-    this.attestor = new AttestorClient(ctx);
+    this.attestor = new AttestorClient(ctx, initialConfig);
     this.infra = new SandboxClient(ctx);
   }
 
@@ -357,30 +373,27 @@ export class AgentApi {
    * inference path). Public endpoint, no key needed — use it to populate
    * a model picker before deploy.
    */
-  async listModels(): Promise<string[]> {
-    return (await this.listModelCaps()).map((m) => m.id);
+  listProviders(): InferenceProvider[] { return this.attestor.listProviders(); }
+
+  async refreshProviders(): Promise<InferenceProvider[]> { return (await this.attestor.getProviderRegistry()).providers; }
+
+  getProviderRegistry() { return this.attestor.getProviderRegistry(); }
+
+  assertProviderSupported(provider: string, options: { sealId?: Hash; framework?: string; sealedImage?: string } = {}): Promise<void> {
+    return this.attestor.assertProviderSupported(provider, options);
   }
 
-  /**
-   * Models with the capability bits a picker needs: `chat` (a chatbot at all —
-   * the router also lists image/audio models) and `tools` (function calling —
-   * required by tool-driven frameworks; a chat-only model deploys fine and
-   * then fails EVERY turn). 10s timeout: a wedged router must not hang the
-   * deploy wizard.
-   */
-  async listModelCaps(): Promise<Array<{ id: string; chat: boolean; tools: boolean }>> {
-    const r = await fetch('https://router-api.0g.ai/v1/models', { signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) throw new Error(`listModels: router returned HTTP ${r.status}`);
-    const body = (await r.json()) as {
-      data?: Array<{ id?: string; type?: string; supported_parameters?: string[] }>;
-    };
-    return (body.data ?? [])
-      .filter((m): m is { id: string; type?: string; supported_parameters?: string[] } => !!m.id)
-      .map((m) => ({
-        id: m.id,
-        chat: (m.type ?? 'chatbot') === 'chatbot',
-        tools: (m.supported_parameters ?? []).includes('tools'),
-      }));
+  async listModels(opts: { provider?: string } = {}): Promise<string[]> {
+    return (await this.listModelCaps(opts)).map((model) => model.id);
+  }
+
+  async listModelCaps(opts: { provider?: string } = {}): Promise<Array<{ id: string; chat: boolean; tools: boolean; formats: string[] }>> {
+    return (await modelsForProvider(await this.attestor.providerDefinition(opts.provider ?? '0g-compute'))).map((model) => ({
+      id: model.id,
+      chat: (model.type ?? 'chatbot') === 'chatbot',
+      tools: (model.supported_parameters ?? []).includes('tools'),
+      formats: model.supported_formats ?? [],
+    }));
   }
 
   /**
@@ -398,16 +411,32 @@ export class AgentApi {
    * token); a read-only `ag` gets a public client (`fetch`/`fetchWithProof`
    * against `/api/*`). Being the ACTUAL owner is verified only when an owner op
    * runs (chat throws for a non-owner); `/hello` and `/api/*` work regardless.
+   *
+   * With an `agentUrl`, the agentId comes from `/hello`'s proof envelope — which
+   * is absent when the runtime signs nothing (no `VERIFIED_FEEDBACK_ADDR`).
+   * Callers that already know the id pass it as `opts.agentId`: it is used when
+   * `/hello` carries no proof, must equal the envelope's id when it does, and
+   * is bound to the URL on chain like a discovered id. An `ag` with a key that
+   * still ends up with no agentId gets a public handle and a console warning —
+   * never a silent downgrade.
    */
-  async client(idOrUrl: bigint | string, opts?: { instanceId?: string }): Promise<AgentClient> {
+  async client(idOrUrl: bigint | string, opts?: { instanceId?: string; agentId?: bigint }): Promise<AgentClient> {
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
-    // #62: when the agentId came from the agent's (untrusted) /hello, bind it to
-    // this URL via chain before this handle could ever sign for it.
+    const agentId = fromUrl ? urlAgentId('client', base, disc.agentId, opts?.agentId) : idOrUrl;
+    // #62: when the agentId came from the agent's (untrusted) /hello — or from
+    // the caller's hint — bind it to this URL via chain before this handle
+    // could ever sign for it.
     if (fromUrl && agentId !== undefined && this.hasAccount()) {
       await this.assertAgentIdBoundToUrl(agentId, base);
+    }
+    if (agentId === undefined && this.hasAccount()) {
+      console.warn(
+        `[agentic-sdk] client(${base}): /hello carried no X-Agent-Proof, so the agentId is unknown — ` +
+          'this handle has NO owner ops (chat/logs) although this AgenticID holds a key. ' +
+          'Pass { agentId } (or call client(agentId)) to connect as the owner.',
+      );
     }
     const owner = agentId !== undefined && this.hasAccount();
     const reauth = owner ? () => this.mintToken(base, agentId!) : undefined;
@@ -419,15 +448,23 @@ export class AgentApi {
    * Owner handshake, eager: like {@link client} on an `ag` with a key, but
    * mints the token up front so a non-owner fails HERE, not at first chat.
    * Kept for that fail-fast semantics and back-compat; requires a wallet.
+   *
+   * With an `agentUrl`, `opts.agentId` works as in {@link client}: used when
+   * `/hello` carries no proof (runtime without `VERIFIED_FEEDBACK_ADDR`),
+   * must equal the envelope's id when it does, and is bound to the URL on
+   * chain before anything is signed.
    */
-  async authenticate(idOrUrl: bigint | string): Promise<AgentClient> {
+  async authenticate(idOrUrl: bigint | string, opts?: { agentId?: bigint }): Promise<AgentClient> {
     requireWallet(this.ctx);
     const base = await this.resolveBase(idOrUrl);
     const disc = await this.discoverSurface(base);
     const fromUrl = typeof idOrUrl === 'string';
-    const agentId = fromUrl ? disc.agentId : idOrUrl;
+    const agentId = fromUrl ? urlAgentId('authenticate', base, disc.agentId, opts?.agentId) : idOrUrl;
     if (agentId === undefined) {
-      throw new Error('authenticate: could not determine agentId from /hello (agent not provisioned?)');
+      throw new Error(
+        `authenticate: ${base}/hello carried no X-Agent-Proof (the runtime has no VERIFIED_FEEDBACK_ADDR, ` +
+          'or the agent is not provisioned yet), so its agentId is unknown — pass { agentId } or call authenticate(agentId)',
+      );
     }
     // #62: reject a lying /hello (URL claims someone else's agentId) before signing.
     if (fromUrl) await this.assertAgentIdBoundToUrl(agentId, base);
@@ -712,6 +749,12 @@ export class AgentApi {
    * plus a structured verification. The whole "is this agent who it
    * claims, running what chain says" check, without hand-rolling the
    * fetch + parse + verify.
+   *
+   * The proof signature is bound to the VerifiedFeedbackRegistry, so the
+   * check needs `addresses.verifiedFeedback` (fromAttestor fills it from
+   * /config). Without it `verification.signerMatches` is false with the
+   * reason 'no VerifiedFeedbackRegistry configured — cannot verify
+   * serve-proof'.
    */
   async sayHi(agentUrl: string): Promise<{
     hello: {
@@ -884,13 +927,13 @@ export class AgentApi {
    *    signer at all.
    */
   start(sealId: Hash, sandboxId: string): Promise<void>;
-  start(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
-  start(sealId: Hash, arg?: string | { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+  start(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void>;
+  start(sealId: Hash, arg?: string | { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
     if (typeof arg === 'string') return this.attestor.lifecycle('start', { sealId, sandboxId: arg });
     // `framework` resolves the right sealed image for a first provision (a
     // mint-only hermes/prime agent otherwise boots the default snapshot) —
     // same resolution deploy/reset use. (review #154 opportunity)
-    return this.attestor.lifecycle('start', { sealId, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
+    return this.attestor.lifecycle('start', { sealId, provider: arg?.provider, framework: arg?.framework, sealedImage: arg?.sealedImage, apiKey: arg?.apiKey, sealedSecretEnv: arg?.sealedSecretEnv, secretEnv: arg?.secretEnv });
   }
   /**
    * Reset (recreate) an agent's container, preserving its on-chain
@@ -904,8 +947,8 @@ export class AgentApi {
    * refuses the clear path). The attestor keeps no reusable copy, which
    * is WHY it must be passed again on every recreate.
    */
-  reset(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.lifecycle('reset', { sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  reset(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.lifecycle('reset', { sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
   }
 
   /**
@@ -983,8 +1026,8 @@ export class AgentApi {
    * Requires the attestor to advertise `secret_env_scheme`. Refusals throw
    * {@link SecretEnvRefusedError}.
    */
-  sealApiKey(sealId: Hash, opts: { owner: Address; apiKey: string }): Promise<string> {
-    return this.attestor.sealApiKey({ sealId, owner: opts.owner, apiKey: opts.apiKey });
+  sealApiKey(sealId: Hash, opts: { owner: Address; apiKey: string; provider?: string; framework?: string; sealedImage?: string }): Promise<string> {
+    return this.attestor.sealApiKey({ sealId, ...opts });
   }
 
   /**
@@ -999,8 +1042,8 @@ export class AgentApi {
    * creation — like {@link reset}, the LLM key must be re-supplied (and is
    * sealed the same way, see `secretEnv`).
    */
-  retry(sealId: Hash, opts?: { framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
-    return this.attestor.retry({ sealId, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
+  retry(sealId: Hash, opts?: { provider?: string; framework?: string; sealedImage?: string; apiKey?: string; sealedSecretEnv?: string; secretEnv?: SecretEnvMode }): Promise<void> {
+    return this.attestor.retry({ sealId, provider: opts?.provider, framework: opts?.framework, sealedImage: opts?.sealedImage, apiKey: opts?.apiKey, sealedSecretEnv: opts?.sealedSecretEnv, secretEnv: opts?.secretEnv });
   }
 
   /**
@@ -1171,8 +1214,20 @@ export class ReputationApi {
 }
 
 /** The AgenticID SDK entry point. */
+/** Attestor-wide operations, authorized by its current Tapp owner. */
+export class AdminApi {
+  constructor(private readonly attestor: AttestorClient) {}
+
+  updateProviders(providers: InferenceProvider[], opts: { baseVersion: number }) { return this.attestor.updateProviders(providers, opts.baseVersion); }
+
+  prepareProviderUpdate(providers: InferenceProvider[], opts: { baseVersion: number }) { return this.attestor.prepareProviderUpdate(providers, opts.baseVersion); }
+
+  publishSignedProviders(update: { document: string; signature: `0x${string}` }) { return this.attestor.publishSignedProviders(update); }
+}
+
 export class AgenticID {
   readonly agent: AgentApi;
+  readonly admin: AdminApi;
   readonly reputation: ReputationApi;
   private readonly infra: SandboxClient;
   /** Long-lived so its instance caches (/config: provider address, sandbox
@@ -1180,13 +1235,14 @@ export class AgenticID {
   private readonly attestor: AttestorClient;
   private readonly ctx: Ctx;
 
-  constructor(config: AgenticIDConfig) {
+  constructor(config: AgenticIDConfig, initialConfig?: import('./context').AttestorPublicConfig) {
     const ctx = buildCtx(config);
     this.ctx = ctx;
-    this.agent = new AgentApi(ctx);
+    this.agent = new AgentApi(ctx, initialConfig);
     this.reputation = new ReputationApi(ctx);
     this.infra = new SandboxClient(ctx);
-    this.attestor = new AttestorClient(ctx);
+    this.attestor = new AttestorClient(ctx, initialConfig);
+    this.admin = new AdminApi(this.attestor);
   }
 
   /**
@@ -1233,7 +1289,7 @@ export class AgenticID {
         : cfgChainId != null
           ? ({ id: cfgChainId, name: `chain-${cfgChainId}`, nativeCurrency: { name: '0G', symbol: '0G', decimals: 18 }, rpcUrls: { default: { http: [cfg.chain_rpc ?? ''] } } } as unknown as import('viem').Chain)
           : undefined);
-    return new AgenticID({
+    const client = new AgenticID({
       ...rest,
       attestorUrl: base,
       rpcUrl: rest.rpcUrl ?? cfg.chain_rpc,
@@ -1248,7 +1304,9 @@ export class AgenticID {
         sandboxServing: addr(cfg.sandbox_serving_addr),
         ...overrides,
       },
-    });
+    }, cfg as unknown as import('./context').AttestorPublicConfig);
+    if (Number(cfg.provider_registry_schema) === 1) await client.agent.refreshProviders();
+    return client;
   }
 
   // — trust-root acknowledgment (spans attestor + kms + sandbox-provider) —

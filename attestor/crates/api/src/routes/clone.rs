@@ -25,8 +25,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use attestor_shared::{
     auth::clone::{verify_clone_contract_intent, verify_clone_signature},
-    derive_phase, CloneRequest, CloneResponse, CloneRetryParams, Deployment, DeploymentPhase, JobCloneAuth,
-    JobPayload, SealId, StageStatus, WsEvent,
+    derive_phase, CloneRequest, CloneResponse, CloneRetryParams, Deployment, DeploymentPhase,
+    JobCloneAuth, JobPayload, SealId, StageStatus, WsEvent,
 };
 use axum::extract::State;
 use axum::Json;
@@ -186,10 +186,12 @@ pub async fn handle(
     // entry.
     let idem_store_key = match &job_authorization {
         JobCloneAuth::Owner => req.idempotency_key.clone(),
-        JobCloneAuth::Contract { authorizer, auth_data, .. } => {
-            let mut buf = Vec::with_capacity(
-                req.idempotency_key.len() + 20 + auth_data.len(),
-            );
+        JobCloneAuth::Contract {
+            authorizer,
+            auth_data,
+            ..
+        } => {
+            let mut buf = Vec::with_capacity(req.idempotency_key.len() + 20 + auth_data.len());
             buf.extend_from_slice(req.idempotency_key.as_bytes());
             buf.extend_from_slice(authorizer.as_slice());
             buf.extend_from_slice(auth_data);
@@ -318,8 +320,8 @@ mod tests {
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain, MockSandbox,
     };
-    use attestor_shared::CloneAuthorization;
     use attestor_shared::sandbox::eip191_digest;
+    use attestor_shared::CloneAuthorization;
     use attestor_shared::{
         AgentId, Config, IDataArtifact, IntelligentData, StageStatus, StorageRoot,
     };
@@ -362,11 +364,15 @@ mod tests {
             tee_data_verifier_addr: None,
             console_enabled: true,
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -454,6 +460,9 @@ mod tests {
         deployments.seed(source);
 
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto,
             chain: chain.clone(),
@@ -463,7 +472,13 @@ mod tests {
             jobs: jobs.clone(),
             events: Arc::new(InMemoryEventBus::new()),
         };
-        Setup { state, jobs, chain, source_agent_id, source_seal }
+        Setup {
+            state,
+            jobs,
+            chain,
+            source_agent_id,
+            source_seal,
+        }
     }
 
     fn signed_clone_req(
@@ -479,7 +494,9 @@ mod tests {
             "target_owner": target,
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
-        let sig = signer.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap();
+        let sig = signer
+            .sign_hash_sync(&B256::from(eip191_digest(&bytes)))
+            .unwrap();
         CloneRequest {
             idempotency_key: idem.to_string(),
             source_agent_id,
@@ -555,13 +572,28 @@ mod tests {
         assert_ne!(resp.0.seal_id, s.source_seal, "clone gets a fresh seal_id");
         // Framework inheritance (review #154): the clone row remembers the
         // source's harness, so its resets/model-selector need no asking.
-        let cloned = s.state.deployments.get(resp.0.seal_id).await.unwrap().unwrap();
-        assert_eq!(cloned.framework.as_deref(), Some("dsh"), "clone inherits source framework");
+        let cloned = s
+            .state
+            .deployments
+            .get(resp.0.seal_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cloned.framework.as_deref(),
+            Some("dsh"),
+            "clone inherits source framework"
+        );
 
         let submitted = s.jobs.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         match &submitted[0] {
-            JobPayload::Clone { source_seal_id, target_owner, new_seal_id, .. } => {
+            JobPayload::Clone {
+                source_seal_id,
+                target_owner,
+                new_seal_id,
+                ..
+            } => {
                 assert_eq!(*source_seal_id, s.source_seal);
                 assert_eq!(*target_owner, target);
                 assert_eq!(*new_seal_id, resp.0.seal_id);
@@ -582,7 +614,10 @@ mod tests {
         let err = handle(axum::extract::State(s.state.clone()), axum::Json(req))
             .await
             .expect_err("non-owner must be rejected");
-        assert!(format!("{err:?}").to_lowercase().contains("owner") || format!("{err:?}").contains("signer"));
+        assert!(
+            format!("{err:?}").to_lowercase().contains("owner")
+                || format!("{err:?}").contains("signer")
+        );
         assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
@@ -622,10 +657,18 @@ mod tests {
         let submitted = s.jobs.submitted.lock().unwrap();
         assert_eq!(submitted.len(), 1);
         match &submitted[0] {
-            JobPayload::Clone { authorization, target_owner, .. } => {
+            JobPayload::Clone {
+                authorization,
+                target_owner,
+                ..
+            } => {
                 assert_eq!(*target_owner, buyer.address());
                 match authorization {
-                    JobCloneAuth::Contract { authorizer, auth_data, caller } => {
+                    JobCloneAuth::Contract {
+                        authorizer,
+                        auth_data,
+                        caller,
+                    } => {
                         assert_eq!(*authorizer, AUTHORIZER, "live authorizer recorded");
                         assert_eq!(auth_data.as_ref(), b"purchase-1", "auth_data forwarded");
                         assert_eq!(*caller, buyer.address(), "caller = buyer");
@@ -697,7 +740,12 @@ mod tests {
         s.chain.set_clone_authorizer(AUTHORIZER);
         s.chain.set_can_clone_verdict(Some(true));
         // A marketplace key signs the intent, not the buyer.
-        let mut req = contract_clone_req(&PrivateKeySigner::random(), "idem-c5", s.source_agent_id, b"p");
+        let mut req = contract_clone_req(
+            &PrivateKeySigner::random(),
+            "idem-c5",
+            s.source_agent_id,
+            b"p",
+        );
         // Bind the envelope to the real buyer so only the signer is wrong.
         let canonical = serde_json::json!({
             "domain": CanonicalCloneContract::DOMAIN,
@@ -709,7 +757,9 @@ mod tests {
         });
         let bytes = serde_json::to_vec(&canonical).unwrap();
         let rogue = PrivateKeySigner::random();
-        let sig = rogue.sign_hash_sync(&B256::from(eip191_digest(&bytes))).unwrap();
+        let sig = rogue
+            .sign_hash_sync(&B256::from(eip191_digest(&bytes)))
+            .unwrap();
         if let Some(CloneAuthorization::Contract {
             ref mut intent_signature,
             ref mut intent_signed_message_b64,

@@ -104,7 +104,8 @@ export function apply(ctx) {
     name: 'seal_register_service',
     description:
       'Register (replace) this agent\'s public HTTP services. Each entry maps a public /api/* path to a ' +
-      'loopback backend you are serving; traffic then flows through the signed :8080 proxy and carries X-Agent-Proof. ' +
+      'loopback backend you are serving; traffic then flows through the :8080 proxy, which stamps each response with ' +
+      'X-Agent-Proof when the runtime has a serve-proof validator (the runtime snapshot\'s "serve-proof validator" row; "none" means unsigned). ' +
       'The list REPLACES all previously registered services.',
     parameters: {
       services: {

@@ -16,6 +16,10 @@ OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 \
 It deploys a fresh source, then runs verify-agent → agent-e2e →
 evolution-probe → lifecycle-e2e → transfer-live against it. The
 individual scripts below are the building blocks it calls.
+`VERIFIED_FEEDBACK_ADDR` must equal the attestor's `GET /config`
+`verified_feedback_addr`: that is the ServeProof validator its containers
+sign for, so any other registry rejects every proof (the script aborts
+on a mismatch before spending gas).
 
 Last verified on the -dev testnet: **3 consecutive full rounds green**
 (~13 min each), absorbing live 0G-Storage / KMS / indexer jitter without
@@ -50,6 +54,8 @@ with exact remediation named, then passed after ack() + deposit().
 cd attestor && cargo test --workspace          # incl. KMS mock, fuse, seal_material
 cd sealed   && go test ./...                   # marker round-trip, adapter conformance, storage upload wiring (Linux only)
 cd contracts && forge test                     # on-chain invariants
+cd sdk/typescript && npm test                  # SDK flows; pins the console's + verify-agent.sh's
+                                               # ServeProof digest copies (that leg needs cast + jq)
 ```
 
 All free, no network, no env. This is the minimum bar for every commit.
@@ -111,13 +117,15 @@ API=http://<attestor>:8080
 # 1. preflight — health, config sanity, and the KMS self-check already
 #    passed if the binaries are up at all (they refuse to boot otherwise)
 curl -s $API/health                                    # "ok"
-curl -s $API/config | jq '{sandbox_snapshot, frameworks}'
+curl -s $API/config | jq '{sandbox_snapshot, frameworks, verified_feedback_addr}'
+# verified_feedback_addr null ⇒ containers emit no X-Agent-Proof (step 3 fails)
 
 # 2. deploy (snapshot is read from /config — never hardcode it)
 OWNER_PRIV=0x<funded key> API=$API bash scripts/e2e.sh # → PASS — phase=running
 
 # 3. verify the identity chain + decrypt + serve-proof in one shot
-AGENT_ID=<decimal id printed by e2e> API=$API bash scripts/verify-agent.sh
+#    (owner-run: reads the owner-scoped deployment row with the same key)
+AGENT_ID=<decimal id printed by e2e> OWNER_PRIV=0x<same key> API=$API bash scripts/verify-agent.sh
 ```
 
 **3b. SDK coverage** (needs node ≥18; `cd sdk/typescript && npm ci && npm run build`):
@@ -143,7 +151,9 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_URL=http://8080-<sandbox>.<proxy> \
 # indexer owner sync, and the post-transfer owner gate (old owner
 # rejected, new owner can recreate). Needs VERIFIED_FEEDBACK_ADDR = the
 # VerifiedFeedbackRegistry bound to this AgenticID (the canonical 8004
-# reputation registry is discovered from it). FEEDBACK_BATCHER_ADDR is
+# reputation registry is discovered from it) — the same address as /config
+# verified_feedback_addr, the validator the containers sign ServeProofs
+# for (a different one rejects every proof). FEEDBACK_BATCHER_ADDR is
 # optional: set → the feedback leg goes through the atomic EIP-7702 path;
 # unset → the script falls back to the attestor /config's advertised value,
 # and to the sequential two-tx flow when that is absent too.
@@ -186,14 +196,28 @@ OWNER_PRIV=0x… ATTESTOR_URL=$API AGENT_ID=<id> SEAL_ADDR=0x… \
   node scripts/evolution-probe.cjs
 ```
 
-`verify-agent.sh` checks:
+`verify-agent.sh` (needs `curl`, `jq` and `cast`) checks:
 1. **identity tri-check** — attestor row == on-chain `getAgentSeal` ==
    the address the container was provisioned with;
 2. **decrypt health** — the sealed bootstrap log has one `decrypted` per
    iData entry and zero `FAIL` lines;
 3. **serve-proof** — `/hello` returns 200 with an `X-Agent-Proof` header
-   whose payload names this agent. (Full signature recovery: paste the
-   agent URL into the console's say-hi verifier, or SDK `sayHi()`.)
+   whose envelope names this agent; `/config` `verified_feedback_addr`'s
+   `getIdentityRegistry()` equals `/config` `agentic_id_addr`; and the
+   signature recovers to the seal address over the EIP-191 version-0x00
+   digest bound to that `verified_feedback_addr` — the signature check the
+   registry makes, gas-free. The anchoring and the recovery are skipped only
+   when `/config` has no `verified_feedback_addr`. An envelope `validator`
+   other than that address fails as
+   "proof signed for a different registry"; no `validator` plus a failed
+   recovery means a sealed image from before the VerifiedFeedbackRegistry
+   1.2.0 cut (the owner must `/reset`). The console's say-hi verifier and
+   SDK `sayHi()` (0.2.0+) run the same recovery.
+
+`bash scripts/verify-agent.sh --kat` checks step 3's digest offline against
+the cross-implementation known-answer vector (`cast` + `jq` only, no attestor
+or agent); the SDK's `npm test` runs it, and the console's copy, from
+`test/serveproof-copies.test.mjs`.
 
 **4. recreate determinism** (the check that guards KMS key stability):
 reset the agent (console button, or SDK `reset({snapshot, apiKey})`),
@@ -235,3 +259,101 @@ the sandbox (it keeps running and billing until the provider GCs it).
 | container_stage failed: `snapshot "…" not found` (mint/storage fine) | config skew | `ATTESTOR_SANDBOX_SNAPSHOT` (or a hardcoded snapshot in a client) doesn't exist on the sandbox provider — align the name; agents minted this way sit `offline` and can be brought up via retry with a corrected envelope |
 | every reset leaks the old container; worker logs `orphan admin_delete failed … 403 "admin only"` | sandbox provider env | the attestor's TEE EOA isn't in the provider's `ADMIN_ADDRESSES` — add it and restart the provider, then clean accumulated orphans |
 | deploy UI does nothing, api log stops after `deploy request` | attestor (fixed) | pre-timeout builds hung forever on a slow KMS call and axum cancelled the handler silently — fixed by the 20s KMS call timeout + UI submit feedback; if seen again, the running image predates that fix |
+
+### Provider registry publication
+
+T0 API tests cover live Tapp-owner authorization, exact-byte signature binding,
+chain/contract/Tapp separation, expiry, validation, replay, concurrent publication,
+ownership transfer, EIP-1271, historical reads, and database receipt tampering:
+
+```bash
+cargo test -p attestor-api providers::
+```
+
+SDK and Go share `sealed/internal/inference/testdata/registry-v1.json` to verify
+the same operator signature, route hash, and encrypted v3 credential. The SDK
+suite publishes through HTTP and checks that a stale base version is refused.
+Publication belongs to the operations API and `ag.admin`; the CLI only reads
+providers and registers local inference keys. Regression coverage checks that
+removed CLI publication commands cannot publish, while discovery and login work.
+Regression tests also reject a first-read 404 from an advertised registry before
+sealing/signing, and exercise changed-compute deployment through mint/settings/start.
+Owner-authorized fresh sandbox tests verify that reset grants the current
+unconfirmed settings a fresh boot without rewriting the document, its version,
+or last-known-good. A real Postgres test checks the version guard and promotion:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_owner_recreate_retries_only_the_expected_unconfirmed_settings -- --ignored
+```
+
+The encrypted credential pins the registry version and acceptance digest.
+Go tests re-create a reader after publication and verify that stop/start keeps
+the old route, reset authorizes the new one, and missing/tampered history never
+falls back to the latest endpoint. Internal settings GET tests check runtime
+state, readiness, and exclusion of credentials/opaque framework configuration.
+
+The Postgres repository integration test is explicitly ignored by default.
+Run it against a disposable database, not an existing deployment database:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_registry_survives_reconnect_and_serializes_publishers -- --ignored
+```
+
+It boots the normal schema, publishes a revision, reconnects through another
+pool, races two publishers, refuses stale replay, and checks immutable history.
+This proves database persistence and concurrency, not a live TEE/router call.
+The real rollout still requires an upgraded image and registered attestor Tapp
+owner; see [operator workflow](../sdk/typescript/PROVIDERS.md).
+
+
+Status boot receipts have a shared Rust/Go signature fixture at
+`sealed/internal/inference/testdata/status-v2.json`. API tests rotate receipts
+and verify that delayed running/warning/error/starting/stopping reports from an
+old instance cannot change stage, liveness, or confirmed settings. They also
+cover absent/mismatched applied digests and legacy reports that never promote.
+SDK tests cover unreadable/withdrawn discovery after factory construction and
+concurrent refreshes with different versions, digests, and first-call failures.
+
+The database race test holds a deployment lock while rotating the receipt and
+checks that a waiting report reads the new binding after the lock is released:
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_status_receipt_guards_are_atomic_and_confirm_only_the_served_version -- --ignored
+```
+
+Upgrade attestor before enabling the matching sealed images. New sealed refuses
+provisioning without its encrypted boot receipt; legacy heartbeats do not
+confirm settings. This protocol adds no environment variables.
+
+
+Lifecycle convergence coverage additionally verifies container private-key proof
+vectors (`boot-v1.json`), reserved/scrubbed internal tickets, duplicate/old boot
+rejection, exact sandbox identity, live owner changes, stop/start round trips,
+creation and persistence failures, version/generation-fenced retry counters,
+late transfer events, and captured teardown targets. The API test crate includes
+the actual worker handlers to test stop → delayed status → start end to end.
+The Postgres tests run concurrently and explicitly test schema bootstrap waiting
+behind runtime locks; do not serialize them to hide lock-order regressions.
+
+```bash
+AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
+  cargo test -p attestor-shared postgres_ -- --ignored
+```
+
+Build sealed images before activating the matching attestor API/worker/indexer.
+Existing agents use reset to adopt the new image and its internal boot ticket.
+Operator environment variables do not change.
+
+
+The live regression runner rebuilds the SDK from the working tree before running.
+Its source identity smoke uses a compute credential and a matching compute
+persona model (`MODEL_ID`, default `gpt-oss-120b`). The default dummy `API_KEY`
+only proves identity/bootstrap/lifecycle: it does not prove inference. For the
+provider release, additionally test a real managed provider/key, an actual model
+reply, publication A → B while the existing agent and stop/start remain on A,
+then reset with the newly authorized key/route to B. Verify both runtime settings
+and upstream request logs. Provider publication is an operations API/SDK action;
+there is no CLI publication command.

@@ -14,10 +14,16 @@ error NonceExpired(uint256 deadline, uint256 nowTimestamp);
 ///         valid and reopen it to replay.
 error NonceDeadlineTooFar(uint256 deadline, uint256 maxDeadline);
 
+/// @notice maxAge outside [MIN_NONCE_MAX_AGE, MAX_NONCE_MAX_AGE].
+error NonceMaxAgeOutOfRange(uint256 maxAge);
+
+/// @notice maxAge may only be raised — lowering it would let the cleanup delete
+///         records whose proofs are still valid (see the contract natspec).
+error NonceMaxAgeDecrease(uint256 currentMaxAge, uint256 newMaxAge);
+
 /// @title NonceRegistryUpgradeable
-/// @notice Shared replay-protection primitive used by all proof-accepting contracts
-///         in the protocol (transfer verifiers, reputation registry, identity
-///         registry's setAgentWallet).
+/// @notice Shared replay-protection primitive used by the proof-accepting contracts
+///         in the protocol (transfer verifiers, the reputation registries).
 ///
 ///         Consumed (key, deadline) pairs are rejected atomically:
 ///           • block.timestamp > deadline → NonceExpired
@@ -32,10 +38,25 @@ error NonceDeadlineTooFar(uint256 deadline, uint256 maxDeadline);
 ///
 ///      Cleanup is safe under two assumptions:
 ///        1. Signers do not reuse a nonce across different signed messages.
-///        2. maxAge is set no shorter than the longest deadline horizon the
-///           protocol issues. Otherwise a cleaned record could expose a still-
-///           valid alternative proof to replay.
+///        2. Every consumed record outlives its proof's deadline. Consumption
+///           enforces deadline <= consumedAt + maxAge, and the cleanup deletes
+///           only once now > consumedAt + maxAge, so this holds as long as
+///           maxAge never shrinks. `_setNonceMaxAge` therefore only raises it
+///           (audit FIND-07: lowering it reopened records consumed under the
+///           old value to replay while their proofs were still valid), and
+///           init and setter keep it within [MIN_NONCE_MAX_AGE, MAX_NONCE_MAX_AGE]
+///           — 0 rejected every proof not expiring this second, and a value
+///           near 2^256 overflowed `now + maxAge`.
 abstract contract NonceRegistryUpgradeable is Initializable {
+
+    /// @dev Floor: twice the longest deadline horizon the protocol issues (the
+    ///      sealed runtime's ServeProof window is 1 hour), so a TEE clock
+    ///      running ahead of block time doesn't trip NonceDeadlineTooFar.
+    uint256 internal constant MIN_NONCE_MAX_AGE = 2 hours;
+    /// @dev Ceiling: keeps `block.timestamp + maxAge` far from overflow.
+    uint256 internal constant MAX_NONCE_MAX_AGE = 365 days;
+
+    event NonceMaxAgeUpdated(uint256 previousMaxAge, uint256 newMaxAge);
 
     /// @custom:storage-location erc7201:0g.storage.NonceRegistry
     struct NonceRegistryStorage {
@@ -57,13 +78,24 @@ abstract contract NonceRegistryUpgradeable is Initializable {
     // ── Initializer ───────────────────────────────────────────────────────────
 
     function __NonceRegistry_init_unchained(uint256 maxAge_) internal onlyInitializing {
+        _requireMaxAgeInRange(maxAge_);
         _getNonceRegistryStorage().maxAge = maxAge_;
     }
 
     // ── Admin (subclass exposes gated setter) ─────────────────────────────────
 
+    /// @dev Raise-only (see the contract natspec, assumption 2).
     function _setNonceMaxAge(uint256 maxAge_) internal {
-        _getNonceRegistryStorage().maxAge = maxAge_;
+        _requireMaxAgeInRange(maxAge_);
+        NonceRegistryStorage storage $ = _getNonceRegistryStorage();
+        uint256 current = $.maxAge;
+        if (maxAge_ < current) revert NonceMaxAgeDecrease(current, maxAge_);
+        emit NonceMaxAgeUpdated(current, maxAge_);
+        $.maxAge = maxAge_;
+    }
+
+    function _requireMaxAgeInRange(uint256 maxAge_) private pure {
+        if (maxAge_ < MIN_NONCE_MAX_AGE || maxAge_ > MAX_NONCE_MAX_AGE) revert NonceMaxAgeOutOfRange(maxAge_);
     }
 
     // ── Core consume ──────────────────────────────────────────────────────────
@@ -86,9 +118,8 @@ abstract contract NonceRegistryUpgradeable is Initializable {
 
     // ── Storage GC ────────────────────────────────────────────────────────────
 
-    /// @dev Permissionless cleanup of consumed nonces older than maxAge.
-    ///      Callers providing too-short maxAge + too-long deadline weaken replay
-    ///      protection — see contract-level natspec for the invariant.
+    /// @dev Permissionless cleanup of consumed nonces older than maxAge. Safe
+    ///      because maxAge never shrinks — see contract-level natspec.
     function _cleanExpiredNonces(bytes32[] calldata keys) internal {
         NonceRegistryStorage storage $ = _getNonceRegistryStorage();
         uint256 maxAge = $.maxAge;

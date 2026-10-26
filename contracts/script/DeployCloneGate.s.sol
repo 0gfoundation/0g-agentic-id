@@ -9,12 +9,14 @@ import {BeaconProxy} from "@openzeppelin/contracts/proxy/beacon/BeaconProxy.sol"
 
 import {CloneGate} from "../src/CloneGate.sol";
 import {StandardCloneAuthorizer} from "../src/StandardCloneAuthorizer.sol";
+import {MainnetGovernance} from "./MainnetGovernance.sol";
 
 /// @notice Incremental deploy: add a CloneGate (impl + beacon + proxy) to an
 ///         EXISTING AgenticID environment (DEPLOYMENT.md section 6). Fresh
 ///         full-stack deploys use Deploy.s.sol, which already includes it.
 ///
-///         Env vars: AGENTIC_ID (existing proxy), TIMELOCK (beacon owner).
+///         Env vars: AGENTIC_ID (existing proxy), TIMELOCK (beacon owner; on 0G
+///         mainnet (16661) it must have minDelay >= 86400).
 ///
 ///         Post-deploy (AgenticID owner, one tx): addTrustedAttestor(proxy) —
 ///         the gate mints through registerWithSeal.
@@ -22,6 +24,7 @@ contract DeployCloneGate is Script {
     function run() external returns (address impl, address beacon, address proxy) {
         address agenticId = vm.envAddress("AGENTIC_ID");
         address timelock  = vm.envAddress("TIMELOCK");
+        MainnetGovernance.requireMainnetTimelock(block.chainid, timelock);
 
         vm.startBroadcast();
         CloneGate cgImpl = new CloneGate();

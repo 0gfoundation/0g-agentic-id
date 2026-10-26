@@ -3,7 +3,7 @@
 
 use crate::events::WsEvent;
 use crate::types::*;
-use alloy::primitives::{Address, Bytes, B256, TxHash};
+use alloy::primitives::{Address, Bytes, TxHash, B256};
 use async_trait::async_trait;
 
 // ── Chain ───────────────────────────────────────────────────────────────
@@ -19,15 +19,21 @@ pub trait ChainClient: Send + Sync {
     async fn is_valid_framework_hash(&self, hash: ImageHash) -> anyhow::Result<bool>;
     async fn is_trusted_attestor(&self, addr: Address) -> anyhow::Result<bool>;
 
-    /// Returns whether `addr` is a currently-active node signer of the
-    /// configured sandbox app in TappRegistry. Used by `/provision` to
-    /// validate that the recovered sandbox attestation signer is one
-    /// the sandbox provider has registered (and rotations propagate
-    /// without an attestor restart).
-    ///
-    /// Returns `Err` when TappRegistry isn't wired in the chain client
-    /// — the attestor requires it to be configured.
-    async fn is_sandbox_node(&self, addr: Address) -> anyhow::Result<bool>;
+    /// Live owner of this attestor's Tapp, used for administrative writes.
+    async fn tapp_app_owner(&self, _registry: Address, _app_id: &str) -> anyhow::Result<Address> {
+        anyhow::bail!("Tapp owner lookup not implemented")
+    }
+
+    /// EIP-1271 verification for contract-wallet owners. Implementations must
+    /// fail closed; the default never grants a contract signature.
+    async fn is_valid_contract_signature(
+        &self,
+        _owner: Address,
+        _digest: [u8; 32],
+        _signature: &[u8],
+    ) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 
     /// TappRegistry.isAcknowledged(user, appId) — whether `user` has acked
     /// `app_id` at its CURRENT ackVersion. Used by the deploy-edge
@@ -57,10 +63,8 @@ pub trait ChainClient: Send + Sync {
 
     /// ERC-7857 `intelligentDatasOf(agentId)` view. Returns the on-chain
     /// (description, dataHash) list. Used by indexer reconstruction.
-    async fn intelligent_datas_of(
-        &self,
-        agent_id: AgentId,
-    ) -> anyhow::Result<Vec<IntelligentData>>;
+    async fn intelligent_datas_of(&self, agent_id: AgentId)
+        -> anyhow::Result<Vec<IntelligentData>>;
 
     /// ERC-7857 `sealedKeysOf(agentId)` view — the per-iData sealed data
     /// keys (ECIES to the agent's agentSeal), in the same order as
@@ -99,16 +103,18 @@ pub trait ChainClient: Send + Sync {
     /// from current data and resubmit).
     async fn clone_from(&self, params: CloneFromParams) -> anyhow::Result<TxHash>;
 
+    /// VerifiedFeedbackRegistry `getIdentityRegistry()` on `registry` — the
+    /// AgenticID that registry verifies ServeProofs against. Read once at
+    /// startup (`chain::check_verified_feedback_anchor`). An address with no
+    /// code, or a call that reverts, is an `Err`.
+    async fn identity_registry_of(&self, registry: Address) -> anyhow::Result<Address>;
+
     /// ERC-8004 `setAgentURI(agentId, uri)`. AgenticID has authorized
     /// trusted attestors to call this, so the attestor EOA can write the
     /// AgentCard URL after OSS upload without going through the owner.
     /// Two-phase deploy: mint with empty URI first, fill via this call
     /// once the canonical AgentCard JSON is uploaded.
-    async fn set_agent_uri(
-        &self,
-        agent_id: AgentId,
-        uri: String,
-    ) -> anyhow::Result<TxHash>;
+    async fn set_agent_uri(&self, agent_id: AgentId, uri: String) -> anyhow::Result<TxHash>;
 }
 
 // ── Crypto ──────────────────────────────────────────────────────────────
@@ -137,11 +143,11 @@ pub trait CryptoModule: Send + Sync {
     /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
     /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
     /// separator string so the same master secret can back independent
-    /// MACs (`"agentic-id.container-pubkey-binding.v1"` etc.) without
+    /// MACs (`"agentic-id.container-pubkey-binding.v2"` etc.) without
     /// cross-protocol attacks.
     fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
 
-    /// Recover signer from (eth personal_sign digest, 65-byte signature).
+    /// Recover signer from a 32-byte prehash and a 65-byte signature.
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address>;
 }
 
@@ -164,6 +170,19 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
+    /// Public bootstrap trust; runtimes refresh independently through pinned Scan.
+    async fn attestor_tls_identity(&self) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
+        Ok(None)
+    }
+    /// Full authenticated issuer scope used by workload attestations. Explicit
+    /// mocks must configure it; the default never authorizes an arbitrary key.
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        Ok(None)
+    }
+    /// Current authenticated connection metadata; mock implementations may omit it.
+    async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
+        Ok(None)
+    }
     /// Create a new sandbox container for `seal_id`. The user-signed
     /// `envelope` (action="create") is relayed as the three X-Wallet-*
     /// headers. Returns sandbox's id + lifecycle state so callers can
@@ -173,24 +192,17 @@ pub trait SandboxClient: Send + Sync {
         &self,
         seal_id: SealId,
         envelope: &SandboxEnvelope,
+        boot_ticket: Option<&str>,
     ) -> anyhow::Result<SandboxCreateResponse>;
 
     /// Resume a previously stopped sandbox. Envelope action="start",
     /// resource_id=<sandbox_id>. Sandbox's HTTP path is
     /// `POST /api/sandbox/:id/start` with empty body.
-    async fn start(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()>;
+    async fn start(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()>;
 
     /// Stop a running sandbox. Envelope action="stop",
     /// resource_id=<sandbox_id>. Sandbox path: `POST /api/sandbox/:id/stop`.
-    async fn stop(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()>;
+    async fn stop(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()>;
 
     /// Permanently destroy a sandbox using attestor admin auth (no
     /// owner-signed envelope). Used in two scenarios:
@@ -235,11 +247,17 @@ pub trait DeploymentRepo: Send + Sync {
     /// Reset the container track after the sandbox is torn down on ownership
     /// transfer: container_stage → NotStarted, sandbox_id → NULL,
     /// provisioned_at → NULL. With storage + mint still Confirmed this yields
+    /// With expected_sandbox, return false if a newer sandbox or authorized
+    /// create replaced it. No newer generation may be revoked by stale cleanup.
     /// phase `Ready` ("provisioned on chain + storage, no running container —
     /// the new owner brings it online via a fresh deploy"), rather than
     /// `Stopped` (implies resumable; the sandbox is deleted) or `Failed`
     /// (implies a crash). Recomputes + persists phase.
-    async fn reset_container_track(&self, seal_id: SealId) -> anyhow::Result<()>;
+    async fn reset_container_track(
+        &self,
+        seal_id: SealId,
+        expected_sandbox: Option<&str>,
+    ) -> anyhow::Result<bool>;
 
     async fn set_agent_id(&self, seal_id: SealId, agent_id: AgentId) -> anyhow::Result<()>;
 
@@ -250,23 +268,24 @@ pub trait DeploymentRepo: Send + Sync {
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
 
     /// Persist the container's `(pubkey, mac)` pair on first /provision.
-    /// `mac` is `HMAC(binding_key, seal_id || pubkey)` — the binding_key
-    /// lives only in attestor memory (HKDF from master secret), so DB
-    /// tampering is detectable at verify time.
+    /// V2 `mac` covers `image_attestation_digest32 || authenticated_app_signer20`
+    /// with the v2-domain binding key (HKDF from the master secret). The digest
+    /// binds the full issuer scope and workload payload; v1 MACs are incompatible.
     async fn set_container_binding(
         &self,
         seal_id: SealId,
         pubkey: Vec<u8>,
         mac: Vec<u8>,
-    ) -> anyhow::Result<()>;
+    ) -> anyhow::Result<bool>;
 
-    /// Clear the container `(pubkey, mac)` binding, keyed by agent_id.
-    /// Called on ownership transfer: the inherited binding is what lets a
-    /// resumed container skip the attestation freshness window, so dropping
-    /// it forces the next /provision to re-establish a binding via a fresh
-    /// attestation. A stale prior owner's container (reused SANDBOX_SEAL_KEY,
-    /// old `issued_at`) then fails freshness and cannot re-provision.
-    async fn clear_container_binding(&self, agent_id: AgentId) -> anyhow::Result<()>;
+    /// Revoke the prior owner's binding, preserving an authorized boot that
+    /// belongs to the live chain owner. Return the captured old sandbox to
+    /// clean up; never resolve a queued teardown to a later sandbox ID.
+    async fn clear_container_binding(
+        &self,
+        agent_id: AgentId,
+        live_owner: Address,
+    ) -> anyhow::Result<Option<String>>;
 
     /// Stamp the deployment row when `POST /provision` succeeds — proves
     /// the container authenticated via sandbox attestation and received
@@ -427,6 +446,45 @@ pub trait DeploymentRepo: Send + Sync {
         base_version: i64,
     ) -> anyhow::Result<Option<i64>>;
 
+    /// An owner-authorized fresh sandbox retries the current unconfirmed
+    /// document before falling back. Reset only the boot counter, preserving
+    /// content, versions and last-known-good. The expected version prevents
+    /// resetting another revision's attempts during a concurrent settings write.
+    async fn retry_settings(&self, seal_id: SealId, version: i64) -> anyhow::Result<bool>;
+
+    /// Start an owner-authorized generation. Some(ticket) creates a new
+    /// sandbox; None resumes the existing ticket. Legacy resumes return None.
+    async fn prepare_status_boot(
+        &self,
+        seal_id: SealId,
+        ticket: Option<[u8; 32]>,
+        owner: Address,
+    ) -> anyhow::Result<Option<i64>>;
+    async fn boot_authorization(
+        &self,
+        seal_id: SealId,
+    ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>>;
+    async fn has_status_binding(&self, seal_id: SealId) -> anyhow::Result<bool>;
+    /// Atomically install the attested container's pubkey and latest-boot receipt hash.
+    async fn bind_status_boot(
+        &self,
+        seal_id: SealId,
+        pubkey: Vec<u8>,
+        mac: Vec<u8>,
+        hash: [u8; 32],
+        claim: &crate::auth::status::BootClaim,
+    ) -> anyhow::Result<bool>;
+    /// Apply liveness/stage and optional exact-version confirmation only while
+    /// the receipt remains current. None accepts only pre-binding legacy boots
+    /// and must never confirm settings. Also checks a sandbox is still tracked.
+    async fn apply_status_report(
+        &self,
+        seal_id: SealId,
+        hash: Option<[u8; 32]>,
+        stage: StageStatus,
+        settings_version: Option<i64>,
+    ) -> anyhow::Result<bool>;
+
     /// Write a document ONLY onto a row that has never had one — the
     /// container-seeded recovery path (`POST /settings/seed`), which is
     /// agentSeal-signed and so must never be able to overwrite what an owner
@@ -441,6 +499,8 @@ pub trait DeploymentRepo: Send + Sync {
         settings: serde_json::Value,
     ) -> anyhow::Result<Option<i64>>;
 
+    /// Legacy counter-based fixture helper. Runtime reports MUST use
+    /// `apply_status_report` with an authenticated boot receipt instead.
     /// Promote `settings` to last-known-good: a container reported `running`
     /// on it.
     ///
@@ -469,11 +529,17 @@ pub trait DeploymentRepo: Send + Sync {
     /// Count one boot served the current unconfirmed document and return the
     /// new attempt count. Bumps only while
     /// `settings_version > settings_confirmed_version` (re-checked in the
-    /// statement, so it is atomic against a concurrent promotion); returns
+    /// statement, so it is atomic against a concurrent promotion), and only
+    /// for the expected document version and authorized generation; returns
     /// `None` when the document is already confirmed and nothing was
     /// counted. `/provision` uses the count to decide whether this boot gets
     /// the new document (first attempt) or the last one that worked.
-    async fn note_settings_attempt(&self, seal_id: SealId) -> anyhow::Result<Option<i32>>;
+    async fn note_settings_attempt(
+        &self,
+        seal_id: SealId,
+        version: i64,
+        generation: Option<i64>,
+    ) -> anyhow::Result<Option<i32>>;
 
     /// Read-only: running deployments whose last heartbeat is older than
     /// `now - threshold_secs`. Returns `(seal_id, sandbox_id)` so the caller

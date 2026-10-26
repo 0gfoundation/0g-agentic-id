@@ -26,6 +26,10 @@ const MIN_SANDBOX_BALANCE_WEI: U256 = U256::from_limbs([100_000_000_000_000_000u
 /// pass or are unconfigured; `Err(402 …)` with code `trust_roots_not_acked`
 /// or `insufficient_sandbox_balance` otherwise.
 pub async fn check_owner_ready(state: &AppState, owner: Address) -> Result<(), ApiError> {
+    let provider = state.sandbox.service_identity().await
+        .map_err(|_| ApiError::internal("sandbox identity lookup unavailable"))?
+        .map(|(provider, _)| provider)
+        .or(state.cfg.sandbox_provider_addr);
     check_inner(
         state.chain.as_ref(),
         owner,
@@ -36,7 +40,7 @@ pub async fn check_owner_ready(state: &AppState, owner: Address) -> Result<(), A
             ("sandbox", state.cfg.sandbox_app_id.as_deref()),
         ],
         state.cfg.sandbox_serving_addr,
-        state.cfg.sandbox_provider_addr,
+        provider,
     )
     .await
 }

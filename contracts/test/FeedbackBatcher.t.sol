@@ -85,7 +85,8 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
             taskHash: keccak256("task"),
             dataHashes: dataHashes,
             frameworkHash: FRAMEWORK_HASH,
-            signature: _sign(signerPk, _eip191RawHash(inner))
+            // Validator = the VF proxy (not the client EOA or the batcher).
+            signature: _sign(signerPk, _eip191ValidatorHash(address(registry), inner))
         });
     }
 
@@ -142,7 +143,7 @@ contract FeedbackBatcherTest is AgenticIDTestBase {
             agentId: agentId, submitter: clientWallet.addr,
             timestamp: block.timestamp, deadline: deadline,
             taskHash: taskHash, dataHashes: dataHashes, frameworkHash: FRAMEWORK_HASH,
-            signature: _sign(sealWallet.privateKey, _eip191RawHash(inner))
+            signature: _sign(sealWallet.privateKey, _eip191ValidatorHash(address(registry), inner))
         });
 
         vm.signAndAttachDelegation(address(batcher), clientWallet.privateKey);

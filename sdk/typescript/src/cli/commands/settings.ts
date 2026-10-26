@@ -1,6 +1,6 @@
 /**
  * @file settings.ts
- * @description `0g-agenticid settings <agent> [key=value …]` — show or change
+ * @description `0g-agentdna settings <agent> [key=value …]` — show or change
  * the agent's configuration document (which model it thinks with, and how
  * hard).
  *
@@ -12,10 +12,10 @@
  * so `settings 286 model=x` changes the model and leaves everything else
  * alone — and it is a compare-and-swap against the version just read, so a
  * concurrent edit by another client is refused rather than silently lost.
- * Before signing, the chosen model is checked against the 0G router's public
- * catalog; an absence is printed as a warning and nothing more. A framework
- * built-in is legitimately absent from that catalog, and the container is the
- * real gate — so the check can inform the owner, never block them.
+ * Before signing, model advisories use the selected provider's catalog.
+ * Native providers without a catalog accept manual model IDs. Provider
+ * changes require a matching local key and runtime capability, then wait
+ * for reset to deliver that key rather than pushing the old credential.
  */
 
 import type { Hash } from 'viem';
@@ -27,6 +27,8 @@ import { parseAgentRef, type AgentRef } from '../ref';
 import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
+import { changesProvider } from '../../Providers';
+import { requireConfiguredInferenceKey, requiresProviderReset } from '../inference';
 
 const ZERO_HASH = `0x${'0'.repeat(64)}` as Hash;
 
@@ -43,7 +45,7 @@ async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): Promise
         hits.length
           ? `"${raw}" matches ${hits.length} agents — add more hex chars`
           : `no agent matching ${raw} on this attestor`,
-        { remedy: '0g-agenticid list   # to discover existing agents' },
+        { remedy: '0g-agentdna list   # to discover existing agents' },
       );
     }
     return hits[0].sealId;
@@ -51,7 +53,7 @@ async function resolveSealId(ag: AgenticID, ref: AgentRef, raw: string): Promise
   const seal = await ag.agent.getSealId(ref.agentId).catch(() => ZERO_HASH);
   if (seal === ZERO_HASH) {
     throw new CliError('AGENT_NOT_FOUND', `agent ${ref.agentId} has no sealId on chain`, {
-      remedy: '0g-agenticid list   # to discover existing agents',
+      remedy: '0g-agentdna list   # to discover existing agents',
     });
   }
   return seal;
@@ -72,7 +74,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     // No row for this seal — a wrong attestor or a wrong id, not an internal fault.
     if (/HTTP 404/.test(e.message)) {
       throw new CliError('AGENT_NOT_FOUND', `no deployment for seal ${sealId} on this attestor`, {
-        remedy: '0g-agenticid list   # to discover existing agents',
+        remedy: '0g-agentdna list   # to discover existing agents',
       });
     }
     throw e;
@@ -91,6 +93,8 @@ export async function run(ctx: CommandContext): Promise<void> {
   // Before anything is signed: a document with no model is the one state the
   // container cannot boot from and last-known-good cannot cover.
   assertModelPresent(next, current !== null);
+  let pendingReset = changesProvider(current, next);
+  if (pendingReset) requireConfiguredInferenceKey(next.provider ?? '0g-compute');
   const warnings: string[] = [];
   // The catalog advisory runs inside setSettings, before it signs.
   const written = await ag.agent
@@ -126,7 +130,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   // boot" for a rejection is a lie that hides an un-bootable document.
   let rejected = false;
   const base = await runningServeBase(ctx.env.attestorUrl, sealId);
-  if (base) {
+  if (base && !pendingReset) {
     const agentId = await ag.agent.getAgentIdBySealId(sealId);
     await ag.agent
       .pushSettingsToContainer(base, agentId, next)
@@ -134,6 +138,10 @@ export async function run(ctx: CommandContext): Promise<void> {
         applied = r.note ?? 'applied to the running container';
       })
       .catch((e: unknown) => {
+        if (requiresProviderReset(e)) {
+          pendingReset = true;
+          return;
+        }
         const msg = e instanceof Error ? e.message : String(e);
         // pushSettingsToContainer throws `… HTTP <n>: …` when the container
         // ANSWERED and refused; a bare fetch failure (no HTTP status) means
@@ -148,12 +156,14 @@ export async function run(ctx: CommandContext): Promise<void> {
   }
 
   if (ctx.json) {
-    emitOk({ sealId, settings: next, version: written.version, warnings, applied: applied ?? null, rejected });
+    emitOk({ sealId, settings: next, version: written.version, warnings, applied: applied ?? null, rejected, pendingReset });
     return;
   }
   for (const line of renderSettings(next)) print(line);
   note(
-    applied
+    pendingReset
+      ? `written — version ${written.version}; provider change pending — run reset ${raw} with the ${next.provider} key`
+      : applied
       ? `written — version ${written.version}; ${applied}`
       : rejected
         ? `written — version ${written.version}, but the running container refused it (see the warning above); it will not boot as-is.`

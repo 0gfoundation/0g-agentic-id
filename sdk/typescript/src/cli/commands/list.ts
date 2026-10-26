@@ -1,6 +1,6 @@
 /**
  * @file list.ts
- * @description `0g-agenticid list [--mine] [--phase <p>]` — deployment
+ * @description `0g-agentdna list [--mine] [--phase <p>]` — deployment
  * listing (spec v0.03 §3.3). Default is the attestor's PUBLIC tier;
  * `--mine` switches to the owner-signed listing (needs AGENTIC_PRIVATE_KEY)
  * whose rows carry the withheld owner-only fields (owner, sandboxId,
@@ -44,7 +44,7 @@ export async function run(ctx: CommandContext): Promise<void> {
   // exit-2, not a plausible-looking empty success (agent-walkthrough finding).
   if (ctx.flags.phase && !PHASES.includes(ctx.flags.phase)) {
     throw new CliError('BAD_FLAG', `--phase must be one of ${PHASES.join('|')}, got "${ctx.flags.phase}"`, {
-      remedy: '0g-agenticid list --phase failed',
+      remedy: '0g-agentdna list --phase failed',
     });
   }
   // --mine is an owner-signed surface: withWallet makes a missing key fail

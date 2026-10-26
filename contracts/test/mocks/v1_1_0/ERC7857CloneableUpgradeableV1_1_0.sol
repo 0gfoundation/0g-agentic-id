@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TEST FIXTURE — FROZEN copy of src/extensions/ERC7857CloneableUpgradeable.sol as of the 1.1.0 impls every
+// environment runs (git a417c65; unchanged from 5e9ab03). It backs the frozen
+// AgenticIDV1_1_0 / TEEDataVerifierV1_1_0 / VerifiedFeedbackRegistryV1_1_0
+// mocks, which UpgradeGovernance.t.sol / UpgradeVerifiedFeedback.t.sol use as
+// pre-upgrade beacon impls, so later src changes to this base cannot leak into
+// them. Only the import paths and the contract name (V1_1_0 suffix) differ.
+// Never edit.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import {IERC7857Cloneable, SealedKeyEntry} from "../../../src/interfaces/IERC7857Cloneable.sol";
+import {IntelligentData} from "../../../src/interfaces/IERC7857Metadata.sol";
+import {TransferValidityProof} from "../../../src/interfaces/IERC7857DataVerifier.sol";
+import {ERC7857UpgradeableV1_1_0 as ERC7857Upgradeable} from "./ERC7857UpgradeableV1_1_0.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
+
+contract ERC7857CloneableUpgradeableV1_1_0 is IERC7857Cloneable, ERC7857Upgradeable {
+
+    /// @custom:storage-location erc7201:0g.storage.ERC7857Cloneable
+    struct ERC7857CloneableStorage {
+        uint256 nextTokenId;
+    }
+
+    // keccak256(abi.encode(uint256(keccak256("0g.storage.ERC7857Cloneable")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant ERC7857CloneableStorageLocation =
+        0x03de6cf14ecf4575e0ed0cc2fdb9b7ee13500cb3c0c403254fc893bf6e0c8000;
+
+    function _getERC7857CloneableStorage() private pure returns (ERC7857CloneableStorage storage $) {
+        assembly {
+            $.slot := ERC7857CloneableStorageLocation
+        }
+    }
+
+    // ── ERC-165 ───────────────────────────────────────────────────────────────
+
+    function supportsInterface(bytes4 interfaceId) public view virtual override(IERC165, ERC7857Upgradeable) returns (bool) {
+        return interfaceId == type(IERC7857Cloneable).interfaceId || super.supportsInterface(interfaceId);
+    }
+
+    // ── Token ID management ───────────────────────────────────────────────────
+
+    function _incrementTokenId() internal virtual returns (uint256 nextTokenId) {
+        ERC7857CloneableStorage storage $ = _getERC7857CloneableStorage();
+        nextTokenId = $.nextTokenId;
+        $.nextTokenId++;
+    }
+
+    // ── iCloneFrom ────────────────────────────────────────────────────────────
+
+    function iCloneFrom(
+        address from,
+        address to,
+        uint256 tokenId,
+        TransferValidityProof[] calldata proofs
+    ) public virtual whenNotPaused nonReentrant returns (uint256 newTokenId) {
+        // Authorization checked BEFORE proof verification
+        if (_ownerOf(tokenId) != from) revert ERC721InvalidSender(from);
+        _checkAuthorized(from, msg.sender, tokenId);
+
+        SealedKeyEntry[] memory entries = _proofCheck(from, to, tokenId, proofs);
+
+        // _safeMint fires the receiver callback before _updateData commits the
+        // clone's keys below. Unlike iTransferFrom this can't be reordered — the
+        // data write needs the token to exist — and no desync was found (each
+        // nested call reserves a fresh newTokenId via _incrementTokenId, so they
+        // write disjoint state). nonReentrant closes it as defense in depth.
+        newTokenId = _incrementTokenId();
+        _safeMint(to, newTokenId);
+
+        IntelligentData[] memory datas = _intelligentDatasOf(tokenId);
+        // `entries[i].sealedKey` is the wrap for `datas[i]` — `_proofCheck`
+        // already verified `entries[i].dataHash == datas[i].dataHash`
+        // index-wise, so we just project the field through.
+        bytes[] memory sealedKeys = new bytes[](entries.length);
+        for (uint256 i; i < entries.length; ++i) {
+            sealedKeys[i] = entries[i].sealedKey;
+        }
+        _updateData(newTokenId, datas, sealedKeys);
+
+        emit Cloned(tokenId, newTokenId, from, to, entries);
+    }
+}

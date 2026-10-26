@@ -1,11 +1,11 @@
 {
-  "name": "@0gfoundation/0g-agenticid-sdk",
-  "version": "0.1.7",
-  "description": "TypeScript SDK for the 0G AgenticID protocol \u2014 register, manage, and interact with on-chain AI agent identities",
+  "name": "0g-agentdna",
+  "version": "0.2.0",
+  "description": "0G AgentDNA TypeScript SDK and CLI for on-chain AI agent identities",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "bin": {
-    "0g-agenticid": "./dist/cli/main.js"
+    "0g-agentdna": "./dist/cli/main.js"
   },
   "exports": {
     ".": {
@@ -15,17 +15,23 @@
     "./seal": {
       "types": "./dist/seal.d.ts",
       "default": "./dist/seal.js"
-    }
+    },
+    "./cli": "./dist/cli/main.js"
   },
   "files": [
     "dist",
     "src",
     "README.md",
     "GUIDE.md",
-    "LICENSE"
+    "LICENSE",
+    "MIGRATION.md",
+    "MIGRATION.zh.md",
+    "PROVIDERS.md",
+    "PROVIDERS.zh.md",
+    "scripts/sync-providers.cjs"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/sync-providers.cjs && tsc",
     "test": "npm run build && node --test test/*.test.mjs",
     "typecheck": "tsc --noEmit",
     "test:kav": "npm run build && node scripts/serveproof-kav.cjs",
@@ -34,7 +40,7 @@
   },
   "keywords": [
     "0g",
-    "agenticid",
+    "agentdna",
     "agent",
     "identity",
     "tee",

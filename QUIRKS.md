@@ -17,20 +17,32 @@ to compile ("stack too deep"). It's already enabled by default in
 ### forge-std pinned to v1.12.0
 
 `forge-std` changed its internal memory layout in v1.13.0+, which triggers a
-known codegen bug when combined with Solidity 0.8.24 + `via_ir`. Precondition
-for unpinning: bump solc to ≥ 0.8.27 (several via_ir bugs are fixed there).
+known codegen bug when combined with Solidity 0.8.24 + `via_ir`. That compiler
+combination is historical: the current pin is Solidity 0.8.38. Keep forge-std at
+v1.12.0 until a separate dependency update passes the full suite; the compiler
+upgrade alone does not establish compatibility with a newer forge-std.
 
-### `via_ir` peak memory exceeds 4 GB on solc 0.8.24
+### Historical: `via_ir` peak memory exceeded 4 GB on solc 0.8.24
 
 The full test tree (120 files as of the VerifiedFeedback/FeedbackBatcher
 suites) gets the compiler SIGKILLed in a 4 GB container, even at `-j 1`.
-Same tree compiles fine with `--use 0.8.28` — but solc stays pinned (see the
-forge-std pin above), so the fix is RAM: build contracts on a machine with
-more than 4 GB. Reported by the PR #144 round-2 review, reproduced there.
+The same tree compiled with `--use 0.8.28`; retaining 0.8.24 then required a
+machine with more than 4 GB. This records the PR #144 round-2 reproduction,
+not a measurement of the current 0.8.38 build.
+
+### Reproduce the linked implementation's build settings
+
+The checked-in settings are solc **0.8.38**, `via_ir = true`, optimizer runs **1**,
+EVM **Cancun**, and `bytecode_hash = "none"`. CBOR stays enabled and retains the
+compiler version; do not substitute `--no-metadata`. The current runtimes are
+24,543 bytes for AgenticID and 1,730 bytes for its stateless linked library.
+`Eip170Size.t.sol` is the size gate; repeat it after any source or compiler change.
+Keep the exact settings and library link address when verifying an implementation.
+Link/deploy and beacon-upgrade rules live in [`contracts/UPGRADING.md`](contracts/UPGRADING.md).
 
 ### The `via_ir + vm.warp` trap in tests
 
-Same root cause as the codegen bug above: after advancing time with
+The historical 0.8.24 review also exposed optimizer-dependent fixtures: after advancing time with
 `vm.warp(...)` in a test, **do not** keep reading a local that was derived from
 `block.timestamp` before the warp. The optimizer rematerializes that read and
 produces the wrong value (typical symptom: a deadline computed as double what
@@ -105,6 +117,25 @@ call.
 ---
 
 ## Misc
+
+### Linux process hardening must remain behind a platform build tag
+
+`unix.Prctl(PR_SET_DUMPABLE, ...)` is Linux-only. Its implementation lives in
+`sealed/internal/privsep/harden_linux.go`; non-Linux local development uses a
+no-op implementation so the adapter and proxy suites can compile on macOS.
+Production images compile the Linux implementation. Verify runtime changes
+with both native tests and a Linux target build.
+
+### AgentDNA updates must follow the package that owns the CLI links
+
+The old CLI updater queries `@0gfoundation/0g-agenticid-sdk`, so the rename
+needs a compatibility release under that package name. Its launcher exposes
+both command names and depends on the matching `0g-agentdna` release.
+`sdk/typescript/src/cli/commands/update.ts` detects this launcher and updates
+the compatibility package: installing the canonical package over its global
+command links instead can fail with npm `EEXIST`. Keep both release versions
+aligned while supporting this path. See the [migration release order](sdk/typescript/MIGRATION.md#release-order)
+([中文](sdk/typescript/MIGRATION.zh.md#发布顺序)).
 
 ### 0g-storage Rust SDK dependency patch
 
@@ -433,7 +464,12 @@ below to attribute it to the right layer:
 
 | Symptom | Faulting layer | Action |
 |---|---|---|
-| `serve-proof` signature fails to verify | sealed / TEE compromised | **Critical** — investigate sealed code + the TEE attestation chain |
+| Response carries no `X-Agent-Proof` at all | first check the route: only `/hello`, `/_seal/auth` and agent-registered `/api/*` services are ever signed — framework chat/UI routes (their SSE streams included) and WebSocket upgrades never are (by design); an `/api/*` backend's SSE is buffered, then signed. On a signed route: the agent has no on-chain identity yet, or the container's `VERIFIED_FEEDBACK_ADDR` is unset / malformed / zero (sealed logs a `WARN VERIFIED_FEEDBACK_ADDR …` line once at boot) or not anchored — its `getIdentityRegistry()` is not `AGENTIC_ID_ADDR`, or unreadable (sealed logs `WARN serve-proof validator …` after the chain dial) | Unsigned route: expected, nothing to fix. Signed route: config issue. Set `ATTESTOR_VERIFIED_FEEDBACK_ADDR` on the attestor to the VerifiedFeedbackRegistry **proxy** bound to its AgenticID (worker and api refuse to start on one that is not); env is applied only at sandbox create, so the owner must `/reset` the agent |
+| `serve-proof` signature fails to verify, and the envelope's `validator` differs from the registry you verify against (SDK: `registryMatches: false`) | wrong validator: the container was created for another `VerifiedFeedbackRegistry`, or the verifier's registry (`verified_feedback_addr` on `GET /config`, CLI `AGENTIC_VERIFIED_FEEDBACK_ADDR`) points elsewhere | **Not a compromise.** Align both with `GET /config` `verified_feedback_addr`, the registry proxy; a container fix needs an owner `/reset` |
+| `serve-proof` signature fails to verify, and the envelope has **no** `validator` field — or a pre-0.2.0 SDK/CLI is verifying | version skew: a sealed image predating `VerifiedFeedbackRegistry` 1.2.0 still signs the legacy `personal_sign` digest, which the upgraded registry and SDK 0.2.0 reject (no fallback) — or an old client checks a new image's `0x19 0x00` digest | **Not a compromise.** Owner signs `/reset` to recreate the agent on the current image; upgrade the client to SDK ≥ 0.2.0 — before rating: a 0.1.x CLI's `rate` discards (deletes from `proofs.json`) every ticket whose check fails, so a new image's genuine tickets are lost, not just reported |
+| `serve-proof` signature fails to verify with a matching `validator`, a current image and SDK ≥ 0.2.0, but the verifier's chain id or AgenticID address differs from the agent's (`GET /config` `chain_id` / `agentic_id_addr`), or the proof came over plain http through an intermediary | verifier configuration (the digest binds both) or the transport (the envelope is covered by the signature, so an edit in transit breaks it) | **Not a compromise by itself.** Align the verifier with the agent's `/config`; re-fetch over an authenticated transport |
+| `serve-proof` signature fails to verify with a matching `validator`, a current image and SDK ≥ 0.2.0, the verifier's chain id and AgenticID equal the agent's (`GET /config`), and the proof came over an authenticated transport | sealed / TEE compromised | **Critical** — investigate sealed code + the TEE attestation chain |
+| A signed route returns a bare `500 data_hash[<role>]: …` and the upstream body is discarded | sealed state bug — should be unreachable: every data hash sealed stores is formatted from a `[32]byte` (the chain read at bootstrap and the uploader's own commits alike), so `writeServeProof` failing to parse one (`sealed/internal/proxy/proxy.go`, the `data_hash[%s]` return) means sealed's own state is corrupt | **Deliberate, pre-existing.** Proof generation failing takes the response down rather than serving it unsigned — correct while every data hash is sealed-formatted. If data hashes ever come from a less trusted source, degrade this path to serve-unsigned instead |
 | Signature verifies, but `task_hash` doesn't match the request/response you sent (`task_hash` folds method‖uri‖req-body‖resp-body‖status) | request tampered in transit (MITM) or a sealed bug | **Critical** — investigate the transport layer + sealed code |
 | Signature verifies, `data_hashes` don't match `AgenticID.intelligentDatasOf(tokenId)` | sealed state-binding bug | **Critical** — sealed lied about the agent's state at response time |
 | Everything verifies, but the response **content is wrong / harmful** | agent quality issue | **Not a sealed bug.** Report to the reputation system; the score will reflect it |
@@ -442,3 +478,23 @@ below to attribute it to the right layer:
 
 See [`sealed/TRUST_MODEL.md`](sealed/TRUST_MODEL.md) for the trust model's
 layering.
+
+
+### HTTP retry tests use deterministic DNS failure
+
+A fixed privileged port such as `127.0.0.1:1` can be silently filtered on a
+host, yielding a timeout instead of a connect-class error. Host HTTP proxies
+can also change that classification. The retry tests inject a resolver that deterministically returns a DNS error
+and bypass proxies, so another process cannot race to bind a released test port. Keep the production Strict policy
+connect-only: retrying timeouts could duplicate non-idempotent sandbox creates.
+
+
+### Deployment transactions take write intent before row locks
+
+Online schema bootstrap can hold a table Share lock before requesting an
+AccessExclusive lock. A runtime transaction that first acquires RowShare via
+`SELECT FOR UPDATE` and later needs RowExclusive for UPDATE can deadlock with
+that migration. `repo.rs::deployment_tx` obtains RowExclusive first (compatible
+with other runtime writers), then takes per-deployment row locks. Bootstrap
+orders deployments before its status child. Keep both orders: the Postgres
+regression deliberately pauses a migration behind an active runtime transaction.
