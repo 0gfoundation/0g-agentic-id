@@ -297,9 +297,13 @@ mod tests {
         // — `then_some(d.owner)` (a copy-paste of the owner line) would pass
         // an is_some() check while leaking the wrong address.
         let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
+        // serde serializes Address lowercase ({:#x}, not EIP-55 to_string) —
+        // compare against the same form so the assertion holds for addresses
+        // that actually contain a–f letters.
+        let expect = format!("{:#x}", Address::from([1u8; 20]));
         assert_eq!(
             minted.get("agent_seal_addr").and_then(|v| v.as_str()),
-            Some(Address::from([1u8; 20]).to_string().as_str()),
+            Some(expect.as_str()),
             "minted rows expose agent_seal_addr — the deployment's seal, not the owner"
         );
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();

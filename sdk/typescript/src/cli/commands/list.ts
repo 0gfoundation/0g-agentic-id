@@ -1,10 +1,12 @@
 /**
  * @file list.ts
  * @description `0g-agentdna list [--mine] [--phase <p>]` — deployment
- * listing (spec v0.03 §3.3). Default is the attestor's PUBLIC tier;
- * `--mine` switches to the owner-signed listing (needs AGENTIC_PRIVATE_KEY)
- * whose rows carry the withheld owner-only fields (owner, sandboxId,
- * failure reasons — #64). `--phase` filters client-side.
+ * listing (spec v0.03 §3.3). Default is the attestor's PUBLIC tier; minted
+ * rows carry owner and agentSeal there (#183-c4 — both are chain-public
+ * once minted). `--mine` switches to the owner-signed listing (needs
+ * AGENTIC_PRIVATE_KEY) whose rows carry the withheld owner-only fields
+ * (sandboxId, failure reasons — #64) AND owner on unminted rows.
+ * `--phase` filters client-side.
  *
  * JSON mode: `data` IS the row array (empty list → `[]`, exit 0 — not an
  * error) and carries the FULL row (sealId, url, sandboxId, framework, whole
@@ -26,6 +28,7 @@
  */
 
 import { buildClient } from '../sdk';
+import { cellText } from './cells';
 import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
@@ -80,21 +83,14 @@ export async function run(ctx: CommandContext): Promise<void> {
     const agentId = sealToAgent.get(owner.toLowerCase());
     return agentId ? `${shortAddr(owner)} ⇄ #${agentId}` : shortAddr(owner);
   };
-  // Untrusted cells (NAME is owner-controlled JSON; PHASE/FRAMEWORK come from
-  // the attestor) must not be able to forge the table: strip C0/C1 controls
-  // and ESC sequences (a `\n` renders a convincing fake row, ANSI can hide
-  // the tail), and truncate to the column width - 1 with an ellipsis so a
-  // long name cannot run into the next column.
-  const clean = (v: unknown): string =>
-    String(v ?? '')
-      // eslint-disable-next-line no-control-regex
-      .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
-      .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
-  const cell = (v: unknown, w: number): string => {
-    if (v === null || v === undefined) return '—'.padEnd(w);
-    const t = clean(v);
-    return (t.length >= w ? `${t.slice(0, Math.max(0, w - 2))}…` : t).padEnd(w);
-  };
+  // ownerCell is built ONLY from trusted short forms (our shortAddr + the
+  // agentId from our own map) — it pads but never truncates: a 6-digit
+  // agentId's `⇄ #123456` annotation must not read as agent #1234.
+  const trustedCell = (t: string, w: number): string => (t.length >= w ? t : t.padEnd(w));
+  // Sanitising lives in ./cells (shared with the REPL's listing — a name
+  // must not be able to forge a row in either): sequence bodies stripped
+  // before control bytes, newlines → space, code-point truncation.
+  const cell = cellText;
   // An unminted row has no agentId, owner, agentSeal or name — its sealId
   // prefix is the only handle (F12: paste it back into any command; the
   // sealPrefix ref resolves it uniquely). Render it in the AGENTID cell so
@@ -105,12 +101,12 @@ export async function run(ctx: CommandContext): Promise<void> {
   };
   print(
     `${'AGENTID'.padEnd(13)}${'PHASE'.padEnd(11)}${'FRAMEWORK'.padEnd(12)}` +
-      `${'AGENTSEAL'.padEnd(13)}${'OWNER'.padEnd(21)}NAME`,
+      `${'AGENTSEAL'.padEnd(13)}${'OWNER'.padEnd(24)}NAME`,
   );
   for (const r of rows) {
     print(
       `${idCell(r)}${cell(r.phase, 11)}${cell(r.framework, 12)}` +
-        `${cell(shortAddr(r.agentSeal), 13)}${cell(ownerCell(r.owner), 21)}${cell(r.name, 19)}`,
+        `${cell(shortAddr(r.agentSeal), 13)}${trustedCell(ownerCell(r.owner), 24)}${cell(r.name, 19)}`,
     );
   }
   print('');

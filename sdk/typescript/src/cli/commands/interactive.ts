@@ -242,6 +242,7 @@ export function completeLine(
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
+import { cleanCell } from './cells';
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
 
@@ -927,7 +928,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           // 66-char column blowout. (feedback.md F12)
           const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
           const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${r.name ?? ''}\n`);
+          // NAME through the shared sanitizer (./cells): the REPL listing and
+          // `list` must both refuse a name that forges rows.
+          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${cleanCell(r.name)}\n`);
         }
         if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
         if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');

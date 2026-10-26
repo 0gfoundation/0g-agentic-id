@@ -331,14 +331,19 @@ test('list human mode: owner-controlled NAME cannot forge rows', async () => {
     assert.equal(r.code, 0);
     // the forged row (agentId 466 + stopped) never begins a line
     assert.doesNotMatch(r.stdout, /(^|\n)466\s+stopped/, 'no forged table row');
-    // no ANSI escape survives into the output
+    // no ANSI escape survives into the output — and no sequence BODY either
+    // (stripping control bytes first would leave `[2J`/`[31m` printing as
+    // text; the sequence-bodies-first order removes them entirely)
     assert.doesNotMatch(r.stdout, /\u001b\[/, 'ANSI sequences stripped');
+    assert.doesNotMatch(r.stdout, /\[2J/, 'no CSI body left behind as text');
+    assert.doesNotMatch(r.stdout, /\[31m/, 'no SGR body left behind as text');
     // the evil row itself renders as ONE line: 2 data rows + header + footer
     const lines = r.stdout.split('\n').filter((l) => l.trim());
     assert.ok(lines.some((l) => /^528\s+running/.test(l)), 'EVIL row present, single line');
     assert.equal(lines.length, 4, 'header + 2 rows + count footer');
-    // and the truncated name keeps the ellipsis marker
-    assert.match(r.stdout, /nice466.*…/);
+    // the newline became a SPACE (not a glue, not a row break), and the
+    // truncated name keeps the ellipsis marker
+    assert.match(r.stdout, /nice 466.*…/);
   } finally {
     server.closeAllConnections?.();
     server.close();
@@ -353,4 +358,71 @@ test('unminted sealId prefix shown by list resolves as a paste-back ref', async 
   const ref = parseAgentRef('0xababababab');
   assert.equal(ref.kind, 'sealPrefix');
   assert.equal(ref.prefix, '0xababababab');
+});
+
+test('list: a 6-digit agentId owner annotation is not truncated into another id', async () => {
+  // ownerCell's `⇄ #<agentId>` is trusted short-form output — truncating it
+  // at the old width-21 would render `⇄ #1234…` and read as agent #1234.
+  const SIX = {
+    seal_id: `0x${'77'.repeat(32)}`,
+    agent_id: '0x1e240', // 123456 — the parent the child is annotated to
+    owner: HUMAN_OWNER,
+    agent_seal_addr: PARENT_SEAL_ADDR,
+    framework: 'dsh',
+    agent_card: { name: 'six-digit-parent' },
+    phase: 'running',
+    created_at: '2026-10-21T00:00:00Z',
+  };
+  const SIX_CHILD = {
+    seal_id: `0x${'78'.repeat(32)}`,
+    agent_id: '0x1e241', // 123457
+    owner: PARENT_SEAL_ADDR, // owned by SIX's seal → `⇄ #123456`
+    framework: 'dsh',
+    agent_card: { name: 'child-of-six' },
+    phase: 'running',
+    created_at: '2026-10-21T00:00:00Z',
+  };
+  const server = await mockAttestor([SIX, SIX_CHILD]);
+  try {
+    const r = await run(['list'], { AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}` });
+    assert.equal(r.code, 0);
+    // the annotation survives in full — no ellipsis inside the OWNER cell
+    assert.match(r.stdout, /⇄ #123456/);
+    assert.doesNotMatch(r.stdout, /⇄ #1234[^5]/, 'annotation must not read as agent #1234');
+    const line = r.stdout.split('\n').find((l) => /child-of-six/.test(l));
+    assert.ok(line, 'child row present');
+    // and the name still starts after the (wider) OWNER column — no overlap
+    assert.match(line, /child-of-six\s*$/);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test('cellText: emoji and format characters survive truncation correctly', async () => {
+  const { cellText, cleanCell } = await import('../dist/cli/commands/cells.js');
+  // truncation slices CODE POINTS: an emoji is 2 UTF-16 units, slicing there
+  // would print U+FFFD
+  const emoji = 'a😀b😀c😀d😀e';
+  const cut = cellText(emoji, 8);
+  assert.ok(!cut.includes('\uFFFD'), `no replacement char in ${JSON.stringify(cut)}`);
+  assert.ok(cut.endsWith('…'), 'truncated with ellipsis');
+  // \p{Cf} (zero-width, bidi marks) removed outright — invisible but they
+  // reorder/group the visible text
+  assert.equal(cleanCell('a\u200Fb\u200Dc'), 'abc', 'bidi RLM + ZWJ stripped');
+  assert.equal(cleanCell('nice\n466'), 'nice 466', 'newline → space, not glue');
+  assert.equal(cleanCell('a\u001b[31mRED\u001b[0mb'), 'aREDb', 'CSI bodies removed, text intact');
+  assert.equal(cleanCell('x\u001b]8;;http://evil.example\u001b\\y'), 'xy', 'OSC-8 hyperlink removed entirely');
+  assert.equal(cleanCell('a\u009b2Jb'), 'ab', 'C1 CSI (0x9b) removed');
+});
+
+test('REPL listing sanitizes NAME through the same helper', async () => {
+  // The REPL's own list must not forge rows either — the shared cleanCell is
+  // what stands between a name and the terminal.
+  const { cleanCell } = await import('../dist/cli/commands/cells.js');
+  const evilName = 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J';
+  const rendered = cleanCell(evilName);
+  assert.doesNotMatch(rendered, /\n/, 'no row break');
+  assert.doesNotMatch(rendered, /2J/, 'no clear-screen body');
+  assert.match(rendered, /nice 466/, 'newline became a space');
 });
