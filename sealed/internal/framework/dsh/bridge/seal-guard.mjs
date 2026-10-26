@@ -11,10 +11,11 @@
  * /sign/ path is denied at tools/pre-execute, with a pointer to the
  * structured tools (seal_sign / seal_sign_transaction / seal_sign_typed_data
  * / seal_register_service, see seal-tools.mjs) that leave a session-log
- * record. The socket's OTHER endpoint — GET /settings and the thinking
- * POST the platform doc names (`curl --unix-socket "$SEAL_SIGN_SOCK"
- * http://localhost/settings`) — stays allowed: it signs nothing and has no
- * structured-tool equivalent.
+ * record. The socket's OTHER endpoints — GET/POST /settings (the thinking
+ * change the platform doc names, `curl --unix-socket "$SEAL_SIGN_SOCK"
+ * http://localhost/settings`) and GET/POST /services — stay allowed: neither
+ * signs anything, and neither has a structured-tool equivalent that covers
+ * reads.
  *
  * Registered via ctx.tools.guard(): monotonic — a later listener cannot turn
  * the denial back into permission. This is channel narrowing, not content
@@ -53,10 +54,12 @@ export function apply(ctx) {
     // structured-tool equivalent, so they stay open.
     if (namesSocket && /\/sign(\/|$|\s|')/.test(text)) {
       return (
-        `shell access to the sign socket's /sign/ endpoints is closed. Use seal_sign (messages), ` +
-        `seal_sign_transaction (chain transactions), seal_sign_typed_data (EIP-712), ` +
-        `or seal_register_service (publish services) — those calls are recorded in ` +
-        `your session log; a shell command is not. (/settings stays allowed: it signs nothing.)`
+        `shell access to the sign socket's /sign/ endpoints is steered away — ` +
+        `not sealed shut (other spellings still get past). Use seal_sign ` +
+        `(messages), seal_sign_transaction (chain transactions) or ` +
+        `seal_sign_typed_data (EIP-712) — those calls are recorded in your ` +
+        `session log; a shell command is not. (/settings and /services stay ` +
+        `allowed: neither signs anything.)`
       )
     }
     return undefined

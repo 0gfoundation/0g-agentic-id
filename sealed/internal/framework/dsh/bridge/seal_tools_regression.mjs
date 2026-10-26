@@ -215,6 +215,44 @@ check(signTools.seal_sign_typed_data.parameters.required?.[0] === "typed_data",
 server.close();
 try { rmSync(dir, { recursive: true, force: true }); } catch { /* tmpdir cleanup best-effort */ }
 
+// ── seal-guard allow/deny split (the b857a41 regression: a broadened guard
+// denied the documented settings channel; this pins the scoped rule) ──
+{
+	const guards = [];
+	const ctx = { tools: { guard: (fn) => guards.push(fn) } };
+	await import("./seal-guard.mjs").then((m) => m.apply(ctx));
+	check(guards.length === 1, "one guard registered");
+	const g = guards[0];
+	const sockPath = process.env.SEAL_SIGN_SOCK;
+	const cases = [
+		// DENIED: a socket spelling + a /sign/ path
+		["deny", "bash", { command: 'curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/sign/personal_sign -d "{}"' }],
+		["deny", "bash", { command: `curl --unix-socket ${sockPath} http://localhost/sign/transaction -d "{}"` }],
+		["deny", "bash", { command: `curl --unix-socket ${sockPath} http://localhost/sign` }],
+		// ALLOWED: the documented non-sign endpoints (b857a41 blocked these)
+		["allow", "bash", { command: 'curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/settings' }],
+		["allow", "bash", { command: `curl --unix-socket ${sockPath} -X POST -d '{"thinking":"high"}' http://localhost/settings` }],
+		["allow", "bash", { command: `curl --unix-socket ${sockPath} http://localhost/services` }],
+		["allow", "bash", { command: 'curl --unix-socket "$SEAL_SIGN_SOCK" -X POST -d "[]" http://localhost/services' }],
+		// ALLOWED: neither socket nor sign
+		["allow", "bash", { command: "curl http://example.com/api" }],
+		["allow", "bash", { command: "ls -la" }],
+		// NOT scanned at all: non-shell tools (the SHELL_TOOLS bound)
+		["allow", "read_file", { command: `curl --unix-socket ${sockPath} http://localhost/sign/personal_sign` }],
+	];
+	for (const [want, tool, args] of cases) {
+		const verdict = g({ name: tool, arguments: args });
+		check(want === "deny" ? typeof verdict === "string" : verdict === undefined,
+			`${tool} ${args.command.slice(0, 60)} → ${want}`);
+	}
+	// the denial text no longer offers seal_register_service (its endpoint is
+	// open now) and no longer overclaims "closed"
+	const v = g({ name: "bash", arguments: { command: 'curl --unix-socket "$SEAL_SIGN_SOCK" http://localhost/sign/personal_sign' } });
+	check(!/seal_register_service/.test(String(v)), "denial text does not offer seal_register_service");
+	check(/steered away/.test(String(v)), "denial text says steered away, not closed");
+}
+
+
 if (failures.length) {
 	console.error("FAIL:", failures.length, "assertion(s)");
 	for (const f of failures) console.error("  -", f);

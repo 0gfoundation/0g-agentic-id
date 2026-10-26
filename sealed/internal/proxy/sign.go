@@ -305,8 +305,14 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 	// 0 or negative panics the geth signer (LatestSignerForChainID on a
 	// zero/negative chain id); net/http would recover the panic, but the
 	// caller would only see "socket hang up". Reject with a real error.
+	// The upper bound is the same class as the amount checks: no real chain
+	// id exceeds uint64, and an absurd one is a caller bug, not intent.
 	if chainID.Sign() <= 0 {
 		writeSignError(w, http.StatusBadRequest, "chain_id must be a positive integer")
+		return
+	}
+	if chainID.BitLen() > 64 {
+		writeSignError(w, http.StatusBadRequest, "chain_id: exceeds uint64")
 		return
 	}
 	if req.GasLimit == 0 {
@@ -447,7 +453,6 @@ func writeSignError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// parseBigInt accepts decimal ("123") or 0x-hex ("0x7b"). Empty → (nil, false).
 // amountRangeErr returns the 400 message for an amount field that is
 // negative or overflows uint256 (BitLen > 256), or "" when the amount is
 // usable (nil — field absent — is fine: the caller defaults it).
@@ -463,6 +468,8 @@ func amountRangeErr(n *big.Int, field string) string {
 	}
 	return ""
 }
+
+// parseBigInt accepts decimal ("123") or 0x-hex ("0x7b"). Empty → (nil, false).
 
 func parseBigInt(s string) (*big.Int, bool) {
 	s = strings.TrimSpace(s)

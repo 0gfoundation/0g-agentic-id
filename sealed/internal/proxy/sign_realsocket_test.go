@@ -258,3 +258,29 @@ func TestSignTransactionRejectsNegativeAmounts(t *testing.T) {
 		}
 	}
 }
+
+func TestSignTransactionRejectsOversizeChainID(t *testing.T) {
+	sock, _ := newRealSocketSignServer(t)
+	to := "0x2ce80374318b1d7fb3345724457a182e0ad165c9"
+	// 2^64: parses fine, exceeds every real chain id (uint64 bound).
+	oversize := new(big.Int).Lsh(big.NewInt(1), 64).String()
+	code, out := sockPost(t, sock, "/sign/transaction", map[string]any{
+		"chain_id": oversize, "nonce": 1, "to": to,
+		"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "1",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("got %d %v, want 400", code, out)
+	}
+	if !strings.Contains(fmt.Sprint(out), "chain_id: exceeds uint64") {
+		t.Fatalf("error %v does not name the bound", out)
+	}
+	// 2^64-1 — the largest sane chain id — still signs.
+	maxOK := new(big.Int).Sub(new(big.Int).Lsh(big.NewInt(1), 64), big.NewInt(1)).String()
+	code, out = sockPost(t, sock, "/sign/transaction", map[string]any{
+		"chain_id": maxOK, "nonce": 1, "to": to,
+		"data": "0x", "gas_limit": 21000, "max_fee_per_gas": "1000", "max_priority_fee_per_gas": "1",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("2^64-1 should sign, got %d %v", code, out)
+	}
+}
