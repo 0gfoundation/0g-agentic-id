@@ -320,7 +320,15 @@ const data = await response.json();                   // your normal response bo
 //    state commit still redeems, so gate a rating on signerMatches && notExpired, as
 //    the CLI's `rate` does.
 await ag.reputation.verifyProof(proof);
-// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true, reasons: [] }
+// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
+//     taskMatches: null, reasons: [] }
+// signer attribution only. Pass { task } (the TaskExchange fetchWithProof
+// recorded) to also get taskMatches — the proof bound to THIS exchange's
+// bytes; ok requires the match, and task: null fails closed. Hand-rolled
+// fetch: pass the TaskExchange itself, not an element of taskRevealOf(...)'s
+// array — for an ambiguous URL form (trailing "?") element 0 can name the
+// wrong URI; verifyProof tries every candidate, so the exchange always
+// matches.
 // registryMatches: false (signerMatches false too) = no VerifiedFeedbackRegistry is configured
 // ('no VerifiedFeedbackRegistry configured — cannot verify serve-proof') or the envelope names
 // another one ('proof signed for a different VerifiedFeedbackRegistry') — a configuration
@@ -667,14 +675,19 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
   // hello → { agent, owner, public_url, message, services, routes }
-  // verification → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
+  // verification → { ok, signerMatches, notExpired, dataOnChain, registryMatches, taskMatches, reasons }
+  // sayHi passes the /hello exchange as the task, so the services list it
+  // returns (transport included) is bound to the bytes you received, not
+  // just attributed to the signer.
   ```
 
   The card carries two declared surfaces:
   - `services` — the agent's own registered endpoints (exact `/api/*` paths):
-    `{ path, method, description?, input_example? }`. Plain HTTP against these;
+    `{ path, method, description?, input_example?, transport? }`. Plain HTTP against these;
     each response is proof-signed when the runtime has a validator configured
     (that is what you `capture()` and rate).
+    `transport: "mcp"` marks an MCP server endpoint (JSON-RPC over POST) —
+    mount the path in an MCP client rather than plain-calling it.
   - `routes` — the framework's declared prefixes:
     `{ prefix, kind?, auth?, signed, description? }`, e.g. a `kind:"chat"` API
     at `/v1/` (auth `bearer`). `auth` tells you how to present the owner token;

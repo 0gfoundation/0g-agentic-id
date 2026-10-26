@@ -30,6 +30,7 @@ export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } f
 export type { DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
 export type { AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask } from './AgentClient';
+export { mcpServices } from './AgentClient';
 export { defaultIData } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
 export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
@@ -69,8 +70,10 @@ export {
   parseServeProofHeader,
   proofFromResponse,
   captureProof,
+  taskRevealOf,
+  proofRecordingFetch,
 } from './ServeSession';
-export type { ServeSessionOptions, ProofVerification } from './ServeSession';
+export type { ServeSessionOptions, ProofVerification, TaskExchange } from './ServeSession';
 
 // ── ServeProof utilities ──
 export {

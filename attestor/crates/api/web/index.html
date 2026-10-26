@@ -4906,7 +4906,13 @@ function buildEndpointSkillsHtml(services, helloUrl) {
       if (qs) full += qs;
     }
     const contentType = isBodyMethod ? ` -H 'Content-Type: application/json'` : '';
-    const curl = `curl -i -H 'Accept: application/json'${contentType}${
+    // MCP endpoints speak streamable HTTP: the official MCP SDK servers
+    // require BOTH Accept types and 406 on application/json alone. Mark the
+    // entry and shape the curl accordingly (a raw JSON-RPC body still
+    // exercises the endpoint for manual testing).
+    const isMcp = (s.transport || '').toLowerCase() === 'mcp';
+    const accept = isMcp ? 'Accept: application/json, text/event-stream' : 'Accept: application/json';
+    const curl = `curl -i -H '${accept}'${contentType}${
       method === 'GET' ? '' : ` -X ${method}`
     }${bodyArg} '${full}'`;
     // escapeHtml the JSON-encoded curl so the embedded double quotes
@@ -4920,6 +4926,7 @@ function buildEndpointSkillsHtml(services, helloUrl) {
           <span class="endpoint-chev">▸</span>
           <span class="endpoint-method">${escapeHtml(method)}</span>
           <span class="endpoint-path">${escapeHtml(path)}</span>
+          ${isMcp ? '<span class="endpoint-summary-desc">[mcp] MCP server endpoint — mount this URL in an MCP client</span>' : ''}
           ${s.description ? `<span class="endpoint-summary-desc">${escapeHtml(s.description)}</span>` : ''}
         </summary>
         <div class="endpoint-body">

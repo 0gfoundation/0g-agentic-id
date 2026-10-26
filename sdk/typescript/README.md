@@ -170,7 +170,7 @@ import { keccak256, toBytes } from 'viem';
 
 // 1. call one of the agent's signed /api/* services and capture the proof (public handle needs no wallet)
 const agent = await ag.agent.connect(agentId);
-const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+const { response, proof, task } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
 // proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature,
@@ -179,8 +179,15 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
 
 // 2. verify before spending gas — the signature is bound to addresses.verifiedFeedback
 //    (fromAttestor fills it); registryMatches: false = none configured / a different one
-await ag.reputation.verifyProof(proof);
-// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
+if (proof) await ag.reputation.verifyProof(proof, { task });
+// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, taskMatches, reasons }
+// pass { task } (the TaskExchange fetchWithProof recorded) to also get
+// taskMatches — the proof bound to THIS response's bytes, not just the
+// signer; ok requires it. task: null (unrecorded) fails closed with ok:
+// false. Hand-rolled fetch: pass the TaskExchange itself — for a URL whose
+// form is ambiguous (trailing "?") taskRevealOf's element 0 can name the
+// wrong URI; verifyProof tries every candidate, so the exchange always
+// matches.
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
@@ -188,9 +195,13 @@ await ag.reputation.verifyProof(proof);
 //    txs. An owner CANNOT attest feedback on their own agent, nor can the
 //    agent's own agentSeal or its payment wallet (the verified registry
 //    rejects all three). |value| must be ≤ 1e9 with 0..18 decimals.
-const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
-// → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
-await ag.reputation.waitForTransaction(fb.attestTx);
+// inside the same guard — serveProof is ServeProof here; the old `proof!`
+// form would have compiled and passed null at runtime
+if (proof) {
+  const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+  // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
+  await ag.reputation.waitForTransaction(fb.attestTx);
+}
 // optional params: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
 // escape hatch: attestFeedback(agentId, idx, proof) marks an entry submitted separately
 
@@ -269,7 +280,15 @@ await ag.agent.runtimeCosts(agentId);    // + that agent's evolution-gas balance
 ```ts
 const { hello, verification } = await ag.agent.sayHi(agentUrl);
 // hello → { agent, owner, public_url, message, services, routes }
-//   services: { path, method, description?, input_example? }   — proof-signed /api/* endpoints
+//   services: { path, method, description?, input_example?, transport? }   — proof-signed /api/* endpoints
+//   transport: "mcp" marks an MCP server endpoint (JSON-RPC over POST):
+//   mount `<base><path>` as a streamable-HTTP MCP server in any MCP client —
+//   responses carry X-Agent-Proof (when the runtime has a serve-proof
+//   validator configured). Per-exchange verification: pass fetchWithProof's
+//   returned `task` to verifyProof(proof, { task }) — the verdict's
+//   `taskMatches` binds the proof to THIS response's bytes (see mcpServices'
+//   doc in AgentClient.ts). Also: the deploy console's copy-ready curl needs
+//   `Accept: application/json, text/event-stream` for MCP routes.
 //   routes:   { prefix, kind?, auth?, signed, description? }    — framework prefixes (e.g. chat at /v1/)
 
 const agent = await ag.agent.client(agentId);   // agentId OR agentUrl — the SDK fills in the other half

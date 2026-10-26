@@ -677,6 +677,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	frameworkRoute := false
 	if svc, ok := s.matchService(r.URL.Path); ok {
 		if !strings.EqualFold(svc.Method, r.Method) {
+			// RFC 9110: a 405 should carry Allow naming the one method
+			// this pinned path accepts (the proxy pins exactly one).
+			w.Header().Set("Allow", svc.Method)
 			http.Error(w, "method not allowed for "+svc.Path, http.StatusMethodNotAllowed)
 			return
 		}
@@ -729,6 +732,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			continue
 		case "Origin", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-Ip":
 			continue
+		case "Accept-Encoding":
+			// Signed service path only. Forwarding the client's
+			// Accept-Encoding explicitly pins it: Go's Transport then skips
+			// its own negotiation AND does not decompress, so the serve-proof
+			// taskHash would cover the gzip bytes while the client (undici,
+			// browsers) hashes the plain body it transparently decompressed —
+			// every compressing backend would fail per-exchange verification.
+			// Dropping the header lets the Transport negotiate + decompress,
+			// so the hashed bytes equal the delivered bytes. Framework routes
+			// keep the client's header: their responses are never hashed, and
+			// dropping it would cost br/zstd on framework UI assets.
+			if signed {
+				continue
+			}
 		}
 		for _, v := range vs {
 			upReq.Header.Add(k, v)

@@ -33,7 +33,7 @@ import { SandboxClient } from './SandboxClient';
 import { AttestorClient, type CloneParams, type DeployParams, type DeployCloneResponse } from './AttestorClient';
 import { sha256Hex, type SettingsDoc } from './Settings';
 import type { SecretEnvMode } from './secretEnv';
-import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader } from './ServeSession';
+import { ServeSession, captureProof, proofFromResponse, parseServeProofHeader, type TaskExchange } from './ServeSession';
 import { buildCtx, requireWallet, type AgenticIDConfig, type Ctx } from './context';
 import { makeAgentClient, type AgentClient, type AgentServiceEntry, type AgentRoute } from './AgentClient';
 import type {
@@ -767,12 +767,20 @@ export class AgentApi {
     const base = agentUrl.replace(/\/$/, '');
     const { response, proof } = await captureProof(() => fetch(`${base}/hello`));
     if (!response.ok) throw new Error(`sayHi: /hello returned HTTP ${response.status}`);
-    const raw = (await response.json()) as {
+    const rawText = await response.text();
+    const raw = JSON.parse(rawText) as {
       agent: Address; owner: Address; public_url: string; message: string;
       services?: AgentServiceEntry[]; routes?: AgentRoute[];
     };
     const hello = { ...raw, services: raw.services ?? [], routes: raw.routes ?? [] };
-    const verification = proof ? await new ServeSession(this.ctx).verifyProof(proof) : null;
+    // Per-exchange binding: the verification verdict is computed against the
+    // exact /hello bytes received, so `services` (including `transport`) is
+    // bound to this content, not only attributed to the signer.
+    const task: TaskExchange = {
+      method: 'GET', url: `${base}/hello`, requestBytes: '',
+      responseBytes: rawText, status: response.status,
+    };
+    const verification = proof ? await new ServeSession(this.ctx).verifyProof(proof, { task }) : null;
     return { hello, proof, verification };
   }
 
@@ -1187,7 +1195,13 @@ export class ReputationApi {
   capture(call: () => Promise<Response>) { return captureProof(call); }
   proofFromResponse(res: Response): ServeProof | null { return proofFromResponse(res); }
   parseServeProofHeader(value: string): ServeProof { return parseServeProofHeader(value); }
-  verifyProof(proof: ServeProof) { return this.session.verifyProof(proof); }
+  /** Verify a serve-proof. Without `opts.task`: signer attribution only.
+   *  With a task (a TaskReveal, the TaskExchange a recorder returned, or
+   *  null for "not recorded") the verdict additionally binds the proof to
+   *  that exchange's bytes — see ServeSession.verifyProof. */
+  verifyProof(proof: ServeProof, opts?: { task?: TaskReveal | TaskExchange | null }) {
+    return this.session.verifyProof(proof, opts);
+  }
 
   // — feedback (canonical write + TEE verification mark, bundled) —
   giveFeedback(params: GiveFeedbackParams): Promise<GiveFeedbackResult> { return this.rep.giveFeedback(params); }
