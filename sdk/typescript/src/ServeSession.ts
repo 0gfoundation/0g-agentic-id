@@ -24,7 +24,7 @@
 import {
   isAddress,
   keccak256,
-  toBytes,
+  stringToBytes,
   type Address,
   type Hash,
   type PublicClient,
@@ -203,12 +203,12 @@ export function proofRecordingFetch(
 export function taskRevealOf(exchange: TaskExchange): TaskReveal[] {
   const reqBytes = exchange.requestBytes ?? '';
   const reqBodyHash = keccak256(
-    typeof reqBytes === 'string' ? toBytes(reqBytes) : toBytes(hexFromBytes(reqBytes)),
+    typeof reqBytes === 'string' ? stringToBytes(reqBytes) : reqBytes,
   );
   const respBodyHash = keccak256(
     typeof exchange.responseBytes === 'string'
-      ? toBytes(exchange.responseBytes)
-      : toBytes(hexFromBytes(exchange.responseBytes)),
+      ? stringToBytes(exchange.responseBytes)
+      : exchange.responseBytes,
   );
   return requestUriCandidates(exchange.url).map((uri) => ({
     method: exchange.method,
@@ -217,11 +217,6 @@ export function taskRevealOf(exchange: TaskExchange): TaskReveal[] {
     respBodyHash,
     statusCode: exchange.status,
   }));
-}
-
-/** keccak of arbitrary bytes as a 0x hex hash (the body-hash preimage form). */
-function hexFromBytes(b: Uint8Array): `0x${string}` {
-  return `0x${Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')}` as `0x${string}`;
 }
 
 /**
