@@ -1,40 +1,46 @@
-// cancelTarget — the decision core of bare /cancel. The re-attach gap: after
-// a dropped connection the REPL no longer knows the turn it started, and Esc
-// (s.currentTask) is gone; /cancel has to pick the target from what the session
-// remembers plus live statuses. Pinned here because "newest id" is wrong (the
-// newest may already be finished) and "any queued" is wrong (an older queued
-// task starts the moment the running one stops — the newest IN FLIGHT is the
-// one the user means).
+// inFlightIds — the decision core of bare /cancel. The re-attach gap: after
+// a dropped stream the REPL no longer knows the turn it started, and Esc
+// (s.currentTask) is gone; /cancel has to decide what to stop from what the
+// session remembers plus live statuses. Pinned here because "newest id" is
+// wrong (the newest may already be finished), "any queued" is wrong (an
+// older queued task starts the moment the running one stops), and "only the
+// newest in flight" is wrong (it would leave an older running turn alive —
+// a brake stops everything still moving, newest first).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { cancelTarget } from '../dist/cli/commands/interactive.js';
+import { inFlightIds } from '../dist/cli/commands/interactive.js';
 
-test('picks the newest in-flight task when newer ones finished', () => {
-  const t = cancelTarget([
+test('stops everything in flight, newest first', () => {
+  assert.deepEqual(inFlightIds([
     { id: 'a', status: 'in_progress' },
     { id: 'b', status: 'completed' },
     { id: 'c', status: 'queued' },
-  ]);
-  assert.equal(t?.id, 'c');
+  ]), ['c', 'a']);
 });
 
-test('picks the only in-flight task whatever its age', () => {
-  const t = cancelTarget([{ id: 'a', status: 'completed' }, { id: 'b', status: 'in_progress' }, { id: 'c', status: 'failed' }]);
-  assert.equal(t?.id, 'b');
+test('a lone in-flight task whatever its age', () => {
+  assert.deepEqual(inFlightIds([
+    { id: 'a', status: 'completed' },
+    { id: 'b', status: 'in_progress' },
+    { id: 'c', status: 'failed' },
+  ]), ['b']);
 });
 
-test('null when everything finished', () => {
-  assert.equal(cancelTarget([{ id: 'a', status: 'completed' }, { id: 'b', status: 'cancelled' }]), null);
+test('empty when everything finished', () => {
+  assert.deepEqual(inFlightIds([
+    { id: 'a', status: 'completed' },
+    { id: 'b', status: 'cancelled' },
+  ]), []);
 });
 
-test('null on unknown statuses — an evicted record cannot be visibly cancelled', () => {
-  assert.equal(cancelTarget([{ id: 'a', status: 'unknown (evicted or agent restarted)' }]), null);
+test('unknown statuses are not cancellable — an evicted record cannot be visibly stopped', () => {
+  assert.deepEqual(inFlightIds([{ id: 'a', status: 'unknown (evicted or agent restarted)' }]), []);
 });
 
-test('null on empty', () => {
-  assert.equal(cancelTarget([]), null);
+test('empty on empty', () => {
+  assert.deepEqual(inFlightIds([]), []);
 });
 
 test('a queued task is in flight (queued→marked cancelled, not started)', () => {
-  assert.equal(cancelTarget([{ id: 'q', status: 'queued' }])?.id, 'q');
+  assert.deepEqual(inFlightIds([{ id: 'q', status: 'queued' }]), ['q']);
 });

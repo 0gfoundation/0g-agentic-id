@@ -113,7 +113,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 Type to talk. **Esc / Ctrl-C interrupts the turn in flight** (server-side cancel on every bundled framework) and also cancels a `/start` or `/reset` wait.
 
-Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` `/result [id]` `/cancel [id]` (stop a task — default newest in flight; the brake that still works after a re-attach, when Esc no longer knows the turn) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
+Slash commands (verified against `interactive.ts`): `/hello` `/balance` `/topup [og]` `/stop` `/start` `/reset` `/settings [k=v …]` `/think [low|high|max]` `/clear` (wipes the conversation; chain-tracked memory untouched — unlike `/reset`) `/tasks` `/result [id]` `/cancel [id]` (stop tasks — bare form brakes everything this session knows to be in flight, newest first; with an id, just that one. The brake for turns that outlived their stream: Esc only cancels a turn the current connection started. /result <id> adopts an id into the session) `/agentlog [n]` `/startuplog [n]` `/back` (alias `/unuse`) `/quit` (alias `/exit`).
 
 The framework used by `/reset` and the chat model selector is **picked by you** from the attestor's list — never guessed.
 
