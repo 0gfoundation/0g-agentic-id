@@ -101,7 +101,7 @@ Endpoints (all POST, all JSON):
 
 - `/sign/transaction` — sign a chain transaction (returns raw signed RLP hex; you broadcast it through any RPC endpoint you choose).
   Body: `{chain_id, nonce, to, value, data, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, type}` (type defaults to `"dynamic"` for EIP-1559; use `"legacy"` with `gas_price` for legacy chains).
-  Returns: `{"raw_tx", "tx_hash", "address", "signature"}`.
+  Returns: `{"raw_tx", "tx_hash", "address", "signature"}`. Never use this endpoint for AgenticID update/updateAt on your own token — that is the drift watcher's reserved channel.
 
 These are the only three shapes the socket signs: an EIP-191 `0x19 0x45` personal message, an EIP-712 `0x19 0x01` digest, or a transaction it assembles from the fields. It has no raw-hash signing and no EIP-191 version `0x00` (intended-validator) signing, by design: that is the domain your serve-proofs are signed in, so nothing you sign here can stand in for one.
 
@@ -111,6 +111,8 @@ Example (curl over unix socket):
       -H 'Content-Type: application/json' \
       -d '{"message":"hello"}' \
       http://localhost/sign/personal_sign
+
+If your framework's tool list includes native sign tools, prefer them: a native tool call lands in the session log as a structured record, while a shell command is an opaque string. If it does not, the curl route above is the documented way to reach the socket — the socket is the capability, the tool is just the preferred channel.
 
 ### When to use agentSeal
 
@@ -198,7 +200,7 @@ A subset of your on-disk paths under `(framework home dir, e.g. ~/.acme/)` is **
 
 You are not a standalone process. The sealed runtime manages your lifecycle and enforces constraints you must be aware of when advising your owner:
 
-**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.
+**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. **Never sign an AgenticID update/updateAt transaction for your own token yourself** (through the sign socket or its tools): iData writes are the watcher's reserved channel — it signs them from its own verified state, and a self-signed update would race the watcher and corrupt the chain snapshot. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.
 
 ### Runtime snapshot
 

@@ -765,6 +765,17 @@ the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
 - Send chain transactions as agentSeal
 
+In the DSH composition, `seal-guard.mjs` steers the model toward the
+native tools (`seal_sign`, `seal_sign_typed_data`,
+`seal_sign_transaction` — one per endpoint, every call a structured
+session-log record) by denying tool calls that name a socket spelling
+AND a `/sign/` path. The socket's other endpoints — `/settings` and
+`/services` — are deliberately NOT guarded: the platform doc tells the
+agent to curl `/settings` (no structured tool covers reads), and neither
+signs anything. That is a steer, not an enforcement: other indirections
+still get past it, and the session log is not tamper-evident. The other
+frameworks reach the socket however their own composition allows.
+
 What the socket **never** signs, by invariant (`sealed/internal/proxy/sign.go`):
 
 - a raw, caller-supplied 32-byte hash (there is no `eth_sign`-style endpoint)

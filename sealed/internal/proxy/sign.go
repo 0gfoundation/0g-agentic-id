@@ -302,11 +302,39 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		writeSignError(w, http.StatusBadRequest, "invalid or missing chain_id")
 		return
 	}
+	// 0 or negative panics the geth signer (LatestSignerForChainID on a
+	// zero/negative chain id); net/http would recover the panic, but the
+	// caller would only see "socket hang up". Reject with a real error.
+	// The upper bound is the same class as the amount checks: no real chain
+	// id exceeds uint64, and an absurd one is a caller bug, not intent.
+	if chainID.Sign() <= 0 {
+		writeSignError(w, http.StatusBadRequest, "chain_id must be a positive integer")
+		return
+	}
+	if chainID.BitLen() > 64 {
+		writeSignError(w, http.StatusBadRequest, "chain_id: exceeds uint64")
+		return
+	}
 	if req.GasLimit == 0 {
 		writeSignError(w, http.StatusBadRequest, "gas_limit required")
 		return
 	}
-	value, _ := parseBigInt(req.Value)
+	// An unparseable non-empty value would otherwise sign as 0 wei: "1.5"
+	// and "1e18" both produce a valid-looking tx with the value silently
+	// dropped. A negative amount parses fine (big.Int accepts a leading
+	// "-") but is nonsense on the wire; 2^256 or more parses fine too but
+	// overflows every uint256 field (the tx would serialize, but no node
+	// accepts it — reject at the door with the same 400). Same for the
+	// fee fields below.
+	value, ok := parseBigInt(req.Value)
+	if !ok && strings.TrimSpace(req.Value) != "" {
+		writeSignError(w, http.StatusBadRequest, "value: not a decimal or 0x-hex integer")
+		return
+	}
+	if msg := amountRangeErr(value, "value"); msg != "" {
+		writeSignError(w, http.StatusBadRequest, msg)
+		return
+	}
 	if value == nil {
 		value = big.NewInt(0)
 	}
@@ -339,6 +367,14 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 				"dynamic tx requires max_fee_per_gas and max_priority_fee_per_gas")
 			return
 		}
+		if msg := amountRangeErr(maxFee, "max_fee_per_gas"); msg != "" {
+			writeSignError(w, http.StatusBadRequest, msg)
+			return
+		}
+		if msg := amountRangeErr(tip, "max_priority_fee_per_gas"); msg != "" {
+			writeSignError(w, http.StatusBadRequest, msg)
+			return
+		}
 		tx = types.NewTx(&types.DynamicFeeTx{
 			ChainID:   chainID,
 			Nonce:     req.Nonce,
@@ -353,6 +389,10 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		gasPrice, _ := parseBigInt(req.GasPrice)
 		if gasPrice == nil {
 			writeSignError(w, http.StatusBadRequest, "legacy tx requires gas_price")
+			return
+		}
+		if msg := amountRangeErr(gasPrice, "gas_price"); msg != "" {
+			writeSignError(w, http.StatusBadRequest, msg)
 			return
 		}
 		tx = types.NewTx(&types.LegacyTx{
@@ -411,6 +451,22 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeSignError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// amountRangeErr returns the 400 message for an amount field that is
+// negative or overflows uint256 (BitLen > 256), or "" when the amount is
+// usable (nil — field absent — is fine: the caller defaults it).
+func amountRangeErr(n *big.Int, field string) string {
+	if n == nil {
+		return ""
+	}
+	if n.Sign() < 0 {
+		return field + ": negative"
+	}
+	if n.BitLen() > 256 {
+		return field + ": exceeds uint256"
+	}
+	return ""
 }
 
 // parseBigInt accepts decimal ("123") or 0x-hex ("0x7b"). Empty → (nil, false).
