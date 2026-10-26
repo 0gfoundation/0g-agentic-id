@@ -1,3 +1,4 @@
+import nodeHttp from 'node:http';
 /**
  * ServeProof digest + verification pins (no network):
  *
@@ -232,7 +233,8 @@ test('verifyProof: a v0 proof parsed from its header verifies (envelope validato
   const { session } = mkSession(VFR);
   const v = await session.verifyProof(parsed);
   assert.deepEqual(v, {
-    ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true, reasons: [],
+    ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
+    taskMatches: null, reasons: [],
   });
 });
 
@@ -275,4 +277,133 @@ test('verifyProof: a legacy personal_sign proof fails as a SIGNATURE mismatch', 
   assert.equal(forged.signerMatches, false);
   assert.equal(forged.registryMatches, true);
   assert.deepEqual(forged.reasons, ['signature does not match the on-chain agentSeal']);
+});
+
+// ── verifyProof per-exchange binding (opts.task) ──
+// The proof's taskHash commits to keccak(method‖uri‖keccak(reqBody)‖
+// keccak(respBody)‖status). Passing the exchange that actually happened must
+// bind the verdict to THIS body: a genuine proof attached to a swapped
+// response body yields taskMatches:false and ok:false.
+
+import { KAT_TASK_HASH, RESP } from './taskhash-vectors.mjs';
+import { taskRevealOf } from '../dist/ServeSession.js';
+import { keccak256, toBytes } from 'viem';
+
+test('taskRevealOf pins the katTaskHash vector (POST /api/x?q=1, 201)', async () => {
+  const reveals = taskRevealOf({
+    method: 'POST', url: 'https://x.example/api/x?q=1',
+    requestBytes: '{"q":"in"}', responseBytes: RESP, status: 201,
+  });
+  assert.equal(reveals.length, 1, 'no bare-? in this URL → one candidate');
+  assert.equal(
+    keccak256(toBytes(JSON.stringify(reveals[0]))).length, 66, 'reveal is well-formed');
+  // taskHashOf over the reveal must equal the cross-impl vector.
+  const { taskHashOf } = await import('../dist/taskHash.js');
+  assert.equal(taskHashOf(reveals[0]), KAT_TASK_HASH);
+});
+
+test('verifyProof with a matching exchange: taskMatches true, ok true', async () => {
+  const signed = await signServeProof(
+    proofParams({ taskHash: KAT_TASK_HASH }), (hash) => seal.sign({ hash }));
+  const { session } = mkSession(VFR);
+  const v = await session.verifyProof(signed, {
+    task: {
+      method: 'POST', url: 'https://x.example/api/x?q=1',
+      requestBytes: '{"q":"in"}', responseBytes: RESP, status: 201,
+    },
+  });
+  assert.equal(v.taskMatches, true);
+  assert.equal(v.ok, true);
+});
+
+test('verifyProof with a SWAPPED response body: taskMatches false, ok false', async () => {
+  // A genuine proof (signed by the real seal, all other checks pass) whose
+  // taskHash is replayed next to a different response body — the attack the
+  // signer-attribution-only verdict could not catch.
+  const signed = await signServeProof(
+    proofParams({ taskHash: KAT_TASK_HASH }), (hash) => seal.sign({ hash }));
+  const { session } = mkSession(VFR);
+  const v = await session.verifyProof(signed, {
+    task: {
+      method: 'POST', url: 'https://x.example/api/x?q=1',
+      requestBytes: '{"q":"in"}', responseBytes: '{"a":"SWAPPED"}', status: 201,
+    },
+  });
+  assert.equal(v.signerMatches, true, 'the signature itself is genuine');
+  assert.equal(v.taskMatches, false, 'but it committed to a different body');
+  assert.equal(v.ok, false);
+  assert.match(v.reasons.join('; '), /taskHash does not match/);
+});
+
+test('verifyProof with a TaskReveal (pre-built) also binds', async () => {
+  const { taskHashOf } = await import('../dist/taskHash.js');
+  const reveal = {
+    method: 'POST', uri: '/api/x?q=1',
+    reqBodyHash: keccak256(toBytes('{"q":"in"}')),
+    respBodyHash: keccak256(toBytes(RESP)),
+    statusCode: 201,
+  };
+  const signed = await signServeProof(
+    proofParams({ taskHash: taskHashOf(reveal) }), (hash) => seal.sign({ hash }));
+  const { session } = mkSession(VFR);
+  assert.equal((await session.verifyProof(signed, { task: reveal })).ok, true);
+  const swapped = { ...reveal, statusCode: 200 };
+  const v = await session.verifyProof(signed, { task: swapped });
+  assert.equal(v.taskMatches, false);
+  assert.equal(v.ok, false);
+});
+
+test('verifyProof URI candidates: the bare-? form is tried too', async () => {
+  // A URL ending in a bare '?' has two candidate URIs; the proxy hashed one
+  // of them. The exchange form must find the match either way.
+  const { taskHashOf } = await import('../dist/taskHash.js');
+  const reveal = {
+    method: 'POST', uri: '/api/a%7Cb?',
+    reqBodyHash: keccak256(toBytes('{"q":"in"}')),
+    respBodyHash: keccak256(toBytes(RESP)),
+    statusCode: 201,
+  };
+  const signed = await signServeProof(
+    proofParams({ taskHash: taskHashOf(reveal) }), (hash) => seal.sign({ hash }));
+  const { session } = mkSession(VFR);
+  const v = await session.verifyProof(signed, {
+    task: {
+      method: 'POST', url: 'https://x.example/api/a|b?',
+      requestBytes: '{"q":"in"}', responseBytes: RESP, status: 201,
+    },
+  });
+  assert.equal(v.taskMatches, true, 'candidates covered the bare-? form');
+});
+
+// ── proofRecordingFetch: the generic-MCP-client recipe ──
+test('proofRecordingFetch records proof + task and passes the Response through', async () => {
+  const { proofRecordingFetch } = await import('../dist/ServeSession.js');
+  const log = [];
+  const rf = proofRecordingFetch(log);
+  // A local stand-in server answering with a header-shaped proof.
+  const body = '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}';
+  const srv = nodeHttp.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-agent-proof': header(proofParams()) });
+    res.end(body);
+  });
+  await new Promise((r) => srv.listen(0, "127.0.0.1", () => r(null)));
+  const port = srv.address().port;
+  try {
+    const response = await rf(`http://127.0.0.1:${port}/api/mcp`, {
+      method: 'POST', body: '{"jsonrpc":"2.0","id":1,"method":"tools/list"}',
+    });
+    // The response is untouched: the MCP client can read it.
+    assert.equal(await response.text(), body);
+    // The exchange was recorded with both halves.
+    assert.equal(log.length, 1);
+    assert.ok(log[0].proof, "proof captured from the header");
+    assert.ok(log[0].task, "task recorded");
+    assert.equal(log[0].task.status, 200);
+    assert.equal(log[0].task.method, 'POST');
+    // and the recorded task round-trips through taskRevealOf.
+    const reveals = taskRevealOf(log[0].task);
+    assert.ok(reveals.length >= 1);
+  } finally {
+    srv.close();
+  }
 });

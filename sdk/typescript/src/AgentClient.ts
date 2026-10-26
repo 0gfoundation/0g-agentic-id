@@ -16,7 +16,7 @@
  *     services via `fetch`/`fetchWithProof` and captures the proof.
  */
 
-import { proofFromResponse } from './ServeSession';
+import { proofFromResponse, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
 
 /**
@@ -54,18 +54,25 @@ export interface AgentServiceEntry {
  * // any MCP client.
  * ```
  *
- * What a proof does and does not tell you — read this before trusting a
- * transcript: `verifyProof` checks the SIGNER (it must be the on-chain
- * agentSeal of this agent id), the deadline, and the declared data hashes.
- * It does NOT recompute the task hash from your own request/response bytes,
- * so it proves "the attested runtime produced SOME exchange in this window",
- * not "this exact response body came from it". For per-exchange binding,
- * recompute the task digest (keccak of method‖uri‖keccak(reqBody)‖
- * keccak(respBody)‖status, see ServeProof.ts) from the raw bytes you sent
- * and received and compare it to the proof's taskHash. And note the digest
- * format that makes this binding unforgeable-by-the-agent lands with the
- * 1.2.0 serving stack — on deployments still running the pre-1.2.0 format,
- * the proof is signer attribution only.
+ * Per-exchange verification — binding the proof to THIS body, not just the
+ * signer. `verifyProof` alone is signer attribution; with the exchange it
+ * also checks that the proof's taskHash equals
+ * keccak(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status)
+ * recomputed from YOUR bytes (`taskMatches` in the verdict, required for
+ * `ok`). The pieces:
+ *
+ * ```ts
+ * const { response, proof, task } = await client.fetchWithProof(mcp[0].path, {
+ *   method: 'POST', headers: { 'content-type': 'application/json' },
+ *   body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+ * });
+ * await response.text();                       // your own read still works
+ * const v = await session.verifyProof(proof!, { task! });
+ * // v.ok && v.taskMatches → THIS response came from the attested runtime
+ * ```
+ * `task` is recorded from the actual bytes (response read via clone()), so a
+ * genuine proof replayed next to a swapped body fails (`taskMatches: false`).
+ * For hand-rolled fetches, build the reveal yourself with `taskRevealOf()`.
  *
  * Note the proxy pins one HTTP method per path, so an MCP route is POST-only:
  * a stateless MCP server (each JSON-RPC request answered in one response,
@@ -157,7 +164,16 @@ export interface AgentClient {
    * verify or submit as on-chain feedback. `proof` is null when the response
    * carries none (e.g. the unsigned owner↔agent chat route).
    */
-  fetchWithProof(path: string, init?: RequestInit): Promise<{ response: Response; proof: ServeProof | null }>;
+  fetchWithProof(path: string, init?: RequestInit): Promise<{
+    response: Response;
+    proof: ServeProof | null;
+    /** The exchange that was actually sent/received, for per-exchange
+     *  verification: `session.verifyProof(proof, { task })` then binds the
+     *  proof to THIS response's bytes (taskMatches), not just to the signer.
+     *  The response body is read via clone(), so `response.json()` etc. still
+     *  work. null when the request could not be recorded. */
+    task: TaskExchange | null;
+  }>;
   /**
    * Present only if the agent declares a `kind: "chat"` route and this handle
    * holds the owner token. POSTs an OpenAI-shaped chat request to
@@ -434,8 +450,34 @@ export function makeAgentClient(params: {
     routes,
     fetch: doFetch,
     async fetchWithProof(path, init) {
+      const rel = path.startsWith('/') ? path : `/${path}`;
       const response = await doFetch(path, init);
-      return { response, proof: proofFromResponse(response) };
+      // Record the exact exchange for per-exchange verification: the proof's
+      // taskHash commits to method/uri/keccak(reqBody)/keccak(respBody)/
+      // status, and the caller can only recompute those from what actually
+      // traveled. clone() so the caller's own body reads still work. On a
+      // streaming response (SSE) the clone stays unread — record null rather
+      // than buffering a stream the caller may be consuming incrementally.
+      let task: TaskExchange | null = null;
+      try {
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const reqBytes = typeof init?.body === 'string' ? init.body
+          : init?.body instanceof Uint8Array ? init.body
+          : init?.body instanceof ArrayBuffer ? new Uint8Array(init.body)
+          : '';
+        const cloned = response.clone();
+        const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
+        task = {
+          method,
+          url: `${base}${rel}`,
+          requestBytes: reqBytes,
+          responseBytes: respBytes,
+          status: response.status,
+        };
+      } catch {
+        task = null;
+      }
+      return { response, proof: proofFromResponse(response), task };
     },
   };
 

@@ -70,8 +70,10 @@ export {
   parseServeProofHeader,
   proofFromResponse,
   captureProof,
+  taskRevealOf,
+  proofRecordingFetch,
 } from './ServeSession';
-export type { ServeSessionOptions, ProofVerification } from './ServeSession';
+export type { ServeSessionOptions, ProofVerification, TaskExchange } from './ServeSession';
 
 // ── ServeProof utilities ──
 export {
