@@ -470,7 +470,6 @@ func amountRangeErr(n *big.Int, field string) string {
 }
 
 // parseBigInt accepts decimal ("123") or 0x-hex ("0x7b"). Empty → (nil, false).
-
 func parseBigInt(s string) (*big.Int, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {

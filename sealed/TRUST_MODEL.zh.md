@@ -650,8 +650,9 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 `/sign/` 路径的 tool 调用，把模型引向原生工具
 （`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
 每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
-socket 的 `/settings` 端点刻意不在守卫范围：平台文档明说 agent 可以
-curl 它（没有对应的结构化工具），而且它不签任何东西。
+socket 的其它端点——`/settings` 和 `/services`——刻意不在守卫范围：
+平台文档明说 agent 可以 curl `/settings`（没有覆盖读取的结构化工
+具），而且两者都不签任何东西。
 这是引导而非强制：其它间接写法仍可绕开，session log 也不是
 防篡改的。其它框架则按各自组合允许的方式到达 socket。
 

@@ -10,10 +10,10 @@
  * (sibling plugin) steers the shell path away from the socket's SIGN
  * endpoints by denying tool calls that name a socket spelling AND a /sign/
  * path — a steer, not an enforcement: other indirections still get past it,
- * and the session log is not tamper-evident. The socket's /settings endpoint
- * is NOT guarded: the platform doc tells the agent to curl it (there is no
- * structured-tool equivalent), and it signs nothing. Prefer the tools for
- * signing because they are the logged channel.
+ * and the session log is not tamper-evident. The socket's other endpoints,
+ * /settings and /services, are NOT guarded: the platform doc tells the agent
+ * to curl /settings (no structured tool covers reads), and neither signs
+ * anything. Prefer the tools for signing because they are the logged channel.
  *
  * The three sign tools map the socket's three sign endpoints one-to-one
  * (personal_sign / typed_data / transaction). That is deliberate parity: the

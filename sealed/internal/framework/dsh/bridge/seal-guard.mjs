@@ -9,13 +9,19 @@
  * string. This guard narrows that road for the SIGN endpoints: a
  * bash/subprocess tool call whose arguments reach the socket AND name a
  * /sign/ path is denied at tools/pre-execute, with a pointer to the
- * structured tools (seal_sign / seal_sign_transaction / seal_sign_typed_data
- * / seal_register_service, see seal-tools.mjs) that leave a session-log
+ * structured sign tools (seal_sign / seal_sign_transaction /
+ * seal_sign_typed_data, see seal-tools.mjs) that leave a session-log
  * record. The socket's OTHER endpoints — GET/POST /settings (the thinking
  * change the platform doc names, `curl --unix-socket "$SEAL_SIGN_SOCK"
  * http://localhost/settings`) and GET/POST /services — stay allowed: neither
  * signs anything, and neither has a structured-tool equivalent that covers
  * reads.
+ *
+ * Known false positive (fail-closed, accepted): the match runs over ALL
+ * flattened arguments, including the bash tool's `description` — a
+ * /settings read whose description happens to mention "/sign/" is denied.
+ * Annoying, never a bypass; narrowing the match to the `command` argument
+ * alone would trade that annoyance for a mislabeled-argument hole.
  *
  * Registered via ctx.tools.guard(): monotonic — a later listener cannot turn
  * the denial back into permission. This is channel narrowing, not content
