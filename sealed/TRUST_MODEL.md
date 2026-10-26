@@ -643,16 +643,21 @@ abuse the sign socket + patch the rest through reputation."
 Beyond the framework auto-signatures (`report.Status` / `chain.Update` /
 `X-Agent-Proof` above), the agent itself can request signatures over
 the unix socket (`/sign/personal_sign`, `/sign/typed_data`,
-`/sign/transaction`) so it can participate as a first-class Web3 actor.
-In the DSH composition the socket is reachable only through the native
-tools (`seal_sign`, `seal_sign_typed_data`, `seal_sign_transaction` —
-one per endpoint, every call a structured session-log record); the
-other frameworks reach it however their own composition allows:
+`/sign/transaction`) so it can participate as a first-class Web3 actor:
 
 - Call contracts that check `msg.sender == agent_seal_addr`
 - Emit off-chain claims tied to its TEE-attested identity
 - Sign EIP-712 structured data (Permit, Seaport, etc.) as agentSeal
 - Send chain transactions as agentSeal
+
+In the DSH composition, `seal-guard.mjs` steers the model toward the
+native tools (`seal_sign`, `seal_sign_typed_data`,
+`seal_sign_transaction` — one per endpoint, every call a structured
+session-log record) by denying tool calls that name the socket path.
+That is a steer, not an enforcement: the guard matches only the literal
+path (a `$SEAL_SIGN_SOCK`-style indirection escapes it), and the
+session log is not tamper-evident. The other frameworks reach the
+socket however their own composition allows.
 
 The unix socket is bound 0600 and owned by the low-privilege `agent`
 user the framework subprocess runs as (`internal/privsep`), and **never

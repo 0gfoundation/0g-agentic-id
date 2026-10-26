@@ -38,11 +38,15 @@ export function apply(ctx) {
   ctx.tools.guard((exec) => {
     if (!SHELL_TOOLS.has(exec.name)) return undefined
     const text = flatten(exec.arguments)
-    if (text.includes(SOCK) || text.includes('seal-sign.sock')) {
+    // Match the literal path AND the $SEAL_SIGN_SOCK / SEAL_SIGN_SOCK idiom
+    // the platform docs name — both spell the same socket.
+    if (text.includes(SOCK) || text.includes('seal-sign.sock') ||
+        text.includes('$SEAL_SIGN_SOCK') || text.includes('SEAL_SIGN_SOCK')) {
       return (
-        `shell access to the sign socket is closed. Use the seal_sign tool to sign, ` +
-        `or seal_register_service to publish services — those calls are recorded in your session log; ` +
-        `a shell command is not.`
+        `shell access to the sign socket is closed. Use seal_sign (messages), ` +
+        `seal_sign_transaction (chain transactions), seal_sign_typed_data (EIP-712), ` +
+        `or seal_register_service (publish services) — those calls are recorded in ` +
+        `your session log; a shell command is not.`
       )
     }
     return undefined

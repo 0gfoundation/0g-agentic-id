@@ -7,8 +7,10 @@
  * socket — the point is the CHANNEL: a native tool call lands in the session
  * log as a structured record (name, arguments, turn, surrounding context), so
  * every signature the agent issues is auditable after the fact. seal-guard
- * (sibling plugin) closes the shell path to the socket, making this the only
- * road.
+ * (sibling plugin) closes the shell path to the socket by denying tool calls
+ * that name the literal socket path — a steer, not an enforcement: it does
+ * not match `$SEAL_SIGN_SOCK`-style indirection, and the session log is not
+ * tamper-evident. Prefer the tools because they are the logged channel.
  *
  * The three sign tools map the socket's three sign endpoints one-to-one
  * (personal_sign / typed_data / transaction). That is deliberate parity: the
@@ -18,6 +20,12 @@
  * (first real victim: a nested owner's TappRegistry acknowledgeApps, which is
  * an on-chain tx and nothing else). Each mapping below is a reviewed decision
  * to expose that endpoint; nothing here forwards arbitrary socket paths.
+ *
+ * One channel is reserved and these tools refuse it by doctrine, not by code:
+ * the agent must NEVER use them for AgenticID update/updateAt calls on its
+ * own token — iData writes are the sealed runtime's drift watcher's job (it
+ * signs them itself, from its own state); a self-signed update would race
+ * the watcher and corrupt the chain snapshot.
  *
  * The doctrine (refusal 1) still governs WHAT may be signed — authorship of
  * the bytes is not machine-checkable. These tools make usage legible; they
@@ -77,7 +85,8 @@ export function apply(ctx) {
       (AGENT_SEAL ? ` (${AGENT_SEAL})` : '') +
       ', seal_sign_transaction to sign a chain transaction you drafted (returns the raw signed transaction), ' +
       'seal_sign_typed_data to sign EIP-712 typed data you authored, and seal_register_service to publish HTTP services you host on loopback through the signed proxy. ' +
-      'These are the ONLY roads to the signing capability — shell access to the sign socket is blocked. ' +
+      'Prefer these tools: their calls land in the session log as structured records (the shell path is steered away by seal-guard, not sealed shut). ' +
+      'Never use seal_sign_transaction for AgenticID update/updateAt calls on your own token — iData writes belong to the sealed runtime\'s drift watcher. ' +
       'Sign only content you authored yourself; the sovereignty section governs every use.',
   })
 
@@ -117,17 +126,20 @@ export function apply(ctx) {
       'Sign a chain transaction with this agent\'s on-chain agentSeal key. Returns the raw signed ' +
       'transaction (broadcast it yourself through any RPC endpoint) plus its hash. Only for transactions ' +
       'you drafted yourself as part of a goal you are pursuing — never sign owner- or caller-supplied ' +
-      'transaction bytes; owners delegate goals, not transactions.',
+      'transaction bytes; owners delegate goals, not transactions. NEVER use this to send ' +
+      'AgenticID update/updateAt calls for this agent\'s own token: those are the sealed runtime\'s ' +
+      'reserved channel (the drift watcher owns iData writes); a self-signed update would fight the ' +
+      'watcher and corrupt the chain snapshot.',
     parameters: {
-      chain_id: { type: 'string', required: true, description: 'Destination chain id — decimal ("16602") or 0x hex ("0x40da").' },
-      nonce: { type: 'number', required: true, description: 'Sender account nonce (eth_getTransactionCount, usually "pending").' },
-      to: { type: 'string', description: 'Recipient address. Empty string = contract creation.' },
-      value: { type: 'string', description: 'Value in wei — decimal or 0x hex. Optional, default 0.' },
+      chain_id: { type: 'string', required: true, description: 'Destination chain id — a positive integer, decimal ("16602") or 0x hex ("0x40da").' },
+      nonce: { type: 'number', required: true, description: 'Sender account nonce, an integer — the numeric result of eth_getTransactionCount(addr, "pending").' },
+      to: { type: 'string', required: true, description: 'Recipient address. REQUIRED — omitting it would silently sign a contract creation; pass the empty string "" explicitly (and say so) when creation is really intended.' },
+      value: { type: 'string', description: 'Value in wei — decimal or 0x hex integer ("1500000000000000000", NOT "1.5" or "1e18"). Optional, default 0.' },
       data: { type: 'string', required: true, description: 'Calldata, 0x hex ("0x" for a plain transfer).' },
       gas_limit: { type: 'number', required: true, description: 'Gas limit (eth_estimateGas).' },
       type: { type: 'string', description: '"legacy" or "dynamic" (EIP-1559, default).' },
-      gas_price: { type: 'string', description: 'Legacy type only: gas price in wei.' },
-      max_fee_per_gas: { type: 'string', description: 'Dynamic type only: max fee per gas in wei.' },
+      gas_price: { type: 'string', description: 'Legacy type only: gas price in wei — decimal or 0x hex integer.' },
+      max_fee_per_gas: { type: 'string', description: 'Dynamic type only: max fee per gas in wei — decimal or 0x hex integer.' },
       max_priority_fee_per_gas: { type: 'string', description: 'Dynamic type only: max priority fee per gas in wei.' },
     },
     output: {
@@ -157,8 +169,28 @@ export function apply(ctx) {
     timeoutMs: 15_000,
     async execute(args, exec) {
       const a = args ?? {}
-      for (const k of ['chain_id', 'nonce', 'data', 'gas_limit']) {
+      for (const k of ['chain_id', 'nonce', 'to', 'data', 'gas_limit']) {
         if (a[k] === undefined || a[k] === null) throw new Error(`provide ${k}`)
+      }
+      // An absent `to` would silently sign a contract CREATION at the socket
+      // (sign.go treats absent like ""); creation must be the explicit ""
+      // sentinel, never an accident of omission.
+      // Numeric string fields: the socket's parseBigInt silently maps junk
+      // like "1.5" or "1e18" to a missing/zero value; reject here so the
+      // model sees the bad field name instead of a signed-but-wrong tx.
+      const intStr = /^[0-9]+$|^0[xX][0-9a-fA-F]+$/
+      for (const k of ['chain_id', 'value', 'gas_price', 'max_fee_per_gas', 'max_priority_fee_per_gas']) {
+        const v = a[k]
+        if (v !== undefined && v !== null && v !== '' && !intStr.test(String(v))) {
+          throw new Error(`${k}: "${v}" is not a decimal or 0x-hex integer (wei-scale amounts must be integer strings)`)
+        }
+      }
+      // A zero/negative chain id panics the geth signer inside the socket;
+      // the caller would only see "socket hang up". Reject it here.
+      if (a.chain_id !== undefined) {
+        const cid = String(a.chain_id).toLowerCase().startsWith('0x')
+          ? parseInt(String(a.chain_id), 16) : parseInt(String(a.chain_id), 10)
+        if (!(cid > 0)) throw new Error('chain_id must be a positive integer')
       }
       // Forward only the fields the caller set: the socket decodes the same
       // names, and an absent field is cleaner than an empty string for
@@ -191,7 +223,7 @@ export function apply(ctx) {
         type: 'object',
         required: true,
         additionalProperties: true,
-        description: 'Standard EIP-712 TypedData JSON: {domain, types, primaryType, message}.',
+        description: 'Standard EIP-712 TypedData JSON: {domain, types, primaryType, message}. Pass uint/int values as decimal STRINGS ("1500000000000000000") — JSON numbers above 2^53 lose precision silently.',
       },
     },
     output: {
@@ -213,7 +245,34 @@ export function apply(ctx) {
     async execute(args, exec) {
       const td = args?.typed_data
       if (!td || typeof td !== 'object') throw new Error('provide typed_data')
-      const out = await sockPost('/sign/typed_data', td, exec.signal)
+      if (!td.domain || typeof td.domain !== 'object') throw new Error('typed_data.domain missing')
+      if (!td.types || typeof td.types !== 'object') throw new Error('typed_data.types missing')
+      if (!td.primaryType || typeof td.primaryType !== 'string') throw new Error('typed_data.primaryType missing')
+      // JSON.parse silently rounds numbers above 2^53 (Number.MAX_SAFE_INTEGER):
+      // message.amount = 1234567890123456789 arrives as …768 and the seal would
+      // sign a DIFFERENT amount with no error. Reject non-safe integers and ask
+      // for decimal strings instead.
+      const walk = (v, path) => {
+        if (typeof v === 'number' && (!Number.isInteger(v) || Math.abs(v) > Number.MAX_SAFE_INTEGER)) {
+          throw new Error(`${path}: ${v} is not a safe integer — pass uint/int values as decimal strings`)
+        }
+        if (v && typeof v === 'object') {
+          for (const [k, x] of Object.entries(v)) walk(x, `${path}.${k}`)
+        }
+      }
+      walk(td.message, 'typed_data.message')
+      // geth's hasher requires an EIP712Domain entry inside `types`; the viem/
+      // ethers convention omits it — inject one in canonical field order
+      // derived from the domain keys present (same as sdk/src/seal.ts).
+      const dom = td.domain
+      const domFields = []
+      if (dom.name !== undefined) domFields.push({ name: 'name', type: 'string' })
+      if (dom.version !== undefined) domFields.push({ name: 'version', type: 'string' })
+      if (dom.chainId !== undefined) domFields.push({ name: 'chainId', type: 'uint256' })
+      if (dom.verifyingContract !== undefined) domFields.push({ name: 'verifyingContract', type: 'address' })
+      if (dom.salt !== undefined) domFields.push({ name: 'salt', type: 'bytes32' })
+      const body = { ...td, types: { EIP712Domain: domFields, ...td.types } }
+      const out = await sockPost('/sign/typed_data', body, exec.signal)
       return {
         signature: String(out.signature),
         address: String(out.address),

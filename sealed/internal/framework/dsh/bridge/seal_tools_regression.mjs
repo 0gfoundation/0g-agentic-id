@@ -106,7 +106,7 @@ check(!("max_fee_per_gas" in fwd.body), `legacy tx must not carry 1559 fields: $
 // unset type-dependent fields must be ABSENT, not null/empty:
 nextBody = { raw_tx: "0x", tx_hash: "0x", address: "0x", signature: {} };
 await signTools.seal_sign_transaction.execute({
-	chain_id: "16602", nonce: 2, data: "0x", gas_limit: 21000,
+	chain_id: "16602", nonce: 2, to: "0xrcpt", data: "0x", gas_limit: 21000,
 	max_fee_per_gas: "1000", max_priority_fee_per_gas: "1",
 }, { signal: undefined });
 const dyn = hits.at(-1).body;
@@ -125,18 +125,67 @@ try {
 	failures.push("tx without required fields must throw");
 } catch { /* expected */ }
 
-// ── seal_sign_typed_data: body IS the TypedData, output mapping ────────────
+// ── seal_sign_typed_data: EIP712Domain injection + output mapping ─────────
+// viem/ethers convention omits EIP712Domain from types; the geth hasher the
+// real socket uses requires it. The tool injects one in canonical order from
+// the domain keys present (same as sdk/src/seal.ts) — the forwarded body
+// must carry it even though the caller's payload didn't.
 nextBody = { signature: "0xsig712", address: "0xaddr", digest: "0xdig" };
-const td = { domain: { name: "x" }, types: { EIP712Domain: [] }, primaryType: "Mail", message: { a: 1 } };
+const td = { domain: { name: "x", chainId: 16602, verifyingContract: "0xabc" }, types: { Mail: [{ name: "a", type: "uint256" }] }, primaryType: "Mail", message: { a: 1 } };
 out = await signTools.seal_sign_typed_data.execute({ typed_data: td }, { signal: undefined });
 check(out.signature === "0xsig712" && out.digest === "0xdig", `typed output: ${j(out)}`);
 const tfwd = hits.at(-1);
 check(tfwd.path === "/sign/typed_data" && tfwd.body.primaryType === "Mail" && tfwd.body.domain.name === "x",
 	`typed forward: ${j(tfwd)}`);
+check(j(tfwd.body.types.EIP712Domain) === j([
+	{ name: "name", type: "string" },
+	{ name: "chainId", type: "uint256" },
+	{ name: "verifyingContract", type: "address" },
+]), `EIP712Domain injected in canonical order: ${j(tfwd.body.types.EIP712Domain)}`);
 try {
 	await signTools.seal_sign_typed_data.execute({}, { signal: undefined });
 	failures.push("typed without typed_data must throw");
 } catch { /* expected */ }
+
+// ── typed_data precision guard: numbers above 2^53 must not pass ──────────
+// JSON.parse silently rounds 1234567890123456789 → …768; the seal would sign
+// a different amount with no error. Non-safe integers are rejected with the
+// field path so the model knows what to turn into a decimal string.
+try {
+	await signTools.seal_sign_typed_data.execute({ typed_data: {
+		domain: { name: "x" }, types: { Mail: [{ name: "amount", type: "uint256" }] },
+		primaryType: "Mail", message: { amount: 1234567890123456789 },
+	} }, { signal: undefined });
+	failures.push("unsafe integer must be rejected before the socket");
+} catch (e) {
+	check(String(e).includes("typed_data.message.amount") && String(e).includes("decimal strings"),
+		`unsafe-integer error must name the field: ${e}`);
+}
+
+// ── tx guards: `to` presence + numeric-string fields ──────────────────────
+// Omitting `to` would silently sign a contract CREATION at the socket — the
+// schema marks it required and execute double-checks; junk numeric strings
+// ("1.5", "1e18") would sign value 0 at the socket — rejected here instead.
+try {
+	await signTools.seal_sign_transaction.execute({
+		chain_id: "16602", nonce: 1, data: "0x", gas_limit: 21000, value: "1000",
+	}, { signal: undefined });
+	failures.push("tx without `to` must be rejected (creation needs explicit \"\")");
+} catch { /* expected */ }
+try {
+	await signTools.seal_sign_transaction.execute({
+		chain_id: "16602", nonce: 1, to: "0xabc", data: "0x", gas_limit: 21000, value: "1.5",
+	}, { signal: undefined });
+	failures.push("value \"1.5\" must be rejected (socket would sign 0 wei)");
+} catch (e) {
+	check(String(e).includes('value: "1.5"'), `bad-value error names the field: ${e}`);
+}
+try {
+	await signTools.seal_sign_transaction.execute({
+		chain_id: "0", nonce: 1, to: "0xabc", data: "0x", gas_limit: 21000,
+	}, { signal: undefined });
+	failures.push("chain_id \"0\" must not be forwarded (geth signer panics)");
+} catch { /* expected — schema-level or execute-level, either way not forwarded */ }
 
 // ── socket error surface: non-200 rejects with the server's message ────────
 nextStatus = 400; nextBody = null;
@@ -158,7 +207,7 @@ check(rendered[0].text.includes("0xraw"), `render must include raw_tx: ${rendere
 // array; the harness then rejects a missing field with ToolArgsError BEFORE
 // execute runs — the run-time guards are the second line, not the only one.)
 const compiled = signTools.seal_sign_transaction.parameters;
-check(j(compiled.required) === j(["chain_id", "nonce", "data", "gas_limit"]),
+check(j(compiled.required) === j(["chain_id", "nonce", "to", "data", "gas_limit"]),
 	`tx required fields: ${j(compiled.required)}`);
 check(signTools.seal_sign_typed_data.parameters.required?.[0] === "typed_data",
 	`typed_data must be schema-required: ${j(signTools.seal_sign_typed_data.parameters.required)}`);

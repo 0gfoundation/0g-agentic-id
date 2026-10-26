@@ -198,12 +198,8 @@ func buildSigningSection(signSock string) string {
 	b.WriteString("  Returns: `{\"signature\", \"address\", \"digest\"}`.\n\n")
 	b.WriteString("- `/sign/transaction` — sign a chain transaction (returns raw signed RLP hex; you broadcast it through any RPC endpoint you choose).\n")
 	b.WriteString("  Body: `{chain_id, nonce, to, value, data, gas_limit, max_fee_per_gas, max_priority_fee_per_gas, type}` (type defaults to `\"dynamic\"` for EIP-1559; use `\"legacy\"` with `gas_price` for legacy chains).\n")
-	b.WriteString("  Returns: `{\"raw_tx\", \"tx_hash\", \"address\", \"signature\"}`.\n\n")
-	b.WriteString("Example (curl over unix socket):\n\n")
-	b.WriteString("    curl --unix-socket \"$SEAL_SIGN_SOCK\" \\\n")
-	b.WriteString("      -H 'Content-Type: application/json' \\\n")
-	b.WriteString("      -d '{\"message\":\"hello\"}' \\\n")
-	b.WriteString("      http://localhost/sign/personal_sign\n\n")
+	b.WriteString("  Returns: `{\"raw_tx\", \"tx_hash\", \"address\", \"signature\"}`. Never use this endpoint for AgenticID update/updateAt on your own token — that is the drift watcher's reserved channel.\n\n")
+	b.WriteString("Mechanics: POST JSON over the unix socket at `$SEAL_SIGN_SOCK` (details in the runtime docs). Do not shell out to it: use your framework's native sign tools where they exist, so every signature is a structured session-log record instead of an opaque command string.\n\n")
 	b.WriteString("### When to use agentSeal\n\n")
 	b.WriteString("- A contract caller / verifier requires `msg.sender == AGENT_SEAL` or checks an EIP-712 signature against `AGENT_SEAL`.\n")
 	b.WriteString("- You need an off-chain claim that a third party can verify came from a legitimate TEE runtime (not just \"the agent says so\").\n")
@@ -252,7 +248,7 @@ func buildConstraints(_ RuntimeSnapshot) string {
 	// Drift auto-commit. Framework-specific constraints (version
 	// whitelist, config-hash semantics, tracked-path layout) are the
 	// ADAPTER's to author and inject alongside this section.
-	b.WriteString("**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.\n\n")
+	b.WriteString("**Drift auto-commit.** Your chain-persistent paths (listed in the injected persistent-state notes) are monitored by a 30s watcher tick. Changes are automatically encrypted, uploaded to 0G Storage, and anchored on the AgenticID contract via a signed `Update` transaction from agentSeal. You do not control when this happens — sealed does it for you. **Never sign an AgenticID update/updateAt transaction for your own token yourself** (through the sign socket or its tools): iData writes are the watcher's reserved channel — it signs them from its own verified state, and a self-signed update would race the watcher and corrupt the chain snapshot. If the chain transaction fails (e.g. insufficient gas), sealed classifies it as `warning` severity and reports to attestor immediately.\n\n")
 
 	return b.String()
 }

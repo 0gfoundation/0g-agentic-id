@@ -252,11 +252,25 @@ func (s *Server) handleSignTransaction(w http.ResponseWriter, r *http.Request) {
 		writeSignError(w, http.StatusBadRequest, "invalid or missing chain_id")
 		return
 	}
+	// 0 or negative panics the geth signer (LatestSignerForChainID on a
+	// zero/negative chain id); net/http would recover the panic, but the
+	// caller would only see "socket hang up". Reject with a real error.
+	if chainID.Sign() <= 0 {
+		writeSignError(w, http.StatusBadRequest, "chain_id must be a positive integer")
+		return
+	}
 	if req.GasLimit == 0 {
 		writeSignError(w, http.StatusBadRequest, "gas_limit required")
 		return
 	}
-	value, _ := parseBigInt(req.Value)
+	// An unparseable non-empty value would otherwise sign as 0 wei: "1.5"
+	// and "1e18" both produce a valid-looking tx with the value silently
+	// dropped. Same for the fee fields below.
+	value, ok := parseBigInt(req.Value)
+	if !ok && strings.TrimSpace(req.Value) != "" {
+		writeSignError(w, http.StatusBadRequest, "value: not a decimal or 0x-hex integer")
+		return
+	}
 	if value == nil {
 		value = big.NewInt(0)
 	}
