@@ -732,6 +732,16 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			continue
 		case "Origin", "X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host", "X-Real-Ip":
 			continue
+		case "Accept-Encoding":
+			// Forwarding the client's Accept-Encoding explicitly pins it:
+			// Go's Transport then skips its own negotiation AND does not
+			// decompress, so the serve-proof taskHash would cover the gzip
+			// bytes while the client (undici, browsers) hashes the plain
+			// body it transparently decompressed — every compressing
+			// backend would fail per-exchange verification. Drop the
+			// header and let the Transport negotiate + decompress, so the
+			// hashed bytes equal the delivered bytes.
+			continue
 		}
 		for _, v := range vs {
 			upReq.Header.Add(k, v)

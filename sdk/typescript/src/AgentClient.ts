@@ -16,7 +16,7 @@
  *     services via `fetch`/`fetchWithProof` and captures the proof.
  */
 
-import { proofFromResponse, type TaskExchange } from './ServeSession';
+import { proofFromResponse, requestBytesOf, normalizedMethod, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
 
 /**
@@ -34,8 +34,9 @@ export interface AgentServiceEntry {
    * the backend implements the MCP streamable-HTTP protocol (JSON-RPC over
    * POST), so an MCP-capable client can mount `<base><path>` as an MCP
    * server and this agent's tools become the client's tools. Responses
-   * carry `X-Agent-Proof` like every agent service — that proof is what
-   * makes it a *trust-attributable* MCP server (see {@link mcpServices}).
+   * carry `X-Agent-Proof` like every agent service (when the runtime has a
+   * serve-proof validator configured) — that proof is what makes it a
+   * *trust-attributable* MCP server (see {@link mcpServices}).
    */
   transport?: 'mcp';
 }
@@ -67,8 +68,9 @@ export interface AgentServiceEntry {
  *   body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
  * });
  * await response.text();                       // your own read still works
- * const v = await session.verifyProof(proof!, { task! });
- * // v.ok && v.taskMatches → THIS response came from the attested runtime
+ * const v = await session.verifyProof(proof!, { task: task! });
+ * // v.ok && v.taskMatches → THIS response came from the attested runtime.
+ * // (task === null → ok: false, fail closed: the exchange wasn't recorded.)
  * ```
  * `task` is recorded from the actual bytes (response read via clone()), so a
  * genuine proof replayed next to a swapped body fails (`taskMatches: false`).
@@ -452,32 +454,33 @@ export function makeAgentClient(params: {
     async fetchWithProof(path, init) {
       const rel = path.startsWith('/') ? path : `/${path}`;
       const response = await doFetch(path, init);
-      // Record the exact exchange for per-exchange verification: the proof's
-      // taskHash commits to method/uri/keccak(reqBody)/keccak(respBody)/
-      // status, and the caller can only recompute those from what actually
-      // traveled. clone() so the caller's own body reads still work. On a
-      // streaming response (SSE) the clone stays unread — record null rather
-      // than buffering a stream the caller may be consuming incrementally.
+      // Per-exchange verification needs the exact bytes that traveled — but
+      // the body is read ONLY when the response carries X-Agent-Proof. A
+      // signed response is always finite (the proxy buffers it whole to
+      // compute the hash), so awaiting it cannot hang; an unsigned/streaming
+      // response (SSE chat) is returned immediately with task = null —
+      // awaiting its clone would block the caller's incremental reads.
+      const proof = proofFromResponse(response);
       let task: TaskExchange | null = null;
-      try {
-        const method = (init?.method ?? 'GET').toUpperCase();
-        const reqBytes = typeof init?.body === 'string' ? init.body
-          : init?.body instanceof Uint8Array ? init.body
-          : init?.body instanceof ArrayBuffer ? new Uint8Array(init.body)
-          : '';
-        const cloned = response.clone();
-        const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
-        task = {
-          method,
-          url: `${base}${rel}`,
-          requestBytes: reqBytes,
-          responseBytes: respBytes,
-          status: response.status,
-        };
-      } catch {
-        task = null;
+      if (proof) {
+        try {
+          const reqBytes = requestBytesOf(init?.body);
+          if (reqBytes !== null) {
+            const cloned = response.clone();
+            const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
+            task = {
+              method: normalizedMethod(init?.method),
+              url: `${base}${rel}`,
+              requestBytes: reqBytes,
+              responseBytes: respBytes,
+              status: response.status,
+            };
+          }
+        } catch {
+          task = null;
+        }
       }
-      return { response, proof: proofFromResponse(response), task };
+      return { response, proof, task };
     },
   };
 

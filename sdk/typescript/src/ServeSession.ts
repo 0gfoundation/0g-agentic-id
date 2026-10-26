@@ -90,6 +90,100 @@ export function proofFromResponse(res: { headers: { get(name: string): string | 
   return header ? parseServeProofHeader(header) : null;
 }
 
+/** The methods undici/fetch normalize to uppercase themselves (measured:
+ *  get→GET … options→OPTIONS; anything else, e.g. `patch`, travels as
+ *  written and the proxy hashes r.Method as received). Recording must
+ *  uppercase exactly these six — more would hash a method the proxy never
+ *  saw, fewer would record 'get' where the wire said 'GET'. */
+const FETCH_NORMALIZED_METHODS = new Set(['get', 'head', 'post', 'put', 'delete', 'options']);
+
+/** The HTTP method as it travels on the wire (see the set above). */
+export function normalizedMethod(m?: string): string {
+  const s = m ?? 'GET';
+  return FETCH_NORMALIZED_METHODS.has(s.toLowerCase()) ? s.toUpperCase() : s;
+}
+
+/** The request body bytes as they traveled, for the taskHash preimage —
+ *  or null when the shape cannot be captured faithfully (Blob/FormData
+ *  are async, ReadableStream would block): the caller must treat the
+ *  whole task as unrecorded, never hash a wrong '' stand-in. */
+export function requestBytesOf(
+  body: unknown,
+): Uint8Array | string | null {
+  if (body == null) return '';
+  if (typeof body === 'string') return body;
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  if (body instanceof URLSearchParams) return body.toString(); // undici sends exactly this
+  if (body instanceof DataView) {
+    return new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+  }
+  return null; // Blob, FormData, ReadableStream, … — unrecordable, not wrong
+}
+
+/**
+ * A fetch-compatible wrapper for generic MCP clients: every SIGNED exchange
+ * it performs is recorded (proof + task) into `log`, and the Response is
+ * returned untouched, so an MCP SDK's streamable-HTTP transport accepts it
+ * as its custom fetch (the transport is passed to `client.connect()`).
+ * Unsigned responses are logged with `task: null` and their body is never
+ * read — a long-lived SSE listener would otherwise never resolve. After the
+ * session, verify each entry with `session.verifyProof(entry.proof, { task:
+ * entry.task })` — note `task: null` yields `ok: false` (fail closed), so
+ * skip entries whose task is null only when you know why it is.
+ *
+ * @example
+ * const log: Array<{ proof: ServeProof | null; task: TaskExchange | null }> = [];
+ * const client = new Client({ name: 'consumer', version: '1' });
+ * await client.connect(new StreamableHTTPClientTransport(url, {
+ *   fetch: proofRecordingFetch(log),
+ * }));
+ * // … run the MCP session …
+ * for (const e of log) if (e.proof) {
+ *   const v = await session.verifyProof(e.proof, { task: e.task });
+ *   if (!v.ok || !v.taskMatches) throw new Error('unverified MCP exchange');
+ * }
+ */
+export function proofRecordingFetch(
+  log: Array<{ proof: ServeProof | null; task: TaskExchange | null }>,
+): typeof fetch {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    // A Request as input: clone it BEFORE fetch consumes its body, so the
+    // request bytes stay recoverable if the response turns out signed.
+    const reqClone = input instanceof Request && input.body ? input.clone() : null;
+    const response = await fetch(input, init);
+    // Record the task only when the response carries X-Agent-Proof: a
+    // signed response is always finite (the proxy buffers it whole), so
+    // awaiting the clone cannot hang; an unsigned/SSE response is returned
+    // immediately — awaiting its body would block the caller's stream.
+    const proof = proofFromResponse(response);
+    let task: TaskExchange | null = null;
+    if (proof) {
+      try {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        const method =
+          input instanceof Request && !init?.method ? input.method : normalizedMethod(init?.method);
+        let reqBytes: Uint8Array | string | null;
+        if (reqClone) {
+          reqBytes = await reqClone.arrayBuffer().then((b) => new Uint8Array(b));
+        } else {
+          reqBytes = requestBytesOf(init?.body);
+        }
+        if (reqBytes !== null) {
+          const cloned = response.clone();
+          const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
+          task = { method, url, requestBytes: reqBytes, responseBytes: respBytes, status: response.status };
+        }
+      } catch {
+        task = null;
+      }
+    }
+    log.push({ proof, task });
+    return response;
+  }) as typeof fetch;
+}
+
 /**
  * Build the TaskReveal(s) for an exchange you actually sent and received —
  * the input to `verifyProof(proof, { task })`'s per-exchange binding. The
@@ -101,50 +195,6 @@ export function proofFromResponse(res: { headers: { get(name: string): string | 
  * string/bytes and the raw response body (NOT a re-serialized JSON —
  * key order and whitespace change the hash).
  */
-/**
- * A fetch-compatible wrapper for generic MCP clients: every exchange it
- * performs is recorded (proof + task) into `log`, and the Response is
- * returned untouched, so an MCP SDK's streamable-HTTP transport accepts it
- * as its custom fetch. After the session, verify each entry with
- * `session.verifyProof(entry.proof, { task: entry.task })` — per-exchange
- * binding for MCP traffic without routing it through an AgentClient.
- *
- * @example
- * const log: RecordedExchange[] = [];
- * const mcp = new Client({…}, { streamableHttp: new StreamableHTTPClientTransport(url, {
- *   fetch: proofRecordingFetch(log),
- * }) });
- * // … run the MCP session …
- * for (const e of log) if (e.proof) {
- *   const v = await session.verifyProof(e.proof, { task: e.task! });
- *   if (!v.ok || !v.taskMatches) throw new Error('unverified MCP exchange');
- * }
- */
-export function proofRecordingFetch(
-  log: Array<{ proof: ServeProof | null; task: TaskExchange | null }>,
-): typeof fetch {
-  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-    const response = await fetch(input, init);
-    const proof = proofFromResponse(response);
-    let task: TaskExchange | null = null;
-    try {
-      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-      const method = (init?.method ?? 'GET').toUpperCase();
-      const reqBytes = typeof init?.body === 'string' ? init.body
-        : init?.body instanceof Uint8Array ? init.body
-        : init?.body instanceof ArrayBuffer ? new Uint8Array(init.body)
-        : '';
-      const cloned = response.clone();
-      const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
-      task = { method, url, requestBytes: reqBytes, responseBytes: respBytes, status: response.status };
-    } catch {
-      task = null;
-    }
-    log.push({ proof, task });
-    return response;
-  }) as typeof fetch;
-}
-
 export function taskRevealOf(exchange: TaskExchange): TaskReveal[] {
   const reqBytes = exchange.requestBytes ?? '';
   const reqBodyHash = keccak256(
@@ -339,12 +389,20 @@ export class ServeSession {
     // caller's own bytes and compare against the proof's commitment. With a
     // TaskExchange every URI candidate gets a reveal (undici drops a bare
     // trailing '?', browsers keep it — the proxy hashed one of the two).
+    // An EXPLICIT null is not "no task": the caller passed
+    // fetchWithProof's task and it wasn't recorded — fail closed rather
+    // than silently degrade to the signer-only verdict.
     let taskMatches: boolean | null = null;
-    if (opts?.task) {
-      const reveals = 'responseBytes' in opts.task ? taskRevealOf(opts.task) : [opts.task];
-      taskMatches = reveals.some((r) => taskHashOf(r) === proof.taskHash);
-      if (!taskMatches) {
-        reasons.push('taskHash does not match this exchange (method/uri/bodies/status)');
+    if (opts && 'task' in opts) {
+      if (opts.task == null) {
+        taskMatches = false;
+        reasons.push('task was passed but not recorded — cannot bind this exchange');
+      } else {
+        const reveals = 'responseBytes' in opts.task ? taskRevealOf(opts.task) : [opts.task];
+        taskMatches = reveals.some((r) => taskHashOf(r) === proof.taskHash);
+        if (!taskMatches) {
+          reasons.push('taskHash does not match this exchange (method/uri/bodies/status)');
+        }
       }
     }
 

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"compress/gzip"
 	"io"
 	"math/big"
 	"net/http"
@@ -194,5 +195,49 @@ func TestWriteServeProof_NoProofClearsStaleHeader(t *testing.T) {
 	}
 	if h := proofHeaders(rec); len(h) != 0 {
 		t.Fatalf("no-proof path left X-Agent-Proof %q", h)
+	}
+}
+
+// A backend that compresses must not break per-exchange verification: the
+// proxy drops the client's Accept-Encoding (Go's Transport then negotiates
+// and decompresses on its own), so the bytes the serve-proof's taskHash
+// covers equal the bytes delivered to the client. Forwarding the client's
+// header instead (the old behavior) pins Accept-Encoding explicitly — the
+// Transport skips its decompression, the hash covers the gzip bytes, and
+// every exchange with a compressing backend fails verifyProof's taskMatches.
+func TestProxy_CompressingBackendDeliversPlainBytes(t *testing.T) {
+	plain := []byte("the plain body the taskHash must cover")
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("X-Backend-Saw", "gzip")
+			gz := gzip.NewWriter(w)
+			_, _ = gz.Write(plain)
+			_ = gz.Close()
+			return
+		}
+		w.Header().Set("X-Backend-Saw", "identity")
+		_, _ = w.Write(plain)
+	}))
+	t.Cleanup(backend.Close)
+	s, _ := armedProxy(t, backend.URL, testValidator)
+	front := httptest.NewServer(http.HandlerFunc(s.handleProxy))
+	t.Cleanup(front.Close)
+
+	// undici/browsers send this; an explicitly-set Accept-Encoding makes Go's
+	// client skip its own decompression, so gzip bytes would surface as-is.
+	req, _ := http.NewRequest(http.MethodPost, front.URL+"/api/x", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.Header.Get("Content-Encoding") != "" {
+		t.Fatalf("Content-Encoding %q relayed to the client — the taskHash would cover compressed bytes", resp.Header.Get("Content-Encoding"))
+	}
+	if string(body) != string(plain) {
+		t.Fatalf("client got %q (%d bytes), want the plain body — a compressing backend breaks per-exchange verification otherwise", body[:min(20, len(body))], len(body))
 	}
 }

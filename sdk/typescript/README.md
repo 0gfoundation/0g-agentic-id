@@ -181,6 +181,9 @@ const { response, proof } = await agent.fetchWithProof('/api/summarize', {
 //    (fromAttestor fills it); registryMatches: false = none configured / a different one
 await ag.reputation.verifyProof(proof);
 // → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
+// pass { task } (the exchange fetchWithProof/taskRevealOf recorded) to also
+// get taskMatches — the proof bound to THIS response's bytes, not just the
+// signer; ok requires it. task: null (unrecorded) fails closed with ok: false.
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
@@ -272,8 +275,9 @@ const { hello, verification } = await ag.agent.sayHi(agentUrl);
 //   services: { path, method, description?, input_example?, transport? }   — proof-signed /api/* endpoints
 //   transport: "mcp" marks an MCP server endpoint (JSON-RPC over POST):
 //   mount `<base><path>` as a streamable-HTTP MCP server in any MCP client —
-//   every response carries X-Agent-Proof. Per-exchange verification: pass
-//   fetchWithProof's returned `task` to verifyProof({ task }) — the verdict's
+//   responses carry X-Agent-Proof (when the runtime has a serve-proof
+//   validator configured). Per-exchange verification: pass fetchWithProof's
+//   returned `task` to verifyProof(proof, { task }) — the verdict's
 //   `taskMatches` binds the proof to THIS response's bytes (see mcpServices'
 //   doc in AgentClient.ts). Also: the deploy console's copy-ready curl needs
 //   `Accept: application/json, text/event-stream` for MCP routes.

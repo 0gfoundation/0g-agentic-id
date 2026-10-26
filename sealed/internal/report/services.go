@@ -6,10 +6,13 @@ package report
 // listing and for callers to draft `curl` requests.
 //
 // The consuming counterpart is the SDK's AgentServiceEntry
-// (sdk/typescript/src/AgentClient.ts) — field names must stay identical
-// so the shape round-trips. (An earlier revision also matched an
-// attestor-side AgentService; that struct no longer exists — /hello is
-// consumed straight from the agent's proxy, the attestor never parses it.)
+// (sdk/typescript/src/AgentClient.ts) — the shared fields (path, method,
+// description, input_example, transport) must stay identical so the shape
+// round-trips; `skill` is proxy-side only (the SDK entry has no such field —
+// a consumer reads it from /hello directly). (An earlier revision also
+// matched an attestor-side AgentService; that struct no longer exists —
+// /hello is consumed straight from the agent's proxy, the attestor never
+// parses it.)
 //
 // Declarations no longer come from a per-framework file (the old
 // `~/.openclaw/services.json` + LoadServices). Agents register services

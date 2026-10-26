@@ -320,7 +320,11 @@ const data = await response.json();                   // your normal response bo
 //    state commit still redeems, so gate a rating on signerMatches && notExpired, as
 //    the CLI's `rate` does.
 await ag.reputation.verifyProof(proof);
-// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true, reasons: [] }
+// → { ok: true, signerMatches: true, notExpired: true, dataOnChain: true, registryMatches: true,
+//     taskMatches: null, reasons: [] }
+// signer attribution only. Pass { task } (what fetchWithProof recorded, or a
+// TaskReveal from taskRevealOf) to also get taskMatches — the proof bound to
+// THIS exchange's bytes; ok requires the match, and task: null fails closed.
 // registryMatches: false (signerMatches false too) = no VerifiedFeedbackRegistry is configured
 // ('no VerifiedFeedbackRegistry configured — cannot verify serve-proof') or the envelope names
 // another one ('proof signed for a different VerifiedFeedbackRegistry') — a configuration
@@ -664,7 +668,10 @@ if (me.phase === 'failed') await ag.agent.retry(me.sealId, { apiKey });
   ```ts
   const { hello, verification } = await ag.agent.sayHi(agentUrl);
   // hello → { agent, owner, public_url, message, services, routes }
-  // verification → { ok, signerMatches, notExpired, dataOnChain, registryMatches, reasons }
+  // verification → { ok, signerMatches, notExpired, dataOnChain, registryMatches, taskMatches, reasons }
+  // sayHi passes the /hello exchange as the task, so the services list it
+  // returns (transport included) is bound to the bytes you received, not
+  // just attributed to the signer.
   ```
 
   The card carries two declared surfaces:

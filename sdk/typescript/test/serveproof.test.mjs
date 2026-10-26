@@ -407,3 +407,230 @@ test('proofRecordingFetch records proof + task and passes the Response through',
     srv.close();
   }
 });
+
+// ── recording-side pins: the wrappers' `task` is the TRUE wire bytes ──
+// A proof is signed over bytes computed INDEPENDENTLY of the wrapper; the
+// wrapper's recorded task must reproduce that hash — pinning that the
+// recording reads what actually traveled, not a re-serialization.
+
+import { AgentApi } from '../dist/AgenticID.js';
+import { taskHashOf as thOf } from '../dist/taskHash.js';
+const { proofRecordingFetch } = await import('../dist/ServeSession.js');
+
+const MCP_RESP = '{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}';
+const MCP_REQ = '{"jsonrpc":"2.0","id":1,"method":"tools/list"}';
+
+function mcpHash(reqBody, respBody) {
+  return thOf({
+    method: 'POST', uri: '/api/mcp',
+    reqBodyHash: keccak256(toBytes(reqBody)),
+    respBodyHash: keccak256(toBytes(respBody)),
+    statusCode: 200,
+  });
+}
+
+/** Local server answering MCP-shaped POSTs with a proof-signed response
+ *  of the GIVEN body (default MCP_RESP). */
+function mcpServer(proof, body = MCP_RESP) {
+  const requests = [];
+  const server = nodeHttp.createServer((req, res) => {
+    let reqBody = '';
+    req.on('data', (d) => (reqBody += d));
+    req.on('end', () => {
+      requests.push(reqBody);
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        ...(proof ? { 'x-agent-proof': header(proof) } : {}),
+      });
+      res.end(body);
+    });
+  });
+  return {
+    server,
+    start: () => new Promise((r) => server.listen(0, '127.0.0.1', r)),
+    port: () => server.address().port,
+    requests,
+  };
+}
+
+test('proofRecordingFetch: the recorded task matches a proof over the REAL bytes', async () => {
+  const signed = await signServeProof(
+    proofParams({ taskHash: mcpHash(MCP_REQ, MCP_RESP) }), (h) => seal.sign({ hash: h }));
+  const s = mcpServer(signed);
+  await s.start();
+  try {
+    const log = [];
+    const rf = proofRecordingFetch(log);
+    const response = await rf(`http://127.0.0.1:${s.port()}/api/mcp`, {
+      method: 'POST', body: MCP_REQ,
+    });
+    assert.equal(await response.text(), MCP_RESP, 'Response passes through untouched');
+    // the recorded task must reproduce the proof's commitment
+    const { session } = mkSession(VFR);
+    const v = await session.verifyProof(log[0].proof, { task: log[0].task });
+    assert.equal(v.taskMatches, true, 'recorded bytes == proof bytes');
+    assert.equal(v.ok, true);
+    // the SWAPPED body: same proof, different response → no match
+    const s2 = mcpServer(signed, MCP_RESP.replace('"tools":[]', '"tools":["FAKE"]}'));
+    await s2.start();
+    try {
+      const log2 = [];
+      const r2 = await proofRecordingFetch(log2)(`http://127.0.0.1:${s2.port()}/api/mcp`, {
+        method: 'POST', body: MCP_REQ,
+      });
+      await r2.text();
+      const v2 = await session.verifyProof(log2[0].proof, { task: log2[0].task });
+      assert.equal(v2.signerMatches, true);
+      assert.equal(v2.taskMatches, false);
+      assert.equal(v2.ok, false);
+    } finally {
+      s2.server.close();
+    }
+  } finally {
+    s.server.close();
+  }
+});
+
+test('proofRecordingFetch: an UNSIGNED response is returned fast, task null, body unread', async () => {
+  const s = mcpServer(null); // no X-Agent-Proof → nothing to record
+  await s.start();
+  try {
+    const log = [];
+    const rf = proofRecordingFetch(log);
+    const response = await rf(`http://127.0.0.1:${s.port()}/api/mcp`, {
+      method: 'POST', body: MCP_REQ,
+    });
+    assert.equal(response.status, 200);
+    assert.equal(log.length, 1);
+    assert.equal(log[0].proof, null);
+    assert.equal(log[0].task, null, 'unsigned → task null (body never read)');
+    // and the caller still owns the body
+    assert.equal(await response.text(), MCP_RESP);
+  } finally {
+    s.server.close();
+  }
+});
+
+test('fetchWithProof (AgentClient): the recorded task matches the proof', async () => {
+  const signed = await signServeProof(
+    proofParams({ taskHash: mcpHash(MCP_REQ, MCP_RESP) }), (h) => seal.sign({ hash: h }));
+  const s = mcpServer(signed);
+  await s.start();
+  const base = `http://127.0.0.1:${s.port()}`;
+  const reads = [];
+  const api = new AgentApi({
+    addresses: { agenticID: AGENTIC_ID, verifiedFeedback: VFR },
+    publicClient: {
+      getChainId: async () => 16602,
+      readContract: async ({ functionName }) => {
+        reads.push(functionName);
+        if (functionName === 'getAgentSeal') return seal.address;
+        if (functionName === 'intelligentDatasOf') return [{ dataDescription: '{}', dataHash: DATA_HASH }];
+        throw new Error(`unstubbed read: ${functionName}`);
+      },
+    },
+  });
+  try {
+    const client = await api.client(base);
+    const { response, proof, task } = await client.fetchWithProof('/api/mcp', {
+      method: 'POST', body: MCP_REQ,
+    });
+    assert.ok(proof, 'proof captured');
+    assert.ok(task, 'task recorded');
+    assert.equal(await response.text(), MCP_RESP, "caller's own read still works");
+    const session = new (await import('../dist/ServeSession.js')).ServeSession(
+      {
+        addresses: { agenticID: AGENTIC_ID, verifiedFeedback: VFR },
+        publicClient: {
+          getChainId: async () => 16602,
+          readContract: async ({ functionName }) => {
+            if (functionName === 'getAgentSeal') return seal.address;
+            if (functionName === 'intelligentDatasOf') return [{ dataDescription: '{}', dataHash: DATA_HASH }];
+            throw new Error(`unstubbed read: ${functionName}`);
+          },
+        },
+      },
+      { now: () => NOW },
+    );
+    const v = await session.verifyProof(proof, { task });
+    assert.equal(v.taskMatches, true, 'fetchWithProof recorded the true bytes');
+    assert.equal(v.ok, true);
+  } finally {
+    s.server.close();
+  }
+});
+
+test('sayHi: the /hello verification binds to the content received', async () => {
+  // A proof committed to hello-body A: served with body A it verifies
+  // content-bound; served with body B (the swapped attack) taskMatches
+  // drops to false — the services list is no longer trusted from this call.
+  const helloA = JSON.stringify({
+    agent: seal.address, owner: seal.address, public_url: 'http://x/', message: 'A',
+    services: [{ path: '/api/mcp', method: 'POST', transport: 'mcp' }], routes: [],
+  });
+  const helloTrueHash = thOf({
+    method: 'GET', uri: '/hello',
+    reqBodyHash: keccak256(toBytes('')),
+    respBodyHash: keccak256(toBytes(helloA)),
+    statusCode: 200,
+  });
+
+  const ctx = {
+    addresses: { agenticID: AGENTIC_ID, verifiedFeedback: VFR },
+    publicClient: {
+      getChainId: async () => 16602,
+      readContract: async ({ functionName }) => {
+        if (functionName === 'getAgentSeal') return seal.address;
+        if (functionName === 'intelligentDatasOf') return [{ dataDescription: '{}', dataHash: DATA_HASH }];
+        throw new Error(`unstubbed read: ${functionName}`);
+      },
+    },
+  };
+  // sayHi builds its own ServeSession on this ctx with the REAL clock — so
+  // the proof here must be fresh (the fixed-NOW fixtures would be judged
+  // expired by 2026's clock).
+  const fresh = Math.floor(Date.now() / 1000);
+  const freshProof = await signServeProof(
+    proofParams({ taskHash: helloTrueHash, timestamp: fresh, deadline: fresh + 3600 }),
+    (h) => seal.sign({ hash: h }));
+  const mkHello = (body) => nodeHttp.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-agent-proof': header(freshProof) });
+    res.end(body);
+  });
+  const api = new AgentApi(ctx);
+
+  const good = mkHello(helloA);
+  await new Promise((r) => good.listen(0, '127.0.0.1', r));
+  try {
+    const { verification } = await api.sayHi(`http://127.0.0.1:${good.address().port}`);
+    assert.equal(verification.taskMatches, true, 'hello content is bound');
+    assert.equal(verification.ok, true);
+    assert.equal(verification.reasons.length, 0);
+  } finally {
+    good.close();
+  }
+  const swapped = mkHello(helloA.replace('"message":"A"', '"message":"SWAPPED"'));
+  await new Promise((r) => swapped.listen(0, '127.0.0.1', r));
+  try {
+    const { verification } = await api.sayHi(`http://127.0.0.1:${swapped.address().port}`);
+    assert.equal(verification.signerMatches, true, 'signature itself is genuine');
+    assert.equal(verification.taskMatches, false, 'but it committed to different /hello bytes');
+    assert.equal(verification.ok, false);
+  } finally {
+    swapped.close();
+  }
+});
+
+test('verifyProof: an explicit task: null fails closed, not signer-only', async () => {
+  const signed = await signServeProof(proofParams(), (h) => seal.sign({ hash: h }));
+  const { session } = mkSession(VFR);
+  // the shape fetchWithProof returns when the exchange wasn't recorded
+  const v = await session.verifyProof(signed, { task: null });
+  assert.equal(v.taskMatches, false);
+  assert.equal(v.ok, false);
+  assert.match(v.reasons.join('; '), /not recorded/);
+  // while NO task key at all keeps the signer-attribution meaning
+  const v2 = await session.verifyProof(signed);
+  assert.equal(v2.taskMatches, null);
+  assert.equal(v2.ok, true);
+});

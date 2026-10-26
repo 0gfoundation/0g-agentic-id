@@ -121,7 +121,7 @@ export function apply(ctx) {
             backend: { type: 'string', required: true, description: 'Loopback upstream, http://127.0.0.1:<port> — host:port only, no path.' },
             description: { type: 'string', description: 'One short sentence for /hello discovery.' },
             input_example: { type: 'string', description: 'Literal JSON body example, if the route takes one.' },
-            transport: { type: 'string', description: '"mcp" to mark the service as an MCP server endpoint (POST-only: the backend speaks MCP streamable HTTP — JSON-RPC over POST — so an MCP-capable client can mount this URL as an MCP server and the tools your backend implements become its tools; every response still carries X-Agent-Proof, attributing the exchange to this attested agent; keep it stateless and short — the proxy buffers whole responses). Omit for a plain HTTP endpoint.' },
+            transport: { type: 'string', description: '"mcp" to mark the service as an MCP server endpoint (POST-only: the backend speaks MCP streamable HTTP — JSON-RPC over POST — so an MCP-capable client can mount this URL as an MCP server and the tools your backend implements become its tools; responses carry X-Agent-Proof when the runtime has a serve-proof validator — see the runtime snapshot\'s "serve-proof validator" row — attributing the exchange to this attested agent; keep it stateless and short — the proxy buffers whole responses). Omit for a plain HTTP endpoint.' },
           },
         },
       },
