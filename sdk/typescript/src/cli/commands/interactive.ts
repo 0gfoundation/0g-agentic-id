@@ -134,14 +134,37 @@ export function hostOf(url?: string): string {
 
 /**
  * A failure meaning the SEAT was taken (occupancy.go): HTTP 409 with
- * 'displaced' or 'in use by another client' in the body, from any path —
- * the chat turn, /cancel, /result, /tasks. All of them route through the
- * same displaced-seat prompt instead of surfacing the raw error. Exported
- * for the tests: this is the routing decision (which errors are seat
- * events, not task errors).
+ * 'displaced' or 'in use by another client' in the body. The seat gates the
+ * chat turn and the seat-gated POSTs (cancelTask, /clear, /compact, the
+ * interrupt brake) — all of them route through the displaced-seat prompt
+ * instead of surfacing the raw error. The status-check GETs (task()) are
+ * ungated today, so their routing is defensive: if the gate ever widens,
+ * those paths still do the right thing. Exported for the tests: this is the
+ * routing decision (which errors are seat events, not task errors).
  */
 export function displacedFailure(failure: string): boolean {
   return /displaced|in use by another client/i.test(failure);
+}
+
+/**
+ * The shared catch for a gated-POST failure: displaced → the seat handler
+ * (which prompts and may reclaim); anything else → the caller's raw line.
+ * `leavesWhat` for these paths is "leaves the seat with the other client" —
+ * unlike the chat turn, declining does NOT close this window. Exported for
+ * the tests: every task-path catch routes through here, so the routing
+ * behavior is pinned in one place.
+ */
+export async function routeTaskFailure(
+  print: (line: string) => void,
+  seat: (failure: string, reclaimedHint: string, leavesWhat?: string) => Promise<'reclaimed' | 'left' | null>,
+  e: unknown,
+  rawLine: string,
+  seatHint: string,
+): Promise<'reclaimed' | 'left' | 'raw'> {
+  const d = await seat((e as Error)?.message ?? '', seatHint, 'leaves the seat with the other client');
+  if (d !== null) return d;
+  if (rawLine) print(rawLine);
+  return 'raw';
 }
 
 /**
@@ -1987,6 +2010,31 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
   advisoryWindowOpen = false;
   // Esc at the idle prompt = stop whatever this agent is doing server-side.
   // Throttled: hammering Esc must not queue N interrupts.
+  // Displaced seat (occupancy.go): WeChat semantics — this window bows
+  // out; Enter claims the seat back. Defined at session scope (the Esc brake
+  // below, the command dispatch, and the chat turn all share it). `leavesWhat`
+  // distinguishes the chat turn ("leaves the session" — it returns) from the
+  // task paths ("leaves the seat with the other client" — this window stays
+  // open, it just stops driving the agent).
+    const displacedSeat = async (
+      failure: string,
+      reclaimedHint: string,
+      leavesWhat = 'leaves the session',
+    ): Promise<'reclaimed' | 'left' | null> => {
+      if (!displacedFailure(failure)) return null;
+      out(`\n⚠ this agent is now driven by another client\n`);
+      const takeBack = (await ask(`press Enter to take the seat back (anything else ${leavesWhat}): `)).trim();
+      if (takeBack === '') {
+        try {
+          if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
+        } catch (e) {
+          out(`reclaim failed: ${(e as Error).message}\n`);
+        }
+      }
+      out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
+      return 'left';
+    };
+
   let lastBrake = 0;
   irq.brake = () => {
     const now = Date.now();
@@ -1996,7 +2044,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!c?.interrupt) { out('\n(this agent image has no interrupt endpoint — /reset is the only stop)\n'); return; }
     c.interrupt().then(
       (r) => out(r.aborted ? '\n⏹ stopped the running task\n' : '\n(nothing to stop, or: ' + (r.note ?? 'not supported') + ')\n'),
-      (e) => out(`\n(interrupt failed: ${(e as Error).message})\n`),
+      // the brake POST is seat-gated too — a displaced 409 gets the prompt
+      (e) => { void routeTaskFailure(out, displacedSeat, e, `\n(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt'); },
     );
   };
   // A friendly message that hides WHICH failure happened costs a whole
@@ -2029,27 +2078,6 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (line === '/back' || line === '/unuse') { out('← back to manager\n'); return; }
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
-
-    // Displaced seat (occupancy.go): WeChat semantics — this window bows
-    // out; Enter claims the seat back. A 409 'displaced' from ANY path
-    // means the same thing: another client drives the agent now. Defined
-    // before the command-dispatch try so the chat turn (which runs after
-    // that try/catch) and the task paths (/cancel, /result, /tasks — inside
-    // it) share it; those paths used to surface the raw HTTP 409 instead.
-    const displacedSeat = async (failure: string, reclaimedHint: string): Promise<'reclaimed' | 'left' | null> => {
-      if (!displacedFailure(failure)) return null;
-      out(`\n⚠ this agent is now driven by another client\n`);
-      const takeBack = (await ask('press Enter to take the seat back (anything else leaves the session): ')).trim();
-      if (takeBack === '') {
-        try {
-          if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
-        } catch (e) {
-          out(`reclaim failed: ${(e as Error).message}\n`);
-        }
-      }
-      out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
-      return 'left';
-    };
 
     try {
       if (line === '/hello') {
@@ -2158,6 +2186,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           messages.length = 0;
           out(`${r.note ?? 'conversation cleared'}\n`);
         } catch (e) {
+          // clear is a seat-gated POST — a displaced 409 is a seat event here too
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /clear') !== 'raw') continue;
           const msg = (e as Error).message;
           if (/HTTP 501/.test(msg)) { messages.length = 0; out('history is client-held for this framework — local history cleared\n'); }
           else out(`clear failed: ${msg}\n`);
@@ -2178,6 +2208,9 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const r = await s.ag.agent.compactConversation(s.url, BigInt(s.agentId), clientInstanceId);
           out(`${r.note ?? 'conversation compacted'}\n`);
         } catch (e) {
+          // compact is a seat-gated POST — a displaced 409 is a seat event;
+          // every other 409 (e.g. "compact refused") stays a compact error
+          if (await routeTaskFailure(out, displacedSeat, e, '', 'retry /compact') !== 'raw') continue;
           const msg = (e as Error).message;
           const status = Number(msg.match(/^compactConversation: HTTP (\d+):/)?.[1] ?? 0);
           const cause = (e as { cause?: { code?: string } }).cause?.code ?? '';
@@ -2260,8 +2293,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         let displacedFromTasks: string | null = null;
         const rows = await Promise.all(s.tasks.map(async (t) => {
           const snap = await s.client!.task!(t.id).catch((e: Error) => {
-            // A 409 displaced is a SEAT event, not a task error — route it
-            // to the same prompt the chat turn uses.
+            // DEFENSIVE: task() is an ungated GET today (the seat gates only
+            // POST /v1/*), so this leg cannot fire on current images — but if
+            // the gate ever widens, a 409 displaced is a seat event and routes
+            // to the same prompt instead of "unknown (evicted…)".
             if (displacedFailure(e.message ?? '')) displacedFromTasks = e.message;
             return null;
           });
@@ -2286,7 +2321,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           (s.tasks ??= []).push({ id, prompt: '(adopted by /result)', at: Date.now() });
         }
         const snap = await s.client.task(id).catch(async (e: Error) => {
-          // 409 displaced = seat event, not a task error — the shared prompt.
+          // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
           if ((await displacedSeat(e.message ?? '', `retry /result ${id}`)) !== null) return null;
           out(`(${e.message})\n`);
           return null;
@@ -2340,7 +2375,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               rows.push({ id: t.id, status: snap.status });
             } catch (e) {
               const msg = (e as Error).message ?? '';
-              // 409 displaced = seat event — same prompt as the chat turn.
+              // DEFENSIVE: ungated GET (see /tasks) — routed in case the gate widens
               if (displacedFailure(msg)) { displacedDuringCheck = msg; break; }
               if (msg.includes('HTTP 404')) rows.push({ id: t.id, status: 'unknown' });
               else unreachable.push(t.id);
@@ -2357,27 +2392,38 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           const inFlight = inFlightIds(rows);
           if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
           if (s.client?.cancelTask) {
+            let seatGone = false;
             for (const tid of inFlight) {
-              try {
-                const t = await s.client.cancelTask(tid);
-                out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
-              } catch (e) {
-                // 409 displaced = seat event — same prompt as the chat turn.
-                if ((await displacedSeat((e as Error).message ?? '', `retry /cancel ${tid}`)) !== null) break;
-                out(`(cancel ${tid} failed: ${(e as Error).message})\n`);
+              // Retry the SAME id after a reclaim — the 409 killed this
+              // cancel, not the task; every other in-flight id still needs
+              // its own brake.
+              for (;;) {
+                try {
+                  const t = await s.client.cancelTask(tid);
+                  out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+                  break;
+                } catch (e) {
+                  const d = await routeTaskFailure(out, displacedSeat, e, `(cancel ${tid} failed: ${(e as Error).message})\n`, `retry /cancel ${tid}`);
+                  if (d === 'reclaimed') continue; // seat is back — retry this id
+                  if (d === 'left') { out(`(cancel ${tid} skipped — the seat is held by another client)\n`); seatGone = true; }
+                  break;
+                }
               }
+              if (seatGone) break; // every further POST would 409 the same way
             }
             continue;
           }
         }
         if (id && s.client?.cancelTask) {
-          try {
-            const t = await s.client.cancelTask(id);
-            out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
-          } catch (e) {
-            // 409 displaced = seat event — same prompt as the chat turn.
-            if ((await displacedSeat((e as Error).message ?? '', `retry /cancel ${id}`)) === null) {
-              out(`(cancel failed: ${(e as Error).message})\n`);
+          for (;;) {
+            try {
+              const t = await s.client.cancelTask(id);
+              out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
+              break;
+            } catch (e) {
+              const d = await routeTaskFailure(out, displacedSeat, e, `(cancel failed: ${(e as Error).message})\n`, `retry /cancel ${id}`);
+              if (d === 'reclaimed') continue; // seat is back — retry
+              break;
             }
           }
           continue;
@@ -2395,7 +2441,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // Bare /cancel on an image without the task surface: same brake as
         // Esc at the idle prompt.
         if (!s.client?.interrupt) { out('(this agent image has no cancel path — /stop stops the whole container)\n'); continue; }
-        const r = await s.client.interrupt().catch((e) => { out(`(interrupt failed: ${(e as Error).message})\n`); return null; });
+        const r = await s.client.interrupt().catch(async (e) => {
+          // gated POST, same as the Esc brake
+          if (await routeTaskFailure(out, displacedSeat, e, `(interrupt failed: ${(e as Error).message})\n`, 'retry the interrupt') !== 'raw') return null;
+          return null;
+        });
         if (r) out(r.aborted ? '⏹ stopped the running turn\n' : `(nothing to stop, or: ${r.note ?? 'not supported'})\n`);
         continue;
       }
@@ -2565,7 +2615,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // still releases the Esc brake). Entering the session again claims the
       // seat back.
       if (failure) {
-        const d = await displacedSeat(failure, 'continue chatting');
+        const d = await displacedSeat(failure, 'continue chatting', 'leaves the session');
         if (d === 'reclaimed') continue;
         if (d === 'left') return;
       }

@@ -66,3 +66,51 @@ test('a mocked 409 displaced routes to the seat prompt on every path', () => {
   assert.equal(displacedFailure('cancelTask: HTTP 500: gateway broke'), false);
   assert.equal(displacedFailure(''), false);
 });
+
+// routeTaskFailure — the shared catch every seat-gated POST path routes
+// through (/cancel's cancelTask legs, /clear, /compact, both interrupt
+// brakes). Pinned with a mocked seat + print: a displaced 409 never reaches
+// the raw print, a plain error always does.
+import { routeTaskFailure } from '../dist/cli/commands/interactive.js';
+
+test('routeTaskFailure: displaced 409 → seat handler, never the raw line', async () => {
+  const printed = [];
+  const print = (l) => printed.push(l);
+  const seatCalls = [];
+  const seat = async (failure, hint, leavesWhat) => {
+    seatCalls.push({ failure, hint, leavesWhat });
+    return displacedFailure(failure) ? 'left' : null;
+  };
+  const d = await routeTaskFailure(print, seat,
+    new Error('cancelTask: HTTP 409: {"error":"displaced"}'),
+    '(cancel t1 failed: …)\n', 'retry /cancel t1');
+  assert.equal(d, 'left', 'the seat verdict propagates');
+  assert.equal(printed.length, 0, 'the raw line is NOT printed for a seat event');
+  assert.equal(seatCalls[0].leavesWhat, 'leaves the seat with the other client',
+    'task paths do not claim the session closes');
+});
+
+test('routeTaskFailure: reclaimed propagates — the caller retries the id', async () => {
+  const print = () => { throw new Error('must not print'); };
+  const seat = async () => 'reclaimed';
+  const d = await routeTaskFailure(print, seat, new Error('HTTP 409: in use by another client'), 'raw\n', 'hint');
+  assert.equal(d, 'reclaimed');
+});
+
+test('routeTaskFailure: a non-seat error prints the raw line and returns raw', async () => {
+  const printed = [];
+  const seat = async () => null; // not displaced — seat declines
+  const d = await routeTaskFailure((l) => printed.push(l), seat,
+    new Error('cancelTask: HTTP 409: {"error":"task already cancelled"}'),
+    '(cancel failed: task already cancelled)\n', 'hint');
+  assert.equal(d, 'raw');
+  assert.deepEqual(printed, ['(cancel failed: task already cancelled)\n']);
+});
+
+test('routeTaskFailure: an empty rawLine prints nothing (caller handles its own raw)', async () => {
+  const printed = [];
+  const seat = async () => null;
+  const d = await routeTaskFailure((l) => printed.push(l), seat, new Error('HTTP 500'), '', 'hint');
+  assert.equal(d, 'raw');
+  assert.equal(printed.length, 0);
+});
