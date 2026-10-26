@@ -756,13 +756,13 @@ export class AgentApi {
    * already-minted agent; reset only helps once the container stage is
    * reached.
    *
-   * This is the PUBLIC listing: the attestor now returns only non-sensitive
-   * fields for an unauthenticated GET (issue #64), so `owner`, `sandboxId` and
+   * This is the PUBLIC listing: the attestor returns only non-sensitive fields
+   * for an unauthenticated GET (issue #64), so `sandboxId` and
    * `lastProvisionError` come back **null** here. No tier carries the owner's
    * settings document — read it with {@link AgentApi.getSettings}, which is
-   * owner-signed. `agentId`/`sealId`/`phase`/
-   * `url`/`name` are still present, and `owner` and `agentSeal` appear for
-   * MINTED rows (both chain-public once the agent exists — ownerOf /
+   * owner-signed. `agentId`/`sealId`/`phase`/`url`/`name` are still
+   * present, and `owner` and `agentSeal` appear for MINTED rows (both
+   * chain-public once the agent exists — ownerOf /
    * getAgentSeal; unminted rows keep them withheld). `agentSeal` is the
    * agent's on-chain signing address: matching it against another row's
    * `owner` is how client code spots agent-owned agents (delegation

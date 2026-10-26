@@ -293,11 +293,14 @@ mod tests {
         // Same gate as `owner`: the agentSeal address is chain-public via
         // getAgentSeal once minted (#183-c4 — lets listings show agent-owned
         // agents without per-row chain reads); before mint nothing is on
-        // chain, so it is withheld.
+        // chain, so it is withheld. The VALUE is asserted, not just presence
+        // — `then_some(d.owner)` (a copy-paste of the owner line) would pass
+        // an is_some() check while leaking the wrong address.
         let minted = serde_json::to_value(PublicDeployment::from(row(true))).unwrap();
-        assert!(
-            minted.get("agent_seal_addr").is_some(),
-            "minted rows expose agent_seal_addr"
+        assert_eq!(
+            minted.get("agent_seal_addr").and_then(|v| v.as_str()),
+            Some(Address::from([1u8; 20]).to_string().as_str()),
+            "minted rows expose agent_seal_addr — the deployment's seal, not the owner"
         );
         let unminted = serde_json::to_value(PublicDeployment::from(row(false))).unwrap();
         assert!(

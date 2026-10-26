@@ -121,9 +121,9 @@ await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
-await ag.agent.listDeployments();             // public listing; owner/sandboxId/lastProvisionError come back null
+await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError }
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
 
 // settings — the owner's configuration document (which model the agent thinks

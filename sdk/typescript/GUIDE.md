@@ -566,8 +566,11 @@ await ag.agent.runtimeCosts(agentId);    // = estimateCosts + that agent's evolu
 `authenticate`/`connect`) resolve it on chain (`tokenURI` → the AgentCard's
 serve `url`). Reach for `listDeployments()` when you want the URL or `phase`
 explicitly. It's the **public** listing (needs `attestorUrl`, no wallet), so it
-returns only non-sensitive fields; `owner`, `sandboxId` and `lastProvisionError`
-come back **null**. To see those for your OWN agents (and the `sandboxId` you
+returns only non-sensitive fields; `sandboxId` and `lastProvisionError` come
+back **null** (`owner` and `agentSeal` are present on minted rows — both
+chain-public — which is what makes nesting visible: a child's `owner` matches
+its parent's `agentSeal`). To see the withheld fields for your OWN agents (and
+the `sandboxId` you
 pass to `stop`/`start`), use `listMyDeployments()`, which signs with your wallet:
 
 ```ts

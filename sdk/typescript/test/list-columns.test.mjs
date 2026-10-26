@@ -5,11 +5,17 @@
  *
  * Layers:
  *   1. mock attestor: human-mode table shape (headers, short forms, the
- *      annotation, case-folded matching)
- *   2. degradation: unminted rows and attestors predating agent_seal_addr
+ *      annotation, case-folded matching — BOTH directions: lowercase
+ *      owner→checksummed seal and checksummed owner→lowercase seal)
+ *   2. degradation: unminted rows render their sealId prefix in the AGENTID
+ *      cell (the F12 paste-back handle) and never mis-annotate; attestors
+ *      predating agent_seal_addr
  *   3. --phase: the annotation survives a filter that hides the parent
- *   4. --mine: owner tier — unminted own rows still carry agentSeal
+ *   4. --mine: owner tier — `WHERE owner = $1`: agent-owned children are
+ *      NEVER in your --mine response (nesting is only visible in the public
+ *      listing); unminted own rows still carry agentSeal
  *   5. --json: agentSeal as an additive, normalized (camelCase) row field
+ *   6. NAME sanitising: owner-controlled names cannot forge rows
  */
 
 import { test } from 'node:test';
@@ -20,6 +26,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { privateKeyToAccount } from 'viem/accounts';
 
 const MAIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli', 'main.js');
 
@@ -42,6 +49,12 @@ function run(args, env = {}) {
 
 // agent 466 (the parent) and its child 492 — addresses mirror the live
 // testnet delegation-hierarchy setup from #183-c4.
+/** Owner-tier wallet: the key the --mine tests sign with. list_by_owner is
+ *  `WHERE owner = $1` — the mock filters on this, so owner-tier fixtures
+ *  carry it as their owner. */
+const MINE_KEY = `0x${'11'.repeat(32)}`;
+const MY_WALLET = privateKeyToAccount(MINE_KEY).address;
+
 const PARENT_SEAL_ADDR = '0xa93265bD62D5B3316cd7FE54dCfcb7861bE29330'; // checksummed
 const PARENT_SEAL_LOWER = PARENT_SEAL_ADDR.toLowerCase(); // owner column of the child — case-fold test
 const HUMAN_OWNER = '0x2AB7F05bA6560ef2B21Aa1b52FCc96DB51Cfa0B3';
@@ -87,15 +100,42 @@ const LEGACY = {
  *  agent_seal_addr unconditionally (unlike the public tier's mint gate). */
 const OWN_UNMINTED = {
   seal_id: `0x${'ef'.repeat(32)}`,
+  owner: MY_WALLET,
   agent_seal_addr: `0x${'b7c8d9e0f1'.repeat(4)}`,
   framework: 'dsh',
   agent_card: {},
   phase: 'deploying',
   created_at: '2026-10-21T00:00:00Z',
 };
+/** Case-fold, the OTHER direction: owner in checksummed form while the map
+ *  key came from a lowercase agentSeal. If the lookup forgot its
+ *  .toLowerCase(), this row would silently degrade to a bare address. */
+const CHILD_CSUM = {
+  ...CHILD,
+  seal_id: `0x${'6f'.repeat(32)}`,
+  agent_id: '0x1ed', // 493
+  owner: PARENT_SEAL_ADDR, // checksummed this time
+  agent_card: { name: 'csum-owner-agent' },
+};
+/** Owner-controlled NAME trying to forge a table row: a newline that renders
+ *  a convincing second row, plus an ANSI clear-screen that hides the tail. */
+const EVIL = {
+  seal_id: `0x${'13'.repeat(32)}`,
+  agent_id: '0x210', // 528
+  owner: HUMAN_OWNER,
+  framework: 'dsh',
+  agent_card: { name: 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J' },
+  phase: 'running',
+  created_at: '2026-10-21T00:00:00Z',
+};
+/** PARENT as the owner tier serves it (owner = MY_WALLET for the filter). */
+const MINE_PARENT = { ...PARENT, owner: MY_WALLET };
 
 /** Minimal attestor double: /config + /deployments (public tier; owner tier
- *  when ownerRows is given and the request carries ?owner=). */
+ *  when ownerRows is given and the request carries ?owner=). The owner tier
+ *  filters like the real query (list_by_owner: WHERE owner = $1) — an
+ *  agent-owned child (owner = some agent's seal, not the wallet) is NEVER
+ *  in the response, so nesting is only visible in the public listing. */
 function mockAttestor(rows, ownerRows) {
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://x');
@@ -103,9 +143,14 @@ function mockAttestor(rows, ownerRows) {
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({ chain_rpc: `http://127.0.0.1:${server.address().port}/rpc` }));
     } else if (req.method === 'GET' && url.pathname === '/deployments') {
-      const ownerTier = url.searchParams.has('owner');
+      const ownerParam = url.searchParams.get('owner');
+      const ownerTier = ownerParam != null && ownerRows;
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify(ownerTier && ownerRows ? ownerRows : rows));
+      res.end(JSON.stringify(
+        ownerTier
+          ? ownerRows.filter((d) => (d.owner ?? '').toLowerCase() === ownerParam.toLowerCase())
+          : rows,
+      ));
     } else if (req.method === 'POST' && url.pathname === '/rpc') {
       let body = '';
       req.on('data', (d) => (body += d));
@@ -137,12 +182,15 @@ test('list human mode: AGENTSEAL/FRAMEWORK columns + nesting annotation', async 
       assert.match(header, new RegExp(col), `header carries ${col}`);
     }
     assert.doesNotMatch(header, /SEALID|URL/, 'no SEALID/URL columns in human mode');
+    // NAME is last (a long/unsanitised name cannot push the identity
+    // columns out of alignment — REPL convention)
+    assert.ok(header.indexOf('NAME') > header.indexOf('OWNER'), 'NAME is the last column');
     // the parent row: human wallet owner, own agentSeal, no annotation
-    assert.match(r.stdout, /wilbert\s+0xa932…9330\s+0x2AB7…a0B3\b/);
+    assert.match(r.stdout, /running\s+dsh\s+0xa932…9330\s+0x2AB7…a0B3\s+wilbert\b/);
     assert.doesNotMatch(r.stdout, /0x2AB7…a0B3 ⇄/);
     // the child row: owner is the parent's seal → explicit annotation,
     // case-folded match (child's owner is the lowercase variant)
-    assert.match(r.stdout, /selftest-agent\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\b/);
+    assert.match(r.stdout, /stopped\s+dsh\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
     // framework values render in their own column
     assert.match(r.stdout, /running\s+dsh/);
   } finally {
@@ -158,11 +206,13 @@ test('list human mode: unminted + legacy rows degrade to —, never mis-annotate
       AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}`,
     });
     assert.equal(r.code, 0);
-    // unminted: no on-chain identity yet — every identity column is —
-    assert.match(r.stdout, /deploying\s+—\s+—\s+—/);
+    // unminted: no on-chain identity, but the sealId PREFIX renders in the
+    // AGENTID cell (0x + 10 hex — the F12 paste-back handle; two unminted
+    // rows stay distinguishable, and the prefix resolves via sealPrefix)
+    assert.match(r.stdout, /0xababababab\s+deploying\s+—\s+—\s+—\s+—/);
     // legacy attestor (no agent_seal_addr): seal column —, owner still
     // shown (chain-public), but no annotation is possible
-    assert.match(r.stdout, /offline\s+openclaw\s+legacy-row\s+—\s+0x2AB7…a0B3\b/);
+    assert.match(r.stdout, /offline\s+openclaw\s+—\s+0x2AB7…a0B3\s+legacy-row\b/);
     assert.doesNotMatch(r.stdout, /⇄/);
   } finally {
     server.closeAllConnections?.();
@@ -181,7 +231,7 @@ test('list --phase: the annotation survives a filter that hides the parent', asy
     });
     assert.equal(r.code, 0);
     assert.doesNotMatch(r.stdout, /wilbert/, 'parent filtered out of view');
-    assert.match(r.stdout, /selftest-agent\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\b/);
+    assert.match(r.stdout, /stopped\s+dsh\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\s+selftest-agent\b/);
     assert.match(r.stdout, /1 deployment\(s\) \(phase=stopped\)/);
   } finally {
     server.closeAllConnections?.();
@@ -189,30 +239,37 @@ test('list --phase: the annotation survives a filter that hides the parent', asy
   }
 });
 
-test('list --mine: owner tier — unminted own rows show their seal; nesting annotates', async () => {
+test('list --mine: owner tier WHERE owner = $1 — own rows only; nesting is public-only', async () => {
   // The owner tier differs from the public tier in exactly the way the
   // normalizeDeploymentRow doc states: agent_seal_addr is carried
   // UNCONDITIONALLY (no mint gate) — an unminted own row still shows its
-  // future on-chain address, and the annotation map works there too.
+  // future on-chain address. But list_by_owner is `WHERE owner = $1`: an
+  // agent-owned child's owner is the agent's seal, not your wallet, so it
+  // is NEVER in your --mine response — nesting (parent/child in one view)
+  // is only visible in the PUBLIC listing. The mock filters the same way.
   const server = await mockAttestor(
-    [PARENT],
-    // owner-signed view of the same wallet: parent, agent-owned child, and
-    // an unminted own row that has no agentId but DOES carry agent_seal_addr
-    [PARENT, CHILD, OWN_UNMINTED],
+    [PARENT, CHILD],
+    // owner-signed view of this wallet: your parent, your unminted row —
+    // and the agent-owned child, which the WHERE clause must drop
+    [MINE_PARENT, CHILD, OWN_UNMINTED],
   );
   try {
     const r = await run(['list', '--mine'], {
       AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}`,
-      AGENTIC_PRIVATE_KEY: `0x${'11'.repeat(32)}`,
+      AGENTIC_PRIVATE_KEY: MINE_KEY,
     });
     assert.equal(r.code, 0);
     assert.match(r.stdout, /— owner tier/);
-    // unminted own row: AGENTID — but AGENTSEAL shows (owner tier carries it)
-    assert.match(r.stdout, /—\s+deploying\s+dsh\s+—\s+0xb7c8…e0f1\s+—/);
-    // the agent-owned child annotates in the owner tier too
-    assert.match(r.stdout, /selftest-agent\s+0xa1b2…d4e5\s+0xa932…9330 ⇄ #466\b/);
-    // 3 rows served, not just the public one
-    assert.match(r.stdout, /3 deployment\(s\)/);
+    // the agent-owned child is NOT here (WHERE owner = $1 drops it)
+    assert.doesNotMatch(r.stdout, /selftest-agent/, 'child owned by agent seal not in --mine');
+    assert.doesNotMatch(r.stdout, /⇄/, 'no nesting annotation possible in the owner tier');
+    // your own rows are: the minted parent + the unminted own row
+    assert.match(r.stdout, /running\s+dsh\s+0xa932…9330\s+0x[0-9a-fA-F]{4}…[0-9a-fA-F]{4}/);
+    // unminted own row: sealId prefix handle in AGENTID + AGENTSEAL shown
+    // (the owner tier carries agent_seal_addr unconditionally)
+    assert.match(r.stdout, /0xefefefefef\s+deploying\s+dsh\s+0xb7c8…e0f1\s+/);
+    // 2 rows served (parent + unminted), not 3 and not just the public one
+    assert.match(r.stdout, /2 deployment\(s\)/);
   } finally {
     server.closeAllConnections?.();
     server.close();
@@ -242,4 +299,58 @@ test('list --json: agentSeal is additive, normalized, null-safe', async () => {
     server.closeAllConnections?.();
     server.close();
   }
+});
+
+test('list human mode: case-fold match in the OTHER direction (checksummed owner)', async () => {
+  // The map key came from a LOWERCASE agentSeal; the child's owner is the
+  // CHECKSUMMED form. A lookup that forgot its own .toLowerCase() would
+  // silently degrade this row to a bare address that reads as a wallet.
+  const server = await mockAttestor([PARENT, CHILD_CSUM]);
+  try {
+    const r = await run(['list'], {
+      AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}`,
+    });
+    assert.equal(r.code, 0);
+    assert.match(r.stdout, /0xa932…9330 ⇄ #466\s+csum-owner-agent\b/);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test('list human mode: owner-controlled NAME cannot forge rows', async () => {
+  // EVIL's name embeds a full fake row ("466   stopped  dsh  …") after a
+  // newline, plus an ANSI clear-screen. With C0/C1 stripped and the cell
+  // truncated, the fake row must NOT render: no stdout line starts with
+  // the forged pattern, and the table still has exactly one row per record.
+  const server = await mockAttestor([PARENT, EVIL]);
+  try {
+    const r = await run(['list'], {
+      AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}`,
+    });
+    assert.equal(r.code, 0);
+    // the forged row (agentId 466 + stopped) never begins a line
+    assert.doesNotMatch(r.stdout, /(^|\n)466\s+stopped/, 'no forged table row');
+    // no ANSI escape survives into the output
+    assert.doesNotMatch(r.stdout, /\u001b\[/, 'ANSI sequences stripped');
+    // the evil row itself renders as ONE line: 2 data rows + header + footer
+    const lines = r.stdout.split('\n').filter((l) => l.trim());
+    assert.ok(lines.some((l) => /^528\s+running/.test(l)), 'EVIL row present, single line');
+    assert.equal(lines.length, 4, 'header + 2 rows + count footer');
+    // and the truncated name keeps the ellipsis marker
+    assert.match(r.stdout, /nice466.*…/);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test('unminted sealId prefix shown by list resolves as a paste-back ref', async () => {
+  // F12 end-to-end: what human-mode list prints for an unminted row (the
+  // 0x+10-hex prefix in the AGENTID cell) must be accepted by parseAgentRef
+  // as a sealPrefix — the handle is not decorative.
+  const { parseAgentRef } = await import('../dist/cli/ref.js');
+  const ref = parseAgentRef('0xababababab');
+  assert.equal(ref.kind, 'sealPrefix');
+  assert.equal(ref.prefix, '0xababababab');
 });

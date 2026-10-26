@@ -9,8 +9,11 @@
  * JSON mode: `data` IS the row array (empty list → `[]`, exit 0 — not an
  * error) and carries the FULL row (sealId, url, sandboxId, framework, whole
  * addresses, …). Human mode is the glance: the columns that identify a row
- * and expose nesting — sealId (the paste-back ref, and the only handle for
- * unminted rows) lives in --json.
+ * and expose nesting. Unminted rows render their sealId prefix in the
+ * AGENTID cell (`0x` + 10 hex, the paste-back form the sealPrefix ref
+ * resolves — an unminted row has no agentId, so the prefix is its only
+ * handle); NAME is last and sanitized (owner-controlled JSON cannot forge
+ * the table).
  *
  * Nesting visibility (follow-up to #187 / #183-c4): the AGENTSEAL and OWNER
  * columns use the same short form, so an agent-owned agent is visible at a
@@ -77,16 +80,37 @@ export async function run(ctx: CommandContext): Promise<void> {
     const agentId = sealToAgent.get(owner.toLowerCase());
     return agentId ? `${shortAddr(owner)} ⇄ #${agentId}` : shortAddr(owner);
   };
-  const cell = (v: unknown, w: number): string =>
-    (v === null || v === undefined ? '—' : String(v)).padEnd(w);
+  // Untrusted cells (NAME is owner-controlled JSON; PHASE/FRAMEWORK come from
+  // the attestor) must not be able to forge the table: strip C0/C1 controls
+  // and ESC sequences (a `\n` renders a convincing fake row, ANSI can hide
+  // the tail), and truncate to the column width - 1 with an ellipsis so a
+  // long name cannot run into the next column.
+  const clean = (v: unknown): string =>
+    String(v ?? '')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+      .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
+  const cell = (v: unknown, w: number): string => {
+    if (v === null || v === undefined) return '—'.padEnd(w);
+    const t = clean(v);
+    return (t.length >= w ? `${t.slice(0, Math.max(0, w - 2))}…` : t).padEnd(w);
+  };
+  // An unminted row has no agentId, owner, agentSeal or name — its sealId
+  // prefix is the only handle (F12: paste it back into any command; the
+  // sealPrefix ref resolves it uniquely). Render it in the AGENTID cell so
+  // two unminted rows stay distinguishable in human mode.
+  const idCell = (r: { agentId: bigint | number | null; sealId: string }): string => {
+    if (r.agentId != null) return cell(r.agentId, 13);
+    return cell(`0x${r.sealId.slice(2, 12)}`, 13);
+  };
   print(
-    `${'AGENTID'.padEnd(9)}${'PHASE'.padEnd(11)}${'FRAMEWORK'.padEnd(12)}` +
-      `${'NAME'.padEnd(19)}${'AGENTSEAL'.padEnd(13)}OWNER`,
+    `${'AGENTID'.padEnd(13)}${'PHASE'.padEnd(11)}${'FRAMEWORK'.padEnd(12)}` +
+      `${'AGENTSEAL'.padEnd(13)}${'OWNER'.padEnd(21)}NAME`,
   );
   for (const r of rows) {
     print(
-      `${cell(r.agentId, 9)}${cell(r.phase, 11)}${cell(r.framework, 12)}` +
-        `${cell(r.name, 19)}${cell(shortAddr(r.agentSeal), 13)}${ownerCell(r.owner)}`,
+      `${idCell(r)}${cell(r.phase, 11)}${cell(r.framework, 12)}` +
+        `${cell(shortAddr(r.agentSeal), 13)}${cell(ownerCell(r.owner), 21)}${cell(r.name, 19)}`,
     );
   }
   print('');
