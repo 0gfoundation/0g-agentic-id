@@ -401,12 +401,19 @@ test('list: a 6-digit agentId owner annotation is not truncated into another id'
 
 test('cellText: emoji and format characters survive truncation correctly', async () => {
   const { cellText, cleanCell } = await import('../dist/cli/commands/cells.js');
-  // truncation slices CODE POINTS: an emoji is 2 UTF-16 units, slicing there
-  // would print U+FFFD
-  const emoji = 'a😀b😀c😀d😀e';
-  const cut = cellText(emoji, 8);
-  assert.ok(!cut.includes('\uFFFD'), `no replacement char in ${JSON.stringify(cut)}`);
-  assert.ok(cut.endsWith('…'), 'truncated with ellipsis');
+  // truncation slices CODE POINTS. UTF-16 slicing at a surrogate pair leaves
+  // a LONE SURROGATE (not U+FFFD — that only appears on later re-encoding),
+  // so the assertion must look for the surrogate itself. w=5 puts the cut
+  // exactly between the high and low half of 😀 (old code sliced
+  // 'ab😀cdef'.slice(0, 3) = 'ab' + a dangling high surrogate).
+  const cut = cellText('ab😀cdef', 5);
+  assert.ok(!/(?:^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]|[\uD800-\uDBFF](?:[^\uDC00-\uDFFF]|$)/.test(cut),
+    `no lone surrogate in ${JSON.stringify(cut)}`);
+  assert.equal(cut.trimEnd(), 'ab😀…', 'the emoji survives whole, cut after it');
+  assert.equal(cut.length, 5, 'padded to the column width — no gluing');
+  // a truncated ASCII cell pads too: 'abc…' alone is 4 wide; without the
+  // padEnd the next column would glue on
+  assert.equal(cellText('abcdefghij', 5), 'abc… ', 'truncated cells keep their padding');
   // \p{Cf} (zero-width, bidi marks) removed outright — invisible but they
   // reorder/group the visible text
   assert.equal(cleanCell('a\u200Fb\u200Dc'), 'abc', 'bidi RLM + ZWJ stripped');
@@ -414,15 +421,95 @@ test('cellText: emoji and format characters survive truncation correctly', async
   assert.equal(cleanCell('a\u001b[31mRED\u001b[0mb'), 'aREDb', 'CSI bodies removed, text intact');
   assert.equal(cleanCell('x\u001b]8;;http://evil.example\u001b\\y'), 'xy', 'OSC-8 hyperlink removed entirely');
   assert.equal(cleanCell('a\u009b2Jb'), 'ab', 'C1 CSI (0x9b) removed');
+  // ECMA-48 exotic forms — a simple [final=A-Za-z] regex would print these
+  assert.equal(cleanCell('a\u001b[1 qb'), 'ab', 'CSI with space intermediate');
+  assert.equal(cleanCell('a\u001b[2~b'), 'ab', 'CSI with ~ final');
+  assert.equal(cleanCell('a\u001b[38:5:196mb'), 'ab', 'colon-separated SGR');
+  assert.equal(cleanCell('a\u001bP1;2q\u001b\\b'), 'ab', 'DCS string');
+  assert.equal(cleanCell('a\u001b^alerty\u009cb'), 'ab', 'PM/APC ended by C1 ST (0x9c)');
+  assert.equal(cleanCell('x\u001b]8;;http://evil\u009cy'), 'xy', 'OSC ended by C1 ST (0x9c)');
 });
 
-test('REPL listing sanitizes NAME through the same helper', async () => {
-  // The REPL's own list must not forge rows either — the shared cleanCell is
-  // what stands between a name and the terminal.
-  const { cleanCell } = await import('../dist/cli/commands/cells.js');
-  const evilName = 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J';
-  const rendered = cleanCell(evilName);
-  assert.doesNotMatch(rendered, /\n/, 'no row break');
-  assert.doesNotMatch(rendered, /2J/, 'no clear-screen body');
-  assert.match(rendered, /nice 466/, 'newline became a space');
+test('REPL listing row: NAME goes through the row renderer the loop uses', async () => {
+  // The REPL's own list must not forge rows either — this drives the ACTUAL
+  // exported row renderer (the same one the interactive loop calls), not
+  // just the shared helper underneath it.
+  const { renderListRow } = await import('../dist/cli/commands/interactive.js');
+  const evil = { agentId: 528, phase: 'running', sealId: `0x${'13'.repeat(32)}`, name: 'nice\n466   stopped  dsh  — — — FORGED-ROW\u001b[2J', owned: ' ' };
+  const line = renderListRow(evil, null);
+  // the row is ONE line: only the trailing newline, none in the middle
+  assert.doesNotMatch(line.slice(0, -1), /\n/, 'no row break in the middle');
+  assert.doesNotMatch(line, /2J/, 'no clear-screen body');
+  assert.match(line, /nice 466/, 'newline became a space');
+  assert.match(line, /^  528 /, 'agentId column intact');
+});
+
+test('list: the OWNER cell is sanitized even though it never truncates', async () => {
+  // trustedCell pads without truncating (the ⇄ annotation is ours), but the
+  // ADDRESS half is attestor-supplied — a malicious attestor or a MITM on
+  // plain-http ATTESTOR_URL can put ESC bytes or a newline in it.
+  const DIRTY_OWNER = {
+    seal_id: `0x${'91'.repeat(32)}`,
+    agent_id: '0x210', // 528
+    // clear-screen + newline + hidden-text ESCs in the MIDDLE; the visible
+    // address halves at the ends (shortAddr keeps first-6/last-4 raw chars)
+    owner: '0xAAA\u001b[2J\n\u001b[8mBBBB',
+    agent_seal_addr: PARENT_SEAL_ADDR,
+    framework: 'dsh',
+    agent_card: { name: 'dirty-owner-row' },
+    phase: 'running',
+    created_at: '2026-10-21T00:00:00Z',
+  };
+  const server = await mockAttestor([DIRTY_OWNER]);
+  try {
+    const r = await run(['list'], { AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}` });
+    assert.equal(r.code, 0);
+    const line = r.stdout.split('\n').find((l) => /dirty-owner-row/.test(l));
+    assert.ok(line, 'row present');
+    assert.doesNotMatch(line, /2J/, 'no clear-screen in the OWNER cell');
+    assert.doesNotMatch(line, /\u001b/, 'no ESC bytes in the OWNER cell');
+    assert.doesNotMatch(line.slice(0, -1), /\n/, 'the row is one line');
+    assert.match(line, /0xAAA…BBBB/, 'the address text survives, the ESC payload does not');
+    // cleanCell turned the embedded newline into a space, not a row break
+    assert.match(line, /dirty-owner-row\s*$/, 'NAME still ends the row');
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test('trustedCell: a full-width cell leaves a separator before NAME', async () => {
+  // At exactly the column width the next column must not glue on — the
+  // 24-char OWNER (a 9-digit agentId annotation) still ends with a space.
+  const NINE = {
+    seal_id: `0x${'92'.repeat(32)}`,
+    agent_id: '0x3b9ac9ff', // 999999999 — 9-digit agentId
+    owner: HUMAN_OWNER,
+    agent_seal_addr: PARENT_SEAL_ADDR,
+    framework: 'dsh',
+    agent_card: { name: 'nine' },
+    phase: 'running',
+    created_at: '2026-10-21T00:00:00Z',
+  };
+  const NINE_CHILD = {
+    seal_id: `0x${'93'.repeat(32)}`,
+    agent_id: '0x3b9aca00',
+    owner: PARENT_SEAL_ADDR, // ⇄ #999999999 — 22 chars + full-width test
+    framework: 'dsh',
+    agent_card: { name: 'nine-child' },
+    phase: 'running',
+    created_at: '2026-10-21T00:00:00Z',
+  };
+  const server = await mockAttestor([NINE, NINE_CHILD]);
+  try {
+    const r = await run(['list'], { AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}` });
+    assert.equal(r.code, 0);
+    const line = r.stdout.split('\n').find((l) => /nine-child/.test(l));
+    assert.ok(line, 'child row present');
+    assert.match(line, /⇄ #999999999/, 'the 9-digit annotation survives whole');
+    assert.match(line, /⇄ #999999999 nine-child/, 'a space separates OWNER from NAME — no gluing');
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
 });

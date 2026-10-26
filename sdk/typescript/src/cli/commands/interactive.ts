@@ -244,6 +244,22 @@ let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
 import { cleanCell } from './cells';
 
+/**
+ * One row of the REPL's agent listing. Exported for the tests: this IS the
+ * renderer the interactive loop prints — NAME goes through cleanCell (./cells),
+ * so a name cannot forge rows in this listing either, same as `list`.
+ * Everyone gets the seal PREFIX short form — commands accept a unique prefix,
+ * so unminted rows stay referenceable without a 66-char column blowout (F12).
+ */
+export function renderListRow(
+  r: { agentId: bigint | number | null; phase?: string | null; sealId: string; name?: string | null },
+  owner: string | null | undefined,
+  owned = ' ',
+): string {
+  const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
+  return `${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${(owner ?? '').padEnd(13)} ${cleanCell(r.name)}\n`;
+}
+
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
 
 /** Build a container URL from a sandbox id + proxy host, matching the
@@ -923,14 +939,8 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
         for (const r of shown) {
           const owned = mine?.has(r.sealId) ? '*' : ' ';
-          // Everyone gets the short form — commands accept a unique sealId
-          // PREFIX, so unminted rows ('?') stay referenceable without a
-          // 66-char column blowout. (feedback.md F12)
-          const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
           const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
-          // NAME through the shared sanitizer (./cells): the REPL listing and
-          // `list` must both refuse a name that forges rows.
-          out(`${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${owner.padEnd(13)} ${cleanCell(r.name)}\n`);
+          out(renderListRow(r, owner, owned));
         }
         if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
         if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');

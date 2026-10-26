@@ -27,10 +27,16 @@
 /** The sanitized text of a cell — no truncation, no padding. */
 export function cleanCell(v: unknown): string {
   return String(v ?? '')
-    // 1. sequence bodies (ESC-anchored) — must run before control stripping
-    .replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '') // CSI: colors, cursor moves, [2J
-    .replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)?/g, '') // OSC: 8;;hyperlinks
-    .replace(/\u009b[0-9;?]*[A-Za-z]/g, '') // C1 CSI (0x9b): 7-bit terminals' CSI
+    // 1. sequence bodies (ESC-anchored) — must run before control stripping.
+    // ECMA-48 classes, so exotic forms don't print as text:
+    //   CSI: (ESC [ | 0x9b) params [0-?]* intermediates [ -/]* final [@-~]
+    //         — covers [1 q (space intermediate), [2~ (~ final), [38:5:196m
+    //   OSC: ESC ] … terminated by BEL, ST (ESC \) or C1 ST (0x9c)
+    //   DCS/APC/PM/SOS: ESC P/X/^/_ … terminated by ST or C1 ST
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u009b[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001b\][^\u0007\u001b\u009c]*(?:\u0007|\u001b\\|\u009c)?/g, '')
+    .replace(/\u001b[PX^_][^\u001b\u009c]*(?:\u001b\\|\u009c)?/g, '')
     // 2. line breaks become a space (visible, but cannot forge a row)
     .replace(/[\n\r\u2028\u2029]/g, ' ')
     // eslint-disable-next-line no-control-regex
@@ -48,6 +54,8 @@ export function cellText(v: unknown, w: number): string {
   if (v === null || v === undefined) return '—'.padEnd(w);
   const t = cleanCell(v);
   const cps = [...t];
-  if (cps.length >= w) return `${cps.slice(0, Math.max(0, w - 2)).join('')}…`;
+  // padEnd on the truncated form too — without it a truncated cell is w-1
+  // wide and the next column glues on.
+  if (cps.length >= w) return `${cps.slice(0, Math.max(0, w - 2)).join('')}…`.padEnd(w);
   return t.padEnd(w);
 }

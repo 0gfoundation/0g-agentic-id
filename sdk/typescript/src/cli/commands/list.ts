@@ -28,7 +28,7 @@
  */
 
 import { buildClient } from '../sdk';
-import { cellText } from './cells';
+import { cellText, cleanCell } from './cells';
 import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
@@ -83,10 +83,13 @@ export async function run(ctx: CommandContext): Promise<void> {
     const agentId = sealToAgent.get(owner.toLowerCase());
     return agentId ? `${shortAddr(owner)} ⇄ #${agentId}` : shortAddr(owner);
   };
-  // ownerCell is built ONLY from trusted short forms (our shortAddr + the
-  // agentId from our own map) — it pads but never truncates: a 6-digit
-  // agentId's `⇄ #123456` annotation must not read as agent #1234.
-  const trustedCell = (t: string, w: number): string => (t.length >= w ? t : t.padEnd(w));
+  // The ANNOTATION is trusted (our shortAddr + the agentId from our own
+  // map) so it pads but never truncates — a 6-digit agentId's `⇄ #123456`
+  // must not read as agent #1234. The ADDRESS part is attestor-supplied
+  // (a malicious attestor, or a MITM on plain-http ATTESTOR_URL, can put
+  // ESC bytes in it), so the cell is still cleaned — just not truncated.
+  // At full width a space separator keeps NAME from gluing on.
+  const trustedCell = (t: string, w: number): string => `${cleanCell(t)} `.padEnd(w);
   // Sanitising lives in ./cells (shared with the REPL's listing — a name
   // must not be able to forge a row in either): sequence bodies stripped
   // before control bytes, newlines → space, code-point truncation.
