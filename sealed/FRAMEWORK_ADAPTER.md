@@ -100,7 +100,10 @@ components hold only the interface (or a narrow subset of it) and need
   prime-agent HTTP bridge both work this way), so its measurement rides the
   sealed image hash. Supporting a new framework in an ecosystem we already
   carry does not require a new image, just (optionally) one more warm-cache
-  line; a new ecosystem does.
+  line; a new ecosystem does. That is the design intent; what ships today
+  differs: openclaw runs on `sealed/Dockerfile` (FROM the
+  `images/openclaw/` base), dsh, also node, has its own `images/dsh/`, and
+  `images/sealed/` builds no image that ships.
 
 - **The owner's configuration is core-owned end to end but the last
   step.** attestor stores the owner's settings document as an opaque blob
@@ -450,6 +453,12 @@ value (`settings/settings.go` package doc).
 | `s.Endpoint` (`*inference.Endpoint`) | non-nil **only** when the platform routes this model; nil for a framework built-in, which brings its own wiring |
 | `s.APIKey` | this boot's inference credential; arrives by env (`API_KEY`, or opened from `SEAL_SECRET_ENV` before any adapter runs), is never part of the document, is never persisted |
 
+Provider definitions come from the signed platform registry;
+`internal/inference/providers.json` is the built-in seed. Runtime renders
+use `ResolveForRegistry` and must handle its error before touching configuration.
+Do not substitute endpoints or keys from compute for another managed provider.
+See [provider extension and image rollout](../sdk/typescript/PROVIDERS.md).
+
 The Facts/Endpoint split is load-bearing, and it is why a native provider now
 still gets a reasoning bound. The two used to share one struct behind a single
 `provider == "0g-compute"` check, so picking a native provider silently
@@ -579,7 +588,7 @@ re-point inference (`hermes/spawn.go:53-60`).
   single call site all three paths share, "so none can be added later without
   it" (`manager/manager.go:224-231`). A `PreStart` error aborts that start
   exactly like a `Start` error. `main.go` points the hook at
-  `adapter.RenderSettings(ctx, settings.Resolve(ctx, live.get(), apiKey))`, so
+  `adapter.RenderSettings(ctx, settings.ResolveForRegistry(ctx, live.get(), credential, registry))`, so
   `Resolve` re-runs too and the endpoint, budget and reasoning flags come from
   the live catalog each time.
 
@@ -725,7 +734,7 @@ boot (Phase 3 of main.go):
                                        stale role
   seed #1: EvolutionFor(role) ∀ roles  → currentSnapshot (pre-Start)
   manager.Start:
-    PreStart → RenderSettings(settings.Resolve(doc, apiKey))
+    PreStart → RenderSettings(settings.ResolveForRegistry(ctx, doc, credential, registry))
     Start(ctx, RuntimeContext)         spawn; return once upstream listens
     MonitorExit(cb)                    arm death watcher
     Liveness(ctx) every 5s             probe loop begins
@@ -767,6 +776,7 @@ fallback.
 | `SealSignSock` | `/run/seal-sign.sock` | the agent-only sign endpoint (§8); tell your agent where it is |
 | `AgentSeal` | 0x address derived from `agent_seal_priv` | the agent's TEE identity address |
 | `AgentID`, `Owner`, `ChainRPC`, `ContractAddr`, `ChainID`, `AttestorURL` | chain bootstrap outputs | public on-chain facts, not secrets; inject into the agent's context so it can reason about its own identity |
+| `VerifiedFeedbackAddr` | VerifiedFeedbackRegistry proxy from `VERIFIED_FEEDBACK_ADDR`; empty when that is unset, malformed or zero, or its `getIdentityRegistry()` is not `AGENTIC_ID_ADDR` | the serve-proof validator (EIP-191 version `0x00`). sealed signs with it itself — the adapter need not act on it; empty ⇒ no `X-Agent-Proof` on any route |
 | `SealedVersion` | sealed binary git hash | for proof/metadata surfaces |
 | `FrameworkHash` | `"0x"+sha256` of the sealed image | the AgenticID Framework code hash signed into serve-proofs |
 
@@ -797,11 +807,19 @@ must be stripped back out of `EvolutionFor` output.
 
 You get these for free; design your framework's surface assuming them:
 
-- **`:8080` signed reverse proxy** — every response (except health/log
-  endpoints) is wrapped with an `X-Agent-Proof` header: an EIP-191
-  signature by `agent_seal_priv` over a canonical envelope that includes
-  each role's `content_hash` + `data_hash`. Your upstream serves plain
-  HTTP on localhost; WebSocket upgrades pass through unsigned.
+- **`:8080` signed reverse proxy** — responses on the signed routes (the
+  runtime's own endpoints such as `/hello`, and the agent-registered `/api/*`
+  services) carry an `X-Agent-Proof` header: a signature by
+  `agent_seal_priv` under EIP-191 version `0x00`, bound to the
+  VerifiedFeedbackRegistry (`VERIFIED_FEEDBACK_ADDR`), over a ServeProof.
+  Your framework-declared routes (chat/UI), health/log endpoints and
+  WebSocket upgrades stay unsigned. The envelope is flat: `agent_id`,
+  `submitter`, `timestamp`, `deadline`, `task_hash`, a `data_hashes` list
+  of on-chain storage roots, `framework_hash`, and a diagnostics-only
+  `validator`. It carries no `content_hash`, which stays internal to drift
+  detection. Without a usable `VERIFIED_FEEDBACK_ADDR` (set, and anchored to
+  `AGENTIC_ID_ADDR` on chain) no header is emitted. Your
+  upstream serves plain HTTP on localhost.
 - **`GET /hello`** — signed self-introduction: agent identity, current
   `data_hashes`, `public_url`, and the agent-declared service list (built
   from sealed's service registry — agents register via
@@ -810,10 +828,18 @@ You get these for free; design your framework's surface assuming them:
 - **`unix:///run/seal-sign.sock`** — `POST /sign/personal_sign`,
   `/sign/typed_data`, `/sign/transaction`; container-local only. This is
   how the agent signs as its AgentSeal identity without ever holding the
-  key. The socket is pure transport — *refusal policy lives in the
-  agent's doctrine* (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md)); your
-  adapter should install an equivalent of openclaw's SOUL rules so
-  externally-prompted sign requests get refused.
+  key. The socket enforces one invariant itself: it signs only
+  `0x19 0x45` personal messages, `0x19 0x01` EIP-712 digests and
+  transactions it builds from fields, and never a raw hash or EIP-191
+  version `0x00` data (the serve-proof's domain; see
+  [TRUST_MODEL.md](TRUST_MODEL.md)). Beyond that, *refusal policy lives
+  in the agent's doctrine* (see [AGENT_DOCTRINE.md](AGENT_DOCTRINE.md));
+  your adapter should install an equivalent of openclaw's SOUL rules so
+  externally-prompted sign requests get refused. If your adapter
+  bridges the socket into an agent tool (as dsh's `seal_sign` does), it
+  must forward only to these endpoints and must **never** add a
+  raw-hash or `0x00` signing path. Either one would let the agent forge
+  serve-proofs.
 - **`/log`, `/log.html`, `/log/agent`(`.html`)** — live bootstrap and
   subprocess logs. Pipe your framework's stdout/stderr to a file and
   implement `framework.SubprocessLogProvider` to light up the subprocess
@@ -1275,7 +1301,9 @@ parts of it:
     claudecode bridge is `go:embed`ded, and the attestor allowlist
     carries a single hash. Net effect: attestor is fully
     framework-agnostic — its only remaining framework knowledge is a
-    list of opaque names.
+    list of opaque names. (Since then hermes, prime and dsh have shipped
+    images of their own, and openclaw ships from `sealed/Dockerfile`;
+    `images/sealed/` builds no image that ships.)
 18. Finding 12 resolved by the ecosystem: 0g-compute shipped an
     Anthropic-compatible endpoint (with Claude models), so claudecode
     now routes `persona.inference.provider = "0g-compute"` through the

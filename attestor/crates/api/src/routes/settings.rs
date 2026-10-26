@@ -118,7 +118,10 @@ pub async fn handle(
     {
         Some(version) => {
             tracing::info!(seal_id = ?req.seal_id, version, "settings stored");
-            Ok((StatusCode::OK, Json(json!({"ok": true, "version": version}))))
+            Ok((
+                StatusCode::OK,
+                Json(json!({"ok": true, "version": version})),
+            ))
         }
         None => {
             let current = load(&state, req.seal_id).await?.settings_version;
@@ -164,9 +167,10 @@ pub struct ReadParams {
 /// settled on the previous document, and it will stay there — the fallback
 /// is deliberately stable, and deliberately not self-clearing, because
 /// flapping between a document that boots and one that does not would be
-/// worse. Pushing again resets the counter and buys the next document a
-/// fresh first boot, so the escape hatch is the write route the client
-/// already has; this is only what makes it discoverable.
+/// worse. Pushing again resets the counter. An owner-authorized fresh sandbox
+/// also retries the current unconfirmed version once, before create, without
+/// changing its content/version. This lets reset recover after a provider
+/// switch instead of pairing its fresh key with another provider's fallback.
 pub async fn handle_get(
     State(state): State<AppState>,
     Query(p): Query<ReadParams>,
@@ -325,12 +329,7 @@ fn owner_auth_parts(headers: &HeaderMap) -> ApiResult<(String, Vec<u8>, OwnerMes
 }
 
 /// The signature must recover to the agent's authority right now.
-async fn authorize_owner(
-    state: &AppState,
-    d: &Deployment,
-    msg: &str,
-    sig: &[u8],
-) -> ApiResult<()> {
+async fn authorize_owner(state: &AppState, d: &Deployment, msg: &str, sig: &[u8]) -> ApiResult<()> {
     let digest = eip191_digest(msg.as_bytes());
     let signer = state
         .crypto
@@ -408,9 +407,7 @@ mod tests {
         InMemoryDeploymentRepo, InMemoryEventBus, InMemoryIdempotencyStore, InMemoryJobQueue,
         MockChain, MockSandbox,
     };
-    use attestor_shared::{
-        derive_phase, Config, Deployment, DeploymentRepo, SealId, StageStatus,
-    };
+    use attestor_shared::{derive_phase, Config, Deployment, DeploymentRepo, SealId, StageStatus};
     use axum::http::HeaderValue;
     use serde_json::value::RawValue;
     use std::sync::Arc;
@@ -452,9 +449,13 @@ mod tests {
             sandbox_snapshot: "0g-test-sealed".into(),
             sandbox_public_ports: vec![],
             secret_env_enabled: false,
+
             cli_latest: String::new(),
             cli_notes: String::new(),
-            frameworks: vec![attestor_shared::Framework { name: "openclaw".into(), image: None }],
+            frameworks: vec![attestor_shared::Framework {
+                name: "openclaw".into(),
+                image: None,
+            }],
             tapp_socket: None,
             chain_priority_fee_gwei: 2,
             chain_max_fee_gwei: 10,
@@ -521,6 +522,9 @@ mod tests {
             updated_at: now,
         });
         let state = AppState {
+            providers: Arc::new(
+                attestor_shared::provider_registry::MemoryProviderRegistry::default(),
+            ),
             cfg: test_config(),
             crypto: Arc::new(RealCrypto::new_for_test([0u8; 32])),
             chain: Arc::new(MockChain::new()),
@@ -651,7 +655,14 @@ mod tests {
         .err()
         .expect("must reject");
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_none());
     }
 
     #[tokio::test]
@@ -713,7 +724,14 @@ mod tests {
         .err()
         .expect("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_none());
     }
 
     #[tokio::test]
@@ -872,17 +890,19 @@ mod tests {
         .await
         .expect("second write");
 
-        let err = handle(
-            State(s.state.clone()),
-            captured_headers,
-            Json(body(old)),
-        )
-        .await
-        .err()
-        .expect("the replay must be refused");
+        let err = handle(State(s.state.clone()), captured_headers, Json(body(old)))
+            .await
+            .err()
+            .expect("the replay must be refused");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(
-            s.repo.get(s.seal_id).await.unwrap().unwrap().settings.unwrap()["model"],
+            s.repo
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings
+                .unwrap()["model"],
             "new",
             "the superseded document did not come back"
         );
@@ -900,8 +920,40 @@ mod tests {
         )
         .await
         .expect("first write");
-        s.repo.note_settings_attempt(s.seal_id).await.unwrap();
-        s.repo.note_settings_attempt(s.seal_id).await.unwrap();
+        s.repo
+            .note_settings_attempt(
+                s.seal_id,
+                s.repo
+                    .get(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                s.repo
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
+        s.repo
+            .note_settings_attempt(
+                s.seal_id,
+                s.repo
+                    .get(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                s.repo
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
 
         let next = r#"{"model":"next"}"#;
         let _ = handle(
@@ -912,7 +964,12 @@ mod tests {
         .await
         .expect("second write");
         assert_eq!(
-            s.repo.get(s.seal_id).await.unwrap().unwrap().settings_attempts,
+            s.repo
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings_attempts,
             0
         );
     }
@@ -934,7 +991,14 @@ mod tests {
         .err()
         .expect("must reject");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_none());
     }
 
     #[tokio::test]
@@ -949,7 +1013,14 @@ mod tests {
         .err()
         .expect("a message that binds no body must not write one");
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_none());
     }
 
     // ── GET /settings ───────────────────────────────────────────────────
@@ -993,10 +1064,29 @@ mod tests {
             .set_settings(s.seal_id, serde_json::json!({"model": "works"}), 0)
             .await
             .unwrap();
-        s.repo.note_settings_attempt(s.seal_id).await.unwrap();
+        s.repo
+            .note_settings_attempt(
+                s.seal_id,
+                s.repo
+                    .get(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                s.repo
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
         s.repo.promote_settings_last_good(s.seal_id).await.unwrap();
         let bad = serde_json::json!({"model": "does-not-start"});
-        s.repo.set_settings(s.seal_id, bad.clone(), 1).await.unwrap();
+        s.repo
+            .set_settings(s.seal_id, bad.clone(), 1)
+            .await
+            .unwrap();
 
         let read = || async {
             handle_get(
@@ -1013,7 +1103,23 @@ mod tests {
         };
 
         // First boot on v2: it is being tried, not yet given up on.
-        s.repo.note_settings_attempt(s.seal_id).await.unwrap();
+        s.repo
+            .note_settings_attempt(
+                s.seal_id,
+                s.repo
+                    .get(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                s.repo
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
         let resp = read().await;
         assert_eq!(resp["version"], 2);
         assert_eq!(resp["confirmed_version"], 1);
@@ -1025,7 +1131,23 @@ mod tests {
 
         // Second boot: /provision served the fallback, and promotion can no
         // longer confirm v2 — the state is terminal, and must be legible.
-        s.repo.note_settings_attempt(s.seal_id).await.unwrap();
+        s.repo
+            .note_settings_attempt(
+                s.seal_id,
+                s.repo
+                    .get(s.seal_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .settings_version,
+                s.repo
+                    .boot_authorization(s.seal_id)
+                    .await
+                    .unwrap()
+                    .map(|a| a.generation),
+            )
+            .await
+            .unwrap();
         let resp = read().await;
         assert_eq!(resp["version"], 2);
         assert_eq!(resp["confirmed_version"], 1);
@@ -1201,7 +1323,14 @@ mod tests {
         .expect("agentSeal-signed seed must be accepted on an unconfigured row");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(resp.0["seeded"], true);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_some());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_some());
     }
 
     #[tokio::test]
@@ -1222,7 +1351,13 @@ mod tests {
         .expect("a seed must not overwrite");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(
-            s.repo.get(s.seal_id).await.unwrap().unwrap().settings.unwrap(),
+            s.repo
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings
+                .unwrap(),
             owner_doc
         );
     }
@@ -1242,7 +1377,12 @@ mod tests {
             .expect("the replay must be refused");
         assert_eq!(err.status, StatusCode::CONFLICT);
         assert_eq!(
-            s.repo.get(s.seal_id).await.unwrap().unwrap().settings_version,
+            s.repo
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings_version,
             1,
             "the replay did not bump the version either"
         );
@@ -1256,7 +1396,7 @@ mod tests {
         let s = make_setup();
         // The real path that leaves a container orphaned: a transfer tore
         // the sandbox down and cleared it off the row.
-        s.repo.reset_container_track(s.seal_id).await.unwrap();
+        s.repo.reset_container_track(s.seal_id, None).await.unwrap();
 
         let (status, resp) = handle_seed(
             State(s.state.clone()),
@@ -1267,7 +1407,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(resp.0["seeded"], false);
         assert!(
-            s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none(),
+            s.repo
+                .get(s.seal_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .settings
+                .is_none(),
             "a ghost container must not be able to plant the first document"
         );
     }
@@ -1284,6 +1430,13 @@ mod tests {
         .err()
         .expect("must reject");
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-        assert!(s.repo.get(s.seal_id).await.unwrap().unwrap().settings.is_none());
+        assert!(s
+            .repo
+            .get(s.seal_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .settings
+            .is_none());
     }
 }

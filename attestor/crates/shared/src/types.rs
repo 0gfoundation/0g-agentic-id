@@ -1,6 +1,6 @@
 //! Domain types shared across api / worker / indexer.
 
-use alloy::primitives::{Address, Bytes, B256, TxHash, U256};
+use alloy::primitives::{Address, Bytes, TxHash, B256, U256};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -38,9 +38,9 @@ pub struct IDataInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IDataArtifact {
     pub role: String,
-    pub description: String,         // on-chain description JSON (rendered)
+    pub description: String, // on-chain description JSON (rendered)
     pub storage_root: StorageRoot,
-    pub sealed_key: Bytes,           // ECIES ciphertext
+    pub sealed_key: Bytes, // ECIES ciphertext
     pub data_hash: DataHash,
     /// Encrypted iData bytes — populated at deploy time so a failed
     /// storage upload can be retried with byte-identical content (same
@@ -327,6 +327,10 @@ pub struct Deployment {
     /// worker build stage runs.
     pub agent_card: serde_json::Value,
 
+    /// Internal retry material (sealed keys, and ciphertext until storage
+    /// confirms). Never serialized outward: no client reads it, and
+    /// `GET /deployment/:seal_id` is unauthenticated.
+    #[serde(default, skip_serializing)]
     pub i_data: Vec<IDataArtifact>,
 
     /// Set on CLONE rows at accept (issue #147): the static recipe /retry
@@ -363,15 +367,19 @@ pub struct Deployment {
     /// Container's secp256k1 pubkey (33-byte compressed) recorded on the
     /// first successful `/provision`. Subsequent /provision calls bypass the
     /// freshness window when the request's pubkey matches and the MAC
-    /// verifies — see `container_pubkey_mac`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// verifies — see `container_pubkey_mac`. Never serialized outward,
+    /// together with the MAC: the pair is provision-binding material.
+    #[serde(default, skip_serializing)]
     pub container_pubkey: Option<alloy::primitives::Bytes>,
 
-    /// HMAC over `seal_id || container_pubkey` using a binding key derived
-    /// from the attestor master secret. DB is considered untrusted; this MAC
-    /// is what makes the binding tamper-evident — an attacker with DB write
-    /// access can't forge `(container_pubkey, mac)` without the binding key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// V2 HMAC over `image_attestation_digest32 || authenticated_app_signer20`
+    /// under `agentic-id.container-pubkey-binding.v2`. The digest covers the
+    /// complete signed issuer scope, key, image and timestamp. Legacy v1
+    /// pubkey-only bindings never satisfy this domain/payload. DB writes
+    /// cannot forge a binding without the master-secret-derived binding key.
+    /// This binding material never leaves the process:
+    /// `GET /deployment/:seal_id` serializes the row and is unauthenticated.
+    #[serde(default, skip_serializing)]
     pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
 
     /// Wall-clock deadline for the container to complete `/provision`.
@@ -582,6 +590,34 @@ mod tests {
         assert!(json.get("settings_attempts").is_none());
     }
 
+    #[test]
+    fn provision_binding_material_never_rides_the_row_serialization() {
+        // Same reader, same reason: `GET /deployment/:seal_id` is
+        // unauthenticated and `/deployments` publishes every seal_id, so
+        // anything in the row serialization is readable fleet-wide. The
+        // container pubkey + its master-secret-derived MAC, and the internal
+        // iData retry material, must not be in there.
+        let mut d = empty_deployment();
+        d.container_pubkey = Some(Bytes::from_static(&[2u8; 33]));
+        d.container_pubkey_mac = Some(Bytes::from_static(&[7u8; 32]));
+        d.i_data = vec![IDataArtifact {
+            role: "framework".into(),
+            description: String::new(),
+            storage_root: StorageRoot { root_hash: B256::ZERO, indexer: String::new(), size: 0 },
+            sealed_key: Bytes::from_static(b"sealed"),
+            data_hash: B256::ZERO,
+            ciphertext: Bytes::from_static(b"ct"),
+        }];
+        let json = serde_json::to_value(&d).unwrap();
+        assert!(json.get("container_pubkey").is_none());
+        assert!(json.get("container_pubkey_mac").is_none());
+        assert!(json.get("i_data").is_none());
+        // What the console reads is still there.
+        for k in ["seal_id", "phase", "agent_card"] {
+            assert!(json.get(k).is_some(), "{k} missing");
+        }
+    }
+
     fn empty_deployment() -> Deployment {
         let now = Utc::now();
         Deployment {
@@ -656,13 +692,13 @@ mod tests {
         // Iterate all 8 (2^3) combos via a tiny truth table.
         let cases: &[(bool, bool, bool, bool)] = &[
             (false, false, false, false),
-            (true,  false, false, false),
-            (false, true,  false, false),
-            (false, false, true,  false),
-            (true,  true,  false, false),
-            (true,  false, true,  false),
-            (false, true,  true,  false),
-            (true,  true,  true,  true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (true, true, false, false),
+            (true, false, true, false),
+            (false, true, true, false),
+            (true, true, true, true),
         ];
         for (ts, pubk, m, expected) in cases.iter().copied() {
             let mut d = empty_deployment();
@@ -694,7 +730,10 @@ mod tests {
         let mut a = dummy_artifact();
         a.ciphertext = Bytes::from_static(b"\x01\x02\x03");
         let s = serde_json::to_string(&a).unwrap();
-        assert!(s.contains("ciphertext"), "non-empty ciphertext must serialize: {s}");
+        assert!(
+            s.contains("ciphertext"),
+            "non-empty ciphertext must serialize: {s}"
+        );
         // alloy::Bytes serializes as 0x-prefixed hex.
         assert!(
             s.contains("0x010203") || s.contains("\"0x010203\""),
@@ -749,7 +788,10 @@ mod tests {
 
     #[test]
     fn stage_status_failed_is_terminal_and_failed() {
-        let s = StageStatus::Failed { at: Utc::now(), reason: "x".into() };
+        let s = StageStatus::Failed {
+            at: Utc::now(),
+            reason: "x".into(),
+        };
         assert!(s.is_terminal());
         assert!(s.is_failed());
     }
@@ -763,7 +805,10 @@ mod tests {
 
     #[test]
     fn stage_status_submitted_not_terminal() {
-        let s = StageStatus::Submitted { tx_hash: None, at: Utc::now() };
+        let s = StageStatus::Submitted {
+            tx_hash: None,
+            at: Utc::now(),
+        };
         assert!(!s.is_terminal());
         assert!(!s.is_failed());
     }
@@ -775,7 +820,10 @@ mod tests {
         // Even if container is Confirmed, a Failed mint dominates.
         let phase = derive_phase(
             &StageStatus::Confirmed { at: Utc::now() },
-            &StageStatus::Failed { at: Utc::now(), reason: "x".into() },
+            &StageStatus::Failed {
+                at: Utc::now(),
+                reason: "x".into(),
+            },
             &StageStatus::Confirmed { at: Utc::now() },
         );
         assert_eq!(phase, DeploymentPhase::Failed);
@@ -784,7 +832,7 @@ mod tests {
     #[test]
     fn derive_phase_running_when_container_confirmed() {
         let phase = derive_phase(
-            &StageStatus::NotStarted,        // even if storage isn't done
+            &StageStatus::NotStarted, // even if storage isn't done
             &StageStatus::NotStarted,
             &StageStatus::Confirmed { at: Utc::now() },
         );
@@ -797,7 +845,10 @@ mod tests {
         let phase = derive_phase(
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Confirmed { at: Utc::now() },
-            &StageStatus::Submitted { tx_hash: None, at: Utc::now() },
+            &StageStatus::Submitted {
+                tx_hash: None,
+                at: Utc::now(),
+            },
         );
         assert_eq!(phase, DeploymentPhase::Deploying);
     }
@@ -819,7 +870,10 @@ mod tests {
         let phase = derive_phase(
             &StageStatus::Confirmed { at: Utc::now() },
             &StageStatus::Confirmed { at: Utc::now() },
-            &StageStatus::Failed { at: Utc::now(), reason: "agent unreachable".into() },
+            &StageStatus::Failed {
+                at: Utc::now(),
+                reason: "agent unreachable".into(),
+            },
         );
         assert_eq!(phase, DeploymentPhase::Offline);
     }
@@ -876,11 +930,34 @@ mod tests {
 // ── /provision ──────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionRequest {
+    // Defaults let old envelopes reach the explicit unsupported-version error.
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub chain_id: u64,
+    #[serde(default)]
+    pub registry_address: Address,
+    #[serde(default)]
+    pub app_id: String,
+    #[serde(default)]
+    pub registered_at: u64,
     pub seal_id: SealId,
-    pub container_pubkey: Bytes,     // 33 or 65 bytes secp256k1 pubkey
+    pub container_pubkey: Bytes,     // 33-byte compressed secp256k1 pubkey
     pub image_hash: ImageHash,
     pub issued_at: u64,
     pub sandbox_signature: Bytes,
+    #[serde(default)]
+    pub status_binding_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_ticket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<B256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_signature: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,6 +971,8 @@ pub struct ProvisionResponse {
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_status_binding: Option<Bytes>,
 }
 
 // ── /status ─────────────────────────────────────────────────────────────
@@ -920,6 +999,10 @@ pub struct StatusReport {
     pub status: ContainerReportStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings_digest: Option<B256>,
     /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the
     /// container's `agentSeal_priv` over `keccak256(canonical_message)`,
     /// where `canonical_message` is a colon-joined ASCII string
@@ -1013,7 +1096,7 @@ pub struct RetryRequest {
 #[derive(Debug, Clone)]
 pub struct AgentSealKeyPair {
     pub address: Address,
-    pub pub_key: Vec<u8>,           // 33-byte compressed secp256k1
+    pub pub_key: Vec<u8>, // 33-byte compressed secp256k1
     pub priv_key: [u8; 32],
 }
 
@@ -1178,6 +1261,8 @@ pub enum JobPayload {
     /// No-op when the deployment has no sandbox_id (non-seal / never-provisioned).
     SandboxTeardown {
         seal_id: SealId,
+        #[serde(default)]
+        expected_sandbox_id: Option<String>,
     },
     /// Clone an existing agent's iData into a brand-new agent owned by
     /// `target_owner`. The worker re-seals each iData `data_key` from the
@@ -1247,4 +1332,3 @@ pub struct CloneRetryParams {
     #[serde(default)]
     pub authorization: JobCloneAuth,
 }
-

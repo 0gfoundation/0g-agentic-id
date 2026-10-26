@@ -5,6 +5,7 @@ import {Vm} from "forge-std/Vm.sol";
 
 import {AgenticIDTestBase} from "./AgenticIDTestBase.sol";
 import {AgenticIDSealIdTaken} from "../src/AgenticID.sol";
+import {IERC721Errors} from "@openzeppelin/contracts/interfaces/draft-IERC6093.sol";
 import {IntelligentData} from "../src/interfaces/IERC7857Metadata.sol";
 import {MetadataEntry} from "../src/interfaces/IERC8004IdentityRegistry.sol";
 import {
@@ -127,8 +128,8 @@ contract CanonicalBindingTest is AgenticIDTestBase {
 
         bytes memory buyerPubkey = _pubkey(buyerWallet);
         uint256 deadline = block.timestamp + 1 hours;
-        AccessProof memory ap = _mkAccessProof(dataHash, "", bytes("ap-c"), deadline, buyerWallet.privateKey);
-        OwnershipProof memory op = _mkOwnershipProof(dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-c"), deadline);
+        AccessProof memory ap = _mkCloneAccessProof(srcId, sellerWallet.addr, dataHash, "", bytes("ap-c"), deadline, buyerWallet.privateKey);
+        OwnershipProof memory op = _mkCloneOwnershipProof(srcId, sellerWallet.addr, dataHash, SEALED_KEY_NEW, buyerPubkey, bytes("op-c"), deadline);
         TransferValidityProof[] memory proofs = new TransferValidityProof[](1);
         proofs[0] = TransferValidityProof({accessProof: ap, ownershipProof: op});
 
@@ -177,5 +178,24 @@ contract CanonicalBindingTest is AgenticIDTestBase {
     function _transfer(uint256 agentId, bytes32 /*dataHash*/) internal {
         vm.prank(sellerWallet.addr);
         agenticId.transferFrom(sellerWallet.addr, buyerWallet.addr, agentId);
+    }
+
+    // ── Read-through views answer for local agents only (1.2.0: FIND-14) ──────
+
+    /// @dev Like tokenURI, getMetadata / getAgentWallet revert for a
+    ///      third-party agent on the shared canonical registry instead of
+    ///      answering as if it were an AgenticID agent.
+    function test_readThroughViews_revertForForeignCanonicalAgent() public {
+        vm.prank(address(0xDEAD));
+        uint256 foreignId = canonical.register();
+
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, foreignId));
+        agenticId.getMetadata(foreignId, "category");
+        vm.expectRevert(abi.encodeWithSelector(IERC721Errors.ERC721NonexistentToken.selector, foreignId));
+        agenticId.getAgentWallet(foreignId);
+
+        (uint256 agentId, ) = _mintWithSeal(alice);
+        assertEq(agenticId.getAgentWallet(agentId), address(0), "local agent still reads through");
+        assertEq(agenticId.getMetadata(agentId, "category"), bytes(""), "local metadata reads through");
     }
 }
