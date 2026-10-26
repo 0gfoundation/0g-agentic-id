@@ -95,7 +95,7 @@ pub struct CanonicalSignedMessage {
     pub nonce: String,
     pub payload: serde_json::Value,
     /// Destination provider binding (0g-sandbox#93, anti cross-provider
-    /// replay): the provider's TEE signer address. Omitted-when-absent keeps
+    /// replay): the provider's stable application signer address. Omitted-when-absent keeps
     /// the legacy byte layout; the provider rejects a mismatch, and (once
     /// AUTH_STRICT flips) requires it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,7 +154,7 @@ pub fn verify_envelope(
 
 /// Pre-derived signing material for admin-flavored sandbox calls
 /// (currently `force-stop` for orphan cleanup). Holds the attestor's
-/// TEE EOA secp256k1 key + the matching ETH address, so each admin
+/// stable application secp256k1 key + the matching ETH address, so each admin
 /// call avoids re-deriving the address from priv.
 pub struct AdminSigner {
     priv_key: [u8; 32],
@@ -162,6 +162,9 @@ pub struct AdminSigner {
 }
 
 impl AdminSigner {
+    pub fn address(&self) -> Address {
+        self.address
+    }
     pub fn from_priv(priv_key: [u8; 32]) -> anyhow::Result<Self> {
         let sk = SigningKey::from_bytes((&priv_key).into())
             .map_err(|e| anyhow::anyhow!("AdminSigner: invalid priv key: {e}"))?;
@@ -190,6 +193,77 @@ fn apply_public_ports(obj: &mut serde_json::Map<String, serde_json::Value>, port
         "publicPorts".into(),
         serde_json::Value::Array(ports.iter().map(|p| serde_json::Value::from(*p)).collect()),
     );
+}
+
+fn apply_attestor_identity(
+    env: &mut serde_json::Map<String, serde_json::Value>,
+    dev_url: &str,
+    identity: Option<&crate::identity::AttestorTlsDescriptor>,
+) -> anyhow::Result<()> {
+    let (url, allow_unpinned) = match identity {
+        Some(identity) => {
+            env.insert(
+                "ATTESTOR_TLS_DESCRIPTOR".into(),
+                serde_json::Value::String(serde_json::to_string(identity)?),
+            );
+            (identity.url.as_str(), "false")
+        }
+        None => {
+            env.remove("ATTESTOR_TLS_DESCRIPTOR");
+            (dev_url, "true")
+        }
+    };
+    env.insert(
+        "ATTESTOR_URL".into(),
+        serde_json::Value::String(url.to_string()),
+    );
+    env.insert(
+        "ATTESTOR_ALLOW_UNPINNED_DEV".into(),
+        serde_json::Value::String(allow_unpinned.to_string()),
+    );
+    Ok(())
+}
+
+/// One operation keeps the provider, URL, pins and signed envelope from one
+/// snapshot. Response bodies are consumed here too, before returning a result.
+async fn send_text_in_snapshot<F>(
+    connection: &crate::identity::SandboxConnection,
+    op: &'static str,
+    policy: RetryPolicy,
+    mut request: F,
+) -> anyhow::Result<(reqwest::StatusCode, String)>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let send = async {
+        let response = retry_send(op, policy, || {
+            let request = request();
+            async move { request.send().await }
+        })
+        .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok((status, body))
+    };
+    if connection.expires_at == i64::MAX {
+        // Explicit mock/manual connections have no discovery lease.
+        return send.await;
+    }
+    let expires_at = chrono::DateTime::from_timestamp(connection.expires_at, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid sandbox snapshot expiry"))?;
+    let remaining = (expires_at - chrono::Utc::now())
+        .to_std()
+        .map_err(|_| anyhow::anyhow!("sandbox snapshot expired before {op}"))?;
+    let deadline = tokio::time::Instant::now() + remaining;
+    tokio::select! {
+        // Check expiry before polling send again: an elapsed retry backoff
+        // must not start another request from an expired snapshot.
+        biased;
+        _ = tokio::time::sleep_until(deadline) => {
+            anyhow::bail!("sandbox snapshot expired during {op}")
+        }
+        result = send => result,
+    }
 }
 
 /// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
@@ -237,16 +311,17 @@ pub struct HttpSandbox {
     /// payload wins (unlike `seal_id`/`ATTESTOR_URL`, which always
     /// override deployer input).
     public_ports: Vec<u16>,
-    /// Attestor's TEE EOA, used to sign envelopes for admin-only sandbox
-    /// endpoints (orphan `force-stop`). The address must be in the
-    /// sandbox's `ADMIN_ADDRESSES` allowlist. None disables admin calls
+    /// Attestor's stable app signer, recognized by appId on the sandbox.
+    /// None disables admin calls
     /// (orphans get GC'd by sandbox runtime instead).
     admin_signer: Option<AdminSigner>,
-    /// The provider's TEE signer address — bound into every envelope this
+    /// The stable provider app signer address — bound into every envelope this
     /// client SIGNS itself (0g-sandbox#93). Relayed owner envelopes are
     /// untouched (the owner binds their own).
     provider_addr: Option<String>,
     http: reqwest::Client,
+    discovery: Option<std::sync::Arc<crate::identity::SandboxDiscovery>>,
+    attestor_identity: Option<std::sync::Arc<crate::identity::AttestorDiscovery>>,
 }
 
 impl HttpSandbox {
@@ -269,18 +344,86 @@ impl HttpSandbox {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .expect("reqwest client build"),
+            discovery: None,
+            attestor_identity: None,
         }
     }
 
-    fn sandbox_url(&self) -> String {
-        // Strip trailing slash from base, then append fixed path.
-        let base = self.base_url.trim_end_matches('/');
-        format!("{base}/api/sandbox")
+    pub fn with_discovery(
+        mut self,
+        discovery: std::sync::Arc<crate::identity::SandboxDiscovery>,
+    ) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    pub fn with_attestor_identity(
+        mut self,
+        identity: std::sync::Arc<crate::identity::AttestorDiscovery>,
+    ) -> Self {
+        self.attestor_identity = Some(identity);
+        self
+    }
+
+    async fn connection(
+        &self,
+    ) -> anyhow::Result<std::sync::Arc<crate::identity::SandboxConnection>> {
+        if let Some(discovery) = &self.discovery {
+            return discovery.snapshot().await;
+        }
+        Ok(std::sync::Arc::new(crate::identity::SandboxConnection {
+            provider: self
+                .provider_addr
+                .as_deref()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Address::ZERO),
+            base_url: self.base_url.clone(),
+            registered_at: 0,
+            expires_at: i64::MAX,
+            http: self.http.clone(),
+        }))
+    }
+
+    fn check_provider(
+        &self,
+        canonical: &CanonicalSignedMessage,
+        connection: &crate::identity::SandboxConnection,
+    ) -> anyhow::Result<()> {
+        if self.discovery.is_some() {
+            anyhow::ensure!(
+                canonical
+                    .provider
+                    .as_deref()
+                    .and_then(|s| s.parse::<Address>().ok())
+                    == Some(connection.provider),
+                "owner envelope targets another provider; refresh config and sign again"
+            );
+        }
+        Ok(())
     }
 }
 
 #[async_trait]
 impl SandboxClient for HttpSandbox {
+    async fn authenticated_service_identity(&self) -> anyhow::Result<Option<crate::identity::SandboxServiceIdentity>> {
+        let discovery = self.discovery.as_ref().ok_or_else(|| anyhow::anyhow!(
+            "workload attestation requires authenticated sandbox discovery"
+        ))?;
+        Ok(Some(discovery.service_identity().await?))
+    }
+
+    async fn attestor_tls_identity(
+        &self,
+    ) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
+        match &self.attestor_identity {
+            Some(identity) => Ok(Some(identity.snapshot().await?)),
+            None => Ok(None),
+        }
+    }
+    async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
+        let snapshot = self.connection().await?;
+        Ok(Some((snapshot.provider, snapshot.base_url.clone())))
+    }
     async fn create(
         &self,
         seal_id: SealId,
@@ -324,6 +467,19 @@ impl SandboxClient for HttpSandbox {
         apply_public_ports(obj, &self.public_ports);
 
         apply_attestor_env(obj, &self.attestor_public_url, &self.extra_env)?;
+        // apply_attestor_env creates and validates this object. Overlay the
+        // authenticated descriptor last so payload/extra env cannot replace it.
+        let env_obj = obj.get_mut("env").and_then(serde_json::Value::as_object_mut)
+            .expect("apply_attestor_env validated env");
+        let attestor_identity = self.attestor_tls_identity().await?;
+        apply_attestor_identity(
+            env_obj,
+            &self.attestor_public_url,
+            attestor_identity.as_ref(),
+        )?;
+        // Own Scan refresh can block; acquire the sandbox lease afterwards.
+        let connection = self.connection().await?;
+        self.check_provider(&canonical, &connection)?;
 
         let sig_hex = format!("0x{}", hex::encode(envelope.wallet_signature.as_ref()));
         let addr_hex = format!("{:#x}", envelope.wallet_address);
@@ -342,9 +498,9 @@ impl SandboxClient for HttpSandbox {
         // a retry after the server processed the original would produce
         // an orphan container. Only retry on connect-class errors (we're
         // sure the request never landed).
-        let url = self.sandbox_url();
-        let res = retry_send("sandbox create", RetryPolicy::Strict, || {
-            let req = self
+        let url = format!("{}/api/sandbox", connection.base_url.trim_end_matches('/'));
+        let res = send_text_in_snapshot(&connection, "sandbox create", RetryPolicy::Strict, || {
+            connection
                 .http
                 .post(&url)
                 .timeout(std::time::Duration::from_secs(120))
@@ -352,40 +508,33 @@ impl SandboxClient for HttpSandbox {
                 .header("X-Wallet-Address", &addr_hex)
                 .header("X-Signed-Message", &envelope.signed_message_b64)
                 .header("X-Wallet-Signature", &sig_hex)
-                .json(&body);
-            async move { req.send().await }
+                .json(&body)
         })
-        .await?;
-
-        let status = res.status();
+        .await;
+        if res.is_err() {
+            if let Some(discovery) = &self.discovery {
+                discovery.invalidate().await;
+            }
+        }
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("create", status.as_u16(), body).into());
         }
 
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
         // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
-        let body = res.text().await.unwrap_or_default();
         let parsed: SandboxCreateResponse = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e} — body={body}"))?;
         tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
         Ok(parsed)
     }
 
-    async fn start(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn start(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.lifecycle_call(seal_id, envelope, "start").await
     }
 
-    async fn stop(
-        &self,
-        seal_id: SealId,
-        envelope: &SandboxEnvelope,
-    ) -> anyhow::Result<()> {
+    async fn stop(&self, seal_id: SealId, envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.lifecycle_call(seal_id, envelope, "stop").await
     }
 
@@ -401,6 +550,7 @@ impl SandboxClient for HttpSandbox {
             anyhow::bail!("sandbox admin_delete: empty sandbox_id");
         }
 
+        let connection = self.connection().await?;
         // Build canonical envelope. Sandbox doesn't verify `action`
         // on the admin force-delete path; we keep `"stop"` for
         // compatibility with the protocol the sandbox team specified.
@@ -416,15 +566,15 @@ impl SandboxClient for HttpSandbox {
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
             payload: serde_json::Value::Object(Default::default()),
-            provider: self.provider_addr.clone(),
+            provider: (connection.provider != Address::ZERO)
+                .then(|| format!("{:#x}", connection.provider)),
             resource_id: sandbox_id.to_string(),
         };
-        let msg_bytes = serde_json::to_vec(&canonical).map_err(|e| {
-            anyhow::anyhow!("sandbox admin_delete: serialize canonical: {e}")
-        })?;
+        let msg_bytes = serde_json::to_vec(&canonical)
+            .map_err(|e| anyhow::anyhow!("sandbox admin_delete: serialize canonical: {e}"))?;
         let digest = eip191_digest(&msg_bytes);
 
-        // EIP-191 sign with the attestor's TEE EOA priv. v += 27 so
+        // EIP-191 sign with the attestor's stable app signer priv. v += 27 so
         // the recovered v matches the eth_sign convention sandbox
         // expects.
         let sk = SigningKey::from_bytes((&signer.priv_key).into())
@@ -438,13 +588,13 @@ impl SandboxClient for HttpSandbox {
 
         // Endpoint: `DELETE /api/sandbox/:id/force` — admin-only,
         // gated by sandbox's `isAdmin` middleware checking
-        // X-Wallet-Address ∈ ADMIN_ADDRESSES. The owner-only path is
+        // the attestor application identity. The owner-only path is
         // `DELETE /api/sandbox/:id` (NO `/force` suffix); hitting that
         // by mistake returns `"forbidden"` from `withOwner`, which is
         // the bug we just fixed.
         let url = format!(
             "{}/api/sandbox/{}/force",
-            self.base_url.trim_end_matches('/'),
+            connection.base_url.trim_end_matches('/'),
             sandbox_id,
         );
         let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&msg_bytes);
@@ -453,21 +603,28 @@ impl SandboxClient for HttpSandbox {
 
         // Idempotent retry: force-delete on a sandbox_id is idempotent
         // (already-deleted returns OK or a 4xx the caller handles).
-        let res = retry_send("sandbox admin_delete", RetryPolicy::Idempotent, || {
-            let req = self
-                .http
-                .delete(&url)
-                .header("Content-Length", "0")
-                .header("X-Wallet-Address", &addr_hex)
-                .header("X-Signed-Message", &signed_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
-        })
-        .await?;
-
-        let status = res.status();
+        let res = send_text_in_snapshot(
+            &connection,
+            "sandbox admin_delete",
+            RetryPolicy::Idempotent,
+            || {
+                connection
+                    .http
+                    .delete(&url)
+                    .header("Content-Length", "0")
+                    .header("X-Wallet-Address", &addr_hex)
+                    .header("X-Signed-Message", &signed_b64)
+                    .header("X-Wallet-Signature", &sig_hex)
+            },
+        )
+        .await;
+        if res.is_err() {
+            if let Some(discovery) = &self.discovery {
+                discovery.invalidate().await;
+            }
+        }
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("admin_delete", status.as_u16(), body).into());
         }
         tracing::info!(%sandbox_id, signer = %addr_hex, "sandbox: admin force-delete ok");
@@ -482,6 +639,7 @@ impl SandboxClient for HttpSandbox {
             anyhow::bail!("get_sandbox: empty sandbox_id");
         }
 
+        let connection = self.connection().await?;
         // GET /api/sandbox/:id is `withOwnerOrAdmin`-gated. We sign the
         // standard CanonicalSignedMessage with the admin signer; the
         // sandbox auth middleware verifies the three X-Wallet-* headers
@@ -497,7 +655,8 @@ impl SandboxClient for HttpSandbox {
             expires_at: chrono::Utc::now().timestamp() + 240,
             nonce,
             payload: serde_json::Value::Object(Default::default()),
-            provider: self.provider_addr.clone(),
+            provider: (connection.provider != Address::ZERO)
+                .then(|| format!("{:#x}", connection.provider)),
             resource_id: sandbox_id.to_string(),
         };
         let msg_bytes = serde_json::to_vec(&canonical)
@@ -515,35 +674,40 @@ impl SandboxClient for HttpSandbox {
 
         let url = format!(
             "{}/api/sandbox/{}",
-            self.base_url.trim_end_matches('/'),
+            connection.base_url.trim_end_matches('/'),
             sandbox_id,
         );
         let signed_b64 = base64::engine::general_purpose::STANDARD.encode(&msg_bytes);
         let sig_hex = format!("0x{}", hex::encode(sig_65));
         let addr_hex = format!("{:#x}", signer.address);
 
-        let res = retry_send("sandbox get_sandbox", RetryPolicy::Idempotent, || {
-            let req = self
-                .http
-                .get(&url)
-                .header("X-Wallet-Address", &addr_hex)
-                .header("X-Signed-Message", &signed_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
-        })
-        .await?;
-
-        let status = res.status();
+        let res = send_text_in_snapshot(
+            &connection,
+            "sandbox get_sandbox",
+            RetryPolicy::Idempotent,
+            || {
+                connection
+                    .http
+                    .get(&url)
+                    .header("X-Wallet-Address", &addr_hex)
+                    .header("X-Signed-Message", &signed_b64)
+                    .header("X-Wallet-Signature", &sig_hex)
+            },
+        )
+        .await;
+        if res.is_err() {
+            if let Some(discovery) = &self.discovery {
+                discovery.invalidate().await;
+            }
+        }
+        let (status, body) = res?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new("get_sandbox", status.as_u16(), body).into());
         }
-        let info: SandboxInfo = res
-            .json()
-            .await
+        let info: SandboxInfo = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("get_sandbox: parse response: {e}"))?;
         Ok(Some(info))
     }
@@ -566,6 +730,8 @@ impl HttpSandbox {
             .map_err(|e| anyhow::anyhow!("sandbox {verb}: base64 decode: {e}"))?;
         let canonical: CanonicalSignedMessage = serde_json::from_slice(&msg_bytes)
             .map_err(|e| anyhow::anyhow!("sandbox {verb}: parse canonical JSON: {e}"))?;
+        let connection = self.connection().await?;
+        self.check_provider(&canonical, &connection)?;
         if canonical.resource_id.is_empty() {
             anyhow::bail!("sandbox {verb}: envelope.resource_id (sandbox_id) must be non-empty");
         }
@@ -579,7 +745,7 @@ impl HttpSandbox {
 
         let url = format!(
             "{}/api/sandbox/{}/{}",
-            self.base_url.trim_end_matches('/'),
+            connection.base_url.trim_end_matches('/'),
             canonical.resource_id,
             verb
         );
@@ -594,21 +760,23 @@ impl HttpSandbox {
             "stop" => "sandbox stop",
             _ => "sandbox lifecycle",
         };
-        let res = retry_send(op, RetryPolicy::Idempotent, || {
-            let req = self
+        let res = send_text_in_snapshot(&connection, op, RetryPolicy::Idempotent, || {
+            connection
                 .http
                 .post(&url)
                 .header("Content-Length", "0")
                 .header("X-Wallet-Address", &addr_hex)
                 .header("X-Signed-Message", &envelope.signed_message_b64)
-                .header("X-Wallet-Signature", &sig_hex);
-            async move { req.send().await }
+                .header("X-Wallet-Signature", &sig_hex)
         })
-        .await?;
-
-        let status = res.status();
+        .await;
+        if res.is_err() {
+            if let Some(discovery) = &self.discovery {
+                discovery.invalidate().await;
+            }
+        }
+        let (status, body) = res?;
         if !status.is_success() {
-            let body = res.text().await.unwrap_or_default();
             return Err(SandboxError::new(verb, status.as_u16(), body).into());
         }
         tracing::info!(?seal_id, sandbox_id = %canonical.resource_id, %verb, "sandbox: lifecycle ok");
@@ -619,6 +787,180 @@ impl HttpSandbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LeaseDns {
+        expires_at: chrono::DateTime<chrono::Utc>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+        late_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl reqwest::dns::Resolve for LeaseDns {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            use std::sync::atomic::Ordering;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let now = chrono::Utc::now();
+            if now >= self.expires_at {
+                self.late_attempts.fetch_add(1, Ordering::SeqCst);
+            }
+            let delay = (self.expires_at - now).to_std().unwrap_or_default()
+                + std::time::Duration::from_millis(50);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "test DNS failure")
+                        .into(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_cancels_connect_before_an_expired_retry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let late_attempts = Arc::new(AtomicUsize::new(0));
+        let expires_at = chrono::Utc::now().timestamp() + 2;
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(LeaseDns {
+                expires_at: chrono::DateTime::from_timestamp(expires_at, 0).unwrap(),
+                attempts: attempts.clone(),
+                late_attempts: late_attempts.clone(),
+            }))
+            .build()
+            .unwrap();
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: "http://lease.invalid".into(),
+            registered_at: 1,
+            expires_at,
+            http,
+        };
+        let error =
+            send_text_in_snapshot(&connection, "test lease", RetryPolicy::Idempotent, || {
+                connection.http.get(&connection.base_url)
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            late_attempts.load(Ordering::SeqCst),
+            0,
+            "retried after the snapshot expired"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "the lease should cancel the first connect attempt"
+        );
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_rejects_expired_snapshot_without_starting_a_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let attempts = AtomicUsize::new(0);
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: "http://lease.invalid".into(),
+            registered_at: 1,
+            expires_at: chrono::Utc::now().timestamp() - 1,
+            http: reqwest::Client::new(),
+        };
+        let error =
+            send_text_in_snapshot(&connection, "test lease", RetryPolicy::Idempotent, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                connection.http.get(&connection.base_url)
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_deadline_includes_response_body_without_retrying_a_processed_create() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = headers_sent.send(());
+            std::future::pending::<()>().await;
+        });
+        let connection = crate::identity::SandboxConnection {
+            provider: Address::repeat_byte(1),
+            base_url: format!("http://{address}"),
+            registered_at: 1,
+            expires_at: chrono::Utc::now().timestamp() + 2,
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(4))
+                .build()
+                .unwrap(),
+        };
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let result = send_text_in_snapshot(&connection, "create", RetryPolicy::Strict, || {
+            attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            connection.http.post(&connection.base_url)
+        })
+        .await;
+        server.abort();
+        received_headers
+            .await
+            .expect("the provider must have returned success headers");
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("snapshot expired"), "{error:#}");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a possibly processed create must never be resent after a body failure"
+        );
+    }
+
+    #[test]
+    fn attestor_transport_overrides_deployer_and_extra_env() {
+        let identity = crate::identity::AttestorTlsDescriptor {
+            version: 1,
+            chain_id: 16602,
+            registry_address: format!("{:#x}", Address::repeat_byte(1)),
+            app_id: "attestor".into(),
+            registered_at: 100,
+            app_signer: format!("{:#x}", Address::repeat_byte(2)),
+            url: "https://attestor.example".into(),
+            scan_url: "https://scan.example".into(),
+            scan_public_key: "ab".repeat(32),
+            tls_spki_sha256: vec!["cd".repeat(32)],
+            checked_at: 1_000,
+            expires_at: 1_300,
+        };
+        let mut env = serde_json::json!({
+            "ATTESTOR_URL":"http://attacker",
+            "ATTESTOR_TLS_DESCRIPTOR":"forged",
+            "ATTESTOR_ALLOW_UNPINNED_DEV":"true"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        apply_attestor_identity(&mut env, "http://dev", Some(&identity)).unwrap();
+        assert_eq!(env["ATTESTOR_URL"], identity.url);
+        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "false");
+        let descriptor: serde_json::Value =
+            serde_json::from_str(env["ATTESTOR_TLS_DESCRIPTOR"].as_str().unwrap()).unwrap();
+        assert_eq!(descriptor["scan_public_key"], identity.scan_public_key);
+        assert_eq!(descriptor["registered_at"], 100);
+
+        apply_attestor_identity(&mut env, "http://dev", None).unwrap();
+        assert_eq!(env["ATTESTOR_URL"], "http://dev");
+        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "true");
+        assert!(!env.contains_key("ATTESTOR_TLS_DESCRIPTOR"));
+    }
     use crate::crypto::RealCrypto;
     use alloy::primitives::{Address, Bytes};
     use k256::ecdsa::{signature::hazmat::PrehashSigner, SigningKey};
@@ -699,7 +1041,10 @@ mod tests {
         let mut obj = serde_json::Map::new();
         obj.insert("snapshot".into(), serde_json::json!("img"));
         apply_public_ports(&mut obj, &[8080, 3000]);
-        assert_eq!(obj.get("publicPorts"), Some(&serde_json::json!([8080, 3000])));
+        assert_eq!(
+            obj.get("publicPorts"),
+            Some(&serde_json::json!([8080, 3000]))
+        );
     }
 
     #[test]
@@ -792,8 +1137,8 @@ mod tests {
     fn verify_envelope_rejects_wrong_declared_address() {
         let (sk, _addr) = test_keypair();
         let (mut envelope, _) = make_envelope(&sk, Address::ZERO); // declare wrong addr
-        // The canonical bytes + signature are still from `sk`, but the
-        // envelope claims Address::ZERO signed it. Signer-mismatch path.
+                                                                   // The canonical bytes + signature are still from `sk`, but the
+                                                                   // envelope claims Address::ZERO signed it. Signer-mismatch path.
         envelope.wallet_address = Address::ZERO;
         let crypto = crypto_for_tests();
         let err = verify_envelope(&envelope, &crypto).unwrap_err().to_string();

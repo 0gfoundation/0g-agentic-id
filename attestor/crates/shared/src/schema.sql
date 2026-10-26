@@ -36,10 +36,10 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
 -- Container-pubkey binding for /provision freshness bypass on restart.
 -- The pubkey is what the container sent on first /provision; the MAC is
--- HMAC(binding_key, seal_id || pubkey) where binding_key is HKDF-derived
--- from the attestor master secret. DB tampering with `container_pubkey`
--- alone is detectable via MAC mismatch — attacker without the master
--- secret can't forge a valid (pk, mac) pair.
+-- HMAC(binding_key_v2, signed_v2_digest32 || authenticated_app_signer20).
+-- The digest covers issuer scope, epoch and the complete workload payload.
+-- The v2-domain key is HKDF-derived from the attestor master secret; legacy
+-- v1 pubkey-only MACs are incompatible. Columns are reused without migration.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey     BYTEA;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
 

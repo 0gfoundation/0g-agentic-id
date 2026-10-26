@@ -12,7 +12,7 @@ delivery of the data key, and a sybil-resistant reputation system.
 ### Environment
 
 - **Foundry** (forge / cast / anvil) for contract compile, test, and scripts
-- **solc 0.8.24**, managed by foundry; don't change by hand
+- **solc 0.8.38**, pinned in `foundry.toml`; use the checked-in build settings
 - **OpenZeppelin v5.0.2** — both `contracts` and `contracts-upgradeable`, vendored as submodules under `lib/`
 
 ### Install Foundry
@@ -46,15 +46,16 @@ Version pinning (for reference only; a fresh clone will get these automatically)
 | `openzeppelin-contracts-upgradeable` | v5.0.2 |
 | `forge-std` | **v1.12.0** (see warning below) |
 
-> ⚠️ **The forge-std pin to v1.12.0 is deliberate.** Combined with `via_ir`
-> it trips a known codegen bug; details in [`../QUIRKS.md`](../QUIRKS.md).
+> **forge-std remains pinned to v1.12.0.** Its original Solidity 0.8.24 codegen
+> workaround is historical; the compiler upgrade does not also upgrade the test
+> dependency. Details in [`../QUIRKS.md`](../QUIRKS.md).
 
 ### Compile and test
 
 ```bash
 forge build                     # incremental compile to out/
 forge build --force             # force full rebuild
-forge test                      # full test suite (currently 290 tests / 28 suites; 2 fork tests skip without FORK_RPC)
+forge test                      # full suite; 2 fork cases skip without FORK_RPC
 forge test -vvvv                # verbose trace
 forge test --match-path test/TransferFlow.t.sol   # one suite only
 forge fmt                       # format
@@ -67,10 +68,12 @@ forge clean                     # clean out/
 [profile.default]
 src = "src"                     # source dir (foundry default)
 libs = ["lib"]                  # OZ submodules
-solc = "0.8.24"                 # locked
+solc = "0.8.38"                 # locked
 via_ir = true                   # ⚠️ required: giveFeedback's argument count causes stack too deep
 optimizer = true
-optimizer_runs = 200
+optimizer_runs = 1
+evm_version = "cancun"
+bytecode_hash = "none"          # omit the metadata hash; retain compiler-version CBOR
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
@@ -80,6 +83,27 @@ remappings = [
 
 `via_ir = true` is required because `giveFeedback`'s argument count causes
 stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
+CBOR remains enabled; `bytecode_hash = "none"` is not `--no-metadata`.
+With these settings, AgenticID's measured runtime is **24,543 bytes** and
+`AttestorAppBindingLib` is **1,730 bytes**. Both pass the 24,576-byte EIP-170 gate;
+rerun `forge build --sizes --skip test --skip script` and `forge test` after changes rather than relying on
+the remaining margin. The size report excludes scripts and test-only upgrade mocks;
+`Eip170Size.t.sol` separately checks every production deployable in the full suite.
+The validation run passed 299 tests, with two fork cases skipped.
+
+### Linked attestor authorization library
+
+AgenticID links the stateless `AttestorAppBindingLib`. It has no owner or configuration;
+its public functions execute by `DELEGATECALL` against the proxy's existing storage.
+The AgenticID facade keeps the owner checks, ABI and migration switch.
+
+`forge script` automatically deploys and links the library for scripts that create
+AgenticID. Standalone `forge create` requires deploying the library first and supplying
+`--libraries src/AttestorAppBindingLib.sol:AttestorAppBindingLib:<LIB_ADDRESS>` when
+creating the implementation. Retain the library address and the linked implementation's
+build metadata for verification. Changing library code requires a new library and linked
+implementation, activated through the existing beacon/timelock; proxy state stays put.
+See [`UPGRADING.md`](UPGRADING.md) for linking and verification constraints.
 
 ---
 
@@ -88,6 +112,7 @@ stack too deep without it (details in [`../QUIRKS.md`](../QUIRKS.md)).
 ```
 contracts/src/
 ├── AgenticID.sol                               main contract (identity + 7857 token + seal)
+├── AttestorAppBindingLib.sol                   stateless linked app-instance authorization code
 ├── VerifiedFeedbackRegistry.sol                TEE-verification layer over the canonical ERC-8004
 │                                               Reputation Registry (attestFeedback + ServeProof)
 ├── FeedbackBatcher.sol                         EIP-7702 delegate: canonical feedback + attest in
@@ -599,7 +624,7 @@ lowering it reopened still-valid consumed proofs to replay).
 | `CanonicalBinding.t.sol` | 10 | canonical custody (token held by contract, survives local transfer) / global agentId counter / URI + metadata canonical visibility / agentWallet cleared at mint / agentId-0 sealId sentinel / clone registers a new canonical id / metadata + wallet views revert for a third-party canonical agent (FIND-14) |
 | `UpgradeReputation.t.sol` | 2 | reputation beacon owned by Timelock + feedback storage survives beacon upgrade |
 | `UpgradeVerifiedFeedback.t.sol` | 5 | VerifiedFeedbackRegistry 1.1.0 → 1.2.0 through the Timelock (pre-upgrade impl = frozen 1.1.0 source in `test/mocks/`): marks / audit data / endpoints / config / nonces survive; legacy-format proofs rejected after the cut, registry-bound accepted; owner preserved and two-step afterwards; a pre-upgrade out-of-range mark is skipped by summaries instead of making them revert |
-| `UpgradeGovernance.t.sol` | 7 | AgenticID + TEEDataVerifier 1.1.0 → 1.2.0 from frozen 1.1.0 sources (and their frozen bases in `test/mocks/v1_1_0/`) through a 1-day Timelock (mainnet's delay, owner-proposer, open execution): seal bindings / iData / URI / metadata / allowlists / verifier / oracle / nonces survive; two-step ownership, zero-address guards and seal-address uniqueness live after the upgrade; 1.1.0-format transfer proofs rejected, token-bound ones accepted; either impl upgraded alone breaks non-seal transfers; a pre-upgrade seal is refused by CloneGate as its own source's clone seal |
+| `UpgradeGovernance.t.sol` | 7 | AgenticID 1.1.0 → 1.3.0 and TEEDataVerifier 1.1.0 → 1.2.0 from frozen 1.1.0 sources (and their frozen bases in `test/mocks/v1_1_0/`) through a 1-day Timelock (mainnet's delay, owner-proposer, open execution): seal bindings / iData / URI / metadata / allowlists / verifier / oracle / nonces survive; two-step ownership, zero-address guards and seal-address uniqueness live after the upgrade; 1.1.0-format transfer proofs rejected, token-bound ones accepted; either impl upgraded alone breaks non-seal transfers; a pre-upgrade seal is refused by CloneGate as its own source's clone seal |
 | `CloneGate.t.sol` | 21 | policy-mode cloning satellite: setCloneAuthorizer gating / cloneFrom happy path + every revert (attestor, no/denying/reverting authorizer, arity, sealId, reused source seal, paused) / owner-at-set invalidation on transfer / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | stock per-buyer clone policy: seller-only grant/revoke, per-agent scoping, grant dies on transfer and revives on re-acquire, clone through the gate |
 | `Eip170Size.t.sol` | 1 | every deployed impl fits the EIP-170 runtime-size limit |

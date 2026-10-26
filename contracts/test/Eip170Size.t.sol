@@ -26,6 +26,7 @@ contract Eip170SizeTest is Test {
         // Every contract we actually put on chain (beacon impls + the
         // non-upgradeable 7702 delegate). Add new deployables here.
         _assertDeployable("AgenticID.sol:AgenticID");
+        _assertDeployable("AttestorAppBindingLib.sol:AttestorAppBindingLib");
         _assertDeployable("VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry");
         _assertDeployable("CloneGate.sol:CloneGate");
         _assertDeployable("StandardCloneAuthorizer.sol:StandardCloneAuthorizer");

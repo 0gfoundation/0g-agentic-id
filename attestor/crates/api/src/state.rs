@@ -1,9 +1,8 @@
 //! Shared app state injected into axum handlers.
 //!
 //! api needs crypto + chain (for provision validation) + the repos /
-//! bus, plus a SandboxClient so /provision can `admin_delete` a
-//! permanently-failed container immediately (no point waiting until
-//! the user clicks Bring back online).
+//! bus, plus a SandboxClient for the authenticated app issuer scope and
+//! permanent-workload cleanup. Discovery failures remain retryable.
 
 use attestor_shared::{
     ChainClient, Config, CryptoModule, DeploymentRepo, EventBus, IdempotencyStore, JobQueue,

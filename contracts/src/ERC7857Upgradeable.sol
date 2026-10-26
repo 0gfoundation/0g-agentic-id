@@ -115,10 +115,7 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         // owner), so doing it while the token still belongs to `from` is fine,
         // and if the receiver rejects, the whole tx (including this write)
         // reverts — atomicity preserved. nonReentrant is belt-and-suspenders.
-        bytes[] memory sealedKeys = new bytes[](entries.length);
-        for (uint256 i; i < entries.length; ++i) {
-            sealedKeys[i] = entries[i].sealedKey;
-        }
+        bytes[] memory sealedKeys = _sealedKeysFromEntries(entries);
         _updateSealedKeys(tokenId, sealedKeys);
 
         // Use internal transfer to avoid a redundant _checkAuthorized call
@@ -126,6 +123,15 @@ contract ERC7857Upgradeable is IERC7857, IERC7857Delegate, ERC721Upgradeable, Pa
         _safeTransfer(from, to, tokenId, "");
 
         emit ITransferred(from, to, tokenId, entries);
+    }
+
+    function _sealedKeysFromEntries(SealedKeyEntry[] memory entries)
+        internal pure returns (bytes[] memory sealedKeys)
+    {
+        sealedKeys = new bytes[](entries.length);
+        for (uint256 i; i < entries.length; ++i) {
+            sealedKeys[i] = entries[i].sealedKey;
+        }
     }
 
     // ── Proof validation ──────────────────────────────────────────────────────

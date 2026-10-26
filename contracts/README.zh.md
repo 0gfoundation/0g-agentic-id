@@ -11,7 +11,7 @@ ERC-8004 身份注册表，并在其上叠加 ERC-7857 智能 NFT，为 TEE 内�
 ### 环境要求
 
 - **Foundry**（forge/cast/anvil）—— 合约编译、测试、脚本
-- **solc 0.8.24** —— 由 foundry 管理，不要手动改
+- **solc 0.8.38** —— 钉在 `foundry.toml`，使用仓库中的完整编译配置
 - **OpenZeppelin v5.0.2** —— `contracts` 和 `contracts-upgradeable` 两套，通过 submodule 装在 `lib/`
 
 ### 安装 Foundry
@@ -45,15 +45,15 @@ git submodule update --init --recursive
 | `openzeppelin-contracts-upgradeable` | v5.0.2 |
 | `forge-std` | **v1.12.0**（见下方警告） |
 
-> ⚠️ **forge-std 钉在 v1.12.0 是有意的**，跟 `via_ir` 一起踩了已知 codegen
-> bug；详见 [`../QUIRKS.md`](../QUIRKS.md)。
+> **forge-std 继续钉在 v1.12.0**。原先针对 Solidity 0.8.24 codegen 的规避已是
+> 历史记录；本次升级编译器并不同时升级测试依赖。详见 [`../QUIRKS.md`](../QUIRKS.md)。
 
 ### 编译与测试
 
 ```bash
 forge build                     # 增量编译到 out/
 forge build --force             # 强制全量重编
-forge test                      # 跑全量测试（当前 290 tests / 28 suites；2 个 fork 测试无 FORK_RPC 时跳过）
+forge test                      # 跑全量测试；2 个 fork 测试无 FORK_RPC 时跳过
 forge test -vvvv                # 详细 trace
 forge test --match-path test/TransferFlow.t.sol   # 只跑指定 suite
 forge fmt                       # 格式化
@@ -66,10 +66,12 @@ forge clean                     # 清 out/
 [profile.default]
 src = "src"                     # 源码目录（foundry 默认值）
 libs = ["lib"]                  # OZ submodules
-solc = "0.8.24"                 # 锁版本
+solc = "0.8.38"                 # 锁版本
 via_ir = true                   # ⚠️ 必需：giveFeedback 参数多会 stack too deep
 optimizer = true
-optimizer_runs = 200
+optimizer_runs = 1
+evm_version = "cancun"
+bytecode_hash = "none"          # 不附加 metadata hash；仍保留编译器版本 CBOR
 
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
@@ -79,6 +81,24 @@ remappings = [
 
 `via_ir = true` 是必需的——`giveFeedback` 参数多会 stack too deep（细节见
 [`../QUIRKS.md`](../QUIRKS.md)）。
+CBOR 保持开启；`bytecode_hash = "none"` 不等于 `--no-metadata`。
+使用上述配置实测，AgenticID runtime 为 **24,543 字节**，`AttestorAppBindingLib` 为
+**1,730 字节**，均通过 24,576 字节的 EIP-170 门槛。修改后应重新运行
+`forge build --sizes --skip test --skip script` 和 `forge test`，不要沿用旧的剩余空间估计。本轮验证通过 299 项测试，
+另有两个 fork 测试跳过。尺寸报告排除脚本和仅用于升级测试的 mock；全套测试中的
+`Eip170Size.t.sol` 另行检查所有生产部署合约。
+
+### 链接 attestor 授权库
+
+AgenticID 链接无状态的 `AttestorAppBindingLib`。库没有 owner 或独立配置，public 函数
+通过 `DELEGATECALL` 操作 proxy 原有存储；owner 检查、外部 ABI 和迁移开关留在 AgenticID。
+
+`forge script` 会为创建 AgenticID 的脚本自动部署并链接库。单独使用 `forge create` 时，
+须先部署库，再在创建实现时指定
+`--libraries src/AttestorAppBindingLib.sol:AttestorAppBindingLib:<LIB_ADDRESS>`。
+保留库地址及链接后实现的编译 metadata，供验证使用。库代码变更需要新的库和链接后实现，
+再通过原 beacon/timelock 激活；proxy 状态不迁移。链接及验证约束见
+[`UPGRADING.md`](UPGRADING.md)。
 
 ---
 
@@ -87,6 +107,7 @@ remappings = [
 ```
 contracts/src/
 ├── AgenticID.sol                               主合约（身份 + 7857 token + seal）
+├── AttestorAppBindingLib.sol                   无状态链接库，处理 app 实例授权
 ├── VerifiedFeedbackRegistry.sol                canonical ERC-8004 声誉注册表之上的
 │                                               TEE 验证层（attestFeedback + ServeProof）
 ├── FeedbackBatcher.sol                         EIP-7702 委托目标：canonical feedback + 盖章
@@ -550,7 +571,7 @@ AgenticID.iTransferFrom(from, to, tokenId, proofs[])
 | `CanonicalBinding.t.sol` | 10 | canonical 托管（token 由合约持有、本地转让后不动）/ 全局 agentId 计数器 / URI + metadata 的 canonical 可见性 / mint 时 agentWallet 清空 / agentId-0 sealId 哨兵 / clone 注册新 canonical id / 第三方 canonical agent 的 metadata、钱包 view 会 revert（FIND-14）|
 | `UpgradeReputation.t.sol` | 2 | 声誉 beacon 归 Timelock 所有 + feedback 存储在 beacon 升级后保留 |
 | `UpgradeVerifiedFeedback.t.sol` | 5 | VerifiedFeedbackRegistry 经 Timelock 从 1.1.0 升到 1.2.0（升级前 impl = `test/mocks/` 里冻结的 1.1.0 源码）：章 / 审计数据 / 接口 / 配置 / nonce 均保留；切换后旧格式 proof 被拒、注册表绑定 proof 通过；owner 保留，之后为两步转移；升级前盖章的超范围条目被 summary 跳过，不再让它 revert |
-| `UpgradeGovernance.t.sol` | 7 | AgenticID + TEEDataVerifier 从冻结的 1.1.0 源码（及其在 `test/mocks/v1_1_0/` 的冻结基类）经 1 天 Timelock（仿 mainnet 的延时、owner 作 proposer、开放执行）升到 1.2.0：seal 绑定 / iData / URI / metadata / 白名单 / verifier / oracle / nonce 均保留；升级后两步 ownership、零地址校验与 seal 地址唯一性生效；1.1.0 格式的转让 proof 被拒、token 绑定的通过；只升级其中一个会让非 seal 转让全部失败；升级前的 seal 作为其源 agent 的克隆 seal 会被 CloneGate 拒绝 |
+| `UpgradeGovernance.t.sol` | 7 | AgenticID + TEEDataVerifier 从冻结的 1.1.0 源码（及其在 `test/mocks/v1_1_0/` 的冻结基类）经 1 天 Timelock（仿 mainnet 的延时、owner 作 proposer、开放执行）分别升到 1.3.0 和 1.2.0：seal 绑定 / iData / URI / metadata / 白名单 / verifier / oracle / nonce 均保留；升级后两步 ownership、零地址校验与 seal 地址唯一性生效；1.1.0 格式的转让 proof 被拒、token 绑定的通过；只升级其中一个会让非 seal 转让全部失败；升级前的 seal 作为其源 agent 的克隆 seal 会被 CloneGate 拒绝 |
 | `CloneGate.t.sol` | 21 | policy 模式克隆卫星合约：setCloneAuthorizer 门禁 / cloneFrom 正常路径 + 全部 revert（attestor、无/拒绝/自身 revert 的 authorizer、arity、sealId、复用源 seal、暂停）/ 转让时按 owner-at-set 失效 / lineage |
 | `StandardCloneAuthorizer.t.sol` | 10 | 官方按买家开关的克隆 policy：仅卖家可 grant/revoke、按 agent 隔离、转让后 grant 失效且收回后复活、经 gate 克隆 |
 | `Eip170Size.t.sol` | 1 | 每个上链 impl 都在 EIP-170 运行时字节码上限内 |

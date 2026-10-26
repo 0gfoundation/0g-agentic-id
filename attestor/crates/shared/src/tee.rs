@@ -1,7 +1,7 @@
-//! TEE key provider abstraction + dev mock.
+//! Stable application signing key provider + explicit dev mock.
 //!
-//! Production: tapp runtime fetches the attestor's EOA private key from
-//! inside the TEE (never leaves the enclave). Dev: set
+//! Production: the attestor reads its dedicated KMS app signer through the
+//! local tapp socket within the TEE. Dev: set
 //! `MOCK_TEE=true` + `MOCK_APP_PRIVATE_KEY=0x...` + `MOCK_APP_ETH_ADDRESS=0x...`
 //! and the process uses the `MockTeeKeyProvider`. Env schema mirrors the
 //! 0g-sandbox/tapp convention — both priv key and address are passed in,
@@ -11,6 +11,30 @@
 use alloy::primitives::keccak256;
 use async_trait::async_trait;
 use k256::ecdsa::SigningKey;
+
+fn canonical_commitment(scheme: &str, commitment: &[u8]) -> bool {
+    // Canonical 32-byte big-endian BN254 Fr, without modulo reduction.
+    const MODULUS: [u8; 32] = [
+        0x30, 0x64, 0x4e, 0x72, 0xe1, 0x31, 0xa0, 0x29, 0xb8, 0x50, 0x45, 0xb6, 0x81, 0x81, 0x58,
+        0x5d, 0x28, 0x33, 0xe8, 0x48, 0x79, 0xb9, 0x70, 0x91, 0x43, 0xe1, 0xf5, 0x93, 0xf0, 0x00,
+        0x00, 0x01,
+    ];
+    scheme == "poseidon-bn254-4-v1" && commitment.len() == 32 && commitment < MODULUS.as_slice()
+}
+
+/// Validate the local tapp's evidence declaration without interpreting a secret
+/// as any particular curve scalar. Both generic KMS and signer RPCs use this.
+pub(crate) fn validate_measured_commitment(
+    scheme: &str,
+    commitment: &[u8],
+    measured_in_evidence: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        measured_in_evidence && canonical_commitment(scheme, commitment),
+        "tapp did not return a measured canonical KMS commitment"
+    );
+    Ok(())
+}
 
 #[async_trait]
 pub trait TeeKeyProvider: Send + Sync {
@@ -73,14 +97,14 @@ impl TeeKeyProvider for MockTeeKeyProvider {
     }
 }
 
-// ── Real tapp-server gRPC (GetAppSecretKey) ────────────────────────────
+// ── Real tapp-server gRPC (GetAppSigner) ────────────────────────────
 
 use crate::tapp_grpc;
 use crate::Config;
 use tonic::transport::Channel;
 
 /// Fetches the attestor's EOA signing key from tapp-server via gRPC
-/// `GetAppSecretKey` (local access only). tapp-server holds the key in
+/// `GetAppSigner` (local access only). tapp-server derives the dedicated material 70726f7669646572 from KMS in
 /// TEE memory and returns it over the local socket. Channel is reused;
 /// we always re-fetch on `app_private_key()` calls (attestor calls it
 /// once at startup).
@@ -101,34 +125,50 @@ impl TappTeeKeyProvider {
 impl TeeKeyProvider for TappTeeKeyProvider {
     async fn app_private_key(&self) -> anyhow::Result<[u8; 32]> {
         use tapp_grpc::proto::tapp_service_client::TappServiceClient;
-        use tapp_grpc::proto::GetAppSecretKeyRequest;
+        use tapp_grpc::proto::GetAppSignerRequest;
 
         let mut client = TappServiceClient::new(self.channel.clone());
-        let mut last_err = anyhow::anyhow!("GetAppSecretKey never attempted");
+        let mut last_err = anyhow::anyhow!("GetAppSigner never attempted");
 
         // Retry tolerates tapp-server lazy-load on cold container start.
         for attempt in 1u32..=10 {
             match client
-                .get_app_secret_key(GetAppSecretKeyRequest {
+                .get_app_signer(GetAppSignerRequest {
                     app_id: self.app_id.clone(),
-                    key_type: "ethereum".to_string(),
-                    x25519: false,
                 })
                 .await
             {
                 Ok(r) => {
                     let resp = r.into_inner();
                     if !resp.success {
-                        anyhow::bail!("GetAppSecretKey failed: {}", resp.message);
+                        anyhow::bail!("GetAppSigner failed: {}", resp.message);
                     }
-                    if resp.private_key.len() != 32 {
-                        anyhow::bail!(
-                            "GetAppSecretKey bad private_key length: {}",
-                            resp.private_key.len()
-                        );
+                    if resp.secret.len() != 32 {
+                        anyhow::bail!("GetAppSigner bad private_key length: {}", resp.secret.len());
                     }
+                    anyhow::ensure!(
+                        resp.key_source == "kms"
+                            && resp.derivation == "raw-scalar-v1",
+                        "GetAppSigner did not return a stable KMS identity"
+                    );
+                    validate_measured_commitment(
+                        &resp.commitment_scheme,
+                        &resp.commitment,
+                        resp.measured_in_evidence,
+                    )?;
+                    let signing = SigningKey::from_slice(&resp.secret)?;
+                    anyhow::ensure!(
+                        resp.public_key
+                            == signing.verifying_key().to_encoded_point(true).as_bytes(),
+                        "GetAppSigner public key mismatch"
+                    );
+                    let public = signing.verifying_key().to_encoded_point(false);
+                    anyhow::ensure!(
+                        resp.eth_address == keccak256(&public.as_bytes()[1..])[12..],
+                        "GetAppSigner address mismatch"
+                    );
                     let mut out = [0u8; 32];
-                    out.copy_from_slice(&resp.private_key);
+                    out.copy_from_slice(&resp.secret);
                     return Ok(out);
                 }
                 Err(e) => {
@@ -136,14 +176,31 @@ impl TeeKeyProvider for TappTeeKeyProvider {
                     tracing::warn!(
                         attempt,
                         error = %e,
-                        "GetAppSecretKey failed, retrying in {}s",
+                        "GetAppSigner failed, retrying in {}s",
                         delay.as_secs()
                     );
-                    last_err = anyhow::anyhow!("GetAppSecretKey RPC failed: {}", e);
+                    last_err = anyhow::anyhow!("GetAppSigner RPC failed: {}", e);
                     tokio::time::sleep(delay).await;
                 }
             }
         }
         Err(last_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_accepts_frozen_scheme_and_canonical_field_encoding() {
+        assert!(canonical_commitment("poseidon-bn254-4-v1", &[0; 32]));
+        assert!(!canonical_commitment("other", &[0; 32]));
+        assert!(!canonical_commitment("poseidon-bn254-4-v1", &[0; 31]));
+        assert!(!canonical_commitment("poseidon-bn254-4-v1", &[255; 32]));
+        let modulus =
+            hex::decode("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001")
+                .unwrap();
+        assert!(!canonical_commitment("poseidon-bn254-4-v1", &modulus));
     }
 }

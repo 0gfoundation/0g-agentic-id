@@ -197,6 +197,7 @@ contract DeployScriptTest is Test {
     function _assertGovernance(Deploy.Deployed memory d, address owner, uint256 delay, bool ownerIsAdmin)
         internal view
     {
+        assertLe(d.agenticIdImpl.code.length, 24576, "linked AgenticID implementation must fit EIP-170");
         TimelockController t = TimelockController(payable(d.timelock));
         assertEq(t.getMinDelay(), delay, "minDelay");
 

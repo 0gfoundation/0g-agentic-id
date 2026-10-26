@@ -8,28 +8,16 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	eciesgo "github.com/ecies/go/v2"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/logger"
 )
-
-// Attestation is the sandbox-injected SANDBOX_SEAL_ATTESTATION envelope.
-// Reproduced here so this package depends only on logger; bootstrap parses
-// it from env at startup and hands the parsed struct in.
-type Attestation struct {
-	SealID    string `json:"seal_id"`
-	Pubkey    string `json:"pubkey"`
-	ImageHash string `json:"image_hash"`
-	Signature string `json:"signature"`
-	Ts        int64  `json:"ts"`
-}
 
 // Result is what /provision hands the container.
 type Result struct {
@@ -55,8 +43,19 @@ type Result struct {
 // logged and dropped rather than being fatal: an agent that boots on its
 // last-good configuration beats one that refuses to boot.
 func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result {
+	// Reject legacy/unknown envelopes even if this function is called without
+	// config.Load. No HTTP request may upgrade or silently rewrite signed scope.
+	if _, err := a.RecoverSigner(); err != nil {
+		logger.Logf("FAIL provision: invalid image attestation: %v", err)
+		return Result{}
+	}
 	imageHashHex := strings.TrimPrefix(a.ImageHash, "sha256:")
 	reqBody, _ := json.Marshal(map[string]any{
+		"version":           a.Version,
+		"chain_id":          a.ChainID,
+		"registry_address":  a.RegistryAddress,
+		"app_id":            a.AppID,
+		"registered_at":     a.RegisteredAt,
 		"seal_id":           "0x" + a.SealID,
 		"container_pubkey":  a.Pubkey,
 		"image_hash":        "0x" + imageHashHex,
@@ -64,7 +63,11 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 		"sandbox_signature": a.Signature,
 	})
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := attestorhttp.Client(attestorURL)
+	if err != nil {
+		logger.Logf("FAIL provision: attestor identity: %v", err)
+		return Result{}
+	}
 	resp, err := client.Post(attestorURL+"/provision", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		logger.Logf("FAIL provision: POST error: %v", err)
@@ -72,7 +75,11 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logger.Logf("FAIL provision: response body: %v", err)
+		return Result{}
+	}
 	if resp.StatusCode != http.StatusOK {
 		logger.Logf("FAIL provision: HTTP %d: %s", resp.StatusCode, string(body))
 		return Result{}
@@ -124,7 +131,3 @@ func FromAttestor(attestorURL string, sealKeyBytes []byte, a Attestation) Result
 	}
 	return Result{AgentSealPriv: plaintext, Settings: settingsBlob}
 }
-
-// fmt is referenced indirectly via fmt.Errorf elsewhere in this package once
-// outbound provisioning is added; kept silent here for now.
-var _ = fmt.Errorf
