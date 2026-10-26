@@ -133,6 +133,18 @@ export function hostOf(url?: string): string {
 }
 
 /**
+ * A failure meaning the SEAT was taken (occupancy.go): HTTP 409 with
+ * 'displaced' or 'in use by another client' in the body, from any path —
+ * the chat turn, /cancel, /result, /tasks. All of them route through the
+ * same displaced-seat prompt instead of surfacing the raw error. Exported
+ * for the tests: this is the routing decision (which errors are seat
+ * events, not task errors).
+ */
+export function displacedFailure(failure: string): boolean {
+  return /displaced|in use by another client/i.test(failure);
+}
+
+/**
  * The tasks bare `/cancel` stops: everything still in flight, NEWEST FIRST
  * (stopping only the newest would leave an older running turn alive; dsh/
  * prime serialize turns, so a queued one is waiting on the running one).
@@ -2018,6 +2030,27 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (line === '/quit' || line === '/exit') { process.exit(0); }
     if (line === '/help') { out(`${L2_HELP_FULL}\n`); continue; }
 
+    // Displaced seat (occupancy.go): WeChat semantics — this window bows
+    // out; Enter claims the seat back. A 409 'displaced' from ANY path
+    // means the same thing: another client drives the agent now. Defined
+    // before the command-dispatch try so the chat turn (which runs after
+    // that try/catch) and the task paths (/cancel, /result, /tasks — inside
+    // it) share it; those paths used to surface the raw HTTP 409 instead.
+    const displacedSeat = async (failure: string, reclaimedHint: string): Promise<'reclaimed' | 'left' | null> => {
+      if (!displacedFailure(failure)) return null;
+      out(`\n⚠ this agent is now driven by another client\n`);
+      const takeBack = (await ask('press Enter to take the seat back (anything else leaves the session): ')).trim();
+      if (takeBack === '') {
+        try {
+          if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out(`seat reclaimed — ${reclaimedHint}\n`); return 'reclaimed'; }
+        } catch (e) {
+          out(`reclaim failed: ${(e as Error).message}\n`);
+        }
+      }
+      out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
+      return 'left';
+    };
+
     try {
       if (line === '/hello') {
         if (s.phase !== 'running' || !s.url) { out(`agent is ${s.phase} — not reachable; /start or /reset first\n`); continue; }
@@ -2224,10 +2257,17 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // memory of submitted ids; status is fetched live from the agent.
         if (!s.client?.task) { out('(this agent has no task surface — chat turns are connection-bound here)\n'); continue; }
         if (!s.tasks?.length) { out('no tasks started from this session yet — every chat turn on this agent is one; /result <id> also re-attaches by id\n'); continue; }
+        let displacedFromTasks: string | null = null;
         const rows = await Promise.all(s.tasks.map(async (t) => {
-          const snap = await s.client!.task!(t.id).catch(() => null);
+          const snap = await s.client!.task!(t.id).catch((e: Error) => {
+            // A 409 displaced is a SEAT event, not a task error — route it
+            // to the same prompt the chat turn uses.
+            if (displacedFailure(e.message ?? '')) displacedFromTasks = e.message;
+            return null;
+          });
           return { ...t, status: snap?.status ?? 'unknown (evicted or agent restarted)' };
         }));
+        if (displacedFromTasks && (await displacedSeat(displacedFromTasks, 'retry /tasks')) !== null) continue;
         for (const t of rows.reverse()) {
           out(`  ${t.id}  ${t.status.padEnd(12)} ${Math.round((Date.now() - t.at) / 1000)}s ago  ${t.prompt}\n`);
         }
@@ -2245,7 +2285,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (line.split(/\s+/)[1] && !s.tasks?.some((t) => t.id === id)) {
           (s.tasks ??= []).push({ id, prompt: '(adopted by /result)', at: Date.now() });
         }
-        const snap = await s.client.task(id).catch((e) => { out(`(${(e as Error).message})\n`); return null; });
+        const snap = await s.client.task(id).catch(async (e: Error) => {
+          // 409 displaced = seat event, not a task error — the shared prompt.
+          if ((await displacedSeat(e.message ?? '', `retry /result ${id}`)) !== null) return null;
+          out(`(${e.message})\n`);
+          return null;
+        });
         if (!snap) continue;
         if (snap.status === 'completed' || snap.status === 'cancelled' || snap.status === 'failed') {
           out(`task ${id} — ${snap.status}\n`);
@@ -2287,6 +2332,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           // error, 5xx, 401, 409) means we could not CHECK, and the honest
           // answer is to say so, not to claim nothing is running.
           const rows: Array<{ id: string; status: string }> = [];
+          let displacedDuringCheck: string | null = null;
           const unreachable: string[] = [];
           for (const t of s.tasks) {
             try {
@@ -2294,10 +2340,13 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               rows.push({ id: t.id, status: snap.status });
             } catch (e) {
               const msg = (e as Error).message ?? '';
+              // 409 displaced = seat event — same prompt as the chat turn.
+              if (displacedFailure(msg)) { displacedDuringCheck = msg; break; }
               if (msg.includes('HTTP 404')) rows.push({ id: t.id, status: 'unknown' });
               else unreachable.push(t.id);
             }
           }
+          if (displacedDuringCheck && (await displacedSeat(displacedDuringCheck, 'retry /cancel')) !== null) continue;
           if (unreachable.length) {
             out(`could not reach the agent to check: ${unreachable.join(', ')} — the tasks may still be running; retry /cancel, or /cancel <id> directly\n`);
             continue;
@@ -2312,7 +2361,11 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
               try {
                 const t = await s.client.cancelTask(tid);
                 out(`⏹ cancel ${tid} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
-              } catch (e) { out(`(cancel ${tid} failed: ${(e as Error).message})\n`); }
+              } catch (e) {
+                // 409 displaced = seat event — same prompt as the chat turn.
+                if ((await displacedSeat((e as Error).message ?? '', `retry /cancel ${tid}`)) !== null) break;
+                out(`(cancel ${tid} failed: ${(e as Error).message})\n`);
+              }
             }
             continue;
           }
@@ -2321,7 +2374,12 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
           try {
             const t = await s.client.cancelTask(id);
             out(`⏹ cancel ${id} — ${t.status === 'completed' ? 'already finished' : t.status}\n`);
-          } catch (e) { out(`(cancel failed: ${(e as Error).message})\n`); }
+          } catch (e) {
+            // 409 displaced = seat event — same prompt as the chat turn.
+            if ((await displacedSeat((e as Error).message ?? '', `retry /cancel ${id}`)) === null) {
+              out(`(cancel failed: ${(e as Error).message})\n`);
+            }
+          }
           continue;
         }
         if (id && !s.client?.cancelTask) {
@@ -2506,18 +2564,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       // window bows out to the manager (same exit as /back; the try/finally
       // still releases the Esc brake). Entering the session again claims the
       // seat back.
-      if (failure && /displaced|in use by another client/i.test(failure)) {
-        out(`\n⚠ this agent is now driven by another client\n`);
-        const takeBack = (await ask('press Enter to take the seat back (anything else leaves the session): ')).trim();
-        if (takeBack === '') {
-          try {
-            if (s.url) { await s.ag.agent.claimAgent(s.url, BigInt(s.agentId), clientInstanceId); out('seat reclaimed — continue chatting\n'); continue; }
-          } catch (e) {
-            out(`reclaim failed: ${(e as Error).message}\n`);
-          }
-        }
-        out(`no live connection to reclaim — \`use ${s.agentId}\` re-enters\n`);
-        return;
+      if (failure) {
+        const d = await displacedSeat(failure, 'continue chatting');
+        if (d === 'reclaimed') continue;
+        if (d === 'left') return;
       }
       if (failure && sawToolActivity && /without any output/.test(failure)) {
         out('\n(the agent ran tools this turn but wrote no reply — /agentlog shows what it did)');

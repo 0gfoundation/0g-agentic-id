@@ -44,3 +44,25 @@ test('empty on empty', () => {
 test('a queued task is in flight (queued→marked cancelled, not started)', () => {
   assert.deepEqual(inFlightIds([{ id: 'q', status: 'queued' }]), ['q']);
 });
+
+// displacedFailure — the routing decision every task path (/cancel, /result,
+// /tasks) and the chat turn share: which failures are SEAT events (HTTP 409
+// displaced / in use by another client → the reclaim prompt), not task
+// errors. Pinned against the exact message shapes the transport throws.
+import { displacedFailure } from '../dist/cli/commands/interactive.js';
+
+test('a mocked 409 displaced routes to the seat prompt on every path', () => {
+  // the shapes cancelTask/task/followTask actually throw (method-prefixed,
+  // body inline)
+  assert.equal(displacedFailure('cancelTask: HTTP 409: {"error":"displaced"}'), true);
+  assert.equal(displacedFailure('task: HTTP 409: {"error":"seat displaced by another client"}'), true);
+  assert.equal(displacedFailure('HTTP 409: in use by another client'), true);
+  assert.equal(displacedFailure('followTask: HTTP 409: Displaced — manager reassigned the seat'), true,
+    'case-insensitive');
+  // NOT seat events: other 409s, other statuses, plain errors
+  assert.equal(displacedFailure('cancelTask: HTTP 409: {"error":"task already cancelled"}'), false,
+    'a 409 that is not a seat event stays a task error');
+  assert.equal(displacedFailure('task: HTTP 404: no such task'), false);
+  assert.equal(displacedFailure('cancelTask: HTTP 500: gateway broke'), false);
+  assert.equal(displacedFailure(''), false);
+});
