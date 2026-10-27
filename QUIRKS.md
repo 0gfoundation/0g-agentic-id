@@ -130,7 +130,8 @@ with both native tests and a Linux target build.
 
 The old CLI updater queries `@0gfoundation/0g-agenticid-sdk`, so the rename
 needs a compatibility release under that package name. Its launcher exposes
-both command names and depends on the matching `0g-agentdna` release.
+both command names and depends on the matching `@0gfoundation/0g-agentdna`
+release.
 `sdk/typescript/src/cli/commands/update.ts` detects this launcher and updates
 the compatibility package: installing the canonical package over its global
 command links instead can fail with npm `EEXIST`. Keep both release versions

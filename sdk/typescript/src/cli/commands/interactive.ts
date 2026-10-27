@@ -360,7 +360,7 @@ import type { CommandContext } from '../types';
 import { cellText, cleanCell, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 
 /** Column widths of the REPL listing; its header and every row share them. */
-const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 22, agentSeal: 13, owner: 24 } as const;
+const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
 
 /** The REPL listing's header line, aligned with {@link renderListRow}. */
 export function renderListHeader(): string {
@@ -375,8 +375,9 @@ export function renderListHeader(): string {
  * with `list`: a name cannot forge rows in this listing either, and an
  * agent-owned agent reads the same way — its OWNER is another row's
  * AGENTSEAL, annotated `⇄ #<agentId>` (`sealToAgent`, from the full listing).
- * SEAL is the sealId PREFIX short form — commands accept a unique prefix,
- * so unminted rows stay referenceable without a 66-char column blowout (F12).
+ * SEAL is the sealId PREFIX (`0x` + 10 hex), the form commands accept as a
+ * reference, so unminted rows stay referenceable without a 66-char column
+ * blowout (F12).
  * AGENTSEAL is the agent's on-chain signing address.
  */
 export function renderListRow(
@@ -389,7 +390,7 @@ export function renderListRow(
   sealToAgent: ReadonlyMap<string, string> = new Map(),
 ): string {
   const c = LIST_COLS;
-  const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
+  const seal = `0x${r.sealId.slice(2, 12)}`;
   return `${owned} ${String(r.agentId ?? '?').padEnd(c.id)} ${cellText(r.phase ?? '?', c.phase)}` +
     `${cellText(r.framework, c.framework)}${cellText(seal, c.seal)}${cellText(shortAddr(r.agentSeal), c.agentSeal)}` +
     `${trustedCell(ownerCellText(owner, sealToAgent), c.owner)}${cleanCell(r.name)}\n`;

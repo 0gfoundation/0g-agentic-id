@@ -32,14 +32,19 @@ import { privateKeyToAccount } from 'viem/accounts';
 
 const MAIN = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'cli', 'main.js');
 
-/** Run the CLI; resolve {code, stdout, stderr}. Never rejects on exit code. */
-function run(args, env = {}) {
+/** Run the CLI; resolve {code, stdout, stderr}. Never rejects on exit code.
+ *  `input` is piped to stdin: the REPL reads it as a line queue. */
+function run(args, env = {}, input) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [MAIN, ...args], {
       // Deliberately NOT inheriting AGENTIC_*; XDG_CONFIG_HOME points at an
       // empty dir so no persisted config can leak into the test.
       env: { PATH: process.env.PATH, XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'agcli-')), ...env },
     });
+    if (input !== undefined) {
+      child.stdin.on('error', () => { /* child gone first: EPIPE is not a test failure */ });
+      child.stdin.end(input);
+    }
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => (stdout += d));
@@ -468,6 +473,45 @@ test('REPL listing: FRAMEWORK, AGENTSEAL and the ⇄ annotation, aligned with it
   const bare = renderListRow({ agentId: null, phase: 'deploying', sealId: `0x${'15'.repeat(32)}`, name: null }, null);
   assert.match(bare, /^  \? /, 'unminted rows show ?');
   assert.equal((bare.match(/—/g) ?? []).length, 3, 'FRAMEWORK, AGENTSEAL and OWNER render the placeholder');
+});
+
+test('REPL list loop: owner-tier fields for an unminted own row, the annotation, --mine', async () => {
+  // Public tier withholds owner and agentSeal on the unminted row; the owner
+  // tier (list_by_owner) carries both — the loop must merge them in.
+  const MINE_SEAL = `0x${'c0ffee12'.repeat(5)}`;
+  const PENDING = {
+    seal_id: `0x${'16'.repeat(32)}`,
+    framework: 'dsh',
+    agent_card: { name: 'pending-mine' },
+    phase: 'deploying',
+    created_at: '2026-10-27T00:00:00Z',
+  };
+  const server = await mockAttestor([PARENT, CHILD, PENDING], [{ ...PENDING, owner: MY_WALLET, agent_seal_addr: MINE_SEAL }]);
+  try {
+    const r = await run([], {
+      AGENTIC_ATTESTOR_URL: `http://127.0.0.1:${server.address().port}`,
+      AGENTIC_PRIVATE_KEY: MINE_KEY,
+    }, 'list\nlist --mine\nexit\n');
+    const lines = r.stdout.split('\n');
+    const short = (a) => `${a.slice(0, 6)}…${a.slice(-4)}`;
+    // Both listings print the same header; slice the output by its line numbers.
+    const at = lines.flatMap((l, i) => (/ID\s+PHASE\s+FRAMEWORK\s+SEAL\s+AGENTSEAL\s+OWNER\s+NAME/.test(l) ? [i] : []));
+    assert.equal(at.length, 2, `both listings print the new header:\n${r.stdout}\n${r.stderr}`);
+    const all = lines.slice(at[0] + 1, at[1]).join('\n');
+    const mineOnly = lines.slice(at[1] + 1).join('\n');
+    const child = all.split('\n').find((l) => /selftest-agent/.test(l));
+    assert.match(child ?? '', /⇄ #466/, `the agent-owned row is annotated:\n${all}`);
+    const pending = all.split('\n').find((l) => /pending-mine/.test(l));
+    assert.match(pending, /^\* \? /, 'own unminted row: * mark and no agentId');
+    assert.ok(pending.includes(short(MINE_SEAL)), 'AGENTSEAL from the owner tier');
+    assert.ok(pending.includes(short(MY_WALLET)), 'OWNER from the owner tier');
+    assert.match(all, /\(\* = owned by your wallet/, 'ownership footer');
+    assert.match(mineOnly, /pending-mine/, '--mine keeps the own row');
+    assert.doesNotMatch(mineOnly, /selftest-agent|wilbert/, '--mine drops rows owned by others');
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
 });
 
 test('REPL listing: attestor-supplied PHASE and FRAMEWORK cannot inject escapes', async () => {
