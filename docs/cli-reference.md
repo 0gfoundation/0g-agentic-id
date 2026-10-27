@@ -1,12 +1,12 @@
 # 0g-agentdna CLI Reference
 
-> Matches `0g-agentdna` ≥ 0.2.0 · the CLI ships inside the SDK package — no separate install
+> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.0 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
 ## 1. Installation & Mental Model
 
 ```bash
-npm install 0g-agentdna
+npm install @0gfoundation/0g-agentdna
 npx 0g-agentdna --help
 ```
 

@@ -49,7 +49,7 @@ curl -fsS "$ATTESTOR_URL/inference/providers" > providers.json
 
 ```typescript
 import { readFileSync } from 'node:fs';
-import { AgentDNA } from '0g-agentdna';
+import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
 const ag = await AgentDNA.fromAttestor(attestorUrl, { account });
 const edited = JSON.parse(readFileSync('providers.json', 'utf8'));

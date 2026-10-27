@@ -1,1 +1,1 @@
-module.exports = require('0g-agentdna');
+module.exports = require('@0gfoundation/0g-agentdna');

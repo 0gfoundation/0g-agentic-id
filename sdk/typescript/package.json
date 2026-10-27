@@ -1,5 +1,5 @@
 {
-  "name": "0g-agentdna",
+  "name": "@0gfoundation/0g-agentdna",
   "version": "0.2.0",
   "description": "0G AgentDNA TypeScript SDK and CLI for on-chain AI agent identities",
   "main": "dist/index.js",

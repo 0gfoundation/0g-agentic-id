@@ -1,6 +1,6 @@
 # 0G AgentDNA SDK — Guide
 
-The full guide for **[0g-agentdna](https://www.npmjs.com/package/0g-agentdna)**:
+The full guide for **[@0gfoundation/0g-agentdna](https://www.npmjs.com/package/@0gfoundation/0g-agentdna)**:
 every method with the reasoning behind it. The package [README](./README.md) is
 the terse interface reference (signatures + shapes); this file is the "why".
 
@@ -11,7 +11,7 @@ Protocol docs & full source: **[github.com/0gfoundation/0g-agentic-id](https://g
 **Fastest path — bootstrap from one URL.** The attestor's `GET /config` self-describes its environment (contract set, chain RPC, component appIds), so the URL alone pins the environment; switching environments is switching URLs. The public 0G attestors are `https://agenticid.0g.ai` (0G mainnet, chain 16661 — real funds) and `https://agenticid-testnet.0g.ai` (0G Galileo testnet, chain 16602):
 
 ```ts
-import { AgentDNA } from '0g-agentdna';
+import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
 const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only; env values are string|undefined, so strict TS needs the assertion
@@ -37,7 +37,7 @@ address without giving up the bootstrap.)
 Construct **once**. All you need for reads is contract addresses; for writes, add a signing key. The SDK builds its viem clients internally from the RPC + its known chain — you don't hand-build a wallet client. `rpcUrl` and `chain` both default to the 0G Galileo testnet, so they're optional there; for mainnet pass both (below).
 
 ```ts
-import { AgentDNA, type ContractAddresses } from '0g-agentdna';
+import { AgentDNA, type ContractAddresses } from '@0gfoundation/0g-agentdna';
 
 // Addresses are a deployment artifact — copy the set you target from
 // contracts/DEPLOYMENT.md §6, or load from your own config/env. An RPC + these
@@ -256,7 +256,7 @@ await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3
 **Compare-and-swap.** `baseVersion` is the version you read before editing. If the stored version has moved on — another client, another device, a replayed request — the write is refused with `SettingsConflictError`, which carries the live document and its version:
 
 ```ts
-import { SettingsConflictError } from '0g-agentdna';
+import { SettingsConflictError } from '@0gfoundation/0g-agentdna';
 
 try {
   await ag.agent.setSettings(sealId, next, { baseVersion: version });
@@ -830,8 +830,8 @@ requests signatures over the container's unix sign socket
 adapter wraps that socket as a viem Account:
 
 ```ts
-import { AgentDNA } from '0g-agentdna';
-import { sealAccount } from '0g-agentdna/seal';   // node-only subpath
+import { AgentDNA } from '@0gfoundation/0g-agentdna';
+import { sealAccount } from '@0gfoundation/0g-agentdna/seal';   // node-only subpath
 
 const ag = await AgentDNA.fromAttestor(url, { account: await sealAccount() });
 // address auto-discovers from $AGENT_SEAL, socket path from $SEAL_SIGN_SOCK
@@ -938,7 +938,7 @@ The per-contract clients (`AgenticIDClient`, `ReputationClient`, `SandboxClient`
 The package ships a CLI — no separate install, zero extra dependencies. Bare `0g-agentdna` opens an **interactive shell** (Claude-Code style); `doctor`/`status`/`list`/`settings` remain scriptable diagnostics subcommands.
 
 ```bash
-npm install 0g-agentdna
+npm install @0gfoundation/0g-agentdna
 npx 0g-agentdna          # interactive shell
 npx 0g-agentdna 286      # jump straight into agent 286's session
 npx 0g-agentdna --help

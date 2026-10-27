@@ -1,9 +1,10 @@
 # Upgrading to 0G AgentDNA
 
-The npm package and CLI command are now both `0g-agentdna`. The SDK exposes
-`AgentDNA` and `AgentDNAConfig`; the existing `AgenticID` and `AgenticIDConfig`
-exports remain compatible. Contract names and signed-message domains retain
-their protocol identifiers.
+The npm package is now `@0gfoundation/0g-agentdna`, published under the
+0gfoundation organization, and the CLI command is `0g-agentdna`. The SDK
+exposes `AgentDNA` and `AgentDNAConfig`; the existing `AgenticID` and
+`AgenticIDConfig` exports remain compatible. Contract names and signed-message
+domains retain their protocol identifiers.
 
 ## Existing CLI users
 
@@ -22,8 +23,17 @@ Subsequent updates use `0g-agentdna update`. When launched through the bridge,
 the updater updates that bridge package so npm retains ownership of its
 global command links.
 
-Fresh installations use `npm install -g 0g-agentdna`. A development checkout
-uses the repository build workflow instead of the npm self-updater.
+Fresh installations use `npm install -g @0gfoundation/0g-agentdna`. A
+development checkout uses the repository build workflow instead of the npm
+self-updater.
+
+A `0g-agentdna` package without the scope was published briefly and is deprecated.
+If you installed it, replace it; both own the `0g-agentdna` command:
+
+```bash
+npm uninstall -g 0g-agentdna
+npm install -g @0gfoundation/0g-agentdna
+```
 
 ## Local configuration
 
@@ -48,8 +58,8 @@ then `reset` to switch an existing agent. See [providers](./PROVIDERS.md).
 ## SDK applications
 
 ```typescript
-import { AgentDNA, type AgentDNAConfig } from '0g-agentdna';
-import { sealAccount } from '0g-agentdna/seal';
+import { AgentDNA, type AgentDNAConfig } from '@0gfoundation/0g-agentdna';
+import { sealAccount } from '@0gfoundation/0g-agentdna/seal';
 ```
 
 Existing imports from `@0gfoundation/0g-agenticid-sdk` and its `/seal` subpath
@@ -61,7 +71,7 @@ the application's dependencies.
 1. Align the canonical package version, lockfile, `SDK_VERSION`, and the
    compatibility manifest's version and exact dependency.
 2. Run SDK typecheck and tests, and inspect both npm package contents.
-3. Publish `0g-agentdna` from `sdk/typescript`.
+3. Publish `@0gfoundation/0g-agentdna` from `sdk/typescript`.
 4. Publish `@0gfoundation/0g-agenticid-sdk` from `sdk/typescript/compat/legacy`
    at the same version after its canonical dependency is available. Repeat
    this step for each release while supporting the old update path.

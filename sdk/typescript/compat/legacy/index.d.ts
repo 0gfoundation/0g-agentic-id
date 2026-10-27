@@ -1,1 +1,1 @@
-export * from '0g-agentdna';
+export * from '@0gfoundation/0g-agentdna';

@@ -1,11 +1,11 @@
 # 0g-agentdna
 
-[![npm](https://img.shields.io/npm/v/0g-agentdna.svg)](https://www.npmjs.com/package/0g-agentdna) [![license: MIT](https://img.shields.io/npm/l/0g-agentdna.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@0gfoundation/0g-agentdna.svg)](https://www.npmjs.com/package/@0gfoundation/0g-agentdna) [![license: MIT](https://img.shields.io/npm/l/@0gfoundation/0g-agentdna.svg)](./LICENSE)
 
 **0G AgentDNA** TypeScript SDK for the AgenticID protocol — deploy, call, and build on-chain reputation for autonomous AI agents. Built on [viem](https://viem.sh).
 
 ```bash
-npm install 0g-agentdna viem
+npm install @0gfoundation/0g-agentdna viem
 ```
 
 **What do you want to do?**
@@ -36,7 +36,7 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ## Quickstart
 
 ```ts
-import { AgentDNA } from '0g-agentdna';
+import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
 // 0G mainnet; for the Galileo testnet use 'https://agenticid-testnet.0g.ai'
 const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
