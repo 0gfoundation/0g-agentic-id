@@ -11,8 +11,11 @@ ENV PATH="/root/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH}"
 # node; fail the build instead of shipping it.
 RUN test "$(node --version)" = "v${NODE_VERSION}"
 
-# Install openclaw globally.
-RUN npm install -g openclaw
+# Install openclaw globally, pinned: the same version sealed/Dockerfile bakes
+# (OPENCLAW_BAKED_VERSION) and validates (whitelistMax in
+# sealed/internal/framework/openclaw/whitelist.go). An unpinned install takes
+# whatever npm calls latest when the base is rebuilt.
+RUN npm install -g openclaw@2026.7.1
 
 # Pre-configure gateway: allow non-loopback Host header origin fallback
 # (sandbox containers have no loopback UI access from the host).
