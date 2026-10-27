@@ -92,14 +92,22 @@ RUN if id -u agent >/dev/null 2>&1; then usermod --home /home/agent agent; else 
 # is effectively a no-op (cache hit). Users who want a different version
 # still pay the full dynamic install cost on first boot — that's the
 # explicit tradeoff for runtime version flexibility.
+#
+# The base's ~/.openclaw was written by whatever openclaw the base installed;
+# a newer one leaves a state database the baked version refuses to open
+# ("uses newer schema version 20; this OpenClaw build supports 1"), so the
+# baked version starts from an empty one. The warmup gateway runs until the
+# timeout (124); any other exit means openclaw could not start, and fails the
+# build.
 ARG OPENCLAW_BAKED_VERSION=2026.7.1
-RUN npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
+RUN rm -rf /root/.openclaw \
+ && npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
  && mkdir -p /root/.openclaw \
  && printf '%s' \
     '{"gateway":{"auth":{"mode":"token","token":"warmup-not-used-at-runtime"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-opus-4-6"}}}}' \
     > /root/.openclaw/openclaw.json \
- && (timeout 60 openclaw gateway run --allow-unconfigured --bind loopback --port 33999 \
-      || true) \
+ && { timeout 60 openclaw gateway run --allow-unconfigured --bind loopback --port 33999; rc=$?; \
+      case "$rc" in 0|124) ;; *) echo "openclaw warmup failed: exit $rc" >&2; exit 1 ;; esac; } \
  && rm -f /root/.openclaw/openclaw.json /root/.openclaw/openclaw.json.bak
 
 # nvm unpacks node release tarballs as root, which restores the tarball's
