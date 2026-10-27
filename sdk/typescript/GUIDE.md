@@ -939,9 +939,9 @@ The package ships a CLI — no separate install, zero extra dependencies. Bare `
 
 ```bash
 npm install @0gfoundation/0g-agentdna
-npx 0g-agentdna          # interactive shell
-npx 0g-agentdna 286      # jump straight into agent 286's session
-npx 0g-agentdna --help
+npx @0gfoundation/0g-agentdna          # interactive shell
+npx @0gfoundation/0g-agentdna 286      # jump straight into agent 286's session
+npx @0gfoundation/0g-agentdna --help
 ```
 
 For the old CLI update path and automatic local-config migration, see
