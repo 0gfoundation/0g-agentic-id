@@ -1,8 +1,8 @@
 # 升级到 0G AgentDNA
 
-npm 包名和 CLI 命令现已统一为 `0g-agentdna`。SDK 提供 `AgentDNA` 和
-`AgentDNAConfig`，原有 `AgenticID` 和 `AgenticIDConfig` 导出继续兼容。
-合约名称和签名消息域沿用协议标识符。
+npm 包名现为 `@0gfoundation/0g-agentdna`，发布在 0gfoundation 组织下；
+CLI 命令为 `0g-agentdna`。SDK 提供 `AgentDNA` 和 `AgentDNAConfig`，原有
+`AgenticID` 和 `AgenticIDConfig` 导出继续兼容。合约名称和签名消息域沿用协议标识符。
 
 ## 已有 CLI 用户
 
@@ -18,8 +18,16 @@ npm 包名和 CLI 命令现已统一为 `0g-agentdna`。SDK 提供 `AgentDNA` �
 并提供新旧两个命令。此后使用 `0g-agentdna update` 更新。通过兼容入口启动时，
 updater 会更新该兼容包，保证全局命令链接仍由原包管理。
 
-新安装使用 `npm install -g 0g-agentdna`。开发检出使用仓库的构建流程，不通过
-npm 自更新命令覆盖。
+新安装使用 `npm install -g @0gfoundation/0g-agentdna`。开发检出使用仓库的
+构建流程，不通过 npm 自更新命令覆盖。
+
+不带组织前缀的 `0g-agentdna` 包曾短暂发布，现已弃用。装过它的用户需要替换，
+因为两个包都提供 `0g-agentdna` 命令：
+
+```bash
+npm uninstall -g 0g-agentdna
+npm install -g @0gfoundation/0g-agentdna
+```
 
 ## 本地配置
 
@@ -40,8 +48,8 @@ npm 自更新命令覆盖。
 ## SDK 应用
 
 ```typescript
-import { AgentDNA, type AgentDNAConfig } from '0g-agentdna';
-import { sealAccount } from '0g-agentdna/seal';
+import { AgentDNA, type AgentDNAConfig } from '@0gfoundation/0g-agentdna';
+import { sealAccount } from '@0gfoundation/0g-agentdna/seal';
 ```
 
 原有 `@0gfoundation/0g-agenticid-sdk` 及其 `/seal` 导入路径通过兼容包继续可用；
@@ -51,7 +59,7 @@ import { sealAccount } from '0g-agentdna/seal';
 
 1. 同步主包版本、lockfile、`SDK_VERSION`，以及兼容包版本和精确依赖版本。
 2. 执行 SDK 类型检查和测试，检查两个 npm 包的打包内容。
-3. 从 `sdk/typescript` 发布 `0g-agentdna`。
+3. 从 `sdk/typescript` 发布 `@0gfoundation/0g-agentdna`。
 4. 主包对应版本可用后，从 `sdk/typescript/compat/legacy` 发布同版本的
    `@0gfoundation/0g-agenticid-sdk`；在支持旧更新入口期间，每次发版均发布兼容包。
 5. 两个包均可用后再更新 attestor 的 `ATTESTOR_CLI_LATEST` 和

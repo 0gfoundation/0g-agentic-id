@@ -16,7 +16,7 @@ import { modelsForProvider, type InferenceProvider } from './Providers';
  *
  * @example
  * ```typescript
- * import { AgentDNA } from '0g-agentdna';
+ * import { AgentDNA } from '@0gfoundation/0g-agentdna';
  * const ag = new AgentDNA({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * await ag.agent.transferFrom(from, to, 33n);
  * const { proof } = await ag.reputation.capture(() => fetch(`${url}/chat`, ...));

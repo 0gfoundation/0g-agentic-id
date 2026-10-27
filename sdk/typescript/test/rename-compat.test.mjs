@@ -18,7 +18,7 @@ function bridgeInstall() {
   const modules = join(root, 'node_modules');
   const bridge = join(modules, '@0gfoundation', '0g-agenticid-sdk');
   mkdirSync(bridge, { recursive: true });
-  symlinkSync(sdk, join(modules, '0g-agentdna'), 'dir');
+  symlinkSync(sdk, join(modules, '@0gfoundation', '0g-agentdna'), 'dir');
   for (const name of ['package.json', 'index.cjs', 'index.d.ts', 'seal.cjs', 'seal.d.ts', 'cli.cjs']) {
     copyFileSync(join(legacySource, name), join(bridge, name));
   }
@@ -32,7 +32,7 @@ test('AgentDNA is the canonical facade and AgenticID remains an identical alias'
 test('canonical and legacy packages align versions, dependency, and bin ownership', () => {
   const lock = JSON.parse(readFileSync(join(sdk, 'package-lock.json'), 'utf8'));
   const legacy = JSON.parse(readFileSync(join(legacySource, 'package.json'), 'utf8'));
-  assert.equal(pkg.name, '0g-agentdna');
+  assert.equal(pkg.name, '@0gfoundation/0g-agentdna');
   assert.deepEqual(Object.keys(pkg.bin), ['0g-agentdna']);
   assert.equal(lock.name, pkg.name);
   assert.equal(lock.packages[''].name, pkg.name);
@@ -47,11 +47,11 @@ test('canonical and legacy packages align versions, dependency, and bin ownershi
 
 test('legacy SDK and /seal imports forward to the canonical implementation', async () => {
   const install = bridgeInstall();
-  const current = install.require('0g-agentdna');
+  const current = install.require('@0gfoundation/0g-agentdna');
   const legacy = install.require('@0gfoundation/0g-agenticid-sdk');
   assert.equal(legacy, current);
   assert.equal(legacy.AgentDNA, legacy.AgenticID);
-  assert.equal(install.require('@0gfoundation/0g-agenticid-sdk/seal'), install.require('0g-agentdna/seal'));
+  assert.equal(install.require('@0gfoundation/0g-agenticid-sdk/seal'), install.require('@0gfoundation/0g-agentdna/seal'));
   const esm = await import(pathToFileURL(install.require.resolve('@0gfoundation/0g-agenticid-sdk')).href);
   assert.equal(esm.AgentDNA, current.AgentDNA);
   assert.equal(esm.AgenticID, current.AgenticID);
@@ -81,7 +81,7 @@ test('updater selects the bridge package that owns the global bin links', () => 
   const bin = join(install.root, '0g-agentdna');
   symlinkSync(join(install.bridge, 'cli.cjs'), bin);
   assert.equal(selfPackage(bin).name, '@0gfoundation/0g-agenticid-sdk');
-  assert.equal(selfPackage(join(sdk, 'dist/cli/main.js')).name, '0g-agentdna');
+  assert.equal(selfPackage(join(sdk, 'dist/cli/main.js')).name, '@0gfoundation/0g-agentdna');
 });
 
 test('legacy update --json queries the old package and reports its matching install command', () => {
@@ -111,5 +111,5 @@ test('an arbitrary launcher manifest cannot redirect the updater to another pack
   const entry = join(root, 'cli.cjs');
   writeFileSync(entry, '');
   writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'other-package', version: '99.0.0', agentdnaLegacyBridge: true }));
-  assert.equal(selfPackage(entry).name, '0g-agentdna');
+  assert.equal(selfPackage(entry).name, '@0gfoundation/0g-agentdna');
 });

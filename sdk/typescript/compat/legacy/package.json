@@ -1,7 +1,7 @@
 {
   "name": "@0gfoundation/0g-agenticid-sdk",
   "version": "0.2.0",
-  "description": "Compatibility entry points for the renamed 0g-agentdna SDK and CLI",
+  "description": "Compatibility entry points for the renamed @0gfoundation/0g-agentdna SDK and 0g-agentdna CLI",
   "agentdnaLegacyBridge": true,
   "main": "./index.cjs",
   "types": "./index.d.ts",
@@ -29,7 +29,7 @@
     "README.zh.md"
   ],
   "dependencies": {
-    "0g-agentdna": "0.2.0"
+    "@0gfoundation/0g-agentdna": "0.2.0"
   },
   "engines": {
     "node": ">=18"

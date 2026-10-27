@@ -9,7 +9,7 @@
  *
  * @example
  * ```typescript
- * import { AgentDNA } from '0g-agentdna';
+ * import { AgentDNA } from '@0gfoundation/0g-agentdna';
  * const ag = new AgentDNA({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * ```
  */

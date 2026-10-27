@@ -2,7 +2,7 @@
 /**
  * @file main.ts
  * @description Entry point of `0g-agentdna` — the diagnostics CLI that ships
- * inside 0g-agentdna (`bin` in package.json; no extra install,
+ * inside @0gfoundation/0g-agentdna (`bin` in package.json; no extra install,
  * no extra deps — arg parsing is node:util's parseArgs).
  *
  * This file owns: argv parsing, command routing, `--help`/`--version`, and
@@ -34,7 +34,7 @@ const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, set
 // env contract, exit-code semantics, runnable examples — it is the ground
 // truth an agent plans against (spec v0.03 §2.4).
 const HELP = `0g-agentdna — 0G AgentDNA CLI for the AgenticID protocol
-(ships with 0g-agentdna; no separate install)
+(ships with @0gfoundation/0g-agentdna; no separate install)
 
 USAGE
   0g-agentdna [agent] [options]     interactive chat (default)
