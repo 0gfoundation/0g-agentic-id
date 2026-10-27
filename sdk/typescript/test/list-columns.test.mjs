@@ -16,6 +16,8 @@
  *      listing); unminted own rows still carry agentSeal
  *   5. --json: agentSeal as an additive, normalized (camelCase) row field
  *   6. NAME sanitising: owner-controlled names cannot forge rows
+ *   7. the REPL's own listing: the same FRAMEWORK/AGENTSEAL columns and
+ *      annotation, aligned with its header, attestor cells sanitized
  */
 
 import { test } from 'node:test';
@@ -442,6 +444,42 @@ test('REPL listing row: NAME goes through the row renderer the loop uses', async
   assert.doesNotMatch(line, /2J/, 'no clear-screen body');
   assert.match(line, /nice 466/, 'newline became a space');
   assert.match(line, /^  528 /, 'agentId column intact');
+});
+
+test('REPL listing: FRAMEWORK, AGENTSEAL and the ⇄ annotation, aligned with its header', async () => {
+  const { renderListRow, renderListHeader } = await import('../dist/cli/commands/interactive.js');
+  const { sealToAgentMap } = await import('../dist/cli/commands/cells.js');
+  const parent = { agentId: 466n, phase: 'running', sealId: PARENT.seal_id, name: 'wilbert', framework: 'dsh', agentSeal: PARENT_SEAL_ADDR };
+  const child = { agentId: 492n, phase: 'stopped', sealId: CHILD.seal_id, name: 'selftest-agent', framework: 'hermes', agentSeal: CHILD.agent_seal_addr };
+  const map = sealToAgentMap([parent, child]);
+  const header = renderListHeader();
+  // the child's owner is the parent's seal, lowercase: the match is case-folded
+  const line = renderListRow(child, PARENT_SEAL_LOWER, ' ', map);
+  assert.match(line, /0xa932…9330 ⇄ #466/, 'the child is annotated with its owning agent');
+  assert.equal(line.indexOf('hermes'), header.indexOf('FRAMEWORK'), 'FRAMEWORK sits under its header');
+  const seal = `${CHILD.agent_seal_addr.slice(0, 6)}…${CHILD.agent_seal_addr.slice(-4)}`;
+  assert.equal(line.indexOf(seal), header.indexOf('AGENTSEAL'), 'AGENTSEAL sits under its header');
+  assert.equal(line.indexOf('0xa932'), header.indexOf('OWNER'), 'OWNER sits under its header');
+  assert.equal(line.indexOf('selftest-agent'), header.indexOf('NAME'), 'NAME sits under its header');
+  const own = renderListRow(parent, HUMAN_OWNER, '*', map);
+  assert.match(own, /^\* 466 /, 'own rows keep the * mark');
+  assert.doesNotMatch(own, /⇄/, 'a human owner is not annotated');
+  // unminted, walletless: no agentId, owner or agentSeal — placeholders, not a crash
+  const bare = renderListRow({ agentId: null, phase: 'deploying', sealId: `0x${'15'.repeat(32)}`, name: null }, null);
+  assert.match(bare, /^  \? /, 'unminted rows show ?');
+  assert.equal((bare.match(/—/g) ?? []).length, 3, 'FRAMEWORK, AGENTSEAL and OWNER render the placeholder');
+});
+
+test('REPL listing: attestor-supplied PHASE and FRAMEWORK cannot inject escapes', async () => {
+  const { renderListRow } = await import('../dist/cli/commands/interactive.js');
+  const line = renderListRow({
+    agentId: 7, phase: 'run\u001b[2Jning', sealId: `0x${'14'.repeat(32)}`, name: 'n',
+    framework: 'ds\u001b]8;;http://evil.example\u0007h', agentSeal: PARENT_SEAL_ADDR,
+  }, HUMAN_OWNER);
+  assert.doesNotMatch(line, /\u001b/, 'no ESC bytes');
+  assert.doesNotMatch(line, /evil\.example/, 'no OSC-8 link target');
+  assert.doesNotMatch(line.slice(0, -1), /\n/, 'the row is one line');
+  assert.match(line, /running/, 'the PHASE text survives');
 });
 
 test('list: the OWNER cell is sanitized even though it never truncates', async () => {

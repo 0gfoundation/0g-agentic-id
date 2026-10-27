@@ -101,7 +101,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 | Command | Effect |
 |---|---|
-| `list` | public listing; `*` marks your wallet's agents |
+| `list` | public listing: sealId, FRAMEWORK, AGENTSEAL, OWNER (`⇄ #<agentId>` on agent-owned agents); `*` marks your wallet's agents |
 | `use <agentId\|sealId>` | enter an agent's session (any phase) |
 | `deploy` | wizard: pick framework → provider → model; async deploy |
 | `hello <id>` | hit any agent's public `/hello`; with a wallet configured, banks a rating ticket |
