@@ -1,21 +1,21 @@
 # 0g-agentdna CLI Reference
 
-> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.0 · the CLI ships inside the SDK package — no separate install
+> Matches `@0gfoundation/0g-agentdna` ≥ 0.2.1 · the CLI ships inside the SDK package — no separate install
 > Every command, flag, and exit code below was verified against `sdk/typescript/src/cli/` source
 
 ## 1. Installation & Mental Model
 
 ```bash
 npm install @0gfoundation/0g-agentdna
-npx 0g-agentdna --help
+npx @0gfoundation/0g-agentdna --help
 ```
 
 One entry point, **two shapes**:
 
 | Shape | Invocation | Purpose |
 |---|---|---|
-| Interactive shell | bare `npx 0g-agentdna` (optionally with an agent ref: `npx 0g-agentdna 286`) | deploy, chat, rate — daily human use |
-| Script subcommands | `npx 0g-agentdna <command>` | diagnostics & automation — all support `--json` |
+| Interactive shell | bare `npx @0gfoundation/0g-agentdna` (optionally with an agent ref: `npx @0gfoundation/0g-agentdna 286`) | deploy, chat, rate — daily human use |
+| Script subcommands | `npx @0gfoundation/0g-agentdna <command>` | diagnostics & automation — all support `--json` |
 
 Key rule: **only `doctor` / `status` / `list` / `settings` / `providers` / `update` are reserved subcommands.** Any other positional is treated as an agent reference (decimal = agentId, `0x…` = sealId) and routes straight into that agent's session — command names and agent refs can never collide.
 
@@ -101,7 +101,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 
 | Command | Effect |
 |---|---|
-| `list` | public listing; `*` marks your wallet's agents |
+| `list` | public listing: sealId, FRAMEWORK, AGENTSEAL, OWNER (`⇄ #<agentId>` on agent-owned agents); `*` marks your wallet's agents |
 | `use <agentId\|sealId>` | enter an agent's session (any phase) |
 | `deploy` | wizard: pick framework → provider → model; async deploy |
 | `hello <id>` | hit any agent's public `/hello`; with a wallet configured, banks a rating ticket |
@@ -146,11 +146,11 @@ The framework used by `/reset` and the chat model selector is **picked by you** 
 ## 7. Examples
 
 ```bash
-npx 0g-agentdna                                    # interactive: deploy and chat
-npx 0g-agentdna 286                                # straight into agent 286's session
-npx 0g-agentdna doctor                             # preflight check
-npx 0g-agentdna status 33                          # one agent's full picture
-npx 0g-agentdna settings 286                       # show config
-npx 0g-agentdna settings 286 model=glm-5.3 thinking=high   # change model + effort
-npx 0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'   # scripted
+npx @0gfoundation/0g-agentdna                                    # interactive: deploy and chat
+npx @0gfoundation/0g-agentdna 286                                # straight into agent 286's session
+npx @0gfoundation/0g-agentdna doctor                             # preflight check
+npx @0gfoundation/0g-agentdna status 33                          # one agent's full picture
+npx @0gfoundation/0g-agentdna settings 286                       # show config
+npx @0gfoundation/0g-agentdna settings 286 model=glm-5.3 thinking=high   # change model + effort
+npx @0gfoundation/0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'   # scripted
 ```

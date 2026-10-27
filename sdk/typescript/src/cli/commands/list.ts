@@ -28,16 +28,10 @@
  */
 
 import { buildClient } from '../sdk';
-import { cellText, cleanCell } from './cells';
+import { cellText, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
 import { CliError } from '../errors';
 import { emitOk, print } from '../envelope';
 import type { CommandContext } from '../types';
-
-/** 0xa932…9330 — human-mode display form of a 42-char address (agentSeal or owner). */
-function shortAddr(s: string | null | undefined): string {
-  if (!s) return '—';
-  return `${s.slice(0, 6)}…${s.slice(-4)}`;
-}
 
 /** The deployment phases derive_phase() can produce — the valid --phase values. */
 const PHASES = ['deploying', 'running', 'stopped', 'offline', 'failed'];
@@ -68,28 +62,12 @@ export async function run(ctx: CommandContext): Promise<void> {
     print('(no deployments)');
     return;
   }
-  // Nesting annotation map, from the UNFILTERED listing (minted rows only —
-  // unminted rows have no on-chain agentSeal). Case-folded: rows may carry
-  // checksummed addresses from different sources. Built from `all`, not
-  // `rows`: a --phase filter must not strip the annotation off a child row
-  // whose parent falls outside the filtered view — the owner's identity
-  // (agent vs human wallet) does not depend on what this view happens to show.
-  const sealToAgent = new Map<string, string>();
-  for (const r of all) {
-    if (r.agentSeal && r.agentId != null) sealToAgent.set(r.agentSeal.toLowerCase(), String(r.agentId));
-  }
-  const ownerCell = (owner: string | null | undefined): string => {
-    if (!owner) return '—';
-    const agentId = sealToAgent.get(owner.toLowerCase());
-    return agentId ? `${shortAddr(owner)} ⇄ #${agentId}` : shortAddr(owner);
-  };
-  // The ANNOTATION is trusted (our shortAddr + the agentId from our own
-  // map) so it pads but never truncates — a 6-digit agentId's `⇄ #123456`
-  // must not read as agent #1234. The ADDRESS part is attestor-supplied
-  // (a malicious attestor, or a MITM on plain-http ATTESTOR_URL, can put
-  // ESC bytes in it), so the cell is still cleaned — just not truncated.
-  // At full width a space separator keeps NAME from gluing on.
-  const trustedCell = (t: string, w: number): string => `${cleanCell(t)} `.padEnd(w);
+  // Nesting annotation map, built from `all`, not `rows`: a --phase filter
+  // must not strip the annotation off a child row whose parent falls outside
+  // the filtered view (./cells: sealToAgentMap). The OWNER cell pads but
+  // never truncates its trusted annotation (./cells: trustedCell).
+  const sealToAgent = sealToAgentMap(all);
+  const ownerCell = (owner: string | null | undefined): string => ownerCellText(owner, sealToAgent);
   // Sanitising lives in ./cells (shared with the REPL's listing — a name
   // must not be able to forge a row in either): sequence bodies stripped
   // before control bytes, newlines → space, code-point truncation.

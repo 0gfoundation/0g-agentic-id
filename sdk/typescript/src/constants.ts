@@ -103,4 +103,4 @@ export const RECEIPT_WAIT = {
 
 /** This SDK's own version. Kept in lockstep with package.json by a test —
  *  a runtime package.json read would break browser bundles, so a constant. */
-export const SDK_VERSION = '0.2.0';
+export const SDK_VERSION = '0.2.1';

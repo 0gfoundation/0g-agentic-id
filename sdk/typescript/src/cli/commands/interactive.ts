@@ -357,22 +357,43 @@ export function completeLine(
 // its history (display masking alone leaves the plaintext one ↑ away).
 let activeRl: readline.Interface | null = null;
 import type { CommandContext } from '../types';
-import { cleanCell } from './cells';
+import { cellText, cleanCell, ownerCellText, sealToAgentMap, shortAddr, trustedCell } from './cells';
+
+/** Column widths of the REPL listing; its header and every row share them. */
+const LIST_COLS = { id: 6, phase: 11, framework: 12, seal: 13, agentSeal: 13, owner: 24 } as const;
+
+/** The REPL listing's header line, aligned with {@link renderListRow}. */
+export function renderListHeader(): string {
+  const c = LIST_COLS;
+  return `  ${'ID'.padEnd(c.id)} ${'PHASE'.padEnd(c.phase)}${'FRAMEWORK'.padEnd(c.framework)}` +
+    `${'SEAL'.padEnd(c.seal)}${'AGENTSEAL'.padEnd(c.agentSeal)}${'OWNER'.padEnd(c.owner)}NAME\n`;
+}
 
 /**
  * One row of the REPL's agent listing. Exported for the tests: this IS the
- * renderer the interactive loop prints — NAME goes through cleanCell (./cells),
- * so a name cannot forge rows in this listing either, same as `list`.
- * Everyone gets the seal PREFIX short form — commands accept a unique prefix,
- * so unminted rows stay referenceable without a 66-char column blowout (F12).
+ * renderer the interactive loop prints. Its cells go through ./cells, shared
+ * with `list`: a name cannot forge rows in this listing either, and an
+ * agent-owned agent reads the same way — its OWNER is another row's
+ * AGENTSEAL, annotated `⇄ #<agentId>` (`sealToAgent`, from the full listing).
+ * SEAL is the sealId PREFIX (`0x` + 10 hex), the form commands accept as a
+ * reference, so unminted rows stay referenceable without a 66-char column
+ * blowout (F12).
+ * AGENTSEAL is the agent's on-chain signing address.
  */
 export function renderListRow(
-  r: { agentId: bigint | number | null; phase?: string | null; sealId: string; name?: string | null },
+  r: {
+    agentId: bigint | number | null; phase?: string | null; sealId: string; name?: string | null;
+    framework?: string | null; agentSeal?: string | null;
+  },
   owner: string | null | undefined,
   owned = ' ',
+  sealToAgent: ReadonlyMap<string, string> = new Map(),
 ): string {
-  const seal = `${r.sealId.slice(0, 12)}…${r.sealId.slice(-6)}`;
-  return `${owned} ${String(r.agentId ?? '?').padEnd(6)} ${String(r.phase ?? '?').padEnd(10)} ${seal.padEnd(21)} ${(owner ?? '').padEnd(13)} ${cleanCell(r.name)}\n`;
+  const c = LIST_COLS;
+  const seal = `0x${r.sealId.slice(2, 12)}`;
+  return `${owned} ${String(r.agentId ?? '?').padEnd(c.id)} ${cellText(r.phase ?? '?', c.phase)}` +
+    `${cellText(r.framework, c.framework)}${cellText(seal, c.seal)}${cellText(shortAddr(r.agentSeal), c.agentSeal)}` +
+    `${trustedCell(ownerCellText(owner, sealToAgent), c.owner)}${cleanCell(r.name)}\n`;
 }
 
 const sbid = (url: string): string | undefined => url.match(/8080-([^.]+)\./)?.[1];
@@ -1050,12 +1071,14 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         }
         const shown = mineOnly ? rows.filter((r) => mine?.has(r.sealId)) : rows;
         if (!shown.length) { out(mineOnly ? 'no agents owned by this wallet here\n' : 'no agents on this attestor\n'); continue; }
-        const shortAddr = (a?: string | null): string => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
-        out(`  ${'ID'.padEnd(6)} ${'PHASE'.padEnd(10)} ${'SEAL'.padEnd(21)} ${'OWNER'.padEnd(13)} NAME\n`);
+        // From the full public listing, as in `list`: a --mine view must not
+        // strip the annotation off a child whose parent it hides.
+        const sealToAgent = sealToAgentMap(rows);
+        out(renderListHeader());
         for (const r of shown) {
-          const owned = mine?.has(r.sealId) ? '*' : ' ';
-          const owner = shortAddr(mine?.get(r.sealId)?.owner ?? r.owner);
-          out(renderListRow(r, owner, owned));
+          const own = mine?.get(r.sealId);
+          // The owner tier carries owner and agentSeal for UNMINTED rows too.
+          out(renderListRow({ ...r, agentSeal: own?.agentSeal ?? r.agentSeal }, own?.owner ?? r.owner, own ? '*' : ' ', sealToAgent));
         }
         if (mine && !mineOnly) out('(* = owned by your wallet · `list --mine` filters to them)\n');
         if (shown.some((r) => r.agentId == null)) out("('?' rows have no agentId yet — reference them by sealId prefix, e.g. retry 0x" + shown.find((r) => r.agentId == null)!.sealId.slice(2, 12) + ')\n');

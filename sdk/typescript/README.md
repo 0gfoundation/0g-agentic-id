@@ -326,7 +326,7 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
 - **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, the last three taking the VerifiedFeedbackRegistry as `validator`; `taskHashOf` / `requestUriOf` / `requestUriCandidates` for the taskHash commitment) and the canonical digest spec (EIP-191 version 0x00, intended validator = the registry; 0.2.0 is a hard cut from personal_sign).
-- **[CLI](./GUIDE.md#cli-0g-agentdna)** `npx 0g-agentdna` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
+- **[CLI](./GUIDE.md#cli-0g-agentdna)** `npx @0gfoundation/0g-agentdna` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
 
