@@ -3,7 +3,8 @@
 
 This helper is offline: its caller supplies runtime and creation bytecode read
 from the intended chain/explorer. Only compiler-declared link/immutable slots may
-vary; the resulting complete runtime, including its metadata, must match.
+vary; the resulting complete runtime, including its metadata, must match. Only
+the OpenZeppelin proxy and beacon may instead stand on an explorer record.
 """
 
 import argparse
@@ -20,6 +21,7 @@ class MatchError(ValueError):
 
 
 BEACON_PROXY_TARGET = "lib/openzeppelin-contracts/contracts/proxy/beacon/BeaconProxy.sol:BeaconProxy"
+UPGRADEABLE_BEACON_TARGET = "lib/openzeppelin-contracts/contracts/proxy/beacon/UpgradeableBeacon.sol:UpgradeableBeacon"
 
 
 def hex_code(value):
@@ -233,6 +235,38 @@ def check_beacon(plan, beacon):
         raise MatchError("BeaconProxy runtime immutable does not match its ERC1967 beacon storage slot")
 
 
+def check_verified(response, target, beacon=None, creation=None):
+    """Accept an explorer record in place of a local match of a proxy or beacon.
+
+    The record must be verified source for exactly the OpenZeppelin contract. A
+    BeaconProxy's constructor beacon is the immutable it delegates through, so it
+    must be the slot's beacon, and the recorded arguments must end its creation input.
+    """
+    if target not in (BEACON_PROXY_TARGET, UPGRADEABLE_BEACON_TARGET):
+        raise MatchError("only the OpenZeppelin proxy and beacon may stand on an explorer record")
+    if (target == BEACON_PROXY_TARGET) != (beacon is not None):
+        raise MatchError("a BeaconProxy record needs the beacon check, and only it")
+    result = response.get("result") if isinstance(response, dict) else None
+    record = result[0] if isinstance(result, list) and len(result) == 1 else None
+    if not isinstance(record, dict) or not record.get("SourceCode"):
+        raise MatchError("not reproduced by this build and not verified on the explorer")
+    source, name = target.split(":")
+    if record.get("ContractFileName") != source or record.get("ContractName") != name:
+        raise MatchError(f"the explorer's verified source is not {target}")
+    if beacon is None:
+        return
+    args = record.get("ConstructorArguments")
+    if not isinstance(args, str) or not args.strip().removeprefix("0x"):
+        raise MatchError("the explorer's BeaconProxy record has no constructor arguments")
+    if not isinstance(creation, str) or not creation.strip().removeprefix("0x"):
+        raise MatchError("the explorer supplied no creation input for the proxy")
+    args = hex_code(args)
+    if not hex_code(creation).endswith(args):
+        raise MatchError("the explorer's constructor arguments do not end the proxy's creation input")
+    if args[:64] != address(beacon)[2:].zfill(64):
+        raise MatchError("BeaconProxy constructor beacon does not match its ERC1967 beacon storage slot")
+
+
 def verification_environment(plan):
     env = dict(os.environ)
     # Environment defaults must not add another, unrecorded linker address.
@@ -293,6 +327,11 @@ def main():
     beacon = sub.add_parser("check-beacon")
     beacon.add_argument("--plan-file", required=True)
     beacon.add_argument("--beacon", required=True)
+    verified = sub.add_parser("check-verified")
+    verified.add_argument("--record-file", required=True)
+    verified.add_argument("--target", required=True)
+    verified.add_argument("--beacon")
+    verified.add_argument("--creation-file")
     submit = sub.add_parser("verify")
     submit.add_argument("--plan-file", required=True)
     submit.add_argument("--address", required=True)
@@ -309,6 +348,9 @@ def main():
             print(constructor_args(json.loads(Path(args.plan_file).read_text()), Path(args.creation_file).read_text()))
         elif args.command == "check-beacon":
             check_beacon(json.loads(Path(args.plan_file).read_text()), args.beacon)
+        elif args.command == "check-verified":
+            creation = Path(args.creation_file).read_text() if args.creation_file else None
+            check_verified(json.loads(Path(args.record_file).read_text()), args.target, args.beacon, creation)
         else:
             verify(json.loads(Path(args.plan_file).read_text()), args.address, args.chain, args.verifier_url, args.constructor_args)
     except (MatchError, KeyError, TypeError, json.JSONDecodeError, OSError, subprocess.CalledProcessError) as error:

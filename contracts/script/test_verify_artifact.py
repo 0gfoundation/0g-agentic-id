@@ -60,7 +60,7 @@ def effective_config(plan):
 
 
 class ArtifactMatchingTests(unittest.TestCase):
-    def run_verified_proxy_script(self, directory, consistent):
+    def run_verified_proxy_script(self, directory, consistent, reproduced=True):
         path = Path(directory)
         artifacts = path / "out"
         artifacts.mkdir()
@@ -74,15 +74,29 @@ class ArtifactMatchingTests(unittest.TestCase):
             "immutableReferences": {"42": [{"start": 1, "length": 32}]},
         }
         proxy_runtime = "0x60" + runtime_beacon[2:].zfill(64) + "5b"
-        beacon_artifact = artifact(
-            "lib/openzeppelin-contracts/contracts/proxy/beacon/UpgradeableBeacon.sol", "UpgradeableBeacon")
+        beacon_runtime = "0x60016002"
+        constructor = runtime_beacon[2:].zfill(64) + "40".zfill(64) + "00" * 32
+        records = {}
+        if not reproduced:
+            # Deployed with an older compiler profile: only the explorer's records
+            # (with the proxy's constructor beacon) can stand for them.
+            proxy_runtime, beacon_runtime = "0x61" + proxy_runtime[4:], "0x60036004"
+            records = {
+                proxy: {"SourceCode": "verified", "ContractName": "BeaconProxy",
+                        "ContractFileName": verify.BEACON_PROXY_TARGET.split(":")[0],
+                        "ConstructorArguments": "0x" + constructor},
+                beacon: {"SourceCode": "verified", "ContractName": "UpgradeableBeacon",
+                         "ContractFileName": verify.UPGRADEABLE_BEACON_TARGET.split(":")[0]},
+            }
+        beacon_artifact = artifact(*verify.UPGRADEABLE_BEACON_TARGET.split(":"))
         implementation_artifact = artifact("src/AgenticID.sol", "AgenticID")
         for name, data in [("Proxy", proxy_artifact), ("Beacon", beacon_artifact), ("Impl", implementation_artifact)]:
             (artifacts / (name + ".json")).write_text(json.dumps(data))
         fixture = path / "fixture.json"
         fixture.write_text(json.dumps({
             "beacon": beacon, "implementation": implementation,
-            "runtime": {proxy: proxy_runtime, beacon: "0x60016002", implementation: "0x60016002"},
+            "runtime": {proxy: proxy_runtime, beacon: beacon_runtime, implementation: "0x60016002"},
+            "records": records, "creation": {proxy: "0x6000" + constructor},
         }))
         binaries = path / "bin"
         binaries.mkdir()
@@ -98,10 +112,17 @@ elif command == "code": print(fixture["runtime"][sys.argv[2].lower()])
 else: raise SystemExit("unexpected cast call")
 ''',
             "curl": '''#!/usr/bin/env python3
-import json, os
+import json, os, sys
 from pathlib import Path
-with Path(os.environ["VERIFY_CALLS"]).open("a") as log: log.write("verified-check\\n")
-print(json.dumps({"result": [{"SourceCode": "already verified"}]}))
+fixture = json.loads(Path(os.environ["VERIFY_FIXTURE"]).read_text())
+fields = dict(arg.split("=", 1) for arg in sys.argv[1:] if arg.split("=", 1)[0] in ("action", "address", "contractaddresses"))
+with Path(os.environ["VERIFY_CALLS"]).open("a") as log:
+    if fields.get("action") == "getcontractcreation":
+        log.write("creation-check\\n")
+        print(json.dumps({"result": [{"creationBytecode": fixture["creation"][fields["contractaddresses"]]}]}))
+    else:
+        log.write("verified-check\\n")
+        print(json.dumps({"result": [fixture["records"].get(fields.get("address"), {"SourceCode": "already verified"})]}))
 ''',
             "forge": '''#!/usr/bin/env python3
 import os
@@ -138,6 +159,49 @@ raise SystemExit(93)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("runtime immutable does not match", result.stderr)
         self.assertEqual(calls, [], "chain mismatch must fail before even consulting the verified-source shortcut")
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "verify.sh requires jq and bash")
+    def test_unreproduced_proxy_and_beacon_stand_on_their_explorer_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls = self.run_verified_proxy_script(directory, True, reproduced=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, ["verified-check", "verified-check", "creation-check", "verified-check"])
+        self.assertIn("explorer record", result.stdout)
+        self.assertIn("done.", result.stdout)
+
+    @unittest.skipUnless(shutil.which("jq") and shutil.which("bash"), "verify.sh requires jq and bash")
+    def test_unreproduced_proxy_with_another_constructor_beacon_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls = self.run_verified_proxy_script(directory, False, reproduced=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("constructor beacon does not match", result.stderr)
+        self.assertEqual(calls, ["verified-check", "verified-check", "creation-check"])
+
+    def test_explorer_record_must_be_the_exact_openzeppelin_contract(self):
+        args = LIB_ADDRESS[2:].zfill(64) + "40".zfill(64) + "00" * 32
+        proxy = {"SourceCode": "verified", "ContractName": "BeaconProxy",
+                 "ContractFileName": verify.BEACON_PROXY_TARGET.split(":")[0], "ConstructorArguments": "0x" + args}
+        beacon = {"SourceCode": "verified", "ContractName": "UpgradeableBeacon",
+                  "ContractFileName": verify.UPGRADEABLE_BEACON_TARGET.split(":")[0]}
+        creation = "0x6000" + args
+        verify.check_verified({"result": [proxy]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation)
+        verify.check_verified({"result": [beacon]}, verify.UPGRADEABLE_BEACON_TARGET)
+        for response, target, slot, code in [
+            ({"result": [dict(proxy, SourceCode="")]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation),
+            ({"result": [proxy, proxy]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation),
+            ({"result": [dict(proxy, ContractName="Proxy")]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation),
+            ({"result": [dict(proxy, ContractFileName="src/BeaconProxy.sol")]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation),
+            ({"result": [dict(proxy, ConstructorArguments="0x")]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation),
+            ({"result": [proxy]}, verify.BEACON_PROXY_TARGET, "0x" + "44" * 20, creation),
+            ({"result": [proxy]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, creation + "00"),
+            ({"result": [proxy]}, verify.BEACON_PROXY_TARGET, LIB_ADDRESS, ""),
+            ({"result": [proxy]}, verify.BEACON_PROXY_TARGET, None, None),
+            ({"result": [beacon]}, verify.UPGRADEABLE_BEACON_TARGET, LIB_ADDRESS, creation),
+            ({"result": [dict(beacon, ContractName="AgenticID", ContractFileName="src/AgenticID.sol")]},
+             "src/AgenticID.sol:AgenticID", None, None),
+        ]:
+            with self.assertRaises(verify.MatchError):
+                verify.check_verified(response, target, slot, code)
 
     def test_beacon_check_requires_one_canonical_immutable_on_the_exact_target(self):
         plan = {"source": verify.BEACON_PROXY_TARGET,
