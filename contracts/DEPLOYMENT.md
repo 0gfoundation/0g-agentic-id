@@ -580,7 +580,9 @@ beacon upgrade executed):
 > are solc 0.8.24 builds (optimizer runs 200, via-IR — the `foundry.toml` of
 > `27aef57`); AgenticID 1.3.0 and its library are built with the current
 > settings (solc 0.8.38, runs 1, Cancun, `bytecode_hash = "none"`;
-> UPGRADING.md §1) — verify each with the settings it was built with. The
+> UPGRADING.md §1). Every dev / test impl and both libraries are verified on
+> chainscan with the settings they were built with (the 1.3.0 impls with their
+> library's link address); verify mainnet's new impls and library the same way. The
 > deprecated fork's source reads **1.3.0** only because a shared base changed
 > under it; it is never to be deployed, and its deployed 1.2.0 instances are
 > paused. Policy-mode cloning (issue #133) shipped as the **CloneGate
@@ -1028,12 +1030,6 @@ Changelog:
 - Testnet / dev (§6.1 / §6.2) deliberately keep an EOA owner and `minDelay` 0;
   none of the above applies there, except that **testnet keys must never be
   reused on mainnet**.
-- **Explorer verification — open on dev / test:** none of the impls deployed
-  2026-10-21 → 2026-10-27 (the 1.2.0 / 1.1.0 impls, both AgenticID 1.3.0
-  impls and both `AttestorAppBindingLib` copies) has source on chainscan yet
-  (`getsourcecode` returns none, 2026-10-28). Verify each with the compiler
-  settings it was built with (§7 note); the 1.3.0 impls also need the link
-  address of their library (UPGRADING.md §1).
 - **Pending ownership transfers (every environment, from 1.2.0).** A
   `transferOwnership(x)` on AgenticID / TEEDataVerifier /
   VerifiedFeedbackRegistry stays pending, with no expiry, until `x` calls
