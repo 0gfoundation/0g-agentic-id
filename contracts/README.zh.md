@@ -368,13 +368,13 @@ sybil 类问题，所以 `getVerifiedSummary` 要求调用方显式给出信任�
 - `getServeData(agentId, client, idx)` —— 该条 feedback 当时的 `dataHashes` + `frameworkHash`，**买家尽调入口**：和 `intelligentDatasOf(agentId)` 对比即可判断这份声誉挣到手之后 agent 的数据有没有变。
 - 上述所有 view 也会计入该环境 1.2.0 升级区块（`DEPLOYMENT.md` §6）之前的章，而这些章没有 FIND-01 / FIND-02 保证（审计数据和验证接口都不可信）。view 不带区块过滤；只要切换后章的读方，按区块过滤 `FeedbackVerified` 日志。
 
-> **已废弃——必须暂停**：先前的私有分叉（`AgenticIDReputationRegistry`，proof
+> **已废弃——已暂停**：先前的私有分叉（`AgenticIDReputationRegistry`，proof
 > 门禁的 `giveFeedback` + 自有 feedback 存储）被这套拆分取代。存量的 test 和 dev
-> 环境上它仍在运行（mainnet 从未部署）、源码保留在仓库，但新部署只带
+> 环境上它仍部署着、已暂停（mainnet 从未部署）、源码保留在仓库，但新部署只带
 > `VerifiedFeedbackRegistry`。它仍按**旧的** `personal_sign(inner)` digest 验签——
 > agent 进程可经 sign socket 对任意 `inner` 拿到这种签名——所以它接受的 feedback
-> 可被伪造。其 pauser 必须在 `VerifiedFeedbackRegistry` 1.2.0 切换之前（或同时）
-> 对每个在线实例调用 `pause()`。1.2.0 的注册表绑定 proof 在它上面验不过，所以同一
+> 可被伪造。其 pauser 已在 `VerifiedFeedbackRegistry` 1.2.0 切换窗口内暂停了两个
+> 在线实例（dev 2026-10-21，test 2026-10-23；`DEPLOYMENT.md` §6）。1.2.0 的注册表绑定 proof 在它上面验不过，所以同一
 > 张 proof 不再能两边各兑一次。
 
 ---

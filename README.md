@@ -326,7 +326,7 @@ a version-`0x00` message — so nobody, the agent included, can forge ServeProof
 contents offline. (Before `VerifiedFeedbackRegistry` 1.2.0 the digest was a
 plain `personal_sign` over `proofHash`, which the socket would sign — audit
 FIND-01. The deprecated `AgenticIDReputationRegistry` still verifies that
-legacy digest and must be paused.) Only `submitter` may redeem a proof
+legacy digest, so its deployed instances are paused.) Only `submitter` may redeem a proof
 (`submitter == msg.sender`, and the entry is attributed to `msg.sender`), each
 proof is single-use (signature nonce), and it verifies at exactly one
 registry. The switch to this digest is a hard cut: proofs from sealed images

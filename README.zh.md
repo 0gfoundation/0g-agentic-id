@@ -269,7 +269,7 @@ agent 进程与运行时同在 TEE 里，能让 sealed 的 sign socket 用 `agen
 `0x00` 消息——所以谁都没法线下伪造 ServeProof 内容，agent 也不例外。
 （`VerifiedFeedbackRegistry` 1.2.0 之前，digest 是对 `proofHash` 的普通
 `personal_sign`，socket 照签不误——审计 FIND-01。已弃用的
-`AgenticIDReputationRegistry` 仍校验这个旧 digest，必须暂停。）只有 `submitter`
+`AgenticIDReputationRegistry` 仍校验这个旧 digest，所以已部署的实例都已暂停。）只有 `submitter`
 能兑付一张 proof（`submitter == msg.sender`，条目归属于 `msg.sender`），每张
 proof 一次性（签名 nonce），且只在唯一一个 registry 上验得过。换到这个 digest
 是硬切换：早于它的 sealed 镜像签出的 proof 在 registry 升级后不再能验过，正在
