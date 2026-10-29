@@ -56,7 +56,7 @@ Start 时才落到磁盘。它**不是** `cordis.yml`、不是 profile、也不�
 - `web`、`e2b`、`subagent`、常驻 `terminal`、`goals`、`agent-presets` ——
   这些能力先不做,见下面档位规划。
 
-**owner 可调的**(settings 文档的 `framework` 段 → `SEAL_DSH_*` 环境变量 →
+**owner 可调的**(settings 文档的 `others` 段 → `SEAL_DSH_*` 环境变量 →
 spine 的选项;默认值就是桥原来写死的那几个,所以什么都不填 = 出厂组合原样)。
 推一次配置下次 spawn 生效 —— 重启的是进程,不是容器:
 

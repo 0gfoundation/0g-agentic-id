@@ -34,7 +34,7 @@ import (
 // and Start hands them to the process it spawns (spawn.go).
 
 // dshKnobs are the composition knobs the owner may set through the settings
-// document's opaque `framework` section. They are the literals the bridge
+// document's opaque `others` section. They are the literals the bridge
 // used to hardcode; an overlay that says nothing must reproduce exactly the
 // composition that shipped.
 //
@@ -68,7 +68,7 @@ func defaultKnobs() dshKnobs {
 	return dshKnobs{ToolJobs: false, MaxParallelToolCalls: 1}
 }
 
-// parseKnobs reads the owner's opaque per-framework section, key by key. An
+// parseKnobs reads the owner's opaque `others` section, key by key. An
 // absent key means "leave it as it ships", and keys this adapter does not know
 // are ignored — being able to carry a key the platform has no opinion about is
 // the whole point of an opaque section.
