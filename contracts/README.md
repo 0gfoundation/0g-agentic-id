@@ -391,15 +391,16 @@ explicit list of trusted clients.
 - `getServeData(agentId, client, idx)` — the `dataHashes` and `frameworkHash` in effect at the time of that feedback. **This is the buyer's due-diligence entrypoint**: compare against `intelligentDatasOf(agentId)` to see whether the agent's data changed since the reputation was earned.
 - Every view above counts marks from before the environment's 1.2.0 upgrade block (`DEPLOYMENT.md` §6) as well, and those carry no FIND-01 / FIND-02 guarantee (audit data and verified endpoint not assured). The views take no block filter; a reader that needs only post-cut marks filters `FeedbackVerified` logs by block.
 
-> **Deprecated — must be paused:** the previous private fork
+> **Deprecated — paused:** the previous private fork
 > (`AgenticIDReputationRegistry`, proof-gated `giveFeedback` with its own
-> feedback store) is replaced by this split. It remains deployed on the
-> existing test and dev environments (mainnet never had one) and its source
+> feedback store) is replaced by this split. It remains deployed, paused, on
+> the existing test and dev environments (mainnet never had one) and its source
 > stays in the repo, but fresh deploys ship `VerifiedFeedbackRegistry` only.
 > It still verifies the **legacy** `personal_sign(inner)` digest — which the
 > agent process can obtain for any `inner` from its sign socket — so feedback
-> it accepts is forgeable. Its pauser must `pause()` each live instance before
-> (or at) the `VerifiedFeedbackRegistry` 1.2.0 cut. Registry-bound 1.2.0 proofs
+> it accepts is forgeable. Its pauser paused both live instances in the
+> `VerifiedFeedbackRegistry` 1.2.0 cut window (dev 2026-10-21, test 2026-10-23;
+> `DEPLOYMENT.md` §6). Registry-bound 1.2.0 proofs
 > do not verify on it, so one proof can no longer be redeemed on both.
 
 ---
