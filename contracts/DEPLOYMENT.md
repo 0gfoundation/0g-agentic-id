@@ -335,7 +335,12 @@ Flow: read the ERC-1967 beacon slot → `beacon.implementation()` → for each o
 constructor args from creation/runtime bytecode; `forge verify-contract` without
 `--watch`, see `../QUIRKS.md`). For a new impl type add a line to
 `IMPL_CANDIDATES` or pass `script/verify.sh <proxy> src/X.sol:X`. Proxy/beacon are
-verified once; re-run after each upgrade (already-verified ones skip). Browser
+verified once; re-run after each upgrade (already-verified ones skip). The impl and
+its libraries must match the current build exactly; the proxy and beacon may
+predate it (AgenticID 1.3.0 is a solc 0.8.38 build, its proxies are 0.8.24). One
+the build does not reproduce passes on its explorer record: verified as
+OpenZeppelin's contract, and for the proxy with its ERC-1967 slot's beacon as the
+constructor argument. Browser
 "Read as Proxy" needs proxy+beacon+impl all verified to expand the business ABI.
 
 ## 6. Deployment records (0G Galileo testnet 16602; 0G mainnet 16661 in §6.2m)

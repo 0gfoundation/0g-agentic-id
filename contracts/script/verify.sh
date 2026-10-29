@@ -3,6 +3,8 @@
 # Usage (from contracts/): script/verify.sh <proxy> [<impl-path:name>]
 # Build with the actual deployment profile first. Compiler settings and library
 # addresses come only from artifacts whose entire runtime matches the chain.
+# The proxy and beacon may come from an older profile: if this build does not
+# reproduce one that is already verified, its explorer record stands in.
 # No --watch: the 0G explorer's verification polling is unreliable.
 set -euo pipefail
 
@@ -30,6 +32,7 @@ IMPL_CANDIDATES=(
     "src/AgenticIDReputationRegistry.sol:AgenticIDReputationRegistry"
     "src/VerifiedFeedbackRegistry.sol:VerifiedFeedbackRegistry"
     "src/verifiers/TEEDataVerifier.sol:TEEDataVerifier"
+    "src/CloneGate.sol:CloneGate"
 )
 BEACON_SRC="lib/openzeppelin-contracts/contracts/proxy/beacon/UpgradeableBeacon.sol:UpgradeableBeacon"
 PROXY_SRC="lib/openzeppelin-contracts/contracts/proxy/beacon/BeaconProxy.sol:BeaconProxy"
@@ -83,6 +86,46 @@ prepare_one() {
     printf '%s\t%s\n' "$label" "$addr" >> "$ORDER"
 }
 
+# The proxy and beacon are deployed and verified once, often with an older
+# compiler profile than a later impl. When this build does not reproduce one,
+# the explorer's verified record of exactly that OpenZeppelin contract stands
+# in; for the proxy, its constructor beacon must be the beacon in its slot.
+prepare_fixed() {
+    local label=$1 addr=$2 target=$3 beacon=${4:-}
+    check_address "$addr"
+    addr=$(printf '%s' "$addr" | tr 'A-F' 'a-f')
+    local plan="$WORK_DIR/$addr.json" runtime="$WORK_DIR/$addr.runtime"
+    cast code "$addr" --rpc-url "$RPC_URL" > "$runtime"
+    if python3 "$HELPER" match --artifacts "$ARTIFACTS_DIR" --runtime-file "$runtime" \
+        --address "$addr" --candidate "$target" > "$plan" 2> "$WORK_DIR/$addr.unmatched"; then
+        printf 'matched %-7s %s -> %s\n' "$label" "$addr" "$target"
+        # The proxy delegates through its immutable beacon, not the discovery slot.
+        # Reject an inconsistent chain before any submission or already-verified skip.
+        if [ -n "$beacon" ]; then
+            python3 "$HELPER" check-beacon --plan-file "$plan" --beacon "$beacon"
+        fi
+        printf '%s\t%s\n' "$label" "$addr" >> "$ORDER"
+        return
+    fi
+    rm -f "$plan"
+    local record="$WORK_DIR/$addr.record" creation="$WORK_DIR/$addr.creation"
+    curl --fail -sS --get "$VERIFIER_URL" --data-urlencode module=contract \
+        --data-urlencode action=getsourcecode --data-urlencode "address=$addr" > "$record"
+    local check=(check-verified --record-file "$record" --target "$target")
+    if [ -n "$beacon" ]; then
+        curl --fail -sS --get "$VERIFIER_URL" --data-urlencode module=contract \
+            --data-urlencode action=getcontractcreation --data-urlencode "contractaddresses=$addr" \
+            | jq -r '.result[0].creationBytecode // ""' > "$creation"
+        check+=(--beacon "$beacon" --creation-file "$creation")
+    fi
+    if ! python3 "$HELPER" "${check[@]}" 2> "$WORK_DIR/$addr.unverified"; then
+        cat "$WORK_DIR/$addr.unmatched" "$WORK_DIR/$addr.unverified" >&2
+        return 1
+    fi
+    printf 'verified %-6s %s -> %s (explorer record; not reproduced by this build)\n' \
+        "$label" "$addr" "$target"
+}
+
 verify_one() {
     local label=$1 addr=$2 plan="$WORK_DIR/$2.json"
     local src
@@ -112,11 +155,8 @@ printf 'rpc: %s\nverifier: %s\nproxy: %s\nbeacon: %s\nimpl: %s\n\n' \
     "$RPC_URL" "$VERIFIER_URL" "$PROXY" "$BEACON" "$IMPL"
 
 prepare_one impl "$IMPL" "$IMPL_HINT"
-prepare_one beacon "$BEACON" "$BEACON_SRC"
-prepare_one proxy "$PROXY" "$PROXY_SRC"
-# The proxy delegates through its immutable beacon, not the discovery slot.
-# Reject an inconsistent chain before any submission or already-verified skip.
-python3 "$HELPER" check-beacon --plan-file "$WORK_DIR/$PROXY.json" --beacon "$BEACON"
+prepare_fixed beacon "$BEACON" "$BEACON_SRC"
+prepare_fixed proxy "$PROXY" "$PROXY_SRC" "$BEACON"
 while IFS=$'\t' read -r label addr; do
     verify_one "$label" "$addr"
 done < "$ORDER"
