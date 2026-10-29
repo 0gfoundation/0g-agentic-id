@@ -64,7 +64,7 @@ A single fixed composition — enough to be a useful agent, nothing more.
 - `web`, `e2b`, `subagent`, `terminal` persistent, `goals`, `agent-presets` —
   capability surface deferred (see below).
 
-**Owner-settable** (the settings document's `framework` section → `SEAL_DSH_*`
+**Owner-settable** (the settings document's `others` section → `SEAL_DSH_*`
 env → the spine's options; defaults are what the bridge used to hardcode, so an
 owner who sets nothing gets exactly the shipped composition). A push takes
 effect on the next spawn — the process restarts, the container does not:

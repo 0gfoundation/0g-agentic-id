@@ -108,7 +108,7 @@ const MODEL_MAX_TOKENS = Number(process.env.SEAL_MODEL_MAX_TOKENS || '0') || 0
 // reasoning, zero reply, stream killed upstream; "low" converges in minutes.
 const MODEL_EFFORT = ['low', 'high', 'max'].includes(process.env.SEAL_MODEL_EFFORT) ? process.env.SEAL_MODEL_EFFORT : ''
 
-// Owner composition knobs (settings document `framework` section → adapter →
+// Owner composition knobs (settings document `others` section → adapter →
 // env). Defaults are the literals this bridge hardcoded before the section
 // existed, so an owner who sets nothing gets exactly the shipped composition.
 const TOOL_JOBS = process.env.SEAL_DSH_TOOL_JOBS === '1'
@@ -183,7 +183,10 @@ async function boot() {
     persona,
     // Pinned off, not owner-settable: see the header.
     workspaceContext: false,
-    toolJobs: TOOL_JOBS,
+    // The spine schema takes `false | ToolJobsConfig`, never a bare boolean:
+    // `true` fails its union and takes the whole spine (session, tools, agent
+    // loop) down with it — a live-verified boot killer. `{}` is "on, defaults".
+    toolJobs: TOOL_JOBS ? {} : false,
     maxParallelToolCalls: MAX_PARALLEL_TOOL_CALLS,
     // The spine bundle unconditionally mounts a set of relational invariant
     // self-checks (scope/session/agent/agent-loop) meant for development. On
