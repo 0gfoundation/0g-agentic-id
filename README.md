@@ -454,6 +454,8 @@ This is a monorepo with four sub-projects:
 | [`sealed/`](sealed/ARCHITECTURE.md) | Agent runtime container (restores iData inside TEE, pushes evolution on chain, signs responses) | Go |
 | [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`@0gfoundation/0g-agentdna`, CLI `0g-agentdna`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
 
+The repository is public. Enable its privacy check once per clone: `git config core.hooksPath .githooks`. The pre-commit hook refuses a commit that adds private keys, tokens, personal paths or emails, or public IPs. `scripts/privacy-check.mjs` has the rules, and `AGENTS.md` has the details.
+
 ### Further reading
 
 **[`sdk/typescript/README.md`](sdk/typescript/README.md) — the client SDK**

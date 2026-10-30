@@ -48,6 +48,10 @@ docker run --rm -v "$PWD":/src -w /src golang:1.24 \
 # verify-agent.sh's ServeProof digest copies); `npm run test:kav` is the cross-impl vector
 cd sdk/typescript && npm install && npm run typecheck && npm test
 
+# privacy check (the repo is public): enable the pre-commit hook once per clone; scan every tracked file
+git config core.hooksPath .githooks
+node scripts/privacy-check.mjs --all
+
 # live regression (costs gas + sandbox billing; drives every e2e leg against a deployed env)
 OWNER_PRIV=0x<funded> ATTESTOR_URL=http://<attestor>:8080 VERIFIED_FEEDBACK_ADDR=0x<registry> \
   bash attestor/scripts/regression.sh
@@ -76,6 +80,17 @@ There is no CI — run the relevant suite(s) locally before pushing. `attestor/T
 
 - **Bilingual docs**: nearly every doc has a `.zh.md` counterpart. Any doc change must be mirrored in the paired file, keeping the established terminology (identifiers/code stay English). Root `README.zh.md` links to `.zh.md` sub-docs where they exist.
 - **`QUIRKS.md`** records deliberate workarounds for 0G-chain/toolchain quirks (gas-price flags, viem receipt `checkReplacement: false`, the vendored `attestor/version-meld/core2` patch, WebSocket subscription behavior). Read it before "fixing" something that looks wrong — and keep it updated when a workaround changes.
+- **Public repo, privacy check**: `.githooks/pre-commit` runs `scripts/privacy-check.mjs` on the lines each commit adds. It refuses the commit if they carry any of these:
+  - private keys or seed phrases;
+  - API keys or tokens;
+  - paths naming a person's machine;
+  - personal emails;
+  - public IPs;
+  - files that hold secrets by convention (`.env`, `*.pem`, …).
+
+  Enable it once per clone (command above). A genuine fixture is allowed in one of two ways:
+  - in code, by a `privacy-check: allow` marker at the end of its line;
+  - by the value's sha256 in `.privacy-check.json`, with a note saying why. The finding prints this fingerprint; the config holds fingerprints only, never values.
 - **Docs make code-verifiable claims** (exact env var names, route tables, test counts, function signatures). A July 2026 audit fixed ~60 stale claims; when changing behavior, grep the docs for the old claim and update it in the same PR.
 - `attestor/.env.example` is the canonical env-var reference (~40 entries); every var in it is read by the code. `MOCK_*` toggles ship blank where a value is required — T1 setup in `TESTING.md` lists what to fill.
 - Upgrades: beacon pattern via Timelock — `contracts/UPGRADING.md` has the schedule/execute scripts; bump the impl `VERSION` constant and record new addresses in `DEPLOYMENT.md` §6, not in the SDK.

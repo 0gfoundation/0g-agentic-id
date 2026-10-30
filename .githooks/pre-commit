@@ -1,0 +1,5 @@
+#!/bin/sh
+# Refuse a commit that carries private information: this repository is
+# public. See scripts/privacy-check.mjs. Enable once per clone:
+#   git config core.hooksPath .githooks
+exec node "$(git rev-parse --show-toplevel)/scripts/privacy-check.mjs" --staged
