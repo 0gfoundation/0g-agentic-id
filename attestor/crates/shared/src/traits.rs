@@ -143,8 +143,7 @@ pub trait CryptoModule: Send + Sync {
     /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
     /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
     /// separator string so the same master secret can back independent
-    /// MACs (`"agentic-id.container-pubkey-binding.v2"` etc.) without
-    /// cross-protocol attacks.
+    /// MACs without cross-protocol attacks.
     fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
 
     /// Recover signer from a 32-byte prehash and a 65-byte signature.
@@ -170,9 +169,13 @@ pub trait StorageClient: Send + Sync {
 // ── Sandbox ─────────────────────────────────────────────────────────────
 #[async_trait]
 pub trait SandboxClient: Send + Sync {
-    /// Public bootstrap trust; runtimes refresh independently through pinned Scan.
-    async fn attestor_tls_identity(&self) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
-        Ok(None)
+    /// The latest provider-signed attestor TLS statement, relayed
+    /// byte-identical for sealed. Clients without a relay have none.
+    async fn attestor_tls_statement(
+        &self,
+        _provider: Address,
+    ) -> Result<Bytes, crate::attestor_tls::RelayError> {
+        Err(crate::attestor_tls::RelayError::Unavailable)
     }
     /// Full authenticated issuer scope used by workload attestations. Explicit
     /// mocks must configure it; the default never authorizes an arbitrary key.
@@ -269,34 +272,15 @@ pub trait DeploymentRepo: Send + Sync {
     /// Persist 0g-sandbox's resource id after container track submits.
     async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()>;
 
-    /// Persist the container's `(pubkey, mac)` pair on first /provision.
-    /// V2 `mac` covers `image_attestation_digest32 || authenticated_app_signer20`
-    /// with the v2-domain binding key (HKDF from the master secret). The digest
-    /// binds the full issuer scope and workload payload; v1 MACs are incompatible.
-    async fn set_container_binding(
-        &self,
-        seal_id: SealId,
-        pubkey: Vec<u8>,
-        mac: Vec<u8>,
-    ) -> anyhow::Result<bool>;
-
-    /// Revoke the prior owner's binding, preserving an authorized boot that
-    /// belongs to the live chain owner. Return the captured old sandbox to
-    /// clean up; never resolve a queued teardown to a later sandbox ID.
+    /// Revoke the prior owner's binding and container record, preserving an
+    /// authorized boot that belongs to the live chain owner. Return the
+    /// captured old sandbox to clean up; never resolve a queued teardown to a
+    /// later sandbox ID.
     async fn clear_container_binding(
         &self,
         agent_id: AgentId,
         live_owner: Address,
     ) -> anyhow::Result<Option<String>>;
-
-    /// Stamp the deployment row when `POST /provision` succeeds — proves
-    /// the container authenticated via sandbox attestation and received
-    /// its encrypted `agentSeal_priv`.
-    async fn mark_provisioned(
-        &self,
-        seal_id: SealId,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<()>;
 
     async fn set_owner(&self, agent_id: AgentId, new_owner: Address) -> anyhow::Result<()>;
 
@@ -455,7 +439,10 @@ pub trait DeploymentRepo: Send + Sync {
     async fn retry_settings(&self, seal_id: SealId, version: i64) -> anyhow::Result<bool>;
 
     /// Start an owner-authorized generation. Some(ticket) creates a new
-    /// sandbox; None resumes the existing ticket. Legacy resumes return None.
+    /// sandbox: it stamps `ticket_issued_at` and clears the container record,
+    /// so the new container must present a certificate. None resumes the
+    /// existing ticket and keeps the record; it returns None when no ticket
+    /// was ever issued.
     async fn prepare_status_boot(
         &self,
         seal_id: SealId,
@@ -466,25 +453,30 @@ pub trait DeploymentRepo: Send + Sync {
         &self,
         seal_id: SealId,
     ) -> anyhow::Result<Option<crate::auth::status::BootAuthorization>>;
-    async fn has_status_binding(&self, seal_id: SealId) -> anyhow::Result<bool>;
-    /// Atomically install the attested container's pubkey and latest-boot receipt hash.
+    /// In one transaction: compare-and-set the boot claim (enabled,
+    /// generation, ticket, strictly newer `started_at`, persisted sandbox),
+    /// install the status token hash and the served settings, and write
+    /// `record` unless an identical one is already recorded. A different
+    /// recorded container, or any failed compare, returns false and writes
+    /// nothing.
     async fn bind_status_boot(
         &self,
         seal_id: SealId,
-        pubkey: Vec<u8>,
-        mac: Vec<u8>,
-        hash: [u8; 32],
+        record: &ContainerRecord,
+        token_hash: [u8; 32],
+        served: Option<crate::auth::status::ServedSettings>,
         claim: &crate::auth::status::BootClaim,
     ) -> anyhow::Result<bool>;
-    /// Apply liveness/stage and optional exact-version confirmation only while
-    /// the receipt remains current. None accepts only pre-binding legacy boots
-    /// and must never confirm settings. Also checks a sandbox is still tracked.
+    /// Apply liveness/stage only while `token_hash` is the current boot's
+    /// token and a sandbox is still tracked. `applied_digest` (a running or
+    /// warning report's applied settings) confirms the current settings
+    /// version only when it equals the digest that boot was served.
     async fn apply_status_report(
         &self,
         seal_id: SealId,
-        hash: Option<[u8; 32]>,
+        token_hash: [u8; 32],
         stage: StageStatus,
-        settings_version: Option<i64>,
+        applied_digest: Option<B256>,
     ) -> anyhow::Result<bool>;
 
     /// Write a document ONLY onto a row that has never had one — the
@@ -501,8 +493,8 @@ pub trait DeploymentRepo: Send + Sync {
         settings: serde_json::Value,
     ) -> anyhow::Result<Option<i64>>;
 
-    /// Legacy counter-based fixture helper. Runtime reports MUST use
-    /// `apply_status_report` with an authenticated boot receipt instead.
+    /// Counter-based fixture helper. Runtime reports MUST use
+    /// `apply_status_report` with the current status token instead.
     /// Promote `settings` to last-known-good: a container reported `running`
     /// on it.
     ///

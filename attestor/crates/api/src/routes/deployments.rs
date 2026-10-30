@@ -16,9 +16,8 @@
 //!   timestamp must be fresh. Returns the operational fields an owner needs for
 //!   their own agents (stages, sandbox_id, provision error, …).
 //!
-//! Neither shape ever serializes `container_pubkey` / `container_pubkey_mac`
-//! (internal provision-binding material — the MAC is derived from the attestor
-//! master secret and must not leave the process), nor `i_data` /
+//! Neither shape ever serializes the container record (key, image and
+//! provider instance recorded at provision), nor `i_data` /
 //! `provision_deadline` / `last_provision_error_at` / `updated_at` (unused by
 //! any client).
 
@@ -262,8 +261,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,

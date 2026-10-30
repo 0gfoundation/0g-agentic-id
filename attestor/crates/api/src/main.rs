@@ -95,9 +95,20 @@ async fn main() -> anyhow::Result<()> {
             Some(d) => client.with_discovery(d.clone()),
             None => client,
         };
-        Arc::new(match &attestor_identity {
-            Some(identity) => client.with_attestor_identity(identity.clone()),
-            None => client,
+        // sealed pins this attestor through the provider-signed statement
+        // relayed at GET /attestor-tls.
+        Arc::new(match (&discovery, &attestor_identity) {
+            (Some(sandbox), Some(attestor)) => client.with_attestor_tls_relay(Arc::new(
+                attestor_shared::attestor_tls::AttestorTlsRelay::new(
+                    Arc::new(attestor_shared::identity::DiscoveredTlsSource {
+                        sandbox: sandbox.clone(),
+                        attestor: attestor.clone(),
+                    }),
+                    cfg.chain_id,
+                    cfg.tapp_registry_addr,
+                ),
+            )),
+            _ => client,
         })
     };
 

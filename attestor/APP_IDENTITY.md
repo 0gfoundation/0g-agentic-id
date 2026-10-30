@@ -122,57 +122,71 @@ acquisition events; they do not require a successful `start_app` reconciliation 
 already-listening attestor HTTP API. Keep the TLS-init completion dependency, without
 making tapp's app startup depend on API business readiness.
 
-Sandbox creation overrides `ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_URL` and
-`ATTESTOR_ALLOW_UNPINNED_DEV` after all other environment fields. Production supplies
-only public scope, app instance, app signer, TLS pins, expiry and the claimed Scan
-URL/SPKI trust anchor; the dev bypass is forced false. The sealed runtime keeps the
-existing attestor locator and pins HTTPS for `/provision`, `/status`, settings and provider-registry reads. It independently
-refreshes identities through pinned Scan; appId, chain/registry, registration epoch,
-app signer and locator cannot change. It never accepts the app's own claims as a lease
-renewal. Changing the Scan trust anchor or app instance requires recreating runtimes.
-No tapp socket or generic secret access is mounted into workloads. Explicit mock mode
-sets `ATTESTOR_ALLOW_UNPINNED_DEV=true` and removes any caller-provided descriptor.
+Sandbox creation always overrides `ATTESTOR_URL` (the HTTPS locator without a trailing
+`/`), `SEAL_BOOT_TICKET` and the chain/indexer settings after the owner-signed
+environment; it writes no TLS trust into the environment. Before every create the
+attestor rechecks that AgenticID still trusts its own app instance. On a sealed create,
+which is every create the attestor makes, the sandbox provider strips
+`ATTESTOR_TLS_DESCRIPTOR`, `ATTESTOR_ALLOW_UNPINNED_DEV`, `TEE_SIGNER_ADDRESS` and every
+`SANDBOX_*` key from the caller's environment before writing its own `SANDBOX_SEAL_KEY`
+and v3 certificate, so a container the provider certifies cannot enable the dev bypass.
+
+The provider signs the TLS SPKI pins of this attestor app (from its own attestor
+identity resolution, at most 300 seconds per statement) with the same key as the
+certificate, as EIP-712 `AttestorTLS`, and serves them at `GET /api/attestor-tls`. The
+attestor relays the latest statement byte-identical at `GET /attestor-tls?provider=0x…`,
+fetching it over the pinned connection of its sandbox discovery snapshot. Before serving
+it checks the provider signature, the lease, and that its own app TLS key (the SPKI hash
+from local tapp `GetAppCsr`) is among the pins; it refreshes 60 seconds before expiry and
+answers 503 when it has no valid statement. A cached statement is served without asking
+sandbox discovery, which is consulted only to refresh; if discovery fails then, the
+cached statement is served for as long as sealed would still accept it. sealed fetches the statement without CA
+validation and accepts it only if the signer of its own certificate signed it for the
+certificate's chain and registry, the lease is at most 300 seconds, and the SPKI of the
+connection it arrived over is pinned. It then pins `/provision`, `/status`, settings and
+provider-registry requests to those keys. No tapp socket or generic secret access is
+mounted into workloads.
 
 Typed public-key bindings are authenticated declarations computed by measured tapp
 code, including the exact derivation and source. They are not ZK proofs, nor exclusive
 custody proofs. No future `evidence.extensions` proof is treated as implemented here.
 
-## Workload provisioning and reboot recovery (v2)
+## Workload provisioning and reboot recovery (v3)
 
-`POST /provision` accepts ImageAttestation version2. Its flat issuer fields are
-`version`, `chain_id`, `registry_address`, `app_id`, and `registered_at`; the existing
-seal, compressed container public key, image hash, issue time and signature remain.
-The authenticated sandbox discovery snapshot supplies the expected stable app signer
-and current chain/registry/app/registration instance. The recovered signature must
-match that app signer; membership in the current or historical node list does not
-substitute for service identity.
+The sandbox provider writes `SANDBOX_SEAL_ATTESTATION` at sealed create: a version 3
+certificate over chain, TappRegistry, appId, registeredAt, sealId, the compressed
+container public key, the image hash and the issue time. It is an EIP-712
+`ImageAttestation` under domain `0G Sandbox ImageAttestation`, version `3`, with the
+chain id and TappRegistry as `verifyingContract`; the provider key signs the raw digest
+without `personal_sign`. The known-answer vector
+`crates/shared/testdata/image-attestation-v3.json` is shared byte-identically with the
+provider and sealed.
 
-The signing digest uses the nine-word ABI encoding documented in the sandbox's
-`docs/APP_IDENTITY.md`: domain hash for `0g.sandbox.ImageAttestation.v2`, chainId,
-registry, exact UTF-8 appId hash, registeredAt, sealId, compressed-public-key hash,
-imageHash and issuedAt. Both sides sign/verify the raw digest without `personal_sign`.
+`GET /provision` returns the enabled generation and `certificate_required`. The first
+provision of a container sends the certificate verbatim. Besides the boot authorization
+(ticket, generation, a strictly newer `boot_started_at`, live owner, persisted sandbox),
+the attestor requires that the recovered signer and the certificate's chain, registry,
+appId and registeredAt equal the provider instance authenticated by sandbox discovery;
+an issue time no earlier than 300 seconds before the boot ticket was issued and no later
+than now + 300 seconds; the image in `validFrameworkHashes`; and the boot claim signed by
+the certified key. In the same transaction as the boot binding it records the container
+key, the image hash and the provider instance (chain, registry, appId, registeredAt,
+signer).
 
-Framework-image authorization and the initial 300-second freshness window still
-apply. After a successful provision, the stored binding uses domain
-`agentic-id.container-pubkey-binding.v2` and MAC input `signingDigest || appSigner`
-(32 raw digest bytes followed by20 raw address bytes). It authenticates the complete
-proof, including issuer instance, image and public key, using the existing database
-binding columns. A matching v2 binding permits the same stored proof on a later
-resume; a v1 MAC does not satisfy it. There is no database schema migration.
+Later boots of the same container send no certificate. The recorded key must sign the
+boot claim, the recorded provider instance must still be the discovered one (otherwise
+`403 provider instance no longer trusted; reset required`, or 503 while discovery is
+down), and the recorded image must still be allowed (otherwise `401 recorded image_hash
+not in validFrameworkHashes; reset required`). A certificate for the recorded key is
+handled as a later boot, which covers a lost first response; one for another key is
+`403 container key differs from record; reset required`; no record and no certificate is
+`409 certificate_required`. A new boot ticket (create or recreate), a reset and an
+ownership revocation clear the record, so every new container presents its own
+certificate. Node rotations within the same provider instance do not affect recorded
+containers; a new registeredAt or provider signer requires an owner reset.
 
-Issuer scope is checked against current authenticated discovery before using a
-stored binding. A reboot with the same app signer and epoch can resume the original
-v2 container after node replacement. A different registeredAt is a new issuer
-instance even if the stable key is unchanged. Discovery failures and expired leases
-remain retryable and never authorize a node-key fallback.
-
-Upgrade sandbox, attestor and sealed images together. Existing v1/node-signed
-containers require an owner-authorized reset; preserve runtime state beforehand.
-Reset retains the agentId, agentSeal and committed iData/settings, and creates a new
-container identity with a v2 proof. This upgrade does not silently re-sign v1 proofs
-or add retired nodes back to the active list.
-
-The stored image binding authenticates a reusable v2 image proof. Each PID-1 boot
-also proves possession of its container key against the current boot ticket and
-generation, and receives an encrypted status receipt. Resuming the same image
-proof does not permit replaying an old boot claim or status receipt.
+Every accepted provision returns a fresh opaque status token encrypted to the container
+key. The attestor stores only its SHA-256, beside the settings version and digest it
+served, and `/status` confirms settings from that record alone. Neither the token nor
+the record carries an attestor MAC. There is no v2 compatibility: release the provider,
+attestor and sealed images together and recreate every agent.

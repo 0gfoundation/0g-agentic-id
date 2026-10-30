@@ -10,7 +10,7 @@
 //! `material = chainId‖contract‖sealId` and gets back 32 bytes used directly
 //! as the secp256k1 private key. The attestor holds no fleet-wide master —
 //! only an app-scoped key (`app_key`, empty material) cached at construction
-//! for `hmac_binding` (provision binding MAC, status boot receipt).
+//! for `hmac_binding`, which no MAC uses any more.
 
 use crate::kms::KmsClient;
 use crate::traits::CryptoModule;
@@ -162,8 +162,7 @@ impl CryptoModule for RealCrypto {
 
     fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32] {
         // HKDF-derive a per-info binding key from the app-scoped KMS key, then
-        // HMAC-SHA256 the data with it. Domain separation lives in `info`
-        // (e.g. `"agentic-id.container-pubkey-binding.v1"`).
+        // HMAC-SHA256 the data with it. Domain separation lives in `info`.
         let hkdf = Hkdf::<Sha256>::new(None, &self.app_key);
         let mut binding_key = [0u8; 32];
         hkdf.expand(info, &mut binding_key)
@@ -180,31 +179,37 @@ impl CryptoModule for RealCrypto {
     }
 
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {
-        if signature.len() != 65 {
-            anyhow::bail!("signature must be 65 bytes (r||s||v), got {}", signature.len());
-        }
-        let r_s = &signature[..64];
-        let v = signature[64];
-        let rec_id = match v {
-            27 | 28 => v - 27,
-            0 | 1 => v,
-            _ => anyhow::bail!("invalid recovery id: {v}"),
-        };
-
-        let sig = EcdsaSignature::from_slice(r_s)
-            .map_err(|e| anyhow::anyhow!("invalid ECDSA signature: {e}"))?;
-        let rec = RecoveryId::try_from(rec_id)
-            .map_err(|e| anyhow::anyhow!("invalid recovery id: {e}"))?;
-
-        let vk = VerifyingKey::recover_from_prehash(digest, &sig, rec)
-            .map_err(|e| anyhow::anyhow!("recover failed: {e}"))?;
-
-        let uncompressed = vk.to_encoded_point(false);
-        let hash = keccak256(&uncompressed.as_bytes()[1..]);
-        let mut addr_bytes = [0u8; 20];
-        addr_bytes.copy_from_slice(&hash[12..]);
-        Ok(Address::from(addr_bytes))
+        recover_prehash_signer(digest, signature)
     }
+}
+
+/// Recover the address that signed a 32-byte prehash with a 65-byte
+/// `r‖s‖v` signature, accepting v in {27,28} and {0,1}. No EIP-191 prefix.
+pub fn recover_prehash_signer(digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {
+    if signature.len() != 65 {
+        anyhow::bail!("signature must be 65 bytes (r||s||v), got {}", signature.len());
+    }
+    let r_s = &signature[..64];
+    let v = signature[64];
+    let rec_id = match v {
+        27 | 28 => v - 27,
+        0 | 1 => v,
+        _ => anyhow::bail!("invalid recovery id: {v}"),
+    };
+
+    let sig = EcdsaSignature::from_slice(r_s)
+        .map_err(|e| anyhow::anyhow!("invalid ECDSA signature: {e}"))?;
+    let rec =
+        RecoveryId::try_from(rec_id).map_err(|e| anyhow::anyhow!("invalid recovery id: {e}"))?;
+
+    let vk = VerifyingKey::recover_from_prehash(digest, &sig, rec)
+        .map_err(|e| anyhow::anyhow!("recover failed: {e}"))?;
+
+    let uncompressed = vk.to_encoded_point(false);
+    let hash = keccak256(&uncompressed.as_bytes()[1..]);
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&hash[12..]);
+    Ok(Address::from(addr_bytes))
 }
 
 #[cfg(test)]

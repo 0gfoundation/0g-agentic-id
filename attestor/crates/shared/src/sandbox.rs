@@ -197,35 +197,6 @@ fn apply_public_ports(obj: &mut serde_json::Map<String, serde_json::Value>, port
     );
 }
 
-fn apply_attestor_identity(
-    env: &mut serde_json::Map<String, serde_json::Value>,
-    dev_url: &str,
-    identity: Option<&crate::identity::AttestorTlsDescriptor>,
-) -> anyhow::Result<()> {
-    let (url, allow_unpinned) = match identity {
-        Some(identity) => {
-            env.insert(
-                "ATTESTOR_TLS_DESCRIPTOR".into(),
-                serde_json::Value::String(serde_json::to_string(identity)?),
-            );
-            (identity.url.as_str(), "false")
-        }
-        None => {
-            env.remove("ATTESTOR_TLS_DESCRIPTOR");
-            (dev_url, "true")
-        }
-    };
-    env.insert(
-        "ATTESTOR_URL".into(),
-        serde_json::Value::String(url.to_string()),
-    );
-    env.insert(
-        "ATTESTOR_ALLOW_UNPINNED_DEV".into(),
-        serde_json::Value::String(allow_unpinned.to_string()),
-    );
-    Ok(())
-}
-
 /// One operation keeps the provider, URL, pins and signed envelope from one
 /// snapshot. Response bodies are consumed here too, before returning a result.
 async fn send_text_in_snapshot<F>(
@@ -287,7 +258,7 @@ fn apply_attestor_env(
     })?;
     env_obj.insert(
         "ATTESTOR_URL".into(),
-        serde_json::Value::String(attestor_public_url.to_string()),
+        serde_json::Value::String(attestor_public_url.trim_end_matches('/').to_string()),
     );
     for (k, v) in extra_env {
         env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
@@ -323,7 +294,9 @@ pub struct HttpSandbox {
     provider_addr: Option<String>,
     http: reqwest::Client,
     discovery: Option<std::sync::Arc<crate::identity::SandboxDiscovery>>,
+    /// Checked before every create: AgenticID must still trust this attestor.
     attestor_identity: Option<std::sync::Arc<crate::identity::AttestorDiscovery>>,
+    attestor_tls: Option<std::sync::Arc<crate::attestor_tls::AttestorTlsRelay>>,
 }
 
 impl HttpSandbox {
@@ -348,6 +321,7 @@ impl HttpSandbox {
                 .expect("reqwest client build"),
             discovery: None,
             attestor_identity: None,
+            attestor_tls: None,
         }
     }
 
@@ -364,6 +338,14 @@ impl HttpSandbox {
         identity: std::sync::Arc<crate::identity::AttestorDiscovery>,
     ) -> Self {
         self.attestor_identity = Some(identity);
+        self
+    }
+
+    pub fn with_attestor_tls_relay(
+        mut self,
+        relay: std::sync::Arc<crate::attestor_tls::AttestorTlsRelay>,
+    ) -> Self {
+        self.attestor_tls = Some(relay);
         self
     }
 
@@ -421,12 +403,13 @@ impl SandboxClient for HttpSandbox {
         Ok(Some(discovery.service_identity().await?))
     }
 
-    async fn attestor_tls_identity(
+    async fn attestor_tls_statement(
         &self,
-    ) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
-        match &self.attestor_identity {
-            Some(identity) => Ok(Some(identity.snapshot().await?)),
-            None => Ok(None),
+        provider: Address,
+    ) -> Result<alloy::primitives::Bytes, crate::attestor_tls::RelayError> {
+        match &self.attestor_tls {
+            Some(relay) => relay.statement(provider).await,
+            None => Err(crate::attestor_tls::RelayError::Unavailable),
         }
     }
     async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
@@ -452,6 +435,8 @@ impl SandboxClient for HttpSandbox {
         //     fine to ride the plain env channel. Same for `extra_env`
         //     (chain / storage / contract config, incl. the ServeProof
         //     validator `VERIFIED_FEEDBACK_ADDR`) — see `apply_attestor_env`.
+        // The container's TLS pins come from the provider-signed statement
+        // sealed fetches through `GET /attestor-tls`, not from this env.
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("sandbox create: base64 decode: {e}"))?;
@@ -477,17 +462,15 @@ impl SandboxClient for HttpSandbox {
         apply_public_ports(obj, &self.public_ports);
 
         apply_attestor_env(obj, &self.attestor_public_url, &self.extra_env)?;
-        // apply_attestor_env creates and validates this object. Overlay the
-        // authenticated descriptor last so payload/extra env cannot replace it.
-        let env_obj = obj.get_mut("env").and_then(serde_json::Value::as_object_mut)
+        let env_obj = obj
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
             .expect("apply_attestor_env validated env");
-        let attestor_identity = self.attestor_tls_identity().await?;
-        apply_attestor_identity(
-            env_obj,
-            &self.attestor_public_url,
-            attestor_identity.as_ref(),
-        )?;
-        // Own Scan refresh can block; acquire the sandbox lease afterwards.
+        // Never start a container this attestor could no longer provision.
+        if let Some(identity) = &self.attestor_identity {
+            identity.snapshot().await?;
+        }
+        // The self-check can block; acquire the sandbox lease afterwards.
         let connection = self.connection().await?;
         self.check_provider(&canonical, &connection)?;
         apply_boot_ticket(env_obj, boot_ticket);
@@ -1003,41 +986,15 @@ mod tests {
     }
 
     #[test]
-    fn attestor_transport_overrides_deployer_and_extra_env() {
-        let identity = crate::identity::AttestorTlsDescriptor {
-            version: 1,
-            chain_id: 16602,
-            registry_address: format!("{:#x}", Address::repeat_byte(1)),
-            app_id: "attestor".into(),
-            registered_at: 100,
-            app_signer: format!("{:#x}", Address::repeat_byte(2)),
-            url: "https://attestor.example".into(),
-            scan_url: "https://scan.example".into(),
-            scan_public_key: "ab".repeat(32),
-            tls_spki_sha256: vec!["cd".repeat(32)],
-            checked_at: 1_000,
-            expires_at: 1_300,
-        };
-        let mut env = serde_json::json!({
-            "ATTESTOR_URL":"http://attacker",
-            "ATTESTOR_TLS_DESCRIPTOR":"forged",
-            "ATTESTOR_ALLOW_UNPINNED_DEV":"true"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        apply_attestor_identity(&mut env, "http://dev", Some(&identity)).unwrap();
-        assert_eq!(env["ATTESTOR_URL"], identity.url);
-        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "false");
-        let descriptor: serde_json::Value =
-            serde_json::from_str(env["ATTESTOR_TLS_DESCRIPTOR"].as_str().unwrap()).unwrap();
-        assert_eq!(descriptor["scan_public_key"], identity.scan_public_key);
-        assert_eq!(descriptor["registered_at"], 100);
-
-        apply_attestor_identity(&mut env, "http://dev", None).unwrap();
-        assert_eq!(env["ATTESTOR_URL"], "http://dev");
-        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "true");
-        assert!(!env.contains_key("ATTESTOR_TLS_DESCRIPTOR"));
+    fn attestor_url_is_normalized_and_never_from_the_payload() {
+        let mut obj = serde_json::json!({"env": {"ATTESTOR_URL": "http://attacker"}});
+        apply_attestor_env(
+            obj.as_object_mut().unwrap(),
+            "https://attestor.example/",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(obj["env"]["ATTESTOR_URL"], "https://attestor.example");
     }
     use crate::crypto::RealCrypto;
     use alloy::primitives::{Address, Bytes};

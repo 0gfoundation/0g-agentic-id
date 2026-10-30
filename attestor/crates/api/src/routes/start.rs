@@ -11,8 +11,8 @@
 //!     repoint the deployment at the new sandbox_id. AgentCard `url`
 //!     gets re-uploaded to OSS (same key, same on-chain `tokenURI`).
 //!
-//! Frontend decides which to sign by reading `provisioned_at` +
-//! `container_pubkey` on the deployment; we don't 409 here, just dispatch.
+//! Frontend decides which to sign from the deployment's phase and stages;
+//! we don't 409 here, just dispatch.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
@@ -227,8 +227,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: Some("sb-old".into()),
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,

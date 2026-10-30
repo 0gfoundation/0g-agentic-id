@@ -446,24 +446,10 @@ async fn handle_sandbox_teardown(
     seal_id: SealId,
     expected_sandbox_id: Option<String>,
 ) -> anyhow::Result<()> {
-    // Never resolve an old teardown job to a newer owner's container.
-    let sandbox_id = match expected_sandbox_id {
-        Some(id) => Some(id),
-        None => {
-            if ctx.deployments.has_status_binding(seal_id).await? {
-                tracing::warn!(
-                    ?seal_id,
-                    "legacy teardown without a captured target ignored for a managed boot"
-                );
-                return Ok(());
-            }
-            ctx.deployments
-                .get(seal_id)
-                .await?
-                .and_then(|d| d.sandbox_id)
-        }
-    };
-    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+    // Never resolve an old teardown job to a newer owner's container: only
+    // the sandbox captured when the transfer was observed is torn down.
+    let Some(sb) = expected_sandbox_id.filter(|s| !s.is_empty()) else {
+        tracing::warn!(?seal_id, "teardown without a captured sandbox ignored");
         return Ok(());
     };
     tracing::info!(
@@ -866,9 +852,9 @@ async fn handle_sandbox_recreate(
         }
     };
 
-    // New sandbox_id replaces the stale one; the old container_pubkey +
-    // mac stay in the DB but `/provision` will overwrite them when the
-    // new container hits us with its (different) pubkey.
+    // New sandbox_id replaces the stale one. The new ticket already cleared
+    // the old container record; the new container's first `/provision`
+    // records its own certificate.
     if let Err(e) = ctx
         .deployments
         .set_sandbox_id(seal_id, resp.id.clone())
@@ -2373,8 +2359,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -2432,8 +2417,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -2602,8 +2586,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -3493,8 +3476,7 @@ mod tests {
             container_stage: StageStatus::Confirmed { at: now },
             sandbox_id: Some("sb-1".into()),
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
