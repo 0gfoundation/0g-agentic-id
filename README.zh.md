@@ -3,7 +3,7 @@
 > 给每一个 AI agent 一个贯穿其整个生命周期、可被任何人独立验证的链上身份。
 
 AgenticID 是构建在 **0G 生态**上的协议：把 agent 的功能数据锚定上链、在 TEE
-里运行其代码、用只存在于 TEE 内的密钥给每条响应盖章，让"这个 agent 可信"
+里运行其代码、用只存在于 TEE 内的密钥给它对外服务的响应盖章，让"这个 agent 可信"
 从一句需要盲信的声明，变成一条任何人都能自己验证的属性。
 
 ---
@@ -87,9 +87,9 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 
 | 名字 | 是什么 | 在哪用 |
 |---|---|---|
-| **ServeProof**（PascalCase）| Solidity struct，链上 reputation 流程的载体 | `giveFeedback(ServeProof, ...)`，合约 ecrecover 验签 |
+| **ServeProof**（PascalCase）| Solidity struct，链上 reputation 流程的载体 | `VerifiedFeedbackRegistry.attestFeedback(agentId, feedbackIndex, ServeProof)`，合约对绑定本 registry 的 digest 做 ecrecover 验签 |
 | **serve-proof**（小写连字符）| 通用概念——sealed 自动签的任何 envelope | 文档里的非正式称呼，包含 ServeProof + heartbeat + chain.Update 等 |
-| **X-Agent-Proof** | HTTP 响应头名 | sealed proxy 给每个 :8080 响应自动加的 header；载体是签过的 envelope |
+| **X-Agent-Proof** | HTTP 响应头名 | 容器有 `VERIFIED_FEEDBACK_ADDR` 时，sealed proxy 给签名的 :8080 响应（`/hello`、`/_seal/auth`、agent 的 `/api/*` 服务）自动加的 header；载体是签过的 envelope |
 
 简记：**ServeProof** 是它的链上形态，**X-Agent-Proof** 是它的 HTTP 形态，**serve-proof** 是统称。
 
@@ -126,8 +126,9 @@ canonical 对应，往后看正文 / 分支文档时遇到拗的称呼时回查�
 被发现、可被调用。
 
 链上记录不是冻结的。agent 可以自动更新功能数据。协议保证的东西更精确：
-**你永远能验证 agent 为你服务的那一刻，跑的是什么样的 iData。** 每条响应都
-带一份对当前 iData 版本的签名证明。这不是不可变性，而是**任意时点的可验
+**你永远能验证 agent 为你服务的那一刻，跑的是什么样的 iData。** 运行时有
+`VERIFIED_FEEDBACK_ADDR` 时，每条签名响应（`/hello`、`/_seal/auth`、agent 的
+`/api/*` 服务）都带一份对当前 iData 版本的签名证明。这不是不可变性，而是**任意时点的可验
 证性**——审计追踪式的信任。
 
 > 在本仓库里，这套"演化即上链"由 `sealed` 运行时实现：watcher 每 30s 比对
@@ -163,8 +164,8 @@ attestation 值，并留下可追溯的日志。没有"悄悄改掉一个运行�
 
 从这份密钥材料，AgenticID 为每个 agent 生成一个 **AgentSeal**：一对密钥，
 私钥只存在于 TEE 运行时内。owner 拿不到，TEE 之外的任何人都拿不到。agent 用
-AgentSeal 给自己产出的**每一条响应**签名——这个签名证明：响应来自一个跑在
-TEE 里、且严格按链上记录运行的 agent。
+AgentSeal 给自己**对外服务的响应**（它的 `/hello`、`/_seal/auth` 和 `/api/*` 服务）签名——这个
+签名证明：响应来自一个跑在 TEE 里、且严格按链上记录运行的 agent。
 
 具体地说，AgenticID 的后端 Attestor 自己也是一个注册在 TappRegistry 上的
 Tapp 应用。它的注册条目包含三样东西：
@@ -222,11 +223,22 @@ Sealed Sandbox 可看作 agent 独立持有的一个运行环境。如上所述�
 > 链上 `frameworkHash` 同时进入每条 `ServeProof`（见机制 5），所以买家做尽
 > 调时能看到"这条声誉是哪个版本的运行时框架挣来的"。
 
-### 5 · 声誉：gaming 不出来
+### 5 · 声誉：凭 proof 准入
 
-AgenticID 扩展了 **ERC-8004**，加了一条关键要求：**每条评价都必须附带一份
-AgentSeal 签名的服务证明（ServeProof）**。没有真实交互，就没有合法评价。
-刷分在结构上做不到——你伪造不出一个只有活着的 TEE 运行时才能生成的签名。
+AgenticID 扩展了 **ERC-8004**，加了一条关键要求：**一条评价只有附带一份
+AgentSeal 签名的服务证明（ServeProof）才算 verified**。这样的评价凭空造不出来：
+sealed 运行时在它自己的签名域里签 proof——EIP-191 version `0x00`，绑定
+`VerifiedFeedbackRegistry`——agent 进程的 sign socket 签不出这个域，所以连
+agent 自己也伪造不出一次没发生过的响应的 proof 内容。没有真实响应撑腰的评价
+拿不到 verified 标记。
+
+这抬高了刷假评价的成本，但**不是**完整的抗 sybil：运行时对每个签名响应都出
+proof，包括无需认证的公开 `GET /hello`，所以 proof 很容易拿到，同一个主体
+也可以用自己控制的多个钱包去请求服务。agent 自己也一样：它可以带一个自己
+控制的 `X-Client-Address` 调自己的 proxy（例如 loopback `:8080`），拿到*真的*
+proof——签名域隔离挡住的是伪造 proof 内容，不是自刷。要做到真正的"一个主体
+一票"需要链下一层——按真实身份限流、质押、proof-of-personhood——这超出了
+链上合约的范围。
 
 每条反馈还**记录了它挣分那一刻生效的具体 iData**（proof 里的 `dataHashes`），
 所以声誉可以对照"agent 当时实际在跑什么"来审计，而不只是它静态的 tokenId。至于
@@ -237,6 +249,7 @@ id-bound（按 tokenId）。
 ```solidity
 struct ServeProof {
     uint256   agentId;
+    address   submitter;      // 唯一可兑付它的地址
     uint256   timestamp;
     uint256   deadline;
     bytes32   taskHash;
@@ -246,10 +259,23 @@ struct ServeProof {
 }
 ```
 
-`giveFeedback` 在链上重建签名内容、`ecrecover` 后与 `getAgentSeal(agentId)`
-比对——`agentSeal_priv` 只有 Agent TEE 持有，谁都伪造不出 ServeProof，且每张
-proof 一次性（签名 nonce）。没有 `client` 字段——归属由提交时的 `msg.sender`
-决定。详见 [`contracts/README.zh.md`](contracts/README.zh.md) §5。
+`VerifiedFeedbackRegistry.attestFeedback` 在链上重建内层 `proofHash`（绑定链、
+identity registry 和 `submitter`），把它包成 EIP-191 version `0x00`、以 registry
+自己的 proxy 地址作 intended validator——`keccak256(0x19 ‖ 0x00 ‖ registry ‖ proofHash)`
+——再 `ecrecover`，与 `getAgentSeal(agentId)` 比对。光靠密钥托管还做不到不可伪造：
+agent 进程与运行时同在 TEE 里，能让 sealed 的 sign socket 用 `agentSeal_priv`
+签名。真正堵住它的是签名域：socket 只签 `personal_sign`（`0x19 0x45`）、EIP-712
+（`0x19 0x01`）和它按字段自己组装的交易——从不签裸 hash，也从不签 version
+`0x00` 消息——所以谁都没法线下伪造 ServeProof 内容，agent 也不例外。
+（`VerifiedFeedbackRegistry` 1.2.0 之前，digest 是对 `proofHash` 的普通
+`personal_sign`，socket 照签不误——审计 FIND-01。已弃用的
+`AgenticIDReputationRegistry` 仍校验这个旧 digest，所以已部署的实例都已暂停。）只有 `submitter`
+能兑付一张 proof（`submitter == msg.sender`，条目归属于 `msg.sender`），每张
+proof 一次性（签名 nonce），且只在唯一一个 registry 上验得过。换到这个 digest
+是硬切换：早于它的 sealed 镜像签出的 proof 在 registry 升级后不再能验过，正在
+运行的 agent 只有经 owner 签名的 `/reset` 才会换到新镜像（上线步骤见
+[`contracts/DEPLOYMENT.md`](contracts/DEPLOYMENT.md) §7）。详见
+[`contracts/README.zh.md`](contracts/README.zh.md) §5。
 
 ### 6 · 转让 agent = 转让它的能力
 
@@ -277,6 +303,9 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 | **AgentSeal 注册表**（`AgenticID.sol`）| agent 的动态身份凭证（set-once）+ `validFrameworkHashes` 白名单 |
 | **TappRegistry** | 所有 Tapp 组件的代码指纹注册表 |
 
+AgenticID 1.3 通过无状态链接库 `AttestorAppBindingLib` 处理 app 实例授权，权限和绑定
+状态仍留在 proxy。固定编译器和链接规则见 [`contracts/README.zh.md`](contracts/README.zh.md)。
+
 ### TEE 层（0g-Tapp 部署）
 
 - **Attestor** — 校验 Sandbox 的 `signerAddress`（against TappRegistry）与容器
@@ -285,8 +314,9 @@ Oracle TEE 用买家公钥重封，Oracle 签 OwnershipProof；链上 `iTransfer
 - **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器并签其镜像
   哈希；保证 agent 按链上功能数据运行。
 - **Agent 运行时（`sealed`）** — 跑在 Sandbox 里、受 RA 后下发密钥的容器：把
-  链上加密 iData 还原成可运行 agent，持续把状态演化写回链上，给每条响应签
-  `X-Agent-Proof`。（Go，见 [`sealed/`](sealed/ARCHITECTURE.zh.md)）
+  链上加密 iData 还原成可运行 agent，持续把状态演化写回链上，给签名响应
+  （`/hello`、`/_seal/auth`、agent 注册的 `/api/*` 服务）签 `X-Agent-Proof`。
+  （Go，见 [`sealed/`](sealed/ARCHITECTURE.zh.md)）
 - **0g-kms** — 为 Tapp 生态提供具有容灾能力的硬件安全级密钥服务。
 
 ### 存储层
@@ -309,7 +339,7 @@ Attestor 验 0g-Sandbox 凭证 + 核对 validFrameworkHashes
 0g-Sandbox 确认授权 owner + 正确运行时代码
         │
         ▼
-agent 用 AgentSeal 给每条响应签名（X-Agent-Proof）
+agent 用 AgentSeal 给对外服务的响应签名（X-Agent-Proof）
         │
         ▼
 0g-compute attest 每一次推理
@@ -345,18 +375,25 @@ Monorepo 四个子项目：
 | [`contracts/`](contracts/README.zh.md) | Solidity 合约、Foundry 测试、部署/升级/verify 脚本 | Foundry (forge / cast) |
 | [`attestor/`](attestor/README.zh.md) | 后端服务（Attestor / Oracle TEE、API、worker、indexer）| Rust (cargo workspace) |
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
-| [`sdk/typescript/`](sdk/typescript/README.zh.md) | 客户端 SDK（`@0gfoundation/agentic-sdk`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
+| [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0gfoundation/0g-agentdna`，CLI `0g-agentdna`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
+
+仓库是公开的。每次克隆后，先运行一次 `git config core.hooksPath .githooks`，启用隐私检查。之后每次提交，pre-commit 钩子都会检查新增的内容：如果加入了私钥、token、个人路径或邮箱、公网 IP，提交会被拒绝。规则见 `scripts/privacy-check.mjs`，详细说明见 `AGENTS.md`。
 
 ### 进一步阅读
 
-**[`sdk/typescript/README.zh.md`](sdk/typescript/README.zh.md) — 客户端 SDK**
+**[`sdk/typescript/README.md`](sdk/typescript/README.md) — 客户端 SDK**
 
-单入口（`AgenticID`）的 TypeScript 门面，罩住整个协议：`ag.agent`
+单入口（`AgentDNA`，保留旧 `AgenticID` 别名）的 TypeScript 门面，罩住整个协议：`ag.agent`
 （deploy / clone / transfer、各类读、agentSeal gas 充值）、
 `ag.reputation`（抓取 TEE 签名的 serve-proof、验证、链上 feedback
 读写），外加顶层的信任根 ack 和 sandbox 预付费充值。合约五件套和
 attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直接
-跑在 testnet 部署上。
+跑在线上部署上——示例里的 `https://agenticid.0g.ai` 是 0G mainnet；换成
+`https://agenticid-testnet.0g.ai` 即为 Galileo testnet。
+
+已有 CLI 用户可参考 [AgentDNA 升级说明](sdk/typescript/MIGRATION.zh.md)。
+
+推理 provider 扩展及切换：[provider 说明](sdk/typescript/PROVIDERS.zh.md)。
 
 **[`contracts/README.zh.md`](contracts/README.zh.md) — 合约层**
 
@@ -364,8 +401,8 @@ attestor HTTP API 都藏在一个 config 对象后面；文中所有示例可直
 （身份注册 + 声誉）、AgenticID（AgentSeal 注册 + framework hash 白名单）、
 TEEDataVerifier（AccessProof + OwnershipProof 双签名校验）、NonceRegistry
 （统一防重放）的扩展点与依赖关系。详细讲三条主链路——`register` /
-`giveFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 138
-个 Foundry 测试（18 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
+`attestFeedback` / `iTransferFrom`——的链上流程与 ecrecover 验签逻辑，附带 290
+个 Foundry 测试（28 个测试套件）与部署 / 升级 / Etherscan verify 全套脚本。
 
 **[`sealed/ARCHITECTURE.zh.md`](sealed/ARCHITECTURE.zh.md) — agent 运行时**
 
@@ -412,12 +449,18 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
   问题：换硬件能再派同一把 priv，链上绑定永远合法
 - **dataKey 转手** —— seller TEE → Oracle TEE → buyer TEE 之间**零信任
   原子交付**（Oracle 短暂持有 + 立即丢弃；链上一笔 tx 双签验）
-- **ServeProof / X-Agent-Proof** —— 每条响应签名的 envelope 提供的 8
+- **ServeProof / X-Agent-Proof** —— 每条签名响应的 envelope 提供的 8
   条保证都是密码学绑定的、但成立条件分两组：**Group A 身份层 3 条**
   只要 priv 不出 TEE 就无条件成立、**Group B 内容层 5 条**还需要"签名
-  能力不被滥用"这一前提（由 agent 钢印兜底）；sealed sign socket 是
-  schema-agnostic 通用 signer，区分 framework-signed 与 agent-signed
-  这件事密码学上做不到；为什么内容真伪要靠链上声誉层而非密码学层
+  能力不被滥用"这一前提。对 serve-proof 本身这一前提是机械保证的：它签在
+  EIP-191 version `0x00` 下、绑定 `VerifiedFeedbackRegistry`，sealed sign
+  socket（只有 `personal_sign`、EIP-712 和 socket 自己组装的交易，没有裸
+  hash 签名）签不出这个域——所以 framework 签的 ServeProof 与 agent 能签的
+  任何东西在密码学上**可以**区分；socket 能签的其他东西（`chain.Update`、
+  agent 自己的声明）上它仍是 schema-agnostic 通用 signer，Group B 由 agent
+  钢印兜底。agent 仍能用自己控制的钱包调自己的 proxy 拿到真 proof，而且没有
+  哪张 proof 能说明响应*内容*是否正确；为什么内容真伪要靠链上声誉层而非
+  密码学层
 
 ---
 

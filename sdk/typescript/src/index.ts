@@ -1,16 +1,16 @@
 /**
  * @file index.ts
- * @description Entry point for @0gfoundation/0g-agenticid-sdk.
+ * @description Entry point for 0g-agentdna.
  *
- * One facade (`AgenticID`): two intent namespaces — `agent` (lifecycle:
+ * One facade (`AgentDNA`; legacy alias `AgenticID`): intent namespaces — `agent` (lifecycle:
  * deploy/clone/transfer + reads + agent-seal gas) and `reputation` (serve-proof
- * + feedback) — plus top-level `ack`/`ackStatus` (trust roots) and
+ * + feedback), and `admin` (attestor-wide provider publication) — plus top-level `ack`/`ackStatus` (trust roots) and
  * `deposit`/`getBalance` (sandbox balance). Construct once with rpc + addresses.
  *
  * @example
  * ```typescript
- * import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
- * const ag = new AgenticID({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
+ * import { AgentDNA } from '@0gfoundation/0g-agentdna';
+ * const ag = new AgentDNA({ addresses, account });  // addresses from DEPLOYMENT.md §6 / your config
  * ```
  */
 
@@ -20,25 +20,26 @@
 // default, so turn the miss into an actionable message at import time.
 if (typeof (globalThis as { fetch?: unknown }).fetch !== 'function') {
   throw new Error(
-    '@0gfoundation/0g-agenticid-sdk requires a global fetch (Node >= 18). ' +
+    '0g-agentdna requires a global fetch (Node >= 18). ' +
       'On Node < 18 either upgrade Node or polyfill globalThis.fetch.',
   );
 }
 
 // ── Facade + namespaces ──
-export { AgenticID, AgentApi, ReputationApi } from './AgenticID';
+export { AgenticID as AgentDNA, AgenticID, AgentApi, AdminApi, ReputationApi } from './AgenticID';
 export type { DeployAccepted, WaitLevel } from './AgenticID';
 export { makeAgentClient } from './AgentClient';
 export type { AgentClient, AgentServiceEntry, AgentRoute, ChatMessage, ChatCompletion, AgentTask } from './AgentClient';
+export { mcpServices } from './AgentClient';
 export { defaultIData } from './AttestorClient';
 export type { DefaultIDataParams } from './AttestorClient';
-export type { AgenticIDConfig } from './context';
+export type { AgenticIDConfig as AgentDNAConfig, AgenticIDConfig } from './context';
 
 // ── Namespace implementation classes (advanced / typing) ──
 export { SandboxClient } from './SandboxClient';
 export { AgenticIDClient } from './AgenticIDClient';
 export type { IntelligentDataResult } from './AgenticIDClient';
-export { ReputationClient } from './ReputationClient';
+export { ReputationClient, MAX_ABS_FEEDBACK_VALUE } from './ReputationClient';
 export { AttestorClient, CLONE_DOMAIN, CLONE_CONTRACT_DOMAIN, DEPLOY_DOMAIN, b64encode } from './AttestorClient';
 export type { CloneParams, DeployParams, IDataInput, DeployCloneResponse } from './AttestorClient';
 // Sealed secret env (issue #166): the inference key sealed to the agent's
@@ -69,8 +70,10 @@ export {
   parseServeProofHeader,
   proofFromResponse,
   captureProof,
+  taskRevealOf,
+  proofRecordingFetch,
 } from './ServeSession';
-export type { ServeSessionOptions, ProofVerification } from './ServeSession';
+export type { ServeSessionOptions, ProofVerification, TaskExchange } from './ServeSession';
 
 // ── ServeProof utilities ──
 export {
@@ -80,7 +83,8 @@ export {
   signServeProof,
   verifyServeProofSignature,
 } from './ServeProof';
-export type { BuildServeProofHashParams } from './ServeProof';
+export type { BuildServeProofHashParams, BuildServeProofSigningHashParams } from './ServeProof';
+export { taskHashOf, requestUriOf, requestUriCandidates } from './taskHash';
 
 // ── Types ──
 export type {
@@ -120,3 +124,6 @@ export {
   tappRegistryAbi,
   sandboxServingAbi,
 } from './abi';
+
+export { listInferenceProviders, inferenceProvider, routeHash } from './Providers';
+export type { InferenceProvider, InferenceFormat, InferenceModel, ProviderRegistrySnapshot, ProviderRegistryPin } from './Providers';

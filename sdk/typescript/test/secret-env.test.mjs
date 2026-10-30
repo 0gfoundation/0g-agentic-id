@@ -205,6 +205,69 @@ test('sealSecretEnv rejects a value that is not a curve point', () => {
   assert.throws(() => sealSecretEnv('0x02' + '00'.repeat(32), OWNER, { API_KEY: KEY }));
 });
 
+test('v2 secret env binds the inference provider inside the ciphertext', () => {
+  assert.deepEqual(openSecretEnv(sealSecretEnv(SEAL_PUB,OWNER,{ API_KEY:KEY },'openai')), {
+    v:2,owner:getAddress(OWNER),provider:'openai',env:{ API_KEY:KEY },
+  });
+  assert.throws(() => sealSecretEnv(SEAL_PUB,OWNER,{ API_KEY:KEY },'https://wrong.example'),/provider/);
+});
+
+const BOUND_CONFIG = {
+  sandbox_snapshot:'new-sealed',secret_env_scheme:SECRET_ENV_SCHEME,
+  inference_capabilities:[{ image:'new-sealed',providers:['0g-compute','openai','anthropic'],secret_env_versions:[1,2] }],
+};
+
+for (const op of ['start','reset','retry']) {
+  test(`${op} sends only a provider-bound sealed key for a non-compute provider`, async () => {
+    await withAttestor({ config:BOUND_CONFIG },async(a)=>{
+      const { c,signed } = client(a.port);
+      const params = { sealId:SEAL_ID,provider:'openai',apiKey:KEY };
+      if (op === 'retry') await c.retry(params); else await c.lifecycle(op,params);
+      assert.equal(a.posts.length,1);
+      const envelope = JSON.parse(Buffer.from(a.posts[0].body.sandbox_envelope.signed_message_b64, 'base64').toString());
+      assert.deepEqual(Object.keys(envelope.payload.env),[SECRET_ENV_VAR]);
+      assert.equal(openSecretEnv(envelope.payload.env[SECRET_ENV_VAR]).provider,'openai');
+      assert.equal(openSecretEnv(envelope.payload.env[SECRET_ENV_VAR]).v,2);
+      assert.ok(signed.every((message)=>!message.includes(KEY)));
+    });
+  });
+}
+
+test('provider binding refuses an old or different image before any owner signature', async () => {
+  for (const config of [
+    { sandbox_snapshot:'new-sealed',secret_env_scheme:SECRET_ENV_SCHEME },
+    { ...BOUND_CONFIG,sandbox_snapshot:'old-sealed' },
+  ]) {
+    await withAttestor({ config },async(a)=>{
+      const { c,signed } = client(a.port);
+      await assert.rejects(c.lifecycle('reset',{ sealId:SEAL_ID,provider:'openai',apiKey:KEY }),
+        (error)=>error.code === 'provider_binding_unsupported');
+      assert.equal(signed.length,0);
+      assert.equal(a.posts.length,0);
+    });
+  }
+});
+
+test('a capability disappearing mid-call cannot downgrade a non-compute key to plaintext', async () => {
+  let reads=0;
+  await withAttestor({ config:()=>++reads < 3 ? BOUND_CONFIG : { sandbox_snapshot:'new-sealed' } },async(a)=>{
+    const { c,signed } = client(a.port);
+    await assert.rejects(c.lifecycle('reset',{ sealId:SEAL_ID,provider:'openai',apiKey:KEY }),SecretEnvRefusedError);
+    assert.equal(signed.length,0);
+    assert.equal(a.posts.length,0);
+  });
+});
+
+test('one-shot non-compute deploy refuses before signing because the agent key does not exist yet', async () => {
+  await withAttestor({ config:BOUND_CONFIG },async(a)=>{
+    const { c,signed } = client(a.port);
+    await assert.rejects(c.deploy({ name:'a',description:'b',inference:{ provider:'openai',model:'m' },sandbox:{ apiKey:KEY } }),
+      (error)=>error.code === 'sealed_needs_agent');
+    assert.equal(signed.length,0);
+    assert.equal(a.posts.length,0);
+  });
+});
+
 // ── 2. lifecycle calls seal the key ─────────────────────────────────────────
 
 for (const op of ['start', 'reset', 'retry']) {
@@ -652,6 +715,19 @@ test('sealedSecretEnv refuses conflicting inputs and values that are not a seale
     // Base64 of something that is not ECIES output.
     const notEcies = Buffer.from('x'.repeat(200)).toString('base64');
     await assert.rejects(c.lifecycle('reset', { sealId: SEAL_ID, sealedSecretEnv: notEcies }), refused('invalid_sealed_secret_env'));
+    assert.equal(signed.length, 0);
+    assert.equal(a.posts.length, 0);
+  });
+});
+
+
+test('non-compute recreation refuses a missing bound key before signing or submitting', async () => {
+  await withAttestor({}, async (a) => {
+    const { c, signed } = client(a.port);
+    for (const op of ['start', 'reset', 'retry']) {
+      const params = { sealId: SEAL_ID, provider: 'openai' };
+      await assert.rejects(op === 'retry' ? c.retry(params) : c.lifecycle(op, params), refused('invalid_input'));
+    }
     assert.equal(signed.length, 0);
     assert.equal(a.posts.length, 0);
   });

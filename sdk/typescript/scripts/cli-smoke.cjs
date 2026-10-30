@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Live-attestor smoke for the `0g-agenticid` CLI (stage 0: doctor / status /
+// Live-attestor smoke for the `0g-agentdna` CLI (stage 0: doctor / status /
 // list) — the CLI-side sibling of scripts/smoke.cjs. The unit suite
 // (test/cli.test.mjs) proves the contracts against mocks; this script proves
 // the same surface against a REAL attestor + chain, where wire-format drift
@@ -25,6 +25,11 @@
 'use strict';
 const { spawn } = require('child_process');
 const { join } = require('path');
+const { mkdtempSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+// CLI startup can migrate the legacy config directory even for read commands.
+// Never let smoke checks touch the caller's login, keys, proof tickets or pins.
+const TEST_CONFIG = mkdtempSync(join(tmpdir(), 'agentdna-cli-smoke-'));
 
 const need = (k, alt) => {
   const v = process.env[k] ?? (alt ? process.env[alt] : undefined);
@@ -42,7 +47,7 @@ const VERSION = require('../package.json').version;
 function cli(args, env = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [MAIN, ...args], {
-      env: { PATH: process.env.PATH, ...env },
+      env: { PATH: process.env.PATH, XDG_CONFIG_HOME: TEST_CONFIG, ...env },
     });
     let stdout = '';
     let stderr = '';
@@ -105,9 +110,10 @@ const byName = (checks, name) => (checks ?? []).find((c) => c.name === name);
         if (!env.ok) console.log(`  note: doctor exit ${r.code} (${env.error.code}) — wallet-state checks: ` +
           checks.map((c) => `${c.name}=${c.status}`).join(' '));
       } else {
-        check('doctor: WALLET_REQUIRED without key (exit 3)',
-          r.code === 3 && env.ok === false && env.error.code === 'WALLET_REQUIRED',
-          `exit ${r.code}, code ${env?.error?.code}`);
+        check('doctor: owner checks skipped without key (exit 0)',
+          r.code === 0 && env.ok === true && ['wallet', 'gas', 'ack', 'sandboxBalance'].every(
+            (name) => byName(checks, name)?.status === 'skip'),
+          `exit ${r.code}, wallet=${byName(checks, 'wallet')?.status}`);
       }
     }
   }

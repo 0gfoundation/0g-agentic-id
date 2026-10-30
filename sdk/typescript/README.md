@@ -1,11 +1,11 @@
-# @0gfoundation/0g-agenticid-sdk
+# 0g-agentdna
 
-[![npm](https://img.shields.io/npm/v/@0gfoundation/0g-agenticid-sdk.svg)](https://www.npmjs.com/package/@0gfoundation/0g-agenticid-sdk) [![license: MIT](https://img.shields.io/npm/l/@0gfoundation/0g-agenticid-sdk.svg)](./LICENSE)
+[![npm](https://img.shields.io/npm/v/@0gfoundation/0g-agentdna.svg)](https://www.npmjs.com/package/@0gfoundation/0g-agentdna) [![license: MIT](https://img.shields.io/npm/l/@0gfoundation/0g-agentdna.svg)](./LICENSE)
 
-TypeScript SDK for **0G AgenticID** — deploy, call, and build on-chain reputation for autonomous AI agents. Built on [viem](https://viem.sh).
+**0G AgentDNA** TypeScript SDK for the AgenticID protocol — deploy, call, and build on-chain reputation for autonomous AI agents. Built on [viem](https://viem.sh).
 
 ```bash
-npm install @0gfoundation/0g-agenticid-sdk viem
+npm install @0gfoundation/0g-agentdna viem
 ```
 
 **What do you want to do?**
@@ -16,9 +16,12 @@ npm install @0gfoundation/0g-agenticid-sdk viem
 
 > This README is the **interface reference** — signatures and shapes. The **[Guide](./GUIDE.md)** explains the reasoning behind each call; the [repo](https://github.com/0gfoundation/0g-agentic-id) has protocol docs + source.
 
+Upgrading from the old SDK/CLI? See [migration](./MIGRATION.md) ([中文](./MIGRATION.zh.md)).
+Provider registration, CLI switching, and image rollout: [providers](./PROVIDERS.md) ([中文](./PROVIDERS.zh.md)).
+
 ## The API at a glance
 
-One entry point, two namespaces + top-level ops.
+One entry point: agent, reputation, and admin namespaces + top-level ops.
 
 | Surface | What |
 |---|---|
@@ -33,14 +36,15 @@ Backends (AgenticID / the canonical ERC-8004 ReputationRegistry + VerifiedFeedba
 ## Quickstart
 
 ```ts
-import { AgenticID } from '@0gfoundation/0g-agenticid-sdk';
+import { AgentDNA } from '@0gfoundation/0g-agentdna';
 
-const ag = await AgenticID.fromAttestor('https://agenticid.0g.ai', {
+// 0G mainnet; for the Galileo testnet use 'https://agenticid-testnet.0g.ai'
+const ag = await AgentDNA.fromAttestor('https://agenticid.0g.ai', {
   account: process.env.PRIVATE_KEY as `0x${string}`,   // omit for read-only
 });
 ```
 
-`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgenticID({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape are covered in the [setup guide](./GUIDE.md#setup).
+`fromAttestor` reads the attestor's `GET /config` and fills all contract addresses, RPC, and appIds — the URL alone pins the environment (0G AgenticID is ERC-8004 identity + reputation, plus ERC-7857 sealed intelligent data). Manual construction (`new AgentDNA({ addresses, … })`), `overrides`, custom `walletClient`, and the full config shape are covered in the [setup guide](./GUIDE.md#setup).
 
 **What you pass grows with what you do:**
 
@@ -121,9 +125,9 @@ await ag.agent.start(sealId, sandboxId);      // resume a STOPPED container
 await ag.agent.start(sealId, { apiKey });     // FIRST provision of a mint-only agent
 await ag.agent.reset(sealId, { framework, apiKey });   // recreate an EXISTING container
 await ag.agent.retry(sealId, { apiKey });     // resume a 'failed' deploy (do NOT redeploy — that orphans the mint)
-await ag.agent.listDeployments();             // public listing; owner/sandboxId/lastProvisionError come back null
+await ag.agent.listDeployments();             // public listing; sandboxId/lastProvisionError null (owner+agentSeal present on minted rows)
 await ag.agent.listMyDeployments();           // owner-signed; full detail
-// row → { agentId, sealId, phase, sandboxId, url, owner, name, createdAt, lastProvisionError }
+// row → { agentId, sealId, phase, sandboxId, url, owner, agentSeal, name, createdAt, lastProvisionError }
 // phase: 'deploying' | 'running' | 'stopped' | 'offline' | 'failed'
 
 // settings — the owner's configuration document (which model the agent thinks
@@ -135,11 +139,11 @@ const { settings, version } = await ag.agent.getSettings(sealId);
 //   version  → the number to write back against (0 when there is no document)
 await ag.agent.setSettings(sealId, { ...(settings ?? {}), model: '0gm-1.0-35b-a3b', thinking: 'high' }, {
   baseVersion: version,                       // compare-and-swap: a stale one is refused, not applied
-  onWarn: console.warn,                       // advisory 0G-router catalog check, run before signing
+  onWarn: console.warn,                       // advisory provider catalog check, run before signing
 });                                           // → { version }
 ```
 
-`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: a model absent from the 0G router catalog is reported, never blocked (a framework built-in is legitimately absent, and the container is the real gate).
+`setSettings` writes the WHOLE document (spread the current one to change a field) and is owner-signed: the attestor verifies the signer against the **live on-chain owner**, so a seller cannot keep configuring an agent they sold — and the same signature gates the READ, because the document is the owner's, not public. It is deliberately **not** on chain — configuration is re-suppliable, where the agent's memory is not. The container picks it up on its next boot (`reset` to apply immediately) and reports success, which promotes it to last-known-good; a container that keeps coming back WITHOUT ever confirming is handed that last-known-good document instead, so a document that prevents boot costs a boot rather than the agent. `framework` is an opaque JSON section for that framework's own knobs — the platform neither parses nor validates it. `onWarn` is advisory only: an unlisted model is reported against its provider's configured catalog without blocking; native providers without a catalog accept manual model IDs. Non-compute providers require runtime image support and a provider-bound key; see [providers](./PROVIDERS.md).
 
 Every write is a **compare-and-swap** on `baseVersion` — the version you read before editing (0 = "no document yet"). If the stored version has moved on, the write is refused with `SettingsConflictError`, which carries the document that is actually there. Re-read, re-apply, write again; do not loop on it, or the other writer's change is the one that disappears.
 
@@ -159,31 +163,45 @@ Convert freely: `getSealId` / `getAgentIdBySealId` / `getAgentSeal`.
 
 ## `ag.reputation` — serve-proof + feedback
 
-The sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Feedback is **stored in the official canonical ERC-8004 Reputation Registry** (every 8004 reader sees it natively); the local VerifiedFeedbackRegistry records which entries were proof-backed — `giveFeedback` bundles the two calls. The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
+When the runtime has a VerifiedFeedbackRegistry configured (`VERIFIED_FEEDBACK_ADDR`; otherwise no response carries a proof and `proof` is `null`), the sealed proxy stamps `X-Agent-Proof` on the agent's **`/api/*` services** (its outward, attributable surface) — not on the owner↔agent chat/UI routes (signing an owner-authenticated channel would be self-dealt reputation). `capture` reads that header; on-chain attribution stays `msg.sender`, and each proof is bound to a single `submitter` (the only address allowed to redeem it). Feedback is **stored in the official canonical ERC-8004 Reputation Registry** (every 8004 reader sees it natively); the local VerifiedFeedbackRegistry records which entries were proof-backed — `giveFeedback` bundles the two calls. The [reputation guide](./GUIDE.md#agreputation--serve-proof--feedback) explains why.
 
 ```ts
 import { keccak256, toBytes } from 'viem';
 
 // 1. call one of the agent's signed /api/* services and capture the proof (public handle needs no wallet)
 const agent = await ag.agent.connect(agentId);
-const { response, proof } = await agent.fetchWithProof('/api/summarize', {
+const { response, proof, task } = await agent.fetchWithProof('/api/summarize', {
   method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ q: 'hi' }),
 });
-// proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature } | null
+// proof → { agentId, submitter, timestamp, deadline, taskHash, dataHashes, frameworkHash, signature,
+//           validator /* registry it was signed for — diagnostics, not on-chain */ } | null
 // low-level escape hatch: ag.reputation.capture(() => fetch(…))
 
-// 2. verify before spending gas
-await ag.reputation.verifyProof(proof);
-// → { ok, signerMatches, notExpired, dataOnChain, reasons }
+// 2. verify before spending gas — the signature is bound to addresses.verifiedFeedback
+//    (fromAttestor fills it); registryMatches: false = none configured / a different one
+if (proof) await ag.reputation.verifyProof(proof, { task });
+// → { ok, signerMatches, notExpired, dataOnChain, registryMatches, taskMatches, reasons }
+// pass { task } (the TaskExchange fetchWithProof recorded) to also get
+// taskMatches — the proof bound to THIS response's bytes, not just the
+// signer; ok requires it. task: null (unrecorded) fails closed with ok:
+// false. Hand-rolled fetch: pass the TaskExchange itself — for a URL whose
+// form is ambiguous (trailing "?") taskRevealOf's element 0 can name the
+// wrong URI; verifyProof tries every candidate, so the exchange always
+// matches.
 
 // 3. submit feedback — canonical 8004 write (attribution = msg.sender) + TEE
 //    verification mark, bundled. On 7702-enabled environments (a feedbackBatcher
 //    is advertised) both land in ONE atomic type-4 tx; otherwise two sequential
-//    txs. An owner CANNOT attest feedback on their own agent (the verified
-//    registry rejects it).
-const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
-// → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
-await ag.reputation.waitForTransaction(fb.attestTx);
+//    txs. An owner CANNOT attest feedback on their own agent, nor can the
+//    agent's own agentSeal or its payment wallet (the verified registry
+//    rejects all three). |value| must be ≤ 1e9 with 0..18 decimals.
+// inside the same guard — serveProof is ServeProof here; the old `proof!`
+// form would have compiled and passed null at runtime
+if (proof) {
+  const fb = await ag.reputation.giveFeedback({ agentId, value: 5n, serveProof: proof });
+  // → { feedbackTx (mined), attestTx (pending — wait it), feedbackIndex }
+  await ag.reputation.waitForTransaction(fb.attestTx);
+}
 // optional params: valueDecimals / tag1 / tag2 / endpoint / feedbackURI / feedbackHash
 // escape hatch: attestFeedback(agentId, idx, proof) marks an entry submitted separately
 
@@ -203,7 +221,8 @@ await ag.reputation.getVerifiedIndexes(agentId, buyer);    // → [1n, …]
 await ag.reputation.getServeData(agentId, buyer, idx);     // → { dataHashes, frameworkHash }
 // task-receipt opening: pass `task` (method/uri/body hashes/status of the rated
 // interaction) to giveFeedback and the contract verifies it against the proof's
-// taskHash, recording the URI as the entry's TEE-verified endpoint:
+// taskHash, recording the URI as the entry's TEE-verified endpoint
+// (statusCode: an integer in 100..999 — anything else is refused before broadcast):
 await ag.reputation.getVerifiedEndpoint(agentId, buyer, idx);            // → "/hello" ("" if unrevealed)
 await ag.reputation.getVerifiedSummaryForEndpoint(agentId, '/hello');    // per-interface verified aggregate
 
@@ -238,6 +257,8 @@ await ag.waitForTransaction(depositTx);
 You don't pass a sealed image — the SDK resolves it from your `framework` via `GET /config`'s `frameworks[]` (each `{ name, image? }`). `iData` is an array of `{ role, plaintext, extra }`; `deploy` builds a `framework` + `persona` entry by default. The [iData guide](./GUIDE.md#the-runtime-image-framework-and-idata-shapes) has the shapes and rules (WYSIWYS, persona is a one-shot seed, what the attestor validates).
 
 ```ts
+await ag.agent.refreshProviders(); // refresh the platform registry
+ag.agent.listProviders();          // cached provider descriptors
 await ag.agent.listModels();   // → ['claude-opus-4-8', …]   the 0G router's live catalog
 ```
 
@@ -259,7 +280,15 @@ await ag.agent.runtimeCosts(agentId);    // + that agent's evolution-gas balance
 ```ts
 const { hello, verification } = await ag.agent.sayHi(agentUrl);
 // hello → { agent, owner, public_url, message, services, routes }
-//   services: { path, method, description?, input_example? }   — proof-signed /api/* endpoints
+//   services: { path, method, description?, input_example?, transport? }   — proof-signed /api/* endpoints
+//   transport: "mcp" marks an MCP server endpoint (JSON-RPC over POST):
+//   mount `<base><path>` as a streamable-HTTP MCP server in any MCP client —
+//   responses carry X-Agent-Proof (when the runtime has a serve-proof
+//   validator configured). Per-exchange verification: pass fetchWithProof's
+//   returned `task` to verifyProof(proof, { task }) — the verdict's
+//   `taskMatches` binds the proof to THIS response's bytes (see mcpServices'
+//   doc in AgentClient.ts). Also: the deploy console's copy-ready curl needs
+//   `Accept: application/json, text/event-stream` for MCP routes.
 //   routes:   { prefix, kind?, auth?, signed, description? }    — framework prefixes (e.g. chat at /v1/)
 
 const agent = await ag.agent.client(agentId);   // agentId OR agentUrl — the SDK fills in the other half
@@ -296,11 +325,11 @@ const pub  = await ag.agent.connect(agentId);        // explicit PUBLIC handle (
 
 - **[Agents as owners (nested agents)](./GUIDE.md#agents-as-owners-nested-agents)** — an in-container agent runs this SDK as itself over the sign socket (`sealAccount()`), never holding a raw key.
 - **[Addresses](./GUIDE.md#addresses)** — a deployment artifact, not baked into the SDK; `fromAttestor` fills them. Exported constants: `ZERO_G_TESTNET` / `ZERO_G_MAINNET` / `RPC_URL` / `CHAIN_ID` / `RECEIPT_WAIT`.
-- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `signServeProof`, `verifyServeProofSignature`) and the canonical digest spec.
-- **[CLI](./GUIDE.md#cli-0g-agenticid)** `npx 0g-agenticid` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
+- **[Advanced](./GUIDE.md#advanced)** — raw ABIs + serve-proof primitives (`buildServeProofMessageHash`, `buildServeProofSigningHash`, `signServeProof`, `verifyServeProofSignature`, the last three taking the VerifiedFeedbackRegistry as `validator`; `taskHashOf` / `requestUriOf` / `requestUriCandidates` for the taskHash commitment) and the canonical digest spec (EIP-191 version 0x00, intended validator = the registry; 0.2.0 is a hard cut from personal_sign).
+- **[CLI](./GUIDE.md#cli-0g-agentdna)** `npx @0gfoundation/0g-agentdna` — interactive shell (deploy/use agents, chat with Esc-interruptible turns); `doctor` / `status <agent>` / `list` subcommands with `--json` for scripts.
 
 ## Notes
 
-- **Serve-proof binding** — attribution is `msg.sender` at submission; each proof also names a `submitter` (the redeemer). Treat proofs as sensitive regardless of transport.
+- **Serve-proof binding** — attribution is `msg.sender` at submission; each proof also names a `submitter` (the redeemer) and is signed for exactly one VerifiedFeedbackRegistry. Treat proofs as sensitive regardless of transport.
 - **0G receipt timing** — `waitForTransaction` is tuned for 0G (120s + retries); if it times out the tx likely still landed — confirm by reading state.
 - **On-chain types** — `value`/`summaryValue` are `int128`, `feedbackIndex` is `uint64` (all bigint).

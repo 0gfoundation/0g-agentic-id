@@ -5,15 +5,24 @@
 //
 //	SANDBOX_SEAL_KEY            (required) hex-encoded ephemeral private key
 //	SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
-//	TEE_SIGNER_ADDRESS          (optional) 0x-prefixed Ethereum address; if set,
-//	                            the attestation signer must match exactly
+//	TEE_SIGNER_ADDRESS          (optional) stable sandbox app signer address; if set,
+//	                            the v2 attestation signer must match exactly
 //	API_KEY                     (optional, legacy) inference provider API key in clear
 //	SEAL_SECRET_ENV             (optional) the owner's secret env (API_KEY) sealed to the
 //	                            agentSeal key; opened after provisioning, wins over API_KEY
 //	                            (internal/secretenv, issue #166)
 //	ATTESTOR_URL                (optional) provisioning endpoint root URL
+//	ATTESTOR_TLS_DESCRIPTOR     public Scan anchor + immutable attestor app scope,
+//	                            injected by attestor; required when ATTESTOR_URL is set
+//	ATTESTOR_ALLOW_UNPINNED_DEV  explicit development-only bypass ("true")
 //	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //	AGENTIC_ID_ADDR             (optional) AgenticID contract address
+//	VERIFIED_FEEDBACK_ADDR      (optional) VerifiedFeedbackRegistry proxy address — the
+//	                            EIP-191 v0x00 intended validator every serve-proof is
+//	                            bound to. Unset, malformed or zero ⇒ no X-Agent-Proof
+//	                            is emitted (never a legacy-wrap fallback); so too when
+//	                            its getIdentityRegistry() is not AGENTIC_ID_ADDR
+//	                            (main.anchorValidator, checked once the chain is dialled)
 //	INDEXER_URL                 (optional) 0g-storage indexer fallback URL
 //	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
 //	                            framework binding (local dev); the binding is authoritative
@@ -45,8 +54,10 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/provision"
+	"seal-verify/internal/report"
 )
 
 // Bootstrap holds all parsed and validated startup inputs.
@@ -57,11 +68,22 @@ type Bootstrap struct {
 	TEESigner    *common.Address // nil if not enforced
 
 	// Optional pipeline knobs
-	APIKey          string
-	AttestorURL     string
-	ChainRPC        string
-	ContractAddr    string
-	FallbackIndexer string
+	APIKey              string
+	InferenceCredential *inference.ProviderCredential
+	StatusBinding       *report.Binding
+	BootTicket          string
+	AttestorURL         string
+	ChainRPC            string
+	ContractAddr        string
+	FallbackIndexer     string
+
+	// VerifiedFeedbackAddr is the VerifiedFeedbackRegistry proxy address
+	// (VERIFIED_FEEDBACK_ADDR, injected by the attestor worker next to
+	// AGENTIC_ID_ADDR), checksummed — or "" when unset, malformed or the
+	// zero address, in which case the proxy signs no serve-proofs. See
+	// verifiedFeedbackAddr. main.anchorValidator also resets it to "" when
+	// the registry is not anchored to AGENTIC_ID_ADDR on chain.
+	VerifiedFeedbackAddr string
 
 	// SecretEnv is the raw SEAL_SECRET_ENV value: ciphertext only. It can
 	// be opened only after Phase 1 (it is sealed to agentSeal_priv) and is
@@ -112,6 +134,9 @@ func Load() (*Bootstrap, error) {
 
 	var teeSignerPtr *common.Address
 	if v := os.Getenv("TEE_SIGNER_ADDRESS"); v != "" {
+		if !common.IsHexAddress(v) || common.HexToAddress(v) == (common.Address{}) {
+			return nil, fmt.Errorf("TEE_SIGNER_ADDRESS must be a nonzero Ethereum address")
+		}
 		addr := common.HexToAddress(v)
 		teeSignerPtr = &addr
 	}
@@ -121,18 +146,52 @@ func Load() (*Bootstrap, error) {
 	}
 
 	return &Bootstrap{
-		SealKeyBytes:    keyBytes,
-		Attestation:     a,
-		TEESigner:       teeSignerPtr,
-		APIKey:          os.Getenv("API_KEY"),
-		SecretEnv:       os.Getenv("SEAL_SECRET_ENV"),
-		AttestorURL:     os.Getenv("ATTESTOR_URL"),
-		ChainRPC:        os.Getenv("CHAIN_RPC_URL"),
-		ContractAddr:    os.Getenv("AGENTIC_ID_ADDR"),
-		FallbackIndexer: os.Getenv("INDEXER_URL"),
-		Framework:       strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
-		PublicURL:       composePublicURL(),
+		SealKeyBytes:         keyBytes,
+		BootTicket:           os.Getenv("SEAL_BOOT_TICKET"),
+		Attestation:          a,
+		TEESigner:            teeSignerPtr,
+		APIKey:               os.Getenv("API_KEY"),
+		SecretEnv:            os.Getenv("SEAL_SECRET_ENV"),
+		AttestorURL:          os.Getenv("ATTESTOR_URL"),
+		ChainRPC:             os.Getenv("CHAIN_RPC_URL"),
+		ContractAddr:         os.Getenv("AGENTIC_ID_ADDR"),
+		VerifiedFeedbackAddr: verifiedFeedbackAddr(os.Getenv("VERIFIED_FEEDBACK_ADDR")),
+		FallbackIndexer:      os.Getenv("INDEXER_URL"),
+		Framework:            strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
+		PublicURL:            composePublicURL(),
 	}, nil
+}
+
+// verifiedFeedbackAddr validates VERIFIED_FEEDBACK_ADDR, the
+// VerifiedFeedbackRegistry proxy that every serve-proof signature is bound to
+// (EIP-191 version 0x00 intended validator — see proxy.serveProofDigest).
+// Returns the checksummed address, or "" when the value is unset, not a hex
+// address, or the zero address. "" disables serve-proofs entirely: the proxy
+// takes the same no-proof path as an agent without a chain identity, and
+// never falls back to the legacy personal_sign wrap the registry rejects.
+//
+// Logs exactly once (here, at boot) so an unusable value is visible in /log
+// without a line per request. Never fatal — a missing validator costs the
+// agent its proofs, not its liveness. This is a format check only: whether
+// the address is a VerifiedFeedbackRegistry anchored to AGENTIC_ID_ADDR is
+// checked on chain once the client has dialled (main.anchorValidator).
+func verifiedFeedbackAddr(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR unset -- serve-proofs disabled (no X-Agent-Proof)")
+		return ""
+	}
+	if !common.IsHexAddress(v) {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR=%q is not a hex address -- serve-proofs disabled (no X-Agent-Proof)", raw)
+		return ""
+	}
+	addr := common.HexToAddress(v)
+	if addr == (common.Address{}) {
+		logger.Logf("WARN VERIFIED_FEEDBACK_ADDR is the zero address -- serve-proofs disabled (no X-Agent-Proof)")
+		return ""
+	}
+	logger.Logf("OK   serve-proof validator (VERIFIED_FEEDBACK_ADDR) well-formed: %s (on-chain anchor checked at bootstrap)", addr.Hex())
+	return addr.Hex()
 }
 
 // composePublicURL builds the externally-reachable URL prefix from the two
@@ -166,11 +225,15 @@ func composePublicURL() string {
 // verifyAttestation runs the two-part Phase 0 check:
 //
 //  1. SANDBOX_SEAL_KEY derives the same compressed pubkey as attestation.pubkey
-//  2. attestation.signature recovers the TEE signer address (and matches
+//  2. the v2 fixed-word digest recovers the stable app signer (and matches
 //     expectedSigner when supplied)
 //
 // On success logs the recovered signer + image_hash for forensic visibility.
 func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner *common.Address) error {
+	recovered, err := a.RecoverSigner()
+	if err != nil {
+		return err
+	}
 	logger.Logf("--- Sealed Container Bootstrap ---")
 	logger.Logf("seal_id:    %s", a.SealID)
 	logger.Logf("pubkey:     %s", a.Pubkey)
@@ -187,39 +250,12 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 	}
 	logger.Logf("OK   keypair match: SANDBOX_SEAL_KEY -> %s", derived)
 
-	canonical := fmt.Sprintf("ImageAttestation:%s:%s:%s:%d", a.SealID, a.Pubkey, a.ImageHash, a.Ts)
-	hash := crypto.Keccak256Hash([]byte(canonical))
-	sigBytes, err := hex.DecodeString(strings.TrimPrefix(a.Signature, "0x"))
-	if err != nil {
-		return fmt.Errorf("decode signature: %w", err)
-	}
-	if len(sigBytes) != 65 {
-		return fmt.Errorf("signature must be 65 bytes, got %d", len(sigBytes))
-	}
-	// The sandbox TEE signer is external code we don't control; its library
-	// may emit the recovery id as raw 0/1 or as Ethereum's 27/28 convention.
-	// crypto.SigToPub only accepts 0/1, so normalize both forms explicitly
-	// instead of blindly subtracting 27 (which corrupts an already-raw 0/1
-	// byte into garbage and rejects an otherwise-valid signature).
-	switch sigBytes[64] {
-	case 27, 28:
-		sigBytes[64] -= 27
-	case 0, 1:
-		// already normalized
-	default:
-		return fmt.Errorf("invalid signature recovery id %d", sigBytes[64])
-	}
-	pub, err := crypto.SigToPub(hash[:], sigBytes)
-	if err != nil {
-		return fmt.Errorf("recover TEE signer: %w", err)
-	}
-	recovered := crypto.PubkeyToAddress(*pub).Hex()
-	logger.Logf("OK   TEE signature valid, signer: %s", recovered)
+	logger.Logf("OK   v2 app signature valid, signer: %s", recovered.Hex())
 	if expectedSigner != nil {
-		if !strings.EqualFold(recovered, expectedSigner.Hex()) {
-			return fmt.Errorf("TEE signer mismatch: recovered %s, expected %s", recovered, expectedSigner.Hex())
+		if recovered != *expectedSigner {
+			return fmt.Errorf("app signer mismatch: recovered %s, expected %s", recovered.Hex(), expectedSigner.Hex())
 		}
-		logger.Logf("OK   TEE signer matches TEE_SIGNER_ADDRESS: %s", expectedSigner.Hex())
+		logger.Logf("OK   app signer matches TEE_SIGNER_ADDRESS: %s", expectedSigner.Hex())
 	}
 	return nil
 }
@@ -233,6 +269,7 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 // a clean self — out of scope for v1. The defence-in-depth here pairs with
 // the env whitelist applied when spawning openclaw.
 func ScrubProvisioningSecrets(keyBytes []byte) {
+	os.Unsetenv("SEAL_BOOT_TICKET")
 	os.Unsetenv("SANDBOX_SEAL_KEY")
 	os.Unsetenv("SANDBOX_SEAL_ATTESTATION")
 	os.Unsetenv("API_KEY")

@@ -49,15 +49,15 @@ impl OssClient {
                 }
                 _ => {
                     tracing::warn!(
-                        "OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_BUCKET not set — OSS disabled"
-                    );
+                    "OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET, OSS_BUCKET not set — OSS disabled"
+                );
                     return None;
                 }
             };
 
         let region = std::env::var("OSS_REGION").unwrap_or_else(|_| "oss-cn-beijing".to_string());
-        let endpoint_host = std::env::var("OSS_ENDPOINT_HOST")
-            .unwrap_or_else(|_| format!("{region}.aliyuncs.com"));
+        let endpoint_host =
+            std::env::var("OSS_ENDPOINT_HOST").unwrap_or_else(|_| format!("{region}.aliyuncs.com"));
         let public_url_base = std::env::var("OSS_PUBLIC_URL_BASE")
             .unwrap_or_else(|_| format!("https://{bucket}.{endpoint_host}"));
 
@@ -158,11 +158,7 @@ impl OssClient {
     /// callers that compute the URL before uploading (e.g. writing it into
     /// the AgentCard body itself).
     pub fn public_url(&self, key: &str) -> String {
-        format!(
-            "{}/{}",
-            self.public_url_base.trim_end_matches('/'),
-            key
-        )
+        format!("{}/{}", self.public_url_base.trim_end_matches('/'), key)
     }
 }
 
@@ -187,9 +183,8 @@ fn sign_put(
     date: &str,
     acl: &str,
 ) -> anyhow::Result<String> {
-    let string_to_sign = format!(
-        "PUT\n\n{content_type}\n{date}\nx-oss-object-acl:{acl}\n/{bucket}/{key}"
-    );
+    let string_to_sign =
+        format!("PUT\n\n{content_type}\n{date}\nx-oss-object-acl:{acl}\n/{bucket}/{key}");
     let mut mac = HmacSha1::new_from_slice(access_key_secret.as_bytes())
         .map_err(|e| anyhow::anyhow!("hmac key: {e}"))?;
     mac.update(string_to_sign.as_bytes());
@@ -230,10 +225,7 @@ mod tests {
         let _ = dotenvy::from_filename("../../.env");
         let oss = OssClient::from_env().expect("OSS env not set");
 
-        let key = format!(
-            "ci-smoke/{}.json",
-            uuid::Uuid::new_v4().simple()
-        );
+        let key = format!("ci-smoke/{}.json", uuid::Uuid::new_v4().simple());
         let body = br#"{"hello":"oss","from":"attestor-shared test"}"#.to_vec();
 
         let url = oss.put_json(&key, body.clone()).await.expect("PUT");

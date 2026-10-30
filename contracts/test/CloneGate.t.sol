@@ -13,7 +13,8 @@ import {
     CloneGateNotTokenOwner,
     CloneGateDenied,
     CloneGateDataHashMismatch,
-    CloneGateArityMismatch
+    CloneGateArityMismatch,
+    CloneGateSourceSealReused
 } from "../src/CloneGate.sol";
 import {IERC7857Updatable} from "../src/interfaces/IERC7857Updatable.sol";
 import {ICloneAuthorizer} from "../src/interfaces/ICloneAuthorizer.sol";
@@ -402,5 +403,22 @@ contract CloneGateTest is AgenticIDTestBase {
         agenticId.transferFrom(buyer, attacker, cloneId);
 
         assertEq(gate.cloneSourceOf(cloneId), sourceId, "lineage survives transfer");
+    }
+
+    // ── Fresh seal for the clone (CloneGate 1.1.0: FIND-08) ───────────────────
+
+    /// @dev Passing the source's own seal would make the clone's mind writable
+    ///      by the source TEE. (For a source bound before AgenticID 1.2.0 —
+    ///      untracked there — see UpgradeGovernance.t.sol
+    ///      test_legacySeal_cloneGateRejectsItAsTheCloneSeal.)
+    function test_cloneFrom_revertsWhenReusingSourceSeal() public {
+        (uint256 sourceId, bytes32 dataHash) = _mintSealedSource(); // seal SEAL_ADDR
+        vm.prank(owner);
+        gate.setCloneAuthorizer(sourceId, address(toggle));
+
+        (bytes32[] memory hashes, bytes[] memory keys) = _cloneArgs(dataHash);
+        vm.prank(attestor);
+        vm.expectRevert(abi.encodeWithSelector(CloneGateSourceSealReused.selector, SEAL_ADDR));
+        gate.cloneFrom(sourceId, buyer, hashes, keys, SEAL_ADDR, CLONE_SEAL_ID, buyer, AUTH_DATA);
     }
 }

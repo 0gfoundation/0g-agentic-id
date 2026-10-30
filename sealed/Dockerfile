@@ -10,17 +10,21 @@
 #
 #   cd sealed && docker build -t openclaw-sealed:0.1.0 .
 #
-# The base image (eliza/0g-sealed:openclaw-1.1.0) is built separately
-# from sealed/images/openclaw/ — its Dockerfile builds the local tag
-# `openclaw-sandbox:1.1.0`; the eliza/0g-sealed:openclaw-1.1.0 registry
-# tag is applied when pushing that image to the registry. You
-# only need to rebuild the base when bumping node / openclaw versions.
+# This file, not sealed/images/sealed/, builds the openclaw sealed image
+# that ships (zg-sealed/0g-sealed; matched against the production image by
+# layer digest, #130).
+#
+# The base image (OPENCLAW_BASE below) is built separately from
+# sealed/images/openclaw/ as openclaw-sandbox:1.1.1, then tagged and pushed.
+# The default is the GCP copy, zg-sandbox/0g-sandbox:openclaw-1.1.1.
+# Build and publish the versioned node/openclaw bases before this runtime;
+# see sealed/images/openclaw/base.Dockerfile and Dockerfile for the order.
 
 # Global build arg (declared before the first FROM so the stage-3 FROM can
 # reference it): the openclaw base registry. GCP by default — reachable from
 # GCP build environments and replacing the aliyun VPC registry. Override with
 # --build-arg OPENCLAW_BASE=<aliyun tag> to build against the aliyun mirror.
-ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.0
+ARG OPENCLAW_BASE=us-central1-docker.pkg.dev/g-devops/zg-sandbox/0g-sandbox:openclaw-1.1.1
 
 # Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data;
 # uploads run inside the bootstrap binary, through the same client's Go SDK).
@@ -49,6 +53,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o bootstrap .
 # Stage 3 — runtime: openclaw base already has node + openclaw + nvm PATH set.
 # OPENCLAW_BASE is the global arg declared at the top of this file.
 FROM ${OPENCLAW_BASE}
+
+# The node this image ships comes from OPENCLAW_BASE, which can be overridden;
+# fail the build if that base carries any node other than the pinned one
+# (keep in step with images/openclaw/Dockerfile's NODE_VERSION).
+ARG NODE_VERSION=24.22.1
+RUN test "$(node --version)" = "v${NODE_VERSION}"
 
 # Low-privilege user the framework subprocess runs as (internal/privsep):
 # sealed (root, PID 1) drops the agent process to it so the agent cannot
@@ -82,14 +92,22 @@ RUN if id -u agent >/dev/null 2>&1; then usermod --home /home/agent agent; else 
 # is effectively a no-op (cache hit). Users who want a different version
 # still pay the full dynamic install cost on first boot — that's the
 # explicit tradeoff for runtime version flexibility.
+#
+# The base's ~/.openclaw was written by whatever openclaw the base installed;
+# a newer one leaves a state database the baked version refuses to open
+# ("uses newer schema version 20; this OpenClaw build supports 1"), so the
+# baked version starts from an empty one. The warmup gateway runs until the
+# timeout (124); any other exit means openclaw could not start, and fails the
+# build.
 ARG OPENCLAW_BAKED_VERSION=2026.7.1
-RUN npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
+RUN rm -rf /root/.openclaw \
+ && npm install -g --no-audit --no-fund openclaw@${OPENCLAW_BAKED_VERSION} \
  && mkdir -p /root/.openclaw \
  && printf '%s' \
     '{"gateway":{"auth":{"mode":"token","token":"warmup-not-used-at-runtime"}},"agents":{"defaults":{"model":{"primary":"anthropic/claude-opus-4-6"}}}}' \
     > /root/.openclaw/openclaw.json \
- && (timeout 60 openclaw gateway run --allow-unconfigured --bind loopback --port 33999 \
-      || true) \
+ && { timeout 60 openclaw gateway run --allow-unconfigured --bind loopback --port 33999; rc=$?; \
+      case "$rc" in 0|124) ;; *) echo "openclaw warmup failed: exit $rc" >&2; exit 1 ;; esac; } \
  && rm -f /root/.openclaw/openclaw.json /root/.openclaw/openclaw.json.bak
 
 # nvm unpacks node release tarballs as root, which restores the tarball's

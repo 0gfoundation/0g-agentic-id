@@ -17,6 +17,7 @@ mod deployments;
 mod lifecycle_auth;
 mod preflight;
 mod probe;
+mod providers;
 mod provision;
 mod reset;
 mod retry;
@@ -52,28 +53,53 @@ pub fn router(state: AppState) -> Router {
         r = r
             .route("/", get(serve_index))
             .route("/static/ethers.js", get(serve_ethers))
-            .route("/static/fonts.css", get(|| static_asset("text/css; charset=utf-8", FONTS_CSS)))
-            .route("/static/fonts/bricolage-grotesque-var.woff2", get(|| static_asset("font/woff2", FONT_BRICOLAGE)))
-            .route("/static/fonts/fraunces-var.woff2", get(|| static_asset("font/woff2", FONT_FRAUNCES)))
-            .route("/static/fonts/fraunces-italic-var.woff2", get(|| static_asset("font/woff2", FONT_FRAUNCES_I)))
-            .route("/static/fonts/geist-mono-var.woff2", get(|| static_asset("font/woff2", FONT_GEIST_MONO)));
+            .route(
+                "/static/fonts.css",
+                get(|| static_asset("text/css; charset=utf-8", FONTS_CSS)),
+            )
+            .route(
+                "/static/fonts/bricolage-grotesque-var.woff2",
+                get(|| static_asset("font/woff2", FONT_BRICOLAGE)),
+            )
+            .route(
+                "/static/fonts/fraunces-var.woff2",
+                get(|| static_asset("font/woff2", FONT_FRAUNCES)),
+            )
+            .route(
+                "/static/fonts/fraunces-italic-var.woff2",
+                get(|| static_asset("font/woff2", FONT_FRAUNCES_I)),
+            )
+            .route(
+                "/static/fonts/geist-mono-var.woff2",
+                get(|| static_asset("font/woff2", FONT_GEIST_MONO)),
+            );
     } else {
         r = r.route("/", get(|| async { "ok" }));
     }
-    r
-        .route("/avatar/default.svg", get(avatar::default_avatar))
+    r.route("/avatar/default.svg", get(avatar::default_avatar))
         .route("/avatar/:seed", get(avatar::keyed_avatar))
         .route("/health", get(health))
         .route("/config", get(config::handle))
+        .route("/inference/providers", get(providers::read))
+        .route(
+            "/admin/inference/providers",
+            axum::routing::put(providers::update),
+        )
         .route("/deploy", post(deploy::handle))
         .route("/clone", post(clone::handle))
-        .route("/provision", post(provision::handle))
+        .route(
+            "/provision",
+            get(provision::challenge).post(provision::handle),
+        )
         .route("/probe", post(probe::handle))
         .route("/status", post(status::handle))
         // GET and POST alike are owner-gated: the settings document is the
         // owner's, so it is not in any public tier and this is the only way
         // to read it.
-        .route("/settings", get(settings::handle_get).post(settings::handle))
+        .route(
+            "/settings",
+            get(settings::handle_get).post(settings::handle),
+        )
         .route("/settings/seed", post(settings::handle_seed))
         .route("/start", post(start::handle))
         .route("/stop", post(stop::handle))
@@ -92,12 +118,18 @@ async fn health() -> &'static str {
 }
 
 async fn serve_index() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML)
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        INDEX_HTML,
+    )
 }
 
 async fn serve_ethers() -> impl IntoResponse {
     (
-        [(header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         ETHERS_JS,
     )
 }

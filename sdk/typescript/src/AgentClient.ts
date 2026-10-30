@@ -16,7 +16,7 @@
  *     services via `fetch`/`fetchWithProof` and captures the proof.
  */
 
-import { proofFromResponse } from './ServeSession';
+import { proofFromResponse, requestBytesOf, normalizedMethod, type TaskExchange } from './ServeSession';
 import type { ServeProof } from './types';
 
 /**
@@ -29,6 +29,74 @@ export interface AgentServiceEntry {
   method: string;
   description?: string;
   input_example?: string;
+  /**
+   * Protocol the consumer should speak. `"mcp"` = an MCP server endpoint:
+   * the backend implements the MCP streamable-HTTP protocol (JSON-RPC over
+   * POST), so an MCP-capable client can mount `<base><path>` as an MCP
+   * server and this agent's tools become the client's tools. Responses
+   * carry `X-Agent-Proof` like every agent service (when the runtime has a
+   * serve-proof validator configured) — that proof is what makes it a
+   * *trust-attributable* MCP server (see {@link mcpServices}).
+   */
+  transport?: 'mcp';
+}
+
+/**
+ * The agent's MCP-mountable service endpoints — the `/hello` entries marked
+ * `transport: "mcp"`. This is the consumption half of trusted-MCP serving:
+ *
+ * ```ts
+ * const { hello, verification } = await ag.agent.sayHi(agentUrl);
+ * // hello.services carries transport: "mcp" on MCP endpoints — sayHi
+ * // verified the /hello proof's signer against the on-chain agentSeal.
+ * const client = await ag.agent.client(agentUrl);            // public handle
+ * const mcp = mcpServices(client);                           // → [{ path: "/api/mcp", … }]
+ * // Mount `${client.base}${mcp[0].path}` as a streamable-HTTP MCP server in
+ * // any MCP client.
+ * ```
+ *
+ * Per-exchange verification — binding the proof to THIS body, not just the
+ * signer. `verifyProof` alone is signer attribution; with the exchange it
+ * also checks that the proof's taskHash equals
+ * keccak(method ‖ uri ‖ keccak(reqBody) ‖ keccak(respBody) ‖ status)
+ * recomputed from YOUR bytes (`taskMatches` in the verdict, required for
+ * `ok`). The pieces:
+ *
+ * ```ts
+ * const { response, proof, task } = await client.fetchWithProof(mcp[0].path, {
+ *   method: 'POST', headers: { 'content-type': 'application/json' },
+ *   body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+ * });
+ * await response.text();                       // your own read still works
+ * const v = await session.verifyProof(proof!, { task: task! });
+ * // v.ok && v.taskMatches → THIS response came from the attested runtime.
+ * // (task === null → ok: false, fail closed: the exchange wasn't recorded.)
+ * ```
+ * `task` is recorded from the actual bytes (response read via clone()), so a
+ * genuine proof replayed next to a swapped body fails (`taskMatches: false`).
+ * For hand-rolled fetches, pass the `TaskExchange` you captured (method, url,
+ * requestBytes, responseBytes, status) — `verifyProof` derives and tries
+ * every URI candidate from it. (`taskRevealOf()` returns an array; its
+ * element 0 can name the wrong URI form for a trailing-`?` URL.)
+ *
+ * Note the proxy pins one HTTP method per path, so an MCP route is POST-only:
+ * a stateless MCP server (each JSON-RPC request answered in one response,
+ * no server-initiated pushes) is the supported shape — and because the proxy
+ * buffers the whole response before signing, progress notifications and
+ * server→client requests (sampling, elicitation) inside a POST stream are
+ * not supported; keep tool calls short and return one JSON response.
+ *
+ * Two environment notes for generic MCP clients: (1) the proof envelope's
+ * `submitter` comes from the `X-Client-Address` request header — generic
+ * MCP clients don't send one, so proofs come back with submitter 0x0 and
+ * cannot be redeemed in protocols that require a real submitter; set the
+ * header through your MCP client's custom-headers option if you need it.
+ * (2) browser MCP clients only get to read `X-Agent-Proof` (the only
+ * CORS-exposed header) and an OPTIONS preflight to the service path 405s —
+ * use a non-browser client for verified MCP.
+ */
+export function mcpServices(client: Pick<AgentClient, 'services'>): AgentServiceEntry[] {
+  return client.services.filter((s) => s.transport === 'mcp');
 }
 
 /**
@@ -101,7 +169,16 @@ export interface AgentClient {
    * verify or submit as on-chain feedback. `proof` is null when the response
    * carries none (e.g. the unsigned owner↔agent chat route).
    */
-  fetchWithProof(path: string, init?: RequestInit): Promise<{ response: Response; proof: ServeProof | null }>;
+  fetchWithProof(path: string, init?: RequestInit): Promise<{
+    response: Response;
+    proof: ServeProof | null;
+    /** The exchange that was actually sent/received, for per-exchange
+     *  verification: `session.verifyProof(proof, { task })` then binds the
+     *  proof to THIS response's bytes (taskMatches), not just to the signer.
+     *  The response body is read via clone(), so `response.json()` etc. still
+     *  work. null when the request could not be recorded. */
+    task: TaskExchange | null;
+  }>;
   /**
    * Present only if the agent declares a `kind: "chat"` route and this handle
    * holds the owner token. POSTs an OpenAI-shaped chat request to
@@ -378,8 +455,35 @@ export function makeAgentClient(params: {
     routes,
     fetch: doFetch,
     async fetchWithProof(path, init) {
+      const rel = path.startsWith('/') ? path : `/${path}`;
       const response = await doFetch(path, init);
-      return { response, proof: proofFromResponse(response) };
+      // Per-exchange verification needs the exact bytes that traveled — but
+      // the body is read ONLY when the response carries X-Agent-Proof. A
+      // signed response is always finite (the proxy buffers it whole to
+      // compute the hash), so awaiting it cannot hang; an unsigned/streaming
+      // response (SSE chat) is returned immediately with task = null —
+      // awaiting its clone would block the caller's incremental reads.
+      const proof = proofFromResponse(response);
+      let task: TaskExchange | null = null;
+      if (proof) {
+        try {
+          const reqBytes = requestBytesOf(init?.body);
+          if (reqBytes !== null) {
+            const cloned = response.clone();
+            const respBytes = await cloned.arrayBuffer().then((b) => new Uint8Array(b));
+            task = {
+              method: normalizedMethod(init?.method),
+              url: `${base}${rel}`,
+              requestBytes: reqBytes,
+              responseBytes: respBytes,
+              status: response.status,
+            };
+          }
+        } catch {
+          task = null;
+        }
+      }
+      return { response, proof, task };
     },
   };
 

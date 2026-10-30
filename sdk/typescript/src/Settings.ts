@@ -1,3 +1,4 @@
+import { inferenceModels, inferenceProvider, modelsForProvider, type InferenceProvider } from './Providers';
 /**
  * @file Settings.ts
  * @description The owner's configuration document — the one blob that says
@@ -54,7 +55,7 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export const SETTINGS_DOMAIN = 'AgenticID.Settings.v1';
 
 /** The 0G router's public model catalog — no auth. */
-export const ROUTER_MODELS_URL = 'https://router-api.0g.ai/v1/models';
+export const ROUTER_MODELS_URL = inferenceProvider('0g-compute').modelCatalog!;
 
 /**
  * The owner's settings document — the exact shape of Go's `settings.Doc`
@@ -66,8 +67,8 @@ export const ROUTER_MODELS_URL = 'https://router-api.0g.ai/v1/models';
 export interface SettingsDoc {
   /**
    * Who serves the model. `'0g-compute'` means the PLATFORM supplies the
-   * endpoint (and the router catalog is then authoritative for `model`);
-   * anything else names a framework built-in that wires itself.
+   * endpoint. Other registered managed providers supply their own endpoint;
+   * registered native providers use the framework's built-in wiring.
    */
   provider?: string;
   /** The model id, spelled the way the provider spells it. */
@@ -250,10 +251,14 @@ export class SettingsConflictError extends Error {
  * @returns human-readable warnings; empty when everything looked fine, the
  *          catalog was unreachable, or there was nothing to check.
  */
-export async function modelAdvisory(doc: SettingsDoc): Promise<string[]> {
+export async function modelAdvisory(doc: SettingsDoc, resolvedProvider?: InferenceProvider): Promise<string[]> {
   const model = doc.model?.trim();
   if (!model) return [];
-  const ids = await fetchRouterModelIds();
+  const provider = doc.provider?.trim() || ZG_COMPUTE_PROVIDER;
+  const definition = resolvedProvider ?? inferenceProvider(provider);
+  if (!definition.modelCatalog && !definition.models?.length) return [];
+  let ids: string[] | null;
+  try { ids = (await modelsForProvider(definition)).map((model) => model.id); } catch { ids = null; }
   if (!ids) return []; // catalog unreachable — say nothing rather than something wrong
   if (ids.some((id) => id.toLowerCase() === model.toLowerCase())) return [];
   // Typo help, cheap and predictable: a substring either way, or a shared
@@ -274,24 +279,18 @@ export async function modelAdvisory(doc: SettingsDoc): Promise<string[]> {
   // provider '0g-compute' = the platform routes this model, so the router
   // catalog IS authoritative there; any other provider is a framework
   // built-in whose models the catalog never lists.
-  const routed = (doc.provider ?? '').trim() === ZG_COMPUTE_PROVIDER;
+  const routed = !!doc.provider?.trim() && !definition.native;
   return [
-    `model "${model}" is not in the 0G router catalog` +
+    `model "${model}" is not in the ${provider === ZG_COMPUTE_PROVIDER ? '0G router' : provider} catalog` +
       (routed
-        ? ` — and provider "${ZG_COMPUTE_PROVIDER}" means the platform routes it there, so this one probably will not resolve.`
+        ? ` — and provider "${provider}" means the platform routes it there, so this one probably will not resolve.`
         : ' — expected for a framework built-in; the container decides.') +
       (near.length ? ` Close matches: ${near.join(', ')}.` : ''),
   ];
 }
 
 /** The router catalog's model ids, or null when it could not be read. */
-export async function fetchRouterModelIds(): Promise<string[] | null> {
-  try {
-    const r = await fetch(ROUTER_MODELS_URL, { signal: AbortSignal.timeout(10_000) });
-    if (!r.ok) return null;
-    const body = (await r.json()) as { data?: Array<{ id?: string }> };
-    return (body.data ?? []).map((m) => m.id).filter((id): id is string => !!id);
-  } catch {
-    return null; // never fail a write over the catalog
-  }
+export async function fetchRouterModelIds(provider = ZG_COMPUTE_PROVIDER): Promise<string[] | null> {
+  try { return (await inferenceModels(provider)).map((model) => model.id); }
+  catch { return null; }
 }

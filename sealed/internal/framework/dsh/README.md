@@ -44,7 +44,7 @@ A single fixed composition — enough to be a useful agent, nothing more.
 | skills | `dsh-skill-filesystem` (the `skills/` iData role — agent-installed, chain-tracked) |
 | context headroom | `dsh-token-meter` + `dsh-compaction-basic` |
 | loop hygiene | `dsh-tool-call-timeout-policy` |
-| **platform control points** | `seal-tools.mjs` (seal_sign / seal_register_service as native, session-logged tools), `seal-guard.mjs` (denies shell calls that reach the sign socket) |
+| **platform control points** | `seal-tools.mjs` (seal_sign / seal_sign_transaction / seal_sign_typed_data / seal_register_service as native, session-logged tools — the three sign tools map the socket's three sign endpoints one-to-one), `seal-guard.mjs` (steers shell calls away from the socket's `/sign/` endpoints; `/settings` and `/services` stay open) |
 
 **Deliberately NOT mounted** (each a decision):
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * @file main.ts
- * @description Entry point of `0g-agenticid` — the diagnostics CLI that ships
- * inside @0gfoundation/0g-agenticid-sdk (`bin` in package.json; no extra install,
+ * @description Entry point of `0g-agentdna` — the diagnostics CLI that ships
+ * inside @0gfoundation/0g-agentdna (`bin` in package.json; no extra install,
  * no extra deps — arg parsing is node:util's parseArgs).
  *
  * This file owns: argv parsing, command routing, `--help`/`--version`, and
@@ -23,24 +23,25 @@ import { run as status } from './commands/status';
 import { run as list } from './commands/list';
 import { run as update } from './commands/update';
 import { run as settings } from './commands/settings';
+import { run as providers } from './commands/providers';
 import { run as interactive } from './commands/interactive';
 
 /** Diagnostics subcommands. Anything else (bare, or a leading agent ref)
  *  routes to the default interactive shell. */
-const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings };
+const COMMANDS: Record<string, CommandRun> = { doctor, status, list, update, settings, providers };
 
 // Help is written for LLM consumption as much as for humans: exact syntax,
 // env contract, exit-code semantics, runnable examples — it is the ground
 // truth an agent plans against (spec v0.03 §2.4).
-const HELP = `0g-agenticid — CLI for the 0G AgenticID protocol
-(ships with @0gfoundation/0g-agenticid-sdk; no separate install)
+const HELP = `0g-agentdna — 0G AgentDNA CLI for the AgenticID protocol
+(ships with @0gfoundation/0g-agentdna; no separate install)
 
 USAGE
-  0g-agenticid [agent] [options]     interactive chat (default)
-  0g-agenticid <command> [options]   diagnostics
+  0g-agentdna [agent] [options]     interactive chat (default)
+  0g-agentdna <command> [options]   diagnostics
 
 INTERACTIVE (default — no command)
-  0g-agenticid            Open the manager REPL. Its commands:
+  0g-agentdna            Open the manager REPL. Its commands:
                             list                 agents on this attestor (* = yours)
                             use <agentId|seal>   enter YOUR agent's session, in
                                                  ANY phase (lifecycle is inside)
@@ -66,10 +67,10 @@ INTERACTIVE (default — no command)
                                                  root (implicit in deploy/
                                                  start/reset)
                             login                guided setup: attestor URL,
-                                                 owner key, inference key (Enter
+                                                 owner key, provider, inference key (Enter
                                                  keeps current; keys echo *)
                             whoami · help · quit
-  0g-agenticid <agent>    Shortcut: use that agent directly, then drop to
+  0g-agentdna <agent>    Shortcut: use that agent directly, then drop to
                           the manager REPL on /back.
 
                           In a session: type to talk; Esc / Ctrl-C interrupts
@@ -78,7 +79,7 @@ INTERACTIVE (default — no command)
                           /start /reset /settings [k=v] /agentlog [n]
                           /startuplog [n] /back (or /unuse) /quit. The framework (for /reset
                           and the chat model selector) is picked by you, never
-                          guessed. Config persists to ~/.config/0g-agenticid
+                          guessed. Config persists to ~/.config/0g-agentdna
                           (config.json + credentials at 0600); AGENTIC_* env
                           vars always override the files.
 
@@ -107,8 +108,9 @@ COMMANDS
                    compare-and-swap against the version just read: if another
                    client changed the document meanwhile, it is refused (exit
                    3, SETTINGS_CONFLICT) rather than overwriting them. The
-                   model is checked against the 0G router catalog first — an
-                   absence is a warning only, never a refusal.
+                   model advisory uses its provider catalog. Provider changes
+                   need a matching key and image support, then require reset.
+  providers        Read the platform provider registry (--json for export).
   update           Self-update: compare against the npm registry and
                    npm install -g the latest (a git-checkout/npm-link copy
                    is reported, not overwritten). --json only reports.
@@ -136,6 +138,9 @@ ENVIRONMENT
   AGENTIC_VERIFIED_FEEDBACK_ADDR / AGENTIC_FEEDBACK_BATCHER_ADDR
                          optional. Reputation-pair address overrides for
                          attestors whose /config doesn't advertise them yet.
+                         The registry must be the one the agents' sealed
+                         proxy signs serve-proofs for, or every proof fails
+                         verification.
 
 EXIT CODES
   0 success · 1 unknown · 2 usage error (incl. unknown command/agent — branch
@@ -143,13 +148,13 @@ EXIT CODES
   remedy, then retry) · 4 timeout (check again later) · 5 auth (stop)
 
 EXAMPLES
-  0g-agenticid                       # deploy a new agent and chat
-  0g-agenticid 286                   # attach to agent 286 and chat
-  0g-agenticid doctor
-  0g-agenticid status 33
-  0g-agenticid settings 286
-  0g-agenticid settings 286 model=0gm-1.0-35b-a3b thinking=high
-  0g-agenticid list --mine --phase failed --json | jq -r '.data[].sealId'`;
+  0g-agentdna                       # deploy a new agent and chat
+  0g-agentdna 286                   # attach to agent 286 and chat
+  0g-agentdna doctor
+  0g-agentdna status 33
+  0g-agentdna settings 286
+  0g-agentdna settings 286 model=0gm-1.0-35b-a3b thinking=high
+  0g-agentdna list --mine --phase failed --json | jq -r '.data[].sealId'`;
 
 /** Package version, read at runtime from the SDK's own package.json
  *  (dist/cli/main.js → ../../package.json). */
@@ -182,8 +187,8 @@ async function main(): Promise<number> {
     return EXIT.OK;
   }
 
-  // Claude-Code-style default: bare `0g-agenticid` (or with just an agent
-  // ref, e.g. `0g-agenticid 286`) enters the interactive chat. The
+  // Claude-Code-style default: bare `0g-agentdna` (or with just an agent
+  // ref, e.g. `0g-agentdna 286`) enters the interactive chat. The
   // diagnostics commands (doctor/status/list) are the only reserved words;
   // an agentId is decimal and a sealId is 0x…, so neither collides with a
   // command name — anything that isn't a known command routes to chat.
@@ -223,7 +228,7 @@ main()
             nodeCode === 'ERR_PARSE_ARGS_UNKNOWN_OPTION'
               ? `unknown flag: ${((e as Error).message.match(/'(--?[^']+)'/) ?? [])[1] ?? '(see --help)'}`
               : 'malformed command-line arguments',
-            { remedy: '0g-agenticid --help' },
+            { remedy: '0g-agentdna --help' },
           )
         : toCliError(e);
     process.exitCode = emitError(err, wantJson);

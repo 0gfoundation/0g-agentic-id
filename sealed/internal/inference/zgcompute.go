@@ -36,14 +36,14 @@ const (
 
 // 0g-compute router endpoints, one per wire format. Anthropic clients
 // append /v1/messages themselves, so that base carries no /v1.
-const (
-	ZGOpenAIBaseURL    = "https://router-api.0g.ai/v1"
-	ZGAnthropicBaseURL = "https://router-api.0g.ai"
+var (
+	ZGOpenAIBaseURL    = DefaultRegistry.providers[ZGComputeProvider].Endpoints[WireOpenAI]
+	ZGAnthropicBaseURL = DefaultRegistry.providers[ZGComputeProvider].Endpoints[WireAnthropic]
 )
 
 // zgModelsURL is the router's PUBLIC model catalog (no auth). Var so
 // tests can point it at a httptest server.
-var zgModelsURL = "https://router-api.0g.ai/v1/models"
+var zgModelsURL = DefaultRegistry.providers[ZGComputeProvider].ModelCatalog
 
 // SetCatalogURLForTest points the catalog at a test server and returns a
 // restore func. For adapter tests in other packages (this package's own tests
@@ -89,8 +89,10 @@ type ModelFacts struct {
 // providers ("anthropic", "openai") ship their own; the 0g router does not
 // exist in any framework's built-in table, so we supply it.
 type Endpoint struct {
-	Format  WireFormat
-	BaseURL string
+	ProviderID    string
+	Format        WireFormat
+	BaseURL       string
+	Compatibility map[string]any
 	// EnvKey is the environment variable the framework's client reads
 	// for this wire format (ANTHROPIC_API_KEY / OPENAI_API_KEY). The 0g
 	// key itself is format-agnostic; only the variable name differs.
@@ -119,6 +121,10 @@ const ZGComputeProvider = "0g-compute"
 // even off-router. A miss simply yields zero facts, which every caller
 // already treats as "say nothing extra".
 func Resolve(ctx context.Context, provider, model string) (ModelFacts, *Endpoint) {
+	if _, registered := DefaultRegistry.providers[provider]; registered {
+		facts, ep, _ := DefaultRegistry.Resolve(ctx, provider, model)
+		return facts, ep
+	}
 	route := ResolveZG(ctx, model)
 	if provider != ZGComputeProvider {
 		return route.ModelFacts, nil

@@ -42,8 +42,8 @@ test('L1 settings k=v completes after the agent id', () => {
   assert.ok(hits.includes('model=glm-5.3') && hits.includes('model=glm-5.2'));
 });
 
-test('provider= completes the one routed name', () => {
-  assert.deepEqual(completeTail('/settings', 'provider=', MODELS), ['provider=0g-compute']);
+test('provider= completes registered managed and native names', () => {
+  assert.deepEqual(completeTail('/settings', 'provider=', MODELS), ['provider=0g-compute', 'provider=openai', 'provider=anthropic']);
 });
 
 test('others= is opaque — no value suggestions', () => {
