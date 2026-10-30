@@ -486,6 +486,7 @@ func (s *Server) streamSynthRecord(w http.ResponseWriter, r *http.Request, rec *
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no") // the preview gateway's nginx: see streamRelay
 	w.WriteHeader(http.StatusOK)
 	fl.Flush()
 	// Paired with the "accepted" line — see the bridges' equivalent: accepted

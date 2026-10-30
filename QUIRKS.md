@@ -456,6 +456,21 @@ agent doc says so (hermes `FrameworkFacts`). Do not "fix" this with
 the denylist, so that would also make the credential files under
 `~/.hermes` deliverable.
 
+### The preview gateway's nginx buffers streams unless the response says not to
+
+Agents are reached through the sandbox's preview gateway, an nginx
+(`Server: nginx/1.27.5` on `https://8080-<id>.<proxy>`) whose preview server
+block keeps nginx's default `proxy_buffering on`. A buffered stream arrives
+only when a buffer fills or the stream ends. Measured on dev (2026-10-30): a
+49-delta reply arrived in one burst when the turn ended, and `/v1/events`,
+which never ends, delivered nothing, not even its headers, for a minute. So
+every SSE response sealed relays or synthesizes carries
+`X-Accel-Buffering: no`, which nginx honors per response
+(`internal/proxy/proxy.go` `streamRelay`, `internal/proxy/responses.go`), and
+0g-harness sets it on its own streams (`src/http.mjs` `openSSE`). Do not drop
+the header because a stream looks fine end to end: a finite stream hides the
+buffering, and only a live view (the CLI's notices, live typing) shows it.
+
 ---
 
 ## Fault localization (serve-proof / sealed runtime)
