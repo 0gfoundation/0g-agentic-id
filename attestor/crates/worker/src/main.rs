@@ -80,13 +80,11 @@ async fn main() -> anyhow::Result<()> {
     let attestor_identity = identities.attestor;
     let discovery = identities.sandbox;
 
-    // Resolve app-scoped key from KMS (same source as api).
+    // KMS for per-seal agentSeal derivation (same source as api).
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
 
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,

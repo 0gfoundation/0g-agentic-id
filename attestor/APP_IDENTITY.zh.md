@@ -2,8 +2,8 @@
 
 生产 API 和 worker 启动时通过本地 tapp `GetAppSigner(app_id)` 取得共享稳定签名密钥。
 固定 KMS material 为 `70726f7669646572`，直接将 secret 作为 secp256k1 标量，兼容旧
-sandbox provider 地址。它与节点 signer（`GetAppSecretKey`）、空 material 加密密钥、
-每个 agent 的 agentSeal 相互独立。稳定 signer 需要交易与存储 gas。
+sandbox provider 地址。它与节点 signer（`GetAppSecretKey`）、每个 agent 的 agentSeal
+相互独立。稳定 signer 需要交易与存储 gas。
 API/worker 广播交易时使用按 signer 共享的 Postgres advisory transaction lock；存储
 上传使用同一锁，并等待此前 pending 交易打包。所有副本必须使用同一数据库。
 Indexer 仍只读取链与派生 agentSeal。

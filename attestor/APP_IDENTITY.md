@@ -3,8 +3,7 @@
 Production API and worker fetch their shared stable signing key once at startup with
 local tapp `GetAppSigner(app_id)`. This uses KMS material `70726f7669646572` and the raw
 secp256k1 scalar convention, matching the existing sandbox provider key. It is separate
-from the node signer (`GetAppSecretKey`), the empty-material encryption key and every
-per-agent agentSeal. Fund the stable signer for business and storage transactions.
+from the node signer (`GetAppSecretKey`) and every per-agent agentSeal. Fund the stable signer for business and storage transactions.
 API/worker broadcasts use a Postgres advisory transaction lock shared by signer; storage
 uploads take that same lock and wait for preceding pending transactions to be packed.
 Every replica must use the same database. The indexer still only reads and derives seals.

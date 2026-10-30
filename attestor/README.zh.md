@@ -194,7 +194,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_APP_ID` | attestor 自己在 TappRegistry 注册的 appId |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | 信任的另外两个 Tapp app（trust-roots ack 用）|
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（加密 KMS key；生产签名与身份发现要求本地 socket）；docker 里通过 `host.docker.internal` 解到宿主 |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（稳定 app signer 与按 `material` 逐 seal 派生的 KMS key；生产签名与身份发现要求本地 socket）；docker 里通过 `host.docker.internal` 解到宿主 |
 | `MOCK_TEE` / `MOCK_KMS` | dev mock 开关 |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | `MOCK_TEE=true` 时必填；私钥需推得出地址（启动校验）|
 | `MOCK_APP_SECRET` | `MOCK_KMS=true` 时必填，32 字节 hex；三个 binary 必须读到**同一个值**否则派生分叉 |

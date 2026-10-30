@@ -139,13 +139,6 @@ pub trait CryptoModule: Send + Sync {
     fn random_key_32(&self) -> [u8; 32];
     fn keccak256(&self, data: &[u8]) -> [u8; 32];
 
-    /// HMAC-SHA256 over `data` with a binding key derived per `info` from
-    /// the app-scoped KMS key via HKDF (`HKDF(app_key, info) → key`,
-    /// then `HMAC-SHA256(key, data) → 32 bytes`). `info` is a domain
-    /// separator string so the same master secret can back independent
-    /// MACs without cross-protocol attacks.
-    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32];
-
     /// Recover signer from a 32-byte prehash and a 65-byte signature.
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address>;
 }

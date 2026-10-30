@@ -8,9 +8,8 @@
 //!
 //! `agentSeal_priv` is derived PER SEAL from the KMS: the attestor sends
 //! `material = chainId‖contract‖sealId` and gets back 32 bytes used directly
-//! as the secp256k1 private key. The attestor holds no fleet-wide master —
-//! only an app-scoped key (`app_key`, empty material) cached at construction
-//! for `hmac_binding`, which no MAC uses any more.
+//! as the secp256k1 private key. The attestor holds no fleet-wide master and
+//! no app-scoped key: every KMS call is a per-`material` derivation.
 
 use crate::kms::KmsClient;
 use crate::traits::CryptoModule;
@@ -19,11 +18,8 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use alloy::primitives::{keccak256, Address};
 use async_trait::async_trait;
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
 use rand::{thread_rng, RngCore};
-use sha2::Sha256;
 use std::sync::Arc;
 
 /// Builds the opaque KMS derivation material for one seal:
@@ -40,9 +36,6 @@ pub fn seal_material(chain_id: u64, contract: Address, seal_id: SealId) -> Vec<u
 }
 
 pub struct RealCrypto {
-    /// App-scoped key (KMS empty-material), cached once at construction so
-    /// `hmac_binding` doesn't take a KMS round-trip. NOT an agentSeal source.
-    app_key: [u8; 32],
     /// KMS handle for per-seal agentSeal derivation.
     kms: Arc<dyn KmsClient>,
     /// Material inputs (public, from chain config).
@@ -51,28 +44,21 @@ pub struct RealCrypto {
 }
 
 impl RealCrypto {
-    pub fn new(
-        app_key: [u8; 32],
-        kms: Arc<dyn KmsClient>,
-        chain_id: u64,
-        contract: Address,
-    ) -> Self {
+    pub fn new(kms: Arc<dyn KmsClient>, chain_id: u64, contract: Address) -> Self {
         Self {
-            app_key,
             kms,
             chain_id,
             contract,
         }
     }
 
-    /// Test/dev constructor: a `MockKmsClient`-backed crypto whose app key
-    /// equals `secret` and whose agentSeal derivation goes through the mock
-    /// (HKDF over the seal material). Deterministic and material-sensitive,
+    /// Test/dev constructor: a `MockKmsClient`-backed crypto keyed by
+    /// `secret`, whose agentSeal derivation goes through the mock (HKDF over
+    /// the seal material). Deterministic and material-sensitive,
     /// so it matches prod semantics without a KMS cluster. chain/contract are
     /// placeholders — fine for tests that don't assert a specific address.
     pub fn new_for_test(secret: [u8; 32]) -> Self {
         Self::new(
-            secret,
             Arc::new(crate::kms::MockKmsClient::from_bytes(secret)),
             0,
             Address::ZERO,
@@ -158,24 +144,6 @@ impl CryptoModule for RealCrypto {
 
     fn keccak256(&self, data: &[u8]) -> [u8; 32] {
         keccak256(data).0
-    }
-
-    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32] {
-        // HKDF-derive a per-info binding key from the app-scoped KMS key, then
-        // HMAC-SHA256 the data with it. Domain separation lives in `info`.
-        let hkdf = Hkdf::<Sha256>::new(None, &self.app_key);
-        let mut binding_key = [0u8; 32];
-        hkdf.expand(info, &mut binding_key)
-            .expect("HKDF-SHA256 expand to 32 bytes is infallible");
-
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&binding_key)
-            .expect("HMAC-SHA256 accepts any key length");
-        mac.update(data);
-        let tag = mac.finalize().into_bytes();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&tag);
-        out
     }
 
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {

@@ -29,14 +29,12 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = repo::connect(&cfg.db_url).await?;
 
-    // KMS master so the indexer can re-derive agentSeal from sealId and
-    // detect "this AgentSealSet event belongs to us". Indexer never sends
-    // chain txs, so it doesn't need the TEE EOA key.
+    // KMS so the indexer can re-derive agentSeal from sealId and detect
+    // "this AgentSealSet event belongs to us". Indexer never sends chain
+    // txs, so it doesn't need the TEE EOA key.
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,

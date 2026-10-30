@@ -214,10 +214,10 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_APP_ID` | Attestor's own appId registered on TappRegistry |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | The other two Tapp apps to trust (used for the trust-roots ack) |
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides KMS-derived encryption keys; production signing/discovery require the local socket (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the stable app signer and per-seal KMS-derived keys (via `material`); production signing/discovery require the local socket. Inside docker, resolved via `host.docker.internal` |
 | `MOCK_TEE` / `MOCK_KMS` | Dev mock switches |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | Required when `MOCK_TEE=true`. The priv key must derive the address (validated on startup) |
-| `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived subkeys diverge |
+| `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived agentSeals diverge |
 
 ### Sandbox + SandboxServing
 

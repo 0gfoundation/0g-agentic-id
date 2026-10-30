@@ -286,9 +286,6 @@ mod tests {
         fn keccak256(&self, d: &[u8]) -> [u8; 32] {
             self.0.keccak256(d)
         }
-        fn hmac_binding(&self, i: &[u8], d: &[u8]) -> [u8; 32] {
-            self.0.hmac_binding(i, d)
-        }
         fn recover_signer(&self, d: &[u8; 32], s: &[u8]) -> anyhow::Result<Address> {
             self.0.recover_signer(d, s)
         }
