@@ -8,7 +8,7 @@ use attestor_shared::{
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     mocks::{MockSandbox, MockStorage},
     oss::OssClient,
     repo::{self, PostgresDeploymentRepo},
@@ -21,6 +21,16 @@ use jobs::Ctx;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// A running job refreshes its liveness stamp this often.
+const JOB_HEARTBEAT: Duration = Duration::from_secs(30);
+
+/// A running job whose stamp is older than this lost its worker (ten missed
+/// heartbeats) and is reaped. Liveness, not age, decides: a job's duration
+/// is unbounded (a deploy uploads its iData entries one after another, each
+/// within the storage client's 750 s budget), and a job that is still
+/// executing keeps heartbeating.
+const JOB_ABANDONED_AFTER_SECS: i64 = 5 * 60;
 
 /// `VERIFIED_FEEDBACK_ADDR` value for the container env. Unset → the key is
 /// STILL injected, empty: extra_env overrides the deployer-signed payload's
@@ -74,7 +84,6 @@ async fn main() -> anyhow::Result<()> {
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
     let app_key = kms.app_key().await?;
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
     let crypto = Arc::new(RealCrypto::new(
         app_key,
@@ -151,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
-    let queue = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    let queue = PostgresJobQueue::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
     // OSS client is required for the deploy path (setAgentURI second
@@ -174,11 +183,14 @@ async fn main() -> anyhow::Result<()> {
         oss,
     };
 
-    // background sweep task — three responsibilities, same 60s tick:
+    // background sweep task — four responsibilities, same 60s tick:
     //  (a) job-queue retention (delete done/failed older than threshold)
-    //  (b) provision deadline (flip stuck container_stage=Submitted to
+    //  (b) job reaper (fail, never requeue, running jobs whose worker
+    //      stopped heartbeating and pending relay jobs whose owner envelope
+    //      expired; settle the stages an abandoned job left in flight)
+    //  (c) provision deadline (flip stuck container_stage=Submitted to
     //      Failed once `now > provision_deadline`, publish events)
-    //  (c) heartbeat staleness (flip running rows whose sealed runtime
+    //  (d) heartbeat staleness (flip running rows whose sealed runtime
     //      has stopped reporting to Stopped, publish events)
     {
         let queue = queue.clone();
@@ -204,7 +216,16 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => tracing::warn!(error = %e, "job sweep failed"),
                 }
 
-                // (b) Provision deadline.
+                // (b) Job reaper.
+                jobs::reap_and_settle(
+                    queue.as_ref(),
+                    deployments.as_ref(),
+                    events.as_ref(),
+                    JOB_ABANDONED_AFTER_SECS,
+                )
+                .await;
+
+                // (c) Provision deadline.
                 let now = chrono::Utc::now();
                 let timeouts = match deployments
                     .flip_provision_timeouts(now, "provision timeout".to_string())
@@ -232,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // (c) Heartbeat staleness — reconcile against the sandbox
+                // (d) Heartbeat staleness — reconcile against the sandbox
                 // instead of blindly flipping Failed. For each stale runner
                 // we check the sandbox's real state and act accordingly,
                 // reaping (admin_delete) confirmed-dead sandboxes so they
@@ -410,14 +431,22 @@ async fn main() -> anyhow::Result<()> {
         match queue.claim_next(&worker_id).await {
             Ok(Some((job_id, payload))) => {
                 tracing::info!(%job_id, kind = payload.kind(), seal_id = ?payload.seal_id(), "claimed job");
-                let res = jobs::run(&ctx, payload).await;
+                let res = jobs::run_heartbeating(
+                    queue.clone(),
+                    job_id,
+                    JOB_HEARTBEAT,
+                    jobs::run(&ctx, payload),
+                )
+                .await;
                 match res {
-                    Ok(()) => {
+                    // Reaped while running: the reaper owns the row.
+                    None => {}
+                    Some(Ok(())) => {
                         if let Err(e) = queue.complete(job_id).await {
                             tracing::error!(error = %e, %job_id, "failed to mark complete");
                         }
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         tracing::error!(error = ?e, %job_id, "job failed");
                         let _ = queue.fail(job_id, &e.to_string()).await;
                     }

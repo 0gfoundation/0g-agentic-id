@@ -181,8 +181,9 @@ create 时的 env,现在不再如此(`sdk/typescript/src/AttestorClient.ts` 的 
 让词汇表可以不改 attestor 就扩充;那个文件的头注释写明了:不要拿它去换一个"更漂亮的"
 类型化 API(`attestor/crates/api/src/routes/settings.rs:5-12`)。
 
-**文档在静态存储上没有加密。**`deployments.settings` 是一个普通的 JSONB 列;ECIES 只
-作用于传输,加密给容器公钥。真正保护它的是"除了 owner 和容器,它不离开 attestor":
+**文档没有列级加密。**`deployments.settings` 是 attestor Postgres 里一个普通的 JSONB 列,
+这个数据库落在 tapp FDE 卷上(§7);ECIES 只作用于传输,加密给容器公钥。在 attestor 内部,
+保护它的是"除了 owner 和容器,它不离开 attestor":
 该字段是 `skip_serializing`(`attestor/crates/shared/src/types.rs` (`Deployment`)),所以
 `GET /deployment/:seal_id` 不带它,`/deployments` 的 owner 层也刻意省略它
 (`routes/deployments.rs` (`OwnerDeployment`)),而 `GET /settings` 需要 owner 签名(§5)。这一点重要,
@@ -375,13 +376,16 @@ v2 明文绑定 provider ID；v3 还绑定 endpoint/协议的路由 hash，以�
 容器存在**之前**密钥停在哪,本次改动并未触及,但仍值得精确说明,因为 grep 会误导。没有
 `api_key` 这个列,这个字符串在 attestor 的 crate 里一次都不出现:密钥藏在 owner 签名的
 沙盒信封里那个不透明的 `env` map 中(SDK 在 `sandboxEnv` 里写 `env.API_KEY`,
-`sdk/typescript/src/AttestorClient.ts`),整个信封被克隆进部署 job 的 payload,而 job 行
-在进 Postgres 之前用 `job_key` 做 AES-GCM 封装
-(`attestor/crates/shared/src/jobs.rs` (`seal`))。`done`/`failed` 的行按
-`ATTESTOR_JOB_RETENTION_SECONDS`(默认 3600)清扫(`attestor/crates/shared/src/jobs.rs` (`sweep_expired`)、
-`attestor/.env.example:168`)。所以 secret 这一档的准确含义是
-**加密、限期、绝不持久**,不是"哪儿都不存"。任何把它变成无限期行的改动都是暴露面的实质
-变化,需要的是**清除方案**,而不只是加密方案。
+`sdk/typescript/src/AttestorClient.ts`),整个信封被克隆进部署 job 的 payload,job 行以明文
+JSON 把它存进 attestor 的 Postgres。这个数据库落在 tapp FDE 卷上
+(`attestor/docker-compose.yml` 里的 `x-tapp: data: encrypted`),而且 job 行只在 job 处于
+pending 时持有 payload:claim 时清空,所有在执行前就判 job 失败的路径也会清空
+(`attestor/crates/shared/src/jobs.rs` (`claim_next`、`reap`))。清空后的 `done`/`failed` 行按
+`ATTESTOR_JOB_RETENTION_SECONDS`(默认 3600)清扫(被 reaper 判失败的行要等 reaper 的后续处理
+跑完)(`attestor/crates/shared/src/jobs.rs` (`sweep_expired`)、
+`attestor/.env.example`)。所以 secret 这一档的准确含义是
+**落在加密卷上、只保留到 worker claim 为止、绝不持久**,不是"哪儿都不存"。任何把它变成
+无限期行的改动都是暴露面的实质变化,需要的是**清除方案**,而不只是加密方案。
 
 ## 8. 修改何时生效
 

@@ -6,8 +6,9 @@ use attestor_shared::{
     oss::OssClient,
     sandbox::SandboxError,
     AgentId, ChainClient, CloneFromParams, CloneRetryParams, Config, CryptoModule, DeploymentRepo,
-    EventBus, IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobPayload, MintParams,
-    SandboxClient, SandboxEnvelope, SealId, StageStatus, StorageClient, StorageRoot, WsEvent,
+    EventBus, IDataArtifact, IDataInput, IntelligentData, JobCloneAuth, JobId, JobPayload,
+    JobQueue, MintParams, ReapCause, ReapedJob, SandboxClient, SandboxEnvelope, SealId,
+    StageStatus, StorageClient, StorageRoot, WsEvent,
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 /// recovery affordance instead of a stuck spinner. 5 min comfortably
 /// covers cold image pull + bootstrap; tweak via env if real workloads
 /// regularly exceed it.
-const PROVISION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(5);
+pub(crate) const PROVISION_TIMEOUT: ChronoDuration = ChronoDuration::minutes(5);
 
 #[derive(Clone)]
 pub struct Ctx {
@@ -176,8 +177,6 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             image,
             sandbox_envelope,
         } => {
-            // `PostgresJobQueue` decrypted the whole payload at claim time —
-            // iData plaintexts are already live here.
             handle_deploy(
                 ctx,
                 seal_id,
@@ -1944,6 +1943,142 @@ async fn run_container_track(
     // Container will POST /status with "running" via api-server; that path
     // updates container_stage to Confirmed. Worker's job ends here.
     Ok(())
+}
+
+/// Run `job` while refreshing `job_id`'s liveness stamp every `every`.
+/// `None`: a heartbeat found the job no longer running, because the reaper
+/// failed it after missed beats (a stalled worker or a lost database
+/// connection) and has settled its stages. The job is then dropped where it
+/// stands, as if its worker had stopped there, so it changes nothing after
+/// that settlement.
+pub async fn run_heartbeating<F>(
+    queue: Arc<dyn JobQueue>,
+    job_id: JobId,
+    every: std::time::Duration,
+    job: F,
+) -> Option<anyhow::Result<()>>
+where
+    F: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let (lost_tx, lost_rx) = tokio::sync::oneshot::channel::<()>();
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.tick().await; // the claim stamped the first beat
+        loop {
+            tick.tick().await;
+            match queue.heartbeat(job_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = lost_tx.send(());
+                    return;
+                }
+                Err(e) => tracing::warn!(error = %e, %job_id, "job heartbeat failed"),
+            }
+        }
+    });
+    let out = tokio::select! {
+        res = job => Some(res),
+        Ok(()) = lost_rx => {
+            tracing::warn!(%job_id, "job was reaped while running; stopped");
+            None
+        }
+    };
+    heartbeat.abort();
+    out
+}
+
+/// Step (b) of the worker sweep: reap, then settle each reaped job and
+/// record it. A job whose settlement fails stays unrecorded, and `reap`
+/// returns it again on the next sweep.
+pub async fn reap_and_settle(
+    queue: &dyn JobQueue,
+    deployments: &dyn DeploymentRepo,
+    events: &dyn EventBus,
+    abandoned_after_secs: i64,
+) {
+    let reaped = match queue.reap(abandoned_after_secs).await {
+        Ok(reaped) => reaped,
+        Err(e) => {
+            tracing::warn!(error = %e, "job reaper failed");
+            return;
+        }
+    };
+    for job in reaped {
+        let job_id = job.id;
+        if settle_reaped_job(deployments, events, job).await {
+            if let Err(e) = queue.mark_reap_settled(job_id).await {
+                tracing::warn!(error = %e, %job_id, "recording a reaped job's settlement failed");
+            }
+        }
+    }
+}
+
+/// Follow-up for a job `JobQueue::reap` failed. An expired relay job never
+/// ran, so its deployment is as the owner left it: only tell them to sign
+/// again. An abandoned job may have left stages in flight: settle them with
+/// `DeploymentRepo::resolve_abandoned_stages`, which never touches a
+/// submitted mint and leaves a submitted container to the provision-timeout
+/// sweep. Re-running it is harmless (a settled deployment has nothing left
+/// to change, so no event repeats). `false`: settling failed; retry later.
+pub async fn settle_reaped_job(
+    deployments: &dyn DeploymentRepo,
+    events: &dyn EventBus,
+    job: ReapedJob,
+) -> bool {
+    tracing::warn!(job_id = %job.id, kind = ?job.kind, seal_id = ?job.seal_id, cause = ?job.cause, "job reaped");
+    let Some(seal_id) = job.seal_id else {
+        return true;
+    };
+    match job.cause {
+        ReapCause::Expired => {
+            let reason = "request expired before it ran — sign it again".to_string();
+            if let Err(e) = events
+                .publish(WsEvent::ContainerWarning { seal_id, reason })
+                .await
+            {
+                tracing::warn!(?seal_id, error = %e, "publish ContainerWarning failed");
+            }
+        }
+        ReapCause::Abandoned => {
+            let reason =
+                "interrupted: the worker stopped before the job finished — retry".to_string();
+            let starts_identity = job.kind.as_deref().is_some_and(JobPayload::starts_identity);
+            let now = Utc::now();
+            let settled = match deployments
+                .resolve_abandoned_stages(
+                    seal_id,
+                    starts_identity,
+                    reason.clone(),
+                    now,
+                    now + PROVISION_TIMEOUT,
+                )
+                .await
+            {
+                Ok(settled) => settled,
+                Err(e) => {
+                    tracing::warn!(?seal_id, error = %e, "settling an abandoned job's stages failed; retried next sweep");
+                    return false;
+                }
+            };
+            tracing::info!(?seal_id, ?settled, "abandoned job's stages settled");
+            let mut failed = Vec::new();
+            if settled.storage_failed {
+                failed.push(WsEvent::StorageFailed {
+                    seal_id,
+                    reason: reason.clone(),
+                });
+            }
+            if settled.mint_failed {
+                failed.push(WsEvent::MintFailed { seal_id, reason });
+            }
+            for event in failed {
+                if let Err(e) = events.publish(event).await {
+                    tracing::warn!(?seal_id, error = %e, "publish stage failure failed");
+                }
+            }
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -5184,6 +5319,193 @@ mod tests {
             0,
             "refresh path must NOT re-write tokenURI"
         );
+    }
+
+    // ── Reaped jobs ───────────────────────────────────────────────────
+
+    fn reaped(kind: &str, seal_id: SealId, cause: ReapCause) -> ReapedJob {
+        ReapedJob {
+            id: attestor_shared::JobId::new_v4(),
+            kind: Some(kind.into()),
+            seal_id: Some(seal_id),
+            cause,
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_deploy_fails_its_tracks_and_defers_the_container() {
+        let repo = InMemoryDeploymentRepo::new();
+        let events = InMemoryEventBus::new();
+        let seal = B256::repeat_byte(0x31);
+        let submitted = StageStatus::Submitted {
+            tx_hash: None,
+            at: Utc::now(),
+        };
+        seed_deployment(
+            &repo,
+            seal,
+            vec![],
+            submitted.clone(),
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        repo.by_seal
+            .lock()
+            .unwrap()
+            .get_mut(&seal)
+            .unwrap()
+            .container_stage = submitted;
+
+        settle_reaped_job(&repo, &events, reaped("deploy", seal, ReapCause::Abandoned)).await;
+
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.storage_stage.is_failed() && d.mint_stage.is_failed());
+        assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
+        let deadline = d
+            .provision_deadline
+            .expect("provision sweep owns the container");
+        assert!((deadline - Utc::now()).num_seconds() > 240);
+        assert_eq!(d.phase, DeploymentPhase::Failed);
+        assert!(matches!(
+            events.events.lock().unwrap().as_slice(),
+            [WsEvent::StorageFailed { .. }, WsEvent::MintFailed { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn reaping_never_touches_a_submitted_mint_and_an_expired_job_only_warns() {
+        let repo = InMemoryDeploymentRepo::new();
+        let events = InMemoryEventBus::new();
+        let seal = B256::repeat_byte(0x32);
+        let mint = StageStatus::Submitted {
+            tx_hash: Some(B256::repeat_byte(0x01)),
+            at: Utc::now(),
+        };
+        seed_deployment(
+            &repo,
+            seal,
+            vec![],
+            StageStatus::Confirmed { at: Utc::now() },
+            mint,
+            None,
+            None,
+        );
+        let before = repo.get(seal).await.unwrap().unwrap();
+
+        settle_reaped_job(
+            &repo,
+            &events,
+            reaped("resume_deploy", seal, ReapCause::Abandoned),
+        )
+        .await;
+        settle_reaped_job(
+            &repo,
+            &events,
+            reaped("sandbox_start", seal, ReapCause::Expired),
+        )
+        .await;
+        settle_reaped_job(
+            &repo,
+            &events,
+            ReapedJob {
+                seal_id: None,
+                ..reaped("deploy", seal, ReapCause::Abandoned)
+            },
+        )
+        .await;
+
+        let after = repo.get(seal).await.unwrap().unwrap();
+        assert!(matches!(after.storage_stage, StageStatus::Confirmed { .. }));
+        assert!(matches!(
+            after.mint_stage,
+            StageStatus::Submitted {
+                tx_hash: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(after.phase, before.phase);
+        assert!(after.provision_deadline.is_none());
+        assert!(matches!(
+            events.events.lock().unwrap().as_slice(),
+            [WsEvent::ContainerWarning { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reaped_job_whose_settlement_fails_is_settled_by_a_later_sweep() {
+        let queue = attestor_shared::mocks::InMemoryJobQueue::new();
+        let repo = InMemoryDeploymentRepo::new();
+        let events = InMemoryEventBus::new();
+        let seal = B256::repeat_byte(0x33);
+        seed_deployment(
+            &repo,
+            seal,
+            vec![],
+            StageStatus::Submitted {
+                tx_hash: None,
+                at: Utc::now(),
+            },
+            StageStatus::NotStarted,
+            None,
+            None,
+        );
+        let job = reaped("deploy", seal, ReapCause::Abandoned);
+        queue.reapable.lock().unwrap().push(job.clone());
+
+        repo.fail_resolve_abandoned_stages
+            .store(true, Ordering::SeqCst);
+        reap_and_settle(&queue, &repo, &events, 300).await;
+        assert!(queue.reap_settled.lock().unwrap().is_empty());
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.storage_stage, StageStatus::Submitted { .. }));
+        assert!(events.events.lock().unwrap().is_empty());
+
+        repo.fail_resolve_abandoned_stages
+            .store(false, Ordering::SeqCst);
+        reap_and_settle(&queue, &repo, &events, 300).await;
+        assert_eq!(queue.reap_settled.lock().unwrap().as_slice(), &[job.id]);
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(d.storage_stage.is_failed() && d.mint_stage.is_failed());
+
+        // Settled once: later sweeps neither return it nor repeat events.
+        reap_and_settle(&queue, &repo, &events, 300).await;
+        assert_eq!(queue.reap_settled.lock().unwrap().len(), 1);
+        assert!(matches!(
+            events.events.lock().unwrap().as_slice(),
+            [WsEvent::StorageFailed { .. }, WsEvent::MintFailed { .. }]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_running_job_heartbeats_and_stops_once_reaped() {
+        let queue = Arc::new(attestor_shared::mocks::InMemoryJobQueue::new());
+        let every = std::time::Duration::from_secs(30);
+
+        let out = run_heartbeating(queue.clone(), JobId::new_v4(), every, async {
+            tokio::time::sleep(std::time::Duration::from_secs(95)).await;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(out, Some(Ok(()))));
+        assert_eq!(queue.heartbeats.load(Ordering::SeqCst), 3);
+
+        // The next beat finds the job reaped: the job stops there and
+        // never reaches its later steps.
+        queue.heartbeat_lost.store(true, Ordering::SeqCst);
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let out = run_heartbeating(queue.clone(), JobId::new_v4(), every, {
+            let finished = finished.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                finished.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(out.is_none());
+        assert_eq!(queue.heartbeats.load(Ordering::SeqCst), 4);
+        assert!(!finished.load(Ordering::SeqCst));
     }
 
     // ── flip_provision_timeouts (mock impl) ───────────────────────────

@@ -223,9 +223,10 @@ property that lets the vocabulary grow without an attestor change, and the
 file's own header says not to trade it for a "nicer" typed API
 (`attestor/crates/api/src/routes/settings.rs:5-12`).
 
-**The document is not encrypted at rest.** `deployments.settings` is a plain
-JSONB column; the ECIES layer is transport-only, to the container pubkey.
-What protects it instead is that it never leaves attestor except to the owner
+**The document has no column-level encryption.** `deployments.settings` is a
+plain JSONB column in the attestor Postgres, which sits on the tapp FDE volume
+(§7); the ECIES layer is transport-only, to the container pubkey. Within the
+attestor, what protects it is that it never leaves attestor except to the owner
 or to the container: the field is `skip_serializing`
 (`attestor/crates/shared/src/types.rs` (`Deployment`)), so `GET /deployment/:seal_id`
 does not carry it, the owner tier of `/deployments` deliberately omits it
@@ -471,14 +472,20 @@ and still worth stating precisely because a grep is misleading. There is no
 `api_key` column and the string appears nowhere in the attestor crates: the
 key rides inside the opaque `env` map of the owner-signed sandbox envelope
 (the SDK sets `env.API_KEY` in `sandboxEnv`,
-`sdk/typescript/src/AttestorClient.ts`), the envelope is cloned into the deploy
-job payload, and the job row is AES-GCM sealed under `job_key` before it
-reaches Postgres (`attestor/crates/shared/src/jobs.rs` (`seal`)). Rows in
-`done`/`failed` are swept after `ATTESTOR_JOB_RETENTION_SECONDS`, default 3600
-(`attestor/crates/shared/src/jobs.rs` (`sweep_expired`), `attestor/.env.example:168`). So the secret tier means
-*encrypted, retention-bounded, never durable* — not "nowhere". Anything that
-turns it into an indefinite row is a real change in exposure and needs a purge
-story, not just an encrypt story.
+`sdk/typescript/src/AttestorClient.ts`), and the envelope is cloned into the
+deploy job payload, which the job row stores as plain JSON on the attestor's
+Postgres. That database sits on the tapp FDE volume
+(`x-tapp: data: encrypted` in `attestor/docker-compose.yml`), and the row holds
+the payload only while the job is pending: the claim clears it, as does every
+path that fails the job before it runs (`attestor/crates/shared/src/jobs.rs`
+(`claim_next`, `reap`)). The cleared rows in `done`/`failed` are swept after
+`ATTESTOR_JOB_RETENTION_SECONDS`, default 3600 (a reaped row once the reaper's
+follow-up for it has run)
+(`attestor/crates/shared/src/jobs.rs` (`sweep_expired`), `attestor/.env.example`).
+So the secret tier means *on the encrypted volume, held only until a worker
+claims the job, never durable* — not "nowhere". Anything that turns it into an
+indefinite row is a real change in exposure and needs a purge story, not just
+an encrypt story.
 
 ## 8. When a change takes effect
 

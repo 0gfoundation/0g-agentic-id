@@ -231,9 +231,11 @@ keys are handed to unreviewed code.
 What the Attestor actually receives from KMS:
 
 - **One app-scoped key** (empty derivation material), fetched at
-  startup and used only for encrypting the job queue at rest and for
-  the provision-binding MAC (Layer 3). It is **not** a seed for any
-  agent key.
+  startup and used only for the provision-binding MAC (Layer 3) and
+  the status boot-receipt HMAC. It is **not** a seed for any agent
+  key. The job queue is not encrypted with it: Attestor's Postgres
+  sits on the tapp FDE volume, and a job row holds its payload only
+  while the job is pending.
 - **Individual `agent_seal_priv` keys**, derived per seal on demand
   (Layer 2). Derivation is one-way inside the KMS cluster: holding one
   derived key reveals nothing about any sibling, and no fleet-wide

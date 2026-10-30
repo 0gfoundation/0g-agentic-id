@@ -19,17 +19,17 @@ Three binaries share a single Postgres and expose HTTP + WebSocket:
   liveness check, and the WebSocket real-time event stream.
 - **worker**: async job consumer. Runs storage encrypted uploads,
   mint txs, and sandbox lifecycle calls. Carries a 60s sweep loop
-  covering job retention, provision deadlines, and heartbeat
-  staleness.
+  covering job retention, the job reaper, provision deadlines, and
+  heartbeat staleness.
 - **indexer**: on-chain event listener and AgentCard rebuilder.
   After persisting to Postgres, it pushes updates to the frontend
   over WS via the EventBus.
 
 Today one node runs all three, but the design is not single-machine
 bound. The queue claims jobs with `FOR UPDATE SKIP LOCKED`
-(`shared/src/jobs.rs`), so any number of workers can share it; job
-payloads and the provision-binding MAC use the KMS **app-scoped** key,
-so every node of the same Tapp app can open them; and each agentSeal
+(`shared/src/jobs.rs`), so any number of workers can share it; the
+provision-binding MAC uses the KMS **app-scoped** key, so every node of
+the same Tapp app can verify it; and each agentSeal
 is derived per seal by KMS on demand, so any node can provision any
 agent with no node-local key state. Multi-node has **not** been run
 yet — production uses one KMS stable app signer with instance-bound
@@ -37,6 +37,38 @@ AgenticID authorization (plus gas), a shared Postgres outside the
 per-host compose, and the **indexer kept to a single instance** (its
 chain checkpoint is single-writer; two indexers would double-process
 events). Tracked as the node-federation workstream.
+
+Job payloads (owner-signed iData plaintexts, sandbox envelopes with their
+env) are stored as plain JSON. A row holds its payload only while the job
+is pending: the claim clears it, and so does every path that fails a job
+before it runs (an undecodable payload, an expired owner envelope). At-rest
+protection comes from the tapp FDE volume: `docker-compose.yml` declares
+`x-tapp: data: encrypted`, which puts the Postgres named volume on the app's
+KMS-keyed encrypted volume. A Postgres outside that volume (such as a shared
+one for multi-node) would hold pending payloads unencrypted.
+
+The worker never requeues a job. While one runs it refreshes the row's
+heartbeat every 30 s; the sweep's reaper marks failed a running job whose
+heartbeat is more than 5 min old (its worker is gone) and a pending
+`/start`, `/stop` or `/reset` job whose owner envelope expires within 30 s
+(the claim skips those too). For an abandoned job it fails a `Submitted`
+storage stage (and, for a deploy or clone, the storage/mint stages it never
+started) so `/retry` can recover, and gives a `Submitted` container without
+a provision deadline the standard 5 min one; it never touches a `Submitted`
+mint, whose transaction `/retry` reconciles by receipt. A reaped row records
+its cause until that follow-up has run, so a follow-up that errors, or a
+sweeping worker that exits first, is retried on the next sweep, and the
+retention sweep keeps the row meanwhile. A worker that was only stalled
+learns from its next heartbeat that its job was reaped and drops the job;
+`done`/`failed` only ever replace `running`, so its late result never
+overwrites the reaped row.
+
+Upgrading from a release that encrypted job payloads: drain the queue first.
+Stop the api so no new jobs arrive, wait until
+`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` returns 0,
+then upgrade. A job written by the earlier release cannot be decoded: a
+pending one is failed at claim and a running one is reaped, both without
+settling its deployment, which then stays `deploying` and needs a redeploy.
 
 ## Workspace
 
@@ -46,11 +78,12 @@ attestor/
 ├── crates/
 │   ├── shared/               types / traits / chain / sandbox / crypto / repo / mocks
 │   ├── api/                  HTTP + WS server + static web/ assets
-│   ├── worker/               async tasks + three sweep loops
+│   ├── worker/               async tasks + the 60s sweep loop
 │   └── indexer/              on-chain event listener
 ├── scripts/                  e2e / verify-agent / regression test scripts
 ├── version-meld/             vendored crate fix wired in via [patch.crates-io] (Cargo.toml; the Dockerfile copies it into the build)
-├── docker-compose.yml        api / worker / indexer / postgres full stack
+├── docker-compose.yml        api / worker / indexer / postgres full stack (`x-tapp: data: encrypted`; Postgres unpublished)
+├── docker-compose.dev.yml    local overlay: publishes Postgres on 127.0.0.1:5432 for host-run binaries
 ├── Dockerfile                one image shared by the three binaries (cargo build --release, multiple entry points)
 └── .env.example              all runtime configuration
 ```
@@ -65,6 +98,9 @@ docker compose up -d                                # bring up postgres + the 3 
 docker compose logs -f attestor-api                 # tail api logs
 ```
 
+Postgres is reachable only on the compose network; nothing publishes it to
+the host.
+
 Heads-up for local builds: the compose file sets `pull_policy: always`
 and `image:` defaults (`ATTESTOR_IMAGE`) to a VPC-internal Aliyun
 registry tag. Outside that VPC the default registry is unreachable, and
@@ -76,7 +112,7 @@ can't serve) or override `pull_policy` before `up -d`.
 Bare-metal (for dev/debug):
 
 ```bash
-docker compose up -d postgres                       # bring up Postgres only
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres   # Postgres only, on 127.0.0.1:5432
 cp .env.example .env && vim .env                    # fill in real chain / app_id / addr
 cargo run -p attestor-api    # one terminal
 cargo run -p attestor-worker # another
