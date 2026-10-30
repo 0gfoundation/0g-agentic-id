@@ -3650,7 +3650,7 @@ function failureReason(dep) {
 // root cause is addressed) but surface a hint pointing at what to do.
 const PERMANENT_PROVISION_MARKERS = [
   ['image_hash not in validFrameworkHashes',
-   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring online.'],
+   'This image_hash isn\'t in the AgenticID contract\'s validFrameworkHashes allowlist. Ask the project to add it there, then click Bring online.'],
   ['provider instance no longer trusted',
    'The sandbox provider that certified this container is no longer the one this attestor trusts. Bring online to recreate it under the current provider.'],
   ['container key differs from record',

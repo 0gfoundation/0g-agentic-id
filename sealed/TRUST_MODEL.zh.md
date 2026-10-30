@@ -610,7 +610,7 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
 | **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
 `report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
-`StatusReport:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
+`StatusReport.v2:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
 永不签裸 hash，所以 agent 没法通过它伪造这两者。本表旧版把
 `report.Status` 列为可经 socket 伪造，这是错的。
 

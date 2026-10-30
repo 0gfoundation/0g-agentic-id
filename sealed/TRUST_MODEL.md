@@ -721,7 +721,7 @@ That marks out the **load-bearing wall**:
 | **Agent doctrine** | Group B fails on what the socket *can* sign: `chain.Update` (an `update` tx via `/sign/transaction`) and any personal_sign / EIP-712 claim the agent issues. The serve-proof's Group B still holds mechanically, and Group A holds on every channel |
 
 `report.Status` and the settings seed are not on that list. sealed signs
-them in-process as a raw keccak256 over `StatusReport:…` /
+them in-process as a raw keccak256 over `StatusReport.v2:…` /
 `SettingsSeed:…`, and the socket never signs raw hashes, so the agent
 cannot fabricate them through it. An earlier version of this table
 listed `report.Status` as socket-fabricable; it is not.
