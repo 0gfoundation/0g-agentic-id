@@ -476,7 +476,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删
 掉 —— 到那时 pin 还没被读出来存下，它就没了，而 prime 和 dsh 没有 pin 都会 hard-fail
-`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:366`），另外三个
+`Start`。今天覆盖并不完整：只有 dsh 实现了 seeder（`dsh/settings.go:385`），另外三个
 把自己退役的 role 当未知 legacy role 记一条日志就忽略。见
 [CONFIG_SURFACE.zh.md](CONFIG_SURFACE.zh.md) §10。
 

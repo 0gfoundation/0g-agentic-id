@@ -19,11 +19,11 @@ import (
 // DSH has no native "append this file to my system prompt" convention the
 // way prime-agent's DefaultResourceLoader does — its own `persona` concept is
 // a config VALUE inside the plugin composition (dsh-system-prompt's `persona`
-// field), which is per-boot platform structure this adapter authors, not
+// field), which is per-boot platform structure the harness authors, not
 // agent-owned state. So this role's bytes reach the model through the
-// bridge's own code: a ctx.systemPrompt.section() call at boot (spawn.go),
-// the same authoritative channel the sealed platform doc uses — never a file
-// DSH itself reads. Consequence: like prime-agent's APPEND_SYSTEM.md, this
+// harness's own code: the persona slot it fills at boot from the file
+// SEAL_PERSONA_PATH names (spawn.go), the system prompt the sealed platform
+// doc also rides — never a file DSH itself reads. Consequence: like prime-agent's APPEND_SYSTEM.md, this
 // role needs no marker stripping, because nothing platform-authored ever
 // shares its bytes.
 

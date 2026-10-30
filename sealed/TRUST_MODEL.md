@@ -829,8 +829,8 @@ invariants (`internal/privsep`):
   neither it nor `/home` may be a link): it is `HOME` for everything the
   agent runs and the default working directory of `AgentCommand`, so tool
   caches and configuration (`~/.npm`, `~/.cache`, `~/.config`, `~/.local`,
-  `~/.gitconfig`, ...) and the agent's own files live there. (The prime and
-  dsh bridges deliberately start in their framework tree instead, so
+  `~/.gitconfig`, ...) and the agent's own files live there. (The prime
+  bridge and the dsh harness deliberately start in their framework tree instead, so
   relative paths of the tools they run resolve inside that tree.)
   `Required` refuses until both homes are in place. Inside `/root` the
   agent owns only its framework trees (`OwnTree`; for prime also

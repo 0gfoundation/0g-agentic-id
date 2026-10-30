@@ -525,7 +525,7 @@ The ordering is load-bearing: the uploader rebuilds the entry list from
 `Roles()` and commits it wholesale, so the first drift commit removes the
 undeclared role — if the pin has not been read out and persisted by then, it
 is gone, and prime and dsh both hard-fail `Start` without one. Coverage is
-partial today: only dsh implements the seeder (`dsh/settings.go:366`); the
+partial today: only dsh implements the seeder (`dsh/settings.go:385`); the
 other three log their retired role as unknown and ignore it. See
 [CONFIG_SURFACE.md](CONFIG_SURFACE.md) §10.
 

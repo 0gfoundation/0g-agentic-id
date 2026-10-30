@@ -133,9 +133,9 @@ func TestClearSessionWithADirectoryAtTheConversation(t *testing.T) {
 	}
 }
 
-// The bridge runs with the agent's own HOME and an explicit DSH_HOME.
+// The harness runs with the agent's own HOME and an explicit DSH_HOME.
 func TestBridgeEnvHomes(t *testing.T) {
-	env := bridgeEnv{token: "tok"}.environ("/nm")
+	env := bridgeEnv{token: "tok"}.environ()
 	want := map[string]bool{"HOME=" + privsep.AgentHome(): false, "DSH_HOME=" + dshHome: false}
 	for _, kv := range env {
 		if _, ok := want[kv]; ok {
@@ -144,7 +144,7 @@ func TestBridgeEnvHomes(t *testing.T) {
 	}
 	for kv, ok := range want {
 		if !ok {
-			t.Errorf("bridge env lacks %s: %v", kv, env)
+			t.Errorf("harness env lacks %s: %v", kv, env)
 		}
 	}
 }

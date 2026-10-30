@@ -5,13 +5,13 @@
 //
 // STATUS: complete adapter. The state half — Roles(), Defaults(),
 // Restore/EvolutionFor, FrameworkFacts — is conformance-tested. The process
-// half (spawn.go) composes the DSH plugin tree inside a sealed-owned Node
-// bridge (bridge/bridge.mjs), embedded via go:embed and materialized at
-// Start, and New() self-registers so an on-chain "dsh" binding selects it.
-// The composition is authored IN the bridge (not a loader/profile/cordis.yml
-// and not any $DSH_HOME patch layer), so the plugin SET rides the image hash
-// and an agent editing its home cannot alter what mounts next boot. Two spine
-// options are the owner's (README.md), delivered as env at spawn. Like prime-agent, the
+// half (spawn.go) runs 0g-harness (github.com/0gfoundation/0g-harness), which
+// the image installs at build time, and New() self-registers so an on-chain
+// "dsh" binding selects it. The harness composes the DSH plugin tree in its
+// own code (not a loader/profile/cordis.yml and not any $DSH_HOME patch
+// layer), so the plugin SET rides the image hash and an agent editing its home
+// cannot alter what mounts next boot. Four composition options are the
+// owner's (README.md), delivered as env at spawn. Like prime-agent, the
 // process half wants a live-boot pass to confirm on first deploy (model
 // streams end-to-end, bash/skills work de-privileged); the state half needed
 // no such loop (FRAMEWORK_ADAPTER.md §13 point 5).
@@ -22,7 +22,7 @@
 //	                npm/release version — the two series match for DSH,
 //	                unlike prime-agent; see whitelist.go)
 //	APPEND_SYSTEM.md Leaf — owner persona, verbatim bytes (persona.go).
-//	                Injected by the bridge into ctx.systemPrompt at boot,
+//	                Injected by the harness into ctx.systemPrompt at boot,
 //	                NOT through any DSH-native config file — DSH's own
 //	                `persona` config key lives in the plugin composition
 //	                (cordis.yml), which is per-boot platform structure, not
@@ -31,7 +31,7 @@
 //	                $DSH_HOME/skills/ (skills.go)
 //
 // There is no config role: the inference pin is not chain state but the
-// owner's settings document, rendered into the bridge's environment at every
+// owner's settings document, rendered into the harness's environment at every
 // Start (RenderSettings in settings.go). So a routing fix reaches an
 // already-minted agent on its next boot instead of only at mint time, and
 // $DSH_HOME/settings.yaml — which DSH itself never read, see settings.go —
@@ -42,8 +42,7 @@
 // per-boot from ~50 independently versioned plugin packages. There is no
 // single "the framework's config file" the way openclaw and hermes each have
 // one — the composition itself (which plugins, which order, which config) is
-// platform structure this adapter authors and materializes at Start, exactly
-// like the sealed-owned HTTP bridge it also ships.
+// platform structure, authored in the harness package the image carries.
 //
 // File map:
 //
@@ -51,13 +50,16 @@
 //	paths.go        on-disk paths this adapter manages (+ what it does not)
 //	whitelist.go    validated DSH version set
 //	persona.go      APPEND_SYSTEM.md + HandleLegacy persona ingestion
-//	settings.go     RenderSettings: the owner's settings → bridge env (no config
+//	settings.go     RenderSettings: the owner's settings → harness env (no config
 //	                file), plus recovery of the retired settings.yaml role
 //	skills.go       the skills/ manifest role
 //	platformtext.go FrameworkFacts (this framework's blanks in the agent doc)
-//	spawn.go        Start/Stop/probes + the bridge lifecycle
-//	bridge/         the go:embed'd Node bridge (bridge.mjs) + platform plugins
-//	                (seal-tools.mjs, seal-guard.mjs)
+//	spawn.go        Start/Stop/probes + the harness lifecycle and the routes
+//	                it advertises
+//
+// The harness itself, with its platform plugins (seal-tools, seal-guard,
+// subagent-guard), lives in github.com/0gfoundation/0g-harness; the image
+// installs a pinned version of it (images/dsh/Dockerfile).
 package dsh
 
 import (
@@ -85,16 +87,16 @@ type Adapter struct {
 	// binding is the composed framework-role state (name + pinned version).
 	binding frameworkBinding
 
-	// cmd is the running bridge process (nil before first Start / after Stop).
+	// cmd is the running harness process (nil before first Start / after Stop).
 	cmd *exec.Cmd
 
-	// bridgeToken gates the bridge's /v1/* surface; AuthResponse hands it to a
+	// bridgeToken gates the harness's /v1/* surface; AuthResponse hands it to a
 	// verified owner. Minted once per container (memory-only), so a reset
 	// rotates it.
 	bridgeToken string
 
 	// rendered is what RenderSettings last produced from the owner's settings
-	// document: the resolved pin Start boots on, plus the bridge environment
+	// document: the resolved pin Start boots on, plus the harness environment
 	// derived from it. nil means RenderSettings has not run — a programming
 	// error Start refuses to paper over, because there is no file left to
 	// recover a pin from (settings.go).

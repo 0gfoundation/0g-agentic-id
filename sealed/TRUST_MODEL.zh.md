@@ -700,7 +700,7 @@ agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所
   `/home` 都不能是链接）：它是 agent 运行的一切进程的 `HOME`，也是
   `AgentCommand` 的默认工作目录，所以工具缓存与配置（`~/.npm`、`~/.cache`、
   `~/.config`、`~/.local`、`~/.gitconfig` 等）以及 agent 自己的文件都在那里。
-  （prime 和 dsh 的 bridge 有意从各自的框架目录树启动，所以它们运行的工具
+  （prime 的 bridge 和 dsh 的 harness 有意从各自的框架目录树启动，所以它们运行的工具
   的相对路径落在那棵树里。）两个家目录都就位之前 `Required` 一律拒绝
   provision。在 `/root` 里 agent 只拥有它的框架目录树（`OwnTree`；prime 另有
   `/root/.prime-conversation` 和每会话 harness 目录 `/root/.prime-session`），

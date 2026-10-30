@@ -288,7 +288,7 @@ not support the role, and is changing the broker to map `developer` →
 
 Workaround, per adapter that speaks the OpenAI dialect to the router: tell the
 framework the model has no `developer` role, so its system prompt goes out as
-`system` — dsh `compat.supportsDeveloperRole: false` (`dsh/bridge/bridge.mjs`),
+`system` — dsh `compat.supportsDeveloperRole: false` (0g-harness `src/composition.mjs`),
 openclaw `supportsDeveloperRole: false` in the rendered model `compat`
 (`openclaw/inference.go`), prime the same flag in `models.json`
 (`prime/modelsjson.go`). The flags stay correct after the broker change.

@@ -47,7 +47,7 @@ func reasoningModel(id string) map[string]any {
 }
 
 // render resolves a document and runs it through the adapter, returning the
-// bridge environment as a map.
+// harness environment as a map.
 func render(t *testing.T, a *Adapter, d settings.Doc) map[string]string {
 	t.Helper()
 	if err := a.RenderSettings(context.Background(), settings.Resolve(context.Background(), d, "sk-test")); err != nil {
@@ -174,17 +174,39 @@ func TestRenderSettings_OverlayAppliedButPlatformWins(t *testing.T) {
 	}
 }
 
-// An empty overlay must reproduce exactly the composition the bridge shipped
-// with — the knobs are an owner option, not a behaviour change.
+// An empty overlay must reproduce exactly the shipped composition — every
+// knob is an owner option, off until the owner turns it on.
 func TestRenderSettings_DefaultKnobsAreTheShippedComposition(t *testing.T) {
 	catalogServer(t, reasoningModel("glm-5.3"))
 	env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3"})
 	for k, want := range map[string]string{
 		"SEAL_DSH_TOOL_JOBS":               "0",
+		"SEAL_DSH_SUBAGENTS":               "0",
+		"SEAL_DSH_SCHEDULE":                "0",
 		"SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1",
 	} {
 		if env[k] != want {
-			t.Errorf("%s = %q, want %q (today's hardcoded literal)", k, env[k], want)
+			t.Errorf("%s = %q, want %q (the shipped default)", k, env[k], want)
+		}
+	}
+}
+
+// The subagents and schedule knobs reach the harness under their own names,
+// each independent of the others.
+func TestRenderSettings_SubagentsAndScheduleKnobs(t *testing.T) {
+	catalogServer(t, reasoningModel("glm-5.3"))
+	for _, c := range []struct {
+		overlay             string
+		subagents, schedule string
+	}{
+		{`{"subagents":true}`, "1", "0"},
+		{`{"schedule":true}`, "0", "1"},
+		{`{"subagents":true,"schedule":true}`, "1", "1"},
+		{`{"subagents":false,"schedule":false}`, "0", "0"},
+	} {
+		env := render(t, New(), settings.Doc{Provider: inference.ZGComputeProvider, Model: "glm-5.3", Others: json.RawMessage(c.overlay)})
+		if env["SEAL_DSH_SUBAGENTS"] != c.subagents || env["SEAL_DSH_SCHEDULE"] != c.schedule {
+			t.Errorf("%s → SUBAGENTS=%q SCHEDULE=%q, want %q %q", c.overlay, env["SEAL_DSH_SUBAGENTS"], env["SEAL_DSH_SCHEDULE"], c.subagents, c.schedule)
 		}
 	}
 }
@@ -210,6 +232,11 @@ func TestRenderSettings_BadOverlayValuesNeverFailTheRender(t *testing.T) {
 			"out-of-range value clamps, same as before",
 			`{"toolJobs":true,"maxParallelToolCalls":0}`,
 			map[string]string{"SEAL_DSH_TOOL_JOBS": "1", "SEAL_DSH_MAX_PARALLEL_TOOL_CALLS": "1"},
+		},
+		{
+			"wrongly-typed subagents falls back; schedule beside it applies",
+			`{"subagents":"yes","schedule":true}`,
+			map[string]string{"SEAL_DSH_SUBAGENTS": "0", "SEAL_DSH_SCHEDULE": "1"},
 		},
 		{
 			"wrongly-typed number",
@@ -257,7 +284,7 @@ func TestRenderSettings_WorkspaceContextKnobIsRefused(t *testing.T) {
 	})
 	for k, v := range env {
 		if strings.Contains(k, "WORKSPACE") {
-			t.Errorf("the refused knob still reaches the bridge: %s=%s", k, v)
+			t.Errorf("the refused knob still reaches the harness: %s=%s", k, v)
 		}
 	}
 	// Refusing one knob must not cost the owner the legitimate ones.
@@ -397,7 +424,7 @@ func TestBridgeEnv_CredentialComesFromTheSettingsDocument(t *testing.T) {
 		apiKey:      a.rendered.resolved.APIKey,
 		settingsEnv: a.rendered.env,
 		rt:          framework.RuntimeContext{APIKey: "sk-from-runtimecontext"},
-	}.environ("/node_modules"), "\n")
+	}.environ(), "\n")
 
 	if !strings.Contains(env, "SEAL_MODEL_API_KEY=sk-from-settings") {
 		t.Errorf("the bridge was not handed the resolved settings credential:\n%s", env)

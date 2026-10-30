@@ -104,7 +104,6 @@ var rootCommands = map[string][]string{
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},
 	"internal/framework/prime.npmGlobalRoot":     {"npm"},
-	"internal/framework/dsh.npmGlobalRoot":       {"npm"},
 }
 
 // rootEnvHelpers are the functions whose result a rootCommands function may
