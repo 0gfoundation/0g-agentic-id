@@ -53,6 +53,118 @@ async fn recheck_job_owner(
     Ok(())
 }
 
+/// The provider's own report of a deployment's sandbox.
+#[derive(Debug, PartialEq, Eq)]
+enum ProviderView {
+    /// Running, or a start is under way.
+    Up,
+    /// Stopped or archived, or on its way there, with no start pending.
+    Down,
+    Missing,
+    /// Errored or being destroyed; a start cannot bring it back.
+    Broken,
+    /// No sandbox id, a failed lookup, or a state that fits none of the above.
+    Unknown,
+}
+
+impl ProviderView {
+    fn of(state: &str, desired_state: Option<&str>) -> Self {
+        match (state, desired_state) {
+            ("error" | "build_failed" | "destroyed" | "destroying", _) | (_, Some("destroyed")) => {
+                Self::Broken
+            }
+            // A start of an archived sandbox reports "archived", then
+            // "restoring", until it runs; only the desired state shows it.
+            (_, Some("started")) => Self::Up,
+            (_, Some("stopped" | "archived")) => Self::Down,
+            (
+                "started" | "starting" | "restoring" | "creating" | "pulling_snapshot"
+                | "pending_build" | "building_snapshot",
+                _,
+            ) => Self::Up,
+            ("stopped" | "stopping" | "archived" | "archiving", _) => Self::Down,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+async fn provider_view(ctx: &Ctx, seal_id: SealId, sandbox_id: Option<&str>) -> ProviderView {
+    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+        return ProviderView::Unknown;
+    };
+    match ctx.sandbox.get_sandbox(sb).await {
+        Ok(Some(info)) => {
+            let view = ProviderView::of(&info.state, info.desired_state.as_deref());
+            tracing::info!(
+                ?seal_id,
+                sandbox_id = %sb,
+                state = %info.state,
+                desired_state = ?info.desired_state,
+                ?view,
+                "provider sandbox state"
+            );
+            view
+        }
+        Ok(None) => ProviderView::Missing,
+        Err(e) => {
+            tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "get_sandbox failed");
+            ProviderView::Unknown
+        }
+    }
+}
+
+/// Owner-facing remediation for a resume that did not start.
+#[derive(Debug, PartialEq, Eq)]
+struct ResumeFailure {
+    hint: &'static str,
+    /// The cause clears on its own, so the job itself succeeds.
+    transient: bool,
+}
+
+fn classify_resume_failure(e: &anyhow::Error, view: &ProviderView) -> ResumeFailure {
+    const UNAVAILABLE: &str = "sandbox temporarily unavailable — resume again in a moment";
+    if matches!(view, ProviderView::Missing | ProviderView::Broken) {
+        return ResumeFailure {
+            hint: "the sandbox no longer exists or is broken — reset the agent to create a new one",
+            transient: false,
+        };
+    }
+    let Some(se) = e.downcast_ref::<SandboxError>() else {
+        return ResumeFailure {
+            hint: UNAVAILABLE,
+            transient: true,
+        };
+    };
+    let (hint, transient) = match se.status {
+        None => (
+            "the signed resume request was rejected before it was sent — refresh, then resume again with a fresh signature",
+            false,
+        ),
+        Some(402) if se.message.to_lowercase().contains("acknowledg") => (
+            "sandbox provider not acknowledged — acknowledge it again (SDK `ack()`), then resume",
+            false,
+        ),
+        Some(402) => (
+            "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then resume",
+            true,
+        ),
+        Some(401) => (
+            "the signed resume request expired or was already used — resume again with a fresh signature",
+            false,
+        ),
+        Some(403) => (
+            "the sandbox provider refused the request — resume again, and reset the agent if it persists",
+            false,
+        ),
+        Some(_) if se.is_transient() => (UNAVAILABLE, true),
+        Some(_) => (
+            "could not resume the sandbox — resume again, or reset the agent",
+            false,
+        ),
+    };
+    ResumeFailure { hint, transient }
+}
+
 pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
     match payload {
         JobPayload::Deploy {
@@ -82,38 +194,36 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
-            // Double-click guard: if a previous start already landed
-            // (Confirmed) or is currently in flight (Submitted), do not
-            // call sandbox.start again — the runtime treats concurrent
-            // start as "operation in progress" and our error handler
-            // below would flip the deployment to Failed + admin_delete,
-            // wiping a perfectly healthy container. Worker jobs are
-            // serialized, so seeing these states here means the earlier
-            // start job already took effect. The user's desired end
-            // state (running) IS achieved; return success silently.
-            if let Some(d) = ctx.deployments.get(seal_id).await? {
-                if matches!(
-                    d.container_stage,
-                    StageStatus::Confirmed { .. } | StageStatus::Submitted { .. }
-                ) {
-                    tracing::info!(
-                        ?seal_id,
-                        stage = ?d.container_stage,
-                        "sandbox start: container already in target state, noop"
-                    );
+            let deployment = ctx.deployments.get(seal_id).await?;
+            let sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
+            match deployment.as_ref().map(|d| &d.container_stage) {
+                // A start or create is in flight; the provision deadline fails
+                // it if the container never comes up.
+                Some(StageStatus::Submitted { .. }) => {
+                    tracing::info!(?seal_id, "sandbox start: a start is already in flight, noop");
                     return Ok(());
                 }
+                // The provider can stop or archive a sandbox on its own and the
+                // attestor only learns of it at the heartbeat sweep, so a
+                // running stage alone does not make a resume a no-op.
+                Some(StageStatus::Confirmed { .. }) => {
+                    let view = provider_view(ctx, seal_id, sandbox_id.as_deref()).await;
+                    if matches!(view, ProviderView::Up | ProviderView::Unknown) {
+                        tracing::info!(
+                            ?seal_id,
+                            ?view,
+                            "sandbox start: container already in target state, noop"
+                        );
+                        return Ok(());
+                    }
+                    tracing::warn!(
+                        ?seal_id,
+                        ?view,
+                        "sandbox start: stage is stale, provider reports the sandbox not running; starting it"
+                    );
+                }
+                _ => {}
             }
-            // sandbox.start can fail when the runtime got into a bad
-            // state (concurrent op in progress, "errored" stuck after
-            // a botched stop, owner forbidden after sandbox-side GC).
-            // Plain `?` would just bail and leave c=Stopped — UI would
-            // re-show Bring back online, user clicks again, same
-            // failure loop. Instead: flip c=Failed + admin_delete the
-            // dead sandbox so the UI's bucket logic transitions
-            // Stopped → Stuck and the user can click "Bring back
-            // online" → SandboxRecreate (action=create) for a fresh
-            // sandbox.
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
             ctx.deployments
                 .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
@@ -136,73 +246,36 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 .publish(WsEvent::ContainerStarting { seal_id })
                 .await?;
             if let Err(e) = ctx.sandbox.start(seal_id, &sandbox_envelope).await {
-                // Classify by the provider's HTTP status (SandboxError), not
-                // by string-matching the body. A transient/recoverable
-                // condition — a state-transition conflict, the ~90s post-stop
-                // backup lock (returned as 400/409 "operation in progress"), a
-                // rate limit, an upstream RPC hiccup, or a top-up-able balance
-                // gap — must NOT flip Failed or admin_delete: the sandbox is
-                // healthy (or will be once the condition clears) and still
-                // resumable. Leave the deployment Stopped (the /start route
-                // never changed it) and surface a hint; the next user-driven
-                // Resume retries. Only a genuinely fatal error falls through to
-                // the recreate path below.
-                let transient = e
-                    .downcast_ref::<SandboxError>()
-                    .map(|se| se.is_transient())
-                    .unwrap_or(false);
-                if transient {
-                    let reason = if e.to_string().to_lowercase().contains("balance") {
-                        "insufficient sandbox balance — run `deposit` (prepaid sandbox balance, NOT /topup which funds agent gas), then resume".to_string()
-                    } else {
-                        "sandbox temporarily unavailable (e.g. backing up) — try Resume again in a moment".to_string()
-                    };
-                    ctx.deployments
-                        .set_container_stage(
-                            seal_id,
-                            StageStatus::Stopped {
-                                at: Utc::now(),
-                                reason: "resume_not_started".into(),
-                            },
-                        )
-                        .await?;
-                    tracing::warn!(?seal_id, error = %e, "sandbox.start: transient condition; staying Stopped for retry");
-                    ctx.events
-                        .publish(WsEvent::ContainerWarning { seal_id, reason })
-                        .await?;
+                // A failed resume never deletes the sandbox: it holds the
+                // agent's only container. The provider's state decides whether
+                // the start took effect despite the error (e.g. a lost response
+                // or a start already under way).
+                let view = provider_view(ctx, seal_id, sandbox_id.as_deref()).await;
+                if view == ProviderView::Up {
+                    tracing::warn!(?seal_id, error = %e, "sandbox.start errored but the provider reports the sandbox running or starting; keeping Submitted");
                     return Ok(());
                 }
-                let now = Utc::now();
-                let reason = format!("sandbox start: {e}");
-                tracing::warn!(?seal_id, error = %e, "sandbox.start failed; flipping c=Failed");
+                let failure = classify_resume_failure(&e, &view);
                 ctx.deployments
                     .set_container_stage(
                         seal_id,
-                        StageStatus::Failed {
-                            at: now,
-                            reason: reason.clone(),
+                        StageStatus::Stopped {
+                            at: Utc::now(),
+                            reason: "resume_not_started".into(),
                         },
                     )
                     .await?;
+                tracing::warn!(?seal_id, error = %e, transient = failure.transient, "sandbox.start did not take effect; staying Stopped");
                 ctx.events
-                    .publish(WsEvent::ContainerFailed {
+                    .publish(WsEvent::ContainerWarning {
                         seal_id,
-                        reason: reason.clone(),
+                        reason: failure.hint.to_string(),
                     })
                     .await?;
-                if let Some(d) = ctx.deployments.get(seal_id).await? {
-                    if let Some(sb) = d.sandbox_id.filter(|s| !s.is_empty()) {
-                        if let Err(e) = ctx.sandbox.admin_delete(&sb).await {
-                            tracing::warn!(
-                                ?seal_id,
-                                sandbox_id = %sb,
-                                error = %e,
-                                "admin_delete after start-failure failed (non-fatal)"
-                            );
-                        }
-                    }
+                if failure.transient {
+                    return Ok(());
                 }
-                anyhow::bail!(reason);
+                anyhow::bail!("resume not started: {e}");
             }
             Ok(())
         }
@@ -210,13 +283,14 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
             seal_id,
             sandbox_envelope,
         } => {
+            let deployment = ctx.deployments.get(seal_id).await?;
             // Double-click guard: if a previous stop already landed,
             // skip the sandbox call entirely. The string-match fallback
             // below still catches state-drift cases (attestor thinks
             // running but sandbox already stopped), but checking local
             // state first avoids a round-trip and is robust against the
             // sandbox changing its error wording.
-            if let Some(d) = ctx.deployments.get(seal_id).await? {
+            if let Some(d) = &deployment {
                 if matches!(d.container_stage, StageStatus::Stopped { .. }) {
                     tracing::info!(
                         ?seal_id,
@@ -226,24 +300,25 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
-            // Same protection as SandboxStart: a failed stop puts the
-            // sandbox into an inconsistent runtime state. Flip Failed so
-            // the user can recreate, instead of leaving Stopped+success
-            // events lying about what actually happened.
+            // A stop the provider refused puts the sandbox into an
+            // inconsistent runtime state. Flip Failed so the user can
+            // recreate, instead of leaving Stopped+success events lying about
+            // what actually happened.
             //
-            // Exception — idempotent "already stopped" responses. A
-            // jittery double-click on the Stop button causes the second
-            // request to race in after the first stop succeeded, and
-            // sandbox returns "Sandbox is not started" (or similar).
-            // That's not a failure: the desired end state (stopped) IS
-            // achieved. Fall through to the success path so the UI
-            // doesn't flip Failed and force the user to recreate.
+            // Exception — the desired end state (stopped) is already
+            // achieved: the provider answers "Sandbox is not started" (or
+            // similar) to a stop that raced an earlier one, or it reports the
+            // sandbox stopped or archived, with no start pending, after an
+            // error. Fall through to the success path so the UI doesn't flip
+            // Failed and force a recreate.
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
             if let Err(e) = ctx.sandbox.stop(seal_id, &sandbox_envelope).await {
                 let msg = e.to_string();
                 let already_stopped = msg.contains("not started")
                     || msg.contains("already stopped")
                     || msg.contains("not running");
+                let sandbox_id = deployment.as_ref().and_then(|d| d.sandbox_id.clone());
+                let refusal = e.downcast_ref::<SandboxError>();
                 if already_stopped {
                     tracing::info!(
                         ?seal_id,
@@ -252,16 +327,31 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                     );
                     // intentionally fall through to the success-path
                     // bookkeeping below
-                } else if e
-                    .downcast_ref::<SandboxError>()
-                    .map(|se| se.is_transient())
-                    .unwrap_or(false)
-                {
-                    // Transient (lock held, rate limit, upstream hiccup): the
-                    // stop didn't take, but the container is still healthy and
-                    // running — flipping Failed would mark a live agent dead.
-                    // Leave the stage as-is (still Running) and let the user
-                    // retry Stop.
+                } else if matches!(
+                    provider_view(ctx, seal_id, sandbox_id.as_deref()).await,
+                    ProviderView::Down | ProviderView::Missing
+                ) {
+                    tracing::info!(
+                        ?seal_id,
+                        error = %e,
+                        "sandbox.stop errored but the provider reports the sandbox not running — treating as success"
+                    );
+                } else if let Some(SandboxError { status: None, .. }) = refusal {
+                    tracing::warn!(?seal_id, error = %e, "sandbox.stop: request rejected before it was sent");
+                    ctx.events
+                        .publish(WsEvent::ContainerWarning {
+                            seal_id,
+                            reason: "the signed stop request was rejected before it was sent — refresh, then stop again"
+                                .to_string(),
+                        })
+                        .await?;
+                    return Ok(());
+                } else if refusal.map_or(true, |se| se.is_transient()) {
+                    // Transient (lock held, rate limit, upstream hiccup) or a
+                    // transport error that leaves the outcome open: the
+                    // container may still be running, so flipping Failed could
+                    // mark a live agent dead. Leave the stage as-is and let the
+                    // user retry Stop.
                     tracing::warn!(?seal_id, error = %e, "sandbox.stop: transient condition; leaving agent running for retry");
                     ctx.events
                         .publish(WsEvent::ContainerWarning {
@@ -3551,6 +3641,7 @@ mod tests {
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.sandbox_state.lock().unwrap() = Some("stopped".into());
         *t.sandbox.fail_status.lock().unwrap() = Some(402);
         *t.sandbox.fail_msg.lock().unwrap() = Some(
             "sandbox start: 402 Payment Required — {\"error\":\"insufficient balance\"}".into(),
@@ -3623,6 +3714,7 @@ mod tests {
             .await
             .unwrap();
         t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.sandbox_state.lock().unwrap() = Some("stopped".into());
         *t.sandbox.fail_status.lock().unwrap() = Some(400);
         *t.sandbox.fail_msg.lock().unwrap() = Some(
             "Sandbox failed to start: An operation is already in progress for this resource".into(),
@@ -3664,22 +3756,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn sandbox_start_fatal_error_flips_failed_and_reaps() {
-        // The classifier's other half: a genuinely fatal start error (404 the
-        // sandbox is gone, a real 400 validation error, 403, …) IS terminal —
-        // flip Failed + admin_delete so the UI moves Stopped → Offline and
-        // offers Recreate. Only transient statuses are spared.
-        let t = make_test_ctx();
-        let seal = dummy_seal();
+    async fn seed_stopped_deployment(t: &TestCtx, seal: SealId, agent: u64, sandbox_id: &str) {
         seed_deployment(
             &t.deployments,
             seal,
             Vec::new(),
             StageStatus::Confirmed { at: Utc::now() },
             StageStatus::Confirmed { at: Utc::now() },
-            Some(U256::from(9u64)),
-            Some("sb-gone".into()),
+            Some(U256::from(agent)),
+            Some(sandbox_id.into()),
         );
         t.deployments
             .set_container_stage(
@@ -3691,38 +3776,226 @@ mod tests {
             )
             .await
             .unwrap();
-        t.sandbox.start_fails.store(true, Ordering::SeqCst);
-        *t.sandbox.fail_status.lock().unwrap() = Some(404);
-        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox not found".into());
+    }
 
-        let res = run(
+    fn warning_reasons(t: &TestCtx) -> Vec<String> {
+        t.events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                WsEvent::ContainerWarning { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn set_provider_state(t: &TestCtx, state: Option<&str>, desired: Option<&str>) {
+        *t.sandbox.sandbox_state.lock().unwrap() = state.map(Into::into);
+        *t.sandbox.sandbox_desired_state.lock().unwrap() = desired.map(Into::into);
+    }
+
+    async fn boot_generation(t: &TestCtx, seal: SealId) -> i64 {
+        t.deployments
+            .boot_authorization(seal)
+            .await
+            .unwrap()
+            .expect("seeded boot authorization")
+            .generation
+    }
+
+    async fn seed_boot_authorization(t: &TestCtx, seal: SealId) -> i64 {
+        t.deployments
+            .prepare_status_boot(seal, Some([1u8; 32]), dummy_envelope("start").wallet_address)
+            .await
+            .unwrap()
+            .expect("generation")
+    }
+
+    async fn run_start(t: &TestCtx, seal: SealId) -> anyhow::Result<()> {
+        run(
             &t.ctx,
             JobPayload::SandboxStart {
                 seal_id: seal,
                 sandbox_envelope: dummy_envelope("start"),
             },
         )
-        .await;
+        .await
+    }
 
-        assert!(res.is_err(), "a fatal start error must bail");
+    async fn run_stop(t: &TestCtx, seal: SealId) -> anyhow::Result<()> {
+        run(
+            &t.ctx,
+            JobPayload::SandboxStop {
+                seal_id: seal,
+                sandbox_envelope: dummy_envelope("stop"),
+            },
+        )
+        .await
+    }
+
+    fn emitted_container_failed(t: &TestCtx) -> bool {
+        t.events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WsEvent::ContainerFailed { .. }))
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_fatal_error_keeps_sandbox_and_stays_stopped() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 9, "sb-gone").await;
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(403);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("forbidden".into());
+        set_provider_state(&t, None, None);
+
+        let res = run_start(&t, seal).await;
+
+        assert!(res.is_err(), "a non-transient start error fails the job");
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(
-            matches!(d.container_stage, StageStatus::Failed { .. }),
-            "fatal error must flip Failed, got {:?}",
+            matches!(d.container_stage, StageStatus::Stopped { ref reason, .. } if reason == "resume_not_started"),
+            "got {:?}",
             d.container_stage
         );
-        assert_eq!(
-            t.sandbox.admin_delete_calls.load(Ordering::SeqCst),
-            1,
-            "fatal error must reap the dead sandbox"
-        );
-        let events = t.events.events.lock().unwrap();
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        let reasons = warning_reasons(&t);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("no longer exists"), "{}", reasons[0]);
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_error_with_lookup_failure_stays_stopped() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 12, "sb-unknown").await;
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(400);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox is not in valid state".into());
+        t.sandbox.get_sandbox_fails.store(true, Ordering::SeqCst);
+
+        let res = run_start(&t, seal).await;
+
+        assert!(res.is_err());
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, WsEvent::ContainerFailed { .. })),
-            "fatal error must emit ContainerFailed"
+            matches!(d.container_stage, StageStatus::Stopped { ref reason, .. } if reason == "resume_not_started"),
+            "got {:?}",
+            d.container_stage
         );
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(warning_reasons(&t).len(), 1);
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_unacknowledged_stays_stopped_with_ack_hint() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 10, "sb-unacked").await;
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(402);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("provider not acknowledged by user".into());
+        set_provider_state(&t, Some("stopped"), Some("stopped"));
+
+        let res = run_start(&t, seal).await;
+
+        assert!(res.is_err());
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Stopped { .. }));
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        let reasons = warning_reasons(&t);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("acknowledge"), "{}", reasons[0]);
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_error_with_provider_started_stays_submitted() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 11, "sb-lost-response").await;
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(401);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("nonce already used".into());
+
+        run_start(&t, seal)
+            .await
+            .expect("a start the provider reports as running succeeds");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Submitted { .. }),
+            "got {:?}",
+            d.container_stage
+        );
+        assert!(d.provision_deadline.is_some());
+        assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert!(warning_reasons(&t).is_empty());
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_error_while_restore_pending_stays_submitted() {
+        for (state, desired) in [
+            ("archived", Some("started")),
+            ("restoring", Some("started")),
+            ("restoring", None),
+            ("pulling_snapshot", None),
+        ] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_stopped_deployment(&t, seal, 13, "sb-restoring").await;
+            t.sandbox.start_fails.store(true, Ordering::SeqCst);
+            *t.sandbox.fail_status.lock().unwrap() = Some(409);
+            *t.sandbox.fail_msg.lock().unwrap() = Some("Sandbox state change in progress".into());
+            set_provider_state(&t, Some(state), desired);
+
+            run_start(&t, seal)
+                .await
+                .expect("a start already under way succeeds");
+
+            let d = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(d.container_stage, StageStatus::Submitted { .. }),
+                "{state}/{desired:?}: got {:?}",
+                d.container_stage
+            );
+            assert!(d.provision_deadline.is_some(), "{state}/{desired:?}");
+            assert!(warning_reasons(&t).is_empty(), "{state}/{desired:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_refused_while_stop_pending_stays_stopped() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_stopped_deployment(&t, seal, 14, "sb-stopping").await;
+        t.sandbox.start_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(400);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("State change in progress".into());
+        set_provider_state(&t, Some("started"), Some("stopped"));
+
+        run_start(&t, seal)
+            .await
+            .expect("a transient refusal does not fail the job");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Stopped { ref reason, .. } if reason == "resume_not_started"),
+            "got {:?}",
+            d.container_stage
+        );
+        assert!(d.provision_deadline.is_none());
+        let reasons = warning_reasons(&t);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("temporarily unavailable"), "{}", reasons[0]);
     }
 
     #[tokio::test]
@@ -3849,11 +4122,9 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_start_noop_when_already_confirmed() {
-        // Worker jobs run serially, so seeing Confirmed at the top of
-        // handle SandboxStart means an earlier start already finished.
-        // Re-calling sandbox.start would race; the failure handler in
-        // handle_job would then flip c=Failed + admin_delete the
-        // healthy container. Pre-check must short-circuit silently.
+        // Confirmed and the provider reports the sandbox started: an earlier
+        // start already took effect, so the job must not grant a new boot
+        // generation or call sandbox.start again.
         let t = make_test_ctx();
         let seal = dummy_seal();
         seed_deployment(
@@ -3869,63 +4140,58 @@ mod tests {
             .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
             .await
             .unwrap();
+        let generation = seed_boot_authorization(&t, seal).await;
 
-        run(
-            &t.ctx,
-            JobPayload::SandboxStart {
-                seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
-            },
-        )
-        .await
-        .expect("noop must return Ok");
+        run_start(&t, seal).await.expect("noop must return Ok");
 
         assert_eq!(
             t.sandbox.start_calls.load(Ordering::SeqCst),
             0,
             "pre-check must skip sandbox.start when already Confirmed"
         );
+        assert_eq!(t.sandbox.get_sandbox_calls.load(Ordering::SeqCst), 1);
         assert_eq!(t.sandbox.admin_delete_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(boot_generation(&t, seal).await, generation);
     }
 
     #[tokio::test]
     async fn sandbox_start_noop_when_already_submitted() {
         // Submitted = previous start/recreate already hit sandbox.start
-        // but container hasn't yet POSTed /provision. Re-issuing start
-        // would trip sandbox's "concurrent op in progress" error path.
-        let t = make_test_ctx();
-        let seal = dummy_seal();
-        seed_deployment(
-            &t.deployments,
-            seal,
-            Vec::new(),
-            StageStatus::Confirmed { at: Utc::now() },
-            StageStatus::Confirmed { at: Utc::now() },
-            Some(U256::from(102u64)),
-            Some("sb-starting".into()),
-        );
-        t.deployments
-            .set_container_stage(
+        // but container hasn't yet POSTed /provision. The provider can still
+        // report the sandbox archived, restoring or creating at this point.
+        for state in ["started", "archived", "restoring", "creating"] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_deployment(
+                &t.deployments,
                 seal,
-                StageStatus::Submitted {
-                    tx_hash: None,
-                    at: Utc::now(),
-                },
-            )
-            .await
-            .unwrap();
+                Vec::new(),
+                StageStatus::Confirmed { at: Utc::now() },
+                StageStatus::Confirmed { at: Utc::now() },
+                Some(U256::from(102u64)),
+                Some("sb-starting".into()),
+            );
+            t.deployments
+                .set_container_stage(
+                    seal,
+                    StageStatus::Submitted {
+                        tx_hash: None,
+                        at: Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+            let generation = seed_boot_authorization(&t, seal).await;
+            set_provider_state(&t, Some(state), None);
 
-        run(
-            &t.ctx,
-            JobPayload::SandboxStart {
-                seal_id: seal,
-                sandbox_envelope: dummy_envelope("start"),
-            },
-        )
-        .await
-        .expect("noop must return Ok");
+            run_start(&t, seal).await.expect("noop must return Ok");
 
-        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0, "{state}");
+            assert_eq!(t.sandbox.get_sandbox_calls.load(Ordering::SeqCst), 0, "{state}");
+            assert_eq!(boot_generation(&t, seal).await, generation, "{state}");
+            let d = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(matches!(d.container_stage, StageStatus::Submitted { .. }), "{state}");
+        }
     }
 
     #[tokio::test]
@@ -3971,6 +4237,259 @@ mod tests {
         );
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
+    }
+
+    async fn seed_confirmed_deployment(t: &TestCtx, seal: SealId, agent: u64, sandbox_id: &str) {
+        seed_deployment(
+            &t.deployments,
+            seal,
+            Vec::new(),
+            StageStatus::Confirmed { at: Utc::now() },
+            StageStatus::Confirmed { at: Utc::now() },
+            Some(U256::from(agent)),
+            Some(sandbox_id.into()),
+        );
+        t.deployments
+            .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_proceeds_when_confirmed_but_provider_archived() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 106, "sb-archived").await;
+        let generation = seed_boot_authorization(&t, seal).await;
+        set_provider_state(&t, Some("archived"), Some("archived"));
+
+        run_start(&t, seal).await.expect("start must succeed");
+
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 1);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Submitted { .. }),
+            "got {:?}",
+            d.container_stage
+        );
+        assert!(boot_generation(&t, seal).await > generation);
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_proceeds_when_confirmed_but_sandbox_missing() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 110, "sb-missing").await;
+        set_provider_state(&t, None, None);
+
+        run_start(&t, seal).await.expect("start must succeed");
+
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_noop_when_confirmed_and_start_pending() {
+        for (state, desired) in [
+            ("archived", Some("started")),
+            ("restoring", Some("started")),
+            ("restoring", None),
+            ("creating", None),
+        ] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_confirmed_deployment(&t, seal, 111, "sb-restoring").await;
+            let generation = seed_boot_authorization(&t, seal).await;
+            set_provider_state(&t, Some(state), desired);
+
+            run_start(&t, seal).await.expect("noop must return Ok");
+
+            assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0, "{state}/{desired:?}");
+            assert_eq!(boot_generation(&t, seal).await, generation, "{state}/{desired:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sandbox_start_noop_when_confirmed_and_lookup_fails() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 107, "sb-unknown").await;
+        let generation = seed_boot_authorization(&t, seal).await;
+        t.sandbox.get_sandbox_fails.store(true, Ordering::SeqCst);
+
+        run_start(&t, seal).await.expect("noop must return Ok");
+
+        assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Confirmed { .. }));
+        assert_eq!(boot_generation(&t, seal).await, generation);
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_error_with_provider_archived_records_stopped() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 108, "sb-archived").await;
+        t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+        set_provider_state(&t, Some("archived"), Some("archived"));
+
+        run_stop(&t, seal)
+            .await
+            .expect("stop of a sandbox the provider reports archived succeeds");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Stopped { ref reason, .. } if reason == "user_stop"),
+            "got {:?}",
+            d.container_stage
+        );
+        assert!(t
+            .events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WsEvent::ContainerStopped { .. })));
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_refused_while_start_pending_keeps_stage() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 112, "sb-restoring").await;
+        t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(400);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("State change in progress".into());
+        set_provider_state(&t, Some("archived"), Some("started"));
+
+        run_stop(&t, seal)
+            .await
+            .expect("a transient refusal does not fail the job");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Confirmed { .. }),
+            "got {:?}",
+            d.container_stage
+        );
+        assert_eq!(warning_reasons(&t).len(), 1);
+        assert!(!t
+            .events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WsEvent::ContainerStopped { .. })));
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_transport_error_keeps_stage() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 113, "sb-running").await;
+        t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+
+        run_stop(&t, seal)
+            .await
+            .expect("an open outcome does not fail the job");
+
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(
+            matches!(d.container_stage, StageStatus::Confirmed { .. }),
+            "got {:?}",
+            d.container_stage
+        );
+        assert_eq!(warning_reasons(&t).len(), 1);
+        assert!(!emitted_container_failed(&t));
+    }
+
+    #[tokio::test]
+    async fn sandbox_stop_refused_with_provider_started_flips_failed() {
+        let t = make_test_ctx();
+        let seal = dummy_seal();
+        seed_confirmed_deployment(&t, seal, 109, "sb-running").await;
+        t.sandbox.stop_fails.store(true, Ordering::SeqCst);
+        *t.sandbox.fail_status.lock().unwrap() = Some(403);
+        *t.sandbox.fail_msg.lock().unwrap() = Some("forbidden".into());
+
+        let res = run_stop(&t, seal).await;
+
+        assert!(res.is_err());
+        let d = t.deployments.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert!(emitted_container_failed(&t));
+    }
+
+    #[test]
+    fn provider_view_reads_state_and_desired_state() {
+        let cases = [
+            ("started", None, ProviderView::Up),
+            ("starting", None, ProviderView::Up),
+            ("restoring", None, ProviderView::Up),
+            ("creating", None, ProviderView::Up),
+            ("pulling_snapshot", None, ProviderView::Up),
+            ("archived", Some("started"), ProviderView::Up),
+            ("stopped", Some("started"), ProviderView::Up),
+            ("stopped", None, ProviderView::Down),
+            ("stopping", None, ProviderView::Down),
+            ("archived", Some("archived"), ProviderView::Down),
+            ("archiving", None, ProviderView::Down),
+            ("started", Some("stopped"), ProviderView::Down),
+            ("error", Some("started"), ProviderView::Broken),
+            ("build_failed", None, ProviderView::Broken),
+            ("destroying", None, ProviderView::Broken),
+            ("stopped", Some("destroyed"), ProviderView::Broken),
+            ("unknown", None, ProviderView::Unknown),
+            ("resizing", None, ProviderView::Unknown),
+        ];
+        for (state, desired, want) in cases {
+            assert_eq!(ProviderView::of(state, desired), want, "{state}/{desired:?}");
+        }
+    }
+
+    #[test]
+    fn classify_resume_failure_maps_each_cause_to_its_remediation() {
+        let unavailable = "temporarily unavailable";
+        let cases = [
+            (Some(402), "provider not acknowledged", "acknowledge", false),
+            (Some(402), "Not Acknowledged", "acknowledge", false),
+            (Some(402), "insufficient balance", "deposit", true),
+            (Some(402), "", "deposit", true),
+            (Some(401), "nonce already used", "fresh signature", false),
+            (Some(403), "forbidden", "if it persists", false),
+            (Some(409), "conflict", unavailable, true),
+            (Some(429), "slow down", unavailable, true),
+            (Some(502), "rpc", unavailable, true),
+            (Some(400), "already in progress", unavailable, true),
+            (None, "owner envelope targets another provider", "fresh signature", false),
+            (Some(404), "Sandbox not found", "could not resume", false),
+            (Some(400), "invalid request", "could not resume", false),
+        ];
+        for (status, message, hint, transient) in cases {
+            let e: anyhow::Error = SandboxError {
+                op: "start".into(),
+                status,
+                message: message.into(),
+            }
+            .into();
+            let got = classify_resume_failure(&e, &ProviderView::Down);
+            assert!(got.hint.contains(hint), "{e}: {}", got.hint);
+            assert_eq!(got.transient, transient, "{e}");
+        }
+        let transport = classify_resume_failure(
+            &anyhow::anyhow!("sandbox start: timed out"),
+            &ProviderView::Unknown,
+        );
+        assert!(transport.hint.contains(unavailable));
+        assert!(transport.transient);
+        for view in [ProviderView::Missing, ProviderView::Broken] {
+            let got = classify_resume_failure(
+                &SandboxError::new("start", 502, "bad gateway").into(),
+                &view,
+            );
+            assert!(got.hint.contains("reset the agent"), "{view:?}: {}", got.hint);
+            assert!(!got.transient, "{view:?}");
+        }
     }
 
     #[tokio::test]

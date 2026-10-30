@@ -438,6 +438,7 @@ impl SandboxClient for MockSandbox {
         Ok(Some(SandboxInfo {
             id: sandbox_id.to_string(),
             state: "started".into(),
+            desired_state: Some("started".into()),
         }))
     }
 }
@@ -462,14 +463,20 @@ pub struct ConfigurableSandbox {
     /// exercises the orphan-delete retry (409 clears after the old sandbox
     /// finishes its state change).
     pub admin_delete_fail_times: AtomicU64,
-    /// When set, create/start fail with this message instead of the generic
-    /// "configured to fail" — lets tests inject a specific error such as the
-    /// sandbox's 402 "insufficient balance" body.
+    /// When set, create/start/stop fail with this message instead of the
+    /// generic "configured to fail" — lets tests inject a specific error such
+    /// as the sandbox's 402 "insufficient balance" body.
     pub fail_msg: Mutex<Option<String>>,
     /// HTTP status the injected failure carries, so tests can exercise the
     /// SandboxError transient/fatal classification (e.g. 402 balance, 400
-    /// "in progress", 409 conflict, 5xx). `None` → a statusless error.
+    /// "in progress", 409 conflict, 5xx). `None` → a plain error with no
+    /// status, as a transport failure produces.
     pub fail_status: Mutex<Option<u16>>,
+    /// What get_sandbox reports: `Some(state)`, or `None` for a missing sandbox.
+    pub sandbox_state: Mutex<Option<String>>,
+    pub sandbox_desired_state: Mutex<Option<String>>,
+    pub get_sandbox_fails: AtomicBool,
+    pub get_sandbox_calls: AtomicU64,
     pub create_calls: AtomicU64,
     pub start_calls: AtomicU64,
     pub stop_calls: AtomicU64,
@@ -491,6 +498,10 @@ impl ConfigurableSandbox {
             admin_delete_fail_times: AtomicU64::new(0),
             fail_msg: Mutex::new(None),
             fail_status: Mutex::new(None),
+            sandbox_state: Mutex::new(Some("started".to_string())),
+            sandbox_desired_state: Mutex::new(None),
+            get_sandbox_fails: AtomicBool::new(false),
+            get_sandbox_calls: AtomicU64::new(0),
             create_calls: AtomicU64::new(0),
             start_calls: AtomicU64::new(0),
             stop_calls: AtomicU64::new(0),
@@ -510,10 +521,10 @@ impl ConfigurableSandbox {
         self
     }
 
-    /// The error create/start return when their fail flag is set — a
+    /// The error create/start/stop return when their fail flag is set — a
     /// `SandboxError` carrying the injected `fail_msg`/`fail_status` (so
-    /// tests exercise the real status-based classification), else a generic
-    /// statusless placeholder.
+    /// tests exercise the real status-based classification), or a plain
+    /// error when no status is set.
     fn fail_error(&self) -> anyhow::Error {
         let msg = self
             .fail_msg
@@ -521,13 +532,10 @@ impl ConfigurableSandbox {
             .unwrap()
             .clone()
             .unwrap_or_else(|| "configured to fail".to_string());
-        let status = *self.fail_status.lock().unwrap();
-        crate::sandbox::SandboxError {
-            op: "mock".to_string(),
-            status,
-            message: msg,
-        }
-        .into()
+        let Some(status) = *self.fail_status.lock().unwrap() else {
+            return anyhow::anyhow!(msg);
+        };
+        crate::sandbox::SandboxError::new("mock", status, msg).into()
     }
 }
 
@@ -577,7 +585,7 @@ impl SandboxClient for ConfigurableSandbox {
     async fn stop(&self, _seal_id: SealId, _envelope: &SandboxEnvelope) -> anyhow::Result<()> {
         self.stop_calls.fetch_add(1, Ordering::SeqCst);
         if self.stop_fails.load(Ordering::SeqCst) {
-            anyhow::bail!("configured to fail");
+            return Err(self.fail_error());
         }
         Ok(())
     }
@@ -599,14 +607,21 @@ impl SandboxClient for ConfigurableSandbox {
     }
 
     async fn get_sandbox(&self, sandbox_id: &str) -> anyhow::Result<Option<SandboxInfo>> {
-        // ConfigurableSandbox: probe defaults to "started" so tests not
-        // exercising the /probe path stay terse. Tests that want a
-        // 404 / non-started response should switch to a fresh test
-        // double or extend this with a mutex when needed.
-        Ok(Some(SandboxInfo {
-            id: sandbox_id.to_string(),
-            state: "started".into(),
-        }))
+        self.get_sandbox_calls.fetch_add(1, Ordering::SeqCst);
+        if self.get_sandbox_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("configured to fail");
+        }
+        let desired_state = self.sandbox_desired_state.lock().unwrap().clone();
+        Ok(self
+            .sandbox_state
+            .lock()
+            .unwrap()
+            .clone()
+            .map(|state| SandboxInfo {
+                id: sandbox_id.to_string(),
+                state,
+                desired_state,
+            }))
     }
 }
 

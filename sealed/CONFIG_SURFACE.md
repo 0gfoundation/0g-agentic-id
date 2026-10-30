@@ -576,10 +576,11 @@ and start time. POST checks the ticket, private-key proof and actual sandbox
 identity and rechecks the live chain owner. Replayed or older boot requests
 cannot rotate receipts. The ticket is scrubbed before spawning the framework.
 
-Stop and fatal worker startup failures revoke receipts in the same transaction.
-Resume opens a generation before sandbox.start. Reset fences the old generation
-before resetting settings attempts, so delayed requests cannot consume the new
-boot's retry. Before the new sandbox ID is persisted, provisioning returns 409;
+Stop and startup failures revoke receipts in the same transaction, including a
+resume the sandbox provider reports as not started; a failed resume never
+deletes the sandbox. Resume opens a generation before sandbox.start. Reset
+fences the old generation before resetting settings attempts, so delayed
+requests cannot consume the new boot's retry. Before the new sandbox ID is persisted, provisioning returns 409;
 sealed retries within a 180-second deadline. Creation/ID persistence failures
 revoke the ticket and clean up the new container. Transfer cleanup targets the
 captured old sandbox ID and preserves a newer owner's authorized container.

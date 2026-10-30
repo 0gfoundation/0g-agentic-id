@@ -487,7 +487,9 @@ A fixed privileged port such as `127.0.0.1:1` can be silently filtered on a
 host, yielding a timeout instead of a connect-class error. Host HTTP proxies
 can also change that classification. The retry tests inject a resolver that deterministically returns a DNS error
 and bypass proxies, so another process cannot race to bind a released test port. Keep the production Strict policy
-connect-only: retrying timeouts could duplicate non-idempotent sandbox creates.
+connect-only: retrying timeouts could duplicate non-idempotent sandbox creates, and owner-signed `start`/`stop`
+use it too because the provider consumes the envelope nonce before handling the request, so a resend can only be
+refused.
 
 
 ### Deployment transactions take write intent before row locks

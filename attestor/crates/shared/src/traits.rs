@@ -217,8 +217,10 @@ pub trait SandboxClient: Send + Sync {
     async fn admin_delete(&self, sandbox_id: &str) -> anyhow::Result<()>;
 
     /// Read-only sandbox lookup using attestor admin auth. Used by the
-    /// `/probe` route to verify a deployment marked Running actually
-    /// has a live container on the sandbox side.
+    /// `/probe` route and the worker's heartbeat sweep to verify a
+    /// deployment marked Running actually has a live container on the
+    /// sandbox side, and by the worker's start/stop jobs to check the
+    /// provider's state before a no-op and after a failed call.
     /// - `Ok(Some(info))` → sandbox exists; `info.state` is sandbox's
     ///   current lifecycle state ("started", "stopped", "archived", …).
     /// - `Ok(None)`       → sandbox 404 (gone). Caller should flip the

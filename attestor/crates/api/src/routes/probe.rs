@@ -143,8 +143,8 @@ pub async fn handle(
             // "archiving" once), and the safe bias is to keep the sandbox — a
             // wrongly-Stopped agent merely shows Resume (harmless), while a
             // wrongly-Failed one loses that option and the sweep would reap a
-            // live sandbox. A genuinely-dead one self-corrects when Resume's
-            // start call fails.
+            // live sandbox. For a genuinely-dead one, Resume's failed start
+            // keeps it Stopped with a hint to reset.
             other => Outcome::Stopped(format!("sandbox {other}")),
         },
     };
