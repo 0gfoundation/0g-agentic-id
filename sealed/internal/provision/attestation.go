@@ -1,21 +1,39 @@
 package provision
 
 import (
-	"encoding/binary"
+	"bytes"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
+
+	"seal-verify/internal/eip712"
 )
 
-const attestationDomain = "0g.sandbox.ImageAttestation.v2"
+// The v3 container certificate's EIP-712 domain name and version. The
+// verifyingContract is the provider's TappRegistry (registry_address).
+const (
+	certificateDomainName    = "0G Sandbox ImageAttestation"
+	certificateDomainVersion = "3"
+)
 
-// Attestation is the sandbox-injected v2 SANDBOX_SEAL_ATTESTATION envelope.
-// The issuer scope belongs to the signed message; never replace it with local
-// defaults when forwarding it to the attestor. AppID is exact UTF-8 bytes.
+var certificateTypeHash = crypto.Keccak256Hash([]byte("ImageAttestation(string appId,uint64 registeredAt,bytes32 sealId,bytes containerPubkey,bytes32 imageHash,uint64 issuedAt)"))
+
+// Attestation is the v3 container certificate the sandbox provider writes
+// into SANDBOX_SEAL_ATTESTATION at sealed create. Field order follows the
+// wire form. The certificate is public; what it certifies is that the
+// provider created this container from image_hash with the key pubkey.
+//
+// The provider instance (chain_id, registry_address, app_id, registered_at)
+// is part of the signed message. sealed only recovers the signer: whether
+// that signer and scope are a provider the attestor trusts is decided by the
+// attestor at first /provision, which receives the certificate verbatim.
 type Attestation struct {
 	Version         uint64 `json:"version"`
 	ChainID         uint64 `json:"chain_id"`
@@ -25,101 +43,123 @@ type Attestation struct {
 	SealID          string `json:"seal_id"`
 	Pubkey          string `json:"pubkey"`
 	ImageHash       string `json:"image_hash"`
-	Signature       string `json:"signature"`
 	Ts              uint64 `json:"ts"`
+	Signature       string `json:"signature"`
 }
 
-// signingWords is the fixed nine-word ABI encoding shared by the sandbox and
-// attestor. Dynamic fields are hashed individually; there are no ABI offsets,
-// string formatting, EIP-191 prefix or node-key fallback in this protocol.
-func (a Attestation) signingWords() ([]byte, error) {
-	if a.Version != 2 {
-		return nil, fmt.Errorf("unsupported image attestation version %d (v2 required)", a.Version)
+// certificateFields are an Attestation's values decoded and checked.
+type certificateFields struct {
+	registry  common.Address
+	seal      []byte
+	pubkey    []byte
+	image     []byte
+	signature []byte
+}
+
+// ParseAttestation decodes a SANDBOX_SEAL_ATTESTATION value: one JSON
+// object with exactly the v3 fields, in the formats checked by Digest.
+func ParseAttestation(raw []byte) (Attestation, error) {
+	var a Attestation
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&a); err != nil {
+		return Attestation{}, fmt.Errorf("container certificate is not the v3 JSON object: %w", err)
+	}
+	// More() would miss a trailing '}' or ']'; only a clean EOF ends it.
+	if err := decoder.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
+		return Attestation{}, fmt.Errorf("container certificate has trailing data")
+	}
+	if _, err := a.fields(); err != nil {
+		return Attestation{}, err
+	}
+	return a, nil
+}
+
+func (a Attestation) fields() (certificateFields, error) {
+	var f certificateFields
+	if a.Version != 3 {
+		return f, fmt.Errorf("unsupported container certificate version %d (v3 required)", a.Version)
 	}
 	if a.ChainID == 0 || a.RegisteredAt == 0 || a.Ts == 0 {
-		return nil, fmt.Errorf("image attestation requires nonzero chain_id, registered_at and ts")
+		return f, fmt.Errorf("container certificate requires nonzero chain_id, registered_at and ts")
 	}
 	if !utf8.ValidString(a.AppID) || len(a.AppID) == 0 || len(a.AppID) > 256 {
-		return nil, fmt.Errorf("image attestation app_id must be 1..256 UTF-8 bytes")
+		return f, fmt.Errorf("container certificate app_id must be 1..256 UTF-8 bytes")
 	}
-	registry, err := exactHex(a.RegistryAddress, "0x", common.AddressLength)
-	if err != nil || common.BytesToAddress(registry) == (common.Address{}) {
-		return nil, fmt.Errorf("image attestation registry_address must be a nonzero 20-byte hex address")
+	var err error
+	if f.registry, err = eip712.Address(a.RegistryAddress); err != nil {
+		return f, fmt.Errorf("container certificate registry_address: %w", err)
 	}
-	seal, err := exactHex(a.SealID, "", common.HashLength)
-	if err != nil {
-		return nil, fmt.Errorf("image attestation seal_id: %w", err)
+	if f.seal, err = eip712.ExactHex(a.SealID, "", common.HashLength); err != nil || hex.EncodeToString(f.seal) != a.SealID {
+		return f, fmt.Errorf("container certificate seal_id must be 64 lowercase hex without 0x")
 	}
-	pubkey, err := exactHex(a.Pubkey, "0x", 33)
-	if err != nil {
-		return nil, fmt.Errorf("image attestation pubkey: %w", err)
+	if f.pubkey, err = eip712.ExactHex(a.Pubkey, "0x", 33); err != nil {
+		return f, fmt.Errorf("container certificate pubkey: %w", err)
 	}
-	if _, err := crypto.DecompressPubkey(pubkey); err != nil {
-		return nil, fmt.Errorf("image attestation pubkey must be compressed secp256k1")
+	if _, err := crypto.DecompressPubkey(f.pubkey); err != nil {
+		return f, fmt.Errorf("container certificate pubkey must be a compressed secp256k1 key")
 	}
-	image, err := exactHex(a.ImageHash, "sha256:", common.HashLength)
-	if err != nil {
-		return nil, fmt.Errorf("image attestation image_hash: %w", err)
+	if f.image, err = eip712.ExactHex(a.ImageHash, "sha256:", common.HashLength); err != nil || hex.EncodeToString(f.image) != strings.TrimPrefix(a.ImageHash, "sha256:") {
+		return f, fmt.Errorf("container certificate image_hash must be sha256: followed by 64 lowercase hex")
 	}
-
-	words := make([]byte, 9*common.HashLength)
-	copy(words[0:32], crypto.Keccak256([]byte(attestationDomain)))
-	binary.BigEndian.PutUint64(words[56:64], a.ChainID)
-	copy(words[76:96], registry)
-	copy(words[96:128], crypto.Keccak256([]byte(a.AppID)))
-	binary.BigEndian.PutUint64(words[152:160], a.RegisteredAt)
-	copy(words[160:192], seal)
-	copy(words[192:224], crypto.Keccak256(pubkey))
-	copy(words[224:256], image)
-	binary.BigEndian.PutUint64(words[280:288], a.Ts)
-	return words, nil
+	if f.signature, err = eip712.DecodeSignature(a.Signature); err != nil {
+		return f, fmt.Errorf("container certificate %w", err)
+	}
+	return f, nil
 }
 
-// Digest validates the v2 signed fields and returns their raw keccak256 digest.
-// Signature authentication against the current app instance remains the
-// attestor's responsibility; Phase 0 can additionally pin its expected signer.
+// hashes returns the certificate's EIP-712 domain separator and struct hash.
+func (a Attestation) hashes() (domain, structHash common.Hash, f certificateFields, err error) {
+	if f, err = a.fields(); err != nil {
+		return
+	}
+	domain = eip712.DomainSeparator(certificateDomainName, certificateDomainVersion, a.ChainID, f.registry)
+	structHash = crypto.Keccak256Hash(certificateTypeHash[:], crypto.Keccak256([]byte(a.AppID)), eip712.Uint64(a.RegisteredAt),
+		f.seal, crypto.Keccak256(f.pubkey), f.image, eip712.Uint64(a.Ts))
+	return
+}
+
+// Digest validates the certificate and returns the EIP-712 digest the
+// provider signed.
 func (a Attestation) Digest() (common.Hash, error) {
-	words, err := a.signingWords()
+	domain, structHash, _, err := a.hashes()
 	if err != nil {
 		return common.Hash{}, err
 	}
-	return crypto.Keccak256Hash(words), nil
+	return eip712.Digest(domain, structHash), nil
 }
 
-// RecoverSigner verifies the v2 envelope's encoding and recovers its app signer.
-// The sandbox emits Ethereum's 27/28 recovery id; common raw 0/1 library
-// output is also accepted and normalized for SigToPub, with the same v2 digest.
+// RecoverSigner validates the certificate and recovers the provider key
+// that signed it.
 func (a Attestation) RecoverSigner() (common.Address, error) {
-	digest, err := a.Digest()
+	domain, structHash, f, err := a.hashes()
 	if err != nil {
 		return common.Address{}, err
 	}
-	signature, err := exactHex(a.Signature, "0x", crypto.SignatureLength)
+	signer, err := eip712.Recover(eip712.Digest(domain, structHash), f.signature)
 	if err != nil {
-		return common.Address{}, fmt.Errorf("image attestation signature: %w", err)
+		return common.Address{}, fmt.Errorf("container certificate: %w", err)
 	}
-	switch signature[64] {
-	case 27, 28:
-		signature[64] -= 27
-	case 0, 1:
-		// Already normalized; this does not enable the old signed payload.
-	default:
-		return common.Address{}, fmt.Errorf("invalid image attestation recovery id %d", signature[64])
-	}
-	pubkey, err := crypto.SigToPub(digest[:], signature)
-	if err != nil {
-		return common.Address{}, fmt.Errorf("recover image attestation app signer: %w", err)
-	}
-	return crypto.PubkeyToAddress(*pubkey), nil
+	return signer, nil
 }
 
-func exactHex(value, prefix string, size int) ([]byte, error) {
-	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+size*2 {
-		return nil, fmt.Errorf("expected %s-prefixed %d-byte hex", prefix, size)
-	}
-	decoded, err := hex.DecodeString(value[len(prefix):])
+// Registry is the certificate's TappRegistry address, the zero address when
+// the certificate does not validate.
+func (a Attestation) Registry() common.Address {
+	f, err := a.fields()
 	if err != nil {
-		return nil, fmt.Errorf("invalid hex")
+		return common.Address{}
 	}
-	return decoded, nil
+	return f.registry
+}
+
+// FrameworkHash is image_hash as the bytes32 hex AgenticID records in
+// validFrameworkHashes and serve-proofs sign: "0x" and 64 lowercase hex.
+// Empty when the certificate does not validate.
+func (a Attestation) FrameworkHash() string {
+	f, err := a.fields()
+	if err != nil {
+		return ""
+	}
+	return "0x" + hex.EncodeToString(f.image)
 }

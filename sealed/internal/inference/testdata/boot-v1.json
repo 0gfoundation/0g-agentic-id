@@ -1,16 +1,19 @@
 {
+  "description": "Later boot: the attestor already records the container key, so the request carries no certificate and container_signature recovers the address of recorded_container_pubkey. TEST-ONLY key; never use it outside tests.",
+  "test_only_container_key": {
+    "private_key": "0x3039aed7d54f4e29d521883f3f81787eaea2fe2300cdef9d37c57655e289afd8",
+    "derivation": "keccak256(\"agentdna1.4 test container key\")",
+    "address": "0x6Cc01F350e9Cbe7A15Cb5919344a8289a7b9c82f",
+    "pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa"
+  },
+  "recorded_container_pubkey": "0x038038c5cc4de940c65aef5e05053b3703b9aac292f8e58e99c93a05a205f472fa",
   "request": {
     "seal_id": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "container_pubkey": "0x023c72addb4fdf09af94f0c94d7fe92a386a7e70cf8a1d85916386bb2535c7b1b1",
-    "image_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
-    "issued_at": 1,
-    "sandbox_signature": "0x",
-    "status_binding_scheme": "agentdna-status-v2",
     "boot_ticket": "1111111111111111111111111111111111111111111111111111111111111111",
     "boot_generation": 7,
     "boot_id": "0x7777777777777777777777777777777777777777777777777777777777777777",
     "boot_started_at": 1700000000123,
-    "container_signature": "0x8af387ff8afbe1be4777242635cf3692a136ff4a833f64a8d5d08cb3db5e569332bdcfbe450756609d218b20c9fd7521f1013ce135f3d8b541fd329fbc6495901c"
+    "container_signature": "0x296b8cd257299879079a01da83fcca5fa92ef526e97eba7b5f2f6c5ee21c13b21e052ef552d0f9b557ed19fa015525a09ce2b9b81c7d78d536d5b5a60dd1499f1b"
   },
   "canonical": "ProvisionBoot.v1:0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:7:3138bb9bc78df27c473ecfd1410f7bd45ebac1f59cf3ff9cfe4db77aab7aedd3:7777777777777777777777777777777777777777777777777777777777777777:1700000000123"
 }

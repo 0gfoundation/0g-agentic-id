@@ -39,17 +39,27 @@ sealed bug — it is an agent quality issue, expressed through reputation.
 
 ## Foundational invariant: owner never holds `agent_seal_priv`
 
-Attestor HTTP calls (`/provision`, `/status`, `/settings/seed`) use
-`internal/attestorhttp`. Production creation overwrites `ATTESTOR_TLS_DESCRIPTOR`
-with public Scan URL/SPKI anchors and the fixed appId, chain, registry, registration
-epoch, app signer and existing business URL. The runtime independently refreshes
-the app's TLS pins through that pinned Scan; expired or mismatched identities stop
-business requests. It receives no tapp socket. The explicit
-`ATTESTOR_ALLOW_UNPINNED_DEV=true` bypass is injected only by mock deployments.
-Each request and its response body share the resolved identity's absolute lease
-deadline. Expiry aborts the exchange, including a reused TLS connection or a body
-received after successful headers; an already processed request is not resent.
-See [application identity migration](../attestor/APP_IDENTITY.md).
+Attestor HTTP calls (`/provision`, `/status`, `/settings/seed`, the provider
+registry) use `internal/attestorhttp`. It pins the attestor's TLS key to a
+statement signed by the sandbox provider that issued this container's
+certificate. sealed fetches `GET {ATTESTOR_URL}/attestor-tls?provider=<provider>`
+without CA validation and accepts the statement only if its EIP-712 signature
+(domain `0G Sandbox AttestorTLS`, version `3`) recovers the provider that Phase 0
+recovered from the certificate, its chain and TappRegistry equal the
+certificate's, its lease is current (at most 300 s, and not older than the one
+already held), and the key of the connection it arrived over is one of its SPKI
+pins. Every other attestor request then requires a leaf key among those pins.
+The statement is refreshed when five seconds or less remain, and, at most once
+every 30 s, when the attestor presents a key it does not list. It carries no
+attestor app id, signer or URL: which attestor the pins belong to is the
+provider's responsibility, resolved from its own tapp identity configuration.
+sealed receives no tapp socket. `ATTESTOR_ALLOW_UNPINNED_DEV=true` is a
+local-development bypass; the provider removes it, with every caller
+`SANDBOX_*` key, from each sealed container it certifies, which is every
+container the attestor creates. Each request and its response body share the statement's absolute
+lease deadline. Expiry aborts the exchange, including a reused TLS connection or
+a body received after successful headers; an already processed request is not
+resent. See [application identity migration](../attestor/APP_IDENTITY.md).
 
 Everything in this document rests on **one** load-bearing property:
 
@@ -81,7 +91,7 @@ How the implementation maintains this:
 | Openclaw subprocess doesn't have it | spawn.go builds the subprocess env from an explicit whitelist (`PATH`, `HOME` — the agent's own home, `/home/agent` —, `OPENCLAW_STATE_DIR` and `OPENCLAW_HOME` — the framework tree's absolute path and its parent, not secret —, the provider `*_API_KEY`, `AGENT_PUBLIC_URL`, `SEAL_SIGN_SOCK`, `AGENT_SEAL`) instead of inheriting the bootstrap's env — the key material never crosses the subprocess boundary |
 | Storage uploads keep it in-process | `dataplane.Upload` uploads through the 0g-storage-client Go SDK inside sealed (`internal/dataplane/upload.go`) and builds the SDK's transaction signer from the key sealed already holds, so the key is never handed to a child process — not in an argument list (`/proc/<pid>/cmdline` is readable by every local user, the de-privileged agent included), an environment, a descriptor or a file. The blob goes to the SDK from memory (no temp file). Once its upload has ended (abandoned at the 90s deadline, say), the SDK can no longer sign or send a transaction with the key: that signer refuses, and so does the fullnode client, on every provider retry; only a send already on the wire at that moment can still reach the node, as one could when the CLI was killed at the deadline. The cost is footprint and fault isolation. The SDK links some 360 more non-standard packages into this process (most of them go-ethereum's node stack; details in `QUIRKS.md`), and through them the standard library's `net/http/pprof` and `expvar` (see the next row); `TestLinkedPackages_Reviewed` pins both the non-standard packages and the standard-library packages they import directly. And an upload now shares sealed's process: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (PID 1), and with it the container and the agent, where it used to end one CLI run (`runBounded` recovers only the goroutine that calls the SDK; see `QUIRKS.md`). The pinned SDK also leaves a goroutine blocked for good behind each submission of a blob over 2 MiB that reverts or whose receipt query fails, which a CLI run took with it when it exited; `Upload` caps how many can pile up (`QUIRKS.md`). The 0g-storage-client CLI is still run, through `privsep.RootCommand` (resolved only in root-only `PATH` directories), for downloads, which involve no key; the images that build it install it at `/usr/local/bin` (`Dockerfile`, `images/{hermes,prime,dsh,sealed}`; the base image `images/openclaw` carries none). Pinned by the `internal/dataplane` tests: `Upload` starts no child process (a source check that nothing on the upload path names a process-starting API, `internal/privsep`'s command builders included; and the root-side guard lists no binary for `Upload`), the dependencies whose source names a process-starting API are a reviewed set, the SDK wiring matches the CLI's, and signing and sending stop with the upload |
 | No HTTP endpoint exposes it | sealed's mux serves derived signatures and public addresses, never the priv bytes. Nor are profiles or process variables served: the `/debug/pprof/*` and `/debug/vars` routes that linked libraries (`net/http/pprof`, `expvar`) register on `http.DefaultServeMux` at init are dropped at start, by replacing that mux (`defaultmux.go`) |
-| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in a v2 envelope signed by the authenticated stable sandbox app signer and bound to its chain, registry, appId and registration epoch. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:227-243`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
+| Provisioning chain doesn't leak it | attestor ECIES-encrypts `agent_seal_priv` to the ephemeral `container_pubkey`; only the holder of the matching `container_privkey` can open it. That keypair is **not** generated inside this container — the 0g-Sandbox sealing layer generates it and injects the private half as `SANDBOX_SEAL_KEY`, which Phase 0 only cross-verifies against `attestation.pubkey` (`internal/config/config.go`). The sandbox layer is therefore inside the TCB for this hop; what keeps the hop honest is that attestor will only encrypt to a pubkey carried in a v3 certificate signed by the key of a sandbox provider it trusts and bound to that provider's chain, TappRegistry, appId and registration epoch, or to the pubkey it recorded from such a certificate. sealed zeroes the key bytes and unsets the env once provisioning succeeds, with a documented `/proc/<pid>/environ` caveat (`config.go:265-282`). Full flow + the gating predicates in [Trust chain](#trust-chain-how-agent_seal_priv-reaches-the-tee) below |
 
 Any future change to sealed that risks crossing this boundary, even
 indirectly (logging priv bytes, exposing them via a debug endpoint,
@@ -228,18 +238,13 @@ Neither ack substitutes for the other. Without the KMS ack the
 derivation logic is unreviewed; without the Attestor ack the derived
 keys are handed to unreviewed code.
 
-What the Attestor actually receives from KMS:
-
-- **One app-scoped key** (empty derivation material), fetched at
-  startup and used only for the provision-binding MAC (Layer 3) and
-  the status boot-receipt HMAC. It is **not** a seed for any agent
-  key. The job queue is not encrypted with it: Attestor's Postgres
-  sits on the tapp FDE volume, and a job row holds its payload only
-  while the job is pending.
-- **Individual `agent_seal_priv` keys**, derived per seal on demand
-  (Layer 2). Derivation is one-way inside the KMS cluster: holding one
-  derived key reveals nothing about any sibling, and no fleet-wide
-  secret ever sits in Attestor memory.
+What the Attestor actually receives from KMS: **individual
+`agent_seal_priv` keys**, derived per seal on demand (Layer 2).
+Derivation is one-way inside the KMS cluster: holding one derived key
+reveals nothing about any sibling, and no fleet-wide secret ever sits in
+Attestor memory. The provision record (Layer 3) and the job queue carry
+no KMS-keyed MAC or encryption: Attestor's Postgres sits on the tapp FDE
+volume, and a job row holds its payload only while the job is pending.
 
 Three consequences worth stating explicitly:
 
@@ -286,7 +291,7 @@ recovery flow), Attestor asks KMS for the same material again, gets the
 have to change because the cryptographic identity behind it doesn't
 change.
 
-### Layer 3: Sandbox-signed image attestation to `/provision`
+### Layer 3: Provider-signed container certificate to `/provision`
 
 The actual hand-off from Attestor to a Sealed container goes through
 **0g-Sandbox**, itself a Tapp app with its own TappRegistry-registered
@@ -294,44 +299,52 @@ node signer keys.
 
 When a Sealed container boots:
 
-1. The 0g-Sandbox sealing layer generates an ephemeral secp256k1 keypair
+1. The 0g-Sandbox provider generates an ephemeral secp256k1 keypair
    (`container_pubkey`, `container_privkey`) for the container and injects
    the private half as the `SANDBOX_SEAL_KEY` env var. The container does
    **not** generate it: Phase 0 only checks that the injected key derives
-   the compressed `pubkey` inside the signed attestation envelope, and
-   fails loud on a mismatch (`internal/config/config.go`). The
-   container never learns the pubkey independently either — it forwards
-   the one the envelope carries (`internal/provision/provision.go`).
-2. 0g-Sandbox signs a version 2 envelope with its stable app/provider key,
-   independent of both the per-boot node key and the container key. The digest
-   is raw `keccak256` of nine fixed ABI words, in order: the hash of
-   `0g.sandbox.ImageAttestation.v2`, `chain_id`, registry address,
-   `keccak256(exact UTF-8 app_id)`, `registered_at`, sealId,
-   `keccak256(compressed container pubkey)`, image hash and timestamp. Integers
-   are uint256 big-endian words, with uint64 values; the address is left-padded
-   by 12 zero bytes. No EIP-191 prefix or legacy string digest is accepted.
-3. The container validates version, scope shape, keypair and signature, then
-   forwards all five issuer fields unchanged alongside the existing
-   `seal_id`, `container_pubkey`, `image_hash`, `issued_at` and
-   `sandbox_signature` to `/provision`. Missing, v1 and unknown versions fail
-   before the request; there is no node-key fallback. The shared known-answer
-   fixture is `internal/provision/testdata/attestation-v2.json`.
+   the compressed `pubkey` inside the signed certificate, and fails loud on
+   a mismatch (`internal/config/config.go`).
+2. The provider signs a version 3 certificate, `SANDBOX_SEAL_ATTESTATION`,
+   with its provider key (KMS-backed), independent of both the per-boot node
+   key and the container key. It is EIP-712: the domain is
+   `EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`
+   with name `0G Sandbox ImageAttestation`, version `3`, the chain id and the
+   TappRegistry address, and the message is
+   `ImageAttestation(string appId,uint64 registeredAt,bytes32 sealId,bytes containerPubkey,bytes32 imageHash,uint64 issuedAt)`.
+   The provider signs the `0x1901` digest raw, with no EIP-191 prefix. The
+   provider writes `SANDBOX_SEAL_KEY`, `SANDBOX_SEAL_ATTESTATION` and
+   `SANDBOX_PROXY_DOMAIN` itself, after deleting every `SANDBOX_*` key (and
+   `ATTESTOR_ALLOW_UNPINNED_DEV`) from the env the caller asked for.
+3. The container checks the version and field formats and the keypair, and
+   recovers the signer. It pins no signer: whether the signer is a provider
+   the attestor trusts is the attestor's decision. Version 1 and 2
+   certificates fail before any request. `GET /provision?seal_id=…` tells
+   the container whether the attestor has a container key recorded for the
+   deployment yet (`certificate_required`); only then does the `POST` carry
+   the certificate, verbatim. Every `POST` carries the boot claim
+   (`ProvisionBoot.v1`, [CONFIG_SURFACE.md §9](CONFIG_SURFACE.md#9-when-a-document-will-not-boot))
+   signed with the container key. The shared known-answer vector,
+   byte-identical in the provider and the attestor, is
+   `internal/provision/testdata/image-attestation-v3.json`; the request
+   fixtures are `internal/inference/testdata/boot-v1-first.json` (first
+   provision) and `boot-v1.json` (later boot).
 
 Attestor's validation has three independent gates:
 
 | Gate | Predicate | Source of truth |
 |---|---|---|
-| **Sandbox identity** | v2 signed scope equals the authenticated sandbox app instance; recovered signer equals its stable provider signer | Scan typed identities/attestation, live TappRegistry epoch, SandboxServing provider binding and unexpired discovery lease |
-| **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
-| **Freshness OR binding** | `\|now − issued_at\| ≤ 300s`, OR the successful v2 binding matches | Local DB + app-scoped HMAC over `signing_digest32 ‖ authenticated_app_signer20`, domain `agentic-id.container-pubkey-binding.v2` |
+| **Sandbox identity** | First provision: the certificate's scope (chain, TappRegistry, appId, `registered_at`) and its recovered signer equal the provider instance the attestor discovers and trusts. Later boots: the provider instance recorded at first provision still equals it | the attestor's provider discovery (TappRegistry, SandboxServing) |
+| **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true`, at first provision and again for the recorded hash on every later boot | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
+| **Freshness OR record** | First provision: `ticket_issued_at − 300 ≤ ts ≤ now + 300`. Later boots: the boot claim recovers the address of the recorded `container_pubkey` | the deployment's container record (`container_pubkey`, image hash and provider instance), written with the first provision's binding in one transaction |
 
-**The first gate** checks the authenticated app signer and complete app-instance
+**The first gate** checks the provider signer and complete app-instance
 scope, never current or historical node-list membership as an alternative.
 User ack remains the upstream approval of that sandbox app. A per-boot node
-rotation can therefore retain the same original v2 envelope and container key;
-a new registration epoch cannot reuse the old binding, even if appId and app
-key are unchanged. Existing v1 envelopes and v1 MACs are not migrated implicitly:
-recreate their container with v2 rather than bypassing issuer authentication.
+rotation keeps the same certificate and container key; a new registration
+epoch or provider key fails every later boot of a container certified under
+the old one (`provider instance no longer trusted; reset required`). Older
+certificate versions are not migrated: every agent is recreated under v3.
 
 **The second gate**, the `validFrameworkHashes` allowlist, follows
 the same spirit as Tapp's "code identity on chain, reviewed by the
@@ -368,12 +381,15 @@ gate above, i.e. from the sandbox `app_id` the user already ack'd. The
 same delivery path also carries the owner's settings document, encrypted
 to the same pubkey, so it inherits exactly this hop's assumptions.
 
-The binding stored on Attestor's side lets restarts skip the 5-minute
-freshness window: if the same 0g-Sandbox-spawned container restarts and
-presents the same `container_pubkey`, Attestor accepts on the binding
-alone. The HMAC prevents an attacker with DB write access (but no
-app-scoped key) from forging valid bindings — the (`container_pubkey`,
-`mac`) pair is unforgeable without Attestor's app-scoped KMS key.
+The container record lets restarts skip the 5-minute freshness window: a
+later boot sends no certificate, proves possession of the recorded key with the
+boot claim, and the attestor encrypts to the recorded `container_pubkey`. The
+record is cleared together whenever a new ticket is issued for a new container
+(create, recreate), on reset and when the container binding is cleared, so a
+new container always presents a fresh certificate; a different key presented
+against an existing record is refused (`container key differs from record;
+reset required`). The record carries no MAC; the attestor trusts its own
+database for it, as it does for the rest of the deployment row.
 
 ---
 

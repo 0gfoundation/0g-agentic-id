@@ -14,7 +14,7 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 | attestor | sandbox 起来后向 attestor 发起 RA，换 `agent_seal_priv`。详见 [`attestor/`](../attestor/README.zh.md) |
 | AgenticID 合约 | 读 `intelligentDatasOf` / `sealedKeysOf`、签 `update` tx 把演化推上链 |
 | 0G storage | 每条 iData 的加密 plaintext 真正的承载层；sealed 通过 `0g-storage-client` CLI 下载，通过同一 client 的 Go SDK 在进程内上传（`internal/dataplane/upload.go`），签名密钥从不离开 sealed |
-| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:115-118`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
+| agent framework | 四个 adapter 编进二进制、启动时自注册 —— openclaw、hermes、prime-agent、dsh（`main.go:118-121`）；链上 binding 的 `name` 选中其一，`AGENT_FRAMEWORK` 只是无 binding 时的 fallback。openclaw 是参考实现：npm 包，由 sealed 安装并 spawn 成子进程，监听 `127.0.0.1:3284`。adapter 接口本身框架无关（见 `FRAMEWORK_ADAPTER.zh.md`）；另一个框架 claude-code 曾作为接缝探针接入、验证完成后下线，移植实录保留在该文档 §12 |
 
 本文档讲**当前代码里实际跑的形态**和**为什么这么分**。
 
@@ -22,12 +22,12 @@ sandbox 里把链上一组加密的 iData 还原成可运行的 agent，跑起�
 
 `main.go` 的 5 个 phase 严格按顺序走。某个 phase 失败**不会**把容器带下去：
 `runMainPipeline` 记日志、上报 attestor、然后返回，`:8080` 继续服务
-`/healthz` 和 `/log` 供诊断（`main.go:209-211`）。两个 listener —— 对外
+`/healthz` 和 `/log` 供诊断（`main.go:181-193`）。两个 listener —— 对外
 `:8080` mux 和 `/run/seal-sign.sock` unix socket —— 在 Phase 1 **之前**就已经
 起来了；在 `agent_seal_priv` 落进 `state.Agent` 之前，handler 一律回 503
-（`main.go:156-158`）。
+（`main.go:166-168`）。
 
-Phase 0 和 Phase 1 之间有一道闸：`provisionGate`（`main.go:186-207`）。
+Phase 0 和 Phase 1 之间有一道闸：`provisionGate`（`main.go:196-217`）。
 `ATTESTOR_URL` 或链相关 env 没设（本地开发）时它跳过整条流水线；
 `privsep.Required` 失败时它**拒绝**流水线 —— sealed 不是 root，或者镜像里没有
 一个拥有自己非 root uid/gid 的 `agent` 账户，或者 `/root` 无法被收紧为不带
@@ -53,8 +53,10 @@ provision 超时扫描兜底：sandbox 创建或重建后 `PROVISION_TIMEOUT`（
 全新创建一次 —— 上线（`/start` 带 `create` 信封）或 `/reset`。
 
 ```
-Phase 0  attest           解析环境、校验 SANDBOX_SEAL_KEY ↔ attestation.pubkey、
-                          恢复 TEE signer (TEE_SIGNER_ADDRESS 校验若设了的话)
+Phase 0  attest           解析环境、校验 v3 容器证书（SANDBOX_SEAL_ATTESTATION）：
+                          SANDBOX_SEAL_KEY ↔ 证书 pubkey，恢复 provider 签名者 ——
+                          正是它签名的 attestor TLS 声明 pin 住每个 attestor 请求
+                          （internal/attestorhttp）
                           ↓
 gate     privsep          privsep.Required：框架将以 `agent` 用户运行、/root 仅
                           root 可写（SecureHome）且没有其他 uid 能改的条目
@@ -64,9 +66,12 @@ gate     privsep          privsep.Required：框架将以 `agent` 用户运行�
                           就停 —— 没有密钥、不发 /status；
                           由 attestor 的 provision 超时扫描把它标为 `offline`
                           ↓
-Phase 1  provision        POST /provision → 用同一把容器密钥 ECIES 解出响应里的
-                          两份载荷：
+Phase 1  provision        GET /provision（generation、certificate_required）→
+                          POST /provision：用容器密钥签名的 boot claim，仅在需要时
+                          附带证书；以退避（1 秒起翻倍到 30 秒）重试，直到 PID 1
+                          启动后 10 分钟 → 用同一把容器密钥 ECIES 解出响应里的载荷：
                             · agent_seal_priv            （缺了是致命的）
+                            · 本次启动的 status 凭据      （缺了是致命的）
                             · owner 的 settings document （不透明 blob；未配置过的
                               agent 就没有，解密失败只记日志丢弃、不致命）
                           然后 scrub SEAL_BOOT_TICKET / SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION / API_KEY
@@ -101,13 +106,22 @@ Phase 4  status report    通知 attestor /status 整条流水线成功（level=
 pre-Start 快照、phase 2 seed 是 framework 启动稳定后的 baseline ——
 这是 watcher 比对的真起点（详见 §4）。
 
+Phase 1 按类别处理 attestor 的回答（`internal/provision`）：400 和 401 直接结束；
+403 重读一次授权，只有拿到更新的 generation 才重新 claim，否则结束；409（sandbox id
+尚未落库，或 `certificate_required`）重读授权后重试；429、5xx、传输错误和 attestor
+TLS 声明失败都重试。每次 `POST` 沿用本次启动唯一的 `boot_id`，并用更晚的
+`boot_started_at` 重新签名。没有任何秘密进入 `/log`：不含 ticket、密钥、签名或原始
+env 值，attestor 的错误正文最多显示前 256 字节且只占一行。
+
 Phase 4 的 `running` / `warning` 报告还携带本次启动凭据和实际使用的配置摘要。
 attestor 只在凭据仍为当前启动、摘要匹配、下发版本仍为当前版本时，才把它提升为
 last-known-good。旧容器的状态不能覆盖新容器，回退配置也不能确认新版本。
 反复启动却未确认的版本仍由 `/provision` 的计数策略回退到上一份可用文档。
-凭据仅由已授权的新启动领取，重复、旧代次和旧容器票据均被拒绝；凭据 ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务中
-完成（`routes/status.rs`、`repo.rs::apply_status_report`）。新 sealed 要求新 attestor，
-先升级 attestor，再启用本版本的全部 sealed 镜像。旧协议心跳永不提升配置。
+凭据仅由已授权的新启动领取，重复、旧代次和旧容器票据均被拒绝；凭据是随机 token，
+ECIES 加密给容器，状态、心跳和版本确认在同一数据库事务中完成（`routes/status.rs`、
+`repo.rs::apply_status_report`）。不带凭据的报告会被拒绝，sealed 也从不发送。本版
+sealed 要求配套的 provider 和 attestor（v3 证书、attestor TLS 声明、上面的
+`/provision` 形状）；所有 agent 都要重建到它上面。
 
 ### settings document 为什么走 `/provision`
 
@@ -115,7 +129,7 @@ last-known-good。旧容器的状态不能覆盖新容器，回退配置也不�
 只在容器 **create** 时下发，`start` 不带 —— 所以**恢复（resume）**起来的容器会
 完全没有配置。`/provision` 每次开机都跑，resume 也跑，而且它本来就在传一份加密到
 容器 pubkey 的秘密，于是 document 搭现成的通道、而不是新开一条
-（`internal/provision/provision.go:35-47`、
+（`internal/provision/provision.go:74-83`、
 `attestor/crates/api/src/routes/provision.rs:12-16`）。
 
 attestor 只把它当不透明字节存和发 —— 不解析、不校验、不打日志，这正是"扩词表不用
@@ -160,7 +174,10 @@ sealed/
 │   ├── chain/                    AgenticID 合约 view + tx 包装
 │   ├── dataplane/                ECIES 解 sealedKey + AES-GCM 解/加密 iData +
 │   │                             0g-storage Download（CLI）/ Upload（进程内 Go SDK）
-│   ├── provision/                /provision RA 请求 + 响应解封装
+│   ├── attestorhttp/             attestor HTTP 客户端，TLS 由 provider 签名的声明 pin 住
+│   ├── eip712/                   v3 证书与 attestor TLS 声明共用的 EIP-712 domain、摘要和
+│   │                             签名者恢复
+│   ├── provision/                v3 容器证书；/provision 的 boot claim、重试和响应解封装
 │   ├── report/                   /status 上报到 attestor
 │   ├── logger/                   结构化日志（公共写入 logger.Logf，被 proxy 暴露成 /log.html）
 │   ├── framework/                framework 适配器抽象 + 可选能力接口
@@ -471,7 +488,7 @@ adapter 同时把自家那份摘掉了，理由见 §5（"什么是 iData，什�
 
 **settings 通道之前铸出来的 agent 怎么迁移。** 它们的 pin 落在一个已经没有 adapter
 声明的链上 role 里，所以 bootstrap 的 Phase C 把它交给 `HandleLegacy`
-（`main.go:638-647`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:403`）
+（`main.go:724-733`）；可选的 `framework.LegacySettingsSeeder`（`framework.go:403`）
 是 adapter 把恢复出来的东西交还给平台的方式，平台再用 `report.SeedSettings` 在
 watcher 第一个 tick 把这条陈旧 role 丢掉之前把它存住。顺序是吃劲的：uploader 按
 `Roles()` 重建条目表并整表提交，所以第一次 drift commit 就会把这条未声明的 role 删
@@ -544,7 +561,9 @@ SOUL.md 的拒绝规则约束**（任何来自外部 prompt 的 sign 请求都�
 ## 8. 配置面
 
 sealed 有两个配置面，各自对不同的人负责。环境变量（`internal/config`）是**平台**
-那一面：attestor 创建 sandbox 时注入，描述容器在哪、可以信什么。**owner** 那一面是
+那一面：attestor 和 sandbox provider 在创建 sandbox 时写入（provider 先删掉调用方
+发来的所有 `SANDBOX_*` 键，再写入 `SANDBOX_SEAL_KEY`、`SANDBOX_SEAL_ATTESTATION` 和
+`SANDBOX_PROXY_DOMAIN`），描述容器在哪、可以信什么。**owner** 那一面是
 另一份 document，走 `/provision` 下来 —— 见下面"owner 的 settings document"。
 
 env 这一面：
@@ -552,10 +571,10 @@ env 这一面：
 | env | 含义 |
 |---|---|
 | `SEAL_BOOT_TICKET` | worker 在 create 时内部注入的随机启动票据，框架启动前清除。stop/start 保留容器票据但轮换启动代次，reset 换新票据；新镜像要求此值，不由运维手配 |
-| `SANDBOX_SEAL_KEY` | sandbox 注入的 ECDSA 私钥；用来跟 `SANDBOX_SEAL_ATTESTATION.pubkey` 互证（Phase 0）|
-| `SANDBOX_SEAL_ATTESTATION` | 稳定 app signer 签发的 v2 attestation JSON，含 `version=2`、`chain_id`、`registry_address`、原样 `app_id`、`registered_at`、`image_hash`、`pubkey`、`seal_id`、`ts` 和 `signature`；sealId 从这里取，不是独立 env。缺失版本、旧版本和未知版本均拒绝 |
-| `TEE_SIGNER_ADDRESS` | （可选）预期的稳定 sandbox app signer。设置后，Phase 0 要求 v2 签名恢复出的地址与之相同。权威的 `/provision` 校验通过 Scan、TappRegistry 和 SandboxServing 认证 sandbox app signer 及完整 app 实例 scope；本地校验永不替换为当前或历史 node key |
-| `ATTESTOR_URL` | attestor 公网入口；用于 `/provision` 换 agentSeal_priv 和 `/status` 心跳 |
+| `SANDBOX_SEAL_KEY` | 容器私钥，由 sandbox provider 在 create 时写入；Phase 0 检查它派生出 `SANDBOX_SEAL_ATTESTATION.pubkey` |
+| `SANDBOX_SEAL_ATTESTATION` | provider 的 v3 容器证书：紧凑 JSON `{version:3, chain_id, registry_address, app_id, registered_at, seal_id, pubkey, image_hash, ts, signature}`，由 provider key 做 EIP-712 签名（domain `0G Sandbox ImageAttestation`，version `3`，verifyingContract = TappRegistry）。sealId 从这里取，不是独立 env，serve-proof 携带的 framework hash（`image_hash`）也从这里取。Phase 0 恢复 provider 签名者，不 pin 任何签名者；其他版本一律拒绝。首次 `/provision` 时原样转发 |
+| `ATTESTOR_URL` | attestor 公网入口，`https`；用于 `/provision` 换 agentSeal_priv、`/status` 心跳、`/settings/seed` 和 provider registry。它的 TLS key 必须在 `GET {ATTESTOR_URL}/attestor-tls?provider=<provider>` 返回的 provider 签名声明的 pin 之中（`internal/attestorhttp`）|
+| `ATTESTOR_ALLOW_UNPINNED_DEV` | 仅限本地开发：设为 `true` 时关闭 attestor TLS pin 并允许 `http`。provider 会从它签发证书的每个 sealed 容器（也就是 attestor 创建的每个容器）的 env 里删掉它，连同调用方传入的所有 `SANDBOX_*` 键 |
 | `CHAIN_RPC_URL` | AgenticID 合约所在 0G 链的 RPC——由 attestor worker 注入其自身的 `ATTESTOR_CHAIN_RPC`（`agenticid.0g.ai` 为 mainnet，`agenticid-testnet.0g.ai` 为 Galileo testnet）。它是公开的，所以不能内嵌凭据：sealed 会把它打进启动日志（`/log`、`/log.html`，需 owner 鉴权），attestor 还会在 `GET /config` 里返回它的来源 `ATTESTOR_CHAIN_RPC` |
 | `AGENTIC_ID_ADDR` | AgenticID 合约地址 |
 | `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** 地址，由 attestor worker 注入在 `AGENTIC_ID_ADDR` 旁边（取自它的 `ATTESTOR_VERIFIED_FEEDBACK_ADDR`）。它是每个 serve-proof 签名所绑定的 EIP-191 version `0x00` intended validator。未设置、格式错误或为零地址时，sealed 在启动时记一行 `WARN`，并且**不**发 `X-Agent-Proof`，跟没有链上身份的 agent 走同一条路径。链客户端连上之后，sealed 还会读它的 `getIdentityRegistry()`：结果不是 `AGENTIC_ID_ADDR`（没有代码、revert、重试后仍读不出都算不是）就记一行点名两个地址的 `WARN`，走同一条不出 proof 的路径。永不回退到 registry 拒收的旧 `personal_sign` 包装 |

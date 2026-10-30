@@ -102,7 +102,7 @@ func loadRegistry(ctx context.Context, base string, chainID uint64, contract str
 	}
 	client, err := attestorhttp.Client(base)
 	if err != nil {
-		return nil, fmt.Errorf("provider registry attestor identity: %w", err)
+		return nil, fmt.Errorf("provider registry attestor client: %w", err)
 	}
 	if err := fetchRegistryJSON(ctx, client, base+"/config", &config); err != nil {
 		return nil, err

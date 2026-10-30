@@ -14,7 +14,6 @@ import (
 // This fixture is also verified by Rust's status signature tests.
 func TestBoundStatusCrossLanguage(t *testing.T) {
 	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
-	t.Setenv("ATTESTOR_TLS_DESCRIPTOR", "")
 	raw, err := os.ReadFile("../inference/testdata/status-v2.json")
 	if err != nil {
 		t.Fatal(err)
@@ -66,5 +65,21 @@ func TestBoundStatusCrossLanguage(t *testing.T) {
 	binding.AdoptSettings(nil)
 	if _, digest := binding.snapshot(); digest != "" {
 		t.Fatal("clearing adoption retained digest")
+	}
+}
+
+// Every report carries this boot's receipt; there is no unbound form.
+func TestStatusWithoutReceiptSendsNothing(t *testing.T) {
+	t.Setenv("ATTESTOR_ALLOW_UNPINNED_DEV", "true")
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
+	defer srv.Close()
+	key := make([]byte, 32)
+	key[31] = 1
+	for _, binding := range []*Binding{nil, NewBinding("")} {
+		Status(srv.URL, key, strings.Repeat("aa", 32), "running", "", binding)
+	}
+	if calls != 0 {
+		t.Fatalf("%d unbound status reports sent", calls)
 	}
 }

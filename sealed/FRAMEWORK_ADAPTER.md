@@ -644,7 +644,7 @@ entry to `HandleLegacy` in round C (§5.4) — and the optional
 recovered back to the platform. `main.go` consults it **only** when the stored
 document names no model, so a real owner document always outranks a recovered
 one, and persists the result through `report.SeedSettings`
-(`main.go:649-677`).
+(`main.go:735-764`).
 
 The timing is the whole point. The uploader rebuilds the chain entry list from
 `Roles()` and commits it wholesale, so the watcher's first tick drops the
@@ -655,7 +655,7 @@ is gone — and two adapters hard-fail Start without one.
 no owner is present at boot. attestor therefore treats it as strictly weaker
 than an owner write: **seed only**, rejected on a row that already has
 settings. The container may recover a lost document; it must never be able to
-change one the owner authored (`report/report.go:66-85`). The call is
+change one the owner authored (`report/report.go:134-138`). The call is
 best-effort — a failure is logged, the agent runs on the recovered pin either
 way, and the next boot retries.
 

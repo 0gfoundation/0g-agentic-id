@@ -173,7 +173,7 @@ prime 早已这样钉住)。
 **create** 时提供;`start` 不带 env,所以 resume 起来的容器会完全没有配置。`/provision`
 每次启动都会跑,resume 也一样,这就是文档搭上那条**本来就在运送 seal key** 的通道的原因
 (`attestor/crates/api/src/routes/provision.rs:12-16`、
-`internal/provision/provision.go:38-47`)。思考档位过去以 `SEAL_OWNER_THINKING` 搭
+`internal/provision/provision.go:74-83`)。思考档位过去以 `SEAL_OWNER_THINKING` 搭
 create 时的 env,现在不再如此(`sdk/typescript/src/AttestorClient.ts` 的 `sandboxEnv`)。
 
 **attestor 从不往里看。**它保存字节、把字节交给容器、把守访问 —— 从不解析、不校验、
@@ -191,7 +191,7 @@ create 时的 env,现在不再如此(`sdk/typescript/src/AttestorClient.ts` 的 
 东西会剥掉**(`framework/prime/modelsjson.go:62-68`)。
 
 **解密失败的 settings blob 会被记录并丢弃,而不是致命错误**
-(`internal/provision/provision.go:53-56`)。**无配置也能开机,好过拒绝开机。**
+(`internal/provision/provision.go:154-156`)。**无配置也能开机,好过拒绝开机。**
 
 **启动路径不校验 owner 签名。**容器从 `/provision` 响应里取走文档,凭的是那次调用本身
 已经完成的证明链,而不是对文档本身再验一次 owner 签名。那条"把 owner 对这次变更的签名
@@ -254,7 +254,7 @@ POST 的签名还额外绑定了请求体的 `sha256`,作为被签消息的第�
 (`internal/proxy/settings.go:18`)—— 面向 owner 的路由上做无界读取是最容易的一种拒绝
 服务。
 
-`main.go` 注册的 applier(`main.go:777`)按固定顺序做三件事:换掉生效中的文档、渲染它、
+`main.go` 注册的 applier(`main.go:903`)按固定顺序做三件事:换掉生效中的文档、渲染它、
 重启框架进程 —— **并且渲染失败时把替换回滚**,这样一份渲染不出来的文档永远不会变成下次
 崩溃重启会捡起来的那份。校验不过的文档在任何东西被应用之前就被拒,所以**一次无法生效的
 推送不可能把 agent 搞下线**。
@@ -289,7 +289,7 @@ agent 问不到的部分不归它。
 (`"durable": false`)。钱和资产都是 owner 的。结构性的后果是
 **agent 没有能力把自己配置成起不来的状态**,而 agent 3586004 正是手工编辑框架配置把自己
 砖了的(`internal/proxy/settings.go:120-129`)。如果 agent 那份文档渲染失败,`main.go`
-会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:794-802`)。
+会把 owner 的重渲染回去,免得一次被拒的尝试留下半应用的框架配置(`main.go:943-948`)。
 
 ## 6. 各框架在哪读它 —— `RenderSettings`
 
@@ -451,31 +451,40 @@ settings,窗口 B 正聊着的 harness 就被重启 —— B 在途的那一轮�
 | `settings_attempts` | 当前这份未确认文档已经被投递给多少次开机 |
 
 **提升(promotion)**只发生在绑定当前启动凭据的 `running` / `warning` 报告上。
-`/provision` 为每次启动生成随机凭据，包含环境、seal、容器公钥、实际下发的配置版本和
-SHA-256 摘要，经 KMS HMAC 认证后，ECIES 加密给容器。数据库的
-`container_status_bindings` 保存当前凭据哈希、票据哈希、启动代次及授权 owner/sandbox。
+`/provision` 为每次启动签发凭据：一个 64 位小写 hex 的随机 token，ECIES 加密给容器
+（`{"token":"…"}`，不带 MAC）。数据库的 `container_status_bindings` 保存当前凭据哈希
+（`sha256(token)`）、票据哈希、启动代次、授权 owner/sandbox，以及这次启动实际下发的
+配置版本和 SHA-256 摘要（`served_settings_version`、`served_settings_digest`）。
 worker 在 owner 授权的 create 前生成独立票据，通过保留的内部环境变量
 `SEAL_BOOT_TICKET` 注入容器，owner env 不能覆盖它。sealed 先读
-`GET /provision?seal_id=…` 获得代次，再用容器私钥签署 `ProvisionBoot.v1`，绑定票据哈希、
-代次、启动 ID 与时间。POST 要求票据、容器私钥证明及实际 sandbox 身份均匹配，
+`GET /provision?seal_id=…` 获得代次，以及 attestor 是否仍需要 provider 的证书
+（`certificate_required`），再用容器私钥签署
+`ProvisionBoot.v1:0x<seal>:<generation>:<sha256(ticket)>:<boot id>:<start ns>`
+（原始 keccak256）并 POST，仅在需要时附带证书。POST 要求票据、容器私钥证明（首次
+provision 对照证书里的 pubkey，之后对照记录的 pubkey）及实际 sandbox 身份均匹配，
 并复核链上 owner。重复或更早的启动请求不能换新凭据。票据在框架启动前从环境中清除。
 
 stop 和启动失败会在同一事务中撤销凭据，包括 sandbox provider 报告未启动的 resume；
 resume 失败从不删除 sandbox。resume 先开新代次，再调用 sandbox.start。reset 在
-恢复配置首次尝试计数之前先隔离旧代次，因此旧请求不能消耗新启动的重试机会。新 sandbox ID 尚未落库时返回 409，sealed 在 180 秒内重试。
+恢复配置首次尝试计数之前先隔离旧代次，因此旧请求不能消耗新启动的重试机会。新
+sandbox ID 尚未落库时返回 409，sealed 重读授权后重试：同一个启动 ID 下每次重新签名，
+退避从 1 秒起翻倍到 30 秒，直到 PID 1 启动后 10 分钟。
 创建或 ID 落库失败会撤销票据，清理新容器。转让清理绑定捕获的旧 sandbox ID，
 不会删除或撤销新 owner 已授权的容器。排队的 owner 操作会在执行前复核链上 owner。
 
 sealed 只有在使用下发的配置完成框架启动后，才在报告里附上该配置原始字节的摘要。
 `StatusReport.v2` 的原始 keccak 签名覆盖凭据哈希和配置摘要。attestor 校验凭据，
 并在同一个数据库事务内锁住 deployment，检查它仍是当前凭据，再更新状态、心跳及确认版本
-（`routes/status.rs`、`repo.rs::apply_status_report`）。只有凭据版本等于当前
-`settings_version` 且摘要匹配时，才提升尚未确认的文档；回退版本不会确认当前版本。
+（`routes/status.rs`、`repo.rs::apply_status_report`）。只有 binding 行记录的下发版本
+等于当前 `settings_version`、且其摘要与上报的摘要匹配时，才提升尚未确认的文档；回退
+版本不会确认当前版本。
 因此旧容器的延迟心跳、运行中推送的新文档，都不能误确认配置。
 
-没有凭据的旧容器只在该 agent 尚未登记新协议启动时能更新存活状态，永不提升配置。
-一旦登记受管启动，旧协议 provision 和心跳不再接受。新 sealed 要求 attestor 返回加密的
-启动凭据与启动票据，因此应先构建全部 sealed 镜像，再统一升级 attestor API/worker/indexer 并启用对应镜像。已有 agent 用 reset 进入新镜像；无需新增运维环境变量。
+不带凭据的报告会被拒绝，sealed 也从不发送：它要求加密的启动凭据和启动票据二者
+俱全。本版同时改变 provider 的证书（v3）、attestor TLS 声明和 `/provision` 请求：
+先部署 provider，再构建 sealed 镜像并把它们的 hash 加入 `validFrameworkHashes`，
+然后升级 attestor，并重建所有 agent（重启会重放旧的容器 env）。sealed 无需新增运维
+环境变量。
 
 **兜底(fallback)以重复尝试为准,而不是以错误报告为准。**当前版本未确认时,`/provision`
 会给 `settings_attempts` 加一,过了第一次就改投 `settings_last_good`:推送后的第一次开机
@@ -501,10 +510,10 @@ owner 授权创建新容器时，也会重新尝试当前未确认版本。worke
 
 在通道出现之前铸造的 agent,它的 pin 存在一个**已经没有任何 adapter 声明**的上链角色里。
 Bootstrap 的 Phase C 会把每一个角色在 `Roles()` 之外的链上条目交给 `HandleLegacy`
-(`main.go:638-647`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:403`)是
-adapter 把恢复出来的东西交还给平台的方式。`main.go:664-677` **仅在**下发的文档没有 model
+(`main.go:724-733`),而可选的 `framework.LegacySettingsSeeder`(`framework.go:403`)是
+adapter 把恢复出来的东西交还给平台的方式。`main.go:750-764` **仅在**下发的文档没有 model
 时才去问 seeder —— 所以真实文档永远压过恢复 —— 并用 `report.SeedSettings`
-(`internal/report/report.go:86`)把拿到的东西持久化。
+(`internal/report/report.go:142`)把拿到的东西持久化。
 
 这个顺序不是顺手的:uploader 会按 `Roles()` 重建链上条目列表并整份提交,所以**第一次漂移
 提交就会丢掉那个已不再声明的配置角色**。若届时 pin 还没被读出来并持久化,它就没了。

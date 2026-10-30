@@ -212,7 +212,7 @@ none, so a resumed container would come up unconfigured. `/provision` runs on
 every boot, resume included, which is why the document rides the channel that
 was already carrying the seal key
 (`attestor/crates/api/src/routes/provision.rs:12-16`,
-`internal/provision/provision.go:38-47`). The reasoning level used to ride the
+`internal/provision/provision.go:74-83`). The reasoning level used to ride the
 create-time env as `SEAL_OWNER_THINKING`; it does not any more
 (`sdk/typescript/src/AttestorClient.ts`, `sandboxEnv`).
 
@@ -236,7 +236,7 @@ text — nothing strips a literal credential an owner pastes into it
 (`framework/prime/modelsjson.go:62-68`).
 
 **A settings blob that fails to decrypt is dropped, not fatal**
-(`internal/provision/provision.go:53-56`). An agent that boots unconfigured
+(`internal/provision/provision.go:154-156`). An agent that boots unconfigured
 beats one that refuses to boot.
 
 **The boot path verifies no owner signature.** The container takes the
@@ -318,7 +318,7 @@ flight could keep a valid signature while substituting a different document
 (`internal/proxy/settings.go:18`) — an unbounded read on an owner-facing route
 is an easy denial.
 
-The applier `main.go` registers (`main.go:777`) does three things in a fixed
+The applier `main.go` registers (`main.go:903`) does three things in a fixed
 order: swap the in-force document, render it, restart the framework process —
 **and roll the swap back if the render fails**, so a document that cannot be
 rendered never becomes the one the next crash-restart picks up. A document
@@ -364,7 +364,7 @@ itself into a state it will not boot from, which is how agent 3586004 bricked
 itself by hand-editing its framework config
 (`internal/proxy/settings.go:120-129`). If a render of the agent's document
 fails, `main.go` re-renders the owner's, so a rejected attempt cannot leave the
-framework half-configured (`main.go:794-802`).
+framework half-configured (`main.go:943-948`).
 
 ## 6. Where each framework reads it — `RenderSettings`
 
@@ -570,27 +570,35 @@ lives server-side, in three columns
 | `settings_attempts` | how many boots have been served the current unconfirmed document |
 
 **Promotion** requires a `running` / `warning` report bound to the active boot
-receipt. Each `/provision` creates a random receipt carrying the environment,
-seal, container public key, and the exact served settings version and SHA-256
-digest. A KMS HMAC authenticates it, and ECIES encrypts it to the container.
-`container_status_bindings` stores the active receipt hash, ticket hash,
-generation, and authorized owner/sandbox. Before an owner-authorized create,
-the worker generates a separate ticket and injects the reserved internal
+receipt. Each `/provision` issues a receipt: a random token of 64 lowercase hex
+characters, ECIES-encrypted to the container (`{"token":"…"}`, no MAC).
+`container_status_bindings` stores the active receipt hash (`sha256(token)`),
+ticket hash, generation, authorized owner/sandbox, and the settings version and
+SHA-256 digest that boot was served (`served_settings_version`,
+`served_settings_digest`). Before an owner-authorized create, the worker
+generates a separate ticket and injects the reserved internal
 `SEAL_BOOT_TICKET` environment value; owner env cannot override it. sealed
-reads `GET /provision?seal_id=…` for the generation, then signs `ProvisionBoot.v1`
-with its container private key, binding the ticket hash, generation, boot ID
-and start time. POST checks the ticket, private-key proof and actual sandbox
-identity and rechecks the live chain owner. Replayed or older boot requests
-cannot rotate receipts. The ticket is scrubbed before spawning the framework.
+reads `GET /provision?seal_id=…` for the generation and whether the attestor
+still needs the provider's certificate (`certificate_required`), then signs
+`ProvisionBoot.v1:0x<seal>:<generation>:<sha256(ticket)>:<boot id>:<start ns>`
+(raw keccak256, container key) and POSTs it, with the certificate only when
+required. POST checks the ticket, the private-key proof (against the
+certificate's pubkey on the first provision, the recorded one afterwards) and
+the actual sandbox identity, and rechecks the live chain owner. Replayed or
+older boot requests cannot rotate receipts. The ticket is scrubbed before
+spawning the framework.
 
 Stop and startup failures revoke receipts in the same transaction, including a
 resume the sandbox provider reports as not started; a failed resume never
 deletes the sandbox. Resume opens a generation before sandbox.start. Reset
 fences the old generation before resetting settings attempts, so delayed
-requests cannot consume the new boot's retry. Before the new sandbox ID is persisted, provisioning returns 409;
-sealed retries within a 180-second deadline. Creation/ID persistence failures
-revoke the ticket and clean up the new container. Transfer cleanup targets the
-captured old sandbox ID and preserves a newer owner's authorized container.
+requests cannot consume the new boot's retry. Before the new sandbox ID is
+persisted, provisioning returns 409; sealed re-reads the authorization and
+retries, signing each attempt afresh under one boot ID, with backoff from 1 s
+doubling to 30 s, until 10 minutes after its PID-1 start. Creation/ID
+persistence failures revoke the ticket and clean up the new container. Transfer
+cleanup targets the captured old sandbox ID and preserves a newer owner's
+authorized container.
 Queued owner operations recheck the live chain owner before execution.
 
 sealed attaches the digest of the original provisioned document only after it
@@ -599,17 +607,18 @@ uses that document to start the framework successfully. The raw-keccak
 After verifying the receipt, attestor locks the deployment and checks the active
 receipt, updates status/liveness, and confirms settings in one transaction
 (`routes/status.rs`, `repo.rs::apply_status_report`). Promotion requires the
-served version to equal the current `settings_version` and the digests to
-match. A fallback version cannot confirm the current document. Delayed old
-container heartbeats and documents pushed mid-run cannot bless new settings.
+served version recorded on the binding row to equal the current
+`settings_version` and its digest to match the reported one. A fallback
+version cannot confirm the current document. Delayed old container heartbeats
+and documents pushed mid-run cannot bless new settings.
 
-Legacy reports without receipts can update liveness only before this agent
-registers its first managed boot, and never promote settings. After modern
-registration, legacy provisioning and heartbeats are refused/ignored. New sealed
-requires both the encrypted receipt and boot ticket. Build all sealed images
-first, then upgrade attestor API/worker/indexer and enable the matching images
-together. Existing agents enter the new image through reset. No new operator
-environment variables are required.
+A report without a receipt is refused, and sealed never sends one: it requires
+both the encrypted receipt and the boot ticket. This release changes the
+provider's certificate (v3), the attestor TLS statement and the `/provision`
+request together: deploy the provider, build the sealed images and add their
+hashes to `validFrameworkHashes`, then upgrade the attestor, and recreate every
+agent (a restart replays the old container env). sealed needs no new operator
+environment variables.
 
 **Fallback** is keyed on repeated attempts, not on an error report.
 `/provision` bumps `settings_attempts` while the current version is
@@ -642,12 +651,12 @@ new credential. Automatic container reboots retain the fallback policy.
 
 An agent minted before the channel has its pin in a chain role no adapter
 declares any more. Bootstrap Phase C hands every chain entry whose role is
-outside `Roles()` to `HandleLegacy` (`main.go:638-647`), and the optional
+outside `Roles()` to `HandleLegacy` (`main.go:724-733`), and the optional
 `framework.LegacySettingsSeeder` (`framework.go:403`) is how an adapter hands
-what it recovered back to the platform. `main.go:664-677` consults the seeder
+what it recovered back to the platform. `main.go:750-764` consults the seeder
 **only** when the provisioned document names no model — so a real document
 always outranks a recovery — and persists what it gets with
-`report.SeedSettings` (`internal/report/report.go:86`).
+`report.SeedSettings` (`internal/report/report.go:142`).
 
 The ordering is not incidental: the uploader rebuilds the chain entry list
 from `Roles()` and commits it wholesale, so the first drift commit drops the
