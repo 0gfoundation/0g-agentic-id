@@ -409,7 +409,7 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match queue.claim_next(&worker_id).await {
             Ok(Some((job_id, payload))) => {
-                tracing::info!(%job_id, ?payload, "claimed job");
+                tracing::info!(%job_id, kind = payload.kind(), seal_id = ?payload.seal_id(), "claimed job");
                 let res = jobs::run(&ctx, payload).await;
                 match res {
                     Ok(()) => {

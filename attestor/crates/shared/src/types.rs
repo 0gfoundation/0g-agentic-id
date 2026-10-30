@@ -22,7 +22,7 @@ pub type JobId = uuid::Uuid;
 //   description = JSON({ role, extra..., storage_ptr })
 // On-chain `IntelligentData` = { description, data_hash } per entry.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IDataInput {
     /// Free-form role tag ("config" | "memory" | "model" | ...).
     /// Attestor does not enforce a vocabulary.
@@ -73,7 +73,7 @@ pub struct StorageRoot {
 //
 // The attestor never re-signs — sandbox's own auth middleware verifies.
 // See `reference_sandbox_api.md` for the spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxEnvelope {
     /// Signer's EOA — must equal the `/deploy` request's `owner` field.
     pub wallet_address: Address,
@@ -81,6 +81,36 @@ pub struct SandboxEnvelope {
     pub signed_message_b64: String,
     /// 65-byte secp256k1 signature; V ∈ {27, 28}.
     pub wallet_signature: Bytes,
+}
+
+/// Debug for logs: job payloads carry iData plaintext and signed messages
+/// whose env may hold an API key, so neither is ever printed.
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Debug for IDataInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IDataInput")
+            .field("role", &self.role)
+            .field("plaintext", &Redacted)
+            .field("extra", &self.extra)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SandboxEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxEnvelope")
+            .field("wallet_address", &self.wallet_address)
+            .field("signed_message_b64", &Redacted)
+            .field("wallet_signature", &self.wallet_signature)
+            .finish()
+    }
 }
 
 // ── /deploy ─────────────────────────────────────────────────────────────
@@ -526,6 +556,80 @@ pub struct SandboxInfo {
 mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, U256};
+
+    fn envelope(secret: &str) -> SandboxEnvelope {
+        SandboxEnvelope {
+            wallet_address: Address::repeat_byte(0x11),
+            signed_message_b64: secret.to_string(),
+            wallet_signature: Bytes::from(vec![0x1b; 65]),
+        }
+    }
+
+    #[test]
+    fn debug_hides_idata_plaintext_and_signed_message() {
+        let idata = IDataInput {
+            role: "persona".into(),
+            plaintext: serde_json::json!({"api_key": "sk-plaintext-secret"}),
+            extra: Default::default(),
+        };
+        let out = format!("{idata:?}");
+        assert!(out.contains("persona") && !out.contains("sk-plaintext-secret"), "{out}");
+
+        let env = envelope("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0");
+        let out = format!("{env:?}");
+        assert!(!out.contains("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0"), "{out}");
+        assert!(out.contains(&format!("{:?}", Address::repeat_byte(0x11))), "{out}");
+
+        let job = JobPayload::Deploy {
+            seal_id: B256::repeat_byte(1),
+            owner: Address::ZERO,
+            i_data: vec![idata],
+            name: "n".into(),
+            description: "d".into(),
+            image: None,
+            sandbox_envelope: Some(env),
+        };
+        let out = format!("{job:?}");
+        assert!(
+            !out.contains("sk-plaintext-secret") && !out.contains("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn job_kind_matches_serde_tag_and_seal_id() {
+        let seal = B256::repeat_byte(7);
+        let jobs = vec![
+            JobPayload::Deploy {
+                seal_id: seal,
+                owner: Address::ZERO,
+                i_data: vec![],
+                name: String::new(),
+                description: String::new(),
+                image: None,
+                sandbox_envelope: None,
+            },
+            JobPayload::SandboxStart { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::SandboxStop { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::SandboxRecreate { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::ResumeDeploy { seal_id: seal, artifacts: vec![], sandbox_envelope: None },
+            JobPayload::SandboxTeardown { seal_id: seal, expected_sandbox_id: None },
+            JobPayload::Clone {
+                new_seal_id: seal,
+                source_seal_id: B256::repeat_byte(8),
+                target_owner: Address::ZERO,
+                name: String::new(),
+                description: String::new(),
+                image: None,
+                authorization: JobCloneAuth::default(),
+            },
+        ];
+        for job in jobs {
+            let tag = serde_json::to_value(&job).unwrap()["kind"].as_str().unwrap().to_string();
+            assert_eq!(job.kind(), tag);
+            assert_eq!(job.seal_id(), seal);
+        }
+    }
 
     #[test]
     fn job_payload_clone_serde_roundtrip() {
@@ -1291,6 +1395,34 @@ pub enum JobPayload {
         #[serde(default)]
         authorization: JobCloneAuth,
     },
+}
+
+impl JobPayload {
+    /// The serde `kind` tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            JobPayload::Deploy { .. } => "deploy",
+            JobPayload::SandboxStart { .. } => "sandbox_start",
+            JobPayload::SandboxStop { .. } => "sandbox_stop",
+            JobPayload::SandboxRecreate { .. } => "sandbox_recreate",
+            JobPayload::ResumeDeploy { .. } => "resume_deploy",
+            JobPayload::SandboxTeardown { .. } => "sandbox_teardown",
+            JobPayload::Clone { .. } => "clone",
+        }
+    }
+
+    /// The seal the job acts on; for a clone, the new seal.
+    pub fn seal_id(&self) -> SealId {
+        match self {
+            JobPayload::Deploy { seal_id, .. }
+            | JobPayload::SandboxStart { seal_id, .. }
+            | JobPayload::SandboxStop { seal_id, .. }
+            | JobPayload::SandboxRecreate { seal_id, .. }
+            | JobPayload::ResumeDeploy { seal_id, .. }
+            | JobPayload::SandboxTeardown { seal_id, .. } => *seal_id,
+            JobPayload::Clone { new_seal_id, .. } => *new_seal_id,
+        }
+    }
 }
 
 /// Mint-path selector carried on `JobPayload::Clone` (issue #133).
