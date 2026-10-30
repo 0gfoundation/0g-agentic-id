@@ -1,35 +1,48 @@
-# DSH adapter — composition & capability tiers
+# 0g-harness adapter — composition & capability tiers
 
-DSH (DeepSeek Harness, `@deepseek-ai/dsh`) is the only *composed* framework
-in this repo: it has no fixed runtime, it is a tree of Cordis plugins assembled
-per boot. What an agent can do is decided by that assembly, not by the
-framework.
+[0g-harness](https://github.com/0gfoundation/0g-harness) is the only
+*composed* framework in this repo. It is built on DSH (DeepSeek Harness,
+`@deepseek-ai/dsh`): it has no fixed runtime, it is a tree of Cordis plugins
+assembled per boot. What an agent can do is decided by that assembly, not by
+the framework.
 
 For the adapter contract (roles, Restore/EvolutionFor, FrameworkFacts) see
-`../../FRAMEWORK_ADAPTER.md` and the package doc in `dsh.go`. This file is
+`../../FRAMEWORK_ADAPTER.md` and the package doc in `harness.go`. This file is
 about the **composition**: which plugins are mounted, why, and how capability
 grows.
 
+## The framework name
+
+The framework is `0g-harness`: the name in the on-chain `framework` binding, in
+the attestor's `ATTESTOR_FRAMEWORKS` and in the deployment record. Its old name
+is `dsh`. An agent whose binding names `dsh` boots on this adapter, and its
+binding is rewritten to `0g-harness` by the agent's first commit (the
+`framework` role is drift-watched like every role; the commit spends the
+agentSeal's gas like every commit). A stopped agent is rewritten when it next
+boots. The attestor renames `dsh` in its deployment records when it starts
+(`attestor/crates/shared/src/schema.sql`).
+
 ## Where the composition lives
 
-In [0g-harness](https://github.com/0gfoundation/0g-harness)
-(`src/composition.mjs`), in code. 0g-harness is the process this adapter runs.
+In 0g-harness (`src/composition.mjs`), in code. 0g-harness is the process this
+adapter runs.
 
-- **Fixed at build time.** The dsh image installs one exact build of it at
-  build time (`../../images/dsh/Dockerfile`, `HARNESS_REF`), with its whole
-  dependency tree locked. So the plugin set and every platform decision in it
-  ride the image hash (measured, and listed on chain in
+- **Fixed at build time.** The 0g-harness image installs one exact build of it
+  at build time (`../../images/harness/Dockerfile`, `HARNESS_REF`), with its
+  whole dependency tree locked. So the plugin set and every platform decision
+  in it ride the image hash (measured, and listed on chain in
   `validFrameworkHashes`).
 - **Out of the agent's reach.** The composition is **not** a `cordis.yml`, a
   profile, or any `$DSH_HOME` patch layer, so an agent editing its own home
   cannot change what mounts next boot. This is the structural form of doctrine
   refusal 5 (the agent does not rewrite its own runtime).
-- **Version check.** The image build also checks that the DSH version the
-  harness locks is the one `whitelist.go` records in every dsh agent's
-  `framework` role. So the role always names the version that runs.
+- **Version check.** The image build also checks that the installed
+  0g-harness version is the one `whitelist.go` records in every 0g-harness
+  agent's `framework` role. So the role always names the version that runs.
+  The harness locks the DSH packages it runs on (its `npm-shrinkwrap.json`).
 
 The **owner** can vary four options inside a fixed allowlist (see
-*Owner-settable* below). They arrive as `SEAL_DSH_*` env from the owner's
+*Owner-settable* below). They arrive as `SEAL_HARNESS_*` env from the owner's
 signed settings document, applied at each spawn. So the image hash fixes the
 composition *and the set of variations an owner may ask for*.
 
@@ -100,7 +113,7 @@ frameworks declare none of the last four, and nothing about them changes.
   continuable subagents**: capability surface deferred (see below).
 
 **Owner-settable.** The chain is: the settings document's `others` section →
-`SEAL_DSH_*` env. An owner who sets nothing gets exactly the shipped
+`SEAL_HARNESS_*` env. An owner who sets nothing gets exactly the shipped
 composition. A push takes effect on the next spawn: the process restarts, the
 container does not.
 

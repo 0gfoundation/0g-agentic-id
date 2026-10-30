@@ -5,7 +5,7 @@
 // chat/completions dies with its connection, and connections die for reasons
 // that are not the owner's intent: the sandbox preview proxy hard-caps request
 // duration (~300s on mainnet, 0g-sandbox#122), laptops sleep, networks blip.
-// The prime and dsh bridges solve this natively (they declare a Route with
+// The prime bridge and 0g-harness solve this natively (they declare a Route with
 // Kind "responses" and the proxy just forwards). openclaw and hermes cannot:
 // at the pinned versions their servers either lack the surface (openclaw
 // 2026.7.1: POST-only wire format, no retrieve/resume/cancel) or give it the
@@ -39,7 +39,7 @@
 //
 // Records live in a bounded in-memory ring: they survive client disconnects,
 // not container restarts — the framework's own session state is the durable
-// record. Event shapes mirror the prime/dsh bridge implementation so SDK
+// record. Event shapes mirror the prime bridge and 0g-harness so SDK
 // clients see one protocol regardless of which layer serves it.
 package proxy
 
@@ -185,7 +185,7 @@ func synthTerminalEvent(name string) bool {
 var synthIDPath = regexp.MustCompile(`^/v1/responses/(resp_[0-9a-f]+)(/cancel)?$`)
 
 // nativeResponsesDeclared reports whether the adapter itself serves a
-// Responses surface (prime/dsh bridges declare Kind "responses"); the proxy
+// Responses surface (the prime bridge and 0g-harness declare Kind "responses"); the proxy
 // then forwards instead of synthesizing.
 func (s *Server) nativeResponsesDeclared() bool {
 	s.mu.RLock()
@@ -408,7 +408,7 @@ func (s *Server) consumeChatSSE(rec *synthRecord, body io.Reader) error {
 		case line == "":
 			eventName = ""
 		case strings.HasPrefix(line, ": activity "):
-			// prime/dsh bridge convention (not used when they serve natively,
+			// prime bridge / 0g-harness convention (not used when they serve natively,
 			// but kept so any comment-style progress becomes a real event).
 			rec.push("response.activity", map[string]any{"type": "response.activity", "label": strings.TrimPrefix(line, ": activity ")})
 		case strings.HasPrefix(line, ":"):

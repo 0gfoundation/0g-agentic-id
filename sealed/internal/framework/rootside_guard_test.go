@@ -125,7 +125,7 @@ var agentCommands = []string{
 	"internal/framework/hermes.spawnGateway",
 	"internal/framework/prime.spawnBridge",
 	"internal/framework/prime.probeKernelVenv",
-	"internal/framework/dsh.spawnBridge",
+	"internal/framework/harness.spawnBridge",
 }
 
 // adapterPackages must each sweep in Stop (privsep.Sweep).
@@ -133,7 +133,7 @@ var adapterPackages = []string{
 	"internal/framework/openclaw",
 	"internal/framework/hermes",
 	"internal/framework/prime",
-	"internal/framework/dsh",
+	"internal/framework/harness",
 }
 
 // agentHomeLinks are the functions that hand an adapter's tree over and
@@ -148,7 +148,7 @@ var agentHomeLinks = []string{
 	"internal/framework/openclaw.Adapter.prepareTree",
 	"internal/framework/hermes.spawnGateway",
 	"internal/framework/prime.spawnBridge",
-	"internal/framework/dsh.spawnBridge",
+	"internal/framework/harness.spawnBridge",
 }
 
 // pathSyscalls are the syscall / golang.org/x/sys/unix functions that take

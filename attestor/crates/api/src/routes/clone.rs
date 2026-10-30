@@ -432,7 +432,7 @@ mod tests {
             agent_uri: "oss://card".into(),
             agent_card: serde_json::json!({ "name": "Sage" }),
             i_data: vec![art],
-            framework: Some("dsh".into()),
+            framework: Some("0g-harness".into()),
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
@@ -581,7 +581,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cloned.framework.as_deref(),
-            Some("dsh"),
+            Some("0g-harness"),
             "clone inherits source framework"
         );
 

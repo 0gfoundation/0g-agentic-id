@@ -1,11 +1,13 @@
-package dsh
+package harness
 
 import (
 	"seal-verify/internal/platform"
 )
 
-// FrameworkFacts implements framework.Framework: DSH's blanks in the shared
-// agent-doc template (FRAMEWORK_ADAPTER.md §11 step 9). Values only —
+// FrameworkFacts implements framework.Framework: 0g-harness's blanks in the
+// shared agent-doc template (FRAMEWORK_ADAPTER.md §11 step 9). The home is
+// DSH's (~/.dsh, DSH_HOME): the DSH packages the harness runs on keep their
+// files there. Values only —
 // platform renders the mechanics prose identically for every framework, so
 // this adapter can neither restate a platform mechanism wrong nor silently
 // drop one.
@@ -27,10 +29,10 @@ func (a *Adapter) FrameworkFacts() platform.FrameworkFacts {
 			{Ask: "Give yourself a new capability", Place: "a skill under `~/.dsh/skills/<name>/` (a `SKILL.md`) or `~/.dsh/skills/<name>.md`"},
 			{Ask: "Change how you always behave", Place: "`~/.dsh/APPEND_SYSTEM.md`"},
 		},
-		VersionScheme: "DSH (@deepseek-ai/dsh) npm versions",
-		Versions:      supportedDSHVersions,
+		VersionScheme: "0g-harness versions",
+		Versions:      supportedVersions,
 		VersionMax:    whitelistMax(),
-		ReconcileHow:  "not applicable — DSH is baked into the sealed image, so a version change means deploying a new image",
+		ReconcileHow:  "not applicable — 0g-harness is baked into the sealed image, so a version change means deploying a new image",
 		// No ConfigFile/ConfigKeys: this framework has no chain-tracked config
 		// file to render an allowlist clause for (settings.go). What the agent
 		// does need to know — that its route is set from outside and not from

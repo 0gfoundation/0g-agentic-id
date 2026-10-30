@@ -189,7 +189,7 @@ deliberate:
   (`sealed/defaultmux.go`), so those routes are never served from the process that
   holds the key.
 - That pin is also the CLI's: the `storage-builder` stage of every image that builds
-  it (`sealed/Dockerfile`, `images/{hermes,prime,dsh,sealed}`; the base image
+  it (`sealed/Dockerfile`, `images/{hermes,prime,harness,sealed}`; the base image
   `images/openclaw` has none) reads the version from
   `sealed/go.mod` (`go list -m`) and `go install`s the CLI at it, so downloads and
   uploads always move together (and a rebuilt image no longer picks up whatever
@@ -288,7 +288,7 @@ not support the role, and is changing the broker to map `developer` →
 
 Workaround, per adapter that speaks the OpenAI dialect to the router: tell the
 framework the model has no `developer` role, so its system prompt goes out as
-`system` — dsh `compat.supportsDeveloperRole: false` (0g-harness `src/composition.mjs`),
+`system` — 0g-harness `compat.supportsDeveloperRole: false` (its `src/composition.mjs`),
 openclaw `supportsDeveloperRole: false` in the rendered model `compat`
 (`openclaw/inference.go`), prime the same flag in `models.json`
 (`prime/modelsjson.go`). The flags stay correct after the broker change.
@@ -324,7 +324,7 @@ themselves when extracting there; nvm does the same under `/root/.nvm`. An
 image built that way boots, then fails at first Start with `"npm" not found
 in a root-only PATH directory` (and `Sweep` quietly stops working).
 
-The workarounds are deliberate: the prime and dsh images extract node with
+The workarounds are deliberate: the prime and 0g-harness images extract node with
 `tar --no-same-owner`; the openclaw images `chown -h 0:0` the nvm and
 `/usr/local` trees after install. Every image then runs a check near its
 end that walks each command sealed needs, and its PATH directory, up to `/`

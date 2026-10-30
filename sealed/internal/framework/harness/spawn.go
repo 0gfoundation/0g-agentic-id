@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"context"
@@ -21,8 +21,8 @@ import (
 // it composes the DSH plugin tree, keeps the one agent, routes each turn's
 // output to whoever opened the turn, and serves the owner's /v1/ surface. The
 // image installs it at build time with its whole dependency tree locked
-// (images/dsh/Dockerfile), so its bytes ride the image hash; the build also
-// fails unless the DSH version it locks is the one whitelist.go records in
+// (images/harness/Dockerfile), so its bytes ride the image hash; the build
+// also fails unless the installed version is the one whitelist.go records in
 // the framework role. Its environment contract is what environ() builds.
 // Identifiers keep the word "bridge" for the loopback process this adapter
 // talks to.
@@ -38,7 +38,7 @@ const (
 
 	// logName names the harness's stdout/stderr log under
 	// framework.StateDir/log, served on /log/agent.
-	logName = "dsh-agent"
+	logName = "harness-agent"
 
 	// startTimeout bounds the wait for the harness to bind. First boot
 	// composes the whole plugin tree and the first model resolution.
@@ -59,12 +59,12 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	// re-point (settings.go). A missing render is a bootstrap bug — not
 	// something an owner can cause — so it fails before anything is spawned.
 	if rendered == nil {
-		return framework.StartResult{}, fmt.Errorf("dsh.Start: RenderSettings has not run before Start (bootstrap must render the owner's settings first)")
+		return framework.StartResult{}, fmt.Errorf("harness.Start: RenderSettings has not run before Start (bootstrap must render the owner's settings first)")
 	}
 	provider, model := rendered.resolved.Provider, rendered.resolved.Model
 	if provider == "" || model == "" {
 		return framework.StartResult{}, fmt.Errorf(
-			"dsh.Start: no inference pin — the owner's settings name provider=%q model=%q; substituting a model the owner never picked is not an option", provider, model)
+			"harness.Start: no inference pin — the owner's settings name provider=%q model=%q; substituting a model the owner never picked is not an option", provider, model)
 	}
 
 	// The credential comes from the RESOLVED SETTINGS, never from
@@ -81,23 +81,23 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if apiKey == "" {
 		if ep := rendered.resolved.Endpoint; ep != nil {
 			return framework.StartResult{}, fmt.Errorf(
-				"dsh.Start: the platform routes %s to %s but this boot has no inference key — the harness would dial it unauthenticated and 401 on the first turn (check API_KEY in the container's environment)", model, ep.BaseURL)
+				"harness.Start: the platform routes %s to %s but this boot has no inference key — the harness would dial it unauthenticated and 401 on the first turn (check API_KEY in the container's environment)", model, ep.BaseURL)
 		}
 		// A framework built-in supplies its own endpoint, and only its own
 		// provider knows whether that endpoint needs a key at all. Say so and
 		// keep booting.
-		logger.Logf("warn: dsh.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
+		logger.Logf("warn: harness.Start: no inference key for this boot; provider %q must serve %s unauthenticated or the first turn fails", provider, model)
 	}
 
 	if !initialized {
 		if token == "" {
 			var err error
 			if token, err = randomTokenHex(); err != nil {
-				return framework.StartResult{}, fmt.Errorf("dsh.Start: mint harness token: %w", err)
+				return framework.StartResult{}, fmt.Errorf("harness.Start: mint harness token: %w", err)
 			}
 		}
 	} else {
-		logger.Logf("dsh restart: reusing the harness token")
+		logger.Logf("harness restart: reusing the harness token")
 	}
 
 	// Agent doc → a file OUTSIDE the framework home; the harness injects it as
@@ -124,7 +124,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 	if err := privsep.WriteFile(agentDocPath(), []byte(platform.AssembleAgentDoc(pc, a.FrameworkFacts())), 0o644); err != nil {
 		// Serving without the platform doc means an agent that doesn't know its
 		// identity or the sign-refusal doctrine. Fail rather than degrade.
-		return framework.StartResult{}, fmt.Errorf("dsh.Start: write agent doc %s: %w", agentDocPath(), err)
+		return framework.StartResult{}, fmt.Errorf("harness.Start: write agent doc %s: %w", agentDocPath(), err)
 	}
 
 	cmd, err := spawnBridge(bridgeEnv{
@@ -134,7 +134,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 		rt:          rt,
 	})
 	if err != nil {
-		return framework.StartResult{}, fmt.Errorf("dsh.Start: %w", err)
+		return framework.StartResult{}, fmt.Errorf("harness.Start: %w", err)
 	}
 
 	a.mu.Lock()
@@ -145,7 +145,7 @@ func (a *Adapter) Start(ctx context.Context, rt framework.RuntimeContext) (frame
 
 	addr := fmt.Sprintf("127.0.0.1:%d", bridgePort)
 	if err := waitForListen(ctx, addr, startTimeout); err != nil {
-		return framework.StartResult{}, fmt.Errorf("dsh.Start: harness not listening: %w", err)
+		return framework.StartResult{}, fmt.Errorf("harness.Start: harness not listening: %w", err)
 	}
 	return framework.StartResult{Upstream: "http://" + addr, PID: cmd.Process.Pid}, nil
 }
@@ -238,7 +238,7 @@ func spawnBridge(be bridgeEnv) (*exec.Cmd, error) {
 		logFile.Close()
 		return nil, fmt.Errorf("start harness: %w", err)
 	}
-	logger.Logf("dsh: harness started (pid %d, port %d)", cmd.Process.Pid, bridgePort)
+	logger.Logf("harness: harness started (pid %d, port %d)", cmd.Process.Pid, bridgePort)
 	return cmd, nil
 }
 
@@ -304,7 +304,7 @@ func (a *Adapter) Stop(ctx context.Context, gracefulTimeout time.Duration) error
 func (a *Adapter) Liveness(ctx context.Context) error {
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", bridgePort), 2*time.Second)
 	if err != nil {
-		return fmt.Errorf("dsh.Liveness: %w", err)
+		return fmt.Errorf("harness.Liveness: %w", err)
 	}
 	conn.Close()
 	return nil
@@ -321,11 +321,11 @@ func (a *Adapter) Readiness(ctx context.Context) error {
 	}
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
 	if err != nil {
-		return fmt.Errorf("dsh.Readiness: %w", err)
+		return fmt.Errorf("harness.Readiness: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("dsh.Readiness: /healthz returned %d", resp.StatusCode)
+		return fmt.Errorf("harness.Readiness: /healthz returned %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -337,7 +337,7 @@ func (a *Adapter) AuthResponse(ctx context.Context) (any, error) {
 	token := a.bridgeToken
 	a.mu.RUnlock()
 	if token == "" {
-		return nil, fmt.Errorf("dsh.AuthResponse: harness not started yet")
+		return nil, fmt.Errorf("harness.AuthResponse: harness not started yet")
 	}
 	return map[string]any{"token": token}, nil
 }

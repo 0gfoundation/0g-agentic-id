@@ -1,6 +1,6 @@
-package dsh
+package harness
 
-// Filesystem paths the dsh adapter manages.
+// Filesystem paths the 0g-harness adapter manages.
 //
 // DSH keeps all user data under one root: $DSH_HOME, default ~/.dsh
 // (dsh-home-paths' resolveDshHome()). This adapter tracks two children of

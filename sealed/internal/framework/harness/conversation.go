@@ -1,4 +1,4 @@
-package dsh
+package harness
 
 import (
 	"context"
@@ -30,7 +30,7 @@ import (
 // the agent put at the conversation's name cannot make the clear fail.
 func (a *Adapter) ClearSession(_ context.Context) error {
 	if err := privsep.RemoveAll(conversationPath()); err != nil {
-		return fmt.Errorf("dsh.ClearSession: %w", err)
+		return fmt.Errorf("harness.ClearSession: %w", err)
 	}
 	dir := filepath.Dir(conversationPath())
 	prefix := filepath.Base(conversationPath()) + "."
@@ -67,11 +67,11 @@ func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 	token := a.bridgeToken
 	a.mu.RUnlock()
 	if token == "" {
-		return "", fmt.Errorf("dsh.CompactSession: harness not started yet")
+		return "", fmt.Errorf("harness.CompactSession: harness not started yet")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, compactBridgeURL, strings.NewReader("{}"))
 	if err != nil {
-		return "", fmt.Errorf("dsh.CompactSession: %w", err)
+		return "", fmt.Errorf("harness.CompactSession: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -80,9 +80,9 @@ func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 		// Giving up waiting does not stop the harness: a compaction that was
 		// queued behind a long turn, or is mid-summary, still completes.
 		if errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err) {
-			return "", fmt.Errorf("dsh.CompactSession: no answer from the harness in time (%w); the compaction may still finish — the agent log shows the outcome", err)
+			return "", fmt.Errorf("harness.CompactSession: no answer from the harness in time (%w); the compaction may still finish — the agent log shows the outcome", err)
 		}
-		return "", fmt.Errorf("dsh.CompactSession: %w", err)
+		return "", fmt.Errorf("harness.CompactSession: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
@@ -105,9 +105,9 @@ func (a *Adapter) CompactSession(ctx context.Context) (string, error) {
 		// 409 is the harness's "not now" (a compaction already pending, or the
 		// session changed under it): nothing was compacted, a retry may work.
 		if resp.StatusCode == http.StatusConflict {
-			return "", fmt.Errorf("dsh.CompactSession: %w: %s", framework.ErrCompactRefused, detail)
+			return "", fmt.Errorf("harness.CompactSession: %w: %s", framework.ErrCompactRefused, detail)
 		}
-		return "", fmt.Errorf("dsh.CompactSession: harness answered %d: %s", resp.StatusCode, detail)
+		return "", fmt.Errorf("harness.CompactSession: harness answered %d: %s", resp.StatusCode, detail)
 	}
 	if out.Note == "" {
 		return "compaction finished", nil

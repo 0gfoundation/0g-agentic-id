@@ -64,7 +64,7 @@ nothing else.
 
 - a blank `model` is the only fatal error, because two adapters hard-fail
   `Start` without a pin (`framework/prime/spawn.go:81`,
-  `framework/dsh/spawn.go:65`) while the other two only warn and run modelless
+  `framework/harness/spawn.go:65`) while the other two only warn and run modelless
   (`framework/openclaw/spawn.go:65`, `framework/hermes/spawn.go:300`);
 - `thinking` must be one of `Levels`, case-insensitively;
 - `framework` must be valid JSON, and nothing more.
@@ -102,8 +102,8 @@ off-router as well (`zgcompute.go:117-120`).
 **Why the split is not cosmetic.** Facts and endpoint used to share one struct
 behind a single `provider == "0g-compute"` check, so choosing a native
 provider silently skipped the reasoning bound along with the endpoint wiring.
-hermes and dsh both shipped that bug (`zgcompute.go:62-65`,
-`framework/dsh/settings.go:164-171`). Splitting them is why a native provider
+the hermes and 0g-harness adapters both shipped that bug (`zgcompute.go:62-65`,
+`framework/harness/settings.go:164-171`). Splitting them is why a native provider
 now still gets a bound, and there is a regression test for exactly that
 (`internal/settings/settings_test.go`,
 `TestNativeProviderStillGetsBoundedReasoning`).
@@ -116,7 +116,7 @@ Provider IDs and endpoints are operator-published configuration stored by the at
 
 ### 3.1 `Effort()` has three outcomes and none may be collapsed
 
-`Resolved.Effort() (level string, decided bool)` (`settings.go:160`):
+`Resolved.Effort() (level string, decided bool)` (`settings.go:201`):
 
 ```
 ("high", true)   apply this level
@@ -153,7 +153,7 @@ passes the choice through rather than second-guessing it
 
 ### 3.2 `PersistableMaxTokens()`, and why nothing resolved is stored
 
-`Resolved.PersistableMaxTokens()` (`settings.go:184`) returns the catalog's
+`Resolved.PersistableMaxTokens()` (`settings.go:225`) returns the catalog's
 output budget, or `0` for "write nothing", gated on
 `ModelFacts.CatalogSourced`. The name heuristic's fallback is
 `inference.HeuristicOpenAIMaxTokens = 8192` (`zgcompute.go:160`); written to
@@ -167,8 +167,8 @@ stored copy goes stale and then fights the computed value
 (`settings.go:11-15`).
 
 What adapters actually hand their framework is `Resolved.RequestMaxTokens()`
-(`settings.go:216`): `PersistableMaxTokens()` capped at
-`RequestOutputCeiling = 32768` (`settings.go:196`), same `0` for "write
+(`settings.go:258`): `PersistableMaxTokens()` capped at
+`RequestOutputCeiling = 32768` (`settings.go:237`), same `0` for "write
 nothing". The catalog's `max_completion_tokens` is a capability — the most one
 reply may ever be — not a per-request value, and every framework sends its
 configured budget on every request. Where a server checks prompt + budget
@@ -177,9 +177,9 @@ lists deepseek-v3 at 147456 of a 163840 window, which leaves 16,384 tokens for
 the conversation; capped, 131,072 (catalog, 2026-10-19). 32768 is also what
 pi-ai sent by default before the catalog budget was wired through, over twice
 the largest completion measured (~13.6K tokens, glm-5.3 at effort=max). On the
-wire: dsh sends it as `max_completion_tokens`, openclaw and hermes as
+wire: 0g-harness sends it as `max_completion_tokens`, openclaw and hermes as
 `max_tokens`; prime-agent's SDK clamps to 32000 whatever models.json says. One
-call sits lower still: dsh's compaction summary (`/compact`) is capped at 16384
+call sits lower still: 0g-harness's compaction summary (`/compact`) is capped at 16384
 (0g-harness `src/composition.mjs` `COMPACT_SUMMARY_MAX_TOKENS`; with no catalog budget, the
 engine's own 8192): it carries about a turn's input
 at the moment the history is longest, so wherever a server checks prompt +
@@ -189,10 +189,10 @@ turn has; 16384 is 3x the largest summary measured (5,239 output tokens for a
 
 The cap is not what fixed the HTTP 400 code `400001` that long glm-5.3
 conversations hit in 2026-10. Those requests had prompt + budget at ~196,608
-or more AND dsh's system prompt in a `developer`-role message; replayed with
+or more AND the system prompt in a `developer`-role message; replayed with
 that prompt as `system`, the same request went through 65 times out of 65
 (2026-10-16), and zg compute confirmed (2026-10-19) that Tencent's and 0G's
-self-hosted backends do not support the role. The fix is dsh sending `system`
+self-hosted backends do not support the role. The fix is 0g-harness sending `system`
 (0g-harness `src/composition.mjs`, `compat.supportsDeveloperRole: false` — openclaw and prime
 already pinned it).
 
@@ -397,15 +397,15 @@ instead of only at mint time.
 | openclaw (`openclaw/inference.go:69`) | `~/.openclaw/openclaw.json` | deep-merged at the top level; `gateway` dropped, because it carries a per-boot credential written at first Start and ordering cannot protect it; a `~/x` agent workspace or `agentDir` outside `~/.openclaw` rendered as `/home/agent/x`, because openclaw expands `~` there from `OPENCLAW_HOME=/root` (`homeRelativeOverlayPaths`; QUIRKS.md). On openclaw 2026.7.1 and later (the versions with `/compact`), three `agents.defaults.compaction` keys: `keepRecentTokens` is set to openclaw's own default (20000) — a manual compaction keeps its recent tail only while it is set — and `timeoutSeconds` to 600, as openclaw's default 180s would cut a slow `/compact` summary short, each unless openclaw.json already holds a positive whole number there (the owner's overlay, or an edit on disk); for a routed pin, `model` is set to the pin, so a compaction right after a model switch summarizes with the new model, unless the overlay names one. `session.reset` is set to `{mode: "idle"}` (never stale) unless openclaw.json already holds one (the overlay's, or an edit on disk) — openclaw's default starts a new session daily (`CONVERSATION.md`) |
 | hermes (`hermes/spawn.go:177`) | `~/.hermes/config.yaml` | deep-merged, then the platform keys written over it: `model.{default,provider,base_url,api_key}`, `agent.reasoning_effort`, and `model.max_tokens` when the catalog gives the budget; the three wiring keys are *cleared* when the document stops supplying them, or hermes would keep dialling the previous boot's endpoint with the previous boot's key; `model.max_tokens` is kept through an outage on the same model and removed when the model changes (unless the overlay sets it), or a switch to a model with a lower output limit fails every request |
 | prime-agent (`prime/modelsjson.go:144`) | `~/.prime/agent/models.json` **and** the bridge's environment | generic-JSON merge with the platform's keys over it on BOTH paths; no file at all for a framework built-in with no overlay, and a stale one is removed |
-| dsh (`dsh/settings.go:178`) | the harness process's environment only | a typed knob allowlist (`toolJobs`, `subagents`, `schedule`, `maxParallelToolCalls`); this framework has no config file to render into |
+| 0g-harness (`harness/settings.go:178`) | the harness process's environment only | a typed knob allowlist (`toolJobs`, `subagents`, `schedule`, `maxParallelToolCalls`); this framework has no config file to render into |
 
-dsh is the interesting case: DSH's own `settings.yaml` is served by
+0g-harness is the interesting case: DSH's own `settings.yaml` is served by
 `@deepseek-ai/dsh-settings-file`, which the harness deliberately does not mount
 because its hot-reload would let an agent edit inject an arbitrary
 `baseURL`/`apiKeyEnv` into a live process. The file survived as this adapter's
 own durable store for the pin; with the settings document as the pin's home it
 has no purpose left, so nothing writes it, nothing reads it, and the plugin is
-still unmounted (`dsh/settings.go:15-34`).
+still unmounted (`harness/settings.go:15-34`).
 
 Three details worth carrying, because each is a scar:
 
@@ -423,18 +423,18 @@ Three details worth carrying, because each is a scar:
   the platform's own keys be written through maps shared with the recorded
   overlay, so the next boot's "withdraw removed overlay keys" pass withdrew
   the platform's own reasoning bound (`openclaw/inference.go:357-364`).
-- **An overlay must never be able to take the boot down.** dsh's `parseKnobs`
+- **An overlay must never be able to take the boot down.** 0g-harness's `parseKnobs`
   is best-effort for every way an overlay can be wrong — wrong type, out of
   range, not an object at all — because `RenderSettings` runs from `PreStart`
   before EVERY spawn, so an error there is not a rejected push but an agent
   that will not boot, and it keeps not booting because the document that
-  caused it is the one attestor stores (`dsh/settings.go:96-105`).
+  caused it is the one attestor stores (`harness/settings.go:96-105`).
 
-dsh's knob set is an allowlist rather than a pass-through for one specific
+0g-harness's knob set is an allowlist rather than a pass-through for one specific
 reason: `workspaceContext` is recognised and **refused**, because it feeds an
 agent-writable file (`~/.dsh/AGENTS.md`, carried by no role) into the system
 prompt. That is a platform-boundary move, not a composition preference, and an
-owner knob must not be able to make it (`dsh/settings.go:46-57`).
+owner knob must not be able to make it (`harness/settings.go:46-57`).
 
 ## 7. The credential
 
@@ -459,7 +459,7 @@ what each framework's client actually reads:
 | openclaw | by reference: the config holds `{source: env, id: <VAR>}`, so only the variable NAME is on disk; `spawn.go` exports the value |
 | hermes | **literally, on disk**, in `model.api_key` — hermes's `custom` provider declares `env_vars=()` and reads the key only from `config.yaml`; injecting it via env produced a live 401 from the router, hermes having dialled it keyless (`hermes/spawn.go:165-172`) |
 | prime-agent | by reference: `models.json` holds `apiKey: "SEAL_MODEL_API_KEY"` (`prime/modelsjson.go:72`); the bridge env holds the value |
-| dsh | the harness env only — and deliberately NOT in the deterministic, logged `settingsEnv` slice, so the rendered environment can be compared and logged without handling a secret (`dsh/settings.go:198-204`) |
+| 0g-harness | the harness env only — and deliberately NOT in the deterministic, logged `settingsEnv` slice, so the rendered environment can be compared and logged without handling a secret (`harness/settings.go:198-204`) |
 
 hermes writing the key to disk needed a `stripSecrets` on the capture path
 while `config.yaml` was a chain role. Both `stripSecrets` implementations are
@@ -669,7 +669,7 @@ weaker than an owner write and guards it three ways
 
 **Coverage: all four adapters recover both legacy sources.** Each implements
 `LegacySettingsSeeder` and recovers the pin from its retired config role
-(openclaw `openclaw.json`, hermes `config.yaml`, prime `models.json`, dsh
+(openclaw `openclaw.json`, hermes `config.yaml`, prime `models.json`, 0g-harness
 `settings.yaml`) AND from the mint-time `persona` seed — the latter matters
 because attestor mints only `framework` + `persona`, so an agent that never
 committed drift carries its pin in the seed and nowhere else. The two sources
@@ -689,7 +689,7 @@ This is the world the channel replaced — kept because it is the evidence, and
 because the same four columns are the fastest way to see what the change
 bought. **Nothing in this section describes current behaviour.**
 
-| | openclaw | hermes | prime-agent | dsh |
+| | openclaw | hermes | prime-agent | 0g-harness |
 |---|---|---|---|---|
 | Config file | `~/.openclaw/openclaw.json` | `~/.hermes/config.yaml` | `~/.prime/agent/models.json` | `~/.dsh/settings.yaml` |
 | Chain-tracked portion | top-level `agents`, `auth`, `models` only | top-level `approvals`, `model`, `terminal` only | whole file | whole file |
@@ -728,7 +728,7 @@ What that table exposed, and what became of it:
    channel does not persist, and the file is re-rendered every spawn.
 5. **Version-pin mutability differed by install strategy.** openclaw and
    hermes install inside the container (a pin change is a harness restart);
-   prime and dsh are baked into the image (a pin change is a new image, i.e. a
+   prime and 0g-harness are baked into the image (a pin change is a new image, i.e. a
    container rebuild). **Unchanged** — it has nothing to do with this channel.
 
 ### 11.1 What left iData, and what was deleted with it
@@ -738,7 +738,7 @@ What that table exposed, and what became of it:
 | openclaw | `framework`, `openclaw.json`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` (`openclaw/openclaw.go:164`) |
 | hermes | `framework`, `config.yaml`, `SOUL.md`, `memories/`, `skills/` | `framework`, `SOUL.md`, `memories/`, `skills/` (`hermes/hermes.go:143`) |
 | prime-agent | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `models.json`, `skills/` | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` (`prime/prime.go:162`) |
-| dsh | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/` (`dsh/dsh.go:155`) |
+| 0g-harness | `framework`, `APPEND_SYSTEM.md`, `settings.yaml`, `skills/` | `framework`, `APPEND_SYSTEM.md`, `skills/` (`harness/harness.go:167`) |
 
 No config role anywhere. All four reduce to *reader + persona + memory +
 skills* — a shape the per-framework config files were hiding.
@@ -813,7 +813,7 @@ chain dissolved the problem they addressed.
   store see ciphertext — and the envelope's `env` is already a named map, the
   natural place a second secret would ride. What remains open is the
   **at-rest** half: §7 still puts the opened key in the framework process env
-  (openclaw/prime/dsh) or on disk in `config.yaml` (hermes), and for a
+  (openclaw/prime/0g-harness) or on disk in `config.yaml` (hermes), and for a
   framework whose agent has shell or file reach, "process env only" is not a
   confidentiality boundary. Use-without-seeing — the treatment #163's
   connections design gives OAuth tokens — is the shape of that remaining fix,

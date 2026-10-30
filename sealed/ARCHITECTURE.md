@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed downloads via the `0g-storage-client` CLI and uploads in-process via the same client's Go SDK (`internal/dataplane/upload.go`), so the signing key never leaves sealed |
-| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, dsh (`main.go:115-118`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
+| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`main.go:117-120`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -193,7 +193,7 @@ sealed/
 │   │   ├── openclaw/             openclaw adapter (node; the reference implementation)
 │   │   ├── hermes/               hermes adapter (python/uv)
 │   │   ├── prime/                prime-agent adapter (node + python; ships its own go:embed'ed HTTP bridge)
-│   │   ├── dsh/                  dsh adapter (node; ships its own go:embed'ed HTTP bridge)
+│   │   ├── harness/              0g-harness adapter (node; runs the 0g-harness its image installs)
 │   │   └── conformance/          executable invariant suite every adapter runs in its tests
 │   ├── settings/                 the owner's configuration document: Doc (what the owner chose,
 │   │                             the only thing persisted) + Resolved (Doc plus what the platform
@@ -216,13 +216,13 @@ sealed/
 ├── images/sealed/                universal node image (npm installs are warm cache only); builds no image that ships — openclaw's is Dockerfile above
 ├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
 ├── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
-└── images/dsh/                   sealed sandbox image, dsh flavour
+└── images/harness/               sealed sandbox image, 0g-harness flavour
 ```
 
 ### One-line per-package summary
 
 - **chain**: all AgenticID chain views / txs funnel through here; outside code never gets an `*ethclient.Client`, only a semantic API (`WaitForMint` / `IntelligentDatasOf` / `Update` etc.). The one transaction sent elsewhere is the 0G storage flow submission, which `dataplane.Upload` sends through the storage SDK
-- **dataplane**: iData crypto plus the 0g-storage transfers; no AgenticID calls. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`; `Download` runs `0g-storage-client download` through `privsep.RootCommand` (resolved only in root-only `PATH` directories; installed at `/usr/local/bin` by `Dockerfile` and `images/{hermes,prime,dsh,sealed}`, at the SDK version pinned in `go.mod`), into a root-only scratch directory; `Upload` runs in-process through the same client's Go SDK and submits the 0G storage flow transaction itself (the SDK talks to `CHAIN_RPC_URL`), signed with the agent_seal key sealed holds — no child process, no temp file — with a 90s cap per blob. Sharing sealed's process, an upload is not isolated: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (`QUIRKS.md`)
+- **dataplane**: iData crypto plus the 0g-storage transfers; no AgenticID calls. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`; `Download` runs `0g-storage-client download` through `privsep.RootCommand` (resolved only in root-only `PATH` directories; installed at `/usr/local/bin` by `Dockerfile` and `images/{hermes,prime,harness,sealed}`, at the SDK version pinned in `go.mod`), into a root-only scratch directory; `Upload` runs in-process through the same client's Go SDK and submits the 0G storage flow transaction itself (the SDK talks to `CHAIN_RPC_URL`), signed with the agent_seal key sealed holds — no child process, no temp file — with a 90s cap per blob. Sharing sealed's process, an upload is not isolated: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (`QUIRKS.md`)
 - **framework**: defines the `Framework` interface (adapter protocol) + `RuntimeContext` + `RoleSpec{Name, Shape}` + shared types like `StartParams`, `StartResult`. **Does not depend on any specific framework**
 - **settings**: `Doc` (provider / model / thinking / an opaque per-framework overlay) is the owner's document and the only persisted half; `Resolved` adds what the platform computes at Start — endpoint, output budget, whether the model takes a reasoning bound — and is persisted nowhere, because a stored copy goes stale and then fights the computed value (`settings.go:10-15`)
 - **framework/openclaw**: the reference adapter implementation. Internally split into `restore.go` / `restore_paths.go`, `evolution.go` / `evolution_paths.go`, `spawn.go`, `ingest.go` (persona legacy), `inference.go` (`RenderSettings`: the owner's document → openclaw.json), `disk.go` (openclaw.json read/write), `whitelist.go` (npm version allowlist), `identitymd.go` / `soulmd.go` / `toolsmd.go` (the IDENTITY/SOUL/TOOLS three sealed-managed platform sections + shared marker utilities)
@@ -302,8 +302,8 @@ The next bootstrap pulls the filled-ptr form from chain. **You must** call `mani
 else on the interface moves chain-anchored state; `RenderSettings` takes
 `settings.Resolved` — the owner's document plus what the platform computed for
 this boot — and places it where that particular framework reads it: a config
-file for openclaw and hermes, the bridge process's environment for prime and
-dsh. (prime additionally renders a `models.json` — an artifact, not a role:
+file for openclaw and hermes, the bridge process's environment for prime, and
+the harness process's environment for 0g-harness. (prime additionally renders a `models.json` — an artifact, not a role:
 the SDK it uses has no built-in for the 0G router, and no env var redirects a
 built-in provider at another endpoint, `prime/modelsjson.go:47-55`.) It is the
 one piece of the configuration channel that cannot be shared,
@@ -510,7 +510,7 @@ the reason in §5 ("What is iData, and what is a deployment parameter"):
 | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `openclaw.json` |
 | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `config.yaml` |
 | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `models.json` |
-| dsh (`dsh.go:153`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
+| 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
 
 All four reduce to the same shape — *binding + persona + memory + skills* —
 which the per-framework config files were obscuring.
@@ -524,8 +524,8 @@ what it recovered back to the platform, which persists it with
 The ordering is load-bearing: the uploader rebuilds the entry list from
 `Roles()` and commits it wholesale, so the first drift commit removes the
 undeclared role — if the pin has not been read out and persisted by then, it
-is gone, and prime and dsh both hard-fail `Start` without one. Coverage is
-partial today: only dsh implements the seeder (`dsh/settings.go:385`); the
+is gone, and prime and 0g-harness both hard-fail `Start` without one. Coverage is
+partial today: only 0g-harness implements the seeder (`harness/settings.go:382`); the
 other three log their retired role as unknown and ignore it. See
 [CONFIG_SURFACE.md](CONFIG_SURFACE.md) §10.
 
@@ -554,8 +554,8 @@ container's `:8080`.
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
-| `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
-| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | dsh only (0g-harness, declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/dsh/spawn.go` `FrameworkRoutes`) |
+| `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
+| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |

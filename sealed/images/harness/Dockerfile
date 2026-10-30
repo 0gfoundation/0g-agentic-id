@@ -1,9 +1,9 @@
-# Sealed sandbox runtime image — DSH (DeepSeek Harness) flavour.
+# Sealed sandbox runtime image — 0g-harness flavour.
 #
-# Per-framework image, node-only: DSH is a TypeScript Cordis-plugin harness,
-# and 0g-harness (github.com/0gfoundation/0g-harness), installed below, composes
-# its plugin tree in-process and serves the owner's /v1/ surface. No Python
-# runtime, unlike images/prime/.
+# Per-framework image, node-only: 0g-harness
+# (github.com/0gfoundation/0g-harness), installed below, composes the DeepSeek
+# Harness (DSH) plugin tree in-process and serves the owner's /v1/ surface. No
+# Python runtime, unlike images/prime/.
 #
 # Contents beyond debian-slim: node, ca-certificates (chain RPC + 0G storage +
 # router TLS), git and procps (the adapter's orphan sweep), 0g-harness with its
@@ -17,13 +17,14 @@
 #
 # Build context = sealed/ (for the bootstrap COPY):
 #
-#   cd sealed && docker build -t 0g-sealed-dsh:0.1.0 -f images/dsh/Dockerfile .
+#   cd sealed && docker build -t 0g-sealed-harness:0.1.0 -f images/harness/Dockerfile .
 #
 # Release checklist: a new image hash must be added to on-chain
 # validFrameworkHashes or the attestor destroys the container right after
-# provision. framework↔image matching is not validated anywhere, so a dsh
-# deploy MUST pass sealedImage explicitly — the default image carries no DSH
-# packages and the agent lands offline.
+# provision. The container does not check that the agent's framework matches
+# the image: an 0g-harness agent booted on an image without the harness fails
+# at framework start. The SDK picks the image by the agent's framework from
+# the attestor's GET /config frameworks[] (ATTESTOR_FRAMEWORKS).
 
 # Stage 1 — 0g-storage-client (used by bootstrap to download intelligent data;
 # uploads run inside the bootstrap binary, through the same client's Go SDK).
@@ -40,7 +41,7 @@ RUN V=$(go list -m -f '{{.Version}}' github.com/0gfoundation/0g-storage-client) 
  && test -z "$(go list -m -f '{{if .Replace}}replaced{{end}}' github.com/0gfoundation/0g-storage-client)" \
  && CGO_ENABLED=0 GOBIN=/out go install -ldflags="-s -w" "github.com/0gfoundation/0g-storage-client@$V"
 
-# Stage 2 — sealed bootstrap binary (carries the embedded bridge + plugins).
+# Stage 2 — sealed bootstrap binary.
 FROM golang:1.24-alpine AS bootstrap-builder
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -61,10 +62,10 @@ RUN apt-get update \
 # read sealed's memory or bootstrap env. Its home is /home/agent, which
 # sealed creates at boot (agent:agent 0700, privsep.PrepareAgentHome) and
 # which is HOME for everything the agent runs, so its tools' caches and
-# config go there. The bridge, and every tool process it runs, starts in
-# the framework tree (/root/.dsh) instead, so relative paths in their
-# output land there, not in /home/agent (internal/framework/dsh/spawn.go
-# explains why). /root stays root's: sealed makes it root:root 0711 at
+# config go there. The harness, and every tool process it runs, starts in
+# the framework tree (/root/.dsh, DSH's home) instead, so relative paths in
+# their output land there, not in /home/agent
+# (internal/framework/harness/spawn.go explains why). /root stays root's: sealed makes it root:root 0711 at
 # boot (privsep.SecureHome) and hands the agent only its framework tree
 # inside it (privsep.OwnTree), linked into /home/agent
 # (privsep.LinkAgentHome) so the ~/.<framework> paths keep working. The
@@ -108,21 +109,21 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
 # slim.
 #
 # The build then checks the one thing the image must agree on with the sealed
-# binary: the DSH version the harness locks is the version whitelist.go records
-# in every dsh agent's chain-tracked framework role (its last entry,
+# binary: the installed 0g-harness version is the version whitelist.go records
+# in every 0g-harness agent's chain-tracked framework role (its last entry,
 # whitelistMax). A mismatch fails the build, not a boot.
-ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/dc2b3febc46d959beeecd4841b652f5953d15a85
-COPY internal/framework/dsh/whitelist.go /tmp/dsh-whitelist.go
+ARG HARNESS_REF=https://codeload.github.com/0gfoundation/0g-harness/tar.gz/690cbf00816804a4a5ee7ee3d10ffbd58c1a1907
+COPY internal/framework/harness/whitelist.go /tmp/harness-whitelist.go
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
  && npm install -g --no-fund --no-audit "${HARNESS_REF}" \
  && H=/usr/local/lib/node_modules/@0gfoundation/0g-harness \
  && test -f "$H/bin/0g-harness.mjs" \
- && GOT="$(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json').version")" \
- && WANT="$(sed -n '/supportedDSHVersions = \[\]string{/,/^}/p' /tmp/dsh-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
- && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "0g-harness locks dsh $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
- && echo "baked 0g-harness $(node -p "require('$H/package.json').version") with dsh $GOT" \
- && rm /tmp/dsh-whitelist.go \
+ && GOT="$(node -p "require('$H/package.json').version")" \
+ && WANT="$(sed -n '/supportedVersions = \[\]string{/,/^}/p' /tmp/harness-whitelist.go | grep -oE '"[^"]+"' | tail -1 | tr -d '"')" \
+ && if [ -z "$WANT" ] || [ "$GOT" != "$WANT" ]; then echo "installed 0g-harness $GOT but whitelist.go records $WANT in the framework role" >&2; exit 1; fi \
+ && echo "baked 0g-harness $GOT with DSH $(node -p "require('$H/node_modules/@deepseek-ai/dsh-agent-spine-demo/package.json').version")" \
+ && rm /tmp/harness-whitelist.go \
  && apt-get purge -y python3 make g++ && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/* /root/.npm
 

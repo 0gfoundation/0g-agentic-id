@@ -1,18 +1,22 @@
-# DSH 适配器 —— 组合与能力档位
+# 0g-harness 适配器 —— 组合与能力档位
 
-DSH(DeepSeek Harness,`@deepseek-ai/dsh`)是本仓库里唯一的**组合式**框架。别的框架有固定的运行时;DSH 没有,它每次启动都现场把一批 Cordis 插件拼成一棵树。所以 **agent 能干什么,由这棵树决定,不由框架决定。**
+[0g-harness](https://github.com/0gfoundation/0g-harness) 是本仓库里唯一的**组合式**框架,建在 DSH(DeepSeek Harness,`@deepseek-ai/dsh`)之上。别的框架有固定的运行时;它没有,每次启动都现场把一批 Cordis 插件拼成一棵树。所以 **agent 能干什么,由这棵树决定,不由框架决定。**
 
-适配器契约(有哪些 role、Restore/EvolutionFor、FrameworkFacts 怎么填)看 `../../FRAMEWORK_ADAPTER.zh.md` 和 `dsh.go` 的包注释。本文只讲**组合**:挂了哪些插件、为什么挂、以后能力怎么扩。
+适配器契约(有哪些 role、Restore/EvolutionFor、FrameworkFacts 怎么填)看 `../../FRAMEWORK_ADAPTER.zh.md` 和 `harness.go` 的包注释。本文只讲**组合**:挂了哪些插件、为什么挂、以后能力怎么扩。
+
+## 框架名
+
+框架名是 `0g-harness`:链上 `framework` binding 里的名字、attestor 的 `ATTESTOR_FRAMEWORKS` 和部署记录里的名字,都是它。旧名是 `dsh`。binding 写着 `dsh` 的 agent 照样用本适配器启动,它的 binding 由 agent 的第一次提交改写成 `0g-harness`(`framework` role 和其他 role 一样受漂移监控,这次提交和其他提交一样花 agentSeal 的 gas)。停着的 agent 下次启动时改写。attestor 启动时把部署记录里的 `dsh` 改名(`attestor/crates/shared/src/schema.sql`)。
 
 ## 组合放在哪
 
-放在 [0g-harness](https://github.com/0gfoundation/0g-harness)(`src/composition.mjs`)里,用代码写死。0g-harness 就是本适配器启动的那个进程。
+放在 0g-harness(`src/composition.mjs`)里,用代码写死。0g-harness 就是本适配器启动的那个进程。
 
-- **构建镜像时就定死。** dsh 镜像在构建时装一个确定版本的 harness(`../../images/dsh/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树。所以插件集合,以及里面每一条平台决定,都包含在镜像哈希里:被度量,并且登记在链上的 `validFrameworkHashes` 里。
+- **构建镜像时就定死。** 0g-harness 镜像在构建时装一个确定版本的 harness(`../../images/harness/Dockerfile` 里的 `HARNESS_REF`),连同它锁定的整棵依赖树。所以插件集合,以及里面每一条平台决定,都包含在镜像哈希里:被度量,并且登记在链上的 `validFrameworkHashes` 里。
 - **agent 改不动。** 组合**不是** `cordis.yml`,不是 profile,也不在 `$DSH_HOME` 下的任何 patch 文件里。agent 就算改自己的家目录,也改不动下次启动挂什么。这是 doctrine 第 5 条(agent 不能重写自己的运行时)在结构上的落地。
-- **版本对得上。** 构建镜像时还会检查一件事:harness 锁定的 DSH 版本,必须等于 `whitelist.go` 写进每个 dsh agent 的 `framework` role 的版本。这样,role 里写的永远是实际运行的版本。
+- **版本对得上。** 构建镜像时还会检查一件事:装上的 0g-harness 版本,必须等于 `whitelist.go` 写进每个 0g-harness agent 的 `framework` role 的版本。这样,role 里写的永远是实际运行的版本。harness 自己锁定它所用的 DSH 包(它的 `npm-shrinkwrap.json`)。
 
-**owner** 可以在一份固定白名单里调四个选项(见下面「owner 可调的」)。它们由 owner 签名的 settings 文档渲染成 `SEAL_DSH_*` 环境变量,每次 spawn 时生效。所以镜像哈希钉住的是:组合本身,**加上 owner 能提出的那几种变体**。
+**owner** 可以在一份固定白名单里调四个选项(见下面「owner 可调的」)。它们由 owner 签名的 settings 文档渲染成 `SEAL_HARNESS_*` 环境变量,每次 spawn 时生效。所以镜像哈希钉住的是:组合本身,**加上 owner 能提出的那几种变体**。
 
 白名单之外,谁都调不了。下面这些都写死在被度量的代码里:
 - 挂哪些插件;
@@ -63,7 +67,7 @@ harness 做三件事:
 - **`sandbox` 那一套**:真正的隔离墙是 privsep,也就是内核 uid 隔离。DSH 自带的 `sandbox-local` 依赖 bwrap 或 Landlock,在没有这两者的精简 TEE 容器里会直接拒绝运行。
 - **`web`、`e2b`、常驻 `terminal`、`goals`、`agent-presets`、可续聊的子 agent**:这些能力暂不提供,见下面的档位规划。
 
-**owner 可调的**:settings 文档的 `others` 段 → `SEAL_DSH_*` 环境变量。什么都不填,就是出厂组合。推送一次配置,下次 spawn 时生效:重启的是进程,不是容器。
+**owner 可调的**:settings 文档的 `others` 段 → `SEAL_HARNESS_*` 环境变量。什么都不填,就是出厂组合。推送一次配置,下次 spawn 时生效:重启的是进程,不是容器。
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
