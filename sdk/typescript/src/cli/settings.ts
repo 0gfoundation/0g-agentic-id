@@ -90,11 +90,11 @@ export function parseAssignments(args: string[]): Assignment[] {
   return out;
 }
 
-/** `others` keys only the dsh adapter reads (sealed `dsh/settings.go`). */
-export const DSH_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls'] as const;
+/** `others` keys only the 0g-harness adapter reads (sealed `harness/settings.go`). */
+export const HARNESS_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelToolCalls'] as const;
 
 /**
- * Refuse dsh switches in `others=` for an agent known to run another
+ * Refuse 0g-harness switches in `others=` for an agent known to run another
  * framework, before anything is signed. There `others` is that framework's
  * own configuration, so the switch does nothing, and openclaw goes further:
  * it refuses a key it does not know, and the adapter then drops the whole
@@ -102,20 +102,20 @@ export const DSH_ONLY_KEYS = ['toolJobs', 'subagents', 'schedule', 'maxParallelT
  * legacy row) is not refused: nothing says the write is wrong.
  */
 export function assertOthersFitFramework(assignments: Assignment[], framework: string | null | undefined): void {
-  if (!framework || framework === 'dsh') return;
+  if (!framework || framework === '0g-harness') return;
   const others = assignments.find((a) => a.key === 'others')?.value;
   if (!others || typeof others !== 'object' || Array.isArray(others)) return;
-  const hits = DSH_ONLY_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(others, k));
+  const hits = HARNESS_ONLY_KEYS.filter((k) => Object.prototype.hasOwnProperty.call(others, k));
   if (!hits.length) return;
   const named = hits.map((k) => `"${k}"`).join(', ');
   const plural = hits.length > 1;
   throw new CliError(
     'BAD_FLAG',
-    `${named} ${plural ? 'are dsh switches' : 'is a dsh switch'}; this agent runs ${framework}, which does not read ${plural ? 'them' : 'it'}` +
+    `${named} ${plural ? 'are 0g-harness switches' : 'is a 0g-harness switch'}; this agent runs ${framework}, which does not read ${plural ? 'them' : 'it'}` +
       (framework === 'openclaw'
         ? ' (openclaw refuses keys it does not know, and the whole others section is then dropped)'
         : ''),
-    { remedy: `leave ${plural ? 'them' : 'it'} out of others=: background jobs, subagents and reminders are dsh features` },
+    { remedy: `leave ${plural ? 'them' : 'it'} out of others=: background jobs, subagents and reminders are 0g-harness features` },
   );
 }
 

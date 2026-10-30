@@ -310,14 +310,15 @@ export interface AgentClient {
    *
    * Pass `signal` to interrupt a turn in flight: aborting tears down the HTTP
    * connection, which is the OpenAI-conventional cancel signal — the runtime
-   * side stops the turn where the framework supports cancellation (dsh does).
+   * side stops the turn where the framework supports cancellation (0g-harness
+   * does).
    * The generator then throws the abort error (`err.name === "AbortError"`).
    */
   chatStream?(messages: ChatMessage[], opts?: {
     model?: string;
     signal?: AbortSignal;
     /** Tool-activity progress, when the agent's bridge streams it (SSE
-     *  ": activity tool/call <name>" comments — dsh does). Labels like
+     *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
@@ -467,7 +468,7 @@ async function* iterSseChunks(
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
       // SSE comments (":...") are invisible to the payload, but a caller may
-      // want them: the dsh bridge streams tool-activity progress as
+      // want them: 0g-harness streams tool-activity progress as
       // ": activity <kind>" comments (keepalives pass through too — the
       // callback filters).
       if (t.startsWith(':') && onComment) onComment(t.slice(1).trim());
@@ -667,7 +668,7 @@ export function makeAgentClient(params: {
     const path = `${chat.prefix}chat/completions`;
 
     client.interrupt = async () => {
-      // dsh/prime bridges expose a real endpoint; call it. openclaw/hermes
+      // 0g-harness and the prime bridge expose a real endpoint; call it. openclaw/hermes
       // serve /v1 themselves (404 here) and both stop the turn when the
       // client disconnects — LAB- and live-verified for openclaw (the run
       // ends stopReason=aborted the moment the stream drops; no
@@ -780,11 +781,11 @@ export function makeAgentClient(params: {
 
   // ── Responses transport (the long-task surface) ──────────────────────────
   //
-  // When the agent declares a `kind: "responses"` route (prime/dsh bridges
-  // natively; openclaw/hermes via the sealed proxy's synthesized layer), a
-  // turn is owned by a server-side response id, not by the HTTP connection —
-  // so it survives network drops and the sandbox preview proxy's request-
-  // duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
+  // When the agent declares a `kind: "responses"` route (the prime bridge and
+  // 0g-harness natively; openclaw/hermes via the sealed proxy's synthesized
+  // layer), a turn is owned by a server-side response id, not by the HTTP
+  // connection — so it survives network drops and the sandbox preview proxy's
+  // request-duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
   // REPLACED to ride it: same signatures, but a dropped connection now means
   // "resume from the last sequence number", not "the task died". task/
   // followTask/cancelTask expose the id-level surface for re-attaching later.

@@ -232,8 +232,9 @@ export async function routeTaskFailure(
 
 /**
  * The tasks bare `/cancel` stops: everything still in flight, NEWEST FIRST
- * (stopping only the newest would leave an older running turn alive; dsh/
- * prime serialize turns, so a queued one is waiting on the running one).
+ * (stopping only the newest would leave an older running turn alive;
+ * 0g-harness and prime serialize turns, so a queued one is waiting on the
+ * running one).
  * Statuses arrive live from the agent; "unknown" (evicted or agent
  * restarted, 404) counts as not in flight — cancelling an unknown record
  * would claim to stop something nobody can see. Exported for the tests:
@@ -2062,7 +2063,7 @@ async function deployWizard(ag: AgenticID, attestorUrl: string, ask: (q: string)
   const provider = await pickInferenceProvider(ask, loadConfig().inferenceProvider ?? '0g-compute');
   const definition = knownProviders.find((entry) => entry.id === provider)!;
   await ag.agent.assertProviderSupported(provider, { framework });
-  const NEEDS_TOOLS = new Set(['openclaw', 'dsh', 'prime-agent']);
+  const NEEDS_TOOLS = new Set(['openclaw', '0g-harness', 'prime-agent']);
   const caps = await ag.agent.listModelCaps({ provider });
   const models = caps.filter((model) => model.chat)
     .filter((model) => !NEEDS_TOOLS.has(framework) || model.tools)
@@ -2240,37 +2241,40 @@ const L2_HELP_FULL = `session commands
                           is untouched; that is the difference from /reset
   /compact                compact the agent's conversation in place — older
                           history becomes a summary, the newest part stays
-                          as it is (openclaw ~20K tokens, dsh its newest
-                          item), and the conversation goes on (unlike
+                          as it is (openclaw ~20K tokens, 0g-harness its
+                          newest item), and the conversation goes on (unlike
                           /clear). One or more model calls; can take
-                          minutes. dsh, and openclaw 2026.7.1 or later
-  /tasks                  on dsh: everything that runs or ran on the agent —
-                          your turns, the turns it opened itself, background
-                          commands and subagents — with who did each (BY) and
-                          who asked (FOR). Elsewhere: this session's long
-                          tasks with live status — on agents with the
-                          responses transport a chat turn survives dropped
-                          connections and keeps running
+                          minutes. 0g-harness, and openclaw 2026.7.1 or later
+  /tasks                  on 0g-harness: everything that runs or ran on the
+                          agent — your turns, the turns it opened itself,
+                          background commands and subagents — with who did
+                          each (BY) and who asked (FOR). Elsewhere: this
+                          session's long tasks with live status — on agents
+                          with the responses transport a chat turn survives
+                          dropped connections and keeps running
   /result [id]            re-attach to a task (default: latest): prints a
-                          finished one, follows a running one live; on dsh
-                          also a subagent's answer or a command's status
+                          finished one, follows a running one live; on
+                          0g-harness also a subagent's answer or a command's
+                          status
   /cancel [id|all]        stop tasks — the brake for orphaned turns: Esc only
-                          cancels a turn THIS connection started (on dsh/prime
-                          it interrupts the bridge-wide current turn), so after
-                          a dropped stream /cancel is the way to stop what
-                          survived. Bare form stops everything this session
-                          knows to be in flight (newest first); with an id,
-                          just that one — /result <id> adopts an id into the
-                          session first. Session memory starts empty after a
-                          CLI restart or /back + use. On dsh an id can be any
-                          task /tasks lists, and /cancel all stops everything
+                          cancels a turn THIS connection started (on
+                          0g-harness and prime it interrupts the agent-wide
+                          current turn), so after a dropped stream /cancel
+                          is the way to stop what survived. Bare form stops
+                          everything this session knows to be in flight
+                          (newest first); with an id, just that one —
+                          /result <id> adopts an id into the session first.
+                          Session memory starts empty after a CLI restart or
+                          /back + use. On 0g-harness an id can be any task
+                          /tasks lists, and /cancel all stops everything
                           running on the agent
-  /inbox [all]            what the agent said on its own (dsh): a background
-                          job finished, a reminder came due. It prints above
-                          the prompt as it arrives, and what came while you
-                          were away prints when you enter. Bare: unread
-                          messages; all: the read ones too
-  /schedules              the reminders the agent set for itself (dsh)
+  /inbox [all]            what the agent said on its own (0g-harness): a
+                          background job finished, a reminder came due. It
+                          prints above the prompt as it arrives, and what
+                          came while you were away prints when you enter.
+                          Bare: unread messages; all: the read ones too
+  /schedules              the reminders the agent set for itself
+                          (0g-harness)
   /agentlog [n]           agent process log, last n lines (owner-only)
   /startuplog [n]         sealed runtime startup log, last n lines
   /back  (or /unuse)      return to the manager
@@ -2594,7 +2598,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue;
       }
       if (line === '/tasks') {
-        // An agent with its own task list (dsh) answers for everything that
+        // An agent with its own task list (0g-harness) answers for everything that
         // runs on it: every turn, yours and the ones it opened itself, and
         // every background command and subagent, with who did each.
         if (s.client?.tasks) {
@@ -2691,7 +2695,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         // survival is the feature). /cancel is the explicit brake: by id, or
         // everything in flight this session knows.
         let id = line.split(/\s+/)[1];
-        // An agent with its own task list (dsh) stops any of its tasks by id
+        // An agent with its own task list (0g-harness) stops any of its tasks by id
         // (a turn, a background command, a subagent), and all of them at once.
         if (id && s.client.stopTask && s.client.stopAllTasks) {
           for (;;) {
@@ -2739,8 +2743,8 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
             continue;
           }
           // A brake stops everything in flight, newest first — stopping only
-          // the newest would leave an older running turn alive (dsh/prime
-          // serialize turns, so a queued one is waiting on the running one).
+          // the newest would leave an older running turn alive (0g-harness and
+          // prime serialize turns, so a queued one is waiting on the running one).
           const inFlight = inFlightIds(rows);
           if (!inFlight.length) { out('nothing in flight from this session — /tasks to list; a finished task cannot be cancelled\n'); continue; }
           if (s.client?.cancelTask) {
@@ -2783,7 +2787,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (id && !s.client?.cancelTask) {
           // An id was asked for but this image has no task-level cancel: do
           // NOT silently interrupt "whatever is running" instead — but on
-          // dsh/prime the bridge-wide interrupt DOES stop the running turn,
+          // 0g-harness and prime the agent-wide interrupt DOES stop the running turn,
           // so point there instead of claiming nothing can be done.
           out(s.client?.interrupt
             ? '(this agent image has no per-task cancel — the bridge interrupt stops the current running turn; try /cancel with no id)\n'
@@ -2835,7 +2839,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
     if (!s.client.chatStream) { out('(chat unavailable on this agent)\n'); continue; }
     messages.push({ role: 'user', content: line });
     // `model` is a per-framework selector some gateways require (openclaw
-    // does; the dsh/prime bridges ignore it). Send it when known, omit it
+    // does; 0g-harness and the prime bridge ignore it). Send it when known, omit it
     // otherwise — and only if the framework rejects that, ask once and retry.
     let retriedWithPick = false;
     for (;;) {
@@ -2875,7 +2879,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
       const onActivity = process.stdout.isTTY
         ? (label: string): void => {
             // "did work this turn" detector, across bridges' label dialects:
-            // dsh "tool/call bash", prime "tool_execution_start — bash" /
+            // 0g-harness "tool/call bash", prime "tool_execution_start — bash" /
             // "bash_command_start", hermes "tool/call web_search". Thinking
             // alone doesn't count — a think-only turn with no output is still
             // a failure worth reporting.
@@ -2980,7 +2984,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         continue; // retry the same user message once with the selector
       }
       // A turn that ran tools but produced no text is WORK, not failure —
-      // dsh agents legitimately end tool-only turns silently. Say what
+      // 0g-harness agents legitimately end tool-only turns silently. Say what
       // happened instead of crying wolf (the true-failure path — no deltas,
       // no activity — still reports as an error).
       // Displaced by another window (occupancy.go): WeChat semantics — this

@@ -89,7 +89,7 @@ export async function run(ctx: CommandContext): Promise<void> {
     return;
   }
 
-  // Before anything is signed: a dsh switch in others= for an agent that runs
+  // Before anything is signed: a 0g-harness switch in others= for an agent that runs
   // another framework does nothing there, or worse (cli/settings.ts).
   if (assignments.some((a) => a.key === 'others' && a.value !== undefined)) {
     assertOthersFitFramework(assignments, await frameworkOf(ctx.env.attestorUrl, sealId));

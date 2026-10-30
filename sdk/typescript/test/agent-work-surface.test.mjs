@@ -1,6 +1,6 @@
 /**
  * The agent's own work, as the SDK and the session see it: the inbox, the
- * live feed, the task list and the reminders (0g-harness, dsh). Each SDK test
+ * live feed, the task list and the reminders (0g-harness). Each SDK test
  * drives the real client against a mock agent; the session pieces (the
  * renderers, the inbox feed, the settings guard) are driven directly.
  *
@@ -12,7 +12,7 @@
  *      4xx;
  *   4. the session shows each inbox message once, acks it only once it is on
  *      screen, and catches up after a reset;
- *   5. dsh switches in others= are refused for an agent known to run another
+ *   5. 0g-harness switches in others= are refused for an agent known to run another
  *      framework.
  *
  * `stallMs` is injected so the feed's recovery runs in milliseconds.
@@ -34,7 +34,7 @@ import {
 } from '../dist/cli/commands/interactive.js';
 import { assertOthersFitFramework, parseAssignments } from '../dist/cli/settings.js';
 
-const DSH_ROUTES = [
+const HARNESS_ROUTES = [
   { prefix: '/v1/', kind: 'chat', auth: 'bearer', signed: false },
   { prefix: '/v1/responses', kind: 'responses', auth: 'bearer', signed: false },
   { prefix: '/v1/inbox', kind: 'inbox', auth: 'bearer', signed: false },
@@ -78,8 +78,8 @@ const afterOf = (url) => new URLSearchParams(url.split('?')[1] ?? '').get('after
 // ── 1. presence ─────────────────────────────────────────────────────────────
 
 test('declared kinds + a token → every method; a chat-only agent → none', () => {
-  const dsh = makeAgentClient({ base: 'http://x', services: [], routes: DSH_ROUTES, token: 't' });
-  for (const m of WORK_METHODS) assert.equal(typeof dsh[m], 'function', m);
+  const harness = makeAgentClient({ base: 'http://x', services: [], routes: HARNESS_ROUTES, token: 't' });
+  for (const m of WORK_METHODS) assert.equal(typeof harness[m], 'function', m);
 
   const openclaw = makeAgentClient({
     base: 'http://x', services: [], token: 't',
@@ -92,7 +92,7 @@ test('declared kinds + a token → every method; a chat-only agent → none', ()
 });
 
 test('without a way to authenticate, the declared kinds attach nothing', () => {
-  const pub = makeAgentClient({ base: 'http://x', services: [], routes: DSH_ROUTES });
+  const pub = makeAgentClient({ base: 'http://x', services: [], routes: HARNESS_ROUTES });
   for (const m of WORK_METHODS) assert.equal(pub[m], undefined, m);
 });
 
@@ -113,7 +113,7 @@ test('inbox, ack, tasks, task info, stop, stop all, schedules: the protocol requ
     return json(res, 404, { error: { message: `no route for ${req.method} ${path}` } });
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok' });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok' });
 
     const page = await c.inbox({ after: 0, limit: 5 });
     assert.equal(page.cursor, 9);
@@ -147,7 +147,7 @@ test('inbox, ack, tasks, task info, stop, stop all, schedules: the protocol requ
 test('stopTask("all") is refused without a request: it is stopAllTasks()', async () => {
   const agent = await mockAgent((req, body, res) => json(res, 200, {}));
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok' });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok' });
     await assert.rejects(c.stopTask('all'), /stopAllTasks/);
     assert.equal(agent.seen.length, 0);
   } finally {
@@ -181,7 +181,7 @@ test('events: type, seq and time on the event, the payload whole', async () => {
     res.write(evt(6, 'schedule.changed', { operation: 'create', id: 'schedule-1' }));
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 200 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 200 });
     const got = await take(c, 2, { after: 4 });
     assert.deepEqual(got, [
       { type: 'inbox.message', seq: 5, time: 1005, data: { seq: 5, time: 1005, id: 'resp_a', text: 'hi' } },
@@ -204,7 +204,7 @@ test('events: a closed stream reopens from the last event, and a replayed one is
     res.write(evt(2, 'turn.completed') + evt(3, 'inbox.message', { text: 'later' }));
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 200 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 200 });
     const got = await take(c, 3, { after: 0 });
     assert.deepEqual(got.map((e) => e.seq), [1, 2, 3]);
     assert.deepEqual(agent.seen.map((r) => afterOf(r.url)), ['0', '2']);
@@ -220,7 +220,7 @@ test('events: a stream gone silent (not even keepalives) is torn down and resume
     res.write(evt(2, 'turn.completed'));
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 150 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 150 });
     const t0 = Date.now();
     const got = await take(c, 2, { after: 0 });
     assert.deepEqual(got.map((e) => e.seq), [1, 2]);
@@ -238,7 +238,7 @@ test('events: keepalives keep a quiet stream open', async () => {
     setTimeout(() => res.write(evt(1, 'turn.started')), 600);
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 150 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 150 });
     const got = await take(c, 1, { after: 0 });
     assert.equal(got[0].seq, 1);
     assert.equal(agent.seen.length, 1, 'no reconnect during 600ms of keepalives at a 150ms stall threshold');
@@ -261,7 +261,7 @@ test('events: a reset after /clear moves the position back; the window-overflow 
     }
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 200 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 200 });
     const got = await take(c, 4, { after: 500 });
     assert.deepEqual(got.map((e) => [e.type, e.seq]), [['reset', 3], ['inbox.message', 4], ['reset', 10], ['turn.started', 11]]);
     assert.deepEqual(got[0].data, { seq: 3, time: 1003, cursor: 3, read_through: 0 });
@@ -273,7 +273,7 @@ test('events: a reset after /clear moves the position back; the window-overflow 
 test('events: a 4xx ends the feed with the answer; a 5xx is retried', async () => {
   const gone = await mockAgent((req, body, res) => json(res, 404, { error: { message: 'no route' } }));
   try {
-    const c = makeAgentClient({ base: gone.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 100 });
+    const c = makeAgentClient({ base: gone.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 100 });
     await assert.rejects(take(c, 1), /events: HTTP 404/);
     assert.equal(gone.seen.length, 1);
   } finally {
@@ -286,7 +286,7 @@ test('events: a 4xx ends the feed with the answer; a 5xx is retried', async () =
     res.write(evt(1, 'turn.started'));
   });
   try {
-    const c = makeAgentClient({ base: flaky.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 50 });
+    const c = makeAgentClient({ base: flaky.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 50 });
     const got = await take(c, 1);
     assert.equal(got[0].seq, 1);
     assert.equal(flaky.seen.length, 3);
@@ -301,7 +301,7 @@ test('events: aborting ends the feed quietly', async () => {
     every(20, () => res.write(': keepalive\n\n'));
   });
   try {
-    const c = makeAgentClient({ base: agent.base, services: [], routes: DSH_ROUTES, token: 'tok', stallMs: 200 });
+    const c = makeAgentClient({ base: agent.base, services: [], routes: HARNESS_ROUTES, token: 'tok', stallMs: 200 });
     const ac = new AbortController();
     setTimeout(() => ac.abort(), 100);
     const got = [];
@@ -552,15 +552,15 @@ test('/schedules lines: how often and when next', () => {
 
 // ── 5. the settings guard ───────────────────────────────────────────────────
 
-test('dsh switches in others= are refused for an agent known to run another framework', () => {
+test('0g-harness switches in others= are refused for an agent known to run another framework', () => {
   const a = (json) => parseAssignments([`others=${json}`]);
   assert.throws(() => assertOthersFitFramework(a('{"subagents": true}'), 'openclaw'), (e) =>
-    e.code === 'BAD_FLAG' && /"subagents" is a dsh switch; this agent runs openclaw/.test(e.message) && /whole others section/.test(e.message));
+    e.code === 'BAD_FLAG' && /"subagents" is a 0g-harness switch; this agent runs openclaw/.test(e.message) && /whole others section/.test(e.message));
   assert.throws(() => assertOthersFitFramework(a('{"toolJobs": true, "schedule": true}'), 'hermes'), (e) =>
-    /"toolJobs", "schedule" are dsh switches; this agent runs hermes, which does not read them$/.test(e.message));
+    /"toolJobs", "schedule" are 0g-harness switches; this agent runs hermes, which does not read them$/.test(e.message));
 
-  // fine: dsh itself, an unknown framework, another framework's own keys, a clear
-  assertOthersFitFramework(a('{"subagents": true}'), 'dsh');
+  // fine: 0g-harness itself, an unknown framework, another framework's own keys, a clear
+  assertOthersFitFramework(a('{"subagents": true}'), '0g-harness');
   assertOthersFitFramework(a('{"subagents": true}'), undefined);
   assertOthersFitFramework(a('{"subagents": true}'), null);
   assertOthersFitFramework(a('{"agents": {"defaults": {}}}'), 'openclaw');

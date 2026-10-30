@@ -314,7 +314,7 @@ await agent.task!(taskId);                        // poll {status, output_text}
 for await (const d of agent.followTask!(taskId)) process.stdout.write(d);  // re-attach: replay + live
 await agent.cancelTask!(taskId);                  // stop the turn
 
-// The agent's own work (dsh): turns it opens by itself (a background job
+// The agent's own work (0g-harness): turns it opens by itself (a background job
 // finished, a reminder came due) and what runs in the background. Each method
 // is present only when /hello declares its kind (inbox / events / tasks /
 // schedules) and this handle holds the owner key:
