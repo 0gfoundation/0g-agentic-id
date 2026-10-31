@@ -1,6 +1,6 @@
 //! Local gRPC channel to tapp-server. Shared between `tee.rs`
 //! (`GetAppSigner` for the stable attestor EOA) and `kms.rs`
-//! (`GetSecretResource` for the app-scoped KMS secret).
+//! (`GetSecretResource` for per-seal KMS derivations).
 //!
 //! Both RPCs are "LOCAL ACCESS ONLY" on tapp-server: the attestor must
 //! reach it over the mounted Unix socket. TCP does not serve private keys.

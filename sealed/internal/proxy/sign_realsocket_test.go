@@ -21,8 +21,8 @@ import (
 	"seal-verify/internal/state"
 )
 
-// The mjs regression (seal_tools_regression.mjs) drives the real plugin
-// against a FAKE socket. This is the other leg: the REAL sign handlers on a
+// The mjs regression (0g-harness test/regression/seal_tools_regression.mjs)
+// drives the real plugin against a FAKE socket. This is the other leg: the REAL sign handlers on a
 // REAL unix socket, driven by plain HTTP — the exact bytes the tool channel
 // produces. Guards the socket-side invariants the tools lean on:
 //   - a malformed value must 400, never sign 0 wei silently;

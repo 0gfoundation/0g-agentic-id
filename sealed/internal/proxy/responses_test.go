@@ -178,6 +178,10 @@ func TestSynthResponses_DisconnectAndResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An nginx in front (the preview gateway) buffers the stream otherwise.
+	if got := resp.Header.Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want \"no\"", got)
+	}
 
 	// Read until we've seen the created event + a couple of deltas, then drop.
 	id, lastSeq, gotText := "", 0, ""

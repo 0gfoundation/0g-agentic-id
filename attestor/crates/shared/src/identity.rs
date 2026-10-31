@@ -2,7 +2,7 @@
 //! business authorization and URLs remain on their own contracts.
 use crate::{tapp_grpc, Config};
 use alloy::{
-    primitives::{keccak256, Address, U256},
+    primitives::{keccak256, Address, B256, U256},
     sol,
 };
 use std::{future::Future, sync::Arc, time::Duration};
@@ -95,12 +95,9 @@ where
 async fn ready_snapshots<A, S>(
     attestor: A,
     sandbox: S,
-) -> anyhow::Result<(
-    Option<AttestorTlsDescriptor>,
-    Option<Arc<SandboxConnection>>,
-)>
+) -> anyhow::Result<(Option<AttestorInstance>, Option<Arc<SandboxConnection>>)>
 where
-    A: Future<Output = anyhow::Result<Option<AttestorTlsDescriptor>>>,
+    A: Future<Output = anyhow::Result<Option<AttestorInstance>>>,
     S: Future<Output = anyhow::Result<Option<Arc<SandboxConnection>>>>,
 {
     let (attestor, sandbox) = tokio::join!(attestor, sandbox);
@@ -241,6 +238,19 @@ pub struct SandboxServiceIdentity {
     pub expires_at: i64,
 }
 
+impl SandboxServiceIdentity {
+    /// The provider instance a container record is compared against.
+    pub fn instance(&self) -> crate::ProviderInstance {
+        crate::ProviderInstance {
+            chain_id: self.chain_id,
+            registry_address: self.registry_address,
+            app_id: self.app_id.clone(),
+            registered_at: self.registered_at,
+            signer: self.provider,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SandboxConnection {
     pub provider: Address,
@@ -256,29 +266,24 @@ pub struct SandboxDiscovery {
     cached: Mutex<Option<Arc<SandboxConnection>>>,
 }
 
-/// Public bootstrap data, delivered only through an authenticated sandbox create.
-/// Runtimes independently refresh through the supplied pinned Scan trust anchor.
-#[derive(Clone, Debug, serde::Serialize)]
-pub struct AttestorTlsDescriptor {
-    pub version: u8,
-    pub chain_id: u64,
-    pub registry_address: String,
+/// This attestor's own app instance, as AgenticID currently authorizes it.
+/// Checked at startup and before every sandbox create.
+#[derive(Clone, Debug)]
+pub struct AttestorInstance {
     pub app_id: String,
     pub registered_at: u64,
-    pub app_signer: String,
-    pub url: String,
-    pub scan_url: String,
-    pub scan_public_key: String,
-    pub tls_spki_sha256: Vec<String>,
-    pub checked_at: i64,
+    pub signer: Address,
     pub expires_at: i64,
 }
 
 pub struct AttestorDiscovery {
     cfg: Config,
     signer: Address,
-    cached: Mutex<Option<AttestorTlsDescriptor>>,
+    cached: Mutex<Option<AttestorInstance>>,
 }
+
+/// Names the throwaway CSR whose only use is its SPKI hash.
+const TLS_KEY_PROBE_DOMAIN: &str = "attestor-tls-pin.invalid";
 
 impl AttestorDiscovery {
     pub fn new(cfg: &Config, signer: Address) -> anyhow::Result<Arc<Self>> {
@@ -294,26 +299,103 @@ impl AttestorDiscovery {
         }))
     }
 
-    pub async fn snapshot(&self) -> anyhow::Result<AttestorTlsDescriptor> {
+    pub async fn snapshot(&self) -> anyhow::Result<AttestorInstance> {
         snapshot_with_deadline(SNAPSHOT_TIMEOUT, self.snapshot_inner()).await
     }
 
-    async fn snapshot_inner(&self) -> anyhow::Result<AttestorTlsDescriptor> {
+    async fn snapshot_inner(&self) -> anyhow::Result<AttestorInstance> {
         let mut cached = self.cached.lock().await;
-        if let Some(descriptor) = &*cached {
-            if descriptor.expires_at > chrono::Utc::now().timestamp() + 30 {
-                return Ok(descriptor.clone());
+        if let Some(instance) = &*cached {
+            if instance.expires_at > chrono::Utc::now().timestamp() + 30 {
+                return Ok(instance.clone());
             }
         }
-        let descriptor = attestor_descriptor(&self.cfg, self.signer).await?;
+        let instance = attestor_instance(&self.cfg, self.signer).await?;
         if let Some(previous) = &*cached {
             anyhow::ensure!(
-                descriptor.registered_at == previous.registered_at,
+                instance.registered_at == previous.registered_at,
                 "attestor registration changed; restart and recreate runtimes"
             );
         }
-        *cached = Some(descriptor.clone());
-        Ok(descriptor)
+        *cached = Some(instance.clone());
+        Ok(instance)
+    }
+
+    /// SHA-256 of this node's current app TLS SubjectPublicKeyInfo, the key
+    /// the attested HTTPS endpoint serves. Read from local tapp's public
+    /// `GetAppCsr`, so no private key material is fetched.
+    pub async fn tls_spki_sha256(&self) -> anyhow::Result<B256> {
+        use tapp_grpc::proto::{tapp_service_client::TappServiceClient, GetAppCsrRequest};
+        let app_id = tapp_grpc::require_app_id(&self.cfg)?;
+        let mut client = TappServiceClient::new(tapp_grpc::connect(&self.cfg).await?);
+        let response = client
+            .get_app_csr(GetAppCsrRequest {
+                app_id,
+                domain: TLS_KEY_PROBE_DOMAIN.into(),
+            })
+            .await?
+            .into_inner();
+        anyhow::ensure!(
+            response.success,
+            "tapp app TLS key lookup failed: {}",
+            response.message
+        );
+        let hex = response
+            .public_key_sha256
+            .strip_prefix("0x")
+            .unwrap_or(&response.public_key_sha256)
+            .to_ascii_lowercase();
+        crate::image_attestation::lower_hex32(&hex)
+            .ok_or_else(|| anyhow::anyhow!("tapp returned an invalid app TLS SPKI hash"))
+    }
+}
+
+/// Production relay source: the discovered provider's `/api/attestor-tls`
+/// over its pinned client, and this node's own app TLS key.
+pub struct DiscoveredTlsSource {
+    pub sandbox: Arc<SandboxDiscovery>,
+    pub attestor: Arc<AttestorDiscovery>,
+}
+
+#[async_trait::async_trait]
+impl crate::attestor_tls::StatementSource for DiscoveredTlsSource {
+    async fn provider(&self) -> anyhow::Result<Address> {
+        Ok(self.sandbox.snapshot().await?.provider)
+    }
+
+    async fn fetch(&self, provider: Address) -> anyhow::Result<Vec<u8>> {
+        let snapshot = self.sandbox.snapshot().await?;
+        anyhow::ensure!(
+            snapshot.provider == provider,
+            "sandbox provider changed during the statement fetch"
+        );
+        let mut response = snapshot
+            .http
+            .get(format!(
+                "{}/api/attestor-tls",
+                snapshot.base_url.trim_end_matches('/')
+            ))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status() == reqwest::StatusCode::OK,
+            "provider attestor-tls request failed: {}",
+            response.status()
+        );
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            body.extend_from_slice(&chunk);
+            anyhow::ensure!(
+                body.len() <= crate::attestor_tls::MAX_BODY_BYTES,
+                "provider attestor-tls response too large"
+            );
+        }
+        Ok(body)
+    }
+
+    async fn own_tls_spki(&self) -> anyhow::Result<B256> {
+        self.attestor.tls_spki_sha256().await
     }
 }
 
@@ -564,13 +646,10 @@ pub fn pinned_client(pins: Vec<String>) -> anyhow::Result<reqwest::Client> {
 }
 
 /// Production must migrate the business contract before using the stable key.
-async fn attestor_descriptor(
-    cfg: &Config,
-    signer: Address,
-) -> anyhow::Result<AttestorTlsDescriptor> {
+async fn attestor_instance(cfg: &Config, signer: Address) -> anyhow::Result<AttestorInstance> {
     let app_id = tapp_grpc::require_app_id(cfg)?;
     let identity = resolve(cfg, &app_id).await?;
-    let (resolved_signer, pins, expires_at) = validate_resolved(
+    let (resolved_signer, _pins, expires_at) = validate_resolved(
         cfg.chain_id,
         cfg.tapp_registry_addr,
         &app_id,
@@ -580,16 +659,6 @@ async fn attestor_descriptor(
     anyhow::ensure!(
         signer == resolved_signer,
         "attestor signer differs from its attested app_signer"
-    );
-    validate_https_locator(&cfg.attestor_public_url)?;
-    validate_https_locator(&identity.scan_url)?;
-    let scan_pin = identity
-        .scan_public_key
-        .strip_prefix("0x")
-        .unwrap_or(&identity.scan_public_key);
-    anyhow::ensure!(
-        scan_pin.len() == 64 && hex::decode(scan_pin).is_ok(),
-        "attestor identity has no pinned Scan trust anchor"
     );
     let provider = identity_provider(cfg.chain_rpc.parse()?, crate::nonce_submit::RPC_TIMEOUT)?;
     let auth = AttestorAuthorization::new(cfg.agentic_id_addr, &provider);
@@ -612,24 +681,10 @@ async fn attestor_descriptor(
         expires_at > chrono::Utc::now().timestamp() + 5,
         "attestor identity expired during authorization lookup"
     );
-    Ok(AttestorTlsDescriptor {
-        version: 1,
-        chain_id: cfg.chain_id,
-        registry_address: format!("{:#x}", cfg.tapp_registry_addr),
+    Ok(AttestorInstance {
         app_id,
         registered_at: identity.registered_at,
-        app_signer: format!("{:#x}", signer),
-        url: cfg.attestor_public_url.trim_end_matches('/').to_string(),
-        scan_url: identity.scan_url,
-        scan_public_key: scan_pin.to_ascii_lowercase(),
-        tls_spki_sha256: pins,
-        checked_at: identity
-            .nodes
-            .iter()
-            .filter(|node| !node.app_signer.is_empty())
-            .map(|node| node.checked_at)
-            .min()
-            .unwrap(),
+        signer,
         expires_at,
     })
 }
@@ -811,18 +866,10 @@ mod tests {
     #[tokio::test]
     async fn startup_snapshots_require_both_final_leases_to_exceed_the_margin() {
         let expires_at = chrono::Utc::now().timestamp() + 5;
-        let attestor = AttestorTlsDescriptor {
-            version: 1,
-            chain_id: 1,
-            registry_address: String::new(),
+        let attestor = AttestorInstance {
             app_id: "app".into(),
             registered_at: 1,
-            app_signer: String::new(),
-            url: String::new(),
-            scan_url: String::new(),
-            scan_public_key: String::new(),
-            tls_spki_sha256: vec![],
-            checked_at: expires_at - 60,
+            signer: Address::ZERO,
             expires_at,
         };
         let sandbox = Arc::new(SandboxConnection {

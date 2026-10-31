@@ -9,7 +9,7 @@ use attestor_shared::{
     crypto::RealCrypto,
     events_bus::PostgresEventBus,
     jobs::PostgresJobQueue,
-    kms::{derive_subkey, KmsClient, MockKmsClient, TappKmsClient, JOB_ENCRYPTION_KEY_INFO},
+    kms::{KmsClient, MockKmsClient, TappKmsClient},
     mocks::MockSandbox,
     repo::{self, PostgresDeploymentRepo, PostgresIdempotencyStore},
     sandbox::{AdminSigner, HttpSandbox},
@@ -38,17 +38,14 @@ async fn main() -> anyhow::Result<()> {
     let attestor_identity = identities.attestor;
     let discovery = identities.sandbox;
 
-    // KMS master (app-scoped 32B secret). All three binaries must resolve
-    // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value
+    // KMS for per-seal agentSeal derivation. All three binaries must resolve
+    // to the same KMS — MOCK_KMS=true requires MOCK_APP_SECRET (same value
     // in every binary; the process refuses to start without it), false
     // goes over local gRPC to tapp-server's GetSecretResource.
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
-    let job_key = derive_subkey(&app_key, JOB_ENCRYPTION_KEY_INFO);
 
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,
@@ -73,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
 
     let deployments = PostgresDeploymentRepo::new(pool.clone());
     let idempotency = PostgresIdempotencyStore::new(pool.clone());
-    let jobs = PostgresJobQueue::new(pool.clone(), crypto.clone(), job_key);
+    let jobs = PostgresJobQueue::new(pool.clone());
     let events = PostgresEventBus::connect(pool.clone()).await?;
 
     // Authenticated discovery is shared with the worker; lifecycle mutations
@@ -96,9 +93,20 @@ async fn main() -> anyhow::Result<()> {
             Some(d) => client.with_discovery(d.clone()),
             None => client,
         };
-        Arc::new(match &attestor_identity {
-            Some(identity) => client.with_attestor_identity(identity.clone()),
-            None => client,
+        // sealed pins this attestor through the provider-signed statement
+        // relayed at GET /attestor-tls.
+        Arc::new(match (&discovery, &attestor_identity) {
+            (Some(sandbox), Some(attestor)) => client.with_attestor_tls_relay(Arc::new(
+                attestor_shared::attestor_tls::AttestorTlsRelay::new(
+                    Arc::new(attestor_shared::identity::DiscoveredTlsSource {
+                        sandbox: sandbox.clone(),
+                        attestor: attestor.clone(),
+                    }),
+                    cfg.chain_id,
+                    cfg.tapp_registry_addr,
+                ),
+            )),
+            _ => client,
         })
     };
 

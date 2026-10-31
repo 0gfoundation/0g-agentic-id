@@ -1,14 +1,21 @@
 # AgenticID 信任模型
 
-attestor HTTP 请求（`/provision`、`/status`、`/settings/seed`）统一使用
-`internal/attestorhttp`。生产创建流程覆盖注入 `ATTESTOR_TLS_DESCRIPTOR`，只包含
-公开的 Scan URL/SPKI 信任锚，以及固定的 appId、chain、registry、注册 epoch、
-app signer 和现有业务 URL。runtime 独立向已 pin 的 Scan 刷新 app TLS pin；
-身份过期或不匹配时停止业务请求，不挂载 tapp socket。只有 mock 部署会明确注入
-`ATTESTOR_ALLOW_UNPINNED_DEV=true` 以绕过校验。
-每次请求及其响应正文共用已解析身份的绝对 lease 截止时间。身份过期会中断交换，
-包括复用的 TLS 连接或成功响应头之后才收到的正文；不会重发已被处理的请求。
-见 [应用身份迁移](../attestor/APP_IDENTITY.zh.md)。
+attestor HTTP 请求（`/provision`、`/status`、`/settings/seed`、provider registry）
+统一使用 `internal/attestorhttp`。它把 attestor 的 TLS key pin 到一份由签发本容器
+证书的 sandbox provider 签名的声明上。sealed 不做 CA 校验地拉取
+`GET {ATTESTOR_URL}/attestor-tls?provider=<provider>`，只有同时满足以下条件才接受：
+EIP-712 签名（domain `0G Sandbox AttestorTLS`，version `3`）恢复出的正是 Phase 0
+从证书恢复出的 provider；chain 与 TappRegistry 等于证书里的；lease 有效（最长
+300 秒，且不早于已持有的那份）；送达这份声明的那条连接的 key 在它的 SPKI pin 里。
+此后其余所有 attestor 请求都要求 leaf key 在这些 pin 之中。剩余有效期不超过 5 秒时
+刷新声明；attestor 出示了声明里没有的 key 时也会刷新，但至多每 30 秒一次。声明不带
+attestor 的 app id、signer 或 URL：这些 pin 属于哪个 attestor，由 provider 依据它
+自己的 tapp 身份配置负责解析。sealed 不挂载 tapp socket。
+`ATTESTOR_ALLOW_UNPINNED_DEV=true` 是本地开发用的绕过开关；provider 会从它签发证书的
+每个 sealed 容器（也就是 attestor 创建的每个容器）的 env 里删掉它，连同调用方传入的所有
+`SANDBOX_*` 键。每次请求及其响应正文共用这份声明的绝对 lease 截止时间。
+过期会中断交换，包括复用的 TLS 连接或成功响应头之后才收到的正文；不会重发已被处理的
+请求。见 [应用身份迁移](../attestor/APP_IDENTITY.zh.md)。
 
 一个 agent 的身份如何在密码学上锚定到一段经过远程认证的代码上，每条
 `serve-proof` 实际证明了什么、又刻意不证明什么，以及声誉系统如何补
@@ -70,9 +77,9 @@ bug —— 这是 agent 的质量问题，由声誉系统来表达。
 | host 读不到容器内存 | TDX 硬件内存加密 + attestation |
 | 磁盘持久化是加密的 | `agent_seal_priv` 从不以明文写盘；只 provision 到内存 |
 | openclaw 子进程拿不到 | spawn.go 用显式 whitelist（`PATH`、`HOME`（agent 自己的家目录 `/home/agent`）、`OPENCLAW_STATE_DIR` 和 `OPENCLAW_HOME`（框架目录树的绝对路径及其上级目录，非机密）、provider 的 `*_API_KEY`、`AGENT_PUBLIC_URL`、`SEAL_SIGN_SOCK`、`AGENT_SEAL`）构造子进程 env，不继承 bootstrap 的 env——密钥材料永不穿越子进程边界 |
-| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,dsh,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
+| 存储上传不让它离开进程 | `dataplane.Upload` 在 sealed 进程内通过 0g-storage-client Go SDK 上传（`internal/dataplane/upload.go`），SDK 的交易签名器直接由 sealed 已持有的密钥构造，所以密钥从不交给任何子进程 —— 不进参数列表（`/proc/<pid>/cmdline` 对所有本地用户可读，降权后的 agent 也不例外），不进环境变量，不经文件描述符，也不落文件。blob 从内存直接交给 SDK（不写临时文件）。本次上传一旦结束（比如在 90s 截止时被放弃），SDK 就不能再用这把密钥签名或发送交易：签名器拒绝签名，fullnode 客户端也拒绝发送，provider 的每次重试都一样；只有截止那一刻已经在线路上的发送仍可能到达节点，这和 CLI 在截止时被杀掉的情形相同。代价是体积和故障隔离。SDK 往这个进程里多链接了约 360 个非标准库包（大部分是 go-ethereum 的 node 栈；细节见 `QUIRKS.md`），并经由它们带进了标准库的 `net/http/pprof` 和 `expvar`（见下一行）；`TestLinkedPackages_Reviewed` 同时钉住这些非标准库包和它们直接导入的标准库包。上传现在也和 sealed 共用一个进程：SDK 自己起的 goroutine 里一旦 panic，或上传期间内存耗尽，结束的是 sealed（PID 1），连同容器和 agent 一起，而以前只会结束一次 CLI 运行（`runBounded` 只 recover 调用 SDK 的那个 goroutine；见 `QUIRKS.md`）。钉住的 SDK 版本还会在 2 MiB 以上 blob 的提交每次被回滚、或回执查询失败后，留下一个永久阻塞的 goroutine，以前 CLI 运行结束退出时会把它一并带走；`Upload` 给它们能累积的数量设了上限（见 `QUIRKS.md`）。下载仍经 `privsep.RootCommand`（只在仅 root 可写的 `PATH` 目录中解析）运行 0g-storage-client CLI，下载不涉及密钥；构建它的那些镜像（`Dockerfile`、`images/{hermes,prime,harness,sealed}`）把它装到 `/usr/local/bin`，基础镜像 `images/openclaw` 不带。由 `internal/dataplane` 的测试钉住：`Upload` 不起任何子进程（一道源码检查：上传路径上不出现任何启动进程的 API，`internal/privsep` 的命令构造函数也算在内；再加 root 侧的结构测试不给 `Upload` 列任何可运行的二进制）、源码里出现启动进程 API 的依赖是一份审查过的固定清单、SDK 接线与 CLI 一致、签名和发送随上传结束而停止 |
 | 没有 HTTP endpoint 暴露它 | sealed 的 mux 只提供派生的签名和公开地址，从不返回 priv 字节。profile 和进程变量也不对外提供：被链接进来的库（`net/http/pprof`、`expvar`）在 init 时注册到 `http.DefaultServeMux` 上的 `/debug/pprof/*` 和 `/debug/vars` 路由，sealed 启动时通过替换这个 mux 一并丢掉（`defaultmux.go`） |
-| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到由已认证的稳定 sandbox app signer 签发、并绑定 chain、registry、appId 和注册 epoch 的 v2 envelope 携带的那个 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:227-243`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
+| provisioning 链路不会泄漏它 | attestor 用 ECIES 把 `agent_seal_priv` 加密到临时 `container_pubkey`；只有持有配对 `container_privkey` 的一方能解开。这对 keypair **不是**在本容器内生成的 —— 是 0g-Sandbox 封装层生成、把私钥那一半作为 `SANDBOX_SEAL_KEY` 注入进来，Phase 0 只做一件事：把它跟 `attestation.pubkey` 互证（`internal/config/config.go`）。因此 sandbox 封装层在这一跳里属于 TCB；这一跳之所以还站得住，靠的是 attestor 只会加密到 v3 证书携带的那个 pubkey —— 证书须由它信任的 sandbox provider 的 key 签发、并绑定该 provider 的 chain、TappRegistry、appId 和注册 epoch —— 或加密到它从这样一张证书记录下来的 pubkey。provision 成功后 sealed 会把密钥字节清零、并 unset 掉环境变量，但代码里记着一条 `/proc/<pid>/environ` 注意事项（`config.go:265-282`）。完整流程 + 各道闸门见下文 [信任链](#信任链agent_seal_priv-如何到达-tee) |
 
 任何对 sealed 的未来变更，只要可能跨越这条边界 —— 即使是间接的
 （例如把 priv 字节写日志、通过 debug endpoint 暴露、把它放进与
@@ -195,14 +202,12 @@ TappRegistry 反推出来。
 两条不能互相替代：缺 KMS 的 ack，派生逻辑没人审；缺 Attestor 的
 ack，等于把派生 key 下发给一段没人审过的代码。
 
-Attestor 实际从 KMS 拿到的是：
-
-- **一把 app-scoped key**（派生 material 为空），启动时取一次，
-  只用于 job 队列落盘加密和 provision 绑定的 MAC（Layer 3）。
-  它**不是**任何 agent key 的种子。
-- **一把把独立的 `agent_seal_priv`**，per seal 按需派生（Layer 2）。
-  派生在 KMS 集群内部完成且单向：拿到一把派生 key 推不出任何兄弟
-  key，Attestor 内存里也从不存在全局密钥。
+Attestor 实际从 KMS 拿到的是**一把把独立的 `agent_seal_priv`**，
+per seal 按需派生（Layer 2）。派生在 KMS 集群内部完成且单向：拿到一把
+派生 key 推不出任何兄弟 key，Attestor 内存里也从不存在全局密钥。
+provision 记录（Layer 3）和 job 队列都不带任何以 KMS key 计算的 MAC 或加密：
+Attestor 的 Postgres 落在 tapp FDE 卷上，job 行只在 job 处于 pending 时持有
+payload。
 
 三个值得明说的后果：
 
@@ -241,7 +246,7 @@ Attestor 实际从 KMS 拿到的是：
 `agent_seal_priv`，并重新 provision。链上绑定不必改，因为绑定
 背后的密码学身份没变。
 
-### Layer 3 —— Sandbox 签名的 image attestation → `/provision`
+### Layer 3 —— provider 签发的容器证书 → `/provision`
 
 从 Attestor 到 Sealed 容器的实际移交，走的是 **0g-Sandbox** ——
 它本身是一个 Tapp app，自己有 TappRegistry 注册的 node signer
@@ -249,39 +254,47 @@ key。
 
 Sealed 容器启动时：
 
-1. 0g-Sandbox 封装层为这个容器生成一对临时 secp256k1 keypair
+1. 0g-Sandbox provider 为这个容器生成一对临时 secp256k1 keypair
    （`container_pubkey`、`container_privkey`），并把私钥那一半作为
    `SANDBOX_SEAL_KEY` 环境变量注入。容器**不**生成它：Phase 0 只检查
-   注入进来的这把 key 派生出的压缩 `pubkey` 跟签名 attestation envelope
-   里的那个一致，不一致就 fail loud（`internal/config/config.go`）。
-   容器也不会自己独立得到那个 pubkey —— 它转发的就是 envelope 里带的那个
-   （`internal/provision/provision.go`）。
-2. 0g-Sandbox 用稳定 app/provider key 签发 version2 envelope，独立于
-   每次启动的 node key 和每容器 key。摘要是以下九个固定 ABI word 顺序拼接后
-   的原始 `keccak256`：`0g.sandbox.ImageAttestation.v2` 的哈希、`chain_id`、
-   registry 地址、`keccak256(原样 UTF-8 app_id)`、`registered_at`、sealId、
-   `keccak256(压缩 container pubkey)`、image hash、timestamp。整数用 uint256
-   大端 word 编码，取值范围为 uint64；地址左补12个零字节。不接受 EIP-191 前缀
-   或旧字符串摘要。
-3. 容器校验版本、scope 格式、密钥对与签名，将五个 issuer 字段原样转发，连同
-   原有 `seal_id`、`container_pubkey`、`image_hash`、`issued_at`、
-   `sandbox_signature` POST 到 `/provision`。缺失、v1、未知版本均在请求前拒绝，
-   永不回退 node key。共享固定向量位于
-   `internal/provision/testdata/attestation-v2.json`。
+   注入进来的这把 key 派生出的压缩 `pubkey` 跟签名证书里的那个一致，
+   不一致就 fail loud（`internal/config/config.go`）。
+2. provider 用它的 provider key（KMS 托管）签发 version 3 证书
+   `SANDBOX_SEAL_ATTESTATION`，独立于每次启动的 node key 和每容器 key。
+   证书是 EIP-712：domain 为
+   `EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)`，
+   name `0G Sandbox ImageAttestation`、version `3`、chain id 和 TappRegistry
+   地址；消息为
+   `ImageAttestation(string appId,uint64 registeredAt,bytes32 sealId,bytes containerPubkey,bytes32 imageHash,uint64 issuedAt)`。
+   provider 对 `0x1901` 摘要直接签名，不加 EIP-191 前缀。
+   `SANDBOX_SEAL_KEY`、`SANDBOX_SEAL_ATTESTATION` 和 `SANDBOX_PROXY_DOMAIN`
+   由 provider 自己写入；写入前先从调用方请求的 env 里删掉所有 `SANDBOX_*`
+   键（以及 `ATTESTOR_ALLOW_UNPINNED_DEV`）。
+3. 容器校验版本、字段格式和密钥对，并恢复出签名者。它不 pin 任何签名者：
+   签名者是不是 attestor 信任的 provider，由 attestor 决定。version 1 和 2
+   的证书在发出任何请求前就被拒绝。`GET /provision?seal_id=…` 告诉容器
+   attestor 是否已为该部署记录了容器 key（`certificate_required`）；只有
+   尚未记录时，`POST` 才携带证书，且原样转发。每次 `POST` 都携带用容器 key
+   签名的 boot claim（`ProvisionBoot.v1`，见
+   [CONFIG_SURFACE.zh.md §9](CONFIG_SURFACE.zh.md#9-一份文档起不来时)）。
+   共享固定向量（与 provider、attestor 中的副本逐字节一致）位于
+   `internal/provision/testdata/image-attestation-v3.json`；请求 fixture 为
+   `internal/inference/testdata/boot-v1-first.json`（首次 provision）和
+   `boot-v1.json`（后续启动）。
 
 Attestor 的校验有三道独立闸门：
 
 | 闸门 | 谓词 | 真源 |
 |---|---|---|
-| **Sandbox 身份** | v2 签名 scope 等于已认证的 sandbox app 实例；恢复的 signer 等于其稳定 provider signer | Scan typed identities/attestation、live TappRegistry epoch、SandboxServing provider 绑定及未过期的 discovery lease |
-| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true` | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
-| **新鲜度 OR 绑定** | `\|now − issued_at\| ≤ 300s`，或匹配此前成功的 v2 绑定 | 本地 DB + app-scoped HMAC：消息 `signing_digest32 ‖ authenticated_app_signer20`，domain `agentic-id.container-pubkey-binding.v2` |
+| **Sandbox 身份** | 首次 provision：证书的 scope（chain、TappRegistry、appId、`registered_at`）及其恢复出的签名者，等于 attestor 发现并信任的 provider 实例。后续启动：首次 provision 时记录的 provider 实例仍等于它 | attestor 的 provider discovery（TappRegistry、SandboxServing）|
+| **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
+| **新鲜度 OR 记录** | 首次 provision：`ticket_issued_at − 300 ≤ ts ≤ now + 300`。后续启动：boot claim 恢复出的地址等于记录的 `container_pubkey` 的地址 | 部署的容器记录（`container_pubkey`、image hash 和 provider 实例），与首次 provision 的 binding 在同一事务中写入 |
 
-**第一道闸门**认证 app signer 与完整 app 实例 scope，当前或历史 node list
-成员身份都不能替代它。用户 ack 仍是对上游 sandbox app 的批准。因此每次启动的
-node 轮换可保留原 v2 envelope 与容器 key；新的注册 epoch 则不能沿用旧绑定，
-即使 appId 和 app key 未变也一样。v1 envelope 与 v1 MAC 不会隐式迁移：应重建
-容器以取得 v2，而不是绕过 issuer 认证。
+**第一道闸门**认证 provider 签名者与完整 app 实例 scope，当前或历史 node list
+成员身份都不能替代它。用户 ack 仍是对上游 sandbox app 的批准。每次启动的
+node 轮换保留同一张证书和同一把容器 key；新的注册 epoch 或新的 provider key
+会让旧实例下签发的容器的每次后续启动都失败（`provider instance no longer
+trusted; reset required`）。旧版本证书不做迁移：所有 agent 都在 v3 下重建。
 
 **第二道闸门** —— `validFrameworkHashes` 白名单 —— 思想上跟 Tapp
 那套"代码身份上链、用户审过再用"一致：sealed runtime image hash
@@ -312,11 +325,12 @@ unset 掉环境变量（`config.ScrubProvisioningSecrets`）。
 sandbox `app_id`。owner 的 settings document 走的是同一条下发路径、加密
 到同一个 pubkey，因此原封不动地继承这一跳的全部假设。
 
-Attestor 侧保存的绑定让重启可以跳过 5 分钟新鲜度窗口：同一个
-0g-Sandbox spawn 出的容器重启、提交相同的 `container_pubkey` 时，
-Attestor 仅凭绑定就接受。HMAC 防止只有 DB 写权限（但没有
-app-scoped key）的攻击者伪造合法绑定 —— 没有 Attestor 的
-app-scoped KMS key 就无法伪造 (`container_pubkey`, `mac`) 这一对。
+容器记录让重启可以跳过 5 分钟新鲜度窗口：后续启动不发送证书，用 boot claim
+证明持有记录的那把 key，attestor 则加密到记录的 `container_pubkey`。每当为新
+容器签发新 ticket（create、recreate）、reset，以及清除容器 binding 时，整份记录
+一起清空，所以新容器总会出示一张新证书；对已有记录出示另一把 key 会被拒绝
+（`container key differs from record; reset required`）。记录不带 MAC；attestor
+信任自己的数据库保存它，就像信任部署行的其余字段一样。
 
 ---
 
@@ -596,7 +610,7 @@ payload。socket **没有裸 hash 签名，也没有 EIP-191 version `0x00`
 | **agent 钢印** | socket *能*签的东西上 Group B 失效：`chain.Update`（经 `/sign/transaction` 发 `update` tx）以及 agent 发出的任何 personal_sign / EIP-712 声明。serve-proof 的 Group B 仍机械成立，Group A 在所有渠道上仍成立 |
 
 `report.Status` 和 settings seed 不在这张表里。sealed 在进程内对
-`StatusReport:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
+`StatusReport.v2:…` / `SettingsSeed:…` 做裸 keccak256 后签名，而 socket
 永不签裸 hash，所以 agent 没法通过它伪造这两者。本表旧版把
 `report.Status` 列为可经 socket 伪造，这是错的。
 
@@ -646,7 +660,7 @@ framework 自动签名以外，agent 自己也会通过 unix socket
 - 作为 agentSeal 签 EIP-712 结构化数据（Permit、Seaport 等）
 - 作为 agentSeal 发链上交易
 
-在 DSH 组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
+在 0g-harness 的组合里，`seal-guard.mjs` 通过拒绝同时点名 socket 拼法和
 `/sign/` 路径的 tool 调用，把模型引向原生工具
 （`seal_sign`、`seal_sign_typed_data`、`seal_sign_transaction` ——
 每个端点一个工具，每次调用都是一条结构化的 session log 记录）。
@@ -668,7 +682,7 @@ EIP-712 digest、或 socket 从字段组装的交易上。sealed 自己在进程
 keccak256 digest，serve-proof 是 `0x00`。`chain.Update` 不在其外：它是
 普通交易，跟 `/sign/transaction` 产出的形状相同，签名域分不开这两者——
 所以这条渠道靠的是钢印（见上面的承重墙表）。
-把 socket 桥接成 agent 工具的 adapter（例如 dsh 的 `seal_sign`）
+把 socket 桥接成 agent 工具的 adapter（例如 0g-harness 的 `seal_sign`）
 不得补上这两条缺失的路径。
 
 unix socket 以 0600 绑定、属主是框架子进程所运行的低权 `agent` 用户
@@ -700,7 +714,7 @@ agent 进程是 sealed 此后以 root 身份所做一切的不可信输入，所
   `/home` 都不能是链接）：它是 agent 运行的一切进程的 `HOME`，也是
   `AgentCommand` 的默认工作目录，所以工具缓存与配置（`~/.npm`、`~/.cache`、
   `~/.config`、`~/.local`、`~/.gitconfig` 等）以及 agent 自己的文件都在那里。
-  （prime 和 dsh 的 bridge 有意从各自的框架目录树启动，所以它们运行的工具
+  （prime 的 bridge 和 0g-harness 有意从各自的框架目录树启动，所以它们运行的工具
   的相对路径落在那棵树里。）两个家目录都就位之前 `Required` 一律拒绝
   provision。在 `/root` 里 agent 只拥有它的框架目录树（`OwnTree`；prime 另有
   `/root/.prime-conversation` 和每会话 harness 目录 `/root/.prime-session`），

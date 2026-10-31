@@ -17,7 +17,7 @@ External components it integrates with:
 | attestor | After the sandbox comes up, it initiates RA against attestor to receive `agent_seal_priv`. See [`attestor/`](../attestor/README.md) for details |
 | AgenticID contract | Reads `intelligentDatasOf` / `sealedKeysOf`, signs `update` txs that push evolution on chain |
 | 0G storage | The actual carrier for each iData's encrypted plaintext; sealed downloads via the `0g-storage-client` CLI and uploads in-process via the same client's Go SDK (`internal/dataplane/upload.go`), so the signing key never leaves sealed |
-| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, dsh (`main.go:115-118`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
+| the agent framework | Four adapters are compiled in and self-register at startup — openclaw, hermes, prime-agent, 0g-harness (`main.go:118-121`); the on-chain binding's `name` selects one, `AGENT_FRAMEWORK` is only the no-binding fallback. openclaw is the reference implementation: an npm package sealed installs and spawns as a subprocess on `127.0.0.1:3284`. The adapter interface is framework-agnostic (see `FRAMEWORK_ADAPTER.md`); another framework, claude-code, was prototyped to validate the seam and retired — its port report survives as §12 there |
 
 This document describes **the form actually running in current code** and **why it's organized that way**.
 
@@ -26,13 +26,13 @@ This document describes **the form actually running in current code** and **why 
 `main.go`'s 5 phases run strictly in order. A failing phase does **not** take
 the container down: `runMainPipeline` logs it, reports it to attestor and
 returns, so `:8080` keeps serving `/healthz` and `/log` for diagnosis
-(`main.go:209-211`). Both listeners — the public `:8080` mux and the
+(`main.go:181-193`). Both listeners — the public `:8080` mux and the
 `/run/seal-sign.sock` unix socket — are already up *before* Phase 1; their
 handlers answer 503 until `agent_seal_priv` reaches `state.Agent`
-(`main.go:156-158`).
+(`main.go:166-168`).
 
 Between Phase 0 and Phase 1 sits a gate, `provisionGate`
-(`main.go:186-207`). It skips the pipeline when `ATTESTOR_URL` or the chain
+(`main.go:196-217`). It skips the pipeline when `ATTESTOR_URL` or the chain
 env is unset (local dev), and **refuses** it when `privsep.Required` fails —
 sealed is not root, the image has no `agent` account with its own non-root
 uid and gid, `/root` could not be made `root:root 0711` without a POSIX
@@ -52,8 +52,8 @@ fix). Nothing reaches attestor, because `/status` is signed with the very key
 this boot declined to fetch; instead attestor's provision-timeout sweep
 catches it once `/provision` has not arrived within `PROVISION_TIMEOUT`
 (5 min) of sandbox create or recreate
-(`attestor/crates/worker/src/jobs.rs:21`,
-`attestor/crates/worker/src/main.rs:166-189`). The sweep flips
+(`attestor/crates/worker/src/jobs.rs:22`,
+`attestor/crates/worker/src/main.rs:228-254`). The sweep flips
 `container_stage` to `Failed` (reason `provision timeout`), so the deployment
 shows as `offline`, not `failed`: `failed` means the deploy itself never
 completed (a storage or mint failure), while a container failure on a
@@ -64,8 +64,10 @@ image (the fix the `FAIL` line names), then a fresh create on it — bring
 online (`/start` with a `create` envelope) or `/reset`.
 
 ```
-Phase 0  attest           parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pubkey,
-                          recover TEE signer (TEE_SIGNER_ADDRESS check if set)
+Phase 0  attest           parse env, verify the v3 container certificate
+                          (SANDBOX_SEAL_ATTESTATION): SANDBOX_SEAL_KEY ↔ its pubkey,
+                          recover the provider signer — the key whose attestor TLS
+                          statement pins every attestor request (internal/attestorhttp)
                           ↓
 gate     privsep          privsep.Required: framework will run as the `agent` user,
                           /root is root-only (SecureHome) and holds nothing
@@ -75,9 +77,14 @@ gate     privsep          privsep.Required: framework will run as the `agent` us
                           (cause + fix) and stop — no key, no /status;
                           attestor's provision-timeout sweep marks it `offline`
                           ↓
-Phase 1  provision        POST /provision → ECIES-decrypt, with the one container key,
-                          both payloads the response carries:
+Phase 1  provision        GET /provision (generation, certificate_required) →
+                          POST /provision: the boot claim signed with the container key,
+                          plus the certificate only when required; retried with backoff
+                          (1 s doubling to 30 s) until 10 min after PID-1 start →
+                          ECIES-decrypt, with the one container key, the payloads the
+                          response carries:
                             · agent_seal_priv                (fatal if absent)
+                            · this boot's status receipt     (fatal if absent)
                             · the owner's settings document  (opaque blob; absent for an
                               unconfigured agent, and a decrypt failure is logged and
                               dropped rather than fatal)
@@ -116,17 +123,28 @@ is the pre-Start snapshot. The phase-2 seed is the baseline taken
 after the framework has stabilized, and that baseline is the actual
 reference point for watcher comparisons (see §4).
 
+Phase 1 treats the attestor's answers by class (`internal/provision`): 400 and
+401 end it; 403 re-reads the authorization once and claims again only under a
+newer generation, else ends it; 409 (the sandbox id is not persisted yet, or
+`certificate_required`) re-reads the authorization and retries; 429, 5xx,
+transport errors and attestor TLS statement failures retry. Every `POST` keeps
+the boot's one `boot_id` and is signed afresh with a later `boot_started_at`.
+Nothing secret reaches `/log`: no ticket, key, signature or raw env value, and
+an attestor error body appears as at most its first 256 bytes on one line.
+
 The Phase 4 `running` / `warning` report also carries this boot's receipt and
 the digest of its applied document. Attestor promotes to last-known-good only
 when the receipt is still active, the digest matches, and the served version
 is still current. Old containers cannot overwrite a new container's status,
 and fallback boots cannot confirm a newer version. Repeated unconfirmed boots
 still trigger `/provision`'s fallback counter. Only an authorized new boot may
-obtain a receipt; replayed/older generations or tickets are refused. Receipts
-are ECIES-encrypted to the container; status, liveness and version promotion
-share one database transaction (`routes/status.rs`, `repo.rs::apply_status_report`).
-New sealed requires the new attestor: upgrade attestor before enabling all sealed
-images from this release. Legacy heartbeats never promote settings.
+obtain a receipt; replayed/older generations or tickets are refused. A receipt
+is a random token, ECIES-encrypted to the container; status, liveness and
+version promotion share one database transaction (`routes/status.rs`,
+`repo.rs::apply_status_report`). A report without a receipt is refused, and
+sealed never sends one. This sealed requires the matching provider and
+attestor (v3 certificate, attestor TLS statement, the `/provision` shape
+above); every agent is recreated onto it.
 
 ### Why the settings document comes down `/provision`
 
@@ -136,7 +154,7 @@ of an owner-signed sandbox envelope is supplied at container **create** only —
 configuration at all. `/provision` runs on every boot, resume included, and it
 was already carrying a secret encrypted to the container pubkey, so the
 document rides the channel that exists rather than a new one
-(`internal/provision/provision.go:35-47`,
+(`internal/provision/provision.go:74-83`,
 `attestor/crates/api/src/routes/provision.rs:12-16`).
 
 attestor stores and serves it as opaque bytes — it never parses, validates or
@@ -186,14 +204,18 @@ sealed/
 │   ├── chain/                    AgenticID contract view + tx wrappers
 │   ├── dataplane/                ECIES-decrypt sealedKey + AES-GCM decrypt/encrypt iData +
 │   │                             0g-storage Download (CLI) / Upload (in-process Go SDK)
-│   ├── provision/                /provision RA request + response envelope unpacking
+│   ├── attestorhttp/             attestor HTTP client, TLS-pinned by the provider-signed statement
+│   ├── eip712/                   EIP-712 domain, digest and signer recovery for the v3 certificate
+│   │                             and the attestor TLS statement
+│   ├── provision/                v3 container certificate; /provision boot claim, retries and
+│   │                             response unpacking
 │   ├── report/                   /status reporting to attestor
 │   ├── logger/                   structured logging (the shared writer logger.Logf, exposed by proxy as /log.html)
 │   ├── framework/                framework adapter abstraction + optional capability interfaces
 │   │   ├── openclaw/             openclaw adapter (node; the reference implementation)
 │   │   ├── hermes/               hermes adapter (python/uv)
 │   │   ├── prime/                prime-agent adapter (node + python; ships its own go:embed'ed HTTP bridge)
-│   │   ├── dsh/                  dsh adapter (node; ships its own go:embed'ed HTTP bridge)
+│   │   ├── harness/              0g-harness adapter (node; runs the 0g-harness its image installs)
 │   │   └── conformance/          executable invariant suite every adapter runs in its tests
 │   ├── settings/                 the owner's configuration document: Doc (what the owner chose,
 │   │                             the only thing persisted) + Resolved (Doc plus what the platform
@@ -216,13 +238,13 @@ sealed/
 ├── images/sealed/                universal node image (npm installs are warm cache only); builds no image that ships — openclaw's is Dockerfile above
 ├── images/hermes/                sealed sandbox image, python/uv flavour (hermes)
 ├── images/prime/                 sealed sandbox image, node+python flavour (prime-agent)
-└── images/dsh/                   sealed sandbox image, dsh flavour
+└── images/harness/               sealed sandbox image, 0g-harness flavour
 ```
 
 ### One-line per-package summary
 
 - **chain**: all AgenticID chain views / txs funnel through here; outside code never gets an `*ethclient.Client`, only a semantic API (`WaitForMint` / `IntelligentDatasOf` / `Update` etc.). The one transaction sent elsewhere is the 0G storage flow submission, which `dataplane.Upload` sends through the storage SDK
-- **dataplane**: iData crypto plus the 0g-storage transfers; no AgenticID calls. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`; `Download` runs `0g-storage-client download` through `privsep.RootCommand` (resolved only in root-only `PATH` directories; installed at `/usr/local/bin` by `Dockerfile` and `images/{hermes,prime,dsh,sealed}`, at the SDK version pinned in `go.mod`), into a root-only scratch directory; `Upload` runs in-process through the same client's Go SDK and submits the 0G storage flow transaction itself (the SDK talks to `CHAIN_RPC_URL`), signed with the agent_seal key sealed holds — no child process, no temp file — with a 90s cap per blob. Sharing sealed's process, an upload is not isolated: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (`QUIRKS.md`)
+- **dataplane**: iData crypto plus the 0g-storage transfers; no AgenticID calls. `UnsealDataKey(sealed, priv) → dataKey`, `Decrypt(ct, key)`, `Encrypt(pt, key)`; `Download` runs `0g-storage-client download` through `privsep.RootCommand` (resolved only in root-only `PATH` directories; installed at `/usr/local/bin` by `Dockerfile` and `images/{hermes,prime,harness,sealed}`, at the SDK version pinned in `go.mod`), into a root-only scratch directory; `Upload` runs in-process through the same client's Go SDK and submits the 0G storage flow transaction itself (the SDK talks to `CHAIN_RPC_URL`), signed with the agent_seal key sealed holds — no child process, no temp file — with a 90s cap per blob. Sharing sealed's process, an upload is not isolated: a panic in a goroutine the SDK starts, or memory exhausted during an upload, ends sealed (`QUIRKS.md`)
 - **framework**: defines the `Framework` interface (adapter protocol) + `RuntimeContext` + `RoleSpec{Name, Shape}` + shared types like `StartParams`, `StartResult`. **Does not depend on any specific framework**
 - **settings**: `Doc` (provider / model / thinking / an opaque per-framework overlay) is the owner's document and the only persisted half; `Resolved` adds what the platform computes at Start — endpoint, output budget, whether the model takes a reasoning bound — and is persisted nowhere, because a stored copy goes stale and then fights the computed value (`settings.go:10-15`)
 - **framework/openclaw**: the reference adapter implementation. Internally split into `restore.go` / `restore_paths.go`, `evolution.go` / `evolution_paths.go`, `spawn.go`, `ingest.go` (persona legacy), `inference.go` (`RenderSettings`: the owner's document → openclaw.json), `disk.go` (openclaw.json read/write), `whitelist.go` (npm version allowlist), `identitymd.go` / `soulmd.go` / `toolsmd.go` (the IDENTITY/SOUL/TOOLS three sealed-managed platform sections + shared marker utilities)
@@ -302,8 +324,8 @@ The next bootstrap pulls the filled-ptr form from chain. **You must** call `mani
 else on the interface moves chain-anchored state; `RenderSettings` takes
 `settings.Resolved` — the owner's document plus what the platform computed for
 this boot — and places it where that particular framework reads it: a config
-file for openclaw and hermes, the bridge process's environment for prime and
-dsh. (prime additionally renders a `models.json` — an artifact, not a role:
+file for openclaw and hermes, the bridge process's environment for prime, and
+the harness process's environment for 0g-harness. (prime additionally renders a `models.json` — an artifact, not a role:
 the SDK it uses has no built-in for the 0G router, and no env var redirects a
 built-in provider at another endpoint, `prime/modelsjson.go:47-55`.) It is the
 one piece of the configuration channel that cannot be shared,
@@ -510,22 +532,22 @@ the reason in §5 ("What is iData, and what is a deployment parameter"):
 | openclaw (`openclaw.go:164`) | `framework`, `workspace/`, `workspace/skills/`, `workspace/canvas/` | `openclaw.json` |
 | hermes (`hermes.go:143`) | `framework`, `SOUL.md`, `memories/`, `skills/` | `config.yaml` |
 | prime-agent (`prime.go:162`) | `framework`, `harness_state.json`, `APPEND_SYSTEM.md`, `skills/` | `models.json` |
-| dsh (`dsh.go:153`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
+| 0g-harness (`harness.go:167`) | `framework`, `APPEND_SYSTEM.md`, `skills/` | `settings.yaml` |
 
 All four reduce to the same shape — *binding + persona + memory + skills* —
 which the per-framework config files were obscuring.
 
 **Migration for agents minted before the settings channel.** Their pin sits in
 a chain role no adapter declares any more, so bootstrap Phase C hands it to
-`HandleLegacy` (`main.go:638-647`); the optional
+`HandleLegacy` (`main.go:724-733`); the optional
 `framework.LegacySettingsSeeder` (`framework.go:403`) is how an adapter hands
 what it recovered back to the platform, which persists it with
 `report.SeedSettings` before the watcher's first tick drops the stale role.
 The ordering is load-bearing: the uploader rebuilds the entry list from
 `Roles()` and commits it wholesale, so the first drift commit removes the
 undeclared role — if the pin has not been read out and persisted by then, it
-is gone, and prime and dsh both hard-fail `Start` without one. Coverage is
-partial today: only dsh implements the seeder (`dsh/settings.go:366`); the
+is gone, and prime and 0g-harness both hard-fail `Start` without one. Coverage is
+partial today: only 0g-harness implements the seeder (`harness/settings.go:382`); the
 other three log their retired role as unknown and ignore it. See
 [CONFIG_SURFACE.md](CONFIG_SURFACE.md) §10.
 
@@ -554,7 +576,8 @@ container's `:8080`.
 | `/_seal/compact` | **owner's wallet** | run the framework's own compaction on that conversation now, no restart (tag `0GSealCompact`, seat-gated): one at a time, a signed message accepted once, never overlapping a synthesized-door turn — each refusal a 409; 501 when the adapter cannot trigger the framework's compaction — no `SessionCompactor`, or an installed version without what it drives (openclaw before 2026.7.1 has no `sessions compact` CLI command) (`internal/proxy/compact.go`, `CONVERSATION.md`) |
 | `/v1/*` | end users, owner | framework chat API, reverse-proxied to the gateway (bearer-auth; responses never proof-signed — the owner↔agent steering channel); every undeclared path 404s — there is no catch-all relay |
 | `/api/*` | external callers | agent-registered services (exact path, registered over the sign socket's `/services`), reverse-proxied to the agent's loopback backend; responses buffered and proof-signed (`X-Agent-Proof`), even when the backend emits SSE |
-| `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, dsh), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
+| `/v1/responses*` | owner | long-task surface (OpenAI Responses subset): the turn is owned by a server-side id, survives dropped connections, resumes via `starting_after`, stops via `POST /{id}/cancel`. Served by the framework's bridge when it declares a `kind:"responses"` route (prime, 0g-harness), otherwise SYNTHESIZED by the sealed proxy in front of the framework's own chat API (openclaw, hermes) — see `internal/proxy/responses.go` |
+| `/v1/inbox`, `/v1/events`, `/v1/tasks`, `/v1/schedules` | owner | 0g-harness only (declared as the kinds `inbox` / `events` / `tasks` / `schedules`): the words of turns the agent opened itself (a background job finished, a reminder came due), a resumable live feed of turn, task, inbox and reminder changes, every turn, background command and subagent with who did it, and the agent's reminders. The other frameworks declare none of them, and the SDK offers them only where they are declared (`internal/framework/harness/spawn.go` `FrameworkRoutes`) |
 | `/log` + `/log.html` | ops | sealed bootstrap live log (with phase coloring) |
 | `/log/agent` + `/log/agent.html` | ops | agent subprocess stdout/stderr (live); path resolved via the adapter's `SubprocessLogPath()`. `/log/openclaw`(`.html`) survives as a legacy alias |
 | `unix:///run/seal-sign.sock` | **container-local agent process only** | `/sign/personal_sign` / `/sign/typed_data` / `/sign/transaction` (sign with `agent_seal_priv`; never a raw hash and never EIP-191 version `0x00`, the serve-proof's domain — see below) + `/services` (agent registers the service list that `/hello` advertises) + `/settings` (agent asks for a settings change — see below) |
@@ -607,9 +630,11 @@ which are easily fooled by identity phishing. See
 ## 8. Configuration surface
 
 sealed has two configuration surfaces and they answer to different people.
-Environment variables (`internal/config`) are the **platform's**: attestor
-injects them when it creates the sandbox, and they describe where the
-container is and what it may trust. The **owner's** surface is a separate
+Environment variables (`internal/config`) are the **platform's**: the attestor
+and the sandbox provider write them when the sandbox is created (the provider
+writes `SANDBOX_SEAL_KEY`, `SANDBOX_SEAL_ATTESTATION` and `SANDBOX_PROXY_DOMAIN`
+after removing every `SANDBOX_*` key the caller sent), and they describe where
+the container is and what it may trust. The **owner's** surface is a separate
 document that arrives on `/provision` — see "The owner's settings document"
 below.
 
@@ -618,10 +643,10 @@ The env surface:
 | env | Meaning |
 |---|---|
 | `SEAL_BOOT_TICKET` | random ticket injected internally by the create worker and scrubbed before framework startup. Stop/start retains the ticket but rotates the generation; reset replaces the ticket. Required by the new image; operators do not set it |
-| `SANDBOX_SEAL_KEY` | sandbox-injected ECDSA private key; used to cross-verify with `SANDBOX_SEAL_ATTESTATION.pubkey` (Phase 0) |
-| `SANDBOX_SEAL_ATTESTATION` | v2 app-signer-signed attestation JSON containing `version=2`, `chain_id`, `registry_address`, exact `app_id`, `registered_at`, `image_hash`, `pubkey`, `seal_id`, `ts` and `signature`; sealId is read from here, not a separate env. Missing, legacy and unknown versions are rejected |
-| `TEE_SIGNER_ADDRESS` | (optional) expected stable sandbox app signer. Phase 0 requires the address recovered from the v2 signature to match when set. The authoritative `/provision` check authenticates the sandbox app signer and full app-instance scope through Scan, TappRegistry and SandboxServing. This local check never substitutes a current or historical node key |
-| `ATTESTOR_URL` | attestor's public entrypoint; used for `/provision` (exchange for agentSeal_priv) and `/status` (heartbeat) |
+| `SANDBOX_SEAL_KEY` | container private key, written by the sandbox provider at create; Phase 0 checks it derives `SANDBOX_SEAL_ATTESTATION.pubkey` |
+| `SANDBOX_SEAL_ATTESTATION` | the provider's v3 container certificate: compact JSON `{version:3, chain_id, registry_address, app_id, registered_at, seal_id, pubkey, image_hash, ts, signature}`, EIP-712 signed by the provider key (domain `0G Sandbox ImageAttestation`, version `3`, verifyingContract = TappRegistry). sealId is read from here, not a separate env, and so is the framework hash serve-proofs carry (`image_hash`). Phase 0 recovers the provider signer and pins none; other versions are rejected. Forwarded verbatim on the first `/provision` |
+| `ATTESTOR_URL` | attestor's public entrypoint, `https`; used for `/provision` (exchange for agentSeal_priv), `/status` (heartbeat), `/settings/seed` and the provider registry. Its TLS key must be among the pins of the provider-signed statement from `GET {ATTESTOR_URL}/attestor-tls?provider=<provider>` (`internal/attestorhttp`) |
+| `ATTESTOR_ALLOW_UNPINNED_DEV` | local development only: `true` turns the attestor TLS pinning off and allows `http`. The provider removes it, with every caller `SANDBOX_*` key, from each sealed container it certifies, which is every container the attestor creates |
 | `CHAIN_RPC_URL` | RPC of the 0G chain where the AgenticID contract lives — the attestor worker injects its own `ATTESTOR_CHAIN_RPC` (mainnet for `agenticid.0g.ai`, Galileo testnet for `agenticid-testnet.0g.ai`). Public, so it must not embed a credential: sealed prints it in the boot log (`/log`, `/log.html`, owner-authenticated), and the attestor serves its source, `ATTESTOR_CHAIN_RPC`, in `GET /config` |
 | `AGENTIC_ID_ADDR` | AgenticID contract address |
 | `VERIFIED_FEEDBACK_ADDR` | VerifiedFeedbackRegistry **proxy** address, injected by the attestor worker next to `AGENTIC_ID_ADDR` (from its `ATTESTOR_VERIFIED_FEEDBACK_ADDR`). It is the EIP-191 version `0x00` intended validator every serve-proof signature is bound to. If it is unset, malformed or the zero address, sealed logs one `WARN` line at boot and emits **no** `X-Agent-Proof`, the same path as an agent without a chain identity. Once the chain client has dialled, sealed also reads its `getIdentityRegistry()`: unless that is `AGENTIC_ID_ADDR` (no code, a revert or an unreadable result after retries count as not), it logs a `WARN` naming both addresses and takes the same no-proof path. It never falls back to the legacy `personal_sign` wrap, which the registry rejects |

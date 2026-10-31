@@ -19,24 +19,54 @@ Three binaries share a single Postgres and expose HTTP + WebSocket:
   liveness check, and the WebSocket real-time event stream.
 - **worker**: async job consumer. Runs storage encrypted uploads,
   mint txs, and sandbox lifecycle calls. Carries a 60s sweep loop
-  covering job retention, provision deadlines, and heartbeat
-  staleness.
+  covering job retention, the job reaper, provision deadlines, and
+  heartbeat staleness.
 - **indexer**: on-chain event listener and AgentCard rebuilder.
   After persisting to Postgres, it pushes updates to the frontend
   over WS via the EventBus.
 
 Today one node runs all three, but the design is not single-machine
 bound. The queue claims jobs with `FOR UPDATE SKIP LOCKED`
-(`shared/src/jobs.rs`), so any number of workers can share it; job
-payloads and the provision-binding MAC use the KMS **app-scoped** key,
-so every node of the same Tapp app can open them; and each agentSeal
-is derived per seal by KMS on demand, so any node can provision any
-agent with no node-local key state. Multi-node has **not** been run
+(`shared/src/jobs.rs`), so any number of workers can share it; and each
+agentSeal is derived per seal by KMS on demand, so any node can provision
+any agent with no node-local key state. Multi-node has **not** been run
 yet — production uses one KMS stable app signer with instance-bound
 AgenticID authorization (plus gas), a shared Postgres outside the
 per-host compose, and the **indexer kept to a single instance** (its
 chain checkpoint is single-writer; two indexers would double-process
 events). Tracked as the node-federation workstream.
+
+Job payloads (owner-signed iData plaintexts, sandbox envelopes with their
+env) are stored as plain JSON. A row holds its payload only while the job
+is pending: the claim clears it, and so does every path that fails a job
+before it runs (an undecodable payload, an expired owner envelope). At-rest
+protection comes from the tapp FDE volume: `docker-compose.yml` declares
+`x-tapp: data: encrypted`, which puts the Postgres named volume on the app's
+KMS-keyed encrypted volume. A Postgres outside that volume (such as a shared
+one for multi-node) would hold pending payloads unencrypted.
+
+The worker never requeues a job. While one runs it refreshes the row's
+heartbeat every 30 s; the sweep's reaper marks failed a running job whose
+heartbeat is more than 5 min old (its worker is gone) and a pending
+`/start`, `/stop` or `/reset` job whose owner envelope expires within 30 s
+(the claim skips those too). For an abandoned job it fails a `Submitted`
+storage stage (and, for a deploy or clone, the storage/mint stages it never
+started) so `/retry` can recover, and gives a `Submitted` container without
+a provision deadline the standard 5 min one; it never touches a `Submitted`
+mint, whose transaction `/retry` reconciles by receipt. A reaped row records
+its cause until that follow-up has run, so a follow-up that errors, or a
+sweeping worker that exits first, is retried on the next sweep, and the
+retention sweep keeps the row meanwhile. A worker that was only stalled
+learns from its next heartbeat that its job was reaped and drops the job;
+`done`/`failed` only ever replace `running`, so its late result never
+overwrites the reaped row.
+
+Upgrading from a release that encrypted job payloads: drain the queue first.
+Stop the api so no new jobs arrive, wait until
+`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` returns 0,
+then upgrade. A job written by the earlier release cannot be decoded: a
+pending one is failed at claim and a running one is reaped, both without
+settling its deployment, which then stays `deploying` and needs a redeploy.
 
 ## Workspace
 
@@ -46,11 +76,12 @@ attestor/
 ├── crates/
 │   ├── shared/               types / traits / chain / sandbox / crypto / repo / mocks
 │   ├── api/                  HTTP + WS server + static web/ assets
-│   ├── worker/               async tasks + three sweep loops
+│   ├── worker/               async tasks + the 60s sweep loop
 │   └── indexer/              on-chain event listener
 ├── scripts/                  e2e / verify-agent / regression test scripts
 ├── version-meld/             vendored crate fix wired in via [patch.crates-io] (Cargo.toml; the Dockerfile copies it into the build)
-├── docker-compose.yml        api / worker / indexer / postgres full stack
+├── docker-compose.yml        api / worker / indexer / postgres full stack (`x-tapp: data: encrypted`; Postgres unpublished)
+├── docker-compose.dev.yml    local overlay: publishes Postgres on 127.0.0.1:5432 for host-run binaries
 ├── Dockerfile                one image shared by the three binaries (cargo build --release, multiple entry points)
 └── .env.example              all runtime configuration
 ```
@@ -65,6 +96,9 @@ docker compose up -d                                # bring up postgres + the 3 
 docker compose logs -f attestor-api                 # tail api logs
 ```
 
+Postgres is reachable only on the compose network; nothing publishes it to
+the host.
+
 Heads-up for local builds: the compose file sets `pull_policy: always`
 and `image:` defaults (`ATTESTOR_IMAGE`) to a VPC-internal Aliyun
 registry tag. Outside that VPC the default registry is unreachable, and
@@ -76,7 +110,7 @@ can't serve) or override `pull_policy` before `up -d`.
 Bare-metal (for dev/debug):
 
 ```bash
-docker compose up -d postgres                       # bring up Postgres only
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres   # Postgres only, on 127.0.0.1:5432
 cp .env.example .env && vim .env                    # fill in real chain / app_id / addr
 cargo run -p attestor-api    # one terminal
 cargo run -p attestor-worker # another
@@ -124,9 +158,10 @@ stay up.
 
 | Path | Purpose | Auth |
 |---|---|---|
-| `GET /provision?seal_id=…` | Returns an enabled boot generation without its ticket; sealed uses it for its container private-key proof | public metadata |
-| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings, and a per-boot receipt (`status_binding_scheme: "agentdna-status-v2"` / `encrypted_status_binding`). The receipt binds the actual served settings version/digest and rotates on each accepted new boot. Modern provision requires a tracked sandbox; it returns 409 before create bookkeeping is persisted, which sealed retries within 180 seconds. Rejected provision requests never mutate or delete containers. Repeated unconfirmed boots still fall back to last-known-good. Modern registration prevents legacy protocol downgrade | sandbox TEE signature + node/image allowlists + owner-authorized ticket, generation and container private-key proof |
-| `POST /status` | sealed heartbeat/status. Signature covers boot receipt hash and applied settings digest; one transaction checks the active receipt and updates stage, liveness, and exact-version confirmation. Only matching current-version `running` / `warning` reports promote settings. Stale instances are ignored; errors leave settings unchanged. Legacy reports update liveness only before modern registration, and never promote settings | agentSeal raw-keccak signature + KMS HMAC boot receipt |
+| `GET /provision?seal_id=…` | Returns `{"generation", "certificate_required"}`: the enabled boot generation (never its ticket), and whether no container key is recorded yet so the next boot must send its certificate. `403 no authorized boot; reset required` without an enabled authorization | public metadata |
+| `GET /attestor-tls?provider=0x…` | Relays, byte-identical, the latest statement in which the sandbox provider signs this attestor's TLS SPKI pins (EIP-712 `AttestorTLS`, fetched from the discovered provider's `/api/attestor-tls`). Before serving, the attestor checks the provider signature, the lease (at most 300 s) and that its own TLS key is pinned; it refreshes 60 s before expiry, and consults sandbox discovery only for that refresh, so a discovery renewal or outage does not hold or fail a request the cache can answer. Unknown provider → 404; no valid statement → 503 with `Retry-After: 5`. Always `Cache-Control: no-store`. sealed pins every later attestor connection to these pins | public |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, and an image in `validFrameworkHashes`, then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never mutate or delete containers. Repeated unconfirmed boots fall back to last-known-good | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
+| `POST /status` | sealed heartbeat/status (`StatusReport.v2` canonical). Signature covers the status token hash and applied settings digest; one transaction checks the token is the current boot's and updates stage, liveness and exact-version confirmation. Only a `running` / `warning` report whose applied digest equals the digest that boot was served promotes settings. Stale instances are ignored; errors leave settings unchanged | agentSeal raw-keccak signature + current status token |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 
 ### Read / real-time
@@ -134,11 +169,15 @@ stay up.
 | Path | Purpose |
 |---|---|
 | `GET /deployments` | List current deployments |
-| `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container pubkey + its MAC, or iData retry material) |
+| `GET /deployment/:seal_id` | Single deployment detail (unauthenticated; never carries the settings document, the container record, or iData retry material) |
 | `GET /agent-seal-pubkey?seal_id=` | The agent's agentSeal public key. The SDK (and this console's Restore/Reset) seal the inference key to it (`SEAL_SECRET_ENV`) so the owner's wallet prompt never shows the key (issue #166). Known seal_ids only; cached per seal, with a small bound on concurrent KMS derivations |
 | `GET /ws/subscribe` | WebSocket event stream (indexer and worker push through the EventBus) |
 
-Detailed signing canonicals live in `crates/shared/src/auth/`.
+Detailed signing canonicals live in `crates/shared/src/auth/`; the v3
+container certificate and attestor TLS statement in
+`crates/shared/src/image_attestation.rs` and `attestor_tls.rs`, with
+known-answer vectors shared with the provider and sealed in
+`crates/shared/testdata/`.
 
 ## On-chain dependencies
 
@@ -146,7 +185,7 @@ Detailed signing canonicals live in `crates/shared/src/auth/`.
 |---|---|
 | **AgenticID** | NFT mint, iData registration, `validFrameworkHashes` allowlist |
 | **VerifiedFeedbackRegistry** | Verifies ServeProofs — the agentSeal's EIP-191 version-0x00 signature `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`, validator = this proxy — and records TEE marks over the canonical ERC-8004 reputation registry. The attestor never writes to it: it serves the address on `GET /config` and injects it into every new container as `VERIFIED_FEEDBACK_ADDR` (`ATTESTOR_VERIFIED_FEEDBACK_ADDR`); its one read is at worker / api startup, where `getIdentityRegistry()` must equal `ATTESTOR_AGENTIC_ID_ADDR` or startup fails |
-| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider). `/provision` validates the stable sandbox app signer and signed registration scope through authenticated discovery |
+| **TappRegistry** | Code-identity and node-signature registry for the three Tapp apps (attestor, 0g-kms, 0g-sandbox-provider), and the EIP-712 `verifyingContract` of the provider's certificate and TLS statement. `/provision` checks the certificate signer and registration scope against authenticated sandbox discovery |
 | **SandboxServing** | Sandbox prepaid balance and voucher settlement. The frontend deploy gate requires owner balance ≥ 0.1 OG |
 
 For contract deploy, upgrade, and verify steps, see
@@ -175,10 +214,10 @@ load-bearing ones, grouped:
 |---|---|
 | `ATTESTOR_APP_ID` | Attestor's own appId registered on TappRegistry |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | The other two Tapp apps to trust (used for the trust-roots ack) |
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides KMS-derived encryption keys; production signing/discovery require the local socket (app-scoped + per-seal via `material`). Inside docker, resolved via `host.docker.internal` |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | Local gRPC endpoint of tapp-server, which provides the stable app signer and per-seal KMS-derived keys (via `material`); production signing/discovery require the local socket. Inside docker, resolved via `host.docker.internal` |
 | `MOCK_TEE` / `MOCK_KMS` | Dev mock switches |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | Required when `MOCK_TEE=true`. The priv key must derive the address (validated on startup) |
-| `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived subkeys diverge |
+| `MOCK_APP_SECRET` | Required when `MOCK_KMS=true`. 32-byte hex; all three binaries must read the **same value**, otherwise derived agentSeals diverge |
 
 ### Sandbox + SandboxServing
 
@@ -191,7 +230,7 @@ load-bearing ones, grouped:
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | Comma-separated public-port allowlist (0g-sandbox#57). When set, sandbox creates carry `publicPorts` so only these ports are publicly reachable; all others fall back to Daytona auth. Must include the agent serve port (8080). Empty = all-ports-public — the only safe setting until the provider runs the 0g-daytona fork images |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | Comma-separated framework names deploys may select — checked pre-mint, served by `GET /config` for the UI picker. Must match the adapters the sealed image in `ATTESTOR_SANDBOX_SNAPSHOT` bundles. Unset/empty = `openclaw` |
 | `ATTESTOR_SECRET_ENV_ENABLED` | Opt-in (`true`/`1`/`on`/`yes`). `GET /config` then advertises `secret_env_scheme`, and the SDK seals the inference key of start/reset/retry to the agentSeal key instead of signing it in clear. Enable only once every image in `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` reads `SEAL_SECRET_ENV`. Default off |
-| `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` so the container can POST `/provision` and `/status` back |
+| `ATTESTOR_PUBLIC_URL` | Attestor's public-facing URL. Injected into the sandbox container as `ATTESTOR_URL` (trailing `/` trimmed) so the container can POST `/provision` and `/status` back |
 | `MOCK_SANDBOX` | Dev mock switch. When `true`, skips actually spinning up containers and only logs |
 
 Attestor and configured sealed images are released together. `/config.inference_capabilities` is derived from that release and the existing framework/snapshot configuration; there is no extra capability ENV. Administrative provider writes require the live owner of `ATTESTOR_APP_ID` in `ATTESTOR_TAPP_REGISTRY_ADDR`. See [rollout](../sdk/typescript/PROVIDERS.md).

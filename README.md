@@ -231,8 +231,9 @@ cascade that ultimately reduces to Tapp's "strong audit" philosophy:
 1. **0g-Sandbox itself** is deployed via Tapp; its verifiability and
    encapsulation are guaranteed by Tapp.
 2. **Every sealed sandbox 0g-Sandbox creates** has its external
-   encapsulation guaranteed by 0g-Sandbox's runtime logic; its image hash
-   is signed by 0g-Sandbox using its own hardware-bound identity.
+   encapsulation guaranteed by 0g-Sandbox's runtime logic; its container
+   key and image hash are signed by 0g-Sandbox with its KMS-backed provider
+   key (an EIP-712 certificate).
 3. **Attestor at provision time** does a dual check: verify 0g-Sandbox's
    identity signature, and confirm that the sealed sandbox's image hash is
    registered on chain. Only with both passing is `agentSeal_priv`
@@ -246,10 +247,12 @@ are registered on chain — can ever obtain the AgentSeal private key.
 - **Authorized startup only**: before launching a container, Sandbox
   verifies the request comes from the on-chain registered owner. Only the
   legitimate owner can instantiate it with the agent's functional data.
-- **Runtime code attestation**: Sandbox signs the container's image hash
-  and hands it to Attestor. Attestor checks that Sandbox's `signerAddress`
-  is registered in TappRegistry and that the image hash appears in the
-  AgenticID contract's **`validFrameworkHashes` allowlist**. This allowlist
+- **Runtime code attestation**: Sandbox signs a certificate over the
+  container's key and image hash, which the container hands to Attestor at
+  its first `/provision`. Attestor checks that the certificate's signer and
+  registration scope are the sandbox app instance registered in
+  TappRegistry, and that the image hash appears in the AgenticID contract's
+  **`validFrameworkHashes` allowlist**. This allowlist
   covers the hashes of the **AgenticID runtime framework** — the container
   code that loads functional data, manages AgentSeal signing, and validates
   owner instructions. It lives at a **different layer** from AI
@@ -373,12 +376,14 @@ are documented in [`contracts/README.md`](contracts/README.md).
 
 ### TEE layer (deployed on 0g-Tapp)
 
-- **Attestor** — validates Sandbox's `signerAddress` (against TappRegistry)
-  and the container's image hash (against `validFrameworkHashes`); derives
+- **Attestor** — validates the Sandbox certificate's signer (against the
+  TappRegistry-registered app instance) and the container's image hash
+  (against `validFrameworkHashes`); derives
   AgentSeal key material via KMS; registers the AgentSeal pubkey on chain.
   (Rust, see [`attestor/`](attestor/README.md))
 - **0g-Sandbox** — validates that startup requests come from registered
-  owners; launches Sealed containers and signs their image hashes;
+  owners; launches Sealed containers, certifies their keys and image hashes,
+  and signs the attestor TLS pins they verify;
   guarantees the agent runs against the on-chain functional data.
 - **Agent runtime (`sealed`)** — the container running inside Sandbox that
   receives the key after RA. It restores encrypted iData from chain into a
@@ -454,6 +459,8 @@ This is a monorepo with four sub-projects:
 | [`sealed/`](sealed/ARCHITECTURE.md) | Agent runtime container (restores iData inside TEE, pushes evolution on chain, signs responses) | Go |
 | [`sdk/typescript/`](sdk/typescript/README.md) | Client SDK (`@0gfoundation/0g-agentdna`, CLI `0g-agentdna`): deploy / clone / transfer, serve-proof capture + verify, feedback, trust-root ack, sandbox deposit | TypeScript (viem) |
 
+The repository is public. Enable its privacy check once per clone: `git config core.hooksPath .githooks`. The pre-commit hook refuses a commit that adds private keys, tokens, personal paths or emails, or public IPs. `scripts/privacy-check.mjs` has the rules, and `AGENTS.md` has the details.
+
 ### Further reading
 
 **[`sdk/typescript/README.md`](sdk/typescript/README.md) — the client SDK**
@@ -527,10 +534,11 @@ The full end-to-end trust chain for AgenticID, across five themes:
 - **Key-derivation chain** — how KMS derives keys for the attestor,
   why they live in a **completely separate key space** from user EOA
   wallets, per-agent `agent_seal_priv` **deterministically derived** by
-  KMS from `chainId ‖ contract ‖ sealId`, sandbox-signed image attestation,
-  attestor's three-way check (TappRegistry node identity,
-  `validFrameworkHashes` allowlist, freshness), and ECIES delivery to the
-  container's ephemeral pubkey (only that TEE can decrypt).
+  KMS from `chainId ‖ contract ‖ sealId`, the sandbox-signed EIP-712
+  certificate, the attestor's three gates (the signer's TappRegistry app
+  instance, the `validFrameworkHashes` allowlist, freshness at first
+  provision or the recorded container key on later boots), and ECIES
+  delivery to the container's ephemeral pubkey (only that TEE can decrypt).
 - **Set-once seal safety** — why the permanent `agentSeal` / `sealId`
   binding is safe. A hardware swap can re-derive the same priv, and the
   on-chain binding stays valid forever.

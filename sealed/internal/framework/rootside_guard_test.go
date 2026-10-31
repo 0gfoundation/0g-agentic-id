@@ -90,11 +90,10 @@ var allowedDirectCalls = map[string]struct {
 	count  int
 	reason string
 }{
-	"internal/attestorhttp/client.go resolver.endpoint assigns .Path": {1, "sets net/url.URL.Path while constructing the pinned Scan HTTPS endpoint; this is neither a filesystem path nor exec.Cmd.Path and does not launch a process"},
-	"internal/framework/state.go OpenLog os.OpenFile":                 {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
-	"internal/logger/logger.go Flush os.MkdirAll":                     {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
-	"internal/logger/logger.go Flush os.OpenFile":                     {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
-	"internal/proxy/sign.go Server.ListenInternal net.Listen":         {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
+	"internal/framework/state.go OpenLog os.OpenFile":         {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
+	"internal/logger/logger.go Flush os.MkdirAll":             {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
+	"internal/logger/logger.go Flush os.OpenFile":             {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
+	"internal/proxy/sign.go Server.ListenInternal net.Listen": {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
 }
 
 // rootCommands is everything root executes: the functions that may call
@@ -104,7 +103,6 @@ var rootCommands = map[string][]string{
 	"internal/framework/openclaw.installCommand": {"npm"},
 	"internal/framework/hermes.installHermes":    {"git", "uv"},
 	"internal/framework/prime.npmGlobalRoot":     {"npm"},
-	"internal/framework/dsh.npmGlobalRoot":       {"npm"},
 }
 
 // rootEnvHelpers are the functions whose result a rootCommands function may
@@ -126,7 +124,7 @@ var agentCommands = []string{
 	"internal/framework/hermes.spawnGateway",
 	"internal/framework/prime.spawnBridge",
 	"internal/framework/prime.probeKernelVenv",
-	"internal/framework/dsh.spawnBridge",
+	"internal/framework/harness.spawnBridge",
 }
 
 // adapterPackages must each sweep in Stop (privsep.Sweep).
@@ -134,7 +132,7 @@ var adapterPackages = []string{
 	"internal/framework/openclaw",
 	"internal/framework/hermes",
 	"internal/framework/prime",
-	"internal/framework/dsh",
+	"internal/framework/harness",
 }
 
 // agentHomeLinks are the functions that hand an adapter's tree over and
@@ -149,7 +147,7 @@ var agentHomeLinks = []string{
 	"internal/framework/openclaw.Adapter.prepareTree",
 	"internal/framework/hermes.spawnGateway",
 	"internal/framework/prime.spawnBridge",
-	"internal/framework/dsh.spawnBridge",
+	"internal/framework/harness.spawnBridge",
 }
 
 // pathSyscalls are the syscall / golang.org/x/sys/unix functions that take

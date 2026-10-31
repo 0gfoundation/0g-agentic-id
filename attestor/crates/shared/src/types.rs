@@ -22,7 +22,7 @@ pub type JobId = uuid::Uuid;
 //   description = JSON({ role, extra..., storage_ptr })
 // On-chain `IntelligentData` = { description, data_hash } per entry.
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IDataInput {
     /// Free-form role tag ("config" | "memory" | "model" | ...).
     /// Attestor does not enforce a vocabulary.
@@ -73,7 +73,7 @@ pub struct StorageRoot {
 //
 // The attestor never re-signs — sandbox's own auth middleware verifies.
 // See `reference_sandbox_api.md` for the spec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxEnvelope {
     /// Signer's EOA — must equal the `/deploy` request's `owner` field.
     pub wallet_address: Address,
@@ -81,6 +81,50 @@ pub struct SandboxEnvelope {
     pub signed_message_b64: String,
     /// 65-byte secp256k1 signature; V ∈ {27, 28}.
     pub wallet_signature: Bytes,
+}
+
+/// Debug for logs: job payloads carry iData plaintext and signed messages
+/// whose env may hold an API key, so neither is ever printed.
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::fmt::Debug for IDataInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IDataInput")
+            .field("role", &self.role)
+            .field("plaintext", &Redacted)
+            .field("extra", &self.extra)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SandboxEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxEnvelope")
+            .field("wallet_address", &self.wallet_address)
+            .field("signed_message_b64", &Redacted)
+            .field("wallet_signature", &self.wallet_signature)
+            .finish()
+    }
+}
+
+impl SandboxEnvelope {
+    /// `expires_at` of the signed canonical message (unix seconds).
+    pub fn expires_at(&self) -> anyhow::Result<i64> {
+        use base64::Engine as _;
+        #[derive(Deserialize)]
+        struct Signed {
+            expires_at: i64,
+        }
+        let bytes =
+            base64::engine::general_purpose::STANDARD.decode(self.signed_message_b64.as_bytes())?;
+        Ok(serde_json::from_slice::<Signed>(&bytes)?.expires_at)
+    }
 }
 
 // ── /deploy ─────────────────────────────────────────────────────────────
@@ -307,6 +351,27 @@ pub fn derive_phase(
     DeploymentPhase::Deploying
 }
 
+/// The sandbox provider instance that signed a container certificate: its
+/// TappRegistry scope and the recovered provider signer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInstance {
+    pub chain_id: u64,
+    pub registry_address: Address,
+    pub app_id: String,
+    pub registered_at: u64,
+    pub signer: Address,
+}
+
+/// The container conclusion `/provision` records from a verified v3
+/// certificate. The seven columns are written and cleared together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRecord {
+    /// 33-byte compressed secp256k1 container key (`SANDBOX_SEAL_KEY`).
+    pub pubkey: Bytes,
+    pub image_hash: ImageHash,
+    pub provider: ProviderInstance,
+}
+
 // ── Deployment aggregate (persisted) ────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
@@ -364,23 +429,14 @@ pub struct Deployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioned_at: Option<DateTime<Utc>>,
 
-    /// Container's secp256k1 pubkey (33-byte compressed) recorded on the
-    /// first successful `/provision`. Subsequent /provision calls bypass the
-    /// freshness window when the request's pubkey matches and the MAC
-    /// verifies — see `container_pubkey_mac`. Never serialized outward,
-    /// together with the MAC: the pair is provision-binding material.
-    #[serde(default, skip_serializing)]
-    pub container_pubkey: Option<alloy::primitives::Bytes>,
-
-    /// V2 HMAC over `image_attestation_digest32 || authenticated_app_signer20`
-    /// under `agentic-id.container-pubkey-binding.v2`. The digest covers the
-    /// complete signed issuer scope, key, image and timestamp. Legacy v1
-    /// pubkey-only bindings never satisfy this domain/payload. DB writes
-    /// cannot forge a binding without the master-secret-derived binding key.
-    /// This binding material never leaves the process:
-    /// `GET /deployment/:seal_id` serializes the row and is unauthenticated.
-    #[serde(default, skip_serializing)]
-    pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
+    /// What the first accepted `/provision` of the current container
+    /// established from its v3 certificate: the container key, its image and
+    /// the provider instance that signed it. Later boots of that container
+    /// send no certificate and are checked against this record. Cleared with
+    /// every new boot ticket, reset and ownership revocation. Never
+    /// serialized: `GET /deployment/:seal_id` is unauthenticated.
+    #[serde(skip)]
+    pub container_record: Option<ContainerRecord>,
 
     /// Wall-clock deadline for the container to complete `/provision`.
     /// Written by `handle_deploy` / `handle_sandbox_recreate` once
@@ -444,14 +500,11 @@ pub struct Deployment {
 }
 
 impl Deployment {
-    /// True once the container has completed `/provision` — both the
-    /// timestamp and the `(pubkey, mac)` binding are written. Subsequent
-    /// recovery flows can fast-path past the freshness check, so a
-    /// stop+start round trip doesn't need a fresh user-signed envelope.
+    /// True once the current container has completed `/provision`: the
+    /// timestamp and its container record (key, image, provider instance)
+    /// are written.
     pub fn is_provisioned(&self) -> bool {
-        self.provisioned_at.is_some()
-            && self.container_pubkey.is_some()
-            && self.container_pubkey_mac.is_some()
+        self.provisioned_at.is_some() && self.container_record.is_some()
     }
 
     /// True when the owner's current document has spent its boot and every
@@ -510,10 +563,16 @@ pub struct SandboxCreateResponse {
 // 404 = gone (Failed); everything else = preserved-but-not-running (Stopped,
 // resumable). Defaulting unknowns to Stopped avoids wrongly Failing/reaping a
 // live sandbox when a new transitional state (e.g. "archiving") appears.
+//
+// `desired_state` is the provider's target state ("started", "stopped",
+// "archived", …). An accepted start of an archived sandbox keeps reporting
+// `state` "archived", then "restoring", while `desired_state` is "started".
 #[derive(Debug, Clone, Deserialize)]
 pub struct SandboxInfo {
     pub id: String,
     pub state: String,
+    #[serde(default, rename = "desiredState")]
+    pub desired_state: Option<String>,
 }
 
 #[cfg(test)]
@@ -521,9 +580,83 @@ mod tests {
     use super::*;
     use alloy::primitives::{Address, B256, U256};
 
+    fn envelope(secret: &str) -> SandboxEnvelope {
+        SandboxEnvelope {
+            wallet_address: Address::repeat_byte(0x11),
+            signed_message_b64: secret.to_string(),
+            wallet_signature: Bytes::from(vec![0x1b; 65]),
+        }
+    }
+
+    #[test]
+    fn debug_hides_idata_plaintext_and_signed_message() {
+        let idata = IDataInput {
+            role: "persona".into(),
+            plaintext: serde_json::json!({"api_key": "sk-plaintext-secret"}),
+            extra: Default::default(),
+        };
+        let out = format!("{idata:?}");
+        assert!(out.contains("persona") && !out.contains("sk-plaintext-secret"), "{out}");
+
+        let env = envelope("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0");
+        let out = format!("{env:?}");
+        assert!(!out.contains("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0"), "{out}");
+        assert!(out.contains(&format!("{:?}", Address::repeat_byte(0x11))), "{out}");
+
+        let job = JobPayload::Deploy {
+            seal_id: B256::repeat_byte(1),
+            owner: Address::ZERO,
+            i_data: vec![idata],
+            name: "n".into(),
+            description: "d".into(),
+            image: None,
+            sandbox_envelope: Some(env),
+        };
+        let out = format!("{job:?}");
+        assert!(
+            !out.contains("sk-plaintext-secret") && !out.contains("c2lnbmVkLW1lc3NhZ2Utc2VjcmV0"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn job_kind_matches_serde_tag_and_seal_id() {
+        let seal = B256::repeat_byte(7);
+        let jobs = vec![
+            JobPayload::Deploy {
+                seal_id: seal,
+                owner: Address::ZERO,
+                i_data: vec![],
+                name: String::new(),
+                description: String::new(),
+                image: None,
+                sandbox_envelope: None,
+            },
+            JobPayload::SandboxStart { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::SandboxStop { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::SandboxRecreate { seal_id: seal, sandbox_envelope: envelope("x") },
+            JobPayload::ResumeDeploy { seal_id: seal, artifacts: vec![], sandbox_envelope: None },
+            JobPayload::SandboxTeardown { seal_id: seal, expected_sandbox_id: None },
+            JobPayload::Clone {
+                new_seal_id: seal,
+                source_seal_id: B256::repeat_byte(8),
+                target_owner: Address::ZERO,
+                name: String::new(),
+                description: String::new(),
+                image: None,
+                authorization: JobCloneAuth::default(),
+            },
+        ];
+        for job in jobs {
+            let tag = serde_json::to_value(&job).unwrap()["kind"].as_str().unwrap().to_string();
+            assert_eq!(job.kind(), tag);
+            assert_eq!(job.seal_id(), seal);
+        }
+    }
+
     #[test]
     fn job_payload_clone_serde_roundtrip() {
-        // PostgresJobQueue seals+serializes JobPayload; a missing/renamed
+        // PostgresJobQueue serializes JobPayload; a missing/renamed
         // field would only surface at runtime. Lock the Clone shape here.
         let p = JobPayload::Clone {
             new_seal_id: B256::repeat_byte(1),
@@ -573,6 +706,97 @@ mod tests {
         }
     }
 
+    fn signed_envelope(expires_at: i64) -> SandboxEnvelope {
+        use base64::Engine as _;
+        let signed = format!(
+            r#"{{"action":"start","expires_at":{expires_at},"nonce":"00","payload":{{}},"resource_id":"sb"}}"#
+        );
+        SandboxEnvelope {
+            wallet_address: Address::ZERO,
+            signed_message_b64: base64::engine::general_purpose::STANDARD.encode(signed),
+            wallet_signature: alloy::primitives::Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn only_relay_jobs_expire() {
+        let seal = B256::repeat_byte(7);
+        let env = signed_envelope(1_800_000_000);
+        let jobs = [
+            (
+                JobPayload::Deploy {
+                    seal_id: seal,
+                    owner: Address::ZERO,
+                    i_data: vec![],
+                    name: "n".into(),
+                    description: "d".into(),
+                    image: None,
+                    sandbox_envelope: Some(env.clone()),
+                },
+                None,
+            ),
+            (
+                JobPayload::SandboxStart {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::SandboxStop {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::SandboxRecreate {
+                    seal_id: seal,
+                    sandbox_envelope: env.clone(),
+                },
+                Some(1_800_000_000),
+            ),
+            (
+                JobPayload::ResumeDeploy {
+                    seal_id: seal,
+                    artifacts: vec![],
+                    sandbox_envelope: Some(env.clone()),
+                },
+                None,
+            ),
+            (
+                JobPayload::SandboxTeardown {
+                    seal_id: seal,
+                    expected_sandbox_id: None,
+                },
+                None,
+            ),
+            (
+                JobPayload::Clone {
+                    new_seal_id: seal,
+                    source_seal_id: B256::repeat_byte(8),
+                    target_owner: Address::ZERO,
+                    name: "n".into(),
+                    description: "d".into(),
+                    image: None,
+                    authorization: JobCloneAuth::Owner,
+                },
+                None,
+            ),
+        ];
+        for (job, expiry) in jobs {
+            assert_eq!(job.expires_at().unwrap(), expiry, "{}", job.kind());
+        }
+        let mut unreadable = signed_envelope(0);
+        unreadable.signed_message_b64 = "not base64".into();
+        assert!(JobPayload::SandboxStop {
+            seal_id: seal,
+            sandbox_envelope: unreadable,
+        }
+        .expires_at()
+        .is_err());
+    }
+
     #[test]
     fn the_settings_document_never_rides_the_row_serialization() {
         // `GET /deployment/:seal_id` serializes a whole Deployment and is
@@ -595,11 +819,10 @@ mod tests {
         // Same reader, same reason: `GET /deployment/:seal_id` is
         // unauthenticated and `/deployments` publishes every seal_id, so
         // anything in the row serialization is readable fleet-wide. The
-        // container pubkey + its master-secret-derived MAC, and the internal
-        // iData retry material, must not be in there.
+        // recorded container conclusion and the internal iData retry
+        // material must not be in there.
         let mut d = empty_deployment();
-        d.container_pubkey = Some(Bytes::from_static(&[2u8; 33]));
-        d.container_pubkey_mac = Some(Bytes::from_static(&[7u8; 32]));
+        d.container_record = Some(record());
         d.i_data = vec![IDataArtifact {
             role: "framework".into(),
             description: String::new(),
@@ -609,8 +832,8 @@ mod tests {
             ciphertext: Bytes::from_static(b"ct"),
         }];
         let json = serde_json::to_value(&d).unwrap();
+        assert!(json.get("container_record").is_none());
         assert!(json.get("container_pubkey").is_none());
-        assert!(json.get("container_pubkey_mac").is_none());
         assert!(json.get("i_data").is_none());
         // What the console reads is still there.
         for k in ["seal_id", "phase", "agent_card"] {
@@ -636,8 +859,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -666,49 +888,35 @@ mod tests {
         }
     }
 
-    // ── Deployment::is_provisioned truth table ─────────────────────────
-    //
-    // Encodes what "provisioned" actually means: ALL THREE
-    // (provisioned_at, container_pubkey, container_pubkey_mac) must be
-    // set. The bug we want to catch is anyone "simplifying" the helper
-    // to look at only one or two fields — e.g. trusting `provisioned_at`
-    // alone would let DB-tampered rows skip the MAC check downstream.
-
-    #[test]
-    fn is_provisioned_all_three_set_returns_true() {
-        let mut d = empty_deployment();
-        d.provisioned_at = Some(Utc::now());
-        d.container_pubkey = Some(Bytes::from_static(b"pubkey"));
-        d.container_pubkey_mac = Some(Bytes::from_static(b"mac"));
-        assert!(d.is_provisioned());
+    fn record() -> ContainerRecord {
+        ContainerRecord {
+            pubkey: Bytes::from_static(&[2u8; 33]),
+            image_hash: B256::repeat_byte(0x11),
+            provider: ProviderInstance {
+                chain_id: 16602,
+                registry_address: Address::repeat_byte(0x22),
+                app_id: "sandbox".into(),
+                registered_at: 100,
+                signer: Address::repeat_byte(0x33),
+            },
+        }
     }
 
-    #[test]
-    fn is_provisioned_any_field_missing_returns_false() {
-        let now = Utc::now();
-        let pk = Bytes::from_static(b"pubkey");
-        let mac = Bytes::from_static(b"mac");
+    // ── Deployment::is_provisioned truth table ─────────────────────────
+    //
+    // "Provisioned" means the timestamp AND the container record are both
+    // set; neither alone is enough.
 
-        // Iterate all 8 (2^3) combos via a tiny truth table.
-        let cases: &[(bool, bool, bool, bool)] = &[
-            (false, false, false, false),
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (true, true, false, false),
-            (true, false, true, false),
-            (false, true, true, false),
-            (true, true, true, true),
-        ];
-        for (ts, pubk, m, expected) in cases.iter().copied() {
+    #[test]
+    fn is_provisioned_requires_timestamp_and_container_record() {
+        for (ts, recorded) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut d = empty_deployment();
-            d.provisioned_at = ts.then_some(now);
-            d.container_pubkey = pubk.then(|| pk.clone());
-            d.container_pubkey_mac = m.then(|| mac.clone());
+            d.provisioned_at = ts.then(Utc::now);
+            d.container_record = recorded.then(record);
             assert_eq!(
                 d.is_provisioned(),
-                expected,
-                "(ts={ts}, pubk={pubk}, mac={m}) expected {expected}"
+                ts && recorded,
+                "(ts={ts}, record={recorded})"
             );
         }
     }
@@ -928,51 +1136,38 @@ mod tests {
 }
 
 // ── /provision ──────────────────────────────────────────────────────────
+/// `POST /provision`. `certificate` is the container's
+/// `SANDBOX_SEAL_ATTESTATION` object, sent verbatim and only when
+/// `GET /provision` reported `certificate_required`. Every request carries a
+/// fresh boot claim signed by the container key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvisionRequest {
-    // Defaults let old envelopes reach the explicit unsupported-version error.
-    #[serde(default)]
-    pub version: u8,
-    #[serde(default)]
-    pub chain_id: u64,
-    #[serde(default)]
-    pub registry_address: Address,
-    #[serde(default)]
-    pub app_id: String,
-    #[serde(default)]
-    pub registered_at: u64,
     pub seal_id: SealId,
-    pub container_pubkey: Bytes,     // 33-byte compressed secp256k1 pubkey
-    pub image_hash: ImageHash,
-    pub issued_at: u64,
-    pub sandbox_signature: Bytes,
-    #[serde(default)]
-    pub status_binding_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_ticket: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_generation: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<B256>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_signature: Option<Bytes>,
+    pub certificate: Option<crate::image_attestation::Certificate>,
+    pub boot_ticket: String,
+    pub boot_generation: i64,
+    pub boot_id: B256,
+    /// Unix nanoseconds; strictly increasing across attempts of one boot.
+    pub boot_started_at: i64,
+    pub container_signature: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionResponse {
     pub encrypted_agent_seal_priv: Bytes,
     /// The owner's settings document, ECIES-encrypted to the SAME
-    /// `container_pubkey` the seal key went to. Omitted when the agent has
+    /// container key the seal key went to. Omitted when the agent has
     /// no stored document. Rides `/provision` because that call runs on
     /// EVERY boot including a resume, whereas the sandbox env is supplied
     /// only at container create — a resumed container would otherwise come
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_status_binding: Option<Bytes>,
+    /// ECIES-encrypted `{"token":"<64 lowercase hex>"}`: the opaque per-boot
+    /// status token. The attestor stores only its SHA-256.
+    pub encrypted_status_binding: Bytes,
 }
 
 // ── /status ─────────────────────────────────────────────────────────────
@@ -999,8 +1194,8 @@ pub struct StatusReport {
     pub status: ContainerReportStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_binding: Option<String>,
+    /// The per-boot status token handed out by `/provision`.
+    pub status_binding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_digest: Option<B256>,
     /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the
@@ -1177,11 +1372,11 @@ pub struct ReceiptSummary {
 
 // ── Jobs ────────────────────────────────────────────────────────────────
 //
-// JobPayload travels plaintext in-memory; `PostgresJobQueue` wraps it in
-// AES-GCM(job_key) before writing the `jobs.payload` Postgres column, so
-// at-rest confidentiality covers the whole payload (i_data plaintexts,
-// sandbox envelope user-supplied env vars, etc.) without callers doing
-// per-field crypto.
+// `PostgresJobQueue` stores JobPayload as plain JSON in `jobs.payload`. The
+// attestor's Postgres lives on the tapp FDE volume (`x-tapp: data:
+// encrypted` in docker-compose.yml). A payload carries iData plaintexts and
+// owner envelopes (with their user-supplied env), so a row holds it only
+// while the job is pending: claiming the job, or failing it unrun, clears it.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -1246,8 +1441,8 @@ pub enum JobPayload {
         /// Pre-mint resume context, carried by the job itself. Populated by
         /// `/retry` from the deployment's `i_data` only when the agent isn't
         /// minted yet; empty once minted (post-mint the authoritative iData is
-        /// read from chain). Sealed at rest in the job envelope, same as
-        /// `Deploy`'s inputs.
+        /// read from chain). Held in the job row only until a worker claims
+        /// it, same as `Deploy`'s inputs.
         #[serde(default)]
         artifacts: Vec<IDataArtifact>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1285,6 +1480,92 @@ pub enum JobPayload {
         #[serde(default)]
         authorization: JobCloneAuth,
     },
+}
+
+impl JobPayload {
+    /// The serde `kind` tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            JobPayload::Deploy { .. } => "deploy",
+            JobPayload::SandboxStart { .. } => "sandbox_start",
+            JobPayload::SandboxStop { .. } => "sandbox_stop",
+            JobPayload::SandboxRecreate { .. } => "sandbox_recreate",
+            JobPayload::ResumeDeploy { .. } => "resume_deploy",
+            JobPayload::SandboxTeardown { .. } => "sandbox_teardown",
+            JobPayload::Clone { .. } => "clone",
+        }
+    }
+
+    /// The seal the job acts on; for a clone, the new seal.
+    pub fn seal_id(&self) -> SealId {
+        match self {
+            JobPayload::Deploy { seal_id, .. }
+            | JobPayload::SandboxStart { seal_id, .. }
+            | JobPayload::SandboxStop { seal_id, .. }
+            | JobPayload::SandboxRecreate { seal_id, .. }
+            | JobPayload::ResumeDeploy { seal_id, .. }
+            | JobPayload::SandboxTeardown { seal_id, .. } => *seal_id,
+            JobPayload::Clone { new_seal_id, .. } => *new_seal_id,
+        }
+    }
+
+    /// Whether the job drives a new deployment's storage and mint tracks
+    /// from `NotStarted`. Nothing else starts them, so if such a job dies the
+    /// reaper fails the tracks it never started.
+    pub fn starts_identity(kind: &str) -> bool {
+        matches!(kind, "deploy" | "clone")
+    }
+
+    /// When the job stops being runnable (unix seconds): the owner envelope's
+    /// `expires_at` for the jobs whose only effect is relaying that envelope
+    /// to the sandbox provider, which refuses an expired one. `None` for jobs
+    /// whose work outlives the envelope: a deploy or retry still mints and
+    /// finalizes the agent, and only its container step fails on a stale
+    /// envelope, on its own terms.
+    pub fn expires_at(&self) -> anyhow::Result<Option<i64>> {
+        match self {
+            Self::SandboxStart {
+                sandbox_envelope, ..
+            }
+            | Self::SandboxStop {
+                sandbox_envelope, ..
+            }
+            | Self::SandboxRecreate {
+                sandbox_envelope, ..
+            } => Ok(Some(sandbox_envelope.expires_at()?)),
+            Self::Deploy { .. }
+            | Self::ResumeDeploy { .. }
+            | Self::SandboxTeardown { .. }
+            | Self::Clone { .. } => Ok(None),
+        }
+    }
+}
+
+/// Why `JobQueue::reap` failed a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapCause {
+    /// Running, but its worker stopped heartbeating.
+    Abandoned,
+    /// Pending when its owner envelope expired; never ran.
+    Expired,
+}
+
+/// A job `JobQueue::reap` marked failed. `kind`/`seal_id` are `None` only on
+/// rows written before those columns existed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReapedJob {
+    pub id: JobId,
+    pub kind: Option<String>,
+    pub seal_id: Option<SealId>,
+    pub cause: ReapCause,
+}
+
+/// What `DeploymentRepo::resolve_abandoned_stages` changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AbandonedStages {
+    pub storage_failed: bool,
+    pub mint_failed: bool,
+    pub container_deadline_set: bool,
 }
 
 /// Mint-path selector carried on `JobPayload::Clone` (issue #133).

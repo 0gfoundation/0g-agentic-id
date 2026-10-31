@@ -24,7 +24,7 @@ import { buildClient } from '../sdk';
 import { CliError } from '../errors';
 import { emitOk, note, print } from '../envelope';
 import { parseAgentRef, type AgentRef } from '../ref';
-import { applyAssignments, assertModelPresent, parseAssignments, renderSettings } from '../settings';
+import { applyAssignments, assertModelPresent, assertOthersFitFramework, parseAssignments, renderSettings } from '../settings';
 import { SettingsConflictError } from '../../Settings';
 import type { CommandContext } from '../types';
 import { changesProvider } from '../../Providers';
@@ -89,6 +89,11 @@ export async function run(ctx: CommandContext): Promise<void> {
     return;
   }
 
+  // Before anything is signed: a 0g-harness switch in others= for an agent that runs
+  // another framework does nothing there, or worse (cli/settings.ts).
+  if (assignments.some((a) => a.key === 'others' && a.value !== undefined)) {
+    assertOthersFitFramework(assignments, await frameworkOf(ctx.env.attestorUrl, sealId));
+  }
   const next = applyAssignments(current, assignments);
   // Before anything is signed: a document with no model is the one state the
   // container cannot boot from and last-known-good cannot cover.
@@ -169,6 +174,22 @@ export async function run(ctx: CommandContext): Promise<void> {
         ? `written — version ${written.version}, but the running container refused it (see the warning above); it will not boot as-is.`
         : `written — version ${written.version}. The container applies it on its next boot.`,
   );
+}
+
+/**
+ * The framework the deployment row records, or undefined when it cannot be
+ * read (a legacy row, an unreachable attestor): the check it feeds then lets
+ * the write through.
+ */
+async function frameworkOf(attestorUrl: string | undefined, sealId: string): Promise<string | undefined> {
+  if (!attestorUrl) return undefined;
+  try {
+    const r = await fetch(`${attestorUrl}/deployment/${sealId}`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return undefined;
+    return ((await r.json()) as { framework?: string | null }).framework ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

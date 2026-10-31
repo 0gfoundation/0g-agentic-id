@@ -152,7 +152,7 @@ func removeScratch(dir string) {
 //
 // The 0g-storage-client CLI is what sealed runs for downloads only (no key
 // involved; uploads run in-process, upload.go). The images that build it
-// (sealed/Dockerfile, images/{hermes,prime,dsh,sealed}) install it at
+// (sealed/Dockerfile, images/{hermes,prime,harness,sealed}) install it at
 // /usr/local/bin, root-owned, at the SDK version pinned in sealed/go.mod;
 // the base image images/openclaw does not carry it, so an image built from
 // it alone fails every download. It runs through

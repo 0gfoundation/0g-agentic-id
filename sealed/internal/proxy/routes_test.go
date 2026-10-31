@@ -78,7 +78,7 @@ func TestFrameworkRoutesForHello_Maps(t *testing.T) {
 	}
 }
 
-// An adapter that declares its own Kind "responses" route (prime, dsh) must
+// An adapter that declares its own Kind "responses" route (prime, 0g-harness) must
 // NOT get a second synthesized entry — the proxy forwards to the native one.
 func TestFrameworkRoutesForHello_NativeResponsesNotDuplicated(t *testing.T) {
 	s := &Server{fwRoutes: []framework.Route{

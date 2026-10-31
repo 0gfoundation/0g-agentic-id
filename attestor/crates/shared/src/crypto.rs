@@ -8,9 +8,8 @@
 //!
 //! `agentSeal_priv` is derived PER SEAL from the KMS: the attestor sends
 //! `material = chainId‖contract‖sealId` and gets back 32 bytes used directly
-//! as the secp256k1 private key. The attestor holds no fleet-wide master —
-//! only an app-scoped key (`app_key`, empty material) cached at construction
-//! for the sync helpers (job-encryption key, binding MAC).
+//! as the secp256k1 private key. The attestor holds no fleet-wide master and
+//! no app-scoped key: every KMS call is a per-`material` derivation.
 
 use crate::kms::KmsClient;
 use crate::traits::CryptoModule;
@@ -19,11 +18,8 @@ use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use alloy::primitives::{keccak256, Address};
 use async_trait::async_trait;
-use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as EcdsaSignature, SigningKey, VerifyingKey};
 use rand::{thread_rng, RngCore};
-use sha2::Sha256;
 use std::sync::Arc;
 
 /// Builds the opaque KMS derivation material for one seal:
@@ -40,10 +36,6 @@ pub fn seal_material(chain_id: u64, contract: Address, seal_id: SealId) -> Vec<u
 }
 
 pub struct RealCrypto {
-    /// App-scoped key (KMS empty-material), cached once at construction so the
-    /// sync helpers (`hmac_binding`, and the job key derived in main) don't
-    /// take a KMS round-trip. NOT an agentSeal source.
-    app_key: [u8; 32],
     /// KMS handle for per-seal agentSeal derivation.
     kms: Arc<dyn KmsClient>,
     /// Material inputs (public, from chain config).
@@ -52,28 +44,21 @@ pub struct RealCrypto {
 }
 
 impl RealCrypto {
-    pub fn new(
-        app_key: [u8; 32],
-        kms: Arc<dyn KmsClient>,
-        chain_id: u64,
-        contract: Address,
-    ) -> Self {
+    pub fn new(kms: Arc<dyn KmsClient>, chain_id: u64, contract: Address) -> Self {
         Self {
-            app_key,
             kms,
             chain_id,
             contract,
         }
     }
 
-    /// Test/dev constructor: a `MockKmsClient`-backed crypto whose app key
-    /// equals `secret` and whose agentSeal derivation goes through the mock
-    /// (HKDF over the seal material). Deterministic and material-sensitive,
+    /// Test/dev constructor: a `MockKmsClient`-backed crypto keyed by
+    /// `secret`, whose agentSeal derivation goes through the mock (HKDF over
+    /// the seal material). Deterministic and material-sensitive,
     /// so it matches prod semantics without a KMS cluster. chain/contract are
     /// placeholders — fine for tests that don't assert a specific address.
     pub fn new_for_test(secret: [u8; 32]) -> Self {
         Self::new(
-            secret,
             Arc::new(crate::kms::MockKmsClient::from_bytes(secret)),
             0,
             Address::ZERO,
@@ -161,51 +146,38 @@ impl CryptoModule for RealCrypto {
         keccak256(data).0
     }
 
-    fn hmac_binding(&self, info: &[u8], data: &[u8]) -> [u8; 32] {
-        // HKDF-derive a per-info binding key from the app-scoped KMS key, then
-        // HMAC-SHA256 the data with it. Domain separation lives in `info`
-        // (e.g. `"agentic-id.container-pubkey-binding.v1"`).
-        let hkdf = Hkdf::<Sha256>::new(None, &self.app_key);
-        let mut binding_key = [0u8; 32];
-        hkdf.expand(info, &mut binding_key)
-            .expect("HKDF-SHA256 expand to 32 bytes is infallible");
-
-        type HmacSha256 = Hmac<Sha256>;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(&binding_key)
-            .expect("HMAC-SHA256 accepts any key length");
-        mac.update(data);
-        let tag = mac.finalize().into_bytes();
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&tag);
-        out
-    }
-
     fn recover_signer(&self, digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {
-        if signature.len() != 65 {
-            anyhow::bail!("signature must be 65 bytes (r||s||v), got {}", signature.len());
-        }
-        let r_s = &signature[..64];
-        let v = signature[64];
-        let rec_id = match v {
-            27 | 28 => v - 27,
-            0 | 1 => v,
-            _ => anyhow::bail!("invalid recovery id: {v}"),
-        };
-
-        let sig = EcdsaSignature::from_slice(r_s)
-            .map_err(|e| anyhow::anyhow!("invalid ECDSA signature: {e}"))?;
-        let rec = RecoveryId::try_from(rec_id)
-            .map_err(|e| anyhow::anyhow!("invalid recovery id: {e}"))?;
-
-        let vk = VerifyingKey::recover_from_prehash(digest, &sig, rec)
-            .map_err(|e| anyhow::anyhow!("recover failed: {e}"))?;
-
-        let uncompressed = vk.to_encoded_point(false);
-        let hash = keccak256(&uncompressed.as_bytes()[1..]);
-        let mut addr_bytes = [0u8; 20];
-        addr_bytes.copy_from_slice(&hash[12..]);
-        Ok(Address::from(addr_bytes))
+        recover_prehash_signer(digest, signature)
     }
+}
+
+/// Recover the address that signed a 32-byte prehash with a 65-byte
+/// `r‖s‖v` signature, accepting v in {27,28} and {0,1}. No EIP-191 prefix.
+pub fn recover_prehash_signer(digest: &[u8; 32], signature: &[u8]) -> anyhow::Result<Address> {
+    if signature.len() != 65 {
+        anyhow::bail!("signature must be 65 bytes (r||s||v), got {}", signature.len());
+    }
+    let r_s = &signature[..64];
+    let v = signature[64];
+    let rec_id = match v {
+        27 | 28 => v - 27,
+        0 | 1 => v,
+        _ => anyhow::bail!("invalid recovery id: {v}"),
+    };
+
+    let sig = EcdsaSignature::from_slice(r_s)
+        .map_err(|e| anyhow::anyhow!("invalid ECDSA signature: {e}"))?;
+    let rec =
+        RecoveryId::try_from(rec_id).map_err(|e| anyhow::anyhow!("invalid recovery id: {e}"))?;
+
+    let vk = VerifyingKey::recover_from_prehash(digest, &sig, rec)
+        .map_err(|e| anyhow::anyhow!("recover failed: {e}"))?;
+
+    let uncompressed = vk.to_encoded_point(false);
+    let hash = keccak256(&uncompressed.as_bytes()[1..]);
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&hash[12..]);
+    Ok(Address::from(addr_bytes))
 }
 
 #[cfg(test)]
@@ -255,6 +227,9 @@ mod tests {
         assert_ne!(ct, pt);
         let out = crypto.aes_gcm_decrypt(&ct, &key).unwrap();
         assert_eq!(out, pt);
+        assert!(crypto
+            .aes_gcm_decrypt(&ct, &crypto.random_key_32())
+            .is_err());
     }
 
     #[tokio::test]

@@ -195,7 +195,8 @@ agent 运行时（Sealed Sandbox）的信任链分两层级联，最终规约到
 
 1. **0g-Sandbox 自己**通过 Tapp 部署，可验证性和封装性由 Tapp 保证。
 2. **0g-Sandbox 创建的每个 sealed sandbox** 的对外封装性由 0g-Sandbox 的运行
-   时逻辑保证；其镜像哈希由 0g-Sandbox 用自己的硬件身份签名。
+   时逻辑保证；其容器公钥与镜像哈希由 0g-Sandbox 用 KMS 托管的 provider key
+   签名（EIP-712 证书）。
 3. **Attestor 在 provision 时**双重验证：核对 0g-Sandbox 身份签名 + 检查
    sealed sandbox 镜像哈希在链上注册过；两项通过才下发 `agentSeal_priv`。
 
@@ -206,9 +207,10 @@ agentSeal 私钥。
 
 - **仅授权启动**：启动容器之前，Sandbox 验证请求来自链上注册的 owner。只有
   合法 owner 才能用 agent 的功能数据实例化它。
-- **运行时代码 attestation**：Sandbox 给容器的镜像哈希签名，交给 Attestor。
-  Attestor 核对 Sandbox 的 `signerAddress` 在 TappRegistry 注册过，且镜像哈希
-  出现在 AgenticID 合约的 **`validFrameworkHashes` 白名单**里。这个白名单覆盖
+- **运行时代码 attestation**：Sandbox 为容器公钥和镜像哈希签发证书，由容器在
+  首次 `/provision` 时交给 Attestor。Attestor 核对证书签名者及其注册 scope 是
+  TappRegistry 中登记的 sandbox app 实例，且镜像哈希出现在 AgenticID 合约的
+  **`validFrameworkHashes` 白名单**里。这个白名单覆盖
   的是 **AgenticID 运行时框架**的哈希——也就是负责加载功能数据、管理 AgentSeal
   签名、校验 owner 指令的那一层容器代码。它与 LangChain / CrewAI 这类 AI 编排
   工具是**不同层级**的东西：后者是存在 agent 功能数据里、由运行时加载的配置。
@@ -308,11 +310,12 @@ AgenticID 1.3 通过无状态链接库 `AttestorAppBindingLib` 处理 app 实例
 
 ### TEE 层（0g-Tapp 部署）
 
-- **Attestor** — 校验 Sandbox 的 `signerAddress`（against TappRegistry）与容器
-  镜像哈希（against `validFrameworkHashes`）；经 KMS 派生 AgentSeal 密钥材料；
+- **Attestor** — 校验 Sandbox 证书的签名者（对照 TappRegistry 登记的 app 实例）
+  与容器镜像哈希（against `validFrameworkHashes`）；经 KMS 派生 AgentSeal 密钥材料；
   把 AgentSeal 公钥注册上链。（Rust，见 [`attestor/`](attestor/README.zh.md)）
-- **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器并签其镜像
-  哈希；保证 agent 按链上功能数据运行。
+- **0g-Sandbox** — 校验启动请求来自注册 owner；启动 Sealed 容器，为其公钥和
+  镜像哈希签发证书，并签署容器所校验的 attestor TLS pin；保证 agent 按链上
+  功能数据运行。
 - **Agent 运行时（`sealed`）** — 跑在 Sandbox 里、受 RA 后下发密钥的容器：把
   链上加密 iData 还原成可运行 agent，持续把状态演化写回链上，给签名响应
   （`/hello`、`/_seal/auth`、agent 注册的 `/api/*` 服务）签 `X-Agent-Proof`。
@@ -377,6 +380,8 @@ Monorepo 四个子项目：
 | [`sealed/`](sealed/ARCHITECTURE.zh.md) | agent 运行时容器（TEE 内还原 iData、演化上链、签名）| Go |
 | [`sdk/typescript/`](sdk/typescript/README.md) | 客户端 SDK（`@0gfoundation/0g-agentdna`，CLI `0g-agentdna`）：deploy / clone / transfer、serve-proof 抓取 + 验证、feedback、信任根 ack、sandbox 充值 | TypeScript (viem) |
 
+仓库是公开的。每次克隆后，先运行一次 `git config core.hooksPath .githooks`，启用隐私检查。之后每次提交，pre-commit 钩子都会检查新增的内容：如果加入了私钥、token、个人路径或邮箱、公网 IP，提交会被拒绝。规则见 `scripts/privacy-check.mjs`，详细说明见 `AGENTS.md`。
+
 ### 进一步阅读
 
 **[`sdk/typescript/README.md`](sdk/typescript/README.md) — 客户端 SDK**
@@ -439,9 +444,9 @@ sealed runtime 在 agent system prompt 里强行注入的"钢印"——agent 拒
 - **密钥派生链** —— KMS 怎么替 attestor 派生密钥、为什么跟
   用户 EOA 钱包是**两个互不相通的密钥空间**；每个 agent 的
   `agent_seal_priv` 由 KMS 按 `chainId ‖ contract ‖ sealId`
-  **确定性派生**；sandbox 签
-  image attestation + attestor 三重校验（TappRegistry 节点身份 +
-  `validFrameworkHashes` 白名单 + 新鲜度）+ ECIES 下发到容器 ephemeral
+  **确定性派生**；sandbox 签发的 EIP-712 证书 + attestor 三道关卡（签名者的
+  TappRegistry app 实例 + `validFrameworkHashes` 白名单 + 首次 provision 的
+  新鲜度或之后启动对照记录的容器公钥）+ ECIES 下发到容器 ephemeral
   pubkey，只有那个 TEE 能解
 - **set-once seal 安全性** —— `agentSeal` / `sealId` 永久绑定为什么没
   问题：换硬件能再派同一把 priv，链上绑定永远合法

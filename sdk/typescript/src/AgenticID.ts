@@ -620,8 +620,8 @@ export class AgentApi {
    * Compact the agent's ONE persisted conversation in place: the framework's
    * own compaction replaces the older history with a summary and keeps the
    * newest part verbatim (how much is the framework's: openclaw ~20K tokens,
-   * dsh only its newest item), so later requests carry less of it while the
-   * conversation goes on — the middle ground between doing nothing and
+   * 0g-harness only its newest item), so later requests carry less of it
+   * while the conversation goes on — the middle ground between doing nothing and
    * {@link clearConversation}. No restart. The summary takes one or more
    * model calls, so this can take minutes — longer than Node's fetch waits
    * for an answer (300s). A connection dropped or timed out meanwhile does not

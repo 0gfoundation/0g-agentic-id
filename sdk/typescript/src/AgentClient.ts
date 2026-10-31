@@ -139,6 +139,120 @@ export interface ChatCompletion {
 }
 
 /**
+ * One unit of work on the agent, as its task list shows it
+ * ({@link AgentClient.tasks}): a turn of its conversation, a background
+ * command, or a subagent. `actor` says who does the work, `trigger` who asked
+ * for it.
+ */
+export interface AgentTaskInfo {
+  /** A turn: `resp_…` (the id {@link AgentClient.task} and
+   *  {@link AgentClient.followTask} take). A command: `bash-N`. A subagent:
+   *  `subagent-N`. */
+  id: string;
+  type: 'turn' | 'command' | 'subagent';
+  status: AgentTask['status'];
+  /** Who does the work: `agent` (the main agent) or `subagent`. */
+  actor: 'agent' | 'subagent';
+  /** Who asked. A turn: `user` | `job` | `schedule` | `plugin`. A command or
+   *  a subagent: `agent` (the main agent started it). */
+  trigger: string;
+  /** What the task is: the prompt, the job notice, the reminder's text. */
+  label: string;
+  /** Unix seconds. */
+  created_at: number;
+  started_at?: number;
+  finished_at?: number;
+  error?: string;
+  detail?: string;
+  /** Notices that reached the agent while this turn ran, merged into it. */
+  merged_notices?: string[];
+  /** {@link AgentClient.taskInfo} only: a turn's text, or a finished
+   *  subagent's final answer. A command's output is never returned. */
+  output_text?: string;
+}
+
+/** What stopping one task did ({@link AgentClient.stopTask}). */
+export interface AgentTaskStop {
+  id: string;
+  outcome: 'cancelled' | 'already-finished' | 'not-running';
+}
+
+/**
+ * The words of a turn the agent opened itself (a background job finished, a
+ * reminder came due), kept in the agent's inbox until the owner reads them.
+ */
+export interface AgentInboxMessage {
+  /** Its position in the agent's cursor: ack through it with
+   *  {@link AgentClient.ackInbox}. */
+  seq: number;
+  /** The turn's id. */
+  id: string;
+  /** What opened the turn: `job` | `schedule` | `plugin`. */
+  trigger: string;
+  /** The job notice, or the reminder's text. */
+  label: string;
+  status: AgentTask['status'];
+  /** What the agent said in that turn. */
+  text: string;
+  error?: string;
+  created_at: number;
+  finished_at?: number;
+}
+
+/** One page of the inbox ({@link AgentClient.inbox}). */
+export interface AgentInbox {
+  data: AgentInboxMessage[];
+  /** Messages after the read position. The position is the agent's, so every
+   *  client sees the same count. */
+  unread: number;
+  read_through: number;
+  /** The agent's cursor now: pass it to {@link AgentClient.events} as
+   *  `after` and the feed misses nothing that happens after this read. */
+  cursor: number;
+}
+
+/** A reminder the agent set for itself ({@link AgentClient.schedules}). */
+export interface AgentSchedule {
+  id: string;
+  kind: 'after' | 'at' | 'every';
+  /** The reminder's own text. */
+  prompt: string;
+  afterSeconds?: number;
+  everySeconds?: number;
+  /** When it comes due next (ISO 8601). */
+  scheduledAt: string;
+  state: 'scheduled' | 'overdue';
+}
+
+/**
+ * One event of the agent's live feed ({@link AgentClient.events}). `data` is
+ * the payload as the agent sent it (its `seq` and `time` included), by
+ * `type`:
+ *
+ * | type | data |
+ * |---|---|
+ * | `turn.queued` / `turn.started` / `turn.completed` / `turn.failed` / `turn.cancelled` | an {@link AgentTaskInfo} (a turn) |
+ * | `task.updated` | an {@link AgentTaskInfo} (a command or a subagent) |
+ * | `inbox.message` | an {@link AgentInboxMessage} |
+ * | `inbox.read` | `{ read_through }` |
+ * | `schedule.changed` | `{ operation: "create" \| "delete" \| "dispatch", id }` |
+ * | `reset` | `{ cursor, read_through }` |
+ *
+ * `reset` means the agent could not serve the position asked for (it is
+ * older than the agent's in-memory window, or from before a `/clear`):
+ * re-read the inbox, tasks and schedules; the feed carries on from `cursor`.
+ * A type this list does not name is passed through as it came.
+ */
+export interface AgentEvent {
+  type: string;
+  /** Its position in the agent's cursor. */
+  seq: number;
+  /** Agent clock, ms since the epoch. */
+  time: number;
+  data: Record<string, unknown>;
+}
+
+/**
  * A live handle to an agent. Always carries `base` and the declared
  * `services`/`routes`. Owner affordances (`chat`/`chatStream`) are
  * present only when this handle can authenticate — i.e. it was built with a
@@ -196,14 +310,15 @@ export interface AgentClient {
    *
    * Pass `signal` to interrupt a turn in flight: aborting tears down the HTTP
    * connection, which is the OpenAI-conventional cancel signal — the runtime
-   * side stops the turn where the framework supports cancellation (dsh does).
+   * side stops the turn where the framework supports cancellation (0g-harness
+   * does).
    * The generator then throws the abort error (`err.name === "AbortError"`).
    */
   chatStream?(messages: ChatMessage[], opts?: {
     model?: string;
     signal?: AbortSignal;
     /** Tool-activity progress, when the agent's bridge streams it (SSE
-     *  ": activity tool/call <name>" comments — dsh does). Labels like
+     *  ": activity tool/call <name>" comments — 0g-harness does). Labels like
      *  "tool/call bash", "tool/result", "turn/end". Advisory: absence just
      *  means the bridge doesn't narrate. */
     onActivity?: (label: string) => void;
@@ -265,6 +380,55 @@ export interface AgentClient {
    * `tail` to keep only the last N lines.
    */
   logs?(opts?: { tail?: number }): Promise<string>;
+  /**
+   * Read the agent's inbox: the words of turns the agent opened itself (a
+   * background job finished, a reminder came due), oldest first. Without
+   * `after`, the messages after the read position; `after: 0` returns all of
+   * them. Present only when the agent declares a `kind: "inbox"` route and
+   * this handle holds the owner token.
+   */
+  inbox?(opts?: { after?: number; limit?: number }): Promise<AgentInbox>;
+  /** Move the inbox read position forward to `through` (it never moves
+   *  back). Present under the same conditions as {@link inbox}. */
+  ackInbox?(through: number): Promise<{ read_through: number; unread: number }>;
+  /**
+   * Follow the agent's live feed: turn, task, inbox and schedule changes, as
+   * they happen. Runs until `signal` aborts: a dropped or silent connection
+   * is reopened from the last event seen, so nothing is lost or repeated. Pass
+   * `after` (e.g. {@link AgentInbox.cursor}) to start from a known position;
+   * without it the feed starts at the agent's current one. Throws only on an
+   * answer that retrying cannot change (an HTTP 4xx). Present only when the
+   * agent declares a `kind: "events"` route and this handle holds the owner
+   * token.
+   */
+  events?(opts?: { after?: number; signal?: AbortSignal }): AsyncGenerator<AgentEvent>;
+  /**
+   * Everything running or that has run on the agent, newest first: turns,
+   * background commands and subagents, with who does each (`actor`) and who
+   * asked (`trigger`). `status` filters: `"active"` (queued or running) or one
+   * status name. Present only when the agent declares a `kind: "tasks"` route
+   * and this handle holds the owner token.
+   */
+  tasks?(opts?: { status?: string; limit?: number }): Promise<AgentTaskInfo[]>;
+  /** One task of {@link tasks}, by id, with its `output_text` where there
+   *  is one. Present under the same conditions as {@link tasks}. */
+  taskInfo?(id: string): Promise<AgentTaskInfo>;
+  /**
+   * Stop one task of {@link tasks}: a turn is cancelled (a queued one never
+   * starts), a command or subagent is killed. Already-executed actions are
+   * not rolled back. Present under the same conditions as {@link tasks}.
+   */
+  stopTask?(id: string): Promise<AgentTaskStop>;
+  /** Stop everything: queued turns first, then the running turn, then every
+   *  running command and subagent. Present under the same conditions as
+   *  {@link tasks}. */
+  stopAllTasks?(): Promise<AgentTaskStop[]>;
+  /**
+   * The reminders the agent set for itself. `enabled: false` means the
+   * agent's reminders are switched off. Present only when the agent declares
+   * a `kind: "schedules"` route and this handle holds the owner token.
+   */
+  schedules?(): Promise<{ enabled: boolean; data: AgentSchedule[] }>;
 }
 
 /** Longest-prefix match over declared routes, or undefined if none match. */
@@ -304,7 +468,7 @@ async function* iterSseChunks(
     for (const line of frame.split('\n')) {
       const t = line.replace(/^﻿/, '').trimStart();
       // SSE comments (":...") are invisible to the payload, but a caller may
-      // want them: the dsh bridge streams tool-activity progress as
+      // want them: 0g-harness streams tool-activity progress as
       // ": activity <kind>" comments (keepalives pass through too — the
       // callback filters).
       if (t.startsWith(':') && onComment) onComment(t.slice(1).trim());
@@ -504,7 +668,7 @@ export function makeAgentClient(params: {
     const path = `${chat.prefix}chat/completions`;
 
     client.interrupt = async () => {
-      // dsh/prime bridges expose a real endpoint; call it. openclaw/hermes
+      // 0g-harness and the prime bridge expose a real endpoint; call it. openclaw/hermes
       // serve /v1 themselves (404 here) and both stop the turn when the
       // client disconnects — LAB- and live-verified for openclaw (the run
       // ends stopReason=aborted the moment the stream drops; no
@@ -617,11 +781,11 @@ export function makeAgentClient(params: {
 
   // ── Responses transport (the long-task surface) ──────────────────────────
   //
-  // When the agent declares a `kind: "responses"` route (prime/dsh bridges
-  // natively; openclaw/hermes via the sealed proxy's synthesized layer), a
-  // turn is owned by a server-side response id, not by the HTTP connection —
-  // so it survives network drops and the sandbox preview proxy's request-
-  // duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
+  // When the agent declares a `kind: "responses"` route (the prime bridge and
+  // 0g-harness natively; openclaw/hermes via the sealed proxy's synthesized
+  // layer), a turn is owned by a server-side response id, not by the HTTP
+  // connection — so it survives network drops and the sandbox preview proxy's
+  // request-duration cap (~300s on mainnet, 0g-sandbox#122). chat/chatStream are
   // REPLACED to ride it: same signatures, but a dropped connection now means
   // "resume from the last sequence number", not "the task died". task/
   // followTask/cancelTask expose the id-level surface for re-attaching later.
@@ -870,6 +1034,159 @@ export function makeAgentClient(params: {
       const r = await doFetch(`${rPrefix}/${id}/cancel`, { method: 'POST' });
       if (!r.ok) throw new Error(`cancelTask: HTTP ${r.status}: ${await r.text()}`);
       return (await r.json()) as AgentTask;
+    };
+  }
+
+  // ── The agent's own work: inbox, live feed, tasks, reminders ─────────────
+  //
+  // An agent that works in the background (commands, subagents, reminders)
+  // also opens turns by itself, and their words belong to no chat request.
+  // These kinds are where they surface (0g-harness, docs/PROTOCOL.md). Each
+  // method is attached only for a kind the agent declares, like chat; agents
+  // that declare none of them are unaffected.
+  const ownerBase = (kind: string): string | undefined => {
+    const r = routes.find((x) => x.kind === kind);
+    return r && canAuth ? r.prefix.replace(/\/$/, '') : undefined;
+  };
+  const query = (params: Record<string, string | number | undefined>): string => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) if (v !== undefined) q.set(k, String(v));
+    const s = q.toString();
+    return s ? `?${s}` : '';
+  };
+  const getJSON = async <T>(what: string, path: string): Promise<T> => {
+    const r = await doFetch(path);
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json()) as T;
+  };
+  const postJSON = async <T>(what: string, path: string, body?: unknown): Promise<T> => {
+    const r = await doFetch(path, {
+      method: 'POST',
+      ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+    });
+    if (!r.ok) throw new Error(`${what}: HTTP ${r.status}: ${await r.text()}`);
+    return (await r.json()) as T;
+  };
+
+  const inboxBase = ownerBase('inbox');
+  if (inboxBase) {
+    client.inbox = (opts) => getJSON<AgentInbox>('inbox', `${inboxBase}${query({ after: opts?.after, limit: opts?.limit })}`);
+    client.ackInbox = (through) => postJSON('ackInbox', `${inboxBase}/ack`, { through });
+  }
+
+  const tasksBase = ownerBase('tasks');
+  if (tasksBase) {
+    client.tasks = async (opts) =>
+      (await getJSON<{ data: AgentTaskInfo[] }>('tasks', `${tasksBase}${query({ status: opts?.status, limit: opts?.limit })}`)).data;
+    client.taskInfo = (id) => getJSON<AgentTaskInfo>('taskInfo', `${tasksBase}/${encodeURIComponent(id)}`);
+    client.stopTask = async (id) => {
+      // `all` is a different request with a different answer.
+      if (id === 'all') throw new Error('stopTask: "all" is stopAllTasks()');
+      return postJSON<AgentTaskStop>('stopTask', `${tasksBase}/${encodeURIComponent(id)}/cancel`);
+    };
+    client.stopAllTasks = async () =>
+      (await postJSON<{ data: AgentTaskStop[] }>('stopAllTasks', `${tasksBase}/all/cancel`)).data;
+  }
+
+  const schedulesBase = ownerBase('schedules');
+  if (schedulesBase) {
+    client.schedules = async () => {
+      const j = await getJSON<{ enabled?: boolean; data?: AgentSchedule[] }>('schedules', schedulesBase);
+      return { enabled: j.enabled !== false, data: j.data ?? [] };
+    };
+  }
+
+  const eventsBase = ownerBase('events');
+  if (eventsBase) {
+    // The agent sends a keepalive every 10s, so this much silence means the
+    // connection is gone — the responses transport's rule, and its knob.
+    const stallMs = params.stallMs ?? 90_000;
+    const pollMs = Math.max(50, Math.floor(stallMs / 6));
+    // A feed has no end to wait for, so a failure never ends it: it backs off
+    // to a ceiling and keeps trying. An agent restarting (a settings push
+    // restarts its process) is a normal reason to be away for a while.
+    const backoff = (n: number): number => Math.min(500 * 2 ** n, 30_000, Math.max(50, stallMs * 4));
+    const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+      new Promise((resolve) => {
+        const done = (): void => {
+          clearTimeout(t);
+          signal?.removeEventListener('abort', done);
+          resolve();
+        };
+        const t = setTimeout(done, ms);
+        signal?.addEventListener('abort', done, { once: true });
+      });
+
+    client.events = async function* (opts) {
+      const signal = opts?.signal;
+      let pos = opts?.after;
+      let failures = 0;
+      while (!signal?.aborted) {
+        const attempt = new AbortController();
+        const onAbort = (): void => attempt.abort();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        let lastByteAt = Date.now();
+        let sawBytes = false;
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastByteAt > stallMs) attempt.abort();
+        }, pollMs);
+        try {
+          let res: Response | undefined;
+          try {
+            res = await doFetch(`${eventsBase}${query({ after: pos })}`, { signal: attempt.signal });
+          } catch {
+            // the network, or an agent that is not up: try again below
+          }
+          if (res && !res.ok) {
+            const text = await res.text().catch(() => '');
+            // A 4xx is an answer (the route is gone, the handle is refused),
+            // and asking again gets the same one.
+            if (res.status < 500 && res.status !== 408 && res.status !== 429) {
+              throw new Error(`events: HTTP ${res.status}: ${text}`);
+            }
+            res = undefined;
+          }
+          if (res) {
+            if (!res.body || !(res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+              throw new Error('events: expected an SSE stream from the events route');
+            }
+            const heard = (): void => {
+              lastByteAt = Date.now();
+              sawBytes = true;
+            };
+            try {
+              for await (const chunk of iterSseChunks(res.body, heard)) {
+                heard();
+                const { __sseEvent, ...data } = chunk as Record<string, unknown> & { __sseEvent?: string };
+                const { seq, time } = data;
+                if (typeof seq !== 'number') continue;
+                const type = __sseEvent ?? '';
+                if (type === 'reset') {
+                  // The position moves to the agent's cursor, backwards too
+                  // (after a /clear). The backlog the agent sends after a
+                  // reset is older than it, and is skipped below.
+                  pos = typeof data.cursor === 'number' ? data.cursor : seq;
+                } else {
+                  if (pos !== undefined && seq <= pos) continue;
+                  pos = seq;
+                }
+                yield { type, seq, time: typeof time === 'number' ? time : Date.now(), data };
+              }
+            } catch {
+              // cut mid-stream, or the stall watchdog: reopen from `pos`
+            }
+          }
+        } finally {
+          clearInterval(watchdog);
+          signal?.removeEventListener('abort', onAbort);
+        }
+        if (signal?.aborted) return;
+        // A connection that carried anything (keepalives included) was
+        // healthy until it closed (a proxy's request-duration cap, an agent
+        // restart): reopen at once. One that carried nothing backs off.
+        if (sawBytes) failures = 0;
+        else await sleep(backoff(++failures), signal);
+      }
     };
   }
 

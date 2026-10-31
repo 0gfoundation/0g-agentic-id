@@ -1,6 +1,7 @@
 //! Shared types, traits, implementations for the Attestor backend.
 
 pub mod agent_card;
+pub mod attestor_tls;
 pub mod auth;
 pub mod avatar;
 pub mod chain;

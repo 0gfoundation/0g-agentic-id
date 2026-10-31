@@ -1,20 +1,23 @@
 // Package config loads bootstrap inputs from environment variables and
-// performs the Phase 0 attestation self-check.
+// performs the Phase 0 certificate self-check.
 //
 // Env vars consumed:
 //
-//	SANDBOX_SEAL_KEY            (required) hex-encoded ephemeral private key
-//	SANDBOX_SEAL_ATTESTATION    (required) JSON envelope from sealing layer
-//	TEE_SIGNER_ADDRESS          (optional) stable sandbox app signer address; if set,
-//	                            the v2 attestation signer must match exactly
+//	SANDBOX_SEAL_KEY            (required) hex-encoded container private key, written
+//	                            by the sandbox provider at sealed create
+//	SANDBOX_SEAL_ATTESTATION    (required) the provider's v3 container certificate
+//	                            (EIP-712, internal/provision/attestation.go)
+//	SEAL_BOOT_TICKET            boot ticket, written by the attestor at create
 //	API_KEY                     (optional, legacy) inference provider API key in clear
 //	SEAL_SECRET_ENV             (optional) the owner's secret env (API_KEY) sealed to the
 //	                            agentSeal key; opened after provisioning, wins over API_KEY
 //	                            (internal/secretenv, issue #166)
-//	ATTESTOR_URL                (optional) provisioning endpoint root URL
-//	ATTESTOR_TLS_DESCRIPTOR     public Scan anchor + immutable attestor app scope,
-//	                            injected by attestor; required when ATTESTOR_URL is set
-//	ATTESTOR_ALLOW_UNPINNED_DEV  explicit development-only bypass ("true")
+//	ATTESTOR_URL                (optional) provisioning endpoint root URL (https); its TLS
+//	                            key is pinned by internal/attestorhttp
+//	ATTESTOR_ALLOW_UNPINNED_DEV  explicit development-only bypass ("true"); the provider
+//	                            removes it, with every caller SANDBOX_* key, from each
+//	                            sealed container it certifies (every container the
+//	                            attestor creates)
 //	CHAIN_RPC_URL               (optional) AgenticID RPC endpoint
 //	AGENTIC_ID_ADDR             (optional) AgenticID contract address
 //	VERIFIED_FEEDBACK_ADDR      (optional) VerifiedFeedbackRegistry proxy address — the
@@ -26,6 +29,8 @@
 //	INDEXER_URL                 (optional) 0g-storage indexer fallback URL
 //	AGENT_FRAMEWORK             (optional) adapter-name fallback for chains without a
 //	                            framework binding (local dev); the binding is authoritative
+//	SANDBOX_PROXY_DOMAIN,       (optional) compose the public URL (composePublicURL)
+//	DAYTONA_SANDBOX_ID
 //
 // CHAIN_RPC_URL and INDEXER_URL are public and must not embed credentials
 // (an API token in the URL's userinfo, path or query). sealed prints both in
@@ -38,13 +43,15 @@
 // in GET /config) and ATTESTOR_STORAGE_INDEXER (which it also records on
 // chain at mint).
 //
-// After provisioning succeeds, SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION /
-// API_KEY / SEAL_SECRET_ENV MUST be cleared from the environment to deny a malicious or
-// prompt-injected agent the ability to read them via /proc/self/environ
-// or shell helpers — see ScrubProvisioningSecrets.
+// After provisioning succeeds, SEAL_BOOT_TICKET / SANDBOX_SEAL_KEY /
+// SANDBOX_SEAL_ATTESTATION / API_KEY / SEAL_SECRET_ENV MUST be cleared from
+// the environment to deny a malicious or prompt-injected agent the ability
+// to read them via /proc/self/environ or shell helpers — see
+// ScrubProvisioningSecrets.
 package config
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -54,6 +61,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/inference"
 	"seal-verify/internal/logger"
 	"seal-verify/internal/provision"
@@ -65,7 +73,13 @@ type Bootstrap struct {
 	// Phase 0 outputs (always populated)
 	SealKeyBytes []byte
 	Attestation  provision.Attestation
-	TEESigner    *common.Address // nil if not enforced
+	// Certificate is SANDBOX_SEAL_ATTESTATION as the provider wrote it; the
+	// first /provision forwards it verbatim. It is public.
+	Certificate json.RawMessage
+	// ProviderSigner is the key that signed the certificate. Phase 0 does
+	// not pin it: the attestor decides at first /provision whether it is a
+	// provider it trusts. It anchors the attestor TLS statement.
+	ProviderSigner common.Address
 
 	// Optional pipeline knobs
 	APIKey              string
@@ -106,9 +120,10 @@ type Bootstrap struct {
 	PublicURL string
 }
 
-// Load reads env vars and runs the attestation self-check (Phase 0). Returns
-// an error if SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION are missing or the
-// keypair-attestation signature pair fails to verify.
+// Load reads env vars and runs the certificate self-check (Phase 0). Returns
+// an error if SANDBOX_SEAL_KEY / SANDBOX_SEAL_ATTESTATION are missing, the
+// certificate is not a well-formed v3 certificate, or it certifies a key
+// other than SANDBOX_SEAL_KEY.
 func Load() (*Bootstrap, error) {
 	sealKey := os.Getenv("SANDBOX_SEAL_KEY")
 	attestRaw := os.Getenv("SANDBOX_SEAL_ATTESTATION")
@@ -119,37 +134,33 @@ func Load() (*Bootstrap, error) {
 		return nil, fmt.Errorf("SANDBOX_SEAL_ATTESTATION not set")
 	}
 
-	var a provision.Attestation
-	if err := json.Unmarshal([]byte(attestRaw), &a); err != nil {
-		return nil, fmt.Errorf("SANDBOX_SEAL_ATTESTATION not valid JSON: %w", err)
-	}
-	if a.SealID == "" || a.Pubkey == "" || a.ImageHash == "" || a.Signature == "" {
-		return nil, fmt.Errorf("attestation missing required fields")
-	}
-
-	keyBytes, err := hex.DecodeString(strings.TrimPrefix(sealKey, "0x"))
+	a, err := provision.ParseAttestation([]byte(attestRaw))
 	if err != nil {
-		return nil, fmt.Errorf("decode SANDBOX_SEAL_KEY: %w", err)
+		return nil, fmt.Errorf("SANDBOX_SEAL_ATTESTATION: %w", err)
+	}
+	// Never echo the key, or any part of it, into an error: /log is public.
+	keyBytes, err := hex.DecodeString(strings.TrimPrefix(sealKey, "0x"))
+	if err != nil || len(keyBytes) != 32 {
+		return nil, fmt.Errorf("SANDBOX_SEAL_KEY must be 32 bytes of hex")
 	}
 
-	var teeSignerPtr *common.Address
-	if v := os.Getenv("TEE_SIGNER_ADDRESS"); v != "" {
-		if !common.IsHexAddress(v) || common.HexToAddress(v) == (common.Address{}) {
-			return nil, fmt.Errorf("TEE_SIGNER_ADDRESS must be a nonzero Ethereum address")
-		}
-		addr := common.HexToAddress(v)
-		teeSignerPtr = &addr
-	}
-
-	if err := verifyAttestation(keyBytes, a, teeSignerPtr); err != nil {
+	signer, err := verifyAttestation(keyBytes, a)
+	if err != nil {
 		return nil, err
+	}
+	// ParseAttestation accepted exactly one JSON value, so this cannot fail;
+	// the compact form is what the first /provision forwards.
+	var certificate bytes.Buffer
+	if err := json.Compact(&certificate, []byte(attestRaw)); err != nil {
+		return nil, fmt.Errorf("SANDBOX_SEAL_ATTESTATION: %w", err)
 	}
 
 	return &Bootstrap{
 		SealKeyBytes:         keyBytes,
 		BootTicket:           os.Getenv("SEAL_BOOT_TICKET"),
 		Attestation:          a,
-		TEESigner:            teeSignerPtr,
+		Certificate:          json.RawMessage(certificate.Bytes()),
+		ProviderSigner:       signer,
 		APIKey:               os.Getenv("API_KEY"),
 		SecretEnv:            os.Getenv("SEAL_SECRET_ENV"),
 		AttestorURL:          os.Getenv("ATTESTOR_URL"),
@@ -160,6 +171,12 @@ func Load() (*Bootstrap, error) {
 		Framework:            strings.TrimSpace(os.Getenv("AGENT_FRAMEWORK")),
 		PublicURL:            composePublicURL(),
 	}, nil
+}
+
+// AttestorAnchor is what the attestor TLS statement must be signed under:
+// the certificate's chain and TappRegistry, and the provider that signed it.
+func (b *Bootstrap) AttestorAnchor() attestorhttp.Anchor {
+	return attestorhttp.Anchor{ChainID: b.Attestation.ChainID, Registry: b.Attestation.Registry(), Provider: b.ProviderSigner}
 }
 
 // verifiedFeedbackAddr validates VERIFIED_FEEDBACK_ADDR, the
@@ -222,17 +239,17 @@ func composePublicURL() string {
 	return scheme + "://8080-" + id + "." + domain
 }
 
-// verifyAttestation runs the two-part Phase 0 check:
+// verifyAttestation runs the Phase 0 check and returns the provider signer:
 //
-//  1. SANDBOX_SEAL_KEY derives the same compressed pubkey as attestation.pubkey
-//  2. the v2 fixed-word digest recovers the stable app signer (and matches
-//     expectedSigner when supplied)
+//  1. SANDBOX_SEAL_KEY derives the compressed pubkey the certificate names
+//  2. the certificate's EIP-712 signature recovers a signer
 //
-// On success logs the recovered signer + image_hash for forensic visibility.
-func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner *common.Address) error {
+// There is no local signer pin; the attestor checks the signer and scope
+// against the provider it trusts. Logs public certificate fields only.
+func verifyAttestation(keyBytes []byte, a provision.Attestation) (common.Address, error) {
 	recovered, err := a.RecoverSigner()
 	if err != nil {
-		return err
+		return common.Address{}, err
 	}
 	logger.Logf("--- Sealed Container Bootstrap ---")
 	logger.Logf("seal_id:    %s", a.SealID)
@@ -242,22 +259,16 @@ func verifyAttestation(keyBytes []byte, a provision.Attestation, expectedSigner 
 
 	priv, err := crypto.ToECDSA(keyBytes)
 	if err != nil {
-		return fmt.Errorf("parse SANDBOX_SEAL_KEY: %w", err)
+		return common.Address{}, fmt.Errorf("SANDBOX_SEAL_KEY is not a secp256k1 private key")
 	}
 	derived := "0x" + hex.EncodeToString(crypto.CompressPubkey(&priv.PublicKey))
 	if !strings.EqualFold(derived, a.Pubkey) {
-		return fmt.Errorf("keypair mismatch: derived %s, attestation %s", derived, a.Pubkey)
+		return common.Address{}, fmt.Errorf("keypair mismatch: derived %s, certificate %s", derived, a.Pubkey)
 	}
 	logger.Logf("OK   keypair match: SANDBOX_SEAL_KEY -> %s", derived)
-
-	logger.Logf("OK   v2 app signature valid, signer: %s", recovered.Hex())
-	if expectedSigner != nil {
-		if recovered != *expectedSigner {
-			return fmt.Errorf("app signer mismatch: recovered %s, expected %s", recovered.Hex(), expectedSigner.Hex())
-		}
-		logger.Logf("OK   app signer matches TEE_SIGNER_ADDRESS: %s", expectedSigner.Hex())
-	}
-	return nil
+	logger.Logf("OK   v3 container certificate signed by provider %s (chain %d, registry %s, app %q, registered_at %d)",
+		recovered.Hex(), a.ChainID, a.Registry().Hex(), a.AppID, a.RegisteredAt)
+	return recovered, nil
 }
 
 // ScrubProvisioningSecrets clears the env vars that contain provisioning

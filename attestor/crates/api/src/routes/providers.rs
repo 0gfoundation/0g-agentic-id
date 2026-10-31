@@ -79,32 +79,10 @@ async fn authenticate(state: &AppState, update: &SignedUpdate) -> ApiResult<(Doc
     Ok((doc, owner))
 }
 
-fn acceptance_mac(
-    state: &AppState,
-    version: i64,
-    publisher: Address,
-    update: &SignedUpdate,
-) -> Vec<u8> {
-    let bytes = serde_json::to_vec(&(
-        state.cfg.chain_id,
-        state.cfg.agentic_id_addr,
-        state.cfg.tapp_registry_addr,
-        &state.cfg.app_id,
-        version,
-        publisher,
-        &update.document,
-        &update.signature,
-    ))
-    .expect("serialize registry receipt");
-    state
-        .crypto
-        .hmac_binding(b"agentdna.provider-registry-acceptance.v1", &bytes)
-        .to_vec()
-}
-
 /// Accepted revisions stay valid after a Tapp ownership transfer or wallet
-/// policy change. The KMS-derived receipt proves authorization at publication,
-/// and prevents DB edits from inventing an accepted revision/publisher.
+/// policy change: `update` authorized them at publication, and only `update`
+/// writes the table, which lives on the tapp FDE volume. Reads re-check that a
+/// row belongs to this environment and to its version.
 pub(super) async fn load_verified(state: &AppState) -> ApiResult<Option<registry::StoredRegistry>> {
     let Some(stored) = state.providers.latest().await? else {
         return Ok(None);
@@ -114,13 +92,6 @@ pub(super) async fn load_verified(state: &AppState) -> ApiResult<Option<registry
 }
 
 fn verify_stored(state: &AppState, stored: &registry::StoredRegistry) -> ApiResult<()> {
-    use subtle::ConstantTimeEq;
-    let expected = acceptance_mac(state, stored.version, stored.publisher, &stored.update);
-    if expected.ct_eq(&stored.acceptance_mac).unwrap_u8() != 1 {
-        return Err(ApiError::internal(
-            "provider registry acceptance receipt is invalid",
-        ));
-    }
     let doc = registry::parse_document(&stored.update.document)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if stored.version <= 0
@@ -184,8 +155,7 @@ pub async fn update(
     let (doc, signer) = authenticate(&state, &update).await?;
     let base = doc.base_version;
     let count = doc.providers.len();
-    let mac = acceptance_mac(&state, base + 1, signer, &update);
-    match state.providers.replace(base, update, signer, mac).await? {
+    match state.providers.replace(base, update, signer).await? {
         Some(version) => {
             tracing::info!(version, count, %signer, "provider registry published");
             Ok(Json(json!({"ok": true, "version": version})))
@@ -587,30 +557,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_changes_cannot_forge_a_publication_receipt() {
+    async fn stored_rows_from_another_environment_or_version_are_refused() {
         use attestor_shared::provider_registry::ProviderRegistryRepo;
         let operator = PrivateKeySigner::random();
         let mut state = state(&operator);
-        update(State(state.clone()), Json(signed(&operator, 0)))
+        // A row whose document claims another base version than its slot.
+        let stored = Arc::new(MemoryProviderRegistry::default());
+        stored
+            .replace(0, signed(&operator, 4), operator.address())
             .await
             .unwrap();
-        let stored = state.providers.latest().await.unwrap().unwrap();
-        let mut changed = stored.update;
-        changed.document = changed
-            .document
-            .replace("partner.example", "attacker.example");
-        let fake = Arc::new(MemoryProviderRegistry::default());
-        fake.replace(0, changed, stored.publisher, stored.acceptance_mac)
+        state.providers = stored;
+        for query in [ReadQuery { version: Some(1) }, ReadQuery::default()] {
+            assert_eq!(
+                read(State(state.clone()), Query(query))
+                    .await
+                    .unwrap_err()
+                    .status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        // A row signed for another chain.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&signed(&operator, 0).document).unwrap();
+        doc["chain_id"] = json!(2);
+        let stored = Arc::new(MemoryProviderRegistry::default());
+        stored
+            .replace(0, resign(&operator, doc.to_string()), operator.address())
             .await
             .unwrap();
-        state.providers = fake;
-        assert_eq!(
-            read(State(state.clone()), Query(ReadQuery { version: Some(1) }))
-                .await
-                .unwrap_err()
-                .status,
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        );
+        state.providers = stored;
         assert_eq!(
             read(State(state), Query(ReadQuery::default()))
                 .await

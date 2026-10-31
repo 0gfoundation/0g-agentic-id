@@ -32,16 +32,32 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
 -- this column existed. Read by clients so nobody has to REMEMBER which
 -- harness an agent runs (reset defaults, chat model selector, sealed image).
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS framework TEXT;
+-- 0g-harness's old name is dsh. Its rows carry the new name, the one
+-- ATTESTOR_FRAMEWORKS lists; the agent's container rewrites the on-chain
+-- binding at the agent's first commit (sealed/internal/framework/harness).
+-- Matches nothing once every row is renamed.
+UPDATE deployments SET framework = '0g-harness' WHERE framework = 'dsh';
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
--- Container-pubkey binding for /provision freshness bypass on restart.
--- The pubkey is what the container sent on first /provision; the MAC is
--- HMAC(binding_key_v2, signed_v2_digest32 || authenticated_app_signer20).
--- The digest covers issuer scope, epoch and the complete workload payload.
--- The v2-domain key is HKDF-derived from the attestor master secret; legacy
--- v1 pubkey-only MACs are incompatible. Columns are reused without migration.
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey     BYTEA;
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
+-- Container record. The first accepted /provision of a container records
+-- what its v3 certificate established: the container key, its image hash and
+-- the provider instance that signed it (chain, TappRegistry, app id,
+-- registration epoch, recovered provider signer). Later boots of the same
+-- container send no certificate and are checked against these columns. The
+-- seven columns are written in one transaction and cleared together with
+-- every new boot ticket, container reset and ownership revocation.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey          BYTEA;
+ALTER TABLE deployments DROP COLUMN IF EXISTS container_pubkey_mac;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_image_hash      BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_chain_id         BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_registry_address BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_app_id           TEXT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_registered_at    BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_signer           BYTEA;
+-- A key recorded before the certificate columns existed has no certificate
+-- behind it; its container must be recreated.
+UPDATE deployments SET container_pubkey = NULL
+ WHERE container_pubkey IS NOT NULL AND container_image_hash IS NULL;
 
 -- Provision timeout deadline. Written when `sandbox.create` succeeds
 -- (handle_deploy / handle_sandbox_recreate). The worker sweep loop
@@ -105,7 +121,7 @@ ALTER TABLE idempotency DROP CONSTRAINT IF EXISTS idempotency_seal_id_fkey;
 
 CREATE TABLE IF NOT EXISTS jobs (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    payload      JSONB NOT NULL,
+    payload      JSONB,
     status       TEXT  NOT NULL DEFAULT 'pending',   -- pending | running | done | failed
     picked_by    TEXT,
     error        TEXT,
@@ -115,6 +131,25 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs (status, created_at);
+
+-- `payload` is plain JSON; the database lives on the tapp FDE volume. Only a
+-- pending row holds one: claiming the job, or failing it before it runs,
+-- clears it. `kind` and `seal_id` keep a running job identifiable for the
+-- reaper; `expires_at` is the owner envelope expiry of a job that only relays
+-- that envelope (NULL: the job does not expire); `heartbeat_at` is the
+-- worker's liveness stamp while the job runs. `reap_cause` marks a job the
+-- reaper failed ('abandoned' | 'expired'); `reap_settled_at` records that its
+-- follow-up ran. The reaper retries rows with a cause and no settlement, and
+-- the retention sweep keeps them. Payloads written as encrypted envelopes by
+-- earlier releases fail as undecodable when claimed (drain the queue before
+-- upgrading; see the attestor README).
+ALTER TABLE jobs ALTER COLUMN payload DROP NOT NULL;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS kind            TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS seal_id         BYTEA;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS expires_at      TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS heartbeat_at    TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reap_cause      TEXT;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS reap_settled_at TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS indexer_checkpoints (
     name       TEXT PRIMARY KEY,
@@ -187,14 +222,14 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL 
 -- Global provider revisions, scoped to the deployment environment. Exact signed
 -- bytes and history survive API restarts and are shared by all replicas.
 -- Lock parent deployments before its status child, matching lifecycle transactions.
--- Only the latest attested boot may report status. The opaque receipt itself
--- is encrypted to the container, never persisted in plaintext here.
+-- Only the latest attested boot may report status. Its opaque status token is
+-- encrypted to the container; only the token's SHA-256 is stored here.
 CREATE TABLE IF NOT EXISTS container_status_bindings (
     seal_id BYTEA PRIMARY KEY REFERENCES deployments(seal_id) ON DELETE CASCADE,
     binding_hash BYTEA NOT NULL CHECK (octet_length(binding_hash) = 32)
 );
 
--- Lifecycle authorization remains after stop to prevent legacy downgrade.
+-- Lifecycle authorization remains after stop; a resume reuses its ticket.
 ALTER TABLE container_status_bindings ALTER COLUMN binding_hash DROP NOT NULL;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_hash BYTEA;
@@ -203,6 +238,14 @@ ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_started_at B
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_id BYTEA;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_owner BYTEA;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_sandbox_id TEXT;
+-- Unix seconds when the current ticket was issued. A first provision accepts
+-- a certificate issued no earlier than 300 seconds before it. NULL on tickets
+-- issued before this column existed: such a container must be recreated.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_issued_at BIGINT;
+-- The settings document the current boot was served. A running/warning
+-- report confirms the version only when its applied digest equals this one.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_version BIGINT;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_digest BYTEA;
 
 CREATE TABLE IF NOT EXISTS inference_provider_registry (
     chain_id BIGINT NOT NULL,
@@ -211,12 +254,13 @@ CREATE TABLE IF NOT EXISTS inference_provider_registry (
     document TEXT NOT NULL,
     signature TEXT NOT NULL,
     publisher BYTEA NOT NULL CHECK (octet_length(publisher) = 20),
-    acceptance_mac BYTEA NOT NULL CHECK (octet_length(acceptance_mac) = 32),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (chain_id, contract, version)
 );
 
 -- Support development databases that already have the earlier registry table.
--- Old rows without an authenticated acceptance record are never trusted.
+-- Old rows without a publisher are never served.
 ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS publisher BYTEA;
-ALTER TABLE inference_provider_registry ADD COLUMN IF NOT EXISTS acceptance_mac BYTEA;
+-- No acceptance MAC: the table lives on the tapp FDE volume, and every read
+-- re-checks the row's environment and version.
+ALTER TABLE inference_provider_registry DROP COLUMN IF EXISTS acceptance_mac;

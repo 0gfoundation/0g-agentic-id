@@ -249,8 +249,7 @@ pub async fn handle(
         container_stage: StageStatus::NotStarted,
         sandbox_id: None,
         provisioned_at: None,
-        container_pubkey: None,
-        container_pubkey_mac: None,
+        container_record: None,
         provision_deadline: None,
         last_provision_error: None,
         last_provision_error_at: None,
@@ -432,7 +431,7 @@ mod tests {
             agent_uri: "oss://card".into(),
             agent_card: serde_json::json!({ "name": "Sage" }),
             i_data: vec![art],
-            framework: Some("dsh".into()),
+            framework: Some("0g-harness".into()),
             clone_params: None,
             phase: derive_phase(
                 &StageStatus::Confirmed { at: now },
@@ -444,8 +443,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -581,7 +579,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             cloned.framework.as_deref(),
-            Some("dsh"),
+            Some("0g-harness"),
             "clone inherits source framework"
         );
 

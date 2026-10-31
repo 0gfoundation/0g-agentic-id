@@ -2,8 +2,8 @@
 
 生产 API 和 worker 启动时通过本地 tapp `GetAppSigner(app_id)` 取得共享稳定签名密钥。
 固定 KMS material 为 `70726f7669646572`，直接将 secret 作为 secp256k1 标量，兼容旧
-sandbox provider 地址。它与节点 signer（`GetAppSecretKey`）、空 material 加密密钥、
-每个 agent 的 agentSeal 相互独立。稳定 signer 需要交易与存储 gas。
+sandbox provider 地址。它与节点 signer（`GetAppSecretKey`）、每个 agent 的 agentSeal
+相互独立。稳定 signer 需要交易与存储 gas。
 API/worker 广播交易时使用按 signer 共享的 Postgres advisory transaction lock；存储
 上传使用同一锁，并等待此前 pending 交易打包。所有副本必须使用同一数据库。
 Indexer 仍只读取链与派生 agentSeal。
@@ -99,46 +99,56 @@ evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 san
 `start_app` reconciliation，也不要求 attestor HTTP API 已监听。保留 TLS-init 完成依赖，
 不要反过来让 tapp 的 app 启动依赖 API 业务就绪。
 
-创建 sandbox 时，在所有其他环境变量之后强制覆盖 `ATTESTOR_TLS_DESCRIPTOR`、
-`ATTESTOR_URL` 和 `ATTESTOR_ALLOW_UNPINNED_DEV`。生产仅传递公开 scope、app 实例、
-app signer、TLS pins、过期时间及 claim 中的 Scan URL/SPKI trust anchor，并强制关闭 dev
-bypass。Sealed runtime 保留现有 attestor locator，对 `/provision` 与 `/status` 使用 pinned
-HTTPS，并独立通过 pinned Scan 刷新身份；appId、chain/registry、注册 epoch、app signer
-和 locator 不可改变，不接受 app 自己声明的续租。Scan trust anchor 或 app 实例改变后
-需要重建 runtime。不会给 workload 挂载 tapp socket 或开放通用 secret API。显式 mock
-模式会设置 `ATTESTOR_ALLOW_UNPINNED_DEV=true` 并删除调用者提供的 descriptor。
+创建 sandbox 时，在 owner 签名的环境变量之后始终覆盖 `ATTESTOR_URL`（HTTPS locator，
+去掉末尾 `/`）、`SEAL_BOOT_TICKET` 以及链/indexer 配置；不再把 TLS 信任写进环境变量。
+每次 create 前 attestor 都会重新确认 AgenticID 仍信任它自己的 app 实例。在 sealed create
+（attestor 发起的每次 create 都是）中，sandbox provider 在写入自己的 `SANDBOX_SEAL_KEY`
+与 v3 证书之前，会从调用方环境变量中删除 `ATTESTOR_TLS_DESCRIPTOR`、
+`ATTESTOR_ALLOW_UNPINNED_DEV`、`TEE_SIGNER_ADDRESS` 以及所有 `SANDBOX_*` 键，因此 provider
+签发证书的容器无法打开 dev bypass。
+
+provider 用与证书相同的 key，把本 attestor app 的 TLS SPKI pin（来自它自己的 attestor
+身份解析，每份声明最长 300 秒）签成 EIP-712 `AttestorTLS`，并在 `GET /api/attestor-tls`
+提供。attestor 通过 sandbox discovery snapshot 的固定 TLS 连接取得最新声明，在
+`GET /attestor-tls?provider=0x…` 原样（逐字节）转发。转发前检查 provider 签名、租期，
+以及它自己的 app TLS 公钥（本地 tapp `GetAppCsr` 返回的 SPKI hash）在 pin 中；到期前
+60 秒刷新，没有有效声明时返回 503。缓存中的声明直接返回，不询问 sandbox discovery；只有
+刷新时才询问 discovery，此时若 discovery 失败，只要缓存的声明 sealed 仍会接受，就继续返回它。sealed 不做 CA 校验地获取声明，只有当签名者是它自己
+证书的签名者、chain 与 registry 与证书一致、租期不超过 300 秒，且声明所经连接的 SPKI
+在 pin 中时才接受；之后对 `/provision`、`/status`、settings 和 provider registry 的请求
+都钉在这些公钥上。不会给 workload 挂载 tapp socket 或开放通用 secret API。
 
 Typed 公钥绑定是受测量 tapp 程序按实际派生规则与来源计算的认证声明，不是 ZK proof，
 也不证明独占保管；尚未实现的 `evidence.extensions` proof 不会被当作已有能力。
 
-## Workload 配置与重启恢复（v2）
+## Workload 配置与重启恢复（v3）
 
-`POST /provision` 接受 ImageAttestation version2。新增平铺 issuer 字段为 `version`、
-`chain_id`、`registry_address`、`app_id`、`registered_at`；原有 seal、压缩容器公钥、
-镜像 hash、签发时间和签名保留。经过认证的 sandbox discovery snapshot 提供预期稳定
-app signer 与当前 chain/registry/app/注册实例。恢复出的签名地址必须匹配该 app signer；
-当前或历史 node 列表成员身份不能代替服务身份。
+sandbox provider 在 sealed create 时写入 `SANDBOX_SEAL_ATTESTATION`：version 3 证书，覆盖
+chain、TappRegistry、appId、registeredAt、sealId、压缩容器公钥、镜像 hash 与签发时间。
+它是 EIP-712 `ImageAttestation`，domain 为 `0G Sandbox ImageAttestation`、version `3`，
+chainId 为链 id，`verifyingContract` 为 TappRegistry；provider key 直接签原始 digest，
+不加 `personal_sign`。known-answer 向量
+`crates/shared/testdata/image-attestation-v3.json` 与 provider、sealed 逐字节共用。
 
-签名 digest 使用 sandbox `docs/APP_IDENTITY.md` 定义的九个 ABI word：
-`0g.sandbox.ImageAttestation.v2` 的 domain hash、chainId、registry、精确 UTF-8 appId
-hash、registeredAt、sealId、压缩公钥 hash、imageHash、issuedAt。两端签验原始 digest，
-不添加 `personal_sign` 包装。
+`GET /provision` 返回已启用的启动代次和 `certificate_required`。容器的首次 provision
+原样携带证书。除启动授权（票据、启动代次、严格递增的 `boot_started_at`、链上实时
+owner、已落库的 sandbox）外，attestor 还要求：恢复出的签名者以及证书的 chain、registry、
+appId、registeredAt 等于 sandbox discovery 认证的 provider 实例；签发时间不早于启动票据
+签发前 300 秒、不晚于当前时间 + 300 秒；镜像在 `validFrameworkHashes` 中；boot claim
+由证书中的公钥签名。随后在与启动绑定相同的事务里记录容器公钥、镜像 hash 和 provider
+实例（chain、registry、appId、registeredAt、signer）。
 
-继续校验 framework 镜像白名单与首次配置的 300 秒新鲜度窗口。成功配置后，持久绑定
-使用 domain `agentic-id.container-pubkey-binding.v2`，MAC 输入为 `signingDigest || appSigner`
-（32 字节原始 digest 后接20 字节地址）。它通过现有数据库绑定列认证完整证明，包括
-issuer 实例、镜像和容器公钥，无需数据库 schema 迁移。匹配的 v2 绑定允许稍后恢复
-时继续使用原证明；v1 MAC 不会通过新绑定校验。
+同一容器之后的启动不带证书。必须由已记录的公钥签 boot claim，已记录的 provider 实例
+必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`；
+discovery 不可用时 503），已记录的镜像必须仍在白名单中（否则 `401 recorded image_hash
+not in validFrameworkHashes; reset required`）。证书对应已记录的公钥时按之后的启动处理，
+覆盖首次响应丢失的情况；对应另一把公钥则返回 `403 container key differs from record;
+reset required`；没有记录也没有证书返回 `409 certificate_required`。新的启动票据
+（create 或 recreate）、reset 与所有权撤销都会清除记录，因此每个新容器都要出示自己的
+证书。同一 provider 实例内的节点轮换不影响已记录的容器；registeredAt 或 provider
+signer 改变则需要 owner 执行 reset。
 
-使用持久绑定前，仍需对照当前已认证 discovery 校验 issuer scope。同 app signer、同
-注册 epoch 的正常重启，在节点替换后可以恢复原 v2 容器。registeredAt 改变则视为新
-实例，即使稳定 key 未变。身份发现失败或 lease 过期可重试，不回退到节点 key。
-
-应同时升级 sandbox、attestor 和 sealed 镜像。旧 v1/node 签名容器需要 owner 明确
-执行 reset，事先保存运行时状态。Reset 保留 agentId、agentSeal 与已提交的
- iData/settings，生成新的容器身份及 v2 证明；不会静默重签旧证明或恢复已退役节点。
-
-sealed 对 `/provision`、`/status`、settings 和 provider registry 的请求使用同一个
-已认证、固定 TLS 公钥的 attestor 客户端。持久化的镜像绑定认证可复用的 v2 镜像证明；
-每次 PID-1 启动仍需用容器私钥证明当前 boot ticket 与 generation，并取得加密的
-status receipt。复用镜像证明不允许重放旧 boot claim 或 status receipt。
+每次被接受的 provision 都返回一个加密给容器公钥的全新不透明状态令牌。attestor 只保存
+它的 SHA-256，旁边记录实际下发的配置版本和摘要，`/status` 只依据这条记录确认配置。
+令牌和记录都不含 attestor MAC。不兼容 v2：provider、attestor 与 sealed 镜像需同时发布，
+并重建所有 agent。
