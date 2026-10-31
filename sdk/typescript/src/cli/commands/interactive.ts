@@ -33,7 +33,7 @@ import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type Thinking
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
-import { configuredInferenceKey, requireConfiguredInferenceKey, agentInferenceProvider, requiresProviderReset, deployWithInference } from '../inference';
+import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferenceProvider, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
@@ -1290,7 +1290,7 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
-        const provider = await agentInferenceProvider(ag, row.sealId);
+        const provider = await resetInferenceProvider(ag, row.sealId, out);
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
@@ -2475,7 +2475,7 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } else {
           s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         }
-        const provider = await agentInferenceProvider(s.ag, s.sealId);
+        const provider = await resetInferenceProvider(s.ag, s.sealId, out);
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }

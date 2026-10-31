@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadCredentials, saveApiKey, loadApiKey, inferenceKeyFromEnv, configPaths } from '../dist/cli/config.js';
-import { configuredInferenceKey, agentInferenceProvider, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
+import { configuredInferenceKey, agentInferenceProvider, resetInferenceProvider, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
 import { listInferenceProviders } from '../dist/Providers.js';
 import { completeLine } from '../dist/cli/commands/interactive.js';
 
@@ -77,6 +77,24 @@ test('reset takes the provider from the agent settings and never hides a failed 
   assert.equal(await agentInferenceProvider({ agent:{ getSettings:async()=>({ settings:{ provider:'anthropic' } }) } },seal),'anthropic');
   assert.equal(await agentInferenceProvider({ agent:{ getSettings:async()=>({ settings:null }) } },seal),'0g-compute');
   await assert.rejects(agentInferenceProvider({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal),/unreadable/);
+});
+
+test('reset gives an agent with no settings the default model pin first', async () => {
+  const seal = `0x${'11'.repeat(32)}`;
+  const writes = [];
+  const notes = [];
+  const agent = (stored) => ({ agent:{
+    getSettings:async()=>stored,
+    setSettings:async(sealId,doc,opts)=>{ writes.push({ sealId, doc, opts }); return { version:1 }; },
+  } });
+  // A clone whose new owner has written nothing: the default is stored first.
+  assert.equal(await resetInferenceProvider(agent({ settings:null, version:0 }),seal,(l)=>notes.push(l)),'0g-compute');
+  assert.deepEqual(writes,[{ sealId:seal, doc:{ provider:'0g-compute', model:'0gm-1.0-35b-a3b' }, opts:{ baseVersion:0 } }]);
+  assert.match(notes[0],/no settings yet/);
+  // An agent that has settings keeps them.
+  assert.equal(await resetInferenceProvider(agent({ settings:{ provider:'anthropic', model:'m' }, version:4 }),seal,(l)=>notes.push(l)),'anthropic');
+  assert.equal(writes.length,1);
+  await assert.rejects(resetInferenceProvider({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal,()=>{}),/unreadable/);
 });
 
 test('inline provider model completion cannot reuse compute suggestions', () => {
