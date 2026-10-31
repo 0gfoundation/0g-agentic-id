@@ -33,7 +33,7 @@ import { SettingsConflictError, THINKING_LEVELS, type SettingsDoc, type Thinking
 import { splitHead, tokenize } from '../tokenize';
 import { pandaLines, svgPixelLines } from '../logo';
 import { listInferenceProviders, type InferenceProvider, changesProvider } from '../../Providers';
-import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferenceProvider, requiresProviderReset, deployWithInference } from '../inference';
+import { configuredInferenceKey, requireConfiguredInferenceKey, resetInferencePlan, applyResetInference, readDeploymentFacts, requiresProviderReset, deployWithInference } from '../inference';
 
 // Tab-completion candidates for the active REPL level (canonical names only —
 // aliases like link//unuse still work typed out but don't clutter the list).
@@ -685,19 +685,63 @@ async function refreshSession(s: Session, quiet = false): Promise<void> {
   if (reason) out(`  last error: ${reason}\n`);
 }
 
+/** An agent's container state just before a lifecycle request was sent. */
+export interface LifecycleBaseline {
+  /** The container stage's `at`, in ms (server clock); undefined when it has none. */
+  at?: number;
+  state?: string;
+  sandboxId?: string;
+}
+
+/**
+ * Read the row a lifecycle request is about to change. The attestor answers
+ * `/reset` and `/start` with 202 before its worker touches the row, so the
+ * wait compares against this. undefined when the row cannot be read; the wait
+ * then takes the row as it finds it.
+ */
+export async function lifecycleBaseline(attestorUrl: string, sealId: `0x${string}`): Promise<LifecycleBaseline | undefined> {
+  try {
+    const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`, { signal: AbortSignal.timeout(10_000) })).json()) as {
+      sandbox_id?: string; container_stage?: { state?: string; at?: string };
+    };
+    const at = Date.parse(d.container_stage?.at ?? '');
+    return { at: Number.isFinite(at) ? at : undefined, state: d.container_stage?.state, sandboxId: d.sandbox_id };
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Wait for a deployment to reach `running` by polling the attestor's public
  * /deployment/:sealId — and FAIL LOUD instead of hanging: a `failed`/`offline`
  * phase (or a failed container_stage) surfaces its recorded reason
  * immediately, and the timeout produces an error naming the last phase seen.
+ *
+ * With a `baseline` (the row read before a reset or start was sent), the row
+ * as it was then is not this request's outcome: until the worker moves the
+ * container on (a new start or create, a new sandbox, a stage written after
+ * the baseline), the wait shows `queued` and neither a still-running old
+ * container nor an earlier failure ends it.
  */
 class WaitCancelled extends Error { constructor() { super('wait cancelled'); } }
 
-async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: string, timeoutMs = 360000, signal?: AbortSignal): Promise<{ url: string }> {
+export async function pollRunning(
+  attestorUrl: string,
+  sealId: `0x${string}`,
+  agentId: string,
+  timeoutMs = 360000,
+  signal?: AbortSignal,
+  opts: { baseline?: LifecycleBaseline; intervalMs?: number } = {},
+): Promise<{ url: string }> {
+  const { baseline, intervalMs = 4000 } = opts;
   const deadline = Date.now() + timeoutMs;
   const t0 = Date.now();
   let lastPhase = 'contacting attestor';
   let lastShown = '';
+  // Whether the request has visibly started: a fresh `submitted` stage, a new
+  // sandbox, or a stage written after the baseline other than the old
+  // container's own running reports.
+  let progressed = !baseline;
   // Transient progress line between phase changes — a deploy sits minutes in
   // one phase with zero output otherwise. Repainted each second; phase-change
   // lines and the final result overwrite it. TTY only.
@@ -723,15 +767,22 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       const d = (await (await fetch(`${attestorUrl}/deployment/${sealId}`)).json()) as {
         phase?: string; url?: string; sandbox_id?: string;
         agent_card?: { url?: string };
-        container_stage?: { state?: string; reason?: string };
+        container_stage?: { state?: string; reason?: string; at?: string };
       };
-      lastPhase = d.phase ?? lastPhase;
+      if (!progressed && baseline) {
+        const at = Date.parse(d.container_stage?.at ?? '');
+        const fresh = Number.isFinite(at) && (baseline.at === undefined || at > baseline.at);
+        const state = d.container_stage?.state;
+        progressed = (fresh && !(state === 'confirmed' && baseline.state === 'confirmed'))
+          || (d.sandbox_id !== undefined && d.sandbox_id !== baseline.sandboxId);
+      }
+      lastPhase = progressed ? (d.phase ?? lastPhase) : 'queued';
       if (lastPhase !== lastShown) { clearSpinner(); out(`  … ${lastPhase}\n`); lastShown = lastPhase; }
       const cardBase = d.agent_card?.url?.replace(/\/hello$/, '');
       const url = d.url ?? cardBase ?? (d.sandbox_id && cfg.sandbox_proxy_addr ? containerUrl(d.sandbox_id, cfg.sandbox_proxy_addr) : undefined);
-      if (d.phase === 'running' && url) return { url };
+      if (progressed && d.phase === 'running' && url) return { url };
       const reason = d.container_stage?.state === 'failed' ? d.container_stage?.reason : undefined;
-      if (d.phase === 'failed' || reason) {
+      if (progressed && (d.phase === 'failed' || reason)) {
         throw new CliError('UNKNOWN', `agent ${agentId} did not start: ${reason ?? `phase=${d.phase}`}`, {
           remedy: `run \`reset ${agentId}\` to recreate the container once the cause is fixed`,
         });
@@ -741,12 +792,17 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
       // transient fetch error — keep polling until the deadline
     }
     if (Date.now() > deadline) {
+      if (!progressed) {
+        throw new CliError('UNKNOWN', `agent ${agentId} did not come online: the attestor had not started this request after ${Math.round(timeoutMs / 1000)}s`, {
+          remedy: 'a request that waits too long in the attestor\'s queue expires and leaves the agent as it was — run the command again',
+        });
+      }
       throw new CliError('UNKNOWN', `timed out after ${Math.round(timeoutMs / 1000)}s waiting for agent ${agentId} (last phase: ${lastPhase})`, {
         remedy: 'check `status` — provisioning can lag; retry the command when the phase moves',
       });
     }
     if (signal?.aborted) throw new WaitCancelled();
-    await new Promise((r) => setTimeout(r, 4000));
+    await new Promise((r) => setTimeout(r, intervalMs));
     if (signal?.aborted) throw new WaitCancelled();
   }
   } finally {
@@ -757,11 +813,11 @@ async function pollRunning(attestorUrl: string, sealId: `0x${string}`, agentId: 
 
 /** pollRunning wired to the Esc/Ctrl-C interrupt: cancelling abandons the
  *  WAIT only — the lifecycle operation keeps going server-side. */
-async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string): Promise<{ url: string } | null> {
+async function waitRunningInterruptible(irq: Interrupt, attestorUrl: string, sealId: `0x${string}`, agentId: string, baseline?: LifecycleBaseline): Promise<{ url: string } | null> {
   const ac = new AbortController();
   irq.streaming = ac;
   try {
-    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal);
+    return await pollRunning(attestorUrl, sealId, agentId, 360000, ac.signal, { baseline });
   } catch (e) {
     if (e instanceof WaitCancelled || ac.signal.aborted) {
       out('\n(wait cancelled — the operation continues server-side; check with `list` or re-enter with `use`)\n');
@@ -1275,8 +1331,9 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
           if (row.phase !== 'stopped' || !row.sandboxId) { out(`agent ${row.agentId} is ${row.phase} — a plain start cannot revive it; run: reset ${row.agentId}\n`); continue; }
           if (!(await ensureOwnerReady(ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
           out(`starting agent ${row.agentId}… (Esc cancels the wait)\n`);
+          const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
           await ag.agent.start(row.sealId, row.sandboxId);
-          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+          const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
           if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
           continue;
         }
@@ -1290,13 +1347,16 @@ async function managerRepl(ctx: CommandContext, ask: (q: string) => Promise<stri
         } else {
           framework = await pickFramework(attestorUrl, ask, row.framework ?? undefined);
         }
-        const provider = await resetInferenceProvider(ag, row.sealId, out);
+        const plan = await resetInferencePlan(ag, row.sealId, await readDeploymentFacts(attestorUrl, row.sealId));
+        const provider = plan.provider;
         await ag.agent.assertProviderSupported(provider, { sealId: row.sealId, framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        await applyResetInference(ag, row.sealId, plan, out);
         out(`resetting agent ${row.agentId} as ${framework}… (Esc cancels the wait)\n`);
+        const baseline = await lifecycleBaseline(attestorUrl, row.sealId);
         await ag.agent.reset(row.sealId, { provider, framework, apiKey });
-        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId);
+        const r = await waitRunningInterruptible(irq, attestorUrl, row.sealId, row.agentId, baseline);
         if (r) out(`running at ${r.url} — enter with: use ${row.agentId}\n`);
         continue;
       }
@@ -2459,8 +2519,10 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         if (s.phase === 'running') { out('already running\n'); continue; }
         if (s.phase !== 'stopped' || !s.sandboxId) { out(`agent is ${s.phase} — a plain start cannot revive it; use /reset\n`); continue; }
         if (!(await ensureOwnerReady(s.ag, ask))) { out('start cancelled — prepaid balance too low\n'); continue; }
-        out('starting… (Esc cancels the wait)\n'); await s.ag.agent.start(s.sealId, s.sandboxId);
-        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        out('starting… (Esc cancels the wait)\n');
+        const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
+        await s.ag.agent.start(s.sealId, s.sandboxId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
         out(`running at ${s.url}\n`); continue;
@@ -2475,13 +2537,16 @@ async function sessionRepl(s: Session, ask: (q: string) => Promise<string>, irq:
         } else {
           s.framework = await pickFramework(s.attestorUrl, ask, s.framework);
         }
-        const provider = await resetInferenceProvider(s.ag, s.sealId, out);
+        const plan = await resetInferencePlan(s.ag, s.sealId, await readDeploymentFacts(s.attestorUrl, s.sealId));
+        const provider = plan.provider;
         await s.ag.agent.assertProviderSupported(provider, { sealId: s.sealId, framework: s.framework });
         const apiKey = await inferenceKey(ctx, ask, provider);
         if (!(await ensureOwnerReady(s.ag, ask))) { out('reset cancelled — prepaid balance too low\n'); continue; }
+        await applyResetInference(s.ag, s.sealId, plan, out);
         out(`resetting as ${s.framework}… (Esc cancels the wait)\n`);
+        const baseline = await lifecycleBaseline(s.attestorUrl, s.sealId);
         await s.ag.agent.reset(s.sealId, { provider, framework: s.framework, apiKey });
-        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId);
+        const r = await waitRunningInterruptible(irq, s.attestorUrl, s.sealId, s.agentId, baseline);
         if (!r) continue;
         await connectSession(s, r.url);
         messages.length = 0; out(`back up at ${s.url}\n`); continue;

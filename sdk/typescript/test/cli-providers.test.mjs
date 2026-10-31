@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadCredentials, saveApiKey, loadApiKey, inferenceKeyFromEnv, configPaths } from '../dist/cli/config.js';
-import { configuredInferenceKey, agentInferenceProvider, resetInferenceProvider, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
+import { configuredInferenceKey, agentInferenceProvider, resetInferencePlan, applyResetInference, requireConfiguredInferenceKey, deployWithInference } from '../dist/cli/inference.js';
 import { listInferenceProviders } from '../dist/Providers.js';
 import { completeLine } from '../dist/cli/commands/interactive.js';
 
@@ -14,7 +14,7 @@ const fresh = () => ({ XDG_CONFIG_HOME: mkdtempSync(join(tmpdir(), 'agentdna-pro
 
 test('deploy wizard binds changed compute routes after mint and keeps legacy compute deployment',async()=>{
   const seal=`0x${'5e'.repeat(32)}`;
-  for (const kind of ['builtin','changed-compute','partner','changed-mint-only']) {
+  for (const kind of ['builtin','builtin-mint-only','changed-compute','partner','changed-mint-only']) {
     const providers=listInferenceProviders();
     const selected=structuredClone(providers[0]);
     delete selected.modelCatalog;
@@ -22,7 +22,7 @@ test('deploy wizard binds changed compute routes after mint and keeps legacy com
     if (kind!=='builtin') selected.endpoints.openai='https://partner.example/v1';
     if (kind==='partner') selected.id='partner';
     const calls=[];
-    const provision=kind!=='changed-mint-only';
+    const provision=!kind.endsWith('mint-only');
     const ag={agent:{
       refreshProviders:async()=>[selected],
       assertProviderSupported:async()=>{},
@@ -36,6 +36,12 @@ test('deploy wizard binds changed compute routes after mint and keeps legacy com
     if (kind==='builtin') {
       assert.deepEqual(calls.map(c=>c[0]),['deploy','mint']);
       assert.equal(calls[0][1].sandbox.apiKey,'test-private-key');
+    } else if (kind==='builtin-mint-only') {
+      // The chosen pin is kept as the settings document, so a later reset
+      // boots on it.
+      assert.deepEqual(calls.map(c=>c[0]),['deploy','mint','settings']);
+      assert.equal(calls[0][1].sandbox,undefined);
+      assert.deepEqual(calls[2].slice(1),[seal,{provider:selected.id,model:'model'},{baseVersion:0}]);
     } else {
       assert.deepEqual(calls.map(c=>c[0]),provision?['deploy','mint','settings','start']:['deploy','mint','settings']);
       assert.equal(calls[0][1].sandbox,undefined);
@@ -79,7 +85,7 @@ test('reset takes the provider from the agent settings and never hides a failed 
   await assert.rejects(agentInferenceProvider({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal),/unreadable/);
 });
 
-test('reset gives an agent with no settings the default model pin first', async () => {
+test('reset stores the default model pin only when the minted pin can be gone', async () => {
   const seal = `0x${'11'.repeat(32)}`;
   const writes = [];
   const notes = [];
@@ -87,14 +93,33 @@ test('reset gives an agent with no settings the default model pin first', async 
     getSettings:async()=>stored,
     setSettings:async(sealId,doc,opts)=>{ writes.push({ sealId, doc, opts }); return { version:1 }; },
   } });
-  // A clone whose new owner has written nothing: the default is stored first.
-  assert.equal(await resetInferenceProvider(agent({ settings:null, version:0 }),seal,(l)=>notes.push(l)),'0g-compute');
-  assert.deepEqual(writes,[{ sealId:seal, doc:{ provider:'0g-compute', model:'0gm-1.0-35b-a3b' }, opts:{ baseVersion:0 } }]);
-  assert.match(notes[0],/no settings yet/);
+  const none = { settings:null, version:0 };
+  const fresh = { provisioned:false, clone:false };
+  // Planning writes nothing: a reset cancelled at a later prompt changes nothing.
+  for (const facts of [{ provisioned:false, clone:true }, { provisioned:true, clone:false }]) {
+    const plan = await resetInferencePlan(agent(none),seal,facts);
+    assert.equal(plan.provider,'0g-compute');
+    assert.equal(writes.length,0);
+    // A clone (its source may have committed) or an agent that has booted
+    // before: the minted pin can be gone, so the default is stored first.
+    await applyResetInference(agent(none),seal,plan,(l)=>notes.push(l));
+    assert.deepEqual(writes.pop(),{ sealId:seal, doc:{ provider:'0g-compute', model:'0gm-1.0-35b-a3b' }, opts:{ baseVersion:0 } });
+    assert.match(notes.pop(),/no settings yet: set provider=0g-compute/);
+  }
+  // Never booted and not a clone (a mint-only agent): the minted pin is still
+  // on chain, and the container seeds it. Nothing is stored.
+  const plan = await resetInferencePlan(agent(none),seal,fresh);
+  assert.equal(plan.provider,'0g-compute');
+  await applyResetInference(agent(none),seal,plan,(l)=>notes.push(l));
+  assert.equal(writes.length,0);
+  assert.match(notes.pop(),/model chosen at mint/);
   // An agent that has settings keeps them.
-  assert.equal(await resetInferenceProvider(agent({ settings:{ provider:'anthropic', model:'m' }, version:4 }),seal,(l)=>notes.push(l)),'anthropic');
-  assert.equal(writes.length,1);
-  await assert.rejects(resetInferenceProvider({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal,()=>{}),/unreadable/);
+  const kept = await resetInferencePlan(agent({ settings:{ provider:'anthropic', model:'m' }, version:4 }),seal,{ provisioned:true, clone:true });
+  assert.equal(kept.provider,'anthropic');
+  await applyResetInference(agent(none),seal,kept,(l)=>notes.push(l));
+  assert.equal(writes.length,0);
+  assert.equal(notes.length,0);
+  await assert.rejects(resetInferencePlan({ agent:{ getSettings:async()=>{ throw new Error('unreadable'); } } },seal,fresh),/unreadable/);
 });
 
 test('inline provider model completion cannot reuse compute suggestions', () => {

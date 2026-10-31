@@ -107,7 +107,7 @@ Self-update: compares against the npm registry and `npm install -g`s the latest 
 | `hello <id>` | hit any agent's public `/hello`; with a wallet configured, banks a rating ticket |
 | `call <id> [path] [json-body]` | call an agent's registered public service; bare `call` lists its services; responses bank tickets |
 | `rate <id> [score] [/endpoint]` | spend a ticket to rate on-chain — **no interaction, no rating** |
-| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document (e.g. a fresh clone) first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` |
+| `start` / `stop` / `reset` / `retry <id>` | container lifecycle (owner-signed; on-chain identity unchanged). `reset` of an agent with no settings document first stores the default pin `provider=0g-compute model=0gm-1.0-35b-a3b` when the model pinned at mint may be gone (a clone, or an agent that has provisioned before), after the reset's prompts; a mint-only agent that never booted keeps the model chosen at mint (the deploy wizard's mint-only path also stores that choice as the settings document). `start` and `reset` wait for their own outcome: until the attestor's worker picks the request up they show `queued`, and the agent's previous state or failure does not end the wait |
 | `clone` / `transfer` / `grant` / `revoke` / `authorizer` | clone, transfer, clone-authorization management |
 | `settings <id> [k=v …]` | same semantics as the subcommand |
 | `balance` / `deposit [og]` / `withdraw [og]` | prepaid account: balance + burn rate / fund / refund withdrawal (time-locked; bare argument claims everything) |
