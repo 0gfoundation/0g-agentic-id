@@ -430,7 +430,12 @@ async fn main() -> anyhow::Result<()> {
     loop {
         match queue.claim_next(&worker_id).await {
             Ok(Some((job_id, payload))) => {
-                tracing::info!(%job_id, kind = payload.kind(), seal_id = ?payload.seal_id(), "claimed job");
+                // Every claimed job ends with a `job done`, `job failed` or
+                // reaped line, so the worker log alone shows whether the
+                // queue is drained.
+                let kind = payload.kind();
+                let seal_id = payload.seal_id();
+                tracing::info!(%job_id, kind, ?seal_id, "claimed job");
                 let res = jobs::run_heartbeating(
                     queue.clone(),
                     job_id,
@@ -439,15 +444,17 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
                 match res {
-                    // Reaped while running: the reaper owns the row.
+                    // Reaped while running (logged by run_heartbeating): the
+                    // reaper owns the row.
                     None => {}
                     Some(Ok(())) => {
                         if let Err(e) = queue.complete(job_id).await {
                             tracing::error!(error = %e, %job_id, "failed to mark complete");
                         }
+                        tracing::info!(%job_id, kind, ?seal_id, "job done");
                     }
                     Some(Err(e)) => {
-                        tracing::error!(error = ?e, %job_id, "job failed");
+                        tracing::error!(error = ?e, %job_id, kind, ?seal_id, "job failed");
                         let _ = queue.fail(job_id, &e.to_string()).await;
                     }
                 }

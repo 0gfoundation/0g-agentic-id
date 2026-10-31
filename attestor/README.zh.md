@@ -52,11 +52,19 @@ storage/mint stage），让 `/retry` 能恢复；给没有 provision deadline �
 worker 会从下一次 heartbeat 得知自己的 job 已被 reap，随即放弃该 job；
 `done`/`failed` 只会替换 `running`，所以它迟到的结果不会覆盖被 reap 的行。
 
-从加密 job payload 的旧版本升级时，先排空队列：停掉 api，不再进新 job，
-等到 `SELECT count(*) FROM jobs WHERE status IN ('pending','running')` 返回 0
-再升级。旧版本写入的 job 无法解码：pending 的会在 claim 时判失败，running
-的会被 reap，两者都不会结算它的 deployment，该 deployment 会一直停在
-`deploying`，只能重新部署。
+从加密 job payload 的旧版本升级时，先排空队列：停掉 api 和 indexer 服务，
+不再进新 job（indexer 从 checkpoint 继续，不会漏事件），worker 保持运行。
+旧版 worker 开始一个 job 时打 `claimed job`，只在失败时再打一行
+（`job failed`），所以当超过一个 job 可能运行的时长都没有新的 `claimed job`
+行时，队列就排空了：留 15 分钟；如果最后 claim 的是带多个 iData 条目的
+deploy，要留得更久（每个条目的上传预算是 750 s）。能连到数据库时，
+`SELECT count(*) FROM jobs WHERE status IN ('pending','running')` 返回 0
+即可确认。然后再升级。旧版本写入的 job 无法解码：pending 的会在 claim 时
+判失败（`undecodable job payload`），running 的会被 reap（`job reaped`，
+没有 `seal_id`），两者都不会结算它的 deployment，该 deployment 会一直停在
+`deploying`，只能重新部署。从本版本起，worker 在每行 `claimed job` 之后都会
+打 `job done` 或 `job failed`（或由 reaper 记为已 reap），以后排空队列只看
+worker 日志即可。
 
 ## Workspace
 
