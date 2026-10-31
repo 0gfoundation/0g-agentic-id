@@ -78,6 +78,41 @@ release on, the worker logs `job done` or `job failed` after every
 `claimed job` line (or the reaper logs the job as reaped), so a later drain
 can be read from the worker log alone.
 
+### Rolling out AgentDNA 1.4
+
+1.4 changes the provider certificate (v3), the attestor TLS statement and the
+`/provision` request together, with no compatibility for the previous
+versions: every agent needs a new container. Run the steps in order and do not
+go on until each check passes.
+
+1. **Images.** Build each framework's sealed image, register it as a provider
+   snapshot and add its image hash with `addValidFrameworkHash`. Check:
+   `isValidFrameworkHash(<hash>)` returns `true` for every image.
+2. **Configuration.** Point `ATTESTOR_SANDBOX_SNAPSHOT` and
+   `ATTESTOR_FRAMEWORKS` at the new snapshots, under the framework names the
+   release ships. Check: after the roll, `GET /config` lists every framework
+   with its new snapshot.
+3. **Pause and drain.** Announce a window in which owners neither deploy nor
+   reset: creates fail while the provider and the attestor run different
+   versions, in either order. Drain the job queue as described above.
+4. **Roll the provider and the attestor** in that window. Check:
+   `GET <provider>/api/attestor-tls` answers 200; the api log shows
+   `attestor tls self-check: provider statement verified`; and
+   `GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` answers 200.
+   A provider error `attestor instance requires explicit re-authorization`
+   means its attestor instance pin is stale: re-authorize the instance as the
+   sandbox provider's `docs/APP_IDENTITY.md` describes before going on.
+5. **One reset per framework.** Reset one agent on each framework and wait for
+   `running`. The sealed log shows `attestor tls: statement accepted` and
+   `OK   status reported`. A refused provision is in the api log
+   (`provision rejected`) and is the reason on the agent's container stage.
+6. **Announce.** Owners reset their agents. A resume (`/start` with `start`)
+   of a sandbox created before 1.4 is refused with 409, because that runtime
+   cannot provision. Owners acknowledge the provider again (SDK `ack()`) if
+   the preflight asks. Ask owners to spread their resets: the worker runs one
+   job at a time, and a reset not started within about 150 s of being signed
+   is failed with `request expired before it ran — sign it again`.
+
 ## Workspace
 
 ```
@@ -159,7 +194,7 @@ stay up.
 |---|---|---|
 | `POST /deploy` | User deploys an agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | Source owner mints a brand-new agent for another owner, reusing the source's on-chain iData (dataKey re-sealed to a fresh agentSeal); lands Offline for the new owner to bring online | owner EIP-191, verified against the **live on-chain `ownerOf(source)`** (not a self-declared owner) |
-| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
+| `POST /start` / `/stop` / `/retry` / `/reset` | Lifecycle actions on an existing agent. A `start` (resume) of a sandbox created before AgentDNA 1.4 is `409`: that runtime cannot provision, so the agent needs a reset | owner envelope, signature verified against the on-chain owner (`/retry` without an envelope is limited to idempotent attestor-side re-runs, gated by an owner-field match) |
 | `GET /settings?seal_id=0x…` | Owner reads the agent's configuration document and its current `version` (the base for the next write). The document is the owner's, so it is in no public tier — this is the only way to read it. The response also carries `confirmed_version` / `attempts` / `fallback_active`, so a client can tell the owner their last push did not boot, the agent is running the previous document, and pushing again is the retry | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /settings` | Owner writes the agent's ONE configuration document. attestor stores it as an OPAQUE blob — it never parses, validates or logs the contents, so widening the settings vocabulary never touches attestor. Not on chain: configuration is re-suppliable, memory is not. Compare-and-swap: a stale base version is 409 with `current_version`, so a captured request cannot reinstate a superseded document and two clients cannot silently overwrite each other | owner EIP-191 over `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<sha256 of the document>` in `X-Auth-Message`, verified against the **live on-chain owner** |
 | `POST /probe` | Synchronous liveness probe; flips unreachable containers to `Failed` and preserved-but-not-running sandboxes to `Stopped` (resumable) | none |
@@ -169,8 +204,8 @@ stay up.
 | Path | Purpose | Auth |
 |---|---|---|
 | `GET /provision?seal_id=…` | Returns `{"generation", "certificate_required"}`: the enabled boot generation (never its ticket), and whether no container key is recorded yet so the next boot must send its certificate. `403 no authorized boot; reset required` without an enabled authorization | public metadata |
-| `GET /attestor-tls?provider=0x…` | Relays, byte-identical, the latest statement in which the sandbox provider signs this attestor's TLS SPKI pins (EIP-712 `AttestorTLS`, fetched from the discovered provider's `/api/attestor-tls`). Before serving, the attestor checks the provider signature, the lease (at most 300 s) and that its own TLS key is pinned; it refreshes 60 s before expiry, and consults sandbox discovery only for that refresh, so a discovery renewal or outage does not hold or fail a request the cache can answer. Unknown provider → 404; no valid statement → 503 with `Retry-After: 5`. Always `Cache-Control: no-store`. sealed pins every later attestor connection to these pins | public |
-| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, and an image in `validFrameworkHashes`, then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never mutate or delete containers. Repeated unconfirmed boots fall back to last-known-good | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
+| `GET /attestor-tls?provider=0x…` | Relays, byte-identical, the latest statement in which the sandbox provider signs this attestor's TLS SPKI pins (EIP-712 `AttestorTLS`, fetched from the discovered provider's `/api/attestor-tls`). Before serving, the attestor checks the provider signature, the lease (at most 300 s) and that its own TLS key is pinned; it refreshes 60 s before expiry, serves a statement until 15 s before it expires (sealed needs more than 5 s left), and consults sandbox discovery only for that refresh, so a discovery renewal or outage does not hold or fail a request the cache can answer. Each new statement is logged; the api fetches one at startup and logs the result. Unknown provider → 404; no valid statement → 503 with `Retry-After: 5`. Always `Cache-Control: no-store`. sealed pins every later attestor connection to these pins | public |
+| `POST /provision` | Container receives ECIES-encrypted `agentSeal_priv`, owner settings and an opaque per-boot status token (`encrypted_status_binding`, plaintext `{"token":"<64 hex>"}`; only its SHA-256 is stored, beside the settings version and digest actually served). **First boot** sends its v3 certificate (`certificate`: the `SANDBOX_SEAL_ATTESTATION` object, EIP-712 `ImageAttestation` signed by the provider key). The attestor requires the discovered provider instance as signer and scope, an issue time from 300 s before the boot ticket up to now + 300 s, and an image in `validFrameworkHashes`, then records container key, image and provider instance. **Later boots** send no certificate: the recorded key must sign the boot claim, the recorded provider instance must still be the discovered one (`403 provider instance no longer trusted; reset required`) and the recorded image still allowed (`401 recorded image_hash not in validFrameworkHashes; reset required`). No record and no certificate → `409 certificate_required`; a certificate for another key → `403 container key differs from record; reset required`. Every request carries the owner-authorized ticket, generation and a container-key boot claim with a strictly newer `boot_started_at`; 409 until create bookkeeping is persisted. Rejected requests never delete containers; a 401/403 for the authorized boot is logged (`provision rejected`), recorded as `last_provision_error` and takes the container stage to `failed` at once, while that generation is current. Repeated unconfirmed boots fall back to last-known-good (a retry by the same boot is the same attempt) | provider-signed certificate (first boot) or recorded container key + owner-authorized ticket, generation and container-key boot claim |
 | `POST /status` | sealed heartbeat/status (`StatusReport.v2` canonical). Signature covers the status token hash and applied settings digest; one transaction checks the token is the current boot's and updates stage, liveness and exact-version confirmation. Only a `running` / `warning` report whose applied digest equals the digest that boot was served promotes settings. Stale instances are ignored; errors leave settings unchanged | agentSeal raw-keccak signature + current status token |
 | `POST /settings/seed` | Container hands back a configuration document recovered from a pre-settings chain role, so it survives a recreate. Seed only, and single-use: it lands only while `settings_version = 0`, and is ignored outright when no sandbox is on record (ghost container — every container this agent ever had holds the agentSeal key) | agentSeal signature over `SettingsSeed:0x<sealId>:<sha256>` |
 

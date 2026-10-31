@@ -69,6 +69,12 @@ nothing else.
 - `thinking` must be one of `Levels`, case-insensitively;
 - `framework` must be valid JSON, and nothing more.
 
+A boot whose document fails `Validate` still starts where the adapter allows
+it, but sealed then reports `warning` (`owner settings unusable (…); write the
+agent's settings (provider and model)`) instead of `running` until a settings
+push applies, e.g. on a clone whose new owner has written no settings yet
+(`main.go`, `status.go` (`SettingsIssue`)).
+
 **An unlisted model is not rejected by the model advisory.** The CLI checks
 the selected provider's configured catalog before signing; native providers
 without a catalog accept manual IDs. Registry membership and credential binding
@@ -627,7 +633,10 @@ instead: the first boot after a push always gets the owner's current document
 (a read-time preference for last-known-good would mean a new document could
 never earn a confirmation), and a container that keeps coming back without
 ever reporting `running` gets the last one that worked
-(`routes/provision.rs` (`settings_for_boot`)). A failure to record the attempt is treated as
+(`routes/provision.rs` (`settings_for_boot`)). Attempts are counted per boot:
+sealed retries a failed or lost `/provision` under one boot ID, and such a
+retry is the same attempt, so it gets the same document
+(`deployments.settings_attempt_boot`). A failure to record the attempt is treated as
 "first attempt" and serves the current document — the bookkeeping must not be
 able to fail the boot.
 
