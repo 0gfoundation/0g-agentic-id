@@ -534,6 +534,7 @@ impl SandboxClient for MockSandbox {
             id: format!("mock-{}", hex::encode(&seal_id.as_slice()[..8])),
             state: Some("creating".to_string()),
             created_at: None,
+            container_pubkey: None,
         })
     }
 
@@ -612,6 +613,9 @@ pub struct ConfigurableSandbox {
     pub admin_delete_calls: AtomicU64,
     pub boot_tickets: Mutex<Vec<String>>,
     pub last_admin_delete_id: Mutex<Option<String>>,
+    /// The container key a create reports, as read from the provider's
+    /// certificate in its response.
+    pub create_container_pubkey: Mutex<Option<Vec<u8>>>,
 }
 
 impl ConfigurableSandbox {
@@ -638,6 +642,7 @@ impl ConfigurableSandbox {
             admin_delete_calls: AtomicU64::new(0),
             boot_tickets: Mutex::new(Vec::new()),
             last_admin_delete_id: Mutex::new(None),
+            create_container_pubkey: Mutex::new(None),
         }
     }
 
@@ -712,6 +717,7 @@ impl SandboxClient for ConfigurableSandbox {
             id: self.create_id.lock().unwrap().clone(),
             state: Some("creating".into()),
             created_at: None,
+            container_pubkey: self.create_container_pubkey.lock().unwrap().clone(),
         })
     }
 
@@ -1249,10 +1255,44 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 self.revoke_status_boot(seal_id);
                 d.provision_deadline = None;
             }
+            if matches!(stage, StageStatus::Submitted { .. }) {
+                d.provision_deadline = None;
+            }
             d.container_stage = stage;
             d.phase =
                 crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
         })
+    }
+
+    async fn set_container_stage_if(
+        &self,
+        seal_id: SealId,
+        sandbox_id: &str,
+        expected_state: &str,
+        stale_before: Option<chrono::DateTime<chrono::Utc>>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        let fresh = stale_before.is_some_and(|cutoff| {
+            self.heartbeats
+                .lock()
+                .unwrap()
+                .get(&seal_id)
+                .map_or(true, |t| *t >= cutoff)
+        });
+        let matches = self
+            .by_seal
+            .lock()
+            .unwrap()
+            .get(&seal_id)
+            .is_some_and(|d| {
+                d.sandbox_id.as_deref() == Some(sandbox_id)
+                    && d.container_stage.state_tag() == expected_state
+            });
+        if fresh || !matches {
+            return Ok(false);
+        }
+        self.set_container_stage(seal_id, stage).await?;
+        Ok(true)
     }
 
     async fn reset_container_track(
@@ -1282,6 +1322,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         d.container_stage = StageStatus::NotStarted;
         d.sandbox_id = None;
         d.provisioned_at = None;
+        d.provision_deadline = None;
         d.container_record = None;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
         Ok(true)
@@ -1297,7 +1338,12 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| d.framework = Some(framework))
     }
 
-    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
+    async fn set_sandbox_id(
+        &self,
+        seal_id: SealId,
+        sandbox_id: String,
+        container_pubkey: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
         self.set_sandbox_id_calls.fetch_add(1, Ordering::SeqCst);
         anyhow::ensure!(
             !self.fail_set_sandbox_id.load(Ordering::SeqCst),
@@ -1307,6 +1353,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             if let Some(auth) = self.boot_authorizations.lock().unwrap().get_mut(&seal_id) {
                 if auth.enabled {
                     auth.sandbox_id = Some(sandbox_id.clone());
+                    auth.container_pubkey = container_pubkey;
                 }
             }
             d.sandbox_id = Some(sandbox_id);
@@ -1445,7 +1492,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         reason: String,
         mark_failed: bool,
         generation: Option<i64>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         self.record_provision_error_calls
             .fetch_add(1, Ordering::SeqCst);
         if let Some(generation) = generation {
@@ -1456,7 +1503,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 .get(&seal_id)
                 .is_some_and(|a| a.enabled && a.generation == generation);
             if !current {
-                return Ok(());
+                return Ok(false);
             }
         }
         let now = chrono::Utc::now();
@@ -1472,7 +1519,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 d.phase =
                     crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             }
-        })
+        })?;
+        Ok(true)
     }
 
     async fn flip_provision_timeouts(
@@ -1591,14 +1639,15 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             .ok_or_else(|| anyhow::anyhow!("unknown seal"))?;
         let mut auths = self.boot_authorizations.lock().unwrap();
         let generation = auths.get(&seal).map_or(1, |a| a.generation + 1);
-        let (sandbox_id, ticket_issued_at) = match ticket {
+        let (sandbox_id, ticket_issued_at, container_pubkey) = match ticket {
             Some(_) => {
                 d.container_record = None;
-                (None, Some(chrono::Utc::now().timestamp()))
+                (None, Some(chrono::Utc::now().timestamp()), None)
             }
             None => (
                 auths.get(&seal).and_then(|a| a.sandbox_id.clone()),
                 auths.get(&seal).and_then(|a| a.ticket_issued_at),
+                auths.get(&seal).and_then(|a| a.container_pubkey.clone()),
             ),
         };
         let ticket = ticket.or_else(|| auths.get(&seal).map(|a| a.ticket_hash));
@@ -1615,6 +1664,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 started_at: 0,
                 owner: Some(owner),
                 sandbox_id,
+                container_pubkey,
             },
         );
         self.status_bindings.lock().unwrap().remove(&seal);

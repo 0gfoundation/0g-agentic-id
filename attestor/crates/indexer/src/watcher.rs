@@ -849,7 +849,7 @@ mod tests {
                 .unwrap();
             if published {
                 deployments
-                    .set_sandbox_id(seal, "buyer-new".into())
+                    .set_sandbox_id(seal, "buyer-new".into(), None)
                     .await
                     .unwrap();
             }

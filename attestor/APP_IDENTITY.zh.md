@@ -103,6 +103,9 @@ evidence 或 Scan 读取公开 app signer，完成上述 AgenticID 绑定及 san
 去掉末尾 `/`）、`SEAL_BOOT_TICKET` 以及链/indexer 配置；不再把 TLS 信任写进环境变量。
 owner 签名的环境变量中如有键不是合法变量名（`[A-Za-z_][A-Za-z0-9_]*`），attestor 拒绝
 create：运行时按 `KEY=VALUE` 拼接条目，含 `=` 的键可能给 attestor 设置的变量多加一条。
+这些覆盖只作用于 attestor 自己创建的容器；直接在 provider 创建的 sealed sandbox 可以带任意
+环境变量，因此 `/provision`（见下文）只接受 attestor 自己 create 出的那个容器的首次启动。
+provider 返回任何 sandbox 时都会删除 `SEAL_BOOT_TICKET`，与 `SANDBOX_SEAL_KEY` 相同。
 每次 create 前 attestor 都会重新确认 AgenticID 仍信任它自己的 app 实例。在 sealed create
 （attestor 发起的每次 create 都是）中，sandbox provider 在写入自己的 `SANDBOX_SEAL_KEY`
 与 v3 证书之前，会从调用方环境变量中删除 `ATTESTOR_TLS_DESCRIPTOR`、
@@ -138,8 +141,14 @@ chainId 为链 id，`verifyingContract` 为 TappRegistry；provider key 直接�
 owner、已落库的 sandbox）外，attestor 还要求：恢复出的签名者以及证书的 chain、registry、
 appId、registeredAt 等于 sandbox discovery 认证的 provider 实例；签发时间不早于启动票据
 签发前 300 秒、不晚于当前时间 + 300 秒；镜像在 `validFrameworkHashes` 中；boot claim
-由证书中的公钥签名。随后在与启动绑定相同的事务里记录容器公钥、镜像 hash 和 provider
-实例（chain、registry、appId、registeredAt、signer）。
+由证书中的公钥签名。证书中的公钥还必须是 provider 为本 attestor 在当前票据下创建的
+sandbox 所报告的公钥：provider 返回 sealed sandbox 时附带其证书（私钥已删除），worker
+把这把公钥与新 sandbox ID 一起保存。直接在 provider 创建的 sealed sandbox 同样有证书，
+甚至可能带着票据，但公钥不同，会以 `401 certificate is not for the sandbox this
+attestor created; reset required` 拒绝（create 响应中没有证书时为 `401 the sandbox
+provider reported no container key for this sandbox at create; reset required`）。随后在
+与启动绑定相同的事务里记录容器公钥、镜像 hash 和 provider 实例（chain、registry、
+appId、registeredAt、signer）。
 
 同一容器之后的启动不带证书。必须由已记录的公钥签 boot claim，已记录的 provider 实例
 必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`；
@@ -154,10 +163,12 @@ signer 改变则需要 owner 执行 reset。
 每次被接受的 provision 都返回一个加密给容器公钥的全新不透明状态令牌。attestor 只保存
 它的 SHA-256，旁边记录实际下发的配置版本和摘要，`/status` 只依据这条记录确认配置。
 令牌和记录都不含 attestor MAC。不兼容 v2：provider、attestor 与 sealed 镜像需同时发布，
-并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。启动票据早于
-v3 的 sandbox 不能 `start`（resume），返回 409，因为那个运行时无法 provision。
+并重建所有 agent（升级步骤见 [`README.zh.md`](README.zh.md#升级到-agentdna-14)）。v3 之前创建的
+sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 409，因为那个
+运行时无法 provision。
 
 对已授权启动（票据、代次、更新的尝试、已落库的 sandbox 与链上实时 owner 均已校验）的
 401 或 403 会以 `provision rejected` 打日志。在该代次仍是启用代次时，记为
-`last_provision_error`，并把容器 stage 置为 `failed`、以此为原因，owner 立即看到原因，
-而不是五分钟后的 provision timeout。其他拒绝不写任何东西。
+`last_provision_error`，并把容器 stage 置为 `failed`、以此为原因，同时发布
+`container_failed`，owner 立即看到原因，而不是五分钟后的 provision timeout。其他拒绝
+不写任何东西。

@@ -13,8 +13,9 @@
 //!
 //! Frontend decides which to sign from the deployment's phase and stages;
 //! we just dispatch, except that a `start` of a sandbox created before
-//! AgentDNA 1.4 (boot ticket without an issue time) is refused with 409:
-//! that runtime cannot provision, so only a `create` brings the agent back.
+//! AgentDNA 1.4 (no boot ticket, or one without an issue time) is refused
+//! with 409: that runtime cannot provision, so only a `create` brings the
+//! agent back.
 
 use super::lifecycle_auth::authorize_lifecycle;
 use crate::error::{ApiError, ApiResult};
@@ -80,16 +81,19 @@ pub async fn handle(
         }
     }
 
-    // A sandbox created before certificate v3 (AgentDNA 1.4) holds a boot
-    // ticket with no issue time and a runtime that cannot provision against
-    // this attestor; resuming it would bill a container that goes offline at
-    // the provision timeout. Only a new container (reset) brings it back.
+    // Only a sandbox created under certificate v3 (AgentDNA 1.4) can be
+    // resumed: its boot ticket carries an issue time. One created under 1.3
+    // holds a ticket without it, and one created before 1.3 has no boot
+    // authorization at all; either runs a runtime that cannot provision
+    // against this attestor, so resuming it would bill a container that goes
+    // offline at the provision timeout. Only a new container (reset) brings
+    // it back.
     if action == "start"
-        && state
+        && !state
             .deployments
             .boot_authorization(req.seal_id)
             .await?
-            .is_some_and(|a| a.ticket_issued_at.is_none())
+            .is_some_and(|a| a.ticket_issued_at.is_some())
     {
         return Err(ApiError::conflict(
             "this agent's sandbox was created before AgentDNA 1.4 and cannot be resumed; reset the agent to create a new one",
@@ -316,6 +320,7 @@ mod tests {
     #[tokio::test]
     async fn action_start_enqueues_sandbox_start() {
         let s = make_setup();
+        seed_boot_authorization(&s, Some(Utc::now().timestamp()));
         let req = signed_req(s.seal_id, &OWNER_PRIV, "start");
         let (status, _) = handle(axum::extract::State(s.state.clone()), Json(req))
             .await
@@ -340,6 +345,7 @@ mod tests {
                 started_at: 0,
                 owner: Some(s.owner),
                 sandbox_id: Some("sb-old".into()),
+                container_pubkey: None,
             },
         );
     }
@@ -362,6 +368,19 @@ mod tests {
             .await
             .expect("create replaces the old sandbox");
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn resuming_a_sandbox_with_no_boot_authorization_is_refused_with_409() {
+        // Created before 1.3: no boot ticket was ever issued for it.
+        let s = make_setup();
+        let req = signed_req(s.seal_id, &OWNER_PRIV, "start");
+        let err = handle(axum::extract::State(s.state.clone()), Json(req))
+            .await
+            .expect_err("a sandbox with no boot ticket cannot provision");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert!(err.message.contains("reset the agent"), "{}", err.message);
+        assert!(s.jobs.submitted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

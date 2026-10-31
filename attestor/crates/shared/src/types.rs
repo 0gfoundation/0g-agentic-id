@@ -290,6 +290,18 @@ impl StageStatus {
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Failed { .. })
     }
+
+    /// The serialized `state` tag, i.e. what `container_stage->>'state'`
+    /// holds in the database.
+    pub fn state_tag(&self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Submitted { .. } => "submitted",
+            Self::Confirmed { .. } => "confirmed",
+            Self::Stopped { .. } => "stopped",
+            Self::Failed { .. } => "failed",
+        }
+    }
 }
 
 // ── Deployment phase (derived) ──────────────────────────────────────────
@@ -550,6 +562,12 @@ pub struct SandboxCreateResponse {
     pub state: Option<String>,
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+    /// The container key from the certificate the provider wrote into the
+    /// new sandbox's env (`env.SANDBOX_SEAL_ATTESTATION`, which the provider
+    /// returns with the sandbox), for this seal. Filled by the client after
+    /// parsing; None when the response carried no such certificate.
+    #[serde(skip)]
+    pub container_pubkey: Option<Vec<u8>>,
 }
 
 // Shape returned by `SandboxClient::get_sandbox`. Mirrors the relevant
@@ -585,6 +603,23 @@ mod tests {
             wallet_address: Address::repeat_byte(0x11),
             signed_message_b64: secret.to_string(),
             wallet_signature: Bytes::from(vec![0x1b; 65]),
+        }
+    }
+
+    #[test]
+    fn stage_state_tag_is_the_serialized_tag() {
+        let at = chrono::Utc::now();
+        for stage in [
+            StageStatus::NotStarted,
+            StageStatus::Submitted { tx_hash: None, at },
+            StageStatus::Confirmed { at },
+            StageStatus::Stopped { at, reason: "r".into() },
+            StageStatus::Failed { at, reason: "r".into() },
+        ] {
+            assert_eq!(
+                serde_json::to_value(&stage).unwrap()["state"],
+                stage.state_tag()
+            );
         }
     }
 

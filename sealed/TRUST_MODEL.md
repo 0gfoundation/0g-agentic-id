@@ -334,7 +334,7 @@ Attestor's validation has three independent gates:
 
 | Gate | Predicate | Source of truth |
 |---|---|---|
-| **Sandbox identity** | First provision: the certificate's scope (chain, TappRegistry, appId, `registered_at`) and its recovered signer equal the provider instance the attestor discovers and trusts. Later boots: the provider instance recorded at first provision still equals it | the attestor's provider discovery (TappRegistry, SandboxServing) |
+| **Sandbox identity** | First provision: the certificate's scope (chain, TappRegistry, appId, `registered_at`) and its recovered signer equal the provider instance the attestor discovers and trusts, and its key is the one the provider reported for the sandbox the attestor created under the current ticket (a sealed sandbox created at the provider directly has another key). Later boots: the provider instance recorded at first provision still equals it | the attestor's provider discovery (TappRegistry, SandboxServing) |
 | **Image legitimacy** | `AgenticID.isValidFrameworkHash(image_hash) == true`, at first provision and again for the recorded hash on every later boot | AgenticID contract's `validFrameworkHashes` allowlist (Attestor-maintained set of approved Sealed runtime image hashes) |
 | **Freshness OR record** | First provision: `ticket_issued_at − 300 ≤ ts ≤ now + 300`. Later boots: the boot claim recovers the address of the recorded `container_pubkey` | the deployment's container record (`container_pubkey`, image hash and provider instance), written with the first provision's binding in one transaction |
 

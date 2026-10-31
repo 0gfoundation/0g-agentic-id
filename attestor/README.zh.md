@@ -78,9 +78,12 @@ worker 日志即可。
 3. **暂停并排空。**公告一个窗口，期间 owner 不部署也不 reset：provider 与 attestor
    版本不一致时 create 会失败，无论哪一方先升级。按上文排空 job 队列。
 4. **在该窗口内升级 provider 和 attestor。**检查：`GET <provider>/api/attestor-tls`
-   返回 200；api 日志出现 `attestor tls self-check: provider statement verified`；
-   `GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` 返回 200。
-   provider 报 `attestor instance requires explicit re-authorization` 说明它保存的
+   返回 200，`GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` 返回 200，
+   且 api 日志出现 `attestor tls self-check: provider statement verified`。自检只在
+   api 启动时运行一次：如果 attestor 先于 provider 提供声明启动，自检记录的是
+   `attestor tls self-check: no valid provider statement`。此时上面的转发请求会加载声明，
+   并记录 `attestor tls: provider statement refreshed`，同样算检查通过（重启 api 会重新
+   自检）。provider 报 `attestor instance requires explicit re-authorization` 说明它保存的
    attestor 实例已过期：先按 sandbox provider 的 `docs/APP_IDENTITY.md` 重新授权该实例
    再继续。
 5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。sealed 日志
@@ -89,8 +92,15 @@ worker 日志即可。
 6. **公告。**owner reset 自己的 agent。1.4 之前创建的 sandbox 不能 resume
    （`/start` 带 `start`），会得到 409，因为那个运行时无法 provision。preflight 要求时，
    owner 需重新确认 provider（SDK `ack()`）。请 owner 错开 reset：worker 一次只跑一个
-   job，签名后约 150 s 内没开始执行的 reset 会以
-   `request expired before it ran — sign it again` 失败。
+   job，签名后约 150 s 内没开始执行的 reset 会被丢弃，agent 保持原样。控制台显示
+   `request expired before it ran — sign it again`；CLI 会一直等新容器直到超时，然后提示
+   agent 没有上线、请重新 reset。
+
+**回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
+（`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
+在同一数据库上启动的 1.3 attestor 读不了 provider registry；它也无法验证 1.4 创建的容器
+的 v3 证书，也解码不了 1.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
+部署 1.3 镜像。
 
 ## Workspace
 
@@ -170,7 +180,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。AgentDNA 1.4 之前创建的 sandbox 不能 `start`（resume），返回 `409`：那个运行时无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 `409`：那个运行时无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
@@ -181,7 +191,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `GET /provision?seal_id=…` | 返回 `{"generation", "certificate_required"}`：已启用的启动代次（不返回票据），以及当前是否尚未记录容器公钥、下一次启动必须携带证书。没有已启用的授权时返回 `403 no authorized boot; reset required` | 公开元数据 |
 | `GET /attestor-tls?provider=0x…` | 原样（逐字节）转发 sandbox provider 对本 attestor TLS SPKI pin 的最新签名声明（EIP-712 `AttestorTLS`，取自已发现 provider 的 `/api/attestor-tls`）。转发前检查 provider 签名、租期（最长 300 秒）以及本 attestor 自己的 TLS 公钥在 pin 中；到期前 60 秒刷新，声明到期前 15 秒停止下发（sealed 要求剩余超过 5 秒），且只在刷新时询问 sandbox discovery，因此 discovery 续期或不可用不会阻塞或拒绝缓存能回答的请求。未知 provider → 404；没有有效声明 → 503 并带 `Retry-After: 5`。始终 `Cache-Control: no-store`。每份新声明都会打日志；api 启动时取一次并记录结果。sealed 之后对 attestor 的所有连接都钉在这些 pin 上 | 公开 |
-| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档，以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
+| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档，以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，且公钥是 provider 为本 attestor 在当前票据下创建的 sandbox 所报告的公钥（`401 certificate is not for the sandbox this attestor created; reset required`），然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`（发布 `container_failed`）。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
 | `POST /status` | sealed 心跳与状态（`StatusReport.v2` canonical）。签名覆盖状态令牌哈希和实际使用的配置摘要；在一个事务里检查令牌属于当前启动，再更新状态、心跳与精确版本确认。只有实际使用的配置摘要等于该次启动下发摘要的 `running` / `warning` 上报才能提升配置；旧容器上报被忽略，`error` 不改配置 | agentSeal 原始 keccak 签名 + 当前状态令牌 |
 | `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
 

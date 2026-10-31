@@ -346,79 +346,56 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
 
-                    // A resume job may have restarted this row while the
-                    // sandbox was being inspected; its stage then no longer
-                    // matches what this decision was based on.
-                    if !matches!(act, Act::Skip) {
-                        match deployments.get(seal_id).await {
-                            Ok(Some(d))
-                                if matches!(
-                                    d.container_stage,
-                                    attestor_shared::StageStatus::Confirmed { .. }
-                                ) => {}
-                            Ok(_) => {
-                                tracing::info!(?seal_id, sandbox_id = %sb, "sweep: container stage changed during reconcile — leaving alone");
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(?seal_id, error = %e, "sweep: re-read failed — leaving alone");
-                                continue;
-                            }
-                        }
-                    }
-
-                    match act {
+                    // A lifecycle job (a reset onto a new sandbox, a resume)
+                    // may have moved this row on while the sandbox was being
+                    // inspected. The verdict lands only while the row still
+                    // names this sandbox, is running and is still stale, and
+                    // a sandbox is reaped only after that write landed.
+                    let cutoff = now - chrono::Duration::seconds(HEARTBEAT_STALENESS_SECS);
+                    let (stage, event, reap) = match act {
                         Act::Skip => {
                             tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but /healthz ok — leaving alone");
+                            continue;
                         }
-                        Act::Stop(reason) => {
-                            if let Err(e) = deployments
-                                .set_container_stage(
-                                    seal_id,
-                                    attestor_shared::StageStatus::Stopped {
-                                        at: now,
-                                        reason: reason.clone(),
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(?seal_id, error = %e, "sweep: set Stopped failed");
-                            }
-                            let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerStopped {
-                                    seal_id,
-                                    reason,
-                                })
-                                .await;
-                            tracing::info!(?seal_id, sandbox_id = %sb, "sweep: sandbox stopped → c=Stopped");
+                        Act::Stop(reason) => (
+                            attestor_shared::StageStatus::Stopped {
+                                at: now,
+                                reason: reason.clone(),
+                            },
+                            attestor_shared::WsEvent::ContainerStopped { seal_id, reason },
+                            false,
+                        ),
+                        Act::Fail(reason, reap) => (
+                            attestor_shared::StageStatus::Failed {
+                                at: now,
+                                reason: reason.clone(),
+                            },
+                            attestor_shared::WsEvent::ContainerFailed { seal_id, reason },
+                            reap,
+                        ),
+                    };
+                    let target = stage.state_tag();
+                    match deployments
+                        .set_container_stage_if(seal_id, &sb, "confirmed", Some(cutoff), stage)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::info!(?seal_id, sandbox_id = %sb, "sweep: deployment changed during reconcile — leaving alone");
+                            continue;
                         }
-                        Act::Fail(reason, reap) => {
-                            if reap {
-                                if let Err(e) = sandbox.admin_delete(&sb).await {
-                                    tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: admin_delete failed (non-fatal)");
-                                }
-                            }
-                            if let Err(e) = deployments
-                                .set_container_stage(
-                                    seal_id,
-                                    attestor_shared::StageStatus::Failed {
-                                        at: now,
-                                        reason: reason.clone(),
-                                    },
-                                )
-                                .await
-                            {
-                                tracing::warn!(?seal_id, error = %e, "sweep: set Failed failed");
-                            }
-                            let _ = events
-                                .publish(attestor_shared::WsEvent::ContainerFailed {
-                                    seal_id,
-                                    reason,
-                                })
-                                .await;
-                            tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, "sweep: → c=Failed");
+                        Err(e) => {
+                            tracing::warn!(?seal_id, error = %e, "sweep: stage write failed");
+                            continue;
                         }
                     }
+                    if reap {
+                        if let Err(e) = sandbox.admin_delete(&sb).await {
+                            tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: admin_delete failed (non-fatal)");
+                        }
+                    }
+                    let _ = events.publish(event).await;
+                    tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, stage = target, "sweep: stale runner reconciled");
                 }
             }
         });

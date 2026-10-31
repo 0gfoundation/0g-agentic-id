@@ -286,7 +286,7 @@ Attestor 的校验有三道独立闸门：
 
 | 闸门 | 谓词 | 真源 |
 |---|---|---|
-| **Sandbox 身份** | 首次 provision：证书的 scope（chain、TappRegistry、appId、`registered_at`）及其恢复出的签名者，等于 attestor 发现并信任的 provider 实例。后续启动：首次 provision 时记录的 provider 实例仍等于它 | attestor 的 provider discovery（TappRegistry、SandboxServing）|
+| **Sandbox 身份** | 首次 provision：证书的 scope（chain、TappRegistry、appId、`registered_at`）及其恢复出的签名者，等于 attestor 发现并信任的 provider 实例，且公钥是 provider 为 attestor 在当前票据下创建的 sandbox 所报告的公钥（直接在 provider 创建的 sealed sandbox 公钥不同）。后续启动：首次 provision 时记录的 provider 实例仍等于它 | attestor 的 provider discovery（TappRegistry、SandboxServing）|
 | **Image 合法性** | `AgenticID.isValidFrameworkHash(image_hash) == true`，首次 provision 时校验，之后每次启动对记录的 hash 再校验一次 | AgenticID 合约的 `validFrameworkHashes` allowlist（Attestor 维护的、批准过的 Sealed runtime image hash 集合）|
 | **新鲜度 OR 记录** | 首次 provision：`ticket_issued_at − 300 ≤ ts ≤ now + 300`。后续启动：boot claim 恢复出的地址等于记录的 `container_pubkey` 的地址 | 部署的容器记录（`container_pubkey`、image hash 和 provider 实例），与首次 provision 的 binding 在同一事务中写入 |
 
