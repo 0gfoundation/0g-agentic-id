@@ -244,10 +244,12 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SANDBOX_ENDPOINT` | Dev-only locator; production uses the authorized on-chain HTTPS URL |
 | `ATTESTOR_SANDBOX_SNAPSHOT` | 实例化新 agent 用的 sealed runtime snapshot 名（升 image 时改这里）|
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
-| `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
+| `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw`。是 `ATTESTOR_FRAMEWORKS`（每项 `name[:image]`，见 `.env.example`）的旧版回退；两者中出现 `dsh` 都会让启动失败 |
 | `ATTESTOR_SECRET_ENV_ENABLED` | 显式开启（`true`/`1`/`on`/`yes`）。开启后 `GET /config` 公布 `secret_env_scheme`，SDK 在 start/reset/retry 时把推理 key 加密给 agentSeal 公钥，而不是明文签进 envelope。只有当 `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` 里所有镜像都能读 `SEAL_SECRET_ENV` 时才开启。默认关闭 |
 | `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`（去掉末尾 `/`）；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
+
+从把 harness 框架叫作 `dsh` 的版本升级时：在同一次升级里把 `ATTESTOR_FRAMEWORKS` 中的该项改名为 `0g-harness`，并指向 0g-harness 镜像。启动时会把所有 `dsh` 部署行改名为 `0g-harness`，并拒绝仍写着 `dsh` 的配置，两者不会不一致。
 
 attestor 与已配置 sealed 镜像统一发布。`/config.inference_capabilities` 根据本版本及已有 framework/snapshot 配置自动生成，不另设能力 ENV。provider 运维写入由 `ATTESTOR_TAPP_REGISTRY_ADDR` 中 `ATTESTOR_APP_ID` 的实时 owner 授权，见 [上线流程](../sdk/typescript/PROVIDERS.zh.md)。
 
