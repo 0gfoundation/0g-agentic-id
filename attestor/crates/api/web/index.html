@@ -3599,7 +3599,7 @@ function renderTaskProgress(dep) {
 
 // Distill the actionable failure reason from a deployment row. Order:
 //   1. last_provision_error  (covers /provision rejections — image_hash
-//      whitelist, signer mismatch, stale attestation, etc.)
+//      whitelist, certificate signer or window, changed provider, etc.)
 //   2. failed stage's `reason`  (storage/mint/sandbox.create errors)
 // Returns '' if the deployment isn't currently failed. Surfaced on the
 // detail-page banner AND as a `title` tooltip on every status pill /
@@ -3650,11 +3650,15 @@ function failureReason(dep) {
 // root cause is addressed) but surface a hint pointing at what to do.
 const PERMANENT_PROVISION_MARKERS = [
   ['image_hash not in validFrameworkHashes',
-   'This image_hash isn\'t registered on chain. Ask the project to register it via TappRegistry, then click Bring online.'],
-  ['signer mismatch',
-   'Sandbox TEE signer doesn\'t match attestor config. Coordinate with infra; recreate alone won\'t fix it.'],
-  ['container_pubkey must be',
-   'Container pubkey shape rejected. Likely a sandbox runtime mismatch — rebuild the image rather than recreate.'],
+   'This image_hash isn\'t in the AgenticID contract\'s validFrameworkHashes allowlist. Ask the project to add it there, then click Bring online.'],
+  ['provider instance no longer trusted',
+   'The sandbox provider that certified this container is no longer the one this attestor trusts. Bring online to recreate it under the current provider.'],
+  ['container key differs from record',
+   'A different container key tried to boot this agent. Bring online to recreate the container.'],
+  ['certificate signer is not',
+   'The container certificate isn\'t signed by the sandbox provider this attestor trusts. Coordinate with infra; recreate alone won\'t fix it.'],
+  ['certificate pubkey must be',
+   'Container certificate shape rejected. Likely a sandbox runtime mismatch — rebuild the image rather than recreate.'],
 ];
 function permanentFailureHint(dep) {
   const r = (dep && dep.last_provision_error) || '';
@@ -4488,8 +4492,8 @@ window.actionStop = (sealId, sandboxId) => lifecycleAction('stop', sealId, sandb
 //
 //   isPaused (phase=stopped) → sign `start`: sandbox is just paused,
 //                              Daytona's `start` resumes the existing
-//                              container (pubkey binding keeps freshness
-//                              window short-circuited).
+//                              container (its recorded key lets it
+//                              provision again without a certificate).
 //   isStuck (c=Failed)        → sign `create`: existing sandbox is dead
 //                              (errored, GC'd, or never provisioned).
 //                              Worker spawns a fresh sandbox via

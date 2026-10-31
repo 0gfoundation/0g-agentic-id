@@ -1,16 +1,16 @@
 // Sealed container bootstrap (orchestrator).
 //
-// Phase 0  attest         - parse env, verify SANDBOX_SEAL_KEY ↔ attestation.pubkey,
-//
-//	recover TEE signer (and match TEE_SIGNER_ADDRESS if set)
-//
-// Phase 1  provision      - POST /provision -> ECIES-decrypt agent_seal_priv
-// Phase 2  chain bootstrap - getAgentIdBySealId + intelligentDatasOf +
-//
-//	loadSealedKeys + per-entry download + AES-GCM decrypt
-//
-// Phase 3  framework      - adapter.Restore each decrypted entry; adapter.Start
-// Phase 4  status report  - notify attestor only on full pipeline success
+//	Phase 0  attest          parse env; verify the v3 container certificate:
+//	                         SANDBOX_SEAL_KEY ↔ certificate pubkey, recover the
+//	                         provider signer (the anchor of the attestor TLS
+//	                         statement, internal/attestorhttp)
+//	Phase 1  provision       GET + POST /provision, retried with backoff up to
+//	                         10 minutes after PID-1 start -> ECIES-decrypt
+//	                         agent_seal_priv
+//	Phase 2  chain bootstrap getAgentIdBySealId + intelligentDatasOf +
+//	                         loadSealedKeys + per-entry download + AES-GCM decrypt
+//	Phase 3  framework       adapter.Restore each decrypted entry; adapter.Start
+//	Phase 4  status report   notify attestor only on full pipeline success
 //
 // Long-running:
 //   - HTTP server on :8080 (proxy package)
@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 
+	"seal-verify/internal/attestorhttp"
 	"seal-verify/internal/chain"
 	"seal-verify/internal/config"
 	"seal-verify/internal/dataplane"
@@ -135,16 +136,21 @@ func main() {
 	// connection and before its first log line, which is what first reads
 	// the time zone: nothing may log before this call.
 	privsep.Harden()
+	// Provisioning gives up a fixed time after this PID-1 start.
+	started := time.Now()
 
 	// Shared agent state -- read by proxy, written by main + manager.
 	agent := state.New()
 
-	// Phase 0: parse env + verify attestation. Done BEFORE starting the HTTP
-	// server because we need cfg.PublicURL to construct proxy.Server.
+	// Phase 0: parse env + verify the container certificate. Done BEFORE
+	// starting the HTTP server because we need cfg.PublicURL to construct
+	// proxy.Server. The provider that signed the certificate is the only
+	// key whose statement can pin the attestor's TLS key.
 	cfg, err := config.Load()
 	if err != nil {
 		logger.Fail("%v", err)
 	}
+	attestorhttp.Configure(cfg.AttestorAnchor())
 
 	// Start the HTTP server now (after we know our public URL but before the
 	// rest of bootstrap so /healthz and /log are reachable while the chain
@@ -176,7 +182,7 @@ func main() {
 	if skip := provisionGate(cfg, privsep.Required); skip != "" {
 		logger.Logf("%s", skip)
 	} else {
-		runMainPipeline(cfg, agent, sealedProxy)
+		runMainPipeline(cfg, agent, sealedProxy, started)
 	}
 
 	logger.Logf("")
@@ -213,9 +219,16 @@ func provisionGate(cfg *config.Bootstrap, privsepRequired func() error) string {
 // runMainPipeline encapsulates Phases 1-4. Errors are logged and reported
 // but never crash the process (main keeps the HTTP server up so /log is
 // reachable even when bootstrap can't complete).
-func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *proxy.Server) {
+func runMainPipeline(cfg *config.Bootstrap, agent *state.Agent, sealedProxy *proxy.Server, started time.Time) {
 	logger.Logf("--- Provisioning from attestor: %s ---", cfg.AttestorURL)
-	prov := provision.FromAttestor(cfg.AttestorURL, cfg.SealKeyBytes, cfg.Attestation, cfg.BootTicket)
+	prov := provision.FromAttestor(provision.Boot{
+		AttestorURL:     cfg.AttestorURL,
+		SealKey:         cfg.SealKeyBytes,
+		Certificate:     cfg.Attestation,
+		CertificateJSON: cfg.Certificate,
+		Ticket:          cfg.BootTicket,
+		Started:         started,
+	})
 	agentSealPriv := prov.AgentSealPriv
 	if agentSealPriv == nil {
 		return
@@ -785,8 +798,12 @@ func startAgent(
 	if err := settingsDoc.Validate(); err != nil {
 		// Loud, not silent: an agent with no usable pin will fail to start on
 		// two of the four adapters, and "why is it offline" must not require
-		// reading adapter internals.
+		// reading adapter internals. Where it does start (e.g. a clone whose
+		// new owner has written no settings yet), it cannot answer, so it
+		// reports a warning rather than a healthy "running" until a settings
+		// push applies.
 		logger.Logf("WARN owner settings invalid: %v", err)
+		currentStatus.SettingsIssue(fmt.Sprintf("owner settings unusable (%v); write the agent's settings (provider and model)", err))
 	}
 
 	// Build the uploader. The watcher tick handler reuses this single
@@ -843,9 +860,9 @@ func startAgent(
 
 			// Sealed runtime metadata.
 			SealedVersion: sealedVersion,
-			// AgenticID Framework code hash = the sealed image measurement.
-			// ImageHash is "sha256:<hex>"; the contract wants a bytes32.
-			FrameworkHash: "0x" + strings.TrimPrefix(cfg.Attestation.ImageHash, "sha256:"),
+			// AgenticID Framework code hash = the sealed image measurement
+			// the provider certified (image_hash), as the contract's bytes32.
+			FrameworkHash: cfg.Attestation.FrameworkHash(),
 		},
 		AgentSealPriv: agentSealPriv,
 		SealID:        sealID,
@@ -907,6 +924,13 @@ func startAgent(
 			currentStatus.SupervisorRecovered()
 		}
 		logger.Logf("settings: applied (provider=%s model=%s thinking=%s)", doc.Provider, doc.Model, doc.Thinking)
+		// A document that applied clears a boot-time settings warning; say
+		// so now rather than at the next heartbeat.
+		if doc.Validate() == nil && currentStatus.SettingsIssue("") != "running" {
+			if level, msg := currentStatus.Get(); level == "running" {
+				go report.Status(cfg.AttestorURL, agentSealPriv, sealID, level, msg, cfg.StatusBinding)
+			}
+		}
 		return nil
 	})
 	sealedProxy.SetRuntimeSettings(live.runtime)

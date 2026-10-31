@@ -308,29 +308,52 @@ The real rollout still requires an upgraded image and registered attestor Tapp
 owner; see [operator workflow](../sdk/typescript/PROVIDERS.md).
 
 
-Status boot receipts have a shared Rust/Go signature fixture at
-`sealed/internal/inference/testdata/status-v2.json`. API tests rotate receipts
-and verify that delayed running/warning/error/starting/stopping reports from an
-old instance cannot change stage, liveness, or confirmed settings. They also
-cover absent/mismatched applied digests and legacy reports that never promote.
+Provision v3 has known-answer vectors shared byte-identically with the
+sandbox provider and sealed: `crates/shared/testdata/image-attestation-v3.json`
+(container certificate, EIP-712 `ImageAttestation`) and
+`crates/shared/testdata/attestor-tls-v3.json` (attestor TLS statement, EIP-712
+`AttestorTLS`). The Rust tests recompute each type hash, domain separator,
+struct hash, digest and recovered signer, and read sealed's
+`sealed/internal/inference/testdata/boot-v1-first.json` (first provision,
+carrying the certificate) and `boot-v1.json` (later boot, recorded key). API
+tests cover a first boot and later boots, another container key, a changed
+provider instance, an image removed from the allowlist, `409
+certificate_required`, the certificate's issue window, and the
+`/attestor-tls` relay's 200/404/503 answers; the relay tests also check that
+a cached statement is served without consulting sandbox discovery, and still
+while discovery fails during a refresh:
+
+```bash
+cargo test -p attestor-shared -- image_attestation:: attestor_tls::
+cargo test -p attestor-api -- provision:: attestor_tls::
+```
+
+Status reports have a shared Rust/Go signature fixture at
+`sealed/internal/inference/testdata/status-v2.json`. API tests rotate status
+tokens and verify that delayed running/warning/error/starting/stopping reports
+from an old instance cannot change stage, liveness, or confirmed settings. They
+also cover absent/mismatched applied digests and unknown or malformed tokens.
 SDK tests cover unreadable/withdrawn discovery after factory construction and
 concurrent refreshes with different versions, digests, and first-call failures.
 
-The database race test holds a deployment lock while rotating the receipt and
-checks that a waiting report reads the new binding after the lock is released:
+The database race test holds a deployment lock while rotating the status token
+and checks that a waiting report reads the new binding after the lock is
+released:
 
 ```bash
 AGENTDNA_TEST_DATABASE_URL=postgres://postgres:<test-password>@127.0.0.1:<test-port>/registry \
-  cargo test -p attestor-shared postgres_status_receipt_guards_are_atomic_and_confirm_only_the_served_version -- --ignored
+  cargo test -p attestor-shared postgres_status_token_guards_are_atomic_and_confirm_only_the_served_version -- --ignored
 ```
 
-Upgrade attestor before enabling the matching sealed images. New sealed refuses
-provisioning without its encrypted boot receipt; legacy heartbeats do not
-confirm settings. This protocol adds no environment variables.
+Release the sandbox provider, attestor and sealed images together, then
+recreate every agent: a container created before the v3 certificate cannot
+provision, and a restart replays its old environment. This protocol adds no
+attestor environment variables; the production relay reads this node's TLS key
+through local tapp `GetAppCsr`.
 
 
 Lifecycle convergence coverage additionally verifies container private-key proof
-vectors (`boot-v1.json`), reserved/scrubbed internal tickets, duplicate/old boot
+vectors (`boot-v1-first.json`, `boot-v1.json`), reserved/scrubbed internal tickets, duplicate/old boot
 rejection, exact sandbox identity, live owner changes, stop/start round trips,
 creation and persistence failures, version/generation-fenced retry counters,
 late transfer events, and captured teardown targets. The API test crate includes

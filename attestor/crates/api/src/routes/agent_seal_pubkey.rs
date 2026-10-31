@@ -183,8 +183,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -286,9 +285,6 @@ mod tests {
         }
         fn keccak256(&self, d: &[u8]) -> [u8; 32] {
             self.0.keccak256(d)
-        }
-        fn hmac_binding(&self, i: &[u8], d: &[u8]) -> [u8; 32] {
-            self.0.hmac_binding(i, d)
         }
         fn recover_signer(&self, d: &[u8; 32], s: &[u8]) -> anyhow::Result<Address> {
             self.0.recover_signer(d, s)

@@ -90,11 +90,10 @@ var allowedDirectCalls = map[string]struct {
 	count  int
 	reason string
 }{
-	"internal/attestorhttp/client.go resolver.endpoint assigns .Path": {1, "sets net/url.URL.Path while constructing the pinned Scan HTTPS endpoint; this is neither a filesystem path nor exec.Cmd.Path and does not launch a process"},
-	"internal/framework/state.go OpenLog os.OpenFile":                 {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
-	"internal/logger/logger.go Flush os.MkdirAll":                     {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
-	"internal/logger/logger.go Flush os.OpenFile":                     {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
-	"internal/proxy/sign.go Server.ListenInternal net.Listen":         {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
+	"internal/framework/state.go OpenLog os.OpenFile":         {1, "framework.StateDir/log is root-only and the file is opened O_NOFOLLOW (TestOpenLogRefusesALink)"},
+	"internal/logger/logger.go Flush os.MkdirAll":             {1, "the root-only state directory; logger cannot import privsep (privsep logs through it)"},
+	"internal/logger/logger.go Flush os.OpenFile":             {1, "LogPath in the root-only state directory, opened O_NOFOLLOW"},
+	"internal/proxy/sign.go Server.ListenInternal net.Listen": {1, "the sign socket is created in /run, which only root can write; privsep.Remove clears the name first and privsep.Chmod/OwnPath act on what was bound without following a link"},
 }
 
 // rootCommands is everything root executes: the functions that may call

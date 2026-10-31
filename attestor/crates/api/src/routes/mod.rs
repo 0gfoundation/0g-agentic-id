@@ -8,6 +8,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 mod agent_seal_pubkey;
+mod attestor_tls;
 mod avatar;
 mod clone;
 mod config;
@@ -91,6 +92,7 @@ pub fn router(state: AppState) -> Router {
             "/provision",
             get(provision::challenge).post(provision::handle),
         )
+        .route("/attestor-tls", get(attestor_tls::handle))
         .route("/probe", post(probe::handle))
         .route("/status", post(status::handle))
         // GET and POST alike are owner-gated: the settings document is the

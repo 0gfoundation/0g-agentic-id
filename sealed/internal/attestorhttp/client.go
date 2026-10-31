@@ -1,70 +1,92 @@
-// Package attestorhttp authenticates the attestor through a public Scan trust
-// descriptor injected at creation. Workloads never receive the tapp socket.
+// Package attestorhttp is sealed's HTTP client for the attestor
+// (ATTESTOR_URL). It pins the attestor's TLS key to a statement signed by
+// the sandbox provider that issued this container's certificate:
+//
+//	GET {ATTESTOR_URL}/attestor-tls?provider=<provider address>
+//
+// is fetched without CA validation, then accepted only if its EIP-712
+// signature recovers the provider recovered from the container certificate
+// in Phase 0, it carries the certificate's chain and TappRegistry, its lease
+// is current, and the key of the TLS connection it arrived over is one of
+// its pins. Every other request to ATTESTOR_URL then goes over a transport
+// whose leaf SPKI must be one of those pins, and must finish before the
+// statement expires. Workloads never receive the tapp socket.
 package attestorhttp
 
 import (
-	"bytes"
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/crypto"
+
+	"seal-verify/internal/logger"
 )
 
-const DescriptorEnv = "ATTESTOR_TLS_DESCRIPTOR"
+// DevEnv turns pinning off for local development when set to "true". The
+// provider removes it, with every caller SANDBOX_* key, from the env of each
+// sealed container it certifies, which is every container the attestor
+// creates.
+const DevEnv = "ATTESTOR_ALLOW_UNPINNED_DEV"
 
-type Descriptor struct {
-	Version         int      `json:"version"`
-	ChainID         uint64   `json:"chain_id"`
-	RegistryAddress string   `json:"registry_address"`
-	AppID           string   `json:"app_id"`
-	RegisteredAt    uint64   `json:"registered_at"`
-	AppSigner       string   `json:"app_signer"`
-	URL             string   `json:"url"`
-	ScanURL         string   `json:"scan_url"`
-	ScanPublicKey   string   `json:"scan_public_key"`
-	TLSPins         []string `json:"tls_spki_sha256"`
-	CheckedAt       int64    `json:"checked_at"`
-	ExpiresAt       int64    `json:"expires_at"`
-}
+const (
+	// statementTimeout bounds one statement fetch.
+	statementTimeout = 10 * time.Second
+	// maxStatementBytes caps a statement body.
+	maxStatementBytes = 16 << 10
+	// mismatchRefresh is the minimum interval between statement refreshes
+	// caused by the attestor presenting a key the held statement lacks.
+	mismatchRefresh = 30
+	// maxExcerpt bounds how much of an attestor response body reaches /log.
+	maxExcerpt = 256
+)
 
-type resolver struct {
-	mu         sync.Mutex
-	descriptor Descriptor
-	base       *url.URL
-	scan       *url.URL
-	scanHTTP   *http.Client
-	transport  *http.Transport
-	expiresAt  int64
+// errPinMismatch is the pinned transport's handshake error when the
+// attestor's key is not in the held statement.
+var errPinMismatch = errors.New("attestor TLS key is not in the provider-signed pins")
+
+// Anchor is what an attestor TLS statement must be signed under: the chain
+// and TappRegistry of this container's certificate, and the provider key
+// that signed the certificate.
+type Anchor struct {
+	ChainID  uint64
+	Registry common.Address
+	Provider common.Address
 }
 
 var clients = struct {
 	sync.Mutex
+	anchor *Anchor
 	values map[string]*http.Client
 }{values: make(map[string]*http.Client)}
 
-// Client returns the one authenticated transport used by provision/status and
-// settings calls. Unpinned access requires an explicit development-only switch.
+// Configure records the anchor Phase 0 recovered. Clients handed out before
+// it are not reused.
+func Configure(anchor Anchor) {
+	clients.Lock()
+	defer clients.Unlock()
+	clients.anchor = &anchor
+	clients.values = make(map[string]*http.Client)
+}
+
+// Client returns the one client used for /provision, /status, /settings/seed
+// and the provider registry under locator (ATTESTOR_URL).
 func Client(locator string) (*http.Client, error) {
-	raw := os.Getenv(DescriptorEnv)
-	dev := os.Getenv("ATTESTOR_ALLOW_UNPINNED_DEV") == "true"
-	key := locator + "\x00" + raw + fmt.Sprint(dev)
+	dev := os.Getenv(DevEnv) == "true"
+	key := fmt.Sprintf("%s\x00%t", locator, dev)
 	clients.Lock()
 	defer clients.Unlock()
 	if client := clients.values[key]; client != nil {
@@ -72,10 +94,13 @@ func Client(locator string) (*http.Client, error) {
 	}
 	var client *http.Client
 	var err error
-	if raw == "" && dev {
+	switch {
+	case dev:
 		client = &http.Client{Timeout: 120 * time.Second, CheckRedirect: noRedirect}
-	} else {
-		client, err = New(locator, raw)
+	case clients.anchor == nil:
+		err = fmt.Errorf("attestor TLS anchor not configured (no verified container certificate)")
+	default:
+		client, err = New(locator, *clients.anchor)
 	}
 	if err == nil {
 		clients.values[key] = client
@@ -83,36 +108,42 @@ func Client(locator string) (*http.Client, error) {
 	return client, err
 }
 
-func New(locator, raw string) (*http.Client, error) {
-	var d Descriptor
-	if raw == "" || json.Unmarshal([]byte(raw), &d) != nil {
-		return nil, fmt.Errorf("missing or invalid %s", DescriptorEnv)
-	}
+// New returns a client that pins requests under locator to the attestor TLS
+// statement signed under anchor. The first request fetches the statement.
+func New(locator string, anchor Anchor) (*http.Client, error) {
 	base, err := httpsURL(locator)
 	if err != nil {
 		return nil, err
 	}
-	scan, err := httpsURL(d.ScanURL)
-	if err != nil {
-		return nil, err
+	if anchor.ChainID == 0 || anchor.Registry == (common.Address{}) || anchor.Provider == (common.Address{}) {
+		return nil, fmt.Errorf("incomplete attestor TLS anchor")
 	}
-	if d.Version != 1 || d.ChainID == 0 || d.AppID == "" || d.AppID == "." || d.AppID == ".." || len(d.AppID) > 1024 ||
-		!nonzeroAddress(d.RegistryAddress) || !nonzeroAddress(d.AppSigner) || d.RegisteredAt == 0 ||
-		strings.TrimRight(d.URL, "/") != strings.TrimRight(locator, "/") ||
-		d.CheckedAt <= 0 || d.ExpiresAt <= d.CheckedAt || d.ExpiresAt > d.CheckedAt+300 ||
-		!validPin(d.ScanPublicKey) || len(d.TLSPins) == 0 {
-		return nil, fmt.Errorf("invalid attestor identity descriptor scope")
-	}
-	for _, pin := range d.TLSPins {
-		if !validPin(pin) {
-			return nil, fmt.Errorf("invalid attestor TLS pin")
-		}
-	}
-	r := &resolver{descriptor: d, base: base, scan: scan,
-		scanHTTP: &http.Client{Transport: pinnedTransport([]string{d.ScanPublicKey}, 0), Timeout: 90 * time.Second, CheckRedirect: noRedirect}}
-	// Always refresh independently at first use. Container creation can take
-	// longer than the descriptor's initial lease; the Scan anchor is still valid.
+	r := &resolver{anchor: anchor, base: base,
+		statementURL: strings.TrimRight(base.String(), "/") + "/attestor-tls?provider=" + strings.ToLower(anchor.Provider.Hex())}
 	return &http.Client{Transport: r, Timeout: 120 * time.Second, CheckRedirect: noRedirect}, nil
+}
+
+// resolver holds the current lease and the transport pinned to it.
+type resolver struct {
+	anchor       Anchor
+	base         *url.URL
+	statementURL string
+	// now is the clock; nil means time.Now.
+	now func() time.Time
+
+	mu        sync.Mutex
+	transport *http.Transport
+	issuedAt  int64
+	expiresAt int64
+	// mismatchAt is when a pin mismatch last forced a refresh (unix seconds).
+	mismatchAt int64
+}
+
+func (r *resolver) clock() int64 {
+	if r.now != nil {
+		return r.now().Unix()
+	}
+	return time.Now().Unix()
 }
 
 func (r *resolver) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -120,28 +151,142 @@ func (r *resolver) RoundTrip(req *http.Request) (*http.Response, error) {
 		!strings.HasPrefix(req.URL.Path, strings.TrimRight(r.base.Path, "/")+"/") {
 		return nil, fmt.Errorf("attestor request left the configured business URL")
 	}
+	transport, expiry, err := r.current(req.Context())
+	if err != nil {
+		return nil, err
+	}
+	response, err := roundTripBefore(transport, req, time.Unix(expiry, 0))
+	if !errors.Is(err, errPinMismatch) {
+		return response, err
+	}
+	// The attestor presented a key the held statement does not list (it may
+	// have moved to another node). The handshake failed before any request
+	// bytes were sent, so one retry under a newer statement is safe.
+	transport, expiry, refreshErr := r.refreshAfterMismatch(req.Context(), transport)
+	if refreshErr != nil {
+		return nil, fmt.Errorf("%w (statement refresh: %v)", err, refreshErr)
+	}
+	retry, rewindErr := rewind(req)
+	if rewindErr != nil {
+		return nil, err
+	}
+	return roundTripBefore(transport, retry, time.Unix(expiry, 0))
+}
+
+// current returns the pinned transport, fetching a statement first when none
+// is held or the held one has five seconds or less left.
+func (r *resolver) current(ctx context.Context) (*http.Transport, int64, error) {
 	r.mu.Lock()
-	if time.Now().Unix()+5 >= r.expiresAt {
-		pins, expiry, err := r.resolve(req.Context())
-		if err != nil {
-			r.mu.Unlock()
-			return nil, err
+	defer r.mu.Unlock()
+	if r.transport == nil || r.clock()+minRemaining >= r.expiresAt {
+		if err := r.refresh(ctx); err != nil {
+			return nil, 0, err
 		}
-		if r.transport != nil {
-			r.transport.CloseIdleConnections()
-		}
-		r.transport, r.expiresAt = pinnedTransport(pins, expiry), expiry
 	}
-	transport, expiry := r.transport, r.expiresAt
-	r.mu.Unlock()
-	if time.Now().Unix() >= expiry {
-		return nil, fmt.Errorf("attestor identity expired")
+	return r.transport, r.expiresAt, nil
+}
+
+// refreshAfterMismatch returns a transport to retry on after failed
+// presented an unlisted key. When another request has already replaced
+// failed, that transport is returned as is; only a mismatch on the current
+// transport fetches a statement, at most once per mismatchRefresh.
+func (r *resolver) refreshAfterMismatch(ctx context.Context, failed *http.Transport) (*http.Transport, int64, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := r.clock()
+	if r.transport != nil && r.transport != failed && now+minRemaining < r.expiresAt {
+		return r.transport, r.expiresAt, nil
 	}
-	return roundTripBefore(transport, req, time.Unix(expiry, 0))
+	if r.mismatchAt != 0 && now < r.mismatchAt+mismatchRefresh {
+		return nil, 0, fmt.Errorf("refreshed less than %ds ago", mismatchRefresh)
+	}
+	r.mismatchAt = now
+	if err := r.refresh(ctx); err != nil {
+		return nil, 0, err
+	}
+	return r.transport, r.expiresAt, nil
+}
+
+// refresh replaces the held lease with a newly fetched one. r.mu is held.
+func (r *resolver) refresh(ctx context.Context) error {
+	l, err := r.fetch(ctx)
+	if err != nil {
+		return err
+	}
+	if r.transport != nil {
+		r.transport.CloseIdleConnections()
+	}
+	if l.issuedAt != r.issuedAt {
+		logger.Logf("attestor tls: statement accepted issued_at=%d expires_at=%d pins=%d", l.issuedAt, l.expiresAt, len(l.pins))
+	}
+	r.transport, r.issuedAt, r.expiresAt = pinnedTransport(l.pins, l.expiresAt), l.issuedAt, l.expiresAt
+	return nil
+}
+
+// fetch reads the attestor's relayed statement and accepts it only when the
+// connection it arrived over presented one of its pins.
+func (r *resolver) fetch(ctx context.Context) (lease, error) {
+	ctx, cancel := context.WithTimeout(ctx, statementTimeout)
+	defer cancel()
+	transport := statementTransport()
+	defer transport.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, r.statementURL, nil)
+	if err != nil {
+		return lease{}, err
+	}
+	// RoundTrip, not a client: a redirect is a failure, never followed.
+	response, err := transport.RoundTrip(req)
+	if err != nil {
+		return lease{}, fmt.Errorf("fetch attestor TLS statement: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return lease{}, fmt.Errorf("fetch attestor TLS statement: HTTP %d", response.StatusCode)
+	}
+	if response.TLS == nil || len(response.TLS.PeerCertificates) == 0 {
+		return lease{}, fmt.Errorf("attestor TLS statement did not arrive over TLS")
+	}
+	spki := spkiHash(response.TLS.PeerCertificates[0])
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxStatementBytes+1))
+	if err != nil {
+		return lease{}, fmt.Errorf("read attestor TLS statement: %w", err)
+	}
+	if len(body) > maxStatementBytes {
+		return lease{}, fmt.Errorf("attestor TLS statement larger than %d bytes", maxStatementBytes)
+	}
+	statement, err := parseStatement(body)
+	if err != nil {
+		return lease{}, err
+	}
+	l, err := statement.accept(r.anchor, r.clock(), r.issuedAt)
+	if err != nil {
+		return lease{}, err
+	}
+	if !hasPin(l.pins, spki) {
+		return lease{}, fmt.Errorf("attestor TLS statement does not list the key of the connection it arrived over")
+	}
+	return l, nil
+}
+
+// rewind returns req with a fresh copy of its body for a second attempt.
+func rewind(req *http.Request) (*http.Request, error) {
+	retry := req.Clone(req.Context())
+	if req.Body == nil || req.Body == http.NoBody {
+		return retry, nil
+	}
+	if req.GetBody == nil {
+		return nil, fmt.Errorf("request body cannot be replayed")
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return nil, err
+	}
+	retry.Body = body
+	return retry, nil
 }
 
 // Keep one transport snapshot for the entire exchange, including response-body
-// reads. A successful response header cannot extend the identity's lease.
+// reads. A successful response header cannot extend the statement's lease.
 func roundTripBefore(transport http.RoundTripper, req *http.Request, deadline time.Time) (*http.Response, error) {
 	ctx, cancel := context.WithDeadline(req.Context(), deadline)
 	if err := ctx.Err(); err != nil {
@@ -190,24 +335,42 @@ func (b *leasedBody) Close() error {
 	return b.ReadCloser.Close()
 }
 
+// pinnedTransport accepts only a leaf certificate whose SPKI SHA-256 is one
+// of pins, and no connection once expiresAt (unix seconds, 0 for none) has
+// passed.
 func pinnedTransport(pins []string, expiresAt int64) *http.Transport {
+	pinned := append([]string(nil), pins...)
 	return &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
 		TLSHandshakeTimeout: 10 * time.Second, IdleConnTimeout: 30 * time.Second,
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12,
-			// The authenticated Scan SPKI replaces CA/name validation.
+			// The provider-signed SPKI pins replace CA and name validation.
 			InsecureSkipVerify: true, //nolint:gosec
 			VerifyConnection: func(cs tls.ConnectionState) error {
-				if len(cs.PeerCertificates) == 0 || (expiresAt != 0 && time.Now().Unix() >= expiresAt) {
-					return fmt.Errorf("missing peer certificate or expired identity")
+				if len(cs.PeerCertificates) == 0 {
+					return fmt.Errorf("attestor presented no certificate")
 				}
-				hash := sha256.Sum256(cs.PeerCertificates[0].RawSubjectPublicKeyInfo)
-				for _, pin := range pins {
-					if hex.EncodeToString(hash[:]) == strings.TrimPrefix(pin, "0x") {
-						return nil
-					}
+				if expiresAt != 0 && time.Now().Unix() >= expiresAt {
+					return fmt.Errorf("attestor TLS statement expired")
 				}
-				return fmt.Errorf("attestor/Scan TLS SPKI pin mismatch")
+				if !hasPin(pinned, spkiHash(cs.PeerCertificates[0])) {
+					return errPinMismatch
+				}
+				return nil
 			}}}
+}
+
+// statementTransport is a one-connection transport for fetching a statement.
+// The statement authenticates itself by its signature; the key of the
+// connection it arrives over is checked against it after it is read.
+func statementTransport() *http.Transport {
+	return &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second, ResponseHeaderTimeout: statementTimeout, DisableKeepAlives: true,
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, InsecureSkipVerify: true}} //nolint:gosec
+}
+
+func spkiHash(leaf *x509.Certificate) string {
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	return hex.EncodeToString(sum[:])
 }
 
 func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
@@ -215,336 +378,29 @@ func noRedirect(_ *http.Request, _ []*http.Request) error { return http.ErrUseLa
 func httpsURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("identity URLs must be HTTPS without credentials, query or fragment")
+		return nil, fmt.Errorf("ATTESTOR_URL must be HTTPS without credentials, query or fragment")
 	}
 	return u, nil
 }
 
-func validPin(pin string) bool {
-	raw := strings.TrimPrefix(pin, "0x")
-	decoded, err := hex.DecodeString(raw)
-	return err == nil && len(decoded) == 32 && raw == hex.EncodeToString(decoded)
-}
-
-func nonzeroAddress(address string) bool {
-	return common.IsHexAddress(address) && common.HexToAddress(address) != (common.Address{})
-}
-
-func sameAddress(a, b string) bool {
-	return nonzeroAddress(a) && nonzeroAddress(b) && common.HexToAddress(a) == common.HexToAddress(b)
-}
-
-func (r *resolver) endpoint(tail ...string) string {
-	u := *r.scan
-	parts := []string{strings.TrimRight(u.EscapedPath(), "/")}
-	if !strings.HasSuffix(parts[0], "/api") {
-		parts = append(parts, "api")
-	}
-	for _, part := range tail {
-		parts = append(parts, url.PathEscape(part))
-	}
-	// Preserve encoded app ids as one path segment (including embedded '/').
-	u.RawPath = strings.Join(parts, "/")
-	u.Path, _ = url.PathUnescape(u.RawPath)
-	return u.String()
-}
-
-func (r *resolver) request(ctx context.Context, method, target string, body any, out any) error {
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, target, reader)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	response, err := r.scanHTTP.Do(req)
-	if err != nil {
-		return fmt.Errorf("pinned Scan lookup failed: %w", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("Scan returned HTTP %d", response.StatusCode)
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024+1))
-	if err != nil || len(data) > 2*1024*1024 {
-		return fmt.Errorf("invalid Scan response size")
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("invalid Scan response JSON")
-	}
-	return nil
-}
-
-type health struct {
-	ChainID     uint64 `json:"chain_id"`
-	Contract    string `json:"contract"`
-	RefreshedAt int64  `json:"refreshed_at"`
-	Block       uint64 `json:"scanned_to_block"`
-}
-
-func (r *resolver) health(ctx context.Context) (health, error) {
-	var h health
-	err := r.request(ctx, http.MethodGet, r.endpoint("health"), nil, &h)
-	if err == nil && (h.ChainID != r.descriptor.ChainID || !sameAddress(h.Contract, r.descriptor.RegistryAddress) || !fresh(h.RefreshedAt)) {
-		err = fmt.Errorf("Scan scope mismatch or stale refresh")
-	}
-	return h, err
-}
-
-type commitment struct {
-	Commitment string `json:"commitment"`
-	Material   string `json:"material"`
-	Scheme     string `json:"scheme"`
-}
-type identity struct {
-	Algorithm  string      `json:"algorithm"`
-	Derivation string      `json:"derivation"`
-	KeyRef     *commitment `json:"key_ref"`
-	Source     string      `json:"key_source"`
-	PublicKey  string      `json:"public_key"`
-	Encoding   string      `json:"public_key_encoding"`
-	Role       string      `json:"role"`
-}
-type verdict struct {
-	AppID              string `json:"app_id"`
-	Signer             string `json:"signer"`
-	Verified           bool   `json:"verified"`
-	IdentitiesVerified *bool  `json:"identities_verified"`
-	CheckedAt          int64  `json:"checked_at"`
-	ExpiresAt          int64  `json:"expires_at"`
-	Reason             string `json:"reason"`
-	ImageEnv           string `json:"image_env"`
-	Scope              struct {
-		ChainID  uint64 `json:"chain_id"`
-		Registry string `json:"registry_address"`
-		AppID    string `json:"app_id"`
-		Epoch    uint64 `json:"registered_at"`
-	} `json:"scope"`
-	Status struct {
-		AppID         string          `json:"app_id"`
-		Signer        string          `json:"signer"`
-		CheckedAt     int64           `json:"checked_at"`
-		Epoch         uint64          `json:"registered_at"`
-		VerifierFault bool            `json:"verifier_fault"`
-		Error         json.RawMessage `json:"error"`
-		Attested      struct {
-			Signer          string       `json:"attested_signer"`
-			SignerOK        bool         `json:"signer_ok"`
-			Fresh           bool         `json:"fresh"`
-			Replay          bool         `json:"runtime_replay_ok"`
-			Debug           *bool        `json:"td_debug"`
-			TCB             string       `json:"tcb_status"`
-			TLS             string       `json:"tls_public_key"`
-			AppSigner       string       `json:"app_signer"`
-			Identities      []identity   `json:"identities"`
-			Commitments     []commitment `json:"key_commitments"`
-			IdentitiesError *string      `json:"identities_error"`
-		} `json:"attested"`
-	} `json:"status"`
-}
-
-func (r *resolver) resolve(ctx context.Context) ([]string, int64, error) {
-	before, err := r.health(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	var app struct {
-		AppID   string   `json:"app_id"`
-		Signers []string `json:"current_signers"`
-	}
-	if err := r.request(ctx, http.MethodGet, r.endpoint("apps", r.descriptor.AppID), nil, &app); err != nil {
-		return nil, 0, err
-	}
-	if app.AppID != r.descriptor.AppID || len(app.Signers) == 0 || len(app.Signers) > 64 {
-		return nil, 0, fmt.Errorf("invalid current app nodes")
-	}
-	nodes := newServiceNodes()
-	for _, signer := range app.Signers {
-		if !nonzeroAddress(signer) {
-			return nil, 0, fmt.Errorf("invalid current node signer")
-		}
-		var v verdict
-		if err := r.request(ctx, http.MethodPost, r.endpoint("verify"), map[string]string{"app_id": app.AppID, "signer": signer}, &v); err != nil {
-			return nil, 0, err
-		}
-		if err := nodes.add(r.descriptor, app.AppID, signer, v); err != nil {
-			return nil, 0, err
-		}
-	}
-	after, err := r.health(ctx)
-	if err != nil {
-		return nil, 0, err
-	}
-	if after.Block < before.Block {
-		return nil, 0, fmt.Errorf("Scan identity expired or scope regressed")
-	}
-	return nodes.result(time.Now().Unix())
-}
-
-type serviceNodes struct {
-	pins      []string
-	seen      map[string]bool
-	materials map[string]commitment
-	kmsRoles  map[string]identity
-	expiresAt int64
-}
-
-func newServiceNodes() *serviceNodes {
-	return &serviceNodes{seen: make(map[string]bool), materials: make(map[string]commitment), kmsRoles: make(map[string]identity)}
-}
-
-func (nodes *serviceNodes) result(now int64) ([]string, int64, error) {
-	if len(nodes.pins) == 0 || nodes.expiresAt <= now {
-		return nil, 0, fmt.Errorf("Scan has no current node with a ready service identity")
-	}
-	return nodes.pins, nodes.expiresAt, nil
-}
-
-func (nodes *serviceNodes) add(d Descriptor, appID, signer string, v verdict) error {
-	if v.AppID != appID || !sameAddress(v.Signer, signer) || v.Scope.ChainID != d.ChainID ||
-		!sameAddress(v.Scope.Registry, d.RegistryAddress) || v.Scope.AppID != appID || v.Scope.Epoch != d.RegisteredAt ||
-		v.Status.AppID != appID || !sameAddress(v.Status.Signer, signer) || v.Status.VerifierFault || !fresh(v.Status.CheckedAt) {
-		return fmt.Errorf("Scan verdict scope, instance or node mismatch")
-	}
-	if !v.Verified {
-		if v.Reason == "" {
-			return fmt.Errorf("invalid negative Scan verdict")
-		}
-		return nil
-	}
-	a := v.Status.Attested
-	if v.IdentitiesVerified == nil || a.IdentitiesError != nil || v.Reason != "" || string(v.Status.Error) != "null" || v.ImageEnv != "prod" ||
-		v.Status.Epoch != d.RegisteredAt || v.CheckedAt != v.Status.CheckedAt || v.ExpiresAt <= time.Now().Unix() || v.ExpiresAt > v.CheckedAt+300 ||
-		!a.SignerOK || !sameAddress(a.Signer, signer) || !a.Fresh || !a.Replay || a.Debug == nil || *a.Debug || a.TCB == "" || strings.EqualFold(a.TCB, "Revoked") ||
-		(a.AppSigner != "" && !sameAddress(a.AppSigner, d.AppSigner)) || (a.TLS != "" && !validPin(a.TLS)) {
-		return fmt.Errorf("Scan did not verify the expected production app identity")
-	}
-	if !*v.IdentitiesVerified {
-		// Scan strips unverified typed metadata from legacy-schema observations.
-		// Only that explicit empty shape is pending; leaked claims remain fatal.
-		if a.Identities == nil || a.Commitments == nil || len(a.Identities) != 0 || len(a.Commitments) != 0 || a.AppSigner != "" {
-			return fmt.Errorf("unverified Scan response contains invalid or leaked typed metadata")
-		}
-		return nil
-	}
-	if err := validateKeys(a.Identities, a.Commitments, signer, a.AppSigner, a.TLS); err != nil {
-		return err
-	}
-	if err := consistentKMSIdentities(nodes.kmsRoles, a.Identities); err != nil {
-		return err
-	}
-	for _, c := range a.Commitments {
-		if old, ok := nodes.materials[c.Material]; ok && old != c {
-			return fmt.Errorf("nodes disagree about KMS commitment")
-		}
-		nodes.materials[c.Material] = c
-	}
-	// A node-only or TLS-only standby is not an authenticated business-service node.
-	// Keep validating its claims above, without accepting its pin or lease.
-	if a.AppSigner == "" || a.TLS == "" {
-		return nil
-	}
-	pin := strings.TrimPrefix(a.TLS, "0x")
-	if !nodes.seen[pin] {
-		nodes.pins, nodes.seen[pin] = append(nodes.pins, pin), true
-	}
-	if nodes.expiresAt == 0 || v.ExpiresAt < nodes.expiresAt {
-		nodes.expiresAt = v.ExpiresAt
-	}
-	return nil
-}
-
-func consistentKMSIdentities(seen map[string]identity, ids []identity) error {
-	for _, id := range ids {
-		if id.Source != "kms" {
-			continue
-		}
-		if old, ok := seen[id.Role]; ok && !reflect.DeepEqual(old, id) {
-			return fmt.Errorf("nodes disagree about KMS identity")
-		}
-		seen[id.Role] = id
-	}
-	return nil
-}
-
-func fresh(at int64) bool { now := time.Now().Unix(); return at > 0 && at <= now+30 && at > now-300 }
-
-func validateKeys(ids []identity, refs []commitment, node, app, tlsHash string) error {
-	modulus, _ := hex.DecodeString("30644e72e131a029b85045b68181585d2833e84879b9709143e1f593f0000001")
-	keys := make(map[commitment]bool)
-	materials := make(map[string]bool)
-	for _, c := range refs {
-		raw, err := hex.DecodeString(strings.TrimPrefix(c.Commitment, "0x"))
-		m, merr := hex.DecodeString(c.Material)
-		if err != nil || !strings.HasPrefix(c.Commitment, "0x") || len(raw) != 32 || hex.EncodeToString(raw) != c.Commitment[2:] || bytes.Compare(raw, modulus) >= 0 ||
-			c.Scheme != "poseidon-bn254-4-v1" || merr != nil || len(m) > 256 || hex.EncodeToString(m) != c.Material || materials[c.Material] {
-			return fmt.Errorf("invalid or conflicting KMS commitment")
-		}
-		keys[c], materials[c.Material] = true, true
-	}
-	roles := make(map[string]bool)
-	for _, id := range ids {
-		pub, err := hex.DecodeString(strings.TrimPrefix(id.PublicKey, "0x"))
-		if err != nil || !strings.HasPrefix(id.PublicKey, "0x") || len(pub) != 33 || hex.EncodeToString(pub) != id.PublicKey[2:] || id.Encoding != "sec1-compressed" || roles[id.Role] {
-			return fmt.Errorf("invalid typed public key")
-		}
-		roles[id.Role] = true
-		if id.Source == "kms" {
-			material := "70726f7669646572"
-			if id.Role == "tls" {
-				material = "746c73"
+// Excerpt is an attestor response body as it may appear in the public /log:
+// at most its first 256 bytes, cut on a character boundary, on one line.
+// logger escapes any other control characters.
+func Excerpt(body []byte) string {
+	truncated := len(body) > maxExcerpt
+	if truncated {
+		body = body[:maxExcerpt]
+		// Drop a character the cut split; ToValidUTF8 handles the rest.
+		for i := 1; i < utf8.UTFMax && len(body) > 0; i++ {
+			if r, size := utf8.DecodeLastRune(body); r != utf8.RuneError || size != 1 {
+				break
 			}
-			if id.KeyRef == nil || !keys[*id.KeyRef] || id.KeyRef.Material != material || id.Derivation != "raw-scalar-v1" {
-				return fmt.Errorf("invalid KMS identity reference")
-			}
-		} else if id.Source != "local" || id.KeyRef != nil {
-			return fmt.Errorf("invalid identity provenance")
-		}
-		switch id.Role {
-		case "node_signer", "app_signer":
-			p, err := crypto.DecompressPubkey(pub)
-			if err != nil || id.Algorithm != "ecdsa-secp256k1" {
-				return fmt.Errorf("invalid secp256k1 identity")
-			}
-			expected := app
-			if id.Role == "node_signer" {
-				expected = node
-				if id.Source != "local" || id.Derivation != "tapp-app-signer-v1" {
-					return fmt.Errorf("invalid node identity provenance")
-				}
-			} else if id.Source != "kms" {
-				return fmt.Errorf("app signer is not KMS backed")
-			}
-			if !sameAddress(crypto.PubkeyToAddress(*p).Hex(), expected) {
-				return fmt.Errorf("public key/address mismatch")
-			}
-		case "tls":
-			x, y := elliptic.UnmarshalCompressed(elliptic.P256(), pub)
-			if x == nil || id.Algorithm != "ecdsa-p256" || (id.Source == "local" && id.Derivation != "tapp-tls-v1-sha256") {
-				return fmt.Errorf("invalid P-256 TLS identity")
-			}
-			spki, err := x509.MarshalPKIXPublicKey(&ecdsa.PublicKey{Curve: elliptic.P256(), X: x, Y: y})
-			if err != nil {
-				return fmt.Errorf("invalid TLS SPKI")
-			}
-			hash := sha256.Sum256(spki)
-			if hex.EncodeToString(hash[:]) != strings.TrimPrefix(tlsHash, "0x") {
-				return fmt.Errorf("public key/TLS SPKI mismatch")
-			}
-		default:
-			return fmt.Errorf("unsupported identity role")
+			body = body[:len(body)-1]
 		}
 	}
-	if !roles["node_signer"] || (tlsHash != "" && !roles["tls"]) || (app != "" && !roles["app_signer"]) {
-		return fmt.Errorf("incomplete typed app identity")
+	text := strings.Join(strings.Fields(strings.ToValidUTF8(string(body), "?")), " ")
+	if truncated {
+		text += " ..."
 	}
-	return nil
+	return text
 }

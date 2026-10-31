@@ -583,8 +583,7 @@ impl Watcher {
             container_stage,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -704,9 +703,18 @@ mod tests {
             container_stage: StageStatus::Confirmed { at: now },
             sandbox_id: Some("sb-1".into()),
             provisioned_at: Some(now),
-            // A live binding — what a resumed container would otherwise inherit.
-            container_pubkey: Some(Bytes::from(vec![1, 2, 3])),
-            container_pubkey_mac: Some(Bytes::from(vec![4, 5, 6])),
+            // A live container record — what a resumed container would otherwise inherit.
+            container_record: Some(attestor_shared::ContainerRecord {
+                pubkey: Bytes::from(vec![2; 33]),
+                image_hash: B256::repeat_byte(0x11),
+                provider: attestor_shared::ProviderInstance {
+                    chain_id: 16602,
+                    registry_address: Address::repeat_byte(0x22),
+                    app_id: "sandbox".into(),
+                    registered_at: 100,
+                    signer: Address::repeat_byte(0x33),
+                },
+            }),
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -746,8 +754,8 @@ mod tests {
         let after = deployments.get(seal_id).await.unwrap().expect("seeded");
         assert_eq!(after.owner, buyer, "owner synced to new on-chain owner");
         assert!(
-            after.container_pubkey.is_none() && after.container_pubkey_mac.is_none(),
-            "binding cleared so the seller's resumed container can't skip freshness"
+            after.container_record.is_none(),
+            "record cleared so the seller's resumed container cannot provision"
         );
         // Layer 2: a SandboxTeardown is enqueued so the worker kills the
         // seller's still-running container (it had sandbox_id = "sb-1").
@@ -785,8 +793,8 @@ mod tests {
 
         let after = deployments.get(seal_id).await.unwrap().expect("seeded");
         assert!(
-            after.container_pubkey.is_some(),
-            "mint must not clear the binding"
+            after.container_record.is_some(),
+            "mint must not clear the record"
         );
         // Mint (from == 0) must not enqueue a teardown.
         assert!(
@@ -841,7 +849,7 @@ mod tests {
                 .unwrap();
             if published {
                 deployments
-                    .set_sandbox_id(seal, "buyer-new".into())
+                    .set_sandbox_id(seal, "buyer-new".into(), None)
                     .await
                     .unwrap();
             }

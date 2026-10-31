@@ -542,7 +542,7 @@ dsh 把 overlay 里每一个畸形值退回出厂默认并记日志,超范围、
 (§5.4)——而可选的 `SeededSettings() (settings.Doc, bool)` 就是 adapter 把回收
 到的文档交还给平台的方式。`main.go` **只在**已存文档没有 model 时才问它,所以
 真正的 owner 文档永远压过回收来的那份;拿到后用 `report.SeedSettings` 持久化
-(`main.go:649-677`)。
+(`main.go:735-764`)。
 
 时机就是全部意义所在。uploader 会按 `Roles()` 重建链上条目表并整体替换提交,所以
 watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那之前 pin 没被读出来
@@ -551,7 +551,7 @@ watcher 第一个 tick 就会把这个已不再声明的 role 丢掉。如果那
 `report.SeedSettings` 用 agentSeal 而不是 owner key 签名,因为开机时没有 owner
 在场。所以 attestor 必须把它当作严格弱于 owner 写入的东西:**只做 seed**,行上
 已经有 settings 就拒绝。容器可以找回一份丢失的文档;它绝不能改动 owner 亲自写下
-的那份(`report/report.go:66-85`)。这个调用是 best-effort ——失败只记日志,agent
+的那份(`report/report.go:134-138`)。这个调用是 best-effort ——失败只记日志,agent
 无论如何跑在回收到的 pin 上,下次开机再试。
 
 今天实现这个接口的 adapter 恰好只有一个:dsh,为它已下线的 `settings.yaml` role

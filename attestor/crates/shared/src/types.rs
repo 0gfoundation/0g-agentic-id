@@ -363,6 +363,27 @@ pub fn derive_phase(
     DeploymentPhase::Deploying
 }
 
+/// The sandbox provider instance that signed a container certificate: its
+/// TappRegistry scope and the recovered provider signer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderInstance {
+    pub chain_id: u64,
+    pub registry_address: Address,
+    pub app_id: String,
+    pub registered_at: u64,
+    pub signer: Address,
+}
+
+/// The container conclusion `/provision` records from a verified v3
+/// certificate. The seven columns are written and cleared together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRecord {
+    /// 33-byte compressed secp256k1 container key (`SANDBOX_SEAL_KEY`).
+    pub pubkey: Bytes,
+    pub image_hash: ImageHash,
+    pub provider: ProviderInstance,
+}
+
 // ── Deployment aggregate (persisted) ────────────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployment {
@@ -420,23 +441,14 @@ pub struct Deployment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provisioned_at: Option<DateTime<Utc>>,
 
-    /// Container's secp256k1 pubkey (33-byte compressed) recorded on the
-    /// first successful `/provision`. Subsequent /provision calls bypass the
-    /// freshness window when the request's pubkey matches and the MAC
-    /// verifies — see `container_pubkey_mac`. Never serialized outward,
-    /// together with the MAC: the pair is provision-binding material.
-    #[serde(default, skip_serializing)]
-    pub container_pubkey: Option<alloy::primitives::Bytes>,
-
-    /// V2 HMAC over `image_attestation_digest32 || authenticated_app_signer20`
-    /// under `agentic-id.container-pubkey-binding.v2`. The digest covers the
-    /// complete signed issuer scope, key, image and timestamp. Legacy v1
-    /// pubkey-only bindings never satisfy this domain/payload. DB writes
-    /// cannot forge a binding without the master-secret-derived binding key.
-    /// This binding material never leaves the process:
-    /// `GET /deployment/:seal_id` serializes the row and is unauthenticated.
-    #[serde(default, skip_serializing)]
-    pub container_pubkey_mac: Option<alloy::primitives::Bytes>,
+    /// What the first accepted `/provision` of the current container
+    /// established from its v3 certificate: the container key, its image and
+    /// the provider instance that signed it. Later boots of that container
+    /// send no certificate and are checked against this record. Cleared with
+    /// every new boot ticket, reset and ownership revocation. Never
+    /// serialized: `GET /deployment/:seal_id` is unauthenticated.
+    #[serde(skip)]
+    pub container_record: Option<ContainerRecord>,
 
     /// Wall-clock deadline for the container to complete `/provision`.
     /// Written by `handle_deploy` / `handle_sandbox_recreate` once
@@ -500,14 +512,11 @@ pub struct Deployment {
 }
 
 impl Deployment {
-    /// True once the container has completed `/provision` — both the
-    /// timestamp and the `(pubkey, mac)` binding are written. Subsequent
-    /// recovery flows can fast-path past the freshness check, so a
-    /// stop+start round trip doesn't need a fresh user-signed envelope.
+    /// True once the current container has completed `/provision`: the
+    /// timestamp and its container record (key, image, provider instance)
+    /// are written.
     pub fn is_provisioned(&self) -> bool {
-        self.provisioned_at.is_some()
-            && self.container_pubkey.is_some()
-            && self.container_pubkey_mac.is_some()
+        self.provisioned_at.is_some() && self.container_record.is_some()
     }
 
     /// True when the owner's current document has spent its boot and every
@@ -553,6 +562,12 @@ pub struct SandboxCreateResponse {
     pub state: Option<String>,
     #[serde(default, rename = "createdAt")]
     pub created_at: Option<String>,
+    /// The container key from the certificate the provider wrote into the
+    /// new sandbox's env (`env.SANDBOX_SEAL_ATTESTATION`, which the provider
+    /// returns with the sandbox), for this seal. Filled by the client after
+    /// parsing; None when the response carried no such certificate.
+    #[serde(skip)]
+    pub container_pubkey: Option<Vec<u8>>,
 }
 
 // Shape returned by `SandboxClient::get_sandbox`. Mirrors the relevant
@@ -839,11 +854,10 @@ mod tests {
         // Same reader, same reason: `GET /deployment/:seal_id` is
         // unauthenticated and `/deployments` publishes every seal_id, so
         // anything in the row serialization is readable fleet-wide. The
-        // container pubkey + its master-secret-derived MAC, and the internal
-        // iData retry material, must not be in there.
+        // recorded container conclusion and the internal iData retry
+        // material must not be in there.
         let mut d = empty_deployment();
-        d.container_pubkey = Some(Bytes::from_static(&[2u8; 33]));
-        d.container_pubkey_mac = Some(Bytes::from_static(&[7u8; 32]));
+        d.container_record = Some(record());
         d.i_data = vec![IDataArtifact {
             role: "framework".into(),
             description: String::new(),
@@ -853,8 +867,8 @@ mod tests {
             ciphertext: Bytes::from_static(b"ct"),
         }];
         let json = serde_json::to_value(&d).unwrap();
+        assert!(json.get("container_record").is_none());
         assert!(json.get("container_pubkey").is_none());
-        assert!(json.get("container_pubkey_mac").is_none());
         assert!(json.get("i_data").is_none());
         // What the console reads is still there.
         for k in ["seal_id", "phase", "agent_card"] {
@@ -880,8 +894,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -910,49 +923,35 @@ mod tests {
         }
     }
 
-    // ── Deployment::is_provisioned truth table ─────────────────────────
-    //
-    // Encodes what "provisioned" actually means: ALL THREE
-    // (provisioned_at, container_pubkey, container_pubkey_mac) must be
-    // set. The bug we want to catch is anyone "simplifying" the helper
-    // to look at only one or two fields — e.g. trusting `provisioned_at`
-    // alone would let DB-tampered rows skip the MAC check downstream.
-
-    #[test]
-    fn is_provisioned_all_three_set_returns_true() {
-        let mut d = empty_deployment();
-        d.provisioned_at = Some(Utc::now());
-        d.container_pubkey = Some(Bytes::from_static(b"pubkey"));
-        d.container_pubkey_mac = Some(Bytes::from_static(b"mac"));
-        assert!(d.is_provisioned());
+    fn record() -> ContainerRecord {
+        ContainerRecord {
+            pubkey: Bytes::from_static(&[2u8; 33]),
+            image_hash: B256::repeat_byte(0x11),
+            provider: ProviderInstance {
+                chain_id: 16602,
+                registry_address: Address::repeat_byte(0x22),
+                app_id: "sandbox".into(),
+                registered_at: 100,
+                signer: Address::repeat_byte(0x33),
+            },
+        }
     }
 
-    #[test]
-    fn is_provisioned_any_field_missing_returns_false() {
-        let now = Utc::now();
-        let pk = Bytes::from_static(b"pubkey");
-        let mac = Bytes::from_static(b"mac");
+    // ── Deployment::is_provisioned truth table ─────────────────────────
+    //
+    // "Provisioned" means the timestamp AND the container record are both
+    // set; neither alone is enough.
 
-        // Iterate all 8 (2^3) combos via a tiny truth table.
-        let cases: &[(bool, bool, bool, bool)] = &[
-            (false, false, false, false),
-            (true, false, false, false),
-            (false, true, false, false),
-            (false, false, true, false),
-            (true, true, false, false),
-            (true, false, true, false),
-            (false, true, true, false),
-            (true, true, true, true),
-        ];
-        for (ts, pubk, m, expected) in cases.iter().copied() {
+    #[test]
+    fn is_provisioned_requires_timestamp_and_container_record() {
+        for (ts, recorded) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut d = empty_deployment();
-            d.provisioned_at = ts.then_some(now);
-            d.container_pubkey = pubk.then(|| pk.clone());
-            d.container_pubkey_mac = m.then(|| mac.clone());
+            d.provisioned_at = ts.then(Utc::now);
+            d.container_record = recorded.then(record);
             assert_eq!(
                 d.is_provisioned(),
-                expected,
-                "(ts={ts}, pubk={pubk}, mac={m}) expected {expected}"
+                ts && recorded,
+                "(ts={ts}, record={recorded})"
             );
         }
     }
@@ -1172,51 +1171,38 @@ mod tests {
 }
 
 // ── /provision ──────────────────────────────────────────────────────────
+/// `POST /provision`. `certificate` is the container's
+/// `SANDBOX_SEAL_ATTESTATION` object, sent verbatim and only when
+/// `GET /provision` reported `certificate_required`. Every request carries a
+/// fresh boot claim signed by the container key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProvisionRequest {
-    // Defaults let old envelopes reach the explicit unsupported-version error.
-    #[serde(default)]
-    pub version: u8,
-    #[serde(default)]
-    pub chain_id: u64,
-    #[serde(default)]
-    pub registry_address: Address,
-    #[serde(default)]
-    pub app_id: String,
-    #[serde(default)]
-    pub registered_at: u64,
     pub seal_id: SealId,
-    pub container_pubkey: Bytes,     // 33-byte compressed secp256k1 pubkey
-    pub image_hash: ImageHash,
-    pub issued_at: u64,
-    pub sandbox_signature: Bytes,
-    #[serde(default)]
-    pub status_binding_scheme: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_ticket: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_generation: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_id: Option<B256>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_started_at: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_signature: Option<Bytes>,
+    pub certificate: Option<crate::image_attestation::Certificate>,
+    pub boot_ticket: String,
+    pub boot_generation: i64,
+    pub boot_id: B256,
+    /// Unix nanoseconds; strictly increasing across attempts of one boot.
+    pub boot_started_at: i64,
+    pub container_signature: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionResponse {
     pub encrypted_agent_seal_priv: Bytes,
     /// The owner's settings document, ECIES-encrypted to the SAME
-    /// `container_pubkey` the seal key went to. Omitted when the agent has
+    /// container key the seal key went to. Omitted when the agent has
     /// no stored document. Rides `/provision` because that call runs on
     /// EVERY boot including a resume, whereas the sandbox env is supplied
     /// only at container create — a resumed container would otherwise come
     /// up unconfigured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_settings: Option<Bytes>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_status_binding: Option<Bytes>,
+    /// ECIES-encrypted `{"token":"<64 lowercase hex>"}`: the opaque per-boot
+    /// status token. The attestor stores only its SHA-256.
+    pub encrypted_status_binding: Bytes,
 }
 
 // ── /status ─────────────────────────────────────────────────────────────
@@ -1243,8 +1229,8 @@ pub struct StatusReport {
     pub status: ContainerReportStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status_binding: Option<String>,
+    /// The per-boot status token handed out by `/provision`.
+    pub status_binding: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settings_digest: Option<B256>,
     /// Raw ECDSA signature (65 bytes, V ∈ {27,28}) produced by the

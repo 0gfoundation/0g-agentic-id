@@ -50,6 +50,134 @@ pub fn signed_envelope(priv_bytes: &[u8; 32], action: &str) -> SandboxEnvelope {
     }
 }
 
+/// A provider attestor-TLS statement signed by `key`, in the provider's wire
+/// field order (the shape of `GET /api/attestor-tls`).
+pub fn signed_attestor_tls(
+    key: &alloy::signers::local::PrivateKeySigner,
+    chain_id: u64,
+    registry: Address,
+    pins: &[B256],
+    issued_at: u64,
+    expires_at: u64,
+) -> Vec<u8> {
+    use alloy::signers::SignerSync;
+    let statement = crate::attestor_tls::Statement {
+        chain_id,
+        registry_address: registry,
+        tls_spki_sha256: pins.to_vec(),
+        issued_at,
+        expires_at,
+        signature: [0; 65],
+    };
+    let signature = key
+        .sign_hash_sync(&statement.signing_digest())
+        .expect("sign statement")
+        .as_bytes();
+    let pins = pins
+        .iter()
+        .map(|pin| format!("\"{}\"", hex::encode(pin)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        r#"{{"version":3,"chain_id":{chain_id},"registry_address":"{registry:#x}","tls_spki_sha256":[{pins}],"issued_at":{issued_at},"expires_at":{expires_at},"signature":"0x{}"}}"#,
+        hex::encode(signature)
+    )
+    .into_bytes()
+}
+
+/// A v3 container certificate for `container_pubkey`, signed by `key` under
+/// the scope of `identity` (the provider's `SANDBOX_SEAL_ATTESTATION`).
+pub fn signed_certificate(
+    key: &alloy::signers::local::PrivateKeySigner,
+    identity: &crate::identity::SandboxServiceIdentity,
+    seal_id: SealId,
+    container_pubkey: &[u8],
+    image_hash: B256,
+    issued_at: u64,
+) -> crate::image_attestation::Certificate {
+    use alloy::signers::SignerSync;
+    let parsed = crate::image_attestation::ParsedCertificate {
+        chain_id: identity.chain_id,
+        registry_address: identity.registry_address,
+        app_id: identity.app_id.clone(),
+        registered_at: identity.registered_at,
+        seal_id,
+        pubkey: Bytes::copy_from_slice(container_pubkey),
+        image_hash,
+        issued_at,
+        signature: [0; 65],
+    };
+    let signature = key
+        .sign_hash_sync(&parsed.signing_digest())
+        .expect("sign certificate")
+        .as_bytes();
+    crate::image_attestation::Certificate {
+        version: crate::image_attestation::VERSION,
+        chain_id: parsed.chain_id,
+        registry_address: parsed.registry_address,
+        app_id: parsed.app_id,
+        registered_at: parsed.registered_at,
+        seal_id: hex::encode(seal_id),
+        pubkey: format!("0x{}", hex::encode(container_pubkey)),
+        image_hash: format!("sha256:{}", hex::encode(image_hash)),
+        ts: issued_at,
+        signature: format!("0x{}", hex::encode(signature)),
+    }
+}
+
+/// Relay source with a fixed provider, statement body and own TLS key.
+pub struct StaticStatementSource {
+    pub provider: Mutex<Address>,
+    /// `provider()` errors while set, like sandbox discovery during an outage.
+    pub provider_fails: AtomicBool,
+    pub provider_calls: AtomicU64,
+    body: Mutex<Result<Vec<u8>, String>>,
+    pub own_tls_spki: Mutex<B256>,
+    pub fetches: AtomicU64,
+}
+
+impl StaticStatementSource {
+    pub fn new(provider: Address, body: Vec<u8>, own_tls_spki: B256) -> Self {
+        Self {
+            provider: Mutex::new(provider),
+            provider_fails: AtomicBool::new(false),
+            provider_calls: AtomicU64::new(0),
+            body: Mutex::new(Ok(body)),
+            own_tls_spki: Mutex::new(own_tls_spki),
+            fetches: AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_body(&self, body: Result<Vec<u8>, String>) {
+        *self.body.lock().unwrap() = body;
+    }
+}
+
+#[async_trait]
+impl crate::attestor_tls::StatementSource for StaticStatementSource {
+    async fn provider(&self) -> anyhow::Result<Address> {
+        self.provider_calls.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(
+            !self.provider_fails.load(Ordering::SeqCst),
+            "mock: sandbox discovery unavailable"
+        );
+        Ok(*self.provider.lock().unwrap())
+    }
+
+    async fn fetch(&self, _provider: Address) -> anyhow::Result<Vec<u8>> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        self.body
+            .lock()
+            .unwrap()
+            .clone()
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    async fn own_tls_spki(&self) -> anyhow::Result<B256> {
+        Ok(*self.own_tls_spki.lock().unwrap())
+    }
+}
+
 // ── ChainClient mock ─────────────────────────────────────────────────────
 
 pub struct MockChain {
@@ -406,6 +534,7 @@ impl SandboxClient for MockSandbox {
             id: format!("mock-{}", hex::encode(&seal_id.as_slice()[..8])),
             state: Some("creating".to_string()),
             created_at: None,
+            container_pubkey: None,
         })
     }
 
@@ -454,6 +583,7 @@ pub struct ConfigurableSandbox {
     /// Authenticated issuer scope is opt-in; no arbitrary-signer acceptance.
     pub authenticated_identity: Mutex<Option<crate::identity::SandboxServiceIdentity>>,
     pub identity_fails: AtomicBool,
+    pub attestor_tls: Mutex<Option<std::sync::Arc<crate::attestor_tls::AttestorTlsRelay>>>,
     pub create_id: Mutex<String>,
     pub create_fails: AtomicBool,
     pub start_fails: AtomicBool,
@@ -483,6 +613,9 @@ pub struct ConfigurableSandbox {
     pub admin_delete_calls: AtomicU64,
     pub boot_tickets: Mutex<Vec<String>>,
     pub last_admin_delete_id: Mutex<Option<String>>,
+    /// The container key a create reports, as read from the provider's
+    /// certificate in its response.
+    pub create_container_pubkey: Mutex<Option<Vec<u8>>>,
 }
 
 impl ConfigurableSandbox {
@@ -490,6 +623,7 @@ impl ConfigurableSandbox {
         Self {
             authenticated_identity: Mutex::new(None),
             identity_fails: AtomicBool::new(false),
+            attestor_tls: Mutex::new(None),
             create_id: Mutex::new("mock-id".to_string()),
             create_fails: AtomicBool::new(false),
             start_fails: AtomicBool::new(false),
@@ -508,6 +642,7 @@ impl ConfigurableSandbox {
             admin_delete_calls: AtomicU64::new(0),
             boot_tickets: Mutex::new(Vec::new()),
             last_admin_delete_id: Mutex::new(None),
+            create_container_pubkey: Mutex::new(None),
         }
     }
 
@@ -554,6 +689,17 @@ impl SandboxClient for ConfigurableSandbox {
         Ok(self.authenticated_identity.lock().unwrap().clone())
     }
 
+    async fn attestor_tls_statement(
+        &self,
+        provider: Address,
+    ) -> Result<Bytes, crate::attestor_tls::RelayError> {
+        let relay = self.attestor_tls.lock().unwrap().clone();
+        match relay {
+            Some(relay) => relay.statement(provider).await,
+            None => Err(crate::attestor_tls::RelayError::Unavailable),
+        }
+    }
+
     async fn create(
         &self,
         _seal_id: SealId,
@@ -571,6 +717,7 @@ impl SandboxClient for ConfigurableSandbox {
             id: self.create_id.lock().unwrap().clone(),
             state: Some("creating".into()),
             created_at: None,
+            container_pubkey: self.create_container_pubkey.lock().unwrap().clone(),
         })
     }
 
@@ -947,7 +1094,12 @@ impl StorageClient for ConfigurableStorage {
 
 pub struct InMemoryDeploymentRepo {
     pub status_bindings: Mutex<HashMap<SealId, [u8; 32]>>,
+    /// Settings served to the boot whose token hash is in `status_bindings`.
+    pub served_settings: Mutex<HashMap<SealId, crate::auth::status::ServedSettings>>,
     pub boot_authorizations: Mutex<HashMap<SealId, crate::auth::status::BootAuthorization>>,
+    /// Mirror of `settings_attempt_boot`: the boot that made the last
+    /// counted settings attempt.
+    pub settings_attempt_boots: Mutex<HashMap<SealId, Option<B256>>>,
     pub by_seal: Mutex<HashMap<SealId, Deployment>>,
     pub by_agent: Mutex<HashMap<AgentId, SealId>>,
     /// Mirror of `last_heartbeat` (DB column not surfaced on the
@@ -984,6 +1136,8 @@ impl InMemoryDeploymentRepo {
     pub fn new() -> Self {
         Self {
             status_bindings: Mutex::new(HashMap::new()),
+            settings_attempt_boots: Mutex::new(HashMap::new()),
+            served_settings: Mutex::new(HashMap::new()),
             boot_authorizations: Mutex::new(HashMap::new()),
             by_seal: Mutex::new(HashMap::new()),
             by_agent: Mutex::new(HashMap::new()),
@@ -1101,6 +1255,9 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 self.revoke_status_boot(seal_id);
                 d.provision_deadline = None;
             }
+            if matches!(stage, StageStatus::Submitted { .. }) {
+                d.provision_deadline = None;
+            }
             d.container_stage = stage;
             d.phase =
                 crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
@@ -1165,6 +1322,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         d.container_stage = StageStatus::NotStarted;
         d.sandbox_id = None;
         d.provisioned_at = None;
+        d.provision_deadline = None;
+        d.container_record = None;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
         Ok(true)
     }
@@ -1179,7 +1338,12 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         self.mut_with(seal_id, |d| d.framework = Some(framework))
     }
 
-    async fn set_sandbox_id(&self, seal_id: SealId, sandbox_id: String) -> anyhow::Result<()> {
+    async fn set_sandbox_id(
+        &self,
+        seal_id: SealId,
+        sandbox_id: String,
+        container_pubkey: Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
         self.set_sandbox_id_calls.fetch_add(1, Ordering::SeqCst);
         anyhow::ensure!(
             !self.fail_set_sandbox_id.load(Ordering::SeqCst),
@@ -1189,32 +1353,11 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             if let Some(auth) = self.boot_authorizations.lock().unwrap().get_mut(&seal_id) {
                 if auth.enabled {
                     auth.sandbox_id = Some(sandbox_id.clone());
+                    auth.container_pubkey = container_pubkey;
                 }
             }
             d.sandbox_id = Some(sandbox_id);
         })
-    }
-
-    async fn set_container_binding(
-        &self,
-        seal: SealId,
-        pubkey: Vec<u8>,
-        mac: Vec<u8>,
-    ) -> anyhow::Result<bool> {
-        let mut rows = self.by_seal.lock().unwrap();
-        let Some(d) = rows.get_mut(&seal) else {
-            return Ok(false);
-        };
-        if self.boot_authorizations.lock().unwrap().contains_key(&seal)
-            || self.status_bindings.lock().unwrap().contains_key(&seal)
-        {
-            return Ok(false);
-        }
-        d.container_pubkey = Some(pubkey.into());
-        d.container_pubkey_mac = Some(mac.into());
-        d.provisioned_at.get_or_insert(chrono::Utc::now());
-        d.provision_deadline = None;
-        Ok(true)
     }
 
     async fn clear_container_binding(
@@ -1240,17 +1383,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             }
         }
         self.revoke_status_boot(seal);
-        d.container_pubkey = None;
-        d.container_pubkey_mac = None;
+        d.container_record = None;
         Ok(sandbox)
-    }
-
-    async fn mark_provisioned(
-        &self,
-        seal_id: SealId,
-        at: chrono::DateTime<chrono::Utc>,
-    ) -> anyhow::Result<()> {
-        self.mut_with(seal_id, |d| d.provisioned_at = Some(at))
     }
 
     async fn set_owner(&self, agent_id: AgentId, new_owner: Address) -> anyhow::Result<()> {
@@ -1357,14 +1491,27 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal_id: SealId,
         reason: String,
         mark_failed: bool,
-    ) -> anyhow::Result<()> {
+        generation: Option<i64>,
+    ) -> anyhow::Result<bool> {
         self.record_provision_error_calls
             .fetch_add(1, Ordering::SeqCst);
+        if let Some(generation) = generation {
+            let current = self
+                .boot_authorizations
+                .lock()
+                .unwrap()
+                .get(&seal_id)
+                .is_some_and(|a| a.enabled && a.generation == generation);
+            if !current {
+                return Ok(false);
+            }
+        }
         let now = chrono::Utc::now();
         self.mut_with(seal_id, |d| {
             d.last_provision_error = Some(reason.clone());
             d.last_provision_error_at = Some(now);
             if mark_failed {
+                d.provision_deadline = None;
                 d.container_stage = StageStatus::Failed {
                     at: now,
                     reason: reason.clone(),
@@ -1372,7 +1519,8 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 d.phase =
                     crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             }
-        })
+        })?;
+        Ok(true)
     }
 
     async fn flip_provision_timeouts(
@@ -1398,6 +1546,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
                 at: now,
                 reason: reason.clone(),
             };
+            d.provision_deadline = None;
             d.phase =
                 crate::types::derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
             d.updated_at = now;
@@ -1478,24 +1627,28 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         Ok(reset)
     }
 
-    async fn has_status_binding(&self, seal: SealId) -> anyhow::Result<bool> {
-        Ok(self.boot_authorizations.lock().unwrap().contains_key(&seal)
-            || self.status_bindings.lock().unwrap().contains_key(&seal))
-    }
     async fn prepare_status_boot(
         &self,
         seal: SealId,
         ticket: Option<[u8; 32]>,
         owner: Address,
     ) -> anyhow::Result<Option<i64>> {
-        let rows = self.by_seal.lock().unwrap();
-        anyhow::ensure!(rows.contains_key(&seal), "unknown seal");
+        let mut rows = self.by_seal.lock().unwrap();
+        let d = rows
+            .get_mut(&seal)
+            .ok_or_else(|| anyhow::anyhow!("unknown seal"))?;
         let mut auths = self.boot_authorizations.lock().unwrap();
         let generation = auths.get(&seal).map_or(1, |a| a.generation + 1);
-        let sandbox_id = if ticket.is_none() {
-            auths.get(&seal).and_then(|a| a.sandbox_id.clone())
-        } else {
-            None
+        let (sandbox_id, ticket_issued_at, container_pubkey) = match ticket {
+            Some(_) => {
+                d.container_record = None;
+                (None, Some(chrono::Utc::now().timestamp()), None)
+            }
+            None => (
+                auths.get(&seal).and_then(|a| a.sandbox_id.clone()),
+                auths.get(&seal).and_then(|a| a.ticket_issued_at),
+                auths.get(&seal).and_then(|a| a.container_pubkey.clone()),
+            ),
         };
         let ticket = ticket.or_else(|| auths.get(&seal).map(|a| a.ticket_hash));
         let Some(ticket_hash) = ticket else {
@@ -1506,10 +1659,12 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             crate::auth::status::BootAuthorization {
                 generation,
                 ticket_hash,
+                ticket_issued_at,
                 enabled: true,
                 started_at: 0,
                 owner: Some(owner),
                 sandbox_id,
+                container_pubkey,
             },
         );
         self.status_bindings.lock().unwrap().remove(&seal);
@@ -1524,9 +1679,9 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
     async fn bind_status_boot(
         &self,
         seal: SealId,
-        pubkey: Vec<u8>,
-        mac: Vec<u8>,
-        hash: [u8; 32],
+        record: &ContainerRecord,
+        token_hash: [u8; 32],
+        served: Option<crate::auth::status::ServedSettings>,
         claim: &crate::auth::status::BootClaim,
     ) -> anyhow::Result<bool> {
         let mut rows = self.by_seal.lock().unwrap();
@@ -1535,6 +1690,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         };
         if d.sandbox_id.as_deref().unwrap_or("").is_empty()
             || matches!(d.container_stage, StageStatus::Stopped { .. })
+            || d.container_record.as_ref().is_some_and(|r| r != record)
         {
             return Ok(false);
         }
@@ -1551,20 +1707,27 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             return Ok(false);
         }
         a.started_at = claim.started_at;
-        d.container_pubkey = Some(pubkey.into());
-        d.container_pubkey_mac = Some(mac.into());
+        d.container_record = Some(record.clone());
         d.provisioned_at.get_or_insert(chrono::Utc::now());
         d.provision_deadline = None;
-        self.status_bindings.lock().unwrap().insert(seal, hash);
+        self.status_bindings
+            .lock()
+            .unwrap()
+            .insert(seal, token_hash);
+        let mut served_settings = self.served_settings.lock().unwrap();
+        match served {
+            Some(served) => served_settings.insert(seal, served),
+            None => served_settings.remove(&seal),
+        };
         Ok(true)
     }
 
     async fn apply_status_report(
         &self,
         seal_id: SealId,
-        hash: Option<[u8; 32]>,
+        token_hash: [u8; 32],
         stage: StageStatus,
-        version: Option<i64>,
+        applied_digest: Option<B256>,
     ) -> anyhow::Result<bool> {
         let mut rows = self.by_seal.lock().unwrap();
         let Some(d) = rows.get_mut(&seal_id) else {
@@ -1572,20 +1735,21 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         };
         if d.sandbox_id.as_deref().unwrap_or("").is_empty()
             || matches!(d.container_stage, StageStatus::Stopped { .. })
-            || self
+            || !self
                 .boot_authorizations
                 .lock()
                 .unwrap()
                 .get(&seal_id)
-                .is_some_and(|a| !a.enabled || hash.is_none())
-            || self.status_bindings.lock().unwrap().get(&seal_id).copied() != hash
+                .is_some_and(|a| a.enabled)
+            || self.status_bindings.lock().unwrap().get(&seal_id) != Some(&token_hash)
         {
             return Ok(false);
         }
         d.container_stage = stage;
         d.phase = derive_phase(&d.storage_stage, &d.mint_stage, &d.container_stage);
-        if hash.is_some()
-            && version == Some(d.settings_version)
+        let served = self.served_settings.lock().unwrap().get(&seal_id).copied();
+        if applied_digest.is_some_and(|applied| served.is_some_and(|s| s.digest == applied))
+            && served.map(|s| s.version) == Some(d.settings_version)
             && d.settings_confirmed_version < d.settings_version
             && d.settings.is_some()
         {
@@ -1640,6 +1804,7 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         seal: SealId,
         version: i64,
         generation: Option<i64>,
+        boot: Option<B256>,
     ) -> anyhow::Result<Option<i32>> {
         let mut rows = self.by_seal.lock().unwrap();
         let Some(d) = rows.get_mut(&seal) else {
@@ -1656,7 +1821,12 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
             && d.settings_version == version
             && d.settings_version > d.settings_confirmed_version
         {
-            d.settings_attempts += 1;
+            let mut last = self.settings_attempt_boots.lock().unwrap();
+            let same_boot = boot.is_some() && last.get(&seal).copied().flatten() == boot;
+            if !(d.settings_attempts > 0 && same_boot) {
+                d.settings_attempts += 1;
+            }
+            last.insert(seal, boot);
             Ok(Some(d.settings_attempts))
         } else {
             Ok(None)

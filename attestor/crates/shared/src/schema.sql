@@ -34,14 +34,25 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS sandbox_id TEXT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS framework TEXT;
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provisioned_at TIMESTAMPTZ;
 
--- Container-pubkey binding for /provision freshness bypass on restart.
--- The pubkey is what the container sent on first /provision; the MAC is
--- HMAC(binding_key_v2, signed_v2_digest32 || authenticated_app_signer20).
--- The digest covers issuer scope, epoch and the complete workload payload.
--- The v2-domain key is HKDF-derived from the attestor master secret; legacy
--- v1 pubkey-only MACs are incompatible. Columns are reused without migration.
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey     BYTEA;
-ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
+-- Container record. The first accepted /provision of a container records
+-- what its v3 certificate established: the container key, its image hash and
+-- the provider instance that signed it (chain, TappRegistry, app id,
+-- registration epoch, recovered provider signer). Later boots of the same
+-- container send no certificate and are checked against these columns. The
+-- seven columns are written in one transaction and cleared together with
+-- every new boot ticket, container reset and ownership revocation.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey          BYTEA;
+ALTER TABLE deployments DROP COLUMN IF EXISTS container_pubkey_mac;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_image_hash      BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_chain_id         BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_registry_address BYTEA;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_app_id           TEXT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_registered_at    BIGINT;
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provider_signer           BYTEA;
+-- A key recorded before the certificate columns existed has no certificate
+-- behind it; its container must be recreated.
+UPDATE deployments SET container_pubkey = NULL
+ WHERE container_pubkey IS NOT NULL AND container_image_hash IS NULL;
 
 -- Provision timeout deadline. Written when `sandbox.create` succeeds
 -- (handle_deploy / handle_sandbox_recreate). The worker sweep loop
@@ -50,6 +61,13 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS container_pubkey_mac BYTEA;
 -- container never got far enough to call /provision at all.
 -- NULL means "no deadline tracked" (legacy rows or no sandbox yet).
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS provision_deadline TIMESTAMPTZ;
+-- A deadline is only live while the container stage is Submitted. Releases
+-- before 1.4 failed a timed-out or refused boot without clearing it; such a
+-- leftover would fail the next boot of that agent while its sandbox is still
+-- being created.
+UPDATE deployments SET provision_deadline = NULL
+ WHERE provision_deadline IS NOT NULL
+   AND container_stage->>'state' IS DISTINCT FROM 'submitted';
 
 -- Last /provision validation error visible to operators / dashboard.
 -- Written on every /provision rejection (bad pubkey shape, signer
@@ -201,19 +219,24 @@ ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_confirmed_version BIGI
 -- a configuration change while an agent is unhealthy, which is exactly when
 -- an owner most needs to.
 ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempts INT NOT NULL DEFAULT 0;
+-- The boot (sealed's per-PID-1 boot_id) that made the last counted attempt.
+-- A retry of /provision by that same boot is not counted again, so it is
+-- served the same document; only a container that comes back as a new boot
+-- moves the count past the first attempt.
+ALTER TABLE deployments ADD COLUMN IF NOT EXISTS settings_attempt_boot BYTEA;
 
 
 -- Global provider revisions, scoped to the deployment environment. Exact signed
 -- bytes and history survive API restarts and are shared by all replicas.
 -- Lock parent deployments before its status child, matching lifecycle transactions.
--- Only the latest attested boot may report status. The opaque receipt itself
--- is encrypted to the container, never persisted in plaintext here.
+-- Only the latest attested boot may report status. Its opaque status token is
+-- encrypted to the container; only the token's SHA-256 is stored here.
 CREATE TABLE IF NOT EXISTS container_status_bindings (
     seal_id BYTEA PRIMARY KEY REFERENCES deployments(seal_id) ON DELETE CASCADE,
     binding_hash BYTEA NOT NULL CHECK (octet_length(binding_hash) = 32)
 );
 
--- Lifecycle authorization remains after stop to prevent legacy downgrade.
+-- Lifecycle authorization remains after stop; a resume reuses its ticket.
 ALTER TABLE container_status_bindings ALTER COLUMN binding_hash DROP NOT NULL;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS generation BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_hash BYTEA;
@@ -222,6 +245,20 @@ ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_started_at B
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS boot_id BYTEA;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_owner BYTEA;
 ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_sandbox_id TEXT;
+-- Unix seconds when the current ticket was issued. A first provision accepts
+-- a certificate issued no earlier than 300 seconds before it. NULL on tickets
+-- issued before this column existed: such a container must be recreated.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS ticket_issued_at BIGINT;
+-- The container key the provider certified for the sandbox this attestor
+-- created under the current ticket, read from the provider's create response.
+-- The first provision must present a certificate for this key: a sealed
+-- sandbox created at the provider directly, even one carrying the ticket,
+-- has another key. Cleared with every new ticket.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS authorized_container_pubkey BYTEA;
+-- The settings document the current boot was served. A running/warning
+-- report confirms the version only when its applied digest equals this one.
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_version BIGINT;
+ALTER TABLE container_status_bindings ADD COLUMN IF NOT EXISTS served_settings_digest BYTEA;
 
 CREATE TABLE IF NOT EXISTS inference_provider_registry (
     chain_id BIGINT NOT NULL,

@@ -54,6 +54,21 @@ async fn recheck_job_owner(
     Ok(())
 }
 
+/// A create response without a certificate for this seal leaves nothing to
+/// bind the first provision to, so that provision is refused. Say why now.
+fn warn_uncertified_create(seal_id: SealId, resp: &attestor_shared::SandboxCreateResponse) {
+    if resp.container_pubkey.is_none() {
+        tracing::warn!(
+            ?seal_id,
+            sandbox_id = %resp.id,
+            "sandbox create response carries no container certificate for this seal; its first provision will be refused"
+        );
+    }
+}
+
+/// Why a resume of a sandbox created before AgentDNA 1.4 is not started.
+const PRE_V3_RESUME: &str = "this agent's sandbox was created before AgentDNA 1.4 and cannot be resumed; reset the agent to create a new one";
+
 /// The provider's own report of a deployment's sandbox.
 #[derive(Debug, PartialEq, Eq)]
 enum ProviderView {
@@ -224,9 +239,32 @@ pub async fn run(ctx: &Ctx, payload: JobPayload) -> anyhow::Result<()> {
                 _ => {}
             }
             recheck_job_owner(ctx, seal_id, &sandbox_envelope).await?;
-            ctx.deployments
-                .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
-                .await?;
+            // Only a sandbox created under AgentDNA 1.4 (a boot ticket with an
+            // issue time) can provision against this attestor; /start refuses
+            // the others, and this keeps a job that slipped past it from
+            // starting a container that can only go offline.
+            let resumable = ctx
+                .deployments
+                .boot_authorization(seal_id)
+                .await?
+                .is_some_and(|a| a.ticket_issued_at.is_some());
+            let generation = if resumable {
+                ctx.deployments
+                    .prepare_status_boot(seal_id, None, sandbox_envelope.wallet_address)
+                    .await?
+            } else {
+                None
+            };
+            if generation.is_none() {
+                tracing::warn!(?seal_id, "sandbox start: sandbox predates AgentDNA 1.4; not starting it");
+                ctx.events
+                    .publish(WsEvent::ContainerWarning {
+                        seal_id,
+                        reason: PRE_V3_RESUME.to_string(),
+                    })
+                    .await?;
+                anyhow::bail!(PRE_V3_RESUME);
+            }
             // Publish the pending stage before start can invoke provisioning;
             // a fast Running callback must never be demoted after start returns.
             ctx.deployments
@@ -469,24 +507,10 @@ async fn handle_sandbox_teardown(
     seal_id: SealId,
     expected_sandbox_id: Option<String>,
 ) -> anyhow::Result<()> {
-    // Never resolve an old teardown job to a newer owner's container.
-    let sandbox_id = match expected_sandbox_id {
-        Some(id) => Some(id),
-        None => {
-            if ctx.deployments.has_status_binding(seal_id).await? {
-                tracing::warn!(
-                    ?seal_id,
-                    "legacy teardown without a captured target ignored for a managed boot"
-                );
-                return Ok(());
-            }
-            ctx.deployments
-                .get(seal_id)
-                .await?
-                .and_then(|d| d.sandbox_id)
-        }
-    };
-    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
+    // Never resolve an old teardown job to a newer owner's container: only
+    // the sandbox captured when the transfer was observed is torn down.
+    let Some(sb) = expected_sandbox_id.filter(|s| !s.is_empty()) else {
+        tracing::warn!(?seal_id, "teardown without a captured sandbox ignored");
         return Ok(());
     };
     tracing::info!(
@@ -889,12 +913,14 @@ async fn handle_sandbox_recreate(
         }
     };
 
-    // New sandbox_id replaces the stale one; the old container_pubkey +
-    // mac stay in the DB but `/provision` will overwrite them when the
-    // new container hits us with its (different) pubkey.
+    // New sandbox_id replaces the stale one. The new ticket already cleared
+    // the old container record; the new container's first `/provision`
+    // records its own certificate, which must be for the key the provider
+    // certified in this response.
+    warn_uncertified_create(seal_id, &resp);
     if let Err(e) = ctx
         .deployments
-        .set_sandbox_id(seal_id, resp.id.clone())
+        .set_sandbox_id(seal_id, resp.id.clone(), resp.container_pubkey.clone())
         .await
     {
         ctx.deployments
@@ -1932,9 +1958,12 @@ async fn run_container_track(
     };
 
     // A container without a persisted identity must not retain a live ticket.
+    // Its first `/provision` must present the key the provider certified in
+    // this response.
+    warn_uncertified_create(seal_id, &resp);
     if let Err(e) = ctx
         .deployments
-        .set_sandbox_id(seal_id, resp.id.clone())
+        .set_sandbox_id(seal_id, resp.id.clone(), resp.container_pubkey.clone())
         .await
     {
         ctx.deployments
@@ -2396,8 +2425,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -2455,8 +2483,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -2625,8 +2652,7 @@ mod tests {
             container_stage: StageStatus::NotStarted,
             sandbox_id: None,
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -3516,8 +3542,7 @@ mod tests {
             container_stage: StageStatus::Confirmed { at: now },
             sandbox_id: Some("sb-1".into()),
             provisioned_at: None,
-            container_pubkey: None,
-            container_pubkey_mac: None,
+            container_record: None,
             provision_deadline: None,
             last_provision_error: None,
             last_provision_error_at: None,
@@ -3617,6 +3642,7 @@ mod tests {
             &mut *t.sandbox.create_id.lock().unwrap(),
             new_id.to_string(),
         );
+        *t.sandbox.create_container_pubkey.lock().unwrap() = Some(vec![0x02; 33]);
 
         let envelope = dummy_envelope("create");
         handle_sandbox_recreate(&t.ctx, seal, envelope)
@@ -3626,6 +3652,11 @@ mod tests {
         assert_eq!(t.sandbox.create_calls.load(Ordering::SeqCst), 1);
         let d = t.deployments.get(seal).await.unwrap().unwrap();
         assert_eq!(d.sandbox_id.as_deref(), Some(new_id));
+        // The first provision is bound to the key the provider certified for
+        // this create.
+        let auth = t.deployments.boot_authorization(seal).await.unwrap().unwrap();
+        assert_eq!(auth.sandbox_id.as_deref(), Some(new_id));
+        assert_eq!(auth.container_pubkey, Some(vec![0x02; 33]));
         assert!(
             matches!(d.container_stage, StageStatus::Submitted { .. }),
             "container stage must be Submitted after recreate"
@@ -3788,6 +3819,7 @@ mod tests {
             Some(U256::from(402u64)),
             Some("sb-broke".into()),
         );
+        seed_boot_authorization(&t, seal).await;
         t.deployments
             .set_container_stage(
                 seal,
@@ -3861,6 +3893,7 @@ mod tests {
             Some(U256::from(7u64)),
             Some("sb-backing-up".into()),
         );
+        seed_boot_authorization(&t, seal).await;
         t.deployments
             .set_container_stage(
                 seal,
@@ -3924,6 +3957,7 @@ mod tests {
             Some(U256::from(agent)),
             Some(sandbox_id.into()),
         );
+        seed_boot_authorization(t, seal).await;
         t.deployments
             .set_container_stage(
                 seal,
@@ -4369,6 +4403,7 @@ mod tests {
             Some(U256::from(103u64)),
             Some("sb-stopped".into()),
         );
+        seed_boot_authorization(&t, seal).await;
         t.deployments
             .set_container_stage(
                 seal,
@@ -4399,6 +4434,59 @@ mod tests {
         assert!(matches!(d.container_stage, StageStatus::Submitted { .. }));
     }
 
+    #[tokio::test]
+    async fn sandbox_start_of_a_sandbox_without_a_v3_ticket_is_not_started() {
+        // No boot authorization (created before 1.3), or a ticket without an
+        // issue time (created under 1.3): neither runtime can provision.
+        for ticket_issued_at in [None, Some(None)] {
+            let t = make_test_ctx();
+            let seal = dummy_seal();
+            seed_deployment(
+                &t.deployments,
+                seal,
+                Vec::new(),
+                StageStatus::Confirmed { at: Utc::now() },
+                StageStatus::Confirmed { at: Utc::now() },
+                Some(U256::from(104u64)),
+                Some("sb-old".into()),
+            );
+            if let Some(issued_at) = ticket_issued_at {
+                seed_boot_authorization(&t, seal).await;
+                t.deployments
+                    .boot_authorizations
+                    .lock()
+                    .unwrap()
+                    .get_mut(&seal)
+                    .unwrap()
+                    .ticket_issued_at = issued_at;
+            }
+            t.deployments
+                .set_container_stage(
+                    seal,
+                    StageStatus::Stopped {
+                        at: Utc::now(),
+                        reason: "user".into(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let err = run_start(&t, seal).await.expect_err("must not start");
+            assert!(err.to_string().contains("reset the agent"), "{err}");
+            assert_eq!(t.sandbox.start_calls.load(Ordering::SeqCst), 0);
+            let d = t.deployments.get(seal).await.unwrap().unwrap();
+            assert!(
+                matches!(d.container_stage, StageStatus::Stopped { .. }),
+                "got {:?}",
+                d.container_stage
+            );
+            assert!(d.provision_deadline.is_none());
+            assert!(warning_reasons(&t)
+                .iter()
+                .any(|r| r.contains("before AgentDNA 1.4")));
+        }
+    }
+
     async fn seed_confirmed_deployment(t: &TestCtx, seal: SealId, agent: u64, sandbox_id: &str) {
         seed_deployment(
             &t.deployments,
@@ -4409,6 +4497,7 @@ mod tests {
             Some(U256::from(agent)),
             Some(sandbox_id.into()),
         );
+        seed_boot_authorization(t, seal).await;
         t.deployments
             .set_container_stage(seal, StageStatus::Confirmed { at: Utc::now() })
             .await
@@ -5133,6 +5222,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5158,6 +5248,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5175,6 +5266,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5205,6 +5297,7 @@ mod tests {
                     .await
                     .unwrap()
                     .map(|a| a.generation),
+                None,
             )
             .await
             .unwrap();
@@ -5608,6 +5701,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert!(
+            d.provision_deadline.is_none(),
+            "the spent deadline is cleared, so a later Submitted cannot match it"
+        );
+        // Moving back to Submitted (a recreate before its new deadline is
+        // written) must not be flipped by the next tick.
+        t.deployments
+            .set_container_stage(
+                B256::repeat_byte(0x01),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: now,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(t
+            .deployments
+            .flip_provision_timeouts(now + chrono::Duration::minutes(1), "test timeout".into())
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| *s != B256::repeat_byte(0x01)));
         // Sanity: the others are untouched.
         let d2 = t
             .deployments
@@ -5623,6 +5739,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(d4.container_stage, StageStatus::Confirmed { .. }));
+        // An expired deadline left beside another stage (as releases before
+        // 1.4 left it on a failed boot) is not inherited by the next start
+        // or create, so it cannot fail that boot while its sandbox is still
+        // being created.
+        t.deployments
+            .set_container_stage(
+                B256::repeat_byte(0x04),
+                StageStatus::Submitted {
+                    tx_hash: None,
+                    at: now,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(t
+            .deployments
+            .flip_provision_timeouts(now + chrono::Duration::minutes(1), "test timeout".into())
+            .await
+            .unwrap()
+            .iter()
+            .all(|s| *s != B256::repeat_byte(0x04)));
     }
 
     #[tokio::test]
@@ -5640,7 +5777,7 @@ mod tests {
         );
 
         t.deployments
-            .record_provision_error(seal, "image_hash not in whitelist".into(), true)
+            .record_provision_error(seal, "image_hash not in whitelist".into(), true, None)
             .await
             .unwrap();
 
@@ -5668,7 +5805,7 @@ mod tests {
         );
 
         t.deployments
-            .record_provision_error(seal, "stale attestation".into(), false)
+            .record_provision_error(seal, "stale attestation".into(), false, None)
             .await
             .unwrap();
 
@@ -5876,7 +6013,7 @@ mod tests {
                 .enabled
         );
         t.deployments
-            .set_sandbox_id(seal, "new".into())
+            .set_sandbox_id(seal, "new".into(), None)
             .await
             .unwrap();
         run(

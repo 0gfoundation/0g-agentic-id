@@ -22,9 +22,7 @@ Attestor 代表 owner 发起 mint tx、给经过 RA 的 Agent TEE 派
 
 目前三个 binary 跑在一个节点上，但设计并不绑定单机：队列用
 `FOR UPDATE SKIP LOCKED` 领活（`shared/src/jobs.rs`），任意多个
-worker 可以共享；provision 绑定 MAC 用的是 KMS **app-scoped** key，
-同一个 Tapp app 的任何节点都能校验；agentSeal
-由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
+worker 可以共享；agentSeal 由 KMS per-seal 按需派生，任何节点都能 provision 任何 agent，节点
 本地没有密钥状态。多节点**尚未实际跑过**——生产使用共享 KMS 稳定 app signer、
 绑定实例的 AgenticID 授权与 gas；Postgres 从
 per-host compose 里抽出来共享、以及 **indexer 保持单实例**（链上
@@ -65,6 +63,44 @@ deploy，要留得更久（每个条目的上传预算是 750 s）。能连到�
 `deploying`，只能重新部署。从本版本起，worker 在每行 `claimed job` 之后都会
 打 `job done` 或 `job failed`（或由 reaper 记为已 reap），以后排空队列只看
 worker 日志即可。
+
+### 升级到 AgentDNA 1.4
+
+1.4 同时改变 provider 证书（v3）、attestor TLS 声明和 `/provision` 请求，不兼容旧版本：
+每个 agent 都需要新容器。按顺序执行，每一步的检查通过之后再继续。
+
+1. **镜像。**为每个框架构建 sealed 镜像，注册为 provider snapshot，并用
+   `addValidFrameworkHash` 加入其镜像哈希。检查：每个镜像的
+   `isValidFrameworkHash(<hash>)` 都返回 `true`。
+2. **配置。**把 `ATTESTOR_SANDBOX_SNAPSHOT` 和 `ATTESTOR_FRAMEWORKS` 指向新的
+   snapshot，使用本版本发布的框架名。检查：升级后 `GET /config` 列出每个框架及其新
+   snapshot。
+3. **暂停并排空。**公告一个窗口，期间 owner 不部署也不 reset：provider 与 attestor
+   版本不一致时 create 会失败，无论哪一方先升级。按上文排空 job 队列。
+4. **在该窗口内升级 provider 和 attestor。**检查：`GET <provider>/api/attestor-tls`
+   返回 200，`GET <ATTESTOR_URL>/attestor-tls?provider=<provider signer>` 返回 200，
+   且 api 日志出现 `attestor tls self-check: provider statement verified`。自检只在
+   api 启动时运行一次：如果 attestor 先于 provider 提供声明启动，自检记录的是
+   `attestor tls self-check: no valid provider statement`。此时上面的转发请求会加载声明，
+   并记录 `attestor tls: provider statement refreshed`，同样算检查通过（重启 api 会重新
+   自检）。provider 报 `attestor instance requires explicit re-authorization` 说明它保存的
+   attestor 实例已过期：先按 sandbox provider 的 `docs/APP_IDENTITY.md` 重新授权该实例
+   再继续。
+5. **每个框架 reset 一个。**每个框架各 reset 一个 agent，等到 `running`。sealed 日志
+   出现 `attestor tls: statement accepted` 和 `OK   status reported`。被拒的 provision
+   会出现在 api 日志里（`provision rejected`），也是该 agent 容器 stage 上的原因。
+6. **公告。**owner reset 自己的 agent。1.4 之前创建的 sandbox 不能 resume
+   （`/start` 带 `start`），会得到 409，因为那个运行时无法 provision。preflight 要求时，
+   owner 需重新确认 provider（SDK `ack()`）。请 owner 错开 reset：worker 一次只跑一个
+   job，签名后约 150 s 内没开始执行的 reset 会被丢弃，agent 保持原样。控制台显示
+   `request expired before it ran — sign it again`；CLI 会一直等新容器直到超时，然后提示
+   agent 没有上线、请重新 reset。
+
+**回滚。**1.4 attestor 是单向的：它的 schema 删除了 1.3 attestor 要读的列
+（`inference_provider_registry.acceptance_mac`、`deployments.container_pubkey_mac`），
+在同一数据库上启动的 1.3 attestor 读不了 provider registry；它也无法验证 1.4 创建的容器
+的 v3 证书，也解码不了 1.4 的 job。某一步检查失败时，按该步的处理方法向前修复，不要重新
+部署 1.3 镜像。
 
 ## Workspace
 
@@ -144,7 +180,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|---|
 | `POST /deploy` | 用户部署 agent | owner EIP-191 + sandbox envelope EIP-191 |
 | `POST /clone` | 源 owner 为另一 owner 铸一个全新 agent，复用源的链上 iData（dataKey 重封给新 agentSeal）；落 Offline，由新 owner 自行上线 | owner EIP-191，校验签名者 == **链上实时 `ownerOf(source)`**（非自声明 owner） |
-| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置 | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
+| `POST /start` / `/stop` / `/retry` / `/reset` | 启停 / 重试 / 重置。AgentDNA 1.4 之前创建的 sandbox（没有启动票据，或票据没有签发时间）不能 `start`（resume），返回 `409`：那个运行时无法 provision，需 reset | owner envelope，签名校验到链上 owner（`/retry` 不带 envelope 时仅限幂等的 attestor 侧重跑，靠 owner 字段匹配把关）|
 | `GET /settings?seal_id=0x…` | owner 读自己的配置文档，连带当前 `version`（下一次写要签的 base）。文档是 owner 的，不进任何公开层——只有这一条路能读。响应还带 `confirmed_version` / `attempts` / `fallback_active`：客户端据此告诉 owner「上次推送没起来、agent 正跑着上一份文档、再推一次就是重试」| owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /settings` | owner 写 agent 的那一份配置文档。attestor 只当**不透明 blob** 存：不解析、不校验、不打日志，所以扩配置词表永远不用改 attestor。不上链——配置可随时重给，记忆不行。写是 compare-and-swap：base version 过期就 409 带 `current_version`，于是抓包重放回不去旧文档，两个客户端也不会互相无声覆盖 | owner 对 `AgenticID.Settings.v1:0x<sealId>:<ts>:<base version>:<文档 sha256>` 的 EIP-191 签名（放 `X-Auth-Message`），校验到**链上实时 owner** |
 | `POST /probe` | 同步探活：失联容器 flip 到 `Failed`；sandbox 仍保留但没在跑的 flip 到 `Stopped`（可 Resume）| 无 |
@@ -153,9 +189,10 @@ cargo run -p attestor-indexer# 第三个终端
 
 | 路径 | 干什么 | 鉴权 |
 |---|---|---|
-| `GET /provision?seal_id=…` | 返回已启用的启动代次，不返回票据；sealed 用于构造容器私钥证明 | 公开元数据 |
-| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档，以及本次启动凭据（`status_binding_scheme: "agentdna-status-v2"` / `encrypted_status_binding`）。凭据绑定实际下发的配置版本和摘要，每次接受的新启动轮换。新协议要求行上已有 sandbox；create 尚未落库时返回 409，sealed 最多重试 180 秒。拒绝的 provision 请求不改状态或删除容器。未确认配置多次启动失败后仍回退至 last-known-good；登记新协议后拒绝旧协议降级 | sandbox TEE 签名 + 节点/镜像白名单 + owner 授权的票据、启动代次和容器私钥证明 |
-| `POST /status` | sealed 心跳与状态。签名覆盖启动凭据哈希和实际使用的配置摘要；在事务内检查当前凭据，再更新状态、心跳与精确版本确认。只有匹配当前版本的 `running` / `warning` 可提升配置；旧容器上报被忽略，`error` 不改配置。旧协议只在未登记新凭据时更新存活状态，永不提升配置 | agentSeal 原始 keccak 签名 + KMS HMAC 启动凭据 |
+| `GET /provision?seal_id=…` | 返回 `{"generation", "certificate_required"}`：已启用的启动代次（不返回票据），以及当前是否尚未记录容器公钥、下一次启动必须携带证书。没有已启用的授权时返回 `403 no authorized boot; reset required` | 公开元数据 |
+| `GET /attestor-tls?provider=0x…` | 原样（逐字节）转发 sandbox provider 对本 attestor TLS SPKI pin 的最新签名声明（EIP-712 `AttestorTLS`，取自已发现 provider 的 `/api/attestor-tls`）。转发前检查 provider 签名、租期（最长 300 秒）以及本 attestor 自己的 TLS 公钥在 pin 中；到期前 60 秒刷新，声明到期前 15 秒停止下发（sealed 要求剩余超过 5 秒），且只在刷新时询问 sandbox discovery，因此 discovery 续期或不可用不会阻塞或拒绝缓存能回答的请求。未知 provider → 404；没有有效声明 → 503 并带 `Retry-After: 5`。始终 `Cache-Control: no-store`。每份新声明都会打日志；api 启动时取一次并记录结果。sealed 之后对 attestor 的所有连接都钉在这些 pin 上 | 公开 |
+| `POST /provision` | 容器领取 ECIES 加密的 `agentSeal_priv`、owner 配置文档，以及不透明的单次启动状态令牌（`encrypted_status_binding`，明文 `{"token":"<64 hex>"}`；只存其 SHA-256，旁边记录实际下发的配置版本和摘要）。**首次启动**携带 v3 证书（`certificate`：`SANDBOX_SEAL_ATTESTATION` 对象，provider 密钥签的 EIP-712 `ImageAttestation`）。attestor 要求签名者与 scope 是已发现的 provider 实例，签发时间在启动票据之前 300 秒到当前时间 + 300 秒之间，镜像在 `validFrameworkHashes` 中，且公钥是 provider 为本 attestor 在当前票据下创建的 sandbox 所报告的公钥（`401 certificate is not for the sandbox this attestor created; reset required`），然后记录容器公钥、镜像和 provider 实例。**之后的启动**不带证书：由已记录的公钥签 boot claim，已记录的 provider 实例必须仍是当前发现的实例（否则 `403 provider instance no longer trusted; reset required`），已记录镜像仍须在白名单中（否则 `401 recorded image_hash not in validFrameworkHashes; reset required`）。没有记录也没有证书 → `409 certificate_required`；证书对应另一把公钥 → `403 container key differs from record; reset required`。每个请求都带 owner 授权的票据、启动代次和容器公钥签名的 boot claim，`boot_started_at` 必须严格递增；create 尚未落库时返回 409。拒绝的请求不删除容器；对已授权启动的 401/403 会打日志（`provision rejected`），在该代次仍有效时记为 `last_provision_error`，并立即把容器 stage 置为 `failed`（发布 `container_failed`）。未确认配置多次启动后回退至 last-known-good（同一次启动的重试算同一次尝试）| provider 签名的证书（首次启动）或已记录的容器公钥 + owner 授权的票据、启动代次和容器公钥签名的 boot claim |
+| `POST /status` | sealed 心跳与状态（`StatusReport.v2` canonical）。签名覆盖状态令牌哈希和实际使用的配置摘要；在一个事务里检查令牌属于当前启动，再更新状态、心跳与精确版本确认。只有实际使用的配置摘要等于该次启动下发摘要的 `running` / `warning` 上报才能提升配置；旧容器上报被忽略，`error` 不改配置 | agentSeal 原始 keccak 签名 + 当前状态令牌 |
 | `POST /settings/seed` | 容器把从旧 config role 里捞回来的配置文档交还 attestor，保证重建容器后不丢。仅播种且一次性：只在 `settings_version = 0` 时落库；行上没有 sandbox 记录时直接忽略（幽灵容器——这个 agent 历史上每个容器都握着 agentSeal 私钥）| agentSeal 对 `SettingsSeed:0x<sealId>:<sha256>` 的签名 |
 
 ### 读 / 实时
@@ -163,11 +200,13 @@ cargo run -p attestor-indexer# 第三个终端
 | 路径 | 干什么 |
 |---|---|
 | `GET /deployments` | 列出当前 deployment |
-| `GET /deployment/:seal_id` | 单条 deployment 详情（无需认证；不返回 settings 文档、容器公钥及其 MAC、iData 重试材料） |
+| `GET /deployment/:seal_id` | 单条 deployment 详情（无需认证；不返回 settings 文档、容器记录、iData 重试材料） |
 | `GET /agent-seal-pubkey?seal_id=` | agent 的 agentSeal 公钥。SDK（以及本 console 的 Restore/Reset）用它加密推理 key（`SEAL_SECRET_ENV`），owner 钱包签名弹窗里不再出现明文 key（issue #166）。只回答已知 seal_id；按 seal 缓存，并限制同时进行的 KMS 派生数量 |
 | `GET /ws/subscribe` | WebSocket 事件流（indexer / worker 通过 EventBus 推 ） |
 
-详细签名 canonical 见 `crates/shared/src/auth/`。
+详细签名 canonical 见 `crates/shared/src/auth/`；v3 容器证书和 attestor TLS 声明见
+`crates/shared/src/image_attestation.rs` 与 `attestor_tls.rs`，与 provider、sealed
+共用的 known-answer 向量在 `crates/shared/testdata/`。
 
 ## 链上依赖
 
@@ -175,7 +214,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | **AgenticID** | NFT mint、iData 注册、`validFrameworkHashes` 白名单 |
 | **VerifiedFeedbackRegistry** | 验证 ServeProof——agentSeal 的 EIP-191 version 0x00 签名 `keccak256(0x19 ‖ 0x00 ‖ validator ‖ proofHash)`，validator = 本 proxy——并在官方 ERC-8004 reputation registry 之上记录 TEE 标记。attestor 从不写它：只在 `GET /config` 公布地址，并作为 `VERIFIED_FEEDBACK_ADDR` 注入每个新容器（`ATTESTOR_VERIFIED_FEEDBACK_ADDR`）；唯一的读取在 worker / api 启动时——`getIdentityRegistry()` 必须等于 `ATTESTOR_AGENTIC_ID_ADDR`，否则启动失败 |
-| **TappRegistry** | attestor / 0g-kms / 0g-sandbox-provider 三个 Tapp app 的代码身份 + 节点签名注册表；`/provision` 通过已认证的 discovery 校验稳定 sandbox app signer 与被签入的注册实例 |
+| **TappRegistry** | attestor / 0g-kms / 0g-sandbox-provider 三个 Tapp app 的代码身份 + 节点签名注册表，也是 provider 证书与 TLS 声明的 EIP-712 `verifyingContract`；`/provision` 用已认证的 sandbox discovery 校验证书签名者与注册 scope |
 | **SandboxServing** | sandbox 预付费余额 + voucher 结算；前端 deploy gate 要求 owner 余额 ≥ 0.1 OG |
 
 合约部署 / 升级 / verify 见 [`../contracts/README.md`](../contracts/README.md) §10。
@@ -201,7 +240,7 @@ cargo run -p attestor-indexer# 第三个终端
 |---|---|
 | `ATTESTOR_APP_ID` | attestor 自己在 TappRegistry 注册的 appId |
 | `ATTESTOR_KMS_APP_ID` / `ATTESTOR_SANDBOX_APP_ID` | 信任的另外两个 Tapp app（trust-roots ack 用）|
-| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（加密 KMS key；生产签名与身份发现要求本地 socket）；docker 里通过 `host.docker.internal` 解到宿主 |
+| `ATTESTOR_TAPP_IP` / `ATTESTOR_TAPP_PORT` | tapp-server 本地 gRPC 端点（稳定 app signer 与按 `material` 逐 seal 派生的 KMS key；生产签名与身份发现要求本地 socket）；docker 里通过 `host.docker.internal` 解到宿主 |
 | `MOCK_TEE` / `MOCK_KMS` | dev mock 开关 |
 | `MOCK_APP_PRIVATE_KEY` / `MOCK_APP_ETH_ADDRESS` | `MOCK_TEE=true` 时必填；私钥需推得出地址（启动校验）|
 | `MOCK_APP_SECRET` | `MOCK_KMS=true` 时必填，32 字节 hex；三个 binary 必须读到**同一个值**否则派生分叉 |
@@ -217,7 +256,7 @@ cargo run -p attestor-indexer# 第三个终端
 | `ATTESTOR_SANDBOX_PUBLIC_PORTS` | 逗号分隔的公开端口白名单（0g-sandbox#57）。设置后 sandbox create 会带上 `publicPorts`，只有名单内端口对外可达，其余回落到 Daytona 认证。必须包含 agent 服务端口（8080）。留空 = 全端口公开——在 provider 切到 0g-daytona fork 镜像之前，这是唯一安全的取值 |
 | `ATTESTOR_SUPPORTED_FRAMEWORKS` | 逗号分隔的可选框架名单——铸造前在 deploy 边缘校验，并经 `GET /config` 提供给前端框架选择器。必须与 `ATTESTOR_SANDBOX_SNAPSHOT` 指向的 sealed 镜像实际打包的 adapter 一致。不设/为空 = 默认 `openclaw` |
 | `ATTESTOR_SECRET_ENV_ENABLED` | 显式开启（`true`/`1`/`on`/`yes`）。开启后 `GET /config` 公布 `secret_env_scheme`，SDK 在 start/reset/retry 时把推理 key 加密给 agentSeal 公钥，而不是明文签进 envelope。只有当 `ATTESTOR_SANDBOX_SNAPSHOT` / `ATTESTOR_FRAMEWORKS` 里所有镜像都能读 `SEAL_SECRET_ENV` 时才开启。默认关闭 |
-| `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`；要让容器能 POST `/provision` 和 `/status` 回来 |
+| `ATTESTOR_PUBLIC_URL` | attestor 自己的外网 URL，注入到 sandbox 容器的 `ATTESTOR_URL`（去掉末尾 `/`）；要让容器能 POST `/provision` 和 `/status` 回来 |
 | `MOCK_SANDBOX` | dev mock 开关；`true` 时不真起容器、只 log |
 
 attestor 与已配置 sealed 镜像统一发布。`/config.inference_capabilities` 根据本版本及已有 framework/snapshot 配置自动生成，不另设能力 ENV。provider 运维写入由 `ATTESTOR_TAPP_REGISTRY_ADDR` 中 `ATTESTOR_APP_ID` 的实时 owner 授权，见 [上线流程](../sdk/typescript/PROVIDERS.zh.md)。

@@ -38,16 +38,14 @@ async fn main() -> anyhow::Result<()> {
     let attestor_identity = identities.attestor;
     let discovery = identities.sandbox;
 
-    // KMS master (app-scoped 32B secret). All three binaries must resolve
-    // to the same key — MOCK_KMS=true requires MOCK_APP_SECRET (same value
+    // KMS for per-seal agentSeal derivation. All three binaries must resolve
+    // to the same KMS — MOCK_KMS=true requires MOCK_APP_SECRET (same value
     // in every binary; the process refuses to start without it), false
     // goes over local gRPC to tapp-server's GetSecretResource.
     let kms = build_kms_client(&cfg).await?;
     attestor_shared::kms::verify_material_honored(kms.as_ref()).await?;
-    let app_key = kms.app_key().await?;
 
     let crypto = Arc::new(RealCrypto::new(
-        app_key,
         kms.clone(),
         cfg.chain_id,
         cfg.agentic_id_addr,
@@ -95,9 +93,27 @@ async fn main() -> anyhow::Result<()> {
             Some(d) => client.with_discovery(d.clone()),
             None => client,
         };
-        Arc::new(match &attestor_identity {
-            Some(identity) => client.with_attestor_identity(identity.clone()),
-            None => client,
+        // sealed pins this attestor through the provider-signed statement
+        // relayed at GET /attestor-tls.
+        Arc::new(match (&discovery, &attestor_identity) {
+            (Some(sandbox), Some(attestor)) => {
+                let relay = Arc::new(attestor_shared::attestor_tls::AttestorTlsRelay::new(
+                    Arc::new(attestor_shared::identity::DiscoveredTlsSource {
+                        sandbox: sandbox.clone(),
+                        attestor: attestor.clone(),
+                    }),
+                    cfg.chain_id,
+                    cfg.tapp_registry_addr,
+                ));
+                // One fetch in the background: a relay that cannot serve
+                // shows in this log now, not first as a failed provision.
+                tokio::spawn({
+                    let relay = relay.clone();
+                    async move { relay.self_check().await }
+                });
+                client.with_attestor_tls_relay(relay)
+            }
+            _ => client,
         })
     };
 

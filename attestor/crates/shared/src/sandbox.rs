@@ -197,35 +197,6 @@ fn apply_public_ports(obj: &mut serde_json::Map<String, serde_json::Value>, port
     );
 }
 
-fn apply_attestor_identity(
-    env: &mut serde_json::Map<String, serde_json::Value>,
-    dev_url: &str,
-    identity: Option<&crate::identity::AttestorTlsDescriptor>,
-) -> anyhow::Result<()> {
-    let (url, allow_unpinned) = match identity {
-        Some(identity) => {
-            env.insert(
-                "ATTESTOR_TLS_DESCRIPTOR".into(),
-                serde_json::Value::String(serde_json::to_string(identity)?),
-            );
-            (identity.url.as_str(), "false")
-        }
-        None => {
-            env.remove("ATTESTOR_TLS_DESCRIPTOR");
-            (dev_url, "true")
-        }
-    };
-    env.insert(
-        "ATTESTOR_URL".into(),
-        serde_json::Value::String(url.to_string()),
-    );
-    env.insert(
-        "ATTESTOR_ALLOW_UNPINNED_DEV".into(),
-        serde_json::Value::String(allow_unpinned.to_string()),
-    );
-    Ok(())
-}
-
 /// One operation keeps the provider, URL, pins and signed envelope from one
 /// snapshot. Response bodies are consumed here too, before returning a result.
 async fn send_text_in_snapshot<F>(
@@ -268,12 +239,27 @@ where
     }
 }
 
+/// `^[A-Za-z_][A-Za-z0-9_]*$`: a name the container runtime cannot read as
+/// anything but one variable.
+fn is_env_name(key: &str) -> bool {
+    let mut chars = key.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Overlay the attestor-controlled env (`ATTESTOR_URL` + `extra_env`) onto a
 /// create body's `env`, creating the object if the payload has none. Always
 /// OVERRIDES a same-named key from the deployer-signed payload — including
 /// with an empty value, which is how an unset attestor setting (e.g. a blank
 /// `VERIFIED_FEEDBACK_ADDR`) still blocks a payload-supplied one. Pulled out
 /// of `create()` so the override is unit-testable without an HTTP round-trip.
+///
+/// A payload key that is not a plain variable name is refused: the runtime
+/// joins each entry as `KEY=VALUE`, so a key such as `CHAIN_RPC_URL=https://x/`
+/// would become a second `CHAIN_RPC_URL` entry beside the attestor's, and
+/// either one may win.
 fn apply_attestor_env(
     obj: &mut serde_json::Map<String, serde_json::Value>,
     attestor_public_url: &str,
@@ -285,9 +271,14 @@ fn apply_attestor_env(
     let env_obj = env_val.as_object_mut().ok_or_else(|| {
         anyhow::anyhow!("sandbox create: canonical.payload.env must be a JSON object")
     })?;
+    if !env_obj.keys().all(|key| is_env_name(key)) {
+        anyhow::bail!(
+            "sandbox create: canonical.payload.env has a key that is not a variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        );
+    }
     env_obj.insert(
         "ATTESTOR_URL".into(),
-        serde_json::Value::String(attestor_public_url.to_string()),
+        serde_json::Value::String(attestor_public_url.trim_end_matches('/').to_string()),
     );
     for (k, v) in extra_env {
         env_obj.insert(k.clone(), serde_json::Value::String(v.clone()));
@@ -301,10 +292,14 @@ pub struct HttpSandbox {
     /// the sandbox create body as `env.ATTESTOR_URL`.
     attestor_public_url: String,
     /// Additional `(KEY, VALUE)` pairs injected into the container's env on
-    /// top of `ATTESTOR_URL`. Same trust boundary — these are
-    /// attestor-controlled, NOT deployer-controlled, so the container can
-    /// trust them as the canonical chain / storage / contract config (a
-    /// malicious deployer can't make the container talk to a fake chain).
+    /// top of `ATTESTOR_URL`: the canonical chain / storage / contract config,
+    /// overriding the owner-signed payload (`apply_attestor_env` also refuses
+    /// payload keys that could smuggle a duplicate entry). This holds for the
+    /// containers this attestor creates. A sealed sandbox created at the
+    /// provider directly can carry any env, so `/provision` hands the agent
+    /// key only to the container this attestor's own create made: the first
+    /// provision must present the key the provider certified in that create's
+    /// response (`SandboxCreateResponse::container_pubkey`).
     extra_env: Vec<(String, String)>,
     /// Public-port allowlist injected into the create body as `publicPorts`
     /// (0g-sandbox#57). Empty = field omitted = all-ports-public (today's
@@ -323,7 +318,9 @@ pub struct HttpSandbox {
     provider_addr: Option<String>,
     http: reqwest::Client,
     discovery: Option<std::sync::Arc<crate::identity::SandboxDiscovery>>,
+    /// Checked before every create: AgenticID must still trust this attestor.
     attestor_identity: Option<std::sync::Arc<crate::identity::AttestorDiscovery>>,
+    attestor_tls: Option<std::sync::Arc<crate::attestor_tls::AttestorTlsRelay>>,
 }
 
 impl HttpSandbox {
@@ -348,6 +345,7 @@ impl HttpSandbox {
                 .expect("reqwest client build"),
             discovery: None,
             attestor_identity: None,
+            attestor_tls: None,
         }
     }
 
@@ -364,6 +362,14 @@ impl HttpSandbox {
         identity: std::sync::Arc<crate::identity::AttestorDiscovery>,
     ) -> Self {
         self.attestor_identity = Some(identity);
+        self
+    }
+
+    pub fn with_attestor_tls_relay(
+        mut self,
+        relay: std::sync::Arc<crate::attestor_tls::AttestorTlsRelay>,
+    ) -> Self {
+        self.attestor_tls = Some(relay);
         self
     }
 
@@ -405,6 +411,20 @@ impl HttpSandbox {
     }
 }
 
+/// The container key the provider certified for `seal_id` in a create
+/// response: the provider returns the new sandbox with its env, which holds
+/// the certificate it wrote (`SANDBOX_SEAL_ATTESTATION`, the private key is
+/// stripped). The certificate's signature is checked at the first
+/// `/provision`; here only its key is taken, so that provision can require
+/// the container this create made.
+fn created_container_pubkey(body: &str, seal_id: SealId) -> Option<Vec<u8>> {
+    let response: serde_json::Value = serde_json::from_str(body).ok()?;
+    let raw = response.get("env")?.get("SANDBOX_SEAL_ATTESTATION")?.as_str()?;
+    let certificate: crate::image_attestation::Certificate = serde_json::from_str(raw).ok()?;
+    let parsed = certificate.parse().ok()?;
+    (parsed.seal_id == seal_id).then(|| parsed.pubkey.to_vec())
+}
+
 fn apply_boot_ticket(env: &mut serde_json::Map<String, serde_json::Value>, ticket: Option<&str>) {
     env.remove("SEAL_BOOT_TICKET");
     if let Some(ticket) = ticket {
@@ -421,12 +441,13 @@ impl SandboxClient for HttpSandbox {
         Ok(Some(discovery.service_identity().await?))
     }
 
-    async fn attestor_tls_identity(
+    async fn attestor_tls_statement(
         &self,
-    ) -> anyhow::Result<Option<crate::identity::AttestorTlsDescriptor>> {
-        match &self.attestor_identity {
-            Some(identity) => Ok(Some(identity.snapshot().await?)),
-            None => Ok(None),
+        provider: Address,
+    ) -> Result<alloy::primitives::Bytes, crate::attestor_tls::RelayError> {
+        match &self.attestor_tls {
+            Some(relay) => relay.statement(provider).await,
+            None => Err(crate::attestor_tls::RelayError::Unavailable),
         }
     }
     async fn service_identity(&self) -> anyhow::Result<Option<(Address, String)>> {
@@ -452,6 +473,8 @@ impl SandboxClient for HttpSandbox {
         //     fine to ride the plain env channel. Same for `extra_env`
         //     (chain / storage / contract config, incl. the ServeProof
         //     validator `VERIFIED_FEEDBACK_ADDR`) — see `apply_attestor_env`.
+        // The container's TLS pins come from the provider-signed statement
+        // sealed fetches through `GET /attestor-tls`, not from this env.
         let msg_bytes = base64::engine::general_purpose::STANDARD
             .decode(envelope.signed_message_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("sandbox create: base64 decode: {e}"))?;
@@ -477,17 +500,15 @@ impl SandboxClient for HttpSandbox {
         apply_public_ports(obj, &self.public_ports);
 
         apply_attestor_env(obj, &self.attestor_public_url, &self.extra_env)?;
-        // apply_attestor_env creates and validates this object. Overlay the
-        // authenticated descriptor last so payload/extra env cannot replace it.
-        let env_obj = obj.get_mut("env").and_then(serde_json::Value::as_object_mut)
+        let env_obj = obj
+            .get_mut("env")
+            .and_then(serde_json::Value::as_object_mut)
             .expect("apply_attestor_env validated env");
-        let attestor_identity = self.attestor_tls_identity().await?;
-        apply_attestor_identity(
-            env_obj,
-            &self.attestor_public_url,
-            attestor_identity.as_ref(),
-        )?;
-        // Own Scan refresh can block; acquire the sandbox lease afterwards.
+        // Never start a container this attestor could no longer provision.
+        if let Some(identity) = &self.attestor_identity {
+            identity.snapshot().await?;
+        }
+        // The self-check can block; acquire the sandbox lease afterwards.
         let connection = self.connection().await?;
         self.check_provider(&canonical, &connection)?;
         apply_boot_ticket(env_obj, boot_ticket);
@@ -535,9 +556,16 @@ impl SandboxClient for HttpSandbox {
         // Sandbox returns a rich object; we only need `id` (+ light metadata)
         // for later /start /stop envelopes. Unknown fields are ignored so
         // sandbox can evolve without breaking us.
-        let parsed: SandboxCreateResponse = serde_json::from_str(&body)
+        let mut parsed: SandboxCreateResponse = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("sandbox create: parse response: {e}"))?;
-        tracing::info!(?seal_id, sandbox_id = %parsed.id, state = ?parsed.state, "sandbox: created");
+        parsed.container_pubkey = created_container_pubkey(&body, seal_id);
+        tracing::info!(
+            ?seal_id,
+            sandbox_id = %parsed.id,
+            state = ?parsed.state,
+            certified_key = parsed.container_pubkey.is_some(),
+            "sandbox: created"
+        );
         Ok(parsed)
     }
 
@@ -809,6 +837,54 @@ impl HttpSandbox {
 mod tests {
     use super::*;
 
+    #[test]
+    fn create_response_yields_the_certified_container_key_for_this_seal() {
+        let provider = alloy::signers::local::PrivateKeySigner::from_bytes(
+            &alloy::primitives::B256::repeat_byte(0x55),
+        )
+        .unwrap();
+        let identity = crate::identity::SandboxServiceIdentity {
+            provider: provider.address(),
+            chain_id: 16602,
+            registry_address: Address::repeat_byte(0x11),
+            app_id: "sandbox-test".into(),
+            registered_at: 100,
+            expires_at: i64::MAX,
+        };
+        let seal = SealId::repeat_byte(0xaa);
+        let key = [0x02; 33];
+        let certificate = crate::mocks::signed_certificate(
+            &provider,
+            &identity,
+            seal,
+            &key,
+            alloy::primitives::B256::repeat_byte(0x11),
+            1_700_000_000,
+        );
+        let body = |env: serde_json::Value| {
+            serde_json::json!({"id": "sb-1", "state": "started", "env": env}).to_string()
+        };
+        let attested = body(serde_json::json!({
+            "SANDBOX_SEAL_ATTESTATION": serde_json::to_string(&certificate).unwrap(),
+            "ATTESTOR_URL": "https://attestor.example",
+        }));
+        assert_eq!(
+            created_container_pubkey(&attested, seal).as_deref(),
+            Some(&key[..])
+        );
+        // Another seal's certificate, none, or a malformed one: no key.
+        assert_eq!(created_container_pubkey(&attested, SealId::repeat_byte(0xbb)), None);
+        assert_eq!(created_container_pubkey(&body(serde_json::json!({})), seal), None);
+        assert_eq!(
+            created_container_pubkey(
+                &body(serde_json::json!({"SANDBOX_SEAL_ATTESTATION": "{}"})),
+                seal
+            ),
+            None
+        );
+        assert_eq!(created_container_pubkey(r#"{"id":"sb-1"}"#, seal), None);
+    }
+
     struct LeaseDns {
         expires_at: chrono::DateTime<chrono::Utc>,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
@@ -1003,41 +1079,15 @@ mod tests {
     }
 
     #[test]
-    fn attestor_transport_overrides_deployer_and_extra_env() {
-        let identity = crate::identity::AttestorTlsDescriptor {
-            version: 1,
-            chain_id: 16602,
-            registry_address: format!("{:#x}", Address::repeat_byte(1)),
-            app_id: "attestor".into(),
-            registered_at: 100,
-            app_signer: format!("{:#x}", Address::repeat_byte(2)),
-            url: "https://attestor.example".into(),
-            scan_url: "https://scan.example".into(),
-            scan_public_key: "ab".repeat(32),
-            tls_spki_sha256: vec!["cd".repeat(32)],
-            checked_at: 1_000,
-            expires_at: 1_300,
-        };
-        let mut env = serde_json::json!({
-            "ATTESTOR_URL":"http://attacker",
-            "ATTESTOR_TLS_DESCRIPTOR":"forged",
-            "ATTESTOR_ALLOW_UNPINNED_DEV":"true"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        apply_attestor_identity(&mut env, "http://dev", Some(&identity)).unwrap();
-        assert_eq!(env["ATTESTOR_URL"], identity.url);
-        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "false");
-        let descriptor: serde_json::Value =
-            serde_json::from_str(env["ATTESTOR_TLS_DESCRIPTOR"].as_str().unwrap()).unwrap();
-        assert_eq!(descriptor["scan_public_key"], identity.scan_public_key);
-        assert_eq!(descriptor["registered_at"], 100);
-
-        apply_attestor_identity(&mut env, "http://dev", None).unwrap();
-        assert_eq!(env["ATTESTOR_URL"], "http://dev");
-        assert_eq!(env["ATTESTOR_ALLOW_UNPINNED_DEV"], "true");
-        assert!(!env.contains_key("ATTESTOR_TLS_DESCRIPTOR"));
+    fn attestor_url_is_normalized_and_never_from_the_payload() {
+        let mut obj = serde_json::json!({"env": {"ATTESTOR_URL": "http://attacker"}});
+        apply_attestor_env(
+            obj.as_object_mut().unwrap(),
+            "https://attestor.example/",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(obj["env"]["ATTESTOR_URL"], "https://attestor.example");
     }
     use crate::crypto::RealCrypto;
     use alloy::primitives::{Address, Bytes};
@@ -1185,6 +1235,29 @@ mod tests {
             obj["env"]["VERIFIED_FEEDBACK_ADDR"],
             "0x00000000000000000000000000000000000000b7"
         );
+    }
+
+    #[test]
+    fn attestor_env_refuses_keys_that_are_not_variable_names() {
+        // A '='-bearing key would reach the runtime as a duplicate of an
+        // attestor-owned variable.
+        for key in [
+            "CHAIN_RPC_URL=https://rpc.example/?x",
+            "AGENTIC_ID_ADDR=0x0",
+            "",
+            "1ABC",
+            "A-B",
+            "A B",
+            "A\nB",
+            "Ä",
+        ] {
+            let mut obj = serde_json::json!({ "env": { key: "" } });
+            let err = apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[])
+                .unwrap_err();
+            assert!(err.to_string().contains("not a variable name"), "{key:?}: {err}");
+        }
+        let mut obj = serde_json::json!({ "env": { "_A1": "x", "SEAL_SECRET_ENV": "y", "a": "z" } });
+        apply_attestor_env(obj.as_object_mut().unwrap(), "http://attestor", &[]).unwrap();
     }
 
     #[test]
