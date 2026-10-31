@@ -777,6 +777,7 @@ mod tests {
     async fn delayed_heartbeat_cannot_undo_stop_or_make_start_skip_resume() {
         use attestor_shared::mocks::{ConfigurableSandbox, ConfigurableStorage};
         use attestor_shared::{JobPayload, SandboxEnvelope};
+        use base64::Engine as _;
         let s = make_setup(
             Some(json!({"model":"m"})),
             None,
@@ -796,7 +797,7 @@ mod tests {
             .unwrap()
             .get_mut(&s.seal_id)
             .unwrap()
-            .sandbox_id = created;
+            .sandbox_id = created.clone();
         s.repo
             .status_bindings
             .lock()
@@ -814,9 +815,18 @@ mod tests {
             events: s.state.events.clone(),
             oss: attestor_shared::oss::OssClient::for_test(),
         };
+        // The owner's stop and start name the row's sandbox.
+        let canonical = json!({
+            "action": "stop",
+            "expires_at": 9_999_999_999_i64,
+            "nonce": "00000000000000000000000000000000",
+            "payload": {},
+            "resource_id": created.expect("row sandbox"),
+        });
         let envelope = SandboxEnvelope {
             wallet_address: Address::ZERO,
-            signed_message_b64: String::new(),
+            signed_message_b64: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&canonical).unwrap()),
             wallet_signature: Bytes::new(),
         };
         crate::test_worker_jobs::run(
