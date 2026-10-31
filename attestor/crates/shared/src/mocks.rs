@@ -1104,6 +1104,37 @@ impl DeploymentRepo for InMemoryDeploymentRepo {
         })
     }
 
+    async fn set_container_stage_if(
+        &self,
+        seal_id: SealId,
+        sandbox_id: &str,
+        expected_state: &str,
+        stale_before: Option<chrono::DateTime<chrono::Utc>>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        let fresh = stale_before.is_some_and(|cutoff| {
+            self.heartbeats
+                .lock()
+                .unwrap()
+                .get(&seal_id)
+                .map_or(true, |t| *t >= cutoff)
+        });
+        let matches = self
+            .by_seal
+            .lock()
+            .unwrap()
+            .get(&seal_id)
+            .is_some_and(|d| {
+                d.sandbox_id.as_deref() == Some(sandbox_id)
+                    && d.container_stage.state_tag() == expected_state
+            });
+        if fresh || !matches {
+            return Ok(false);
+        }
+        self.set_container_stage(seal_id, stage).await?;
+        Ok(true)
+    }
+
     async fn reset_container_track(
         &self,
         seal: SealId,

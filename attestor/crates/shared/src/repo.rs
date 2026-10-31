@@ -269,6 +269,53 @@ impl DeploymentRepo for PostgresDeploymentRepo {
         }
     }
 
+    async fn set_container_stage_if(
+        &self,
+        seal_id: SealId,
+        sandbox_id: &str,
+        expected_state: &str,
+        stale_before: Option<DateTime<Utc>>,
+        stage: StageStatus,
+    ) -> anyhow::Result<bool> {
+        let mut tx = deployment_tx(&self.pool).await?;
+        // The row lock re-checks the predicate against the latest version,
+        // so a lifecycle write that committed first makes this a no-op.
+        let row = sqlx::query(
+            "SELECT storage_stage,mint_stage FROM deployments
+              WHERE seal_id=$1 AND sandbox_id=$2 AND container_stage->>'state'=$3
+                AND ($4::timestamptz IS NULL OR last_heartbeat < $4)
+              FOR UPDATE",
+        )
+        .bind(seal_id.as_slice())
+        .bind(sandbox_id)
+        .bind(expected_state)
+        .bind(stale_before)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let storage: StageStatus = serde_json::from_value(row.try_get("storage_stage")?)?;
+        let mint: StageStatus = serde_json::from_value(row.try_get("mint_stage")?)?;
+        let phase = derive_phase(&storage, &mint, &stage);
+        let revoke = matches!(
+            stage,
+            StageStatus::Stopped { .. } | StageStatus::Failed { .. }
+        );
+        sqlx::query("UPDATE deployments SET container_stage=$2,phase=$3,provision_deadline=CASE WHEN $4 THEN NULL ELSE provision_deadline END,updated_at=now() WHERE seal_id=$1")
+            .bind(seal_id.as_slice())
+            .bind(serde_json::to_value(stage)?)
+            .bind(phase.serde_tag())
+            .bind(revoke)
+            .execute(&mut *tx)
+            .await?;
+        if revoke {
+            sqlx::query("UPDATE container_status_bindings SET enabled=FALSE,binding_hash=NULL,generation=generation+1 WHERE seal_id=$1").bind(seal_id.as_slice()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     async fn reset_container_track(
         &self,
         seal_id: SealId,
@@ -1161,6 +1208,71 @@ mod settings_retry_tests {
             if url.contains('?') { '&' } else { '?' },
             hex::encode(rand::random::<[u8; 8]>())
         )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated AGENTDNA_TEST_DATABASE_URL"]
+    async fn postgres_reconciler_writes_only_the_row_it_inspected() {
+        let pool = connect(&test_database_url()).await.unwrap();
+        let repo = PostgresDeploymentRepo::new(pool.clone());
+        let seal = B256::from(rand::random::<[u8; 32]>());
+        let now = Utc::now();
+        let stale = now - chrono::Duration::hours(1);
+        let cutoff = now - chrono::Duration::minutes(15);
+        let confirmed = serde_json::to_value(StageStatus::Confirmed { at: stale }).unwrap();
+        sqlx::query("INSERT INTO deployments(seal_id,agent_seal_addr,owner,storage_stage,mint_stage,container_stage,phase,sandbox_id,last_heartbeat) VALUES($1,$2,$2,$3,$3,$3,'running','sb-2',$4)")
+            .bind(seal.as_slice()).bind(Address::ZERO.as_slice()).bind(&confirmed).bind(stale).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO container_status_bindings(seal_id,binding_hash,generation,enabled) VALUES($1,$2,4,TRUE)")
+            .bind(seal.as_slice()).bind([7u8; 32].as_slice()).execute(&pool).await.unwrap();
+        let failed = StageStatus::Failed {
+            at: now,
+            reason: "container missing (sandbox deleted)".into(),
+        };
+
+        // A reset moved the row onto another sandbox.
+        assert!(!repo
+            .set_container_stage_if(seal, "sb-1", "confirmed", Some(cutoff), failed.clone())
+            .await
+            .unwrap());
+        // A resume moved the stage on.
+        assert!(!repo
+            .set_container_stage_if(seal, "sb-2", "submitted", Some(cutoff), failed.clone())
+            .await
+            .unwrap());
+        // The container reported in since the candidate was read.
+        repo.mark_heartbeat(seal, now).await.unwrap();
+        assert!(!repo
+            .set_container_stage_if(seal, "sb-2", "confirmed", Some(cutoff), failed.clone())
+            .await
+            .unwrap());
+        let enabled: bool = sqlx::query_scalar("SELECT enabled FROM container_status_bindings WHERE seal_id=$1")
+            .bind(seal.as_slice()).fetch_one(&pool).await.unwrap();
+        assert!(enabled, "a refused verdict revokes nothing");
+        assert!(matches!(
+            repo.get(seal).await.unwrap().unwrap().container_stage,
+            StageStatus::Confirmed { .. }
+        ));
+
+        // Still the row that was inspected: the verdict lands and revokes
+        // the boot, as set_container_stage does.
+        sqlx::query("UPDATE deployments SET last_heartbeat=$2 WHERE seal_id=$1")
+            .bind(seal.as_slice()).bind(stale).execute(&pool).await.unwrap();
+        assert!(repo
+            .set_container_stage_if(seal, "sb-2", "confirmed", Some(cutoff), failed)
+            .await
+            .unwrap());
+        let d = repo.get(seal).await.unwrap().unwrap();
+        assert!(matches!(d.container_stage, StageStatus::Failed { .. }));
+        assert_ne!(d.phase, DeploymentPhase::Running);
+        let (enabled, generation): (bool, i64) = sqlx::query_as("SELECT enabled,generation FROM container_status_bindings WHERE seal_id=$1")
+            .bind(seal.as_slice()).fetch_one(&pool).await.unwrap();
+        assert!(!enabled);
+        assert_eq!(generation, 5);
+        sqlx::query("DELETE FROM deployments WHERE seal_id=$1")
+            .bind(seal.as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
