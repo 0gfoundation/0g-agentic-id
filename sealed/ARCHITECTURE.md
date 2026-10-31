@@ -725,7 +725,7 @@ section in the attestor README).
 
 In one line: **handleDrift decides "what state are we in right now"; runHeartbeat handles "tell others periodically"**. They don't overwrite each other because they read and write the same `currentStatus`; whatever one updates, the other will see next time.
 
-On the attestor side, if no `/status` arrives within 15 min, the deployment flips to `Failed { reason: "heartbeat timeout (15min)" }` and broadcasts a `ContainerFailed` event. This only happens when sealed is actually dead (process crashed, network entirely down).
+On the attestor side, the worker sweep reconciles a deployment with no `/status` for 15 min against its sandbox (see the attestor README): a started sandbox whose `/healthz` is unreachable too is marked `Failed` and deleted, with a `ContainerFailed` event. A report can only arrive while the provider serves the attestor TLS statement, so the sweep does not act on a stale heartbeat while the provider serves none, nor for 15 min after it serves one again.
 
 ### `handleDrift`'s three-severity scheme
 

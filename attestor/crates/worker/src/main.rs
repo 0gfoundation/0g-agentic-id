@@ -2,6 +2,7 @@
 //! lifecycle actions.
 
 mod jobs;
+mod sweep;
 
 use attestor_shared::{
     chain::connect_http as chain_connect_http,
@@ -188,8 +189,8 @@ async fn main() -> anyhow::Result<()> {
     //      expired; settle the stages an abandoned job left in flight)
     //  (c) provision deadline (flip stuck container_stage=Submitted to
     //      Failed once `now > provision_deadline`, publish events)
-    //  (d) heartbeat staleness (flip running rows whose sealed runtime
-    //      has stopped reporting to Stopped, publish events)
+    //  (d) heartbeat staleness (reconcile running rows whose sealed runtime
+    //      has stopped reporting against their sandbox; see sweep.rs)
     {
         let queue = queue.clone();
         let retention = cfg.job_retention_seconds;
@@ -198,12 +199,21 @@ async fn main() -> anyhow::Result<()> {
         let sandbox = ctx.sandbox.clone();
         let sandbox_proxy_addr = cfg.sandbox_proxy_addr.clone();
         let agent_serve_port = cfg.agent_serve_port;
+        // sealed reports through the provider-signed attestor TLS statement;
+        // the sweep checks that the provider serves one, as the api relay
+        // does, before it reads a stale heartbeat as a dead agent.
+        let mut reports = match (&discovery, &attestor_identity) {
+            (Some(sandbox), Some(attestor)) => sweep::ReportPath::pinned(
+                Arc::new(attestor_shared::identity::DiscoveredTlsSource {
+                    sandbox: sandbox.clone(),
+                    attestor: attestor.clone(),
+                }),
+                cfg.chain_id,
+                cfg.tapp_registry_addr,
+            ),
+            _ => sweep::ReportPath::unpinned(),
+        };
         tokio::spawn(async move {
-            // 15 minutes = 3 missed 5-min heartbeats. Sandbox-side
-            // terminations (balance exhaustion, manual kill, hardware
-            // failure) all surface within one threshold window.
-            const HEARTBEAT_STALENESS_SECS: i64 = 15 * 60;
-
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -251,152 +261,26 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // (d) Heartbeat staleness — reconcile against the sandbox
-                // instead of blindly flipping Failed. For each stale runner
-                // we check the sandbox's real state and act accordingly,
-                // reaping (admin_delete) confirmed-dead sandboxes so they
-                // don't linger as orphans, while preserving stopped ones for
-                // the owner to Resume.
-                let candidates = match deployments
-                    .stale_running_candidates(now, HEARTBEAT_STALENESS_SECS)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "stale-candidate query failed");
-                        continue;
-                    }
+                // (d) Heartbeat staleness. The /healthz probe confirms a
+                // started sandbox is really serving, and is the fallback
+                // liveness signal when get_sandbox itself is unavailable.
+                let healthz_ok = |sb: String| {
+                    let url = attestor_shared::agent_card::build_healthz_url(
+                        &sandbox_proxy_addr,
+                        &sb,
+                        agent_serve_port,
+                    );
+                    async move { attestor_shared::agent_card::agent_is_healthy(&url).await }
                 };
-
-                // What to do with a stale runner after inspecting its sandbox.
-                enum Act {
-                    Skip,               // actually alive (healthz ok) — leave it
-                    Stop(String),       // sandbox preserved → Stopped (resumable)
-                    Fail(String, bool), // → Failed; bool = reap (admin_delete)
-                }
-
-                for (seal_id, sandbox_id) in candidates {
-                    let Some(sb) = sandbox_id.filter(|s| !s.is_empty()) else {
-                        // No sandbox to reconcile against; leave for an operator.
-                        continue;
-                    };
-                    // Probe the agent's /healthz directly — used both to confirm
-                    // a "started" sandbox is really serving, and as the fallback
-                    // liveness signal when get_sandbox itself is unavailable.
-                    let healthz_ok = || async {
-                        let url = attestor_shared::agent_card::build_healthz_url(
-                            &sandbox_proxy_addr,
-                            &sb,
-                            agent_serve_port,
-                        );
-                        attestor_shared::agent_card::agent_is_healthy(&url).await
-                    };
-
-                    let act = match sandbox.get_sandbox(&sb).await {
-                        // Gone already — flip Failed, nothing to reap.
-                        Ok(None) => {
-                            Act::Fail("container missing (sandbox deleted)".to_string(), false)
-                        }
-                        Ok(Some(ref i)) => match i.state.as_str() {
-                            // Sandbox up but heartbeat stale: confirm with a
-                            // /healthz probe before declaring the agent dead,
-                            // so we don't reap a healthy-but-isolated agent.
-                            "started" | "starting" => {
-                                if healthz_ok().await {
-                                    Act::Skip
-                                } else {
-                                    Act::Fail(
-                                        "agent unreachable (heartbeat stale + /healthz down)"
-                                            .to_string(),
-                                        true,
-                                    )
-                                }
-                            }
-                            // Sandbox runtime explicitly reports broken → reap.
-                            "error" => Act::Fail("sandbox error".to_string(), true),
-                            // Anything else — stopped / stopping / archived /
-                            // archiving / any future transitional state — is
-                            // "not running but preserved" → resumable. Flip
-                            // Stopped, NEVER reap. Safe default: an unrecognized
-                            // state must not delete a still-live sandbox (we
-                            // already mis-Failed "archiving" once by enumerating).
-                            other => Act::Stop(format!("sandbox {other}")),
-                        },
-                        // get_sandbox unavailable — e.g. the provider 500s on a
-                        // destroyed/error sandbox (its state machine can't report
-                        // it; see 0g-sandbox#50), or a genuine transient. Don't
-                        // skip forever, or a dead agent stays "running". The
-                        // heartbeat is already stale (candidate filter), so fall
-                        // back to a direct /healthz probe as an independent
-                        // liveness signal: unreachable there too → confidently
-                        // dead → Failed + reap; still reachable → alive, just a
-                        // flaky get_sandbox → leave it. Never reaps on one signal.
-                        Err(e) => {
-                            if healthz_ok().await {
-                                tracing::debug!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed but /healthz ok — leaving alone");
-                                Act::Skip
-                            } else {
-                                tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: get_sandbox failed + /healthz down — reaping unreachable agent");
-                                Act::Fail(
-                                    "agent unreachable (get_sandbox unavailable + heartbeat stale + /healthz down)"
-                                        .to_string(),
-                                    true,
-                                )
-                            }
-                        }
-                    };
-
-                    // A lifecycle job (a reset onto a new sandbox, a resume)
-                    // may have moved this row on while the sandbox was being
-                    // inspected. The verdict lands only while the row still
-                    // names this sandbox, is running and is still stale, and
-                    // a sandbox is reaped only after that write landed.
-                    let cutoff = now - chrono::Duration::seconds(HEARTBEAT_STALENESS_SECS);
-                    let (stage, event, reap) = match act {
-                        Act::Skip => {
-                            tracing::debug!(?seal_id, sandbox_id = %sb, "sweep: heartbeat stale but /healthz ok — leaving alone");
-                            continue;
-                        }
-                        Act::Stop(reason) => (
-                            attestor_shared::StageStatus::Stopped {
-                                at: now,
-                                reason: reason.clone(),
-                            },
-                            attestor_shared::WsEvent::ContainerStopped { seal_id, reason },
-                            false,
-                        ),
-                        Act::Fail(reason, reap) => (
-                            attestor_shared::StageStatus::Failed {
-                                at: now,
-                                reason: reason.clone(),
-                            },
-                            attestor_shared::WsEvent::ContainerFailed { seal_id, reason },
-                            reap,
-                        ),
-                    };
-                    let target = stage.state_tag();
-                    match deployments
-                        .set_container_stage_if(seal_id, &sb, "confirmed", Some(cutoff), stage)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            tracing::info!(?seal_id, sandbox_id = %sb, "sweep: deployment changed during reconcile — leaving alone");
-                            continue;
-                        }
-                        Err(e) => {
-                            tracing::warn!(?seal_id, error = %e, "sweep: stage write failed");
-                            continue;
-                        }
-                    }
-                    if reap {
-                        if let Err(e) = sandbox.admin_delete(&sb).await {
-                            tracing::warn!(?seal_id, sandbox_id = %sb, error = %e, "sweep: admin_delete failed (non-fatal)");
-                        }
-                    }
-                    let _ = events.publish(event).await;
-                    tracing::info!(?seal_id, sandbox_id = %sb, reaped = reap, stage = target, "sweep: stale runner reconciled");
-                }
+                sweep::reconcile_stale_runners(
+                    deployments.as_ref(),
+                    sandbox.as_ref(),
+                    events.as_ref(),
+                    &mut reports,
+                    healthz_ok,
+                    now,
+                )
+                .await;
             }
         });
     }
